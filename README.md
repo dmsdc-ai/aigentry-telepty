@@ -1,4 +1,4 @@
-# @dmsdc-ai/aigentry-telept
+# @dmsdc-ai/aigentry-telepty
 
 **Cross-machine PTY-based remote prompt injection daemon for AI CLIs.**
 
