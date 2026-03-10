@@ -6,6 +6,11 @@ const DAEMON_URL = 'http://127.0.0.1:3848';
 
 async function main() {
   const cmd = args[0];
+  if (cmd === 'mcp') {
+    require('./mcp.js');
+    return;
+  }
+
   if (cmd === 'daemon') {
     console.log('Starting telepty daemon...');
     require('./daemon.js');
@@ -64,7 +69,8 @@ async function main() {
     return;
   }
 
-  console.log(`\n\x1b[1maigentry-telepty\x1b[0m - Cross-machine PTY-based remote prompt injection\n\nUsage:\n  telepty daemon                                 Start the background daemon\n  telepty spawn --id <id> <command> [args...]    Spawn a new background CLI\n  telepty list                                   List all active sessions\n  telepty inject <id> "<prompt>"                 Inject text into an active session\n  `);
+  console.log(`\n\x1b[1maigentry-telepty\x1b[0m - Cross-machine PTY-based remote prompt injection\n\nUsage:\n  telepty daemon                                 Start the background daemon\n  telepty spawn --id <id> <command> [args...]    Spawn a new background CLI\n  telepty list                                   List all active sessions\n  telepty inject <id> "<prompt>"                 Inject text into an active session
+  telepty mcp                                    Start the MCP stdio server\n  `);
 }
 
 main();
