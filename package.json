@@ -1,6 +1,6 @@
 {
   "name": "aigentry-telepty",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "main": "daemon.js",
   "bin": {
     "telepty": "cli.js"
