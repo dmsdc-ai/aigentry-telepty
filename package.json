@@ -1,12 +1,20 @@
 {
   "name": "aigentry-telepty",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "daemon.js",
+  "bin": {
+    "telepty": "cli.js"
+  },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "node-pty": "^1.1.0"
+  }
 }
