@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const pty = require('node-pty');
 const os = require('os');
-const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -13,20 +12,19 @@ const HOST = process.env.HOST || '0.0.0.0';
 
 const sessions = {};
 
-function generateId() { return crypto.randomBytes(4).toString('hex'); }
-
 app.post('/api/sessions/spawn', (req, res) => {
-  const { command, args = [], cwd = process.cwd() } = req.body;
+  const { session_id, command, args = [], cwd = process.cwd() } = req.body;
+  if (!session_id) return res.status(400).json({ error: 'session_id is strictly required. Auto-generation is disabled to enforce deterministic routing.' });
+  if (sessions[session_id]) return res.status(409).json({ error: `Session ID '${session_id}' is already actively running.` });
   if (!command) return res.status(400).json({ error: 'command is required' });
-  const sessionId = generateId();
   const shell = os.platform() === 'win32' ? 'cmd.exe' : command;
   const shellArgs = os.platform() === 'win32' ? ['/c', command, ...args] : args;
   try {
     const ptyProcess = pty.spawn(shell, shellArgs, { name: 'xterm-color', cols: 80, rows: 30, cwd, env: process.env });
-    ptyProcess.onExit(({ exitCode }) => { console.log(`Session ${sessionId} exited`); delete sessions[sessionId]; });
-    sessions[sessionId] = { ptyProcess, command, cwd, createdAt: new Date().toISOString() };
-    console.log(`[SPAWN] Created session ${sessionId}`);
-    res.status(201).json({ sessionId, command, cwd });
+    ptyProcess.onExit(({ exitCode }) => { console.log(`Session ${session_id} exited`); delete sessions[session_id]; });
+    sessions[session_id] = { ptyProcess, command, cwd, createdAt: new Date().toISOString() };
+    console.log(`[SPAWN] Created session ${session_id}`);
+    res.status(201).json({ session_id, command, cwd });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
