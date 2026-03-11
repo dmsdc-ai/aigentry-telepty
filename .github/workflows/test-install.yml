@@ -1,0 +1,32 @@
+name: Test Installation Scripts
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run Install Script
+        shell: powershell
+        run: |
+          ./install.ps1
+
+  test-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run Install Script
+        run: |
+          bash ./install.sh
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run Install Script
+        run: |
+          bash ./install.sh
