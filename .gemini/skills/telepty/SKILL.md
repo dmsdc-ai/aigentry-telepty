@@ -4,7 +4,7 @@
 Help the user interact with the `telepty` daemon, check their current session ID, list active sessions, and inject commands into remote or local PTY sessions.
 
 **Trigger:**
-When the user asks about their current session ID (e.g. "내 세션 ID가 뭐야?"), wants to check active sessions ("세션 목록 보여줘"), or wants to inject a prompt/command into a specific session ("dustcraw한테 메시지 보내줘").
+When the user asks about their current session ID (e.g. "내 세션 ID가 뭐야?"), wants to check active sessions ("세션 목록 보여줘"), wants to inject a prompt/command into a specific session ("dustcraw한테 메시지 보내줘"), or wants to update telepty to the latest version ("업데이트 해줘").
 
 **Instructions:**
 1. **To check the current session ID:**
@@ -17,3 +17,5 @@ When the user asks about their current session ID (e.g. "내 세션 ID가 뭐야
    - For a single session: Run `telepty inject <target_session_id> "<message or command>"`.
    - For broadcasting to ALL active sessions: Run `telepty broadcast "<message or command>"`.
    - For multicasting to multiple specific sessions: Run `telepty multicast <id1>,<id2> "<message or command>"`.
+4. **To update telepty:**
+   - Run `telepty update`.
