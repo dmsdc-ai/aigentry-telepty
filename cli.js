@@ -104,6 +104,36 @@ async function ensureDaemonRunning() {
   }
 }
 
+async function manageInteractiveAttach(sessionId, targetHost) {
+  const wsUrl = `ws://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
+  const ws = new WebSocket(wsUrl);
+  return new Promise((resolve) => {
+    ws.on('open', () => {
+      console.log(`\n\x1b[32mEntered room '${sessionId}'. The room will be destroyed if you exit (Ctrl+C or exit command).\x1b[0m\n`);
+      if (process.stdin.isTTY) process.stdin.setRawMode(true);
+      process.stdin.on('data', d => ws.send(JSON.stringify({ type: 'input', data: d.toString() })));
+      const resizer = () => ws.send(JSON.stringify({ type: 'resize', cols: process.stdout.columns, rows: process.stdout.rows }));
+      process.stdout.on('resize', resizer); resizer();
+    });
+    ws.on('message', m => {
+      const msg = JSON.parse(m);
+      if (msg.type === 'output') process.stdout.write(msg.data);
+    });
+    ws.on('close', async () => {
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      console.log(`\n\x1b[33mLeft room '${sessionId}'. Destroying session to prevent zombies...\x1b[0m\n`);
+      process.stdin.removeAllListeners('data');
+      
+      // Auto-kill session when the primary creator leaves
+      try {
+        await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+      } catch(e) {}
+      
+      resolve();
+    });
+  });
+}
+
 async function manageInteractive() {
   console.clear();
   console.log('\x1b[36m\x1b[1m⚡ Telepty Agent Manager\x1b[0m\n');
@@ -189,7 +219,12 @@ async function manageInteractive() {
         });
         const data = await res.json();
         if (!res.ok) console.error(`\n❌ Error: ${data.error}\n`);
-        else console.log(`\n✅ Session '\x1b[36m${data.session_id}\x1b[0m' spawned successfully.\n`);
+        else {
+          // Immediately attach to the spawned session automatically
+          console.log(`\n✅ Session '\x1b[36m${data.session_id}\x1b[0m' spawned. Entering room automatically...\n`);
+          args[1] = data.session_id; // Spoof args for attach
+          return manageInteractiveAttach(data.session_id, '127.0.0.1');
+        }
       } catch (e) {
         console.error('\n❌ Failed to connect to local daemon. Is it running?\n');
       }
@@ -215,27 +250,7 @@ async function manageInteractive() {
       if (!target) continue;
 
       if (response.action === 'attach') {
-        const wsUrl = `ws://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}?token=${encodeURIComponent(TOKEN)}`;
-        const ws = new WebSocket(wsUrl);
-        await new Promise((resolve) => {
-          ws.on('open', () => {
-            console.log(`\n\x1b[32mConnected to '${target.id}'. Press Ctrl+C to detach.\x1b[0m\n`);
-            if (process.stdin.isTTY) process.stdin.setRawMode(true);
-            process.stdin.on('data', d => ws.send(JSON.stringify({ type: 'input', data: d.toString() })));
-            const resizer = () => ws.send(JSON.stringify({ type: 'resize', cols: process.stdout.columns, rows: process.stdout.rows }));
-            process.stdout.on('resize', resizer); resizer();
-          });
-          ws.on('message', m => {
-            const msg = JSON.parse(m);
-            if (msg.type === 'output') process.stdout.write(msg.data);
-          });
-          ws.on('close', () => {
-            if (process.stdin.isTTY) process.stdin.setRawMode(false);
-            console.log(`\n\x1b[33mDisconnected from session.\x1b[0m\n`);
-            process.stdin.removeAllListeners('data');
-            resolve();
-          });
-        });
+        await manageInteractiveAttach(target.id, target.host);
         continue;
       }
 
@@ -340,7 +355,8 @@ async function main() {
       });
       const data = await res.json();
       if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
-      console.log(`✅ Session '\x1b[36m${data.session_id}\x1b[0m' spawned successfully.`);
+      console.log(`✅ Session '\x1b[36m${data.session_id}\x1b[0m' spawned. Entering room automatically...`);
+      return manageInteractiveAttach(data.session_id, '127.0.0.1');
     } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
     return;
   }
@@ -380,7 +396,7 @@ async function main() {
     const ws = new WebSocket(wsUrl);
 
     ws.on('open', () => {
-      console.log(`\x1b[32mConnected to session '${sessionId}' at ${targetHost}. Press Ctrl+C to detach.\x1b[0m\n`);
+      console.log(`\x1b[32mEntered room '${sessionId}' at ${targetHost}. The room will be destroyed if you exit.\x1b[0m\n`);
       
       if (process.stdin.isTTY) {
         process.stdin.setRawMode(true);
@@ -409,11 +425,14 @@ async function main() {
       }
     });
 
-    ws.on('close', (code, reason) => {
+    ws.on('close', async (code, reason) => {
       if (process.stdin.isTTY) {
         process.stdin.setRawMode(false);
       }
-      console.log(`\n\x1b[33mDisconnected from session. (Code: ${code}, Reason: ${reason || 'None'})\x1b[0m`);
+      console.log(`\n\x1b[33mLeft room. Destroying session '${sessionId}' to prevent zombies... (Code: ${code})\x1b[0m`);
+      try {
+        await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+      } catch(e) {}
       process.exit(0);
     });
 

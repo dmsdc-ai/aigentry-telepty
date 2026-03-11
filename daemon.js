@@ -164,6 +164,20 @@ app.post('/api/sessions/:id/inject', (req, res) => {
   }
 });
 
+app.delete('/api/sessions/:id', (req, res) => {
+  const { id } = req.params;
+  const session = sessions[id];
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  try {
+    session.ptyProcess.kill();
+    delete sessions[id];
+    console.log(`[KILL] Session ${id} forcefully closed`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const server = app.listen(PORT, HOST, () => {
   console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
 });
