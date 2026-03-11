@@ -4,9 +4,9 @@
 
 `telepty` (Tele-Prompt) is a lightweight background daemon that bridges the gap between the network and interactive AI command-line interfaces. It allows you to seamlessly share, attach to, and inject commands into terminal sessions across different machines.
 
-## One-Click Installation
+## One-Click Installation & Update
 
-To install and set up `telepty` on any machine (macOS, Linux, or Windows). These scripts will automatically install Node.js if it is missing from your system.
+To install or update `telepty` on any machine (macOS, Linux, or Windows), just run the command for your OS. (Node.js will be automatically installed if you don't have it).
 
 ### For macOS and Linux (Ubuntu, CentOS, etc.)
 Open your terminal and run:
@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/inst
 ```
 
 ### For Windows (PowerShell)
-Open PowerShell and run:
+Open PowerShell as Administrator and run:
 ```powershell
 iwr -useb https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/install.ps1 | iex
 ```
