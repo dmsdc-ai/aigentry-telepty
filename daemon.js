@@ -182,21 +182,11 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
 });
 
-const wss = new WebSocketServer({ server });
+
+const wss = new WebSocketServer({ noServer: true });
 
 wss.on('connection', (ws, req) => {
-  const isLocalhost = req.socket.remoteAddress === '127.0.0.1' || req.socket.remoteAddress === '::1' || req.socket.remoteAddress === '::ffff:127.0.0.1';
-  const isTailscale = req.socket.remoteAddress && req.socket.remoteAddress.startsWith('100.');
-  
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const token = url.searchParams.get('token');
-
-  if (!isLocalhost && !isTailscale && token !== EXPECTED_TOKEN) {
-    console.warn(`[WS-AUTH] Rejected unauthorized WebSocket from ${req.socket.remoteAddress}`);
-    ws.close(1008, 'Unauthorized');
-    return;
-  }
-
+  const url = new URL(req.url, 'http://' + req.headers.host);
   const sessionId = url.pathname.split('/').pop();
   const session = sessions[sessionId];
 
@@ -206,7 +196,7 @@ wss.on('connection', (ws, req) => {
   }
 
   session.clients.add(ws);
-  console.log(`[WS] Client attached to session ${sessionId} (Total: ${session.clients.size})`);
+  console.log(`[WS] Client attached to session \${sessionId} (Total: \${session.clients.size})`);
 
   ws.on('message', (message) => {
     try {
@@ -223,6 +213,59 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     session.clients.delete(ws);
-    console.log(`[WS] Client detached from session ${sessionId} (Total: ${session.clients.size})`);
+    console.log(`[WS] Client detached from session \${sessionId} (Total: \${session.clients.size})`);
   });
+});
+
+const busWss = new WebSocketServer({ noServer: true });
+const busClients = new Set();
+
+busWss.on('connection', (ws, req) => {
+  busClients.add(ws);
+  console.log('[BUS] New agent connected to event bus');
+
+  ws.on('message', (message) => {
+    try {
+      const msg = JSON.parse(message);
+      // For MVP, simply broadcast any valid JSON message to all other bus clients
+      busClients.forEach(client => {
+        if (client !== ws && client.readyState === 1) {
+          client.send(JSON.stringify(msg));
+        }
+      });
+    } catch (e) {
+      console.error('[BUS] Invalid message format', e);
+    }
+  });
+
+  ws.on('close', () => {
+    busClients.delete(ws);
+    console.log('[BUS] Agent disconnected from event bus');
+  });
+});
+
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, 'http://' + req.headers.host);
+  const token = url.searchParams.get('token');
+  
+  const isLocalhost = req.socket.remoteAddress === '127.0.0.1' || req.socket.remoteAddress === '::1' || req.socket.remoteAddress === '::ffff:127.0.0.1';
+  const isTailscale = req.socket.remoteAddress && req.socket.remoteAddress.startsWith('100.');
+  
+  if (!isLocalhost && !isTailscale && token !== EXPECTED_TOKEN) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  if (url.pathname.startsWith('/api/sessions/')) {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  } else if (url.pathname === '/api/bus') {
+    busWss.handleUpgrade(req, socket, head, (ws) => {
+      busWss.emit('connection', ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
 });
