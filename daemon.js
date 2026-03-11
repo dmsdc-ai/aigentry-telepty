@@ -73,16 +73,18 @@ app.post('/api/sessions/spawn', (req, res) => {
 
     // Set Window Title via OSC 0 escape sequence
     const label = type.toUpperCase();
-    const titleCmd = isWin ? "" : `\x1b]0;[${label}: ${session_id}] Telepty Session\x07`;
+    const titleCmd = isWin ? "" : `\x1b]0;⚡ telepty :: ${session_id}\x07`;
     if (titleCmd) ptyProcess.write(titleCmd);
 
-    sessions[session_id] = {
+    const sessionRecord = {
       ptyProcess,
       command,
       cwd,
       createdAt: new Date().toISOString(),
-      clients: new Set()
+      clients: new Set(),
+      isClosing: false
     };
+    sessions[session_id] = sessionRecord;
 
     // Broadcast session creation to bus
     const spawnMsg = JSON.stringify({
@@ -98,16 +100,24 @@ app.post('/api/sessions/spawn', (req, res) => {
     });
 
     ptyProcess.onData((data) => {
+      const currentSession = sessions[session_id];
+      if (!currentSession || currentSession !== sessionRecord) {
+        return;
+      }
+
       // Send to direct WS clients
-      sessions[session_id].clients.forEach(ws => {
+      currentSession.clients.forEach(ws => {
         if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'output', data }));
       });
     });
 
     ptyProcess.onExit(({ exitCode, signal }) => {
       console.log(`[EXIT] Session ${session_id} exited with code ${exitCode}`);
-      sessions[session_id].clients.forEach(ws => ws.close(1000, 'Session exited'));
-      delete sessions[session_id];
+      sessionRecord.isClosing = true;
+      sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
+      if (sessions[session_id] === sessionRecord) {
+        delete sessions[session_id];
+      }
     });
 
     console.log(`[SPAWN] Created session ${session_id} (${command})`);
@@ -225,15 +235,50 @@ app.post('/api/sessions/:id/inject', (req, res) => {
   }
 });
 
+app.patch('/api/sessions/:id', (req, res) => {
+  const { id } = req.params;
+  const { new_id } = req.body;
+  const session = sessions[id];
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  if (!new_id) return res.status(400).json({ error: 'new_id is required' });
+  if (sessions[new_id]) return res.status(409).json({ error: `Session ID '${new_id}' is already in use.` });
+
+  // Move session to new key
+  sessions[new_id] = session;
+  delete sessions[id];
+
+  // Update PTY environment and terminal title
+  const isWin = os.platform() === 'win32';
+  if (!isWin) {
+    session.ptyProcess.write(`\x1b]0;⚡ telepty :: ${new_id}\x07`);
+  }
+
+  // Broadcast rename to bus
+  const busMsg = JSON.stringify({
+    type: 'session_rename',
+    sender: 'daemon',
+    old_id: id,
+    new_id,
+    timestamp: new Date().toISOString()
+  });
+  busClients.forEach(client => {
+    if (client.readyState === 1) client.send(busMsg);
+  });
+
+  console.log(`[RENAME] Session '${id}' renamed to '${new_id}'`);
+  res.json({ success: true, old_id: id, new_id });
+});
+
 app.delete('/api/sessions/:id', (req, res) => {
   const { id } = req.params;
   const session = sessions[id];
   if (!session) return res.status(404).json({ error: 'Session not found' });
+  if (session.isClosing) return res.json({ success: true, status: 'closing' });
   try {
+    session.isClosing = true;
     session.ptyProcess.kill();
-    delete sessions[id];
     console.log(`[KILL] Session ${id} forcefully closed`);
-    res.json({ success: true });
+    res.json({ success: true, status: 'closing' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

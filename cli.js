@@ -89,13 +89,19 @@ async function ensureDaemonRunning() {
 async function manageInteractiveAttach(sessionId, targetHost) {
   const wsUrl = `ws://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
   const ws = new WebSocket(wsUrl);
+  let inputHandler = null;
+  let resizeHandler = null;
   return new Promise((resolve) => {
     ws.on('open', () => {
-      console.log(`\n\x1b[32mEntered room '${sessionId}'. The room will be destroyed if you exit (Ctrl+C or exit command).\x1b[0m\n`);
+      // Set Ghostty tab title to show session ID
+      process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
+      console.log(`\n\x1b[32mEntered room '${sessionId}'.\x1b[0m\n`);
       if (process.stdin.isTTY) process.stdin.setRawMode(true);
-      process.stdin.on('data', d => ws.send(JSON.stringify({ type: 'input', data: d.toString() })));
-      const resizer = () => ws.send(JSON.stringify({ type: 'resize', cols: process.stdout.columns, rows: process.stdout.rows }));
-      process.stdout.on('resize', resizer); resizer();
+      inputHandler = (d) => ws.send(JSON.stringify({ type: 'input', data: d.toString() }));
+      resizeHandler = () => ws.send(JSON.stringify({ type: 'resize', cols: process.stdout.columns, rows: process.stdout.rows }));
+      process.stdin.on('data', inputHandler);
+      process.stdout.on('resize', resizeHandler);
+      resizeHandler();
     });
     ws.on('message', m => {
       const msg = JSON.parse(m);
@@ -103,7 +109,9 @@ async function manageInteractiveAttach(sessionId, targetHost) {
     });
     ws.on('close', async () => {
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
-      process.stdin.removeAllListeners('data');
+      process.stdout.write(`\x1b]0;\x07`); // Restore default terminal title
+      if (inputHandler) process.stdin.off('data', inputHandler);
+      if (resizeHandler) process.stdout.off('resize', resizeHandler);
 
       // Check if other clients are still attached before destroying
       try {
@@ -382,19 +390,25 @@ async function main() {
 
     const wsUrl = `ws://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
     const ws = new WebSocket(wsUrl);
+    let inputHandler = null;
+    let resizeHandler = null;
 
     ws.on('open', () => {
-      console.log(`\x1b[32mEntered room '${sessionId}' at ${targetHost}. The room will be destroyed if you exit.\x1b[0m\n`);
-      
+      // Set Ghostty tab title to show session ID
+      const hostSuffix = targetHost === '127.0.0.1' ? '' : ` @ ${targetHost}`;
+      process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}${hostSuffix}\x07`);
+      console.log(`\x1b[32mEntered room '${sessionId}'${hostSuffix ? ` (${targetHost})` : ''}.\x1b[0m\n`);
+
       if (process.stdin.isTTY) {
         process.stdin.setRawMode(true);
       }
 
-      process.stdin.on('data', (data) => {
+      inputHandler = (data) => {
         ws.send(JSON.stringify({ type: 'input', data: data.toString() }));
-      });
+      };
+      process.stdin.on('data', inputHandler);
 
-      const resizeHandler = () => {
+      resizeHandler = () => {
         ws.send(JSON.stringify({
           type: 'resize',
           cols: process.stdout.columns,
@@ -417,6 +431,9 @@ async function main() {
       if (process.stdin.isTTY) {
         process.stdin.setRawMode(false);
       }
+      process.stdout.write(`\x1b]0;\x07`); // Restore default terminal title
+      if (inputHandler) process.stdin.off('data', inputHandler);
+      if (resizeHandler) process.stdout.off('resize', resizeHandler);
 
       // Check if other clients are still attached before destroying
       try {
@@ -494,6 +511,20 @@ async function main() {
     return;
   }
 
+  if (cmd === 'rename') {
+    const oldId = args[1]; const newId = args[2];
+    if (!oldId || !newId) { console.error('❌ Usage: telepty rename <old_id> <new_id>'); process.exit(1); }
+    try {
+      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(oldId)}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_id: newId })
+      });
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      console.log(`✅ Session renamed: '\x1b[36m${oldId}\x1b[0m' → '\x1b[36m${newId}\x1b[0m'`);
+    } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+    return;
+  }
+
   if (cmd === 'listen' || cmd === 'monitor') {
     await ensureDaemonRunning();
     
@@ -564,6 +595,7 @@ Usage:
   telepty inject [--no-enter] <id> "<prompt>"    Inject text into a single session
   telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
+  telepty rename <old_id> <new_id>               Rename a session (updates terminal title too)
   telepty listen                                 Listen to the event bus and print JSON to stdout
   telepty monitor                                Human-readable real-time billboard of bus events
   telepty update                                 Update telepty to the latest version

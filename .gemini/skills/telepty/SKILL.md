@@ -44,5 +44,12 @@ When the user asks about their current session ID, wants to check active session
      chmod +x /tmp/telepty-auto.command
      open -a Ghostty /tmp/telepty-auto.command || open /tmp/telepty-auto.command
      ```
-6. **To update telepty:**
+6. **To rename a session:**
+   - Run `telepty rename <old_id> <new_id>`
+   - This updates the session key, Ghostty tab title, and broadcasts a `session_rename` event on the bus.
+7. **Terminal Title Convention:**
+   - Each telepty session displays its ID in the Ghostty tab title.
+   - Local: `⚡ telepty :: {session_id}`
+   - Remote: `⚡ telepty :: {session_id} @ {host}`
+8. **To update telepty:**
    - Run `telepty update`.
