@@ -287,6 +287,8 @@ async function main() {
     }
     return;
   }
+
+  if (cmd === 'mcp') {
     require('./mcp.js');
     return;
   }
