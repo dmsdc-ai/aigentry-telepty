@@ -1,16 +1,16 @@
 # telepty
 
 **Description:**
-Help the user interact with the `telepty` daemon, check their current session ID, list active sessions, and inject commands into remote or local PTY sessions.
+Help the user interact with the `telepty` daemon, check their current session ID, list active sessions, and inject commands or JSON events into remote or local PTY sessions. All operations are performed using standard CLI commands or `curl`.
 
 **Trigger:**
-When the user asks about their current session ID (e.g. "내 세션 ID가 뭐야?"), wants to check active sessions ("세션 목록 보여줘"), wants to inject a prompt/command into a specific session ("dustcraw한테 메시지 보내줘"), or wants to update telepty to the latest version ("업데이트 해줘").
+When the user asks about their current session ID, wants to check active sessions, wants to inject a prompt/command into a specific session, wants to send a JSON event via the bus, or wants to update telepty.
 
 **Instructions:**
 1. **To check the current session ID:**
    - Execute `run_shell_command` with `echo $TELEPTY_SESSION_ID`.
-   - If the value is empty, inform the user that the current shell is *not* running inside a telepty spawned session (it is a normal native terminal).
-   - If it has a value, output it clearly: "현재 계신 터미널의 telepty 세션 ID는 `[ID]` 입니다."
+   - If the value is empty, inform the user that the current shell is *not* running inside a telepty spawned session.
+   - If it has a value, output it clearly.
 2. **To list all sessions:**
    - Run `telepty list`.
 3. **To inject a command into another session:**
@@ -19,3 +19,14 @@ When the user asks about their current session ID (e.g. "내 세션 ID가 뭐야
    - For multicasting to multiple specific sessions: Run `telepty multicast <id1>,<id2> "<message or command>"`.
 4. **To update telepty:**
    - Run `telepty update`.
+5. **To publish a JSON event to the Event Bus (/api/bus):**
+   - Use `curl` to post directly to the local daemon (it will relay to all active clients).
+   - First, get the token: `TOKEN=$(cat ~/.telepty/config.json | grep authToken | cut -d '"' -f 4)`
+   - Then run:
+     ```bash
+     curl -X POST http://127.0.0.1:3848/api/bus/publish \
+       -H "Content-Type: application/json" \
+       -H "x-telepty-token: $TOKEN" \
+       -d '{"type": "my_event", "payload": "data"}'
+     ```
+   - (Modify the JSON payload structure according to the user's specific request.)

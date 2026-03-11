@@ -305,11 +305,6 @@ async function main() {
     return;
   }
 
-  if (cmd === 'mcp') {
-    require('./mcp.js');
-    return;
-  }
-
   if (cmd === 'daemon') {
     console.log('Starting telepty daemon...');
     require('./daemon.js');
@@ -502,7 +497,6 @@ Usage:
   telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
   telepty update                                 Update telepty to the latest version
-  telepty mcp                                    Start the MCP stdio server
 `);
 }
 
