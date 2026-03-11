@@ -1,8 +1,8 @@
 'use strict';
 
-const { after, afterEach, before, test } = require('node:test');
+const { afterEach, beforeEach, test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createSessionId, startTestDaemon, stripAnsi, waitFor } = require('./helpers/daemon-harness');
+const { createSessionId, startTestDaemon, stripAnsi, waitFor } = require('../test-support/daemon-harness');
 
 let harness;
 
@@ -18,16 +18,12 @@ function collectJsonMessages(ws) {
   return messages;
 }
 
-before(async () => {
+beforeEach(async () => {
   harness = await startTestDaemon();
 });
 
-after(async () => {
-  await harness.stop();
-});
-
 afterEach(async () => {
-  await harness.cleanupSessions();
+  await harness.stop();
 });
 
 test('telepty list prints active sessions from the configured host and port', async () => {

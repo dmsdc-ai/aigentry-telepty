@@ -1,8 +1,8 @@
 'use strict';
 
-const { after, afterEach, before, test } = require('node:test');
+const { afterEach, beforeEach, test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createSessionId, delay, startTestDaemon, waitFor } = require('./helpers/daemon-harness');
+const { createSessionId, delay, startTestDaemon, waitFor } = require('../test-support/daemon-harness');
 
 let harness;
 
@@ -18,16 +18,12 @@ function collectJsonMessages(ws) {
   return messages;
 }
 
-before(async () => {
+beforeEach(async () => {
   harness = await startTestDaemon();
 });
 
-after(async () => {
-  await harness.stop();
-});
-
 afterEach(async () => {
-  await harness.cleanupSessions();
+  await harness.stop();
 });
 
 test('GET /api/sessions returns an empty array on a fresh daemon', async () => {
@@ -139,7 +135,10 @@ test('broadcast inject publishes a single bus event with all successful target I
     message.content === prompt
   )).length === 1, { description: 'single broadcast bus event' });
 
+  await delay(100);
+
   const event = messages.find((message) => message.type === 'injection' && message.content === prompt);
+  assert.equal(messages.filter((message) => message.type === 'injection' && message.content === prompt).length, 1);
   assert.deepEqual(event.session_ids.slice().sort(), [sessionA, sessionB].sort());
 
   bus.close();

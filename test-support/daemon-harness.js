@@ -7,7 +7,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
 
-const projectRoot = path.resolve(__dirname, '..', '..');
+const projectRoot = path.resolve(__dirname, '..');
 
 let sessionCounter = 0;
 
@@ -142,22 +142,18 @@ async function startTestDaemon(options = {}) {
     return parseResponse(response);
   }
 
-  async function waitUntilReachable() {
-    await waitFor(async () => {
-      if (child.exitCode !== null) {
-        throw new Error(`Daemon exited early.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
-      }
+  await waitFor(async () => {
+    if (child.exitCode !== null) {
+      throw new Error(`Daemon exited early.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
 
-      try {
-        const response = await fetch(`http://${host}:${port}/api/sessions`);
-        return response.ok;
-      } catch {
-        return false;
-      }
-    }, { timeoutMs: 7000, description: 'daemon start' });
-  }
-
-  await waitUntilReachable();
+    try {
+      const response = await fetch(`http://${host}:${port}/api/sessions`);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }, { timeoutMs: 7000, description: 'daemon start' });
 
   async function cleanupSessions() {
     const list = await request('/api/sessions');
@@ -179,7 +175,7 @@ async function startTestDaemon(options = {}) {
     try {
       await cleanupSessions();
     } catch {
-      // Ignore cleanup failures during shutdown.
+      // Ignore cleanup failures during shutdown and force-stop the daemon below.
     }
 
     if (child.exitCode === null) {

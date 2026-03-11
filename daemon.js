@@ -81,6 +81,7 @@ app.post('/api/sessions/spawn', (req, res) => {
     if (titleCmd) ptyProcess.write(titleCmd);
 
     const sessionRecord = {
+      id: session_id,
       ptyProcess,
       command,
       cwd,
@@ -104,7 +105,7 @@ app.post('/api/sessions/spawn', (req, res) => {
     });
 
     ptyProcess.onData((data) => {
-      const currentSession = sessions[session_id];
+      const currentSession = sessions[sessionRecord.id];
       if (!currentSession || currentSession !== sessionRecord) {
         return;
       }
@@ -116,11 +117,12 @@ app.post('/api/sessions/spawn', (req, res) => {
     });
 
     ptyProcess.onExit(({ exitCode, signal }) => {
-      console.log(`[EXIT] Session ${session_id} exited with code ${exitCode}`);
+      const currentId = sessionRecord.id;
+      console.log(`[EXIT] Session ${currentId} exited with code ${exitCode}`);
       sessionRecord.isClosing = true;
       sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
-      if (sessions[session_id] === sessionRecord) {
-        delete sessions[session_id];
+      if (sessions[currentId] === sessionRecord) {
+        delete sessions[currentId];
       }
     });
 
@@ -250,6 +252,7 @@ app.patch('/api/sessions/:id', (req, res) => {
   // Move session to new key
   sessions[new_id] = session;
   delete sessions[id];
+  session.id = new_id;
 
   // Update terminal title and PS1/PROMPT with new session ID
   const isWin = os.platform() === 'win32';
