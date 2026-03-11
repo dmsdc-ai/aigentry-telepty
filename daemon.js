@@ -151,12 +151,12 @@ app.post('/api/sessions/broadcast/inject', (req, res) => {
 
 app.post('/api/sessions/:id/inject', (req, res) => {
   const { id } = req.params;
-  const { prompt } = req.body;
+  const { prompt, no_enter } = req.body;
   const session = sessions[id];
   if (!session) return res.status(404).json({ error: 'Session not found' });
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
   try {
-    session.ptyProcess.write(`${prompt}\r`);
+    session.ptyProcess.write(no_enter ? prompt : `${prompt}\r`);
     console.log(`[INJECT] Wrote to session ${id}`);
     res.json({ success: true });
   } catch (err) {

@@ -440,11 +440,16 @@ async function main() {
   }
 
   if (cmd === 'inject') {
+    // Check for --no-enter flag
+    const noEnterIndex = args.indexOf('--no-enter');
+    const noEnter = noEnterIndex !== -1;
+    if (noEnter) args.splice(noEnterIndex, 1);
+    
     const sessionId = args[1]; const prompt = args.slice(2).join(' ');
-    if (!sessionId || !prompt) { console.error('❌ Usage: telepty inject <session_id> "<prompt text>"'); process.exit(1); }
+    if (!sessionId || !prompt) { console.error('❌ Usage: telepty inject [--no-enter] <session_id> "<prompt text>"'); process.exit(1); }
     try {
       const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt })
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt, no_enter: noEnter })
       });
       const data = await res.json();
       if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
@@ -519,7 +524,7 @@ Usage:
   telepty spawn --id <id> <command> [args...]    Spawn a new background CLI
   telepty list                                   List all active sessions
   telepty attach [id]                            Attach to a session (Interactive picker if no ID)
-  telepty inject <id> "<prompt>"                 Inject text into a single session
+  telepty inject [--no-enter] <id> "<prompt>"    Inject text into a single session
   telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
   telepty listen                                 Listen to the event bus and print JSON to stdout
