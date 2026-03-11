@@ -4,7 +4,7 @@
 Help the user interact with the `telepty` daemon, check their current session ID, list active sessions, and inject commands or JSON events into remote or local PTY sessions. All operations are performed using standard CLI commands or `curl`.
 
 **Trigger:**
-When the user asks about their current session ID, wants to check active sessions, wants to inject a prompt/command into a specific session, wants to send a JSON event via the bus, or wants to update telepty.
+When the user asks about their current session ID, wants to check active sessions, wants to inject a prompt/command into a specific session, wants to send a JSON event via the bus, wants to subscribe/listen to the bus, or wants to update telepty.
 
 **Instructions:**
 1. **To check the current session ID:**
@@ -30,3 +30,12 @@ When the user asks about their current session ID, wants to check active session
        -d '{"type": "my_event", "payload": "data"}'
      ```
    - (Modify the JSON payload structure according to the user's specific request.)
+6. **To subscribe to the Event Bus (Listen for JSON events):**
+   - If the user wants to wait for and listen to messages from other agents, you can spawn a background listener using `wscat`.
+   - First, ensure `wscat` is installed globally: `npm install -g wscat`
+   - Get the token: `TOKEN=$(cat ~/.telepty/config.json | grep authToken | cut -d '"' -f 4)`
+   - Run `wscat` in a loop and append outputs to a log file, so the AI can periodically check it, or just run it in the background:
+     ```bash
+     nohup wscat -c "ws://127.0.0.1:3848/api/bus?token=$TOKEN" > .telepty_bus_events.log 2>&1 &
+     ```
+   - Inform the user that the agent is now listening, and any received JSON messages will be saved to `.telepty_bus_events.log` in the current directory. (You can read this file using `read_file` to see what messages arrived).
