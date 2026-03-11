@@ -4,6 +4,7 @@ const { execSync, spawn } = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const { cleanupDaemonProcesses } = require('./daemon-control');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 
 console.log("🚀 Installing @dmsdc-ai/aigentry-telepty...");
@@ -23,6 +24,15 @@ function resolveInstalledPackageRoot() {
     return path.join(globalRoot, '@dmsdc-ai', 'aigentry-telepty');
   } catch (e) {
     return __dirname;
+  }
+}
+
+function cleanupLocalDaemons() {
+  console.log('🧹 Cleaning up existing telepty daemons...');
+  const results = cleanupDaemonProcesses();
+  console.log(`   Stopped ${results.stopped.length} daemon(s).`);
+  if (results.failed.length > 0) {
+    console.warn(`   Could not stop ${results.failed.length} daemon(s).`);
   }
 }
 
@@ -65,6 +75,7 @@ async function installSkills() {
   const platform = os.platform();
 
   if (platform === 'win32') {
+    cleanupLocalDaemons();
     console.log("⚙️ Setting up Windows background process...");
     const subprocess = spawn(teleptyPath, ['daemon'], {
       detached: true,
@@ -78,6 +89,8 @@ async function installSkills() {
     console.log("⚙️ Setting up macOS launchd service...");
     const plistPath = path.join(os.homedir(), 'Library', 'LaunchAgents', 'com.aigentry.telepty.plist');
     fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+    try { execSync(`launchctl unload "${plistPath}" 2>/dev/null`); } catch(e){}
+    cleanupLocalDaemons();
 
     const plistContent = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -98,7 +111,6 @@ async function installSkills() {
 </plist>`;
 
     fs.writeFileSync(plistPath, plistContent);
-    try { execSync(`launchctl unload "${plistPath}" 2>/dev/null`); } catch(e){}
     run(`launchctl load "${plistPath}"`);
     console.log("✅ macOS LaunchAgent installed and started.");
 
@@ -108,6 +120,8 @@ async function installSkills() {
       execSync('systemctl --version', { stdio: 'ignore' });
       if (process.getuid && process.getuid() === 0) {
         console.log("⚙️ Setting up systemd service for Linux...");
+        try { execSync('systemctl stop telepty', { stdio: 'ignore' }); } catch(e) {}
+        cleanupLocalDaemons();
         const serviceContent = `[Unit]
 Description=Telepty Daemon
 After=network.target
@@ -133,6 +147,7 @@ WantedBy=multi-user.target`;
 
     // Fallback for Linux without systemd or non-root
     console.log("⚠️ Skipping systemd (no root or no systemd). Starting in background...");
+    cleanupLocalDaemons();
     const subprocess = spawn(teleptyPath, ['daemon'], {
       detached: true,
       stdio: 'ignore'

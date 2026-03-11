@@ -4,6 +4,8 @@ const pty = require('node-pty');
 const os = require('os');
 const { WebSocketServer } = require('ws');
 const { getConfig } = require('./auth');
+const pkg = require('./package.json');
+const { claimDaemonState, clearDaemonState } = require('./daemon-control');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -33,6 +35,14 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3848;
 
 const HOST = process.env.HOST || '0.0.0.0';
+process.title = 'telepty-daemon';
+
+const daemonClaim = claimDaemonState({ host: HOST, port: Number(PORT), version: pkg.version });
+if (!daemonClaim.claimed) {
+  const current = daemonClaim.current;
+  console.log(`[DAEMON] telepty daemon already running (pid ${current.pid}, port ${current.port}). Exiting.`);
+  process.exit(0);
+}
 
 const sessions = {};
 const STRIPPED_SESSION_ENV_KEYS = [
@@ -195,6 +205,17 @@ app.get('/api/sessions', (req, res) => {
     active_clients: session.clients.size
   }));
   res.json(list);
+});
+
+app.get('/api/meta', (req, res) => {
+  res.json({
+    name: pkg.name,
+    version: pkg.version,
+    pid: process.pid,
+    host: HOST,
+    port: Number(PORT),
+    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon']
+  });
 });
 
 app.post('/api/sessions/multicast/inject', (req, res) => {
@@ -396,6 +417,17 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
 });
 
+server.on('error', (error) => {
+  clearDaemonState(process.pid);
+
+  if (error && error.code === 'EADDRINUSE') {
+    console.error(`[DAEMON] Port ${PORT} is already in use. Another process is blocking telepty.`);
+    process.exit(1);
+  }
+
+  throw error;
+});
+
 
 const wss = new WebSocketServer({ noServer: true });
 
@@ -521,4 +553,15 @@ server.on('upgrade', (req, socket, head) => {
   } else {
     socket.destroy();
   }
+});
+
+function shutdown(code) {
+  clearDaemonState(process.pid);
+  process.exit(code);
+}
+
+process.on('SIGINT', () => shutdown(0));
+process.on('SIGTERM', () => shutdown(0));
+process.on('exit', () => {
+  clearDaemonState(process.pid);
 });

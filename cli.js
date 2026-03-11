@@ -9,6 +9,7 @@ const prompts = require('prompts');
 const updateNotifier = require('update-notifier');
 const pkg = require('./package.json');
 const { getConfig } = require('./auth');
+const { cleanupDaemonProcesses } = require('./daemon-control');
 const { attachInteractiveTerminal } = require('./interactive-terminal');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const args = process.argv.slice(2);
@@ -31,6 +32,28 @@ const fetchWithAuth = (url, options = {}) => {
   const headers = { ...options.headers, 'x-telepty-token': TOKEN };
   return fetch(url, { ...options, headers });
 };
+
+async function getDaemonMeta(host = REMOTE_HOST) {
+  try {
+    const res = await fetchWithAuth(`http://${host}:${PORT}/api/meta`, {
+      signal: AbortSignal.timeout(1500)
+    });
+    if (!res.ok) {
+      return null;
+    }
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+function startDetachedDaemon() {
+  const cp = spawn(process.argv[0], [process.argv[1], 'daemon'], {
+    detached: true,
+    stdio: 'ignore'
+  });
+  cp.unref();
+}
 
 async function discoverSessions() {
   await ensureDaemonRunning();
@@ -71,22 +94,42 @@ async function discoverSessions() {
   return allSessions;
 }
 
-async function ensureDaemonRunning() {
+async function ensureDaemonRunning(options = {}) {
   if (REMOTE_HOST !== '127.0.0.1') return; // Only auto-start local daemon
+
+  const requiredCapabilities = options.requiredCapabilities || [];
+
   try {
-    const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions`);
-    if (res.ok) return; // Already running
-  } catch (e) {
-    // Not running, let's start it
-    process.stdout.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
-    const cp = spawn(process.argv[0], [process.argv[1], 'daemon'], {
-      detached: true,
-      stdio: 'ignore'
+    const meta = await getDaemonMeta('127.0.0.1');
+    const hasCapabilities = meta && requiredCapabilities.every((item) => meta.capabilities.includes(item));
+
+    const sessionsRes = await fetchWithAuth(`${DAEMON_URL}/api/sessions`, {
+      signal: AbortSignal.timeout(1500)
     });
-    cp.unref();
-    
-    // Wait a brief moment for the daemon to boot up
-    await new Promise(r => setTimeout(r, 1000));
+
+    if (sessionsRes.ok && hasCapabilities) {
+      return;
+    }
+
+    if (sessionsRes.ok && !meta) {
+      process.stdout.write('\x1b[33m⚙️ Found an older local telepty daemon. Restarting it...\x1b[0m\n');
+      cleanupDaemonProcesses();
+    } else if (sessionsRes.ok && meta) {
+      process.stdout.write('\x1b[33m⚙️ Found a local telepty daemon without the required features. Restarting it...\x1b[0m\n');
+      cleanupDaemonProcesses();
+    }
+  } catch (e) {
+    // Continue to auto-start below.
+  }
+
+  process.stdout.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
+  cleanupDaemonProcesses();
+  startDetachedDaemon();
+  await new Promise(r => setTimeout(r, 1000));
+
+  const meta = await getDaemonMeta('127.0.0.1');
+  if (!meta || !requiredCapabilities.every((item) => meta.capabilities.includes(item))) {
+    console.error('❌ Failed to start a compatible local telepty daemon. Try `telepty cleanup-daemons` or rerun the installer.');
   }
 }
 
@@ -160,11 +203,7 @@ async function manageInteractive() {
       try {
         execSync('npm install -g @dmsdc-ai/aigentry-telepty@latest', { stdio: 'inherit' });
         console.log('\n\x1b[32m✅ Update complete! Restarting daemon...\x1b[0m');
-        try {
-          const os = require('os');
-          if (os.platform() === 'win32') execSync('taskkill /IM node.exe /FI "WINDOWTITLE eq telepty daemon*" /F', { stdio: 'ignore' });
-          else execSync('pkill -f "telepty daemon"', { stdio: 'ignore' });
-        } catch(e) {}
+        cleanupDaemonProcesses();
       } catch (e) {
         console.error('\n❌ Update failed.\n');
       }
@@ -178,11 +217,8 @@ async function manageInteractive() {
 
     if (response.action === 'daemon') {
       console.log('\n\x1b[33mStarting daemon in background...\x1b[0m');
-      const cp = spawn(process.argv[0], [process.argv[1], 'daemon'], {
-        detached: true,
-        stdio: 'ignore'
-      });
-      cp.unref();
+      cleanupDaemonProcesses();
+      startDetachedDaemon();
       console.log('✅ Daemon started.\n');
       continue;
     }
@@ -313,19 +349,20 @@ async function main() {
     try {
       execSync('npm install -g @dmsdc-ai/aigentry-telepty@latest', { stdio: 'inherit' });
       console.log('\n\x1b[32m✅ Update complete! Restarting daemon...\x1b[0m');
-      
-      // Kill local daemon if running, so it auto-restarts on next command
-      try {
-        if (os.platform() === 'win32') {
-          execSync('taskkill /IM node.exe /FI "WINDOWTITLE eq telepty daemon*" /F', { stdio: 'ignore' });
-        } else {
-          execSync('pkill -f "telepty daemon"', { stdio: 'ignore' });
-        }
-      } catch (e) {} // Ignore if not running
-
+      cleanupDaemonProcesses();
       console.log('🎉 You are now using the latest version.');
     } catch (e) {
       console.error('\n❌ Update failed. Please try running: npm install -g @dmsdc-ai/aigentry-telepty@latest');
+    }
+    return;
+  }
+
+  if (cmd === 'cleanup-daemons') {
+    const results = cleanupDaemonProcesses();
+    console.log(`Stopped ${results.stopped.length} telepty daemon(s).`);
+    if (results.failed.length > 0) {
+      console.log(`Failed to stop ${results.failed.length} daemon(s).`);
+      process.exitCode = 1;
     }
     return;
   }
@@ -411,7 +448,7 @@ async function main() {
       sessionId = path.basename(command);
     }
 
-    await ensureDaemonRunning();
+    await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
     // Register session with daemon
     try {
@@ -739,6 +776,7 @@ Usage:
   telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
   telepty rename <old_id> <new_id>               Rename a session (updates terminal title too)
+  telepty cleanup-daemons                        Stop old local telepty daemon processes
   telepty listen                                 Listen to the event bus and print JSON to stdout
   telepty monitor                                Human-readable real-time billboard of bus events
   telepty update                                 Update telepty to the latest version

@@ -26,7 +26,13 @@ if (!$teleptyCmd) {
 }
 
 $teleptyPath = $teleptyCmd.Source
-Start-Process -FilePath node -ArgumentList "$teleptyPath daemon" -WindowStyle Hidden
+try {
+    & $teleptyPath cleanup-daemons | Out-Null
+} catch {
+    Write-Host "Warning: Could not clean up existing telepty daemons." -ForegroundColor Yellow
+}
+
+Start-Process -FilePath $teleptyPath -ArgumentList "daemon" -WindowStyle Hidden
 Write-Host "Success: Windows daemon started in background." -ForegroundColor Green
 
 Write-Host "`nInstallation complete! Telepty daemon is running." -ForegroundColor Cyan

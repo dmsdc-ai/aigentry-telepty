@@ -56,6 +56,9 @@ if command -v systemctl &> /dev/null && [ -d "/etc/systemd/system" ]; then
         SUDO_CMD=""
     fi
 
+    $SUDO_CMD systemctl stop telepty 2>/dev/null || true
+    "$TELEPTY_PATH" cleanup-daemons >/dev/null 2>&1 || true
+
     $SUDO_CMD bash -c "cat <<EOF > /etc/systemd/system/telepty.service
 [Unit]
 Description=Telepty Daemon
@@ -80,6 +83,8 @@ EOF"
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     PLIST_PATH="$HOME/Library/LaunchAgents/com.aigentry.telepty.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    "$TELEPTY_PATH" cleanup-daemons >/dev/null 2>&1 || true
     cat <<EOF > "$PLIST_PATH"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -104,11 +109,11 @@ elif [[ "$OSTYPE" == "darwin"* ]]; then
 </dict>
 </plist>
 EOF
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
     launchctl load "$PLIST_PATH"
     echo "✅ macOS LaunchAgent installed and started. (Auto-starts on boot)"
 else
     echo "⚠️ Skipping OS-level service setup (Termux or missing systemd). Starting in background..."
+    "$TELEPTY_PATH" cleanup-daemons >/dev/null 2>&1 || true
     nohup $TELEPTY_PATH daemon > /dev/null 2>&1 &
     echo "✅ Daemon started in background. (Note: Will not auto-start on device reboot)"
 fi

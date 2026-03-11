@@ -21,6 +21,7 @@ iwr -useb https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/insta
 ```
 
 *These single commands will install the package globally and automatically configure it to run as a background service specific to your OS (`systemd` for Linux, `launchd` for macOS, or a detached background process for Windows).*
+The installer now stops older local telepty daemons before starting the new one, so updates do not leave duplicate background processes behind.
 
 ## Seamless Usage
 
@@ -55,6 +56,12 @@ npm run test:watch
 ```
 
 The automated suite covers config generation, daemon HTTP APIs, WebSocket attach/output flow, bus events, session deletion regressions, and CLI smoke tests against a real daemon process.
+
+If you ever need to manually clear stale local daemon processes:
+
+```bash
+telepty cleanup-daemons
+```
 
 ## Skill Installation
 
