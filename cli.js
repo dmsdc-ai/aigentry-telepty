@@ -60,6 +60,25 @@ async function discoverSessions() {
   return allSessions;
 }
 
+async function ensureDaemonRunning() {
+  if (REMOTE_HOST !== '127.0.0.1') return; // Only auto-start local daemon
+  try {
+    const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions`);
+    if (res.ok) return; // Already running
+  } catch (e) {
+    // Not running, let's start it
+    process.stdout.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
+    const cp = spawn(process.argv[0], [process.argv[1], 'daemon'], {
+      detached: true,
+      stdio: 'ignore'
+    });
+    cp.unref();
+    
+    // Wait a brief moment for the daemon to boot up
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
 async function manageInteractive() {
   console.clear();
   console.log('\x1b[36m\x1b[1m⚡ Telepty Agent Manager\x1b[0m\n');
@@ -118,6 +137,8 @@ async function manageInteractive() {
       ]);
       if (!id || !command) continue;
       
+      await ensureDaemonRunning();
+
       const cols = process.stdout.columns || 80;
       const rows = process.stdout.rows || 30;
       try {
@@ -218,6 +239,7 @@ async function main() {
   }
 
   if (cmd === 'list') {
+    await ensureDaemonRunning();
     try {
       const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -239,6 +261,7 @@ async function main() {
   }
 
   if (cmd === 'spawn') {
+    await ensureDaemonRunning();
     const idIndex = args.indexOf('--id');
     if (idIndex === -1 || !args[idIndex + 1]) { console.error('❌ Usage: telepty spawn --id <session_id> <command> [args...]'); process.exit(1); }
     const sessionId = args[idIndex + 1];
@@ -262,6 +285,7 @@ async function main() {
   }
 
   if (cmd === 'attach') {
+    await ensureDaemonRunning();
     let sessionId = args[1];
     let targetHost = REMOTE_HOST;
 
@@ -342,6 +366,7 @@ async function main() {
   }
 
   if (cmd === 'inject') {
+    await ensureDaemonRunning();
     const sessionId = args[1]; const prompt = args.slice(2).join(' ');
     if (!sessionId || !prompt) { console.error('❌ Usage: telepty inject <session_id> "<prompt text>"'); process.exit(1); }
     try {
@@ -356,6 +381,7 @@ async function main() {
   }
 
   if (cmd === 'multicast') {
+    await ensureDaemonRunning();
     const sessionIdsRaw = args[1]; const prompt = args.slice(2).join(' ');
     if (!sessionIdsRaw || !prompt) { console.error('❌ Usage: telepty multicast <id1,id2,...> "<prompt text>"'); process.exit(1); }
     const sessionIds = sessionIdsRaw.split(',').map(s => s.trim()).filter(s => s);
@@ -374,6 +400,7 @@ async function main() {
   }
 
   if (cmd === 'broadcast') {
+    await ensureDaemonRunning();
     const prompt = args.slice(1).join(' ');
     if (!prompt) { console.error('❌ Usage: telepty broadcast "<prompt text>"'); process.exit(1); }
     try {
