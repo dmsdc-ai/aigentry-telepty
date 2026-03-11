@@ -48,12 +48,25 @@ app.post('/api/sessions/spawn', (req, res) => {
 
   try {
     console.log(`[SPAWN] Spawning ${shell} with args:`, shellArgs, "in cwd:", cwd);
+
+    // Create a custom prompt for Linux/Mac so the user sees the session ID.
+    // For bash/zsh, we can inject a custom PS1 variable.
+    let customEnv = { ...process.env, TERM: isWin ? undefined : 'xterm-256color', TELEPTY_SESSION_ID: session_id };
+    
+    if (!isWin) {
+      if (command.includes('bash')) {
+        customEnv.PS1 = `\\[\\e[36m\\][telepty: ${session_id}]\\[\\e[0m\\] \\w \\$ `;
+      } else if (command.includes('zsh')) {
+        customEnv.PROMPT = `%F{cyan}[telepty: ${session_id}]%f %~ %# `;
+      }
+    }
+
     const ptyProcess = pty.spawn(shell, shellArgs, {
       name: isWin ? 'Windows Terminal' : 'xterm-256color',
       cols: parseInt(cols),
       rows: parseInt(rows),
       cwd,
-      env: { ...process.env, TERM: isWin ? undefined : 'xterm-256color', TELEPTY_SESSION_ID: session_id }
+      env: customEnv
     });
 
     sessions[session_id] = {
