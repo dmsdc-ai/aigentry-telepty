@@ -35,6 +35,31 @@ const PORT = process.env.PORT || 3848;
 const HOST = process.env.HOST || '0.0.0.0';
 
 const sessions = {};
+const STRIPPED_SESSION_ENV_KEYS = [
+  'CLAUDECODE',
+  'CODEX_CI',
+  'CODEX_THREAD_ID'
+];
+
+function buildSessionEnv(sessionId) {
+  const env = {
+    ...process.env,
+    TERM: os.platform() === 'win32' ? undefined : 'xterm-256color',
+    TELEPTY_SESSION_ID: sessionId
+  };
+
+  for (const key of STRIPPED_SESSION_ENV_KEYS) {
+    delete env[key];
+  }
+
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('CLAUDECODE_')) {
+      delete env[key];
+    }
+  }
+
+  return env;
+}
 
 app.post('/api/sessions/spawn', (req, res) => {
   const { session_id, command, args = [], cwd = process.cwd(), cols = 80, rows = 30, type = 'AGENT' } = req.body;
@@ -49,25 +74,18 @@ app.post('/api/sessions/spawn', (req, res) => {
   try {
     console.log(`[SPAWN] Spawning ${shell} with args:`, shellArgs, "in cwd:", cwd);
 
-    let customEnv = { ...process.env, TERM: isWin ? undefined : 'xterm-256color', TELEPTY_SESSION_ID: session_id };
+    const customEnv = buildSessionEnv(session_id);
     
     if (!isWin) {
       const label = type.toUpperCase();
       const colorCode = label === 'USER' ? '32' : '35'; // USER: Green (32), AGENT: Magenta (35)
       const zshColor = label === 'USER' ? 'green' : 'magenta';
-      const title = `⚡ telepty :: ${session_id}`;
-
-      // TELEPTY_TITLE env var allows child processes to know the desired title
-      customEnv.TELEPTY_TITLE = title;
 
       if (command.includes('bash')) {
-        // PROMPT_COMMAND runs before every prompt, overriding any title set by child processes (e.g. Claude Code)
-        customEnv.PROMPT_COMMAND = `printf '\\e]0;${title}\\a'`;
         customEnv.PS1 = `\\[\\e[${colorCode}m\\][${label}: ${session_id}]\\[\\e[0m\\] \\w \\$ `;
       } else if (command.includes('zsh')) {
         customEnv.DISABLE_AUTO_TITLE = 'true';
         customEnv.PROMPT = `%F{${zshColor}}[${label}: ${session_id}]%f %~ %# `;
-        // precmd hook will be injected after spawn to override titles set by child processes
       }
     }
 
@@ -79,20 +97,9 @@ app.post('/api/sessions/spawn', (req, res) => {
       env: customEnv
     });
 
-    // Set Window Title via OSC 0 and install persistent title hook
-    const label = type.toUpperCase();
-    const title = `⚡ telepty :: ${session_id}`;
-    if (!isWin) {
-      ptyProcess.write(`\x1b]0;${title}\x07`);
-      // For zsh: inject precmd hook that resets title before every prompt
-      // This overrides any title set by child processes (e.g. Claude Code)
-      if (command.includes('zsh')) {
-        ptyProcess.write(`precmd() { print -Pn '\\e]0;${title}\\a' }\r`);
-      }
-    }
-
     const sessionRecord = {
       id: session_id,
+      type: 'spawned',
       ptyProcess,
       command,
       cwd,
@@ -144,9 +151,44 @@ app.post('/api/sessions/spawn', (req, res) => {
   }
 });
 
+app.post('/api/sessions/register', (req, res) => {
+  const { session_id, command, cwd = process.cwd() } = req.body;
+  if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+  if (sessions[session_id]) return res.status(409).json({ error: `Session ID '${session_id}' is already active.` });
+
+  const sessionRecord = {
+    id: session_id,
+    type: 'wrapped',
+    ptyProcess: null,
+    ownerWs: null,
+    command: command || 'wrapped',
+    cwd,
+    createdAt: new Date().toISOString(),
+    clients: new Set(),
+    isClosing: false
+  };
+  sessions[session_id] = sessionRecord;
+
+  const busMsg = JSON.stringify({
+    type: 'session_register',
+    sender: 'daemon',
+    session_id,
+    command: sessionRecord.command,
+    cwd,
+    timestamp: new Date().toISOString()
+  });
+  busClients.forEach(client => {
+    if (client.readyState === 1) client.send(busMsg);
+  });
+
+  console.log(`[REGISTER] Registered wrapped session ${session_id}`);
+  res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd });
+});
+
 app.get('/api/sessions', (req, res) => {
   const list = Object.entries(sessions).map(([id, session]) => ({
     id,
+    type: session.type || 'spawned',
     command: session.command,
     cwd: session.cwd,
     createdAt: session.createdAt,
@@ -166,8 +208,18 @@ app.post('/api/sessions/multicast/inject', (req, res) => {
     const session = sessions[id];
     if (session) {
       try {
-        session.ptyProcess.write(`${prompt}\r`);
-        results.successful.push(id);
+        const injectData = `${prompt}\r`;
+        if (session.type === 'wrapped') {
+          if (session.ownerWs && session.ownerWs.readyState === 1) {
+            session.ownerWs.send(JSON.stringify({ type: 'inject', data: injectData }));
+            results.successful.push(id);
+          } else {
+            results.failed.push({ id, error: 'Wrap process not connected' });
+          }
+        } else {
+          session.ptyProcess.write(injectData);
+          results.successful.push(id);
+        }
 
         // Broadcast injection to bus
         const busMsg = JSON.stringify({
@@ -198,9 +250,20 @@ app.post('/api/sessions/broadcast/inject', (req, res) => {
   const results = { successful: [], failed: [] };
 
   Object.keys(sessions).forEach(id => {
+    const session = sessions[id];
     try {
-      sessions[id].ptyProcess.write(`${prompt}\r`);
-      results.successful.push(id);
+      const injectData = `${prompt}\r`;
+      if (session.type === 'wrapped') {
+        if (session.ownerWs && session.ownerWs.readyState === 1) {
+          session.ownerWs.send(JSON.stringify({ type: 'inject', data: injectData }));
+          results.successful.push(id);
+        } else {
+          results.failed.push({ id, error: 'Wrap process not connected' });
+        }
+      } else {
+        session.ptyProcess.write(injectData);
+        results.successful.push(id);
+      }
     } catch (err) {
       results.failed.push({ id, error: err.message });
     }
@@ -231,10 +294,18 @@ app.post('/api/sessions/:id/inject', (req, res) => {
   if (!session) return res.status(404).json({ error: 'Session not found' });
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
   try {
-    session.ptyProcess.write(no_enter ? prompt : `${prompt}\r`);
+    const injectData = no_enter ? prompt : `${prompt}\r`;
+    if (session.type === 'wrapped') {
+      if (session.ownerWs && session.ownerWs.readyState === 1) {
+        session.ownerWs.send(JSON.stringify({ type: 'inject', data: injectData }));
+      } else {
+        return res.status(503).json({ error: 'Wrap process is not connected' });
+      }
+    } else {
+      session.ptyProcess.write(injectData);
+    }
     console.log(`[INJECT] Wrote to session ${id}`);
 
-    // Broadcast injection to bus
     const busMsg = JSON.stringify({
       type: 'injection',
       sender: 'cli',
@@ -265,21 +336,6 @@ app.patch('/api/sessions/:id', (req, res) => {
   delete sessions[id];
   session.id = new_id;
 
-  // Update terminal title and PS1/PROMPT with new session ID
-  const isWin = os.platform() === 'win32';
-  if (!isWin) {
-    const title = `⚡ telepty :: ${new_id}`;
-    // Set window title immediately
-    session.ptyProcess.write(`\x1b]0;${title}\x07`);
-    // Update PROMPT_COMMAND/precmd and PS1/PROMPT with new ID
-    const cmd = session.command || '';
-    if (cmd.includes('bash')) {
-      session.ptyProcess.write(`export PROMPT_COMMAND="printf '\\e]0;${title}\\a'" PS1='\\[\\e[35m\\][AGENT: ${new_id}]\\[\\e[0m\\] \\w \\$ '\r`);
-    } else if (cmd.includes('zsh')) {
-      session.ptyProcess.write(`precmd() { print -Pn '\\e]0;${title}\\a' }; export PROMPT='%F{magenta}[AGENT: ${new_id}]%f %~ %# '\r`);
-    }
-  }
-
   // Broadcast rename to bus
   const busMsg = JSON.stringify({
     type: 'session_rename',
@@ -303,8 +359,14 @@ app.delete('/api/sessions/:id', (req, res) => {
   if (session.isClosing) return res.json({ success: true, status: 'closing' });
   try {
     session.isClosing = true;
-    session.ptyProcess.kill();
-    console.log(`[KILL] Session ${id} forcefully closed`);
+    if (session.type === 'wrapped') {
+      session.clients.forEach(ws => ws.close(1000, 'Session destroyed'));
+      delete sessions[id];
+      console.log(`[KILL] Wrapped session ${id} removed`);
+    } else {
+      session.ptyProcess.kill();
+      console.log(`[KILL] Session ${id} forcefully closed`);
+    }
     res.json({ success: true, status: 'closing' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -348,15 +410,44 @@ wss.on('connection', (ws, req) => {
   }
 
   session.clients.add(ws);
-  console.log(`[WS] Client attached to session ${sessionId} (Total: ${session.clients.size})`);
+
+  // For wrapped sessions, first connector becomes the owner
+  if (session.type === 'wrapped' && !session.ownerWs) {
+    session.ownerWs = ws;
+    console.log(`[WS] Wrap owner connected for session ${sessionId} (Total: ${session.clients.size})`);
+  } else {
+    console.log(`[WS] Client attached to session ${sessionId} (Total: ${session.clients.size})`);
+  }
 
   ws.on('message', (message) => {
     try {
       const { type, data, cols, rows } = JSON.parse(message);
-      if (type === 'input') {
-        session.ptyProcess.write(data);
-      } else if (type === 'resize') {
-        session.ptyProcess.resize(cols, rows);
+
+      if (session.type === 'wrapped') {
+        if (ws === session.ownerWs) {
+          // Owner sending output -> broadcast to other clients
+          if (type === 'output') {
+            session.clients.forEach(client => {
+              if (client !== ws && client.readyState === 1) {
+                client.send(JSON.stringify({ type: 'output', data }));
+              }
+            });
+          }
+        } else {
+          // Non-owner client input -> forward to owner as inject
+          if (type === 'input' && session.ownerWs && session.ownerWs.readyState === 1) {
+            session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
+          } else if (type === 'resize' && session.ownerWs && session.ownerWs.readyState === 1) {
+            session.ownerWs.send(JSON.stringify({ type: 'resize', cols, rows }));
+          }
+        }
+      } else {
+        // Existing spawned session logic
+        if (type === 'input') {
+          session.ptyProcess.write(data);
+        } else if (type === 'resize') {
+          session.ptyProcess.resize(cols, rows);
+        }
       }
     } catch (e) {
       console.error('[WS] Invalid message format', e);
@@ -365,7 +456,17 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     session.clients.delete(ws);
-    console.log(`[WS] Client detached from session ${sessionId} (Total: ${session.clients.size})`);
+    if (session.type === 'wrapped' && ws === session.ownerWs) {
+      session.ownerWs = null;
+      console.log(`[WS] Wrap owner disconnected from session ${sessionId} (Total: ${session.clients.size})`);
+      // Clean up wrapped session when owner disconnects and no other clients
+      if (session.clients.size === 0 && !session.isClosing) {
+        delete sessions[sessionId];
+        console.log(`[CLEANUP] Wrapped session ${sessionId} removed (owner disconnected)`);
+      }
+    } else {
+      console.log(`[WS] Client detached from session ${sessionId} (Total: ${session.clients.size})`);
+    }
   });
 });
 

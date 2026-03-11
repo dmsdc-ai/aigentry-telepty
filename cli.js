@@ -149,6 +149,7 @@ async function manageInteractive() {
       choices: [
         { title: '🖥️   Enter a room (Attach to session)', value: 'attach' },
         { title: '➕  Create a new room (Spawn session)', value: 'spawn' },
+        { title: '🔌  Allow inject (Run CLI with inject)', value: 'allow' },
         { title: '💬  Send message to a room (Inject command)', value: 'inject' },
         { title: '📋  View all open rooms (List sessions)', value: 'list' },
         { title: '🔄  Update telepty to latest version', value: 'update' },
@@ -232,6 +233,20 @@ async function manageInteractive() {
         console.error('\n❌ Failed to connect to local daemon. Is it running?\n');
       }
       continue;
+    }
+
+    if (response.action === 'allow') {
+      const { id, command } = await prompts([
+        { type: 'text', name: 'id', message: 'Enter session ID (e.g. my-claude):', validate: v => v ? true : 'Required' },
+        { type: 'text', name: 'command', message: 'Enter command to run (e.g. claude, codex, gemini, bash):', initial: 'bash' }
+      ]);
+      if (!id || !command) continue;
+
+      // Delegate to the allow command handler by setting up args and calling main flow
+      process.argv.splice(2, process.argv.length - 2, 'allow', '--id', id, command);
+      args.length = 0;
+      args.push('allow', '--id', id, command);
+      return main();
     }
 
     if (response.action === 'attach' || response.action === 'inject') {
@@ -356,6 +371,139 @@ async function main() {
       console.log(`✅ Session '\x1b[36m${data.session_id}\x1b[0m' spawned. Entering room automatically...`);
       return manageInteractiveAttach(data.session_id, '127.0.0.1');
     } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+    return;
+  }
+
+  if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap') {
+    // Parse arguments: telepty allow [--id <session_id>] <command> [args...]
+    // Also supports legacy: telepty allow [--id <session_id>] -- <command> [args...]
+    const allowArgs = args.slice(1);
+
+    // Extract --id flag
+    let sessionId;
+    const idIndex = allowArgs.indexOf('--id');
+    if (idIndex !== -1 && allowArgs[idIndex + 1]) {
+      sessionId = allowArgs[idIndex + 1];
+      allowArgs.splice(idIndex, 2);
+    }
+
+    // Strip optional -- separator for backward compat
+    const sepIndex = allowArgs.indexOf('--');
+    if (sepIndex !== -1) allowArgs.splice(sepIndex, 1);
+
+    const command = allowArgs[0];
+    const cmdArgs = allowArgs.slice(1);
+
+    if (!command) {
+      console.error('❌ Usage: telepty allow [--id <session_id>] <command> [args...]');
+      process.exit(1);
+    }
+
+    // Default session ID = command name
+    if (!sessionId) {
+      sessionId = path.basename(command);
+    }
+
+    await ensureDaemonRunning();
+
+    // Register session with daemon
+    try {
+      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, command, cwd: process.cwd() })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.error(`❌ Error: ${data.error}`);
+        process.exit(1);
+      }
+    } catch (e) {
+      console.error('❌ Failed to register with daemon:', e.message);
+      process.exit(1);
+    }
+
+    // Spawn local PTY (preserves isTTY, env, shell config)
+    const pty = require('node-pty');
+    const child = pty.spawn(command, cmdArgs, {
+      name: 'xterm-256color',
+      cols: process.stdout.columns || 80,
+      rows: process.stdout.rows || 30,
+      cwd: process.cwd(),
+      env: { ...process.env, TELEPTY_SESSION_ID: sessionId }
+    });
+
+    // Connect to daemon WebSocket for inject reception and output relay
+    const wsUrl = `ws://${REMOTE_HOST}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
+    const daemonWs = new WebSocket(wsUrl);
+    let wsReady = false;
+
+    daemonWs.on('open', () => {
+      wsReady = true;
+    });
+
+    // Receive inject messages from daemon
+    daemonWs.on('message', (message) => {
+      try {
+        const msg = JSON.parse(message);
+        if (msg.type === 'inject') {
+          child.write(msg.data);
+        } else if (msg.type === 'resize') {
+          child.resize(msg.cols, msg.rows);
+        }
+      } catch (e) {
+        // ignore malformed messages
+      }
+    });
+
+    daemonWs.on('close', () => {
+      wsReady = false;
+      console.error(`\n\x1b[33m⚠️ Disconnected from daemon. Inject unavailable. Session continues locally.\x1b[0m`);
+    });
+
+    daemonWs.on('error', () => {
+      // silently handle
+    });
+
+    // Set terminal title
+    process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
+    console.log(`\x1b[32m⚡ '${command}' is now session '\x1b[36m${sessionId}\x1b[32m'. Inject allowed.\x1b[0m\n`);
+
+    // Enter raw mode and relay stdin to local PTY
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+    process.stdin.on('data', (data) => {
+      child.write(data.toString());
+    });
+
+    // Relay PTY output to current terminal + send to daemon for attach clients
+    child.onData((data) => {
+      process.stdout.write(data);
+      if (wsReady && daemonWs.readyState === 1) {
+        daemonWs.send(JSON.stringify({ type: 'output', data }));
+      }
+    });
+
+    // Handle terminal resize
+    process.stdout.on('resize', () => {
+      child.resize(process.stdout.columns, process.stdout.rows);
+    });
+
+    // Handle child exit
+    child.onExit(({ exitCode }) => {
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      process.stdout.write(`\x1b]0;\x07`);
+      console.log(`\n\x1b[33mSession '${sessionId}' exited (code ${exitCode}).\x1b[0m`);
+
+      // Deregister from daemon
+      fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }).catch(() => {});
+      daemonWs.close();
+      process.exit(exitCode || 0);
+    });
+
+    // Graceful shutdown on SIGINT (let child handle it via PTY)
+    process.on('SIGINT', () => {});
+
     return;
   }
 
@@ -592,6 +740,7 @@ async function main() {
 Usage:
   telepty daemon                                 Start the background daemon
   telepty spawn --id <id> <command> [args...]    Spawn a new background CLI
+  telepty allow [--id <id>] <command> [args...]       Allow inject on a CLI
   telepty list                                   List all active sessions
   telepty attach [id]                            Attach to a session (Interactive picker if no ID)
   telepty inject [--no-enter] <id> "<prompt>"    Inject text into a single session

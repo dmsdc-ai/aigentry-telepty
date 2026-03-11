@@ -63,7 +63,20 @@ Each telepty session displays its ID in the Ghostty tab title:
 - Local: `⚡ telepty :: {session_id}`
 - Remote: `⚡ telepty :: {session_id} @ {host}`
 
-### 7. Update
+### 7. Allow Inject on a CLI
+Run any command with inject allowed:
+```bash
+# With custom session ID
+telepty allow --id my-claude -- claude
+telepty allow --id codex-main -- codex
+telepty allow --id gemini-1 -- gemini
+
+# Auto-generated session ID
+telepty allow -- bash
+```
+The process runs locally (isTTY preserved), but registers with the daemon so inject works.
+
+### 8. Update
 ```bash
 telepty update
 ```

@@ -100,6 +100,7 @@ async function startTestDaemon(options = {}) {
   const sharedEnv = {
     ...process.env,
     ...homeEnv,
+    ...(options.env || {}),
     NO_UPDATE_NOTIFIER: '1',
     TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
   };
@@ -209,6 +210,17 @@ async function startTestDaemon(options = {}) {
     return request('/api/sessions/spawn', { method: 'POST', body });
   }
 
+  async function registerSession(sessionId, overrides = {}) {
+    const body = {
+      session_id: sessionId,
+      command: 'test-wrap',
+      cwd: projectRoot,
+      ...overrides
+    };
+
+    return request('/api/sessions/register', { method: 'POST', body });
+  }
+
   async function connectWebSocket(pathname) {
     const ws = new WebSocket(`ws://${host}:${port}${pathname}`);
     await new Promise((resolve, reject) => {
@@ -280,6 +292,7 @@ async function startTestDaemon(options = {}) {
     homeDir,
     request,
     spawnSession,
+    registerSession,
     cleanupSessions,
     connectBus: () => connectWebSocket('/api/bus'),
     connectSession: (sessionId) => connectWebSocket(`/api/sessions/${encodeURIComponent(sessionId)}`),
