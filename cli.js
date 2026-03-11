@@ -2,14 +2,16 @@
 
 const path = require('path');
 const WebSocket = require('ws');
+const { execSync } = require('child_process');
+const readline = require('readline');
 const { getConfig } = require('./auth');
 const args = process.argv.slice(2);
 
 // Support remote host via environment variable or default to localhost
-const REMOTE_HOST = process.env.TELEPTY_HOST || '127.0.0.1';
+let REMOTE_HOST = process.env.TELEPTY_HOST || '127.0.0.1';
 const PORT = 3848;
-const DAEMON_URL = `http://${REMOTE_HOST}:${PORT}`;
-const WS_URL = `ws://${REMOTE_HOST}:${PORT}`;
+let DAEMON_URL = `http://${REMOTE_HOST}:${PORT}`;
+let WS_URL = `ws://${REMOTE_HOST}:${PORT}`;
 
 const config = getConfig();
 const TOKEN = config.authToken;
@@ -18,6 +20,44 @@ const fetchWithAuth = (url, options = {}) => {
   const headers = { ...options.headers, 'x-telepty-token': TOKEN };
   return fetch(url, { ...options, headers });
 };
+
+async function discoverSessions() {
+  const hosts = ['127.0.0.1'];
+  try {
+    const tsStatus = execSync('tailscale status --json', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+    const tsData = JSON.parse(tsStatus);
+    if (tsData && tsData.Peer) {
+      for (const peer of Object.values(tsData.Peer)) {
+        if (peer.Online && peer.TailscaleIPs && peer.TailscaleIPs.length > 0) {
+          hosts.push(peer.TailscaleIPs[0]);
+        }
+      }
+    }
+  } catch (e) {
+    // Tailscale not available or not running, ignore
+  }
+
+  const allSessions = [];
+  process.stdout.write('\x1b[36m🔍 Discovering active sessions across your Tailnet...\x1b[0m\n');
+  
+  await Promise.all(hosts.map(async (host) => {
+    try {
+      const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions`, { 
+        signal: AbortSignal.timeout(1500) 
+      });
+      if (res.ok) {
+        const sessions = await res.json();
+        sessions.forEach(s => {
+          allSessions.push({ host, ...s });
+        });
+      }
+    } catch (e) {
+      // Ignore nodes that don't have telepty running
+    }
+  }));
+
+  return allSessions;
+}
 
 async function main() {
   const cmd = args[0];
@@ -77,13 +117,41 @@ async function main() {
   }
 
   if (cmd === 'attach') {
-    const sessionId = args[1];
-    if (!sessionId) { console.error('❌ Usage: telepty attach <session_id>'); process.exit(1); }
+    let sessionId = args[1];
+    let targetHost = REMOTE_HOST;
 
-    const ws = new WebSocket(`${WS_URL}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`);
+    if (!sessionId) {
+      const sessions = await discoverSessions();
+      if (sessions.length === 0) {
+        console.log('❌ No active sessions found on any known networks.');
+        process.exit(0);
+      }
+
+      console.log('\n\x1b[1mAvailable Sessions:\x1b[0m');
+      sessions.forEach((s, i) => {
+        const hostLabel = s.host === '127.0.0.1' ? 'Local' : s.host;
+        console.log(`  [${i + 1}] \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) - ${s.command}`);
+      });
+
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise(resolve => rl.question('\nSelect a session number to attach: ', resolve));
+      rl.close();
+
+      const idx = parseInt(answer) - 1;
+      if (isNaN(idx) || !sessions[idx]) {
+        console.error('❌ Invalid selection.');
+        process.exit(1);
+      }
+
+      sessionId = sessions[idx].id;
+      targetHost = sessions[idx].host;
+    }
+
+    const wsUrl = `ws://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
+    const ws = new WebSocket(wsUrl);
 
     ws.on('open', () => {
-      console.log(`\x1b[32mConnected to session '${sessionId}'. Press Ctrl+C to detach (if shell supports) or use your shell's exit command.\x1b[0m\n`);
+      console.log(`\x1b[32mConnected to session '${sessionId}' at ${targetHost}. Press Ctrl+C to detach.\x1b[0m\n`);
       
       if (process.stdin.isTTY) {
         process.stdin.setRawMode(true);
@@ -149,7 +217,7 @@ Usage:
   telepty daemon                                 Start the background daemon
   telepty spawn --id <id> <command> [args...]    Spawn a new background CLI
   telepty list                                   List all active sessions
-  telepty attach <id>                            Attach to an active session (Interactive)
+  telepty attach [id]                            Attach to a session (Interactive picker if no ID)
   telepty inject <id> "<prompt>"                 Inject text into an active session
   telepty mcp                                    Start the MCP stdio server
 `);

@@ -1,9 +1,10 @@
 {
   "name": "@dmsdc-ai/aigentry-telepty",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "main": "daemon.js",
   "bin": {
-    "telepty": "cli.js"
+    "telepty": "cli.js",
+    "telepty-install": "install.js"
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"

@@ -8,17 +8,12 @@
 
 To install and set up `telepty` on any machine (macOS, Linux, or Windows):
 
-### Option 1: Quick Install Script (Linux/macOS)
-This script installs the package globally and sets it up as a background service (if `systemd` is available).
+### The Universal Installer (Windows/macOS/Linux)
+Open your terminal (or PowerShell/CMD) and run:
 ```bash
-curl -s https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/install.sh | sudo bash
+npx --yes @dmsdc-ai/aigentry-telepty@latest telepty-install
 ```
-
-### Option 2: via NPM
-```bash
-npm install -g @dmsdc-ai/aigentry-telepty
-telepty daemon &
-```
+*This single command will install the package globally and automatically configure it to run as a background service specific to your OS (`systemd` for Linux, `launchd` for macOS, or a detached background process for Windows).*
 
 ## Seamless Usage
 
