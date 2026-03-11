@@ -178,6 +178,25 @@ app.delete('/api/sessions/:id', (req, res) => {
   }
 });
 
+app.post('/api/bus/publish', (req, res) => {
+  const payload = req.body;
+  
+  if (!payload || typeof payload !== 'object') {
+    return res.status(400).json({ error: 'Payload must be a JSON object' });
+  }
+
+  let deliveredCount = 0;
+  
+  busClients.forEach(client => {
+    if (client.readyState === 1) { // WebSocket.OPEN
+      client.send(JSON.stringify(payload));
+      deliveredCount++;
+    }
+  });
+
+  res.json({ success: true, delivered: deliveredCount });
+});
+
 const server = app.listen(PORT, HOST, () => {
   console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
 });

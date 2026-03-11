@@ -26,6 +26,14 @@ const tools = [
       broadcast: z.boolean().optional().describe('If true, injects the prompt into ALL active sessions on the remote daemon. Overrides session_ids.'),
       prompt: z.string().describe('Text to inject into stdin.') 
     })
+  },
+  {
+    name: 'telepty_publish_bus_event',
+    description: 'Publish a structured JSON event to the telepty in-memory event bus. This is a fire-and-forget broadcast to any AI agents currently listening. If no agents are listening, the message is dropped.',
+    schema: z.object({
+      remote_url: z.string().describe('Tailscale IP/Host and port (e.g., 100.100.100.5:3848) of the remote daemon.'),
+      payload: z.record(z.any()).describe('The structured JSON payload to broadcast to the event bus. Must be an object.')
+    })
   }
 ];
 
@@ -83,6 +91,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       return { content: [{ type: 'text', text: msg }] };
     }
+    
+    if (name === 'telepty_publish_bus_event') {
+      const baseUrl = args.remote_url.startsWith('http') ? args.remote_url : `http://${args.remote_url}`;
+      
+      const res = await fetch(`${baseUrl}/api/bus/publish`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-telepty-token': TOKEN }, body: JSON.stringify(args.payload)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      
+      return { content: [{ type: 'text', text: `✅ Successfully published event to the bus. Delivered to ${data.delivered} active listeners.` }] };
+    }
+
     throw new Error(`Unknown tool: ${name}`);
   } catch (err) {
     return { content: [{ type: 'text', text: `❌ Error: ${err.message}` }], isError: true };
