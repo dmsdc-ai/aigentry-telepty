@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const path = require('path');
+const os = require('os');
 const WebSocket = require('ws');
 const { execSync, spawn } = require('child_process');
 const readline = require('readline');
@@ -26,25 +27,6 @@ const fetchWithAuth = (url, options = {}) => {
   const headers = { ...options.headers, 'x-telepty-token': TOKEN };
   return fetch(url, { ...options, headers });
 };
-
-async function ensureDaemonRunning() {
-  if (REMOTE_HOST !== '127.0.0.1') return; // Only auto-start local daemon
-  try {
-    const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions`);
-    if (res.ok) return; // Already running
-  } catch (e) {
-    // Not running, let's start it
-    process.stdout.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
-    const cp = spawn(process.argv[0], [process.argv[1], 'daemon'], {
-      detached: true,
-      stdio: 'ignore'
-    });
-    cp.unref();
-    
-    // Wait a brief moment for the daemon to boot up
-    await new Promise(r => setTimeout(r, 1000));
-  }
-}
 
 async function discoverSessions() {
   await ensureDaemonRunning();
@@ -121,14 +103,25 @@ async function manageInteractiveAttach(sessionId, targetHost) {
     });
     ws.on('close', async () => {
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
-      console.log(`\n\x1b[33mLeft room '${sessionId}'. Destroying session to prevent zombies...\x1b[0m\n`);
       process.stdin.removeAllListeners('data');
-      
-      // Auto-kill session when the primary creator leaves
+
+      // Check if other clients are still attached before destroying
       try {
-        await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
-      } catch(e) {}
-      
+        const res = await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions`);
+        if (res.ok) {
+          const sessions = await res.json();
+          const session = sessions.find(s => s.id === sessionId);
+          if (session && session.active_clients > 0) {
+            console.log(`\n\x1b[33mLeft room '${sessionId}'. Other clients still attached — session kept alive.\x1b[0m\n`);
+          } else {
+            console.log(`\n\x1b[33mLeft room '${sessionId}'. No other clients — destroying session.\x1b[0m\n`);
+            await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+          }
+        }
+      } catch(e) {
+        // Daemon unreachable, nothing to clean up
+      }
+
       resolve();
     });
   });
@@ -215,7 +208,7 @@ async function manageInteractive() {
       try {
         const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/spawn`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: id, command, args: [], cwd: process.cwd(), cols, rows })
+          body: JSON.stringify({ session_id: id, command, args: [], cwd: process.cwd(), cols, rows, type: 'USER' })
         });
         const data = await res.json();
         if (!res.ok) console.error(`\n❌ Error: ${data.error}\n`);
@@ -346,7 +339,7 @@ async function main() {
     try {
       const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/spawn`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, command: command, args: cmdArgs, cwd: process.cwd(), cols, rows })
+        body: JSON.stringify({ session_id: sessionId, command: command, args: cmdArgs, cwd: process.cwd(), cols, rows, type: 'USER' })
       });
       const data = await res.json();
       if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
@@ -424,9 +417,20 @@ async function main() {
       if (process.stdin.isTTY) {
         process.stdin.setRawMode(false);
       }
-      console.log(`\n\x1b[33mLeft room. Destroying session '${sessionId}' to prevent zombies... (Code: ${code})\x1b[0m`);
+
+      // Check if other clients are still attached before destroying
       try {
-        await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+        const res = await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions`);
+        if (res.ok) {
+          const allSessions = await res.json();
+          const session = allSessions.find(s => s.id === sessionId);
+          if (session && session.active_clients > 0) {
+            console.log(`\n\x1b[33mLeft room '${sessionId}'. Other clients still attached — session kept alive.\x1b[0m`);
+          } else {
+            console.log(`\n\x1b[33mLeft room '${sessionId}'. No other clients — destroying session.\x1b[0m`);
+            await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+          }
+        }
       } catch(e) {}
       process.exit(0);
     });
@@ -518,14 +522,19 @@ async function main() {
           const msg = JSON.parse(raw);
           const time = new Date().toLocaleTimeString();
           const sender = msg.sender || msg.from || 'Unknown';
-          const target = msg.target_agent || msg.to || 'Broadcast';
+          const target = msg.target_agent || msg.to || 'Bus';
           
-          let preview = msg.content || msg.message || msg.payload || JSON.stringify(msg);
+          let preview = msg.content || msg.message || msg.payload || msg.data;
+          if (msg.type === 'session_spawn') {
+            console.log(`\x1b[90m[${time}]\x1b[0m 🚀 \x1b[32m\x1b[1mNew Session\x1b[0m: \x1b[36m${msg.session_id}\x1b[0m (${msg.command})`);
+            return;
+          }
+          
           if (typeof preview === 'object') preview = JSON.stringify(preview);
-          if (preview.length > 200) preview = preview.substring(0, 197) + '...';
+          if (preview && preview.length > 200) preview = preview.substring(0, 197) + '...';
 
           console.log(`\x1b[90m[${time}]\x1b[0m \x1b[32m\x1b[1m${sender}\x1b[0m ➔ \x1b[33m\x1b[1m${target}\x1b[0m`);
-          console.log(`  \x1b[37m${preview}\x1b[0m\n`);
+          if (preview) console.log(`  \x1b[37m${preview}\x1b[0m\n`);
         } catch (e) {
           // Fallback if not valid JSON
           console.log(`\x1b[90m[${new Date().toLocaleTimeString()}]\x1b[0m 📦 \x1b[37m${raw}\x1b[0m\n`);

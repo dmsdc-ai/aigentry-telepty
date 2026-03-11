@@ -37,7 +37,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 const sessions = {};
 
 app.post('/api/sessions/spawn', (req, res) => {
-  const { session_id, command, args = [], cwd = process.cwd(), cols = 80, rows = 30 } = req.body;
+  const { session_id, command, args = [], cwd = process.cwd(), cols = 80, rows = 30, type = 'AGENT' } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is strictly required.' });
   if (sessions[session_id]) return res.status(409).json({ error: `Session ID '${session_id}' is already active.` });
   if (!command) return res.status(400).json({ error: 'command is required' });
@@ -49,15 +49,17 @@ app.post('/api/sessions/spawn', (req, res) => {
   try {
     console.log(`[SPAWN] Spawning ${shell} with args:`, shellArgs, "in cwd:", cwd);
 
-    // Create a custom prompt for Linux/Mac so the user sees the session ID.
-    // For bash/zsh, we can inject a custom PS1 variable.
     let customEnv = { ...process.env, TERM: isWin ? undefined : 'xterm-256color', TELEPTY_SESSION_ID: session_id };
     
     if (!isWin) {
+      const label = type.toUpperCase();
+      const colorCode = label === 'USER' ? '32' : '35'; // USER: Green (32), AGENT: Magenta (35)
+      const zshColor = label === 'USER' ? 'green' : 'magenta';
+
       if (command.includes('bash')) {
-        customEnv.PS1 = `\\[\\e[36m\\][telepty: ${session_id}]\\[\\e[0m\\] \\w \\$ `;
+        customEnv.PS1 = `\\[\\e[${colorCode}m\\][${label}: ${session_id}]\\[\\e[0m\\] \\w \\$ `;
       } else if (command.includes('zsh')) {
-        customEnv.PROMPT = `%F{cyan}[telepty: ${session_id}]%f %~ %# `;
+        customEnv.PROMPT = `%F{${zshColor}}[${label}: ${session_id}]%f %~ %# `;
       }
     }
 
@@ -69,6 +71,11 @@ app.post('/api/sessions/spawn', (req, res) => {
       env: customEnv
     });
 
+    // Set Window Title via OSC 0 escape sequence
+    const label = type.toUpperCase();
+    const titleCmd = isWin ? "" : `\x1b]0;[${label}: ${session_id}] Telepty Session\x07`;
+    if (titleCmd) ptyProcess.write(titleCmd);
+
     sessions[session_id] = {
       ptyProcess,
       command,
@@ -77,7 +84,21 @@ app.post('/api/sessions/spawn', (req, res) => {
       clients: new Set()
     };
 
+    // Broadcast session creation to bus
+    const spawnMsg = JSON.stringify({
+      type: 'session_spawn',
+      sender: 'daemon',
+      session_id,
+      command,
+      cwd,
+      timestamp: new Date().toISOString()
+    });
+    busClients.forEach(client => {
+      if (client.readyState === 1) client.send(spawnMsg);
+    });
+
     ptyProcess.onData((data) => {
+      // Send to direct WS clients
       sessions[session_id].clients.forEach(ws => {
         if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'output', data }));
       });
@@ -120,6 +141,18 @@ app.post('/api/sessions/multicast/inject', (req, res) => {
       try {
         session.ptyProcess.write(`${prompt}\r`);
         results.successful.push(id);
+
+        // Broadcast injection to bus
+        const busMsg = JSON.stringify({
+          type: 'injection',
+          sender: 'cli',
+          target_agent: id,
+          content: prompt,
+          timestamp: new Date().toISOString()
+        });
+        busClients.forEach(client => {
+          if (client.readyState === 1) client.send(busMsg);
+        });
       } catch (err) {
         results.failed.push({ id, error: err.message });
       }
@@ -146,6 +179,21 @@ app.post('/api/sessions/broadcast/inject', (req, res) => {
     }
   });
 
+  // Send a single bus event for the entire broadcast (not per-session)
+  if (results.successful.length > 0) {
+    const busMsg = JSON.stringify({
+      type: 'injection',
+      sender: 'cli',
+      target_agent: 'all',
+      content: prompt,
+      session_ids: results.successful,
+      timestamp: new Date().toISOString()
+    });
+    busClients.forEach(client => {
+      if (client.readyState === 1) client.send(busMsg);
+    });
+  }
+
   res.json({ success: true, results });
 });
 
@@ -158,6 +206,19 @@ app.post('/api/sessions/:id/inject', (req, res) => {
   try {
     session.ptyProcess.write(no_enter ? prompt : `${prompt}\r`);
     console.log(`[INJECT] Wrote to session ${id}`);
+
+    // Broadcast injection to bus
+    const busMsg = JSON.stringify({
+      type: 'injection',
+      sender: 'cli',
+      target_agent: id,
+      content: prompt,
+      timestamp: new Date().toISOString()
+    });
+    busClients.forEach(client => {
+      if (client.readyState === 1) client.send(busMsg);
+    });
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -215,7 +276,7 @@ wss.on('connection', (ws, req) => {
   }
 
   session.clients.add(ws);
-  console.log(`[WS] Client attached to session \${sessionId} (Total: \${session.clients.size})`);
+  console.log(`[WS] Client attached to session ${sessionId} (Total: ${session.clients.size})`);
 
   ws.on('message', (message) => {
     try {
@@ -232,7 +293,7 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     session.clients.delete(ws);
-    console.log(`[WS] Client detached from session \${sessionId} (Total: \${session.clients.size})`);
+    console.log(`[WS] Client detached from session ${sessionId} (Total: ${session.clients.size})`);
   });
 });
 
