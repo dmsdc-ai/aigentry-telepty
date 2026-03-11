@@ -1,6 +1,6 @@
 {
   "name": "@dmsdc-ai/aigentry-telepty",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "main": "daemon.js",
   "bin": {
     "telepty": "cli.js",

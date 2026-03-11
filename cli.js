@@ -93,9 +93,26 @@ async function manageInteractive() {
         { title: '➕  Create a new room (Spawn session)', value: 'spawn' },
         { title: '💬  Send message to a room (Inject command)', value: 'inject' },
         { title: '📋  View all open rooms (List sessions)', value: 'list' },
+        { title: '🔄  Update telepty to latest version', value: 'update' },
         { title: '❌  Exit', value: 'exit' }
       ]
     });
+
+    if (response.action === 'update') {
+      console.log('\n\x1b[36m🔄 Updating telepty to the latest version...\x1b[0m');
+      try {
+        execSync('npm install -g @dmsdc-ai/aigentry-telepty@latest', { stdio: 'inherit' });
+        console.log('\n\x1b[32m✅ Update complete! Restarting daemon...\x1b[0m');
+        try {
+          const os = require('os');
+          if (os.platform() === 'win32') execSync('taskkill /IM node.exe /FI "WINDOWTITLE eq telepty daemon*" /F', { stdio: 'ignore' });
+          else execSync('pkill -f "telepty daemon"', { stdio: 'ignore' });
+        } catch(e) {}
+      } catch (e) {
+        console.error('\n❌ Update failed.\n');
+      }
+      process.exit(0);
+    }
 
     if (!response.action || response.action === 'exit') {
       console.log('Goodbye!');
@@ -226,7 +243,27 @@ async function main() {
     return manageInteractive();
   }
 
-  if (cmd === 'mcp') {
+  if (cmd === 'update') {
+    console.log('\x1b[36m🔄 Updating telepty to the latest version...\x1b[0m');
+    try {
+      execSync('npm install -g @dmsdc-ai/aigentry-telepty@latest', { stdio: 'inherit' });
+      console.log('\n\x1b[32m✅ Update complete! Restarting daemon...\x1b[0m');
+      
+      // Kill local daemon if running, so it auto-restarts on next command
+      try {
+        if (os.platform() === 'win32') {
+          execSync('taskkill /IM node.exe /FI "WINDOWTITLE eq telepty daemon*" /F', { stdio: 'ignore' });
+        } else {
+          execSync('pkill -f "telepty daemon"', { stdio: 'ignore' });
+        }
+      } catch (e) {} // Ignore if not running
+
+      console.log('🎉 You are now using the latest version.');
+    } catch (e) {
+      console.error('\n❌ Update failed. Please try running: npm install -g @dmsdc-ai/aigentry-telepty@latest');
+    }
+    return;
+  }
     require('./mcp.js');
     return;
   }
@@ -424,6 +461,7 @@ Usage:
   telepty inject <id> "<prompt>"                 Inject text into a single session
   telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
+  telepty update                                 Update telepty to the latest version
   telepty mcp                                    Start the MCP stdio server
 `);
 }
