@@ -33,5 +33,16 @@ When the user asks about their current session ID, wants to check active session
      ```
 4. **To subscribe to the Event Bus (Listen for JSON events):**
    - Run `nohup telepty listen > .telepty_bus_events.log 2>&1 &`
-5. **To update telepty:**
+5. **To physically OPEN a new Terminal Window for the user (macOS):**
+   - If the user asks you to "open a new telepty terminal" or "방 파줘", you can physically spawn a new Ghostty/Terminal window on their screen that is already attached to a telepty session.
+   - Run this shell command (replace `<ID>` and `<CMD>`):
+     ```bash
+     cat << 'EOF' > /tmp/telepty-auto.command
+     #!/bin/bash
+     telepty spawn --id <ID> <CMD>
+     EOF
+     chmod +x /tmp/telepty-auto.command
+     open -a Ghostty /tmp/telepty-auto.command || open /tmp/telepty-auto.command
+     ```
+6. **To update telepty:**
    - Run `telepty update`.
