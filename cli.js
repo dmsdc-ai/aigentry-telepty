@@ -490,9 +490,16 @@ async function main() {
     return;
   }
 
-  if (cmd === 'listen') {
+  if (cmd === 'listen' || cmd === 'monitor') {
     await ensureDaemonRunning();
-    console.log('\x1b[36m👂 Listening to the telepty event bus...\x1b[0m');
+    
+    if (cmd === 'monitor') {
+      console.log('\x1b[36m\x1b[1m📺 Telepty Event Billboard\x1b[0m');
+      console.log('Listening for background agent communications...\n');
+    } else {
+      console.log('\x1b[36m👂 Listening to the telepty event bus...\x1b[0m');
+    }
+
     const wsUrl = `ws://${REMOTE_HOST}:${PORT}/api/bus?token=${encodeURIComponent(TOKEN)}`;
     const ws = new WebSocket(wsUrl);
     
@@ -501,8 +508,29 @@ async function main() {
     });
 
     ws.on('message', (message) => {
-      // Print raw JSON to stdout so agents can parse it
-      console.log(message.toString());
+      const raw = message.toString();
+      if (cmd === 'listen') {
+        // Raw JSON output for machines
+        console.log(raw);
+      } else {
+        // Human readable billboard output
+        try {
+          const msg = JSON.parse(raw);
+          const time = new Date().toLocaleTimeString();
+          const sender = msg.sender || msg.from || 'Unknown';
+          const target = msg.target_agent || msg.to || 'Broadcast';
+          
+          let preview = msg.content || msg.message || msg.payload || JSON.stringify(msg);
+          if (typeof preview === 'object') preview = JSON.stringify(preview);
+          if (preview.length > 200) preview = preview.substring(0, 197) + '...';
+
+          console.log(`\x1b[90m[${time}]\x1b[0m \x1b[32m\x1b[1m${sender}\x1b[0m ➔ \x1b[33m\x1b[1m${target}\x1b[0m`);
+          console.log(`  \x1b[37m${preview}\x1b[0m\n`);
+        } catch (e) {
+          // Fallback if not valid JSON
+          console.log(`\x1b[90m[${new Date().toLocaleTimeString()}]\x1b[0m 📦 \x1b[37m${raw}\x1b[0m\n`);
+        }
+      }
     });
 
     ws.on('close', () => {
@@ -528,6 +556,7 @@ Usage:
   telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
   telepty listen                                 Listen to the event bus and print JSON to stdout
+  telepty monitor                                Human-readable real-time billboard of bus events
   telepty update                                 Update telepty to the latest version
 `);
 }
