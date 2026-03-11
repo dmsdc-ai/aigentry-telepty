@@ -2,9 +2,12 @@
 
 const { afterEach, beforeEach, test } = require('node:test');
 const assert = require('node:assert/strict');
+const path = require('path');
+const pty = require('node-pty');
 const { createSessionId, startTestDaemon, stripAnsi, waitFor } = require('../test-support/daemon-harness');
 
 let harness;
+const projectRoot = path.resolve(__dirname, '..');
 
 function collectJsonMessages(ws) {
   const messages = [];
@@ -54,4 +57,54 @@ test('telepty inject forwards input to the target PTY session', async () => {
   )), { timeoutMs: 7000, description: 'CLI inject output' });
 
   ws.close();
+});
+
+test('telepty attach resumes stdin after session selection and forwards room input', async () => {
+  const sessionId = createSessionId('cli-attach');
+  await harness.spawnSession(sessionId);
+
+  const cli = pty.spawn(process.execPath, ['cli.js', 'attach'], {
+    cwd: projectRoot,
+    cols: 80,
+    rows: 24,
+    name: process.platform === 'win32' ? 'xterm' : 'xterm-256color',
+    env: {
+      ...process.env,
+      HOME: harness.homeDir,
+      USERPROFILE: harness.homeDir,
+      TELEPTY_HOST: harness.host,
+      TELEPTY_PORT: String(harness.port),
+      NO_UPDATE_NOTIFIER: '1',
+      TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
+    }
+  });
+
+  let output = '';
+  cli.onData((chunk) => {
+    output += chunk;
+  });
+
+  try {
+    await waitFor(() => stripAnsi(output).includes('Select a session number to attach:'), {
+      timeoutMs: 7000,
+      description: 'attach selection prompt'
+    });
+
+    cli.write('1\r');
+
+    await waitFor(() => stripAnsi(output).includes(`Entered room '${sessionId}'`), {
+      timeoutMs: 7000,
+      description: 'attach room entry'
+    });
+
+    const token = createSessionId('attach-token');
+    cli.write(`echo ${token}\r`);
+
+    await waitFor(() => stripAnsi(output).includes(token), {
+      timeoutMs: 7000,
+      description: 'attach input echoed through room'
+    });
+  } finally {
+    cli.kill();
+  }
 });

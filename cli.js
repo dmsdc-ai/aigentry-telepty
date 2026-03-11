@@ -9,6 +9,7 @@ const prompts = require('prompts');
 const updateNotifier = require('update-notifier');
 const pkg = require('./package.json');
 const { getConfig } = require('./auth');
+const { attachInteractiveTerminal } = require('./interactive-terminal');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const args = process.argv.slice(2);
 
@@ -92,29 +93,24 @@ async function ensureDaemonRunning() {
 async function manageInteractiveAttach(sessionId, targetHost) {
   const wsUrl = `ws://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
   const ws = new WebSocket(wsUrl);
-  let inputHandler = null;
-  let resizeHandler = null;
+  let cleanupTerminal = null;
   return new Promise((resolve) => {
     ws.on('open', () => {
       // Set Ghostty tab title to show session ID
       process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
       console.log(`\n\x1b[32mEntered room '${sessionId}'.\x1b[0m\n`);
-      if (process.stdin.isTTY) process.stdin.setRawMode(true);
-      inputHandler = (d) => ws.send(JSON.stringify({ type: 'input', data: d.toString() }));
-      resizeHandler = () => ws.send(JSON.stringify({ type: 'resize', cols: process.stdout.columns, rows: process.stdout.rows }));
-      process.stdin.on('data', inputHandler);
-      process.stdout.on('resize', resizeHandler);
-      resizeHandler();
+      cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
+        onData: (d) => ws.send(JSON.stringify({ type: 'input', data: d.toString() })),
+        onResize: () => ws.send(JSON.stringify({ type: 'resize', cols: process.stdout.columns, rows: process.stdout.rows }))
+      });
     });
     ws.on('message', m => {
       const msg = JSON.parse(m);
       if (msg.type === 'output') process.stdout.write(msg.data);
     });
     ws.on('close', async () => {
-      if (process.stdin.isTTY) process.stdin.setRawMode(false);
       process.stdout.write(`\x1b]0;\x07`); // Restore default terminal title
-      if (inputHandler) process.stdin.off('data', inputHandler);
-      if (resizeHandler) process.stdout.off('resize', resizeHandler);
+      if (cleanupTerminal) cleanupTerminal();
 
       // Check if other clients are still attached before destroying
       try {
@@ -480,11 +476,13 @@ async function main() {
     process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
     console.log(`\x1b[32m⚡ '${command}' is now session '\x1b[36m${sessionId}\x1b[32m'. Inject allowed.\x1b[0m\n`);
 
-    // Enter raw mode and relay stdin to local PTY
-    if (process.stdin.isTTY) process.stdin.setRawMode(true);
-
-    process.stdin.on('data', (data) => {
-      child.write(data.toString());
+    const cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
+      onData: (data) => {
+        child.write(data.toString());
+      },
+      onResize: () => {
+        child.resize(process.stdout.columns, process.stdout.rows);
+      }
     });
 
     // Relay PTY output to current terminal + send to daemon for attach clients
@@ -495,14 +493,9 @@ async function main() {
       }
     });
 
-    // Handle terminal resize
-    process.stdout.on('resize', () => {
-      child.resize(process.stdout.columns, process.stdout.rows);
-    });
-
     // Handle child exit
     child.onExit(({ exitCode }) => {
-      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      cleanupTerminal();
       process.stdout.write(`\x1b]0;\x07`);
       console.log(`\n\x1b[33mSession '${sessionId}' exited (code ${exitCode}).\x1b[0m`);
 
@@ -551,8 +544,7 @@ async function main() {
 
     const wsUrl = `ws://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
     const ws = new WebSocket(wsUrl);
-    let inputHandler = null;
-    let resizeHandler = null;
+    let cleanupTerminal = null;
 
     ws.on('open', () => {
       // Set Ghostty tab title to show session ID
@@ -560,25 +552,18 @@ async function main() {
       process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}${hostSuffix}\x07`);
       console.log(`\x1b[32mEntered room '${sessionId}'${hostSuffix ? ` (${targetHost})` : ''}.\x1b[0m\n`);
 
-      if (process.stdin.isTTY) {
-        process.stdin.setRawMode(true);
-      }
-
-      inputHandler = (data) => {
-        ws.send(JSON.stringify({ type: 'input', data: data.toString() }));
-      };
-      process.stdin.on('data', inputHandler);
-
-      resizeHandler = () => {
-        ws.send(JSON.stringify({
-          type: 'resize',
-          cols: process.stdout.columns,
-          rows: process.stdout.rows
-        }));
-      };
-
-      process.stdout.on('resize', resizeHandler);
-      resizeHandler(); // Initial resize
+      cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
+        onData: (data) => {
+          ws.send(JSON.stringify({ type: 'input', data: data.toString() }));
+        },
+        onResize: () => {
+          ws.send(JSON.stringify({
+            type: 'resize',
+            cols: process.stdout.columns,
+            rows: process.stdout.rows
+          }));
+        }
+      });
     });
 
     ws.on('message', (message) => {
@@ -589,12 +574,8 @@ async function main() {
     });
 
     ws.on('close', async (code, reason) => {
-      if (process.stdin.isTTY) {
-        process.stdin.setRawMode(false);
-      }
       process.stdout.write(`\x1b]0;\x07`); // Restore default terminal title
-      if (inputHandler) process.stdin.off('data', inputHandler);
-      if (resizeHandler) process.stdout.off('resize', resizeHandler);
+      if (cleanupTerminal) cleanupTerminal();
 
       // Check if other clients are still attached before destroying
       try {
