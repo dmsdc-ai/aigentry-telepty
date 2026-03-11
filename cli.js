@@ -2,8 +2,9 @@
 
 const path = require('path');
 const WebSocket = require('ws');
-const { execSync } = require('child_process');
+const { execSync, spawn } = require('child_process');
 const readline = require('readline');
+const prompts = require('prompts');
 const { getConfig } = require('./auth');
 const args = process.argv.slice(2);
 
@@ -59,8 +60,152 @@ async function discoverSessions() {
   return allSessions;
 }
 
+async function manageInteractive() {
+  console.clear();
+  console.log('\x1b[36m\x1b[1m⚡ Telepty Agent Manager\x1b[0m\n');
+
+  while (true) {
+    const response = await prompts({
+      type: 'select',
+      name: 'action',
+      message: 'What would you like to do?',
+      choices: [
+        { title: '📡  Attach to a session', value: 'attach' },
+        { title: '🚀  Spawn a new session', value: 'spawn' },
+        { title: '💉  Inject command into a session', value: 'inject' },
+        { title: '📋  List active sessions', value: 'list' },
+        { title: '⚙️   Start background daemon', value: 'daemon' },
+        { title: '❌  Exit', value: 'exit' }
+      ]
+    });
+
+    if (!response.action || response.action === 'exit') {
+      console.log('Goodbye!');
+      process.exit(0);
+    }
+
+    if (response.action === 'daemon') {
+      console.log('\n\x1b[33mStarting daemon in background...\x1b[0m');
+      const cp = spawn(process.argv[0], [process.argv[1], 'daemon'], {
+        detached: true,
+        stdio: 'ignore'
+      });
+      cp.unref();
+      console.log('✅ Daemon started.\n');
+      continue;
+    }
+
+    if (response.action === 'list') {
+      console.log('\n');
+      const sessions = await discoverSessions();
+      if (sessions.length === 0) {
+        console.log('❌ No active sessions found.');
+      } else {
+        console.log('\x1b[1mAvailable Sessions:\x1b[0m');
+        sessions.forEach(s => {
+          const hostLabel = s.host === '127.0.0.1' ? 'Local' : s.host;
+          console.log(`  - \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) [${s.command}] - Clients: ${s.active_clients}`);
+        });
+      }
+      console.log('\n');
+      continue;
+    }
+
+    if (response.action === 'spawn') {
+      const { id, command } = await prompts([
+        { type: 'text', name: 'id', message: 'Enter new session ID (e.g. agent-1):', validate: v => v ? true : 'Required' },
+        { type: 'text', name: 'command', message: 'Enter command to run (e.g. bash, zsh, python):', initial: 'bash' }
+      ]);
+      if (!id || !command) continue;
+      
+      const cols = process.stdout.columns || 80;
+      const rows = process.stdout.rows || 30;
+      try {
+        const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/spawn`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: id, command, args: [], cwd: process.cwd(), cols, rows })
+        });
+        const data = await res.json();
+        if (!res.ok) console.error(`\n❌ Error: ${data.error}\n`);
+        else console.log(`\n✅ Session '\x1b[36m${data.session_id}\x1b[0m' spawned successfully.\n`);
+      } catch (e) {
+        console.error('\n❌ Failed to connect to local daemon. Is it running?\n');
+      }
+      continue;
+    }
+
+    if (response.action === 'attach' || response.action === 'inject') {
+      const sessions = await discoverSessions();
+      if (sessions.length === 0) {
+        console.log('\n❌ No active sessions found to ' + response.action + '.\n');
+        continue;
+      }
+      const { target } = await prompts({
+        type: 'select',
+        name: 'target',
+        message: `Select a session to ${response.action}:`,
+        choices: sessions.map(s => ({
+          title: `${s.id} (${s.host === '127.0.0.1' ? 'Local' : s.host}) - ${s.command}`,
+          value: s
+        }))
+      });
+
+      if (!target) continue;
+
+      if (response.action === 'attach') {
+        const wsUrl = `ws://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}?token=${encodeURIComponent(TOKEN)}`;
+        const ws = new WebSocket(wsUrl);
+        await new Promise((resolve) => {
+          ws.on('open', () => {
+            console.log(`\n\x1b[32mConnected to '${target.id}'. Press Ctrl+C to detach.\x1b[0m\n`);
+            if (process.stdin.isTTY) process.stdin.setRawMode(true);
+            process.stdin.on('data', d => ws.send(JSON.stringify({ type: 'input', data: d.toString() })));
+            const resizer = () => ws.send(JSON.stringify({ type: 'resize', cols: process.stdout.columns, rows: process.stdout.rows }));
+            process.stdout.on('resize', resizer); resizer();
+          });
+          ws.on('message', m => {
+            const msg = JSON.parse(m);
+            if (msg.type === 'output') process.stdout.write(msg.data);
+          });
+          ws.on('close', () => {
+            if (process.stdin.isTTY) process.stdin.setRawMode(false);
+            console.log(`\n\x1b[33mDisconnected from session.\x1b[0m\n`);
+            process.stdin.removeAllListeners('data');
+            resolve();
+          });
+        });
+        continue;
+      }
+
+      if (response.action === 'inject') {
+        const { promptText } = await prompts({
+          type: 'text',
+          name: 'promptText',
+          message: 'Enter text to inject:',
+          validate: v => v ? true : 'Required'
+        });
+        if (!promptText) continue;
+        try {
+          const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: promptText })
+          });
+          const data = await res.json();
+          if (!res.ok) console.error(`\n❌ Error: ${data.error}\n`);
+          else console.log(`\n✅ Injected successfully into '\x1b[36m${target.id}\x1b[0m'.\n`);
+        } catch (e) { console.error('\n❌ Failed to connect.\n'); }
+        continue;
+      }
+    }
+  }
+}
+
 async function main() {
   const cmd = args[0];
+  
+  if (!cmd) {
+    return manageInteractive();
+  }
+
   if (cmd === 'mcp') {
     require('./mcp.js');
     return;

@@ -1,6 +1,6 @@
 {
   "name": "@dmsdc-ai/aigentry-telepty",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "main": "daemon.js",
   "bin": {
     "telepty": "cli.js",
@@ -18,6 +18,7 @@
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "node-pty": "^1.2.0-beta.11",
+    "prompts": "^2.4.2",
     "uuid": "^13.0.0",
     "ws": "^8.19.0",
     "zod": "^4.3.6"
