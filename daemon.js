@@ -53,7 +53,7 @@ app.post('/api/sessions/spawn', (req, res) => {
       cols: parseInt(cols),
       rows: parseInt(rows),
       cwd,
-      env: { ...process.env, TERM: isWin ? undefined : 'xterm-256color' }
+      env: { ...process.env, TERM: isWin ? undefined : 'xterm-256color', TELEPTY_SESSION_ID: session_id }
     });
 
     sessions[session_id] = {
