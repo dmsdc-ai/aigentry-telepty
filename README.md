@@ -6,14 +6,21 @@
 
 ## One-Click Installation
 
-To install and set up `telepty` on any machine (macOS, Linux, or Windows):
+To install and set up `telepty` on any machine (macOS, Linux, or Windows). These scripts will automatically install Node.js if it is missing from your system.
 
-### The Universal Installer (Windows/macOS/Linux)
-Open your terminal (or PowerShell/CMD) and run:
+### For macOS and Linux (Ubuntu, CentOS, etc.)
+Open your terminal and run:
 ```bash
-npx --yes @dmsdc-ai/aigentry-telepty@latest telepty-install
+curl -fsSL https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/install.sh | bash
 ```
-*This single command will install the package globally and automatically configure it to run as a background service specific to your OS (`systemd` for Linux, `launchd` for macOS, or a detached background process for Windows).*
+
+### For Windows (PowerShell)
+Open PowerShell and run:
+```powershell
+iwr -useb https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/install.ps1 | iex
+```
+
+*These single commands will install the package globally and automatically configure it to run as a background service specific to your OS (`systemd` for Linux, `launchd` for macOS, or a detached background process for Windows).*
 
 ## Seamless Usage
 
