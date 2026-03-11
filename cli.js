@@ -178,6 +178,8 @@ async function manageInteractive() {
       ]);
       if (!id || !command) continue;
 
+      await ensureDaemonRunning();
+
       const cols = process.stdout.columns || 80;
       const rows = process.stdout.rows || 30;
       try {
