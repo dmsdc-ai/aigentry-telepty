@@ -5,8 +5,13 @@ const WebSocket = require('ws');
 const { execSync, spawn } = require('child_process');
 const readline = require('readline');
 const prompts = require('prompts');
+const updateNotifier = require('update-notifier');
+const pkg = require('./package.json');
 const { getConfig } = require('./auth');
 const args = process.argv.slice(2);
+
+// Check for updates
+updateNotifier({pkg}).notify({ isGlobal: true });
 
 // Support remote host via environment variable or default to localhost
 let REMOTE_HOST = process.env.TELEPTY_HOST || '127.0.0.1';
