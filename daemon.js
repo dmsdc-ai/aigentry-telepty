@@ -3,12 +3,35 @@ const cors = require('cors');
 const pty = require('node-pty');
 const os = require('os');
 const { WebSocketServer } = require('ws');
+const { getConfig } = require('./auth');
+
+const config = getConfig();
+const EXPECTED_TOKEN = config.authToken;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Authentication Middleware
+app.use((req, res, next) => {
+  const isLocalhost = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
+  const isTailscale = req.ip && req.ip.startsWith('100.');
+  
+  if (isLocalhost || isTailscale) {
+    return next(); // Trust local and Tailscale networks
+  }
+
+  const token = req.headers['x-telepty-token'] || req.query.token;
+  if (token === EXPECTED_TOKEN) {
+    return next();
+  }
+
+  console.warn(`[AUTH] Rejected unauthorized request from ${req.ip}`);
+  res.status(401).json({ error: 'Unauthorized: Invalid or missing token.' });
+});
+
 const PORT = process.env.PORT || 3848;
+
 const HOST = process.env.HOST || '0.0.0.0';
 
 const sessions = {};
@@ -93,7 +116,18 @@ const server = app.listen(PORT, HOST, () => {
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
+  const isLocalhost = req.socket.remoteAddress === '127.0.0.1' || req.socket.remoteAddress === '::1' || req.socket.remoteAddress === '::ffff:127.0.0.1';
+  const isTailscale = req.socket.remoteAddress && req.socket.remoteAddress.startsWith('100.');
+  
   const url = new URL(req.url, `http://${req.headers.host}`);
+  const token = url.searchParams.get('token');
+
+  if (!isLocalhost && !isTailscale && token !== EXPECTED_TOKEN) {
+    console.warn(`[WS-AUTH] Rejected unauthorized WebSocket from ${req.socket.remoteAddress}`);
+    ws.close(1008, 'Unauthorized');
+    return;
+  }
+
   const sessionId = url.pathname.split('/').pop();
   const session = sessions[sessionId];
 

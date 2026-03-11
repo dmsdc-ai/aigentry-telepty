@@ -3,6 +3,10 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const { z } = require('zod');
 const { zodToJsonSchema } = require('zod-to-json-schema');
+const { getConfig } = require('./auth');
+
+const config = getConfig();
+const TOKEN = config.authToken;
 
 const server = new Server({ name: 'telepty-mcp-server', version: '0.0.1' }, { capabilities: { tools: {} } });
 
@@ -20,7 +24,12 @@ const tools = [
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: tools.map(t => ({ name: t.name, description: t.description, inputSchema: zodToJsonSchema(t.schema) }))
+  tools: tools.map(t => {
+    const schema = zodToJsonSchema(t.schema);
+    delete schema.$schema;
+    if (!schema.type) schema.type = 'object';
+    return { name: t.name, description: t.description, inputSchema: schema };
+  })
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -28,7 +37,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     if (name === 'telepty_list_remote_sessions') {
       const baseUrl = args.remote_url.startsWith('http') ? args.remote_url : `http://${args.remote_url}`;
-      const res = await fetch(`${baseUrl}/api/sessions`);
+      const res = await fetch(`${baseUrl}/api/sessions`, { headers: { 'x-telepty-token': TOKEN } });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const sessions = await res.json();
       if (!sessions || sessions.length === 0) return { content: [{ type: 'text', text: `No active sessions found on ${args.remote_url}` }] };
@@ -39,7 +48,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'telepty_inject_context') {
       const baseUrl = args.remote_url.startsWith('http') ? args.remote_url : `http://${args.remote_url}`;
       const res = await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(args.session_id)}/inject`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: args.prompt })
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-telepty-token': TOKEN }, body: JSON.stringify({ prompt: args.prompt })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);

@@ -2,6 +2,7 @@
 
 const path = require('path');
 const WebSocket = require('ws');
+const { getConfig } = require('./auth');
 const args = process.argv.slice(2);
 
 // Support remote host via environment variable or default to localhost
@@ -9,6 +10,14 @@ const REMOTE_HOST = process.env.TELEPTY_HOST || '127.0.0.1';
 const PORT = 3848;
 const DAEMON_URL = `http://${REMOTE_HOST}:${PORT}`;
 const WS_URL = `ws://${REMOTE_HOST}:${PORT}`;
+
+const config = getConfig();
+const TOKEN = config.authToken;
+
+const fetchWithAuth = (url, options = {}) => {
+  const headers = { ...options.headers, 'x-telepty-token': TOKEN };
+  return fetch(url, { ...options, headers });
+};
 
 async function main() {
   const cmd = args[0];
@@ -25,7 +34,7 @@ async function main() {
 
   if (cmd === 'list') {
     try {
-      const res = await fetch(`${DAEMON_URL}/api/sessions`);
+      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const sessions = await res.json();
       if (sessions.length === 0) { console.log('No active sessions found.'); return; }
@@ -56,7 +65,7 @@ async function main() {
     const rows = process.stdout.rows || 30;
 
     try {
-      const res = await fetch(`${DAEMON_URL}/api/sessions/spawn`, {
+      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/spawn`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId, command: command, args: cmdArgs, cwd: process.cwd(), cols, rows })
       });
@@ -71,7 +80,7 @@ async function main() {
     const sessionId = args[1];
     if (!sessionId) { console.error('❌ Usage: telepty attach <session_id>'); process.exit(1); }
 
-    const ws = new WebSocket(`${WS_URL}/api/sessions/${encodeURIComponent(sessionId)}`);
+    const ws = new WebSocket(`${WS_URL}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`);
 
     ws.on('open', () => {
       console.log(`\x1b[32mConnected to session '${sessionId}'. Press Ctrl+C to detach (if shell supports) or use your shell's exit command.\x1b[0m\n`);
@@ -123,7 +132,7 @@ async function main() {
     const sessionId = args[1]; const prompt = args.slice(2).join(' ');
     if (!sessionId || !prompt) { console.error('❌ Usage: telepty inject <session_id> "<prompt text>"'); process.exit(1); }
     try {
-      const res = await fetch(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt })
       });
       const data = await res.json();
