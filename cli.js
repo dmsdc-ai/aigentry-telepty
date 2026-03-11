@@ -485,6 +485,32 @@ async function main() {
     return;
   }
 
+  if (cmd === 'listen') {
+    await ensureDaemonRunning();
+    console.log('\x1b[36m👂 Listening to the telepty event bus...\x1b[0m');
+    const wsUrl = `ws://${REMOTE_HOST}:${PORT}/api/bus?token=${encodeURIComponent(TOKEN)}`;
+    const ws = new WebSocket(wsUrl);
+    
+    ws.on('open', () => {
+      // connected
+    });
+
+    ws.on('message', (message) => {
+      // Print raw JSON to stdout so agents can parse it
+      console.log(message.toString());
+    });
+
+    ws.on('close', () => {
+      console.error('\x1b[31m❌ Disconnected from event bus.\x1b[0m');
+      process.exit(1);
+    });
+
+    ws.on('error', (err) => {
+      console.error('\x1b[31m❌ WebSocket error:\x1b[0m', err.message);
+    });
+    return;
+  }
+
   console.log(`
 \x1b[1maigentry-telepty\x1b[0m - Remote PTY Control
 
@@ -496,6 +522,7 @@ Usage:
   telepty inject <id> "<prompt>"                 Inject text into a single session
   telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
+  telepty listen                                 Listen to the event bus and print JSON to stdout
   telepty update                                 Update telepty to the latest version
 `);
 }
