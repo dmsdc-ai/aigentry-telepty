@@ -57,13 +57,17 @@ app.post('/api/sessions/spawn', (req, res) => {
       const zshColor = label === 'USER' ? 'green' : 'magenta';
       const title = `⚡ telepty :: ${session_id}`;
 
+      // TELEPTY_TITLE env var allows child processes to know the desired title
+      customEnv.TELEPTY_TITLE = title;
+
       if (command.includes('bash')) {
-        // Embed OSC 0 title in PS1 so it persists on every prompt
-        customEnv.PS1 = `\\[\\e]0;${title}\\a\\]\\[\\e[${colorCode}m\\][${label}: ${session_id}]\\[\\e[0m\\] \\w \\$ `;
+        // PROMPT_COMMAND runs before every prompt, overriding any title set by child processes (e.g. Claude Code)
+        customEnv.PROMPT_COMMAND = `printf '\\e]0;${title}\\a'`;
+        customEnv.PS1 = `\\[\\e[${colorCode}m\\][${label}: ${session_id}]\\[\\e[0m\\] \\w \\$ `;
       } else if (command.includes('zsh')) {
-        // Disable oh-my-zsh / zsh auto-title and embed OSC 0 in PROMPT
         customEnv.DISABLE_AUTO_TITLE = 'true';
-        customEnv.PROMPT = `%{\\e]0;${title}\\a%}%F{${zshColor}}[${label}: ${session_id}]%f %~ %# `;
+        customEnv.PROMPT = `%F{${zshColor}}[${label}: ${session_id}]%f %~ %# `;
+        // precmd hook will be injected after spawn to override titles set by child processes
       }
     }
 
@@ -75,10 +79,17 @@ app.post('/api/sessions/spawn', (req, res) => {
       env: customEnv
     });
 
-    // Set Window Title via OSC 0 escape sequence
+    // Set Window Title via OSC 0 and install persistent title hook
     const label = type.toUpperCase();
-    const titleCmd = isWin ? "" : `\x1b]0;⚡ telepty :: ${session_id}\x07`;
-    if (titleCmd) ptyProcess.write(titleCmd);
+    const title = `⚡ telepty :: ${session_id}`;
+    if (!isWin) {
+      ptyProcess.write(`\x1b]0;${title}\x07`);
+      // For zsh: inject precmd hook that resets title before every prompt
+      // This overrides any title set by child processes (e.g. Claude Code)
+      if (command.includes('zsh')) {
+        ptyProcess.write(`precmd() { print -Pn '\\e]0;${title}\\a' }\r`);
+      }
+    }
 
     const sessionRecord = {
       id: session_id,
@@ -260,12 +271,12 @@ app.patch('/api/sessions/:id', (req, res) => {
     const title = `⚡ telepty :: ${new_id}`;
     // Set window title immediately
     session.ptyProcess.write(`\x1b]0;${title}\x07`);
-    // Update PS1/PROMPT env so subsequent prompts show new ID
+    // Update PROMPT_COMMAND/precmd and PS1/PROMPT with new ID
     const cmd = session.command || '';
     if (cmd.includes('bash')) {
-      session.ptyProcess.write(`export PS1='\\[\\e]0;${title}\\a\\]\\[\\e[35m\\][AGENT: ${new_id}]\\[\\e[0m\\] \\w \\$ '\r`);
+      session.ptyProcess.write(`export PROMPT_COMMAND="printf '\\e]0;${title}\\a'" PS1='\\[\\e[35m\\][AGENT: ${new_id}]\\[\\e[0m\\] \\w \\$ '\r`);
     } else if (cmd.includes('zsh')) {
-      session.ptyProcess.write(`export PROMPT='%{\\e]0;${title}\\a%}%F{magenta}[AGENT: ${new_id}]%f %~ %# '\r`);
+      session.ptyProcess.write(`precmd() { print -Pn '\\e]0;${title}\\a' }; export PROMPT='%F{magenta}[AGENT: ${new_id}]%f %~ %# '\r`);
     }
   }
 
