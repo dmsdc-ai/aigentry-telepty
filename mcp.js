@@ -18,8 +18,14 @@ const tools = [
   },
   {
     name: 'telepty_inject_context',
-    description: 'Inject a prompt or context into an active AI CLI session on a remote machine. WARNING: You MUST use telepty_list_remote_sessions first to find the exact session_id, and ask the user for confirmation if ambiguous.',
-    schema: z.object({ remote_url: z.string(), session_id: z.string().describe('The EXACT session ID.'), prompt: z.string().describe('Text to inject into stdin.') })
+    description: 'Inject a prompt or context into specific active AI CLI sessions on a remote machine. You can specify a single session ID, multiple session IDs, or broadcast to all.',
+    schema: z.object({ 
+      remote_url: z.string(), 
+      session_ids: z.array(z.string()).optional().describe('An array of exact session IDs to inject into. If not provided, it will inject into session_id.'), 
+      session_id: z.string().optional().describe('Legacy fallback for a single session ID.'),
+      broadcast: z.boolean().optional().describe('If true, injects the prompt into ALL active sessions on the remote daemon. Overrides session_ids.'),
+      prompt: z.string().describe('Text to inject into stdin.') 
+    })
   }
 ];
 
@@ -47,12 +53,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === 'telepty_inject_context') {
       const baseUrl = args.remote_url.startsWith('http') ? args.remote_url : `http://${args.remote_url}`;
-      const res = await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(args.session_id)}/inject`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-telepty-token': TOKEN }, body: JSON.stringify({ prompt: args.prompt })
+      
+      let endpoint = '';
+      let body = {};
+      
+      if (args.broadcast) {
+        endpoint = `${baseUrl}/api/sessions/broadcast/inject`;
+        body = { prompt: args.prompt };
+      } else if (args.session_ids && args.session_ids.length > 0) {
+        endpoint = `${baseUrl}/api/sessions/multicast/inject`;
+        body = { session_ids: args.session_ids, prompt: args.prompt };
+      } else if (args.session_id) {
+        endpoint = `${baseUrl}/api/sessions/${encodeURIComponent(args.session_id)}/inject`;
+        body = { prompt: args.prompt };
+      } else {
+        throw new Error('You must provide either broadcast: true, session_ids: [...], or session_id: "..."');
+      }
+
+      const res = await fetch(endpoint, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-telepty-token': TOKEN }, body: JSON.stringify(body)
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      return { content: [{ type: 'text', text: `✅ Successfully injected context into session '${args.session_id}'. The remote agent has been awakened.` }] };
+      
+      let msg = `✅ Successfully injected context.`;
+      if (args.broadcast) msg += ` (Broadcasted to ${data.results.successful.length} sessions)`;
+      else if (args.session_ids) msg += ` (Multicasted to ${data.results.successful.length} sessions)`;
+      else msg += ` (Targeted session '${args.session_id}')`;
+
+      return { content: [{ type: 'text', text: msg }] };
     }
     throw new Error(`Unknown tool: ${name}`);
   } catch (err) {

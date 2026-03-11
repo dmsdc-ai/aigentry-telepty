@@ -94,6 +94,48 @@ app.get('/api/sessions', (req, res) => {
   res.json(list);
 });
 
+app.post('/api/sessions/multicast/inject', (req, res) => {
+  const { session_ids, prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+  if (!Array.isArray(session_ids)) return res.status(400).json({ error: 'session_ids must be an array' });
+
+  const results = { successful: [], failed: [] };
+
+  session_ids.forEach(id => {
+    const session = sessions[id];
+    if (session) {
+      try {
+        session.ptyProcess.write(`${prompt}\r`);
+        results.successful.push(id);
+      } catch (err) {
+        results.failed.push({ id, error: err.message });
+      }
+    } else {
+      results.failed.push({ id, error: 'Session not found' });
+    }
+  });
+
+  res.json({ success: true, results });
+});
+
+app.post('/api/sessions/broadcast/inject', (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+
+  const results = { successful: [], failed: [] };
+
+  Object.keys(sessions).forEach(id => {
+    try {
+      sessions[id].ptyProcess.write(`${prompt}\r`);
+      results.successful.push(id);
+    } catch (err) {
+      results.failed.push({ id, error: err.message });
+    }
+  });
+
+  res.json({ success: true, results });
+});
+
 app.post('/api/sessions/:id/inject', (req, res) => {
   const { id } = req.params;
   const { prompt } = req.body;

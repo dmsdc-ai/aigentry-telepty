@@ -14,5 +14,6 @@ When the user asks about their current session ID (e.g. "내 세션 ID가 뭐야
 2. **To list all sessions:**
    - Run `telepty list`.
 3. **To inject a command into another session:**
-   - Ensure you know the target session ID. If not specified, ask the user or run `telepty list` to find it.
-   - Run `telepty inject <target_session_id> "<message or command>"`.
+   - For a single session: Run `telepty inject <target_session_id> "<message or command>"`.
+   - For broadcasting to ALL active sessions: Run `telepty broadcast "<message or command>"`.
+   - For multicasting to multiple specific sessions: Run `telepty multicast <id1>,<id2> "<message or command>"`.

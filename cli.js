@@ -355,6 +355,38 @@ async function main() {
     return;
   }
 
+  if (cmd === 'multicast') {
+    const sessionIdsRaw = args[1]; const prompt = args.slice(2).join(' ');
+    if (!sessionIdsRaw || !prompt) { console.error('❌ Usage: telepty multicast <id1,id2,...> "<prompt text>"'); process.exit(1); }
+    const sessionIds = sessionIdsRaw.split(',').map(s => s.trim()).filter(s => s);
+    try {
+      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/multicast/inject`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_ids: sessionIds, prompt })
+      });
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      console.log(`✅ Context multicasted successfully to ${data.results.successful.length} sessions.`);
+      if (data.results.failed.length > 0) {
+        console.warn(`⚠️ Failed to inject into ${data.results.failed.length} sessions:`, data.results.failed.map(f => f.id).join(', '));
+      }
+    } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+    return;
+  }
+
+  if (cmd === 'broadcast') {
+    const prompt = args.slice(1).join(' ');
+    if (!prompt) { console.error('❌ Usage: telepty broadcast "<prompt text>"'); process.exit(1); }
+    try {
+      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/broadcast/inject`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt })
+      });
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      console.log(`✅ Context broadcasted successfully to ${data.results.successful.length} active sessions.`);
+    } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+    return;
+  }
+
   console.log(`
 \x1b[1maigentry-telepty\x1b[0m - Remote PTY Control
 
@@ -363,7 +395,9 @@ Usage:
   telepty spawn --id <id> <command> [args...]    Spawn a new background CLI
   telepty list                                   List all active sessions
   telepty attach [id]                            Attach to a session (Interactive picker if no ID)
-  telepty inject <id> "<prompt>"                 Inject text into an active session
+  telepty inject <id> "<prompt>"                 Inject text into a single session
+  telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
+  telepty broadcast "<prompt>"                   Inject text into ALL active sessions
   telepty mcp                                    Start the MCP stdio server
 `);
 }
