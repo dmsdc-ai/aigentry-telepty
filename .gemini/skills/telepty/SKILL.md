@@ -13,27 +13,25 @@ When the user asks about their current session ID, wants to check active session
    - If it has a value, output it clearly.
 2. **To list all sessions:**
    - Run `telepty list`.
-3. **To inject a command into another session:**
-   - For a single session: Run `telepty inject <target_session_id> "<message or command>"`.
-   - For broadcasting to ALL active sessions: Run `telepty broadcast "<message or command>"`.
-   - For multicasting to multiple specific sessions: Run `telepty multicast <id1>,<id2> "<message or command>"`.
-4. **To update telepty:**
+3. **To send a message/command to another agent, you must choose ONE of three methods depending on the user's intent:**
+   
+   **Method A: Prompt Injection (Active Interruption)**
+   - Use this when you want the receiving AI to IMMEDIATELY read and execute the message as a prompt.
+   - Run: `telepty inject <target_session_id> "<prompt text>"`
+   - (For multiple: `telepty multicast <id1>,<id2> "<prompt>"`)
+
+   **Method B: Log Injection (Visual Notification)**
+   - Use this when you want the message to appear immediately on the receiving terminal's screen for the user to see, but WITHOUT forcing the AI to execute it as a prompt.
+   - Run: `telepty inject <target_session_id> "echo '\x1b[33m[📬 Message from $TELEPTY_SESSION_ID]\x1b[0m <message text>'"`
+
+   **Method C: Background JSON Bus (Passive/Silent)**
+   - Use this for structured data transfer that the other AI will read later from its log file, without disturbing its current terminal screen.
+   - Run: 
+     ```bash
+     TOKEN=$(cat ~/.telepty/config.json | grep authToken | cut -d '"' -f 4)
+     curl -s -X POST http://127.0.0.1:3848/api/bus/publish -H "Content-Type: application/json" -H "x-telepty-token: $TOKEN" -d '{"type": "bg_message", "payload": "..."}'
+     ```
+4. **To subscribe to the Event Bus (Listen for JSON events):**
+   - Run `nohup telepty listen > .telepty_bus_events.log 2>&1 &`
+5. **To update telepty:**
    - Run `telepty update`.
-5. **To publish a JSON event to the Event Bus (/api/bus):**
-   - Use `curl` to post directly to the local daemon (it will relay to all active clients).
-   - First, get the token: `TOKEN=$(cat ~/.telepty/config.json | grep authToken | cut -d '"' -f 4)`
-   - Then run:
-     ```bash
-     curl -X POST http://127.0.0.1:3848/api/bus/publish \
-       -H "Content-Type: application/json" \
-       -H "x-telepty-token: $TOKEN" \
-       -d '{"type": "my_event", "payload": "data"}'
-     ```
-   - (Modify the JSON payload structure according to the user's specific request.)
-6. **To subscribe to the Event Bus (Listen for JSON events):**
-   - If the user wants to wait for and listen to messages from other agents, simply run `telepty listen`.
-   - Run it in the background and redirect output to a log file so you can periodically check it:
-     ```bash
-     nohup telepty listen > .telepty_bus_events.log 2>&1 &
-     ```
-   - Inform the user that the agent is now listening, and any received JSON messages will be saved to `.telepty_bus_events.log` in the current directory. (You can read this file using `read_file` to see what messages arrived).
