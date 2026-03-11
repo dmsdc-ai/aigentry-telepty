@@ -31,3 +31,4 @@ Write-Host "Success: Windows daemon started in background." -ForegroundColor Gre
 
 Write-Host "`nInstallation complete! Telepty daemon is running." -ForegroundColor Cyan
 Write-Host "Next step: Try running: telepty attach" -ForegroundColor Yellow
+Write-Host "Optional: Run telepty and choose 'Install telepty skills' to add skills for Claude Code, Codex, or Gemini" -ForegroundColor Yellow

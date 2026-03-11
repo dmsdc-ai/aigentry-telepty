@@ -1,0 +1,27 @@
+# Deliberation artifacts
+.deliberation_request*.json
+.cross_session_deliberation.json
+
+# Old tarballs
+*.tgz
+
+# Images
+*.png
+
+# Runtime logs
+*.log
+
+# Test files
+test/
+test-support/
+test-pty.js
+
+# CI
+.github/
+
+# Gemini skills
+.gemini/
+
+# Claude project config (but keep commands/)
+.claude/*
+!.claude/commands/

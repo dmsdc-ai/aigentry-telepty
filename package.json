@@ -1,15 +1,15 @@
 {
   "name": "@dmsdc-ai/aigentry-telepty",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "main": "daemon.js",
   "bin": {
     "telepty": "cli.js",
     "telepty-install": "install.js"
   },
   "scripts": {
-    "test": "node --test test/auth.test.js test/daemon.test.js test/cli.test.js",
-    "test:watch": "node --test --watch test/auth.test.js test/daemon.test.js test/cli.test.js",
-    "test:ci": "node --test --test-reporter=spec test/auth.test.js test/daemon.test.js test/cli.test.js"
+    "test": "node --test test/auth.test.js test/daemon.test.js test/cli.test.js test/skill-installer.test.js",
+    "test:watch": "node --test --watch test/auth.test.js test/daemon.test.js test/cli.test.js test/skill-installer.test.js",
+    "test:ci": "node --test --test-reporter=spec test/auth.test.js test/daemon.test.js test/cli.test.js test/skill-installer.test.js"
   },
   "keywords": [],
   "author": "",

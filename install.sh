@@ -116,3 +116,4 @@ fi
 echo ""
 echo "🎉 Installation complete! Telepty daemon is running in the background."
 echo "👉 Try running: telepty attach"
+echo "👉 Optional: run telepty and choose 'Install telepty skills' to add skills for Claude Code, Codex, or Gemini"

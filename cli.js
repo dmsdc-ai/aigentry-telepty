@@ -9,6 +9,7 @@ const prompts = require('prompts');
 const updateNotifier = require('update-notifier');
 const pkg = require('./package.json');
 const { getConfig } = require('./auth');
+const { runInteractiveSkillInstaller } = require('./skill-installer');
 const args = process.argv.slice(2);
 
 // Check for updates unless explicitly disabled for tests/CI.
@@ -152,6 +153,7 @@ async function manageInteractive() {
         { title: '🔌  Allow inject (Run CLI with inject)', value: 'allow' },
         { title: '💬  Send message to a room (Inject command)', value: 'inject' },
         { title: '📋  View all open rooms (List sessions)', value: 'list' },
+        { title: '🧠  Install telepty skills', value: 'install-skills' },
         { title: '🔄  Update telepty to latest version', value: 'update' },
         { title: '❌  Exit', value: 'exit' }
       ]
@@ -186,6 +188,15 @@ async function manageInteractive() {
       });
       cp.unref();
       console.log('✅ Daemon started.\n');
+      continue;
+    }
+
+    if (response.action === 'install-skills') {
+      try {
+        await runInteractiveSkillInstaller({ packageRoot: __dirname, cwd: process.cwd() });
+      } catch (e) {
+        console.error(`\n❌ ${e.message}\n`);
+      }
       continue;
     }
 

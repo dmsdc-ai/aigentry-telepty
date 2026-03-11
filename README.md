@@ -55,3 +55,14 @@ npm run test:watch
 ```
 
 The automated suite covers config generation, daemon HTTP APIs, WebSocket attach/output flow, bus events, session deletion regressions, and CLI smoke tests against a real daemon process.
+
+## Skill Installation
+
+The package installer opens the telepty skill TUI automatically when you run it in a terminal.
+
+To reopen it later, run `telepty` and choose `Install telepty skills`.
+
+The TUI lets you choose:
+- which packaged skills to install
+- which target clients to install into (`Claude Code`, `Codex`, `Gemini`)
+- whether each target uses a global path, the current project path, or a custom path
