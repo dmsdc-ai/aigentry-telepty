@@ -26,7 +26,7 @@ if (!$teleptyCmd) {
 }
 
 $teleptyPath = $teleptyCmd.Source
-Start-Process -NoNewWindow -FilePath node -ArgumentList "$teleptyPath daemon" -WindowStyle Hidden
+Start-Process -FilePath node -ArgumentList "$teleptyPath daemon" -WindowStyle Hidden
 Write-Host "✅ Windows daemon started in background." -ForegroundColor Green
 
 Write-Host "`n🎉 Installation complete! Telepty daemon is running." -ForegroundColor Cyan
