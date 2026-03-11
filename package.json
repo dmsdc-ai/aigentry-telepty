@@ -7,7 +7,9 @@
     "telepty-install": "install.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test",
+    "test:watch": "node --test --watch",
+    "test:ci": "node --test --test-reporter=spec"
   },
   "keywords": [],
   "author": "",

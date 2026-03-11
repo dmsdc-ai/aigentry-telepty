@@ -39,3 +39,19 @@ iwr -useb https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/insta
    ```bash
    telepty inject my-session "echo 'Hello from nowhere!'"
    ```
+
+## Testing
+
+Run the full regression suite locally:
+
+```bash
+npm test
+```
+
+Keep the suite running while you work:
+
+```bash
+npm run test:watch
+```
+
+The automated suite covers config generation, daemon HTTP APIs, WebSocket attach/output flow, bus events, session deletion regressions, and CLI smoke tests against a real daemon process.

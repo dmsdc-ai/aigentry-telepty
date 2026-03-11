@@ -11,12 +11,14 @@ const pkg = require('./package.json');
 const { getConfig } = require('./auth');
 const args = process.argv.slice(2);
 
-// Check for updates
-updateNotifier({pkg}).notify({ isGlobal: true });
+// Check for updates unless explicitly disabled for tests/CI.
+if (!process.env.NO_UPDATE_NOTIFIER && !process.env.TELEPTY_DISABLE_UPDATE_NOTIFIER) {
+  updateNotifier({pkg}).notify({ isGlobal: true });
+}
 
 // Support remote host via environment variable or default to localhost
 let REMOTE_HOST = process.env.TELEPTY_HOST || '127.0.0.1';
-const PORT = 3848;
+const PORT = Number(process.env.TELEPTY_PORT || 3848);
 let DAEMON_URL = `http://${REMOTE_HOST}:${PORT}`;
 let WS_URL = `ws://${REMOTE_HOST}:${PORT}`;
 

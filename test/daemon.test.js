@@ -1,152 +1,206 @@
 'use strict';
 
-const { test, before, after } = require('node:test');
+const { after, afterEach, before, test } = require('node:test');
 const assert = require('node:assert/strict');
+const { createSessionId, delay, startTestDaemon, waitFor } = require('./helpers/daemon-harness');
 
-// Pick a random high port to avoid conflicts with a running daemon
-const TEST_PORT = 30000 + Math.floor(Math.random() * 5000);
-const BASE_URL = `http://127.0.0.1:${TEST_PORT}`;
+let harness;
 
-// Set env vars BEFORE requiring daemon so it binds to our test port
-process.env.PORT = String(TEST_PORT);
-process.env.HOST = '127.0.0.1';
-
-// Load the daemon module - it calls app.listen() at module level
-require('../daemon');
-
-// Helper: wait until the server is actually accepting connections
-async function waitForServer(url, maxMs = 5000) {
-  const deadline = Date.now() + maxMs;
-  while (Date.now() < deadline) {
+function collectJsonMessages(ws) {
+  const messages = [];
+  ws.on('message', (chunk) => {
     try {
-      await fetch(`${url}/api/sessions`);
-      return; // success
+      messages.push(JSON.parse(chunk.toString()));
     } catch {
-      await new Promise(r => setTimeout(r, 100));
+      // Ignore malformed payloads in tests.
     }
-  }
-  throw new Error(`Server at ${url} did not start within ${maxMs}ms`);
+  });
+  return messages;
 }
 
 before(async () => {
-  await waitForServer(BASE_URL);
+  harness = await startTestDaemon();
 });
 
-after(() => {
-  // Close all open net.Server / WebSocketServer handles so the process can exit
-  for (const handle of process._getActiveHandles()) {
-    if (typeof handle.close === 'function') {
-      try { handle.close(); } catch { /* ignore */ }
-    }
-    if (typeof handle.destroy === 'function') {
-      try { handle.destroy(); } catch { /* ignore */ }
-    }
-  }
+after(async () => {
+  await harness.stop();
 });
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-
-function post(path, body) {
-  return fetch(`${BASE_URL}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-}
-
-function del(path) {
-  return fetch(`${BASE_URL}${path}`, { method: 'DELETE' });
-}
-
-function get(path) {
-  return fetch(`${BASE_URL}${path}`);
-}
-
-// ── tests ────────────────────────────────────────────────────────────────────
-
-test('GET /api/sessions returns empty array initially', async () => {
-  const res = await get('/api/sessions');
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.ok(Array.isArray(body), 'response should be an array');
-  assert.equal(body.length, 0);
+afterEach(async () => {
+  await harness.cleanupSessions();
 });
 
-test('POST /api/sessions/spawn with missing session_id returns 400', async () => {
-  const res = await post('/api/sessions/spawn', { command: 'echo' });
-  assert.equal(res.status, 400);
-  const body = await res.json();
-  assert.ok(body.error, 'error field should be present');
+test('GET /api/sessions returns an empty array on a fresh daemon', async () => {
+  const result = await harness.request('/api/sessions');
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body, []);
 });
 
-test('POST /api/sessions/spawn with missing command returns 400', async () => {
-  const res = await post('/api/sessions/spawn', { session_id: 'test-no-cmd' });
-  assert.equal(res.status, 400);
-  const body = await res.json();
-  assert.ok(body.error, 'error field should be present');
-});
-
-test('POST /api/sessions/spawn with valid data returns 201', async () => {
-  const res = await post('/api/sessions/spawn', {
-    session_id: 'test-session-1',
-    command: 'bash',
-  });
-  assert.equal(res.status, 201);
-  const body = await res.json();
-  assert.equal(body.session_id, 'test-session-1');
-  assert.equal(body.command, 'bash');
-});
-
-test('GET /api/sessions returns the spawned session', async () => {
-  const res = await get('/api/sessions');
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.ok(Array.isArray(body));
-  const session = body.find(s => s.id === 'test-session-1');
-  assert.ok(session, 'test-session-1 should appear in session list');
-  assert.equal(session.command, 'bash');
-});
-
-test('POST /api/sessions/:id/inject with valid prompt returns success', async () => {
-  const res = await post('/api/sessions/test-session-1/inject', {
-    prompt: 'echo hello',
-  });
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(body.success, true);
-});
-
-test('POST /api/sessions/:id/inject with missing prompt returns 400', async () => {
-  const res = await post('/api/sessions/test-session-1/inject', {});
-  assert.equal(res.status, 400);
-  const body = await res.json();
-  assert.ok(body.error, 'error field should be present');
-});
-
-test('DELETE /api/sessions/:id returns success', async () => {
-  const res = await del('/api/sessions/test-session-1');
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(body.success, true);
-});
-
-test('POST /api/sessions/spawn with duplicate ID returns 409', async () => {
-  // Spawn the session first
-  const first = await post('/api/sessions/spawn', {
-    session_id: 'dup-session',
-    command: 'bash',
-  });
+test('spawned sessions appear in the list and duplicate IDs are rejected', async () => {
+  const sessionId = createSessionId('spawn');
+  const first = await harness.spawnSession(sessionId);
   assert.equal(first.status, 201);
+  assert.equal(first.body.session_id, sessionId);
 
-  // Attempt to spawn with the same ID
-  const second = await post('/api/sessions/spawn', {
-    session_id: 'dup-session',
-    command: 'bash',
+  const duplicate = await harness.spawnSession(sessionId);
+  assert.equal(duplicate.status, 409);
+  assert.match(duplicate.body.error, /already active/i);
+
+  const list = await harness.request('/api/sessions');
+  assert.equal(list.status, 200);
+  assert.equal(list.body.length, 1);
+  assert.equal(list.body[0].id, sessionId);
+  assert.equal(list.body[0].active_clients, 0);
+});
+
+test('PATCH /api/sessions/:id renames the session and publishes a bus event', async () => {
+  const originalId = createSessionId('rename');
+  const newId = `${originalId}-renamed`;
+  await harness.spawnSession(originalId);
+
+  const bus = await harness.connectBus();
+  const messages = collectJsonMessages(bus);
+
+  const rename = await harness.request(`/api/sessions/${encodeURIComponent(originalId)}`, {
+    method: 'PATCH',
+    body: { new_id: newId }
   });
-  assert.equal(second.status, 409);
-  const body = await second.json();
-  assert.ok(body.error, 'error field should be present');
 
-  // Cleanup
-  await del('/api/sessions/dup-session');
+  assert.equal(rename.status, 200);
+  assert.equal(rename.body.new_id, newId);
+
+  await waitFor(() => messages.find((message) => (
+    message.type === 'session_rename' &&
+    message.old_id === originalId &&
+    message.new_id === newId
+  )), { description: 'rename bus event' });
+
+  const list = await harness.request('/api/sessions');
+  assert.equal(list.status, 200);
+  assert.equal(list.body.length, 1);
+  assert.equal(list.body[0].id, newId);
+
+  bus.close();
+});
+
+test('inject and multicast endpoints report success and partial failure correctly', async () => {
+  const sessionId = createSessionId('inject');
+  const missingId = createSessionId('missing');
+  await harness.spawnSession(sessionId);
+
+  const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    method: 'POST',
+    body: { prompt: 'echo injected' }
+  });
+  assert.equal(inject.status, 200);
+  assert.equal(inject.body.success, true);
+
+  const injectMissingPrompt = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    method: 'POST',
+    body: {}
+  });
+  assert.equal(injectMissingPrompt.status, 400);
+
+  const multicast = await harness.request('/api/sessions/multicast/inject', {
+    method: 'POST',
+    body: {
+      session_ids: [sessionId, missingId],
+      prompt: 'echo multicast'
+    }
+  });
+
+  assert.equal(multicast.status, 200);
+  assert.deepEqual(multicast.body.results.successful, [sessionId]);
+  assert.equal(multicast.body.results.failed.length, 1);
+  assert.equal(multicast.body.results.failed[0].id, missingId);
+});
+
+test('broadcast inject publishes a single bus event with all successful target IDs', async () => {
+  const sessionA = createSessionId('broadcast-a');
+  const sessionB = createSessionId('broadcast-b');
+  await harness.spawnSession(sessionA);
+  await harness.spawnSession(sessionB);
+
+  const bus = await harness.connectBus();
+  const messages = collectJsonMessages(bus);
+
+  const prompt = `echo ${createSessionId('broadcast-token')}`;
+  const broadcast = await harness.request('/api/sessions/broadcast/inject', {
+    method: 'POST',
+    body: { prompt }
+  });
+
+  assert.equal(broadcast.status, 200);
+  assert.equal(broadcast.body.results.successful.length, 2);
+
+  await waitFor(() => messages.filter((message) => (
+    message.type === 'injection' &&
+    message.target_agent === 'all' &&
+    message.content === prompt
+  )).length === 1, { description: 'single broadcast bus event' });
+
+  const event = messages.find((message) => message.type === 'injection' && message.content === prompt);
+  assert.deepEqual(event.session_ids.slice().sort(), [sessionA, sessionB].sort());
+
+  bus.close();
+});
+
+test('session WebSocket updates active client counts and relays PTY output', async () => {
+  const sessionId = createSessionId('ws');
+  await harness.spawnSession(sessionId);
+
+  const firstClient = await harness.connectSession(sessionId);
+  const secondClient = await harness.connectSession(sessionId);
+  const outputs = collectJsonMessages(firstClient);
+
+  await waitFor(async () => {
+    const list = await harness.request('/api/sessions');
+    const session = list.body.find((item) => item.id === sessionId);
+    return session && session.active_clients === 2;
+  }, { description: 'two attached websocket clients' });
+
+  const token = createSessionId('ws-output');
+  firstClient.send(JSON.stringify({ type: 'input', data: `echo ${token}\r` }));
+
+  await waitFor(() => outputs.some((message) => (
+    message.type === 'output' && String(message.data).includes(token)
+  )), { timeoutMs: 7000, description: 'PTY output over websocket' });
+
+  secondClient.close();
+
+  await waitFor(async () => {
+    const list = await harness.request('/api/sessions');
+    const session = list.body.find((item) => item.id === sessionId);
+    return session && session.active_clients === 1;
+  }, { description: 'one attached websocket client after close' });
+
+  firstClient.close();
+
+  await waitFor(async () => {
+    const list = await harness.request('/api/sessions');
+    const session = list.body.find((item) => item.id === sessionId);
+    return session && session.active_clients === 0;
+  }, { description: 'zero attached websocket clients after close' });
+});
+
+test('DELETE /api/sessions/:id closes the session without crashing the daemon', async () => {
+  const sessionId = createSessionId('delete');
+  await harness.spawnSession(sessionId);
+
+  const destroy = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE'
+  });
+  assert.equal(destroy.status, 200);
+  assert.equal(destroy.body.status, 'closing');
+
+  await waitFor(async () => {
+    const list = await harness.request('/api/sessions');
+    return list.status === 200 && !list.body.some((session) => session.id === sessionId);
+  }, { description: 'session removal after delete' });
+
+  await delay(200);
+  assert.equal(harness.isAlive(), true, harness.getLogs().stderr || harness.getLogs().stdout);
+
+  const healthCheck = await harness.request('/api/sessions');
+  assert.equal(healthCheck.status, 200);
 });

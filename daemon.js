@@ -55,11 +55,15 @@ app.post('/api/sessions/spawn', (req, res) => {
       const label = type.toUpperCase();
       const colorCode = label === 'USER' ? '32' : '35'; // USER: Green (32), AGENT: Magenta (35)
       const zshColor = label === 'USER' ? 'green' : 'magenta';
+      const title = `⚡ telepty :: ${session_id}`;
 
       if (command.includes('bash')) {
-        customEnv.PS1 = `\\[\\e[${colorCode}m\\][${label}: ${session_id}]\\[\\e[0m\\] \\w \\$ `;
+        // Embed OSC 0 title in PS1 so it persists on every prompt
+        customEnv.PS1 = `\\[\\e]0;${title}\\a\\]\\[\\e[${colorCode}m\\][${label}: ${session_id}]\\[\\e[0m\\] \\w \\$ `;
       } else if (command.includes('zsh')) {
-        customEnv.PROMPT = `%F{${zshColor}}[${label}: ${session_id}]%f %~ %# `;
+        // Disable oh-my-zsh / zsh auto-title and embed OSC 0 in PROMPT
+        customEnv.DISABLE_AUTO_TITLE = 'true';
+        customEnv.PROMPT = `%{\\e]0;${title}\\a%}%F{${zshColor}}[${label}: ${session_id}]%f %~ %# `;
       }
     }
 
@@ -247,10 +251,19 @@ app.patch('/api/sessions/:id', (req, res) => {
   sessions[new_id] = session;
   delete sessions[id];
 
-  // Update PTY environment and terminal title
+  // Update terminal title and PS1/PROMPT with new session ID
   const isWin = os.platform() === 'win32';
   if (!isWin) {
-    session.ptyProcess.write(`\x1b]0;⚡ telepty :: ${new_id}\x07`);
+    const title = `⚡ telepty :: ${new_id}`;
+    // Set window title immediately
+    session.ptyProcess.write(`\x1b]0;${title}\x07`);
+    // Update PS1/PROMPT env so subsequent prompts show new ID
+    const cmd = session.command || '';
+    if (cmd.includes('bash')) {
+      session.ptyProcess.write(`export PS1='\\[\\e]0;${title}\\a\\]\\[\\e[35m\\][AGENT: ${new_id}]\\[\\e[0m\\] \\w \\$ '\r`);
+    } else if (cmd.includes('zsh')) {
+      session.ptyProcess.write(`export PROMPT='%{\\e]0;${title}\\a%}%F{magenta}[AGENT: ${new_id}]%f %~ %# '\r`);
+    }
   }
 
   // Broadcast rename to bus
