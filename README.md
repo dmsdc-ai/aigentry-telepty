@@ -1,5 +1,5 @@
-# @dmsdc-ai/aigentry-telepty
+# aigentry-telepty
 
-**Cross-machine PTY-based remote prompt injection daemon for AI CLIs.**
+**Personal PTY-based remote prompt injection daemon for AI CLIs.**
 
-`telept` (Tele-Prompt) is a lightweight, always-on background daemon that bridges the gap between the network and interactive AI command-line interfaces.
+`telepty` (Tele-Prompt) is a lightweight, personal background daemon that bridges the gap between the network and interactive AI command-line interfaces.
