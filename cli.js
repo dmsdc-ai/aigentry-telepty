@@ -89,11 +89,10 @@ async function manageInteractive() {
       name: 'action',
       message: 'What would you like to do?',
       choices: [
-        { title: '📡  Attach to a session', value: 'attach' },
-        { title: '🚀  Spawn a new session', value: 'spawn' },
-        { title: '💉  Inject command into a session', value: 'inject' },
-        { title: '📋  List active sessions', value: 'list' },
-        { title: '⚙️   Start background daemon', value: 'daemon' },
+        { title: '🖥️   Enter a room (Attach to session)', value: 'attach' },
+        { title: '➕  Create a new room (Spawn session)', value: 'spawn' },
+        { title: '💬  Send message to a room (Inject command)', value: 'inject' },
+        { title: '📋  View all open rooms (List sessions)', value: 'list' },
         { title: '❌  Exit', value: 'exit' }
       ]
     });
