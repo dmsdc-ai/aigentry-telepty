@@ -47,6 +47,8 @@ The installer now stops older local telepty daemons before starting the new one,
    telepty inject my-session "echo 'Hello from nowhere!'"
    ```
 
+CLI commands such as `list`, `attach`, `inject`, `rename`, `multicast`, and `broadcast` now auto-discover sessions across your Tailnet by default. If the same session ID exists on multiple hosts, disambiguate with `session_id@host`.
+
 ## Testing
 
 Run the full regression suite locally:

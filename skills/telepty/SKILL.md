@@ -39,6 +39,8 @@ telepty attach <session_id>
 telepty inject <session_id> "<prompt text>"
 ```
 
+When the same session ID exists on multiple hosts, use `session_id@host`.
+
 5. Allow inject on a local CLI:
 
 ```bash

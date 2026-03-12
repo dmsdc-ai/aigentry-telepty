@@ -12,6 +12,7 @@ const { getConfig } = require('./auth');
 const { cleanupDaemonProcesses } = require('./daemon-control');
 const { attachInteractiveTerminal, getTerminalSize } = require('./interactive-terminal');
 const { getRuntimeInfo } = require('./runtime-info');
+const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const args = process.argv.slice(2);
 
@@ -70,16 +71,32 @@ async function repairLocalDaemon(options = {}) {
   return { stopped: results.stopped.length, failed: results.failed.length, meta };
 }
 
-async function discoverSessions() {
-  await ensureDaemonRunning();
-  const hosts = ['127.0.0.1'];
+function getDiscoveryHosts() {
+  const hosts = new Set();
+
+  if (REMOTE_HOST && REMOTE_HOST !== '127.0.0.1') {
+    hosts.add(REMOTE_HOST);
+  } else {
+    hosts.add('127.0.0.1');
+  }
+
+  const extraHosts = String(process.env.TELEPTY_DISCOVERY_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter(Boolean);
+  extraHosts.forEach((host) => hosts.add(host));
+
+  if (REMOTE_HOST && REMOTE_HOST !== '127.0.0.1') {
+    return Array.from(hosts);
+  }
+
   try {
     const tsStatus = execSync('tailscale status --json', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
     const tsData = JSON.parse(tsStatus);
     if (tsData && tsData.Peer) {
       for (const peer of Object.values(tsData.Peer)) {
         if (peer.Online && peer.TailscaleIPs && peer.TailscaleIPs.length > 0) {
-          hosts.push(peer.TailscaleIPs[0]);
+          hosts.add(peer.TailscaleIPs[0]);
         }
       }
     }
@@ -87,18 +104,27 @@ async function discoverSessions() {
     // Tailscale not available or not running, ignore
   }
 
+  return Array.from(hosts);
+}
+
+async function discoverSessions(options = {}) {
+  await ensureDaemonRunning();
+  const hosts = getDiscoveryHosts();
   const allSessions = [];
-  process.stdout.write('\x1b[36m🔍 Discovering active sessions across your Tailnet...\x1b[0m\n');
-  
+
+  if (!options.silent) {
+    process.stdout.write('\x1b[36m🔍 Discovering active sessions across your Tailnet...\x1b[0m\n');
+  }
+
   await Promise.all(hosts.map(async (host) => {
     try {
-      const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions`, { 
-        signal: AbortSignal.timeout(1500) 
+      const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions`, {
+        signal: AbortSignal.timeout(1500)
       });
       if (res.ok) {
         const sessions = await res.json();
-        sessions.forEach(s => {
-          allSessions.push({ host, ...s });
+        sessions.forEach((session) => {
+          allSessions.push({ host, ...session });
         });
       }
     } catch (e) {
@@ -107,6 +133,11 @@ async function discoverSessions() {
   }));
 
   return allSessions;
+}
+
+async function resolveSessionTarget(sessionRef, options = {}) {
+  const sessions = options.sessions || await discoverSessions({ silent: true });
+  return pickSessionTarget(sessionRef, sessions, REMOTE_HOST);
 }
 
 async function ensureDaemonRunning(options = {}) {
@@ -272,7 +303,7 @@ async function manageInteractive() {
       } else {
         console.log('\x1b[1mAvailable Sessions:\x1b[0m');
         sessions.forEach(s => {
-          const hostLabel = s.host === '127.0.0.1' ? 'Local' : s.host;
+          const hostLabel = formatHostLabel(s.host);
           console.log(`  - \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) [${s.command}] - Clients: ${s.active_clients}`);
         });
       }
@@ -407,13 +438,12 @@ async function main() {
 
   if (cmd === 'list') {
     try {
-      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const sessions = await res.json();
+      const sessions = await discoverSessions({ silent: true });
       if (sessions.length === 0) { console.log('No active sessions found.'); return; }
       console.log('\x1b[1mActive Sessions:\x1b[0m');
       sessions.forEach(s => {
         console.log(`  - ID: \x1b[36m${s.id}\x1b[0m`);
+        console.log(`    Host: ${formatHostLabel(s.host)}`);
         console.log(`    Command: ${s.command}`);
         console.log(`    CWD: ${s.cwd}`);
         console.log(`    Clients: ${s.active_clients}`);
@@ -421,7 +451,7 @@ async function main() {
         console.log('');
       });
     } catch (e) {
-      console.error('❌ Failed to connect to daemon. Is it running? (run `telepty daemon`)');
+      console.error(`❌ ${e.message || 'Failed to discover sessions.'}`);
     }
     return;
   }
@@ -594,7 +624,7 @@ async function main() {
 
       console.log('\n\x1b[1mAvailable Sessions:\x1b[0m');
       sessions.forEach((s, i) => {
-        const hostLabel = s.host === '127.0.0.1' ? 'Local' : s.host;
+        const hostLabel = formatHostLabel(s.host);
         console.log(`  [${i + 1}] \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) - ${s.command}`);
       });
 
@@ -610,6 +640,19 @@ async function main() {
 
       sessionId = sessions[idx].id;
       targetHost = sessions[idx].host;
+    } else {
+      try {
+        const target = await resolveSessionTarget(sessionId);
+        if (!target) {
+          console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
+          process.exit(1);
+        }
+        sessionId = target.id;
+        targetHost = target.host;
+      } catch (error) {
+        console.error(`❌ ${error.message}`);
+        process.exit(1);
+      }
     }
 
     const wsUrl = `ws://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
@@ -682,31 +725,61 @@ async function main() {
     const sessionId = args[1]; const prompt = args.slice(2).join(' ');
     if (!sessionId || !prompt) { console.error('❌ Usage: telepty inject [--no-enter] <session_id> "<prompt text>"'); process.exit(1); }
     try {
-      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+      const target = await resolveSessionTarget(sessionId);
+      if (!target) {
+        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
+        process.exit(1);
+      }
+
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt, no_enter: noEnter })
       });
       const data = await res.json();
       if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
-      console.log(`✅ Context injected successfully into '\x1b[36m${sessionId}\x1b[0m'.`);
-    } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+      const hostSuffix = target.host === '127.0.0.1' ? '' : ` @ ${target.host}`;
+      console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'${hostSuffix}.`);
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
     return;
   }
 
   if (cmd === 'multicast') {
     const sessionIdsRaw = args[1]; const prompt = args.slice(2).join(' ');
     if (!sessionIdsRaw || !prompt) { console.error('❌ Usage: telepty multicast <id1,id2,...> "<prompt text>"'); process.exit(1); }
-    const sessionIds = sessionIdsRaw.split(',').map(s => s.trim()).filter(s => s);
+    const sessionRefs = sessionIdsRaw.split(',').map(s => s.trim()).filter(s => s);
     try {
-      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/multicast/inject`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_ids: sessionIds, prompt })
-      });
-      const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
-      console.log(`✅ Context multicasted successfully to ${data.results.successful.length} sessions.`);
-      if (data.results.failed.length > 0) {
-        console.warn(`⚠️ Failed to inject into ${data.results.failed.length} sessions:`, data.results.failed.map(f => f.id).join(', '));
+      const discovered = await discoverSessions({ silent: true });
+      const groupedTargets = new Map();
+      for (const sessionRef of sessionRefs) {
+        const target = await resolveSessionTarget(sessionRef, { sessions: discovered });
+        if (!target) {
+          throw new Error(`Session '${sessionRef}' was not found on any discovered host.`);
+        }
+        if (!groupedTargets.has(target.host)) {
+          groupedTargets.set(target.host, []);
+        }
+        groupedTargets.get(target.host).push(target.id);
       }
-    } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+
+      const aggregate = { successful: [], failed: [] };
+      for (const [host, ids] of groupedTargets.entries()) {
+        const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/multicast/inject`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_ids: ids, prompt })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || `Multicast failed on ${host}`);
+        }
+        aggregate.successful.push(...data.results.successful.map((id) => `${id}@${host}`));
+        aggregate.failed.push(...data.results.failed.map((item) => ({ ...item, host })));
+      }
+
+      console.log(`✅ Context multicasted successfully to ${aggregate.successful.length} session(s).`);
+      if (aggregate.failed.length > 0) {
+        console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host}`).join(', '));
+      }
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
     return;
   }
 
@@ -714,13 +787,29 @@ async function main() {
     const prompt = args.slice(1).join(' ');
     if (!prompt) { console.error('❌ Usage: telepty broadcast "<prompt text>"'); process.exit(1); }
     try {
-      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/broadcast/inject`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt })
-      });
-      const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
-      console.log(`✅ Context broadcasted successfully to ${data.results.successful.length} active sessions.`);
-    } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+      const discovered = await discoverSessions({ silent: true });
+      const grouped = groupSessionsByHost(discovered);
+      const aggregate = { successful: [], failed: [] };
+
+      for (const host of grouped.keys()) {
+        const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/broadcast/inject`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || `Broadcast failed on ${host}`);
+        }
+        aggregate.successful.push(...data.results.successful.map((id) => `${id}@${host}`));
+        aggregate.failed.push(...data.results.failed.map((item) => ({ ...item, host })));
+      }
+
+      console.log(`✅ Context broadcasted successfully to ${aggregate.successful.length} active session(s).`);
+      if (aggregate.failed.length > 0) {
+        console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host}`).join(', '));
+      }
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
     return;
   }
 
@@ -728,13 +817,20 @@ async function main() {
     const oldId = args[1]; const newId = args[2];
     if (!oldId || !newId) { console.error('❌ Usage: telepty rename <old_id> <new_id>'); process.exit(1); }
     try {
-      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(oldId)}`, {
+      const target = await resolveSessionTarget(oldId);
+      if (!target) {
+        console.error(`❌ Session '${oldId}' was not found on any discovered host.`);
+        process.exit(1);
+      }
+
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_id: newId })
       });
       const data = await res.json();
       if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
-      console.log(`✅ Session renamed: '\x1b[36m${oldId}\x1b[0m' → '\x1b[36m${newId}\x1b[0m'`);
-    } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+      const hostSuffix = target.host === '127.0.0.1' ? '' : ` @ ${target.host}`;
+      console.log(`✅ Session renamed: '\x1b[36m${target.id}\x1b[0m' → '\x1b[36m${newId}\x1b[0m'${hostSuffix}`);
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
     return;
   }
 
@@ -748,51 +844,63 @@ async function main() {
       console.log('\x1b[36m👂 Listening to the telepty event bus...\x1b[0m');
     }
 
-    const wsUrl = `ws://${REMOTE_HOST}:${PORT}/api/bus?token=${encodeURIComponent(TOKEN)}`;
-    const ws = new WebSocket(wsUrl);
-    
-    ws.on('open', () => {
-      // connected
-    });
+    const hosts = getDiscoveryHosts();
+    let connectedHosts = 0;
 
-    ws.on('message', (message) => {
-      const raw = message.toString();
-      if (cmd === 'listen') {
-        // Raw JSON output for machines
-        console.log(raw);
-      } else {
-        // Human readable billboard output
+    hosts.forEach((host) => {
+      const wsUrl = `ws://${host}:${PORT}/api/bus?token=${encodeURIComponent(TOKEN)}`;
+      const ws = new WebSocket(wsUrl);
+
+      ws.on('open', () => {
+        connectedHosts += 1;
+      });
+
+      ws.on('message', (message) => {
+        const raw = message.toString();
+        if (cmd === 'listen') {
+          try {
+            const payload = JSON.parse(raw);
+            console.log(JSON.stringify({ host, ...payload }));
+          } catch (e) {
+            console.log(JSON.stringify({ host, raw }));
+          }
+          return;
+        }
+
         try {
           const msg = JSON.parse(raw);
           const time = new Date().toLocaleTimeString();
           const sender = msg.sender || msg.from || 'Unknown';
           const target = msg.target_agent || msg.to || 'Bus';
-          
+          const hostLabel = formatHostLabel(host);
+
           let preview = msg.content || msg.message || msg.payload || msg.data;
           if (msg.type === 'session_spawn') {
-            console.log(`\x1b[90m[${time}]\x1b[0m 🚀 \x1b[32m\x1b[1mNew Session\x1b[0m: \x1b[36m${msg.session_id}\x1b[0m (${msg.command})`);
+            console.log(`\x1b[90m[${time}]\x1b[0m 🚀 \x1b[32m\x1b[1mNew Session\x1b[0m: \x1b[36m${msg.session_id}\x1b[0m (${msg.command}) @ ${hostLabel}`);
             return;
           }
-          
+
           if (typeof preview === 'object') preview = JSON.stringify(preview);
           if (preview && preview.length > 200) preview = preview.substring(0, 197) + '...';
 
-          console.log(`\x1b[90m[${time}]\x1b[0m \x1b[32m\x1b[1m${sender}\x1b[0m ➔ \x1b[33m\x1b[1m${target}\x1b[0m`);
+          console.log(`\x1b[90m[${time}]\x1b[0m \x1b[32m\x1b[1m${sender}\x1b[0m ➔ \x1b[33m\x1b[1m${target}\x1b[0m @ ${hostLabel}`);
           if (preview) console.log(`  \x1b[37m${preview}\x1b[0m\n`);
         } catch (e) {
-          // Fallback if not valid JSON
-          console.log(`\x1b[90m[${new Date().toLocaleTimeString()}]\x1b[0m 📦 \x1b[37m${raw}\x1b[0m\n`);
+          console.log(`\x1b[90m[${new Date().toLocaleTimeString()}]\x1b[0m 📦 \x1b[37m${raw}\x1b[0m @ ${formatHostLabel(host)}\n`);
         }
-      }
-    });
+      });
 
-    ws.on('close', () => {
-      console.error('\x1b[31m❌ Disconnected from event bus.\x1b[0m');
-      process.exit(1);
-    });
+      ws.on('close', () => {
+        connectedHosts -= 1;
+        if (connectedHosts <= 0) {
+          console.error('\x1b[31m❌ Disconnected from event bus.\x1b[0m');
+          process.exit(1);
+        }
+      });
 
-    ws.on('error', (err) => {
-      console.error('\x1b[31m❌ WebSocket error:\x1b[0m', err.message);
+      ws.on('error', (err) => {
+        console.error(`\x1b[31m❌ WebSocket error (${formatHostLabel(host)}):\x1b[0m`, err.message);
+      });
     });
     return;
   }
@@ -804,12 +912,12 @@ Usage:
   telepty daemon                                 Start the background daemon
   telepty spawn --id <id> <command> [args...]    Spawn a new background CLI
   telepty allow [--id <id>] <command> [args...]       Allow inject on a CLI
-  telepty list                                   List all active sessions
-  telepty attach [id]                            Attach to a session (Interactive picker if no ID)
-  telepty inject [--no-enter] <id> "<prompt>"    Inject text into a single session
-  telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
+  telepty list                                   List all active sessions across discovered hosts
+  telepty attach [id[@host]]                     Attach to a session (Interactive picker if no ID)
+  telepty inject [--no-enter] <id[@host]> "<prompt>"    Inject text into a single session
+  telepty multicast <id1[@host],id2[@host]> "<prompt>"  Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
-  telepty rename <old_id> <new_id>               Rename a session (updates terminal title too)
+  telepty rename <old_id[@host]> <new_id>        Rename a session (updates terminal title too)
   telepty listen                                 Listen to the event bus and print JSON to stdout
   telepty monitor                                Human-readable real-time billboard of bus events
   telepty update                                 Update telepty to the latest version

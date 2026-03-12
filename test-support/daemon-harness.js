@@ -95,7 +95,7 @@ async function parseResponse(response) {
 
 async function startTestDaemon(options = {}) {
   const port = options.port ?? randomPort();
-  const host = '127.0.0.1';
+  const host = options.host ?? '127.0.0.1';
   const { homeDir, env: homeEnv } = createTempHome();
   const sharedEnv = {
     ...process.env,
