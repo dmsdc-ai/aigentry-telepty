@@ -15,6 +15,89 @@ const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const args = process.argv.slice(2);
+let pendingTerminalInputError = null;
+let simulatedPromptErrorInjected = false;
+
+function isRecoverableTerminalInputError(error) {
+  return Boolean(error && (error.code === 'EIO' || error.syscall === 'read'));
+}
+
+function rememberTerminalInputError(error) {
+  pendingTerminalInputError = error;
+}
+
+function consumeTerminalInputError() {
+  if (!pendingTerminalInputError) {
+    return null;
+  }
+
+  const error = pendingTerminalInputError;
+  pendingTerminalInputError = null;
+  return error;
+}
+
+function resetInteractiveInput(stream = process.stdin) {
+  if (!stream) {
+    return;
+  }
+
+  if (stream.isTTY && typeof stream.setRawMode === 'function') {
+    try {
+      stream.setRawMode(false);
+    } catch {
+      // Ignore raw-mode reset failures when the TTY is already gone.
+    }
+  }
+
+  if (typeof stream.pause === 'function') {
+    stream.pause();
+  }
+
+  if (typeof stream.resume === 'function') {
+    stream.resume();
+  }
+}
+
+function handleTerminalInputError(error, options = {}) {
+  if (!isRecoverableTerminalInputError(error)) {
+    return false;
+  }
+
+  rememberTerminalInputError(error);
+  resetInteractiveInput(options.stream);
+
+  if (!options.silent) {
+    process.stderr.write('\n\x1b[33m⚠️ Terminal input was interrupted. Returning to the telepty menu...\x1b[0m\n');
+  }
+
+  return true;
+}
+
+const originalCreateInterface = readline.createInterface.bind(readline);
+readline.createInterface = function patchedCreateInterface(...interfaceArgs) {
+  const rl = originalCreateInterface(...interfaceArgs);
+  rl.on('error', (error) => {
+    if (handleTerminalInputError(error, { stream: rl.input, silent: true })) {
+      try {
+        rl.close();
+      } catch {
+        // Ignore close failures after a TTY read error.
+      }
+      return;
+    }
+
+    process.stderr.write(`\n❌ Telepty terminal input error: ${error.message}\n`);
+  });
+  return rl;
+};
+
+process.stdin.on('error', (error) => {
+  if (handleTerminalInputError(error, { stream: process.stdin, silent: true })) {
+    return;
+  }
+
+  process.stderr.write(`\n❌ Telepty stdin error: ${error.message}\n`);
+});
 
 // Check for updates unless explicitly disabled for tests/CI.
 if (!process.env.NO_UPDATE_NOTIFIER && !process.env.TELEPTY_DISABLE_UPDATE_NOTIFIER) {
@@ -62,6 +145,24 @@ function renderInteractiveHeader() {
   console.clear();
   console.log('\x1b[36m\x1b[1m⚡ Telepty Agent Manager\x1b[0m\n');
   console.log(`\x1b[90mVersion ${runtimeInfo.version}  Updated ${runtimeInfo.updatedAtLabel}\x1b[0m\n`);
+}
+
+async function promptWithRecovery(promptConfig) {
+  if (process.env.TELEPTY_TEST_TRIGGER_PROMPT_EIO_ONCE === '1' && !simulatedPromptErrorInjected) {
+    simulatedPromptErrorInjected = true;
+    rememberTerminalInputError(Object.assign(new Error('simulated terminal EIO'), { code: 'EIO', syscall: 'read' }));
+    console.log('\n\x1b[33m⚠️ Terminal input was interrupted. Returning to the telepty menu...\x1b[0m\n');
+    return { __teleptyRetry: true };
+  }
+
+  const response = await prompts(promptConfig);
+  const terminalError = consumeTerminalInputError();
+  if (terminalError) {
+    console.log('\n\x1b[33m⚠️ Terminal input was interrupted. Returning to the telepty menu...\x1b[0m\n');
+    return { __teleptyRetry: true };
+  }
+
+  return response;
 }
 
 function runUpdateInstall() {
@@ -250,7 +351,7 @@ async function manageInteractive() {
   renderInteractiveHeader();
 
   while (true) {
-    const response = await prompts({
+    const response = await promptWithRecovery({
       type: 'select',
       name: 'action',
       message: 'What would you like to do?',
@@ -266,6 +367,11 @@ async function manageInteractive() {
         { title: '❌  Exit', value: 'exit' }
       ]
     });
+
+    if (response.__teleptyRetry) {
+      renderInteractiveHeader();
+      continue;
+    }
 
     if (response.action === 'update') {
       console.log('\n\x1b[36m🔄 Updating telepty to the latest version...\x1b[0m');
@@ -335,10 +441,15 @@ async function manageInteractive() {
     }
 
     if (response.action === 'spawn') {
-      const { id, command } = await prompts([
+      const spawnResponse = await promptWithRecovery([
         { type: 'text', name: 'id', message: 'Enter new session ID (e.g. agent-1):', validate: v => v ? true : 'Required' },
         { type: 'text', name: 'command', message: 'Enter command to run (e.g. bash, zsh, python):', initial: 'bash' }
       ]);
+      if (spawnResponse.__teleptyRetry) {
+        renderInteractiveHeader();
+        continue;
+      }
+      const { id, command } = spawnResponse;
       if (!id || !command) continue;
 
       await ensureDaemonRunning();
@@ -365,10 +476,15 @@ async function manageInteractive() {
     }
 
     if (response.action === 'allow') {
-      const { id, command } = await prompts([
+      const allowResponse = await promptWithRecovery([
         { type: 'text', name: 'id', message: 'Enter session ID (e.g. my-claude):', validate: v => v ? true : 'Required' },
         { type: 'text', name: 'command', message: 'Enter command to run (e.g. claude, codex, gemini, bash):', initial: 'bash' }
       ]);
+      if (allowResponse.__teleptyRetry) {
+        renderInteractiveHeader();
+        continue;
+      }
+      const { id, command } = allowResponse;
       if (!id || !command) continue;
 
       // Delegate to the allow command handler by setting up args and calling main flow
@@ -384,7 +500,7 @@ async function manageInteractive() {
         console.log('\n❌ No active sessions found to ' + response.action + '.\n');
         continue;
       }
-      const { target } = await prompts({
+      const attachOrInjectResponse = await promptWithRecovery({
         type: 'select',
         name: 'target',
         message: `Select a session to ${response.action}:`,
@@ -393,6 +509,11 @@ async function manageInteractive() {
           value: s
         }))
       });
+      if (attachOrInjectResponse.__teleptyRetry) {
+        renderInteractiveHeader();
+        continue;
+      }
+      const { target } = attachOrInjectResponse;
 
       if (!target) continue;
 
@@ -402,12 +523,17 @@ async function manageInteractive() {
       }
 
       if (response.action === 'inject') {
-        const { promptText } = await prompts({
+        const injectPromptResponse = await promptWithRecovery({
           type: 'text',
           name: 'promptText',
           message: 'Enter text to inject:',
           validate: v => v ? true : 'Required'
         });
+        if (injectPromptResponse.__teleptyRetry) {
+          renderInteractiveHeader();
+          continue;
+        }
+        const { promptText } = injectPromptResponse;
         if (!promptText) continue;
         try {
           const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {

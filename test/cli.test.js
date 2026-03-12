@@ -185,3 +185,40 @@ test('interactive update returns to the TUI instead of exiting', async () => {
     cli.kill();
   }
 });
+
+test('interactive menu recovers from a terminal EIO instead of crashing', async () => {
+  const cli = pty.spawn(process.execPath, ['cli.js'], {
+    cwd: projectRoot,
+    cols: 80,
+    rows: 24,
+    name: process.platform === 'win32' ? 'xterm' : 'xterm-256color',
+    env: {
+      ...process.env,
+      HOME: harness.homeDir,
+      USERPROFILE: harness.homeDir,
+      TELEPTY_HOST: harness.host,
+      TELEPTY_PORT: String(harness.port),
+      NO_UPDATE_NOTIFIER: '1',
+      TELEPTY_DISABLE_UPDATE_NOTIFIER: '1',
+      TELEPTY_TEST_TRIGGER_PROMPT_EIO_ONCE: '1'
+    }
+  });
+
+  let output = '';
+  cli.onData((chunk) => {
+    output += chunk;
+  });
+
+  try {
+    await waitFor(() => {
+      const normalized = stripAnsi(output);
+      return normalized.includes('Terminal input was interrupted. Returning to the telepty menu...')
+        && normalized.split('What would you like to do?').length - 1 >= 1;
+    }, {
+      timeoutMs: 7000,
+      description: 'menu recovery after terminal EIO'
+    });
+  } finally {
+    cli.kill();
+  }
+});
