@@ -49,6 +49,17 @@ The installer now stops older local telepty daemons before starting the new one,
    telepty inject my-session "echo 'Hello from nowhere!'"
    ```
 
+4. **Universal CLI submit (split_cr):**
+
+   All AI CLIs (Claude, Codex, Gemini) submit reliably via the `split_cr` strategy — text is injected first, then `\r` is sent separately after a 300ms delay. This works universally across all CLIs without any per-CLI workarounds.
+
+   ```bash
+   # The inject API handles split_cr automatically
+   curl -X POST http://127.0.0.1:3848/api/sessions/my-session/inject \
+     -H "Content-Type: application/json" \
+     -d '{"prompt": "your command here"}'
+   ```
+
 CLI commands such as `list`, `attach`, `inject`, `rename`, `multicast`, and `broadcast` now auto-discover sessions across your Tailnet by default. If the same session ID exists on multiple hosts, disambiguate with `session_id@host`.
 
 ## Testing
