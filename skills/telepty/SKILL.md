@@ -1,17 +1,34 @@
 ---
 name: telepty
-description: Use telepty to inspect sessions, attach or inject into rooms, repair local daemon issues, and guide users through the TUI-first workflow when telepty is installed.
+description: Use telepty primarily through LLM CLI prompts and natural-language requests, with raw telepty commands as a secondary path for execution, repair, and session management.
 ---
 
 # telepty
 
-Use this skill when the user wants help operating `telepty`, recovering a broken local daemon, or managing telepty sessions in natural language.
+Use this skill when the user wants help operating `telepty`, recovering a broken local daemon, or managing telepty sessions through an LLM CLI prompt.
+
+`telepty` is primarily a prompt-driven tool inside LLM CLIs. Raw `telepty ...` commands are the execution layer, not the primary user surface.
 
 ## Default approach
 
-- For interactive human guidance, prefer the `telepty` TUI and point the user to the relevant menu action.
+- For interactive human guidance, prefer LLM CLI prompt examples first, then the `telepty` TUI, and only then raw commands.
+- When explaining telepty usage to a user, always lead with a skill-style or natural-language example first.
+- Only show raw CLI commands after the skill-style example, as the secondary option.
 - For agent execution inside a CLI session, run the underlying `telepty` command directly.
 - When the request is about a broken or duplicated local daemon, repair the daemon before doing session work.
+
+## User-facing response order
+
+When the user asks how to do something with telepty, respond in this order:
+
+1. Show a plain-language or skill-style example first.
+2. Then show the matching CLI command.
+3. Keep maintenance commands behind the user-facing flow unless the user is clearly operating as a CLI power user.
+
+Example:
+
+- Skill-style example: "telepty에서 해당 세션에 붙어줘" 또는 "telepty에서 로컬 데몬 복구해줘"
+- CLI follow-up: `telepty attach <session_id>` 또는 `telepty cleanup-daemons`
 
 ## Common actions
 

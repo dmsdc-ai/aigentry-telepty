@@ -57,6 +57,22 @@ function startDetachedDaemon() {
   cp.unref();
 }
 
+function relaunchInteractiveManager() {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.argv[0], [process.argv[1]], {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        NO_UPDATE_NOTIFIER: '1',
+        TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
+      }
+    });
+
+    child.once('error', reject);
+    child.once('spawn', () => resolve(child));
+  });
+}
+
 async function repairLocalDaemon(options = {}) {
   const restart = options.restart !== false;
   const results = cleanupDaemonProcesses();
@@ -256,10 +272,13 @@ async function manageInteractive() {
         execSync('npm install -g @dmsdc-ai/aigentry-telepty@latest', { stdio: 'inherit' });
         console.log('\n\x1b[32m✅ Update complete! Restarting daemon...\x1b[0m');
         await repairLocalDaemon({ restart: true });
+        console.log('\x1b[36m↻ Reopening telepty...\x1b[0m\n');
+        await relaunchInteractiveManager();
+        process.exit(0);
       } catch (e) {
-        console.error('\n❌ Update failed.\n');
+        console.error(`\n❌ Update failed: ${e.message}\n`);
       }
-      process.exit(0);
+      continue;
     }
 
     if (!response.action || response.action === 'exit') {

@@ -4,6 +4,8 @@
 
 `telepty` (Tele-Prompt) is a lightweight background daemon that bridges the gap between the network and interactive AI command-line interfaces. It allows you to seamlessly share, attach to, and inject commands into terminal sessions across different machines.
 
+Its primary user experience is prompt-driven operation inside LLM CLIs and the built-in TUI. Raw `telepty ...` commands are the lower-level control surface.
+
 ## One-Click Installation & Update
 
 To install or update `telepty` on any machine (macOS, Linux, or Windows), just run the command for your OS. (Node.js will be automatically installed if you don't have it).
