@@ -135,3 +135,53 @@ test('telepty allow works without a TTY by using fallback terminal dimensions', 
     return list.status === 200 && !list.body.some((session) => session.id === sessionId);
   }, { description: 'wrapped session cleanup after non-interactive allow' });
 });
+
+test('interactive update returns to the TUI instead of exiting', async () => {
+  const cli = pty.spawn(process.execPath, ['cli.js'], {
+    cwd: projectRoot,
+    cols: 80,
+    rows: 24,
+    name: process.platform === 'win32' ? 'xterm' : 'xterm-256color',
+    env: {
+      ...process.env,
+      HOME: harness.homeDir,
+      USERPROFILE: harness.homeDir,
+      TELEPTY_HOST: harness.host,
+      TELEPTY_PORT: String(harness.port),
+      NO_UPDATE_NOTIFIER: '1',
+      TELEPTY_DISABLE_UPDATE_NOTIFIER: '1',
+      TELEPTY_SKIP_PACKAGE_UPDATE: '1',
+      TELEPTY_SKIP_DAEMON_REPAIR: '1'
+    }
+  });
+
+  let output = '';
+  cli.onData((chunk) => {
+    output += chunk;
+  });
+
+  try {
+    await waitFor(() => stripAnsi(output).includes('What would you like to do?'), {
+      timeoutMs: 7000,
+      description: 'interactive menu prompt'
+    });
+    const initialPromptCount = stripAnsi(output).split('What would you like to do?').length - 1;
+
+    cli.write('\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r');
+
+    await waitFor(() => stripAnsi(output).includes('Update complete! Restarting daemon...'), {
+      timeoutMs: 7000,
+      description: 'update completion message'
+    });
+
+    await waitFor(() => {
+      const promptCount = stripAnsi(output).split('What would you like to do?').length - 1;
+      return promptCount >= initialPromptCount + 1;
+    }, {
+      timeoutMs: 7000,
+      description: 'menu prompt after update'
+    });
+  } finally {
+    cli.kill();
+  }
+});
