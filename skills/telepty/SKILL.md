@@ -1,86 +1,99 @@
+---
+name: telepty
+description: Use telepty to inspect sessions, attach or inject into rooms, repair local daemon issues, and guide users through the TUI-first workflow when telepty is installed.
+---
+
 # telepty
 
-Use `telepty` to inspect active sessions, check the current telepty session ID, attach to sessions, inject commands, listen to the event bus, rename sessions, and update the daemon.
+Use this skill when the user wants help operating `telepty`, recovering a broken local daemon, or managing telepty sessions in natural language.
 
-## When To Use
+## Default approach
 
-Use this skill when the user asks to:
-- Check whether the current shell is running inside a telepty session
-- List or inspect telepty sessions
-- Attach to a telepty session
-- Inject a prompt or command into another telepty session
-- Listen to telepty bus events or publish a JSON payload
-- Rename a session
-- Update telepty
+- For interactive human guidance, prefer the `telepty` TUI and point the user to the relevant menu action.
+- For agent execution inside a CLI session, run the underlying `telepty` command directly.
+- When the request is about a broken or duplicated local daemon, repair the daemon before doing session work.
 
-## Commands
+## Common actions
 
-1. Check the current telepty session:
+1. Check whether the current shell is already inside a telepty session:
 
 ```bash
 echo "$TELEPTY_SESSION_ID"
 ```
 
-2. List sessions:
+2. Inspect active sessions:
 
 ```bash
 telepty list
 ```
 
-3. Attach to a session:
+3. Attach to a room:
 
 ```bash
 telepty attach <session_id>
 ```
 
-4. Inject a prompt or command:
+4. Inject a command or prompt:
 
 ```bash
 telepty inject <session_id> "<prompt text>"
 ```
 
-5. Inject into multiple sessions:
+5. Allow inject on a local CLI:
 
 ```bash
-telepty multicast <id1,id2,...> "<prompt text>"
+telepty allow --id <session_id> <command> [args...]
 ```
 
-6. Broadcast to all sessions:
-
-```bash
-telepty broadcast "<prompt text>"
-```
-
-7. Rename a session:
+6. Rename a room:
 
 ```bash
 telepty rename <old_id> <new_id>
 ```
 
-8. Listen to the event bus:
+7. Listen to the event bus:
 
 ```bash
 telepty listen
 ```
 
-9. Publish a JSON payload to the bus:
-
-```bash
-TOKEN=$(grep authToken ~/.telepty/config.json | cut -d '"' -f 4)
-curl -s -X POST http://127.0.0.1:3848/api/bus/publish \
-  -H "Content-Type: application/json" \
-  -H "x-telepty-token: $TOKEN" \
-  -d '{"type":"bg_message","payload":"..."}'
-```
-
-10. Update telepty:
+8. Update telepty:
 
 ```bash
 telepty update
 ```
 
+## Local daemon recovery
+
+When the user reports any of these symptoms, repair the local daemon first:
+
+- `Failed to connect to local daemon`
+- local sessions do not appear but remote sessions do
+- duplicate or stale daemon processes
+- install/update completed but `spawn` or `allow` still fails locally
+
+### Human-facing path
+
+Tell the user to run `telepty` and choose `Repair local daemon`.
+
+### Agent execution path
+
+Use the maintenance command directly:
+
+```bash
+telepty cleanup-daemons
+telepty daemon
+```
+
+If the daemon still does not come up, rerun the installer.
+
 ## Notes
 
 - `TELEPTY_SESSION_ID` is only set inside telepty-managed sessions.
-- Use `telepty inject` when the target session should receive the command immediately.
-- Use the JSON bus when the payload should be delivered without interrupting the target shell.
+- For non-interactive `telepty allow` use cases, set terminal dimensions if the environment does not provide them:
+
+```bash
+COLUMNS=120 LINES=40 telepty allow --id <session_id> <command>
+```
+
+- For interactive users, keep explanations centered on TUI actions instead of raw maintenance commands whenever possible.

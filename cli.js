@@ -56,6 +56,20 @@ function startDetachedDaemon() {
   cp.unref();
 }
 
+async function repairLocalDaemon(options = {}) {
+  const restart = options.restart !== false;
+  const results = cleanupDaemonProcesses();
+
+  if (!restart) {
+    return { stopped: results.stopped.length, failed: results.failed.length, meta: null };
+  }
+
+  startDetachedDaemon();
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const meta = await getDaemonMeta('127.0.0.1');
+  return { stopped: results.stopped.length, failed: results.failed.length, meta };
+}
+
 async function discoverSessions() {
   await ensureDaemonRunning();
   const hosts = ['127.0.0.1'];
@@ -130,7 +144,7 @@ async function ensureDaemonRunning(options = {}) {
 
   const meta = await getDaemonMeta('127.0.0.1');
   if (!meta || !requiredCapabilities.every((item) => meta.capabilities.includes(item))) {
-    console.error('❌ Failed to start a compatible local telepty daemon. Try `telepty cleanup-daemons` or rerun the installer.');
+    console.error('❌ Failed to start a compatible local telepty daemon. Open telepty and choose "Repair local daemon", or rerun the installer.');
   }
 }
 
@@ -198,6 +212,7 @@ async function manageInteractive() {
         { title: '🔌  Allow inject (Run CLI with inject)', value: 'allow' },
         { title: '💬  Send message to a room (Inject command)', value: 'inject' },
         { title: '📋  View all open rooms (List sessions)', value: 'list' },
+        { title: '🧹  Repair local daemon', value: 'repair-daemon' },
         { title: '🧠  Install telepty skills', value: 'install-skills' },
         { title: '🔄  Update telepty to latest version', value: 'update' },
         { title: '❌  Exit', value: 'exit' }
@@ -209,7 +224,7 @@ async function manageInteractive() {
       try {
         execSync('npm install -g @dmsdc-ai/aigentry-telepty@latest', { stdio: 'inherit' });
         console.log('\n\x1b[32m✅ Update complete! Restarting daemon...\x1b[0m');
-        cleanupDaemonProcesses();
+        await repairLocalDaemon({ restart: true });
       } catch (e) {
         console.error('\n❌ Update failed.\n');
       }
@@ -226,6 +241,17 @@ async function manageInteractive() {
       cleanupDaemonProcesses();
       startDetachedDaemon();
       console.log('✅ Daemon started.\n');
+      continue;
+    }
+
+    if (response.action === 'repair-daemon') {
+      console.log('\n\x1b[36m🧹 Repairing local telepty daemon...\x1b[0m');
+      const result = await repairLocalDaemon({ restart: true });
+      if (result.meta) {
+        console.log(`✅ Local daemon is healthy. Version ${result.meta.version}, pid ${result.meta.pid}, stopped ${result.stopped} old daemon(s).\n`);
+      } else {
+        console.log(`⚠️ Daemon cleanup ran, but a fresh local daemon did not respond. Stopped ${result.stopped} old daemon(s).\n`);
+      }
       continue;
     }
 
@@ -784,7 +810,6 @@ Usage:
   telepty multicast <id1,id2> "<prompt>"         Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
   telepty rename <old_id> <new_id>               Rename a session (updates terminal title too)
-  telepty cleanup-daemons                        Stop old local telepty daemon processes
   telepty listen                                 Listen to the event bus and print JSON to stdout
   telepty monitor                                Human-readable real-time billboard of bus events
   telepty update                                 Update telepty to the latest version

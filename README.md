@@ -63,11 +63,7 @@ npm run test:watch
 
 The automated suite covers config generation, daemon HTTP APIs, WebSocket attach/output flow, bus events, session deletion regressions, and CLI smoke tests against a real daemon process.
 
-If you ever need to manually clear stale local daemon processes:
-
-```bash
-telepty cleanup-daemons
-```
+If the local daemon ever gets stuck or duplicated, open `telepty` and choose `Repair local daemon`.
 
 ## Skill Installation
 
