@@ -58,6 +58,28 @@ telepty inject <session_id> "<prompt text>"
 
 When the same session ID exists on multiple hosts, use `session_id@host`.
 
+**Return address rule**: If you expect a reply from the target session, you MUST include your own session ID in the inject message so the recipient knows where to send the response:
+
+```bash
+telepty inject <target_session_id> "your message here. 응답은 telepty inject <your_session_id> 로 보내줘."
+```
+
+Your session ID is available via `echo $TELEPTY_SESSION_ID`.
+
+**Reliable inject pattern (2-step)**: Some CLIs (e.g. codex) do not submit on `\r` alone. For reliable delivery, use the REST API in two steps:
+
+```bash
+TOKEN=$(cat ~/.telepty/config.json | grep authToken | cut -d '"' -f 4)
+# Step 1: send content without enter
+curl -s -X POST "http://127.0.0.1:3848/api/sessions/<target_id>/inject" \
+  -H "Content-Type: application/json" -H "x-telepty-token: $TOKEN" \
+  -d '{"prompt": "<content>", "no_enter": true}'
+# Step 2: send enter separately
+curl -s -X POST "http://127.0.0.1:3848/api/sessions/<target_id>/inject" \
+  -H "Content-Type: application/json" -H "x-telepty-token: $TOKEN" \
+  -d '{"prompt": "\n"}'
+```
+
 5. Allow inject on a local CLI:
 
 ```bash

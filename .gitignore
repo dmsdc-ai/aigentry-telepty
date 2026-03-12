@@ -7,3 +7,8 @@ state/
 .DS_Store
 .omc/
 test-*.mjs
+.deliberation_request.json
+.cross_session_deliberation.json
+.deliberation_request_bridge.json
+.deliberation_request_bridge_retry.json
+BOUNDARY.md

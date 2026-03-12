@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const pty = require('node-pty');
 const os = require('os');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const { getConfig } = require('./auth');
 const pkg = require('./package.json');
@@ -229,17 +230,23 @@ app.post('/api/sessions/multicast/inject', (req, res) => {
     const session = sessions[id];
     if (session) {
       try {
-        const injectData = `${prompt}\r`;
+        // Inject text first, then \r separately after delay
         if (session.type === 'wrapped') {
           if (session.ownerWs && session.ownerWs.readyState === 1) {
-            session.ownerWs.send(JSON.stringify({ type: 'inject', data: injectData }));
-            results.successful.push(id);
+            session.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
+            setTimeout(() => {
+              if (session.ownerWs && session.ownerWs.readyState === 1) {
+                session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+              }
+            }, 300);
+            results.successful.push({ id, strategy: 'split_cr' });
           } else {
             results.failed.push({ id, error: 'Wrap process not connected' });
           }
         } else {
-          session.ptyProcess.write(injectData);
-          results.successful.push(id);
+          session.ptyProcess.write(prompt);
+          setTimeout(() => session.ptyProcess.write('\r'), 300);
+          results.successful.push({ id, strategy: 'split_cr' });
         }
 
         // Broadcast injection to bus
@@ -273,17 +280,23 @@ app.post('/api/sessions/broadcast/inject', (req, res) => {
   Object.keys(sessions).forEach(id => {
     const session = sessions[id];
     try {
-      const injectData = `${prompt}\r`;
+      // Inject text first, then \r separately after delay
       if (session.type === 'wrapped') {
         if (session.ownerWs && session.ownerWs.readyState === 1) {
-          session.ownerWs.send(JSON.stringify({ type: 'inject', data: injectData }));
-          results.successful.push(id);
+          session.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
+          setTimeout(() => {
+            if (session.ownerWs && session.ownerWs.readyState === 1) {
+              session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+            }
+          }, 300);
+          results.successful.push({ id, strategy: 'split_cr' });
         } else {
           results.failed.push({ id, error: 'Wrap process not connected' });
         }
       } else {
-        session.ptyProcess.write(injectData);
-        results.successful.push(id);
+        session.ptyProcess.write(prompt);
+        setTimeout(() => session.ptyProcess.write('\r'), 300);
+        results.successful.push({ id, strategy: 'split_cr' });
       }
     } catch (err) {
       results.failed.push({ id, error: err.message });
@@ -308,28 +321,184 @@ app.post('/api/sessions/broadcast/inject', (req, res) => {
   res.json({ success: true, results });
 });
 
+// CLI-specific submit strategies
+// All CLIs submit via PTY \r when running inside telepty allow bridge
+const SUBMIT_STRATEGIES = {
+  claude: 'pty_cr',
+  gemini: 'pty_cr',
+  codex: 'pty_cr',
+};
+
+function getSubmitStrategy(command) {
+  const base = command.split('/').pop().split(' ')[0]; // extract binary name
+  return SUBMIT_STRATEGIES[base] || 'pty_cr'; // default to \r
+}
+
+function submitViaPty(session) {
+  if (session.type === 'wrapped') {
+    if (session.ownerWs && session.ownerWs.readyState === 1) {
+      session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+      return true;
+    }
+    return false;
+  } else {
+    session.ptyProcess.write('\r');
+    return true;
+  }
+}
+
+function submitViaOsascript(sessionId, keyCombo) {
+  const { execSync } = require('child_process');
+  const session = sessions[sessionId];
+  // Build fallback search terms: session ID, project dir name, CLI-specific patterns
+  const searchTerms = [sessionId];
+  if (session) {
+    // Extract project name from cwd (e.g., "aigentry-deliberation" from full path)
+    const projectName = session.cwd.split('/').pop();
+    if (projectName) searchTerms.push(projectName);
+    // CLI-specific known window titles
+    if (session.command === 'codex') {
+      searchTerms.push('New agent conversation', 'codex');
+    }
+  }
+
+  const keyAction = keyCombo === 'cmd_enter'
+    ? 'key code 36 using command down'
+    : 'key code 36';
+
+  // Try each search term until we find a matching window
+  const searchTermsStr = searchTerms.map(t => `"${t}"`).join(', ');
+  const script = `
+    tell application "System Events"
+      tell process "stable"
+        set searchList to {${searchTermsStr}}
+        repeat with term in searchList
+          repeat with w in windows
+            if name of w contains (term as text) then
+              perform action "AXRaise" of w
+              delay 0.3
+              ${keyAction}
+              return "ok:" & (name of w)
+            end if
+          end repeat
+        end repeat
+        return "window_not_found"
+      end tell
+    end tell`;
+
+  try {
+    const result = execSync(`osascript -e '${script}'`, { timeout: 5000 }).toString().trim();
+    const ok = result.startsWith('ok:');
+    if (ok) console.log(`[SUBMIT] osascript matched: ${result}`);
+    return ok;
+  } catch (err) {
+    console.error(`[SUBMIT] osascript failed for ${sessionId}:`, err.message);
+    return false;
+  }
+}
+
+// POST /api/sessions/:id/submit — CLI-aware submit
+app.post('/api/sessions/:id/submit', (req, res) => {
+  const { id } = req.params;
+  const session = sessions[id];
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
+  const strategy = getSubmitStrategy(session.command);
+  console.log(`[SUBMIT] Session ${id} (${session.command}) using strategy: ${strategy}`);
+
+  let success = false;
+  if (strategy === 'pty_cr') {
+    success = submitViaPty(session);
+  } else if (strategy === 'osascript_cmd_enter') {
+    success = submitViaOsascript(id, 'cmd_enter');
+  } else {
+    success = submitViaPty(session); // fallback
+  }
+
+  if (success) {
+    const busMsg = JSON.stringify({
+      type: 'submit',
+      sender: 'daemon',
+      session_id: id,
+      strategy,
+      timestamp: new Date().toISOString()
+    });
+    busClients.forEach(client => {
+      if (client.readyState === 1) client.send(busMsg);
+    });
+    res.json({ success: true, strategy });
+  } else {
+    res.status(503).json({ error: `Submit failed via ${strategy}`, strategy });
+  }
+});
+
+// POST /api/sessions/submit-all — Submit all active sessions
+app.post('/api/sessions/submit-all', (req, res) => {
+  const results = { successful: [], failed: [] };
+
+  for (const [id, session] of Object.entries(sessions)) {
+    const strategy = getSubmitStrategy(session.command);
+    let success = false;
+
+    if (strategy === 'pty_cr') {
+      success = submitViaPty(session);
+    } else if (strategy === 'osascript_cmd_enter') {
+      success = submitViaOsascript(id, 'cmd_enter');
+    }
+
+    if (success) {
+      results.successful.push({ id, strategy });
+    } else {
+      results.failed.push({ id, strategy, error: 'Submit failed' });
+    }
+  }
+
+  res.json({ success: true, results });
+});
+
 app.post('/api/sessions/:id/inject', (req, res) => {
   const { id } = req.params;
-  const { prompt, no_enter } = req.body;
+  const { prompt, no_enter, auto_submit } = req.body;
   const session = sessions[id];
   if (!session) return res.status(404).json({ error: 'Session not found' });
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+  const inject_id = crypto.randomUUID();
   try {
-    const injectData = no_enter ? prompt : `${prompt}\r`;
-    if (session.type === 'wrapped') {
-      if (session.ownerWs && session.ownerWs.readyState === 1) {
-        session.ownerWs.send(JSON.stringify({ type: 'inject', data: injectData }));
+    // Always inject text WITHOUT \r first, then send \r separately after delay
+    // This two-step approach works for ALL CLIs (claude, codex, gemini)
+    function writeToSession(data) {
+      if (session.type === 'wrapped') {
+        if (session.ownerWs && session.ownerWs.readyState === 1) {
+          session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
+          return true;
+        }
+        return false;
       } else {
-        return res.status(503).json({ error: 'Wrap process is not connected' });
+        session.ptyProcess.write(data);
+        return true;
       }
-    } else {
-      session.ptyProcess.write(injectData);
     }
-    console.log(`[INJECT] Wrote to session ${id}`);
+
+    if (!writeToSession(prompt)) {
+      return res.status(503).json({ error: 'Wrap process is not connected' });
+    }
+
+    // Send \r separately after 300ms delay — works for ALL CLIs
+    let submitResult = null;
+    if (!no_enter) {
+      setTimeout(() => {
+        const ok = writeToSession('\r');
+        console.log(`[INJECT+SUBMIT] Split \\r for ${id}: ${ok ? 'success' : 'failed'}`);
+      }, 300);
+      submitResult = { deferred: true, strategy: 'split_cr' };
+    }
+
+    console.log(`[INJECT] Wrote to session ${id} (inject_id: ${inject_id})`);
 
     const busMsg = JSON.stringify({
-      type: 'injection',
-      sender: 'cli',
+      type: 'inject_written',
+      inject_id,
+      sender: 'daemon',
       target_agent: id,
       content: prompt,
       timestamp: new Date().toISOString()
@@ -338,8 +507,19 @@ app.post('/api/sessions/:id/inject', (req, res) => {
       if (client.readyState === 1) client.send(busMsg);
     });
 
-    res.json({ success: true });
+    res.json({ success: true, inject_id, submit: submitResult });
   } catch (err) {
+    const busFailMsg = JSON.stringify({
+      type: 'inject_write_failed',
+      inject_id,
+      sender: 'daemon',
+      target_agent: id,
+      error: err.message,
+      timestamp: new Date().toISOString()
+    });
+    busClients.forEach(client => {
+      if (client.readyState === 1) client.send(busFailMsg);
+    });
     res.status(500).json({ error: err.message });
   }
 });
@@ -416,6 +596,25 @@ app.post('/api/bus/publish', (req, res) => {
 const server = app.listen(PORT, HOST, () => {
   console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
 });
+
+setInterval(() => {
+  for (const [id, session] of Object.entries(sessions)) {
+    const healthMsg = JSON.stringify({
+      type: 'session_health',
+      session_id: id,
+      payload: {
+        alive: session.type === 'wrapped' ? (session.ownerWs && session.ownerWs.readyState === 1) : (session.ptyProcess && !session.ptyProcess.killed),
+        pid: session.ptyProcess?.pid || null,
+        type: session.type,
+        clients: session.clients ? session.clients.size : 0
+      },
+      timestamp: new Date().toISOString()
+    });
+    busClients.forEach(client => {
+      if (client.readyState === 1) client.send(healthMsg);
+    });
+  }
+}, 10000);
 
 server.on('error', (error) => {
   clearDaemonState(process.pid);
