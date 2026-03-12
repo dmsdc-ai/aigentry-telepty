@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('events');
 
-const { attachInteractiveTerminal } = require('../interactive-terminal');
+const { attachInteractiveTerminal, getTerminalSize } = require('../interactive-terminal');
 
 class FakeInput extends EventEmitter {
   constructor() {
@@ -28,7 +28,13 @@ class FakeInput extends EventEmitter {
   }
 }
 
-class FakeOutput extends EventEmitter {}
+class FakeOutput extends EventEmitter {
+  constructor() {
+    super();
+    this.columns = undefined;
+    this.rows = undefined;
+  }
+}
 
 test('attachInteractiveTerminal resumes paused stdin and cleans up listeners', () => {
   const input = new FakeInput();
@@ -63,4 +69,24 @@ test('attachInteractiveTerminal resumes paused stdin and cleans up listeners', (
 
   assert.deepEqual(received, ['hello']);
   assert.equal(resizeCalls, 2);
+});
+
+test('getTerminalSize falls back to environment and defaults when output size is missing', () => {
+  const output = new FakeOutput();
+  const originalColumns = process.env.COLUMNS;
+  const originalLines = process.env.LINES;
+
+  process.env.COLUMNS = '132';
+  process.env.LINES = '48';
+  assert.deepEqual(getTerminalSize(output, { cols: 80, rows: 24 }), { cols: 132, rows: 48 });
+
+  delete process.env.COLUMNS;
+  delete process.env.LINES;
+  assert.deepEqual(getTerminalSize(output, { cols: 90, rows: 33 }), { cols: 90, rows: 33 });
+
+  if (originalColumns === undefined) delete process.env.COLUMNS;
+  else process.env.COLUMNS = originalColumns;
+
+  if (originalLines === undefined) delete process.env.LINES;
+  else process.env.LINES = originalLines;
 });

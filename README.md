@@ -20,6 +20,12 @@ Open PowerShell as Administrator and run:
 iwr -useb https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/install.ps1 | iex
 ```
 
+You can also launch the installer through npm without downloading the script first:
+
+```bash
+npx --yes @dmsdc-ai/aigentry-telepty@latest
+```
+
 *These single commands will install the package globally and automatically configure it to run as a background service specific to your OS (`systemd` for Linux, `launchd` for macOS, or a detached background process for Windows).*
 The installer now stops older local telepty daemons before starting the new one, so updates do not leave duplicate background processes behind.
 

@@ -10,7 +10,8 @@ const updateNotifier = require('update-notifier');
 const pkg = require('./package.json');
 const { getConfig } = require('./auth');
 const { cleanupDaemonProcesses } = require('./daemon-control');
-const { attachInteractiveTerminal } = require('./interactive-terminal');
+const { attachInteractiveTerminal, getTerminalSize } = require('./interactive-terminal');
+const { getRuntimeInfo } = require('./runtime-info');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const args = process.argv.slice(2);
 
@@ -144,7 +145,10 @@ async function manageInteractiveAttach(sessionId, targetHost) {
       console.log(`\n\x1b[32mEntered room '${sessionId}'.\x1b[0m\n`);
       cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
         onData: (d) => ws.send(JSON.stringify({ type: 'input', data: d.toString() })),
-        onResize: () => ws.send(JSON.stringify({ type: 'resize', cols: process.stdout.columns, rows: process.stdout.rows }))
+        onResize: () => {
+          const size = getTerminalSize(process.stdout, { cols: 80, rows: 30 });
+          ws.send(JSON.stringify({ type: 'resize', cols: size.cols, rows: size.rows }));
+        }
       });
     });
     ws.on('message', m => {
@@ -178,8 +182,10 @@ async function manageInteractiveAttach(sessionId, targetHost) {
 }
 
 async function manageInteractive() {
+  const runtimeInfo = getRuntimeInfo(__dirname);
   console.clear();
   console.log('\x1b[36m\x1b[1m⚡ Telepty Agent Manager\x1b[0m\n');
+  console.log(`\x1b[90mVersion ${runtimeInfo.version}  Updated ${runtimeInfo.updatedAtLabel}\x1b[0m\n`);
 
   while (true) {
     const response = await prompts({
@@ -518,7 +524,8 @@ async function main() {
         child.write(data.toString());
       },
       onResize: () => {
-        child.resize(process.stdout.columns, process.stdout.rows);
+        const size = getTerminalSize(process.stdout, { cols: 120, rows: 40 });
+        child.resize(size.cols, size.rows);
       }
     });
 
@@ -594,10 +601,11 @@ async function main() {
           ws.send(JSON.stringify({ type: 'input', data: data.toString() }));
         },
         onResize: () => {
+          const size = getTerminalSize(process.stdout, { cols: 80, rows: 30 });
           ws.send(JSON.stringify({
             type: 'resize',
-            cols: process.stdout.columns,
-            rows: process.stdout.rows
+            cols: size.cols,
+            rows: size.rows
           }));
         }
       });

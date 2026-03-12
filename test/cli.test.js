@@ -108,3 +108,30 @@ test('telepty attach resumes stdin after session selection and forwards room inp
     cli.kill();
   }
 });
+
+test('telepty allow works without a TTY by using fallback terminal dimensions', async () => {
+  const sessionId = createSessionId('cli-allow-no-tty');
+  const result = await harness.runCli([
+    'allow',
+    '--id',
+    sessionId,
+    process.execPath,
+    '-e',
+    'console.log("allow-ok")'
+  ], {
+    env: {
+      COLUMNS: '120',
+      LINES: '40'
+    },
+    timeoutMs: 8000
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  const output = stripAnsi(`${result.stdout}\n${result.stderr}`);
+  assert.match(output, /allow-ok/);
+
+  await waitFor(async () => {
+    const list = await harness.request('/api/sessions');
+    return list.status === 200 && !list.body.some((session) => session.id === sessionId);
+  }, { description: 'wrapped session cleanup after non-interactive allow' });
+});
