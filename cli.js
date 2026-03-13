@@ -694,6 +694,28 @@ async function main() {
       env: { ...process.env, TELEPTY_SESSION_ID: sessionId }
     });
 
+    // Prompt-ready detection for safe inject delivery
+    const PROMPT_PATTERNS = {
+      claude: /[❯>]\s*$/,
+      gemini: /[❯>]\s*$/,
+      codex: /[❯>]\s*$/,
+    };
+    const cmdBase = path.basename(command).replace(/\..*$/, '');
+    const promptPattern = PROMPT_PATTERNS[cmdBase] || /[❯>$#%]\s*$/;
+    let promptReady = true;  // assume ready initially for first inject
+    const injectQueue = [];
+
+    function flushInjectQueue() {
+      if (injectQueue.length === 0) return;
+      const batch = injectQueue.splice(0);
+      let delay = 0;
+      for (const item of batch) {
+        setTimeout(() => child.write(item), delay);
+        delay += item === '\r' ? 0 : 100;
+      }
+      promptReady = false;
+    }
+
     // Connect to daemon WebSocket for inject reception and output relay
     const wsUrl = `ws://${REMOTE_HOST}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
     const daemonWs = new WebSocket(wsUrl);
@@ -708,7 +730,15 @@ async function main() {
       try {
         const msg = JSON.parse(message);
         if (msg.type === 'inject') {
-          child.write(msg.data);
+          if (promptReady) {
+            child.write(msg.data);
+            // After writing prompt text (not \r), mark as not ready until next prompt
+            if (msg.data !== '\r' && msg.data.length > 1) {
+              promptReady = false;
+            }
+          } else {
+            injectQueue.push(msg.data);
+          }
         } else if (msg.type === 'resize') {
           child.resize(msg.cols, msg.rows);
         }
@@ -745,6 +775,11 @@ async function main() {
       process.stdout.write(data);
       if (wsReady && daemonWs.readyState === 1) {
         daemonWs.send(JSON.stringify({ type: 'output', data }));
+      }
+      // Detect prompt in output to enable inject delivery
+      if (promptPattern.test(data)) {
+        promptReady = true;
+        flushInjectQueue();
       }
     });
 
