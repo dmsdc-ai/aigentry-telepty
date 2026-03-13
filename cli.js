@@ -2,6 +2,7 @@
 
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const WebSocket = require('ws');
 const { execSync, spawn } = require('child_process');
 const readline = require('readline');
@@ -870,9 +871,27 @@ async function main() {
     const noEnterIndex = args.indexOf('--no-enter');
     const noEnter = noEnterIndex !== -1;
     if (noEnter) args.splice(noEnterIndex, 1);
-    
+
+    // Extract --from flag
+    let fromId;
+    const fromIndex = args.indexOf('--from');
+    if (fromIndex !== -1 && args[fromIndex + 1]) {
+      fromId = args[fromIndex + 1];
+      args.splice(fromIndex, 2);
+    } else {
+      fromId = process.env.TELEPTY_SESSION_ID || undefined;
+    }
+
+    // Extract --reply-to flag
+    let replyTo;
+    const replyToIndex = args.indexOf('--reply-to');
+    if (replyToIndex !== -1 && args[replyToIndex + 1]) {
+      replyTo = args[replyToIndex + 1];
+      args.splice(replyToIndex, 2);
+    }
+
     const sessionId = args[1]; const prompt = args.slice(2).join(' ');
-    if (!sessionId || !prompt) { console.error('❌ Usage: telepty inject [--no-enter] <session_id> "<prompt text>"'); process.exit(1); }
+    if (!sessionId || !prompt) { console.error('❌ Usage: telepty inject [--no-enter] [--from <id>] [--reply-to <id>] <session_id> "<prompt text>"'); process.exit(1); }
     try {
       const target = await resolveSessionTarget(sessionId);
       if (!target) {
@@ -880,13 +899,42 @@ async function main() {
         process.exit(1);
       }
 
+      const body = { prompt, no_enter: noEnter };
+      if (fromId) body.from = fromId;
+      if (replyTo) body.reply_to = replyTo;
+
       const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt, no_enter: noEnter })
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
       const data = await res.json();
       if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
       const hostSuffix = target.host === '127.0.0.1' ? '' : ` @ ${target.host}`;
       console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'${hostSuffix}.`);
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    return;
+  }
+
+  if (cmd === 'reply') {
+    const mySessionId = process.env.TELEPTY_SESSION_ID;
+    if (!mySessionId) { console.error('❌ TELEPTY_SESSION_ID env var is required for reply command'); process.exit(1); }
+    const replyText = args.slice(1).join(' ');
+    if (!replyText) { console.error('❌ Usage: telepty reply "<text>"'); process.exit(1); }
+    try {
+      const metaRes = await fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(mySessionId)}`);
+      if (!metaRes.ok) { console.error(`❌ Could not fetch session metadata for '${mySessionId}'`); process.exit(1); }
+      const meta = await metaRes.json();
+      const replyTo = meta.lastInjectReplyTo;
+      if (!replyTo) { console.error(`❌ No pending reply-to found for session '${mySessionId}'`); process.exit(1); }
+      const target = await resolveSessionTarget(replyTo);
+      if (!target) { console.error(`❌ Session '${replyTo}' was not found on any discovered host.`); process.exit(1); }
+      const fullPrompt = `[from: ${mySessionId}] [reply-to: ${mySessionId}] ${replyText}`;
+      const body = { prompt: fullPrompt, from: mySessionId, reply_to: mySessionId };
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      console.log(`✅ Reply sent to '\x1b[36m${replyTo}\x1b[0m'.`);
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
     return;
   }
@@ -983,6 +1031,441 @@ async function main() {
     return;
   }
 
+  if (cmd === 'deliberate') {
+    await ensureDaemonRunning();
+    const subCmd = args[1];
+
+    if (subCmd === 'status') {
+      // telepty deliberate status [thread_id]
+      const threadId = args[2];
+      try {
+        if (threadId) {
+          const resp = await fetchWithAuth(`${DAEMON_URL}/api/threads/${threadId}`);
+          const thread = await resp.json();
+          if (!resp.ok) { console.error('Error:', thread.error); process.exit(1); }
+          console.log(`\n  Thread: ${thread.id}`);
+          console.log(`  Topic: ${thread.topic}`);
+          console.log(`  Status: ${thread.status}`);
+          console.log(`  Orchestrator: ${thread.orchestrator_session_id || '(none)'}`);
+          console.log(`  Participants: ${thread.participant_session_ids.join(', ') || '(none)'}`);
+          console.log(`  Messages: ${thread.message_count}`);
+          console.log(`  Created: ${thread.created_at}`);
+          if (thread.closed_at) console.log(`  Closed: ${thread.closed_at}`);
+          console.log();
+        } else {
+          const resp = await fetchWithAuth(`${DAEMON_URL}/api/threads`);
+          const list = await resp.json();
+          if (list.length === 0) {
+            console.log('No deliberation threads found.');
+          } else {
+            console.log(`\n  Deliberation Threads (${list.length}):\n`);
+            for (const t of list) {
+              const icon = t.status === 'active' ? '🟢' : '⏹️';
+              console.log(`  ${icon} ${t.id.slice(0, 8)}  ${t.status.padEnd(8)}  msgs:${t.message_count}  participants:${t.participant_count}  "${t.topic}"`);
+            }
+            console.log();
+          }
+        }
+      } catch (err) {
+        console.error('Failed:', err.message);
+        process.exit(1);
+      }
+      return;
+    }
+
+    if (subCmd === 'end') {
+      // telepty deliberate end <thread_id>
+      const threadId = args[2];
+      if (!threadId) { console.error('Usage: telepty deliberate end <thread_id>'); process.exit(1); }
+      try {
+        const resp = await fetchWithAuth(`${DAEMON_URL}/api/threads/${threadId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'closed' })
+        });
+        const result = await resp.json();
+        if (!resp.ok) { console.error('Error:', result.error); process.exit(1); }
+        console.log(`Deliberation thread ${threadId} closed.`);
+      } catch (err) {
+        console.error('Failed:', err.message);
+        process.exit(1);
+      }
+      return;
+    }
+
+    // telepty deliberate --topic "..." [--sessions id1,id2,...] [--context path]
+    // Extract flags
+    const topicIdx = args.indexOf('--topic');
+    const sessionsIdx = args.indexOf('--sessions');
+    const contextIdx = args.indexOf('--context');
+
+    const topic = topicIdx !== -1 && args[topicIdx + 1] ? args[topicIdx + 1] : null;
+    const sessionsArg = sessionsIdx !== -1 && args[sessionsIdx + 1] ? args[sessionsIdx + 1] : null;
+    const contextPath = contextIdx !== -1 && args[contextIdx + 1] ? args[contextIdx + 1] : null;
+
+    if (!topic) {
+      console.error('Usage: telepty deliberate --topic "topic description" [--sessions id1,id2,...] [--context file]');
+      console.error('       telepty deliberate status [thread_id]');
+      console.error('       telepty deliberate end <thread_id>');
+      process.exit(1);
+    }
+
+    const orchestratorId = process.env.TELEPTY_SESSION_ID || null;
+
+    // Read context file if provided
+    let contextContent = null;
+    if (contextPath) {
+      try {
+        contextContent = fs.readFileSync(contextPath, 'utf-8');
+      } catch (err) {
+        console.error(`Failed to read context file: ${err.message}`);
+        process.exit(1);
+      }
+    }
+
+    // Discover target sessions
+    let targetSessions;
+    try {
+      const discovered = await discoverSessions({ silent: true });
+      if (sessionsArg) {
+        const requestedIds = sessionsArg.split(',').map(s => s.trim());
+        targetSessions = discovered.filter(s => requestedIds.includes(s.id));
+        const foundIds = targetSessions.map(s => s.id);
+        const missing = requestedIds.filter(id => !foundIds.includes(id));
+        if (missing.length > 0) {
+          console.error(`Warning: Sessions not found: ${missing.join(', ')}`);
+        }
+      } else {
+        // All sessions except orchestrator
+        targetSessions = discovered.filter(s => s.id !== orchestratorId);
+      }
+    } catch (err) {
+      console.error('Failed to discover sessions:', err.message);
+      process.exit(1);
+    }
+
+    if (targetSessions.length === 0) {
+      console.error('No target sessions found.');
+      process.exit(1);
+    }
+
+    const participantIds = targetSessions.map(s => s.id);
+
+    // Create thread on daemon
+    let threadId;
+    try {
+      const resp = await fetchWithAuth(`${DAEMON_URL}/api/threads`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          topic,
+          orchestrator_session_id: orchestratorId,
+          participant_session_ids: participantIds,
+          context: contextContent
+        })
+      });
+      const result = await resp.json();
+      if (!resp.ok) { console.error('Error:', result.error); process.exit(1); }
+      threadId = result.thread_id;
+    } catch (err) {
+      console.error('Failed to create thread:', err.message);
+      process.exit(1);
+    }
+
+    // Build session directory
+    const sessionDirectory = targetSessions.map(s => {
+      const proj = s.cwd ? s.cwd.split('/').pop() : '(unknown)';
+      return `  - ${s.id} (${s.command || 'unknown'}, project: ${proj})`;
+    }).join('\n');
+
+    // Build protocol template
+    const protocolTemplate = `[from: ${orchestratorId || 'orchestrator'}] [reply-to: ${orchestratorId || 'orchestrator'}]
+
+## Bidirectional Multi-Session Deliberation
+
+**Thread ID:** ${threadId}
+**Topic:** ${topic}
+**Orchestrator:** ${orchestratorId || '(not set)'}
+
+### Session Directory
+${sessionDirectory}
+
+${contextContent ? `### Context\n${contextContent}\n` : ''}
+### Protocol Rules (MANDATORY)
+
+1. **Always include sender identity**: Every message you send to another session MUST include \`[from: YOUR_SESSION_ID] [reply-to: YOUR_SESSION_ID]\` at the beginning.
+
+2. **Use telepty for cross-session communication**: To send a message to another session:
+   \`\`\`
+   telepty inject --from YOUR_SESSION_ID --reply-to YOUR_SESSION_ID <target_session_id> "your message"
+   \`\`\`
+   Or use: \`telepty reply "your message"\` to reply to the last sender.
+
+3. **Do NOT self-resolve cross-cutting concerns**: If a question involves another project's domain, ASK that session directly via telepty inject. Do not guess or assume.
+
+4. **Sub-deliberation allowed**: You may initiate side conversations with specific sessions for detailed technical discussions.
+
+5. **Thread tracking**: Include \`thread_id: ${threadId}\` in bus events for this deliberation.
+
+6. **Completion**: When you believe the discussion on your part is complete, send a summary to the orchestrator (${orchestratorId || 'orchestrator'}).
+
+### Your Task
+Discuss the following topic from your project's perspective. Engage with other sessions to align on interfaces and implementation details.
+
+**Topic:** ${topic}
+`;
+
+    // Inject protocol to all target sessions
+    console.log(`\nStarting deliberation thread ${threadId.slice(0, 8)}...`);
+    console.log(`Topic: ${topic}`);
+    console.log(`Participants: ${participantIds.length}\n`);
+
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const session of targetSessions) {
+      try {
+        const host = session._host || '127.0.0.1';
+        const body = {
+          prompt: protocolTemplate,
+          no_enter: true,
+          from: orchestratorId,
+          reply_to: orchestratorId,
+          thread_id: threadId
+        };
+        const resp = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/${encodeURIComponent(session.id)}/inject`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (resp.ok) {
+          // Submit after text injection (300ms delay handled by daemon)
+          setTimeout(async () => {
+            try {
+              await fetchWithAuth(`http://${host}:${PORT}/api/sessions/${encodeURIComponent(session.id)}/submit`, { method: 'POST' });
+            } catch {}
+          }, 500);
+          console.log(`  ✅ Injected to ${session.id}`);
+          successCount++;
+        } else {
+          const err = await resp.json();
+          console.log(`  ❌ Failed ${session.id}: ${err.error}`);
+          failCount++;
+        }
+      } catch (err) {
+        console.log(`  ❌ Failed ${session.id}: ${err.message}`);
+        failCount++;
+      }
+    }
+
+    console.log(`\nDeliberation started: ${successCount} injected, ${failCount} failed`);
+    console.log(`Thread ID: ${threadId}`);
+    console.log(`Monitor: telepty deliberate status ${threadId}`);
+    console.log(`End: telepty deliberate end ${threadId}`);
+
+    // Wait for submit timeouts to complete
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    return;
+  }
+
+  if (cmd === 'handoff') {
+    const handoffCmd = args[1];
+
+    if (!handoffCmd || handoffCmd === 'list') {
+      // telepty handoff list [--status=pending]
+      const statusFilter = args.find(a => a.startsWith('--status='));
+      const qs = statusFilter ? `?status=${statusFilter.split('=')[1]}` : '';
+      try {
+        const resp = await fetchWithAuth(`${DAEMON_URL}/api/handoff${qs}`);
+        const list = await resp.json();
+        if (list.length === 0) {
+          console.log('No handoffs found.');
+        } else {
+          console.log(`\n  Handoffs (${list.length}):\n`);
+          for (const h of list) {
+            const statusIcon = { pending: '⏳', claimed: '🔄', executing: '⚙️', completed: '✅', failed: '❌' }[h.status] || '?';
+            console.log(`  ${statusIcon} ${h.id.slice(0, 8)}  ${h.status.padEnd(10)}  tasks:${h.task_count}  ${h.deliberation_id || '(no delib)'}  ${h.created_at}`);
+          }
+          console.log();
+        }
+      } catch (err) {
+        console.error('Failed to list handoffs:', err.message);
+        process.exit(1);
+      }
+
+    } else if (handoffCmd === 'drop') {
+      // telepty handoff drop [--delib=ID] [--source=SESSION] [--auto-execute] < synthesis.json
+      // Or: telepty handoff drop --summary="..." --tasks='[{"task":"do X","files":["a.js"]}]'
+      const delibFlag = args.find(a => a.startsWith('--delib='));
+      const sourceFlag = args.find(a => a.startsWith('--source='));
+      const autoExec = args.includes('--auto-execute');
+      const summaryFlag = args.find(a => a.startsWith('--summary='));
+      const tasksFlag = args.find(a => a.startsWith('--tasks='));
+
+      let synthesis;
+      if (summaryFlag && tasksFlag) {
+        synthesis = {
+          summary: summaryFlag.split('=').slice(1).join('='),
+          tasks: JSON.parse(tasksFlag.split('=').slice(1).join('='))
+        };
+      } else if (!process.stdin.isTTY) {
+        // Read from stdin
+        const chunks = [];
+        for await (const chunk of process.stdin) {
+          chunks.push(chunk);
+        }
+        synthesis = JSON.parse(Buffer.concat(chunks).toString());
+      } else {
+        console.error('Usage: telepty handoff drop --summary="..." --tasks=\'[...]\'');
+        console.error('  Or pipe JSON: echo \'{"summary":"...","tasks":[...]}\' | telepty handoff drop');
+        process.exit(1);
+      }
+
+      try {
+        const resp = await fetchWithAuth(`${DAEMON_URL}/api/handoff`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deliberation_id: delibFlag ? delibFlag.split('=').slice(1).join('=') : null,
+            source_session_id: sourceFlag ? sourceFlag.split('=').slice(1).join('=') : (process.env.TELEPTY_SESSION_ID || null),
+            synthesis,
+            auto_execute: autoExec
+          })
+        });
+        const result = await resp.json();
+        if (resp.ok) {
+          console.log(`Handoff created: ${result.handoff_id}`);
+        } else {
+          console.error('Failed:', result.error);
+          process.exit(1);
+        }
+      } catch (err) {
+        console.error('Failed to create handoff:', err.message);
+        process.exit(1);
+      }
+
+    } else if (handoffCmd === 'claim') {
+      // telepty handoff claim <handoff_id> [--agent=SESSION_ID]
+      const handoffId = args[2];
+      if (!handoffId) {
+        console.error('Usage: telepty handoff claim <handoff_id> [--agent=SESSION_ID]');
+        process.exit(1);
+      }
+      const agentFlag = args.find(a => a.startsWith('--agent='));
+      const agentId = agentFlag ? agentFlag.split('=').slice(1).join('=') : process.env.TELEPTY_SESSION_ID;
+      if (!agentId) {
+        console.error('Error: --agent=SESSION_ID or TELEPTY_SESSION_ID env required');
+        process.exit(1);
+      }
+
+      try {
+        const resp = await fetchWithAuth(`${DAEMON_URL}/api/handoff/${handoffId}/claim`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agent_session_id: agentId })
+        });
+        const result = await resp.json();
+        if (resp.ok) {
+          console.log(`Claimed handoff ${handoffId}`);
+        } else {
+          console.error('Failed:', result.error);
+          process.exit(1);
+        }
+      } catch (err) {
+        console.error('Failed to claim handoff:', err.message);
+        process.exit(1);
+      }
+
+    } else if (handoffCmd === 'status') {
+      // telepty handoff status <handoff_id> [executing|completed|failed] [--message="..."]
+      const handoffId = args[2];
+      if (!handoffId) {
+        console.error('Usage: telepty handoff status <handoff_id> [new_status] [--message="..."]');
+        process.exit(1);
+      }
+
+      const newStatus = args[3] && !args[3].startsWith('--') ? args[3] : null;
+      const msgFlag = args.find(a => a.startsWith('--message='));
+
+      if (!newStatus) {
+        // GET status
+        try {
+          const resp = await fetchWithAuth(`${DAEMON_URL}/api/handoff/${handoffId}`);
+          const handoff = await resp.json();
+          if (!resp.ok) {
+            console.error('Error:', handoff.error);
+            process.exit(1);
+          }
+          console.log(`\n  Handoff: ${handoff.id}`);
+          console.log(`  Status: ${handoff.status}`);
+          console.log(`  Deliberation: ${handoff.deliberation_id || '(none)'}`);
+          console.log(`  Claimed by: ${handoff.claimed_by || '(unclaimed)'}`);
+          console.log(`  Tasks: ${Array.isArray(handoff.synthesis.tasks) ? handoff.synthesis.tasks.length : 0}`);
+          if (handoff.synthesis.summary) console.log(`  Summary: ${handoff.synthesis.summary}`);
+          if (handoff.progress.length > 0) {
+            console.log(`  Progress:`);
+            for (const p of handoff.progress) {
+              console.log(`    - ${p.timestamp}: ${p.message}`);
+            }
+          }
+          console.log();
+        } catch (err) {
+          console.error('Failed:', err.message);
+          process.exit(1);
+        }
+      } else {
+        // PATCH status
+        try {
+          const resp = await fetchWithAuth(`${DAEMON_URL}/api/handoff/${handoffId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              status: newStatus,
+              message: msgFlag ? msgFlag.split('=').slice(1).join('=') : null
+            })
+          });
+          const result = await resp.json();
+          if (resp.ok) {
+            console.log(`Handoff ${handoffId} -> ${newStatus}`);
+          } else {
+            console.error('Failed:', result.error);
+            process.exit(1);
+          }
+        } catch (err) {
+          console.error('Failed:', err.message);
+          process.exit(1);
+        }
+      }
+
+    } else if (handoffCmd === 'get') {
+      // telepty handoff get <handoff_id> — dump full synthesis JSON
+      const handoffId = args[2];
+      if (!handoffId) {
+        console.error('Usage: telepty handoff get <handoff_id>');
+        process.exit(1);
+      }
+      try {
+        const resp = await fetchWithAuth(`${DAEMON_URL}/api/handoff/${handoffId}`);
+        const handoff = await resp.json();
+        if (!resp.ok) {
+          console.error('Error:', handoff.error);
+          process.exit(1);
+        }
+        // Output raw JSON for piping to other tools
+        console.log(JSON.stringify(handoff.synthesis, null, 2));
+      } catch (err) {
+        console.error('Failed:', err.message);
+        process.exit(1);
+      }
+
+    } else {
+      console.error(`Unknown handoff command: ${handoffCmd}`);
+      console.error('Available: list, drop, claim, status, get');
+      process.exit(1);
+    }
+    return;
+  }
+
   if (cmd === 'listen' || cmd === 'monitor') {
     await ensureDaemonRunning();
     
@@ -1063,13 +1546,27 @@ Usage:
   telepty allow [--id <id>] <command> [args...]       Allow inject on a CLI
   telepty list                                   List all active sessions across discovered hosts
   telepty attach [id[@host]]                     Attach to a session (Interactive picker if no ID)
-  telepty inject [--no-enter] <id[@host]> "<prompt>"    Inject text into a single session
+  telepty inject [--no-enter] [--from <id>] [--reply-to <id>] <id[@host]> "<prompt>"    Inject text into a single session
+  telepty reply "<text>"                         Reply to the session that last injected into $TELEPTY_SESSION_ID
   telepty multicast <id1[@host],id2[@host]> "<prompt>"  Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
   telepty rename <old_id[@host]> <new_id>        Rename a session (updates terminal title too)
   telepty listen                                 Listen to the event bus and print JSON to stdout
   telepty monitor                                Human-readable real-time billboard of bus events
   telepty update                                 Update telepty to the latest version
+
+  Handoff Commands:
+    handoff list [--status=S]        List handoffs (filter: pending/claimed/executing/completed)
+    handoff drop [options]           Create handoff from synthesis (pipe JSON or use --summary/--tasks)
+    handoff claim <id> [--agent=S]   Claim a pending handoff
+    handoff status <id> [status]     Get or update handoff status
+    handoff get <id>                 Get full synthesis JSON (for piping)
+
+  Deliberation Commands:
+    deliberate --topic "..." [--sessions s1,s2] [--context file]
+                                       Start multi-session deliberation
+    deliberate status [thread_id]      List threads or show thread details
+    deliberate end <thread_id>         Close a deliberation thread
 `);
 }
 

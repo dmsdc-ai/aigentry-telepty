@@ -46,6 +46,8 @@ if (!daemonClaim.claimed) {
 }
 
 const sessions = {};
+const handoffs = {};
+const threads = {};
 const STRIPPED_SESSION_ENV_KEYS = [
   'CLAUDECODE',
   'CODEX_CI',
@@ -208,6 +210,22 @@ app.get('/api/sessions', (req, res) => {
   res.json(list);
 });
 
+app.get('/api/sessions/:id', (req, res) => {
+  const { id } = req.params;
+  const session = sessions[id];
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  res.json({
+    id,
+    type: session.type || 'spawned',
+    command: session.command,
+    cwd: session.cwd,
+    createdAt: session.createdAt,
+    active_clients: session.clients ? session.clients.size : 0,
+    lastInjectFrom: session.lastInjectFrom || null,
+    lastInjectReplyTo: session.lastInjectReplyTo || null
+  });
+});
+
 app.get('/api/meta', (req, res) => {
   res.json({
     name: pkg.name,
@@ -215,7 +233,7 @@ app.get('/api/meta', (req, res) => {
     pid: process.pid,
     host: HOST,
     port: Number(PORT),
-    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon']
+    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads']
   });
 });
 
@@ -458,10 +476,12 @@ app.post('/api/sessions/submit-all', (req, res) => {
 
 app.post('/api/sessions/:id/inject', (req, res) => {
   const { id } = req.params;
-  const { prompt, no_enter, auto_submit } = req.body;
+  const { prompt, no_enter, auto_submit, from, reply_to } = req.body;
   const session = sessions[id];
   if (!session) return res.status(404).json({ error: 'Session not found' });
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+  if (from) session.lastInjectFrom = from;
+  if (reply_to) session.lastInjectReplyTo = reply_to;
   const inject_id = crypto.randomUUID();
   try {
     // Always inject text WITHOUT \r first, then send \r separately after delay
@@ -501,11 +521,30 @@ app.post('/api/sessions/:id/inject', (req, res) => {
       sender: 'daemon',
       target_agent: id,
       content: prompt,
+      from: from || null,
+      reply_to: reply_to || null,
       timestamp: new Date().toISOString()
     });
     busClients.forEach(client => {
       if (client.readyState === 1) client.send(busMsg);
     });
+
+    if (from && reply_to) {
+      const routedMsg = JSON.stringify({
+        type: 'message_routed',
+        message_id: inject_id,
+        from,
+        to: id,
+        reply_to,
+        inject_id,
+        deliberation_session_id: req.body.deliberation_session_id || null,
+        thread_id: req.body.thread_id || null,
+        timestamp: new Date().toISOString()
+      });
+      busClients.forEach(client => {
+        if (client.readyState === 1) client.send(routedMsg);
+      });
+    }
 
     res.json({ success: true, inject_id, submit: submitResult });
   } catch (err) {
@@ -591,6 +630,232 @@ app.post('/api/bus/publish', (req, res) => {
   });
 
   res.json({ success: true, delivered: deliveredCount });
+});
+
+app.post('/api/handoff', (req, res) => {
+  const { source_session_id, deliberation_id, synthesis, auto_execute } = req.body;
+  if (!synthesis) return res.status(400).json({ error: 'synthesis is required' });
+
+  const handoff_id = crypto.randomUUID();
+  const handoff = {
+    id: handoff_id,
+    source_session_id: source_session_id || null,
+    deliberation_id: deliberation_id || null,
+    synthesis,
+    status: 'pending',
+    auto_execute: !!auto_execute,
+    claimed_by: null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    progress: [],
+    result: null
+  };
+  handoffs[handoff_id] = handoff;
+
+  const busMsg = JSON.stringify({
+    type: 'handoff.created',
+    handoff_id,
+    source_session_id: handoff.source_session_id,
+    deliberation_id: handoff.deliberation_id,
+    auto_execute: handoff.auto_execute,
+    task_count: Array.isArray(synthesis.tasks) ? synthesis.tasks.length : 0,
+    timestamp: handoff.created_at
+  });
+  busClients.forEach(client => {
+    if (client.readyState === 1) client.send(busMsg);
+  });
+
+  console.log(`[HANDOFF] Created ${handoff_id} (${Array.isArray(synthesis.tasks) ? synthesis.tasks.length : 0} tasks)`);
+  res.status(201).json({ handoff_id, status: 'pending' });
+});
+
+app.get('/api/handoff', (req, res) => {
+  const status = req.query.status;
+  const list = Object.values(handoffs)
+    .filter(h => !status || h.status === status)
+    .map(h => ({
+      id: h.id,
+      status: h.status,
+      deliberation_id: h.deliberation_id,
+      source_session_id: h.source_session_id,
+      auto_execute: h.auto_execute,
+      claimed_by: h.claimed_by,
+      task_count: Array.isArray(h.synthesis.tasks) ? h.synthesis.tasks.length : 0,
+      created_at: h.created_at,
+      updated_at: h.updated_at
+    }));
+  res.json(list);
+});
+
+app.get('/api/handoff/:id', (req, res) => {
+  const handoff = handoffs[req.params.id];
+  if (!handoff) return res.status(404).json({ error: 'Handoff not found' });
+  res.json(handoff);
+});
+
+app.post('/api/handoff/:id/claim', (req, res) => {
+  const handoff = handoffs[req.params.id];
+  if (!handoff) return res.status(404).json({ error: 'Handoff not found' });
+  if (handoff.status !== 'pending') {
+    return res.status(409).json({ error: `Handoff already ${handoff.status}`, claimed_by: handoff.claimed_by });
+  }
+
+  const { agent_session_id } = req.body;
+  if (!agent_session_id) return res.status(400).json({ error: 'agent_session_id is required' });
+
+  handoff.status = 'claimed';
+  handoff.claimed_by = agent_session_id;
+  handoff.updated_at = new Date().toISOString();
+
+  const busMsg = JSON.stringify({
+    type: 'handoff.claimed',
+    handoff_id: handoff.id,
+    agent_session_id,
+    timestamp: handoff.updated_at
+  });
+  busClients.forEach(client => {
+    if (client.readyState === 1) client.send(busMsg);
+  });
+
+  console.log(`[HANDOFF] ${handoff.id} claimed by ${agent_session_id}`);
+  res.json({ success: true, handoff_id: handoff.id, status: 'claimed' });
+});
+
+app.patch('/api/handoff/:id', (req, res) => {
+  const handoff = handoffs[req.params.id];
+  if (!handoff) return res.status(404).json({ error: 'Handoff not found' });
+
+  const { status, message, result } = req.body;
+  const validTransitions = {
+    pending: ['claimed'],
+    claimed: ['executing', 'failed'],
+    executing: ['completed', 'failed'],
+  };
+
+  if (status) {
+    const allowed = validTransitions[handoff.status] || [];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ error: `Invalid transition: ${handoff.status} -> ${status}` });
+    }
+    handoff.status = status;
+  }
+
+  if (message) {
+    handoff.progress.push({ message, timestamp: new Date().toISOString() });
+  }
+
+  if (result) {
+    handoff.result = result;
+  }
+
+  handoff.updated_at = new Date().toISOString();
+
+  const busMsg = JSON.stringify({
+    type: `handoff.${handoff.status}`,
+    handoff_id: handoff.id,
+    claimed_by: handoff.claimed_by,
+    message: message || null,
+    timestamp: handoff.updated_at
+  });
+  busClients.forEach(client => {
+    if (client.readyState === 1) client.send(busMsg);
+  });
+
+  console.log(`[HANDOFF] ${handoff.id} -> ${handoff.status}${message ? ': ' + message : ''}`);
+  res.json({ success: true, handoff_id: handoff.id, status: handoff.status });
+});
+
+// --- Deliberation Thread Tracking ---
+
+app.post('/api/threads', (req, res) => {
+  const { topic, orchestrator_session_id, participant_session_ids, context } = req.body;
+  if (!topic) return res.status(400).json({ error: 'topic is required' });
+
+  const thread_id = crypto.randomUUID();
+  const thread = {
+    id: thread_id,
+    topic,
+    orchestrator_session_id: orchestrator_session_id || null,
+    participant_session_ids: participant_session_ids || [],
+    context: context || null,
+    status: 'active',
+    message_count: 0,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    closed_at: null
+  };
+  threads[thread_id] = thread;
+
+  const busMsg = JSON.stringify({
+    type: 'thread.opened',
+    thread_id,
+    topic,
+    orchestrator_session_id: thread.orchestrator_session_id,
+    participant_session_ids: thread.participant_session_ids,
+    timestamp: thread.created_at
+  });
+  busClients.forEach(client => {
+    if (client.readyState === 1) client.send(busMsg);
+  });
+
+  console.log(`[THREAD] Opened ${thread_id}: "${topic}" (${thread.participant_session_ids.length} participants)`);
+  res.status(201).json({ thread_id, status: 'active' });
+});
+
+app.get('/api/threads', (req, res) => {
+  const status = req.query.status;
+  const list = Object.values(threads)
+    .filter(t => !status || t.status === status)
+    .map(t => ({
+      id: t.id,
+      topic: t.topic,
+      status: t.status,
+      orchestrator_session_id: t.orchestrator_session_id,
+      participant_count: t.participant_session_ids.length,
+      message_count: t.message_count,
+      created_at: t.created_at,
+      updated_at: t.updated_at
+    }));
+  res.json(list);
+});
+
+app.get('/api/threads/:id', (req, res) => {
+  const thread = threads[req.params.id];
+  if (!thread) return res.status(404).json({ error: 'Thread not found' });
+  res.json(thread);
+});
+
+app.patch('/api/threads/:id', (req, res) => {
+  const thread = threads[req.params.id];
+  if (!thread) return res.status(404).json({ error: 'Thread not found' });
+
+  const { status, message_count } = req.body;
+
+  if (status === 'closed' && thread.status === 'active') {
+    thread.status = 'closed';
+    thread.closed_at = new Date().toISOString();
+    thread.updated_at = thread.closed_at;
+
+    const busMsg = JSON.stringify({
+      type: 'thread.closed',
+      thread_id: thread.id,
+      topic: thread.topic,
+      message_count: thread.message_count,
+      timestamp: thread.closed_at
+    });
+    busClients.forEach(client => {
+      if (client.readyState === 1) client.send(busMsg);
+    });
+
+    console.log(`[THREAD] Closed ${thread.id}: "${thread.topic}" (${thread.message_count} messages)`);
+  }
+
+  if (typeof message_count === 'number') {
+    thread.message_count = message_count;
+    thread.updated_at = new Date().toISOString();
+  }
+
+  res.json({ success: true, thread_id: thread.id, status: thread.status });
 });
 
 const server = app.listen(PORT, HOST, () => {
