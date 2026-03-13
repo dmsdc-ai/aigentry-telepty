@@ -557,6 +557,11 @@ async function main() {
     return manageInteractive();
   }
 
+  if (cmd === '--version' || cmd === '-v' || cmd === 'version') {
+    console.log(pkg.version);
+    return;
+  }
+
   if (cmd === 'update') {
     console.log('\x1b[36m🔄 Updating telepty to the latest version...\x1b[0m');
     try {
