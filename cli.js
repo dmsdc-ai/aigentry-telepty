@@ -770,9 +770,19 @@ async function main() {
       }
     });
 
+    // Intercept terminal title escape sequences and prefix with session ID
+    const titlePrefix = `\u26A1 ${sessionId}`;
+    function rewriteTitleSequences(output) {
+      // Match OSC title sequences: \x1b]0;TITLE\x07 or \x1b]2;TITLE\x07
+      return output.replace(/\x1b\]([02]);([^\x07]*)\x07/g, (match, code, title) => {
+        return `\x1b]${code};${titlePrefix} | ${title}\x07`;
+      });
+    }
+
     // Relay PTY output to current terminal + send to daemon for attach clients
     child.onData((data) => {
-      process.stdout.write(data);
+      const rewritten = rewriteTitleSequences(data);
+      process.stdout.write(rewritten);
       if (wsReady && daemonWs.readyState === 1) {
         daemonWs.send(JSON.stringify({ type: 'output', data }));
       }
