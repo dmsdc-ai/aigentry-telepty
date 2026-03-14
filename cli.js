@@ -745,6 +745,11 @@ async function main() {
         wsReady = true;
         if (reconnectAttempts > 0) {
           console.error(`\n\x1b[32m⚡ Reconnected to daemon. Inject restored.\x1b[0m`);
+          // Force CLI redraw by triggering SIGWINCH (resize +1/-1)
+          const origCols = child.cols || process.stdout.columns || 80;
+          const origRows = child.rows || process.stdout.rows || 30;
+          child.resize(origCols - 1, origRows);
+          setTimeout(() => child.resize(origCols, origRows), 150);
         }
         reconnectAttempts = 0;
       });
