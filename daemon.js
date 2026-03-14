@@ -416,15 +416,13 @@ function submitViaPty(session) {
 // Send text directly to Kitty tab via remote control (bypasses allow bridge entirely)
 function sendViaKitty(sessionId, text) {
   const { execSync } = require('child_process');
-  const socketPaths = ['/tmp/kitty-sock', `/tmp/kitty-${process.getuid()}`];
+  // Find kitty socket: /tmp/kitty-sock or /tmp/kitty-sock-PID
+  const fs = require('fs');
   let socket = null;
-  for (const p of socketPaths) {
-    try {
-      require('fs').accessSync(p);
-      socket = p;
-      break;
-    } catch { /* skip */ }
-  }
+  try {
+    const files = fs.readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
+    if (files.length > 0) socket = '/tmp/' + files[0];
+  } catch { /* /tmp not readable */ }
   if (!socket) return false;
 
   try {
