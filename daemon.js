@@ -193,7 +193,14 @@ app.post('/api/sessions/spawn', (req, res) => {
 app.post('/api/sessions/register', (req, res) => {
   const { session_id, command, cwd = process.cwd() } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is required' });
-  if (sessions[session_id]) return res.status(409).json({ error: `Session ID '${session_id}' is already active.` });
+  // Idempotent: allow re-registration (update command/cwd, keep clients)
+  if (sessions[session_id]) {
+    const existing = sessions[session_id];
+    if (command) existing.command = command;
+    if (cwd) existing.cwd = cwd;
+    console.log(`[REGISTER] Re-registered session ${session_id} (updated metadata)`);
+    return res.status(200).json({ session_id, type: 'wrapped', command: existing.command, cwd: existing.cwd, reregistered: true });
+  }
 
   const sessionRecord = {
     id: session_id,
