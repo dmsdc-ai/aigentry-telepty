@@ -726,15 +726,18 @@ async function main() {
     });
 
     // Receive inject messages from daemon
+    let lastInjectTextTime = 0;
     daemonWs.on('message', (message) => {
       try {
         const msg = JSON.parse(message);
         if (msg.type === 'inject') {
-          if (promptReady) {
+          // Allow \r through if it follows a recently-written inject text (within 1s)
+          const isFollowUpCr = msg.data === '\r' && (Date.now() - lastInjectTextTime) < 1000;
+          if (promptReady || isFollowUpCr) {
             child.write(msg.data);
-            // After writing prompt text (not \r), mark as not ready until next prompt
             if (msg.data !== '\r' && msg.data.length > 1) {
               promptReady = false;
+              lastInjectTextTime = Date.now();
             }
           } else {
             injectQueue.push(msg.data);
