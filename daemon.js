@@ -662,42 +662,42 @@ app.post('/api/sessions/:id/inject', (req, res) => {
       if (!session.kittyWindowId && sock) session.kittyWindowId = findKittyWindowId(sock, id);
       const wid = session.kittyWindowId;
 
-      // Always send via WS too (for new allow bridges with queue flush)
-      writeToSession(finalPrompt);
-
+      let kittyOk = false;
       if (wid && sock) {
-        // Kitty send-text for reliable text delivery
+        // Kitty send-text primary (bypasses allow bridge queue)
         try {
           const escaped = finalPrompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
           require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} '${escaped}'`, {
             timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
           });
+          kittyOk = true;
           console.log(`[INJECT] Kitty send-text for ${id} (window ${wid})`);
         } catch {}
+      }
+      if (!kittyOk) {
+        // Fallback: WS (works with new allow bridges that have queue flush)
+        writeToSession(finalPrompt);
+        console.log(`[INJECT] WS fallback for ${id}`);
+      }
 
-        if (!no_enter) {
-          setTimeout(() => {
+      if (!no_enter) {
+        setTimeout(() => {
+          if (wid && sock) {
             try {
-              writeToSession('\r'); // WS \r for new bridges
               require('child_process').execSync(`kitty @ --to unix:${sock} send-key --match id:${wid} Return`, {
                 timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
               });
               require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${wid} '⚡ telepty :: ${id}'`, {
                 timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
               });
-            } catch {}
-          }, 500);
-          submitResult = { deferred: true, strategy: 'kitty_text_key' };
-        }
-      } else {
-        // No kitty — WS only
-        if (!no_enter) {
-          setTimeout(() => {
+            } catch {
+              writeToSession('\r');
+            }
+          } else {
             writeToSession('\r');
-            console.log(`[INJECT+SUBMIT] WS-only split_cr for ${id}`);
-          }, 300);
-          submitResult = { deferred: true, strategy: 'ws_split_cr' };
-        }
+          }
+        }, 500);
+        submitResult = { deferred: true, strategy: kittyOk ? 'kitty_text_key' : 'ws_split_cr' };
       }
     } else {
       // Spawned sessions: direct PTY write
