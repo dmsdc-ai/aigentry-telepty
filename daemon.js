@@ -426,9 +426,9 @@ function sendViaKitty(sessionId, text) {
   if (!socket) return false;
 
   try {
-    // Match by tab title containing session ID
+    // Match by cmdline containing session ID (works even when CLI overwrites tab title)
     const escaped = text.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
-    execSync(`kitty @ --to unix:${socket} send-text --match title:${sessionId} '${escaped}'`, {
+    execSync(`kitty @ --to unix:${socket} send-text --match cmdline:${sessionId} '${escaped}'`, {
       timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
     });
     console.log(`[KITTY] Sent ${text.length} chars to ${sessionId}`);
@@ -1045,7 +1045,8 @@ wss.on('connection', (ws, req) => {
     };
     sessions[sessionId] = autoSession;
     console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect`);
-    // Skip to message/close handlers below (ownerWs already set)
+    // Trigger CLI redraw via kitty Ctrl+L after short delay
+    setTimeout(() => sendViaKitty(sessionId, '\x0c'), 1000);
   } else {
     session.clients.add(ws);
   }
