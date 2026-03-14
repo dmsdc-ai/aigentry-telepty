@@ -143,6 +143,7 @@ app.post('/api/sessions/spawn', (req, res) => {
       command,
       cwd,
       createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
       clients: new Set(),
       isClosing: false
     };
@@ -210,6 +211,7 @@ app.post('/api/sessions/register', (req, res) => {
     command: command || 'wrapped',
     cwd,
     createdAt: new Date().toISOString(),
+    lastActivityAt: new Date().toISOString(),
     clients: new Set(),
     isClosing: false
   };
@@ -252,14 +254,24 @@ app.post('/api/sessions/register', (req, res) => {
 });
 
 app.get('/api/sessions', (req, res) => {
-  const list = Object.entries(sessions).map(([id, session]) => ({
-    id,
-    type: session.type || 'spawned',
-    command: session.command,
-    cwd: session.cwd,
-    createdAt: session.createdAt,
-    active_clients: session.clients.size
-  }));
+  const idleGt = req.query.idle_gt ? Number(req.query.idle_gt) : null;
+  const now = Date.now();
+  let list = Object.entries(sessions).map(([id, session]) => {
+    const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
+    return {
+      id,
+      type: session.type || 'spawned',
+      command: session.command,
+      cwd: session.cwd,
+      createdAt: session.createdAt,
+      lastActivityAt: session.lastActivityAt || null,
+      idleSeconds,
+      active_clients: session.clients.size
+    };
+  });
+  if (idleGt !== null) {
+    list = list.filter(s => s.idleSeconds !== null && s.idleSeconds > idleGt);
+  }
   res.json(list);
 });
 
@@ -268,6 +280,7 @@ app.get('/api/sessions/:id', (req, res) => {
   const resolvedId = resolveSessionAlias(requestedId);
   if (!resolvedId) return res.status(404).json({ error: 'Session not found' });
   const session = sessions[resolvedId];
+  const idleSeconds = session.lastActivityAt ? Math.floor((Date.now() - new Date(session.lastActivityAt).getTime()) / 1000) : null;
   res.json({
     id: resolvedId,
     alias: requestedId !== resolvedId ? requestedId : null,
@@ -275,6 +288,8 @@ app.get('/api/sessions/:id', (req, res) => {
     command: session.command,
     cwd: session.cwd,
     createdAt: session.createdAt,
+    lastActivityAt: session.lastActivityAt || null,
+    idleSeconds,
     active_clients: session.clients ? session.clients.size : 0,
     lastInjectFrom: session.lastInjectFrom || null,
     lastInjectReplyTo: session.lastInjectReplyTo || null
@@ -611,6 +626,7 @@ app.post('/api/sessions/:id/inject', (req, res) => {
   if (from) session.lastInjectFrom = from;
   if (reply_to) session.lastInjectReplyTo = reply_to;
   if (thread_id) session.lastThreadId = thread_id;
+  session.lastActivityAt = new Date().toISOString();
 
   // Auto-prepend [from:] [reply-to:] header if from is set and not already in prompt
   let finalPrompt = prompt;
@@ -1037,8 +1053,11 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
 });
 
+const IDLE_THRESHOLD_SECONDS = 60;
 setInterval(() => {
+  const now = Date.now();
   for (const [id, session] of Object.entries(sessions)) {
+    const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
     const healthMsg = JSON.stringify({
       type: 'session_health',
       session_id: id,
@@ -1046,13 +1065,34 @@ setInterval(() => {
         alive: session.type === 'wrapped' ? (session.ownerWs && session.ownerWs.readyState === 1) : (session.ptyProcess && !session.ptyProcess.killed),
         pid: session.ptyProcess?.pid || null,
         type: session.type,
-        clients: session.clients ? session.clients.size : 0
+        clients: session.clients ? session.clients.size : 0,
+        idleSeconds
       },
       timestamp: new Date().toISOString()
     });
     busClients.forEach(client => {
       if (client.readyState === 1) client.send(healthMsg);
     });
+
+    // Emit session.idle when idle exceeds threshold
+    if (idleSeconds !== null && idleSeconds >= IDLE_THRESHOLD_SECONDS && !session._idleEmitted) {
+      session._idleEmitted = true;
+      const idleMsg = JSON.stringify({
+        type: 'session.idle',
+        session_id: id,
+        idleSeconds,
+        lastActivityAt: session.lastActivityAt,
+        timestamp: new Date().toISOString()
+      });
+      busClients.forEach(client => {
+        if (client.readyState === 1) client.send(idleMsg);
+      });
+      console.log(`[IDLE] Session ${id} idle for ${idleSeconds}s`);
+    }
+    // Reset idle flag when activity resumes
+    if (idleSeconds !== null && idleSeconds < IDLE_THRESHOLD_SECONDS) {
+      session._idleEmitted = false;
+    }
   }
 }, 10000);
 
@@ -1085,6 +1125,7 @@ wss.on('connection', (ws, req) => {
       command: 'wrapped',
       cwd: process.cwd(),
       createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
       clients: new Set([ws]),
       isClosing: false
     };
@@ -1123,8 +1164,9 @@ wss.on('connection', (ws, req) => {
 
       if (activeSession.type === 'wrapped') {
         if (ws === activeSession.ownerWs) {
-          // Owner sending output -> broadcast to other clients
+          // Owner sending output -> broadcast to other clients + update activity
           if (type === 'output') {
+            activeSession.lastActivityAt = new Date().toISOString();
             activeSession.clients.forEach(client => {
               if (client !== ws && client.readyState === 1) {
                 client.send(JSON.stringify({ type: 'output', data }));
