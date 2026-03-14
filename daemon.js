@@ -10,6 +10,7 @@ const { claimDaemonState, clearDaemonState } = require('./daemon-control');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
+const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
 const fs = require('fs');
 const SESSION_PERSIST_PATH = require('path').join(os.homedir(), '.config', 'aigentry-telepty', 'sessions.json');
 
@@ -35,13 +36,28 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
+const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
+
+function isAllowedPeer(ip) {
+  if (!ip) return false;
+  const cleanIp = ip.replace('::ffff:', '');
+  // Localhost always allowed
+  if (cleanIp === '127.0.0.1' || ip === '::1') return true;
+  // Tailscale range (100.x.y.z)
+  if (cleanIp.startsWith('100.')) return true;
+  // Peer allowlist
+  if (PEER_ALLOWLIST.length > 0) return PEER_ALLOWLIST.includes(cleanIp);
+  // No allowlist = allow all authenticated
+  return false;
+}
+
 // Authentication Middleware
 app.use((req, res, next) => {
-  const isLocalhost = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
-  const isTailscale = req.ip && req.ip.startsWith('100.');
-  
-  if (isLocalhost || isTailscale) {
-    return next(); // Trust local and Tailscale networks
+  const clientIp = req.ip;
+
+  if (isAllowedPeer(clientIp)) {
+    return next(); // Trust local, Tailscale, and allowlisted peers
   }
 
   const token = req.headers['x-telepty-token'] || req.query.token;
@@ -49,7 +65,7 @@ app.use((req, res, next) => {
     return next();
   }
 
-  console.warn(`[AUTH] Rejected unauthorized request from ${req.ip}`);
+  console.warn(`[AUTH] Rejected unauthorized request from ${clientIp}`);
   res.status(401).json({ error: 'Unauthorized: Invalid or missing token.' });
 });
 
@@ -295,8 +311,10 @@ app.get('/api/sessions', (req, res) => {
   const now = Date.now();
   let list = Object.entries(sessions).map(([id, session]) => {
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
+    const projectId = session.cwd ? session.cwd.split('/').pop() : null;
     return {
       id,
+      locator: { machine_id: MACHINE_ID, session_id: id, project_id: projectId },
       type: session.type || 'spawned',
       command: session.command,
       cwd: session.cwd,
@@ -318,8 +336,10 @@ app.get('/api/sessions/:id', (req, res) => {
   if (!resolvedId) return res.status(404).json({ error: 'Session not found' });
   const session = sessions[resolvedId];
   const idleSeconds = session.lastActivityAt ? Math.floor((Date.now() - new Date(session.lastActivityAt).getTime()) / 1000) : null;
+  const projectId = session.cwd ? session.cwd.split('/').pop() : null;
   res.json({
     id: resolvedId,
+    locator: { machine_id: MACHINE_ID, session_id: resolvedId, project_id: projectId },
     alias: requestedId !== resolvedId ? requestedId : null,
     type: session.type || 'spawned',
     command: session.command,
@@ -340,6 +360,7 @@ app.get('/api/meta', (req, res) => {
     pid: process.pid,
     host: HOST,
     port: Number(PORT),
+    machine_id: MACHINE_ID,
     capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads']
   });
 });
@@ -924,6 +945,7 @@ function busAutoRoute(msg) {
     type: 'inject_written',
     inject_id,
     sender: 'daemon',
+    source_host: MACHINE_ID,
     target_agent: targetId,
     source_type: 'bus_auto_route',
     delivered,
@@ -1379,10 +1401,7 @@ server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://' + req.headers.host);
   const token = url.searchParams.get('token');
   
-  const isLocalhost = req.socket.remoteAddress === '127.0.0.1' || req.socket.remoteAddress === '::1' || req.socket.remoteAddress === '::ffff:127.0.0.1';
-  const isTailscale = req.socket.remoteAddress && req.socket.remoteAddress.startsWith('100.');
-  
-  if (!isLocalhost && !isTailscale && token !== EXPECTED_TOKEN) {
+  if (!isAllowedPeer(req.socket.remoteAddress) && token !== EXPECTED_TOKEN) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;

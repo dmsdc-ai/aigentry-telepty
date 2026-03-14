@@ -1,6 +1,6 @@
 # Telepty Bus Event Schema Standard
 
-Version: 1.0 (2026-03-15)
+Version: 2.0 (2026-03-15)
 Agreed by: telepty, deliberation, devkit, brain, orchestrator
 
 ## Transport
@@ -13,9 +13,11 @@ Agreed by: telepty, deliberation, devkit, brain, orchestrator
 
 ```json
 {
+  "version": 1,
   "message_id": "string (UUID or prefixed ID)",
   "kind": "string (event type)",
   "source": "string (sender identifier)",
+  "source_host": "string (machine_id of sender, e.g. hostname or Tailscale IP)",
   "target": "string | null (target session ID, optional @host suffix)",
   "ts": "ISO 8601 timestamp"
 }
@@ -25,11 +27,37 @@ Agreed by: telepty, deliberation, devkit, brain, orchestrator
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `version` | number | Envelope schema version (currently 1) |
 | `kind` | string | Event type (NOT `type` — `kind` is canonical) |
 | `target` | string | Target telepty session ID. May include `@host` suffix for remote |
 | `source` | string | Sender identifier (format: `project:session_id`) |
+| `source_host` | string | Machine ID of sender (hostname or TELEPTY_MACHINE_ID) |
 | `message_id` | string | Unique message identifier |
 | `ts` | string | ISO 8601 timestamp |
+
+## Cross-Machine Addressing
+
+### Session Locator
+Every session is uniquely identified by a locator triple:
+```json
+{ "machine_id": "hostname", "session_id": "aigentry-devkit-001", "project_id": "aigentry-devkit" }
+```
+
+### Remote Target Format
+`target` field supports `@host` suffix: `aigentry-devkit-001@100.100.100.5`
+- Router strips suffix, resolves session on local daemon
+- For cross-machine relay (P3), daemon forwards to target host
+
+### Machine ID
+- Default: `os.hostname()`
+- Override: `TELEPTY_MACHINE_ID` env var
+- Exposed in: `GET /api/meta` (`machine_id` field), session `locator` object, bus event `source_host`
+
+### Peer Auth
+- Localhost: always trusted
+- Tailscale (100.x.y.z): trusted by default
+- Custom peers: `TELEPTY_PEER_ALLOWLIST=ip1,ip2` env var
+- All others: require `x-telepty-token` header
 
 ## Routable Events (Auto-Router)
 
