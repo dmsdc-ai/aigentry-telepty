@@ -454,11 +454,21 @@ function sendViaKitty(sessionId, text) {
   }
 
   try {
-    const escaped = text.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
-    execSync(`kitty @ --to unix:${socket} send-text --match id:${windowId} '${escaped}'`, {
-      timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-    });
-    console.log(`[KITTY] Sent ${text.length} chars to ${sessionId} (window ${windowId})`);
+    // Split text and CR — send-text for content, send-key for Enter
+    const hasCr = text.endsWith('\r') || text.endsWith('\n');
+    const textOnly = hasCr ? text.slice(0, -1) : text;
+    if (textOnly.length > 0) {
+      const escaped = textOnly.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
+      execSync(`kitty @ --to unix:${socket} send-text --match id:${windowId} '${escaped}'`, {
+        timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+      });
+    }
+    if (hasCr) {
+      execSync(`kitty @ --to unix:${socket} send-key --match id:${windowId} Return`, {
+        timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+      });
+    }
+    console.log(`[KITTY] Sent ${textOnly.length} chars${hasCr ? ' + Return' : ''} to ${sessionId} (window ${windowId})`);
     return true;
   } catch (err) {
     console.error(`[KITTY] Failed for ${sessionId}:`, err.message);
