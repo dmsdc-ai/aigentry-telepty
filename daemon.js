@@ -74,6 +74,32 @@ function buildSessionEnv(sessionId) {
   return env;
 }
 
+// Stable alias routing: resolve alias to latest session with matching prefix
+function resolveSessionAlias(requestedId) {
+  // Exact match first
+  if (sessions[requestedId]) return requestedId;
+
+  // Strip trailing version number to get base alias (e.g., "aigentry-dustcraw-002" → "aigentry-dustcraw")
+  // Also handles bare alias like "aigentry-dustcraw"
+  const baseAlias = requestedId.replace(/-\d+$/, '');
+
+  // Find all sessions matching the base alias
+  const candidates = Object.keys(sessions).filter(id => {
+    const candidateBase = id.replace(/-\d+$/, '');
+    return candidateBase === baseAlias;
+  });
+
+  if (candidates.length === 0) return null;
+
+  // Return the most recently created session
+  candidates.sort((a, b) => {
+    const timeA = new Date(sessions[a].createdAt).getTime();
+    const timeB = new Date(sessions[b].createdAt).getTime();
+    return timeB - timeA;
+  });
+  return candidates[0];
+}
+
 app.post('/api/sessions/spawn', (req, res) => {
   const { session_id, command, args = [], cwd = process.cwd(), cols = 80, rows = 30, type = 'AGENT' } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is strictly required.' });
@@ -180,6 +206,26 @@ app.post('/api/sessions/register', (req, res) => {
     clients: new Set(),
     isClosing: false
   };
+  // Check for existing session with same base alias and emit replaced event
+  const baseAlias = session_id.replace(/-\d+$/, '');
+  const replaced = Object.keys(sessions).find(id => {
+    return id !== session_id && id.replace(/-\d+$/, '') === baseAlias;
+  });
+  if (replaced) {
+    const replacedMsg = JSON.stringify({
+      type: 'session.replaced',
+      sender: 'daemon',
+      old_id: replaced,
+      new_id: session_id,
+      alias: baseAlias,
+      timestamp: new Date().toISOString()
+    });
+    busClients.forEach(client => {
+      if (client.readyState === 1) client.send(replacedMsg);
+    });
+    console.log(`[ALIAS] Session '${replaced}' replaced by '${session_id}' (alias: ${baseAlias})`);
+  }
+
   sessions[session_id] = sessionRecord;
 
   const busMsg = JSON.stringify({
@@ -211,11 +257,13 @@ app.get('/api/sessions', (req, res) => {
 });
 
 app.get('/api/sessions/:id', (req, res) => {
-  const { id } = req.params;
-  const session = sessions[id];
-  if (!session) return res.status(404).json({ error: 'Session not found' });
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return res.status(404).json({ error: 'Session not found' });
+  const session = sessions[resolvedId];
   res.json({
-    id,
+    id: resolvedId,
+    alias: requestedId !== resolvedId ? requestedId : null,
     type: session.type || 'spawned',
     command: session.command,
     cwd: session.cwd,
@@ -417,9 +465,11 @@ function submitViaOsascript(sessionId, keyCombo) {
 
 // POST /api/sessions/:id/submit — CLI-aware submit
 app.post('/api/sessions/:id/submit', (req, res) => {
-  const { id } = req.params;
-  const session = sessions[id];
-  if (!session) return res.status(404).json({ error: 'Session not found' });
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+  const session = sessions[resolvedId];
+  const id = resolvedId;
 
   const strategy = getSubmitStrategy(session.command);
   console.log(`[SUBMIT] Session ${id} (${session.command}) using strategy: ${strategy}`);
@@ -475,10 +525,12 @@ app.post('/api/sessions/submit-all', (req, res) => {
 });
 
 app.post('/api/sessions/:id/inject', (req, res) => {
-  const { id } = req.params;
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+  const session = sessions[resolvedId];
+  const id = resolvedId;
   const { prompt, no_enter, auto_submit, from, reply_to } = req.body;
-  const session = sessions[id];
-  if (!session) return res.status(404).json({ error: 'Session not found' });
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
   if (from) session.lastInjectFrom = from;
   if (reply_to) session.lastInjectReplyTo = reply_to;
@@ -529,6 +581,10 @@ app.post('/api/sessions/:id/inject', (req, res) => {
       if (client.readyState === 1) client.send(busMsg);
     });
 
+    if (requestedId !== resolvedId) {
+      console.log(`[ALIAS] Resolved '${requestedId}' → '${resolvedId}'`);
+    }
+
     if (from && reply_to) {
       const routedMsg = JSON.stringify({
         type: 'message_routed',
@@ -564,10 +620,12 @@ app.post('/api/sessions/:id/inject', (req, res) => {
 });
 
 app.patch('/api/sessions/:id', (req, res) => {
-  const { id } = req.params;
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+  const session = sessions[resolvedId];
+  const id = resolvedId;
   const { new_id } = req.body;
-  const session = sessions[id];
-  if (!session) return res.status(404).json({ error: 'Session not found' });
   if (!new_id) return res.status(400).json({ error: 'new_id is required' });
   if (sessions[new_id]) return res.status(409).json({ error: `Session ID '${new_id}' is already in use.` });
 
@@ -593,9 +651,11 @@ app.patch('/api/sessions/:id', (req, res) => {
 });
 
 app.delete('/api/sessions/:id', (req, res) => {
-  const { id } = req.params;
-  const session = sessions[id];
-  if (!session) return res.status(404).json({ error: 'Session not found' });
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+  const session = sessions[resolvedId];
+  const id = resolvedId;
   if (session.isClosing) return res.json({ success: true, status: 'closing' });
   try {
     session.isClosing = true;

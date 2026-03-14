@@ -716,48 +716,82 @@ async function main() {
       promptReady = false;
     }
 
-    // Connect to daemon WebSocket for inject reception and output relay
+    // Connect to daemon WebSocket with auto-reconnect
     const wsUrl = `ws://${REMOTE_HOST}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
-    const daemonWs = new WebSocket(wsUrl);
+    let daemonWs = null;
     let wsReady = false;
-
-    daemonWs.on('open', () => {
-      wsReady = true;
-    });
-
-    // Receive inject messages from daemon
+    let reconnectAttempts = 0;
+    let reconnectTimer = null;
     let lastInjectTextTime = 0;
-    daemonWs.on('message', (message) => {
-      try {
-        const msg = JSON.parse(message);
-        if (msg.type === 'inject') {
-          // Allow \r through if it follows a recently-written inject text (within 1s)
-          const isFollowUpCr = msg.data === '\r' && (Date.now() - lastInjectTextTime) < 1000;
-          if (promptReady || isFollowUpCr) {
-            child.write(msg.data);
-            if (msg.data !== '\r' && msg.data.length > 1) {
-              promptReady = false;
-              lastInjectTextTime = Date.now();
-            }
-          } else {
-            injectQueue.push(msg.data);
+    const MAX_RECONNECT_DELAY = 30000;
+
+    function connectDaemonWs() {
+      daemonWs = new WebSocket(wsUrl);
+
+      daemonWs.on('open', async () => {
+        wsReady = true;
+        if (reconnectAttempts > 0) {
+          console.error(`\n\x1b[32m⚡ Reconnected to daemon. Inject restored.\x1b[0m`);
+          // Re-register session on reconnect
+          try {
+            await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ session_id: sessionId, command, cwd: process.cwd() })
+            });
+          } catch (e) {
+            // Registration may fail if session already exists, that's fine
           }
-        } else if (msg.type === 'resize') {
-          child.resize(msg.cols, msg.rows);
         }
-      } catch (e) {
-        // ignore malformed messages
+        reconnectAttempts = 0;
+      });
+
+      daemonWs.on('message', (message) => {
+        try {
+          const msg = JSON.parse(message);
+          if (msg.type === 'inject') {
+            const isFollowUpCr = msg.data === '\r' && (Date.now() - lastInjectTextTime) < 1000;
+            if (promptReady || isFollowUpCr) {
+              child.write(msg.data);
+              if (msg.data !== '\r' && msg.data.length > 1) {
+                promptReady = false;
+                lastInjectTextTime = Date.now();
+              }
+            } else {
+              injectQueue.push(msg.data);
+            }
+          } else if (msg.type === 'resize') {
+            child.resize(msg.cols, msg.rows);
+          }
+        } catch (e) {
+          // ignore malformed messages
+        }
+      });
+
+      daemonWs.on('close', () => {
+        wsReady = false;
+        scheduleReconnect();
+      });
+
+      daemonWs.on('error', () => {
+        // Error will be followed by close event
+      });
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectAttempts++;
+      const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
+      if (reconnectAttempts === 1) {
+        console.error(`\n\x1b[33m⚠️ Disconnected from daemon. Reconnecting...\x1b[0m`);
       }
-    });
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectDaemonWs();
+      }, delay);
+    }
 
-    daemonWs.on('close', () => {
-      wsReady = false;
-      console.error(`\n\x1b[33m⚠️ Disconnected from daemon. Inject unavailable. Session continues locally.\x1b[0m`);
-    });
-
-    daemonWs.on('error', () => {
-      // silently handle
-    });
+    connectDaemonWs();
 
     // Set terminal title
     process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
@@ -804,6 +838,7 @@ async function main() {
 
       // Deregister from daemon
       fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }).catch(() => {});
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       daemonWs.close();
       process.exit(exitCode || 0);
     });
