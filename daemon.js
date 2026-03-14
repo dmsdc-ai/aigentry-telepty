@@ -10,6 +10,26 @@ const { claimDaemonState, clearDaemonState } = require('./daemon-control');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
+const fs = require('fs');
+const SESSION_PERSIST_PATH = require('path').join(os.homedir(), '.config', 'aigentry-telepty', 'sessions.json');
+
+function persistSessions() {
+  try {
+    const data = {};
+    for (const [id, s] of Object.entries(sessions)) {
+      data[id] = { id, type: s.type, command: s.command, cwd: s.cwd, createdAt: s.createdAt, lastActivityAt: s.lastActivityAt || null };
+    }
+    fs.mkdirSync(require('path').dirname(SESSION_PERSIST_PATH), { recursive: true });
+    fs.writeFileSync(SESSION_PERSIST_PATH, JSON.stringify(data, null, 2));
+  } catch {}
+}
+
+function loadPersistedSessions() {
+  try {
+    if (!fs.existsSync(SESSION_PERSIST_PATH)) return {};
+    return JSON.parse(fs.readFileSync(SESSION_PERSIST_PATH, 'utf8'));
+  } catch { return {}; }
+}
 
 const app = express();
 app.use(cors());
@@ -48,6 +68,21 @@ if (!daemonClaim.claimed) {
 const sessions = {};
 const handoffs = {};
 const threads = {};
+
+// Restore persisted session metadata (wrapped sessions await reconnect)
+const _persisted = loadPersistedSessions();
+for (const [id, meta] of Object.entries(_persisted)) {
+  if (meta.type === 'wrapped') {
+    sessions[id] = {
+      id, type: 'wrapped', ptyProcess: null, ownerWs: null,
+      command: meta.command || 'wrapped', cwd: meta.cwd || process.cwd(),
+      createdAt: meta.createdAt || new Date().toISOString(),
+      lastActivityAt: meta.lastActivityAt || new Date().toISOString(),
+      clients: new Set(), isClosing: false
+    };
+    console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
+  }
+}
 const STRIPPED_SESSION_ENV_KEYS = [
   'CLAUDECODE',
   'CODEX_CI',
@@ -185,6 +220,7 @@ app.post('/api/sessions/spawn', (req, res) => {
     });
 
     console.log(`[SPAWN] Created session ${session_id} (${command})`);
+    persistSessions();
     res.status(201).json({ session_id, command, cwd });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -250,6 +286,7 @@ app.post('/api/sessions/register', (req, res) => {
   });
 
   console.log(`[REGISTER] Registered wrapped session ${session_id}`);
+  persistSessions();
   res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd });
 });
 
@@ -814,9 +851,11 @@ app.delete('/api/sessions/:id', (req, res) => {
       session.clients.forEach(ws => ws.close(1000, 'Session destroyed'));
       delete sessions[id];
       console.log(`[KILL] Wrapped session ${id} removed`);
+      persistSessions();
     } else {
       session.ptyProcess.kill();
       console.log(`[KILL] Session ${id} forcefully closed`);
+      persistSessions();
     }
     res.json({ success: true, status: 'closing' });
   } catch (err) {
