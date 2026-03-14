@@ -589,7 +589,7 @@ function sendViaKitty(sessionId, text) {
   }
 
   try {
-    // Split text and CR — send-text for content, send-key for Enter
+    // Split text and CR — send-text for both (send-key corrupts keyboard protocol)
     const hasCr = text.endsWith('\r') || text.endsWith('\n');
     const textOnly = hasCr ? text.slice(0, -1) : text;
     if (textOnly.length > 0) {
@@ -601,7 +601,7 @@ function sendViaKitty(sessionId, text) {
     if (hasCr) {
       // Delay before sending Return — CLI needs time to process text input
       execSync('sleep 0.5', { timeout: 2000 });
-      execSync(`kitty @ --to unix:${socket} send-key --match id:${windowId} Return`, {
+      execSync(`kitty @ --to unix:${socket} send-text --match id:${windowId} $'\\r'`, {
         timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
       });
     }
@@ -797,7 +797,7 @@ app.post('/api/sessions/:id/inject', (req, res) => {
         setTimeout(() => {
           if (wid && sock) {
             try {
-              require('child_process').execSync(`kitty @ --to unix:${sock} send-key --match id:${wid} Return`, {
+              require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
                 timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
               });
               require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${wid} '⚡ telepty :: ${id}'`, {
@@ -970,7 +970,7 @@ function busAutoRoute(msg) {
       });
       setTimeout(() => {
         try {
-          require('child_process').execSync(`kitty @ --to unix:${sock} send-key --match id:${wid} Return`, {
+          require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
             timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
           });
         } catch {}
