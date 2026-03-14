@@ -633,8 +633,9 @@ app.post('/api/sessions/:id/inject', (req, res) => {
   if (from && !prompt.startsWith('[from:')) {
     finalPrompt = `[from: ${from}] [reply-to: ${reply_to}] ${prompt}`;
   }
-  // Append reply guide when reply_to is set (self-contained reply instructions)
-  if (reply_to && reply_to !== id) {
+  // Append reply guide when reply_to is set, UNLESS message contains termination signal
+  const TERMINATION_SIGNALS = /no further reply needed|thread closed|closed on .+ side|ack received|ack-only|회신 불필요|스레드 종료/i;
+  if (reply_to && reply_to !== id && !TERMINATION_SIGNALS.test(prompt)) {
     finalPrompt += `\n\n---\n[reply-to: ${reply_to}] 위 세션에 회신이 필요합니다. 답변 시 아래 명령을 실행하세요:\ntelepty inject --from ${id} ${reply_to} "답변 내용"\n---`;
   }
   const inject_id = crypto.randomUUID();
