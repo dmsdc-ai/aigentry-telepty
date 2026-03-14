@@ -981,29 +981,44 @@ wss.on('connection', (ws, req) => {
   const session = sessions[sessionId];
 
   if (!session) {
-    ws.close(1008, 'Session not found');
-    return;
+    // Auto-register wrapped session on WS connect (supports reconnect after daemon restart)
+    const autoSession = {
+      id: sessionId,
+      type: 'wrapped',
+      ptyProcess: null,
+      ownerWs: ws,
+      command: 'wrapped',
+      cwd: process.cwd(),
+      createdAt: new Date().toISOString(),
+      clients: new Set([ws]),
+      isClosing: false
+    };
+    sessions[sessionId] = autoSession;
+    console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect`);
+    // Skip to message/close handlers below (ownerWs already set)
+  } else {
+    session.clients.add(ws);
   }
 
-  session.clients.add(ws);
+  const activeSession = sessions[sessionId];
 
   // For wrapped sessions, first connector becomes the owner
-  if (session.type === 'wrapped' && !session.ownerWs) {
-    session.ownerWs = ws;
-    console.log(`[WS] Wrap owner connected for session ${sessionId} (Total: ${session.clients.size})`);
+  if (activeSession.type === 'wrapped' && !activeSession.ownerWs) {
+    activeSession.ownerWs = ws;
+    console.log(`[WS] Wrap owner connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
   } else {
-    console.log(`[WS] Client attached to session ${sessionId} (Total: ${session.clients.size})`);
+    console.log(`[WS] Client attached to session ${sessionId} (Total: ${activeSession.clients.size})`);
   }
 
   ws.on('message', (message) => {
     try {
       const { type, data, cols, rows } = JSON.parse(message);
 
-      if (session.type === 'wrapped') {
-        if (ws === session.ownerWs) {
+      if (activeSession.type === 'wrapped') {
+        if (ws === activeSession.ownerWs) {
           // Owner sending output -> broadcast to other clients
           if (type === 'output') {
-            session.clients.forEach(client => {
+            activeSession.clients.forEach(client => {
               if (client !== ws && client.readyState === 1) {
                 client.send(JSON.stringify({ type: 'output', data }));
               }
@@ -1011,18 +1026,18 @@ wss.on('connection', (ws, req) => {
           }
         } else {
           // Non-owner client input -> forward to owner as inject
-          if (type === 'input' && session.ownerWs && session.ownerWs.readyState === 1) {
-            session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
-          } else if (type === 'resize' && session.ownerWs && session.ownerWs.readyState === 1) {
-            session.ownerWs.send(JSON.stringify({ type: 'resize', cols, rows }));
+          if (type === 'input' && activeSession.ownerWs && activeSession.ownerWs.readyState === 1) {
+            activeSession.ownerWs.send(JSON.stringify({ type: 'inject', data }));
+          } else if (type === 'resize' && activeSession.ownerWs && activeSession.ownerWs.readyState === 1) {
+            activeSession.ownerWs.send(JSON.stringify({ type: 'resize', cols, rows }));
           }
         }
       } else {
         // Existing spawned session logic
         if (type === 'input') {
-          session.ptyProcess.write(data);
+          activeSession.ptyProcess.write(data);
         } else if (type === 'resize') {
-          session.ptyProcess.resize(cols, rows);
+          activeSession.ptyProcess.resize(cols, rows);
         }
       }
     } catch (e) {
@@ -1031,17 +1046,17 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    session.clients.delete(ws);
-    if (session.type === 'wrapped' && ws === session.ownerWs) {
-      session.ownerWs = null;
-      console.log(`[WS] Wrap owner disconnected from session ${sessionId} (Total: ${session.clients.size})`);
+    activeSession.clients.delete(ws);
+    if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+      activeSession.ownerWs = null;
+      console.log(`[WS] Wrap owner disconnected from session ${sessionId} (Total: ${activeSession.clients.size})`);
       // Clean up wrapped session when owner disconnects and no other clients
-      if (session.clients.size === 0 && !session.isClosing) {
+      if (activeSession.clients.size === 0 && !activeSession.isClosing) {
         delete sessions[sessionId];
         console.log(`[CLEANUP] Wrapped session ${sessionId} removed (owner disconnected)`);
       }
     } else {
-      console.log(`[WS] Client detached from session ${sessionId} (Total: ${session.clients.size})`);
+      console.log(`[WS] Client detached from session ${sessionId} (Total: ${activeSession.clients.size})`);
     }
   });
 });
