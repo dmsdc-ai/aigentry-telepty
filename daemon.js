@@ -608,6 +608,10 @@ app.post('/api/sessions/:id/inject', (req, res) => {
   if (from && !prompt.startsWith('[from:')) {
     finalPrompt = `[from: ${from}] [reply-to: ${reply_to}] ${prompt}`;
   }
+  // Append reply guide when reply_to is set (self-contained reply instructions)
+  if (reply_to && reply_to !== id) {
+    finalPrompt += `\n\n---\n[reply-to: ${reply_to}] 위 세션에 회신이 필요합니다. 답변 시 아래 명령을 실행하세요:\ntelepty inject --from ${id} ${reply_to} "답변 내용"\n---`;
+  }
   const inject_id = crypto.randomUUID();
   try {
     // Always inject text WITHOUT \r first, then send \r separately after delay
