@@ -744,7 +744,7 @@ async function main() {
       daemonWs.on('open', () => {
         wsReady = true;
         if (reconnectAttempts > 0) {
-          console.error(`\n\x1b[32m⚡ Reconnected to daemon. Inject restored.\x1b[0m`);
+          // Silent reconnect — no console output to avoid breaking TUI rendering
           // Force CLI redraw by triggering SIGWINCH (resize +1/-1)
           const origCols = child.cols || process.stdout.columns || 80;
           const origRows = child.rows || process.stdout.rows || 30;
@@ -791,7 +791,7 @@ async function main() {
       reconnectAttempts++;
       const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
       if (reconnectAttempts === 1) {
-        console.error(`\n\x1b[33m⚠️ Disconnected from daemon. Reconnecting...\x1b[0m`);
+        // Silent — no console output to avoid breaking TUI rendering
       }
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
@@ -818,9 +818,9 @@ async function main() {
     // Intercept terminal title escape sequences and prefix with session ID
     const titlePrefix = `\u26A1 ${sessionId}`;
     function rewriteTitleSequences(output) {
-      // Match OSC title sequences: \x1b]0;TITLE\x07 or \x1b]2;TITLE\x07
-      return output.replace(/\x1b\]([02]);([^\x07]*)\x07/g, (match, code, title) => {
-        return `\x1b]${code};${titlePrefix} | ${title}\x07`;
+      // Match OSC title sequences with BEL (\x07) or ST (\x1b\\) terminator
+      return output.replace(/\x1b\]([02]);([^\x07\x1b]*?)(\x07|\x1b\\)/g, (match, code, title, term) => {
+        return `\x1b]${code};${titlePrefix} | ${title}${term}`;
       });
     }
 
