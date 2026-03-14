@@ -725,23 +725,26 @@ async function main() {
     let lastInjectTextTime = 0;
     const MAX_RECONNECT_DELAY = 30000;
 
-    function connectDaemonWs() {
+    async function connectDaemonWs() {
+      // Re-register session BEFORE WebSocket connect (daemon rejects WS if session unknown)
+      if (reconnectAttempts > 0) {
+        try {
+          await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId, command, cwd: process.cwd() })
+          });
+        } catch (e) {
+          // Registration may fail if session already exists or daemon not ready
+        }
+      }
+
       daemonWs = new WebSocket(wsUrl);
 
-      daemonWs.on('open', async () => {
+      daemonWs.on('open', () => {
         wsReady = true;
         if (reconnectAttempts > 0) {
           console.error(`\n\x1b[32m⚡ Reconnected to daemon. Inject restored.\x1b[0m`);
-          // Re-register session on reconnect
-          try {
-            await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ session_id: sessionId, command, cwd: process.cwd() })
-            });
-          } catch (e) {
-            // Registration may fail if session already exists, that's fine
-          }
         }
         reconnectAttempts = 0;
       });
