@@ -551,18 +551,26 @@ app.post('/api/sessions/:id/inject', (req, res) => {
       }
     }
 
-    if (!writeToSession(prompt)) {
-      return res.status(503).json({ error: 'Wrap process is not connected' });
-    }
-
-    // Send \r separately after 300ms delay — works for ALL CLIs
     let submitResult = null;
-    if (!no_enter) {
-      setTimeout(() => {
-        const ok = writeToSession('\r');
-        console.log(`[INJECT+SUBMIT] Split \\r for ${id}: ${ok ? 'success' : 'failed'}`);
-      }, 300);
-      submitResult = { deferred: true, strategy: 'split_cr' };
+    if (!no_enter && session.type === 'wrapped') {
+      // Wrapped sessions: send text+\r in single message to bypass allow bridge prompt-ready gate
+      if (!writeToSession(prompt + '\r')) {
+        return res.status(503).json({ error: 'Wrap process is not connected' });
+      }
+      submitResult = { strategy: 'combined_cr' };
+      console.log(`[INJECT+SUBMIT] Combined \\r for ${id}`);
+    } else {
+      if (!writeToSession(prompt)) {
+        return res.status(503).json({ error: 'Wrap process is not connected' });
+      }
+      // Spawned sessions: send \r separately after delay (proven split_cr strategy)
+      if (!no_enter) {
+        setTimeout(() => {
+          const ok = writeToSession('\r');
+          console.log(`[INJECT+SUBMIT] Split \\r for ${id}: ${ok ? 'success' : 'failed'}`);
+        }, 300);
+        submitResult = { deferred: true, strategy: 'split_cr' };
+      }
     }
 
     console.log(`[INJECT] Wrote to session ${id} (inject_id: ${inject_id})`);
