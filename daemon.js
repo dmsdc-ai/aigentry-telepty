@@ -639,43 +639,30 @@ app.post('/api/sessions/:id/inject', (req, res) => {
     }
 
     let submitResult = null;
-    if (session.type === 'wrapped' && !no_enter) {
-      // Hybrid: text via WS (allow bridge handles it), Enter via kitty send-key
-      if (!writeToSession(finalPrompt)) {
-        return res.status(503).json({ error: 'Wrap process is not connected' });
-      }
+    if (!writeToSession(finalPrompt)) {
+      return res.status(503).json({ error: 'Wrap process is not connected' });
+    }
+
+    if (!no_enter) {
+      // Universal split_cr: text first, \r after delay
+      // Allow bridge 0.1.40+ has 3s queue flush timeout, so \r always gets delivered
       setTimeout(() => {
-        // Try kitty send-key Return (reliable for all CLIs)
-        const windowId = findKittyWindowId(findKittySocket(), id);
-        if (windowId) {
-          try {
-            const { execSync } = require('child_process');
-            execSync(`kitty @ --to unix:${findKittySocket()} send-key --match id:${windowId} Return`, {
-              timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-            });
-            console.log(`[INJECT+SUBMIT] WS text + kitty Return for ${id} (window ${windowId})`);
-            // Restore tab title after inject (Claude Code overwrites it)
-            try {
-              execSync(`kitty @ --to unix:${findKittySocket()} set-tab-title --match id:${windowId} '⚡ telepty :: ${id}'`, {
+        const ok = writeToSession('\r');
+        console.log(`[INJECT+SUBMIT] Split \\r for ${id}: ${ok ? 'success' : 'failed'}`);
+        // Restore kitty tab title (optional, no-op if not kitty)
+        try {
+          const sock = findKittySocket();
+          if (sock) {
+            if (!session.kittyWindowId) session.kittyWindowId = findKittyWindowId(sock, id);
+            if (session.kittyWindowId) {
+              require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${session.kittyWindowId} '⚡ telepty :: ${id}'`, {
                 timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
               });
-            } catch {}
-          } catch {
-            writeToSession('\r');
-            console.log(`[INJECT+SUBMIT] WS text + WS \\r fallback for ${id}`);
+            }
           }
-        } else {
-          writeToSession('\r');
-          console.log(`[INJECT+SUBMIT] WS text + WS \\r (no kitty window) for ${id}`);
-        }
-      }, 500);
-      submitResult = { deferred: true, strategy: 'ws_text_kitty_return' };
-    } else if (session.type === 'wrapped') {
-      // no_enter=true for wrapped
-      if (!writeToSession(finalPrompt)) {
-        return res.status(503).json({ error: 'Wrap process is not connected' });
-      }
-      submitResult = { strategy: 'ws_no_enter' };
+        } catch {}
+      }, 300);
+      submitResult = { deferred: true, strategy: 'split_cr' };
     } else {
       if (!writeToSession(finalPrompt)) {
         return res.status(503).json({ error: 'Wrap process is not connected' });

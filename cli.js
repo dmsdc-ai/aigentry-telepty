@@ -705,7 +705,9 @@ async function main() {
     let promptReady = true;  // assume ready initially for first inject
     const injectQueue = [];
 
+    let queueFlushTimer = null;
     function flushInjectQueue() {
+      if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
       if (injectQueue.length === 0) return;
       const batch = injectQueue.splice(0);
       let delay = 0;
@@ -714,6 +716,15 @@ async function main() {
         delay += item === '\r' ? 0 : 100;
       }
       promptReady = false;
+    }
+    function scheduleQueueFlush() {
+      if (queueFlushTimer) return;
+      queueFlushTimer = setTimeout(() => {
+        queueFlushTimer = null;
+        if (injectQueue.length > 0) {
+          flushInjectQueue();
+        }
+      }, 3000);
     }
 
     // Connect to daemon WebSocket with auto-reconnect
@@ -767,6 +778,7 @@ async function main() {
               }
             } else {
               injectQueue.push(msg.data);
+              scheduleQueueFlush();
             }
           } else if (msg.type === 'resize') {
             child.resize(msg.cols, msg.rows);
