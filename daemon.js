@@ -633,35 +633,36 @@ app.post('/api/sessions/:id/inject', (req, res) => {
 
     let submitResult = null;
     if (session.type === 'wrapped' && !no_enter) {
-      // Wrapped sessions: try kitty remote control first (bypasses allow bridge entirely)
-      const kittyPayload = finalPrompt + '\r';
-      const kittyOk = sendViaKitty(id, kittyPayload);
-      if (kittyOk) {
-        submitResult = { strategy: 'kitty_remote' };
-        console.log(`[INJECT+SUBMIT] Kitty remote for ${id}`);
-      } else {
-        // Fallback: WS text + osascript/WS Enter
-        if (!writeToSession(finalPrompt)) {
-          return res.status(503).json({ error: 'Wrap process is not connected' });
-        }
-        setTimeout(() => {
-          const osascriptOk = submitViaOsascript(id, 'enter');
-          if (!osascriptOk) {
-            writeToSession('\r');
-            console.log(`[INJECT+SUBMIT] WS \\r last-resort for ${id}`);
-          }
-        }, 500);
-        submitResult = { deferred: true, strategy: 'osascript_fallback' };
+      // Hybrid: text via WS (allow bridge handles it), Enter via kitty send-key
+      if (!writeToSession(finalPrompt)) {
+        return res.status(503).json({ error: 'Wrap process is not connected' });
       }
+      setTimeout(() => {
+        // Try kitty send-key Return (reliable for all CLIs)
+        const windowId = findKittyWindowId(findKittySocket(), id);
+        if (windowId) {
+          try {
+            const { execSync } = require('child_process');
+            execSync(`kitty @ --to unix:${findKittySocket()} send-key --match id:${windowId} Return`, {
+              timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+            });
+            console.log(`[INJECT+SUBMIT] WS text + kitty Return for ${id} (window ${windowId})`);
+          } catch {
+            writeToSession('\r');
+            console.log(`[INJECT+SUBMIT] WS text + WS \\r fallback for ${id}`);
+          }
+        } else {
+          writeToSession('\r');
+          console.log(`[INJECT+SUBMIT] WS text + WS \\r (no kitty window) for ${id}`);
+        }
+      }, 500);
+      submitResult = { deferred: true, strategy: 'ws_text_kitty_return' };
     } else if (session.type === 'wrapped') {
       // no_enter=true for wrapped
-      const kittyOk = sendViaKitty(id, finalPrompt);
-      if (!kittyOk) {
-        if (!writeToSession(finalPrompt)) {
-          return res.status(503).json({ error: 'Wrap process is not connected' });
-        }
+      if (!writeToSession(finalPrompt)) {
+        return res.status(503).json({ error: 'Wrap process is not connected' });
       }
-      submitResult = { strategy: kittyOk ? 'kitty_remote_no_enter' : 'ws_no_enter' };
+      submitResult = { strategy: 'ws_no_enter' };
     } else {
       if (!writeToSession(finalPrompt)) {
         return res.status(503).json({ error: 'Wrap process is not connected' });
