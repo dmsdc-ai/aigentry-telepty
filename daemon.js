@@ -413,6 +413,34 @@ function submitViaPty(session) {
   }
 }
 
+// Send text directly to Kitty tab via remote control (bypasses allow bridge entirely)
+function sendViaKitty(sessionId, text) {
+  const { execSync } = require('child_process');
+  const socketPaths = ['/tmp/kitty-sock', `/tmp/kitty-${process.getuid()}`];
+  let socket = null;
+  for (const p of socketPaths) {
+    try {
+      require('fs').accessSync(p);
+      socket = p;
+      break;
+    } catch { /* skip */ }
+  }
+  if (!socket) return false;
+
+  try {
+    // Match by tab title containing session ID
+    const escaped = text.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
+    execSync(`kitty @ --to unix:${socket} send-text --match title:${sessionId} '${escaped}'`, {
+      timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+    });
+    console.log(`[KITTY] Sent ${text.length} chars to ${sessionId}`);
+    return true;
+  } catch (err) {
+    console.error(`[KITTY] Failed for ${sessionId}:`, err.message);
+    return false;
+  }
+}
+
 function submitViaOsascript(sessionId, keyCombo) {
   const { execSync } = require('child_process');
   const session = sessions[sessionId];
@@ -562,27 +590,42 @@ app.post('/api/sessions/:id/inject', (req, res) => {
     }
 
     let submitResult = null;
-    if (!writeToSession(finalPrompt)) {
-      return res.status(503).json({ error: 'Wrap process is not connected' });
-    }
-
-    if (!no_enter) {
-      if (session.type === 'wrapped') {
-        // Wrapped sessions: send text via WS, then Enter via osascript (bypasses allow bridge prompt-ready gate)
-        // First try combined \r via WS, then fall back to osascript
+    if (session.type === 'wrapped' && !no_enter) {
+      // Wrapped sessions: try kitty remote control first (bypasses allow bridge entirely)
+      const kittyPayload = finalPrompt + '\r';
+      const kittyOk = sendViaKitty(id, kittyPayload);
+      if (kittyOk) {
+        submitResult = { strategy: 'kitty_remote' };
+        console.log(`[INJECT+SUBMIT] Kitty remote for ${id}`);
+      } else {
+        // Fallback: WS text + osascript/WS Enter
+        if (!writeToSession(finalPrompt)) {
+          return res.status(503).json({ error: 'Wrap process is not connected' });
+        }
         setTimeout(() => {
-          // Try osascript keystroke (works regardless of allow bridge version)
           const osascriptOk = submitViaOsascript(id, 'enter');
-          if (osascriptOk) {
-            console.log(`[INJECT+SUBMIT] osascript Enter for ${id}`);
-          } else {
-            // Fallback: send \r via WS (works if allow bridge has prompt-ready bypass)
-            const wsOk = writeToSession('\r');
-            console.log(`[INJECT+SUBMIT] WS \\r fallback for ${id}: ${wsOk ? 'success' : 'failed'}`);
+          if (!osascriptOk) {
+            writeToSession('\r');
+            console.log(`[INJECT+SUBMIT] WS \\r last-resort for ${id}`);
           }
         }, 500);
-        submitResult = { deferred: true, strategy: 'osascript_enter' };
-      } else {
+        submitResult = { deferred: true, strategy: 'osascript_fallback' };
+      }
+    } else if (session.type === 'wrapped') {
+      // no_enter=true for wrapped
+      const kittyOk = sendViaKitty(id, finalPrompt);
+      if (!kittyOk) {
+        if (!writeToSession(finalPrompt)) {
+          return res.status(503).json({ error: 'Wrap process is not connected' });
+        }
+      }
+      submitResult = { strategy: kittyOk ? 'kitty_remote_no_enter' : 'ws_no_enter' };
+    } else {
+      if (!writeToSession(finalPrompt)) {
+        return res.status(503).json({ error: 'Wrap process is not connected' });
+      }
+
+      if (!no_enter) {
         // Spawned sessions: send \r separately after delay (proven split_cr strategy)
         setTimeout(() => {
           const ok = writeToSession('\r');
