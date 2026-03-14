@@ -429,12 +429,13 @@ function findKittyWindowId(socket, sessionId) {
     for (const osw of data) {
       for (const tab of osw.tabs) {
         for (const w of tab.windows) {
-          const cmds = (w.foreground_processes || []).map(p => (p.cmdline || []).join(' ')).join(' ');
-          // Check full process tree cmdline for session ID
-          if (cmds.includes(sessionId)) return w.id;
-          // Also check the window's own cmdline/title
-          const allCmds = JSON.stringify(w);
-          if (allCmds.includes(sessionId)) return w.id;
+          // Only check process cmdlines for --id SESSION_ID pattern (not output text)
+          for (const p of (w.foreground_processes || [])) {
+            const cmd = (p.cmdline || []).join(' ');
+            if (cmd.includes('--id ' + sessionId) || cmd.includes('--id=' + sessionId)) {
+              return w.id;
+            }
+          }
         }
       }
     }
