@@ -414,24 +414,51 @@ function submitViaPty(session) {
 }
 
 // Send text directly to Kitty tab via remote control (bypasses allow bridge entirely)
+function findKittySocket() {
+  try {
+    const files = require('fs').readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
+    return files.length > 0 ? '/tmp/' + files[0] : null;
+  } catch { return null; }
+}
+
+function findKittyWindowId(socket, sessionId) {
+  const { execSync } = require('child_process');
+  try {
+    const raw = execSync(`kitty @ --to unix:${socket} ls`, { timeout: 3000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const data = JSON.parse(raw);
+    for (const osw of data) {
+      for (const tab of osw.tabs) {
+        for (const w of tab.windows) {
+          const cmds = (w.foreground_processes || []).map(p => (p.cmdline || []).join(' ')).join(' ');
+          // Check full process tree cmdline for session ID
+          if (cmds.includes(sessionId)) return w.id;
+          // Also check the window's own cmdline/title
+          const allCmds = JSON.stringify(w);
+          if (allCmds.includes(sessionId)) return w.id;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
 function sendViaKitty(sessionId, text) {
   const { execSync } = require('child_process');
-  // Find kitty socket: /tmp/kitty-sock or /tmp/kitty-sock-PID
-  const fs = require('fs');
-  let socket = null;
-  try {
-    const files = fs.readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
-    if (files.length > 0) socket = '/tmp/' + files[0];
-  } catch { /* /tmp not readable */ }
+  const socket = findKittySocket();
   if (!socket) return false;
 
+  const windowId = findKittyWindowId(socket, sessionId);
+  if (!windowId) {
+    console.error(`[KITTY] No window found for ${sessionId}`);
+    return false;
+  }
+
   try {
-    // Match by cmdline containing session ID (works even when CLI overwrites tab title)
     const escaped = text.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
-    execSync(`kitty @ --to unix:${socket} send-text --match cmdline:${sessionId} '${escaped}'`, {
+    execSync(`kitty @ --to unix:${socket} send-text --match id:${windowId} '${escaped}'`, {
       timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
     });
-    console.log(`[KITTY] Sent ${text.length} chars to ${sessionId}`);
+    console.log(`[KITTY] Sent ${text.length} chars to ${sessionId} (window ${windowId})`);
     return true;
   } catch (err) {
     console.error(`[KITTY] Failed for ${sessionId}:`, err.message);
