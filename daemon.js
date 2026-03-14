@@ -69,6 +69,24 @@ function relayToPeers(msg) {
   }
 }
 
+// JWT auth: set TELEPTY_JWT_SECRET to enable. Tokens in Authorization: Bearer <token>
+const JWT_SECRET = process.env.TELEPTY_JWT_SECRET || null;
+
+function verifyJwt(token) {
+  if (!JWT_SECRET || !token) return false;
+  try {
+    // Simple HS256 JWT verification (no external deps)
+    const [headerB64, payloadB64, sigB64] = token.split('.');
+    if (!headerB64 || !payloadB64 || !sigB64) return false;
+    const expected = crypto.createHmac('sha256', JWT_SECRET)
+      .update(`${headerB64}.${payloadB64}`).digest('base64url');
+    if (sigB64 !== expected) return false;
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString());
+    if (payload.exp && Date.now() / 1000 > payload.exp) return false;
+    return payload;
+  } catch { return false; }
+}
+
 function isAllowedPeer(ip) {
   if (!ip) return false;
   const cleanIp = ip.replace('::ffff:', '');
@@ -92,6 +110,12 @@ app.use((req, res, next) => {
 
   const token = req.headers['x-telepty-token'] || req.query.token;
   if (token === EXPECTED_TOKEN) {
+    return next();
+  }
+
+  // JWT Bearer token
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Bearer ') && verifyJwt(authHeader.slice(7))) {
     return next();
   }
 
@@ -1435,7 +1459,9 @@ server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://' + req.headers.host);
   const token = url.searchParams.get('token');
   
-  if (!isAllowedPeer(req.socket.remoteAddress) && token !== EXPECTED_TOKEN) {
+  const wsAuthHeader = req.headers['authorization'] || '';
+  const wsJwtValid = wsAuthHeader.startsWith('Bearer ') && verifyJwt(wsAuthHeader.slice(7));
+  if (!isAllowedPeer(req.socket.remoteAddress) && token !== EXPECTED_TOKEN && !wsJwtValid) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;

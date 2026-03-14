@@ -53,6 +53,13 @@ Every session is uniquely identified by a locator triple:
 - Override: `TELEPTY_MACHINE_ID` env var
 - Exposed in: `GET /api/meta` (`machine_id` field), session `locator` object, bus event `source_host`
 
+### Global Session ID Uniqueness (P4)
+- Convention: `{project}-{NNN}` (e.g. `aigentry-devkit-001`)
+- Cross-machine uniqueness: guaranteed by `locator.machine_id` prefix in bus events
+- Collision resolution: `resolveSessionAlias` returns local session only; remote sessions discovered via `source_host` field
+- If two machines have `aigentry-devkit-001`, inject uses `target@host` to disambiguate
+- Short form `aigentry-devkit-001` resolves to LOCAL session; remote requires explicit `@host`
+
 ### Peer Auth
 - Localhost: always trusted
 - Tailscale (100.x.y.z): trusted by default
