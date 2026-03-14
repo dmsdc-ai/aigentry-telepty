@@ -39,6 +39,36 @@ app.use(express.json());
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
 const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
 
+// Cross-machine bus relay: forward bus events to peer daemons
+const RELAY_PEERS = (process.env.TELEPTY_RELAY_PEERS || '').split(',').map(s => s.trim()).filter(Boolean);
+const RELAY_SEEN = new Set(); // dedup by message_id
+
+function relayToPeers(msg) {
+  if (RELAY_PEERS.length === 0) return;
+  if (!msg.message_id) msg.message_id = crypto.randomUUID();
+  if (RELAY_SEEN.has(msg.message_id)) return; // already relayed
+  RELAY_SEEN.add(msg.message_id);
+  // Prevent unbounded growth
+  if (RELAY_SEEN.size > 10000) {
+    const arr = [...RELAY_SEEN];
+    arr.splice(0, 5000);
+    RELAY_SEEN.clear();
+    arr.forEach(id => RELAY_SEEN.add(id));
+  }
+
+  msg.source_host = msg.source_host || MACHINE_ID;
+  msg._relayed_from = MACHINE_ID;
+
+  for (const peer of RELAY_PEERS) {
+    fetch(`http://${peer}:${PORT}/api/bus/publish`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-telepty-token': EXPECTED_TOKEN },
+      body: JSON.stringify(msg),
+      signal: AbortSignal.timeout(3000)
+    }).catch(() => {}); // fire-and-forget
+  }
+}
+
 function isAllowedPeer(ip) {
   if (!ip) return false;
   const cleanIp = ip.replace('::ffff:', '');
@@ -976,6 +1006,8 @@ app.post('/api/bus/publish', (req, res) => {
 
   // Auto-route if this is a turn_request
   busAutoRoute(payload);
+  // Relay to peer daemons (dedup prevents loops)
+  if (!payload._relayed_from) relayToPeers(payload);
 
   res.json({ success: true, delivered: deliveredCount });
 });
@@ -1386,6 +1418,8 @@ busWss.on('connection', (ws, req) => {
 
       // Auto-route turn_request events (shared logic with HTTP publish)
       busAutoRoute(msg);
+      // Relay to peer daemons (dedup prevents loops)
+      if (!msg._relayed_from) relayToPeers(msg);
     } catch (e) {
       console.error('[BUS] Invalid message format', e);
     }

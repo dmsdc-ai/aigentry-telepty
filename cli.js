@@ -208,6 +208,13 @@ function getDiscoveryHosts() {
     .filter(Boolean);
   extraHosts.forEach((host) => hosts.add(host));
 
+  // Also include relay peers for cross-machine session discovery
+  const relayPeers = String(process.env.TELEPTY_RELAY_PEERS || '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter(Boolean);
+  relayPeers.forEach((host) => hosts.add(host));
+
   if (REMOTE_HOST && REMOTE_HOST !== '127.0.0.1') {
     return Array.from(hosts);
   }
