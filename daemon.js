@@ -562,19 +562,28 @@ app.post('/api/sessions/:id/inject', (req, res) => {
     }
 
     let submitResult = null;
-    if (!no_enter && session.type === 'wrapped') {
-      // Wrapped sessions: send text+\r in single message to bypass allow bridge prompt-ready gate
-      if (!writeToSession(finalPrompt + '\r')) {
-        return res.status(503).json({ error: 'Wrap process is not connected' });
-      }
-      submitResult = { strategy: 'combined_cr' };
-      console.log(`[INJECT+SUBMIT] Combined \\r for ${id}`);
-    } else {
-      if (!writeToSession(finalPrompt)) {
-        return res.status(503).json({ error: 'Wrap process is not connected' });
-      }
-      // Spawned sessions: send \r separately after delay (proven split_cr strategy)
-      if (!no_enter) {
+    if (!writeToSession(finalPrompt)) {
+      return res.status(503).json({ error: 'Wrap process is not connected' });
+    }
+
+    if (!no_enter) {
+      if (session.type === 'wrapped') {
+        // Wrapped sessions: send text via WS, then Enter via osascript (bypasses allow bridge prompt-ready gate)
+        // First try combined \r via WS, then fall back to osascript
+        setTimeout(() => {
+          // Try osascript keystroke (works regardless of allow bridge version)
+          const osascriptOk = submitViaOsascript(id, 'enter');
+          if (osascriptOk) {
+            console.log(`[INJECT+SUBMIT] osascript Enter for ${id}`);
+          } else {
+            // Fallback: send \r via WS (works if allow bridge has prompt-ready bypass)
+            const wsOk = writeToSession('\r');
+            console.log(`[INJECT+SUBMIT] WS \\r fallback for ${id}: ${wsOk ? 'success' : 'failed'}`);
+          }
+        }, 500);
+        submitResult = { deferred: true, strategy: 'osascript_enter' };
+      } else {
+        // Spawned sessions: send \r separately after delay (proven split_cr strategy)
         setTimeout(() => {
           const ok = writeToSession('\r');
           console.log(`[INJECT+SUBMIT] Split \\r for ${id}: ${ok ? 'success' : 'failed'}`);
