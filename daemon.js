@@ -824,21 +824,97 @@ app.delete('/api/sessions/:id', (req, res) => {
   }
 });
 
+// Shared auto-router: handles turn_request events from any source (WS or HTTP)
+function busAutoRoute(msg) {
+  const eventType = msg.type || msg.kind;
+  const isRoutable = (eventType === 'turn_request' || eventType === 'deliberation_route_turn') && (msg.target || msg.target_session_id);
+  if (!isRoutable) return;
+
+  const rawTarget = (msg.target || msg.target_session_id).split('@')[0];
+  console.log(`[BUS-ROUTE] Received ${eventType}: target=${rawTarget}`);
+  const targetId = resolveSessionAlias(rawTarget);
+  const targetSession = targetId ? sessions[targetId] : null;
+  if (!targetSession) {
+    console.log(`[BUS-ROUTE] Target ${rawTarget} not found`);
+    return;
+  }
+
+  const prompt = (msg.payload && msg.payload.prompt) || msg.content || msg.prompt || JSON.stringify(msg);
+  const inject_id = crypto.randomUUID();
+
+  // Write to session (kitty primary, WS fallback)
+  const sock = findKittySocket();
+  if (!targetSession.kittyWindowId && sock) targetSession.kittyWindowId = findKittyWindowId(sock, targetId);
+  const wid = targetSession.kittyWindowId;
+  let delivered = false;
+
+  if (wid && sock && targetSession.type === 'wrapped') {
+    try {
+      const escaped = prompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
+      require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} '${escaped}'`, {
+        timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+      });
+      setTimeout(() => {
+        try {
+          require('child_process').execSync(`kitty @ --to unix:${sock} send-key --match id:${wid} Return`, {
+            timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+          });
+        } catch {}
+      }, 500);
+      delivered = true;
+    } catch {}
+  }
+  if (!delivered) {
+    if (targetSession.type === 'wrapped' && targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
+      targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
+      setTimeout(() => {
+        if (targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
+          targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+        }
+      }, 300);
+      delivered = true;
+    } else if (targetSession.ptyProcess) {
+      targetSession.ptyProcess.write(prompt);
+      setTimeout(() => targetSession.ptyProcess.write('\r'), 300);
+      delivered = true;
+    }
+  }
+
+  // Emit inject_written ack
+  const ackMsg = JSON.stringify({
+    type: 'inject_written',
+    inject_id,
+    sender: 'daemon',
+    target_agent: targetId,
+    source_type: 'bus_auto_route',
+    delivered,
+    timestamp: new Date().toISOString()
+  });
+  busClients.forEach(client => {
+    if (client.readyState === 1) client.send(ackMsg);
+  });
+  targetSession.lastActivityAt = new Date().toISOString();
+  console.log(`[BUS-ROUTE] ${eventType} → ${targetId}: ${delivered ? 'delivered' : 'failed'}`);
+}
+
 app.post('/api/bus/publish', (req, res) => {
   const payload = req.body;
-  
+
   if (!payload || typeof payload !== 'object') {
     return res.status(400).json({ error: 'Payload must be a JSON object' });
   }
 
   let deliveredCount = 0;
-  
+
   busClients.forEach(client => {
     if (client.readyState === 1) { // WebSocket.OPEN
       client.send(JSON.stringify(payload));
       deliveredCount++;
     }
   });
+
+  // Auto-route if this is a turn_request
+  busAutoRoute(payload);
 
   res.json({ success: true, delivered: deliveredCount });
 });
@@ -1247,76 +1323,8 @@ busWss.on('connection', (ws, req) => {
         }
       });
 
-      // Auto-router: turn_request → inject to target session PTY
-      // Matches both msg.type and msg.kind (deliberation uses 'kind')
-      const eventType = msg.type || msg.kind;
-      const isRoutable = (eventType === 'turn_request' || eventType === 'deliberation_route_turn') && (msg.target || msg.target_session_id);
-      if (isRoutable) {
-        // Parse target: may include @host suffix (e.g. "session-001@100.x.y.z")
-        const rawTarget = (msg.target || msg.target_session_id).split('@')[0];
-        console.log(`[BUS-ROUTE] Received ${eventType}: target=${rawTarget}`);
-        const targetId = resolveSessionAlias(rawTarget);
-        const targetSession = targetId ? sessions[targetId] : null;
-        if (targetSession) {
-          // Extract prompt from payload.prompt (deliberation schema) or fallbacks
-          const prompt = (msg.payload && msg.payload.prompt) || msg.content || msg.prompt || JSON.stringify(msg);
-          const inject_id = crypto.randomUUID();
-
-          // Write to session (kitty primary, WS fallback)
-          const sock = findKittySocket();
-          if (!targetSession.kittyWindowId && sock) targetSession.kittyWindowId = findKittyWindowId(sock, targetId);
-          const wid = targetSession.kittyWindowId;
-          let delivered = false;
-
-          if (wid && sock && targetSession.type === 'wrapped') {
-            try {
-              const escaped = prompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
-              require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} '${escaped}'`, {
-                timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
-              });
-              setTimeout(() => {
-                try {
-                  require('child_process').execSync(`kitty @ --to unix:${sock} send-key --match id:${wid} Return`, {
-                    timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-                  });
-                } catch {}
-              }, 500);
-              delivered = true;
-            } catch {}
-          }
-          if (!delivered) {
-            // WS fallback
-            if (targetSession.type === 'wrapped' && targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
-              targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
-              setTimeout(() => {
-                if (targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
-                  targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
-                }
-              }, 300);
-              delivered = true;
-            } else if (targetSession.ptyProcess) {
-              targetSession.ptyProcess.write(prompt);
-              setTimeout(() => targetSession.ptyProcess.write('\r'), 300);
-              delivered = true;
-            }
-          }
-
-          // Emit inject_written ack
-          const ackMsg = JSON.stringify({
-            type: 'inject_written',
-            inject_id,
-            sender: 'daemon',
-            target_agent: targetId,
-            source_type: 'bus_auto_route',
-            delivered,
-            timestamp: new Date().toISOString()
-          });
-          busClients.forEach(client => {
-            if (client.readyState === 1) client.send(ackMsg);
-          });
-          console.log(`[BUS-ROUTE] turn_request → ${targetId}: ${delivered ? 'delivered' : 'failed'}`);
-        }
-      }
+      // Auto-route turn_request events (shared logic with HTTP publish)
+      busAutoRoute(msg);
     } catch (e) {
       console.error('[BUS] Invalid message format', e);
     }
