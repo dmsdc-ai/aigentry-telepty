@@ -530,10 +530,20 @@ app.post('/api/sessions/:id/inject', (req, res) => {
   if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
   const session = sessions[resolvedId];
   const id = resolvedId;
-  const { prompt, no_enter, auto_submit, from, reply_to } = req.body;
+  const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
+  let { from, reply_to } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+  // reply_to defaults to from when omitted
+  if (from && !reply_to) reply_to = from;
   if (from) session.lastInjectFrom = from;
   if (reply_to) session.lastInjectReplyTo = reply_to;
+  if (thread_id) session.lastThreadId = thread_id;
+
+  // Auto-prepend [from:] [reply-to:] header if from is set and not already in prompt
+  let finalPrompt = prompt;
+  if (from && !prompt.startsWith('[from:')) {
+    finalPrompt = `[from: ${from}] [reply-to: ${reply_to}] ${prompt}`;
+  }
   const inject_id = crypto.randomUUID();
   try {
     // Always inject text WITHOUT \r first, then send \r separately after delay
@@ -554,13 +564,13 @@ app.post('/api/sessions/:id/inject', (req, res) => {
     let submitResult = null;
     if (!no_enter && session.type === 'wrapped') {
       // Wrapped sessions: send text+\r in single message to bypass allow bridge prompt-ready gate
-      if (!writeToSession(prompt + '\r')) {
+      if (!writeToSession(finalPrompt + '\r')) {
         return res.status(503).json({ error: 'Wrap process is not connected' });
       }
       submitResult = { strategy: 'combined_cr' };
       console.log(`[INJECT+SUBMIT] Combined \\r for ${id}`);
     } else {
-      if (!writeToSession(prompt)) {
+      if (!writeToSession(finalPrompt)) {
         return res.status(503).json({ error: 'Wrap process is not connected' });
       }
       // Spawned sessions: send \r separately after delay (proven split_cr strategy)
@@ -583,6 +593,8 @@ app.post('/api/sessions/:id/inject', (req, res) => {
       content: prompt,
       from: from || null,
       reply_to: reply_to || null,
+      thread_id: thread_id || null,
+      reply_expected: !!reply_expected,
       timestamp: new Date().toISOString()
     });
     busClients.forEach(client => {

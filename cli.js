@@ -978,6 +978,11 @@ async function main() {
       args.splice(replyToIndex, 2);
     }
 
+    // Extract --reply-expected flag
+    const replyExpectedIndex = args.indexOf('--reply-expected');
+    const replyExpected = replyExpectedIndex !== -1;
+    if (replyExpected) args.splice(replyExpectedIndex, 1);
+
     const sessionId = args[1]; const prompt = args.slice(2).join(' ');
     if (!sessionId || !prompt) { console.error('❌ Usage: telepty inject [--no-enter] [--from <id>] [--reply-to <id>] <session_id> "<prompt text>"'); process.exit(1); }
     try {
@@ -990,6 +995,7 @@ async function main() {
       const body = { prompt, no_enter: noEnter };
       if (fromId) body.from = fromId;
       if (replyTo) body.reply_to = replyTo;
+      if (replyExpected) body.reply_expected = true;
 
       const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
@@ -1015,8 +1021,7 @@ async function main() {
       if (!replyTo) { console.error(`❌ No pending reply-to found for session '${mySessionId}'`); process.exit(1); }
       const target = await resolveSessionTarget(replyTo);
       if (!target) { console.error(`❌ Session '${replyTo}' was not found on any discovered host.`); process.exit(1); }
-      const fullPrompt = `[from: ${mySessionId}] [reply-to: ${mySessionId}] ${replyText}`;
-      const body = { prompt: fullPrompt, from: mySessionId, reply_to: mySessionId };
+      const body = { prompt: replyText, from: mySessionId, reply_to: mySessionId };
       const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
