@@ -660,25 +660,32 @@ app.post('/api/sessions/:id/inject', (req, res) => {
     }
 
     if (!no_enter) {
-      // Universal split_cr: text first, \r after delay
-      // Allow bridge 0.1.40+ has 3s queue flush timeout, so \r always gets delivered
+      // Split_cr: text first, \r after delay + kitty send-key Return as backup
       setTimeout(() => {
         const ok = writeToSession('\r');
         console.log(`[INJECT+SUBMIT] Split \\r for ${id}: ${ok ? 'success' : 'failed'}`);
-        // Restore kitty tab title (optional, no-op if not kitty)
+        // Kitty send-key Return as backup (handles old allow bridges without queue flush)
         try {
           const sock = findKittySocket();
           if (sock) {
             if (!session.kittyWindowId) session.kittyWindowId = findKittyWindowId(sock, id);
             if (session.kittyWindowId) {
-              require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${session.kittyWindowId} '⚡ telepty :: ${id}'`, {
-                timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
-              });
+              const { execSync } = require('child_process');
+              setTimeout(() => {
+                try {
+                  execSync(`kitty @ --to unix:${sock} send-key --match id:${session.kittyWindowId} Return`, {
+                    timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+                  });
+                  execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${session.kittyWindowId} '⚡ telepty :: ${id}'`, {
+                    timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
+                  });
+                } catch {}
+              }, 500);
             }
           }
         } catch {}
       }, 300);
-      submitResult = { deferred: true, strategy: 'split_cr' };
+      submitResult = { deferred: true, strategy: 'split_cr_kitty_backup' };
     } else {
       if (!writeToSession(finalPrompt)) {
         return res.status(503).json({ error: 'Wrap process is not connected' });
