@@ -1247,15 +1247,19 @@ busWss.on('connection', (ws, req) => {
         }
       });
 
-      // Auto-router: turn_request / deliberation_route_turn → inject to target session PTY
-      const isRoutable = (msg.type === 'turn_request' || msg.type === 'deliberation_route_turn' || msg.type === 'deliberation_turn_request') && (msg.target_session_id || msg.target || msg.session_id);
+      // Auto-router: turn_request → inject to target session PTY
+      // Matches both msg.type and msg.kind (deliberation uses 'kind')
+      const eventType = msg.type || msg.kind;
+      const isRoutable = (eventType === 'turn_request' || eventType === 'deliberation_route_turn') && (msg.target || msg.target_session_id);
       if (isRoutable) {
-        console.log(`[BUS-ROUTE] Received routable event: type=${msg.type} target=${msg.target_session_id || msg.target || msg.session_id}`);
-        const rawTarget = msg.target_session_id || msg.target || msg.session_id;
+        // Parse target: may include @host suffix (e.g. "session-001@100.x.y.z")
+        const rawTarget = (msg.target || msg.target_session_id).split('@')[0];
+        console.log(`[BUS-ROUTE] Received ${eventType}: target=${rawTarget}`);
         const targetId = resolveSessionAlias(rawTarget);
         const targetSession = targetId ? sessions[targetId] : null;
         if (targetSession) {
-          const prompt = msg.content || msg.prompt || JSON.stringify(msg);
+          // Extract prompt from payload.prompt (deliberation schema) or fallbacks
+          const prompt = (msg.payload && msg.payload.prompt) || msg.content || msg.prompt || JSON.stringify(msg);
           const inject_id = crypto.randomUUID();
 
           // Write to session (kitty primary, WS fallback)
