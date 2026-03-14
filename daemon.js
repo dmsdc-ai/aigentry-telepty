@@ -1247,9 +1247,12 @@ busWss.on('connection', (ws, req) => {
         }
       });
 
-      // Auto-router: turn_request → inject to target session PTY
-      if (msg.type === 'turn_request' && msg.target_session_id) {
-        const targetId = resolveSessionAlias(msg.target_session_id);
+      // Auto-router: turn_request / deliberation_route_turn → inject to target session PTY
+      const isRoutable = (msg.type === 'turn_request' || msg.type === 'deliberation_route_turn' || msg.type === 'deliberation_turn_request') && (msg.target_session_id || msg.target || msg.session_id);
+      if (isRoutable) {
+        console.log(`[BUS-ROUTE] Received routable event: type=${msg.type} target=${msg.target_session_id || msg.target || msg.session_id}`);
+        const rawTarget = msg.target_session_id || msg.target || msg.session_id;
+        const targetId = resolveSessionAlias(rawTarget);
         const targetSession = targetId ? sessions[targetId] : null;
         if (targetSession) {
           const prompt = msg.content || msg.prompt || JSON.stringify(msg);
