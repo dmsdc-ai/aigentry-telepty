@@ -647,6 +647,12 @@ app.post('/api/sessions/:id/inject', (req, res) => {
               timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
             });
             console.log(`[INJECT+SUBMIT] WS text + kitty Return for ${id} (window ${windowId})`);
+            // Restore tab title after inject (Claude Code overwrites it)
+            try {
+              execSync(`kitty @ --to unix:${findKittySocket()} set-tab-title --match id:${windowId} '⚡ telepty :: ${id}'`, {
+                timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
+              });
+            } catch {}
           } catch {
             writeToSession('\r');
             console.log(`[INJECT+SUBMIT] WS text + WS \\r fallback for ${id}`);
@@ -1090,8 +1096,19 @@ wss.on('connection', (ws, req) => {
     };
     sessions[sessionId] = autoSession;
     console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect`);
-    // Trigger CLI redraw via kitty Ctrl+L after short delay
-    setTimeout(() => sendViaKitty(sessionId, '\x0c'), 1000);
+    // Trigger CLI redraw + set tab title via kitty after short delay
+    setTimeout(() => {
+      sendViaKitty(sessionId, '\x0c');
+      const sock = findKittySocket();
+      const wid = findKittyWindowId(sock, sessionId);
+      if (sock && wid) {
+        try {
+          require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${wid} '⚡ telepty :: ${sessionId}'`, {
+            timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
+          });
+        } catch {}
+      }
+    }, 1000);
   } else {
     session.clients.add(ws);
   }
