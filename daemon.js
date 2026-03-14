@@ -461,10 +461,12 @@ function sendViaKitty(sessionId, text) {
     if (textOnly.length > 0) {
       const escaped = textOnly.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
       execSync(`kitty @ --to unix:${socket} send-text --match id:${windowId} '${escaped}'`, {
-        timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+        timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
       });
     }
     if (hasCr) {
+      // Delay before sending Return — CLI needs time to process text input
+      execSync('sleep 0.5', { timeout: 2000 });
       execSync(`kitty @ --to unix:${socket} send-key --match id:${windowId} Return`, {
         timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
       });
