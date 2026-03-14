@@ -655,49 +655,61 @@ app.post('/api/sessions/:id/inject', (req, res) => {
     }
 
     let submitResult = null;
-    if (!writeToSession(finalPrompt)) {
-      return res.status(503).json({ error: 'Wrap process is not connected' });
-    }
+    if (session.type === 'wrapped') {
+      // For wrapped sessions: try kitty send-text (bypasses allow bridge queue)
+      // then WS as fallback, then kitty send-key Return for enter
+      const sock = findKittySocket();
+      if (!session.kittyWindowId && sock) session.kittyWindowId = findKittyWindowId(sock, id);
+      const wid = session.kittyWindowId;
 
-    if (!no_enter) {
-      // Split_cr: text first, \r after delay + kitty send-key Return as backup
-      setTimeout(() => {
-        const ok = writeToSession('\r');
-        console.log(`[INJECT+SUBMIT] Split \\r for ${id}: ${ok ? 'success' : 'failed'}`);
-        // Kitty send-key Return as backup (handles old allow bridges without queue flush)
+      // Always send via WS too (for new allow bridges with queue flush)
+      writeToSession(finalPrompt);
+
+      if (wid && sock) {
+        // Kitty send-text for reliable text delivery
         try {
-          const sock = findKittySocket();
-          if (sock) {
-            if (!session.kittyWindowId) session.kittyWindowId = findKittyWindowId(sock, id);
-            if (session.kittyWindowId) {
-              const { execSync } = require('child_process');
-              setTimeout(() => {
-                try {
-                  execSync(`kitty @ --to unix:${sock} send-key --match id:${session.kittyWindowId} Return`, {
-                    timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-                  });
-                  execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${session.kittyWindowId} '⚡ telepty :: ${id}'`, {
-                    timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
-                  });
-                } catch {}
-              }, 500);
-            }
-          }
+          const escaped = finalPrompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
+          require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} '${escaped}'`, {
+            timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+          });
+          console.log(`[INJECT] Kitty send-text for ${id} (window ${wid})`);
         } catch {}
-      }, 300);
-      submitResult = { deferred: true, strategy: 'split_cr_kitty_backup' };
-    } else {
-      if (!writeToSession(finalPrompt)) {
-        return res.status(503).json({ error: 'Wrap process is not connected' });
-      }
 
+        if (!no_enter) {
+          setTimeout(() => {
+            try {
+              writeToSession('\r'); // WS \r for new bridges
+              require('child_process').execSync(`kitty @ --to unix:${sock} send-key --match id:${wid} Return`, {
+                timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+              });
+              require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${wid} '⚡ telepty :: ${id}'`, {
+                timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
+              });
+            } catch {}
+          }, 500);
+          submitResult = { deferred: true, strategy: 'kitty_text_key' };
+        }
+      } else {
+        // No kitty — WS only
+        if (!no_enter) {
+          setTimeout(() => {
+            writeToSession('\r');
+            console.log(`[INJECT+SUBMIT] WS-only split_cr for ${id}`);
+          }, 300);
+          submitResult = { deferred: true, strategy: 'ws_split_cr' };
+        }
+      }
+    } else {
+      // Spawned sessions: direct PTY write
+      if (!writeToSession(finalPrompt)) {
+        return res.status(503).json({ error: 'Process not connected' });
+      }
       if (!no_enter) {
-        // Spawned sessions: send \r separately after delay (proven split_cr strategy)
         setTimeout(() => {
-          const ok = writeToSession('\r');
-          console.log(`[INJECT+SUBMIT] Split \\r for ${id}: ${ok ? 'success' : 'failed'}`);
+          writeToSession('\r');
+          console.log(`[INJECT+SUBMIT] PTY split_cr for ${id}`);
         }, 300);
-        submitResult = { deferred: true, strategy: 'split_cr' };
+        submitResult = { deferred: true, strategy: 'pty_split_cr' };
       }
     }
 
