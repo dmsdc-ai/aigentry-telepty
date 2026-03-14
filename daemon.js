@@ -1240,12 +1240,76 @@ busWss.on('connection', (ws, req) => {
   ws.on('message', (message) => {
     try {
       const msg = JSON.parse(message);
-      // For MVP, simply broadcast any valid JSON message to all other bus clients
+      // Broadcast to all other bus clients
       busClients.forEach(client => {
         if (client !== ws && client.readyState === 1) {
           client.send(JSON.stringify(msg));
         }
       });
+
+      // Auto-router: turn_request → inject to target session PTY
+      if (msg.type === 'turn_request' && msg.target_session_id) {
+        const targetId = resolveSessionAlias(msg.target_session_id);
+        const targetSession = targetId ? sessions[targetId] : null;
+        if (targetSession) {
+          const prompt = msg.content || msg.prompt || JSON.stringify(msg);
+          const inject_id = crypto.randomUUID();
+
+          // Write to session (kitty primary, WS fallback)
+          const sock = findKittySocket();
+          if (!targetSession.kittyWindowId && sock) targetSession.kittyWindowId = findKittyWindowId(sock, targetId);
+          const wid = targetSession.kittyWindowId;
+          let delivered = false;
+
+          if (wid && sock && targetSession.type === 'wrapped') {
+            try {
+              const escaped = prompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
+              require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} '${escaped}'`, {
+                timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+              });
+              setTimeout(() => {
+                try {
+                  require('child_process').execSync(`kitty @ --to unix:${sock} send-key --match id:${wid} Return`, {
+                    timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+                  });
+                } catch {}
+              }, 500);
+              delivered = true;
+            } catch {}
+          }
+          if (!delivered) {
+            // WS fallback
+            if (targetSession.type === 'wrapped' && targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
+              targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
+              setTimeout(() => {
+                if (targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
+                  targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+                }
+              }, 300);
+              delivered = true;
+            } else if (targetSession.ptyProcess) {
+              targetSession.ptyProcess.write(prompt);
+              setTimeout(() => targetSession.ptyProcess.write('\r'), 300);
+              delivered = true;
+            }
+          }
+
+          // Emit inject_written ack
+          const ackMsg = JSON.stringify({
+            type: 'inject_written',
+            inject_id,
+            sender: 'daemon',
+            target_agent: targetId,
+            source_type: 'bus_auto_route',
+            delivered,
+            timestamp: new Date().toISOString()
+          });
+          busClients.forEach(client => {
+            if (client.readyState === 1) client.send(ackMsg);
+          });
+          console.log(`[BUS-ROUTE] turn_request → ${targetId}: ${delivered ? 'delivered' : 'failed'}`);
+        }
+      }
     } catch (e) {
       console.error('[BUS] Invalid message format', e);
     }
