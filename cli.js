@@ -667,9 +667,11 @@ async function main() {
       process.exit(1);
     }
 
-    // Default session ID = command name
+    // Default session ID = {folder}-{cli} (e.g. aigentry-dustcraw-claude)
     if (!sessionId) {
-      sessionId = path.basename(command);
+      const folder = path.basename(process.cwd());
+      const cli = path.basename(command).replace(/\..*$/, '');
+      sessionId = `${folder}-${cli}`;
     }
 
     await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
@@ -1148,6 +1150,61 @@ async function main() {
       const hostSuffix = target.host === '127.0.0.1' ? '' : ` @ ${target.host}`;
       console.log(`✅ Session renamed: '\x1b[36m${target.id}\x1b[0m' → '\x1b[36m${newId}\x1b[0m'${hostSuffix}`);
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    return;
+  }
+
+  if (cmd === 'session' && args[1] === 'start') {
+    // Generate kitty session file and launch
+    const configArg = args.find(a => a.startsWith('--config='));
+    const configPath = configArg ? configArg.split('=').slice(1).join('=') : null;
+    const cliArg = args.find(a => a.startsWith('--cli='));
+    const cli = cliArg ? cliArg.split('=')[1] : 'claude --dangerously-skip-permissions';
+    const projectsDir = args.find(a => a.startsWith('--dir=')) ? args.find(a => a.startsWith('--dir=')).split('=')[1] : process.cwd();
+
+    // Discover project folders (subdirectories with .git)
+    let projects;
+    if (configPath) {
+      projects = JSON.parse(fs.readFileSync(configPath, 'utf8')).projects;
+    } else {
+      projects = fs.readdirSync(projectsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory() && fs.existsSync(path.join(projectsDir, d.name, '.git')))
+        .map(d => ({ name: d.name, cwd: path.join(projectsDir, d.name) }));
+    }
+
+    if (projects.length === 0) {
+      console.error('❌ No git projects found in', projectsDir);
+      process.exit(1);
+    }
+
+    // Generate kitty session file
+    const sessionFile = path.join(os.tmpdir(), `telepty-session-${Date.now()}.conf`);
+    let conf = '# Auto-generated telepty session\n';
+    projects.forEach((p, i) => {
+      const name = p.name;
+      const cwd = p.cwd || path.join(projectsDir, name);
+      const sessionId = `${name}-${cli.split(' ')[0]}`;
+      if (i === 0) {
+        conf += `new_tab ${name}\n`;
+      } else {
+        conf += `\nnew_tab ${name}\n`;
+      }
+      conf += `layout tall\n`;
+      conf += `cd ${cwd}\n`;
+      conf += `title ${name}\n`;
+      conf += `launch --type=window telepty allow --id ${sessionId} ${cli}\n`;
+    });
+
+    fs.writeFileSync(sessionFile, conf);
+    console.log(`✅ Kitty session file: ${sessionFile}`);
+    console.log(`   ${projects.length} projects, CLI: ${cli}`);
+    console.log(`\n   Launch: kitty --session ${sessionFile}\n`);
+
+    // Auto-launch if --launch flag
+    if (args.includes('--launch')) {
+      const { spawn } = require('child_process');
+      spawn('kitty', ['--session', sessionFile], { detached: true, stdio: 'ignore' }).unref();
+      console.log('🚀 Kitty launched.');
+    }
     return;
   }
 

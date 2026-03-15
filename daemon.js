@@ -942,14 +942,21 @@ app.delete('/api/sessions/:id', (req, res) => {
 function busAutoRoute(msg) {
   const eventType = msg.type || msg.kind;
   const isRoutable = (eventType === 'turn_request' || eventType === 'deliberation_route_turn') && (msg.target || msg.target_session_id);
-  if (!isRoutable) return;
+  if (!isRoutable) {
+    // Log all bus messages for debugging (excluding health checks)
+    if (eventType && eventType !== 'session_health') {
+      console.log(`[BUS] Event: ${eventType} (not routable)`);
+    }
+    return;
+  }
 
   const rawTarget = (msg.target || msg.target_session_id).split('@')[0];
-  console.log(`[BUS-ROUTE] Received ${eventType}: target=${rawTarget}`);
+  const turnId = (msg.payload && msg.payload.turn_id) || null;
+  console.log(`[BUS-ROUTE] ${eventType}: target=${rawTarget} turn=${turnId} msg_id=${msg.message_id || 'none'}`);
   const targetId = resolveSessionAlias(rawTarget);
   const targetSession = targetId ? sessions[targetId] : null;
   if (!targetSession) {
-    console.log(`[BUS-ROUTE] Target ${rawTarget} not found`);
+    console.log(`[BUS-ROUTE] Target ${rawTarget} not found among: ${Object.keys(sessions).join(', ')}`);
     return;
   }
 
@@ -1002,6 +1009,8 @@ function busAutoRoute(msg) {
     source_host: MACHINE_ID,
     target_agent: targetId,
     source_type: 'bus_auto_route',
+    turn_id: (msg.payload && msg.payload.turn_id) || null,
+    original_message_id: msg.message_id || null,
     delivered,
     timestamp: new Date().toISOString()
   });
