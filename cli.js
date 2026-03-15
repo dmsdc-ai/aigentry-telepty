@@ -677,6 +677,10 @@ async function main() {
     // Override inherited TELEPTY_SESSION_ID — prevent parent session hijacking
     // When launched via kitty @ launch, the parent's env leaks through.
     // With --id flag, we always use the explicitly requested session ID.
+    if (process.env.TELEPTY_SESSION_ID && process.env.TELEPTY_SESSION_ID !== sessionId) {
+      console.error(`⚠️  [allow] Overriding inherited TELEPTY_SESSION_ID="${process.env.TELEPTY_SESSION_ID}" → "${sessionId}"`);
+    }
+    delete process.env.TELEPTY_SESSION_ID;
     process.env.TELEPTY_SESSION_ID = sessionId;
 
     await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
@@ -1195,6 +1199,7 @@ async function main() {
       cliFullPath = cliParts[0];
     }
     const cliFullArgs = cliParts.slice(1).join(' ');
+    const nodeFullPath = process.execPath; // Bypass #!/usr/bin/env node shebang (nvm not in PATH for non-interactive shells)
 
     // Generate kitty session file
     const sessionFile = path.join(os.tmpdir(), `telepty-session-${Date.now()}.conf`);
@@ -1212,7 +1217,8 @@ async function main() {
       conf += `cd ${cwd}\n`;
       conf += `title ${name}\n`;
       conf += `env TELEPTY_SESSION_ID=\n`;
-      conf += `launch --type=window /bin/zsh -c 'unset TELEPTY_SESSION_ID; ${teleptyFullPath} allow --id ${sessionId} ${cliFullPath}${cliFullArgs ? ' ' + cliFullArgs : ''}'\n`;
+      conf += `env PATH=${process.env.PATH}\n`;
+      conf += `launch --type=window /bin/zsh -c 'unset TELEPTY_SESSION_ID; ${nodeFullPath} ${teleptyFullPath} allow --id ${sessionId} ${cliFullPath}${cliFullArgs ? ' ' + cliFullArgs : ''}'\n`;
     });
 
     fs.writeFileSync(sessionFile, conf);
@@ -1244,10 +1250,11 @@ async function main() {
           const name = p.name;
           const cwd = p.cwd || path.join(projectsDir, name);
           const sessionIdForProject = `${name}-${cli.split(' ')[0]}`;
-          const shellCmd = `unset TELEPTY_SESSION_ID; ${teleptyFullPath} allow --id ${sessionIdForProject} ${cliFullPath}${cliFullArgs ? ' ' + cliFullArgs : ''}`;
+          const shellCmd = `unset TELEPTY_SESSION_ID; ${nodeFullPath} ${teleptyFullPath} allow --id ${sessionIdForProject} ${cliFullPath}${cliFullArgs ? ' ' + cliFullArgs : ''}`;
           const launchArgs = ['@', '--to', `unix:${kittySocket}`,
             'launch', '--type=tab', '--tab-title', name, '--cwd', cwd,
             '--env', 'TELEPTY_SESSION_ID=',
+            '--env', `PATH=${process.env.PATH}`,
             '/bin/zsh', '-c', shellCmd];
           try {
             execFileSync('kitty', launchArgs, { timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] });
