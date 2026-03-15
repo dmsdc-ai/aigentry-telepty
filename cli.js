@@ -1296,15 +1296,22 @@ async function main() {
     const dockH = 70;
     const usableH = screenH - menuBarH - dockH;
 
-    // Build AppleScript for the chosen layout
-    let script;
+    // Build AppleScript — collect windows from ALL kitty process instances
+    // (kitty --session spawns separate processes, each with its own window)
+    const collectWindows = `
+          set wList to {}
+          set kittyProcs to every process whose name is "${processName}"
+          repeat with p in kittyProcs
+            repeat with w in (every window of p)
+              set end of wList to w
+            end repeat
+          end repeat
+          set n to count of wList
+          if n = 0 then return "0"`;
+
+    let layoutBody;
     if (layoutType === 'grid') {
-      script = `
-        tell application "System Events"
-          tell process "${processName}"
-            set wList to every window
-            set n to count of wList
-            if n = 0 then return "0"
+      layoutBody = `
             set cols to (n ^ 0.5) as integer
             if cols * cols < n then set cols to cols + 1
             set rows to ((n - 1) div cols) + 1
@@ -1315,17 +1322,9 @@ async function main() {
               set r to ((i - 1) div cols)
               set position of (item i of wList) to {c * cellW, ${menuBarH} + r * cellH}
               set size of (item i of wList) to {cellW, cellH}
-            end repeat
-            return n
-          end tell
-        end tell`;
+            end repeat`;
     } else if (layoutType === 'tall') {
-      script = `
-        tell application "System Events"
-          tell process "${processName}"
-            set wList to every window
-            set n to count of wList
-            if n = 0 then return "0"
+      layoutBody = `
             set halfW to ${screenW} div 2
             if n = 1 then
               set position of (item 1 of wList) to {0, ${menuBarH}}
@@ -1339,27 +1338,23 @@ async function main() {
                 set position of (item i of wList) to {halfW, y}
                 set size of (item i of wList) to {halfW, rightH}
               end repeat
-            end if
-            return n
-          end tell
-        end tell`;
+            end if`;
     } else if (layoutType === 'stack') {
-      script = `
-        tell application "System Events"
-          tell process "${processName}"
-            set wList to every window
-            set n to count of wList
-            if n = 0 then return "0"
+      layoutBody = `
             set cellH to ${usableH} div n
             repeat with i from 1 to n
               set y to ${menuBarH} + ((i - 1) * cellH)
               set position of (item i of wList) to {0, y}
               set size of (item i of wList) to {${screenW}, cellH}
-            end repeat
-            return n
-          end tell
-        end tell`;
+            end repeat`;
     }
+
+    const script = `
+        tell application "System Events"
+          ${collectWindows}
+          ${layoutBody}
+          return n
+        end tell`;
 
     try {
       const result = execSync(`osascript -e '${script}'`, { encoding: 'utf8', timeout: 10000 }).trim();
