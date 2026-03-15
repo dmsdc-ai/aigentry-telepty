@@ -674,6 +674,11 @@ async function main() {
       sessionId = `${folder}-${cli}`;
     }
 
+    // Override inherited TELEPTY_SESSION_ID — prevent parent session hijacking
+    // When launched via kitty @ launch, the parent's env leaks through.
+    // With --id flag, we always use the explicitly requested session ID.
+    process.env.TELEPTY_SESSION_ID = sessionId;
+
     await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
     // Register session with daemon
