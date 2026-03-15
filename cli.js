@@ -1246,6 +1246,134 @@ async function main() {
     return;
   }
 
+  if (cmd === 'layout') {
+    const layoutType = args[1] || 'grid';
+    const validLayouts = ['grid', 'tall', 'stack'];
+    if (!validLayouts.includes(layoutType)) {
+      console.error(`❌ Invalid layout: ${layoutType}. Valid: ${validLayouts.join(', ')}`);
+      process.exit(1);
+    }
+
+    await ensureDaemonRunning();
+    const { execSync } = require('child_process');
+
+    // Get active session count for grid calculation
+    try {
+      const sessionsRes = await fetchWithAuth(`${DAEMON_URL}/api/sessions`);
+      const sessionsList = await sessionsRes.json();
+      const activeIds = Object.keys(sessionsList);
+      if (activeIds.length === 0) {
+        console.log('No active sessions to arrange.');
+        return;
+      }
+    } catch (e) {
+      console.error('❌ Could not fetch sessions:', e.message);
+      process.exit(1);
+    }
+
+    // Detect kitty process name
+    let processName = 'kitty';
+    try {
+      execSync(`osascript -e 'tell application "System Events" to get name of first process whose name is "kitty"'`, {
+        timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+      });
+    } catch {
+      processName = 'stable';
+    }
+
+    // Get screen dimensions
+    let screenW = 2560, screenH = 1440;
+    try {
+      const bounds = execSync(`osascript -e 'tell application "Finder" to get bounds of window of desktop'`, {
+        encoding: 'utf8', timeout: 3000
+      }).trim();
+      const parts = bounds.split(', ');
+      screenW = parseInt(parts[2]);
+      screenH = parseInt(parts[3]);
+    } catch {}
+
+    const menuBarH = 25;
+    const dockH = 70;
+    const usableH = screenH - menuBarH - dockH;
+
+    // Build AppleScript for the chosen layout
+    let script;
+    if (layoutType === 'grid') {
+      script = `
+        tell application "System Events"
+          tell process "${processName}"
+            set wList to every window
+            set n to count of wList
+            if n = 0 then return "0"
+            set cols to (n ^ 0.5) as integer
+            if cols * cols < n then set cols to cols + 1
+            set rows to ((n - 1) div cols) + 1
+            set cellW to ${screenW} div cols
+            set cellH to ${usableH} div rows
+            repeat with i from 1 to n
+              set c to ((i - 1) mod cols)
+              set r to ((i - 1) div cols)
+              set position of (item i of wList) to {c * cellW, ${menuBarH} + r * cellH}
+              set size of (item i of wList) to {cellW, cellH}
+            end repeat
+            return n
+          end tell
+        end tell`;
+    } else if (layoutType === 'tall') {
+      script = `
+        tell application "System Events"
+          tell process "${processName}"
+            set wList to every window
+            set n to count of wList
+            if n = 0 then return "0"
+            set halfW to ${screenW} div 2
+            if n = 1 then
+              set position of (item 1 of wList) to {0, ${menuBarH}}
+              set size of (item 1 of wList) to {${screenW}, ${usableH}}
+            else
+              set position of (item 1 of wList) to {0, ${menuBarH}}
+              set size of (item 1 of wList) to {halfW, ${usableH}}
+              set rightH to ${usableH} div (n - 1)
+              repeat with i from 2 to n
+                set y to ${menuBarH} + ((i - 2) * rightH)
+                set position of (item i of wList) to {halfW, y}
+                set size of (item i of wList) to {halfW, rightH}
+              end repeat
+            end if
+            return n
+          end tell
+        end tell`;
+    } else if (layoutType === 'stack') {
+      script = `
+        tell application "System Events"
+          tell process "${processName}"
+            set wList to every window
+            set n to count of wList
+            if n = 0 then return "0"
+            set cellH to ${usableH} div n
+            repeat with i from 1 to n
+              set y to ${menuBarH} + ((i - 1) * cellH)
+              set position of (item i of wList) to {0, y}
+              set size of (item i of wList) to {${screenW}, cellH}
+            end repeat
+            return n
+          end tell
+        end tell`;
+    }
+
+    try {
+      const result = execSync(`osascript -e '${script}'`, { encoding: 'utf8', timeout: 10000 }).trim();
+      if (result === '0') {
+        console.log('⚠️  No kitty windows found. Sessions may be in tabs — use kitty @ launch --type=os-window for separate windows.');
+      } else {
+        console.log(`✅ Layout '${layoutType}' applied to ${result} kitty windows.`);
+      }
+    } catch (e) {
+      console.error(`❌ Layout failed: ${e.message}`);
+    }
+    return;
+  }
+
   if (cmd === 'deliberate') {
     await ensureDaemonRunning();
     const subCmd = args[1];
@@ -1769,6 +1897,7 @@ Usage:
   telepty listen                                 Listen to the event bus and print JSON to stdout
   telepty monitor                                Human-readable real-time billboard of bus events
   telepty update                                 Update telepty to the latest version
+  telepty layout [grid|tall|stack]               Arrange kitty windows on screen (default: grid)
 
   Handoff Commands:
     handoff list [--status=S]        List handoffs (filter: pending/claimed/executing/completed)
