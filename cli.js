@@ -1312,14 +1312,14 @@ async function main() {
     let layoutBody;
     if (layoutType === 'grid') {
       layoutBody = `
-            set cols to (n ^ 0.5) as integer
-            if cols * cols < n then set cols to cols + 1
-            set rows to ((n - 1) div cols) + 1
-            set cellW to ${screenW} div cols
-            set cellH to ${usableH} div rows
+            set numCols to (n ^ 0.5) as integer
+            if numCols * numCols < n then set numCols to numCols + 1
+            set numRows to ((n - 1) div numCols) + 1
+            set cellW to ${screenW} div numCols
+            set cellH to ${usableH} div numRows
             repeat with i from 1 to n
-              set c to ((i - 1) mod cols)
-              set r to ((i - 1) div cols)
+              set c to ((i - 1) mod numCols)
+              set r to ((i - 1) div numCols)
               set position of (item i of wList) to {c * cellW, ${menuBarH} + r * cellH}
               set size of (item i of wList) to {cellW, cellH}
             end repeat`;
