@@ -795,22 +795,37 @@ app.post('/api/sessions/:id/inject', (req, res) => {
 
       if (!no_enter) {
         setTimeout(() => {
+          // Primary: osascript keystroke (reliable across all CLIs)
+          const submitStrategy = getSubmitStrategy(session.command);
+          const keyCombo = submitStrategy === 'osascript_cmd_enter' ? 'cmd_enter' : 'return_key';
+          const osascriptOk = submitViaOsascript(id, keyCombo);
+
+          if (!osascriptOk) {
+            // Fallback: kitty send-text → WS
+            console.log(`[INJECT] osascript submit failed for ${id}, trying fallback`);
+            if (wid && sock) {
+              try {
+                require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
+                  timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+                });
+              } catch {
+                writeToSession('\r');
+              }
+            } else {
+              writeToSession('\r');
+            }
+          }
+
+          // Update tab title regardless of submit method
           if (wid && sock) {
             try {
-              require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
-                timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-              });
               require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${wid} '⚡ telepty :: ${id}'`, {
                 timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
               });
-            } catch {
-              writeToSession('\r');
-            }
-          } else {
-            writeToSession('\r');
+            } catch {}
           }
         }, 500);
-        submitResult = { deferred: true, strategy: kittyOk ? 'kitty_text_key' : 'ws_split_cr' };
+        submitResult = { deferred: true, strategy: 'osascript_with_fallback' };
       }
     } else {
       // Spawned sessions: direct PTY write
