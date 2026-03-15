@@ -1197,13 +1197,51 @@ async function main() {
     fs.writeFileSync(sessionFile, conf);
     console.log(`✅ Kitty session file: ${sessionFile}`);
     console.log(`   ${projects.length} projects, CLI: ${cli}`);
-    console.log(`\n   Launch: kitty --session ${sessionFile}\n`);
 
     // Auto-launch if --launch flag
     if (args.includes('--launch')) {
-      const { spawn } = require('child_process');
-      spawn('kitty', ['--session', sessionFile], { detached: true, stdio: 'ignore' }).unref();
-      console.log('🚀 Kitty launched.');
+      const { spawn, execFileSync } = require('child_process');
+
+      // Detect existing kitty instance via remote control socket
+      let kittySocket = null;
+      try {
+        const sockFiles = fs.readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
+        if (sockFiles.length > 0) {
+          const candidate = '/tmp/' + sockFiles[0];
+          // Verify socket is alive
+          execFileSync('kitty', ['@', '--to', `unix:${candidate}`, 'ls'], {
+            timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+          });
+          kittySocket = candidate;
+        }
+      } catch { kittySocket = null; }
+
+      if (kittySocket) {
+        // Launch tabs in existing kitty instance (single Dock icon, kitty @ controllable)
+        let launched = 0;
+        for (const p of projects) {
+          const name = p.name;
+          const cwd = p.cwd || path.join(projectsDir, name);
+          const sessionIdForProject = `${name}-${cli.split(' ')[0]}`;
+          const launchArgs = ['@', '--to', `unix:${kittySocket}`,
+            'launch', '--type=tab', '--tab-title', name, '--cwd', cwd,
+            'telepty', 'allow', '--id', sessionIdForProject, ...cli.split(' ')];
+          try {
+            execFileSync('kitty', launchArgs, { timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] });
+            launched++;
+          } catch (e) {
+            console.error(`⚠️  Failed to launch tab for ${name}: ${e.message}`);
+          }
+        }
+        console.log(`🚀 ${launched}/${projects.length} tabs launched in existing kitty instance.`);
+      } else {
+        // No existing kitty — start a new instance with session file
+        console.log(`\n   Launch: kitty --session ${sessionFile}\n`);
+        spawn('kitty', ['--session', sessionFile], { detached: true, stdio: 'ignore' }).unref();
+        console.log('🚀 Kitty launched (new instance).');
+      }
+    } else {
+      console.log(`\n   Launch: kitty --session ${sessionFile}\n`);
     }
     return;
   }
