@@ -1176,6 +1176,21 @@ async function main() {
       process.exit(1);
     }
 
+    // Resolve full paths (kitty @ launch has no shell PATH)
+    const cliParts = cli.split(' ');
+    let teleptyFullPath, cliFullPath;
+    try {
+      teleptyFullPath = execSync('which telepty', { encoding: 'utf8' }).trim();
+    } catch {
+      teleptyFullPath = process.argv[1];
+    }
+    try {
+      cliFullPath = execSync(`which ${cliParts[0]}`, { encoding: 'utf8' }).trim();
+    } catch {
+      cliFullPath = cliParts[0];
+    }
+    const cliFullArgs = cliParts.slice(1).join(' ');
+
     // Generate kitty session file
     const sessionFile = path.join(os.tmpdir(), `telepty-session-${Date.now()}.conf`);
     let conf = '# Auto-generated telepty session\n';
@@ -1191,7 +1206,8 @@ async function main() {
       conf += `layout tall\n`;
       conf += `cd ${cwd}\n`;
       conf += `title ${name}\n`;
-      conf += `launch --type=window telepty allow --id ${sessionId} ${cli}\n`;
+      conf += `env TELEPTY_SESSION_ID=\n`;
+      conf += `launch --type=window /bin/zsh -c 'unset TELEPTY_SESSION_ID; ${teleptyFullPath} allow --id ${sessionId} ${cliFullPath}${cliFullArgs ? ' ' + cliFullArgs : ''}'\n`;
     });
 
     fs.writeFileSync(sessionFile, conf);
@@ -1223,9 +1239,11 @@ async function main() {
           const name = p.name;
           const cwd = p.cwd || path.join(projectsDir, name);
           const sessionIdForProject = `${name}-${cli.split(' ')[0]}`;
+          const shellCmd = `unset TELEPTY_SESSION_ID; ${teleptyFullPath} allow --id ${sessionIdForProject} ${cliFullPath}${cliFullArgs ? ' ' + cliFullArgs : ''}`;
           const launchArgs = ['@', '--to', `unix:${kittySocket}`,
             'launch', '--type=tab', '--tab-title', name, '--cwd', cwd,
-            'telepty', 'allow', '--id', sessionIdForProject, ...cli.split(' ')];
+            '--env', 'TELEPTY_SESSION_ID=',
+            '/bin/zsh', '-c', shellCmd];
           try {
             execFileSync('kitty', launchArgs, { timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] });
             launched++;
