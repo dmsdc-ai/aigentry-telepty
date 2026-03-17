@@ -48,6 +48,20 @@ function pickSessionTarget(sessionRef, sessions, defaultHost = '127.0.0.1') {
   const matches = sessions.filter((session) => session.id === parsed.id);
 
   if (matches.length === 0) {
+    // Project-based fallback: match sessions whose ID starts with the requested prefix.
+    // e.g., "aigentry-dustcraw" matches "aigentry-dustcraw-001" or "aigentry-dustcraw-claude".
+    const prefixMatches = sessions.filter((s) =>
+      s.id.startsWith(parsed.id + '-') || s.id.startsWith(parsed.id)
+    );
+    if (prefixMatches.length === 1) {
+      return { id: prefixMatches[0].id, host: prefixMatches[0].host };
+    }
+    if (prefixMatches.length > 1) {
+      // Multiple candidates: prefer same host, then first alphabetically
+      const local = prefixMatches.find((s) => s.host === '127.0.0.1');
+      const best = local || prefixMatches.sort((a, b) => a.id.localeCompare(b.id))[0];
+      return { id: best.id, host: best.host };
+    }
     return null;
   }
 

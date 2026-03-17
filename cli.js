@@ -787,10 +787,14 @@ async function main() {
         try {
           const msg = JSON.parse(message);
           if (msg.type === 'inject') {
-            const isFollowUpCr = msg.data === '\r' && (Date.now() - lastInjectTextTime) < 1000;
-            if (promptReady || isFollowUpCr) {
+            const isCr = msg.data === '\r';
+            // \r is always written immediately — daemon only sends it as deliberate submit.
+            // Previously relied on isFollowUpCr heuristic which failed when text was
+            // delivered via kitty send-text (bypassing WS) leaving lastInjectTextTime=0.
+            const isFollowUpCr = isCr && (Date.now() - lastInjectTextTime) < 1000;
+            if (isCr || promptReady || isFollowUpCr) {
               child.write(msg.data);
-              if (msg.data !== '\r' && msg.data.length > 1) {
+              if (!isCr && msg.data.length > 1) {
                 promptReady = false;
                 lastInjectTextTime = Date.now();
               }
