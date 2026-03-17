@@ -792,7 +792,10 @@ app.post('/api/sessions/:id/inject', (req, res) => {
       }
       if (!kittyOk) {
         // Fallback: WS (works with new allow bridges that have queue flush)
-        writeToSession(finalPrompt);
+        const wsOk = writeToSession(finalPrompt);
+        if (!wsOk) {
+          return res.status(503).json({ error: 'Process not connected' });
+        }
         console.log(`[INJECT] WS fallback for ${id}`);
       }
 

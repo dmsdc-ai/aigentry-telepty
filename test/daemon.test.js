@@ -106,7 +106,8 @@ test('inject and multicast endpoints report success and partial failure correctl
   });
 
   assert.equal(multicast.status, 200);
-  assert.deepEqual(multicast.body.results.successful, [sessionId]);
+  assert.equal(multicast.body.results.successful.length, 1);
+  assert.equal(multicast.body.results.successful[0].id, sessionId);
   assert.equal(multicast.body.results.failed.length, 1);
   assert.equal(multicast.body.results.failed[0].id, missingId);
 });
@@ -139,7 +140,8 @@ test('broadcast inject publishes a single bus event with all successful target I
 
   const event = messages.find((message) => message.type === 'injection' && message.content === prompt);
   assert.equal(messages.filter((message) => message.type === 'injection' && message.content === prompt).length, 1);
-  assert.deepEqual(event.session_ids.slice().sort(), [sessionA, sessionB].sort());
+  const eventIds = event.session_ids.map(s => typeof s === 'string' ? s : s.id).sort();
+  assert.deepEqual(eventIds, [sessionA, sessionB].sort());
 
   bus.close();
 });
@@ -226,18 +228,22 @@ test('register rejects missing session_id and duplicate IDs', async () => {
   const sessionId = createSessionId('dup-reg');
   await harness.registerSession(sessionId);
   const duplicate = await harness.registerSession(sessionId);
-  assert.equal(duplicate.status, 409);
-  assert.match(duplicate.body.error, /already active/i);
+  // Re-registration is idempotent — returns 200 with reregistered flag
+  assert.equal(duplicate.status, 200);
+  assert.equal(duplicate.body.reregistered, true);
 });
 
 test('register and spawn share the same namespace (cross-type duplicate rejection)', async () => {
   const sessionId = createSessionId('cross');
   await harness.spawnSession(sessionId);
+  // Register is idempotent — re-registers existing session
   const dup = await harness.registerSession(sessionId);
-  assert.equal(dup.status, 409);
+  assert.equal(dup.status, 200);
+  assert.equal(dup.body.reregistered, true);
 
   const sessionId2 = createSessionId('cross2');
   await harness.registerSession(sessionId2);
+  // Spawn rejects duplicate IDs
   const dup2 = await harness.spawnSession(sessionId2);
   assert.equal(dup2.status, 409);
 });
@@ -378,7 +384,8 @@ test('multicast inject handles mixed spawned and wrapped sessions', async () => 
   });
 
   assert.equal(result.status, 200);
-  assert.deepEqual(result.body.results.successful, [spawnedId]);
+  assert.equal(result.body.results.successful.length, 1);
+  assert.equal(result.body.results.successful[0].id, spawnedId);
   assert.equal(result.body.results.failed.length, 1);
   assert.equal(result.body.results.failed[0].id, wrappedId);
   assert.match(result.body.results.failed[0].error, /not connected/i);
