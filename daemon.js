@@ -785,7 +785,10 @@ app.post('/api/sessions/:id/inject', (req, res) => {
           });
           kittyOk = true;
           console.log(`[INJECT] Kitty send-text for ${id} (window ${wid})`);
-        } catch {}
+        } catch {
+          // Invalidate cached window ID — window may have changed or been closed
+          session.kittyWindowId = null;
+        }
       }
       if (!kittyOk) {
         // Fallback: WS (works with new allow bridges that have queue flush)

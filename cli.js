@@ -598,6 +598,12 @@ async function main() {
     return;
   }
 
+  if (cmd === 'tui' || cmd === 'dashboard') {
+    const { TuiDashboard } = require('./tui');
+    new TuiDashboard();
+    return;
+  }
+
   if (cmd === 'list') {
     try {
       const sessions = await discoverSessions({ silent: true });
@@ -790,11 +796,14 @@ async function main() {
           const msg = JSON.parse(message);
           if (msg.type === 'inject') {
             const isCr = msg.data === '\r';
-            // \r is always written immediately — daemon only sends it as deliberate submit.
-            // Previously relied on isFollowUpCr heuristic which failed when text was
-            // delivered via kitty send-text (bypassing WS) leaving lastInjectTextTime=0.
-            const isFollowUpCr = isCr && (Date.now() - lastInjectTextTime) < 1000;
-            if (isCr || promptReady || isFollowUpCr) {
+            if (isCr && injectQueue.length > 0) {
+              // CR with pending queued text — queue CR too and flush immediately.
+              // Prevents the busy-session bug where CR fires before queued text,
+              // causing empty submit followed by orphaned text without Return.
+              injectQueue.push(msg.data);
+              if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
+              flushInjectQueue();
+            } else if (isCr || promptReady) {
               child.write(msg.data);
               if (!isCr && msg.data.length > 1) {
                 promptReady = false;
