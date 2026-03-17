@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 
 const blessed = require('blessed');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { execSync, execFileSync } = require('child_process');
 const { getConfig } = require('./auth');
 
 const PORT = process.env.PORT || 3848;
 const DAEMON_URL = `http://localhost:${PORT}`;
 const POLL_INTERVAL = 2000;
 const STALE_THRESHOLD = 120; // seconds idle before "stale"
+const PROJECTS_DIR = path.join(os.homedir(), 'projects');
+const DEFAULT_CLI = 'claude --dangerously-skip-permissions';
 
 class TuiDashboard {
   constructor() {
@@ -71,6 +77,175 @@ class TuiDashboard {
     } catch (e) {
       this.setStatus(`{red-fg}Broadcast error: ${e.message}{/}`);
     }
+  }
+
+  // ── Session lifecycle (P1) ──────────────────────────────────
+
+  findKittySocket() {
+    try {
+      const files = fs.readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
+      return files.length > 0 ? '/tmp/' + files[0] : null;
+    } catch { return null; }
+  }
+
+  findKittyWindowId(sock, sessionId) {
+    try {
+      const raw = execSync(`kitty @ --to unix:${sock} ls`, { timeout: 3000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+      const data = JSON.parse(raw);
+      for (const osw of data) {
+        for (const tab of osw.tabs) {
+          for (const w of tab.windows) {
+            for (const p of (w.foreground_processes || [])) {
+              const cmd = (p.cmdline || []).join(' ');
+              if (cmd.includes('--id ' + sessionId) || cmd.includes('--id=' + sessionId)) {
+                return w.id;
+              }
+            }
+            // Also match by window title
+            if (w.title && w.title.includes(sessionId)) return w.id;
+          }
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  discoverProjects() {
+    try {
+      return fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
+        .filter(d => d.isDirectory() && d.name.startsWith('aigentry-') &&
+                fs.existsSync(path.join(PROJECTS_DIR, d.name, '.git')))
+        .map(d => ({ name: d.name, cwd: path.join(PROJECTS_DIR, d.name) }));
+    } catch { return []; }
+  }
+
+  async startSession(project) {
+    const sock = this.findKittySocket();
+    if (!sock) return this.setStatus('{red-fg}No kitty socket found{/}');
+
+    const cli = DEFAULT_CLI;
+    const cliParts = cli.split(' ');
+    let teleptyPath, cliPath;
+    try { teleptyPath = execSync('which telepty', { encoding: 'utf8' }).trim(); }
+    catch { teleptyPath = path.join(__dirname, 'cli.js'); }
+    try { cliPath = execSync(`which ${cliParts[0]}`, { encoding: 'utf8' }).trim(); }
+    catch { cliPath = cliParts[0]; }
+    const cliArgs = cliParts.slice(1).join(' ');
+    const nodePath = process.execPath;
+
+    const sessionId = `${project.name}-${cliParts[0]}`;
+    const shellCmd = `unset TELEPTY_SESSION_ID; ${nodePath} ${teleptyPath} allow --id ${sessionId} ${cliPath}${cliArgs ? ' ' + cliArgs : ''}`;
+
+    try {
+      execFileSync('kitty', ['@', '--to', `unix:${sock}`,
+        'launch', '--type=tab', '--tab-title', project.name, '--cwd', project.cwd,
+        '--env', 'TELEPTY_SESSION_ID=',
+        '--env', `PATH=${process.env.PATH}`,
+        '/bin/zsh', '-c', shellCmd
+      ], { timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] });
+      this.setStatus(`{green-fg}Started ${sessionId}{/}`);
+      setTimeout(() => this.fetchSessions(), 2000);
+    } catch (e) {
+      this.setStatus(`{red-fg}Start failed: ${e.message}{/}`);
+    }
+  }
+
+  async killSession(id) {
+    try {
+      // Send Ctrl+C to kitty window first
+      const sock = this.findKittySocket();
+      if (sock) {
+        const wid = this.findKittyWindowId(sock, id);
+        if (wid) {
+          try {
+            execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\x03'`, {
+              timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+            });
+          } catch {}
+        }
+      }
+      // Deregister from daemon
+      await this.apiFetch(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      this.setStatus(`{green-fg}Killed ${id}{/}`);
+      setTimeout(() => this.fetchSessions(), 1000);
+    } catch (e) {
+      this.setStatus(`{red-fg}Kill error: ${e.message}{/}`);
+    }
+  }
+
+  async purgeStale() {
+    const staleSessions = this.sessions.filter(s => {
+      const idle = s.idleSeconds;
+      return (idle !== null && idle > STALE_THRESHOLD) || s.active_clients === 0;
+    });
+    if (staleSessions.length === 0) {
+      return this.setStatus('{yellow-fg}No stale sessions to purge{/}');
+    }
+
+    const sock = this.findKittySocket();
+    let purged = 0;
+    for (const s of staleSessions) {
+      try {
+        // Send Ctrl+C to the session's kitty window
+        if (sock) {
+          const wid = this.findKittyWindowId(sock, s.id);
+          if (wid) {
+            execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\x03'`, {
+              timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+            });
+          }
+        }
+        // Deregister from daemon
+        await this.apiFetch(`/api/sessions/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
+        purged++;
+      } catch {}
+    }
+    this.setStatus(`{green-fg}Purged ${purged}/${staleSessions.length} stale sessions{/}`);
+    setTimeout(() => this.fetchSessions(), 1000);
+  }
+
+  showProjectPicker() {
+    const projects = this.discoverProjects();
+    // Filter out projects that already have active sessions
+    const activeIds = new Set(this.sessions.map(s => s.id));
+    const available = projects.filter(p => {
+      const expectedId = `${p.name}-claude`;
+      return !activeIds.has(expectedId);
+    });
+
+    if (available.length === 0) {
+      return this.setStatus('{yellow-fg}All projects already have active sessions{/}');
+    }
+
+    const picker = blessed.list({
+      parent: this.screen,
+      top: 'center', left: 'center',
+      width: '50%', height: Math.min(available.length + 2, 20),
+      border: { type: 'line' },
+      label: ' Start Session — Select Project ',
+      tags: true,
+      keys: true, vi: true, mouse: true,
+      items: available.map(p => ` ${p.name}`),
+      style: {
+        border: { fg: 'green' },
+        selected: { bg: 'green', fg: 'black', bold: true },
+        item: { fg: 'white' }
+      }
+    });
+
+    picker.focus();
+    picker.on('select', (item, index) => {
+      picker.destroy();
+      this.sessionList.focus();
+      this.screen.render();
+      this.startSession(available[index]);
+    });
+    picker.key(['escape', 'q'], () => {
+      picker.destroy();
+      this.sessionList.focus();
+      this.screen.render();
+    });
+    this.screen.render();
   }
 
   // ── Event Bus ────────────────────────────────────────────────
@@ -166,7 +341,7 @@ class TuiDashboard {
       bottom: 1, left: 0, width: '100%', height: 1,
       tags: true,
       style: { fg: 'white', bg: 'gray' },
-      content: ' {bold}i{/}:Inject  {bold}b{/}:Broadcast  {bold}r{/}:Refresh  {bold}q{/}:Quit'
+      content: ' {bold}s{/}:Start  {bold}k{/}:Kill  {bold}i{/}:Inject  {bold}b{/}:Broadcast  {bold}p{/}:Purge  {bold}r{/}:Refresh  {bold}q{/}:Quit'
     });
 
     // Status bar
@@ -202,6 +377,20 @@ class TuiDashboard {
     this.screen.key(['r'], () => {
       this.fetchSessions();
       this.setStatus('{green-fg}Refreshed{/}');
+    });
+
+    this.screen.key(['s'], () => {
+      this.showProjectPicker();
+    });
+
+    this.screen.key(['k'], () => {
+      const session = this.sessions[this.selectedIndex];
+      if (!session) return this.setStatus('{red-fg}No session selected{/}');
+      this.killSession(session.id);
+    });
+
+    this.screen.key(['p'], () => {
+      this.purgeStale();
     });
 
     this.sessionList.focus();
