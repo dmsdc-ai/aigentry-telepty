@@ -746,7 +746,9 @@ async function main() {
     }
 
     // Connect to daemon WebSocket with auto-reconnect
-    const wsUrl = `ws://${REMOTE_HOST}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
+    // owner=1 tells daemon this is the allow bridge (owner), not an attach viewer.
+    // Daemon uses this to reclaim ownership even if a stale ownerWs is still registered.
+    const wsUrl = `ws://${REMOTE_HOST}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}&owner=1`;
     let daemonWs = null;
     let wsReady = false;
     let reconnectAttempts = 0;

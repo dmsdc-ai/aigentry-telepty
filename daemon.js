@@ -1351,6 +1351,21 @@ wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://' + req.headers.host);
   const sessionId = url.pathname.split('/').pop();
   const session = sessions[sessionId];
+  // ?owner=1 indicates the allow bridge (PTY owner), not an attach viewer
+  const isOwnerConnect = url.searchParams.get('owner') === '1';
+
+  // Ping/pong heartbeat — detect and terminate stale TCP half-open connections (30s interval)
+  let isAlive = true;
+  ws.on('pong', () => { isAlive = true; });
+  const pingInterval = setInterval(() => {
+    if (!isAlive) {
+      console.log(`[WS] Terminating stale connection (no pong) for ${sessionId}`);
+      ws.terminate();
+      return;
+    }
+    isAlive = false;
+    ws.ping();
+  }, 30000);
 
   if (!session) {
     // Auto-register wrapped session on WS connect (supports reconnect after daemon restart)
@@ -1387,10 +1402,17 @@ wss.on('connection', (ws, req) => {
 
   const activeSession = sessions[sessionId];
 
-  // For wrapped sessions, first connector becomes the owner
-  if (activeSession.type === 'wrapped' && !activeSession.ownerWs) {
+  // For wrapped sessions, first connector OR explicit ?owner=1 claim becomes the owner.
+  // ?owner=1 reclaim handles the stale-ownerWs bug: allow bridge reconnects but stale TCP
+  // half-open connection still holds ownerWs slot → reconnect wrongly becomes a viewer.
+  if (activeSession.type === 'wrapped' && (!activeSession.ownerWs || isOwnerConnect)) {
+    if (isOwnerConnect && activeSession.ownerWs && activeSession.ownerWs !== ws) {
+      // Terminate the stale owner connection before claiming ownership
+      console.log(`[WS] Replacing stale ownerWs for session ${sessionId}`);
+      activeSession.ownerWs.terminate();
+    }
     activeSession.ownerWs = ws;
-    console.log(`[WS] Wrap owner connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
+    console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
   } else {
     console.log(`[WS] Client attached to session ${sessionId} (Total: ${activeSession.clients.size})`);
   }
@@ -1432,6 +1454,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    clearInterval(pingInterval);
     activeSession.clients.delete(ws);
     if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
       activeSession.ownerWs = null;
