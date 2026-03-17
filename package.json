@@ -17,6 +17,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "blessed": "^0.1.81",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "node-pty": "^1.2.0-beta.11",
