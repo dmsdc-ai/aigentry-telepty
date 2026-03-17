@@ -1,1 +1,0 @@
-{"topic": "Brainstorming and critiquing the 3 communication modes in telepty (Prompt Injection, Visual Log, Background JSON). What crucial interaction pattern between human users and AI agents is missing from this list? Consider synchronous vs asynchronous, blocking vs non-blocking, and explicit handshakes.", "speakers": ["claude", "codex", "gemini"], "role_preset": "brainstorm"}
