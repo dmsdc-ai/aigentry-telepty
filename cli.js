@@ -780,14 +780,8 @@ async function main() {
 
       daemonWs.on('open', () => {
         wsReady = true;
-        if (reconnectAttempts > 0) {
-          // Silent reconnect — no console output to avoid breaking TUI rendering
-          // Force CLI redraw by triggering SIGWINCH (resize +1/-1)
-          const origCols = child.cols || process.stdout.columns || 80;
-          const origRows = child.rows || process.stdout.rows || 30;
-          child.resize(origCols - 1, origRows);
-          setTimeout(() => child.resize(origCols, origRows), 150);
-        }
+        // No resize trick on reconnect — it causes visible flickering across all
+        // terminals when the daemon restarts and multiple sessions reconnect at once.
         reconnectAttempts = 0;
       });
 

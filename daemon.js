@@ -1389,9 +1389,8 @@ wss.on('connection', (ws, req) => {
     };
     sessions[sessionId] = autoSession;
     console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect`);
-    // Trigger CLI redraw + set tab title via kitty after short delay
+    // Set tab title via kitty (no \x0c redraw — it causes flickering on multi-session reconnect)
     setTimeout(() => {
-      sendViaKitty(sessionId, '\x0c');
       const sock = findKittySocket();
       const wid = findKittyWindowId(sock, sessionId);
       if (sock && wid) {
