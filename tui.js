@@ -23,6 +23,7 @@ class TuiDashboard {
     this.pollTimer = null;
     this.busWs = null;
     this.busLog = [];
+    this.sessionTasks = {}; // { sessionId: { summary, state, updatedAt } }
     this.setupScreen();
     this.startPolling();
     this.connectBus();
@@ -248,6 +249,35 @@ class TuiDashboard {
     this.screen.render();
   }
 
+  // ── Task extraction from bus events ─────────────────────────
+
+  parseTaskInfo(content) {
+    if (!content || typeof content !== 'string') return null;
+    const firstLine = content.split('\n')[0].trim();
+    // Extract [tag] patterns: [P0 착수], [완료 보고], [telepty 관점], etc.
+    const tagMatch = firstLine.match(/\[([^\]]{2,30})\]/);
+    const tag = tagMatch ? tagMatch[1] : null;
+    // Detect state from keywords
+    let state = 'working';
+    if (/완료|complete|done|finish/i.test(firstLine)) state = 'done';
+    else if (/토론|deliberat|discuss|synthesis|합의/i.test(firstLine)) state = 'discussing';
+    else if (/동의|반대|vote|찬성/i.test(firstLine)) state = 'voting';
+    else if (/대기|standby|waiting|idle/i.test(firstLine)) state = 'idle';
+    // Build summary (tag or truncated first line)
+    const summary = tag || firstLine.replace(/\[.*?\]/g, '').trim().slice(0, 30);
+    return { summary, state };
+  }
+
+  updateSessionTask(sessionId, content) {
+    const info = this.parseTaskInfo(content);
+    if (!info || !info.summary) return;
+    this.sessionTasks[sessionId] = {
+      summary: info.summary,
+      state: info.state,
+      updatedAt: Date.now()
+    };
+  }
+
   // ── Event Bus ────────────────────────────────────────────────
 
   connectBus() {
@@ -263,16 +293,20 @@ class TuiDashboard {
           let line = `${ts} `;
           if (msg.type === 'inject_written') {
             line += `{cyan-fg}inject{/} -> ${msg.target || '?'}`;
+            // Track task from inject content
+            if (msg.target) this.updateSessionTask(msg.target, msg.content || msg.prompt);
           } else if (msg.type === 'injection') {
             line += `{cyan-fg}broadcast{/} -> ${msg.target_agent || 'all'}`;
           } else if (msg.type === 'message_routed') {
             line += `{yellow-fg}${msg.from || '?'}{/} -> {green-fg}${msg.to || '?'}{/}`;
+            if (msg.from) this.updateSessionTask(msg.from, msg.content || msg.prompt);
           } else {
             line += `{white-fg}${msg.type || 'event'}{/}`;
           }
           this.busLog.push(line);
           if (this.busLog.length > 100) this.busLog.shift();
           this.renderBusLog();
+          this.renderSessionList(); // refresh task info
         } catch { /* ignore malformed */ }
       });
       this.busWs.on('close', () => {
@@ -428,9 +462,20 @@ class TuiDashboard {
   getStatusInfo(session) {
     const idle = session.idleSeconds;
     const clients = session.active_clients || 0;
-
+    const task = this.sessionTasks[session.id];
+    // Task-aware state (bus events override idle heuristic)
     if (clients === 0) return { icon: '{red-fg}✕{/}', label: '{red-fg}dead{/}' };
     if (idle !== null && idle > STALE_THRESHOLD) return { icon: '{yellow-fg}○{/}', label: '{yellow-fg}stale{/}' };
+    if (task && (Date.now() - task.updatedAt) < 300000) { // 5min freshness
+      const stateMap = {
+        done:       { icon: '{green-fg}✓{/}',  label: '{green-fg}done{/}' },
+        discussing: { icon: '{magenta-fg}◉{/}', label: '{magenta-fg}discuss{/}' },
+        voting:     { icon: '{magenta-fg}◎{/}', label: '{magenta-fg}vote{/}' },
+        working:    { icon: '{cyan-fg}●{/}',    label: '{cyan-fg}working{/}' },
+        idle:       { icon: '{green-fg}●{/}',   label: '{white-fg}idle{/}' }
+      };
+      return stateMap[task.state] || stateMap.working;
+    }
     if (idle !== null && idle < 10) return { icon: '{green-fg}●{/}', label: '{green-fg}busy{/}' };
     return { icon: '{green-fg}●{/}', label: '{white-fg}idle{/}' };
   }
@@ -439,7 +484,10 @@ class TuiDashboard {
     const items = this.sessions.map((s) => {
       const { icon, label } = this.getStatusInfo(s);
       const shortId = s.id.replace(/^aigentry-/, '').replace(/-claude$/, '');
-      return ` ${icon}  ${shortId.padEnd(24)} ${label}  {gray-fg}C:${s.active_clients}{/}`;
+      const task = this.sessionTasks[s.id];
+      const taskStr = (task && (Date.now() - task.updatedAt) < 300000)
+        ? ` {gray-fg}${task.summary.slice(0, 20)}{/}` : '';
+      return ` ${icon}  ${shortId.padEnd(20)} ${label.padEnd(18)}${taskStr}`;
     });
 
     this.sessionList.setItems(items);
