@@ -1039,6 +1039,16 @@ async function main() {
         process.exit(1);
       }
 
+      // Entitlement: remote session check
+      if (target.host && target.host !== '127.0.0.1' && target.host !== 'localhost') {
+        const { checkEntitlement } = require('./entitlement');
+        const ent = checkEntitlement({ feature: 'telepty.remote_sessions' });
+        if (!ent.allowed) {
+          console.error(`⚠️  ${ent.reason}\n   Upgrade: ${ent.upgrade_url}`);
+          process.exit(1);
+        }
+      }
+
       const body = { prompt, no_enter: noEnter };
       if (fromId) body.from = fromId;
       if (replyTo) body.reply_to = replyTo;

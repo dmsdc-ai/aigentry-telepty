@@ -7,6 +7,7 @@ const { WebSocketServer } = require('ws');
 const { getConfig } = require('./auth');
 const pkg = require('./package.json');
 const { claimDaemonState, clearDaemonState } = require('./daemon-control');
+const { checkEntitlement } = require('./entitlement');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -209,6 +210,13 @@ app.post('/api/sessions/spawn', (req, res) => {
   const { session_id, command, args = [], cwd = process.cwd(), cols = 80, rows = 30, type = 'AGENT' } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is strictly required.' });
   if (sessions[session_id]) return res.status(409).json({ error: `Session ID '${session_id}' is already active.` });
+  // Entitlement: check session limit
+  const sessionCount = Object.keys(sessions).length;
+  const ent = checkEntitlement({ feature: 'telepty.multi_session', currentUsage: sessionCount });
+  if (!ent.allowed) {
+    console.log(`[ENTITLEMENT] Session limit reached (${sessionCount}/${ent.limit?.max || '?'}), tier: ${ent.tier}`);
+    return res.status(402).json({ error: ent.reason, upgrade_url: ent.upgrade_url, tier: ent.tier });
+  }
   if (!command) return res.status(400).json({ error: 'command is required' });
 
   const isWin = os.platform() === 'win32';
@@ -300,6 +308,15 @@ app.post('/api/sessions/spawn', (req, res) => {
 app.post('/api/sessions/register', (req, res) => {
   const { session_id, command, cwd = process.cwd() } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+  // Entitlement: check session limit for new registrations
+  if (!sessions[session_id]) {
+    const sessionCount = Object.keys(sessions).length;
+    const ent = checkEntitlement({ feature: 'telepty.multi_session', currentUsage: sessionCount });
+    if (!ent.allowed) {
+      console.log(`[ENTITLEMENT] Session limit reached (${sessionCount}/${ent.limit?.max || '?'}), tier: ${ent.tier}`);
+      return res.status(402).json({ error: ent.reason, upgrade_url: ent.upgrade_url, tier: ent.tier });
+    }
+  }
   // Idempotent: allow re-registration (update command/cwd, keep clients)
   if (sessions[session_id]) {
     const existing = sessions[session_id];
