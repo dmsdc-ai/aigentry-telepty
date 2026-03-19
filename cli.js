@@ -1186,7 +1186,7 @@ async function main() {
     const configArg = args.find(a => a.startsWith('--config='));
     const configPath = configArg ? configArg.split('=').slice(1).join('=') : null;
     const cliArg = args.find(a => a.startsWith('--cli='));
-    const cli = cliArg ? cliArg.split('=')[1] : 'claude --dangerously-skip-permissions';
+    const cli = cliArg ? cliArg.split('=')[1] : 'claude --dangerously-skip-permissions --continue';
     const projectsDir = args.find(a => a.startsWith('--dir=')) ? args.find(a => a.startsWith('--dir=')).split('=')[1] : process.cwd();
 
     // Discover project folders (subdirectories with .git)

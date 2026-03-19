@@ -12,7 +12,7 @@ const DAEMON_URL = `http://localhost:${PORT}`;
 const POLL_INTERVAL = 2000;
 const STALE_THRESHOLD = 120; // seconds idle before "stale"
 const PROJECTS_DIR = path.join(os.homedir(), 'projects');
-const DEFAULT_CLI = 'claude --dangerously-skip-permissions';
+const DEFAULT_CLI = 'claude --dangerously-skip-permissions --continue';
 
 class TuiDashboard {
   constructor() {
