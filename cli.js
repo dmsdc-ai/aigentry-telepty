@@ -1271,7 +1271,7 @@ async function main() {
           const sessionIdForProject = `${name}-${cli.split(' ')[0]}`;
           const shellCmd = `unset TELEPTY_SESSION_ID; ${nodeFullPath} ${teleptyFullPath} allow --id ${sessionIdForProject} ${cliFullPath}${cliFullArgs ? ' ' + cliFullArgs : ''}`;
           const launchArgs = ['@', '--to', `unix:${kittySocket}`,
-            'launch', '--type=os-window', '--title', name, '--cwd', cwd,
+            'launch', '--type=os-window', '--cwd', cwd,
             '--env', 'TELEPTY_SESSION_ID=',
             '--env', `PATH=${process.env.PATH}`,
             '/bin/zsh', '-c', shellCmd];

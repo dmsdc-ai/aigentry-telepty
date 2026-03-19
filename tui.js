@@ -139,7 +139,7 @@ class TuiDashboard {
 
     try {
       execFileSync('kitty', ['@', '--to', `unix:${sock}`,
-        'launch', '--type=os-window', '--title', project.name, '--cwd', project.cwd,
+        'launch', '--type=os-window', '--cwd', project.cwd,
         '--env', 'TELEPTY_SESSION_ID=',
         '--env', `PATH=${process.env.PATH}`,
         '/bin/zsh', '-c', shellCmd
