@@ -697,7 +697,8 @@ async function main() {
           command,
           cwd: process.cwd(),
           backend: detectedBackend,
-          cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null
+          cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
+          cmux_surface_id: process.env.CMUX_SURFACE_ID || null
         })
       });
       const data = await res.json();
@@ -776,7 +777,8 @@ async function main() {
               command,
               cwd: process.cwd(),
               backend: detectedBackend,
-              cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null
+              cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
+              cmux_surface_id: process.env.CMUX_SURFACE_ID || null
             })
           });
         } catch (e) {

@@ -8,6 +8,7 @@ const { getConfig } = require('./auth');
 const pkg = require('./package.json');
 const { claimDaemonState, clearDaemonState } = require('./daemon-control');
 const { checkEntitlement } = require('./entitlement');
+const terminalBackend = require('./terminal-backend');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -19,7 +20,7 @@ function persistSessions() {
   try {
     const data = {};
     for (const [id, s] of Object.entries(sessions)) {
-      data[id] = { id, type: s.type, command: s.command, cwd: s.cwd, backend: s.backend || null, cmuxWorkspaceId: s.cmuxWorkspaceId || null, createdAt: s.createdAt, lastActivityAt: s.lastActivityAt || null };
+      data[id] = { id, type: s.type, command: s.command, cwd: s.cwd, backend: s.backend || null, cmuxWorkspaceId: s.cmuxWorkspaceId || null, cmuxSurfaceId: s.cmuxSurfaceId || null, createdAt: s.createdAt, lastActivityAt: s.lastActivityAt || null };
     }
     fs.mkdirSync(require('path').dirname(SESSION_PERSIST_PATH), { recursive: true });
     fs.writeFileSync(SESSION_PERSIST_PATH, JSON.stringify(data, null, 2));
@@ -137,6 +138,10 @@ if (!daemonClaim.claimed) {
 const sessions = {};
 const handoffs = {};
 const threads = {};
+
+// Detect terminal environment at daemon startup
+const DETECTED_TERMINAL = terminalBackend.detectTerminal();
+console.log(`[DAEMON] Terminal backend: ${DETECTED_TERMINAL}`);
 
 // Restore persisted session metadata (wrapped sessions await reconnect)
 const _persisted = loadPersistedSessions();
@@ -304,7 +309,7 @@ app.post('/api/sessions/spawn', (req, res) => {
 });
 
 app.post('/api/sessions/register', (req, res) => {
-  const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id } = req.body;
+  const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is required' });
   // Entitlement: check session limit for new registrations
   if (!sessions[session_id]) {
@@ -322,6 +327,7 @@ app.post('/api/sessions/register', (req, res) => {
     if (cwd) existing.cwd = cwd;
     if (backend) existing.backend = backend;
     if (cmux_workspace_id) existing.cmuxWorkspaceId = cmux_workspace_id;
+    if (cmux_surface_id) existing.cmuxSurfaceId = cmux_surface_id;
     console.log(`[REGISTER] Re-registered session ${session_id} (updated metadata)`);
     return res.status(200).json({ session_id, type: 'wrapped', command: existing.command, cwd: existing.cwd, reregistered: true });
   }
@@ -335,6 +341,7 @@ app.post('/api/sessions/register', (req, res) => {
     cwd,
     backend: backend || 'kitty',
     cmuxWorkspaceId: cmux_workspace_id || null,
+    cmuxSurfaceId: cmux_surface_id || null,
     createdAt: new Date().toISOString(),
     lastActivityAt: new Date().toISOString(),
     clients: new Set(),
@@ -393,6 +400,7 @@ app.get('/api/sessions', (req, res) => {
       cwd: session.cwd,
       backend: session.backend || 'kitty',
       cmuxWorkspaceId: session.cmuxWorkspaceId || null,
+      cmuxSurfaceId: session.cmuxSurfaceId || null,
       createdAt: session.createdAt,
       lastActivityAt: session.lastActivityAt || null,
       idleSeconds,
@@ -436,6 +444,7 @@ app.get('/api/meta', (req, res) => {
     host: HOST,
     port: Number(PORT),
     machine_id: MACHINE_ID,
+    terminal: DETECTED_TERMINAL,
     capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine']
   });
 });
@@ -464,6 +473,27 @@ app.post('/api/sessions/multicast/inject', (req, res) => {
     const session = sessions[id];
     if (session) {
       try {
+        // cmux auto-detect at daemon level (text + enter)
+        if (DETECTED_TERMINAL === 'cmux') {
+          const ok = terminalBackend.cmuxSendText(id, prompt);
+          if (ok) {
+            setTimeout(() => terminalBackend.cmuxSendEnter(id), 300);
+            results.successful.push({ id, strategy: 'cmux_auto' });
+            // Broadcast injection to bus
+            const busMsg = JSON.stringify({
+              type: 'injection',
+              sender: 'cli',
+              target_agent: id,
+              content: prompt,
+              timestamp: new Date().toISOString()
+            });
+            busClients.forEach(client => {
+              if (client.readyState === 1) client.send(busMsg);
+            });
+            return; // skip WS path for this session
+          }
+        }
+
         // Inject text first, then \r separately after delay
         if (session.type === 'wrapped') {
           if (session.ownerWs && session.ownerWs.readyState === 1) {
@@ -516,6 +546,16 @@ app.post('/api/sessions/broadcast/inject', (req, res) => {
   Object.keys(sessions).forEach(id => {
     const session = sessions[id];
     try {
+      // cmux auto-detect at daemon level (text + enter)
+      if (DETECTED_TERMINAL === 'cmux') {
+        const ok = terminalBackend.cmuxSendText(id, prompt);
+        if (ok) {
+          setTimeout(() => terminalBackend.cmuxSendEnter(id), 300);
+          results.successful.push({ id, strategy: 'cmux_auto' });
+          return; // skip WS path for this session
+        }
+      }
+
       // Inject text first, then \r separately after delay
       if (session.type === 'wrapped') {
         if (session.ownerWs && session.ownerWs.readyState === 1) {
@@ -729,8 +769,12 @@ app.post('/api/sessions/:id/submit', (req, res) => {
   console.log(`[SUBMIT] Session ${id} (${session.command}) using strategy: ${strategy}`);
 
   let success = false;
-  // cmux backend takes priority
-  if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+  // cmux auto-detect at daemon level
+  if (DETECTED_TERMINAL === 'cmux') {
+    success = terminalBackend.cmuxSendEnter(id);
+  }
+  // Session-level cmux backend
+  if (!success && session.backend === 'cmux' && session.cmuxWorkspaceId) {
     success = submitViaCmux(id);
   }
   if (!success) {
@@ -768,8 +812,12 @@ app.post('/api/sessions/submit-all', (req, res) => {
     const strategy = getSubmitStrategy(session.command);
     let success = false;
 
-    // cmux backend takes priority
-    if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+    // cmux auto-detect at daemon level
+    if (DETECTED_TERMINAL === 'cmux') {
+      success = terminalBackend.cmuxSendEnter(id);
+    }
+    // Session-level cmux backend
+    if (!success && session.backend === 'cmux' && session.cmuxWorkspaceId) {
       success = submitViaCmux(id);
     }
     if (!success) {
@@ -835,14 +883,23 @@ app.post('/api/sessions/:id/inject', (req, res) => {
 
     let submitResult = null;
     if (session.type === 'wrapped') {
-      // For wrapped sessions: try kitty send-text (bypasses allow bridge queue)
-      // then WS as fallback, then kitty send-key Return for enter
+      // For wrapped sessions: try cmux send (daemon-level auto-detect),
+      // then kitty send-text (bypasses allow bridge queue),
+      // then WS as fallback, then submit via cmux/osascript/kitty/WS
       const sock = findKittySocket();
       if (!session.kittyWindowId && sock) session.kittyWindowId = findKittyWindowId(sock, id);
       const wid = session.kittyWindowId;
 
       let kittyOk = false;
-      if (wid && sock) {
+      let cmuxOk = false;
+
+      // cmux backend: send text directly to surface (daemon-level auto-detect)
+      if (DETECTED_TERMINAL === 'cmux') {
+        cmuxOk = terminalBackend.cmuxSendText(id, finalPrompt);
+        if (cmuxOk) console.log(`[INJECT] cmux send for ${id}`);
+      }
+
+      if (!cmuxOk && wid && sock) {
         // Kitty send-text primary (bypasses allow bridge queue)
         try {
           const escaped = finalPrompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
@@ -856,7 +913,7 @@ app.post('/api/sessions/:id/inject', (req, res) => {
           session.kittyWindowId = null;
         }
       }
-      if (!kittyOk) {
+      if (!cmuxOk && !kittyOk) {
         // Fallback: WS (works with new allow bridges that have queue flush)
         const wsOk = writeToSession(finalPrompt);
         if (!wsOk) {
@@ -869,20 +926,26 @@ app.post('/api/sessions/:id/inject', (req, res) => {
         setTimeout(() => {
           let submitted = false;
 
-          // 1. cmux backend: use cmux send-key
-          if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
-            submitted = submitViaCmux(id);
+          // 1. cmux backend: send-key return to surface (daemon-level auto-detect)
+          if (DETECTED_TERMINAL === 'cmux') {
+            submitted = terminalBackend.cmuxSendEnter(id);
             if (submitted) console.log(`[INJECT] cmux submit for ${id}`);
           }
 
-          // 2. kitty/default backend: osascript primary
+          // 2. Session-level cmux (registered backend)
+          if (!submitted && session.backend === 'cmux' && session.cmuxWorkspaceId) {
+            submitted = submitViaCmux(id);
+            if (submitted) console.log(`[INJECT] cmux session-level submit for ${id}`);
+          }
+
+          // 3. kitty/default: osascript primary
           if (!submitted) {
             const submitStrategy = getSubmitStrategy(session.command);
             const keyCombo = submitStrategy === 'osascript_cmd_enter' ? 'cmd_enter' : 'return_key';
             submitted = submitViaOsascript(id, keyCombo);
           }
 
-          // 3. Fallback: kitty send-text → WS
+          // 4. Fallback: kitty send-text → WS
           if (!submitted) {
             console.log(`[INJECT] submit fallback for ${id}`);
             if (wid && sock) {
@@ -907,7 +970,7 @@ app.post('/api/sessions/:id/inject', (req, res) => {
             } catch {}
           }
         }, 500);
-        submitResult = { deferred: true, strategy: session.backend === 'cmux' ? 'cmux_with_fallback' : 'osascript_with_fallback' };
+        submitResult = { deferred: true, strategy: DETECTED_TERMINAL === 'cmux' ? 'cmux_auto' : (session.backend === 'cmux' ? 'cmux_with_fallback' : 'osascript_with_fallback') };
       }
     } else {
       // Spawned sessions: direct PTY write
@@ -1060,13 +1123,22 @@ function busAutoRoute(msg) {
   const prompt = (msg.payload && msg.payload.prompt) || msg.content || msg.prompt || JSON.stringify(msg);
   const inject_id = crypto.randomUUID();
 
-  // Write to session (kitty primary, WS fallback)
+  // Write to session (cmux auto-detect > kitty > session-level cmux > WS fallback)
   const sock = findKittySocket();
   if (!targetSession.kittyWindowId && sock) targetSession.kittyWindowId = findKittyWindowId(sock, targetId);
   const wid = targetSession.kittyWindowId;
   let delivered = false;
 
-  if (wid && sock && targetSession.type === 'wrapped') {
+  // cmux backend: send text + enter to surface (daemon-level auto-detect)
+  if (!delivered && DETECTED_TERMINAL === 'cmux') {
+    const textOk = terminalBackend.cmuxSendText(targetId, prompt);
+    if (textOk) {
+      setTimeout(() => terminalBackend.cmuxSendEnter(targetId), 500);
+      delivered = true;
+    }
+  }
+
+  if (!delivered && wid && sock && targetSession.type === 'wrapped') {
     try {
       const escaped = prompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
       require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} '${escaped}'`, {
@@ -1082,7 +1154,7 @@ function busAutoRoute(msg) {
       delivered = true;
     } catch {}
   }
-  // cmux backend: use WS for text, cmux send-key for enter
+  // Session-level cmux backend: use WS for text, cmux send-key for enter
   if (!delivered && targetSession.backend === 'cmux' && targetSession.cmuxWorkspaceId) {
     if (targetSession.type === 'wrapped' && targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
       targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
