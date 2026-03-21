@@ -691,12 +691,27 @@ async function main() {
 
     await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
+    // Detect terminal backend for session registration
+    function findKittySocketCli() {
+      try {
+        const files = require('fs').readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
+        return files.length > 0;
+      } catch { return false; }
+    }
+    const detectedBackend = process.env.CMUX_WORKSPACE_ID ? 'cmux' : (findKittySocketCli() ? 'kitty' : 'pty');
+
     // Register session with daemon
     try {
       const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, command, cwd: process.cwd() })
+        body: JSON.stringify({
+          session_id: sessionId,
+          command,
+          cwd: process.cwd(),
+          backend: detectedBackend,
+          cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null
+        })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -769,7 +784,13 @@ async function main() {
           await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId, command, cwd: process.cwd() })
+            body: JSON.stringify({
+              session_id: sessionId,
+              command,
+              cwd: process.cwd(),
+              backend: detectedBackend,
+              cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null
+            })
           });
         } catch (e) {
           // Registration may fail if session already exists or daemon not ready

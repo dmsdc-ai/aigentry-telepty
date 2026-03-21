@@ -19,7 +19,7 @@ function persistSessions() {
   try {
     const data = {};
     for (const [id, s] of Object.entries(sessions)) {
-      data[id] = { id, type: s.type, command: s.command, cwd: s.cwd, createdAt: s.createdAt, lastActivityAt: s.lastActivityAt || null };
+      data[id] = { id, type: s.type, command: s.command, cwd: s.cwd, backend: s.backend || null, cmuxWorkspaceId: s.cmuxWorkspaceId || null, createdAt: s.createdAt, lastActivityAt: s.lastActivityAt || null };
     }
     fs.mkdirSync(require('path').dirname(SESSION_PERSIST_PATH), { recursive: true });
     fs.writeFileSync(SESSION_PERSIST_PATH, JSON.stringify(data, null, 2));
@@ -306,7 +306,7 @@ app.post('/api/sessions/spawn', (req, res) => {
 });
 
 app.post('/api/sessions/register', (req, res) => {
-  const { session_id, command, cwd = process.cwd() } = req.body;
+  const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is required' });
   // Entitlement: check session limit for new registrations
   if (!sessions[session_id]) {
@@ -322,6 +322,8 @@ app.post('/api/sessions/register', (req, res) => {
     const existing = sessions[session_id];
     if (command) existing.command = command;
     if (cwd) existing.cwd = cwd;
+    if (backend) existing.backend = backend;
+    if (cmux_workspace_id) existing.cmuxWorkspaceId = cmux_workspace_id;
     console.log(`[REGISTER] Re-registered session ${session_id} (updated metadata)`);
     return res.status(200).json({ session_id, type: 'wrapped', command: existing.command, cwd: existing.cwd, reregistered: true });
   }
@@ -333,6 +335,8 @@ app.post('/api/sessions/register', (req, res) => {
     ownerWs: null,
     command: command || 'wrapped',
     cwd,
+    backend: backend || 'kitty',
+    cmuxWorkspaceId: cmux_workspace_id || null,
     createdAt: new Date().toISOString(),
     lastActivityAt: new Date().toISOString(),
     clients: new Set(),
@@ -389,6 +393,8 @@ app.get('/api/sessions', (req, res) => {
       type: session.type || 'spawned',
       command: session.command,
       cwd: session.cwd,
+      backend: session.backend || 'kitty',
+      cmuxWorkspaceId: session.cmuxWorkspaceId || null,
       createdAt: session.createdAt,
       lastActivityAt: session.lastActivityAt || null,
       idleSeconds,
@@ -452,11 +458,13 @@ app.post('/api/sessions/multicast/inject', (req, res) => {
           if (session.ownerWs && session.ownerWs.readyState === 1) {
             session.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
             setTimeout(() => {
-              if (session.ownerWs && session.ownerWs.readyState === 1) {
+              if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+                submitViaCmux(id);
+              } else if (session.ownerWs && session.ownerWs.readyState === 1) {
                 session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
               }
             }, 300);
-            results.successful.push({ id, strategy: 'split_cr' });
+            results.successful.push({ id, strategy: session.backend === 'cmux' ? 'cmux_split_cr' : 'split_cr' });
           } else {
             results.failed.push({ id, error: 'Wrap process not connected' });
           }
@@ -502,11 +510,13 @@ app.post('/api/sessions/broadcast/inject', (req, res) => {
         if (session.ownerWs && session.ownerWs.readyState === 1) {
           session.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
           setTimeout(() => {
-            if (session.ownerWs && session.ownerWs.readyState === 1) {
+            if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+              submitViaCmux(id);
+            } else if (session.ownerWs && session.ownerWs.readyState === 1) {
               session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
             }
           }, 300);
-          results.successful.push({ id, strategy: 'split_cr' });
+          results.successful.push({ id, strategy: session.backend === 'cmux' ? 'cmux_split_cr' : 'split_cr' });
         } else {
           results.failed.push({ id, error: 'Wrap process not connected' });
         }
@@ -680,6 +690,22 @@ function submitViaOsascript(sessionId, keyCombo) {
   }
 }
 
+function submitViaCmux(sessionId) {
+  const { execSync } = require('child_process');
+  const session = sessions[sessionId];
+  if (!session || !session.cmuxWorkspaceId) return false;
+  try {
+    execSync(`cmux send-key --workspace ${session.cmuxWorkspaceId} return`, {
+      timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+    });
+    console.log(`[SUBMIT] cmux send-key return for ${sessionId} (workspace ${session.cmuxWorkspaceId})`);
+    return true;
+  } catch (err) {
+    console.error(`[SUBMIT] cmux send-key failed for ${sessionId}:`, err.message);
+    return false;
+  }
+}
+
 // POST /api/sessions/:id/submit — CLI-aware submit
 app.post('/api/sessions/:id/submit', (req, res) => {
   const requestedId = req.params.id;
@@ -692,12 +718,18 @@ app.post('/api/sessions/:id/submit', (req, res) => {
   console.log(`[SUBMIT] Session ${id} (${session.command}) using strategy: ${strategy}`);
 
   let success = false;
-  if (strategy === 'pty_cr') {
-    success = submitViaPty(session);
-  } else if (strategy === 'osascript_cmd_enter') {
-    success = submitViaOsascript(id, 'cmd_enter');
-  } else {
-    success = submitViaPty(session); // fallback
+  // cmux backend takes priority
+  if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+    success = submitViaCmux(id);
+  }
+  if (!success) {
+    if (strategy === 'pty_cr') {
+      success = submitViaPty(session);
+    } else if (strategy === 'osascript_cmd_enter') {
+      success = submitViaOsascript(id, 'cmd_enter');
+    } else {
+      success = submitViaPty(session); // fallback
+    }
   }
 
   if (success) {
@@ -725,10 +757,16 @@ app.post('/api/sessions/submit-all', (req, res) => {
     const strategy = getSubmitStrategy(session.command);
     let success = false;
 
-    if (strategy === 'pty_cr') {
-      success = submitViaPty(session);
-    } else if (strategy === 'osascript_cmd_enter') {
-      success = submitViaOsascript(id, 'cmd_enter');
+    // cmux backend takes priority
+    if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+      success = submitViaCmux(id);
+    }
+    if (!success) {
+      if (strategy === 'pty_cr') {
+        success = submitViaPty(session);
+      } else if (strategy === 'osascript_cmd_enter') {
+        success = submitViaOsascript(id, 'cmd_enter');
+      }
     }
 
     if (success) {
@@ -818,14 +856,24 @@ app.post('/api/sessions/:id/inject', (req, res) => {
 
       if (!no_enter) {
         setTimeout(() => {
-          // Primary: osascript keystroke (reliable across all CLIs)
-          const submitStrategy = getSubmitStrategy(session.command);
-          const keyCombo = submitStrategy === 'osascript_cmd_enter' ? 'cmd_enter' : 'return_key';
-          const osascriptOk = submitViaOsascript(id, keyCombo);
+          let submitted = false;
 
-          if (!osascriptOk) {
-            // Fallback: kitty send-text → WS
-            console.log(`[INJECT] osascript submit failed for ${id}, trying fallback`);
+          // 1. cmux backend: use cmux send-key
+          if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+            submitted = submitViaCmux(id);
+            if (submitted) console.log(`[INJECT] cmux submit for ${id}`);
+          }
+
+          // 2. kitty/default backend: osascript primary
+          if (!submitted) {
+            const submitStrategy = getSubmitStrategy(session.command);
+            const keyCombo = submitStrategy === 'osascript_cmd_enter' ? 'cmd_enter' : 'return_key';
+            submitted = submitViaOsascript(id, keyCombo);
+          }
+
+          // 3. Fallback: kitty send-text → WS
+          if (!submitted) {
+            console.log(`[INJECT] submit fallback for ${id}`);
             if (wid && sock) {
               try {
                 require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
@@ -839,7 +887,7 @@ app.post('/api/sessions/:id/inject', (req, res) => {
             }
           }
 
-          // Update tab title regardless of submit method
+          // Update tab title (kitty-specific, safe to fail)
           if (wid && sock) {
             try {
               require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${wid} '⚡ telepty :: ${id}'`, {
@@ -848,7 +896,7 @@ app.post('/api/sessions/:id/inject', (req, res) => {
             } catch {}
           }
         }, 500);
-        submitResult = { deferred: true, strategy: 'osascript_with_fallback' };
+        submitResult = { deferred: true, strategy: session.backend === 'cmux' ? 'cmux_with_fallback' : 'osascript_with_fallback' };
       }
     } else {
       // Spawned sessions: direct PTY write
@@ -1022,6 +1070,14 @@ function busAutoRoute(msg) {
       }, 500);
       delivered = true;
     } catch {}
+  }
+  // cmux backend: use WS for text, cmux send-key for enter
+  if (!delivered && targetSession.backend === 'cmux' && targetSession.cmuxWorkspaceId) {
+    if (targetSession.type === 'wrapped' && targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
+      targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
+      setTimeout(() => submitViaCmux(targetId), 500);
+      delivered = true;
+    }
   }
   if (!delivered) {
     if (targetSession.type === 'wrapped' && targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
