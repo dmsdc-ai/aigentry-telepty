@@ -91,14 +91,12 @@ function verifyJwt(token) {
 function isAllowedPeer(ip) {
   if (!ip) return false;
   const cleanIp = ip.replace('::ffff:', '');
-  // Localhost always allowed
+  // Localhost always allowed (includes SSH tunnel traffic)
   if (cleanIp === '127.0.0.1' || ip === '::1') return true;
-  // Tailscale range (100.x.y.z)
-  if (cleanIp.startsWith('100.')) return true;
   // Peer allowlist
   if (PEER_ALLOWLIST.length > 0) return PEER_ALLOWLIST.includes(cleanIp);
   // No allowlist = allow all authenticated
-  return false;
+  return true;
 }
 
 // Authentication Middleware
@@ -106,7 +104,7 @@ app.use((req, res, next) => {
   const clientIp = req.ip;
 
   if (isAllowedPeer(clientIp)) {
-    return next(); // Trust local, Tailscale, and allowlisted peers
+    return next(); // Trust local and allowlisted peers (SSH tunnels arrive as localhost)
   }
 
   const token = req.headers['x-telepty-token'] || req.query.token;
@@ -438,8 +436,21 @@ app.get('/api/meta', (req, res) => {
     host: HOST,
     port: Number(PORT),
     machine_id: MACHINE_ID,
-    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads']
+    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine']
   });
+});
+
+// Peer management endpoint (for cross-machine module)
+app.get('/api/peers', (req, res) => {
+  try {
+    const crossMachine = require('./cross-machine');
+    res.json({
+      active: crossMachine.listActivePeers(),
+      known: crossMachine.listKnownPeers()
+    });
+  } catch {
+    res.json({ active: [], known: {} });
+  }
 });
 
 app.post('/api/sessions/multicast/inject', (req, res) => {

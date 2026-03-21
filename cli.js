@@ -15,6 +15,7 @@ const { attachInteractiveTerminal, getTerminalSize } = require('./interactive-te
 const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
+const crossMachine = require('./cross-machine');
 const args = process.argv.slice(2);
 let pendingTerminalInputError = null;
 let simulatedPromptErrorInjected = false;
@@ -208,30 +209,16 @@ function getDiscoveryHosts() {
     .filter(Boolean);
   extraHosts.forEach((host) => hosts.add(host));
 
-  // Also include relay peers for cross-machine session discovery
+  // Include relay peers for cross-machine session discovery
   const relayPeers = String(process.env.TELEPTY_RELAY_PEERS || '')
     .split(',')
     .map((host) => host.trim())
     .filter(Boolean);
   relayPeers.forEach((host) => hosts.add(host));
 
-  if (REMOTE_HOST && REMOTE_HOST !== '127.0.0.1') {
-    return Array.from(hosts);
-  }
-
-  try {
-    const tsStatus = execSync('tailscale status --json', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
-    const tsData = JSON.parse(tsStatus);
-    if (tsData && tsData.Peer) {
-      for (const peer of Object.values(tsData.Peer)) {
-        if (peer.Online && peer.TailscaleIPs && peer.TailscaleIPs.length > 0) {
-          hosts.add(peer.TailscaleIPs[0]);
-        }
-      }
-    }
-  } catch (e) {
-    // Tailscale not available or not running, ignore
-  }
+  // Include SSH tunnel-connected peers
+  const connectedHosts = crossMachine.getConnectedHosts();
+  connectedHosts.forEach((host) => hosts.add(host));
 
   return Array.from(hosts);
 }
@@ -242,7 +229,7 @@ async function discoverSessions(options = {}) {
   const allSessions = [];
 
   if (!options.silent) {
-    process.stdout.write('\x1b[36m🔍 Discovering active sessions across your Tailnet...\x1b[0m\n');
+    process.stdout.write('\x1b[36m🔍 Discovering active sessions across connected machines...\x1b[0m\n');
   }
 
   await Promise.all(hosts.map(async (host) => {
@@ -1874,6 +1861,85 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
+  // telepty connect <target> [--name <name>] [--port <port>]
+  if (cmd === 'connect') {
+    const target = args[1];
+    if (!target) {
+      console.error('❌ Usage: telepty connect <user@host> [--name <name>] [--port <port>]');
+      process.exit(1);
+    }
+    const nameFlag = args.indexOf('--name');
+    const portFlag = args.indexOf('--port');
+    const options = {};
+    if (nameFlag !== -1 && args[nameFlag + 1]) options.name = args[nameFlag + 1];
+    if (portFlag !== -1 && args[portFlag + 1]) options.port = Number(args[portFlag + 1]);
+
+    process.stdout.write(`\x1b[36m🔗 Connecting to ${target}...\x1b[0m\n`);
+    const result = await crossMachine.connect(target, options);
+    if (result.success) {
+      console.log(`\x1b[32m✅ Connected to ${result.name}\x1b[0m`);
+      console.log(`   Machine ID: ${result.machineId}`);
+      console.log(`   Local port: ${result.localPort}`);
+      console.log(`   Version: ${result.version}`);
+      console.log(`\nSessions on ${result.name} are now discoverable via \x1b[36mtelepty list\x1b[0m`);
+    } else {
+      console.error(`\x1b[31m❌ ${result.error}\x1b[0m`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // telepty disconnect [<name> | --all]
+  if (cmd === 'disconnect') {
+    if (args[1] === '--all') {
+      const result = crossMachine.disconnectAll();
+      console.log(`\x1b[32m✅ Disconnected from ${result.disconnected.length} peer(s)\x1b[0m`);
+    } else if (args[1]) {
+      const result = crossMachine.disconnect(args[1]);
+      if (result.success) {
+        console.log(`\x1b[32m✅ Disconnected from ${result.name}\x1b[0m`);
+      } else {
+        console.error(`\x1b[31m❌ ${result.error}\x1b[0m`);
+      }
+    } else {
+      console.error('❌ Usage: telepty disconnect <name> | --all');
+      process.exit(1);
+    }
+    return;
+  }
+
+  // telepty peers [--remove <name>]
+  if (cmd === 'peers') {
+    if (args[1] === '--remove' && args[2]) {
+      crossMachine.removePeer(args[2]);
+      console.log(`\x1b[32m✅ Removed peer ${args[2]}\x1b[0m`);
+      return;
+    }
+
+    const active = crossMachine.listActivePeers();
+    const known = crossMachine.listKnownPeers();
+
+    console.log('\x1b[1mConnected Peers:\x1b[0m');
+    if (active.length === 0) {
+      console.log('  (none)');
+    } else {
+      for (const peer of active) {
+        console.log(`  \x1b[32m●\x1b[0m ${peer.name} (${peer.target}) → localhost:${peer.localPort} [${peer.machineId}]`);
+      }
+    }
+
+    const knownNames = Object.keys(known);
+    const disconnected = knownNames.filter(n => !active.find(a => a.name === n));
+    if (disconnected.length > 0) {
+      console.log('\n\x1b[1mKnown Peers (disconnected):\x1b[0m');
+      for (const name of disconnected) {
+        const p = known[name];
+        console.log(`  \x1b[90m○\x1b[0m ${name} (${p.target}) — last: ${p.lastConnected || 'never'}`);
+      }
+    }
+    return;
+  }
+
   if (cmd === 'listen' || cmd === 'monitor') {
     await ensureDaemonRunning();
     
@@ -1959,6 +2025,9 @@ Usage:
   telepty multicast <id1[@host],id2[@host]> "<prompt>"  Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
   telepty rename <old_id[@host]> <new_id>        Rename a session (updates terminal title too)
+  telepty connect <user@host> [--name N] [--port P]  Connect to a remote machine via SSH tunnel
+  telepty disconnect <name> | --all              Disconnect from a remote machine
+  telepty peers [--remove <name>]                List connected and known peers
   telepty listen                                 Listen to the event bus and print JSON to stdout
   telepty monitor                                Human-readable real-time billboard of bus events
   telepty update                                 Update telepty to the latest version
