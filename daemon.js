@@ -139,6 +139,17 @@ const sessions = {};
 const handoffs = {};
 const threads = {};
 
+function appendToOutputRing(session, data) {
+  if (!session.outputRing) session.outputRing = [];
+  session.outputRing.push(data);
+  // Keep total data under ~200KB limit by trimming old entries
+  let totalLen = session.outputRing.reduce((sum, d) => sum + d.length, 0);
+  while (totalLen > 200000 && session.outputRing.length > 1) {
+    totalLen -= session.outputRing[0].length;
+    session.outputRing.shift();
+  }
+}
+
 // Detect terminal environment at daemon startup
 const DETECTED_TERMINAL = terminalBackend.detectTerminal();
 console.log(`[DAEMON] Terminal backend: ${DETECTED_TERMINAL}`);
@@ -152,8 +163,7 @@ for (const [id, meta] of Object.entries(_persisted)) {
       command: meta.command || 'wrapped', cwd: meta.cwd || process.cwd(),
       createdAt: meta.createdAt || new Date().toISOString(),
       lastActivityAt: meta.lastActivityAt || new Date().toISOString(),
-      clients: new Set(), isClosing: false
-    };
+      clients: new Set(), isClosing: false, outputRing: [], ready: false,     };
     console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
   }
 }
@@ -261,8 +271,10 @@ app.post('/api/sessions/spawn', (req, res) => {
       createdAt: new Date().toISOString(),
       lastActivityAt: new Date().toISOString(),
       clients: new Set(),
-      isClosing: false
-    };
+      isClosing: false,
+      outputRing: [],
+      ready: true,
+          };
     sessions[session_id] = sessionRecord;
 
     // Broadcast session creation to bus
@@ -283,6 +295,8 @@ app.post('/api/sessions/spawn', (req, res) => {
       if (!currentSession || currentSession !== sessionRecord) {
         return;
       }
+
+      appendToOutputRing(currentSession, data);
 
       // Send to direct WS clients
       currentSession.clients.forEach(ws => {
@@ -345,8 +359,10 @@ app.post('/api/sessions/register', (req, res) => {
     createdAt: new Date().toISOString(),
     lastActivityAt: new Date().toISOString(),
     clients: new Set(),
-    isClosing: false
-  };
+    isClosing: false,
+    outputRing: [],
+    ready: false,
+      };
   // Check for existing session with same base alias and emit replaced event
   const baseAlias = session_id.replace(/-\d+$/, '');
   const replaced = Object.keys(sessions).find(id => {
@@ -404,7 +420,8 @@ app.get('/api/sessions', (req, res) => {
       createdAt: session.createdAt,
       lastActivityAt: session.lastActivityAt || null,
       idleSeconds,
-      active_clients: session.clients.size
+      active_clients: session.clients.size,
+      ready: session.ready || false
     };
   });
   if (idleGt !== null) {
@@ -473,8 +490,8 @@ app.post('/api/sessions/multicast/inject', (req, res) => {
     const session = sessions[id];
     if (session) {
       try {
-        // cmux auto-detect at daemon level (text + enter)
-        if (DETECTED_TERMINAL === 'cmux') {
+        // cmux per-session backend (text + enter)
+        if (session.backend === 'cmux') {
           const ok = terminalBackend.cmuxSendText(id, prompt);
           if (ok) {
             setTimeout(() => terminalBackend.cmuxSendEnter(id), 300);
@@ -546,8 +563,8 @@ app.post('/api/sessions/broadcast/inject', (req, res) => {
   Object.keys(sessions).forEach(id => {
     const session = sessions[id];
     try {
-      // cmux auto-detect at daemon level (text + enter)
-      if (DETECTED_TERMINAL === 'cmux') {
+      // cmux per-session backend (text + enter)
+      if (session.backend === 'cmux') {
         const ok = terminalBackend.cmuxSendText(id, prompt);
         if (ok) {
           setTimeout(() => terminalBackend.cmuxSendEnter(id), 300);
@@ -769,11 +786,10 @@ app.post('/api/sessions/:id/submit', (req, res) => {
   console.log(`[SUBMIT] Session ${id} (${session.command}) using strategy: ${strategy}`);
 
   let success = false;
-  // cmux auto-detect at daemon level
-  if (DETECTED_TERMINAL === 'cmux') {
+  // cmux per-session backend
+  if (session.backend === 'cmux') {
     success = terminalBackend.cmuxSendEnter(id);
   }
-  // Session-level cmux backend
   if (!success && session.backend === 'cmux' && session.cmuxWorkspaceId) {
     success = submitViaCmux(id);
   }
@@ -812,11 +828,10 @@ app.post('/api/sessions/submit-all', (req, res) => {
     const strategy = getSubmitStrategy(session.command);
     let success = false;
 
-    // cmux auto-detect at daemon level
-    if (DETECTED_TERMINAL === 'cmux') {
+    // cmux per-session backend
+    if (session.backend === 'cmux') {
       success = terminalBackend.cmuxSendEnter(id);
     }
-    // Session-level cmux backend
     if (!success && session.backend === 'cmux' && session.cmuxWorkspaceId) {
       success = submitViaCmux(id);
     }
@@ -885,28 +900,37 @@ app.post('/api/sessions/:id/inject', (req, res) => {
     if (session.type === 'wrapped') {
       // For wrapped sessions: try cmux send (daemon-level auto-detect),
       // then kitty send-text (bypasses allow bridge queue),
-      // then WS as fallback, then submit via cmux/osascript/kitty/WS
-      const sock = findKittySocket();
-      if (!session.kittyWindowId && sock) session.kittyWindowId = findKittyWindowId(sock, id);
-      const wid = session.kittyWindowId;
+      // then WS as fallback, then submit via consistent path for CR.
+      //
+      // When session is NOT ready (CLI hasn't shown prompt yet), skip cmux/kitty
+      // because they bypass the allow-bridge's prompt-ready queue.
+      // The WS path sends to the allow-bridge which queues until CLI is ready.
+      const sock = session.ready ? findKittySocket() : null;
+      if (sock && !session.kittyWindowId) session.kittyWindowId = findKittyWindowId(sock, id);
+      const wid = session.ready ? session.kittyWindowId : null;
 
       let kittyOk = false;
       let cmuxOk = false;
+      let deliveryPath = null; // 'cmux', 'kitty', 'ws'
 
-      // cmux backend: send text directly to surface (daemon-level auto-detect)
-      if (DETECTED_TERMINAL === 'cmux') {
+      // cmux per-session backend: send text directly to surface (only when ready)
+      if (session.ready && session.backend === 'cmux') {
         cmuxOk = terminalBackend.cmuxSendText(id, finalPrompt);
-        if (cmuxOk) console.log(`[INJECT] cmux send for ${id}`);
+        if (cmuxOk) {
+          deliveryPath = 'cmux';
+          console.log(`[INJECT] cmux send for ${id}`);
+        }
       }
 
       if (!cmuxOk && wid && sock) {
-        // Kitty send-text primary (bypasses allow bridge queue)
+        // Kitty send-text primary (only when ready — bypasses allow bridge queue)
         try {
           const escaped = finalPrompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
           require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} '${escaped}'`, {
             timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
           });
           kittyOk = true;
+          deliveryPath = 'kitty';
           console.log(`[INJECT] Kitty send-text for ${id} (window ${wid})`);
         } catch {
           // Invalidate cached window ID — window may have changed or been closed
@@ -914,51 +938,74 @@ app.post('/api/sessions/:id/inject', (req, res) => {
         }
       }
       if (!cmuxOk && !kittyOk) {
-        // Fallback: WS (works with new allow bridges that have queue flush)
+        // WS path: allow-bridge has its own prompt-ready queue
         const wsOk = writeToSession(finalPrompt);
         if (!wsOk) {
           return res.status(503).json({ error: 'Process not connected' });
         }
-        console.log(`[INJECT] WS fallback for ${id}`);
+        deliveryPath = 'ws';
+        if (!session.ready) {
+          console.log(`[INJECT] WS (not ready, allow-bridge will queue) for ${id}`);
+        } else {
+          console.log(`[INJECT] WS fallback for ${id}`);
+        }
       }
 
       if (!no_enter) {
         setTimeout(() => {
           let submitted = false;
 
-          // 1. cmux backend: send-key return to surface (daemon-level auto-detect)
-          if (DETECTED_TERMINAL === 'cmux') {
-            submitted = terminalBackend.cmuxSendEnter(id);
-            if (submitted) console.log(`[INJECT] cmux submit for ${id}`);
-          }
-
-          // 2. Session-level cmux (registered backend)
-          if (!submitted && session.backend === 'cmux' && session.cmuxWorkspaceId) {
-            submitted = submitViaCmux(id);
-            if (submitted) console.log(`[INJECT] cmux session-level submit for ${id}`);
-          }
-
-          // 3. kitty/default: osascript primary
-          if (!submitted) {
-            const submitStrategy = getSubmitStrategy(session.command);
-            const keyCombo = submitStrategy === 'osascript_cmd_enter' ? 'cmd_enter' : 'return_key';
-            submitted = submitViaOsascript(id, keyCombo);
-          }
-
-          // 4. Fallback: kitty send-text → WS
-          if (!submitted) {
-            console.log(`[INJECT] submit fallback for ${id}`);
+          // Use the SAME path that delivered text for CR to guarantee ordering
+          if (deliveryPath === 'cmux') {
+            // cmux: send-key return via same surface
+            if (session.backend === 'cmux') {
+              submitted = terminalBackend.cmuxSendEnter(id);
+              if (submitted) console.log(`[INJECT] cmux submit for ${id}`);
+            }
+            if (!submitted && session.backend === 'cmux' && session.cmuxWorkspaceId) {
+              submitted = submitViaCmux(id);
+              if (submitted) console.log(`[INJECT] cmux session-level submit for ${id}`);
+            }
+          } else if (deliveryPath === 'kitty') {
+            // kitty: send-text CR via same window (not osascript!)
             if (wid && sock) {
               try {
                 require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
                   timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
                 });
+                submitted = true;
+                console.log(`[INJECT] kitty submit for ${id} (window ${wid})`);
               } catch {
-                writeToSession('\r');
+                session.kittyWindowId = null;
               }
-            } else {
-              writeToSession('\r');
             }
+          }
+          // deliveryPath === 'ws' or any fallback:
+          // Try terminal-level submit first (bypasses PTY ICRNL which converts CR→LF)
+          // This matters for cmux/kitty sessions where text went via WS but
+          // the application expects CR(13) not LF(10) from Enter.
+          if (!submitted && session.backend === 'cmux') {
+            submitted = terminalBackend.cmuxSendEnter(id);
+            if (submitted) console.log(`[INJECT] cmux submit (fallback) for ${id}`);
+          }
+          if (!submitted && session.backend === 'cmux' && session.cmuxWorkspaceId) {
+            submitted = submitViaCmux(id);
+            if (submitted) console.log(`[INJECT] cmux session-level submit (fallback) for ${id}`);
+          }
+          if (!submitted && wid && sock) {
+            try {
+              require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
+                timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+              });
+              submitted = true;
+              console.log(`[INJECT] kitty submit (fallback) for ${id}`);
+            } catch {
+              session.kittyWindowId = null;
+            }
+          }
+          if (!submitted) {
+            writeToSession('\r');
+            console.log(`[INJECT] WS submit for ${id}`);
           }
 
           // Update tab title (kitty-specific, safe to fail)
@@ -970,7 +1017,7 @@ app.post('/api/sessions/:id/inject', (req, res) => {
             } catch {}
           }
         }, 500);
-        submitResult = { deferred: true, strategy: DETECTED_TERMINAL === 'cmux' ? 'cmux_auto' : (session.backend === 'cmux' ? 'cmux_with_fallback' : 'osascript_with_fallback') };
+        submitResult = { deferred: true, strategy: deliveryPath || 'ws' };
       }
     } else {
       // Spawned sessions: direct PTY write
@@ -988,6 +1035,7 @@ app.post('/api/sessions/:id/inject', (req, res) => {
 
     console.log(`[INJECT] Wrote to session ${id} (inject_id: ${inject_id})`);
 
+    const injectTimestamp = new Date().toISOString();
     const busMsg = JSON.stringify({
       type: 'inject_written',
       inject_id,
@@ -998,11 +1046,29 @@ app.post('/api/sessions/:id/inject', (req, res) => {
       reply_to: reply_to || null,
       thread_id: thread_id || null,
       reply_expected: !!reply_expected,
-      timestamp: new Date().toISOString()
+      timestamp: injectTimestamp
     });
     busClients.forEach(client => {
       if (client.readyState === 1) client.send(busMsg);
     });
+
+    // Notify all attached viewers (telepty attach clients) about the inject
+    // This enables aterm and other viewers to show inject events in real-time
+    if (session.clients && session.clients.size > 0) {
+      const viewerMsg = JSON.stringify({
+        type: 'inject_notification',
+        inject_id,
+        session_id: id,
+        from: from || null,
+        content: prompt,
+        timestamp: injectTimestamp
+      });
+      session.clients.forEach(client => {
+        if (client !== session.ownerWs && client.readyState === 1) {
+          client.send(viewerMsg);
+        }
+      });
+    }
 
     if (requestedId !== resolvedId) {
       console.log(`[ALIAS] Resolved '${requestedId}' → '${resolvedId}'`);
@@ -1040,6 +1106,53 @@ app.post('/api/sessions/:id/inject', (req, res) => {
     });
     res.status(500).json({ error: err.message });
   }
+});
+
+// GET /api/sessions/:id/screen — read current screen buffer
+app.get('/api/sessions/:id/screen', (req, res) => {
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+  const session = sessions[resolvedId];
+
+  const lines = parseInt(req.query.lines) || 50;
+  const raw = req.query.raw === '1' || req.query.raw === 'true';
+
+  if (!session.outputRing || session.outputRing.length === 0) {
+    return res.json({ session_id: resolvedId, screen: '', lines: 0, raw: false });
+  }
+
+  // Join all buffered output
+  const fullOutput = session.outputRing.join('');
+
+  // Strip ANSI escape sequences for clean text
+  function stripAnsi(str) {
+    return str
+      .replace(/[[0-9;]*[a-zA-Z]/g, '')      // CSI sequences
+      .replace(/][^]*/g, '')          // OSC sequences (BEL terminated)
+      .replace(/][^]*\\/g, '')  // OSC sequences (ST terminated)
+      .replace(/[()][AB012]/g, '')              // Character set selection
+      .replace(/[>=<]/g, '')                    // Keypad mode
+      .replace(/[[?]?[0-9;]*[hlsurm]/g, '') // Mode set/reset
+      .replace(/[[0-9;]*[ABCDHJ]/g, '')       // Cursor movement
+      .replace(/[[0-9;]*[KG]/g, '')           // Line clearing
+      .replace(/\r/g, '');                         // Carriage returns
+  }
+
+  const cleaned = raw ? fullOutput : stripAnsi(fullOutput);
+
+  // Take last N lines
+  const allLines = cleaned.split('\n');
+  const lastLines = allLines.slice(-lines);
+  const screen = lastLines.join('\n').trim();
+
+  res.json({
+    session_id: resolvedId,
+    screen,
+    lines: lastLines.length,
+    total_lines: allLines.length,
+    raw: !!raw
+  });
 });
 
 app.patch('/api/sessions/:id', (req, res) => {
@@ -1129,8 +1242,8 @@ function busAutoRoute(msg) {
   const wid = targetSession.kittyWindowId;
   let delivered = false;
 
-  // cmux backend: send text + enter to surface (daemon-level auto-detect)
-  if (!delivered && DETECTED_TERMINAL === 'cmux') {
+  // cmux per-session backend: send text + enter to surface
+  if (!delivered && targetSession.backend === 'cmux') {
     const textOk = terminalBackend.cmuxSendText(targetId, prompt);
     if (textOk) {
       setTimeout(() => terminalBackend.cmuxSendEnter(targetId), 500);
@@ -1541,8 +1654,10 @@ wss.on('connection', (ws, req) => {
       createdAt: new Date().toISOString(),
       lastActivityAt: new Date().toISOString(),
       clients: new Set([ws]),
-      isClosing: false
-    };
+      isClosing: false,
+      outputRing: [],
+      ready: false,
+          };
     sessions[sessionId] = autoSession;
     console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect`);
     // Set tab title via kitty (no \x0c redraw — it causes flickering on multi-session reconnect)
@@ -1587,10 +1702,24 @@ wss.on('connection', (ws, req) => {
           // Owner sending output -> broadcast to other clients + update activity
           if (type === 'output') {
             activeSession.lastActivityAt = new Date().toISOString();
+            appendToOutputRing(activeSession, data);
             activeSession.clients.forEach(client => {
               if (client !== ws && client.readyState === 1) {
                 client.send(JSON.stringify({ type: 'output', data }));
               }
+            });
+          } else if (type === 'ready') {
+            activeSession.ready = true;
+            activeSession.lastActivityAt = new Date().toISOString();
+            console.log(`[READY] Session ${sessionId} CLI is ready for inject`);
+            // Broadcast readiness to bus (cmux/kitty paths now enabled for this session)
+            const readyMsg = JSON.stringify({
+              type: 'session_ready',
+              session_id: sessionId,
+              timestamp: new Date().toISOString()
+            });
+            busClients.forEach(client => {
+              if (client.readyState === 1) client.send(readyMsg);
             });
           }
         } else {

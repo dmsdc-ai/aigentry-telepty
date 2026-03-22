@@ -1,15 +1,17 @@
 'use strict';
 
-const { spawn } = require('child_process');
+const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
 const PEERS_PATH = path.join(os.homedir(), '.telepty', 'peers.json');
-const BASE_LOCAL_PORT = 3849; // tunnels start at this port
+const CONTROL_DIR = path.join(os.homedir(), '.telepty', 'ssh');
 
-// In-memory active tunnels
-const activeTunnels = new Map(); // name -> { process, localPort, target, connectedAt, ... }
+// SSH ControlMaster socket path pattern
+function controlPath(target) {
+  return path.join(CONTROL_DIR, `ctrl-${target.replace(/[^a-zA-Z0-9@.-]/g, '_')}`);
+}
 
 function loadPeers() {
   try {
@@ -25,155 +27,188 @@ function savePeers(data) {
   } catch {}
 }
 
-function getNextLocalPort() {
-  const usedPorts = new Set([...activeTunnels.values()].map(t => t.localPort));
-  let port = BASE_LOCAL_PORT;
-  while (usedPorts.has(port)) port++;
-  return port;
-}
+// In-memory active peers
+const activePeers = new Map(); // name -> { target, controlSocket, connectedAt, machineId }
 
 /**
- * Connect to a remote machine via SSH tunnel.
- * @param {string} target - "user@host" or "host" (uses current user)
- * @param {object} options - { name, port }
- * @returns {Promise<object>} - { success, name, localPort, machineId, version } or { success: false, error }
+ * Connect to a remote machine via SSH ControlMaster.
  */
 async function connect(target, options = {}) {
-  const remotePort = options.port || 3848;
-  const localPort = getNextLocalPort();
-
-  // Parse target
   let sshTarget = target;
   if (!target.includes('@')) {
     sshTarget = `${os.userInfo().username}@${target}`;
   }
 
-  const name = options.name || target.split('@').pop().split('.')[0]; // short hostname
+  const name = options.name || target.split('@').pop().split('.')[0];
 
-  // Check if already connected
-  if (activeTunnels.has(name)) {
-    const existing = activeTunnels.get(name);
-    return { success: false, error: `Already connected to ${name} on port ${existing.localPort}` };
+  if (activePeers.has(name)) {
+    return { success: false, error: `Already connected to ${name}` };
   }
 
-  // Create SSH tunnel
-  const tunnel = spawn('ssh', [
-    '-N',                                           // No remote command
-    '-L', `${localPort}:localhost:${remotePort}`,   // Local port forwarding
-    '-o', 'ServerAliveInterval=30',                 // Keep alive
-    '-o', 'ServerAliveCountMax=3',                  // Disconnect after 3 missed keepalives
-    '-o', 'ExitOnForwardFailure=yes',               // Fail if port forwarding fails
-    '-o', 'ConnectTimeout=10',                      // Connection timeout
-    '-o', 'StrictHostKeyChecking=accept-new',       // Auto-accept new host keys
-    sshTarget
-  ], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: false
-  });
+  // Ensure control directory exists
+  fs.mkdirSync(CONTROL_DIR, { recursive: true });
 
-  // Wait for tunnel to establish or fail
-  const result = await new Promise((resolve) => {
-    let stderr = '';
-    const timeout = setTimeout(() => {
-      // If process is still running after 5s, tunnel is up
-      if (!tunnel.killed && tunnel.exitCode === null) {
-        resolve({ success: true });
-      } else {
-        resolve({ success: false, error: stderr || 'Connection timeout' });
-      }
-    }, 5000);
+  const ctrlPath = controlPath(sshTarget);
 
-    tunnel.stderr.on('data', (data) => { stderr += data.toString(); });
-    tunnel.on('exit', (code) => {
-      clearTimeout(timeout);
-      if (code !== 0) {
-        resolve({ success: false, error: stderr || `SSH exited with code ${code}` });
-      }
-    });
-    tunnel.on('error', (err) => {
-      clearTimeout(timeout);
-      resolve({ success: false, error: err.message });
-    });
-  });
-
-  if (!result.success) {
-    tunnel.kill();
-    return result;
-  }
-
-  // Verify remote daemon is accessible through tunnel
+  // Start SSH ControlMaster
   try {
-    const res = await fetch(`http://127.0.0.1:${localPort}/api/meta`, {
-      signal: AbortSignal.timeout(3000)
-    });
-    if (!res.ok) throw new Error('Daemon not responding');
-    const meta = await res.json();
-
-    const peerInfo = {
-      process: tunnel,
-      localPort,
-      target: sshTarget,
-      name,
-      machineId: meta.machine_id || name,
-      version: meta.version || 'unknown',
-      connectedAt: new Date().toISOString()
-    };
-
-    activeTunnels.set(name, peerInfo);
-
-    // Persist peer for reconnection
-    const peers = loadPeers();
-    peers.peers[name] = {
-      target: sshTarget,
-      remotePort,
-      lastConnected: peerInfo.connectedAt,
-      machineId: peerInfo.machineId
-    };
-    savePeers(peers);
-
-    // Monitor tunnel health
-    tunnel.on('exit', () => {
-      console.log(`[PEER] SSH tunnel to ${name} disconnected`);
-      activeTunnels.delete(name);
-    });
-
-    return {
-      success: true,
-      name,
-      localPort,
-      machineId: peerInfo.machineId,
-      version: peerInfo.version
-    };
+    execSync([
+      'ssh', '-o', 'ControlMaster=auto',
+      '-o', `ControlPath=${ctrlPath}`,
+      '-o', 'ControlPersist=600',
+      '-o', 'ConnectTimeout=10',
+      '-o', 'ServerAliveInterval=30',
+      '-o', 'ServerAliveCountMax=3',
+      '-o', 'StrictHostKeyChecking=accept-new',
+      '-N', '-f', // Go to background
+      sshTarget
+    ].join(' '), { timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (err) {
-    tunnel.kill();
-    return { success: false, error: `Remote daemon not accessible: ${err.message}` };
+    return { success: false, error: `SSH connection failed: ${err.message}` };
   }
+
+  // Verify remote telepty is available
+  let machineId = name;
+  try {
+    const output = execSync(
+      `ssh -o ControlPath=${ctrlPath} ${sshTarget} "hostname"`,
+      { timeout: 5000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+    ).trim();
+    if (output) machineId = output;
+  } catch {}
+
+  // Verify telepty CLI is available on remote
+  try {
+    execSync(
+      `ssh -o ControlPath=${ctrlPath} ${sshTarget} "telepty list --json"`,
+      { timeout: 10000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+  } catch (err) {
+    // Clean up ControlMaster
+    try { execSync(`ssh -O exit -o ControlPath=${ctrlPath} ${sshTarget}`, { stdio: 'pipe' }); } catch {}
+    return { success: false, error: `Remote telepty not available: ${err.message}` };
+  }
+
+  const peerInfo = {
+    target: sshTarget,
+    controlSocket: ctrlPath,
+    name,
+    machineId,
+    connectedAt: new Date().toISOString()
+  };
+
+  activePeers.set(name, peerInfo);
+
+  // Persist peer
+  const peers = loadPeers();
+  peers.peers[name] = {
+    target: sshTarget,
+    lastConnected: peerInfo.connectedAt,
+    machineId
+  };
+  savePeers(peers);
+
+  return { success: true, name, machineId };
 }
 
 function disconnect(name) {
-  const tunnel = activeTunnels.get(name);
-  if (!tunnel) {
+  const peer = activePeers.get(name);
+  if (!peer) {
     return { success: false, error: `Not connected to ${name}` };
   }
-  tunnel.process.kill();
-  activeTunnels.delete(name);
+
+  // Close ControlMaster
+  try {
+    execSync(`ssh -O exit -o ControlPath=${peer.controlSocket} ${peer.target}`, {
+      timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+    });
+  } catch {}
+
+  activePeers.delete(name);
   return { success: true, name };
 }
 
 function disconnectAll() {
-  const names = [...activeTunnels.keys()];
+  const names = [...activePeers.keys()];
   names.forEach(name => disconnect(name));
   return { disconnected: names };
 }
 
+/**
+ * List sessions on a remote peer via SSH.
+ * @returns {Array} sessions with host info
+ */
+function listRemoteSessions(name) {
+  const peer = activePeers.get(name);
+  if (!peer) return [];
+
+  try {
+    const output = execSync(
+      `ssh -o ControlPath=${peer.controlSocket} ${peer.target} "telepty list --json"`,
+      { timeout: 10000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    const sessions = JSON.parse(output);
+    return sessions.map(s => ({ ...s, host: peer.target, peerName: name, remote: true }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Discover sessions across all connected peers.
+ * @returns {Array} all remote sessions
+ */
+function discoverAllRemoteSessions() {
+  const allSessions = [];
+  for (const [name] of activePeers) {
+    allSessions.push(...listRemoteSessions(name));
+  }
+  return allSessions;
+}
+
+/**
+ * Inject text into a remote session via SSH.
+ */
+function remoteInject(name, sessionId, prompt, options = {}) {
+  const peer = activePeers.get(name);
+  if (!peer) return { success: false, error: `Not connected to ${name}` };
+
+  try {
+    const escaped = prompt.replace(/'/g, "'\\''");
+    const fromFlag = options.from ? `--from '${options.from}'` : '';
+    const noEnterFlag = options.no_enter ? '--no-enter' : '';
+    execSync(
+      `ssh -o ControlPath=${peer.controlSocket} ${peer.target} "telepty inject ${noEnterFlag} ${fromFlag} '${sessionId}' '${escaped}'"`,
+      { timeout: 15000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Spawn an interactive SSH attach to a remote session.
+ * Returns the child process for stdin/stdout piping.
+ */
+function remoteAttach(name, sessionId) {
+  const peer = activePeers.get(name);
+  if (!peer) return null;
+
+  return spawn('ssh', [
+    '-o', `ControlPath=${peer.controlSocket}`,
+    '-t', // Force TTY allocation
+    peer.target,
+    'telepty', 'attach', sessionId
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
 function listActivePeers() {
-  return [...activeTunnels.entries()].map(([name, info]) => ({
+  return [...activePeers.entries()].map(([name, info]) => ({
     name,
     target: info.target,
-    localPort: info.localPort,
     machineId: info.machineId,
-    connectedAt: info.connectedAt,
-    host: `127.0.0.1:${info.localPort}`
+    connectedAt: info.connectedAt
   }));
 }
 
@@ -182,25 +217,31 @@ function listKnownPeers() {
 }
 
 /**
- * Get all connected peer hosts for discovery.
- * @returns {string[]} Array of "127.0.0.1:PORT" strings
+ * Find which peer has a given session.
+ * @returns {{ peerName, peer } | null}
  */
-function getConnectedHosts() {
-  return [...activeTunnels.values()].map(t => `127.0.0.1:${t.localPort}`);
+function findSessionPeer(sessionId) {
+  for (const [name] of activePeers) {
+    const sessions = listRemoteSessions(name);
+    if (sessions.some(s => s.id === sessionId)) {
+      return { peerName: name, peer: activePeers.get(name) };
+    }
+  }
+  return null;
 }
 
-/**
- * Get connected host for a specific peer.
- * @param {string} name - Peer name
- * @returns {string|null} "127.0.0.1:PORT" or null
- */
+// Backward compat - getConnectedHosts no longer returns HTTP hosts
+// Instead returns peer names for SSH-based discovery
+function getConnectedHosts() {
+  return []; // No HTTP hosts - use discoverAllRemoteSessions() instead
+}
+
 function getPeerHost(name) {
-  const tunnel = activeTunnels.get(name);
-  return tunnel ? `127.0.0.1:${tunnel.localPort}` : null;
+  return null; // No HTTP host - use SSH direct
 }
 
 function removePeer(name) {
-  disconnect(name); // disconnect if active
+  disconnect(name);
   const peers = loadPeers();
   delete peers.peers[name];
   savePeers(peers);
@@ -217,5 +258,10 @@ module.exports = {
   getPeerHost,
   removePeer,
   loadPeers,
+  listRemoteSessions,
+  discoverAllRemoteSessions,
+  remoteInject,
+  remoteAttach,
+  findSessionPeer,
   PEERS_PATH
 };

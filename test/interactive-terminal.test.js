@@ -4,7 +4,12 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('events');
 
-const { attachInteractiveTerminal, getTerminalSize } = require('../interactive-terminal');
+const {
+  attachInteractiveTerminal,
+  getTerminalSize,
+  restoreTerminalModes,
+  TERMINAL_CLEANUP_SEQUENCE
+} = require('../interactive-terminal');
 
 class FakeInput extends EventEmitter {
   constructor() {
@@ -33,6 +38,11 @@ class FakeOutput extends EventEmitter {
     super();
     this.columns = undefined;
     this.rows = undefined;
+    this.writes = [];
+  }
+
+  write(value) {
+    this.writes.push(value);
   }
 }
 
@@ -69,6 +79,24 @@ test('attachInteractiveTerminal resumes paused stdin and cleans up listeners', (
 
   assert.deepEqual(received, ['hello']);
   assert.equal(resizeCalls, 2);
+});
+
+test('interactive terminal cleanup restores terminal keyboard modes', () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const cleanup = attachInteractiveTerminal(input, output, {});
+
+  cleanup();
+
+  assert.deepEqual(output.writes, [TERMINAL_CLEANUP_SEQUENCE]);
+});
+
+test('restoreTerminalModes falls back to output.write when fd is unavailable', () => {
+  const output = new FakeOutput();
+
+  restoreTerminalModes(output);
+
+  assert.deepEqual(output.writes, [TERMINAL_CLEANUP_SEQUENCE]);
 });
 
 test('getTerminalSize falls back to environment and defaults when output size is missing', () => {

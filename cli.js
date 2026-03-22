@@ -3,6 +3,7 @@
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const { constants: osConstants } = require('os');
 const WebSocket = require('ws');
 const { execSync, spawn } = require('child_process');
 const readline = require('readline');
@@ -11,7 +12,7 @@ const updateNotifier = require('update-notifier');
 const pkg = require('./package.json');
 const { getConfig } = require('./auth');
 const { cleanupDaemonProcesses } = require('./daemon-control');
-const { attachInteractiveTerminal, getTerminalSize } = require('./interactive-terminal');
+const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
 const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
@@ -43,9 +44,14 @@ function resetInteractiveInput(stream = process.stdin) {
     return;
   }
 
+  if (stream.isTTY && (stream.isRaw || stream.__teleptyRawModeActive)) {
+    restoreTerminalModes(process.stdout);
+  }
+
   if (stream.isTTY && typeof stream.setRawMode === 'function') {
     try {
       stream.setRawMode(false);
+      stream.__teleptyRawModeActive = false;
     } catch {
       // Ignore raw-mode reset failures when the TTY is already gone.
     }
@@ -99,6 +105,10 @@ process.stdin.on('error', (error) => {
   }
 
   process.stderr.write(`\n❌ Telepty stdin error: ${error.message}\n`);
+});
+
+process.on('exit', () => {
+  resetInteractiveInput(process.stdin);
 });
 
 // Check for updates unless explicitly disabled for tests/CI.
@@ -196,59 +206,44 @@ async function repairLocalDaemon(options = {}) {
 
 function getDiscoveryHosts() {
   const hosts = new Set();
-
   if (REMOTE_HOST && REMOTE_HOST !== '127.0.0.1') {
     hosts.add(REMOTE_HOST);
   } else {
     hosts.add('127.0.0.1');
   }
-
-  const extraHosts = String(process.env.TELEPTY_DISCOVERY_HOSTS || '')
-    .split(',')
-    .map((host) => host.trim())
-    .filter(Boolean);
-  extraHosts.forEach((host) => hosts.add(host));
-
-  // Include relay peers for cross-machine session discovery
-  const relayPeers = String(process.env.TELEPTY_RELAY_PEERS || '')
-    .split(',')
-    .map((host) => host.trim())
-    .filter(Boolean);
-  relayPeers.forEach((host) => hosts.add(host));
-
-  // Include SSH tunnel-connected peers
-  const connectedHosts = crossMachine.getConnectedHosts();
-  connectedHosts.forEach((host) => hosts.add(host));
-
   return Array.from(hosts);
 }
 
 async function discoverSessions(options = {}) {
   await ensureDaemonRunning();
-  const hosts = getDiscoveryHosts();
   const allSessions = [];
 
   if (!options.silent) {
     process.stdout.write('\x1b[36m🔍 Discovering active sessions across connected machines...\x1b[0m\n');
   }
 
-  await Promise.all(hosts.map(async (host) => {
-    try {
-      const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions`, {
-        signal: AbortSignal.timeout(1500)
+  // Local daemon sessions
+  try {
+    const res = await fetchWithAuth(`http://127.0.0.1:${PORT}/api/sessions`, {
+      signal: AbortSignal.timeout(1500)
+    });
+    if (res.ok) {
+      const sessions = await res.json();
+      sessions.forEach((session) => {
+        allSessions.push({ host: '127.0.0.1', ...session });
       });
-      if (res.ok) {
-        const sessions = await res.json();
-        sessions.forEach((session) => {
-          allSessions.push({ host, ...session });
-        });
-      }
-    } catch (e) {
-      // Ignore nodes that don't have telepty running
     }
-  }));
+  } catch {}
+
+  // Remote peer sessions via SSH direct
+  const remoteSessions = crossMachine.discoverAllRemoteSessions();
+  allSessions.push(...remoteSessions);
 
   return allSessions;
+}
+
+function isRemoteSession(session) {
+  return session.remote === true || (session.host && session.host !== '127.0.0.1' && session.host.includes('@'));
 }
 
 async function resolveSessionTarget(sessionRef, options = {}) {
@@ -648,6 +643,11 @@ async function main() {
       allowArgs.splice(idIndex, 2);
     }
 
+    // Extract --auto-restart flag
+    const autoRestartIndex = allowArgs.indexOf('--auto-restart');
+    const autoRestart = autoRestartIndex !== -1;
+    if (autoRestart) allowArgs.splice(autoRestartIndex, 1);
+
     // Strip optional -- separator for backward compat
     const sepIndex = allowArgs.indexOf('--');
     if (sepIndex !== -1) allowArgs.splice(sepIndex, 1);
@@ -713,13 +713,60 @@ async function main() {
 
     // Spawn local PTY (preserves isTTY, env, shell config)
     const pty = require('node-pty');
-    const child = pty.spawn(command, cmdArgs, {
-      name: 'xterm-256color',
-      cols: process.stdout.columns || 80,
-      rows: process.stdout.rows || 30,
-      cwd: process.cwd(),
-      env: { ...process.env, TELEPTY_SESSION_ID: sessionId }
-    });
+    const sessionCwd = process.cwd();
+    const sessionEnv = { ...process.env, TELEPTY_SESSION_ID: sessionId };
+    let child = null;
+    let sessionStartTime = Date.now();
+    let crashCount = 0;
+    const MAX_CRASHES = 3;
+    const DEATH_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'session-deaths.log');
+
+    function logSessionDeath(exitCode, signal, duration) {
+      try {
+        fs.mkdirSync(path.dirname(DEATH_LOG_PATH), { recursive: true });
+        const entry = `[${new Date().toISOString()}] session=${sessionId} command=${command} exit=${exitCode} signal=${signal || 'none'} duration=${Math.round(duration / 1000)}s crashes=${crashCount}\n`;
+        fs.appendFileSync(DEATH_LOG_PATH, entry);
+      } catch {}
+    }
+
+    function emitDeathEvent(exitCode, signal, willRestart) {
+      if (wsReady && daemonWs && daemonWs.readyState === 1) {
+        daemonWs.send(JSON.stringify({
+          type: 'session_died',
+          session_id: sessionId,
+          exitCode, signal: signal || null,
+          duration: Date.now() - sessionStartTime,
+          crashCount,
+          willRestart,
+          timestamp: new Date().toISOString()
+        }));
+      }
+    }
+
+    function emitRestartEvent(attempt) {
+      if (wsReady && daemonWs && daemonWs.readyState === 1) {
+        daemonWs.send(JSON.stringify({
+          type: 'session_restarted',
+          session_id: sessionId,
+          attempt,
+          timestamp: new Date().toISOString()
+        }));
+      }
+    }
+
+    function spawnChild() {
+      child = pty.spawn(command, cmdArgs, {
+        name: 'xterm-256color',
+        cols: process.stdout.columns || 80,
+        rows: process.stdout.rows || 30,
+        cwd: sessionCwd,
+        env: sessionEnv
+      });
+      sessionStartTime = Date.now();
+      return child;
+    }
+
+    spawnChild();
 
     // Prompt-ready detection for safe inject delivery
     const PROMPT_PATTERNS = {
@@ -729,12 +776,21 @@ async function main() {
     };
     const cmdBase = path.basename(command).replace(/\..*$/, '');
     const promptPattern = PROMPT_PATTERNS[cmdBase] || /[❯>$#%]\s*$/;
-    let promptReady = true;  // assume ready initially for first inject
+    let promptReady = false;  // wait for CLI prompt before accepting inject
     const injectQueue = [];
+    let lastUserInputTime = 0;  // timestamp of last user keystroke
+    const IDLE_THRESHOLD = 2000; // ms after last user input to consider idle
+
+    function isIdle() {
+      return promptReady && (Date.now() - lastUserInputTime > IDLE_THRESHOLD);
+    }
 
     let queueFlushTimer = null;
+    let idleCheckTimer = null;
+
     function flushInjectQueue() {
       if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
+      if (idleCheckTimer) { clearInterval(idleCheckTimer); idleCheckTimer = null; }
       if (injectQueue.length === 0) return;
       const batch = injectQueue.splice(0);
       let delay = 0;
@@ -744,14 +800,23 @@ async function main() {
       }
       promptReady = false;
     }
-    function scheduleQueueFlush() {
-      if (queueFlushTimer) return;
-      queueFlushTimer = setTimeout(() => {
-        queueFlushTimer = null;
-        if (injectQueue.length > 0) {
+    function scheduleIdleFlush() {
+      if (idleCheckTimer) return;
+      // Poll every 500ms for idle state
+      idleCheckTimer = setInterval(() => {
+        if (isIdle() && injectQueue.length > 0) {
           flushInjectQueue();
         }
-      }, 3000);
+      }, 500);
+      // Safety: flush after 15s regardless (prevent stuck queue)
+      if (!queueFlushTimer) {
+        queueFlushTimer = setTimeout(() => {
+          queueFlushTimer = null;
+          if (injectQueue.length > 0) {
+            flushInjectQueue();
+          }
+        }, 15000);
+      }
     }
 
     // Connect to daemon WebSocket with auto-reconnect
@@ -793,6 +858,10 @@ async function main() {
         // No resize trick on reconnect — it causes visible flickering across all
         // terminals when the daemon restarts and multiple sessions reconnect at once.
         reconnectAttempts = 0;
+        // Re-send ready on reconnect so new daemon knows CLI is ready
+        if (readyNotified && promptReady) {
+          daemonWs.send(JSON.stringify({ type: 'ready' }));
+        }
       });
 
       daemonWs.on('message', (message) => {
@@ -802,20 +871,21 @@ async function main() {
             const isCr = msg.data === '\r';
             if (isCr && injectQueue.length > 0) {
               // CR with pending queued text — queue CR too and flush immediately.
-              // Prevents the busy-session bug where CR fires before queued text,
-              // causing empty submit followed by orphaned text without Return.
               injectQueue.push(msg.data);
               if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
               flushInjectQueue();
-            } else if (isCr || promptReady) {
+            } else if (isCr) {
+              // CR always written immediately — never idle-gated
               child.write(msg.data);
-              if (!isCr && msg.data.length > 1) {
-                promptReady = false;
-                lastInjectTextTime = Date.now();
-              }
+            } else if (isIdle()) {
+              // Text when idle — write immediately
+              child.write(msg.data);
+              promptReady = false;
+              lastInjectTextTime = Date.now();
             } else {
+              // Text when not idle — queue for safe delivery
               injectQueue.push(msg.data);
-              scheduleQueueFlush();
+              scheduleIdleFlush();
             }
           } else if (msg.type === 'resize') {
             child.resize(msg.cols, msg.rows);
@@ -856,6 +926,7 @@ async function main() {
 
     const cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
       onData: (data) => {
+        lastUserInputTime = Date.now();
         child.write(data.toString());
       },
       onResize: () => {
@@ -863,6 +934,31 @@ async function main() {
         child.resize(size.cols, size.rows);
       }
     });
+    let allowSessionClosed = false;
+    const allowSignalHandlers = new Map();
+
+    function closeAllowSession() {
+      if (allowSessionClosed) {
+        return false;
+      }
+
+      allowSessionClosed = true;
+      cleanupTerminal();
+      process.stdout.write(`\x1b]0;\x07`);
+      fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }).catch(() => {});
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try {
+        daemonWs.close();
+      } catch {}
+      for (const [signalName, handler] of allowSignalHandlers) {
+        process.off(signalName, handler);
+      }
+      return true;
+    }
+
+    function exitAllowSession(code) {
+      setTimeout(() => process.exit(code), 25);
+    }
 
     // Intercept terminal title escape sequences and prefix with session ID
     const titlePrefix = `\u26A1 ${sessionId}`;
@@ -874,6 +970,7 @@ async function main() {
     }
 
     // Relay PTY output to current terminal + send to daemon for attach clients
+    let readyNotified = false;
     child.onData((data) => {
       const rewritten = rewriteTitleSequences(data);
       process.stdout.write(rewritten);
@@ -884,21 +981,85 @@ async function main() {
       if (promptPattern.test(data)) {
         promptReady = true;
         flushInjectQueue();
+        // Notify daemon that CLI is ready for inject
+        if (!readyNotified && wsReady && daemonWs.readyState === 1) {
+          readyNotified = true;
+          daemonWs.send(JSON.stringify({ type: 'ready' }));
+        }
       }
     });
 
-    // Handle child exit
-    child.onExit(({ exitCode }) => {
-      cleanupTerminal();
-      process.stdout.write(`\x1b]0;\x07`);
-      console.log(`\n\x1b[33mSession '${sessionId}' exited (code ${exitCode}).\x1b[0m`);
+    // Handle child exit with death tracking + auto-restart
+    function attachChildExitHandler() {
+      child.onExit(({ exitCode, signal }) => {
+        const duration = Date.now() - sessionStartTime;
+        const isAbnormal = exitCode !== 0 || signal;
+        const durationStr = duration > 60000 ? `${Math.round(duration / 60000)}m ${Math.round((duration % 60000) / 1000)}s` : `${Math.round(duration / 1000)}s`;
 
-      // Deregister from daemon
-      fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }).catch(() => {});
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      daemonWs.close();
-      process.exit(exitCode || 0);
-    });
+        logSessionDeath(exitCode, signal, duration);
+
+        if (isAbnormal && autoRestart && crashCount < MAX_CRASHES) {
+          crashCount++;
+          const backoffMs = Math.min(1000 * Math.pow(2, crashCount - 1), 8000);
+          const willRestart = true;
+          emitDeathEvent(exitCode, signal, willRestart);
+          console.log(`\n\x1b[33m⚠️ Session '${sessionId}' died (code ${exitCode}, signal ${signal || 'none'}, ${durationStr}). Restarting in ${backoffMs}ms (attempt ${crashCount}/${MAX_CRASHES})...\x1b[0m`);
+
+          setTimeout(() => {
+            try {
+              spawnChild();
+              // Re-attach output relay, prompt detection, and exit handler
+              child.onData((data) => {
+                const rewritten = rewriteTitleSequences(data);
+                process.stdout.write(rewritten);
+                if (wsReady && daemonWs.readyState === 1) {
+                  daemonWs.send(JSON.stringify({ type: 'output', data }));
+                }
+                if (promptPattern.test(data)) {
+                  promptReady = true;
+                  flushInjectQueue();
+                  if (wsReady && daemonWs.readyState === 1) {
+                    daemonWs.send(JSON.stringify({ type: 'ready' }));
+                  }
+                }
+              });
+              attachChildExitHandler();
+              emitRestartEvent(crashCount);
+              console.log(`\x1b[32m✅ Session '${sessionId}' restarted (attempt ${crashCount}).\x1b[0m\n`);
+              // Reset crash counter if session survives 30s
+              setTimeout(() => { if (crashCount > 0) crashCount = 0; }, 30000);
+            } catch (err) {
+              console.error(`\x1b[31m❌ Failed to restart session '${sessionId}': ${err.message}\x1b[0m`);
+              emitDeathEvent(exitCode, signal, false);
+              if (!closeAllowSession()) return;
+              exitAllowSession(exitCode || 1);
+            }
+          }, backoffMs);
+        } else {
+          if (isAbnormal && autoRestart && crashCount >= MAX_CRASHES) {
+            console.log(`\n\x1b[31m❌ Session '${sessionId}' crashed ${MAX_CRASHES} times. Giving up.\x1b[0m`);
+          }
+          emitDeathEvent(exitCode, signal, false);
+          if (!closeAllowSession()) return;
+          console.log(`\n\x1b[33mSession '${sessionId}' exited (code ${exitCode}${signal ? ', signal ' + signal : ''}, ${durationStr}).\x1b[0m`);
+          exitAllowSession(exitCode || 0);
+        }
+      });
+    }
+    attachChildExitHandler();
+
+    for (const signalName of ['SIGTERM', 'SIGHUP', 'SIGQUIT']) {
+      const handler = () => {
+        closeAllowSession();
+        try {
+          child.kill(signalName);
+        } catch {}
+        const signalCode = osConstants.signals[signalName] || 1;
+        exitAllowSession(128 + signalCode);
+      };
+      allowSignalHandlers.set(signalName, handler);
+      process.on(signalName, handler);
+    }
 
     // Graceful shutdown on SIGINT (let child handle it via PTY)
     process.on('SIGINT', () => {});
@@ -1011,6 +1172,34 @@ async function main() {
     return;
   }
 
+  if (cmd === 'read-screen') {
+    const sessionId = args[1];
+    if (!sessionId) { console.error('❌ Usage: telepty read-screen <session_id> [--lines N] [--raw]'); process.exit(1); }
+
+    const linesIndex = args.indexOf('--lines');
+    const lines = (linesIndex !== -1 && args[linesIndex + 1]) ? args[linesIndex + 1] : '50';
+    const raw = args.includes('--raw');
+
+    try {
+      const target = await resolveSessionTarget(sessionId);
+      if (!target) {
+        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
+        process.exit(1);
+      }
+
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/screen?lines=${lines}${raw ? '&raw=1' : ''}`);
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ Error: ${data.error}`); process.exit(1); }
+
+      if (!data.screen) {
+        console.log('(empty screen)');
+      } else {
+        console.log(data.screen);
+      }
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    return;
+  }
+
   if (cmd === 'inject') {
     // Check for --no-enter flag
     const noEnterIndex = args.indexOf('--no-enter');
@@ -1049,14 +1238,24 @@ async function main() {
         process.exit(1);
       }
 
-      // Entitlement: remote session check
-      if (target.host && target.host !== '127.0.0.1' && target.host !== 'localhost') {
+      // Remote session: use SSH direct execution
+      if (isRemoteSession(target)) {
         const { checkEntitlement } = require('./entitlement');
         const ent = checkEntitlement({ feature: 'telepty.remote_sessions' });
         if (!ent.allowed) {
           console.error(`⚠️  ${ent.reason}\n   Upgrade: ${ent.upgrade_url}`);
           process.exit(1);
         }
+        const result = crossMachine.remoteInject(target.peerName, target.id, prompt, {
+          from: fromId,
+          no_enter: noEnter
+        });
+        if (result.success) {
+          console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m' @ ${target.peerName}.`);
+        } else {
+          console.error(`❌ Error: ${result.error}`);
+        }
+        return;
       }
 
       const body = { prompt, no_enter: noEnter };
@@ -1069,8 +1268,7 @@ async function main() {
       });
       const data = await res.json();
       if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
-      const hostSuffix = target.host === '127.0.0.1' ? '' : ` @ ${target.host}`;
-      console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'${hostSuffix}.`);
+      console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'.`);
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
     return;
   }
@@ -1881,8 +2079,6 @@ Discuss the following topic from your project's perspective. Engage with other s
     if (result.success) {
       console.log(`\x1b[32m✅ Connected to ${result.name}\x1b[0m`);
       console.log(`   Machine ID: ${result.machineId}`);
-      console.log(`   Local port: ${result.localPort}`);
-      console.log(`   Version: ${result.version}`);
       console.log(`\nSessions on ${result.name} are now discoverable via \x1b[36mtelepty list\x1b[0m`);
     } else {
       console.error(`\x1b[31m❌ ${result.error}\x1b[0m`);
@@ -2019,10 +2215,11 @@ Discuss the following topic from your project's perspective. Engage with other s
 Usage:
   telepty daemon                                 Start the background daemon
   telepty spawn --id <id> <command> [args...]    Spawn a new background CLI
-  telepty allow [--id <id>] <command> [args...]       Allow inject on a CLI
+  telepty allow [--id <id>] [--auto-restart] <command> [args...]  Allow inject on a CLI (auto-restart on crash)
   telepty list                                   List all active sessions across discovered hosts
   telepty attach [id[@host]]                     Attach to a session (Interactive picker if no ID)
   telepty inject [--no-enter] [--from <id>] [--reply-to <id>] <id[@host]> "<prompt>"    Inject text into a single session
+  telepty read-screen <id[@host]> [--lines N] [--raw]                  Read session screen buffer
   telepty reply "<text>"                         Reply to the session that last injected into $TELEPTY_SESSION_ID
   telepty multicast <id1[@host],id2[@host]> "<prompt>"  Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
