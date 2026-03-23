@@ -144,6 +144,56 @@ async function getDaemonMeta(host = REMOTE_HOST) {
   }
 }
 
+function detectTerminalProgram(env = process.env) {
+  const rawTermProgram = typeof env.TERM_PROGRAM === 'string' ? env.TERM_PROGRAM.trim() : '';
+  if (rawTermProgram) {
+    return rawTermProgram;
+  }
+
+  if (env.TMUX) {
+    return 'tmux';
+  }
+
+  const term = typeof env.TERM === 'string' ? env.TERM.toLowerCase() : '';
+  if (term.includes('kitty')) return 'kitty';
+  if (term.includes('ghostty')) return 'ghostty';
+  if (term.includes('tmux')) return 'tmux';
+
+  return null;
+}
+
+function formatSessionTerminal(session) {
+  const terminal = session.terminal || session.termProgram || null;
+  const term = session.term || null;
+  if (terminal && term) {
+    return `${terminal} (${term})`;
+  }
+  return terminal || term || 'unknown';
+}
+
+function printSessionInfo(session, options = {}) {
+  const host = options.host || session.host || '127.0.0.1';
+  console.log('\x1b[1mSession Info:\x1b[0m');
+  console.log(`  - ID: \x1b[36m${session.id}\x1b[0m`);
+  console.log(`    Host: ${formatHostLabel(host)}`);
+  console.log(`    Command: ${session.command}`);
+  console.log(`    Type: ${session.type || 'unknown'}`);
+  console.log(`    Terminal: ${session.terminal || session.termProgram || 'unknown'}`);
+  console.log(`    TERM: ${session.term || 'n/a'}`);
+  console.log(`    CWD: ${session.cwd}`);
+  console.log(`    Clients: ${session.active_clients ?? 0}`);
+  if (session.createdAt) {
+    console.log(`    Started: ${new Date(session.createdAt).toLocaleString()}`);
+  }
+  if (session.lastActivityAt) {
+    console.log(`    Last Activity: ${new Date(session.lastActivityAt).toLocaleString()}`);
+  }
+  if (typeof session.idleSeconds === 'number') {
+    console.log(`    Idle: ${session.idleSeconds}s`);
+  }
+  console.log('');
+}
+
 function startDetachedDaemon() {
   const cp = spawn(process.argv[0], [process.argv[1], 'daemon'], {
     detached: true,
@@ -589,12 +639,17 @@ async function main() {
   if (cmd === 'list') {
     try {
       const sessions = await discoverSessions({ silent: true });
+      if (args.includes('--json')) {
+        console.log(JSON.stringify(sessions, null, 2));
+        return;
+      }
       if (sessions.length === 0) { console.log('No active sessions found.'); return; }
       console.log('\x1b[1mActive Sessions:\x1b[0m');
       sessions.forEach(s => {
         console.log(`  - ID: \x1b[36m${s.id}\x1b[0m`);
         console.log(`    Host: ${formatHostLabel(s.host)}`);
         console.log(`    Command: ${s.command}`);
+        console.log(`    Terminal: ${formatSessionTerminal(s)}`);
         console.log(`    CWD: ${s.cwd}`);
         console.log(`    Clients: ${s.active_clients}`);
         console.log(`    Started: ${new Date(s.createdAt).toLocaleString()}`);
@@ -688,6 +743,8 @@ async function main() {
     const detectedBackend = process.env.CMUX_WORKSPACE_ID ? 'cmux' : (findKittySocketCli() ? 'kitty' : 'pty');
 
     // Register session with daemon
+    const terminalProgram = detectTerminalProgram(process.env);
+    const terminalType = process.env.TERM || null;
     try {
       const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
         method: 'POST',
@@ -698,7 +755,9 @@ async function main() {
           cwd: process.cwd(),
           backend: detectedBackend,
           cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
-          cmux_surface_id: process.env.CMUX_SURFACE_ID || null
+          cmux_surface_id: process.env.CMUX_SURFACE_ID || null,
+          term_program: terminalProgram,
+          term: terminalType
         })
       });
       const data = await res.json();
@@ -843,7 +902,9 @@ async function main() {
               cwd: process.cwd(),
               backend: detectedBackend,
               cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
-              cmux_surface_id: process.env.CMUX_SURFACE_ID || null
+              cmux_surface_id: process.env.CMUX_SURFACE_ID || null,
+              term_program: terminalProgram,
+              term: terminalType
             })
           });
         } catch (e) {
@@ -868,24 +929,35 @@ async function main() {
         try {
           const msg = JSON.parse(message);
           if (msg.type === 'inject') {
-            const isCr = msg.data === '\r';
-            if (isCr && injectQueue.length > 0) {
-              // CR with pending queued text — queue CR too and flush immediately.
-              injectQueue.push(msg.data);
-              if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
-              flushInjectQueue();
-            } else if (isCr) {
-              // CR always written immediately — never idle-gated
-              child.write(msg.data);
-            } else if (isIdle()) {
-              // Text when idle — write immediately
-              child.write(msg.data);
-              promptReady = false;
-              lastInjectTextTime = Date.now();
-            } else {
-              // Text when not idle — queue for safe delivery
-              injectQueue.push(msg.data);
-              scheduleIdleFlush();
+            const chunks = [];
+            const rawData = typeof msg.data === 'string' ? msg.data : String(msg.data ?? '');
+            // Keep text+CR combined — do NOT split them.
+            chunks.push(rawData);
+
+            for (const chunk of chunks) {
+              if (!chunk) {
+                continue;
+              }
+
+              const isCr = chunk === '\r';
+              if (isCr && injectQueue.length > 0) {
+                // CR with pending queued text — queue CR too and flush immediately.
+                injectQueue.push(chunk);
+                if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
+                flushInjectQueue();
+              } else if (isCr) {
+                // CR always written immediately — never idle-gated.
+                child.write(chunk);
+              } else if (isIdle()) {
+                // Text when idle — write immediately.
+                child.write(chunk);
+                promptReady = false;
+                lastInjectTextTime = Date.now();
+              } else {
+                // Text when not idle — queue for safe delivery.
+                injectQueue.push(chunk);
+                scheduleIdleFlush();
+              }
             }
           } else if (msg.type === 'resize') {
             child.resize(msg.cols, msg.rows);
@@ -1386,6 +1458,56 @@ async function main() {
       const hostSuffix = target.host === '127.0.0.1' ? '' : ` @ ${target.host}`;
       console.log(`✅ Session renamed: '\x1b[36m${target.id}\x1b[0m' → '\x1b[36m${newId}\x1b[0m'${hostSuffix}`);
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    return;
+  }
+
+  if (cmd === 'session' && args[1] === 'info') {
+    const sessionRef = args[2];
+    if (!sessionRef) {
+      console.error('❌ Usage: telepty session info <id[@host]>');
+      process.exit(1);
+    }
+
+    try {
+      const sessions = await discoverSessions({ silent: true });
+      const target = await resolveSessionTarget(sessionRef, { sessions });
+      if (!target) {
+        console.error(`❌ Session '${sessionRef}' was not found on any discovered host.`);
+        process.exit(1);
+      }
+
+      if (args.includes('--json')) {
+        if (isRemoteSession(target)) {
+          console.log(JSON.stringify(target, null, 2));
+          return;
+        }
+
+        const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}`);
+        const data = await res.json();
+        if (!res.ok) {
+          console.error(`❌ Error: ${data.error}`);
+          process.exit(1);
+        }
+        console.log(JSON.stringify({ host: target.host, ...data }, null, 2));
+        return;
+      }
+
+      if (isRemoteSession(target)) {
+        printSessionInfo(target, { host: target.host });
+        return;
+      }
+
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}`);
+      const data = await res.json();
+      if (!res.ok) {
+        console.error(`❌ Error: ${data.error}`);
+        process.exit(1);
+      }
+
+      printSessionInfo(data, { host: target.host });
+    } catch (e) {
+      console.error(`❌ ${e.message || 'Failed to fetch session info.'}`);
+    }
     return;
   }
 
@@ -2216,7 +2338,7 @@ Usage:
   telepty daemon                                 Start the background daemon
   telepty spawn --id <id> <command> [args...]    Spawn a new background CLI
   telepty allow [--id <id>] [--auto-restart] <command> [args...]  Allow inject on a CLI (auto-restart on crash)
-  telepty list                                   List all active sessions across discovered hosts
+  telepty list [--json]                          List all active sessions across discovered hosts
   telepty attach [id[@host]]                     Attach to a session (Interactive picker if no ID)
   telepty inject [--no-enter] [--from <id>] [--reply-to <id>] <id[@host]> "<prompt>"    Inject text into a single session
   telepty read-screen <id[@host]> [--lines N] [--raw]                  Read session screen buffer
@@ -2224,6 +2346,7 @@ Usage:
   telepty multicast <id1[@host],id2[@host]> "<prompt>"  Inject text into multiple specific sessions
   telepty broadcast "<prompt>"                   Inject text into ALL active sessions
   telepty rename <old_id[@host]> <new_id>        Rename a session (updates terminal title too)
+  telepty session info <id[@host]> [--json]      Show detailed session metadata
   telepty connect <user@host> [--name N] [--port P]  Connect to a remote machine via SSH tunnel
   telepty disconnect <name> | --all              Disconnect from a remote machine
   telepty peers [--remove <name>]                List connected and known peers

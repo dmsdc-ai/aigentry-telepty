@@ -221,6 +221,28 @@ test('POST /api/sessions/register creates a wrapped session with correct type', 
   assert.equal(list.body[0].type, 'wrapped');
 });
 
+test('register stores terminal metadata and exposes it through session APIs', async () => {
+  const sessionId = createSessionId('terminal-meta');
+  const result = await harness.registerSession(sessionId, {
+    term_program: 'ghostty',
+    term: 'xterm-256color'
+  });
+
+  assert.equal(result.status, 201);
+
+  const list = await harness.request('/api/sessions');
+  const session = list.body.find((item) => item.id === sessionId);
+  assert.equal(session.termProgram, 'ghostty');
+  assert.equal(session.term, 'xterm-256color');
+  assert.equal(session.terminal, 'ghostty');
+
+  const detail = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.termProgram, 'ghostty');
+  assert.equal(detail.body.term, 'xterm-256color');
+  assert.equal(detail.body.terminal, 'ghostty');
+});
+
 test('register rejects missing session_id and duplicate IDs', async () => {
   const noId = await harness.registerSession(undefined, { session_id: undefined });
   assert.equal(noId.status, 400);
@@ -293,6 +315,34 @@ test('inject on wrapped session forwards to owner WebSocket', async () => {
   await waitFor(() => ownerMessages.find((message) => (
     message.type === 'inject' && String(message.data).includes('injected-text')
   )), { description: 'inject message forwarded to owner' });
+
+  ownerWs.close();
+});
+
+test('inject keeps routing metadata out of wrapped prompt text and submits separately', async () => {
+  const sessionId = createSessionId('owner-routing');
+  await harness.registerSession(sessionId);
+
+  const ownerWs = await harness.connectSession(sessionId);
+  const ownerMessages = collectJsonMessages(ownerWs);
+
+  const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    method: 'POST',
+    body: { prompt: 'visible-task', from: 'orch', reply_to: 'orch' }
+  });
+  assert.equal(inject.status, 200);
+  assert.equal(inject.body.success, true);
+
+  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 2, {
+    timeoutMs: 7000,
+    description: 'wrapped inject text and submit'
+  });
+
+  const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
+  assert.equal(injectMessages[0], 'visible-task');
+  assert.equal(injectMessages[1], '\r');
+  assert.equal(injectMessages.some((data) => String(data).includes('[from:')), false);
+  assert.equal(injectMessages.some((data) => String(data).includes('telepty inject --from')), false);
 
   ownerWs.close();
 });

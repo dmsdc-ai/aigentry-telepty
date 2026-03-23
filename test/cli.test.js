@@ -46,7 +46,10 @@ afterEach(async () => {
 
 test('telepty list prints active sessions from the configured host and port', async () => {
   const sessionId = createSessionId('cli-list');
-  await harness.spawnSession(sessionId);
+  await harness.registerSession(sessionId, {
+    term_program: 'kitty',
+    term: 'xterm-kitty'
+  });
 
   const result = await harness.runCli(['list']);
   assert.equal(result.code, 0, result.stderr);
@@ -54,6 +57,40 @@ test('telepty list prints active sessions from the configured host and port', as
   const output = stripAnsi(`${result.stdout}\n${result.stderr}`);
   assert.match(output, new RegExp(sessionId));
   assert.match(output, /Active Sessions/i);
+  assert.match(output, /Terminal: kitty \(xterm-kitty\)/i);
+});
+
+test('telepty list --json includes terminal metadata', async () => {
+  const sessionId = createSessionId('cli-list-json');
+  await harness.registerSession(sessionId, {
+    term_program: 'ghostty',
+    term: 'xterm-256color'
+  });
+
+  const result = await harness.runCli(['list', '--json']);
+  assert.equal(result.code, 0, result.stderr);
+
+  const parsed = JSON.parse(result.stdout);
+  const session = parsed.find((item) => item.id === sessionId);
+  assert.equal(session.termProgram, 'ghostty');
+  assert.equal(session.term, 'xterm-256color');
+  assert.equal(session.terminal, 'ghostty');
+});
+
+test('telepty session info prints terminal metadata', async () => {
+  const sessionId = createSessionId('cli-session-info');
+  await harness.registerSession(sessionId, {
+    term_program: 'Apple_Terminal',
+    term: 'xterm-256color'
+  });
+
+  const result = await harness.runCli(['session', 'info', sessionId]);
+  assert.equal(result.code, 0, result.stderr);
+
+  const output = stripAnsi(`${result.stdout}\n${result.stderr}`);
+  assert.match(output, /Session Info/i);
+  assert.match(output, /Terminal: Apple_Terminal/i);
+  assert.match(output, /TERM: xterm-256color/i);
 });
 
 test('telepty inject forwards input to the target PTY session', async () => {
@@ -149,6 +186,81 @@ test('telepty allow works without a TTY by using fallback terminal dimensions', 
     const list = await harness.request('/api/sessions');
     return list.status === 200 && !list.body.some((session) => session.id === sessionId);
   }, { description: 'wrapped session cleanup after non-interactive allow' });
+});
+
+test('telepty allow inject submits once without exposing routing metadata', async () => {
+  const sessionId = createSessionId('cli-allow-inject');
+  const childScript = [
+    "process.stdin.setEncoding('utf8');",
+    "let buffer='';",
+    "process.stdin.resume();",
+    "process.stdout.write('> ');",
+    "process.stdin.on('data', (chunk) => {",
+    "  for (const ch of chunk) {",
+    "    if (ch === '\\r' || ch === '\\n') {",
+    "      process.stdout.write(`\\nSUBMIT:${buffer}\\n`);",
+    "      process.exit(0);",
+    "      return;",
+    "    }",
+    "    buffer += ch;",
+    "  }",
+    "});"
+  ].join(' ');
+
+  const cli = pty.spawn(process.execPath, [
+    'cli.js',
+    'allow',
+    '--id',
+    sessionId,
+    process.execPath,
+    '-e',
+    childScript
+  ], {
+    cwd: projectRoot,
+    cols: 80,
+    rows: 24,
+    name: process.platform === 'win32' ? 'xterm' : 'xterm-256color',
+    env: {
+      ...process.env,
+      HOME: harness.homeDir,
+      USERPROFILE: harness.homeDir,
+      TELEPTY_HOST: harness.host,
+      TELEPTY_PORT: String(harness.port),
+      NO_UPDATE_NOTIFIER: '1',
+      TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
+    }
+  });
+
+  let output = '';
+  cli.onData((chunk) => {
+    output += chunk;
+  });
+
+  try {
+    await waitFor(() => stripAnsi(output).includes('Inject allowed.'), {
+      timeoutMs: 7000,
+      description: 'allow bridge ready'
+    });
+
+    const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+      method: 'POST',
+      body: { prompt: 'hello-once', from: 'orch', reply_to: 'orch' }
+    });
+    assert.equal(inject.status, 200);
+
+    await waitFor(() => stripAnsi(output).includes('SUBMIT:hello-once'), {
+      timeoutMs: 7000,
+      description: 'single submitted inject payload'
+    });
+
+    const normalized = stripAnsi(output);
+    assert.equal(countOccurrences(normalized, 'SUBMIT:'), 1);
+    assert.equal(normalized.includes('[from:'), false);
+    assert.equal(normalized.includes('reply-to:'), false);
+    assert.equal(normalized.includes('telepty inject --from'), false);
+  } finally {
+    cli.kill();
+  }
 });
 
 test('telepty allow restores terminal keyboard modes after the child exits', async () => {

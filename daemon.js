@@ -20,7 +20,19 @@ function persistSessions() {
   try {
     const data = {};
     for (const [id, s] of Object.entries(sessions)) {
-      data[id] = { id, type: s.type, command: s.command, cwd: s.cwd, backend: s.backend || null, cmuxWorkspaceId: s.cmuxWorkspaceId || null, cmuxSurfaceId: s.cmuxSurfaceId || null, createdAt: s.createdAt, lastActivityAt: s.lastActivityAt || null };
+      data[id] = {
+        id,
+        type: s.type,
+        command: s.command,
+        cwd: s.cwd,
+        backend: s.backend || null,
+        cmuxWorkspaceId: s.cmuxWorkspaceId || null,
+        cmuxSurfaceId: s.cmuxSurfaceId || null,
+        termProgram: s.termProgram || null,
+        term: s.term || null,
+        createdAt: s.createdAt,
+        lastActivityAt: s.lastActivityAt || null
+      };
     }
     fs.mkdirSync(require('path').dirname(SESSION_PERSIST_PATH), { recursive: true });
     fs.writeFileSync(SESSION_PERSIST_PATH, JSON.stringify(data, null, 2));
@@ -150,6 +162,50 @@ function appendToOutputRing(session, data) {
   }
 }
 
+function getSessionTerminalLabel(session) {
+  if (session.termProgram) {
+    return session.termProgram;
+  }
+
+  const term = String(session.term || '').toLowerCase();
+  if (term.includes('kitty')) return 'kitty';
+  if (term.includes('ghostty')) return 'ghostty';
+  if (term.includes('tmux')) return 'tmux';
+
+  if (session.type === 'aterm') return 'aterm';
+  if (session.backend === 'cmux') return 'cmux';
+  if (session.backend === 'kitty') return 'kitty';
+  if ((session.type || 'spawned') === 'spawned') return 'daemon-pty';
+
+  return null;
+}
+
+function serializeSession(id, session, options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const idleSeconds = session.lastActivityAt ? Math.floor((nowMs - new Date(session.lastActivityAt).getTime()) / 1000) : null;
+  const projectId = session.cwd ? session.cwd.split('/').pop() : null;
+
+  return {
+    id,
+    locator: { machine_id: MACHINE_ID, session_id: id, project_id: projectId },
+    type: session.type || 'spawned',
+    command: session.command,
+    cwd: session.cwd,
+    backend: session.backend || 'kitty',
+    terminal: getSessionTerminalLabel(session),
+    termProgram: session.termProgram || null,
+    term: session.term || null,
+    cmuxWorkspaceId: session.cmuxWorkspaceId || null,
+    cmuxSurfaceId: session.cmuxSurfaceId || null,
+    createdAt: session.createdAt,
+    lastActivityAt: session.lastActivityAt || null,
+    idleSeconds,
+    active_clients: session.clients ? session.clients.size : 0,
+    ready: session.ready || false,
+    deliveryEndpoint: session.deliveryEndpoint || null
+  };
+}
+
 // Detect terminal environment at daemon startup
 const DETECTED_TERMINAL = terminalBackend.detectTerminal();
 console.log(`[DAEMON] Terminal backend: ${DETECTED_TERMINAL}`);
@@ -161,6 +217,11 @@ for (const [id, meta] of Object.entries(_persisted)) {
     sessions[id] = {
       id, type: 'wrapped', ptyProcess: null, ownerWs: null,
       command: meta.command || 'wrapped', cwd: meta.cwd || process.cwd(),
+      backend: meta.backend || 'kitty',
+      cmuxWorkspaceId: meta.cmuxWorkspaceId || null,
+      cmuxSurfaceId: meta.cmuxSurfaceId || null,
+      termProgram: meta.termProgram || null,
+      term: meta.term || null,
       createdAt: meta.createdAt || new Date().toISOString(),
       lastActivityAt: meta.lastActivityAt || new Date().toISOString(),
       clients: new Set(), isClosing: false, outputRing: [], ready: false,     };
@@ -323,7 +384,7 @@ app.post('/api/sessions/spawn', (req, res) => {
 });
 
 app.post('/api/sessions/register', (req, res) => {
-  const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id } = req.body;
+  const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id, term_program, term } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is required' });
   // Entitlement: check session limit for new registrations
   if (!sessions[session_id]) {
@@ -342,13 +403,19 @@ app.post('/api/sessions/register', (req, res) => {
     if (backend) existing.backend = backend;
     if (cmux_workspace_id) existing.cmuxWorkspaceId = cmux_workspace_id;
     if (cmux_surface_id) existing.cmuxSurfaceId = cmux_surface_id;
-    console.log(`[REGISTER] Re-registered session ${session_id} (updated metadata)`);
-    return res.status(200).json({ session_id, type: 'wrapped', command: existing.command, cwd: existing.cwd, reregistered: true });
+    if (Object.prototype.hasOwnProperty.call(req.body, 'term_program')) existing.termProgram = term_program || null;
+    if (Object.prototype.hasOwnProperty.call(req.body, 'term')) existing.term = term || null;
+    if (req.body.delivery_type) existing.type = req.body.delivery_type;
+    if (req.body.delivery_endpoint) existing.deliveryEndpoint = req.body.delivery_endpoint;
+    if (req.body.delivery_type === 'aterm') existing.ready = true;
+    console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
+    return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true });
   }
 
+  const { delivery_type, delivery_endpoint } = req.body;
   const sessionRecord = {
     id: session_id,
-    type: 'wrapped',
+    type: delivery_type || 'wrapped',
     ptyProcess: null,
     ownerWs: null,
     command: command || 'wrapped',
@@ -356,12 +423,15 @@ app.post('/api/sessions/register', (req, res) => {
     backend: backend || 'kitty',
     cmuxWorkspaceId: cmux_workspace_id || null,
     cmuxSurfaceId: cmux_surface_id || null,
+    termProgram: term_program || null,
+    term: term || null,
+    deliveryEndpoint: delivery_endpoint || null,
     createdAt: new Date().toISOString(),
     lastActivityAt: new Date().toISOString(),
     clients: new Set(),
     isClosing: false,
     outputRing: [],
-    ready: false,
+    ready: delivery_type === 'aterm',  // aterm sessions are always ready (aterm manages readiness)
       };
   // Check for existing session with same base alias and emit replaced event
   const baseAlias = session_id.replace(/-\d+$/, '');
@@ -405,25 +475,7 @@ app.post('/api/sessions/register', (req, res) => {
 app.get('/api/sessions', (req, res) => {
   const idleGt = req.query.idle_gt ? Number(req.query.idle_gt) : null;
   const now = Date.now();
-  let list = Object.entries(sessions).map(([id, session]) => {
-    const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
-    const projectId = session.cwd ? session.cwd.split('/').pop() : null;
-    return {
-      id,
-      locator: { machine_id: MACHINE_ID, session_id: id, project_id: projectId },
-      type: session.type || 'spawned',
-      command: session.command,
-      cwd: session.cwd,
-      backend: session.backend || 'kitty',
-      cmuxWorkspaceId: session.cmuxWorkspaceId || null,
-      cmuxSurfaceId: session.cmuxSurfaceId || null,
-      createdAt: session.createdAt,
-      lastActivityAt: session.lastActivityAt || null,
-      idleSeconds,
-      active_clients: session.clients.size,
-      ready: session.ready || false
-    };
-  });
+  let list = Object.entries(sessions).map(([id, session]) => serializeSession(id, session, { nowMs: now }));
   if (idleGt !== null) {
     list = list.filter(s => s.idleSeconds !== null && s.idleSeconds > idleGt);
   }
@@ -435,19 +487,9 @@ app.get('/api/sessions/:id', (req, res) => {
   const resolvedId = resolveSessionAlias(requestedId);
   if (!resolvedId) return res.status(404).json({ error: 'Session not found' });
   const session = sessions[resolvedId];
-  const idleSeconds = session.lastActivityAt ? Math.floor((Date.now() - new Date(session.lastActivityAt).getTime()) / 1000) : null;
-  const projectId = session.cwd ? session.cwd.split('/').pop() : null;
   res.json({
-    id: resolvedId,
-    locator: { machine_id: MACHINE_ID, session_id: resolvedId, project_id: projectId },
+    ...serializeSession(resolvedId, session),
     alias: requestedId !== resolvedId ? requestedId : null,
-    type: session.type || 'spawned',
-    command: session.command,
-    cwd: session.cwd,
-    createdAt: session.createdAt,
-    lastActivityAt: session.lastActivityAt || null,
-    idleSeconds,
-    active_clients: session.clients ? session.clients.size : 0,
     lastInjectFrom: session.lastInjectFrom || null,
     lastInjectReplyTo: session.lastInjectReplyTo || null
   });
@@ -869,22 +911,26 @@ app.post('/api/sessions/:id/inject', (req, res) => {
   if (thread_id) session.lastThreadId = thread_id;
   session.lastActivityAt = new Date().toISOString();
 
-  // Auto-prepend [from:] [reply-to:] header if from is set and not already in prompt
-  let finalPrompt = prompt;
-  if (from && !prompt.startsWith('[from:')) {
-    finalPrompt = `[from: ${from}] [reply-to: ${reply_to}] ${prompt}`;
-  }
-  // Append reply guide when reply_to is set, UNLESS message contains termination signal
-  const TERMINATION_SIGNALS = /no further reply needed|thread closed|closed on .+ side|ack received|ack-only|회신 불필요|스레드 종료/i;
-  if (reply_to && reply_to !== id && !TERMINATION_SIGNALS.test(prompt)) {
-    finalPrompt += `\n\n---\n[reply-to: ${reply_to}] 위 세션에 회신이 필요합니다. 답변 시 아래 명령을 실행하세요:\ntelepty inject --from ${id} ${reply_to} "답변 내용"\n---`;
-  }
+  // Routing metadata stays in session/bus state, not in the visible prompt text.
+  const finalPrompt = prompt;
   const inject_id = crypto.randomUUID();
   try {
-    // Always inject text WITHOUT \r first, then send \r separately after delay
-    // This two-step approach works for ALL CLIs (claude, codex, gemini)
+    // Always inject text without \r first, then send \r separately after delay.
+    // The allow bridge handles ordering and prompt-ready queueing.
     function writeToSession(data) {
-      if (session.type === 'wrapped') {
+      if (session.type === 'aterm' && session.deliveryEndpoint) {
+        // Route to aterm PtyManager — fire-and-forget, aterm handles delivery
+        try {
+          const url = session.deliveryEndpoint;
+          fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: data, session_id: id }),
+            signal: AbortSignal.timeout(5000)
+          }).catch(() => {});
+          return true;
+        } catch { return false; }
+      } else if (session.type === 'wrapped') {
         if (session.ownerWs && session.ownerWs.readyState === 1) {
           session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
           return true;
@@ -897,127 +943,26 @@ app.post('/api/sessions/:id/inject', (req, res) => {
     }
 
     let submitResult = null;
-    if (session.type === 'wrapped') {
-      // For wrapped sessions: try cmux send (daemon-level auto-detect),
-      // then kitty send-text (bypasses allow bridge queue),
-      // then WS as fallback, then submit via consistent path for CR.
-      //
-      // When session is NOT ready (CLI hasn't shown prompt yet), skip cmux/kitty
-      // because they bypass the allow-bridge's prompt-ready queue.
-      // The WS path sends to the allow-bridge which queues until CLI is ready.
-      const sock = session.ready ? findKittySocket() : null;
-      if (sock && !session.kittyWindowId) session.kittyWindowId = findKittyWindowId(sock, id);
-      const wid = session.ready ? session.kittyWindowId : null;
-
-      let kittyOk = false;
-      let cmuxOk = false;
-      let deliveryPath = null; // 'cmux', 'kitty', 'ws'
-
-      // cmux per-session backend: send text directly to surface (only when ready)
-      if (session.ready && session.backend === 'cmux') {
-        cmuxOk = terminalBackend.cmuxSendText(id, finalPrompt);
-        if (cmuxOk) {
-          deliveryPath = 'cmux';
-          console.log(`[INJECT] cmux send for ${id}`);
-        }
+    if (session.type === 'aterm' && session.deliveryEndpoint) {
+      // aterm sessions: deliver text + CR via aterm PtyManager endpoint
+      const wsOk = writeToSession(finalPrompt);
+      if (!wsOk) {
+        return res.status(503).json({ error: 'aterm endpoint not reachable' });
       }
-
-      if (!cmuxOk && wid && sock) {
-        // Kitty send-text primary (only when ready — bypasses allow bridge queue)
-        try {
-          const escaped = finalPrompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
-          require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} '${escaped}'`, {
-            timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
-          });
-          kittyOk = true;
-          deliveryPath = 'kitty';
-          console.log(`[INJECT] Kitty send-text for ${id} (window ${wid})`);
-        } catch {
-          // Invalidate cached window ID — window may have changed or been closed
-          session.kittyWindowId = null;
-        }
-      }
-      if (!cmuxOk && !kittyOk) {
-        // WS path: allow-bridge has its own prompt-ready queue
-        const wsOk = writeToSession(finalPrompt);
-        if (!wsOk) {
-          return res.status(503).json({ error: 'Process not connected' });
-        }
-        deliveryPath = 'ws';
-        if (!session.ready) {
-          console.log(`[INJECT] WS (not ready, allow-bridge will queue) for ${id}`);
-        } else {
-          console.log(`[INJECT] WS fallback for ${id}`);
-        }
-      }
-
       if (!no_enter) {
-        setTimeout(() => {
-          let submitted = false;
-
-          // Use the SAME path that delivered text for CR to guarantee ordering
-          if (deliveryPath === 'cmux') {
-            // cmux: send-key return via same surface
-            if (session.backend === 'cmux') {
-              submitted = terminalBackend.cmuxSendEnter(id);
-              if (submitted) console.log(`[INJECT] cmux submit for ${id}`);
-            }
-            if (!submitted && session.backend === 'cmux' && session.cmuxWorkspaceId) {
-              submitted = submitViaCmux(id);
-              if (submitted) console.log(`[INJECT] cmux session-level submit for ${id}`);
-            }
-          } else if (deliveryPath === 'kitty') {
-            // kitty: send-text CR via same window (not osascript!)
-            if (wid && sock) {
-              try {
-                require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
-                  timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-                });
-                submitted = true;
-                console.log(`[INJECT] kitty submit for ${id} (window ${wid})`);
-              } catch {
-                session.kittyWindowId = null;
-              }
-            }
-          }
-          // deliveryPath === 'ws' or any fallback:
-          // Try terminal-level submit first (bypasses PTY ICRNL which converts CR→LF)
-          // This matters for cmux/kitty sessions where text went via WS but
-          // the application expects CR(13) not LF(10) from Enter.
-          if (!submitted && session.backend === 'cmux') {
-            submitted = terminalBackend.cmuxSendEnter(id);
-            if (submitted) console.log(`[INJECT] cmux submit (fallback) for ${id}`);
-          }
-          if (!submitted && session.backend === 'cmux' && session.cmuxWorkspaceId) {
-            submitted = submitViaCmux(id);
-            if (submitted) console.log(`[INJECT] cmux session-level submit (fallback) for ${id}`);
-          }
-          if (!submitted && wid && sock) {
-            try {
-              require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
-                timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-              });
-              submitted = true;
-              console.log(`[INJECT] kitty submit (fallback) for ${id}`);
-            } catch {
-              session.kittyWindowId = null;
-            }
-          }
-          if (!submitted) {
-            writeToSession('\r');
-            console.log(`[INJECT] WS submit for ${id}`);
-          }
-
-          // Update tab title (kitty-specific, safe to fail)
-          if (wid && sock) {
-            try {
-              require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${wid} '⚡ telepty :: ${id}'`, {
-                timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
-              });
-            } catch {}
-          }
-        }, 500);
-        submitResult = { deferred: true, strategy: deliveryPath || 'ws' };
+        setTimeout(() => writeToSession('\r'), 300);
+        submitResult = { deferred: true, strategy: 'aterm_endpoint' };
+      }
+    } else if (session.type === 'wrapped') {
+      // Send text+CR combined so the allow-bridge writes them atomically.
+      const payload = no_enter ? finalPrompt : finalPrompt + '\r';
+      const wsOk = writeToSession(payload);
+      if (!wsOk) {
+        return res.status(503).json({ error: 'Process not connected' });
+      }
+      console.log(`[INJECT] WS text${no_enter ? '' : '+CR'} for ${id}`);
+      if (!no_enter) {
+        submitResult = { immediate: true, strategy: 'ws_combined_cr' };
       }
     } else {
       // Spawned sessions: direct PTY write
