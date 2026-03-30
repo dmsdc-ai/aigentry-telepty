@@ -38,11 +38,13 @@ function pickSessionTarget(sessionRef, sessions, defaultHost = '127.0.0.1') {
   }
 
   if (parsed.host) {
-    return { id: parsed.id, host: parsed.host };
+    const exactMatch = sessions.find((session) => session.id === parsed.id && session.host === parsed.host);
+    return exactMatch || { id: parsed.id, host: parsed.host };
   }
 
   if (defaultHost && defaultHost !== '127.0.0.1') {
-    return { id: parsed.id, host: defaultHost };
+    const defaultMatch = sessions.find((session) => session.id === parsed.id && session.host === defaultHost);
+    return defaultMatch || { id: parsed.id, host: defaultHost };
   }
 
   const matches = sessions.filter((session) => session.id === parsed.id);
@@ -54,19 +56,19 @@ function pickSessionTarget(sessionRef, sessions, defaultHost = '127.0.0.1') {
       s.id.startsWith(parsed.id + '-') || s.id.startsWith(parsed.id)
     );
     if (prefixMatches.length === 1) {
-      return { id: prefixMatches[0].id, host: prefixMatches[0].host };
+      return prefixMatches[0];
     }
     if (prefixMatches.length > 1) {
       // Multiple candidates: prefer same host, then first alphabetically
       const local = prefixMatches.find((s) => s.host === '127.0.0.1');
       const best = local || prefixMatches.sort((a, b) => a.id.localeCompare(b.id))[0];
-      return { id: best.id, host: best.host };
+      return best;
     }
     return null;
   }
 
   if (matches.length === 1) {
-    return { id: parsed.id, host: matches[0].host };
+    return matches[0];
   }
 
   const hosts = matches.map((session) => session.host).sort().join(', ');

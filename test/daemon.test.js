@@ -2,6 +2,7 @@
 
 const { afterEach, beforeEach, test } = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('http');
 const { createSessionId, delay, startTestDaemon, waitFor } = require('../test-support/daemon-harness');
 
 let harness;
@@ -16,6 +17,25 @@ function collectJsonMessages(ws) {
     }
   });
   return messages;
+}
+
+function createSubmitCaptureScript() {
+  return [
+    "process.stdin.setEncoding('utf8');",
+    "let buffer='';",
+    "process.stdin.resume();",
+    "process.stdout.write('> ');",
+    "process.stdin.on('data', (chunk) => {",
+    "  for (const ch of chunk) {",
+    "    if (ch === '\\r' || ch === '\\n') {",
+    "      process.stdout.write(`\\nSUBMIT:${buffer}\\n`);",
+    "      process.exit(0);",
+    "      return;",
+    "    }",
+    "    buffer += ch;",
+    "  }",
+    "});"
+  ].join(' ');
 }
 
 beforeEach(async () => {
@@ -110,6 +130,36 @@ test('inject and multicast endpoints report success and partial failure correctl
   assert.equal(multicast.body.results.successful[0].id, sessionId);
   assert.equal(multicast.body.results.failed.length, 1);
   assert.equal(multicast.body.results.failed[0].id, missingId);
+});
+
+test('inject endpoint accepts an empty prompt and still submits enter', async () => {
+  const sessionId = createSessionId('inject-empty');
+  await harness.spawnSession(sessionId, {
+    command: process.execPath,
+    args: ['-e', createSubmitCaptureScript()]
+  });
+
+  const ws = await harness.connectSession(sessionId);
+  const outputs = collectJsonMessages(ws);
+
+  const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    method: 'POST',
+    body: { prompt: '' }
+  });
+  assert.equal(inject.status, 200);
+  assert.equal(inject.body.success, true);
+
+  await waitFor(() => outputs.some((message) => (
+    message.type === 'output' && String(message.data).includes('SUBMIT:')
+  )), { timeoutMs: 7000, description: 'empty prompt submit output' });
+
+  const normalized = outputs
+    .filter((message) => message.type === 'output')
+    .map((message) => String(message.data))
+    .join('');
+  assert.equal(normalized.includes('SUBMIT:'), true);
+
+  ws.close();
 });
 
 test('broadcast inject publishes a single bus event with all successful target IDs', async () => {
@@ -235,12 +285,17 @@ test('register stores terminal metadata and exposes it through session APIs', as
   assert.equal(session.termProgram, 'ghostty');
   assert.equal(session.term, 'xterm-256color');
   assert.equal(session.terminal, 'ghostty');
+  assert.equal(session.healthStatus, 'DISCONNECTED');
+  assert.equal(session.transport.health_status, 'DISCONNECTED');
+  assert.equal(session.semantic, null);
 
   const detail = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
   assert.equal(detail.status, 200);
   assert.equal(detail.body.termProgram, 'ghostty');
   assert.equal(detail.body.term, 'xterm-256color');
   assert.equal(detail.body.terminal, 'ghostty');
+  assert.equal(detail.body.transport.health_status, 'DISCONNECTED');
+  assert.equal(detail.body.semantic, null);
 });
 
 test('register rejects missing session_id and duplicate IDs', async () => {
@@ -285,7 +340,7 @@ test('register publishes a session_register bus event', async () => {
   bus.close();
 });
 
-test('inject on wrapped session without owner returns 503', async () => {
+test('inject on wrapped session without owner returns a DISCONNECTED error code', async () => {
   const sessionId = createSessionId('no-owner');
   await harness.registerSession(sessionId);
 
@@ -294,7 +349,8 @@ test('inject on wrapped session without owner returns 503', async () => {
     body: { prompt: 'hello' }
   });
   assert.equal(inject.status, 503);
-  assert.match(inject.body.error, /not connected/i);
+  assert.equal(inject.body.code, 'DISCONNECTED');
+  assert.match(inject.body.error, /disconnected/i);
 });
 
 test('inject on wrapped session forwards to owner WebSocket', async () => {
@@ -343,6 +399,39 @@ test('inject keeps routing metadata out of wrapped prompt text and submits separ
   assert.equal(injectMessages[1], '\r');
   assert.equal(injectMessages.some((data) => String(data).includes('[from:')), false);
   assert.equal(injectMessages.some((data) => String(data).includes('telepty inject --from')), false);
+
+  ownerWs.close();
+});
+
+test('bus auto-route uses wrapped WS split delivery instead of cmux direct injection', async () => {
+  const sessionId = createSessionId('bus-route');
+  await harness.registerSession(sessionId, {
+    backend: 'cmux',
+    cmux_workspace_id: 'workspace:test'
+  });
+
+  const ownerWs = await harness.connectSession(sessionId);
+  const ownerMessages = collectJsonMessages(ownerWs);
+
+  const publish = await harness.request('/api/bus/publish', {
+    method: 'POST',
+    body: {
+      type: 'turn_request',
+      target: sessionId,
+      payload: { prompt: 'bus-visible-task' }
+    }
+  });
+  assert.equal(publish.status, 200);
+  assert.equal(publish.body.success, true);
+
+  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 2, {
+    timeoutMs: 7000,
+    description: 'bus auto-route wrapped inject text and submit'
+  });
+
+  const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
+  assert.equal(injectMessages[0], 'bus-visible-task');
+  assert.equal(injectMessages[1], '\r');
 
   ownerWs.close();
 });
@@ -401,24 +490,75 @@ test('DELETE on wrapped session removes it without crashing the daemon', async (
   assert.equal(harness.isAlive(), true, harness.getLogs().stderr || harness.getLogs().stdout);
 });
 
-test('wrapped session auto-cleans when owner disconnects and no other clients remain', async () => {
+test('wrapped sessions emit disconnect/reconnect/stale lifecycle and clean up after the stale threshold', async () => {
+  await harness.stop();
+  harness = await startTestDaemon({
+    env: {
+      TELEPTY_SESSION_STALE_SECONDS: '1',
+      TELEPTY_SESSION_CLEANUP_SECONDS: '2',
+      TELEPTY_HEALTH_POLL_MS: '100'
+    }
+  });
+
   const sessionId = createSessionId('auto-clean');
+  const bus = await harness.connectBus();
+  const messages = collectJsonMessages(bus);
   await harness.registerSession(sessionId);
 
   const ownerWs = await harness.connectSession(sessionId);
-
   await waitFor(async () => {
     const list = await harness.request('/api/sessions');
-    const session = list.body.find((s) => s.id === sessionId);
-    return session && session.active_clients === 1;
+    const session = list.body.find((item) => item.id === sessionId);
+    return session && session.healthStatus === 'CONNECTED';
   }, { description: 'owner connected' });
 
   ownerWs.close();
 
+  await waitFor(() => messages.find((message) => (
+    message.type === 'session_disconnect' &&
+    message.session_id === sessionId &&
+    message.transport &&
+    message.transport.health_status === 'DISCONNECTED'
+  )), { description: 'session disconnect event' });
+
   await waitFor(async () => {
     const list = await harness.request('/api/sessions');
-    return !list.body.some((s) => s.id === sessionId);
-  }, { description: 'wrapped session auto-removed after owner disconnect' });
+    const session = list.body.find((item) => item.id === sessionId);
+    return session && session.healthStatus === 'DISCONNECTED';
+  }, { description: 'disconnected health status' });
+
+  const reconnectedWs = await harness.connectSession(sessionId);
+  await waitFor(() => messages.find((message) => (
+    message.type === 'session_reconnect' &&
+    message.session_id === sessionId &&
+    message.transport &&
+    message.transport.health_status === 'CONNECTED'
+  )), { description: 'session reconnect event' });
+
+  reconnectedWs.close();
+
+  await waitFor(() => messages.find((message) => (
+    message.type === 'session_stale' &&
+    message.session_id === sessionId
+  )), { timeoutMs: 5000, description: 'session stale event' });
+
+  await waitFor(async () => {
+    const list = await harness.request('/api/sessions');
+    const session = list.body.find((item) => item.id === sessionId);
+    return session && session.healthStatus === 'STALE';
+  }, { timeoutMs: 5000, description: 'stale health status' });
+
+  await waitFor(() => messages.find((message) => (
+    message.type === 'session_cleanup' &&
+    message.session_id === sessionId
+  )), { timeoutMs: 5000, description: 'session cleanup event' });
+
+  await waitFor(async () => {
+    const list = await harness.request('/api/sessions');
+    return !list.body.some((item) => item.id === sessionId);
+  }, { timeoutMs: 5000, description: 'wrapped session cleanup after stale disconnect' });
+
+  bus.close();
 });
 
 test('multicast inject handles mixed spawned and wrapped sessions', async () => {
@@ -438,7 +578,116 @@ test('multicast inject handles mixed spawned and wrapped sessions', async () => 
   assert.equal(result.body.results.successful[0].id, spawnedId);
   assert.equal(result.body.results.failed.length, 1);
   assert.equal(result.body.results.failed[0].id, wrappedId);
-  assert.match(result.body.results.failed[0].error, /not connected/i);
+  assert.equal(result.body.results.failed[0].code, 'DISCONNECTED');
+  assert.match(result.body.results.failed[0].error, /disconnected/i);
+});
+
+test('session state reports are stored in snapshots and emitted with normalized transport and semantic blocks', async () => {
+  const sessionId = createSessionId('state-report');
+  const bus = await harness.connectBus();
+  const messages = collectJsonMessages(bus);
+  await harness.registerSession(sessionId);
+
+  const report = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/state`, {
+    method: 'POST',
+    body: {
+      phase: 'implementing',
+      current_task: 'ship observer schema',
+      blocker: 'awaiting review',
+      needs_input: true,
+      thread_id: 'thread-123'
+    }
+  });
+
+  assert.equal(report.status, 200);
+  assert.equal(report.body.session_id, sessionId);
+  assert.equal(report.body.transport.health_status, 'DISCONNECTED');
+  assert.deepEqual(report.body.semantic, {
+    phase: 'implementing',
+    current_task: 'ship observer schema',
+    blocker: 'awaiting review',
+    needs_input: true,
+    thread_id: 'thread-123',
+    source: 'self_report',
+    seq: 1
+  });
+
+  const detail = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.semantic.phase, 'implementing');
+  assert.equal(detail.body.semantic.current_task, 'ship observer schema');
+  assert.equal(detail.body.transport.health_status, 'DISCONNECTED');
+
+  await waitFor(() => messages.find((message) => (
+    message.type === 'session_state_report' &&
+    message.event_type === 'session_state_report' &&
+    message.session_id === sessionId &&
+    message.transport &&
+    message.transport.health_status === 'DISCONNECTED' &&
+    message.semantic &&
+    message.semantic.phase === 'implementing' &&
+    message.semantic.current_task === 'ship observer schema' &&
+    message.semantic.seq === 1
+  )), { description: 'session_state_report bus event' });
+
+  bus.close();
+});
+
+test('broadcast inject reports disconnected wrapped sessions with a reason code', async () => {
+  const spawnedId = createSessionId('broadcast-ok');
+  const wrappedId = createSessionId('broadcast-disconnected');
+  await harness.spawnSession(spawnedId);
+  await harness.registerSession(wrappedId);
+
+  const result = await harness.request('/api/sessions/broadcast/inject', {
+    method: 'POST',
+    body: { prompt: 'echo status' }
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.results.successful.some((item) => item.id === spawnedId), true);
+  const failure = result.body.results.failed.find((item) => item.id === wrappedId);
+  assert.equal(Boolean(failure), true);
+  assert.equal(failure.code, 'DISCONNECTED');
+  assert.match(failure.error, /disconnected/i);
+});
+
+test('aterm delivery timeouts surface a TIMEOUT error code', async () => {
+  await harness.stop();
+  harness = await startTestDaemon({
+    env: {
+      TELEPTY_DELIVERY_TIMEOUT_MS: '50'
+    }
+  });
+
+  const delayedServer = http.createServer((req, res) => {
+    setTimeout(() => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }, 200);
+  });
+
+  await new Promise((resolve) => delayedServer.listen(0, '127.0.0.1', resolve));
+  const { port } = delayedServer.address();
+
+  try {
+    const sessionId = createSessionId('aterm-timeout');
+    const registered = await harness.registerSession(sessionId, {
+      delivery_type: 'aterm',
+      delivery_endpoint: `http://127.0.0.1:${port}/deliver`
+    });
+    assert.equal(registered.status, 201);
+
+    const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+      method: 'POST',
+      body: { prompt: 'hello timeout' }
+    });
+    assert.equal(inject.status, 504);
+    assert.equal(inject.body.code, 'TIMEOUT');
+    assert.match(inject.body.error, /timed out/i);
+  } finally {
+    await new Promise((resolve) => delayedServer.close(resolve));
+  }
 });
 
 test('spawned shells strip parent Claude session markers from the environment', async () => {
@@ -469,4 +718,12 @@ test('spawned shells strip parent Claude session markers from the environment', 
   } finally {
     await localHarness.stop();
   }
+});
+
+test('GET /api/health returns status ok and version', async () => {
+  const result = await harness.request('/api/health');
+  assert.equal(result.status, 200);
+  assert.equal(result.body.status, 'ok');
+  assert.equal(typeof result.body.version, 'string');
+  assert.ok(result.body.version.length > 0);
 });

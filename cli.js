@@ -15,6 +15,7 @@ const { cleanupDaemonProcesses } = require('./daemon-control');
 const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
 const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
+const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const crossMachine = require('./cross-machine');
 const args = process.argv.slice(2);
@@ -171,6 +172,135 @@ function formatSessionTerminal(session) {
   return terminal || term || 'unknown';
 }
 
+function formatSessionHealth(session) {
+  const status = session.healthStatus || 'UNKNOWN';
+  const reason = session.healthReason || null;
+  if (reason && reason !== status) {
+    return `${status} (${reason})`;
+  }
+  return status;
+}
+
+function formatApiError(data, fallback = 'Request failed.') {
+  if (!data) {
+    return fallback;
+  }
+
+  const code = data.code ? `[${data.code}] ` : '';
+  const message = data.error || fallback;
+  return `${code}${message}`;
+}
+
+function buildInjectRequestBody(prompt, options = {}) {
+  const body = {
+    prompt,
+    no_enter: options.noEnter === true
+  };
+
+  if (options.fromId) body.from = options.fromId;
+  if (options.replyTo) body.reply_to = options.replyTo;
+  if (options.replyExpected) body.reply_expected = true;
+
+  return body;
+}
+
+function buildSessionStateReportBody(options = {}) {
+  const body = {
+    phase: options.phase,
+    source: options.source || 'self_report'
+  };
+
+  if (options.currentTask !== undefined) body.current_task = options.currentTask;
+  if (options.blocker !== undefined) body.blocker = options.blocker;
+  if (options.needsInput !== undefined) body.needs_input = options.needsInput;
+  if (options.threadId !== undefined) body.thread_id = options.threadId;
+  if (options.seq !== undefined) body.seq = options.seq;
+
+  return body;
+}
+
+function splitSessionsByTransport(sessions) {
+  const local = [];
+  const remoteByPeer = new Map();
+
+  for (const session of sessions) {
+    if (!isRemoteSession(session)) {
+      local.push(session);
+      continue;
+    }
+
+    const peerName = session.peerName || session.host;
+    if (!remoteByPeer.has(peerName)) {
+      remoteByPeer.set(peerName, []);
+    }
+    remoteByPeer.get(peerName).push(session);
+  }
+
+  return { local, remoteByPeer };
+}
+
+function parseRefOption(argv) {
+  const refIndex = argv.indexOf('--ref');
+  if (refIndex === -1) {
+    return { useRef: false, refFilePath: null };
+  }
+
+  argv.splice(refIndex, 1);
+  const candidate = argv[refIndex];
+  if (!candidate || candidate.startsWith('--')) {
+    return { useRef: true, refFilePath: null };
+  }
+
+  try {
+    if (fs.statSync(candidate).isFile()) {
+      argv.splice(refIndex, 1);
+      return { useRef: true, refFilePath: candidate };
+    }
+  } catch {
+    // Fall through to inline ref mode when the candidate is not a readable file.
+  }
+
+  return { useRef: true, refFilePath: null };
+}
+
+function createSharedReferenceDescriptor(prompt, refFilePath) {
+  if (refFilePath) {
+    const fileContent = fs.readFileSync(refFilePath, 'utf8');
+    return createSharedContextDescriptor(fileContent);
+  }
+
+  return createSharedContextDescriptor(prompt);
+}
+
+function buildSharedReferenceInjectPrompt(referencePath, message = '') {
+  const basePrompt = buildSharedContextPrompt(referencePath);
+  const normalizedMessage = String(message ?? '').trim();
+  return normalizedMessage ? `${basePrompt} ${normalizedMessage}` : basePrompt;
+}
+
+function ensureLocalSharedReference(descriptor, message = '') {
+  const reference = ensureSharedContextFile(descriptor);
+  return {
+    descriptor: reference,
+    referencePath: reference.promptPath,
+    prompt: buildSharedReferenceInjectPrompt(reference.promptPath, message)
+  };
+}
+
+function ensureRemoteSharedReference(peerName, descriptor, message = '') {
+  const result = crossMachine.remoteEnsureSharedContext(peerName, descriptor);
+  if (!result.success) {
+    throw new Error(result.error || `Failed to prepare shared context on ${peerName}`);
+  }
+
+  const referencePath = result.promptPath || descriptor.promptPath;
+  return {
+    descriptor,
+    referencePath,
+    prompt: buildSharedReferenceInjectPrompt(referencePath, message)
+  };
+}
+
 function printSessionInfo(session, options = {}) {
   const host = options.host || session.host || '127.0.0.1';
   console.log('\x1b[1mSession Info:\x1b[0m');
@@ -178,6 +308,7 @@ function printSessionInfo(session, options = {}) {
   console.log(`    Host: ${formatHostLabel(host)}`);
   console.log(`    Command: ${session.command}`);
   console.log(`    Type: ${session.type || 'unknown'}`);
+  console.log(`    Status: ${formatSessionHealth(session)}`);
   console.log(`    Terminal: ${session.terminal || session.termProgram || 'unknown'}`);
   console.log(`    TERM: ${session.term || 'n/a'}`);
   console.log(`    CWD: ${session.cwd}`);
@@ -190,6 +321,15 @@ function printSessionInfo(session, options = {}) {
   }
   if (typeof session.idleSeconds === 'number') {
     console.log(`    Idle: ${session.idleSeconds}s`);
+  }
+  if (session.semantic && session.semantic.phase) {
+    console.log(`    Phase: ${session.semantic.phase}`);
+  }
+  if (session.semantic && session.semantic.current_task) {
+    console.log(`    Current Task: ${session.semantic.current_task}`);
+  }
+  if (session.semantic && session.semantic.blocker) {
+    console.log(`    Blocker: ${session.semantic.blocker}`);
   }
   console.log('');
 }
@@ -473,7 +613,7 @@ async function manageInteractive() {
         console.log('\x1b[1mAvailable Sessions:\x1b[0m');
         sessions.forEach(s => {
           const hostLabel = formatHostLabel(s.host);
-          console.log(`  - \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) [${s.command}] - Clients: ${s.active_clients}`);
+          console.log(`  - \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) [${s.command}] - Status: ${s.healthStatus || 'UNKNOWN'} - Clients: ${s.active_clients}`);
         });
       }
       console.log('\n');
@@ -580,7 +720,7 @@ async function manageInteractive() {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: promptText })
           });
           const data = await res.json();
-          if (!res.ok) console.error(`\n❌ Error: ${data.error}\n`);
+          if (!res.ok) console.error(`\n❌ ${formatApiError(data)}\n`);
           else console.log(`\n✅ Injected successfully into '\x1b[36m${target.id}\x1b[0m'.\n`);
         } catch (e) { console.error('\n❌ Failed to connect.\n'); }
         continue;
@@ -649,6 +789,7 @@ async function main() {
         console.log(`  - ID: \x1b[36m${s.id}\x1b[0m`);
         console.log(`    Host: ${formatHostLabel(s.host)}`);
         console.log(`    Command: ${s.command}`);
+        console.log(`    Status: ${formatSessionHealth(s)}`);
         console.log(`    Terminal: ${formatSessionTerminal(s)}`);
         console.log(`    CWD: ${s.cwd}`);
         console.log(`    Clients: ${s.active_clients}`);
@@ -1273,10 +1414,17 @@ async function main() {
   }
 
   if (cmd === 'inject') {
-    // Check for --no-enter flag
-    const noEnterIndex = args.indexOf('--no-enter');
-    const noEnter = noEnterIndex !== -1;
-    if (noEnter) args.splice(noEnterIndex, 1);
+    const { useRef, refFilePath } = parseRefOption(args);
+
+    if (args.includes('--no-enter')) {
+      console.error('❌ telepty inject always submits after text. Use `telepty enter <session_id>` to send Enter only.');
+      process.exit(1);
+    }
+
+    // Extract --submit flag (terminal-level submit instead of deferred PTY CR)
+    const submitIndex = args.indexOf('--submit');
+    const useSubmit = submitIndex !== -1;
+    if (useSubmit) args.splice(submitIndex, 1);
 
     // Extract --from flag
     let fromId;
@@ -1301,14 +1449,20 @@ async function main() {
     const replyExpected = replyExpectedIndex !== -1;
     if (replyExpected) args.splice(replyExpectedIndex, 1);
 
-    const sessionId = args[1]; const prompt = args.slice(2).join(' ');
-    if (!sessionId || !prompt) { console.error('❌ Usage: telepty inject [--no-enter] [--from <id>] [--reply-to <id>] <session_id> "<prompt text>"'); process.exit(1); }
+    const sessionId = args[1];
+    const hasPromptArgument = args.length >= 3;
+    const prompt = args.slice(2).join(' ');
+    if (!sessionId || (!refFilePath && !hasPromptArgument)) { console.error('❌ Usage: telepty inject [--ref [file]] [--from <id>] [--reply-to <id>] <session_id> "<prompt text>"'); process.exit(1); }
     try {
       const target = await resolveSessionTarget(sessionId);
       if (!target) {
         console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
         process.exit(1);
       }
+
+      let injectPrompt = prompt;
+      let referencePath = null;
+      const refDescriptor = useRef ? createSharedReferenceDescriptor(prompt, refFilePath) : null;
 
       // Remote session: use SSH direct execution
       if (isRemoteSession(target)) {
@@ -1318,30 +1472,136 @@ async function main() {
           console.error(`⚠️  ${ent.reason}\n   Upgrade: ${ent.upgrade_url}`);
           process.exit(1);
         }
-        const result = crossMachine.remoteInject(target.peerName, target.id, prompt, {
+
+        if (useRef) {
+          const reference = ensureRemoteSharedReference(target.peerName, refDescriptor, refFilePath ? prompt : '');
+          injectPrompt = reference.prompt;
+          referencePath = reference.referencePath;
+        }
+
+        const result = crossMachine.remoteInject(target.peerName, target.id, injectPrompt, {
           from: fromId,
-          no_enter: noEnter
+          reply_to: replyTo,
+          reply_expected: replyExpected
         });
         if (result.success) {
-          console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m' @ ${target.peerName}.`);
+          const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
+          console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m' @ ${target.peerName}.${refSuffix}`);
         } else {
-          console.error(`❌ Error: ${result.error}`);
+          console.error(`❌ ${result.error}`);
         }
         return;
       }
 
-      const body = { prompt, no_enter: noEnter };
-      if (fromId) body.from = fromId;
-      if (replyTo) body.reply_to = replyTo;
-      if (replyExpected) body.reply_expected = true;
+      if (useRef) {
+        const reference = ensureLocalSharedReference(refDescriptor, refFilePath ? prompt : '');
+        injectPrompt = reference.prompt;
+        referencePath = reference.referencePath;
+      }
+
+      const body = buildInjectRequestBody(injectPrompt, {
+        fromId,
+        replyTo,
+        replyExpected,
+        noEnter: useSubmit
+      });
 
       const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
-      console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'.`);
+      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
+      const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
+      console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'.${refSuffix}`);
+
+      // Terminal-level submit: POST /submit after text injection
+      if (useSubmit) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        try {
+          const submitRes = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pre_delay_ms: 200, retries: 2, retry_delay_ms: 500 })
+          });
+          const submitData = await submitRes.json();
+          if (submitRes.ok) {
+            console.log(`✅ Submitted via ${submitData.strategy}${submitData.attempts > 1 ? ` (${submitData.attempts} attempts)` : ''}.`);
+          } else {
+            console.error(`⚠️  Submit failed: ${formatApiError(submitData)}`);
+          }
+        } catch (submitErr) {
+          console.error(`⚠️  Submit failed: ${submitErr.message}`);
+        }
+      }
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    return;
+  }
+
+  if (cmd === 'enter') {
+    const sessionId = args[1];
+    if (!sessionId) { console.error('❌ Usage: telepty enter <session_id>'); process.exit(1); }
+
+    try {
+      const target = await resolveSessionTarget(sessionId);
+      if (!target) {
+        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
+        process.exit(1);
+      }
+
+      if (isRemoteSession(target)) {
+        const { checkEntitlement } = require('./entitlement');
+        const ent = checkEntitlement({ feature: 'telepty.remote_sessions' });
+        if (!ent.allowed) {
+          console.error(`⚠️  ${ent.reason}\n   Upgrade: ${ent.upgrade_url}`);
+          process.exit(1);
+        }
+
+        const result = crossMachine.remoteInject(target.peerName, target.id, '', {});
+        if (result.success) {
+          console.log(`✅ Enter sent successfully into '\x1b[36m${target.id}\x1b[0m' @ ${target.peerName}.`);
+        } else {
+          console.error(`❌ ${result.error}`);
+        }
+        return;
+      }
+
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildInjectRequestBody('', {}))
+      });
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
+      console.log(`✅ Enter sent successfully into '\x1b[36m${target.id}\x1b[0m'.`);
+    } catch (e) {
+      console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`);
+    }
+    return;
+  }
+
+  if (cmd === 'send-key') {
+    const sessionId = args[1];
+    const key = (args[2] || '').toLowerCase();
+    if (!sessionId || !key) { console.error('❌ Usage: telepty send-key <session_id> <key>\n   Supported keys: enter'); process.exit(1); }
+    if (key !== 'enter' && key !== 'return') {
+      console.error(`❌ Unsupported key: '${key}'. Supported keys: enter`);
+      process.exit(1);
+    }
+
+    try {
+      const target = await resolveSessionTarget(sessionId);
+      if (!target) {
+        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
+        process.exit(1);
+      }
+
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
+      console.log(`✅ Key '${key}' sent to '\x1b[36m${target.id}\x1b[0m'. (strategy: ${data.strategy})`);
+    } catch (e) {
+      console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`);
+    }
     return;
   }
 
@@ -1363,9 +1623,91 @@ async function main() {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
       console.log(`✅ Reply sent to '\x1b[36m${replyTo}\x1b[0m'.`);
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    return;
+  }
+
+  if (cmd === 'status-report') {
+    const reportArgs = args.slice(1);
+    let sessionId = process.env.TELEPTY_SESSION_ID || undefined;
+
+    const idIndex = reportArgs.indexOf('--id');
+    if (idIndex !== -1) {
+      if (!reportArgs[idIndex + 1]) {
+        console.error('❌ Usage: telepty status-report [--id <session_id>] --phase <phase> [--task <text>] [--blocker <text>] [--needs-input] [--thread-id <id>] [--seq <n>]');
+        process.exit(1);
+      }
+      sessionId = reportArgs[idIndex + 1];
+      reportArgs.splice(idIndex, 2);
+    }
+
+    function takeFlagValue(flag) {
+      const index = reportArgs.indexOf(flag);
+      if (index === -1) return undefined;
+      if (!reportArgs[index + 1]) {
+        console.error(`❌ ${flag} requires a value.`);
+        process.exit(1);
+      }
+      const value = reportArgs[index + 1];
+      reportArgs.splice(index, 2);
+      return value;
+    }
+
+    const phase = takeFlagValue('--phase');
+    const currentTask = takeFlagValue('--task') ?? takeFlagValue('--current-task');
+    const blocker = takeFlagValue('--blocker');
+    const threadId = takeFlagValue('--thread-id');
+    const source = takeFlagValue('--source');
+    const seqRaw = takeFlagValue('--seq');
+    const needsInputIndex = reportArgs.indexOf('--needs-input');
+    const needsInput = needsInputIndex !== -1;
+    if (needsInput) reportArgs.splice(needsInputIndex, 1);
+
+    if (!sessionId || !phase || reportArgs.length > 0) {
+      console.error('❌ Usage: telepty status-report [--id <session_id>] --phase <phase> [--task <text>] [--blocker <text>] [--needs-input] [--thread-id <id>] [--seq <n>]');
+      process.exit(1);
+    }
+
+    if (seqRaw !== undefined && (!Number.isInteger(Number(seqRaw)) || Number(seqRaw) < 0)) {
+      console.error('❌ --seq must be a non-negative integer.');
+      process.exit(1);
+    }
+
+    try {
+      const target = await resolveSessionTarget(sessionId);
+      if (!target) {
+        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
+        process.exit(1);
+      }
+      if (isRemoteSession(target)) {
+        console.error('❌ telepty status-report currently supports local daemon sessions only.');
+        process.exit(1);
+      }
+
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/state`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildSessionStateReportBody({
+          phase,
+          currentTask,
+          blocker,
+          needsInput,
+          threadId,
+          source,
+          seq: seqRaw === undefined ? undefined : Number(seqRaw)
+        }))
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.error(`❌ ${formatApiError(data)}`);
+        return;
+      }
+      console.log(`✅ Session state reported for '\x1b[36m${target.id}\x1b[0m' (${phase}).`);
+    } catch (e) {
+      console.error(`❌ ${e.message || 'Failed to report session state.'}`);
+    }
     return;
   }
 
@@ -1396,7 +1738,7 @@ async function main() {
         });
         const data = await res.json();
         if (!res.ok) {
-          throw new Error(data.error || `Multicast failed on ${host}`);
+          throw new Error(formatApiError(data, `Multicast failed on ${host}`));
         }
         aggregate.successful.push(...data.results.successful.map((id) => `${id}@${host}`));
         aggregate.failed.push(...data.results.failed.map((item) => ({ ...item, host })));
@@ -1404,37 +1746,70 @@ async function main() {
 
       console.log(`✅ Context multicasted successfully to ${aggregate.successful.length} session(s).`);
       if (aggregate.failed.length > 0) {
-        console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host}`).join(', '));
+        console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host} [${item.code || 'UNKNOWN'}] ${item.error || ''}`.trim()).join(', '));
       }
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
     return;
   }
 
   if (cmd === 'broadcast') {
+    const { useRef, refFilePath } = parseRefOption(args);
+
     const prompt = args.slice(1).join(' ');
-    if (!prompt) { console.error('❌ Usage: telepty broadcast "<prompt text>"'); process.exit(1); }
+    if (!prompt && !refFilePath) { console.error('❌ Usage: telepty broadcast [--ref [file]] "<prompt text>"'); process.exit(1); }
     try {
       const discovered = await discoverSessions({ silent: true });
-      const grouped = groupSessionsByHost(discovered);
       const aggregate = { successful: [], failed: [] };
+      const { local, remoteByPeer } = splitSessionsByTransport(discovered);
+      let descriptor = useRef ? createSharedReferenceDescriptor(prompt, refFilePath) : null;
+      let referencePath = null;
 
-      for (const host of grouped.keys()) {
-        const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/broadcast/inject`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt })
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || `Broadcast failed on ${host}`);
+      if (local.length > 0) {
+        let localPrompt = prompt;
+        if (useRef) {
+          const reference = ensureLocalSharedReference(descriptor, refFilePath ? prompt : '');
+          descriptor = reference.descriptor;
+          referencePath = reference.referencePath;
+          localPrompt = reference.prompt;
         }
-        aggregate.successful.push(...data.results.successful.map((id) => `${id}@${host}`));
-        aggregate.failed.push(...data.results.failed.map((item) => ({ ...item, host })));
+
+        for (const host of groupSessionsByHost(local).keys()) {
+          const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/broadcast/inject`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt: localPrompt })
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(formatApiError(data, `Broadcast failed on ${host}`));
+          }
+          aggregate.successful.push(...data.results.successful.map((id) => `${id}@${host}`));
+          aggregate.failed.push(...data.results.failed.map((item) => ({ ...item, host })));
+        }
       }
 
-      console.log(`✅ Context broadcasted successfully to ${aggregate.successful.length} active session(s).`);
+      for (const [peerName, sessions] of remoteByPeer.entries()) {
+        let remotePrompt = prompt;
+        if (useRef) {
+          const reference = ensureRemoteSharedReference(peerName, descriptor, refFilePath ? prompt : '');
+          referencePath ||= reference.referencePath;
+          remotePrompt = reference.prompt;
+        }
+
+        for (const session of sessions) {
+          const result = crossMachine.remoteInject(peerName, session.id, remotePrompt);
+          if (result.success) {
+            aggregate.successful.push(`${session.id}@${session.host}`);
+          } else {
+            aggregate.failed.push({ id: session.id, host: session.host, error: result.error });
+          }
+        }
+      }
+
+      const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
+      console.log(`✅ Context broadcasted successfully to ${aggregate.successful.length} active session(s).${refSuffix}`);
       if (aggregate.failed.length > 0) {
-        console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host}`).join(', '));
+        console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host} [${item.code || 'UNKNOWN'}] ${item.error || ''}`.trim()).join(', '));
       }
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
     return;
@@ -2340,11 +2715,13 @@ Usage:
   telepty allow [--id <id>] [--auto-restart] <command> [args...]  Allow inject on a CLI (auto-restart on crash)
   telepty list [--json]                          List all active sessions across discovered hosts
   telepty attach [id[@host]]                     Attach to a session (Interactive picker if no ID)
-  telepty inject [--no-enter] [--from <id>] [--reply-to <id>] <id[@host]> "<prompt>"    Inject text into a single session
+  telepty inject [--ref [file]] [--from <id>] [--reply-to <id>] <id[@host]> "<prompt>"    Inject text into a single session
+  telepty enter <id[@host]>                      Send only Enter/Return to a single session
   telepty read-screen <id[@host]> [--lines N] [--raw]                  Read session screen buffer
   telepty reply "<text>"                         Reply to the session that last injected into $TELEPTY_SESSION_ID
+  telepty status-report [--id <id>] --phase <phase> [--task <text>] [--blocker <text>] [--needs-input] [--thread-id <id>] [--seq N]
   telepty multicast <id1[@host],id2[@host]> "<prompt>"  Inject text into multiple specific sessions
-  telepty broadcast "<prompt>"                   Inject text into ALL active sessions
+  telepty broadcast [--ref [file]] "<prompt>"    Inject text into ALL active sessions
   telepty rename <old_id[@host]> <new_id>        Rename a session (updates terminal title too)
   telepty session info <id[@host]> [--json]      Show detailed session metadata
   telepty connect <user@host> [--name N] [--port P]  Connect to a remote machine via SSH tunnel

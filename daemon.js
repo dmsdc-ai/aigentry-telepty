@@ -15,6 +15,10 @@ const EXPECTED_TOKEN = config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
 const fs = require('fs');
 const SESSION_PERSIST_PATH = require('path').join(os.homedir(), '.config', 'aigentry-telepty', 'sessions.json');
+const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STALE_SECONDS || 60));
+const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
+const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
+const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS || 10000));
 
 function persistSessions() {
   try {
@@ -31,7 +35,11 @@ function persistSessions() {
         termProgram: s.termProgram || null,
         term: s.term || null,
         createdAt: s.createdAt,
-        lastActivityAt: s.lastActivityAt || null
+        lastActivityAt: s.lastActivityAt || null,
+        lastConnectedAt: s.lastConnectedAt || null,
+        lastDisconnectedAt: s.lastDisconnectedAt || null,
+        lastStateReportAt: s.lastStateReportAt || null,
+        stateReport: s.stateReport || null
       };
     }
     fs.mkdirSync(require('path').dirname(SESSION_PERSIST_PATH), { recursive: true });
@@ -112,6 +120,11 @@ function isAllowedPeer(ip) {
   return true;
 }
 
+// Health check – no auth required
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', version: pkg.version });
+});
+
 // Authentication Middleware
 app.use((req, res, next) => {
   const clientIp = req.ip;
@@ -132,7 +145,7 @@ app.use((req, res, next) => {
   }
 
   console.warn(`[AUTH] Rejected unauthorized request from ${clientIp}`);
-  res.status(401).json({ error: 'Unauthorized: Invalid or missing token.' });
+  res.status(401).json({ error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED' });
 });
 
 const PORT = process.env.PORT || 3848;
@@ -150,6 +163,349 @@ if (!daemonClaim.claimed) {
 const sessions = {};
 const handoffs = {};
 const threads = {};
+
+function broadcastBusEvent(event) {
+  const serialized = JSON.stringify(event);
+  busClients.forEach((client) => {
+    if (client.readyState === 1) client.send(serialized);
+  });
+}
+
+function buildErrorBody(code, error, extra = {}) {
+  return { success: false, code, error, ...extra };
+}
+
+function respondWithError(res, httpStatus, code, error, extra = {}) {
+  return res.status(httpStatus).json(buildErrorBody(code, error, extra));
+}
+
+function isOpenWebSocket(ws) {
+  return Boolean(ws && ws.readyState === 1);
+}
+
+function normalizeNullableText(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const normalized = String(value).trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function getSessionDisconnectedMs(session, nowMs = Date.now()) {
+  if (!session.lastDisconnectedAt) {
+    return null;
+  }
+
+  return Math.max(0, nowMs - new Date(session.lastDisconnectedAt).getTime());
+}
+
+function getSessionHealthStatus(session, options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const staleMs = (options.staleSeconds ?? SESSION_STALE_SECONDS) * 1000;
+  const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
+
+  if (session.type === 'wrapped') {
+    if (isOpenWebSocket(session.ownerWs)) {
+      return 'CONNECTED';
+    }
+    if (disconnectedMs !== null && disconnectedMs >= staleMs) {
+      return 'STALE';
+    }
+    return 'DISCONNECTED';
+  }
+
+  if (session.type === 'aterm') {
+    if (session.deliveryEndpoint) {
+      return 'CONNECTED';
+    }
+    if (disconnectedMs !== null && disconnectedMs >= staleMs) {
+      return 'STALE';
+    }
+    return 'DISCONNECTED';
+  }
+
+  return session.ptyProcess && !session.ptyProcess.killed ? 'CONNECTED' : 'DISCONNECTED';
+}
+
+function getSessionHealthReason(session, healthStatus) {
+  if (session.type === 'wrapped') {
+    if (healthStatus === 'CONNECTED') return session.ready ? 'OWNER_CONNECTED' : 'OWNER_CONNECTED_NOT_READY';
+    if (healthStatus === 'STALE') return 'OWNER_DISCONNECTED_STALE';
+    return 'OWNER_DISCONNECTED';
+  }
+
+  if (session.type === 'aterm') {
+    if (healthStatus === 'CONNECTED') return 'DELIVERY_ENDPOINT_AVAILABLE';
+    if (healthStatus === 'STALE') return 'DELIVERY_ENDPOINT_STALE';
+    return 'DELIVERY_ENDPOINT_MISSING';
+  }
+
+  return session.ptyProcess && !session.ptyProcess.killed ? 'PTY_RUNNING' : 'PTY_EXITED';
+}
+
+function buildSessionTransportBlock(session, options = {}) {
+  if (!session) {
+    return null;
+  }
+
+  const nowMs = options.nowMs ?? Date.now();
+  const idleSeconds = session.lastActivityAt ? Math.floor((nowMs - new Date(session.lastActivityAt).getTime()) / 1000) : null;
+  const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
+  const healthStatus = getSessionHealthStatus(session, { nowMs });
+  const healthReason = getSessionHealthReason(session, healthStatus);
+
+  return {
+    health_status: healthStatus,
+    health_reason: healthReason,
+    type: session.type || 'spawned',
+    backend: session.backend || 'kitty',
+    terminal: getSessionTerminalLabel(session),
+    active_clients: session.clients ? session.clients.size : 0,
+    ready: session.ready || false,
+    idle_seconds: idleSeconds,
+    disconnected_seconds: disconnectedMs === null ? null : Math.floor(disconnectedMs / 1000),
+    last_activity_at: session.lastActivityAt || null,
+    last_connected_at: session.lastConnectedAt || null,
+    last_disconnected_at: session.lastDisconnectedAt || null,
+    last_inject_from: session.lastInjectFrom || null,
+    last_reply_to: session.lastInjectReplyTo || null,
+    last_thread_id: session.lastThreadId || null
+  };
+}
+
+function buildSessionSemanticBlock(session) {
+  if (!session || !session.stateReport) {
+    return null;
+  }
+
+  const report = session.stateReport;
+  return {
+    phase: report.phase,
+    current_task: report.current_task,
+    blocker: report.blocker,
+    needs_input: report.needs_input,
+    thread_id: report.thread_id,
+    source: report.source,
+    seq: report.seq
+  };
+}
+
+function buildSessionEvent(eventType, sessionId, session, options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const timestamp = options.timestamp || new Date(nowMs).toISOString();
+  return {
+    type: eventType,
+    event_type: eventType,
+    sender: options.sender || 'daemon',
+    session_id: sessionId,
+    timestamp,
+    transport: options.includeTransport === false ? null : buildSessionTransportBlock(session, { nowMs }),
+    semantic: options.includeSemantic === false ? null : buildSessionSemanticBlock(session),
+    ...(options.extra || {})
+  };
+}
+
+function broadcastSessionEvent(eventType, sessionId, session, options = {}) {
+  const event = buildSessionEvent(eventType, sessionId, session, options);
+  broadcastBusEvent(event);
+  return event;
+}
+
+function parseSessionStateReport(session, payload = {}) {
+  if (!payload || typeof payload !== 'object') {
+    return buildErrorBody('INVALID_REQUEST', 'state report payload must be a JSON object', { httpStatus: 400 });
+  }
+
+  const phase = normalizeNullableText(payload.phase || payload.task_phase);
+  if (!phase) {
+    return buildErrorBody('INVALID_REQUEST', 'phase is required', { httpStatus: 400 });
+  }
+
+  let seq;
+  if (payload.seq === undefined || payload.seq === null || payload.seq === '') {
+    seq = ((session && session.stateReport && session.stateReport.seq) || 0) + 1;
+  } else {
+    seq = Number(payload.seq);
+    if (!Number.isInteger(seq) || seq < 0) {
+      return buildErrorBody('INVALID_REQUEST', 'seq must be a non-negative integer', { httpStatus: 400 });
+    }
+  }
+
+  if (payload.needs_input !== undefined && typeof payload.needs_input !== 'boolean') {
+    return buildErrorBody('INVALID_REQUEST', 'needs_input must be a boolean', { httpStatus: 400 });
+  }
+
+  const source = normalizeNullableText(payload.source) || 'self_report';
+  const timestamp = new Date().toISOString();
+  return {
+    success: true,
+    report: {
+      phase,
+      current_task: normalizeNullableText(payload.current_task ?? payload.task),
+      blocker: normalizeNullableText(payload.blocker),
+      needs_input: payload.needs_input === true,
+      thread_id: normalizeNullableText(payload.thread_id),
+      source,
+      seq,
+      timestamp
+    }
+  };
+}
+
+function applySessionStateReport(sessionId, session, payload = {}) {
+  const parsed = parseSessionStateReport(session, payload);
+  if (!parsed.success) {
+    return parsed;
+  }
+
+  session.stateReport = parsed.report;
+  session.lastStateReportAt = parsed.report.timestamp;
+  if (parsed.report.thread_id) {
+    session.lastThreadId = parsed.report.thread_id;
+  }
+
+  const event = broadcastSessionEvent('session_state_report', sessionId, session, {
+    timestamp: parsed.report.timestamp
+  });
+  return {
+    success: true,
+    event,
+    semantic: buildSessionSemanticBlock(session),
+    transport: buildSessionTransportBlock(session, { nowMs: Date.parse(parsed.report.timestamp) })
+  };
+}
+
+function getInjectFailure(session, options = {}) {
+  const healthStatus = getSessionHealthStatus(session, options);
+  if (healthStatus === 'STALE') {
+    return { httpStatus: 410, code: 'STALE', error: 'Session is stale and awaiting cleanup.' };
+  }
+  if (healthStatus === 'DISCONNECTED') {
+    return { httpStatus: 503, code: 'DISCONNECTED', error: 'Session owner is disconnected.' };
+  }
+  return null;
+}
+
+function markSessionConnected(session, timestamp = new Date().toISOString()) {
+  session.lastConnectedAt = timestamp;
+  session.lastDisconnectedAt = null;
+  session._staleEmitted = false;
+}
+
+function markSessionDisconnected(session, timestamp = new Date().toISOString()) {
+  session.lastDisconnectedAt = timestamp;
+  session.ready = false;
+}
+
+function emitSessionLifecycleEvent(type, sessionId, session, extra = {}) {
+  const now = Date.now();
+  broadcastSessionEvent(type, sessionId, session, {
+    nowMs: now,
+    extra: {
+      healthStatus: getSessionHealthStatus(session, { nowMs: now }),
+      healthReason: getSessionHealthReason(session, getSessionHealthStatus(session, { nowMs: now })),
+      ...extra
+    }
+  });
+}
+
+function emitInjectFailureEvent(sessionId, code, error, extra = {}, session = null) {
+  broadcastSessionEvent('inject_failed', sessionId, session, {
+    extra: {
+      target_agent: sessionId,
+      code,
+      error,
+      ...extra
+    }
+  });
+}
+
+async function writeDataToSession(id, session, data) {
+  if (session.type === 'aterm') {
+    if (!session.deliveryEndpoint) {
+      return buildErrorBody('DISCONNECTED', 'Delivery endpoint is missing.', { httpStatus: 503 });
+    }
+
+    try {
+      const response = await fetch(session.deliveryEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: data, session_id: id }),
+        signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS)
+      });
+
+      if (!response.ok) {
+        return buildErrorBody('DELIVERY_FAILED', `Delivery endpoint returned ${response.status}.`, {
+          httpStatus: 502,
+          deliveryStatus: response.status
+        });
+      }
+
+      return { success: true };
+    } catch (error) {
+      if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+        return buildErrorBody('TIMEOUT', 'Delivery endpoint timed out.', { httpStatus: 504 });
+      }
+      return buildErrorBody('DISCONNECTED', 'Delivery endpoint is unreachable.', {
+        httpStatus: 503,
+        detail: error.message
+      });
+    }
+  }
+
+  if (session.type === 'wrapped') {
+    if (!isOpenWebSocket(session.ownerWs)) {
+      return buildErrorBody('DISCONNECTED', 'Session owner is disconnected.', { httpStatus: 503 });
+    }
+    session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
+    return { success: true };
+  }
+
+  if (!session.ptyProcess || session.ptyProcess.killed) {
+    return buildErrorBody('DISCONNECTED', 'PTY process is not connected.', { httpStatus: 503 });
+  }
+
+  session.ptyProcess.write(data);
+  return { success: true };
+}
+
+async function deliverInjectionToSession(id, session, prompt, options = {}) {
+  const now = Date.now();
+  const injectFailure = getInjectFailure(session, { nowMs: now });
+  if (injectFailure) {
+    return { success: false, ...injectFailure };
+  }
+
+  const textResult = await writeDataToSession(id, session, prompt);
+  if (!textResult.success) {
+    return textResult;
+  }
+
+  if (!options.noEnter) {
+    const submitDelay = session.type === 'wrapped' ? 500 : 300;
+    setTimeout(async () => {
+      const submitResult = await writeDataToSession(id, session, '\r');
+      if (!submitResult.success) {
+        emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
+          phase: 'submit',
+          source: options.source || 'inject'
+        }, session);
+      }
+    }, submitDelay);
+  }
+
+  session.lastActivityAt = new Date(now).toISOString();
+  return {
+    success: true,
+    strategy: session.type === 'wrapped'
+      ? 'ws_split_cr'
+      : session.type === 'aterm'
+        ? 'aterm_endpoint'
+        : 'pty_split_cr',
+    submit: options.noEnter ? 'skipped' : 'deferred'
+  };
+}
 
 function appendToOutputRing(session, data) {
   if (!session.outputRing) session.outputRing = [];
@@ -184,6 +540,11 @@ function serializeSession(id, session, options = {}) {
   const nowMs = options.nowMs ?? Date.now();
   const idleSeconds = session.lastActivityAt ? Math.floor((nowMs - new Date(session.lastActivityAt).getTime()) / 1000) : null;
   const projectId = session.cwd ? session.cwd.split('/').pop() : null;
+  const healthStatus = getSessionHealthStatus(session, { nowMs });
+  const healthReason = getSessionHealthReason(session, healthStatus);
+  const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
+  const transport = buildSessionTransportBlock(session, { nowMs });
+  const semantic = buildSessionSemanticBlock(session);
 
   return {
     id,
@@ -199,10 +560,18 @@ function serializeSession(id, session, options = {}) {
     cmuxSurfaceId: session.cmuxSurfaceId || null,
     createdAt: session.createdAt,
     lastActivityAt: session.lastActivityAt || null,
+    lastConnectedAt: session.lastConnectedAt || null,
+    lastDisconnectedAt: session.lastDisconnectedAt || null,
     idleSeconds,
     active_clients: session.clients ? session.clients.size : 0,
     ready: session.ready || false,
-    deliveryEndpoint: session.deliveryEndpoint || null
+    deliveryEndpoint: session.deliveryEndpoint || null,
+    healthStatus,
+    healthReason,
+    disconnectedSeconds: disconnectedMs === null ? null : Math.floor(disconnectedMs / 1000),
+    lastStateReportAt: session.lastStateReportAt || null,
+    transport,
+    semantic
   };
 }
 
@@ -224,6 +593,10 @@ for (const [id, meta] of Object.entries(_persisted)) {
       term: meta.term || null,
       createdAt: meta.createdAt || new Date().toISOString(),
       lastActivityAt: meta.lastActivityAt || new Date().toISOString(),
+      lastConnectedAt: meta.lastConnectedAt || null,
+      lastDisconnectedAt: meta.lastDisconnectedAt || meta.lastActivityAt || new Date().toISOString(),
+      lastStateReportAt: meta.lastStateReportAt || null,
+      stateReport: meta.stateReport || null,
       clients: new Set(), isClosing: false, outputRing: [], ready: false,     };
     console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
   }
@@ -331,6 +704,10 @@ app.post('/api/sessions/spawn', (req, res) => {
       cwd,
       createdAt: new Date().toISOString(),
       lastActivityAt: new Date().toISOString(),
+      lastConnectedAt: new Date().toISOString(),
+      lastDisconnectedAt: null,
+      lastStateReportAt: null,
+      stateReport: null,
       clients: new Set(),
       isClosing: false,
       outputRing: [],
@@ -407,7 +784,10 @@ app.post('/api/sessions/register', (req, res) => {
     if (Object.prototype.hasOwnProperty.call(req.body, 'term')) existing.term = term || null;
     if (req.body.delivery_type) existing.type = req.body.delivery_type;
     if (req.body.delivery_endpoint) existing.deliveryEndpoint = req.body.delivery_endpoint;
-    if (req.body.delivery_type === 'aterm') existing.ready = true;
+    if (req.body.delivery_type === 'aterm') {
+      existing.ready = true;
+      markSessionConnected(existing);
+    }
     console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
     return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true });
   }
@@ -428,6 +808,10 @@ app.post('/api/sessions/register', (req, res) => {
     deliveryEndpoint: delivery_endpoint || null,
     createdAt: new Date().toISOString(),
     lastActivityAt: new Date().toISOString(),
+    lastConnectedAt: delivery_type === 'aterm' ? new Date().toISOString() : null,
+    lastDisconnectedAt: delivery_type === 'aterm' ? null : new Date().toISOString(),
+    lastStateReportAt: null,
+    stateReport: null,
     clients: new Set(),
     isClosing: false,
     outputRing: [],
@@ -495,6 +879,25 @@ app.get('/api/sessions/:id', (req, res) => {
   });
 });
 
+app.post('/api/sessions/:id/state', (req, res) => {
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
+  const session = sessions[resolvedId];
+  const applied = applySessionStateReport(resolvedId, session, req.body);
+  if (!applied.success) {
+    return respondWithError(res, applied.httpStatus || 400, applied.code || 'INVALID_REQUEST', applied.error);
+  }
+
+  persistSessions();
+  res.json({
+    success: true,
+    session_id: resolvedId,
+    transport: applied.transport,
+    semantic: applied.semantic
+  });
+});
+
 app.get('/api/meta', (req, res) => {
   res.json({
     name: pkg.name,
@@ -521,124 +924,68 @@ app.get('/api/peers', (req, res) => {
   }
 });
 
-app.post('/api/sessions/multicast/inject', (req, res) => {
+app.post('/api/sessions/multicast/inject', async (req, res) => {
   const { session_ids, prompt } = req.body;
-  if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+  if (typeof prompt !== 'string' || prompt.length === 0) return respondWithError(res, 400, 'INVALID_REQUEST', 'prompt is required');
   if (!Array.isArray(session_ids)) return res.status(400).json({ error: 'session_ids must be an array' });
 
   const results = { successful: [], failed: [] };
 
-  session_ids.forEach(id => {
+  for (const id of session_ids) {
     const session = sessions[id];
     if (session) {
       try {
-        // cmux per-session backend (text + enter)
-        if (session.backend === 'cmux') {
-          const ok = terminalBackend.cmuxSendText(id, prompt);
-          if (ok) {
-            setTimeout(() => terminalBackend.cmuxSendEnter(id), 300);
-            results.successful.push({ id, strategy: 'cmux_auto' });
-            // Broadcast injection to bus
-            const busMsg = JSON.stringify({
-              type: 'injection',
-              sender: 'cli',
-              target_agent: id,
-              content: prompt,
-              timestamp: new Date().toISOString()
-            });
-            busClients.forEach(client => {
-              if (client.readyState === 1) client.send(busMsg);
-            });
-            return; // skip WS path for this session
-          }
+        const delivery = await deliverInjectionToSession(id, session, prompt, {
+          source: 'multicast'
+        });
+        if (!delivery.success) {
+          results.failed.push({ id, code: delivery.code, error: delivery.error });
+          continue;
         }
 
-        // Inject text first, then \r separately after delay
-        if (session.type === 'wrapped') {
-          if (session.ownerWs && session.ownerWs.readyState === 1) {
-            session.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
-            setTimeout(() => {
-              if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
-                submitViaCmux(id);
-              } else if (session.ownerWs && session.ownerWs.readyState === 1) {
-                session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
-              }
-            }, 300);
-            results.successful.push({ id, strategy: session.backend === 'cmux' ? 'cmux_split_cr' : 'split_cr' });
-          } else {
-            results.failed.push({ id, error: 'Wrap process not connected' });
-          }
-        } else {
-          session.ptyProcess.write(prompt);
-          setTimeout(() => session.ptyProcess.write('\r'), 300);
-          results.successful.push({ id, strategy: 'split_cr' });
-        }
+        results.successful.push({ id, strategy: delivery.strategy });
 
         // Broadcast injection to bus
-        const busMsg = JSON.stringify({
+        broadcastBusEvent({
           type: 'injection',
           sender: 'cli',
           target_agent: id,
           content: prompt,
           timestamp: new Date().toISOString()
         });
-        busClients.forEach(client => {
-          if (client.readyState === 1) client.send(busMsg);
-        });
       } catch (err) {
-        results.failed.push({ id, error: err.message });
+        results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
       }
     } else {
-      results.failed.push({ id, error: 'Session not found' });
+      results.failed.push({ id, code: 'SESSION_NOT_FOUND', error: 'Session not found' });
     }
-  });
+  }
 
   res.json({ success: true, results });
 });
 
-app.post('/api/sessions/broadcast/inject', (req, res) => {
+app.post('/api/sessions/broadcast/inject', async (req, res) => {
   const { prompt } = req.body;
-  if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+  if (typeof prompt !== 'string' || prompt.length === 0) return respondWithError(res, 400, 'INVALID_REQUEST', 'prompt is required');
 
   const results = { successful: [], failed: [] };
 
-  Object.keys(sessions).forEach(id => {
+  for (const id of Object.keys(sessions)) {
     const session = sessions[id];
     try {
-      // cmux per-session backend (text + enter)
-      if (session.backend === 'cmux') {
-        const ok = terminalBackend.cmuxSendText(id, prompt);
-        if (ok) {
-          setTimeout(() => terminalBackend.cmuxSendEnter(id), 300);
-          results.successful.push({ id, strategy: 'cmux_auto' });
-          return; // skip WS path for this session
-        }
+      const delivery = await deliverInjectionToSession(id, session, prompt, {
+        source: 'broadcast'
+      });
+      if (!delivery.success) {
+        results.failed.push({ id, code: delivery.code, error: delivery.error });
+        continue;
       }
 
-      // Inject text first, then \r separately after delay
-      if (session.type === 'wrapped') {
-        if (session.ownerWs && session.ownerWs.readyState === 1) {
-          session.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
-          setTimeout(() => {
-            if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
-              submitViaCmux(id);
-            } else if (session.ownerWs && session.ownerWs.readyState === 1) {
-              session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
-            }
-          }, 300);
-          results.successful.push({ id, strategy: session.backend === 'cmux' ? 'cmux_split_cr' : 'split_cr' });
-        } else {
-          results.failed.push({ id, error: 'Wrap process not connected' });
-        }
-      } else {
-        session.ptyProcess.write(prompt);
-        setTimeout(() => session.ptyProcess.write('\r'), 300);
-        results.successful.push({ id, strategy: 'split_cr' });
-      }
+      results.successful.push({ id, strategy: delivery.strategy });
     } catch (err) {
-      results.failed.push({ id, error: err.message });
+      results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
     }
-  });
+  }
 
   // Send a single bus event for the entire broadcast (not per-session)
   if (results.successful.length > 0) {
@@ -817,32 +1164,49 @@ function submitViaCmux(sessionId) {
 }
 
 // POST /api/sessions/:id/submit — CLI-aware submit
-app.post('/api/sessions/:id/submit', (req, res) => {
+app.post('/api/sessions/:id/submit', async (req, res) => {
   const requestedId = req.params.id;
   const resolvedId = resolveSessionAlias(requestedId);
   if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
   const session = sessions[resolvedId];
   const id = resolvedId;
 
-  const strategy = getSubmitStrategy(session.command);
-  console.log(`[SUBMIT] Session ${id} (${session.command}) using strategy: ${strategy}`);
+  const retries = Math.min(Math.max(Number(req.body?.retries) || 0, 0), 3);
+  const retryDelayMs = Math.min(Math.max(Number(req.body?.retry_delay_ms) || 500, 100), 2000);
+  const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
 
-  let success = false;
-  // cmux per-session backend
-  if (session.backend === 'cmux') {
-    success = terminalBackend.cmuxSendEnter(id);
+  const strategy = getSubmitStrategy(session.command);
+  console.log(`[SUBMIT] Session ${id} (${session.command}) strategy: ${strategy}${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}`);
+
+  // Pre-delay: wait for paste processing to complete before sending CR
+  if (preDelayMs > 0) {
+    await new Promise(resolve => setTimeout(resolve, preDelayMs));
   }
-  if (!success && session.backend === 'cmux' && session.cmuxWorkspaceId) {
-    success = submitViaCmux(id);
-  }
-  if (!success) {
-    if (strategy === 'pty_cr') {
-      success = submitViaPty(session);
-    } else if (strategy === 'osascript_cmd_enter') {
-      success = submitViaOsascript(id, 'cmd_enter');
-    } else {
-      success = submitViaPty(session); // fallback
+
+  function executeSubmit() {
+    // cmux per-session backend
+    if (session.backend === 'cmux') {
+      if (terminalBackend.cmuxSendEnter(id)) return true;
     }
+    if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+      if (submitViaCmux(id)) return true;
+    }
+    if (strategy === 'pty_cr') {
+      return submitViaPty(session);
+    } else if (strategy === 'osascript_cmd_enter') {
+      return submitViaOsascript(id, 'cmd_enter');
+    }
+    return submitViaPty(session); // fallback
+  }
+
+  let success = executeSubmit();
+  let attempts = 1;
+
+  // Retry: resend CR if paste may have absorbed the first one
+  for (let i = 0; i < retries && success; i++) {
+    await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+    executeSubmit();
+    attempts++;
   }
 
   if (success) {
@@ -851,14 +1215,15 @@ app.post('/api/sessions/:id/submit', (req, res) => {
       sender: 'daemon',
       session_id: id,
       strategy,
+      attempts,
       timestamp: new Date().toISOString()
     });
     busClients.forEach(client => {
       if (client.readyState === 1) client.send(busMsg);
     });
-    res.json({ success: true, strategy });
+    res.json({ success: true, strategy, attempts });
   } else {
-    res.status(503).json({ error: `Submit failed via ${strategy}`, strategy });
+    res.status(503).json({ error: `Submit failed via ${strategy}`, strategy, attempts });
   }
 });
 
@@ -895,106 +1260,53 @@ app.post('/api/sessions/submit-all', (req, res) => {
   res.json({ success: true, results });
 });
 
-app.post('/api/sessions/:id/inject', (req, res) => {
+app.post('/api/sessions/:id/inject', async (req, res) => {
   const requestedId = req.params.id;
   const resolvedId = resolveSessionAlias(requestedId);
-  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+  if (!resolvedId) return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
   const session = sessions[resolvedId];
   const id = resolvedId;
   const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
   let { from, reply_to } = req.body;
-  if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+  if (typeof prompt !== 'string') return respondWithError(res, 400, 'INVALID_REQUEST', 'prompt is required');
   // reply_to defaults to from when omitted
   if (from && !reply_to) reply_to = from;
-  if (from) session.lastInjectFrom = from;
-  if (reply_to) session.lastInjectReplyTo = reply_to;
-  if (thread_id) session.lastThreadId = thread_id;
-  session.lastActivityAt = new Date().toISOString();
 
   // Routing metadata stays in session/bus state, not in the visible prompt text.
   const finalPrompt = prompt;
   const inject_id = crypto.randomUUID();
   try {
-    // Always inject text without \r first, then send \r separately after delay.
-    // The allow bridge handles ordering and prompt-ready queueing.
-    function writeToSession(data) {
-      if (session.type === 'aterm' && session.deliveryEndpoint) {
-        // Route to aterm PtyManager — fire-and-forget, aterm handles delivery
-        try {
-          const url = session.deliveryEndpoint;
-          fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: data, session_id: id }),
-            signal: AbortSignal.timeout(5000)
-          }).catch(() => {});
-          return true;
-        } catch { return false; }
-      } else if (session.type === 'wrapped') {
-        if (session.ownerWs && session.ownerWs.readyState === 1) {
-          session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
-          return true;
-        }
-        return false;
-      } else {
-        session.ptyProcess.write(data);
-        return true;
-      }
+    const delivery = await deliverInjectionToSession(id, session, finalPrompt, {
+      noEnter: !!no_enter,
+      source: 'inject'
+    });
+    if (!delivery.success) {
+      emitInjectFailureEvent(id, delivery.code, delivery.error, {
+        inject_id,
+        from: from || null,
+        reply_to: reply_to || null
+      }, session);
+      return respondWithError(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error);
     }
 
-    let submitResult = null;
-    if (session.type === 'aterm' && session.deliveryEndpoint) {
-      // aterm sessions: deliver text + CR via aterm PtyManager endpoint
-      const wsOk = writeToSession(finalPrompt);
-      if (!wsOk) {
-        return res.status(503).json({ error: 'aterm endpoint not reachable' });
-      }
-      if (!no_enter) {
-        setTimeout(() => writeToSession('\r'), 300);
-        submitResult = { deferred: true, strategy: 'aterm_endpoint' };
-      }
-    } else if (session.type === 'wrapped') {
-      // Send text+CR combined so the allow-bridge writes them atomically.
-      const payload = no_enter ? finalPrompt : finalPrompt + '\r';
-      const wsOk = writeToSession(payload);
-      if (!wsOk) {
-        return res.status(503).json({ error: 'Process not connected' });
-      }
-      console.log(`[INJECT] WS text${no_enter ? '' : '+CR'} for ${id}`);
-      if (!no_enter) {
-        submitResult = { immediate: true, strategy: 'ws_combined_cr' };
-      }
-    } else {
-      // Spawned sessions: direct PTY write
-      if (!writeToSession(finalPrompt)) {
-        return res.status(503).json({ error: 'Process not connected' });
-      }
-      if (!no_enter) {
-        setTimeout(() => {
-          writeToSession('\r');
-          console.log(`[INJECT+SUBMIT] PTY split_cr for ${id}`);
-        }, 300);
-        submitResult = { deferred: true, strategy: 'pty_split_cr' };
-      }
-    }
+    if (from) session.lastInjectFrom = from;
+    if (reply_to) session.lastInjectReplyTo = reply_to;
+    if (thread_id) session.lastThreadId = thread_id;
 
     console.log(`[INJECT] Wrote to session ${id} (inject_id: ${inject_id})`);
 
     const injectTimestamp = new Date().toISOString();
-    const busMsg = JSON.stringify({
-      type: 'inject_written',
-      inject_id,
-      sender: 'daemon',
-      target_agent: id,
-      content: prompt,
-      from: from || null,
-      reply_to: reply_to || null,
-      thread_id: thread_id || null,
-      reply_expected: !!reply_expected,
-      timestamp: injectTimestamp
-    });
-    busClients.forEach(client => {
-      if (client.readyState === 1) client.send(busMsg);
+    broadcastSessionEvent('inject_written', id, session, {
+      timestamp: injectTimestamp,
+      extra: {
+        inject_id,
+        target_agent: id,
+        content: prompt,
+        from: from || null,
+        reply_to: reply_to || null,
+        thread_id: thread_id || null,
+        reply_expected: !!reply_expected
+      }
     });
 
     // Notify all attached viewers (telepty attach clients) about the inject
@@ -1036,20 +1348,10 @@ app.post('/api/sessions/:id/inject', (req, res) => {
       });
     }
 
-    res.json({ success: true, inject_id, submit: submitResult });
+    res.json({ success: true, inject_id, strategy: delivery.strategy, submit: delivery.submit });
   } catch (err) {
-    const busFailMsg = JSON.stringify({
-      type: 'inject_write_failed',
-      inject_id,
-      sender: 'daemon',
-      target_agent: id,
-      error: err.message,
-      timestamp: new Date().toISOString()
-    });
-    busClients.forEach(client => {
-      if (client.readyState === 1) client.send(busFailMsg);
-    });
-    res.status(500).json({ error: err.message });
+    emitInjectFailureEvent(id, 'DELIVERY_FAILED', err.message, { inject_id }, session);
+    res.status(500).json(buildErrorBody('DELIVERY_FAILED', err.message));
   }
 });
 
@@ -1157,7 +1459,7 @@ app.delete('/api/sessions/:id', (req, res) => {
 });
 
 // Shared auto-router: handles turn_request events from any source (WS or HTTP)
-function busAutoRoute(msg) {
+async function busAutoRoute(msg) {
   const eventType = msg.type || msg.kind;
   const isRoutable = (eventType === 'turn_request' || eventType === 'deliberation_route_turn') && (msg.target || msg.target_session_id);
   if (!isRoutable) {
@@ -1175,84 +1477,42 @@ function busAutoRoute(msg) {
   const targetSession = targetId ? sessions[targetId] : null;
   if (!targetSession) {
     console.log(`[BUS-ROUTE] Target ${rawTarget} not found among: ${Object.keys(sessions).join(', ')}`);
+    emitInjectFailureEvent(rawTarget, 'SESSION_NOT_FOUND', 'Target session was not found.', {
+      source: 'bus_auto_route',
+      turn_id: turnId,
+      original_message_id: msg.message_id || null
+    });
     return;
   }
 
   const prompt = (msg.payload && msg.payload.prompt) || msg.content || msg.prompt || JSON.stringify(msg);
   const inject_id = crypto.randomUUID();
-
-  // Write to session (cmux auto-detect > kitty > session-level cmux > WS fallback)
-  const sock = findKittySocket();
-  if (!targetSession.kittyWindowId && sock) targetSession.kittyWindowId = findKittyWindowId(sock, targetId);
-  const wid = targetSession.kittyWindowId;
-  let delivered = false;
-
-  // cmux per-session backend: send text + enter to surface
-  if (!delivered && targetSession.backend === 'cmux') {
-    const textOk = terminalBackend.cmuxSendText(targetId, prompt);
-    if (textOk) {
-      setTimeout(() => terminalBackend.cmuxSendEnter(targetId), 500);
-      delivered = true;
-    }
-  }
-
-  if (!delivered && wid && sock && targetSession.type === 'wrapped') {
-    try {
-      const escaped = prompt.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
-      require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} '${escaped}'`, {
-        timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
-      });
-      setTimeout(() => {
-        try {
-          require('child_process').execSync(`kitty @ --to unix:${sock} send-text --match id:${wid} $'\\r'`, {
-            timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-          });
-        } catch {}
-      }, 500);
-      delivered = true;
-    } catch {}
-  }
-  // Session-level cmux backend: use WS for text, cmux send-key for enter
-  if (!delivered && targetSession.backend === 'cmux' && targetSession.cmuxWorkspaceId) {
-    if (targetSession.type === 'wrapped' && targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
-      targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
-      setTimeout(() => submitViaCmux(targetId), 500);
-      delivered = true;
-    }
-  }
+  const delivery = await deliverInjectionToSession(targetId, targetSession, prompt, {
+    source: 'bus_auto_route'
+  });
+  const delivered = delivery.success === true;
   if (!delivered) {
-    if (targetSession.type === 'wrapped' && targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
-      targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: prompt }));
-      setTimeout(() => {
-        if (targetSession.ownerWs && targetSession.ownerWs.readyState === 1) {
-          targetSession.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
-        }
-      }, 300);
-      delivered = true;
-    } else if (targetSession.ptyProcess) {
-      targetSession.ptyProcess.write(prompt);
-      setTimeout(() => targetSession.ptyProcess.write('\r'), 300);
-      delivered = true;
-    }
+    emitInjectFailureEvent(targetId, delivery.code, delivery.error, {
+      source: 'bus_auto_route',
+      turn_id: turnId,
+      original_message_id: msg.message_id || null
+    }, targetSession);
   }
 
   // Emit inject_written ack
-  const ackMsg = JSON.stringify({
-    type: 'inject_written',
-    inject_id,
-    sender: 'daemon',
-    source_host: MACHINE_ID,
-    target_agent: targetId,
-    source_type: 'bus_auto_route',
-    turn_id: (msg.payload && msg.payload.turn_id) || null,
-    original_message_id: msg.message_id || null,
-    delivered,
-    timestamp: new Date().toISOString()
+  broadcastSessionEvent('inject_written', targetId, targetSession, {
+    extra: {
+      inject_id,
+      source_host: MACHINE_ID,
+      target_agent: targetId,
+      source_type: 'bus_auto_route',
+      turn_id: (msg.payload && msg.payload.turn_id) || null,
+      original_message_id: msg.message_id || null,
+      delivered,
+      code: delivered ? null : delivery.code,
+      error: delivered ? null : delivery.error
+    }
   });
-  busClients.forEach(client => {
-    if (client.readyState === 1) client.send(ackMsg);
-  });
-  targetSession.lastActivityAt = new Date().toISOString();
   console.log(`[BUS-ROUTE] ${eventType} → ${targetId}: ${delivered ? 'delivered' : 'failed'}`);
 }
 
@@ -1261,6 +1521,22 @@ app.post('/api/bus/publish', (req, res) => {
 
   if (!payload || typeof payload !== 'object') {
     return res.status(400).json({ error: 'Payload must be a JSON object' });
+  }
+
+  if (payload.type === 'session_state_report') {
+    const resolvedId = resolveSessionAlias(payload.session_id || '');
+    if (!resolvedId || !sessions[resolvedId]) {
+      return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: payload.session_id || null });
+    }
+
+    const applied = applySessionStateReport(resolvedId, sessions[resolvedId], payload);
+    if (!applied.success) {
+      return respondWithError(res, applied.httpStatus || 400, applied.code || 'INVALID_REQUEST', applied.error);
+    }
+
+    if (!payload._relayed_from) relayToPeers(applied.event);
+    persistSessions();
+    return res.json({ success: true, delivered: busClients.size, event: applied.event });
   }
 
   let deliveredCount = 0;
@@ -1515,20 +1791,26 @@ setInterval(() => {
   const now = Date.now();
   for (const [id, session] of Object.entries(sessions)) {
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
-    const healthMsg = JSON.stringify({
-      type: 'session_health',
-      session_id: id,
-      payload: {
-        alive: session.type === 'wrapped' ? (session.ownerWs && session.ownerWs.readyState === 1) : (session.ptyProcess && !session.ptyProcess.killed),
-        pid: session.ptyProcess?.pid || null,
-        type: session.type,
-        clients: session.clients ? session.clients.size : 0,
-        idleSeconds
-      },
-      timestamp: new Date().toISOString()
-    });
-    busClients.forEach(client => {
-      if (client.readyState === 1) client.send(healthMsg);
+    const healthStatus = getSessionHealthStatus(session, { nowMs: now });
+    const healthReason = getSessionHealthReason(session, healthStatus);
+    const disconnectedSeconds = session.lastDisconnectedAt
+      ? Math.floor((now - new Date(session.lastDisconnectedAt).getTime()) / 1000)
+      : null;
+
+    broadcastSessionEvent('session_health', id, session, {
+      nowMs: now,
+      extra: {
+        payload: {
+          alive: healthStatus === 'CONNECTED',
+          pid: session.ptyProcess?.pid || null,
+          type: session.type,
+          clients: session.clients ? session.clients.size : 0,
+          idleSeconds,
+          healthStatus,
+          healthReason,
+          disconnectedSeconds
+        }
+      }
     });
 
     // Emit session.idle when idle exceeds threshold
@@ -1550,14 +1832,46 @@ setInterval(() => {
     if (idleSeconds !== null && idleSeconds < IDLE_THRESHOLD_SECONDS) {
       session._idleEmitted = false;
     }
-  }
-}, 10000);
 
-server.on('error', (error) => {
+    if (healthStatus === 'STALE' && !session._staleEmitted) {
+      session._staleEmitted = true;
+      emitSessionLifecycleEvent('session_stale', id, session, {
+        disconnectedSeconds
+      });
+    }
+
+    const shouldCleanupDisconnected = (session.type === 'wrapped' || session.type === 'aterm')
+      && !isOpenWebSocket(session.ownerWs)
+      && (!session.clients || session.clients.size === 0)
+      && disconnectedSeconds !== null
+      && disconnectedSeconds >= SESSION_CLEANUP_SECONDS;
+
+    if (shouldCleanupDisconnected) {
+      emitSessionLifecycleEvent('session_cleanup', id, session, {
+        reason: 'STALE_DISCONNECTED',
+        disconnectedSeconds
+      });
+      delete sessions[id];
+      console.log(`[CLEANUP] Removed stale session ${id} after ${disconnectedSeconds}s disconnected`);
+      persistSessions();
+    }
+  }
+}, HEALTH_POLL_MS);
+
+server.on('error', async (error) => {
   clearDaemonState(process.pid);
 
   if (error && error.code === 'EADDRINUSE') {
-    console.error(`[DAEMON] Port ${PORT} is already in use. Another process is blocking telepty.`);
+    // Probe health to determine if it's a telepty daemon on this port
+    try {
+      const probe = await fetch(`http://127.0.0.1:${PORT}/api/health`);
+      const data = await probe.json();
+      if (data && data.status === 'ok') {
+        console.log(`[DAEMON] telepty daemon already running on port ${PORT} (v${data.version}). Exiting.`);
+        process.exit(0);
+      }
+    } catch {}
+    console.error(`[DAEMON] Port ${PORT} is already in use by another process.`);
     process.exit(1);
   }
 
@@ -1588,6 +1902,7 @@ wss.on('connection', (ws, req) => {
   }, 30000);
 
   if (!session) {
+    const connectedAt = new Date().toISOString();
     // Auto-register wrapped session on WS connect (supports reconnect after daemon restart)
     const autoSession = {
       id: sessionId,
@@ -1596,8 +1911,10 @@ wss.on('connection', (ws, req) => {
       ownerWs: ws,
       command: 'wrapped',
       cwd: process.cwd(),
-      createdAt: new Date().toISOString(),
-      lastActivityAt: new Date().toISOString(),
+      createdAt: connectedAt,
+      lastActivityAt: connectedAt,
+      lastConnectedAt: connectedAt,
+      lastDisconnectedAt: null,
       clients: new Set([ws]),
       isClosing: false,
       outputRing: [],
@@ -1627,13 +1944,19 @@ wss.on('connection', (ws, req) => {
   // ?owner=1 reclaim handles the stale-ownerWs bug: allow bridge reconnects but stale TCP
   // half-open connection still holds ownerWs slot → reconnect wrongly becomes a viewer.
   if (activeSession.type === 'wrapped' && (!activeSession.ownerWs || isOwnerConnect)) {
+    const hadDisconnectedOwner = !isOpenWebSocket(activeSession.ownerWs) && activeSession.lastDisconnectedAt;
     if (isOwnerConnect && activeSession.ownerWs && activeSession.ownerWs !== ws) {
       // Terminate the stale owner connection before claiming ownership
       console.log(`[WS] Replacing stale ownerWs for session ${sessionId}`);
       activeSession.ownerWs.terminate();
     }
     activeSession.ownerWs = ws;
+    markSessionConnected(activeSession);
     console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
+    if (hadDisconnectedOwner) {
+      emitSessionLifecycleEvent('session_reconnect', sessionId, activeSession);
+    }
+    persistSessions();
   } else {
     console.log(`[WS] Client attached to session ${sessionId} (Total: ${activeSession.clients.size})`);
   }
@@ -1693,12 +2016,12 @@ wss.on('connection', (ws, req) => {
     activeSession.clients.delete(ws);
     if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
       activeSession.ownerWs = null;
+      markSessionDisconnected(activeSession);
       console.log(`[WS] Wrap owner disconnected from session ${sessionId} (Total: ${activeSession.clients.size})`);
-      // Clean up wrapped session when owner disconnects and no other clients
-      if (activeSession.clients.size === 0 && !activeSession.isClosing) {
-        delete sessions[sessionId];
-        console.log(`[CLEANUP] Wrapped session ${sessionId} removed (owner disconnected)`);
-      }
+      emitSessionLifecycleEvent('session_disconnect', sessionId, activeSession, {
+        clients: activeSession.clients.size
+      });
+      persistSessions();
     } else {
       console.log(`[WS] Client detached from session ${sessionId} (Total: ${activeSession.clients.size})`);
     }
@@ -1715,6 +2038,22 @@ busWss.on('connection', (ws, req) => {
   ws.on('message', (message) => {
     try {
       const msg = JSON.parse(message);
+      if (msg.type === 'session_state_report') {
+        const resolvedId = resolveSessionAlias(msg.session_id || '');
+        if (!resolvedId || !sessions[resolvedId]) {
+          return;
+        }
+
+        const applied = applySessionStateReport(resolvedId, sessions[resolvedId], msg);
+        if (!applied.success) {
+          return;
+        }
+
+        if (!msg._relayed_from) relayToPeers(applied.event);
+        persistSessions();
+        return;
+      }
+
       // Broadcast to all other bus clients
       busClients.forEach(client => {
         if (client !== ws && client.readyState === 1) {

@@ -1,9 +1,10 @@
 'use strict';
 
-const { execSync, spawn } = require('child_process');
+const { execSync, spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { getSharedContextPromptPath } = require('./shared-context');
 
 const PEERS_PATH = path.join(os.homedir(), '.telepty', 'peers.json');
 const CONTROL_DIR = path.join(os.homedir(), '.telepty', 'ssh');
@@ -29,6 +30,35 @@ function savePeers(data) {
 
 // In-memory active peers
 const activePeers = new Map(); // name -> { target, controlSocket, connectedAt, machineId }
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function runRemoteCommand(peer, remoteCommand, options = {}) {
+  const result = spawnSync('ssh', [
+    '-o', `ControlPath=${peer.controlSocket}`,
+    peer.target,
+    remoteCommand
+  ], {
+    timeout: options.timeout ?? 15000,
+    encoding: 'utf8',
+    input: options.input,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (result.status !== 0) {
+    const stderr = String(result.stderr || '').trim();
+    const stdout = String(result.stdout || '').trim();
+    throw new Error(stderr || stdout || `Remote command failed with exit code ${result.status}`);
+  }
+
+  return String(result.stdout || '');
+}
 
 /**
  * Connect to a remote machine via SSH ControlMaster.
@@ -174,14 +204,43 @@ function remoteInject(name, sessionId, prompt, options = {}) {
   if (!peer) return { success: false, error: `Not connected to ${name}` };
 
   try {
-    const escaped = prompt.replace(/'/g, "'\\''");
-    const fromFlag = options.from ? `--from '${options.from}'` : '';
-    const noEnterFlag = options.no_enter ? '--no-enter' : '';
-    execSync(
-      `ssh -o ControlPath=${peer.controlSocket} ${peer.target} "telepty inject ${noEnterFlag} ${fromFlag} '${sessionId}' '${escaped}'"`,
-      { timeout: 15000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-    );
+    const parts = ['telepty', 'inject'];
+    if (options.ref) parts.push('--ref');
+    if (options.no_enter) parts.push('--no-enter');
+    if (options.from) parts.push('--from', options.from);
+    if (options.reply_to) parts.push('--reply-to', options.reply_to);
+    if (options.reply_expected) parts.push('--reply-expected');
+    parts.push(sessionId, prompt);
+
+    const remoteCommand = parts.map(shellQuote).join(' ');
+    runRemoteCommand(peer, remoteCommand, { timeout: 15000 });
     return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+function remoteEnsureSharedContext(name, descriptor) {
+  const peer = activePeers.get(name);
+  if (!peer) return { success: false, error: `Not connected to ${name}` };
+
+  try {
+    const remotePath = `$HOME/.telepty/shared/${descriptor.fileName}`;
+    const remoteCommand = [
+      'sh',
+      '-lc',
+      shellQuote(`umask 077 && mkdir -p "$HOME/.telepty/shared" && cat > "${remotePath}"`)
+    ].join(' ');
+
+    runRemoteCommand(peer, remoteCommand, {
+      timeout: 15000,
+      input: descriptor.content
+    });
+
+    return {
+      success: true,
+      promptPath: getSharedContextPromptPath(descriptor.fileName)
+    };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -261,6 +320,7 @@ module.exports = {
   listRemoteSessions,
   discoverAllRemoteSessions,
   remoteInject,
+  remoteEnsureSharedContext,
   remoteAttach,
   findSessionPeer,
   PEERS_PATH
