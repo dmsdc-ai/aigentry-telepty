@@ -1175,28 +1175,16 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   const retryDelayMs = Math.min(Math.max(Number(req.body?.retry_delay_ms) || 500, 100), 2000);
   const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
 
-  const strategy = getSubmitStrategy(session.command);
+  const strategy = 'pty_cr';
   console.log(`[SUBMIT] Session ${id} (${session.command}) strategy: ${strategy}${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}`);
 
-  // Pre-delay: wait for paste processing to complete before sending CR
+  // Pre-delay: wait for paste rendering to complete before sending CR
   if (preDelayMs > 0) {
     await new Promise(resolve => setTimeout(resolve, preDelayMs));
   }
 
   function executeSubmit() {
-    // cmux per-session backend
-    if (session.backend === 'cmux') {
-      if (terminalBackend.cmuxSendEnter(id)) return true;
-    }
-    if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
-      if (submitViaCmux(id)) return true;
-    }
-    if (strategy === 'pty_cr') {
-      return submitViaPty(session);
-    } else if (strategy === 'osascript_cmd_enter') {
-      return submitViaOsascript(id, 'cmd_enter');
-    }
-    return submitViaPty(session); // fallback
+    return submitViaPty(session);
   }
 
   let success = executeSubmit();

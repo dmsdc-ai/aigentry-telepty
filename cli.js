@@ -1521,7 +1521,7 @@ async function main() {
           const submitRes = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pre_delay_ms: 200, retries: 2, retry_delay_ms: 500 })
+            body: JSON.stringify({ pre_delay_ms: 600, retries: 2, retry_delay_ms: 500 })
           });
           const submitData = await submitRes.json();
           if (submitRes.ok) {
