@@ -1100,6 +1100,10 @@ async function main() {
                 scheduleIdleFlush();
               }
             }
+            // Reset readyNotified so next prompt detection re-notifies daemon (auto-report)
+            if (rawData && rawData !== '\r') {
+              readyNotified = false;
+            }
           } else if (msg.type === 'resize') {
             child.resize(msg.cols, msg.rows);
           }

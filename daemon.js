@@ -160,6 +160,9 @@ if (!daemonClaim.claimed) {
   process.exit(0);
 }
 
+const pendingReports = {}; // {targetSessionId: {source, injectedAt, injectId}}
+const AUTO_REPORT_IDLE_SECONDS = Number(process.env.TELEPTY_AUTO_REPORT_IDLE_SECONDS) || 10;
+
 const sessions = {};
 const handoffs = {};
 const threads = {};
@@ -1297,6 +1300,11 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       }
     });
 
+    // Auto-report: track pending inject for idle notification back to source
+    if (from) {
+      pendingReports[id] = { source: from, injectedAt: injectTimestamp, injectId: inject_id };
+    }
+
     // Notify all attached viewers (telepty attach clients) about the inject
     // This enables aterm and other viewers to show inject events in real-time
     if (session.clients && session.clients.size > 0) {
@@ -1816,6 +1824,19 @@ setInterval(() => {
       });
       console.log(`[IDLE] Session ${id} idle for ${idleSeconds}s`);
     }
+    // Auto-report for non-wrapped sessions: use idle threshold
+    const pendingRpt = pendingReports[id];
+    if (pendingRpt && session.type !== 'wrapped' && idleSeconds !== null && idleSeconds >= AUTO_REPORT_IDLE_SECONDS) {
+      delete pendingReports[id];
+      const elapsed = ((Date.now() - new Date(pendingRpt.injectedAt).getTime()) / 1000).toFixed(1);
+      const reportMsg = `TASK_COMPLETE: ${id} is now idle after processing inject (${elapsed}s)`;
+      const srcId = resolveSessionAlias(pendingRpt.source) || pendingRpt.source;
+      const srcSession = sessions[srcId];
+      if (srcSession) {
+        deliverInjectionToSession(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
+        console.log(`[AUTO-REPORT] ${id} → ${srcId}: idle after ${elapsed}s (threshold)`);
+      }
+    }
     // Reset idle flag when activity resumes
     if (idleSeconds !== null && idleSeconds < IDLE_THRESHOLD_SECONDS) {
       session._idleEmitted = false;
@@ -1977,6 +1998,19 @@ wss.on('connection', (ws, req) => {
             busClients.forEach(client => {
               if (client.readyState === 1) client.send(readyMsg);
             });
+            // Auto-report: notify source that target completed inject task
+            const pendingReport = pendingReports[sessionId];
+            if (pendingReport) {
+              delete pendingReports[sessionId];
+              const elapsed = ((Date.now() - new Date(pendingReport.injectedAt).getTime()) / 1000).toFixed(1);
+              const reportMsg = `TASK_COMPLETE: ${sessionId} is now idle after processing inject (${elapsed}s)`;
+              const srcId = resolveSessionAlias(pendingReport.source) || pendingReport.source;
+              const srcSession = sessions[srcId];
+              if (srcSession) {
+                deliverInjectionToSession(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
+                console.log(`[AUTO-REPORT] ${sessionId} → ${srcId}: idle after ${elapsed}s`);
+              }
+            }
           }
         } else {
           // Non-owner client input -> forward to owner as inject
