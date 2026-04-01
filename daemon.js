@@ -13,6 +13,7 @@ const terminalBackend = require('./terminal-backend');
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
+const net = require('net');
 const fs = require('fs');
 const SESSION_PERSIST_PATH = require('path').join(os.homedir(), '.config', 'aigentry-telepty', 'sessions.json');
 const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STALE_SECONDS || 60));
@@ -34,6 +35,8 @@ function persistSessions() {
         cmuxSurfaceId: s.cmuxSurfaceId || null,
         termProgram: s.termProgram || null,
         term: s.term || null,
+        delivery: s.delivery || null,
+        deliveryEndpoint: s.deliveryEndpoint || null,
         createdAt: s.createdAt,
         lastActivityAt: s.lastActivityAt || null,
         lastConnectedAt: s.lastConnectedAt || null,
@@ -219,7 +222,7 @@ function getSessionHealthStatus(session, options = {}) {
   }
 
   if (session.type === 'aterm') {
-    if (session.deliveryEndpoint) {
+    if (session.deliveryEndpoint || (session.delivery && session.delivery.address)) {
       return 'CONNECTED';
     }
     if (disconnectedMs !== null && disconnectedMs >= staleMs) {
@@ -426,6 +429,33 @@ function emitInjectFailureEvent(sessionId, code, error, extra = {}, session = nu
 
 async function writeDataToSession(id, session, data) {
   if (session.type === 'aterm') {
+    // UDS delivery via net.connect()
+    if (session.delivery && session.delivery.transport === 'unix_socket' && session.delivery.address) {
+      return new Promise((resolve) => {
+        const payload = JSON.stringify({ text: data, session_id: id }) + '\n';
+        const timeout = setTimeout(() => {
+          sock.destroy();
+          resolve(buildErrorBody('TIMEOUT', 'UDS delivery timed out.', { httpStatus: 504 }));
+        }, DELIVERY_TIMEOUT_MS);
+        const sock = net.connect(session.delivery.address, () => {
+          sock.end(payload);
+        });
+        sock.on('data', () => {}); // drain
+        sock.on('end', () => {
+          clearTimeout(timeout);
+          resolve({ success: true });
+        });
+        sock.on('error', (err) => {
+          clearTimeout(timeout);
+          resolve(buildErrorBody('DISCONNECTED', 'UDS endpoint is unreachable.', {
+            httpStatus: 503,
+            detail: err.message
+          }));
+        });
+      });
+    }
+
+    // HTTP delivery (backward compat)
     if (!session.deliveryEndpoint) {
       return buildErrorBody('DISCONNECTED', 'Delivery endpoint is missing.', { httpStatus: 503 });
     }
@@ -504,7 +534,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
     strategy: session.type === 'wrapped'
       ? 'ws_split_cr'
       : session.type === 'aterm'
-        ? 'aterm_endpoint'
+        ? (session.delivery && session.delivery.transport === 'unix_socket' ? 'aterm_uds' : 'aterm_endpoint')
         : 'pty_split_cr',
     submit: options.noEnter ? 'skipped' : 'deferred'
   };
@@ -568,6 +598,7 @@ function serializeSession(id, session, options = {}) {
     idleSeconds,
     active_clients: session.clients ? session.clients.size : 0,
     ready: session.ready || false,
+    delivery: session.delivery || null,
     deliveryEndpoint: session.deliveryEndpoint || null,
     healthStatus,
     healthReason,
@@ -787,6 +818,12 @@ app.post('/api/sessions/register', (req, res) => {
     if (Object.prototype.hasOwnProperty.call(req.body, 'term')) existing.term = term || null;
     if (req.body.delivery_type) existing.type = req.body.delivery_type;
     if (req.body.delivery_endpoint) existing.deliveryEndpoint = req.body.delivery_endpoint;
+    if (req.body.delivery) {
+      existing.delivery = req.body.delivery;
+      if (!existing.deliveryEndpoint && req.body.delivery.address) {
+        existing.deliveryEndpoint = req.body.delivery.address;
+      }
+    }
     if (req.body.delivery_type === 'aterm') {
       existing.ready = true;
       markSessionConnected(existing);
@@ -795,7 +832,8 @@ app.post('/api/sessions/register', (req, res) => {
     return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true });
   }
 
-  const { delivery_type, delivery_endpoint } = req.body;
+  const { delivery_type, delivery_endpoint, delivery } = req.body;
+  const resolvedEndpoint = delivery_endpoint || (delivery && delivery.address) || null;
   const sessionRecord = {
     id: session_id,
     type: delivery_type || 'wrapped',
@@ -808,7 +846,8 @@ app.post('/api/sessions/register', (req, res) => {
     cmuxSurfaceId: cmux_surface_id || null,
     termProgram: term_program || null,
     term: term || null,
-    deliveryEndpoint: delivery_endpoint || null,
+    delivery: delivery || null,
+    deliveryEndpoint: resolvedEndpoint,
     createdAt: new Date().toISOString(),
     lastActivityAt: new Date().toISOString(),
     lastConnectedAt: delivery_type === 'aterm' ? new Date().toISOString() : null,

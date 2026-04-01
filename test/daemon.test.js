@@ -690,6 +690,61 @@ test('aterm delivery timeouts surface a TIMEOUT error code', async () => {
   }
 });
 
+test('aterm registration with delivery unix_socket stores delivery and enables UDS inject', async () => {
+  const net = require('net');
+  const os = require('os');
+  const path = require('path');
+
+  const socketPath = path.join(os.tmpdir(), `telepty-test-uds-${Date.now()}.sock`);
+  const received = [];
+
+  // Create a UDS server that receives inject payloads
+  const udsServer = net.createServer((conn) => {
+    let buf = '';
+    conn.on('data', (chunk) => { buf += chunk.toString(); });
+    conn.on('end', () => {
+      try { received.push(JSON.parse(buf.trim())); } catch {}
+      conn.end();
+    });
+  });
+
+  await new Promise((resolve) => udsServer.listen(socketPath, resolve));
+
+  try {
+    const sessionId = createSessionId('aterm-uds');
+    const registered = await harness.registerSession(sessionId, {
+      delivery_type: 'aterm',
+      delivery: { transport: 'unix_socket', address: socketPath }
+    });
+    assert.equal(registered.status, 201);
+
+    // Verify delivery field is stored and health is CONNECTED
+    const list = await harness.request('/api/sessions');
+    const session = list.body.find((s) => s.id === sessionId);
+    assert.equal(session.delivery.transport, 'unix_socket');
+    assert.equal(session.delivery.address, socketPath);
+    assert.equal(session.deliveryEndpoint, socketPath);
+    assert.equal(session.healthStatus, 'CONNECTED');
+
+    // Inject via UDS
+    const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+      method: 'POST',
+      body: { prompt: 'hello uds' }
+    });
+    assert.equal(inject.status, 200);
+    assert.equal(inject.body.success, true);
+    assert.equal(inject.body.strategy, 'aterm_uds');
+
+    // Wait for UDS payload to arrive (text + CR submit)
+    await waitFor(() => received.length >= 1, { description: 'UDS text delivery' });
+    assert.equal(received[0].text, 'hello uds');
+    assert.equal(received[0].session_id, sessionId);
+  } finally {
+    udsServer.close();
+    try { require('fs').unlinkSync(socketPath); } catch {}
+  }
+});
+
 test('spawned shells strip parent Claude session markers from the environment', async () => {
   const marker = createSessionId('claude-env');
   const localHarness = await startTestDaemon({ env: { CLAUDECODE: marker } });
