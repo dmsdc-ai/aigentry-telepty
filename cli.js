@@ -2711,43 +2711,66 @@ Discuss the following topic from your project's perspective. Engage with other s
   }
 
   console.log(`
-\x1b[1maigentry-telepty\x1b[0m - Remote PTY Control
+\x1b[1mtelepty\x1b[0m — Connect any terminal to any terminal, any machine.
 
-Usage:
-  telepty daemon                                 Start the background daemon
-  telepty spawn --id <id> <command> [args...]    Spawn a new background CLI
-  telepty allow [--id <id>] [--auto-restart] <command> [args...]  Allow inject on a CLI (auto-restart on crash)
-  telepty list [--json]                          List all active sessions across discovered hosts
-  telepty attach [id[@host]]                     Attach to a session (Interactive picker if no ID)
-  telepty inject [--ref [file]] [--from <id>] [--reply-to <id>] <id[@host]> "<prompt>"    Inject text into a single session
-  telepty enter <id[@host]>                      Send only Enter/Return to a single session
-  telepty read-screen <id[@host]> [--lines N] [--raw]                  Read session screen buffer
-  telepty reply "<text>"                         Reply to the session that last injected into $TELEPTY_SESSION_ID
-  telepty status-report [--id <id>] --phase <phase> [--task <text>] [--blocker <text>] [--needs-input] [--thread-id <id>] [--seq N]
-  telepty multicast <id1[@host],id2[@host]> "<prompt>"  Inject text into multiple specific sessions
-  telepty broadcast [--ref [file]] "<prompt>"    Inject text into ALL active sessions
-  telepty rename <old_id[@host]> <new_id>        Rename a session (updates terminal title too)
-  telepty session info <id[@host]> [--json]      Show detailed session metadata
-  telepty connect <user@host> [--name N] [--port P]  Connect to a remote machine via SSH tunnel
-  telepty disconnect <name> | --all              Disconnect from a remote machine
-  telepty peers [--remove <name>]                List connected and known peers
-  telepty listen                                 Listen to the event bus and print JSON to stdout
-  telepty monitor                                Human-readable real-time billboard of bus events
-  telepty update                                 Update telepty to the latest version
-  telepty layout [grid|tall|stack]               Arrange kitty windows on screen (default: grid)
+\x1b[1mSession Management:\x1b[0m
+  telepty daemon                                 Start the background daemon (port 3848)
+  telepty spawn --id <id> <command> [args...]    Spawn a new background session
+  telepty allow [--id <id>] [--auto-restart] <command> [args...]  Wrap a CLI for remote control
+  telepty list [--json]                          List sessions (local + Tailnet)
+  telepty attach [id[@host]]                     Attach interactively (picker if no ID)
+  telepty rename <old_id[@host]> <new_id>        Rename a session
+  telepty session info <id[@host]> [--json]      Show session metadata
 
-  Handoff Commands:
-    handoff list [--status=S]        List handoffs (filter: pending/claimed/executing/completed)
-    handoff drop [options]           Create handoff from synthesis (pipe JSON or use --summary/--tasks)
-    handoff claim <id> [--agent=S]   Claim a pending handoff
-    handoff status <id> [status]     Get or update handoff status
-    handoff get <id>                 Get full synthesis JSON (for piping)
+\x1b[1mInject & Communicate:\x1b[0m
+  telepty inject [--ref [file]] [--from <id>] <id[@host]> "<prompt>"  Inject text
+  telepty enter <id[@host]>                      Send Enter/Return
+  telepty reply "<text>"                         Reply to last injector
+  telepty multicast <id1,id2> "<prompt>"         Inject into multiple sessions
+  telepty broadcast [--ref [file]] "<prompt>"    Inject into ALL sessions
+  telepty read-screen <id[@host]> [--lines N]    Read session screen buffer
 
-  Deliberation Commands:
-    deliberate --topic "..." [--sessions s1,s2] [--context file]
-                                       Start multi-session deliberation
-    deliberate status [thread_id]      List threads or show thread details
-    deliberate end <thread_id>         Close a deliberation thread
+\x1b[1mCross-Machine:\x1b[0m
+  telepty connect <user@host> [--name N] [--port P]  SSH tunnel to remote host
+  telepty disconnect <name> | --all              Disconnect remote host
+  telepty peers [--remove <name>]                List connected peers
+
+\x1b[1mMonitoring:\x1b[0m
+  telepty tui                                    Full TUI dashboard
+  telepty monitor                                Real-time event billboard
+  telepty listen                                 Stream event bus as JSON
+
+\x1b[1mHandoff:\x1b[0m
+  telepty handoff list [--status=S]              List handoffs
+  telepty handoff drop [options]                 Create handoff from synthesis
+  telepty handoff claim <id> [--agent=S]         Claim a pending handoff
+  telepty handoff status <id> [status]           Get/update handoff status
+
+\x1b[1mDeliberation:\x1b[0m
+  telepty deliberate --topic "..." [--sessions s1,s2]  Start multi-session discussion
+  telepty deliberate status [thread_id]          Show thread details
+  telepty deliberate end <thread_id>             Close a thread
+
+\x1b[1mOther:\x1b[0m
+  telepty update                                 Update to latest version
+  telepty layout [grid|tall|stack]               Arrange terminal windows
+  telepty status-report --phase <p> [options]    Emit structured status event
+
+\x1b[1mExamples:\x1b[0m
+  \x1b[2m# Wrap Claude Code for remote control\x1b[0m
+  telepty allow --id my-claude claude
+
+  \x1b[2m# Send a prompt to a session\x1b[0m
+  telepty inject my-claude "explain the auth module"
+
+  \x1b[2m# Read what a session is showing\x1b[0m
+  telepty read-screen my-claude --lines 30
+
+  \x1b[2m# Broadcast to all sessions\x1b[0m
+  telepty broadcast "status report please"
+
+  \x1b[2m# Inject into a session on another machine\x1b[0m
+  telepty inject my-claude@server-01 "run the tests"
 `);
 }
 

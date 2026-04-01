@@ -1,6 +1,6 @@
 {
   "name": "@dmsdc-ai/aigentry-telepty",
-  "version": "0.1.80",
+  "version": "0.1.81",
   "main": "daemon.js",
   "bin": {
     "aigentry-telepty": "install.js",
@@ -12,10 +12,31 @@
     "test:watch": "node --test --watch test/auth.test.js test/daemon.test.js test/daemon-singleton.test.js test/cli.test.js test/skill-installer.test.js test/interactive-terminal.test.js test/runtime-info.test.js test/session-routing.test.js",
     "test:ci": "node --test --test-reporter=spec test/auth.test.js test/daemon.test.js test/daemon-singleton.test.js test/cli.test.js test/skill-installer.test.js test/interactive-terminal.test.js test/runtime-info.test.js test/session-routing.test.js"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "pty",
+    "terminal",
+    "session",
+    "multiplexer",
+    "remote",
+    "inject",
+    "ai-cli",
+    "claude",
+    "codex",
+    "gemini",
+    "cross-machine",
+    "tailscale"
+  ],
+  "author": "dmsdc-ai",
   "license": "ISC",
-  "description": "",
+  "description": "Universal terminal session bridge — connect any terminal to any terminal, any machine",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmsdc-ai/aigentry-telepty.git"
+  },
+  "homepage": "https://github.com/dmsdc-ai/aigentry-telepty#readme",
+  "bugs": {
+    "url": "https://github.com/dmsdc-ai/aigentry-telepty/issues"
+  },
   "dependencies": {
     "blessed": "^0.1.81",
     "cors": "^2.8.6",
