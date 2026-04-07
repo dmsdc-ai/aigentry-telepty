@@ -18,6 +18,7 @@ const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./s
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const crossMachine = require('./cross-machine');
+const { FileMailbox } = require('./src/mailbox/index');
 const args = process.argv.slice(2);
 let pendingTerminalInputError = null;
 let simulatedPromptErrorInjected = false;
@@ -334,12 +335,81 @@ function printSessionInfo(session, options = {}) {
   console.log('');
 }
 
+function resolveTeleptyEntryPoint() {
+  // After npm upgrade, process.argv[1] still points to the OLD version's cli.js.
+  // Resolve the current telepty binary from PATH, which npm updates on install.
+  try {
+    const cmd = process.platform === 'win32' ? 'where telepty' : 'which telepty';
+    const binPath = execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n')[0];
+    if (binPath && fs.existsSync(binPath)) {
+      return fs.realpathSync(binPath);
+    }
+  } catch {}
+  return process.argv[1];
+}
+
 function startDetachedDaemon() {
-  const cp = spawn(process.argv[0], [process.argv[1], 'daemon'], {
+  const entryPoint = resolveTeleptyEntryPoint();
+  const cp = spawn(process.argv[0], [entryPoint, 'daemon'], {
     detached: true,
     stdio: 'ignore'
   });
   cp.unref();
+}
+
+async function waitForDaemonHealth(maxMs = 5000) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    try {
+      const meta = await getDaemonMeta('127.0.0.1');
+      if (meta && meta.version) return meta;
+    } catch {}
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return null;
+}
+
+async function restartDaemonGraceful(options = {}) {
+  const maxAttempts = options.maxAttempts || 3;
+  const requiredCapabilities = options.requiredCapabilities || [];
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // (a) Kill existing daemon processes
+    const results = cleanupDaemonProcesses();
+
+    // (b) Wait up to 3s for old processes to fully exit
+    if (results.stopped.length > 0) {
+      const { isProcessRunning } = require('./daemon-control');
+      const killDeadline = Date.now() + 3000;
+      for (const item of results.stopped) {
+        while (Date.now() < killDeadline && isProcessRunning(item.pid)) {
+          await new Promise(r => setTimeout(r, 100));
+        }
+      }
+    }
+
+    // (c) Start new daemon
+    startDetachedDaemon();
+
+    // (d) Wait for new daemon to respond with correct version
+    const meta = await waitForDaemonHealth(5000);
+    if (meta && meta.version === pkg.version) {
+      const hasCapabilities = requiredCapabilities.every(c => (meta.capabilities || []).includes(c));
+      if (hasCapabilities || requiredCapabilities.length === 0) {
+        return { success: true, meta, attempt };
+      }
+    }
+
+    // Retry with backoff
+    if (attempt < maxAttempts) {
+      const backoff = 1000 * attempt;
+      process.stdout.write(`\x1b[33m⚠️ Daemon restart attempt ${attempt}/${maxAttempts} failed. Retrying in ${backoff / 1000}s...\x1b[0m\n`);
+      await new Promise(r => setTimeout(r, backoff));
+    }
+  }
+
+  console.error(`\x1b[31m❌ Daemon restart failed after ${maxAttempts} attempts. Run "telepty daemon" manually to start.\x1b[0m`);
+  return { success: false, meta: null, attempt: maxAttempts };
 }
 
 function renderInteractiveHeader() {
@@ -388,10 +458,13 @@ async function repairLocalDaemon(options = {}) {
     return { stopped: results.stopped.length, failed: results.failed.length, meta: null };
   }
 
-  startDetachedDaemon();
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-  const meta = await getDaemonMeta('127.0.0.1');
-  return { stopped: results.stopped.length, failed: results.failed.length, meta };
+  const restartResult = await restartDaemonGraceful();
+  return {
+    stopped: results.stopped.length,
+    failed: results.failed.length,
+    meta: restartResult.meta,
+    versionMatch: restartResult.success
+  };
 }
 
 function getDiscoveryHosts() {
@@ -455,29 +528,25 @@ async function ensureDaemonRunning(options = {}) {
     });
 
     if (sessionsRes.ok && hasCapabilities) {
-      return;
-    }
-
-    if (sessionsRes.ok && !meta) {
+      // Version mismatch: running daemon is older than installed CLI
+      if (meta && meta.version !== pkg.version) {
+        process.stdout.write(`\x1b[33m⚙️ Daemon version mismatch (running v${meta.version}, installed v${pkg.version}). Restarting...\x1b[0m\n`);
+        await restartDaemonGraceful({ requiredCapabilities });
+        return;
+      } else {
+        return;
+      }
+    } else if (sessionsRes.ok && !meta) {
       process.stdout.write('\x1b[33m⚙️ Found an older local telepty daemon. Restarting it...\x1b[0m\n');
-      cleanupDaemonProcesses();
     } else if (sessionsRes.ok && meta) {
       process.stdout.write('\x1b[33m⚙️ Found a local telepty daemon without the required features. Restarting it...\x1b[0m\n');
-      cleanupDaemonProcesses();
     }
   } catch (e) {
     // Continue to auto-start below.
   }
 
   process.stdout.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
-  cleanupDaemonProcesses();
-  startDetachedDaemon();
-  await new Promise(r => setTimeout(r, 1000));
-
-  const meta = await getDaemonMeta('127.0.0.1');
-  if (!meta || !requiredCapabilities.every((item) => meta.capabilities.includes(item))) {
-    console.error('❌ Failed to start a compatible local telepty daemon. Open telepty and choose "Repair local daemon", or rerun the installer.');
-  }
+  await restartDaemonGraceful({ requiredCapabilities });
 }
 
 async function manageInteractiveAttach(sessionId, targetHost) {
@@ -871,6 +940,7 @@ async function main() {
     }
     delete process.env.TELEPTY_SESSION_ID;
     process.env.TELEPTY_SESSION_ID = sessionId;
+    process.env.TELEPTY_AVAILABLE = 'true';
 
     await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
@@ -914,7 +984,7 @@ async function main() {
     // Spawn local PTY (preserves isTTY, env, shell config)
     const pty = require('node-pty');
     const sessionCwd = process.cwd();
-    const sessionEnv = { ...process.env, TELEPTY_SESSION_ID: sessionId };
+    const sessionEnv = { ...process.env, TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true' };
     let child = null;
     let sessionStartTime = Date.now();
     let crashCount = 0;
@@ -977,9 +1047,40 @@ async function main() {
     const cmdBase = path.basename(command).replace(/\..*$/, '');
     const promptPattern = PROMPT_PATTERNS[cmdBase] || /[❯>$#%]\s*$/;
     let promptReady = false;  // wait for CLI prompt before accepting inject
-    const injectQueue = [];
     let lastUserInputTime = 0;  // timestamp of last user keystroke
     const IDLE_THRESHOLD = 2000; // ms after last user input to consider idle
+
+    // Mailbox-backed inject queue (replaces in-memory array for crash resilience)
+    const bridgeMailbox = new FileMailbox({
+      root: path.join(os.homedir(), '.aigentry', 'mailbox', 'bridge'),
+    });
+    const bridgeTarget = sessionId;
+    let bridgeMsgSeq = 0;
+    let bridgePendingCount = 0;
+
+    // Recover undelivered messages from a previous crash
+    try {
+      const leftover = bridgeMailbox.peek(bridgeTarget).filter(m => m.state === 'pending' || m.state === 'in_flight');
+      bridgePendingCount = leftover.length;
+      if (bridgePendingCount > 0) {
+        console.log(`\x1b[33m[BRIDGE] Recovered ${bridgePendingCount} undelivered message(s) from previous session\x1b[0m`);
+      }
+    } catch {}
+
+    function enqueueBridgeMessage(text) {
+      const msgId = `${sessionId}:${Date.now()}:${++bridgeMsgSeq}`;
+      try {
+        bridgeMailbox.enqueue({
+          msg_id: msgId, from: 'daemon', to: bridgeTarget,
+          payload: text, created_at: Math.floor(Date.now() / 1000), attempt: 0,
+        });
+        bridgePendingCount++;
+      } catch (err) {
+        // Fallback: write directly if mailbox fails
+        console.error(`[BRIDGE] Mailbox enqueue failed, writing directly: ${err.message}`);
+        child.write(text);
+      }
+    }
 
     function isIdle() {
       return promptReady && (Date.now() - lastUserInputTime > IDLE_THRESHOLD);
@@ -988,34 +1089,47 @@ async function main() {
     let queueFlushTimer = null;
     let idleCheckTimer = null;
 
-    function flushInjectQueue() {
+    function flushBridgeMailbox() {
       if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
       if (idleCheckTimer) { clearInterval(idleCheckTimer); idleCheckTimer = null; }
-      if (injectQueue.length === 0) return;
-      const batch = injectQueue.splice(0);
+      if (bridgePendingCount === 0) return;
       let delay = 0;
-      for (const item of batch) {
-        setTimeout(() => child.write(item), delay);
-        delay += item === '\r' ? 0 : 100;
+      const batch = [];
+      // Dequeue all pending messages
+      while (true) {
+        const msg = bridgeMailbox.dequeue(bridgeTarget);
+        if (!msg) break;
+        batch.push(msg);
       }
+      if (batch.length === 0) { bridgePendingCount = 0; return; }
+      for (const msg of batch) {
+        const text = msg.payload;
+        const msgId = msg.msg_id;
+        setTimeout(() => {
+          child.write(text);
+          try { bridgeMailbox.ack(bridgeTarget, msgId); } catch {}
+        }, delay);
+        delay += text === '\r' ? 0 : 100;
+      }
+      bridgePendingCount = Math.max(0, bridgePendingCount - batch.length);
       promptReady = false;
     }
     function scheduleIdleFlush() {
       if (idleCheckTimer) return;
       // Poll every 500ms for idle state
       idleCheckTimer = setInterval(() => {
-        if (isIdle() && injectQueue.length > 0) {
-          flushInjectQueue();
+        if (isIdle() && bridgePendingCount > 0) {
+          flushBridgeMailbox();
         }
       }, 500);
-      // Safety: flush after 15s regardless (prevent stuck queue)
+      // Safety: flush after 5s regardless (prevent stuck queue when prompt not detected)
       if (!queueFlushTimer) {
         queueFlushTimer = setTimeout(() => {
           queueFlushTimer = null;
-          if (injectQueue.length > 0) {
-            flushInjectQueue();
+          if (bridgePendingCount > 0) {
+            flushBridgeMailbox();
           }
-        }, 15000);
+        }, 5000);
       }
     }
 
@@ -1081,11 +1195,11 @@ async function main() {
               }
 
               const isCr = chunk === '\r';
-              if (isCr && injectQueue.length > 0) {
+              if (isCr && bridgePendingCount > 0) {
                 // CR with pending queued text — queue CR too and flush immediately.
-                injectQueue.push(chunk);
+                enqueueBridgeMessage(chunk);
                 if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
-                flushInjectQueue();
+                flushBridgeMailbox();
               } else if (isCr) {
                 // CR always written immediately — never idle-gated.
                 child.write(chunk);
@@ -1096,7 +1210,7 @@ async function main() {
                 lastInjectTextTime = Date.now();
               } else {
                 // Text when not idle — queue for safe delivery.
-                injectQueue.push(chunk);
+                enqueueBridgeMessage(chunk);
                 scheduleIdleFlush();
               }
             }
@@ -1161,6 +1275,8 @@ async function main() {
 
       allowSessionClosed = true;
       cleanupTerminal();
+      // Purge bridge mailbox on clean exit (undelivered messages are stale)
+      try { bridgeMailbox.purge(bridgeTarget); } catch {}
       process.stdout.write(`\x1b]0;\x07`);
       fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }).catch(() => {});
       if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -1197,7 +1313,7 @@ async function main() {
       // Detect prompt in output to enable inject delivery
       if (promptPattern.test(data)) {
         promptReady = true;
-        flushInjectQueue();
+        flushBridgeMailbox();
         // Notify daemon that CLI is ready for inject
         if (!readyNotified && wsReady && daemonWs.readyState === 1) {
           readyNotified = true;
@@ -1234,7 +1350,7 @@ async function main() {
                 }
                 if (promptPattern.test(data)) {
                   promptReady = true;
-                  flushInjectQueue();
+                  flushBridgeMailbox();
                   if (wsReady && daemonWs.readyState === 1) {
                     daemonWs.send(JSON.stringify({ type: 'ready' }));
                   }
@@ -1633,6 +1749,76 @@ async function main() {
     return;
   }
 
+  if (cmd === 'status') {
+    const statusSessionId = args[1] || process.env.TELEPTY_SESSION_ID;
+    if (!statusSessionId) {
+      console.error('❌ Usage: telepty status <session_id>');
+      process.exit(1);
+    }
+
+    try {
+      const target = await resolveSessionTarget(statusSessionId);
+      if (!target) {
+        console.error(`❌ Session '${statusSessionId}' was not found on any discovered host.`);
+        process.exit(1);
+      }
+
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/state`);
+      const data = await res.json();
+      if (!res.ok) {
+        console.error(`❌ ${formatApiError(data)}`);
+        process.exit(1);
+      }
+
+      const auto = data.auto || {};
+      const selfReport = data.self_report || {};
+
+      // Color-coded state display
+      const stateColors = {
+        running: '\x1b[32m',       // green
+        idle: '\x1b[33m',          // yellow
+        thinking: '\x1b[36m',      // cyan
+        stuck: '\x1b[31m',         // red
+        waiting_input: '\x1b[35m', // magenta
+      };
+      const stateColor = stateColors[auto.state] || '\x1b[37m';
+      const reset = '\x1b[0m';
+
+      console.log(`\n  Session: \x1b[36m${data.session_id}${reset}`);
+      console.log(`  Auto State: ${stateColor}${auto.state || 'unknown'}${reset} (confidence: ${auto.confidence != null ? (auto.confidence * 100).toFixed(0) + '%' : '?'})`);
+      if (auto.since) {
+        const durationMs = auto.duration_ms || 0;
+        const durationStr = durationMs < 60000
+          ? `${(durationMs / 1000).toFixed(0)}s`
+          : `${(durationMs / 60000).toFixed(1)}m`;
+        console.log(`  Since: ${auto.since} (${durationStr} ago)`);
+      }
+      if (auto.detail) {
+        console.log(`  Trigger: ${auto.detail.trigger || '-'}`);
+        if (auto.detail.matched_line) console.log(`  Matched: "${auto.detail.matched_line}"`);
+        if (auto.detail.silence_ms) console.log(`  Silence: ${(auto.detail.silence_ms / 1000).toFixed(1)}s`);
+        if (auto.detail.repeat_count) console.log(`  Error repeats: ${auto.detail.repeat_count}`);
+      }
+      if (auto.last_output_preview) {
+        const preview = auto.last_output_preview.replace(/\n/g, '\\n').slice(-80);
+        console.log(`  Last output: "${preview}"`);
+      }
+
+      if (selfReport.phase) {
+        console.log(`\n  Self-report:`);
+        console.log(`    Phase: ${selfReport.phase}`);
+        if (selfReport.current_task) console.log(`    Task: ${selfReport.current_task}`);
+        if (selfReport.blocker) console.log(`    Blocker: \x1b[31m${selfReport.blocker}${reset}`);
+        if (selfReport.needs_input) console.log(`    Needs input: \x1b[35myes${reset}`);
+      }
+      console.log('');
+    } catch (e) {
+      console.error(`❌ ${e.message || 'Failed to get session state.'}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   if (cmd === 'status-report') {
     const reportArgs = args.slice(1);
     let sessionId = process.env.TELEPTY_SESSION_ID || undefined;
@@ -1816,6 +2002,39 @@ async function main() {
         console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host} [${item.code || 'UNKNOWN'}] ${item.error || ''}`.trim()).join(', '));
       }
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    return;
+  }
+
+  if (cmd === 'delete') {
+    const sessionRef = args[1];
+    if (!sessionRef) { console.error('❌ Usage: telepty delete <session-id>'); process.exit(1); }
+    try {
+      const target = await resolveSessionTarget(sessionRef);
+      if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exit(1); }
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      console.log(`✅ Session '\x1b[36m${target.id}\x1b[0m' deleted.`);
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to delete session.'}`); }
+    return;
+  }
+
+  if (cmd === 'clean') {
+    try {
+      const sessions = await discoverSessions({ silent: true });
+      if (sessions.length === 0) { console.log('No sessions found.'); return; }
+      let cleaned = 0;
+      for (const s of sessions) {
+        if (s.healthStatus === 'STALE' || s.healthStatus === 'DISCONNECTED') {
+          try {
+            const host = s.host || '127.0.0.1';
+            const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
+            if (res.ok) { console.log(`  🗑  Removed ghost: \x1b[36m${s.id}\x1b[0m (${s.healthStatus})`); cleaned++; }
+          } catch (_) {}
+        }
+      }
+      console.log(cleaned > 0 ? `✅ Cleaned ${cleaned} ghost session(s).` : '✅ No ghost sessions found.');
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to clean sessions.'}`); }
     return;
   }
 

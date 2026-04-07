@@ -9,6 +9,10 @@ const pkg = require('./package.json');
 const { claimDaemonState, clearDaemonState } = require('./daemon-control');
 const { checkEntitlement } = require('./entitlement');
 const terminalBackend = require('./terminal-backend');
+const { FileMailbox } = require('./src/mailbox/index');
+const { DeliveryEngine } = require('./src/mailbox/delivery');
+const { UnixSocketNotifier } = require('./src/mailbox/notifier');
+const { SessionStateManager } = require('./session-state');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -20,6 +24,23 @@ const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STA
 const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
 const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
 const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS || 10000));
+
+// Session state machine manager — auto-detects session state from PTY output
+const sessionStateManager = new SessionStateManager({
+  idle_timeout_ms:    Number(process.env.TELEPTY_STATE_IDLE_TIMEOUT_MS || 5000),
+  stuck_repeat_count: Number(process.env.TELEPTY_STATE_STUCK_REPEAT_COUNT || 3),
+  stuck_window_ms:    Number(process.env.TELEPTY_STATE_STUCK_WINDOW_MS || 180000),
+  thinking_timeout_ms:Number(process.env.TELEPTY_STATE_THINKING_TIMEOUT_MS || 300000),
+});
+
+// Broadcast state transitions to the bus
+sessionStateManager.onTransition((sessionId, from, to, detail) => {
+  const session = sessions[sessionId];
+  if (!session) return;
+  broadcastSessionEvent('session_auto_state', sessionId, session, {
+    extra: { auto_state: to, auto_state_from: from, auto_detail: detail }
+  });
+});
 
 function persistSessions() {
   try {
@@ -222,7 +243,17 @@ function getSessionHealthStatus(session, options = {}) {
   }
 
   if (session.type === 'aterm') {
-    if (session.deliveryEndpoint || (session.delivery && session.delivery.address)) {
+    const endpoint = session.deliveryEndpoint || (session.delivery && session.delivery.address);
+    if (endpoint) {
+      const isSocketPath = endpoint.startsWith('/');
+      if (isSocketPath) {
+        try {
+          const stat = fs.statSync(endpoint);
+          return stat.isSocket() ? 'CONNECTED' : 'DISCONNECTED';
+        } catch {
+          return 'DISCONNECTED';
+        }
+      }
       return 'CONNECTED';
     }
     if (disconnectedMs !== null && disconnectedMs >= staleMs) {
@@ -432,7 +463,8 @@ async function writeDataToSession(id, session, data) {
     // UDS delivery via net.connect()
     if (session.delivery && session.delivery.transport === 'unix_socket' && session.delivery.address) {
       return new Promise((resolve) => {
-        const payload = JSON.stringify({ text: data, session_id: id }) + '\n';
+        const payload = JSON.stringify({ action: "Inject", workspace: id, text: data }) + '\n';
+        let responseBuf = '';
         const timeout = setTimeout(() => {
           sock.destroy();
           resolve(buildErrorBody('TIMEOUT', 'UDS delivery timed out.', { httpStatus: 504 }));
@@ -440,13 +472,32 @@ async function writeDataToSession(id, session, data) {
         const sock = net.connect(session.delivery.address, () => {
           sock.end(payload);
         });
-        sock.on('data', () => {}); // drain
+        sock.on('data', (chunk) => { responseBuf += chunk.toString(); });
         sock.on('end', () => {
           clearTimeout(timeout);
+          if (responseBuf) {
+            try {
+              const resp = JSON.parse(responseBuf.trim());
+              if (resp.status === 'Error' || resp.success === false) {
+                console.log(`[UDS] Delivery rejected by ${id}: ${resp.error || resp.message || 'unknown'}`);
+                resolve(buildErrorBody('DELIVERY_REJECTED', resp.error || resp.message || 'Target rejected the payload.', {
+                  httpStatus: 502,
+                  detail: resp
+                }));
+                return;
+              }
+            } catch {
+              // Non-JSON response — treat as success (legacy endpoints)
+            }
+          } else {
+            console.log(`[UDS] Empty response from ${id} — delivery unconfirmed (aterm may not have processed)`);
+          }
           resolve({ success: true });
         });
         sock.on('error', (err) => {
           clearTimeout(timeout);
+          console.log(`[UDS] Connection error for ${id} at ${session.delivery.address}: ${err.message}`);
+          markSessionDisconnected(session);
           resolve(buildErrorBody('DISCONNECTED', 'UDS endpoint is unreachable.', {
             httpStatus: 503,
             detail: err.message
@@ -510,34 +561,67 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
     return { success: false, ...injectFailure };
   }
 
-  const textResult = await writeDataToSession(id, session, prompt);
-  if (!textResult.success) {
-    return textResult;
-  }
+  // Build the payload: text + CR for non-aterm sessions (aterm handles Enter internally)
+  const payload = (!options.noEnter && session.type !== 'aterm')
+    ? prompt + '\r'
+    : prompt;
 
-  if (!options.noEnter) {
-    const submitDelay = session.type === 'wrapped' ? 500 : 300;
-    setTimeout(async () => {
-      const submitResult = await writeDataToSession(id, session, '\r');
-      if (!submitResult.success) {
-        emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
-          phase: 'submit',
-          source: options.source || 'inject'
-        }, session);
-      }
-    }, submitDelay);
-  }
+  const from = options.from || 'daemon';
+  const msgId = `${from}:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
 
-  session.lastActivityAt = new Date(now).toISOString();
-  return {
-    success: true,
-    strategy: session.type === 'wrapped'
-      ? 'ws_split_cr'
-      : session.type === 'aterm'
-        ? (session.delivery && session.delivery.transport === 'unix_socket' ? 'aterm_uds' : 'aterm_endpoint')
-        : 'pty_split_cr',
-    submit: options.noEnter ? 'skipped' : 'deferred'
-  };
+  try {
+    const ack = mailbox.enqueue({
+      msg_id: msgId,
+      from,
+      to: id,
+      payload,
+      created_at: Math.floor(now / 1000),
+      attempt: 0,
+    });
+
+    // Notify aterm sessions immediately via UDS wake
+    if (session.type === 'aterm') {
+      mailboxNotifier.notify(id);
+    }
+
+    // Trigger immediate delivery tick for low-latency
+    mailboxDelivery.tick().catch(() => {});
+
+    session.lastActivityAt = new Date(now).toISOString();
+    return {
+      success: true,
+      msg_id: msgId,
+      queued: ack.queued,
+      pending: ack.pending,
+      strategy: 'mailbox',
+      submit: options.noEnter ? 'skipped' : 'included'
+    };
+  } catch (err) {
+    console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
+    // Fallback: direct delivery (backward compat during migration)
+    const textResult = await writeDataToSession(id, session, prompt);
+    if (!textResult.success) return textResult;
+
+    if (!options.noEnter && session.type !== 'aterm') {
+      const submitDelay = session.type === 'wrapped' ? 500 : 300;
+      setTimeout(async () => {
+        const submitResult = await writeDataToSession(id, session, '\r');
+        if (!submitResult.success) {
+          emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
+            phase: 'submit',
+            source: options.source || 'inject'
+          }, session);
+        }
+      }, submitDelay);
+    }
+
+    session.lastActivityAt = new Date(now).toISOString();
+    return {
+      success: true,
+      strategy: 'direct_fallback',
+      submit: options.noEnter ? 'skipped' : 'deferred'
+    };
+  }
 }
 
 function appendToOutputRing(session, data) {
@@ -578,6 +662,7 @@ function serializeSession(id, session, options = {}) {
   const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
   const transport = buildSessionTransportBlock(session, { nowMs });
   const semantic = buildSessionSemanticBlock(session);
+  const autoState = sessionStateManager.getState(id);
 
   return {
     id,
@@ -605,7 +690,15 @@ function serializeSession(id, session, options = {}) {
     disconnectedSeconds: disconnectedMs === null ? null : Math.floor(disconnectedMs / 1000),
     lastStateReportAt: session.lastStateReportAt || null,
     transport,
-    semantic
+    semantic,
+    autoState: autoState ? { state: autoState.state, since: autoState.since, confidence: autoState.confidence } : null,
+    mailbox: (() => {
+      try {
+        const pending = mailbox.peek(id).filter(m => m.state === 'pending' || m.state === 'in_flight');
+        const deadLetter = mailbox.peekDeadLetter(id);
+        return { pending: pending.length, dead_letter: deadLetter.length };
+      } catch { return { pending: 0, dead_letter: 0 }; }
+    })()
   };
 }
 
@@ -691,13 +784,6 @@ app.post('/api/sessions/spawn', (req, res) => {
   const { session_id, command, args = [], cwd = process.cwd(), cols = 80, rows = 30, type = 'AGENT' } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is strictly required.' });
   if (sessions[session_id]) return res.status(409).json({ error: `Session ID '${session_id}' is already active.` });
-  // Entitlement: check session limit
-  const sessionCount = Object.keys(sessions).length;
-  const ent = checkEntitlement({ feature: 'telepty.multi_session', currentUsage: sessionCount });
-  if (!ent.allowed) {
-    console.log(`[ENTITLEMENT] Session limit reached (${sessionCount}/${ent.limit?.max || '?'}), tier: ${ent.tier}`);
-    return res.status(402).json({ error: ent.reason, upgrade_url: ent.upgrade_url, tier: ent.tier });
-  }
   if (!command) return res.status(400).json({ error: 'command is required' });
 
   const isWin = os.platform() === 'win32';
@@ -769,12 +855,16 @@ app.post('/api/sessions/spawn', (req, res) => {
       }
 
       appendToOutputRing(currentSession, data);
+      sessionStateManager.feed(sessionRecord.id, data);
 
       // Send to direct WS clients
       currentSession.clients.forEach(ws => {
         if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'output', data }));
       });
     });
+
+    // Register session with state machine
+    sessionStateManager.register(session_id);
 
     ptyProcess.onExit(({ exitCode, signal }) => {
       const currentId = sessionRecord.id;
@@ -783,6 +873,7 @@ app.post('/api/sessions/spawn', (req, res) => {
       sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
       if (sessions[currentId] === sessionRecord) {
         delete sessions[currentId];
+        sessionStateManager.unregister(currentId);
       }
     });
 
@@ -797,15 +888,6 @@ app.post('/api/sessions/spawn', (req, res) => {
 app.post('/api/sessions/register', (req, res) => {
   const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id, term_program, term } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is required' });
-  // Entitlement: check session limit for new registrations
-  if (!sessions[session_id]) {
-    const sessionCount = Object.keys(sessions).length;
-    const ent = checkEntitlement({ feature: 'telepty.multi_session', currentUsage: sessionCount });
-    if (!ent.allowed) {
-      console.log(`[ENTITLEMENT] Session limit reached (${sessionCount}/${ent.limit?.max || '?'}), tier: ${ent.tier}`);
-      return res.status(402).json({ error: ent.reason, upgrade_url: ent.upgrade_url, tier: ent.tier });
-    }
-  }
   // Idempotent: allow re-registration (update command/cwd, keep clients)
   if (sessions[session_id]) {
     const existing = sessions[session_id];
@@ -880,6 +962,7 @@ app.post('/api/sessions/register', (req, res) => {
   }
 
   sessions[session_id] = sessionRecord;
+  sessionStateManager.register(session_id);
 
   const busMsg = JSON.stringify({
     type: 'session_register',
@@ -921,6 +1004,26 @@ app.get('/api/sessions/:id', (req, res) => {
   });
 });
 
+// Auto-detected session state (from PTY output pattern analysis)
+app.get('/api/sessions/:id/state', (req, res) => {
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
+  if (!sessions[resolvedId]) return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
+
+  const autoState = sessionStateManager.getState(resolvedId);
+  const session = sessions[resolvedId];
+  const semantic = buildSessionSemanticBlock(session);
+
+  res.json({
+    session_id: resolvedId,
+    auto: autoState || { state: 'unknown', detail: 'no state machine registered' },
+    self_report: semantic,
+    last_state_report_at: session.lastStateReportAt || null,
+  });
+});
+
+// Self-reported session state (explicit POST from session)
 app.post('/api/sessions/:id/state', (req, res) => {
   const requestedId = req.params.id;
   const resolvedId = resolveSessionAlias(requestedId);
@@ -949,8 +1052,57 @@ app.get('/api/meta', (req, res) => {
     port: Number(PORT),
     machine_id: MACHINE_ID,
     terminal: DETECTED_TERMINAL,
-    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine']
+    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox']
   });
+});
+
+// --- Mailbox API endpoints ---
+
+app.get('/api/sessions/:id/mailbox', (req, res) => {
+  const id = resolveSessionAlias(req.params.id);
+  if (!id || !sessions[id]) return res.status(404).json({ error: 'Session not found' });
+  try {
+    const pending = mailbox.peek(id);
+    const deadLetter = mailbox.peekDeadLetter(id);
+    res.json({ session_id: id, pending, dead_letter: deadLetter });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/sessions/:id/mailbox/ack', (req, res) => {
+  const id = resolveSessionAlias(req.params.id);
+  if (!id || !sessions[id]) return res.status(404).json({ error: 'Session not found' });
+  const { msg_id } = req.body;
+  if (!msg_id) return res.status(400).json({ error: 'msg_id is required' });
+  try {
+    mailbox.ack(id, msg_id);
+    res.json({ success: true, msg_id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/sessions/:id/mailbox', (req, res) => {
+  const id = resolveSessionAlias(req.params.id);
+  if (!id || !sessions[id]) return res.status(404).json({ error: 'Session not found' });
+  try {
+    mailbox.purge(id);
+    res.json({ success: true, session_id: id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/sessions/:id/mailbox/dead-letter', (req, res) => {
+  const id = resolveSessionAlias(req.params.id);
+  if (!id || !sessions[id]) return res.status(404).json({ error: 'Session not found' });
+  try {
+    mailbox.purgeDeadLetter(id);
+    res.json({ success: true, session_id: id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Peer management endpoint (for cross-machine module)
@@ -1308,7 +1460,8 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
   try {
     const delivery = await deliverInjectionToSession(id, session, finalPrompt, {
       noEnter: !!no_enter,
-      source: 'inject'
+      source: 'inject',
+      from: from || 'inject'
     });
     if (!delivery.success) {
       emitInjectFailureEvent(id, delivery.code, delivery.error, {
@@ -1447,9 +1600,11 @@ app.patch('/api/sessions/:id', (req, res) => {
   if (!new_id) return res.status(400).json({ error: 'new_id is required' });
   if (sessions[new_id]) return res.status(409).json({ error: `Session ID '${new_id}' is already in use.` });
 
-  // Move session to new key
+  // Move session to new key (including state machine)
   sessions[new_id] = session;
   delete sessions[id];
+  sessionStateManager.unregister(id);
+  sessionStateManager.register(new_id);
   session.id = new_id;
 
   // Broadcast rename to bus
@@ -1478,18 +1633,24 @@ app.delete('/api/sessions/:id', (req, res) => {
   try {
     session.isClosing = true;
     if (session.type === 'wrapped') {
-      session.clients.forEach(ws => ws.close(1000, 'Session destroyed'));
-      delete sessions[id];
-      console.log(`[KILL] Wrapped session ${id} removed`);
-      persistSessions();
-    } else {
+      if (session.clients) session.clients.forEach(ws => ws.close(1000, 'Session destroyed'));
+    } else if (session.ptyProcess) {
       session.ptyProcess.kill();
-      console.log(`[KILL] Session ${id} forcefully closed`);
-      persistSessions();
     }
+    delete sessions[id];
+    sessionStateManager.unregister(id);
+    try { mailbox.purge(id); } catch {}
+    console.log(`[KILL] Session ${id} removed`);
+    persistSessions();
     res.json({ success: true, status: 'closing' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    // Even if kill fails, remove from registry
+    delete sessions[id];
+    sessionStateManager.unregister(id);
+    try { mailbox.purge(id); } catch {}
+    persistSessions();
+    console.log(`[KILL] Session ${id} force-removed (process cleanup error: ${err.message})`);
+    res.json({ success: true, status: 'force-removed' });
   }
 });
 
@@ -1821,6 +1982,46 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
 });
 
+// --- Mailbox system initialization ---
+const mailbox = new FileMailbox();
+const mailboxNotifier = new UnixSocketNotifier({ coalesceMs: 25 });
+
+// Resolve aterm UDS socket path for a session
+mailboxNotifier.setSocketResolver((sessionId) => {
+  const session = sessions[sessionId];
+  if (!session || session.type !== 'aterm') return null;
+  return (session.delivery && session.delivery.transport === 'unix_socket' && session.delivery.address) || null;
+});
+
+// Delivery engine: dequeue → writeDataToSession → ack/nack
+const mailboxDelivery = new DeliveryEngine(mailbox, {
+  pollMs: 200,
+  sessionResolver: () => Object.keys(sessions),
+  deliverFn: async (sessionId, msg) => {
+    const session = sessions[sessionId];
+    if (!session) return { success: false, error: 'Session not found' };
+    const result = await writeDataToSession(sessionId, session, msg.payload);
+    if (result.success) {
+      session.lastActivityAt = new Date().toISOString();
+    }
+    return result;
+  },
+  onDelivery: (sessionId, msgId, result) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    if (result.success) {
+      broadcastSessionEvent('mailbox_delivered', sessionId, session, {
+        extra: { msg_id: msgId }
+      });
+    } else {
+      broadcastSessionEvent('mailbox_delivery_failed', sessionId, session, {
+        extra: { msg_id: msgId, error: result.error }
+      });
+    }
+  },
+});
+mailboxDelivery.start();
+
 const IDLE_THRESHOLD_SECONDS = 60;
 setInterval(() => {
   const now = Date.now();
@@ -1881,6 +2082,29 @@ setInterval(() => {
       session._idleEmitted = false;
     }
 
+    // Periodically verify aterm socket existence — triggers health transition
+    // NOTE: Do NOT nullify delivery address here. The address is preserved so that
+    // if aterm restarts and the socket reappears, health check recovers automatically.
+    if (session.type === 'aterm') {
+      const atermEndpoint = session.deliveryEndpoint || (session.delivery && session.delivery.address);
+      if (atermEndpoint && atermEndpoint.startsWith('/')) {
+        let socketAlive = false;
+        try {
+          const stat = fs.statSync(atermEndpoint);
+          socketAlive = stat.isSocket();
+        } catch {
+          socketAlive = false;
+        }
+        if (!socketAlive && !session.lastDisconnectedAt) {
+          markSessionDisconnected(session);
+          console.log(`[SWEEP] aterm socket gone for ${id}: ${atermEndpoint}`);
+        } else if (socketAlive && session.lastDisconnectedAt) {
+          markSessionConnected(session);
+          console.log(`[SWEEP] aterm socket recovered for ${id}: ${atermEndpoint}`);
+        }
+      }
+    }
+
     if (healthStatus === 'STALE' && !session._staleEmitted) {
       session._staleEmitted = true;
       emitSessionLifecycleEvent('session_stale', id, session, {
@@ -1900,6 +2124,7 @@ setInterval(() => {
         disconnectedSeconds
       });
       delete sessions[id];
+      sessionStateManager.unregister(id);
       console.log(`[CLEANUP] Removed stale session ${id} after ${disconnectedSeconds}s disconnected`);
       persistSessions();
     }
@@ -2019,6 +2244,7 @@ wss.on('connection', (ws, req) => {
           if (type === 'output') {
             activeSession.lastActivityAt = new Date().toISOString();
             appendToOutputRing(activeSession, data);
+            sessionStateManager.feed(sessionId, data);
             activeSession.clients.forEach(client => {
               if (client !== ws && client.readyState === 1) {
                 client.send(JSON.stringify({ type: 'output', data }));
@@ -2163,6 +2389,8 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 function shutdown(code) {
+  mailboxDelivery.stop();
+  mailboxNotifier.cancelAll();
   clearDaemonState(process.pid);
   process.exit(code);
 }

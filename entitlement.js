@@ -9,7 +9,7 @@ const UPGRADE_URL = 'https://aigentry.dev/upgrade';
 
 const FEATURES = {
   'telepty.core':            { tiers: ['free', 'pro', 'team'] },
-  'telepty.multi_session':   { tiers: ['pro', 'team'], freeLimit: 3 },
+  'telepty.multi_session':   { tiers: ['free', 'pro', 'team'] },
   'telepty.remote_sessions': { tiers: ['pro', 'team'] },
   'telepty.team_broadcast':  { tiers: ['team'] }
 };

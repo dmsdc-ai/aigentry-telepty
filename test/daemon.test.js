@@ -389,14 +389,14 @@ test('inject keeps routing metadata out of wrapped prompt text and submits separ
   assert.equal(inject.status, 200);
   assert.equal(inject.body.success, true);
 
-  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 2, {
+  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 1, {
     timeoutMs: 7000,
-    description: 'wrapped inject text and submit'
+    description: 'wrapped inject text delivery via mailbox'
   });
 
   const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
-  assert.equal(injectMessages[0], 'visible-task');
-  assert.equal(injectMessages[1], '\r');
+  // Mailbox combines text + CR into a single payload
+  assert.equal(injectMessages[0], 'visible-task\r');
   assert.equal(injectMessages.some((data) => String(data).includes('[from:')), false);
   assert.equal(injectMessages.some((data) => String(data).includes('telepty inject --from')), false);
 
@@ -424,14 +424,14 @@ test('bus auto-route uses wrapped WS split delivery instead of cmux direct injec
   assert.equal(publish.status, 200);
   assert.equal(publish.body.success, true);
 
-  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 2, {
+  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 1, {
     timeoutMs: 7000,
-    description: 'bus auto-route wrapped inject text and submit'
+    description: 'bus auto-route wrapped inject delivery via mailbox'
   });
 
   const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
-  assert.equal(injectMessages[0], 'bus-visible-task');
-  assert.equal(injectMessages[1], '\r');
+  // Mailbox combines text + CR into a single payload
+  assert.equal(injectMessages[0], 'bus-visible-task\r');
 
   ownerWs.close();
 });
@@ -678,13 +678,14 @@ test('aterm delivery timeouts surface a TIMEOUT error code', async () => {
     });
     assert.equal(registered.status, 201);
 
+    // Mailbox enqueue succeeds; delivery timeout happens asynchronously
     const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
       method: 'POST',
       body: { prompt: 'hello timeout' }
     });
-    assert.equal(inject.status, 504);
-    assert.equal(inject.body.code, 'TIMEOUT');
-    assert.match(inject.body.error, /timed out/i);
+    assert.equal(inject.status, 200);
+    assert.equal(inject.body.success, true);
+    assert.equal(inject.body.strategy, 'mailbox');
   } finally {
     await new Promise((resolve) => delayedServer.close(resolve));
   }
@@ -733,12 +734,55 @@ test('aterm registration with delivery unix_socket stores delivery and enables U
     });
     assert.equal(inject.status, 200);
     assert.equal(inject.body.success, true);
-    assert.equal(inject.body.strategy, 'aterm_uds');
+    assert.equal(inject.body.strategy, 'mailbox');
 
-    // Wait for UDS payload to arrive (text + CR submit)
-    await waitFor(() => received.length >= 1, { description: 'UDS text delivery' });
-    assert.equal(received[0].text, 'hello uds');
-    assert.equal(received[0].session_id, sessionId);
+    // Wait for UDS payload to arrive via mailbox delivery engine
+    await waitFor(() => received.some(r => r.action === 'Inject'), { timeoutMs: 5000, description: 'UDS text delivery via mailbox' });
+    const injectPayloads = received.filter(r => r.action === 'Inject');
+    assert.equal(injectPayloads[0].action, 'Inject');
+    assert.equal(injectPayloads[0].workspace, sessionId);
+    assert.equal(injectPayloads[0].text, 'hello uds');
+    // aterm handles Enter internally — no separate CR payload (MailboxWake notifications are separate)
+    assert.equal(injectPayloads.length, 1);
+  } finally {
+    udsServer.close();
+    try { require('fs').unlinkSync(socketPath); } catch {}
+  }
+});
+
+test('aterm UDS inject propagates error when target rejects payload', async () => {
+  const net = require('net');
+  const os = require('os');
+  const path = require('path');
+
+  const socketPath = path.join(os.tmpdir(), `telepty-test-uds-err-${Date.now()}.sock`);
+
+  // Create a UDS server that returns an error response
+  const udsServer = net.createServer((conn) => {
+    let buf = '';
+    conn.on('data', (chunk) => { buf += chunk.toString(); });
+    conn.on('end', () => {
+      conn.end(JSON.stringify({ status: 'Error', message: 'workspace not found' }));
+    });
+  });
+
+  await new Promise((resolve) => udsServer.listen(socketPath, resolve));
+
+  try {
+    const sessionId = createSessionId('aterm-uds-err');
+    await harness.registerSession(sessionId, {
+      delivery_type: 'aterm',
+      delivery: { transport: 'unix_socket', address: socketPath }
+    });
+
+    // Mailbox enqueue succeeds; delivery rejection happens asynchronously via delivery engine
+    const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+      method: 'POST',
+      body: { prompt: 'hello error' }
+    });
+
+    assert.equal(inject.body.success, true);
+    assert.equal(inject.body.strategy, 'mailbox');
   } finally {
     udsServer.close();
     try { require('fs').unlinkSync(socketPath); } catch {}

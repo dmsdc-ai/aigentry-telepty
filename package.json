@@ -1,11 +1,12 @@
 {
   "name": "@dmsdc-ai/aigentry-telepty",
-  "version": "0.1.81",
+  "version": "0.1.91",
   "main": "daemon.js",
   "bin": {
     "aigentry-telepty": "install.js",
     "telepty": "cli.js",
-    "telepty-install": "install.js"
+    "telepty-install": "install.js",
+    "telepty-mcp": "mcp-server/index.mjs"
   },
   "scripts": {
     "test": "node --test test/auth.test.js test/daemon.test.js test/daemon-singleton.test.js test/cli.test.js test/skill-installer.test.js test/interactive-terminal.test.js test/runtime-info.test.js test/session-routing.test.js",
@@ -20,6 +21,8 @@
     "remote",
     "inject",
     "ai-cli",
+    "mcp",
+    "model-context-protocol",
     "claude",
     "codex",
     "gemini",
@@ -38,6 +41,7 @@
     "url": "https://github.com/dmsdc-ai/aigentry-telepty/issues"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "blessed": "^0.1.81",
     "cors": "^2.8.6",
     "express": "^5.2.1",
@@ -45,6 +49,7 @@
     "prompts": "^2.4.2",
     "update-notifier": "^5.1.0",
     "uuid": "^13.0.0",
-    "ws": "^8.19.0"
+    "ws": "^8.19.0",
+    "zod": "^3.24.0"
   }
 }
