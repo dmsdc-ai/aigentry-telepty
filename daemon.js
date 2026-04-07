@@ -561,11 +561,9 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
     return { success: false, ...injectFailure };
   }
 
-  // Build the payload: text + CR for non-aterm sessions (aterm handles Enter internally)
-  const payload = (!options.noEnter && session.type !== 'aterm')
-    ? prompt + '\r'
-    : prompt;
-
+  // Mailbox payload is TEXT ONLY — CR is sent separately after a delay.
+  // Reason: combining text+CR in one write triggers bracketed paste mode in modern
+  // terminals. CLIs ignore \r inside paste brackets, so Enter never fires.
   const from = options.from || 'daemon';
   const msgId = `${from}:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
 
@@ -574,7 +572,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       msg_id: msgId,
       from,
       to: id,
-      payload,
+      payload: prompt,
       created_at: Math.floor(now / 1000),
       attempt: 0,
     });
@@ -584,12 +582,24 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       mailboxNotifier.notify(id);
     }
 
-    // Deliver synchronously — ensures text is written before inject returns success.
-    // Mailbox gives us persistence/retry, but the initial delivery must complete
-    // before the HTTP response so --submit timing and CR delivery are reliable.
+    // Deliver text synchronously — ensures text is written before inject returns success.
     try {
       await mailboxDelivery.tick();
     } catch {}
+
+    // Send CR separately after delay (outside paste brackets)
+    if (!options.noEnter && session.type !== 'aterm') {
+      const submitDelay = session.type === 'wrapped' ? 500 : 300;
+      setTimeout(async () => {
+        const submitResult = await writeDataToSession(id, session, '\r');
+        if (!submitResult.success) {
+          emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
+            phase: 'submit',
+            source: options.source || 'inject'
+          }, session);
+        }
+      }, submitDelay);
+    }
 
     session.lastActivityAt = new Date(now).toISOString();
     return {
@@ -598,7 +608,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       queued: ack.queued,
       pending: ack.pending,
       strategy: 'mailbox',
-      submit: options.noEnter ? 'skipped' : 'included'
+      submit: options.noEnter ? 'skipped' : 'deferred'
     };
   } catch (err) {
     console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);

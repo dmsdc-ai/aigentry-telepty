@@ -389,14 +389,14 @@ test('inject keeps routing metadata out of wrapped prompt text and submits separ
   assert.equal(inject.status, 200);
   assert.equal(inject.body.success, true);
 
-  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 1, {
+  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 2, {
     timeoutMs: 7000,
-    description: 'wrapped inject text delivery via mailbox'
+    description: 'wrapped inject text and deferred CR'
   });
 
   const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
-  // Mailbox combines text + CR into a single payload
-  assert.equal(injectMessages[0], 'visible-task\r');
+  assert.equal(injectMessages[0], 'visible-task');
+  assert.equal(injectMessages[1], '\r');
   assert.equal(injectMessages.some((data) => String(data).includes('[from:')), false);
   assert.equal(injectMessages.some((data) => String(data).includes('telepty inject --from')), false);
 
@@ -424,14 +424,14 @@ test('bus auto-route uses wrapped WS split delivery instead of cmux direct injec
   assert.equal(publish.status, 200);
   assert.equal(publish.body.success, true);
 
-  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 1, {
+  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 2, {
     timeoutMs: 7000,
-    description: 'bus auto-route wrapped inject delivery via mailbox'
+    description: 'bus auto-route wrapped inject text and deferred CR'
   });
 
   const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
-  // Mailbox combines text + CR into a single payload
-  assert.equal(injectMessages[0], 'bus-visible-task\r');
+  assert.equal(injectMessages[0], 'bus-visible-task');
+  assert.equal(injectMessages[1], '\r');
 
   ownerWs.close();
 });
