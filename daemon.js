@@ -584,8 +584,12 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       mailboxNotifier.notify(id);
     }
 
-    // Trigger immediate delivery tick for low-latency
-    mailboxDelivery.tick().catch(() => {});
+    // Deliver synchronously — ensures text is written before inject returns success.
+    // Mailbox gives us persistence/retry, but the initial delivery must complete
+    // before the HTTP response so --submit timing and CR delivery are reliable.
+    try {
+      await mailboxDelivery.tick();
+    } catch {}
 
     session.lastActivityAt = new Date(now).toISOString();
     return {
