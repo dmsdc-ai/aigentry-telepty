@@ -1577,15 +1577,24 @@ app.get('/api/sessions/:id/screen', (req, res) => {
   // Strip ANSI escape sequences for clean text
   function stripAnsi(str) {
     return str
-      .replace(/[[0-9;]*[a-zA-Z]/g, '')      // CSI sequences
-      .replace(/][^]*/g, '')          // OSC sequences (BEL terminated)
-      .replace(/][^]*\\/g, '')  // OSC sequences (ST terminated)
-      .replace(/[()][AB012]/g, '')              // Character set selection
-      .replace(/[>=<]/g, '')                    // Keypad mode
-      .replace(/[[?]?[0-9;]*[hlsurm]/g, '') // Mode set/reset
-      .replace(/[[0-9;]*[ABCDHJ]/g, '')       // Cursor movement
-      .replace(/[[0-9;]*[KG]/g, '')           // Line clearing
-      .replace(/\r/g, '');                         // Carriage returns
+      // Replace cursor-forward (ESC[NC, ESC[C) with N spaces to preserve whitespace
+      .replace(/\[(\d*)C/g, (_, n) => ' '.repeat(Number(n) || 1))
+      // CSI sequences: ESC [ ? (optional) params final_byte
+      .replace(/\[\??[0-9;]*[a-zA-Z@`]/g, '')
+      // OSC sequences: ESC ] ... BEL
+      .replace(/\][^]*/g, '')
+      // OSC sequences: ESC ] ... ST (ESC \)
+      .replace(/\][^]*\\/g, '')
+      // Character set selection: ESC ( / ) + charset
+      .replace(/[()][AB012]/g, '')
+      // Keypad and other 2-char ESC sequences
+      .replace(/[>=<78DMEHcNOZ~}|]/g, '')
+      // DCS / PM / APC sequences
+      .replace(/[P^_][^]*\\/g, '')
+      // Any remaining bare ESC + single char
+      .replace(/./g, '')
+      // Carriage returns
+      .replace(/\r/g, '');
   }
 
   const cleaned = raw ? fullOutput : stripAnsi(fullOutput);
