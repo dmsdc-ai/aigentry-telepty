@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const {
   acquireLock,
+  breakStaleLocks,
   ensureSessionDir,
   loadStates,
   appendState,
@@ -276,6 +277,16 @@ class FileMailbox {
     if (!fs.existsSync(sessionDir)) return;
     const p = path.join(sessionDir, 'dead-letter.jsonl');
     try { fs.writeFileSync(p, ''); } catch {}
+  }
+
+  /**
+   * Break stale lock files across all session directories.
+   * Call at daemon startup before DeliveryEngine.start().
+   * Returns count of broken locks.
+   */
+  breakStaleLocks() {
+    const staleLockAgeMs = (this.config.staleLockAgeSecs || 60) * 1000;
+    return breakStaleLocks(this.config.root, { staleLockAgeMs });
   }
 
   /**

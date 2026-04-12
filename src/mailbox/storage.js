@@ -7,6 +7,7 @@ const path = require('path');
 
 const LOCK_POLL_MS = 10;
 const LOCK_TIMEOUT_MS = 500;
+const DEFAULT_STALE_LOCK_AGE_MS = 60000; // 60s — lock hold time is ~5ms, so 60s is definitionally stale
 
 function isProcessAlive(pid) {
   try {
@@ -20,10 +21,15 @@ function isProcessAlive(pid) {
 /**
  * Acquire an advisory lock for a session directory.
  * Returns a release function. Throws on timeout.
+ *
+ * @param {string} sessionDir
+ * @param {Object} [options]
+ * @param {number} [options.staleLockAgeMs] — break locks older than this (default 60s)
  */
-function acquireLock(sessionDir) {
+function acquireLock(sessionDir, options = {}) {
   const lockPath = path.join(sessionDir, '.lock');
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const staleLockAgeMs = options.staleLockAgeMs || DEFAULT_STALE_LOCK_AGE_MS;
 
   while (Date.now() < deadline) {
     try {
@@ -36,12 +42,28 @@ function acquireLock(sessionDir) {
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
 
-      // Lock file exists — check for stale PID
+      // Lock file exists — check age first, then PID
+
+      // Fix 2: Lock age threshold — if lock is older than staleLockAgeMs,
+      // break regardless of PID (handles PID recycling)
+      try {
+        const stat = fs.statSync(lockPath);
+        const ageMs = Date.now() - stat.mtimeMs;
+        if (ageMs > staleLockAgeMs) {
+          try { fs.unlinkSync(lockPath); } catch {}
+          continue;
+        }
+      } catch {
+        // stat failed — file may have been removed between EEXIST and stat
+        continue;
+      }
+
+      // Fix 1: Invalid PID handling — treat NaN, 0, negative, empty as stale
       try {
         const content = fs.readFileSync(lockPath, 'utf8').trim();
         const pid = Number(content);
-        if (pid > 0 && !isProcessAlive(pid)) {
-          // Stale lock — remove and retry
+        if (!Number.isFinite(pid) || pid <= 0 || !isProcessAlive(pid)) {
+          // Invalid PID (empty, NaN, 0, negative) OR dead PID → stale lock
           try { fs.unlinkSync(lockPath); } catch {}
           continue;
         }
@@ -51,7 +73,7 @@ function acquireLock(sessionDir) {
         continue;
       }
 
-      // Lock is held by a live process — wait
+      // Lock is held by a live process with a recent lock — wait
       const buffer = new SharedArrayBuffer(4);
       const view = new Int32Array(buffer);
       Atomics.wait(view, 0, 0, LOCK_POLL_MS);
@@ -59,6 +81,61 @@ function acquireLock(sessionDir) {
   }
 
   throw new Error(`Mailbox lock timeout for ${sessionDir}`);
+}
+
+/**
+ * Break stale lock files across all session directories (startup sweep).
+ * Returns count of broken locks.
+ *
+ * @param {string} root — mailbox root directory
+ * @param {Object} [options]
+ * @param {number} [options.staleLockAgeMs] — age threshold (default 60s)
+ */
+function breakStaleLocks(root, options = {}) {
+  const staleLockAgeMs = options.staleLockAgeMs || DEFAULT_STALE_LOCK_AGE_MS;
+  const dirs = listSessionDirs(root);
+  let broken = 0;
+
+  for (const { sessionId, dir } of dirs) {
+    const lockPath = path.join(dir, '.lock');
+    if (!fs.existsSync(lockPath)) continue;
+
+    let shouldBreak = false;
+    let reason = '';
+
+    try {
+      const stat = fs.statSync(lockPath);
+      const ageMs = Date.now() - stat.mtimeMs;
+
+      if (ageMs > staleLockAgeMs) {
+        shouldBreak = true;
+        reason = `age ${Math.round(ageMs / 1000)}s > ${Math.round(staleLockAgeMs / 1000)}s threshold`;
+      } else {
+        // Check PID validity
+        const content = fs.readFileSync(lockPath, 'utf8').trim();
+        const pid = Number(content);
+        if (!Number.isFinite(pid) || pid <= 0) {
+          shouldBreak = true;
+          reason = `invalid PID: ${JSON.stringify(content)}`;
+        } else if (!isProcessAlive(pid)) {
+          shouldBreak = true;
+          reason = `dead PID ${pid}`;
+        }
+      }
+    } catch {
+      // Can't read/stat lock — treat as stale
+      shouldBreak = true;
+      reason = 'unreadable lock file';
+    }
+
+    if (shouldBreak) {
+      try { fs.unlinkSync(lockPath); } catch {}
+      console.log(`[MAILBOX] Broke stale lock for ${sessionId}: ${reason}`);
+      broken++;
+    }
+  }
+
+  return broken;
 }
 
 // --- JSONL read/write ---
@@ -172,6 +249,7 @@ function compact(sessionDir, threshold) {
 
 module.exports = {
   acquireLock,
+  breakStaleLocks,
   readJsonl,
   appendJsonl,
   writeJsonl,
@@ -182,4 +260,5 @@ module.exports = {
   loadMessages,
   countPending,
   compact,
+  isProcessAlive,
 };

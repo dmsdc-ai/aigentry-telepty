@@ -1,5 +1,8 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
+
 /**
  * DeliveryEngine — polls mailbox for pending messages and delivers them.
  *
@@ -9,6 +12,7 @@
  * Also handles:
  * - In-flight timeout recovery (auto-nack stuck messages)
  * - TTL expiry (expire stale pending messages)
+ * - Stale lock detection: consecutive failure tracking + exponential backoff
  */
 class DeliveryEngine {
   /**
@@ -28,6 +32,10 @@ class DeliveryEngine {
     this._timer = null;
     this._running = false;
     this._tickInProgress = false;
+    // Fix 4: Per-session consecutive lock failure count
+    this._lockFailures = new Map();  // sessionId → count
+    // Fix 5: Per-session skip-until timestamp for backoff
+    this._skipUntil = new Map();     // sessionId → timestamp
   }
 
   /**
@@ -66,8 +74,15 @@ class DeliveryEngine {
 
     try {
       const sessionIds = this.sessionResolver();
+      const lockBreakThreshold = this.mailbox.config.lockBreakAfterFailures || 3;
 
       for (const sessionId of sessionIds) {
+        // Fix 5: Skip sessions in backoff
+        const skipUntil = this._skipUntil.get(sessionId) || 0;
+        if (Date.now() < skipUntil) continue;
+
+        let lockFailed = false;
+
         // 1. Recover in-flight timeouts
         try {
           const recovered = this.mailbox.recoverInflight(sessionId);
@@ -75,52 +90,98 @@ class DeliveryEngine {
             console.log(`[MAILBOX] Recovered ${recovered} in-flight message(s) for ${sessionId}`);
           }
         } catch (err) {
-          console.error(`[MAILBOX] recoverInflight error for ${sessionId}: ${err.message}`);
+          if (err.message.includes('lock timeout')) {
+            lockFailed = true;
+          } else {
+            console.error(`[MAILBOX] recoverInflight error for ${sessionId}: ${err.message}`);
+          }
         }
 
         // 2. Expire stale messages
-        try {
-          const expired = this.mailbox.expireStale(sessionId);
-          if (expired > 0) {
-            console.log(`[MAILBOX] Expired ${expired} stale message(s) for ${sessionId}`);
+        if (!lockFailed) {
+          try {
+            const expired = this.mailbox.expireStale(sessionId);
+            if (expired > 0) {
+              console.log(`[MAILBOX] Expired ${expired} stale message(s) for ${sessionId}`);
+            }
+          } catch (err) {
+            if (err.message.includes('lock timeout')) {
+              lockFailed = true;
+            } else {
+              console.error(`[MAILBOX] expireStale error for ${sessionId}: ${err.message}`);
+            }
           }
-        } catch (err) {
-          console.error(`[MAILBOX] expireStale error for ${sessionId}: ${err.message}`);
         }
 
         // 3. Dequeue and deliver
-        try {
-          const msg = this.mailbox.dequeue(sessionId);
-          if (!msg) continue;
-
-          if (!this.deliverFn) {
-            // No delivery function — auto-ack (testing mode)
-            this.mailbox.ack(sessionId, msg.msg_id);
-            continue;
-          }
-
-          let result;
+        if (!lockFailed) {
           try {
-            result = await this.deliverFn(sessionId, msg);
-          } catch (err) {
-            result = { success: false, error: err.message };
-          }
+            const msg = this.mailbox.dequeue(sessionId);
+            if (!msg) {
+              // Success path (no message but lock acquired OK)
+              this._lockFailures.delete(sessionId);
+              this._skipUntil.delete(sessionId);
+              continue;
+            }
 
-          if (result && result.success) {
-            this.mailbox.ack(sessionId, msg.msg_id);
-            if (this.onDelivery) {
-              this.onDelivery(sessionId, msg.msg_id, { success: true });
+            if (!this.deliverFn) {
+              // No delivery function — auto-ack (testing mode)
+              this.mailbox.ack(sessionId, msg.msg_id);
+              this._lockFailures.delete(sessionId);
+              this._skipUntil.delete(sessionId);
+              continue;
             }
-          } else {
-            const reason = (result && result.error) || 'delivery failed';
-            this.mailbox.nack(sessionId, msg.msg_id, reason);
-            console.log(`[MAILBOX] Delivery failed for ${sessionId}/${msg.msg_id}: ${reason} (attempt ${msg.attempt})`);
-            if (this.onDelivery) {
-              this.onDelivery(sessionId, msg.msg_id, { success: false, error: reason });
+
+            let result;
+            try {
+              result = await this.deliverFn(sessionId, msg);
+            } catch (err) {
+              result = { success: false, error: err.message };
+            }
+
+            if (result && result.success) {
+              this.mailbox.ack(sessionId, msg.msg_id);
+              if (this.onDelivery) {
+                this.onDelivery(sessionId, msg.msg_id, { success: true });
+              }
+            } else {
+              const reason = (result && result.error) || 'delivery failed';
+              this.mailbox.nack(sessionId, msg.msg_id, reason);
+              console.log(`[MAILBOX] Delivery failed for ${sessionId}/${msg.msg_id}: ${reason} (attempt ${msg.attempt})`);
+              if (this.onDelivery) {
+                this.onDelivery(sessionId, msg.msg_id, { success: false, error: reason });
+              }
+            }
+
+            // Success path (lock was acquired)
+            this._lockFailures.delete(sessionId);
+            this._skipUntil.delete(sessionId);
+          } catch (err) {
+            if (err.message.includes('lock timeout')) {
+              lockFailed = true;
+            } else {
+              console.error(`[MAILBOX] Delivery loop error for ${sessionId}: ${err.message}`);
             }
           }
-        } catch (err) {
-          console.error(`[MAILBOX] Delivery loop error for ${sessionId}: ${err.message}`);
+        }
+
+        // Fix 4 & 5: Handle lock failure — track, force-break, backoff
+        if (lockFailed) {
+          const failCount = (this._lockFailures.get(sessionId) || 0) + 1;
+          this._lockFailures.set(sessionId, failCount);
+
+          // Fix 4: Force-break after N consecutive failures
+          if (failCount >= lockBreakThreshold) {
+            const lockPath = path.join(this.mailbox._sessionDir(sessionId), '.lock');
+            try { fs.unlinkSync(lockPath); } catch {}
+            console.warn(`[MAILBOX] Force-broke stale lock for ${sessionId} after ${failCount} consecutive failures`);
+            this._lockFailures.delete(sessionId);
+            this._skipUntil.delete(sessionId);
+          } else {
+            // Fix 5: Exponential backoff — skip this session for increasing intervals
+            const backoffMs = Math.min(this.pollMs * (1 << failCount), 30000);
+            this._skipUntil.set(sessionId, Date.now() + backoffMs);
+          }
         }
       }
     } finally {

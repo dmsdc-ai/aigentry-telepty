@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); EC=$(echo \"$INPUT\" | jq -r \".tool_response.exit_code // empty\" 2>/dev/null); ORCH=${ATERM_ORCHESTRATOR_SESSION:-}; if [ -n \"$EC\" ] && [ \"$EC\" != \"0\" ] && [ -n \"$TELEPTY_SESSION_ID\" ] && [ -n \"$ORCH\" ]; then telepty inject --from \"$TELEPTY_SESSION_ID\" \"$ORCH\" \"[BUILD ERROR] session: $TELEPTY_SESSION_ID | exit_code: $EC\" 2>/dev/null; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

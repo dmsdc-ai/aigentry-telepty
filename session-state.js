@@ -1,16 +1,22 @@
 // session-state.js — PTY output-based session state machine for telepty.
 //
-// Automatically detects session state from PTY output patterns:
-//   running      — PTY output actively flowing
-//   idle         — no output for idle_timeout_ms + prompt pattern detected
-//   thinking     — AI CLI spinner/progress patterns detected
-//   stuck        — same error repeated stuck_repeat_count times within stuck_window_ms
-//   waiting_input— Y/n or interactive prompt pattern detected
+// 8-state dynamic session control (#185):
+//   starting     — PTY not yet spawned / initializing
+//   idle         — prompt detected (OSC 133;B or pattern), ready for input
+//   working      — PTY output actively flowing (AI generating text)
+//   thinking     — AI spinner/progress patterns (no substantive text)
+//   waiting      — interactive prompt detected (approve, y/n, confirm)
+//   error        — error patterns detected in output
+//   restarting   — CLI restart triggered
+//   dead         — PTY process terminated
 //
 // Usage:
 //   const { SessionStateMachine } = require('./session-state');
 //   const sm = new SessionStateMachine(sessionId, config);
 //   sm.feed(data);              // call on every PTY output chunk
+//   sm.markStarting();          // daemon: PTY spawn initiated
+//   sm.markDead(exitCode);      // daemon: PTY exited
+//   sm.markRestarting();        // daemon: auto-restart triggered
 //   sm.getState();              // → { state, since, confidence, last_output_preview, detail }
 //   sm.onTransition(callback);  // (from, to, detail) => {}
 //   sm.destroy();               // cleanup timers
@@ -22,11 +28,26 @@
 // ---------------------------------------------------------------------------
 
 const STATES = Object.freeze({
-  RUNNING:       'running',
-  IDLE:          'idle',
-  THINKING:      'thinking',
-  STUCK:         'stuck',
-  WAITING_INPUT: 'waiting_input',
+  STARTING:    'starting',
+  IDLE:        'idle',
+  WORKING:     'working',
+  THINKING:    'thinking',
+  WAITING:     'waiting',
+  ERROR:       'error',
+  RESTARTING:  'restarting',
+  DEAD:        'dead',
+});
+
+// State display metadata
+const STATE_DISPLAY = Object.freeze({
+  [STATES.STARTING]:   { emoji: '🔄', color: '\x1b[33m' },  // yellow
+  [STATES.IDLE]:       { emoji: '💤', color: '\x1b[32m' },   // green
+  [STATES.WORKING]:    { emoji: '🔨', color: '\x1b[36m' },   // cyan
+  [STATES.THINKING]:   { emoji: '🧠', color: '\x1b[35m' },   // magenta
+  [STATES.WAITING]:    { emoji: '⏳', color: '\x1b[33m' },   // yellow
+  [STATES.ERROR]:      { emoji: '🔴', color: '\x1b[31m' },   // red
+  [STATES.RESTARTING]: { emoji: '🔄', color: '\x1b[33m' },   // yellow
+  [STATES.DEAD]:       { emoji: '☠️', color: '\x1b[90m' },    // gray
 });
 
 // ---------------------------------------------------------------------------
@@ -35,9 +56,9 @@ const STATES = Object.freeze({
 
 const DEFAULT_CONFIG = Object.freeze({
   idle_timeout_ms:      5000,    // 5s silence + prompt → idle
-  stuck_repeat_count:   3,       // same error N times → stuck
-  stuck_window_ms:      180000,  // 3 min window for stuck detection
-  thinking_timeout_ms:  300000,  // 5 min thinking before → stuck
+  error_repeat_count:   3,       // same error N times → high confidence
+  error_window_ms:      180000,  // 3 min window for error dedup
+  thinking_timeout_ms:  300000,  // 5 min thinking before → error
   poll_interval_ms:     1000,    // state check tick interval
   output_preview_len:   200,     // last N chars for preview
   error_dedup_len:      120,     // error line length for dedup fingerprint
@@ -46,6 +67,11 @@ const DEFAULT_CONFIG = Object.freeze({
 // ---------------------------------------------------------------------------
 // Pattern sets (all terminal-agnostic, CLI-agnostic)
 // ---------------------------------------------------------------------------
+
+// OSC 133 prompt marks — high-confidence idle detection
+// OSC 133;A = prompt start, OSC 133;B = command start (prompt ready)
+// Both indicate the shell/CLI is at a prompt waiting for input.
+const OSC_133_RE = /\x1b\]133;[AB](?:\x07|\x1b\\)/;
 
 // Shell prompt patterns — last line of output looks like a prompt
 const PROMPT_PATTERNS = [
@@ -74,7 +100,7 @@ const THINKING_PATTERNS = [
 ];
 
 // Interactive input prompts — session is waiting for user input
-const WAITING_INPUT_PATTERNS = [
+const WAITING_PATTERNS = [
   /\[Y\/n\]/i,                 // [Y/n]
   /\(y\/N\)/i,                 // (y/N)
   /\[yes\/no\]/i,              // [yes/no]
@@ -91,7 +117,7 @@ const WAITING_INPUT_PATTERNS = [
   /\benter .*[:\s]*$/i,        // Enter something:
 ];
 
-// Error patterns for stuck detection
+// Error patterns for error detection
 const ERROR_PATTERNS = [
   /\berror\b[:\[]/i,
   /\bError:/,
@@ -109,7 +135,7 @@ const ERROR_PATTERNS = [
   /\bECONNREFUSED\b/,
 ];
 
-// ANSI escape stripper
+// ANSI escape stripper (preserves OSC 133 detection by running after OSC check)
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b\[[\?]?[0-9;]*[hlm]/g;
 
 function stripAnsi(str) {
@@ -126,9 +152,9 @@ class SessionStateMachine {
     this.config = { ...DEFAULT_CONFIG, ...config };
 
     // Current state
-    this._state = STATES.RUNNING;
+    this._state = STATES.STARTING;
     this._since = Date.now();
-    this._confidence = 0.5;
+    this._confidence = 1.0;
     this._detail = null;
 
     // Output tracking
@@ -137,10 +163,13 @@ class SessionStateMachine {
     this._recentLines = [];         // last N stripped lines
     this._maxRecentLines = 50;
 
-    // Stuck detection: error fingerprints with timestamps
+    // OSC 133 tracking
+    this._lastOsc133At = null;
+
+    // Error detection: error fingerprints with timestamps
     this._errorHistory = [];        // [{ fingerprint, timestamp }]
 
-    // Thinking start time (for thinking → stuck timeout)
+    // Thinking start time (for thinking → error timeout)
     this._thinkingStartedAt = null;
 
     // Transition listeners
@@ -162,6 +191,16 @@ class SessionStateMachine {
     const previewLen = this.config.output_preview_len;
     this._lastOutputPreview = (this._lastOutputPreview + data).slice(-previewLen);
 
+    // Check for OSC 133 prompt mark in RAW data (before ANSI stripping)
+    if (OSC_133_RE.test(data)) {
+      this._lastOsc133At = now;
+      this._transition(STATES.IDLE, 0.95, {
+        trigger: 'osc_133_prompt',
+        timestamp: new Date(now).toISOString(),
+      });
+      return;
+    }
+
     // Strip ANSI and split into lines for pattern analysis
     const cleaned = stripAnsi(data);
     const lines = cleaned.split(/\r?\n/).filter(l => l.trim().length > 0);
@@ -172,6 +211,11 @@ class SessionStateMachine {
     // Trim to max
     while (this._recentLines.length > this._maxRecentLines) {
       this._recentLines.shift();
+    }
+
+    // Don't run detection on lifecycle states managed externally
+    if (this._state === STATES.DEAD || this._state === STATES.RESTARTING) {
+      return;
     }
 
     // Run detection pipeline (order matters: most specific first)
@@ -205,6 +249,24 @@ class SessionStateMachine {
       this._pollTimer = null;
     }
     this._listeners = [];
+  }
+
+  // --- Lifecycle methods (called by daemon) ---
+
+  markStarting() {
+    this._transition(STATES.STARTING, 1.0, { trigger: 'lifecycle' });
+  }
+
+  markDead(exitCode, signal) {
+    this._transition(STATES.DEAD, 1.0, {
+      trigger: 'lifecycle',
+      exit_code: exitCode ?? null,
+      signal: signal ?? null,
+    });
+  }
+
+  markRestarting() {
+    this._transition(STATES.RESTARTING, 1.0, { trigger: 'lifecycle' });
   }
 
   // --- Internal ---
@@ -249,20 +311,20 @@ class SessionStateMachine {
       ? this._recentLines[this._recentLines.length - 1].text
       : '';
 
-    // --- Priority 1: waiting_input (most specific, must act on immediately) ---
-    if (this._matchesAny(lastLine, WAITING_INPUT_PATTERNS)) {
-      this._transition(STATES.WAITING_INPUT, 0.9, {
+    // --- Priority 1: waiting (most specific, must act on immediately) ---
+    if (this._matchesAny(lastLine, WAITING_PATTERNS)) {
+      this._transition(STATES.WAITING, 0.9, {
         trigger: 'pattern',
         matched_line: lastLine.slice(0, 100),
       });
       return;
     }
 
-    // --- Priority 2: stuck detection (repeated errors) ---
+    // --- Priority 2: error detection (error patterns in output) ---
     this._trackErrors(now);
-    const stuckResult = this._checkStuck(now);
-    if (stuckResult) {
-      this._transition(STATES.STUCK, stuckResult.confidence, stuckResult.detail);
+    const errorResult = this._checkError(now);
+    if (errorResult) {
+      this._transition(STATES.ERROR, errorResult.confidence, errorResult.detail);
       return;
     }
 
@@ -275,8 +337,8 @@ class SessionStateMachine {
       return;
     }
 
-    // --- Priority 4: running (we just received output, not matching other patterns) ---
-    this._transition(STATES.RUNNING, 0.9, {
+    // --- Priority 4: working (we just received output, not matching other patterns) ---
+    this._transition(STATES.WORKING, 0.9, {
       trigger: 'output_received',
     });
   }
@@ -285,11 +347,16 @@ class SessionStateMachine {
     const now = Date.now();
     const silenceMs = now - this._lastOutputAt;
 
-    // Thinking → stuck after timeout
+    // Don't override lifecycle states
+    if (this._state === STATES.DEAD || this._state === STATES.RESTARTING || this._state === STATES.STARTING) {
+      return;
+    }
+
+    // Thinking → error after timeout
     if (this._state === STATES.THINKING && this._thinkingStartedAt) {
       const thinkingDuration = now - this._thinkingStartedAt;
       if (thinkingDuration > this.config.thinking_timeout_ms) {
-        this._transition(STATES.STUCK, 0.7, {
+        this._transition(STATES.ERROR, 0.7, {
           trigger: 'thinking_timeout',
           thinking_duration_ms: thinkingDuration,
         });
@@ -297,10 +364,10 @@ class SessionStateMachine {
       }
     }
 
-    // Silence → idle (only if last output looks like a prompt)
+    // Silence → idle (only if last output looks like a prompt or OSC 133 was recent)
     if (silenceMs > this.config.idle_timeout_ms) {
-      // Don't override stuck or waiting_input with idle
-      if (this._state === STATES.STUCK || this._state === STATES.WAITING_INPUT) {
+      // Don't override error or waiting with idle
+      if (this._state === STATES.ERROR || this._state === STATES.WAITING) {
         return;
       }
 
@@ -308,11 +375,12 @@ class SessionStateMachine {
         ? this._recentLines[this._recentLines.length - 1].text
         : '';
 
+      const hasOsc133 = this._lastOsc133At && (now - this._lastOsc133At) < this.config.idle_timeout_ms * 2;
       const hasPrompt = this._matchesAny(lastLine, PROMPT_PATTERNS);
-      const confidence = hasPrompt ? 0.9 : 0.6;
+      const confidence = hasOsc133 ? 0.95 : (hasPrompt ? 0.9 : 0.6);
 
       this._transition(STATES.IDLE, confidence, {
-        trigger: hasPrompt ? 'prompt_detected' : 'silence_timeout',
+        trigger: hasOsc133 ? 'osc_133_prompt' : (hasPrompt ? 'prompt_detected' : 'silence_timeout'),
         silence_ms: silenceMs,
         last_line: lastLine.slice(0, 100),
       });
@@ -320,7 +388,7 @@ class SessionStateMachine {
   }
 
   _trackErrors(now) {
-    const cutoff = now - this.config.stuck_window_ms;
+    const cutoff = now - this.config.error_window_ms;
     // Expire old errors
     this._errorHistory = this._errorHistory.filter(e => e.timestamp > cutoff);
 
@@ -336,8 +404,8 @@ class SessionStateMachine {
     }
   }
 
-  _checkStuck(now) {
-    if (this._errorHistory.length < this.config.stuck_repeat_count) {
+  _checkError(now) {
+    if (this._errorHistory.length === 0) {
       return null;
     }
 
@@ -347,18 +415,27 @@ class SessionStateMachine {
       counts[e.fingerprint] = (counts[e.fingerprint] || 0) + 1;
     }
 
+    // Find the most repeated error
+    let maxFp = null;
+    let maxCount = 0;
     for (const [fp, count] of Object.entries(counts)) {
-      if (count >= this.config.stuck_repeat_count) {
-        return {
-          confidence: Math.min(0.95, 0.7 + (count - this.config.stuck_repeat_count) * 0.05),
-          detail: {
-            trigger: 'repeated_error',
-            error_fingerprint: fp,
-            repeat_count: count,
-            window_ms: this.config.stuck_window_ms,
-          },
-        };
+      if (count > maxCount) {
+        maxCount = count;
+        maxFp = fp;
       }
+    }
+
+    // Repeated errors → high confidence error state
+    if (maxCount >= this.config.error_repeat_count) {
+      return {
+        confidence: Math.min(0.95, 0.7 + (maxCount - this.config.error_repeat_count) * 0.05),
+        detail: {
+          trigger: 'repeated_error',
+          error_fingerprint: maxFp,
+          repeat_count: maxCount,
+          window_ms: this.config.error_window_ms,
+        },
+      };
     }
 
     return null;
@@ -438,6 +515,30 @@ class SessionStateManager {
   }
 
   /**
+   * Mark a session as starting (PTY spawn initiated).
+   */
+  markStarting(sessionId) {
+    const sm = this._machines.get(sessionId);
+    if (sm) sm.markStarting();
+  }
+
+  /**
+   * Mark a session as dead (PTY exited).
+   */
+  markDead(sessionId, exitCode, signal) {
+    const sm = this._machines.get(sessionId);
+    if (sm) sm.markDead(exitCode, signal);
+  }
+
+  /**
+   * Mark a session as restarting (auto-restart triggered).
+   */
+  markRestarting(sessionId) {
+    const sm = this._machines.get(sessionId);
+    if (sm) sm.markRestarting();
+  }
+
+  /**
    * Unregister and cleanup a session's state machine.
    */
   unregister(sessionId) {
@@ -484,13 +585,15 @@ class SessionStateManager {
 
 module.exports = {
   STATES,
+  STATE_DISPLAY,
   DEFAULT_CONFIG,
   SessionStateMachine,
   SessionStateManager,
   // Exported for testing
   PROMPT_PATTERNS,
   THINKING_PATTERNS,
-  WAITING_INPUT_PATTERNS,
+  WAITING_PATTERNS,
   ERROR_PATTERNS,
+  OSC_133_RE,
   stripAnsi,
 };

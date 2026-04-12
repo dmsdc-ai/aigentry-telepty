@@ -12,7 +12,7 @@ const terminalBackend = require('./terminal-backend');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
-const { SessionStateManager } = require('./session-state');
+const { SessionStateManager, STATE_DISPLAY } = require('./session-state');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -27,10 +27,10 @@ const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS |
 
 // Session state machine manager — auto-detects session state from PTY output
 const sessionStateManager = new SessionStateManager({
-  idle_timeout_ms:    Number(process.env.TELEPTY_STATE_IDLE_TIMEOUT_MS || 5000),
-  stuck_repeat_count: Number(process.env.TELEPTY_STATE_STUCK_REPEAT_COUNT || 3),
-  stuck_window_ms:    Number(process.env.TELEPTY_STATE_STUCK_WINDOW_MS || 180000),
-  thinking_timeout_ms:Number(process.env.TELEPTY_STATE_THINKING_TIMEOUT_MS || 300000),
+  idle_timeout_ms:      Number(process.env.TELEPTY_STATE_IDLE_TIMEOUT_MS || 5000),
+  error_repeat_count:   Number(process.env.TELEPTY_STATE_ERROR_REPEAT_COUNT || 3),
+  error_window_ms:      Number(process.env.TELEPTY_STATE_ERROR_WINDOW_MS || 180000),
+  thinking_timeout_ms:  Number(process.env.TELEPTY_STATE_THINKING_TIMEOUT_MS || 300000),
 });
 
 // Broadcast state transitions to the bus
@@ -267,7 +267,7 @@ function getSessionHealthStatus(session, options = {}) {
 
 function getSessionHealthReason(session, healthStatus) {
   if (session.type === 'wrapped') {
-    if (healthStatus === 'CONNECTED') return session.ready ? 'OWNER_CONNECTED' : 'OWNER_CONNECTED_NOT_READY';
+    if (healthStatus === 'CONNECTED') return 'OWNER_CONNECTED';
     if (healthStatus === 'STALE') return 'OWNER_DISCONNECTED_STALE';
     return 'OWNER_DISCONNECTED';
   }
@@ -705,7 +705,13 @@ function serializeSession(id, session, options = {}) {
     lastStateReportAt: session.lastStateReportAt || null,
     transport,
     semantic,
-    autoState: autoState ? { state: autoState.state, since: autoState.since, confidence: autoState.confidence } : null,
+    autoState: autoState ? {
+      state: autoState.state,
+      emoji: (STATE_DISPLAY[autoState.state] || {}).emoji || '?',
+      since: autoState.since,
+      confidence: autoState.confidence,
+      detail: autoState.detail,
+    } : null,
     mailbox: (() => {
       try {
         const pending = mailbox.peek(id).filter(m => m.state === 'pending' || m.state === 'in_flight');
@@ -738,7 +744,7 @@ for (const [id, meta] of Object.entries(_persisted)) {
       lastDisconnectedAt: meta.lastDisconnectedAt || meta.lastActivityAt || new Date().toISOString(),
       lastStateReportAt: meta.lastStateReportAt || null,
       stateReport: meta.stateReport || null,
-      clients: new Set(), isClosing: false, outputRing: [], ready: false,     };
+      clients: new Set(), isClosing: false, outputRing: [], ready: true,     };
     console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
   }
 }
@@ -883,6 +889,7 @@ app.post('/api/sessions/spawn', (req, res) => {
     ptyProcess.onExit(({ exitCode, signal }) => {
       const currentId = sessionRecord.id;
       console.log(`[EXIT] Session ${currentId} exited with code ${exitCode}`);
+      sessionStateManager.markDead(currentId, exitCode, signal);
       sessionRecord.isClosing = true;
       sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
       if (sessions[currentId] === sessionRecord) {
@@ -953,7 +960,7 @@ app.post('/api/sessions/register', (req, res) => {
     clients: new Set(),
     isClosing: false,
     outputRing: [],
-    ready: delivery_type === 'aterm',  // aterm sessions are always ready (aterm manages readiness)
+    ready: true,  // all sessions are injectable once registered (#150)
       };
   // Check for existing session with same base alias and emit replaced event
   const baseAlias = session_id.replace(/-\d+$/, '');
@@ -1031,7 +1038,9 @@ app.get('/api/sessions/:id/state', (req, res) => {
 
   res.json({
     session_id: resolvedId,
-    auto: autoState || { state: 'unknown', detail: 'no state machine registered' },
+    auto: autoState
+      ? { ...autoState, emoji: (STATE_DISPLAY[autoState.state] || {}).emoji || '?' }
+      : { state: 'unknown', emoji: '?', detail: 'no state machine registered' },
     self_report: semantic,
     last_state_report_at: session.lastStateReportAt || null,
   });
@@ -2043,6 +2052,11 @@ const mailboxDelivery = new DeliveryEngine(mailbox, {
     }
   },
 });
+// Startup sweep: break stale lock files before starting delivery
+const staleBroken = mailbox.breakStaleLocks();
+if (staleBroken > 0) {
+  console.log(`[MAILBOX] Startup sweep: broke ${staleBroken} stale lock(s)`);
+}
 mailboxDelivery.start();
 
 const IDLE_THRESHOLD_SECONDS = 60;
@@ -2214,7 +2228,7 @@ wss.on('connection', (ws, req) => {
       clients: new Set([ws]),
       isClosing: false,
       outputRing: [],
-      ready: false,
+      ready: true,
           };
     sessions[sessionId] = autoSession;
     console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect`);

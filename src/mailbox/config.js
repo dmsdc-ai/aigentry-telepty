@@ -27,6 +27,10 @@ const DEFAULTS = {
   deliveryPollMs: 200,
   /** Notification coalesce window in ms. */
   notifyCoalesceMs: 25,
+  /** Lock age threshold in seconds — break locks older than this (handles PID recycling). */
+  staleLockAgeSecs: 60,
+  /** Force-break lock after this many consecutive lock timeout failures per session. */
+  lockBreakAfterFailures: 3,
 };
 
 function createConfig(overrides = {}) {

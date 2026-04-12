@@ -682,7 +682,9 @@ async function manageInteractive() {
         console.log('\x1b[1mAvailable Sessions:\x1b[0m');
         sessions.forEach(s => {
           const hostLabel = formatHostLabel(s.host);
-          console.log(`  - \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) [${s.command}] - Status: ${s.healthStatus || 'UNKNOWN'} - Clients: ${s.active_clients}`);
+          const stEmoji = s.autoState ? s.autoState.emoji : '';
+          const stLabel = s.autoState ? s.autoState.state : '';
+          console.log(`  - \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) [${s.command}] - ${s.healthStatus || 'UNKNOWN'}${stLabel ? ` ${stEmoji} ${stLabel}` : ''} - Clients: ${s.active_clients}`);
         });
       }
       console.log('\n');
@@ -858,7 +860,9 @@ async function main() {
         console.log(`  - ID: \x1b[36m${s.id}\x1b[0m`);
         console.log(`    Host: ${formatHostLabel(s.host)}`);
         console.log(`    Command: ${s.command}`);
-        console.log(`    Status: ${formatSessionHealth(s)}`);
+        const autoEmoji = s.autoState ? s.autoState.emoji : '';
+      const autoLabel = s.autoState ? s.autoState.state : '';
+      console.log(`    Status: ${formatSessionHealth(s)}${autoLabel ? ` ${autoEmoji} ${autoLabel}` : ''}`);
         console.log(`    Terminal: ${formatSessionTerminal(s)}`);
         console.log(`    CWD: ${s.cwd}`);
         console.log(`    Clients: ${s.active_clients}`);
@@ -1775,17 +1779,21 @@ async function main() {
 
       // Color-coded state display
       const stateColors = {
-        running: '\x1b[32m',       // green
-        idle: '\x1b[33m',          // yellow
-        thinking: '\x1b[36m',      // cyan
-        stuck: '\x1b[31m',         // red
-        waiting_input: '\x1b[35m', // magenta
+        starting: '\x1b[33m',      // yellow
+        idle: '\x1b[32m',          // green
+        working: '\x1b[36m',       // cyan
+        thinking: '\x1b[35m',      // magenta
+        waiting: '\x1b[33m',       // yellow
+        error: '\x1b[31m',         // red
+        restarting: '\x1b[33m',    // yellow
+        dead: '\x1b[90m',          // gray
       };
       const stateColor = stateColors[auto.state] || '\x1b[37m';
       const reset = '\x1b[0m';
 
       console.log(`\n  Session: \x1b[36m${data.session_id}${reset}`);
-      console.log(`  Auto State: ${stateColor}${auto.state || 'unknown'}${reset} (confidence: ${auto.confidence != null ? (auto.confidence * 100).toFixed(0) + '%' : '?'})`);
+      const stateEmoji = auto.emoji || '';
+      console.log(`  State: ${stateColor}${stateEmoji} ${auto.state || 'unknown'}${reset} (confidence: ${auto.confidence != null ? (auto.confidence * 100).toFixed(0) + '%' : '?'})`);
       if (auto.since) {
         const durationMs = auto.duration_ms || 0;
         const durationStr = durationMs < 60000

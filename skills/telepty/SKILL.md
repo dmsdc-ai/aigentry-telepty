@@ -1,140 +1,61 @@
 ---
 name: telepty
-description: Use telepty primarily through LLM CLI prompts and natural-language requests, with raw telepty commands as a secondary path for execution, repair, and session management.
+description: Overview of telepty — PTY multiplexer for AI session orchestration. Use this when user asks "what is telepty" or needs a getting-started guide.
 ---
 
-# telepty
+# telepty — Overview
 
-Use this skill when the user wants help operating `telepty`, recovering a broken local daemon, or managing telepty sessions through an LLM CLI prompt.
+telepty is a PTY multiplexer and session orchestrator. It creates, connects, and controls multiple AI CLI sessions (Claude, Gemini, Codex) from a single terminal.
 
-`telepty` is primarily a prompt-driven tool inside LLM CLIs. Raw `telepty ...` commands are the execution layer, not the primary user surface.
-
-## Default approach
-
-- For interactive human guidance, prefer LLM CLI prompt examples first, then the `telepty` TUI, and only then raw commands.
-- When explaining telepty usage to a user, always lead with a skill-style or natural-language example first.
-- Only show raw CLI commands after the skill-style example, as the secondary option.
-- For agent execution inside a CLI session, run the underlying `telepty` command directly.
-- When the request is about a broken or duplicated local daemon, repair the daemon before doing session work.
-
-## User-facing response order
-
-When the user asks how to do something with telepty, respond in this order:
-
-1. Show a plain-language or skill-style example first.
-2. Then show the matching CLI command.
-3. Keep maintenance commands behind the user-facing flow unless the user is clearly operating as a CLI power user.
-
-Example:
-
-- Skill-style example: "telepty에서 해당 세션에 붙어줘" 또는 "telepty에서 로컬 데몬 복구해줘"
-- CLI follow-up: `telepty attach <session_id>` 또는 `telepty cleanup-daemons`
-
-## Common actions
-
-1. Check whether the current shell is already inside a telepty session:
+## Quick Start
 
 ```bash
-echo "$TELEPTY_SESSION_ID"
-```
-
-2. Inspect active sessions:
-
-```bash
-telepty list
-```
-
-3. Attach to a room:
-
-```bash
-telepty attach <session_id>
-```
-
-4. Inject a command or prompt:
-
-```bash
-telepty inject <session_id> "<prompt text>"
-```
-
-When the same session ID exists on multiple hosts, use `session_id@host`.
-
-**Return address rule**: If you expect a reply from the target session, you MUST include your own session ID in the inject message so the recipient knows where to send the response:
-
-```bash
-telepty inject <target_session_id> "your message here. 응답은 telepty inject <your_session_id> 로 보내줘."
-```
-
-Your session ID is available via `echo $TELEPTY_SESSION_ID`.
-
-**Reliable inject pattern (2-step)**: Some CLIs (e.g. codex) do not submit on `\r` alone. For reliable delivery, use the REST API in two steps:
-
-```bash
-TOKEN=$(cat ~/.telepty/config.json | grep authToken | cut -d '"' -f 4)
-# Step 1: send content without enter
-curl -s -X POST "http://127.0.0.1:3848/api/sessions/<target_id>/inject" \
-  -H "Content-Type: application/json" -H "x-telepty-token: $TOKEN" \
-  -d '{"prompt": "<content>", "no_enter": true}'
-# Step 2: send enter separately
-curl -s -X POST "http://127.0.0.1:3848/api/sessions/<target_id>/inject" \
-  -H "Content-Type: application/json" -H "x-telepty-token: $TOKEN" \
-  -d '{"prompt": "\n"}'
-```
-
-5. Allow inject on a local CLI:
-
-```bash
-telepty allow --id <session_id> <command> [args...]
-```
-
-6. Rename a room:
-
-```bash
-telepty rename <old_id> <new_id>
-```
-
-7. Listen to the event bus:
-
-```bash
-telepty listen
-```
-
-8. Update telepty:
-
-```bash
-telepty update
-```
-
-## Local daemon recovery
-
-When the user reports any of these symptoms, repair the local daemon first:
-
-- `Failed to connect to local daemon`
-- local sessions do not appear but remote sessions do
-- duplicate or stale daemon processes
-- install/update completed but `spawn` or `allow` still fails locally
-
-### Human-facing path
-
-Tell the user to run `telepty` and choose `Repair local daemon`.
-
-### Agent execution path
-
-Use the maintenance command directly:
-
-```bash
-telepty cleanup-daemons
+# Start daemon
 telepty daemon
+
+# Create a session wrapping Claude Code
+telepty allow --id my-session claude
+
+# Send a message to the session
+telepty inject my-session "analyze the auth module"
+
+# List all sessions
+telepty list
+
+# Attach to a session interactively
+telepty attach my-session
+
+# Open TUI dashboard
+telepty tui
 ```
 
-If the daemon still does not come up, rerun the installer.
+## Core Concepts
 
-## Notes
+- **Session**: A PTY-wrapped CLI process managed by telepty (spawned or wrapped via `allow`)
+- **Daemon**: Background HTTP/WS server on port 3848 managing all sessions
+- **Inject**: Send text to a session's PTY input
+- **Allow-bridge**: Wraps an existing CLI for remote control via telepty
 
-- `TELEPTY_SESSION_ID` is only set inside telepty-managed sessions.
-- For non-interactive `telepty allow` use cases, set terminal dimensions if the environment does not provide them:
+## Environment
 
-```bash
-COLUMNS=120 LINES=40 telepty allow --id <session_id> <command>
-```
+- `TELEPTY_SESSION_ID` — set inside telepty-managed sessions; use to identify yourself
+- `TELEPTY_AVAILABLE=true` — set when running inside a telepty allow session
 
-- For interactive users, keep explanations centered on TUI actions instead of raw maintenance commands whenever possible.
+## Default Approach
+
+- For humans: prefer natural-language examples and TUI, then raw CLI commands
+- For AI agents: use raw `telepty` commands directly for execution
+- When daemon is broken: repair first with `telepty cleanup-daemons && telepty daemon`
+
+## Related Skills
+
+Each telepty feature has its own detailed skill:
+- `telepty-inject` — send messages to sessions
+- `telepty-allow` — create and manage sessions
+- `telepty-list` — discover sessions and check status
+- `telepty-attach` — attach interactively to a session
+- `telepty-broadcast` — send to multiple sessions
+- `telepty-daemon` — daemon management, repair, update
+- `telepty-rename` — rename, delete, clean sessions
+- `telepty-listen` — monitor events and read screen
+- `telepty-session` — multi-session start and layout
