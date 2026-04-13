@@ -33,13 +33,27 @@ const sessionStateManager = new SessionStateManager({
   thinking_timeout_ms:  Number(process.env.TELEPTY_STATE_THINKING_TIMEOUT_MS || 300000),
 });
 
-// Broadcast state transitions to the bus
+// Broadcast state transitions to the bus + fire auto-report on idle
 sessionStateManager.onTransition((sessionId, from, to, detail) => {
   const session = sessions[sessionId];
   if (!session) return;
   broadcastSessionEvent('session_auto_state', sessionId, session, {
     extra: { auto_state: to, auto_state_from: from, auto_detail: detail }
   });
+
+  // Auto-report: fire when session transitions to idle after inject
+  if (to === 'idle' && pendingReports[sessionId]) {
+    const pendingReport = pendingReports[sessionId];
+    delete pendingReports[sessionId];
+    const elapsed = ((Date.now() - new Date(pendingReport.injectedAt).getTime()) / 1000).toFixed(1);
+    const reportMsg = `TASK_COMPLETE: ${sessionId} is now idle after processing inject (${elapsed}s)`;
+    const srcId = resolveSessionAlias(pendingReport.source) || pendingReport.source;
+    const srcSession = sessions[srcId];
+    if (srcSession) {
+      deliverInjectionToSession(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
+      console.log(`[AUTO-REPORT] ${sessionId} → ${srcId}: idle after ${elapsed}s (via state machine)`);
+    }
+  }
 });
 
 function persistSessions() {
@@ -552,6 +566,22 @@ async function writeDataToSession(id, session, data) {
 
   session.ptyProcess.write(data);
   return { success: true };
+}
+
+/**
+ * Submit Enter to a session using terminal-level methods.
+ * Used by POST /submit endpoint for explicit terminal-level submit.
+ * Priority: kitty send-text → cmux send-key → PTY \r fallback.
+ * Returns the strategy name or null on failure.
+ */
+function terminalLevelSubmit(id, session) {
+  // Priority 1: kitty send-text (terminal-level, bypasses PTY raw mode quirks)
+  if (session.type === 'wrapped' && sendViaKitty(id, '\r')) return 'kitty';
+  // Priority 2: cmux send-key
+  if (session.backend === 'cmux' && session.cmuxWorkspaceId && submitViaCmux(id)) return 'cmux';
+  // Priority 3: PTY \r
+  if (submitViaPty(session)) return 'pty_cr';
+  return null;
 }
 
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
@@ -1300,8 +1330,11 @@ function sendViaKitty(sessionId, text) {
       });
     }
     if (hasCr) {
-      // Delay before sending Return — CLI needs time to process text input
-      execSync('sleep 0.5', { timeout: 2000 });
+      // Delay before sending Return — only when text was sent in the same call
+      // (when CR-only, text was already delivered via a different path)
+      if (textOnly.length > 0) {
+        execSync('sleep 0.5', { timeout: 2000 });
+      }
       execSync(`kitty @ --to unix:${socket} send-text --match id:${windowId} $'\\r'`, {
         timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
       });
@@ -1392,29 +1425,25 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   const retryDelayMs = Math.min(Math.max(Number(req.body?.retry_delay_ms) || 500, 100), 2000);
   const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
 
-  const strategy = 'pty_cr';
-  console.log(`[SUBMIT] Session ${id} (${session.command}) strategy: ${strategy}${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}`);
+  // Terminal-level submit: kitty → cmux → PTY fallback
+  console.log(`[SUBMIT] Session ${id} (${session.command})${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}`);
 
   // Pre-delay: wait for paste rendering to complete before sending CR
   if (preDelayMs > 0) {
     await new Promise(resolve => setTimeout(resolve, preDelayMs));
   }
 
-  function executeSubmit() {
-    return submitViaPty(session);
-  }
-
-  let success = executeSubmit();
+  let strategy = terminalLevelSubmit(id, session);
   let attempts = 1;
 
   // Retry: resend CR if paste may have absorbed the first one
-  for (let i = 0; i < retries && success; i++) {
+  for (let i = 0; i < retries && strategy; i++) {
     await new Promise(resolve => setTimeout(resolve, retryDelayMs));
-    executeSubmit();
+    terminalLevelSubmit(id, session);
     attempts++;
   }
 
-  if (success) {
+  if (strategy) {
     const busMsg = JSON.stringify({
       type: 'submit',
       sender: 'daemon',
@@ -1428,7 +1457,7 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     });
     res.json({ success: true, strategy, attempts });
   } else {
-    res.status(503).json({ error: `Submit failed via ${strategy}`, strategy, attempts });
+    res.status(503).json({ error: 'Submit failed via all strategies (kitty/cmux/pty)', strategy: 'none', attempts });
   }
 });
 
