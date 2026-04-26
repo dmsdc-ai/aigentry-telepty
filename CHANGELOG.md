@@ -2,6 +2,79 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.3.2] — 2026-04-26
+
+### Added — Layer 3 prompt-symbol render gate (spec: `docs/superpowers/specs/2026-04-26-prompt-symbol-render-gate.md`)
+
+Strictly additive layer above the 0.3.1 `sessionStateManager` gate. Closes
+the recurring "Enter not applied on freshly-spawned `claude`/`codex`" trap
+by directly observing the rendered terminal screen for a per-CLI prompt
+symbol — the only deterministic ready-signal these TUIs expose to external
+automation (no OSC 133, no exit-on-prompt, no socket signal).
+
+- **`src/prompt-symbol-registry.js`** (NEW) — per-CLI prompt-symbol catalog:
+
+  | CLI | Symbol | Codepoint | UTF-8 | Geometry sanity |
+  |---|---|---|---|---|
+  | `claude` | `❯` | U+276F | `E2 9D AF` | sandwiched between U+2500 (`─`) horizontal-rule borders |
+  | `codex` | `›` | U+203A | `E2 80 BA` | model footer (`gpt-N…`) within 2 lines below |
+  | `gemini` | `*` | U+002A | `2A` | bracketed by U+2580 (`▀`) above / U+2584 (`▄`) below |
+
+  `lookup(command)` normalizes path + args (`/usr/local/bin/claude --resume`
+  → claude entry; `codex resume` → codex entry). Unknown CLIs return `null`,
+  causing the gate to skip cleanly via `unknown_cli`.
+
+- **`src/submit-gate.js` `awaitPromptSymbol(session, opts)`** (NEW) — polls
+  `cmux read-screen --workspace <id> --lines <n>` (default 30) every
+  `pollIntervalMs` (default 150 ms) and resolves only when the symbol has
+  been stably detected for ≥ `stabilityMs` (default 200 ms). Bounded by
+  `timeoutMs` (default 8000 ms; clamp [500, 30000]). Resolves cleanly with
+  one of:
+  - `{ ready: true, last_seen_at, waited_ms }`
+  - `{ ready: false, reason: 'no_screen_primitive', waited_ms: 0 }` (non-cmux backend)
+  - `{ ready: false, reason: 'unknown_cli', waited_ms: 0 }`
+  - `{ ready: false, reason: 'no_prompt_symbol_seen', waited_ms }` (timeout, fall through)
+  Pure helper: `now`/`sleep`/`readScreen`/`registry` are all injectable for
+  deterministic tests (fakeClock harness from `verifyBodyConsumed`).
+
+- **`daemon.js` POST /submit** — Layer 3 runs immediately before Layer 1
+  on the gated path. Result threaded into success and 504 response bodies
+  as optional `prompt_symbol: { found, waited_ms, [reason], [last_seen_at] }`.
+  **Never emits its own 504** — best-effort fall-through to Layer 1, which
+  retains all existing 0.3.1 outcomes (success / `gated_dispatch_unconsumed`
+  / hard-fail). Per-request bypass via `{ "prompt_symbol_gate": false }`
+  (Layer 3 only); `force:true` and `TELEPTY_SUBMIT_GATE=off` continue to
+  bypass BOTH layers.
+
+### Tests
+
+- `test/prompt-symbol-registry.test.js` (NEW) — registry coverage with
+  inline cmux read-screen fixtures: claude/codex/gemini detect on idle
+  screens, banner-stage rejection (no border geometry), history-echo
+  disambiguation (LAST occurrence anchored), `lookup()` path/args
+  normalization + case-insensitivity + unknown/null inputs, `byteSeq`
+  matches `Buffer.from(symbol, 'utf8')`.
+- `test/submit-gate.test.js` (extended) — `awaitPromptSymbol` covers:
+  non-cmux → `no_screen_primitive`; missing workspace → same; unknown CLI
+  → `unknown_cli`; stable claude/codex screen → ready after `stabilityMs`;
+  empty `readScreen` returns → `no_prompt_symbol_seen` after `timeoutMs`;
+  symbol-then-disappear → stability streak resets; injected registry
+  override is honored; `readScreen` receives `(workspaceId, tailLines)`.
+
+### Invariants preserved
+
+- All 32 existing `test/submit-gate.test.js` tests pass unchanged.
+- `force: true` and `TELEPTY_SUBMIT_GATE=off` bypass BOTH layers.
+- Layer 1 hard-fail short-circuits (`session_dead`/`error`/`restarting`/
+  `no_state`/`no_state_manager`) still emit 504; Layer 3 never adds a new
+  504 source.
+- `inject --ref` (no `--submit`) path unchanged.
+- aterm / non-cmux backends skip Layer 3 cleanly via `no_screen_primitive`.
+- Cross-machine remote inject unchanged: Layer 3 runs only on the daemon
+  with cmux access; remote daemons fall through.
+- Response shape additive — `prompt_symbol` is an optional field; existing
+  callers ignore unknown JSON keys.
+
 ## [0.3.1] — 2026-04-26
 
 ### Fixed — submit-gate regression cluster (spec: `docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md`)

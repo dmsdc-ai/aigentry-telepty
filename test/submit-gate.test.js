@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const {
   awaitReplReady,
   verifyBodyConsumed,
+  awaitPromptSymbol,
   isReady,
   isFailed,
   READY_STATES,
@@ -331,4 +332,202 @@ test('isReady boundary: 0.5 default admits exactly conf=0.5, rejects 0.49', () =
   assert.equal(isReady({ state: 'idle', confidence: 0.5 }, 0.5), true);
   assert.equal(isReady({ state: 'idle', confidence: 0.49 }, 0.5), false);
   assert.equal(isReady({ state: 'idle', confidence: 0.6 }, 0.5), true);
+});
+
+// ---------------------------------------------------------------------------
+// 0.3.2 — Layer 3 awaitPromptSymbol (δ-fix-5)
+// See: docs/superpowers/specs/2026-04-26-prompt-symbol-render-gate.md
+// ---------------------------------------------------------------------------
+
+const STABLE_CLAUDE_SCREEN = [
+  '──────────────────',
+  '❯                 ',
+  '──────────────────',
+  '  status footer',
+].join('\n');
+
+const STABLE_CODEX_SCREEN = [
+  '',
+  ' › Explain this codebase',
+  '',
+  '  gpt-5.5 · ~/proj',
+].join('\n');
+
+function makeRegistry(entries) {
+  return {
+    lookup(cmd) {
+      if (!cmd) return null;
+      return entries[String(cmd).toLowerCase()] || null;
+    },
+  };
+}
+
+test('awaitPromptSymbol returns no_screen_primitive for non-cmux session', async () => {
+  const session = { backend: 'kitty', cmuxWorkspaceId: null, command: 'claude' };
+  const r = await awaitPromptSymbol(session, { timeoutMs: 100 });
+  assert.equal(r.ready, false);
+  assert.equal(r.reason, 'no_screen_primitive');
+  assert.equal(r.waited_ms, 0);
+});
+
+test('awaitPromptSymbol returns no_screen_primitive when cmuxWorkspaceId is missing', async () => {
+  const session = { backend: 'cmux', cmuxWorkspaceId: null, command: 'claude' };
+  const r = await awaitPromptSymbol(session, { timeoutMs: 100 });
+  assert.equal(r.reason, 'no_screen_primitive');
+});
+
+test('awaitPromptSymbol returns no_screen_primitive for null/undefined session', async () => {
+  assert.equal((await awaitPromptSymbol(null)).reason, 'no_screen_primitive');
+  assert.equal((await awaitPromptSymbol(undefined)).reason, 'no_screen_primitive');
+});
+
+test('awaitPromptSymbol returns unknown_cli for unrecognized command', async () => {
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:7', command: 'bash' };
+  const r = await awaitPromptSymbol(session, { timeoutMs: 100 });
+  assert.equal(r.ready, false);
+  assert.equal(r.reason, 'unknown_cli');
+  assert.equal(r.waited_ms, 0);
+});
+
+test('awaitPromptSymbol resolves ready after stabilityMs on stable claude screen', async () => {
+  const clock = makeFakeClock();
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:9', command: 'claude' };
+  const promise = awaitPromptSymbol(session, {
+    timeoutMs: 5000,
+    pollIntervalMs: 50,
+    stabilityMs: 100,
+    readScreen: () => STABLE_CLAUDE_SCREEN,
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  // First poll: lastSeenAt set to now=start. Sleep 50.
+  await clock.advance(50);
+  // Second poll: now-lastSeen = 50 < 100. Sleep 50.
+  await clock.advance(50);
+  // Third poll: now-lastSeen = 100 ≥ 100 → ready.
+  await clock.advance(50);
+  const r = await promise;
+  assert.equal(r.ready, true);
+  assert.equal(typeof r.last_seen_at, 'number');
+  assert.ok(r.waited_ms >= 100, `waited_ms ${r.waited_ms} should be ≥ 100`);
+});
+
+test('awaitPromptSymbol resolves ready for codex session', async () => {
+  const clock = makeFakeClock();
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:22', command: 'codex' };
+  const promise = awaitPromptSymbol(session, {
+    timeoutMs: 5000,
+    pollIntervalMs: 50,
+    stabilityMs: 100,
+    readScreen: () => STABLE_CODEX_SCREEN,
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  await clock.advance(50);
+  await clock.advance(50);
+  await clock.advance(50);
+  const r = await promise;
+  assert.equal(r.ready, true);
+});
+
+test('awaitPromptSymbol times out with no_prompt_symbol_seen when readScreen returns ""', async () => {
+  const clock = makeFakeClock();
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:9', command: 'claude' };
+  const promise = awaitPromptSymbol(session, {
+    timeoutMs: 100,
+    pollIntervalMs: 30,
+    stabilityMs: 50,
+    readScreen: () => '',
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  await clock.advance(30);
+  await clock.advance(30);
+  await clock.advance(50); // exceed timeout
+  const r = await promise;
+  assert.equal(r.ready, false);
+  assert.equal(r.reason, 'no_prompt_symbol_seen');
+  assert.ok(r.waited_ms >= 100, `waited_ms ${r.waited_ms} should be ≥ timeoutMs`);
+});
+
+test('awaitPromptSymbol times out when symbol disappears mid-stability (streak reset)', async () => {
+  const clock = makeFakeClock();
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:9', command: 'claude' };
+  let pollCount = 0;
+  const promise = awaitPromptSymbol(session, {
+    timeoutMs: 200,
+    pollIntervalMs: 30,
+    stabilityMs: 100,
+    // poll 1: symbol present → lastSeen set
+    // poll 2: symbol gone   → lastSeen reset
+    // poll 3+: symbol gone  → never recovers, eventually times out
+    readScreen: () => {
+      pollCount++;
+      return pollCount === 1 ? STABLE_CLAUDE_SCREEN : 'just\nnoise\nhere\n';
+    },
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  await clock.advance(30);
+  await clock.advance(30);
+  await clock.advance(30);
+  await clock.advance(30);
+  await clock.advance(30);
+  await clock.advance(60); // exceed timeout
+  const r = await promise;
+  assert.equal(r.ready, false);
+  assert.equal(r.reason, 'no_prompt_symbol_seen');
+});
+
+test('awaitPromptSymbol honors injected registry override', async () => {
+  const clock = makeFakeClock();
+  let detectCalls = 0;
+  const fakeRegistry = makeRegistry({
+    claude: {
+      symbol: '❯',
+      detect() {
+        detectCalls++;
+        return { found: true, line_index: 0, col: 1 };
+      },
+    },
+  });
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:9', command: 'claude' };
+  const promise = awaitPromptSymbol(session, {
+    timeoutMs: 5000,
+    pollIntervalMs: 50,
+    stabilityMs: 100,
+    readScreen: () => 'any non-empty string',
+    registry: fakeRegistry,
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  await clock.advance(50);
+  await clock.advance(50);
+  await clock.advance(50);
+  const r = await promise;
+  assert.equal(r.ready, true);
+  assert.ok(detectCalls >= 2, `expected detect to be called at least twice, got ${detectCalls}`);
+});
+
+test('awaitPromptSymbol passes workspaceId and tailLines into readScreen', async () => {
+  const calls = [];
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:42', command: 'claude' };
+  const clock = makeFakeClock();
+  const promise = awaitPromptSymbol(session, {
+    timeoutMs: 50,
+    pollIntervalMs: 30,
+    stabilityMs: 200,
+    tailLines: 25,
+    readScreen: (ws, n) => {
+      calls.push([ws, n]);
+      return ''; // never finds symbol → eventual timeout
+    },
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  await clock.advance(30);
+  await clock.advance(30);
+  await promise;
+  assert.ok(calls.length >= 1);
+  assert.deepEqual(calls[0], ['workspace:42', 25]);
 });

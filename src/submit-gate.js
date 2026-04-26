@@ -183,9 +183,85 @@ function readTail(session, maxBytes) {
   return parts.join('');
 }
 
+/**
+ * Layer 3 (0.3.2+): poll the rendered terminal screen via `cmux read-screen`
+ * for the per-CLI prompt symbol and resolve only when the symbol has been
+ * stably rendered for ≥ stabilityMs. Layered ABOVE awaitReplReady — strictly
+ * additive: skips cleanly on non-cmux backends and unknown CLIs.
+ *
+ * Resolution shape:
+ *   - { ready: true,  last_seen_at, waited_ms }
+ *   - { ready: false, reason: 'no_screen_primitive', waited_ms: 0 }   // skip
+ *   - { ready: false, reason: 'unknown_cli',         waited_ms: 0 }   // skip
+ *   - { ready: false, reason: 'no_prompt_symbol_seen', waited_ms }    // best-effort fall-through
+ *
+ * @param {{ backend?: string, cmuxWorkspaceId?: string|null, command?: string }} session
+ * @param {{ timeoutMs?: number, pollIntervalMs?: number, stabilityMs?: number, tailLines?: number, readScreen?: Function, registry?: { lookup: Function }, now?: Function, sleep?: Function }} [opts]
+ * @returns {Promise<{ ready: boolean, waited_ms: number, last_seen_at?: number, reason?: string }>}
+ */
+async function awaitPromptSymbol(session, opts = {}) {
+  const timeoutMs      = Number.isFinite(opts.timeoutMs)      ? opts.timeoutMs      : 8000;
+  const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) ? opts.pollIntervalMs : 150;
+  const stabilityMs    = Number.isFinite(opts.stabilityMs)    ? opts.stabilityMs    : 200;
+  const tailLines      = Number.isFinite(opts.tailLines)      ? opts.tailLines      : 30;
+  const readScreen     = typeof opts.readScreen === 'function' ? opts.readScreen : defaultReadScreen;
+  const registry       = opts.registry || require('./prompt-symbol-registry');
+  const now            = typeof opts.now   === 'function' ? opts.now   : () => Date.now();
+  const sleep          = typeof opts.sleep === 'function' ? opts.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+
+  if (!session || session.backend !== 'cmux' || !session.cmuxWorkspaceId) {
+    return { ready: false, reason: 'no_screen_primitive', waited_ms: 0 };
+  }
+  const entry = registry.lookup(session.command);
+  if (!entry) {
+    return { ready: false, reason: 'unknown_cli', waited_ms: 0 };
+  }
+
+  const start = now();
+  let lastSeenAt = null;
+  while (true) {
+    const screen = readScreen(session.cmuxWorkspaceId, tailLines);
+    if (screen) {
+      const match = entry.detect(screen);
+      if (match && match.found) {
+        if (lastSeenAt === null) {
+          lastSeenAt = now();
+        } else if (now() - lastSeenAt >= stabilityMs) {
+          return { ready: true, last_seen_at: lastSeenAt, waited_ms: now() - start };
+        }
+      } else {
+        // symbol disappeared — reset the stability streak
+        lastSeenAt = null;
+      }
+    }
+    if (now() - start >= timeoutMs) {
+      return { ready: false, reason: 'no_prompt_symbol_seen', waited_ms: now() - start };
+    }
+    await sleep(pollIntervalMs);
+  }
+}
+
+function defaultReadScreen(workspaceId, lines) {
+  const { execSync } = require('child_process');
+  try {
+    const out = execSync(
+      `cmux read-screen --workspace ${workspaceId} --lines ${lines}`,
+      { timeout: 1000, stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 1 << 20 }
+    );
+    return out.toString('utf8');
+  } catch (_err) {
+    // cmux missing, workspace closed, permission denied — skip silently and
+    // let the caller decide (typically: poll again until timeout, then fall
+    // through to Layer 1).
+    return '';
+  }
+}
+
 module.exports = {
   awaitReplReady,
   verifyBodyConsumed,
+  awaitPromptSymbol,
+  defaultReadScreen,
   isReady,
   isFailed,
   READY_STATES,

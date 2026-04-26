@@ -1579,6 +1579,36 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
 
   // ── Gated path (default, 0.3.0+; best-effort dispatch on timeout in 0.3.1+) ──
 
+  // Step 0 (Layer 3, 0.3.2+): prompt-symbol render gate — strictly additive.
+  // Polls `cmux read-screen` for the per-CLI prompt symbol and resolves only
+  // when the symbol is stably rendered. Skips cleanly on non-cmux backends
+  // (`no_screen_primitive`) and unknown CLIs (`unknown_cli`); on
+  // `no_prompt_symbol_seen` (timeout) falls through to Layer 1 — never emits
+  // its own 504. Per-request opt-out via `prompt_symbol_gate: false`.
+  // See: docs/superpowers/specs/2026-04-26-prompt-symbol-render-gate.md
+  const promptSymbolGate = req.body?.prompt_symbol_gate !== false;
+  const promptSymbolTimeoutMs = Math.min(
+    Math.max(Number(req.body?.prompt_symbol_timeout_ms) || 8000, 500),
+    30000
+  );
+  let promptSymbol = null;
+  if (promptSymbolGate) {
+    const psResult = await submitGate.awaitPromptSymbol(session, {
+      timeoutMs: promptSymbolTimeoutMs,
+    });
+    promptSymbol = {
+      found: !!psResult.ready,
+      waited_ms: psResult.waited_ms || 0,
+      ...(psResult.reason ? { reason: psResult.reason } : {}),
+      ...(psResult.last_seen_at != null ? { last_seen_at: psResult.last_seen_at } : {}),
+    };
+    if (psResult.reason === 'no_prompt_symbol_seen') {
+      console.log(`[SUBMIT] Layer 3 timeout for ${id} after ${psResult.waited_ms}ms — falling through to Layer 1`);
+    } else if (psResult.ready) {
+      console.log(`[SUBMIT] Layer 3 ready for ${id} after ${psResult.waited_ms}ms`);
+    }
+  }
+
   // Step 1: wait for REPL readiness — best-effort, proceed on plain `timeout`.
   // Hard-fail reasons (session_dead/error/restarting/no_state/no_state_manager)
   // still short-circuit to 504 because dispatching to a dead/missing PTY is
@@ -1598,6 +1628,7 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
       attempts: 0,
       gated: true,
       gate_wait_ms: gateResult.waited_ms,
+      ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
     });
   }
   if (gatedDispatchAfterTimeout) {
@@ -1614,6 +1645,7 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
       attempts: 0,
       gated: true,
       gate_wait_ms: gateResult.waited_ms,
+      ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
     });
   }
 
@@ -1653,6 +1685,7 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
         gate_wait_ms: gateResult.waited_ms,
         verify,
         gated_dispatch_after_timeout: true,
+        ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
       };
       emitSubmitBus(failBody);
       return res.status(504).json(failBody);
@@ -1667,6 +1700,7 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     gate_wait_ms: gateResult.waited_ms,
     verify,
     ...(gatedDispatchAfterTimeout ? { gated_dispatch_after_timeout: true } : {}),
+    ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
   };
   emitSubmitBus(responseBody);
   return res.json(responseBody);
