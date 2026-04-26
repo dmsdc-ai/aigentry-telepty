@@ -1638,18 +1638,37 @@ async function main() {
       const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
       console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'.${refSuffix}`);
 
-      // Terminal-level submit: POST /submit after text injection
+      // Terminal-level submit: POST /submit after text injection.
+      // Daemon-side render-gate handles timing (waits for REPL readiness),
+      // so the CLI no longer needs the legacy 500ms blind sleep. Pass the
+      // injected body so the daemon can verify it was consumed by the input
+      // box and bounded-retry once if not.
+      // See docs/superpowers/specs/2026-04-26-inject-submit-enter-reliability.md
       if (useSubmit) {
-        await new Promise(resolve => setTimeout(resolve, 500));
         try {
           const submitRes = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pre_delay_ms: 600, retries: 2, retry_delay_ms: 500 })
+            body: JSON.stringify({
+              injected_body: injectPrompt || '',
+              retries: 1,
+              retry_delay_ms: 500,
+            })
           });
           const submitData = await submitRes.json();
           if (submitRes.ok) {
-            console.log(`✅ Submitted via ${submitData.strategy}${submitData.attempts > 1 ? ` (${submitData.attempts} attempts)` : ''}.`);
+            const gateNote = submitData.gated && submitData.gate_wait_ms > 0
+              ? ` [gate ${submitData.gate_wait_ms}ms]`
+              : '';
+            const attemptsNote = submitData.attempts > 1 ? ` (${submitData.attempts} attempts)` : '';
+            console.log(`✅ Submitted via ${submitData.strategy}${attemptsNote}${gateNote}.`);
+          } else if (submitRes.status === 504) {
+            // Soft failure: REPL never readied. Orchestrator scripts depend on
+            // exit 0 here — surface a clear remediation hint but do not exit
+            // non-zero.
+            const reason = submitData.reason || 'gate_timeout';
+            const lastState = submitData.last_state || 'unknown';
+            console.log(`⚠️  Submit gated-timeout (${reason}, last_state=${lastState}). Manual \`telepty send-key ${target.id} enter\` may be needed.`);
           } else {
             console.error(`⚠️  Submit failed: ${formatApiError(submitData)}`);
           }

@@ -12,7 +12,9 @@ const terminalBackend = require('./terminal-backend');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
-const { SessionStateManager, STATE_DISPLAY } = require('./session-state');
+const { SessionStateManager, STATE_DISPLAY, stripAnsi: stripAnsiState } = require('./session-state');
+const { classifyReportPrompt, buildAutoSummary } = require('./src/report-enforcement');
+const submitGate = require('./src/submit-gate');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -33,7 +35,23 @@ const sessionStateManager = new SessionStateManager({
   thinking_timeout_ms:  Number(process.env.TELEPTY_STATE_THINKING_TIMEOUT_MS || 300000),
 });
 
-// Broadcast state transitions to the bus + fire auto-report on idle
+// Report enforcement config (0.2.0) — see specs/enforce-report-spec.md
+const REPORT_AUTO_SUMMARY_ON_QUERY = (process.env.DELIBERATION_REPORT_AUTO_SUMMARY_ON_QUERY || 'true').toLowerCase() !== 'false';
+const REPORT_AUTO_SUMMARY_LINES = Math.max(1, Number(process.env.DELIBERATION_REPORT_AUTO_SUMMARY_LINES || 40));
+const REPORT_AUTO_SUMMARY_MAX_BYTES = Math.max(256, Number(process.env.DELIBERATION_REPORT_AUTO_SUMMARY_MAX_BYTES || 4096));
+if (process.env.reportTimeoutSecs) {
+  console.warn('[CONFIG] reportTimeoutSecs is deprecated (removed in 0.2.0) — ignored');
+}
+
+// Wrap buildAutoSummary with daemon config defaults
+function buildAutoSummaryWithDefaults(session) {
+  return buildAutoSummary(session, {
+    maxLines: REPORT_AUTO_SUMMARY_LINES,
+    maxBytes: REPORT_AUTO_SUMMARY_MAX_BYTES
+  });
+}
+
+// Broadcast state transitions to the bus + fire enforcement events on idle/dead
 sessionStateManager.onTransition((sessionId, from, to, detail) => {
   const session = sessions[sessionId];
   if (!session) return;
@@ -41,18 +59,59 @@ sessionStateManager.onTransition((sessionId, from, to, detail) => {
     extra: { auto_state: to, auto_state_from: from, auto_detail: detail }
   });
 
-  // Auto-report: fire when session transitions to idle after inject
+  // Fire TASK_IDLE_NO_REPORT on idle transition (for sessions with pendingReports).
+  // Session still needs to self-inject a content REPORT — this event only observes.
+  // Legacy TASK_COMPLETE text-inject is also fired for back-compat (0.2.x grandfather).
   if (to === 'idle' && pendingReports[sessionId]) {
     const pendingReport = pendingReports[sessionId];
-    delete pendingReports[sessionId];
+    // Mark as idle-notified (but keep the entry — REPORT is still pending).
+    // Entry is cleared when REPORT arrives (via inject endpoint) OR session dies.
+    if (pendingReport.idleNotified) return; // only fire once
+    pendingReport.idleNotified = true;
+    pendingReport.idleAt = new Date().toISOString();
+
     const elapsed = ((Date.now() - new Date(pendingReport.injectedAt).getTime()) / 1000).toFixed(1);
+
+    // New bus event: TASK_IDLE_NO_REPORT (richer observability)
+    broadcastSessionEvent('TASK_IDLE_NO_REPORT', sessionId, session, {
+      extra: {
+        source: pendingReport.source,
+        inject_id: pendingReport.injectId,
+        elapsed_secs: Number(elapsed),
+        injected_at: pendingReport.injectedAt
+      }
+    });
+    console.log(`[ENFORCE-REPORT] ${sessionId} idle after ${elapsed}s — awaiting REPORT from ${pendingReport.source}`);
+
+    // Legacy text-inject for back-compat (grandfather period 0.2.x)
     const reportMsg = `TASK_COMPLETE: ${sessionId} is now idle after processing inject (${elapsed}s)`;
     const srcId = resolveSessionAlias(pendingReport.source) || pendingReport.source;
     const srcSession = sessions[srcId];
     if (srcSession) {
       deliverInjectionToSession(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
-      console.log(`[AUTO-REPORT] ${sessionId} → ${srcId}: idle after ${elapsed}s (via state machine)`);
+      console.log(`[AUTO-REPORT] ${sessionId} → ${srcId}: idle after ${elapsed}s (legacy text-inject)`);
     }
+  }
+
+  // Fire TASK_DEAD_NO_REPORT when session dies with a pending report
+  if (to === 'dead' && pendingReports[sessionId]) {
+    const pendingReport = pendingReports[sessionId];
+    delete pendingReports[sessionId];
+
+    const autoSummary = buildAutoSummaryWithDefaults(session);
+    const elapsed = ((Date.now() - new Date(pendingReport.injectedAt).getTime()) / 1000).toFixed(1);
+
+    broadcastSessionEvent('TASK_DEAD_NO_REPORT', sessionId, session, {
+      extra: {
+        source: pendingReport.source,
+        inject_id: pendingReport.injectId,
+        elapsed_secs: Number(elapsed),
+        injected_at: pendingReport.injectedAt,
+        auto_summary: autoSummary,
+        exit_detail: detail
+      }
+    });
+    console.log(`[ENFORCE-REPORT] ${sessionId} died before REPORT after ${elapsed}s — auto_summary attached`);
   }
 });
 
@@ -1413,7 +1472,28 @@ function submitViaCmux(sessionId) {
   }
 }
 
-// POST /api/sessions/:id/submit — CLI-aware submit
+// POST /api/sessions/:id/submit — render-gated CLI-aware submit
+//
+// Default behavior (0.3.0+): wait for the target REPL to be ready (sessionStateManager
+// reports `idle`/`waiting` with confidence ≥ 0.85) before firing Enter. When the
+// caller passes `injected_body`, also verify the body has been consumed (i.e.
+// disappeared from the input box) by polling the session output ring; if still
+// visible, perform one bounded retry.
+//
+// Why HTTP 504 (not 503 or 408)?
+//   - 503 already used by this endpoint to mean "all dispatch strategies failed"
+//     (kitty/cmux/PTY couldn't even fire Enter). Reusing 503 would conflate
+//     "we never attempted" with "we attempted and failed".
+//   - 408 (Request Timeout) describes a timeout on the *request itself*; here
+//     the request was processed in time, but the *upstream* (target REPL) did
+//     not become ready. 504 (Gateway Timeout) precisely describes "we acted as
+//     a gateway/proxy to the REPL, and the upstream did not respond in time".
+//   - This is an additive change to existing endpoint semantics — minor bump.
+//
+// Legacy (blind retry) path is preserved as an escape hatch via the
+// TELEPTY_SUBMIT_GATE=off env var, for parity testing and rollback.
+//
+// See: docs/superpowers/specs/2026-04-26-inject-submit-enter-reliability.md
 app.post('/api/sessions/:id/submit', async (req, res) => {
   const requestedId = req.params.id;
   const resolvedId = resolveSessionAlias(requestedId);
@@ -1424,41 +1504,123 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   const retries = Math.min(Math.max(Number(req.body?.retries) || 0, 0), 3);
   const retryDelayMs = Math.min(Math.max(Number(req.body?.retry_delay_ms) || 500, 100), 2000);
   const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
+  const gateTimeoutMs = Math.min(Math.max(Number(req.body?.gate_timeout_ms) || 5000, 500), 15000);
+  const verifyTimeoutMs = Math.min(Math.max(Number(req.body?.verify_timeout_ms) || 1500, 200), 5000);
+  const injectedBody = typeof req.body?.injected_body === 'string' ? req.body.injected_body : null;
 
-  // Terminal-level submit: kitty → cmux → PTY fallback
-  console.log(`[SUBMIT] Session ${id} (${session.command})${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}`);
+  const gateOff = String(process.env.TELEPTY_SUBMIT_GATE || '').toLowerCase() === 'off';
 
-  // Pre-delay: wait for paste rendering to complete before sending CR
-  if (preDelayMs > 0) {
-    await new Promise(resolve => setTimeout(resolve, preDelayMs));
-  }
+  console.log(`[SUBMIT] Session ${id} (${session.command})${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}${gateOff ? ' [gate=off]' : ''}`);
 
-  let strategy = terminalLevelSubmit(id, session);
-  let attempts = 1;
-
-  // Retry: resend CR if paste may have absorbed the first one
-  for (let i = 0; i < retries && strategy; i++) {
-    await new Promise(resolve => setTimeout(resolve, retryDelayMs));
-    terminalLevelSubmit(id, session);
-    attempts++;
-  }
-
-  if (strategy) {
+  function emitSubmitBus(payload) {
     const busMsg = JSON.stringify({
       type: 'submit',
       sender: 'daemon',
       session_id: id,
-      strategy,
-      attempts,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      ...payload,
     });
     busClients.forEach(client => {
       if (client.readyState === 1) client.send(busMsg);
     });
-    res.json({ success: true, strategy, attempts });
-  } else {
-    res.status(503).json({ error: 'Submit failed via all strategies (kitty/cmux/pty)', strategy: 'none', attempts });
   }
+
+  // ── Legacy escape-hatch path: blind pre-delay + retries (0.2.x behavior) ──
+  if (gateOff) {
+    if (preDelayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, preDelayMs));
+    }
+    let legacyStrategy = terminalLevelSubmit(id, session);
+    let legacyAttempts = legacyStrategy ? 1 : 0;
+    for (let i = 0; i < retries && legacyStrategy; i++) {
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      terminalLevelSubmit(id, session);
+      legacyAttempts++;
+    }
+    if (legacyStrategy) {
+      emitSubmitBus({ strategy: legacyStrategy, attempts: legacyAttempts, gated: false });
+      return res.json({ success: true, strategy: legacyStrategy, attempts: legacyAttempts, gated: false });
+    }
+    return res.status(503).json({
+      error: 'Submit failed via all strategies (kitty/cmux/pty)',
+      strategy: 'none',
+      attempts: legacyAttempts,
+      gated: false,
+    });
+  }
+
+  // ── Gated path (default, 0.3.0+) ──
+
+  // Step 1: wait for REPL readiness via session state machine.
+  const gateResult = await submitGate.awaitReplReady(id, sessionStateManager, {
+    timeoutMs: gateTimeoutMs,
+  });
+  if (!gateResult.ready) {
+    console.log(`[SUBMIT] gate_timeout ${id}: ${gateResult.reason} (waited ${gateResult.waited_ms}ms, last_state=${gateResult.last_state})`);
+    return res.status(504).json({
+      error: 'Submit gated-timeout — target REPL never readied for input',
+      reason: gateResult.reason,
+      last_state: gateResult.last_state,
+      strategy: 'none',
+      attempts: 0,
+      gated: true,
+      gate_wait_ms: gateResult.waited_ms,
+    });
+  }
+
+  // Step 2: dispatch Enter via existing kitty → cmux → PTY chain.
+  let strategy = terminalLevelSubmit(id, session);
+  let attempts = strategy ? 1 : 0;
+  if (!strategy) {
+    return res.status(503).json({
+      error: 'Submit failed via all strategies (kitty/cmux/pty)',
+      strategy: 'none',
+      attempts: 0,
+      gated: true,
+      gate_wait_ms: gateResult.waited_ms,
+    });
+  }
+
+  // Step 3: verify body consumption (only when the caller provided the body).
+  // Without `injected_body`, this is a bare Enter press (`telepty enter` or
+  // `telepty send-key`) — there is nothing to verify and one shot is enough.
+  let verify = null;
+  if (injectedBody && injectedBody.length > 0) {
+    verify = await submitGate.verifyBodyConsumed(session, injectedBody, {
+      timeoutMs: verifyTimeoutMs,
+      stripAnsi: stripAnsiState,
+    });
+    if (!verify.consumed) {
+      // Bounded retry: one more dispatch + one more verify.
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      const retryStrategy = terminalLevelSubmit(id, session);
+      if (retryStrategy) {
+        strategy = retryStrategy;
+        attempts++;
+        verify = await submitGate.verifyBodyConsumed(session, injectedBody, {
+          timeoutMs: verifyTimeoutMs,
+          stripAnsi: stripAnsiState,
+        });
+      }
+    }
+  }
+
+  emitSubmitBus({
+    strategy,
+    attempts,
+    gated: true,
+    gate_wait_ms: gateResult.waited_ms,
+    verify,
+  });
+
+  return res.json({
+    success: true,
+    strategy,
+    attempts,
+    gated: true,
+    gate_wait_ms: gateResult.waited_ms,
+    verify,
+  });
 });
 
 // POST /api/sessions/submit-all — Submit all active sessions
@@ -1544,9 +1706,57 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       }
     });
 
-    // Auto-report: track pending inject for idle notification back to source
+    // Reverse-match for REPORT detection:
+    // If this inject is FROM a session with a pending report whose source is
+    // the current recipient, and the prompt matches a REPORT prefix, then
+    // this is a content REPORT satisfying enforcement for the sender.
     if (from) {
-      pendingReports[id] = { source: from, injectedAt: injectTimestamp, injectId: inject_id };
+      const senderAlias = resolveSessionAlias(from) || from;
+      const senderPending = pendingReports[senderAlias];
+      const recipientAlias = resolveSessionAlias(id) || id;
+      if (senderPending) {
+        const pendingSourceAlias = resolveSessionAlias(senderPending.source) || senderPending.source;
+        if (pendingSourceAlias === recipientAlias) {
+          const classification = classifyReportPrompt(prompt);
+          if (classification) {
+            delete pendingReports[senderAlias];
+            const elapsedSecs = Number(((Date.now() - new Date(senderPending.injectedAt).getTime()) / 1000).toFixed(1));
+            const senderSession = sessions[senderAlias];
+            const eventType =
+              classification === 'report_blocked' ? 'TASK_BLOCKED_WITH_REASON' :
+              classification === 'report_dismissed' ? 'TASK_DISMISSED' :
+              classification === 'report_error' ? 'TASK_COMPLETE_WITH_REPORT' :
+              'TASK_COMPLETE_WITH_REPORT';
+            broadcastSessionEvent(eventType, senderAlias, senderSession, {
+              extra: {
+                source: senderPending.source,
+                inject_id: senderPending.injectId,
+                report_inject_id: inject_id,
+                elapsed_secs: elapsedSecs,
+                injected_at: senderPending.injectedAt,
+                report_status: classification,
+                report_summary: prompt.slice(0, 500)
+              }
+            });
+            console.log(`[ENFORCE-REPORT] ${eventType} from ${senderAlias} → ${recipientAlias} (${classification}, ${elapsedSecs}s)`);
+          }
+        }
+      }
+    }
+
+    // Auto-report: track pending inject for idle notification back to source.
+    // Overwrite warning: if an entry already exists, log for observability.
+    if (from) {
+      if (pendingReports[id]) {
+        console.warn(`[AUTO-REPORT] overwritten pending report for ${id} (previous source: ${pendingReports[id].source}, new source: ${from})`);
+      }
+      pendingReports[id] = {
+        source: from,
+        injectedAt: injectTimestamp,
+        injectId: inject_id,
+        awaitingReport: true,
+        idleNotified: false
+      };
     }
 
     // Notify all attached viewers (telepty attach clients) about the inject
@@ -1593,6 +1803,50 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
     emitInjectFailureEvent(id, 'DELIVERY_FAILED', err.message, { inject_id }, session);
     res.status(500).json(buildErrorBody('DELIVERY_FAILED', err.message));
   }
+});
+
+// GET /api/pendingReports/:id — inspect pending report entry + optional auto_summary
+app.get('/api/pendingReports/:id', (req, res) => {
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId) || requestedId;
+  const entry = pendingReports[resolvedId];
+  if (!entry) {
+    return res.status(404).json({ error: 'No pending report', requested: requestedId });
+  }
+  const session = sessions[resolvedId];
+  const autoSummary = REPORT_AUTO_SUMMARY_ON_QUERY && session ? buildAutoSummaryWithDefaults(session) : null;
+  res.json({
+    session_id: resolvedId,
+    source: entry.source,
+    inject_id: entry.injectId,
+    injected_at: entry.injectedAt,
+    idle_notified: !!entry.idleNotified,
+    idle_at: entry.idleAt || null,
+    awaiting_report: !!entry.awaitingReport,
+    auto_summary: autoSummary
+  });
+});
+
+// DELETE /api/pendingReports/:id — orchestrator-side dismissal
+app.delete('/api/pendingReports/:id', (req, res) => {
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId) || requestedId;
+  const entry = pendingReports[resolvedId];
+  if (!entry) {
+    return res.status(404).json({ error: 'No pending report', requested: requestedId });
+  }
+  delete pendingReports[resolvedId];
+  const session = sessions[resolvedId];
+  broadcastSessionEvent('TASK_DISMISSED', resolvedId, session, {
+    extra: {
+      source: entry.source,
+      inject_id: entry.injectId,
+      dismissed_by: 'orchestrator',
+      injected_at: entry.injectedAt
+    }
+  });
+  console.log(`[ENFORCE-REPORT] ${resolvedId} pending report dismissed by orchestrator`);
+  res.json({ success: true, session_id: resolvedId });
 });
 
 // GET /api/sessions/:id/screen — read current screen buffer
@@ -2130,11 +2384,22 @@ setInterval(() => {
       });
       console.log(`[IDLE] Session ${id} idle for ${idleSeconds}s`);
     }
-    // Auto-report for non-wrapped sessions: use idle threshold
+    // Auto-report fallback for non-wrapped sessions (legacy threshold path).
+    // Skip if onTransition already fired the idle notification.
     const pendingRpt = pendingReports[id];
-    if (pendingRpt && session.type !== 'wrapped' && idleSeconds !== null && idleSeconds >= AUTO_REPORT_IDLE_SECONDS) {
-      delete pendingReports[id];
+    if (pendingRpt && !pendingRpt.idleNotified && session.type !== 'wrapped' && idleSeconds !== null && idleSeconds >= AUTO_REPORT_IDLE_SECONDS) {
+      pendingRpt.idleNotified = true;
+      pendingRpt.idleAt = new Date().toISOString();
       const elapsed = ((Date.now() - new Date(pendingRpt.injectedAt).getTime()) / 1000).toFixed(1);
+      // Fire new bus event + legacy text-inject
+      broadcastSessionEvent('TASK_IDLE_NO_REPORT', id, session, {
+        extra: {
+          source: pendingRpt.source,
+          inject_id: pendingRpt.injectId,
+          elapsed_secs: Number(elapsed),
+          injected_at: pendingRpt.injectedAt
+        }
+      });
       const reportMsg = `TASK_COMPLETE: ${id} is now idle after processing inject (${elapsed}s)`;
       const srcId = resolveSessionAlias(pendingRpt.source) || pendingRpt.source;
       const srcSession = sessions[srcId];
@@ -2330,16 +2595,28 @@ wss.on('connection', (ws, req) => {
               if (client.readyState === 1) client.send(readyMsg);
             });
             // Auto-report: notify source that target completed inject task
+            // Legacy ready-signal auto-report path. Skip if onTransition already
+            // fired (pendingReports[sessionId].idleNotified === true).
             const pendingReport = pendingReports[sessionId];
-            if (pendingReport) {
-              delete pendingReports[sessionId];
+            if (pendingReport && !pendingReport.idleNotified) {
+              pendingReport.idleNotified = true;
+              pendingReport.idleAt = new Date().toISOString();
               const elapsed = ((Date.now() - new Date(pendingReport.injectedAt).getTime()) / 1000).toFixed(1);
+              // Fire new bus event + legacy text-inject
+              broadcastSessionEvent('TASK_IDLE_NO_REPORT', sessionId, activeSession, {
+                extra: {
+                  source: pendingReport.source,
+                  inject_id: pendingReport.injectId,
+                  elapsed_secs: Number(elapsed),
+                  injected_at: pendingReport.injectedAt
+                }
+              });
               const reportMsg = `TASK_COMPLETE: ${sessionId} is now idle after processing inject (${elapsed}s)`;
               const srcId = resolveSessionAlias(pendingReport.source) || pendingReport.source;
               const srcSession = sessions[srcId];
               if (srcSession) {
                 deliverInjectionToSession(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
-                console.log(`[AUTO-REPORT] ${sessionId} → ${srcId}: idle after ${elapsed}s`);
+                console.log(`[AUTO-REPORT] ${sessionId} → ${srcId}: idle after ${elapsed}s (ready signal)`);
               }
             }
           }
