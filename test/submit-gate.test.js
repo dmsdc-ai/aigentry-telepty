@@ -182,11 +182,15 @@ test('awaitReplReady resolves to fail when transitioning to dead mid-wait', asyn
   assert.equal(result.reason, 'session_dead');
 });
 
-test('awaitReplReady rejects ready transition with low confidence and falls through to timeout', async () => {
+test('awaitReplReady rejects ready transition with below-threshold confidence and falls through to timeout', async () => {
+  // Semantic preserved from 0.3.0: when an explicit threshold is given, an
+  // idle transition with confidence strictly below it must NOT settle.
+  // Literals shifted because the 0.3.1 default is 0.5 (not 0.85), so testing
+  // against {0.85, 0.6} would conflate threshold semantics with the new
+  // default. Here threshold=0.7 + conf=0.5 cleanly isolates the rejection.
   const sm = makeStateManager({ s1: { state: 'working', confidence: 0.9 } });
-  const promise = awaitReplReady('s1', sm, { timeoutMs: 80, minConfidence: 0.85 });
-  // idle but with low confidence — should NOT settle.
-  setImmediate(() => sm.setState('s1', 'idle', 0.6));
+  const promise = awaitReplReady('s1', sm, { timeoutMs: 80, minConfidence: 0.7 });
+  setImmediate(() => sm.setState('s1', 'idle', 0.5));
   const result = await promise;
   assert.equal(result.ready, false);
   assert.equal(result.reason, 'timeout');
@@ -279,4 +283,52 @@ test('verifyBodyConsumed honors injectable now/sleep for deterministic timing (i
   assert.equal(result.consumed, false);
   assert.equal(result.reason, 'still_visible');
   assert.ok(result.waited_ms >= 100);
+});
+
+// ---------------------------------------------------------------------------
+// 0.3.1 — threshold relaxation (δ-fix-3 / Fix 2 in v2 spec)
+// session-state.js:380 emits IDLE conf=0.6 in the silence-fallback case.
+// Default minConfidence is now 0.5 so that the dominant fresh-spawn IDLE
+// (no OSC 133, no PROMPT_PATTERNS match) is admitted.
+// See: docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md §3.2
+// ---------------------------------------------------------------------------
+
+test('awaitReplReady default threshold (0.5) admits silence-fallback IDLE conf=0.6', async () => {
+  // The pre-fix failure case: state='idle', confidence=0.6 → 0.85 default
+  // rejected → gate timed out. Now default 0.5 admits it immediately.
+  const sm = makeStateManager({ s1: { state: 'idle', confidence: 0.6 } });
+  const result = await awaitReplReady('s1', sm, { timeoutMs: 200 });
+  assert.equal(result.ready, true);
+  assert.equal(result.last_state, 'idle');
+  assert.equal(result.waited_ms, 0);
+});
+
+test('awaitReplReady default threshold admits IDLE at boundary conf=0.5', async () => {
+  // isReady checks confidence < minConfidence strictly, so 0.5 vs 0.5 passes.
+  const sm = makeStateManager({ s1: { state: 'idle', confidence: 0.5 } });
+  const result = await awaitReplReady('s1', sm, { timeoutMs: 200 });
+  assert.equal(result.ready, true);
+});
+
+test('awaitReplReady default threshold rejects IDLE just below 0.5 (conf=0.49)', async () => {
+  const sm = makeStateManager({ s1: { state: 'idle', confidence: 0.49 } });
+  const result = await awaitReplReady('s1', sm, { timeoutMs: 80 });
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, 'timeout');
+});
+
+test('awaitReplReady honors per-request stricter override even when default is 0.5', async () => {
+  // The daemon passes through `min_confidence` body field. Strict callers can
+  // still demand high-confidence readiness (OSC 133 / shell prompt only).
+  const sm = makeStateManager({ s1: { state: 'idle', confidence: 0.6 } });
+  const result = await awaitReplReady('s1', sm, { timeoutMs: 80, minConfidence: 0.85 });
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, 'timeout');
+});
+
+test('isReady boundary: 0.5 default admits exactly conf=0.5, rejects 0.49', () => {
+  // Pure helper-level coverage of the new default.
+  assert.equal(isReady({ state: 'idle', confidence: 0.5 }, 0.5), true);
+  assert.equal(isReady({ state: 'idle', confidence: 0.49 }, 0.5), false);
+  assert.equal(isReady({ state: 'idle', confidence: 0.6 }, 0.5), true);
 });

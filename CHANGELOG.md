@@ -2,6 +2,50 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.3.1] — 2026-04-26
+
+### Fixed — submit-gate regression cluster (spec: `docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md`)
+
+Three regressions surfaced post-`0.3.0` against fresh-spawned `claude`/`codex`
+sessions where the gate's strict thresholds and timeout-abandon path made the
+new `/submit` endpoint less reliable than the pre-`0.3.0` blind retry on cold
+REPLs. All three fixes ship in this single patch.
+
+- **δ-fix-2 — `send-key` bypass (P0).** `POST /api/sessions/:id/submit` now
+  accepts `{ "force": true }` to skip the render-readiness gate and verify
+  step, dispatching once via the existing kitty/cmux/PTY chain. `cli.js`
+  `send-key` always sets `force:true`, restoring the manual Enter override.
+  Response shape additive (`forced:true`); existing callers unaffected.
+- **δ-fix-3 — gate threshold relaxed 0.85 → 0.5 (P1).** `sessionStateManager`
+  emits IDLE `confidence=0.6` when neither OSC 133 nor a shell-prompt pattern
+  matches (`session-state.js:380`) — the dominant case for AI-CLI TUIs whose
+  Unicode-box input line bypasses `PROMPT_PATTERNS`. Default `minConfidence`
+  lowered to `0.5` (below the 0.6 silence-fallback with margin); per-request
+  override `min_confidence` body field accepted (clamped `[0, 1]`).
+- **δ-fix-4 — timeout extension + best-effort dispatch on timeout (P1).**
+  Default `gate_timeout_ms` raised `5000 → 10000` (upper clamp `15000 →
+  30000`) to cover empirical `claude` ready window (3-6 s on fresh spawn).
+  On a plain `timeout` reason, `/submit` now dispatches anyway and verifies
+  body consumption — the pre-`0.3.0` blind dispatch is restored as a fallback
+  while keeping the new honesty signal: 504 only fires when
+  `verifyBodyConsumed` confirms the body is still in the input box (new
+  `reason: 'gated_dispatch_unconsumed'`). Dispatch-on-timeout success path
+  adds `gated_dispatch_after_timeout: true` (additive).
+  Hard-fail reasons (`session_dead`/`error`/`restarting`/`no_state`) still
+  short-circuit to 504 immediately.
+
+### Invariants preserved
+
+- `inject --submit` warm-session reliability ≥99% target (gate short-circuits
+  at conf≥0.85 still passes after default drops to 0.5).
+- 504 still emitted in true-fail case (after best-effort dispatch + verify
+  reports `still_visible`).
+- `TELEPTY_SUBMIT_GATE=off` daemon-wide escape hatch preserved.
+- `inject --ref` (no `--submit`) path unchanged.
+- 22/23 existing `test/submit-gate.test.js` tests pass unchanged; one test
+  (line 185-193) updated to preserve the below-threshold-rejection semantic
+  with literals shifted away from the new 0.5 default.
+
 ## [0.3.0] — 2026-04-26
 
 ### Added — render-gated submit (specs: `docs/superpowers/specs/2026-04-26-inject-submit-enter-reliability.md`)

@@ -48,7 +48,13 @@ function isFailed(state) {
  */
 function awaitReplReady(sessionId, stateManager, opts = {}) {
   const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 5000;
-  const minConfidence = Number.isFinite(opts.minConfidence) ? opts.minConfidence : 0.85;
+  // Default 0.5: below the lowest legitimate IDLE confidence (0.6, the
+  // silence-fallback emit at session-state.js:380) with explicit margin.
+  // Admits AI-CLI TUIs that emit no OSC 133 and whose Unicode-box input
+  // line does not match PROMPT_PATTERNS — the dominant fresh-spawn case.
+  // Per-request override via `min_confidence` body field on POST /submit.
+  // See: docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md §2.2
+  const minConfidence = Number.isFinite(opts.minConfidence) ? opts.minConfidence : 0.5;
   const start = Date.now();
 
   if (!stateManager || typeof stateManager.getState !== 'function') {

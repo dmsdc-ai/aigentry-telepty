@@ -1504,9 +1504,18 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   const retries = Math.min(Math.max(Number(req.body?.retries) || 0, 0), 3);
   const retryDelayMs = Math.min(Math.max(Number(req.body?.retry_delay_ms) || 500, 100), 2000);
   const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
-  const gateTimeoutMs = Math.min(Math.max(Number(req.body?.gate_timeout_ms) || 5000, 500), 15000);
+  // Default raised 5000 → 10000 (0.3.1) to cover empirical claude REPL
+  // ready window (3-6s on fresh spawn) with margin. Upper clamp raised
+  // 15000 → 30000 for the rare extreme-cold case.
+  const gateTimeoutMs = Math.min(Math.max(Number(req.body?.gate_timeout_ms) || 10000, 500), 30000);
   const verifyTimeoutMs = Math.min(Math.max(Number(req.body?.verify_timeout_ms) || 1500, 200), 5000);
   const injectedBody = typeof req.body?.injected_body === 'string' ? req.body.injected_body : null;
+  const minConfidence = req.body?.min_confidence != null
+    ? Math.min(Math.max(Number(req.body.min_confidence), 0), 1)
+    : undefined;
+  // Per-request bypass for manual overrides (`telepty send-key`). Skips gate +
+  // verify and dispatches once via the existing terminal-level chain.
+  const force = req.body?.force === true;
 
   const gateOff = String(process.env.TELEPTY_SUBMIT_GATE || '').toLowerCase() === 'off';
 
@@ -1522,6 +1531,25 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     });
     busClients.forEach(client => {
       if (client.readyState === 1) client.send(busMsg);
+    });
+  }
+
+  // ── Per-request bypass: { force: true } skips gate + verify (0.3.1+) ──
+  // Used by `telepty send-key` (manual override). Mirrors the env-var
+  // escape-hatch but at request scope.
+  // See: docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md §3.1
+  if (force) {
+    const strategy = terminalLevelSubmit(id, session);
+    if (strategy) {
+      emitSubmitBus({ strategy, attempts: 1, gated: false, forced: true });
+      return res.json({ success: true, strategy, attempts: 1, gated: false, forced: true });
+    }
+    return res.status(503).json({
+      error: 'Submit failed via all strategies (kitty/cmux/pty)',
+      strategy: 'none',
+      attempts: 0,
+      gated: false,
+      forced: true,
     });
   }
 
@@ -1549,16 +1577,21 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     });
   }
 
-  // ── Gated path (default, 0.3.0+) ──
+  // ── Gated path (default, 0.3.0+; best-effort dispatch on timeout in 0.3.1+) ──
 
-  // Step 1: wait for REPL readiness via session state machine.
+  // Step 1: wait for REPL readiness — best-effort, proceed on plain `timeout`.
+  // Hard-fail reasons (session_dead/error/restarting/no_state/no_state_manager)
+  // still short-circuit to 504 because dispatching to a dead/missing PTY is
+  // pointless. See spec §1.3 / §3.3.
   const gateResult = await submitGate.awaitReplReady(id, sessionStateManager, {
     timeoutMs: gateTimeoutMs,
+    ...(minConfidence !== undefined ? { minConfidence } : {}),
   });
-  if (!gateResult.ready) {
-    console.log(`[SUBMIT] gate_timeout ${id}: ${gateResult.reason} (waited ${gateResult.waited_ms}ms, last_state=${gateResult.last_state})`);
+  const gatedDispatchAfterTimeout = !gateResult.ready;
+  if (gatedDispatchAfterTimeout && gateResult.reason && gateResult.reason !== 'timeout') {
+    console.log(`[SUBMIT] gate hard-fail ${id}: ${gateResult.reason} (last_state=${gateResult.last_state})`);
     return res.status(504).json({
-      error: 'Submit gated-timeout — target REPL never readied for input',
+      error: 'Submit gated-timeout — target REPL not in a dispatchable state',
       reason: gateResult.reason,
       last_state: gateResult.last_state,
       strategy: 'none',
@@ -1566,6 +1599,9 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
       gated: true,
       gate_wait_ms: gateResult.waited_ms,
     });
+  }
+  if (gatedDispatchAfterTimeout) {
+    console.log(`[SUBMIT] gate timeout ${id}: dispatching anyway (last_state=${gateResult.last_state})`);
   }
 
   // Step 2: dispatch Enter via existing kitty → cmux → PTY chain.
@@ -1583,7 +1619,8 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
 
   // Step 3: verify body consumption (only when the caller provided the body).
   // Without `injected_body`, this is a bare Enter press (`telepty enter` or
-  // `telepty send-key`) — there is nothing to verify and one shot is enough.
+  // `telepty send-key` without force) — there is nothing to verify and one
+  // shot is enough.
   let verify = null;
   if (injectedBody && injectedBody.length > 0) {
     verify = await submitGate.verifyBodyConsumed(session, injectedBody, {
@@ -1591,7 +1628,6 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
       stripAnsi: stripAnsiState,
     });
     if (!verify.consumed) {
-      // Bounded retry: one more dispatch + one more verify.
       await new Promise(resolve => setTimeout(resolve, retryDelayMs));
       const retryStrategy = terminalLevelSubmit(id, session);
       if (retryStrategy) {
@@ -1603,24 +1639,37 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
         });
       }
     }
+    // Honest 504: gate timed out AND the body never left the input box even
+    // after the best-effort dispatch + verify. Distinguishable from the legacy
+    // `gate_timeout` reason (which dropped dispatch entirely).
+    if (gatedDispatchAfterTimeout && !verify.consumed) {
+      const failBody = {
+        error: 'Submit gated-timeout and body not consumed after best-effort dispatch',
+        reason: 'gated_dispatch_unconsumed',
+        last_state: gateResult.last_state,
+        strategy,
+        attempts,
+        gated: true,
+        gate_wait_ms: gateResult.waited_ms,
+        verify,
+        gated_dispatch_after_timeout: true,
+      };
+      emitSubmitBus(failBody);
+      return res.status(504).json(failBody);
+    }
   }
 
-  emitSubmitBus({
-    strategy,
-    attempts,
-    gated: true,
-    gate_wait_ms: gateResult.waited_ms,
-    verify,
-  });
-
-  return res.json({
+  const responseBody = {
     success: true,
     strategy,
     attempts,
     gated: true,
     gate_wait_ms: gateResult.waited_ms,
     verify,
-  });
+    ...(gatedDispatchAfterTimeout ? { gated_dispatch_after_timeout: true } : {}),
+  };
+  emitSubmitBus(responseBody);
+  return res.json(responseBody);
 });
 
 // POST /api/sessions/submit-all — Submit all active sessions

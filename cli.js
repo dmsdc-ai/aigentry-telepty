@@ -1660,8 +1660,11 @@ async function main() {
             const gateNote = submitData.gated && submitData.gate_wait_ms > 0
               ? ` [gate ${submitData.gate_wait_ms}ms]`
               : '';
+            const lateNote = submitData.gated_dispatch_after_timeout
+              ? ' (dispatched-after-gate-timeout)'
+              : '';
             const attemptsNote = submitData.attempts > 1 ? ` (${submitData.attempts} attempts)` : '';
-            console.log(`✅ Submitted via ${submitData.strategy}${attemptsNote}${gateNote}.`);
+            console.log(`✅ Submitted via ${submitData.strategy}${attemptsNote}${gateNote}${lateNote}.`);
           } else if (submitRes.status === 504) {
             // Soft failure: REPL never readied. Orchestrator scripts depend on
             // exit 0 here — surface a clear remediation hint but do not exit
@@ -1738,7 +1741,13 @@ async function main() {
         process.exit(1);
       }
 
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, { method: 'POST' });
+      // send-key is a manual override — bypass the render gate via force=true.
+      // See: docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md §3.1
+      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force: true }),
+      });
       const data = await res.json();
       if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
       console.log(`✅ Key '${key}' sent to '\x1b[36m${target.id}\x1b[0m'. (strategy: ${data.strategy})`);
