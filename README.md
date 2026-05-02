@@ -53,6 +53,9 @@ telepty broadcast "status report"
 | `telepty list [--json]` | List sessions across all discovered hosts |
 | `telepty attach [id[@host]]` | Attach to a session (interactive picker if no ID) |
 | `telepty inject <id[@host]> "text"` | Inject text into a session |
+| `telepty inject --submit <id> "text"` | Inject text and press Enter (render-gated, retries once on safe gate-timeout) |
+| `telepty inject --submit --submit-force <id> "text"` | As above, but bypass the gate (skip Layer 1/3 detection — opt-in escape hatch) |
+| `telepty inject --submit --submit-retry N <id> "text"` | Override retry count [0–3] on safe 504 (default 1) |
 | `telepty enter <id[@host]>` | Send Enter/Return to a session |
 | `telepty multicast <id1,id2> "text"` | Inject into multiple sessions |
 | `telepty broadcast "text"` | Inject into ALL sessions |

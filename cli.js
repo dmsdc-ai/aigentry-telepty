@@ -1550,6 +1550,32 @@ async function main() {
     const useSubmit = submitIndex !== -1;
     if (useSubmit) args.splice(submitIndex, 1);
 
+    // Extract --submit-force flag (gate bypass; opt-in escape hatch).
+    // Mirrors `telepty send-key`'s force semantics: skip both Layer 3 and
+    // Layer 1 gates and dispatch Enter immediately. Safe only when the
+    // caller is confident the target REPL is ready (e.g., orchestrator is
+    // visibly idle). See specs/2026-05-02-submit-force-and-retry.md
+    const submitForceIndex = args.indexOf('--submit-force');
+    const submitForce = submitForceIndex !== -1;
+    if (submitForce) args.splice(submitForceIndex, 1);
+
+    // Extract --submit-retry N flag (default 1, clamp [0, 3]). On a 504
+    // gated-failure with a retry-safe reason (gate timed out and body is
+    // still in the input box → idempotent), wait 300ms and retry. Hard-fail
+    // reasons (session_dead/error/restarting/no_state) do NOT retry —
+    // re-firing won't recover and would be a wasted round-trip.
+    let submitRetries = 1;
+    const submitRetryIndex = args.indexOf('--submit-retry');
+    if (submitRetryIndex !== -1) {
+      const raw = Number(args[submitRetryIndex + 1]);
+      if (Number.isFinite(raw)) {
+        submitRetries = Math.min(Math.max(Math.floor(raw), 0), 3);
+        args.splice(submitRetryIndex, 2);
+      } else {
+        args.splice(submitRetryIndex, 1);
+      }
+    }
+
     // Extract --from flag
     let fromId;
     const fromIndex = args.indexOf('--from');
@@ -1643,40 +1669,79 @@ async function main() {
       // so the CLI no longer needs the legacy 500ms blind sleep. Pass the
       // injected body so the daemon can verify it was consumed by the input
       // box and bounded-retry once if not.
+      //
+      // 0.3.3: opt-in --submit-force (gate bypass) and idempotent client-side
+      // retry on retry-safe 504s. The retry guard is gate timeout + body
+      // still visible in the input box (verify.consumed=false) — re-firing
+      // an Enter that genuinely never landed cannot double-submit.
       // See docs/superpowers/specs/2026-04-26-inject-submit-enter-reliability.md
       if (useSubmit) {
-        try {
-          const submitRes = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              injected_body: injectPrompt || '',
-              retries: 1,
-              retry_delay_ms: 500,
-            })
-          });
-          const submitData = await submitRes.json();
-          if (submitRes.ok) {
-            const gateNote = submitData.gated && submitData.gate_wait_ms > 0
-              ? ` [gate ${submitData.gate_wait_ms}ms]`
-              : '';
-            const lateNote = submitData.gated_dispatch_after_timeout
-              ? ' (dispatched-after-gate-timeout)'
-              : '';
-            const attemptsNote = submitData.attempts > 1 ? ` (${submitData.attempts} attempts)` : '';
-            console.log(`✅ Submitted via ${submitData.strategy}${attemptsNote}${gateNote}${lateNote}.`);
-          } else if (submitRes.status === 504) {
-            // Soft failure: REPL never readied. Orchestrator scripts depend on
-            // exit 0 here — surface a clear remediation hint but do not exit
-            // non-zero.
-            const reason = submitData.reason || 'gate_timeout';
-            const lastState = submitData.last_state || 'unknown';
-            console.log(`⚠️  Submit gated-timeout (${reason}, last_state=${lastState}). Manual \`telepty send-key ${target.id} enter\` may be needed.`);
-          } else {
-            console.error(`⚠️  Submit failed: ${formatApiError(submitData)}`);
+        const submitBody = {
+          injected_body: injectPrompt || '',
+          retries: 1,
+          retry_delay_ms: 500,
+          ...(submitForce ? { force: true } : {}),
+        };
+        const RETRY_DELAY_MS = 300;
+        const RETRY_SAFE_REASONS = new Set([
+          'gated_dispatch_unconsumed',
+          'gate_timeout',
+          'no_prompt_symbol_seen',
+        ]);
+        const maxAttempts = 1 + submitRetries;
+        let submitRes = null;
+        let submitData = null;
+        let attemptsMade = 0;
+        let lastError = null;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          if (attempt > 0) {
+            await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
           }
-        } catch (submitErr) {
-          console.error(`⚠️  Submit failed: ${submitErr.message}`);
+          attemptsMade = attempt + 1;
+          try {
+            submitRes = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(submitBody),
+            });
+            submitData = await submitRes.json();
+          } catch (submitErr) {
+            lastError = submitErr;
+            submitRes = null;
+            submitData = null;
+            break;
+          }
+          if (submitRes.ok) break;
+          if (submitRes.status !== 504) break;
+          const retryReason = submitData && typeof submitData.reason === 'string' ? submitData.reason : null;
+          if (!RETRY_SAFE_REASONS.has(retryReason)) break;
+        }
+        if (lastError) {
+          console.error(`⚠️  Submit failed: ${lastError.message}`);
+        } else if (submitRes && submitRes.ok) {
+          const gateNote = submitData.gated && submitData.gate_wait_ms > 0
+            ? ` [gate ${submitData.gate_wait_ms}ms]`
+            : '';
+          const lateNote = submitData.gated_dispatch_after_timeout
+            ? ' (dispatched-after-gate-timeout)'
+            : '';
+          const attemptsNote = submitData.attempts > 1 ? ` (${submitData.attempts} attempts)` : '';
+          const retryNote = attemptsMade > 1 ? ` [retry ${attemptsMade - 1}/${submitRetries}]` : '';
+          const forcedNote = submitData.forced ? ' [forced]' : '';
+          console.log(`✅ Submitted via ${submitData.strategy}${attemptsNote}${gateNote}${lateNote}${retryNote}${forcedNote}.`);
+        } else if (submitRes && submitRes.status === 504) {
+          // Soft failure: REPL never readied. Orchestrator scripts depend on
+          // exit 0 here — surface a clear remediation hint but do not exit
+          // non-zero.
+          const reason = (submitData && submitData.reason) || 'gate_timeout';
+          const lastState = (submitData && submitData.last_state) || 'unknown';
+          const retriesNote = attemptsMade > 1 ? ` after ${attemptsMade} attempts` : '';
+          const hint = submitForce
+            ? ''
+            : ` Try \`telepty inject --submit --submit-force ${target.id} ...\` or manual \`telepty send-key ${target.id} enter\`.`;
+          console.log(`⚠️  Submit gated-timeout (${reason}, last_state=${lastState})${retriesNote}.${hint}`);
+        } else {
+          console.error(`⚠️  Submit failed: ${formatApiError(submitData)}`);
         }
       }
     } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }

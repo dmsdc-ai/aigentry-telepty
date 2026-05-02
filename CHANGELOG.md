@@ -2,6 +2,73 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.3.3] — 2026-05-02
+
+### Added — `inject --submit-force` + idempotent client retry (spec: `docs/superpowers/specs/2026-05-02-submit-force-and-retry.md`)
+
+Closes task #347. Two opt-in CLI knobs on `telepty inject` for cases where
+the 0.3.2 prompt-symbol gate has a transient render mismatch (autocomplete
+dropdown open, cursor moved, mid-paste race) and the 504 fall-through
+forces the human user to press Enter manually.
+
+- **`--submit-force`** — passes `force: true` to `POST /submit`. Skips
+  both Layer 3 (prompt-symbol) and Layer 1 (state-gate) and dispatches
+  Enter once via the existing `terminalLevelSubmit` chain (kitty → cmux
+  → PTY). Daemon-side `force` semantics already shipped in 0.3.1 for
+  `telepty send-key`; this just plumbs the flag through inject.
+- **`--submit-retry N`** (default 1, clamp [0, 3]) — on a 504 response
+  with a retry-safe reason, wait 300 ms and retry the same `/submit`
+  request up to N times. Retry-safe reasons (idempotent re-fire is
+  guaranteed because the body is verifiably still in the input box):
+
+  | Reason | Source |
+  |---|---|
+  | `gated_dispatch_unconsumed` | `daemon.js:1680` (verify said body still visible after best-effort dispatch) |
+  | `gate_timeout` | reserved (Layer 1 plain timeout — falls through to dispatch in 0.3.1+, not currently a 504 source) |
+  | `no_prompt_symbol_seen` | reserved (Layer 3 timeout — currently never emits 504) |
+
+  Hard-fail reasons (`session_dead`, `session_error`, `session_restarting`,
+  `no_state`, `no_state_manager`) and any non-504 status (4xx) **never**
+  trigger client-side retry — re-firing won't recover.
+
+- **Default behavior preserved**: a bare `telepty inject --submit ...`
+  call now retries once on a retry-safe 504. This is a strict improvement
+  over 0.3.2 (which surfaced a warning and required manual `send-key`)
+  and remains backward-compatible because retry only fires when the
+  server tells the client the dispatch demonstrably did not land.
+
+### Tests
+
+- `test/inject-submit-flags.test.js` (NEW, 9 tests) — mock-daemon
+  coverage:
+  - `--submit-force` adds `force:true` to `/submit` body; success line
+    renders `[forced]` tag.
+  - bare `--submit` does NOT add `force` to body.
+  - default `--submit-retry 1` retries once on `gated_dispatch_unconsumed`
+    504 then succeeds; output contains `[retry 1/1]`.
+  - `--submit-retry 2` exhausts to 3 calls then prints
+    `Submit gated-timeout … after 3 attempts`.
+  - `--submit-retry 0` makes exactly 1 call, no `[retry`.
+  - `session_dead` 504 → no retry even with `--submit-retry 3`.
+  - `no_state` 504 → no retry even with `--submit-retry 3`.
+  - `--submit-force --submit-retry 2` preserves `force:true` across retries.
+  - 500 error → no retry, prints to stderr.
+- `test/enforce-report.test.js` — version assertion 0.2.0 → 0.3.3.
+- All 174 existing tests pass unchanged.
+
+### Invariants preserved
+
+- Daemon code unchanged. `force:true` and the gate layers behave exactly
+  as in 0.3.2.
+- `telepty send-key` unchanged.
+- `telepty enter` unchanged.
+- `telepty inject --ref` (no `--submit`) unchanged.
+- Cross-machine remote inject path unchanged (the SSH branch in `cli.js`
+  bypasses the new flags by design — remote daemons handle their own
+  submit semantics).
+- Exit code on soft failure (504) remains 0; orchestrator scripts that
+  check for non-zero exits are unaffected.
+
 ## [0.3.2] — 2026-04-26
 
 ### Added — Layer 3 prompt-symbol render gate (spec: `docs/superpowers/specs/2026-04-26-prompt-symbol-render-gate.md`)

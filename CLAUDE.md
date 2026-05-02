@@ -65,10 +65,14 @@ npm version patch --no-git-tag-version && npm publish --access public
 - inject 시 발신자 session ID (`--from`)를 항상 포함
 - PTY `\r` 직접 의존 금지
 
-## 최근 주요 변경 (v0.1.58–0.1.62)
+## 최근 주요 변경 (v0.1.58–0.3.3)
 
 | 버전 | 변경 |
 |------|------|
+| 0.3.3 | inject `--submit-force` (gate bypass) + idempotent `--submit-retry` (default 1, retry-safe 504만). 클라이언트 측 변경, daemon 무수정. task #347. |
+| 0.3.2 | Layer 3 prompt-symbol 렌더 게이트 — claude/codex/gemini 별 prompt symbol을 cmux read-screen으로 polling. |
+| 0.3.1 | 게이트 임계값 0.85 → 0.5 완화 + dispatch-on-timeout best-effort + send-key force=true 우회 추가. |
+| 0.3.0 | Render-gated submit (sessionStateManager 기반). Enter 송신 전 REPL ready 검증. |
 | 0.1.62 | TUI 태스크 추적 — bus 이벤트에서 [태그] 자동 파싱, 세션별 상태 표시 |
 | 0.1.61 | reconnect 시 resize/\x0c 제거 (멀티터미널 깜빡임 수정) |
 | 0.1.60 | TUI P1 — s=start, k=kill, p=purge stale |
