@@ -8,6 +8,7 @@ const path = require('path');
 
 const {
   copySkillDirectory,
+  detectInstalledClients,
   listPackagedSkills,
   resolveTargetDirectory,
   runInteractiveSkillInstaller
@@ -88,6 +89,63 @@ test('runInteractiveSkillInstaller installs selected skills into multiple client
     assert.equal(results.length, 2);
     assert.equal(fs.existsSync(path.join(homeDir, '.codex', 'skills', 'telepty', 'SKILL.md')), true);
     assert.equal(fs.existsSync(path.join(cwd, '.gemini', 'skills', 'telepty', 'SKILL.md')), true);
+  } finally {
+    os.homedir = originalHome;
+  }
+});
+
+test('detectInstalledClients filters by ~/.{cli} dir or binary on PATH', () => {
+  const homeDir = makeTempDir('telepty-detect-home-');
+  const originalHome = os.homedir;
+  os.homedir = () => homeDir;
+
+  try {
+    fs.mkdirSync(path.join(homeDir, '.claude'));
+    const detected = detectInstalledClients();
+    assert.ok(detected.includes('claude'), 'claude detected via dir');
+  } finally {
+    os.homedir = originalHome;
+  }
+});
+
+test('runInteractiveSkillInstaller pre-selects detected clients via injected detector', async () => {
+  const packageRoot = makeTempDir('telepty-installer-detect-pkg-');
+  createSkillPackage(packageRoot, 'telepty');
+
+  const cwd = makeTempDir('telepty-installer-detect-project-');
+  const homeDir = makeTempDir('telepty-installer-detect-home-');
+  const originalHome = os.homedir;
+  os.homedir = () => homeDir;
+
+  let lastChoices = null;
+  const promptImpl = async (questionSet) => {
+    if (Array.isArray(questionSet)) {
+      return { scope: 'global', customPath: null };
+    }
+    if (questionSet.name === 'clients') {
+      lastChoices = questionSet.choices;
+      return { clients: ['claude'] };
+    }
+    if (questionSet.name === 'skills') {
+      return { skills: ['telepty'] };
+    }
+    throw new Error(`Unexpected prompt: ${questionSet.name}`);
+  };
+
+  try {
+    await runInteractiveSkillInstaller({
+      packageRoot,
+      cwd,
+      promptImpl,
+      detectClients: () => ['claude']
+    });
+    assert.ok(lastChoices, 'clients prompt was called');
+    const claudeChoice = lastChoices.find((c) => c.value === 'claude');
+    const codexChoice = lastChoices.find((c) => c.value === 'codex');
+    assert.equal(claudeChoice.selected, true, 'claude pre-selected');
+    assert.equal(codexChoice.selected, false, 'codex not pre-selected');
+    assert.match(claudeChoice.title, /detected/);
+    assert.match(codexChoice.title, /not detected/);
   } finally {
     os.homedir = originalHome;
   }

@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execSync } = require('child_process');
 const prompts = require('prompts');
 
 const TARGET_CLIENTS = {
@@ -10,21 +11,43 @@ const TARGET_CLIENTS = {
     label: 'Claude Code',
     globalDir: () => path.join(os.homedir(), '.claude', 'skills'),
     projectDir: (cwd) => path.join(cwd, '.claude', 'skills'),
-    defaultScope: 'global'
+    defaultScope: 'global',
+    homeDir: () => path.join(os.homedir(), '.claude'),
+    binary: 'claude'
   },
   codex: {
     label: 'Codex',
     globalDir: () => path.join(os.homedir(), '.codex', 'skills'),
     projectDir: (cwd) => path.join(cwd, '.codex', 'skills'),
-    defaultScope: 'global'
+    defaultScope: 'global',
+    homeDir: () => path.join(os.homedir(), '.codex'),
+    binary: 'codex'
   },
   gemini: {
     label: 'Gemini',
     globalDir: () => path.join(os.homedir(), '.gemini', 'skills'),
     projectDir: (cwd) => path.join(cwd, '.gemini', 'skills'),
-    defaultScope: 'project'
+    defaultScope: 'project',
+    homeDir: () => path.join(os.homedir(), '.gemini'),
+    binary: 'gemini'
   }
 };
+
+function hasCliBinary(cmd) {
+  try {
+    execSync(`command -v ${cmd}`, { stdio: 'ignore', shell: '/bin/sh' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function detectInstalledClients() {
+  return Object.keys(TARGET_CLIENTS).filter((key) => {
+    const client = TARGET_CLIENTS[key];
+    return fs.existsSync(client.homeDir()) || hasCliBinary(client.binary);
+  });
+}
 
 function resolveSkillsSourceRoot(packageRoot = __dirname) {
   return path.join(packageRoot, 'skills');
@@ -163,13 +186,23 @@ async function runInteractiveSkillInstaller(options = {}) {
     console.log(`Installing packaged skill: ${packagedSkills[0].name}`);
   }
 
+  const installedClients = options.detectClients
+    ? options.detectClients()
+    : detectInstalledClients();
+  const installedSet = new Set(installedClients);
+  const detectedLabel = installedClients.length
+    ? `Detected: ${installedClients.join(', ')}`
+    : 'No AI CLI detected — manual selection required';
+  console.log(detectedLabel);
+
   const selectedClientsAnswer = await promptImpl({
     type: 'multiselect',
     name: 'clients',
-    message: 'Select target clients',
+    message: 'Select target clients (detected CLIs pre-selected)',
     choices: Object.entries(TARGET_CLIENTS).map(([key, value]) => ({
-      title: value.label,
-      value: key
+      title: `${value.label}${installedSet.has(key) ? ' ✓ detected' : ' (not detected)'}`,
+      value: key,
+      selected: installedSet.has(key)
     })),
     min: 1
   });
@@ -262,6 +295,8 @@ async function runInteractiveSkillInstaller(options = {}) {
 module.exports = {
   TARGET_CLIENTS,
   copySkillDirectory,
+  detectInstalledClients,
+  hasCliBinary,
   installSkillsWithPlan,
   listPackagedSkills,
   resolveTargetDirectory,
