@@ -110,6 +110,51 @@ CLI (telepty) ──> HTTP/WS ──> Daemon (:3848)
 - **`inject`** delivers text via the fastest available path: kitty terminal API, WebSocket, or UDS (Unix Domain Socket for embedded integrations)
 - **`submit`** is handled separately from text injection for reliability across all AI CLIs
 
+## `[context-ref]` Protocol — long payloads via shared file
+
+When a sender uses `telepty inject --ref <file> <target> "<message>"`, telepty
+stores the payload in a shared file under `~/.telepty/shared/<sha256>.md` and
+injects only a short pointer prompt of the form:
+
+```
+[context-ref] Read ~/.telepty/shared/<sha256>.md and use it as the source of truth for this task.
+<inline message>
+```
+
+This avoids prompt rot in the receiving session (and in the orchestrator's
+window when the reply is small).
+
+### Receiver contract
+
+The receiving AI session is expected to:
+1. Detect the `[context-ref]` prefix on the first line.
+2. Read the file at the absolute path.
+3. Treat the file contents as the **authoritative payload** for the task — the
+   inline message is supplementary (topic / hint), not the source of truth.
+
+### Storage location
+
+- File path: `~/.telepty/shared/<sha256>.md` (sha256 of payload body)
+- Created with mode `0600`; readable only by the local user
+- Persists across sessions; not garbage-collected automatically (run
+  `telepty clean --shared` to prune)
+
+### When to use `--ref`
+
+- Payload exceeds ~1KB or contains structured content (code, logs, tables).
+- You want the receiver to load the payload deterministically rather than
+  paraphrase it from the inject prompt.
+- You're orchestrating a multi-hop conversation where the orchestrator should
+  not see the full payload in its own context window.
+
+### Integration scope
+
+Per-agent receiver integrations (auto-loading the file via Claude Code
+`UserPromptSubmit` hooks, Codex `AGENTS.md` directives, etc.) are **out of
+scope for telepty core** — they live in the agent's own configuration. The
+receiver-side install commands proposed in #10 (`telepty install hooks …`)
+are tracked as separate follow-up work.
+
 ## Inject Delivery Paths
 
 | Priority | Method | When |
