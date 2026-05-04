@@ -1,6 +1,6 @@
 ---
 name: telepty-broadcast
-description: Send messages to multiple telepty sessions at once. Covers broadcast (all sessions) and multicast (selected targets).
+description: Send messages to multiple telepty sessions at once. Covers broadcast (all sessions) and multicast (selected targets). 키워드: 전체 공지, 모든 세션에, 일괄 전송, 브로드캐스트, 멀티캐스트, 다중 주입
 ---
 
 # telepty-broadcast — Multi-Target Messaging

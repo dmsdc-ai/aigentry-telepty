@@ -1,6 +1,6 @@
 ---
 name: telepty-session
-description: Multi-session orchestration — start multiple sessions at once and arrange terminal layouts. Covers session start and layout commands.
+description: Multi-session orchestration — start multiple sessions at once and arrange terminal layouts. Covers session start and layout commands. 키워드: 멀티 세션 시작, 다중 세션, 세션 레이아웃, 세션 일괄 시작, 멀티 시작, layout
 ---
 
 # telepty-session — Multi-Session Orchestration

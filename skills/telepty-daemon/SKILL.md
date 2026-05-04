@@ -1,6 +1,6 @@
 ---
 name: telepty-daemon
-description: Manage the telepty daemon — start, stop, repair, update, and TUI dashboard. Use when daemon is broken or needs maintenance.
+description: Manage the telepty daemon — start, stop, repair, update, and TUI dashboard. Use when daemon is broken or needs maintenance. 키워드: 데몬 시작, 데몬 재시작, 데몬 종료, TUI, 대시보드, 데몬 상태, daemon
 ---
 
 # telepty-daemon — Daemon Management

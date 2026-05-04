@@ -1,6 +1,6 @@
 ---
 name: telepty-inject
-description: Send messages, commands, and keystrokes to telepty sessions. Covers inject, enter, send-key, and reply commands.
+description: Send messages, commands, and keystrokes to telepty sessions. Covers inject, enter, send-key, and reply commands. 키워드: 세션에 메시지, 메시지 보내기, 전달, 주입, inject, 응답, 답장, 키 입력
 ---
 
 # telepty-inject — Send Messages to Sessions
