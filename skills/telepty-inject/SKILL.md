@@ -83,6 +83,58 @@ telepty reply "<message>"
 
 Automatically targets the session that last injected into yours (uses stored `lastInjectFrom`).
 
+## Report Convention (REPORT to orchestrator)
+
+When a sub-session finishes a task or needs to escalate state, it reports to the
+**orchestrator** session using the `REPORT:` prefix.
+
+### Hard rule: NEVER hardcode the orchestrator session ID
+
+Session IDs are volatile runtime identifiers — they may change across hosts,
+restarts, or topology shifts. Resolve the orchestrator ID at runtime from
+`telepty list --json` instead.
+
+### Standard pattern (telepty 0.3.3+)
+
+```bash
+# 1. Resolve orchestrator session ID at runtime (filter out role-suffixed peers)
+ORCH_ID=$(telepty list --json | python3 -c "import json,sys; \
+  print(next(s['id'] for s in json.load(sys.stdin) \
+    if 'orchestrator' in s['id'] \
+    and not any(x in s['id'] for x in ('coder','reviewer','architect','runner','tester','analyst','builder'))))")
+
+# 2. Inject the REPORT (retry-safe submit; --ref keeps payload short)
+telepty inject --ref --submit --submit-retry 2 \
+  --from "$TELEPTY_SESSION_ID" "$ORCH_ID" \
+  "REPORT: <one-line summary> | evidence: <commit/test/etc> | next: <handoff>"
+```
+
+### Convention rules
+
+- **Prefix**: messages MUST start with `REPORT:` so the orchestrator's event
+  classifier can route them.
+- **Return address**: include `--from "$TELEPTY_SESSION_ID"` so the orchestrator
+  knows which sub-session reported.
+- **Retry**: pass `--submit-retry 2` (telepty 0.3.3+). The retry is idempotent
+  on safe gate-timeout 504s (`gated_dispatch_unconsumed`, `gate_timeout`,
+  `no_prompt_symbol_seen`); hard-fail reasons (`session_dead`, `error`,
+  `restarting`, `no_state`) are not retried.
+- **Long payloads**: store the full body in a file and use `--ref <file>` so the
+  inject prompt itself stays short.
+- **Self-report (idempotent)**: a session reporting on its own behalf may use
+  `--submit-force` to bypass the render gate. Do NOT use `--submit-force` for
+  general inject — it can clobber in-flight user input.
+
+### Anti-patterns (DO NOT)
+
+- `telepty inject orchestrator-claude "..."` — hardcoded session ID; breaks the
+  moment the orchestrator is renamed or runs under a different CLI (codex,
+  gemini).
+- Embedding `aigentry-orchestrator-claude` in spec templates, scripts, or
+  docs as a literal target.
+- Reporting without the `REPORT:` prefix — the orchestrator cannot distinguish
+  a status report from a peer-to-peer message.
+
 ## Common Errors
 
 | Error | Cause | Fix |
