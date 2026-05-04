@@ -72,12 +72,30 @@ telepty broadcast "status report"
 
 telepty auto-discovers sessions across your Tailnet. All commands (`list`, `attach`, `inject`, `rename`, `multicast`, `broadcast`) work seamlessly across machines.
 
-When the same session ID exists on multiple hosts, disambiguate with `session_id@host`:
+### `<id>@<host>` syntax
+
+To target a specific host (when the same session ID exists on multiple hosts,
+or when there is no Tailnet auto-discovery), append `@<host>` to the session
+ID. `<host>` can be a hostname, LAN IP, or Tailnet name.
 
 ```bash
+# Hostname / Tailnet name
 telepty inject my-session@macbook "hello"
 telepty attach worker@server-01
+
+# LAN IP — useful when no Tailnet is configured
+telepty inject orchestrator-claude@172.28.4.165 "ping"
+telepty read-screen build-runner@10.0.0.42 --lines 50
 ```
+
+**Requirements**:
+- The remote daemon must be reachable on port **3848** from the calling host
+  (LAN routing, firewall rules, or Tailscale).
+- No SSH or `sshd` is required on either side — the call hits the remote
+  daemon's HTTP API directly. This is the recommended path for laptop
+  daemons that don't run sshd.
+- The `@<host>` qualifier works for `inject`, `attach`, `read-screen`,
+  `enter`, `multicast`, and `rename`.
 
 ## How It Works
 

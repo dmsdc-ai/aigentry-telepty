@@ -51,13 +51,33 @@ If you expect a reply, ALWAYS include `--from` so the target knows where to resp
 telepty inject <target> "your message" --from $(echo $TELEPTY_SESSION_ID)
 ```
 
-### Cross-host inject
+### Cross-host inject — `<id>@<host>` syntax
 
-When the same session ID exists on multiple hosts:
+To inject into a session running on a different machine, append `@<host>` to
+the session ID. `<host>` can be a hostname, LAN IP, or Tailnet name.
 
 ```bash
-telepty inject session_id@remote-host "message"
+# Hostname
+telepty inject session_id@worker-01 "message"
+
+# LAN IP (daemon must be reachable on port 3848)
+telepty inject orchestrator-claude@172.28.4.165 "PING from build server"
+
+# With return address (recommended for cross-host)
+telepty inject orchestrator-claude@192.168.1.10 "task done" \
+  --from "$TELEPTY_SESSION_ID"
 ```
+
+**Requirements**:
+- The remote daemon must be reachable on port `3848` from the calling host
+  (firewall / LAN routing / Tailscale).
+- No SSH or sshd is required on either side — the call hits the remote
+  daemon's HTTP API directly.
+- Use the same `<id>@<host>` syntax for `attach`, `read-screen`, `enter`,
+  and `multicast` targets.
+
+Use this when the same session ID exists on multiple hosts, or when the
+calling host has no local daemon discovery (no Tailnet, mixed LAN, etc.).
 
 ## enter — Send Enter keystroke only
 
