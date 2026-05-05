@@ -191,3 +191,13 @@ test('internal snippet load failure exits 4 with stderr and empty stdout', () =>
   assert.equal(stdout.value, '');
   assert.notEqual(stderr.value, '');
 });
+
+test('stdin pipe is ignored and closed input still emits full output', async () => {
+  const result = await runTelepty(['init', '--print-snippet', '--target', 'all'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    stdin: 'ignored stdin payload\n'
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(countMatches(result.stdout, /<!-- telepty-snippet\/v1 BEGIN target=/g), 3);
+});
