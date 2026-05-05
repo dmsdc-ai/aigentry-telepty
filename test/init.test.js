@@ -15,6 +15,12 @@ function countMatches(value, pattern) {
   return [...value.matchAll(pattern)].length;
 }
 
+async function readJsonRecords(target = 'all') {
+  const result = await runTelepty(['init', '--print-snippet', '--target', target, '--format', 'json']);
+  assert.equal(result.code, 0, result.stderr);
+  return result.stdout.trimEnd().split('\n').map((line) => JSON.parse(line));
+}
+
 function runTelepty(args, options = {}) {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-init-home-'));
   const env = {
@@ -108,5 +114,18 @@ test('json output for all emits three typed NDJSON records', async () => {
     assert.equal(parsed.target, targets[index]);
     assert.match(parsed.sha256, /^[0-9a-f]{64}$/);
     assert.equal(typeof parsed.body, 'string');
+  });
+});
+
+test('snippet bodies contain no shell-substitution hazards', async () => {
+  const records = await readJsonRecords();
+
+  records.forEach(({ body }) => {
+    assert.equal(body.includes('$HOME'), false);
+    assert.equal(body.includes('$('), false);
+    assert.equal(body.includes('~'), false);
+    for (const inlineCode of body.matchAll(/`([^`\n]+)`/g)) {
+      assert.doesNotMatch(inlineCode[1], /[$;|&]/);
+    }
   });
 });
