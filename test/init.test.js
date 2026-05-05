@@ -93,3 +93,20 @@ test('markdown output for all emits three envelopes in target order with empty s
   assert.match(result.stdout, /END target=claude -->\n\n<!-- telepty-snippet\/v1 BEGIN target=agents/);
   assert.match(result.stdout, /END target=agents -->\n\n<!-- telepty-snippet\/v1 BEGIN target=gemini/);
 });
+
+test('json output for all emits three typed NDJSON records', async () => {
+  const result = await runTelepty(['init', '--print-snippet', '--target', 'all', '--format', 'json']);
+
+  assert.equal(result.code, 0, result.stderr);
+  const lines = result.stdout.trimEnd().split('\n');
+  assert.equal(lines.length, 3);
+
+  lines.forEach((line, index) => {
+    const parsed = JSON.parse(line);
+    assert.deepEqual(Object.keys(parsed), ['version', 'target', 'sha256', 'body']);
+    assert.equal(parsed.version, 'telepty-snippet/v1');
+    assert.equal(parsed.target, targets[index]);
+    assert.match(parsed.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(typeof parsed.body, 'string');
+  });
+});
