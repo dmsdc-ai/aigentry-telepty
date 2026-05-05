@@ -159,3 +159,11 @@ test('print-snippet defaults to all markdown and exits zero', async () => {
     targets
   );
 });
+
+test('unsupported target exits 2 with stderr and empty stdout', async () => {
+  const result = await runTelepty(['init', '--print-snippet', '--target', 'zsh']);
+
+  assert.equal(result.code, 2);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /--target must be one of claude, agents, gemini, all/);
+});
