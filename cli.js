@@ -18,6 +18,7 @@ const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./s
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const crossMachine = require('./cross-machine');
+const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec');
 const { FileMailbox } = require('./src/mailbox/index');
 const args = process.argv.slice(2);
 let pendingTerminalInputError = null;
@@ -118,11 +119,25 @@ if (!process.env.NO_UPDATE_NOTIFIER && !process.env.TELEPTY_DISABLE_UPDATE_NOTIF
   updateNotifier({pkg}).notify({ isGlobal: true });
 }
 
-// Support remote host via environment variable or default to localhost
-let REMOTE_HOST = process.env.TELEPTY_HOST || '127.0.0.1';
-const PORT = Number(process.env.TELEPTY_PORT || 3848);
-let DAEMON_URL = `http://${REMOTE_HOST}:${PORT}`;
-let WS_URL = `ws://${REMOTE_HOST}:${PORT}`;
+// Support remote host via environment variable or default to localhost.
+// TELEPTY_HOST accepts: `host`, `host:port`, or `http://host:port`. Embedded
+// port from TELEPTY_HOST is used unless TELEPTY_PORT is set explicitly.
+const _explicitPort = process.env.TELEPTY_PORT ? Number(process.env.TELEPTY_PORT) : null;
+const _hostSpec = parseHostSpec(process.env.TELEPTY_HOST, _explicitPort || 3848);
+let REMOTE_HOST = _hostSpec.host;
+const PORT = _explicitPort != null ? _explicitPort : _hostSpec.port;
+let DAEMON_URL = buildDaemonUrl(REMOTE_HOST, PORT);
+let WS_URL = buildDaemonWsUrl(REMOTE_HOST, PORT);
+
+function daemonUrl(host) {
+  if (host == null || host === '') return DAEMON_URL;
+  return buildDaemonUrl(host, PORT);
+}
+
+function daemonWsUrl(host) {
+  if (host == null || host === '') return WS_URL;
+  return buildDaemonWsUrl(host, PORT);
+}
 
 const config = getConfig();
 const TOKEN = config.authToken;
@@ -134,7 +149,7 @@ const fetchWithAuth = (url, options = {}) => {
 
 async function getDaemonMeta(host = REMOTE_HOST) {
   try {
-    const res = await fetchWithAuth(`http://${host}:${PORT}/api/meta`, {
+    const res = await fetchWithAuth(`${daemonUrl(host)}/api/meta`, {
       signal: AbortSignal.timeout(1500)
     });
     if (!res.ok) {
@@ -487,7 +502,7 @@ async function discoverSessions(options = {}) {
 
   // Local daemon sessions
   try {
-    const res = await fetchWithAuth(`http://127.0.0.1:${PORT}/api/sessions`, {
+    const res = await fetchWithAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
       signal: AbortSignal.timeout(1500)
     });
     if (res.ok) {
@@ -501,6 +516,14 @@ async function discoverSessions(options = {}) {
   // Remote peer sessions via SSH direct
   const remoteSessions = crossMachine.discoverAllRemoteSessions();
   allSessions.push(...remoteSessions);
+
+  // Remote peer sessions via HTTP (no SSH)
+  try {
+    const httpSessions = await crossMachine.discoverHttpRemoteSessions();
+    allSessions.push(...httpSessions);
+  } catch {
+    // HTTP peer discovery is best-effort.
+  }
 
   return allSessions;
 }
@@ -550,7 +573,7 @@ async function ensureDaemonRunning(options = {}) {
 }
 
 async function manageInteractiveAttach(sessionId, targetHost) {
-  const wsUrl = `ws://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
+  const wsUrl = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
   const ws = new WebSocket(wsUrl);
   let cleanupTerminal = null;
   return new Promise((resolve) => {
@@ -576,7 +599,7 @@ async function manageInteractiveAttach(sessionId, targetHost) {
 
       // Check if other clients are still attached before destroying
       try {
-        const res = await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions`);
+        const res = await fetchWithAuth(`${daemonUrl(targetHost)}/api/sessions`);
         if (res.ok) {
           const sessions = await res.json();
           const session = sessions.find(s => s.id === sessionId);
@@ -584,7 +607,7 @@ async function manageInteractiveAttach(sessionId, targetHost) {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. Other clients still attached — session kept alive.\x1b[0m\n`);
           } else {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. No other clients — destroying session.\x1b[0m\n`);
-            await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+            await fetchWithAuth(`${daemonUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
           }
         }
       } catch(e) {
@@ -787,7 +810,7 @@ async function manageInteractive() {
         const { promptText } = injectPromptResponse;
         if (!promptText) continue;
         try {
-          const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
+          const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: promptText })
           });
           const data = await res.json();
@@ -1140,7 +1163,7 @@ async function main() {
     // Connect to daemon WebSocket with auto-reconnect
     // owner=1 tells daemon this is the allow bridge (owner), not an attach viewer.
     // Daemon uses this to reclaim ownership even if a stale ownerWs is still registered.
-    const wsUrl = `ws://${REMOTE_HOST}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}&owner=1`;
+    const wsUrl = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}&owner=1`;
     let daemonWs = null;
     let wsReady = false;
     let reconnectAttempts = 0;
@@ -1448,7 +1471,7 @@ async function main() {
       }
     }
 
-    const wsUrl = `ws://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
+    const wsUrl = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
     const ws = new WebSocket(wsUrl);
     let cleanupTerminal = null;
 
@@ -1486,7 +1509,7 @@ async function main() {
 
       // Check if other clients are still attached before destroying
       try {
-        const res = await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions`);
+        const res = await fetchWithAuth(`${daemonUrl(targetHost)}/api/sessions`);
         if (res.ok) {
           const allSessions = await res.json();
           const session = allSessions.find(s => s.id === sessionId);
@@ -1494,7 +1517,7 @@ async function main() {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. Other clients still attached — session kept alive.\x1b[0m`);
           } else {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. No other clients — destroying session.\x1b[0m`);
-            await fetchWithAuth(`http://${targetHost}:${PORT}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+            await fetchWithAuth(`${daemonUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
           }
         }
       } catch(e) {}
@@ -1524,7 +1547,7 @@ async function main() {
         process.exit(1);
       }
 
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/screen?lines=${lines}${raw ? '&raw=1' : ''}`);
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/screen?lines=${lines}${raw ? '&raw=1' : ''}`);
       const data = await res.json();
       if (!res.ok) { console.error(`❌ Error: ${data.error}`); process.exit(1); }
 
@@ -1656,7 +1679,7 @@ async function main() {
         noEnter: useSubmit
       });
 
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
       const data = await res.json();
@@ -1699,7 +1722,7 @@ async function main() {
           }
           attemptsMade = attempt + 1;
           try {
-            submitRes = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
+            submitRes = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(submitBody),
@@ -1776,7 +1799,7 @@ async function main() {
         return;
       }
 
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildInjectRequestBody('', {}))
@@ -1808,7 +1831,7 @@ async function main() {
 
       // send-key is a manual override — bypass the render gate via force=true.
       // See: docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md §3.1
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force: true }),
@@ -1836,7 +1859,7 @@ async function main() {
       const target = await resolveSessionTarget(replyTo);
       if (!target) { console.error(`❌ Session '${replyTo}' was not found on any discovered host.`); process.exit(1); }
       const body = { prompt: replyText, from: mySessionId, reply_to: mySessionId };
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
       const data = await res.json();
@@ -1860,7 +1883,7 @@ async function main() {
         process.exit(1);
       }
 
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/state`);
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/state`);
       const data = await res.json();
       if (!res.ok) {
         console.error(`❌ ${formatApiError(data)}`);
@@ -1977,7 +2000,7 @@ async function main() {
         process.exit(1);
       }
 
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}/state`, {
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/state`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildSessionStateReportBody({
@@ -2022,7 +2045,7 @@ async function main() {
 
       const aggregate = { successful: [], failed: [] };
       for (const [host, ids] of groupedTargets.entries()) {
-        const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/multicast/inject`, {
+        const res = await fetchWithAuth(`${daemonUrl(host)}/api/sessions/multicast/inject`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ session_ids: ids, prompt })
@@ -2065,7 +2088,7 @@ async function main() {
         }
 
         for (const host of groupSessionsByHost(local).keys()) {
-          const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/broadcast/inject`, {
+          const res = await fetchWithAuth(`${daemonUrl(host)}/api/sessions/broadcast/inject`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ prompt: localPrompt })
@@ -2112,7 +2135,7 @@ async function main() {
     try {
       const target = await resolveSessionTarget(sessionRef);
       if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exit(1); }
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}`, { method: 'DELETE' });
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}`, { method: 'DELETE' });
       const data = await res.json();
       if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
       console.log(`✅ Session '\x1b[36m${target.id}\x1b[0m' deleted.`);
@@ -2129,7 +2152,7 @@ async function main() {
         if (s.healthStatus === 'STALE' || s.healthStatus === 'DISCONNECTED') {
           try {
             const host = s.host || '127.0.0.1';
-            const res = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
+            const res = await fetchWithAuth(`${daemonUrl(host)}/api/sessions/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
             if (res.ok) { console.log(`  🗑  Removed ghost: \x1b[36m${s.id}\x1b[0m (${s.healthStatus})`); cleaned++; }
           } catch (_) {}
         }
@@ -2149,7 +2172,7 @@ async function main() {
         process.exit(1);
       }
 
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}`, {
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_id: newId })
       });
       const data = await res.json();
@@ -2181,7 +2204,7 @@ async function main() {
           return;
         }
 
-        const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}`);
+        const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}`);
         const data = await res.json();
         if (!res.ok) {
           console.error(`❌ Error: ${data.error}`);
@@ -2196,7 +2219,7 @@ async function main() {
         return;
       }
 
-      const res = await fetchWithAuth(`http://${target.host}:${PORT}/api/sessions/${encodeURIComponent(target.id)}`);
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}`);
       const data = await res.json();
       if (!res.ok) {
         console.error(`❌ Error: ${data.error}`);
@@ -2649,7 +2672,7 @@ Discuss the following topic from your project's perspective. Engage with other s
           reply_to: orchestratorId,
           thread_id: threadId
         };
-        const resp = await fetchWithAuth(`http://${host}:${PORT}/api/sessions/${encodeURIComponent(session.id)}/inject`, {
+        const resp = await fetchWithAuth(`${daemonUrl(host)}/api/sessions/${encodeURIComponent(session.id)}/inject`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
@@ -2658,7 +2681,7 @@ Discuss the following topic from your project's perspective. Engage with other s
           // Submit after text injection (300ms delay handled by daemon)
           setTimeout(async () => {
             try {
-              await fetchWithAuth(`http://${host}:${PORT}/api/sessions/${encodeURIComponent(session.id)}/submit`, { method: 'POST' });
+              await fetchWithAuth(`${daemonUrl(host)}/api/sessions/${encodeURIComponent(session.id)}/submit`, { method: 'POST' });
             } catch {}
           }, 500);
           console.log(`  ✅ Injected to ${session.id}`);
@@ -2908,6 +2931,43 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
+  // telepty connect-http <host>[:port] [--name <name>] [--token <token>]
+  // HTTP-only remote daemon registration (no SSH/sshd required).
+  // Records peer in ~/.telepty/peers.json with transport='http' so subsequent
+  // `telepty list`/`inject`/etc. discover sessions on the remote daemon via
+  // its HTTP API. Designed for laptop daemons where running sshd is not
+  // viable. See GitHub issue #13.
+  if (cmd === 'connect-http') {
+    const target = args[1];
+    if (!target) {
+      console.error('❌ Usage: telepty connect-http <host>[:port] [--name <name>] [--token <token>]');
+      process.exit(1);
+    }
+    const nameFlag = args.indexOf('--name');
+    const tokenFlag = args.indexOf('--token');
+    const options = {};
+    if (nameFlag !== -1 && args[nameFlag + 1]) options.name = args[nameFlag + 1];
+    if (tokenFlag !== -1 && args[tokenFlag + 1]) options.token = args[tokenFlag + 1];
+
+    process.stdout.write(`\x1b[36m🔗 Connecting to ${target} via HTTP...\x1b[0m\n`);
+    try {
+      const result = await crossMachine.connectHttp(target, options);
+      if (result.success) {
+        console.log(`\x1b[32m✅ Connected to ${result.name}\x1b[0m`);
+        console.log(`   Host: ${result.host}:${result.port}`);
+        console.log(`   Machine ID: ${result.machineId}`);
+        console.log(`\nSessions on ${result.name} are now discoverable via \x1b[36mtelepty list\x1b[0m`);
+      } else {
+        console.error(`\x1b[31m❌ ${result.error}\x1b[0m`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`\x1b[31m❌ ${err.message}\x1b[0m`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // telepty disconnect [<name> | --all]
   if (cmd === 'disconnect') {
     if (args[1] === '--all') {
@@ -2937,8 +2997,9 @@ Discuss the following topic from your project's perspective. Engage with other s
 
     const active = crossMachine.listActivePeers();
     const known = crossMachine.listKnownPeers();
+    const httpPeers = crossMachine.listHttpPeers();
 
-    console.log('\x1b[1mConnected Peers:\x1b[0m');
+    console.log('\x1b[1mConnected Peers (SSH ControlMaster):\x1b[0m');
     if (active.length === 0) {
       console.log('  (none)');
     } else {
@@ -2948,12 +3009,21 @@ Discuss the following topic from your project's perspective. Engage with other s
     }
 
     const knownNames = Object.keys(known);
-    const disconnected = knownNames.filter(n => !active.find(a => a.name === n));
+    const httpNames = new Set(httpPeers.map((p) => p.name));
+    const disconnected = knownNames.filter(n => !active.find(a => a.name === n) && !httpNames.has(n));
     if (disconnected.length > 0) {
       console.log('\n\x1b[1mKnown Peers (disconnected):\x1b[0m');
       for (const name of disconnected) {
         const p = known[name];
         console.log(`  \x1b[90m○\x1b[0m ${name} (${p.target}) — last: ${p.lastConnected || 'never'}`);
+      }
+    }
+
+    if (httpPeers.length > 0) {
+      console.log('\n\x1b[1mHTTP Peers (no SSH):\x1b[0m');
+      for (const peer of httpPeers) {
+        const tokenNote = peer.hasToken ? ' [token]' : '';
+        console.log(`  \x1b[36m◆\x1b[0m ${peer.name} (${peer.host}:${peer.port}) [${peer.machineId}]${tokenNote}`);
       }
     }
     return;
@@ -2973,7 +3043,7 @@ Discuss the following topic from your project's perspective. Engage with other s
     let connectedHosts = 0;
 
     hosts.forEach((host) => {
-      const wsUrl = `ws://${host}:${PORT}/api/bus?token=${encodeURIComponent(TOKEN)}`;
+      const wsUrl = `${daemonWsUrl(host)}/api/bus?token=${encodeURIComponent(TOKEN)}`;
       const ws = new WebSocket(wsUrl);
 
       ws.on('open', () => {
@@ -3051,7 +3121,8 @@ Discuss the following topic from your project's perspective. Engage with other s
   telepty read-screen <id[@host]> [--lines N]    Read session screen buffer
 
 \x1b[1mCross-Machine:\x1b[0m
-  telepty connect <user@host> [--name N] [--port P]  SSH tunnel to remote host
+  telepty connect <user@host> [--name N] [--port P]      SSH tunnel to remote host
+  telepty connect-http <host>[:port] [--name N] [--token T]  Register remote daemon via HTTP (no SSH)
   telepty disconnect <name> | --all              Disconnect remote host
   telepty peers [--remove <name>]                List connected peers
 

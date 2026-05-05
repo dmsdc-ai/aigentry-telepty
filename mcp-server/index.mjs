@@ -34,9 +34,30 @@ function getAuthToken() {
 }
 
 function getDaemonUrl() {
-  const port = process.env.TELEPTY_PORT || "3848";
-  const host = process.env.TELEPTY_HOST || "127.0.0.1";
-  return `http://${host}:${port}`;
+  // TELEPTY_HOST accepts: `host`, `host:port`, or `http://host:port`. Embedded
+  // port from TELEPTY_HOST is used unless TELEPTY_PORT is set explicitly.
+  const explicitPort = process.env.TELEPTY_PORT ? Number(process.env.TELEPTY_PORT) : null;
+  const raw = process.env.TELEPTY_HOST || "127.0.0.1";
+  let stripped = String(raw).trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
+  let host = stripped;
+  let embeddedPort = null;
+  const ipv6Bracketed = stripped.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (ipv6Bracketed) {
+    host = ipv6Bracketed[1];
+    if (ipv6Bracketed[2]) embeddedPort = Number(ipv6Bracketed[2]);
+  } else {
+    const colonCount = (stripped.match(/:/g) || []).length;
+    if (colonCount === 1) {
+      const m = stripped.match(/^(.+):(\d+)$/);
+      if (m) {
+        host = m[1];
+        embeddedPort = Number(m[2]);
+      }
+    }
+  }
+  const port = explicitPort != null ? explicitPort : (embeddedPort != null ? embeddedPort : 3848);
+  const hostForUrl = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `http://${hostForUrl}:${port}`;
 }
 
 async function daemonFetch(endpoint, options = {}) {

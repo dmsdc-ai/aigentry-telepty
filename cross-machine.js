@@ -5,9 +5,15 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { getSharedContextPromptPath } = require('./shared-context');
+const { parseHostSpec } = require('./host-spec');
 
 const PEERS_PATH = path.join(os.homedir(), '.telepty', 'peers.json');
 const CONTROL_DIR = path.join(os.homedir(), '.telepty', 'ssh');
+
+function getPeerTransport(entry) {
+  if (!entry) return null;
+  return entry.transport || 'ssh';
+}
 
 // SSH ControlMaster socket path pattern
 function controlPath(target) {
@@ -307,6 +313,126 @@ function removePeer(name) {
   return { success: true };
 }
 
+// ── HTTP peer support (no SSH required) ─────────────────────────────────────
+// connect-http records a remote daemon's host:port in peers.json with
+// transport='http'. Subsequent inject/list calls discover sessions via the
+// remote daemon's HTTP API directly. Built for laptop daemons where running
+// sshd is not viable. See GitHub issue #13.
+
+async function connectHttp(target, options = {}) {
+  const spec = parseHostSpec(target);
+  if (!spec.host) {
+    return { success: false, error: 'connect-http requires a host (got empty value).' };
+  }
+
+  const name = options.name || spec.host.split('.')[0] || spec.host;
+
+  const headers = {};
+  if (options.token) headers['x-telepty-token'] = options.token;
+
+  let machineId = name;
+  let healthOk = false;
+  try {
+    const healthUrl = `http://${spec.host}:${spec.port}/api/health`;
+    const res = await fetch(healthUrl, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) {
+      return { success: false, error: `Daemon at ${spec.host}:${spec.port} returned HTTP ${res.status} on /api/health.` };
+    }
+    healthOk = true;
+  } catch (err) {
+    return { success: false, error: `Cannot reach daemon at ${spec.host}:${spec.port}: ${err.message}` };
+  }
+
+  try {
+    const metaUrl = `http://${spec.host}:${spec.port}/api/meta`;
+    const res = await fetch(metaUrl, { signal: AbortSignal.timeout(3000), headers });
+    if (res.ok) {
+      const meta = await res.json();
+      if (meta && typeof meta.machine_id === 'string' && meta.machine_id) {
+        machineId = meta.machine_id;
+      } else if (meta && typeof meta.host === 'string' && meta.host) {
+        machineId = meta.host;
+      }
+    }
+  } catch {
+    // /api/meta is auth-gated; failure is not fatal — health passed.
+  }
+
+  const peers = loadPeers();
+  peers.peers[name] = {
+    transport: 'http',
+    host: spec.host,
+    port: spec.port,
+    target: `${spec.host}:${spec.port}`,
+    machineId,
+    lastConnected: new Date().toISOString()
+  };
+  if (options.token) {
+    peers.peers[name].token = options.token;
+  }
+  savePeers(peers);
+
+  return {
+    success: true,
+    name,
+    host: spec.host,
+    port: spec.port,
+    machineId,
+    healthOk
+  };
+}
+
+function listHttpPeers() {
+  const peers = loadPeers().peers || {};
+  return Object.entries(peers)
+    .filter(([, entry]) => getPeerTransport(entry) === 'http')
+    .map(([name, entry]) => ({
+      name,
+      host: entry.host,
+      port: entry.port,
+      machineId: entry.machineId,
+      lastConnected: entry.lastConnected,
+      hasToken: Boolean(entry.token)
+    }));
+}
+
+async function listHttpRemoteSessions(name, options = {}) {
+  const peers = loadPeers().peers || {};
+  const entry = peers[name];
+  if (!entry || getPeerTransport(entry) !== 'http') return [];
+
+  const headers = {};
+  const token = options.token || entry.token;
+  if (token) headers['x-telepty-token'] = token;
+
+  try {
+    const url = `http://${entry.host}:${entry.port}/api/sessions`;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(options.timeoutMs || 3000),
+      headers
+    });
+    if (!res.ok) return [];
+    const sessions = await res.json();
+    if (!Array.isArray(sessions)) return [];
+    return sessions.map((s) => ({
+      ...s,
+      host: `${entry.host}:${entry.port}`,
+      peerName: name,
+      peerPort: entry.port
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function discoverHttpRemoteSessions(options = {}) {
+  const peers = listHttpPeers();
+  const results = await Promise.all(
+    peers.map((peer) => listHttpRemoteSessions(peer.name, options))
+  );
+  return results.flat();
+}
+
 module.exports = {
   connect,
   disconnect,
@@ -323,5 +449,11 @@ module.exports = {
   remoteEnsureSharedContext,
   remoteAttach,
   findSessionPeer,
+  // HTTP peer transport (no SSH required)
+  connectHttp,
+  listHttpPeers,
+  listHttpRemoteSessions,
+  discoverHttpRemoteSessions,
+  getPeerTransport,
   PEERS_PATH
 };
