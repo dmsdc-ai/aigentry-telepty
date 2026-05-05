@@ -6,6 +6,7 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { buildOutput } = require('../src/init/print-snippet');
 
 const projectRoot = path.resolve(__dirname, '..');
 const cliPath = path.join(projectRoot, 'cli.js');
@@ -19,6 +20,15 @@ async function readJsonRecords(target = 'all') {
   const result = await runTelepty(['init', '--print-snippet', '--target', target, '--format', 'json']);
   assert.equal(result.code, 0, result.stderr);
   return result.stdout.trimEnd().split('\n').map((line) => JSON.parse(line));
+}
+
+function createCaptureStream() {
+  return {
+    value: '',
+    write(chunk) {
+      this.value += chunk;
+    }
+  };
 }
 
 function runTelepty(args, options = {}) {
@@ -166,4 +176,18 @@ test('unsupported target exits 2 with stderr and empty stdout', async () => {
   assert.equal(result.code, 2);
   assert.equal(result.stdout, '');
   assert.match(result.stderr, /--target must be one of claude, agents, gemini, all/);
+});
+
+test('internal snippet load failure exits 4 with stderr and empty stdout', () => {
+  const stdout = createCaptureStream();
+  const stderr = createCaptureStream();
+  const code = buildOutput(['--print-snippet', '--target', 'claude'], {
+    stdout,
+    stderr,
+    snippetDir: path.join(projectRoot, 'missing-snippet-dir')
+  });
+
+  assert.equal(code, 4);
+  assert.equal(stdout.value, '');
+  assert.notEqual(stderr.value, '');
 });
