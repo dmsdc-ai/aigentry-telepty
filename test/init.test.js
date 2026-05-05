@@ -9,6 +9,11 @@ const path = require('node:path');
 
 const projectRoot = path.resolve(__dirname, '..');
 const cliPath = path.join(projectRoot, 'cli.js');
+const targets = ['claude', 'agents', 'gemini'];
+
+function countMatches(value, pattern) {
+  return [...value.matchAll(pattern)].length;
+}
 
 function runTelepty(args, options = {}) {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-init-home-'));
@@ -73,4 +78,18 @@ test('markdown output for gemini includes target and 8-char sha256 envelope', as
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /^<!-- telepty-snippet\/v1 BEGIN target=gemini sha256=[0-9a-f]{8} -->\n/);
   assert.match(result.stdout, /\n<!-- telepty-snippet\/v1 END target=gemini -->\n$/);
+});
+
+test('markdown output for all emits three envelopes in target order with empty separators', async () => {
+  const result = await runTelepty(['init', '--print-snippet', '--target', 'all', '--format', 'markdown']);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(countMatches(result.stdout, /<!-- telepty-snippet\/v1 BEGIN target=/g), 3);
+  assert.equal(countMatches(result.stdout, /<!-- telepty-snippet\/v1 END target=/g), 3);
+  assert.deepEqual(
+    [...result.stdout.matchAll(/BEGIN target=(claude|agents|gemini) /g)].map((match) => match[1]),
+    targets
+  );
+  assert.match(result.stdout, /END target=claude -->\n\n<!-- telepty-snippet\/v1 BEGIN target=agents/);
+  assert.match(result.stdout, /END target=agents -->\n\n<!-- telepty-snippet\/v1 BEGIN target=gemini/);
 });
