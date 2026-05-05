@@ -148,3 +148,14 @@ test('snippet output is byte-identical across sequential invocations', async () 
     assert.equal(first.stdout, second.stdout);
   }
 });
+
+test('print-snippet defaults to all markdown and exits zero', async () => {
+  const result = await runTelepty(['init', '--print-snippet']);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(countMatches(result.stdout, /<!-- telepty-snippet\/v1 BEGIN target=/g), 3);
+  assert.deepEqual(
+    [...result.stdout.matchAll(/BEGIN target=(claude|agents|gemini) /g)].map((match) => match[1]),
+    targets
+  );
+});
