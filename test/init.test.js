@@ -32,6 +32,24 @@ function createCaptureStream() {
   };
 }
 
+function pathWithoutAigentryExecutables(envPath = process.env.PATH || '') {
+  return envPath
+    .split(path.delimiter)
+    .filter((entry) => {
+      if (!entry) {
+        return false;
+      }
+      const aigentryPath = path.join(entry, process.platform === 'win32' ? 'aigentry.cmd' : 'aigentry');
+      try {
+        fs.accessSync(aigentryPath, fs.constants.X_OK);
+        return false;
+      } catch {
+        return true;
+      }
+    })
+    .join(path.delimiter);
+}
+
 function runTelepty(args, options = {}) {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-init-home-'));
   const env = {
@@ -222,4 +240,17 @@ test('golden snippet fixtures match runtime output', async () => {
       assert.equal(result.stdout, expected, fixturePath);
     }
   }
+});
+
+test('print-snippet works with devkit-free PATH', async () => {
+  const fixturePath = path.join(projectRoot, 'tests', 'snippet-protocol', 'v1', 'golden-all.md');
+  const expected = fs.readFileSync(fixturePath, 'utf8');
+  const result = await runTelepty(['init', '--print-snippet', '--target', 'all'], {
+    env: {
+      PATH: pathWithoutAigentryExecutables()
+    }
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout, expected);
 });
