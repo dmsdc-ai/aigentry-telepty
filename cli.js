@@ -139,11 +139,17 @@ function daemonWsUrl(host) {
   return buildDaemonWsUrl(host, PORT);
 }
 
-const config = getConfig();
-const TOKEN = config.authToken;
+let cachedAuthToken = null;
+
+function getAuthToken() {
+  if (cachedAuthToken == null) {
+    cachedAuthToken = getConfig().authToken;
+  }
+  return cachedAuthToken;
+}
 
 const fetchWithAuth = (url, options = {}) => {
-  const headers = { ...options.headers, 'x-telepty-token': TOKEN };
+  const headers = { ...options.headers, 'x-telepty-token': getAuthToken() };
   return fetch(url, { ...options, headers });
 };
 
@@ -573,7 +579,7 @@ async function ensureDaemonRunning(options = {}) {
 }
 
 async function manageInteractiveAttach(sessionId, targetHost) {
-  const wsUrl = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
+  const wsUrl = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}`;
   const ws = new WebSocket(wsUrl);
   let cleanupTerminal = null;
   return new Promise((resolve) => {
@@ -832,6 +838,15 @@ async function main() {
 
   if (cmd === '--version' || cmd === '-v' || cmd === 'version') {
     console.log(pkg.version);
+    return;
+  }
+
+  if (cmd === 'init') {
+    const { main: runInit } = require('./src/init/print-snippet');
+    const exitCode = runInit(args.slice(1));
+    if (exitCode) {
+      process.exitCode = exitCode;
+    }
     return;
   }
 
@@ -1163,7 +1178,7 @@ async function main() {
     // Connect to daemon WebSocket with auto-reconnect
     // owner=1 tells daemon this is the allow bridge (owner), not an attach viewer.
     // Daemon uses this to reclaim ownership even if a stale ownerWs is still registered.
-    const wsUrl = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}&owner=1`;
+    const wsUrl = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}&owner=1`;
     let daemonWs = null;
     let wsReady = false;
     let reconnectAttempts = 0;
@@ -1471,7 +1486,7 @@ async function main() {
       }
     }
 
-    const wsUrl = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(TOKEN)}`;
+    const wsUrl = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}`;
     const ws = new WebSocket(wsUrl);
     let cleanupTerminal = null;
 
@@ -3043,7 +3058,7 @@ Discuss the following topic from your project's perspective. Engage with other s
     let connectedHosts = 0;
 
     hosts.forEach((host) => {
-      const wsUrl = `${daemonWsUrl(host)}/api/bus?token=${encodeURIComponent(TOKEN)}`;
+      const wsUrl = `${daemonWsUrl(host)}/api/bus?token=${encodeURIComponent(getAuthToken())}`;
       const ws = new WebSocket(wsUrl);
 
       ws.on('open', () => {
