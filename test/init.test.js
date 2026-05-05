@@ -201,3 +201,10 @@ test('stdin pipe is ignored and closed input still emits full output', async () 
   assert.equal(result.code, 0, result.stderr);
   assert.equal(countMatches(result.stdout, /<!-- telepty-snippet\/v1 BEGIN target=/g), 3);
 });
+
+test('happy path emits no stderr warnings', async () => {
+  const result = await runTelepty(['init', '--print-snippet', '--target', 'claude']);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stderr, '');
+});
