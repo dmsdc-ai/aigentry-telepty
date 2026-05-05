@@ -11,6 +11,7 @@ const { buildOutput } = require('../src/init/print-snippet');
 const projectRoot = path.resolve(__dirname, '..');
 const cliPath = path.join(projectRoot, 'cli.js');
 const targets = ['claude', 'agents', 'gemini'];
+const formats = ['markdown', 'json'];
 
 function countMatches(value, pattern) {
   return [...value.matchAll(pattern)].length;
@@ -207,4 +208,18 @@ test('happy path emits no stderr warnings', async () => {
 
   assert.equal(result.code, 0, result.stderr);
   assert.equal(result.stderr, '');
+});
+
+test('golden snippet fixtures match runtime output', async () => {
+  for (const target of [...targets, 'all']) {
+    for (const format of formats) {
+      const ext = format === 'markdown' ? 'md' : 'json';
+      const fixturePath = path.join(projectRoot, 'tests', 'snippet-protocol', 'v1', `golden-${target}.${ext}`);
+      const expected = fs.readFileSync(fixturePath, 'utf8');
+      const result = await runTelepty(['init', '--print-snippet', '--target', target, '--format', format]);
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stdout, expected, fixturePath);
+    }
+  }
 });
