@@ -137,3 +137,14 @@ test('snippet bodies are LF-only', async () => {
     assert.equal(body.includes('\r'), false);
   });
 });
+
+test('snippet output is byte-identical across sequential invocations', async () => {
+  for (const target of targets) {
+    const first = await runTelepty(['init', '--print-snippet', '--target', target]);
+    const second = await runTelepty(['init', '--print-snippet', '--target', target]);
+
+    assert.equal(first.code, 0, first.stderr);
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(first.stdout, second.stdout);
+  }
+});
