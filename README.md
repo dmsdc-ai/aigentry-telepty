@@ -151,9 +151,12 @@ The receiving AI session is expected to:
 
 Per-agent receiver integrations (auto-loading the file via Claude Code
 `UserPromptSubmit` hooks, Codex `AGENTS.md` directives, etc.) are **out of
-scope for telepty core** — they live in the agent's own configuration. The
-receiver-side install commands proposed in #10 (`telepty install hooks …`)
-are tracked as separate follow-up work.
+scope for telepty core** — they live in the agent's own configuration.
+Per-CLI hook installation lives in devkit: run `aigentry scaffold
+install-hooks {claude|codex|gemini}` after installing
+`@dmsdc-ai/aigentry-devkit`. (Older drafts proposed a receiver-side
+`telepty install` subcommand for this; that direction is rejected per ADR
+2026-05-05-telepty-devkit-boundary §3.1.2 / §3.4 row 2.)
 
 ## Inject Delivery Paths
 

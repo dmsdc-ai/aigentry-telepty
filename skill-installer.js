@@ -1,3 +1,4 @@
+// LEGACY: grandfathered by ADR 2026-05-05-telepty-devkit-boundary §6.2.1. New installer behavior MUST land in @dmsdc-ai/aigentry-devkit. Bugfixes only.
 'use strict';
 
 const fs = require('fs');

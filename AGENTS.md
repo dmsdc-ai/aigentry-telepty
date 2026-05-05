@@ -72,3 +72,26 @@ telepty inject --ref --from aigentry-telepty-{cli} aigentry-orchestrator-claude 
 - **Evidence-Based**: 추측 금지. 데이터/로그/테스트 결과 기반 판단.
 - **Fail Fast**: 에러 즉시 보고. 숨기지 않음.
 - **Constitution**: ~/projects/aigentry/docs/CONSTITUTION.md 준수.
+
+## Legacy exception — `skill-installer.js`
+
+`skill-installer.js` is a **named legacy exception** grandfathered by
+**ADR 2026-05-05-telepty-devkit-boundary §6.2.1**. It is the single
+exception to the telepty/devkit boundary rule and is NOT precedent for
+new placements.
+
+- **Scope**: bugfixes, security patches, dependency upgrades only.
+- **No new feature expansion**: net-new functionality (new CLI detection,
+  new skill types, new install paths, new flags) MUST land in
+  `@dmsdc-ai/aigentry-devkit`. At migration time devkit will introduce
+  `aigentry scaffold install-skills`.
+- **Reviewer enforcement**: PR reviewers cite ADR 2026-05-05 §6.2.1 when
+  rejecting feature-expansion PRs against `skill-installer.js`.
+- **Migration triggers** (per ADR §6.2.1): ≥2 PRs in 60 days attempting
+  net-new features; devkit feature requires functionality only in
+  `skill-installer.js`; breaking change to its interface.
+
+Per-CLI hook installation, `CLAUDE.md`/`AGENTS.md`/`GEMINI.md` scaffolding,
+project-file generation, and cross-cutting installable skills are
+**devkit-owned** per ADR 2026-05-05 §3.3 — not telepty's responsibility.
+See `@dmsdc-ai/aigentry-devkit` (`aigentry scaffold …`).
