@@ -66,3 +66,11 @@ test('markdown output for agents includes target and 8-char sha256 envelope', as
   assert.match(result.stdout, /^<!-- telepty-snippet\/v1 BEGIN target=agents sha256=[0-9a-f]{8} -->\n/);
   assert.match(result.stdout, /\n<!-- telepty-snippet\/v1 END target=agents -->\n$/);
 });
+
+test('markdown output for gemini includes target and 8-char sha256 envelope', async () => {
+  const result = await runTelepty(['init', '--print-snippet', '--target', 'gemini', '--format', 'markdown']);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^<!-- telepty-snippet\/v1 BEGIN target=gemini sha256=[0-9a-f]{8} -->\n/);
+  assert.match(result.stdout, /\n<!-- telepty-snippet\/v1 END target=gemini -->\n$/);
+});
