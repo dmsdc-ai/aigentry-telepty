@@ -89,14 +89,14 @@ One line per target. `sha256` here is the **full** 64-char digest (NOT truncated
   - `warn: telepty version <X.Y.Z> emits telepty-snippet/v1 forward-compat lines; consumers expecting strict v1 line set may see additive content.` (when telepty version exceeds the version range it was last fixture-pinned to.)
 - Tee-safe: devkit consumers may redirect stderr to a log file without affecting stdout pipeline integrity.
 
-### §3.5 Exit codes (verbatim from ADR §3.1.1.2)
+### §3.5 Exit codes (per ADR §3.1.1.2 — paraphrased)
 
 | Code | Meaning |
 |---|---|
-| 0 | Success |
+| 0 | Success — snippet emitted to stdout |
 | 2 | Unsupported `--target` value |
-| 3 | Reserved for legacy detection (telepty too old; consumer detects shell exit 127 OR exit 3) |
-| 4 | Internal failure (e.g., template file unreadable) |
+| 3 | Telepty version older than `--print-snippet` introduction (legacy telepty, command not found); consumers detect shell exit 127 OR exit 3 |
+| 4 | Internal failure (snippet generation error, e.g., template file unreadable) |
 
 `v1` MAY add new non-zero codes; consumers MUST treat any non-zero as fail-closed (refuse to write into user files).
 
@@ -130,7 +130,7 @@ Reproduced for the spec record (and to satisfy the dispatch envelope's "verbatim
 
 > **§3.4 row 1 (issue #8 placement):** "telepty exposes stable stdout contract (versioned snippet); devkit consumes it. **No file editing in telepty.**"
 
-> **§3.5 row 1:** "Contract spec gate: before #8/#10.2/#3 implementation, publish SSOT entries and conformance fixtures for `telepty-snippet/v1`, `[context-ref/v1]`, `telepty list --json`, and `--scaffold`." (RESOLVED at §3.1.1, §3.1.2, §3.3.1, §6.5.)
+> **§3.5 codex-conditions table, row 1:** "Contract spec gate: before #8/#10.2/#3 implementation, publish SSOT entries and conformance fixtures for `telepty-snippet/v1`, `[context-ref/v1]`, `telepty list --json`, and `--scaffold`." (RESOLVED at §3.1.1, §3.1.2, §3.3.1, §6.5.)
 
 > **§3.3.1.5 (what telepty MUST NOT do):** "Telepty CI MUST pass on a clean machine without devkit installed (Article 9 / §8 M3). Telepty's core test suite MUST NOT invoke `aigentry scaffold` for any non-`--scaffold` codepath."
 
@@ -315,7 +315,7 @@ All tests live in `test/init.test.js` (node:test, matching existing 17-file conv
 
 ### §8.2 Body invariants (3)
 
-6. For each target, body bytes contain none of: `$HOME`, `$(`, backtick (`` ` ``) outside fenced code blocks, literal `~` outside the section header line. (Defends §3.1.1.1 line 161 "no shell substitution.")
+6. For each target, body bytes contain none of: `$HOME`, `$(`, backtick (`` ` ``) outside fenced code blocks, literal `~` anywhere in body. (Defends §3.1.1.1 line 161 "no shell substitution.")
 7. For each target, body is UTF-8 LF-only — `body.includes('\r')` is false.
 8. For each target, two sequential `--print-snippet --target <X>` invocations produce byte-identical stdout. (§3.1.1.1 idempotency row.)
 
@@ -334,11 +334,15 @@ All tests live in `test/init.test.js` (node:test, matching existing 17-file conv
 
 14. `tests/snippet-protocol/v1/golden-{claude,agents,gemini,all}.{md,json}` (8 files) byte-equal the runtime emitter's stdout for the matching invocation. Test uses `fs.readFileSync` and `assert.strictEqual`. Test will fail if `git diff --exit-code tests/snippet-protocol/v1/` is non-empty after running `npm run regen-fixtures`.
 
-**Total: 14 tests.** All run under `npm test` (node:test runner, devkit-free per Article 9 / M3).
+### §8.6 Devkit-free path enforcement (1, M3 in-suite)
 
-### §8.6 Cross-cutting verification
+15. Run `telepty init --print-snippet --target all` in a child process with `PATH` filtered to remove any directory containing an `aigentry` executable; assert exit 0 and stdout matches the golden fixture. Defends Article 9 / §8 M3 inside the test suite (not just narratively).
 
-- `npm test` runs to green on a clean checkout without `aigentry` on PATH (M3).
+**Total: 15 tests.** All run under `npm test` (node:test runner, devkit-free per Article 9 / M3).
+
+### §8.7 Cross-cutting verification
+
+- `npm test` runs to green on a clean checkout without `aigentry` on PATH (M3) — enforced by test 15 (§8.6) plus narrative external smoke.
 - Telepty CI does not invoke `aigentry scaffold` (§3.3.1.5).
 
 ---
@@ -398,10 +402,10 @@ Lessons honored:
 ### §11.2 Open questions (for user / orchestrator review)
 
 - **OQ-A** — Should the G1 SSOT stub PR be co-authored from this session (single agent ships both repos) or dispatched as a sibling to a different session? **Author lean:** single agent ships both for atomic correctness; user has confirmed Option B which implies single-agent atomic.
-- **OQ-B** — Should `telepty init` (no flags) print help to stdout (exit 0) or stderr (exit 64 — `EX_USAGE`)? **Author lean:** stdout + exit 0; help is a documented happy-path output, not an error.
+- ~~**OQ-B**~~ — *Resolved by §3.1 invocation matrix row 1: `telepty init` with no flags prints help to stdout, exit 0. Help is a documented happy-path output, not an error.*
 - **OQ-C** — Is the 8-char sha256 prefix in the markdown sentinel sufficient for devkit's idempotency check, or should the markdown form also carry the full 64-char digest in a comment? **Author lean:** 8-char is sufficient for tag-line collision detection (2^32 namespace, deterministic input set ≤ 3 targets); full digest is available via `--format json` if devkit needs it.
 
-User/orchestrator: signal preferences on OQ-A/B/C in the approval round, or accept author-leans.
+User/orchestrator: signal preferences on OQ-A/C in the approval round, or accept author-leans.
 
 ---
 
@@ -466,7 +470,7 @@ Per SAWP Rule 24 + dispatch step 3:
 
 > Step 3. Commit spec to `~/projects/aigentry-telepty` + report to orchestrator. WAIT for user approval before implementation.
 
-This spec is the deliverable for the SPEC FIRST gate. **No code lands until the user (via orchestrator) approves this spec.** After approval, implementation proceeds per `superpowers:test-driven-development` + `superpowers:writing-plans` with frequent commits, fixture regeneration via `npm run regen-fixtures`, and a final REPORT confirming all 14 tests green.
+This spec is the deliverable for the SPEC FIRST gate. **No code lands until the user (via orchestrator) approves this spec.** After approval, implementation proceeds per `superpowers:test-driven-development` + `superpowers:writing-plans` with frequent commits, fixture regeneration via `npm run regen-fixtures`, and a final REPORT confirming all 15 tests green.
 
 ---
 
