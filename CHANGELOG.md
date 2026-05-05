@@ -2,6 +2,116 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.3.5] — 2026-05-05
+
+### Added — `telepty init --print-snippet` (Issue #8)
+
+New subcommand that emits the canonical telepty-baseline snippet to stdout for
+graceful integration into per-CLI agent files. **Mechanism only** — telepty
+emits the versioned snippet text; downstream tooling (`aigentry-devkit
+scaffold --integrate-telepty`) owns idempotent insertion into
+`~/CLAUDE.md` / `~/AGENTS.md` / `~/GEMINI.md`. Boundary contract per ADR
+`2026-05-05-telepty-devkit-boundary` (commit `e4b072b`).
+
+```
+telepty init --print-snippet [--target {claude|agents|gemini|all}] [--format {markdown|json}]
+```
+
+- **argv-only**: never consumes stdin (safe in scripted pipelines).
+- **zero file I/O**: pure stdout emission; nothing read from or written to disk.
+- **deterministic**: byte-identical output for a given (target, format) pair —
+  fixtures can be hashed for verification.
+- **LF-only bodies**: no CRLF leakage on cross-platform consumers.
+- **stderr clean**: success path emits no warnings.
+
+Spec: `docs/specs/2026-05-05-issue-8-telepty-init.md` (commit `8d2dc94`).
+Implementation: `f5c6bad`. Protocol SSOT: `aigentry-ssot/contracts/telepty-snippet-v1.md`
+(commit `f4ff0cd`). 15 conformance fixtures shipped at `tests/snippet-protocol/v1/`
+covering markdown envelopes (claude, agents, gemini, all), JSON records,
+shell-hazard guards, deterministic LF output, default targeting, unsupported-target
+rejection, internal-failure exit codes, stdin-pipe ignore, devkit-free invocation,
+and the snippet golden fixtures themselves.
+
+### Docs — G7/G8/G9 M0 audit gate closure (commit `d7b8b21`)
+
+Per ADR `2026-05-05-telepty-devkit-boundary` §3.1.2 (devkit owns content
+placement; telepty owns mechanism), three gates closed:
+
+- **G7 — `README.md`**: removed reference to the rejected `telepty install
+  hooks` subcommand. Per ADR §3.1.2, that responsibility lives in devkit.
+- **G8 — `AGENTS.md`**: added Legacy exception subsection documenting the
+  remaining devkit-shaped legacy surface.
+- **G9 — `skill-installer.js`**: top-of-file LEGACY header per ADR §6.2.1
+  marking the module as legacy-track (devkit migration pending).
+
+### Internal
+
+- Cross-LLM review pattern applied: Codex implemented the `init` subcommand
+  + fixtures; Claude reviewed and ACCEPTed (commit `d06e1e9`).
+- `test/enforce-report.test.js` version assertion bumped to track release
+  (commit `d0f4495`).
+
+### Tests
+
+- `test/init.test.js` — full coverage of the new subcommand (snippet
+  emission, target/format permutations, stdin-ignore, error exits, devkit-free
+  invocation).
+- `tests/snippet-protocol/v1/` — golden fixtures for protocol conformance;
+  `npm test` runs `git diff --exit-code` against them so any drift fails CI.
+
+### Invariants preserved
+
+- Daemon code unchanged. No new dependencies. No `bin` field changes.
+- Existing CLI subcommands (`allow`, `inject`, `list`, `tui`, `daemon`, …)
+  unchanged.
+- Cross-host inject path (0.3.4) unchanged.
+
+## [0.3.4] — 2026-05-05
+
+### Added — Cross-host inject (`<id>@<host>` syntax)
+
+Enables `telepty inject <id>@<host> "msg"` to deliver to a remote daemon
+without SSH wrapping, by resolving `<host>` against the peer registry and
+issuing direct HTTP `POST /api/sessions/<id>/inject`. Closes the gap that
+forced operators to either pre-shell into the host or pipe through SSH.
+
+- **`connect-http` peer mode** (commit `a92cacc`) — new HTTP-only peer
+  registration path that does not require a reverse PTY tunnel; suitable
+  for daemons reachable via Tailscale / private DNS.
+- **`TELEPTY_HOST` env parser fix** (commit `a92cacc`) — `<id>@<host>` now
+  parses correctly when the host segment contains a port or non-default
+  scheme; prior parser dropped the host portion silently.
+- **Peer registry HTTP-only mode** — registry entries can be marked
+  HTTP-only so the daemon does not attempt PTY fan-out for them.
+
+### Added — Skill installer auto-detect (`486bc1e`)
+
+`telepty install` now auto-detects which AI CLIs are present
+(`claude`, `codex`, `gemini`) and only installs the corresponding skill
+files. Reduces noisy "skipped" log lines and prevents stub installs
+on machines that don't have the target CLI yet.
+
+### Fixed — Node 18 ESM regression (`fc7ff9a`)
+
+Pinned `uuid@9` (was floating to v10, which is ESM-only and caused
+`ERR_REQUIRE_ESM` under Node 18 CommonJS consumers).
+
+### Docs
+
+- Cross-host inject `<id>@<host>` syntax documented (commit `c8b9bbb`).
+- `[context-ref]` inject protocol standardized across docs (commit `8986a96`).
+- REPORT pattern + orchestrator-id runtime resolution documented in skills
+  (commit `658f712`).
+- Korean trigger keywords added to skill `SKILL.md` descriptions for
+  cross-locale activation (commit `57f46e1`).
+
+### Note — never published to npm
+
+`0.3.4` was version-bumped locally but never reached the registry; this
+entry is added retrospectively alongside the `0.3.5` publish so the
+changelog history matches the git log. Registry consumers go directly
+from `0.3.3` → `0.3.5`.
+
 ## [0.3.3] — 2026-05-02
 
 ### Added — `inject --submit-force` + idempotent client retry (spec: `docs/superpowers/specs/2026-05-02-submit-force-and-retry.md`)
