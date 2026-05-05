@@ -129,3 +129,11 @@ test('snippet bodies contain no shell-substitution hazards', async () => {
     }
   });
 });
+
+test('snippet bodies are LF-only', async () => {
+  const records = await readJsonRecords();
+
+  records.forEach(({ body }) => {
+    assert.equal(body.includes('\r'), false);
+  });
+});
