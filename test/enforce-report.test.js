@@ -277,9 +277,9 @@ test('Idle WITHOUT pendingReports (no inject source) fires no enforcement event'
 
 // ---------------- Version check ----------------
 
-test('package.json version is 0.3.3', async () => {
+test('package.json version is 0.3.4', async () => {
   const pkg = require('../package.json');
-  assert.equal(pkg.version, '0.3.3');
+  assert.equal(pkg.version, '0.3.4');
 });
 
 // ---------------- Legacy back-compat ----------------
