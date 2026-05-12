@@ -1,7 +1,9 @@
 //! NDJSON wire schema (V1 ADR §6.1 envelope + §6.2 kind-conditional + §6.2.1 A1
-//! + §6.4 A2). Full enum schema lands here per F12 (contract drift guard) even
-//! though Phase 1 only emits POSIX values; cross-LLM amendments that grow the
-//! enums must update the goldens, which the reviewer catches in PR diff.
+//! + §6.4 A2).
+//!
+//! Full enum schema lands here per F12 (contract drift guard) even though
+//! Phase 1 only emits POSIX values; cross-LLM amendments that grow the enums
+//! must update the goldens, which the reviewer catches in PR diff.
 
 use serde::{Deserialize, Serialize};
 
@@ -190,7 +192,12 @@ impl Frame {
         f
     }
 
-    pub fn shutdown_drain(sid: &str, exit_reason: ExitReasonWire, exit_code: Option<i32>, escalated: bool) -> Self {
+    pub fn shutdown_drain(
+        sid: &str,
+        exit_reason: ExitReasonWire,
+        exit_code: Option<i32>,
+        escalated: bool,
+    ) -> Self {
         let mut f = Self::new(Kind::ShutdownDrain);
         f.sid = Some(sid.to_string());
         f.exit_reason = Some(exit_reason);
@@ -253,8 +260,12 @@ mod tests {
     #[test]
     fn round_trip_every_signal_variant() {
         for sk in [
-            SignalKind::Sigint, SignalKind::Sigterm, SignalKind::Sighup,
-            SignalKind::Sigkill, SignalKind::JobTerminate, SignalKind::CtrlBreakEvent,
+            SignalKind::Sigint,
+            SignalKind::Sigterm,
+            SignalKind::Sighup,
+            SignalKind::Sigkill,
+            SignalKind::JobTerminate,
+            SignalKind::CtrlBreakEvent,
         ] {
             let j = serde_json::to_string(&sk).unwrap();
             let back: SignalKind = serde_json::from_str(&j).unwrap();
@@ -265,11 +276,20 @@ mod tests {
     #[test]
     fn round_trip_every_error_code_variant() {
         let all = [
-            ErrorCode::UnknownSession, ErrorCode::BadFrame, ErrorCode::UnsupportedVersion,
-            ErrorCode::PermissionDenied, ErrorCode::NotReachable, ErrorCode::DuplicateOp,
-            ErrorCode::SpawnFailed, ErrorCode::ShuttingDown, ErrorCode::UnknownKind,
-            ErrorCode::UnkillableChild, ErrorCode::ParentGone, ErrorCode::SupervisorGone,
-            ErrorCode::ManifestWriteFail, ErrorCode::EscapedDescendant,
+            ErrorCode::UnknownSession,
+            ErrorCode::BadFrame,
+            ErrorCode::UnsupportedVersion,
+            ErrorCode::PermissionDenied,
+            ErrorCode::NotReachable,
+            ErrorCode::DuplicateOp,
+            ErrorCode::SpawnFailed,
+            ErrorCode::ShuttingDown,
+            ErrorCode::UnknownKind,
+            ErrorCode::UnkillableChild,
+            ErrorCode::ParentGone,
+            ErrorCode::SupervisorGone,
+            ErrorCode::ManifestWriteFail,
+            ErrorCode::EscapedDescendant,
             ErrorCode::PgrpLiveAfterKill,
         ];
         for code in all {
@@ -301,7 +321,8 @@ mod tests {
 
     #[test]
     fn inject_without_trace_id_rejected() {
-        let f: Frame = serde_json::from_str(r#"{"v":1,"kind":"inject","sid":"x","data":"hi"}"#).unwrap();
+        let f: Frame =
+            serde_json::from_str(r#"{"v":1,"kind":"inject","sid":"x","data":"hi"}"#).unwrap();
         let err = validate_incoming(&f).unwrap_err();
         assert_eq!(err.0, ErrorCode::BadFrame);
         assert_eq!(err.1, "inject_missing_trace_id");
@@ -309,7 +330,9 @@ mod tests {
 
     #[test]
     fn inject_with_trace_id_ok() {
-        let f: Frame = serde_json::from_str(r#"{"v":1,"kind":"inject","sid":"x","trace_id":"t","data":"hi"}"#).unwrap();
+        let f: Frame =
+            serde_json::from_str(r#"{"v":1,"kind":"inject","sid":"x","trace_id":"t","data":"hi"}"#)
+                .unwrap();
         assert_eq!(validate_incoming(&f).unwrap(), Kind::Inject);
     }
 }

@@ -58,8 +58,11 @@ fn error_code_full_a2_set_round_trips() {
 #[test]
 fn exit_reason_all_five_round_trip() {
     for r in [
-        ExitReasonWire::Normal, ExitReasonWire::Signaled, ExitReasonWire::Killed,
-        ExitReasonWire::Crashed, ExitReasonWire::Unkillable,
+        ExitReasonWire::Normal,
+        ExitReasonWire::Signaled,
+        ExitReasonWire::Killed,
+        ExitReasonWire::Crashed,
+        ExitReasonWire::Unkillable,
     ] {
         let j = serde_json::to_string(&r).unwrap();
         let back: ExitReasonWire = serde_json::from_str(&j).unwrap();

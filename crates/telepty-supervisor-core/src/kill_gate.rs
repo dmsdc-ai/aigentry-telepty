@@ -171,6 +171,11 @@ mod tests {
         let outcome = perform_kill(99_999_999, &mut rx, KillKind::Graceful, timeouts)
             .await
             .unwrap();
-        assert!(matches!(outcome, KillOutcome::Unkillable { last_signal: "SIGKILL" }));
+        assert!(matches!(
+            outcome,
+            KillOutcome::Unkillable {
+                last_signal: "SIGKILL"
+            }
+        ));
     }
 }

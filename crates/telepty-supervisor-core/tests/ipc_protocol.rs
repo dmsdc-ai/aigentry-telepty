@@ -6,7 +6,7 @@
 //! than shelling out to the binary; this keeps the tests deterministic.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Duration;
 
 use telepty_supervisor_core::ipc::socket_path_for;
@@ -40,9 +40,11 @@ fn cfg(sid: &str, argv: &[&str]) -> SupervisorConfig {
     }
 }
 
-async fn wait_for_socket(path: &PathBuf) -> bool {
+async fn wait_for_socket(path: &Path) -> bool {
     for _ in 0..50 {
-        if path.exists() { return true; }
+        if path.exists() {
+            return true;
+        }
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
     false
@@ -66,7 +68,11 @@ async fn ping_returns_pong() {
     let sock = socket_path_for(&session_dir(&sid).unwrap());
     let cfg = cfg(&sid, &["bash", "-c", "sleep 5"]);
     let h = tokio::spawn(async move { run(cfg).await });
-    assert!(wait_for_socket(&sock).await, "socket never appeared: {:?}", sock);
+    assert!(
+        wait_for_socket(&sock).await,
+        "socket never appeared: {:?}",
+        sock
+    );
 
     let mut stream = UnixStream::connect(&sock).await.expect("connect");
     let mut ping = Frame::new(Kind::Ping);
@@ -118,10 +124,16 @@ async fn unknown_kind_returns_bad_frame() {
     wait_for_socket(&sock).await;
     let mut stream = UnixStream::connect(&sock).await.unwrap();
 
-    let _ = stream.write_all(b"{\"v\":1,\"kind\":\"telepathy\",\"sid\":\"x\"}\n").await;
+    let _ = stream
+        .write_all(b"{\"v\":1,\"kind\":\"telepathy\",\"sid\":\"x\"}\n")
+        .await;
     let (rx, _tx) = stream.split();
     let mut lines = BufReader::new(rx).lines();
-    let l = timeout(Duration::from_secs(2), lines.next_line()).await.unwrap().unwrap().unwrap();
+    let l = timeout(Duration::from_secs(2), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let reply: Frame = serde_json::from_str(&l).unwrap();
     assert_eq!(reply.kind, Kind::Error);
     assert_eq!(reply.code, Some(ErrorCode::BadFrame));
@@ -147,7 +159,11 @@ async fn v2_returns_bad_frame_version_unsupported() {
     let _ = stream.write_all(b"{\"v\":2,\"kind\":\"ping\"}\n").await;
     let (rx, _tx) = stream.split();
     let mut lines = BufReader::new(rx).lines();
-    let l = timeout(Duration::from_secs(2), lines.next_line()).await.unwrap().unwrap().unwrap();
+    let l = timeout(Duration::from_secs(2), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let reply: Frame = serde_json::from_str(&l).unwrap();
     assert_eq!(reply.code, Some(ErrorCode::BadFrame));
     assert_eq!(reply.data.as_deref(), Some("version_unsupported"));

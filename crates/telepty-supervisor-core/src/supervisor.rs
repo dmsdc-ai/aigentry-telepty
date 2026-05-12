@@ -27,7 +27,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task;
 use tokio::time::Duration;
 
-use crate::ipc::{self, frame_op_key, IdempotencyLru, Ingest, IPC_QUEUE_DEPTH, OUTPUT_BROADCAST_DEPTH};
+use crate::ipc::{
+    self, frame_op_key, IdempotencyLru, Ingest, IPC_QUEUE_DEPTH, OUTPUT_BROADCAST_DEPTH,
+};
 use crate::kill_gate::{
     perform_kill, KillKind, KillOutcome, KillTimeouts, PTY_READ_DRAIN_DEADLINE_MS,
 };
@@ -42,7 +44,11 @@ pub struct ObserveOutcome {
 }
 impl ObserveOutcome {
     pub fn exit_code(&self) -> i32 {
-        if self.exit_status.success() { 0 } else { self.exit_status.exit_code() as i32 }
+        if self.exit_status.success() {
+            0
+        } else {
+            self.exit_status.exit_code() as i32
+        }
     }
 }
 
@@ -51,8 +57,12 @@ pub async fn spawn_observe(argv: &[OsString], cwd: Option<PathBuf>) -> Result<Ob
     let (head, rest) = argv.split_first().context("spawn_observe argv empty")?;
     let mut builder = CommandBuilder::new(head);
     builder.args(rest);
-    if let Some(dir) = cwd { builder.cwd(dir); }
-    let pair = native_pty_system().openpty(default_pty_size()).context("openpty")?;
+    if let Some(dir) = cwd {
+        builder.cwd(dir);
+    }
+    let pair = native_pty_system()
+        .openpty(default_pty_size())
+        .context("openpty")?;
     let mut child = pair.slave.spawn_command(builder).context("spawn_command")?;
     drop(pair.slave);
     let reader = pair.master.try_clone_reader().context("try_clone_reader")?;
@@ -104,12 +114,18 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
     let (head, rest) = cfg.argv.split_first().context("supervisor argv empty")?;
     let mut builder = CommandBuilder::new(head);
     builder.args(rest);
-    if let Some(dir) = &cfg.cwd { builder.cwd(dir); }
+    if let Some(dir) = &cfg.cwd {
+        builder.cwd(dir);
+    }
 
-    let pair = native_pty_system().openpty(default_pty_size()).context("openpty")?;
+    let pair = native_pty_system()
+        .openpty(default_pty_size())
+        .context("openpty")?;
     let mut child = pair.slave.spawn_command(builder).context("spawn_command")?;
     drop(pair.slave);
-    let child_pid = child.process_id().context("portable-pty no child pid (POSIX-only)")?;
+    let child_pid = child
+        .process_id()
+        .context("portable-pty no child pid (POSIX-only)")?;
     let pgid: i32 = child_pid as i32;
 
     // Manifest atomic write — ERR_SPAWN_FAILED on collision per F11 / plan §6.1.
@@ -118,9 +134,15 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
     let socket_path = ipc::socket_path_for(&session_dir);
     if let Ok(existing) = std::fs::read_to_string(&manifest_path) {
         if let Ok(m) = serde_json::from_str::<Manifest>(&existing) {
-            if matches!(m.status, Status::Ready | Status::Draining | Status::Spawning) {
+            if matches!(
+                m.status,
+                Status::Ready | Status::Draining | Status::Spawning
+            ) {
                 let _ = child.kill();
-                anyhow::bail!("ERR_SPAWN_FAILED: live manifest already at {}", manifest_path.display());
+                anyhow::bail!(
+                    "ERR_SPAWN_FAILED: live manifest already at {}",
+                    manifest_path.display()
+                );
             }
         }
     }
@@ -128,7 +150,10 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
         schema_version: SCHEMA_VERSION,
         id: cfg.sid.clone(),
         pid: std::process::id(),
-        ipc: IpcRef { kind: "uds".into(), path: socket_path.to_string_lossy().into_owned() },
+        ipc: IpcRef {
+            kind: "uds".into(),
+            path: socket_path.to_string_lossy().into_owned(),
+        },
         status: Status::Ready,
         restart_count: 0,
         created_at: now_rfc3339(),
@@ -148,14 +173,20 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
     let (ingest_tx, mut ingest_rx) = mpsc::channel::<Ingest>(IPC_QUEUE_DEPTH);
     let (output_tx, _output_rx0) = broadcast::channel::<Frame>(OUTPUT_BROADCAST_DEPTH);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let ipc_task = tokio::spawn(ipc::serve(listener, ingest_tx.clone(), output_tx.clone(), shutdown_rx));
+    let ipc_task = tokio::spawn(ipc::serve(
+        listener,
+        ingest_tx.clone(),
+        output_tx.clone(),
+        shutdown_rx,
+    ));
 
     // PTY reader: broadcast as Frame::output + mirror to stdout for M1/M2 smoke parity.
     let reader = pair.master.try_clone_reader().context("try_clone_reader")?;
     let writer = pair.master.take_writer().context("take_writer")?;
     let sid_for_reader = cfg.sid.clone();
     let output_tx_reader = output_tx.clone();
-    let read_task = task::spawn_blocking(move || drain_pty_dual(reader, output_tx_reader, sid_for_reader));
+    let read_task =
+        task::spawn_blocking(move || drain_pty_dual(reader, output_tx_reader, sid_for_reader));
     drop(pair.master);
 
     let (wait_tx, mut wait_rx) = oneshot::channel::<std::io::Result<ExitStatus>>();
@@ -202,27 +233,40 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
     let _ = wait_join.await;
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_millis(200), ipc_task).await;
-    let _ = tokio::time::timeout(
-        Duration::from_millis(PTY_READ_DRAIN_DEADLINE_MS),
-        read_task,
-    ).await;
+    let _ =
+        tokio::time::timeout(Duration::from_millis(PTY_READ_DRAIN_DEADLINE_MS), read_task).await;
     ipc::unlink_socket(&socket_path);
 
     let (exit_status, exit_reason, exit_signal, escalated) = match outcome {
-        KillOutcome::Reaped { exit_status, exit_reason, exit_signal, escalated } => (
-            Some(exit_status), exit_reason,
-            if exit_signal.is_empty() { None } else { Some(exit_signal.to_string()) },
+        KillOutcome::Reaped {
+            exit_status,
+            exit_reason,
+            exit_signal,
+            escalated,
+        } => (
+            Some(exit_status),
+            exit_reason,
+            if exit_signal.is_empty() {
+                None
+            } else {
+                Some(exit_signal.to_string())
+            },
             escalated,
         ),
         KillOutcome::Unkillable { last_signal } => (
-            None, ExitReason::Unkillable, Some(last_signal.to_string()), true,
+            None,
+            ExitReason::Unkillable,
+            Some(last_signal.to_string()),
+            true,
         ),
     };
 
     let wire_reason = to_wire_reason(exit_reason);
     let drain_frame = Frame::shutdown_drain(
-        &cfg.sid, wire_reason,
-        exit_status.as_ref().map(|s| s.exit_code() as i32), escalated,
+        &cfg.sid,
+        wire_reason,
+        exit_status.as_ref().map(|s| s.exit_code() as i32),
+        escalated,
     );
     let _ = output_tx.send(drain_frame);
 
@@ -243,9 +287,19 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
         }
         manifest::write_tombstone(&manifest_path, &tomb)?;
     }
-    tracing::info!(?exit_reason, ?exit_signal, escalated, "supervisor finalized");
+    tracing::info!(
+        ?exit_reason,
+        ?exit_signal,
+        escalated,
+        "supervisor finalized"
+    );
 
-    Ok(RunOutcome { exit_status, exit_reason, exit_signal, escalated })
+    Ok(RunOutcome {
+        exit_status,
+        exit_reason,
+        exit_signal,
+        escalated,
+    })
 }
 
 /// Returns `Some(kind)` when the dispatched frame triggers terminal kill flow.
@@ -256,15 +310,12 @@ async fn dispatch_ingest(
     pty_writer: &std::sync::Arc<tokio::sync::Mutex<Box<dyn Write + Send>>>,
     lru: &mut IdempotencyLru,
 ) -> Option<KillKind> {
-    match crate::wire::validate_incoming(&frame) {
-        Err((code, detail)) => {
-            let mut err = Frame::error(code, detail);
-            err.trace_id = frame.trace_id;
-            err.frame_ref = frame.op_id;
-            let _ = output_tx.send(err);
-            return None;
-        }
-        Ok(_) => {}
+    if let Err((code, detail)) = crate::wire::validate_incoming(&frame) {
+        let mut err = Frame::error(code, detail);
+        err.trace_id = frame.trace_id;
+        err.frame_ref = frame.op_id;
+        let _ = output_tx.send(err);
+        return None;
     }
     match frame.kind {
         Kind::Inject => {
@@ -285,7 +336,8 @@ async fn dispatch_ingest(
                 w.write_all(&bytes)?;
                 w.flush()?;
                 Ok(())
-            }).await;
+            })
+            .await;
             None
         }
         Kind::Ping => {
@@ -304,11 +356,20 @@ async fn dispatch_ingest(
         }
         Kind::Delete => {
             let _ = sid; // sid validation happens via manifest read; M3 trusts the channel.
-            let kind = if frame.force.unwrap_or(false) { KillKind::Forced } else { KillKind::Graceful };
+            let kind = if frame.force.unwrap_or(false) {
+                KillKind::Forced
+            } else {
+                KillKind::Graceful
+            };
             Some(kind)
         }
         // Server-emitted kinds — ignored if received from clients (per V1 ADR §6.7).
-        Kind::Output | Kind::Pong | Kind::Error | Kind::ShutdownDrain | Kind::Spawn | Kind::Resize => None,
+        Kind::Output
+        | Kind::Pong
+        | Kind::Error
+        | Kind::ShutdownDrain
+        | Kind::Spawn
+        | Kind::Resize => None,
         Kind::Unknown => unreachable!("validate_incoming should have rejected Unknown"),
     }
 }
@@ -319,7 +380,10 @@ fn drain_pty_to_stdout(mut reader: Box<dyn Read + Send>) -> Result<()> {
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => { stdout.write_all(&buf[..n])?; stdout.flush()?; }
+            Ok(n) => {
+                stdout.write_all(&buf[..n])?;
+                stdout.flush()?;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
@@ -366,5 +430,10 @@ fn to_wire_reason(r: ExitReason) -> ExitReasonWire {
 }
 
 fn default_pty_size() -> PtySize {
-    PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }
+    PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
 }

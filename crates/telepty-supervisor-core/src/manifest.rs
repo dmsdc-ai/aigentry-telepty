@@ -120,8 +120,7 @@ pub fn write_atomic(path: &Path, m: &Manifest) -> Result<()> {
     fs::create_dir_all(parent).with_context(|| format!("create_dir_all {}", parent.display()))?;
     let tmp = path.with_extension("json.tmp");
     {
-        let mut f = fs::File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
+        let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         let bytes = serde_json::to_vec_pretty(m).context("serialize manifest")?;
         f.write_all(&bytes).context("write manifest tmp")?;
         f.sync_all().context("fsync manifest tmp")?;
@@ -149,10 +148,7 @@ pub fn unlink_clean(path: &Path) -> Result<()> {
 /// Tombstone uses the same atomic write — caller fills status/exit_reason fields.
 pub fn write_tombstone(path: &Path, m: &Manifest) -> Result<()> {
     debug_assert!(matches!(m.status, Status::Error));
-    debug_assert!(m
-        .exit_reason
-        .map(|r| !r.is_clean())
-        .unwrap_or(false));
+    debug_assert!(m.exit_reason.map(|r| !r.is_clean()).unwrap_or(false));
     write_atomic(path, m)
 }
 
@@ -173,7 +169,10 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             id: "mock-unkillable".into(),
             pid: 12345,
-            ipc: IpcRef { kind: "uds".into(), path: "/tmp/x.sock".into() },
+            ipc: IpcRef {
+                kind: "uds".into(),
+                path: "/tmp/x.sock".into(),
+            },
             status: Status::Error,
             restart_count: 0,
             created_at: now.clone(),

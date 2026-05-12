@@ -1,10 +1,11 @@
 //! Per-session UDS server + NDJSON ingest queue.
 //!
 //! Architecture (plan §3.4, codex F5, SPEC-C3-r1 §7.G):
-//! - One `UnixListener` at `manifest.ipc.path` (`~/.telepty/sessions/<sid>/supervisor.sock`).
-//!   Path mismatch note: dispatch mentioned `~/.aigentry/.../ipc.sock`; spec §1.1
-//!   + plan §3.4 + the M2 manifest already shipped both declare `.telepty/…/supervisor.sock`,
-//!   so we honor the binding sources.
+//! - One `UnixListener` at `manifest.ipc.path`
+//!   (`~/.telepty/sessions/<sid>/supervisor.sock`).
+//!   Path mismatch note: dispatch mentioned `~/.aigentry/.../ipc.sock`;
+//!   spec §1.1 + plan §3.4 + the shipped M2 manifest declare
+//!   `.telepty/.../supervisor.sock`, so we honor the binding sources.
 //! - Per-connection task reads NDJSON line-by-line, parses to `wire::Frame`, and
 //!   enqueues `(ConnId, Frame)` onto a single `mpsc::channel` consumed by the
 //!   supervisor — establishes the global FIFO ordering F5 requires.
@@ -44,7 +45,8 @@ pub struct Ingest {
 /// must be unlinked explicitly on clean exit (`unlink_socket`).
 pub fn bind_socket(path: &Path) -> Result<UnixListener> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create_dir_all {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create_dir_all {}", parent.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -129,7 +131,11 @@ async fn handle_connection(
             .await
             {
                 Ok(Ok(frame)) => {
-                    if writer_half.write_all(frame.to_ndjson_line().as_bytes()).await.is_err() {
+                    if writer_half
+                        .write_all(frame.to_ndjson_line().as_bytes())
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -185,7 +191,11 @@ pub struct IdempotencyLru {
 }
 
 impl IdempotencyLru {
-    pub fn new() -> Self { Self { keys: VecDeque::new() } }
+    pub fn new() -> Self {
+        Self {
+            keys: VecDeque::new(),
+        }
+    }
 
     /// Returns true if the key was already seen (= duplicate). Otherwise records
     /// it as the freshest entry and returns false.
@@ -204,10 +214,7 @@ impl IdempotencyLru {
 /// Convenience helper: extract the idempotency key from a frame (op_id falls
 /// back to idempotency_key per V1 ADR §6.5).
 pub fn frame_op_key(frame: &Frame) -> Option<&str> {
-    frame
-        .op_id
-        .as_deref()
-        .or(frame.idempotency_key.as_deref())
+    frame.op_id.as_deref().or(frame.idempotency_key.as_deref())
 }
 
 /// Standardized session socket path under `~/.telepty/sessions/<sid>/`.
@@ -238,6 +245,6 @@ mod tests {
         assert!(lru.check_and_insert("k0"));
         // Push one more — evicts k0.
         assert!(!lru.check_and_insert("knew"));
-        assert!(!lru.check_and_insert("k0"));  // re-inserted as fresh
+        assert!(!lru.check_and_insert("k0")); // re-inserted as fresh
     }
 }
