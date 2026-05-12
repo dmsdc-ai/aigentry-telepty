@@ -1,5 +1,6 @@
 node_modules/
 state/
+target/
 *.log
 .env
 .env.local
