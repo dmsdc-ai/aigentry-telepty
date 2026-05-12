@@ -231,11 +231,6 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
         }
     };
     let _ = wait_join.await;
-    let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_millis(200), ipc_task).await;
-    let _ =
-        tokio::time::timeout(Duration::from_millis(PTY_READ_DRAIN_DEADLINE_MS), read_task).await;
-    ipc::unlink_socket(&socket_path);
 
     let (exit_status, exit_reason, exit_signal, escalated) = match outcome {
         KillOutcome::Reaped {
@@ -261,6 +256,8 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
         ),
     };
 
+    // Emit shutdown_drain BEFORE the IPC server tears down so connected
+    // clients receive it (SPEC §1.1 step 4 / §1.2 step 6).
     let wire_reason = to_wire_reason(exit_reason);
     let drain_frame = Frame::shutdown_drain(
         &cfg.sid,
@@ -269,6 +266,14 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
         escalated,
     );
     let _ = output_tx.send(drain_frame);
+    // Brief flush window for per-connection tasks to forward the broadcast.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_millis(200), ipc_task).await;
+    let _ =
+        tokio::time::timeout(Duration::from_millis(PTY_READ_DRAIN_DEADLINE_MS), read_task).await;
+    ipc::unlink_socket(&socket_path);
 
     if exit_reason.is_clean() {
         manifest::unlink_clean(&manifest_path)?;
