@@ -128,7 +128,7 @@ After `shutdown_drain`, the supervisor closes all client WS / pipe sessions with
 2. **Drain in-flight ops** — wait until all currently-acked inject frames have been written to PTY master and acked, *or* `graceful_grace_ms` elapses, whichever comes first (per V1 ADR M36 — "graceful drain on SIGTERM, flush log, ack in-flight, write final manifest entry, exit").
 3. **Forward signal to child**:
    - **POSIX**: `kill(-pgid, SIGTERM)` — process-group-scoped (see §3.1 process group rationale). The PTY child runs in its own pgrp via `setsid()` at spawn.
-   - **Windows ConPTY**: `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, console_group_id)` — equivalent to POSIX SIGTERM-to-pgrp because the supervisor created the ConPTY with `CREATE_NEW_PROCESS_GROUP` and its own console group ID.
+   - **Windows ConPTY**: `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, console_group_id)` — Windows **observable parity** for POSIX SIGTERM-to-pgrp (NOT primitive equivalence per §3.2.3 / §3.5: control events are handler-based, not POSIX signals; the child MAY ignore in either OS). The supervisor created the ConPTY with `CREATE_NEW_PROCESS_GROUP` and owns the console group ID; see §3.2.4 for the console-attachment caveat (supervisor may need `AttachConsole`/`FreeConsole` toggle from a service/daemon context).
 4. **Wait for child reap** — up to `graceful_grace_ms` total (combined with step 2). If child exits during this window, transition to A.1 normal termination.
 5. **Escalate on timeout** — if `graceful_grace_ms` elapses with the child still alive, the supervisor MUST escalate to forced kill per §1.3 step 3 (SIGKILL / job termination). This is the **graceful-to-forced escalation contract**.
 6. **Final `shutdown_drain` log event** — record `in_flight: <N_unacked>, completed: <N_acked>, escalated: <bool>, exit_reason ∈ {signaled, killed}, exit_signal, exit_code`.
@@ -335,19 +335,11 @@ The public `portable-pty::CommandBuilder` does not expose a `pre_exec` hook (see
 
 **Reap**: `waitpid(child_pid, &status, 0)` blocking, or `waitpid(child_pid, &status, WNOHANG)` polling. After `child_reap_timeout_ms` budget exhausted, switch to `WNOHANG` poll; if still ECHILD/0 returns, treat as unkillable per §1.3.4.
 
-**SIGCHLD handling**: supervisor MUST install a SIGCHLD handler that calls `waitpid(-1, &status, WNOHANG)` in a loop to reap any sub-children that the L3 child spawned. Otherwise the supervisor accumulates zombies. Implementation note: tokio's `Child::wait()` handles this for the direct child only; sub-children require the explicit handler.
+**SIGCHLD handling**: per §4.1 r1, the supervisor reaps **only its direct child**. Sub-children spawned by the L3 child (e.g., claude → bash → grep) are reparented to PID 1 on POSIX (or to a Linux subreaper if §4.1.3 opt-in is enabled) and reaped by the new parent — the supervisor MUST NOT install a `waitpid(-1, …, WNOHANG)` reaper for grandchildren, as that contradicts the §4.1 direct-child-only ownership model and §4 r1's pgrp-liveness verification path. tokio's `Child::wait()` covers the direct child's terminal status; no separate SIGCHLD reaper for non-direct descendants is required (informational note: the optional `prctl PR_SET_CHILD_SUBREAPER` Linux-only opt-in per §4.1.3 changes this only for orphaned descendants after the L3 child exits, and the supervisor still reaps them as direct children at that point — not as grandchildren).
 
 **PTY master/slave drop ordering** (per portable-pty design, RFC 1857 stable drop): in `PtyPair`, slave is dropped first, then master. The supervisor SHOULD explicitly `drop(pty.slave)` after spawn (slave is held only briefly for the child's stdio dup); master remains owned by supervisor until kill completes.
 
-**Linux-specific (parent death)**:
-
-```rust
-unsafe {
-    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-}
-```
-
-The supervisor MAY install this so it self-receives SIGTERM if its parent (typically the service manager) dies. **However**, per §1.4 policy, the supervisor does **not** self-terminate on parent death — it logs and continues. So this `prctl` is informational, not actionable. Alternative: omit `prctl` and rely on the `parent_death_grace_ms` heartbeat detection (§2.1). Spec recommends omitting `prctl PR_SET_PDEATHSIG` for portability with macOS (which lacks it).
+**Linux-specific (parent death)**: `prctl PR_SET_PDEATHSIG` is **REJECTED** in r1 (Q3 closure, §10) and per §3.5 row 6 — do NOT install it. Two binding reasons: (1) the only deliverable signal would be `SIGTERM`, which §1.2 binds to *graceful shutdown*, but §1.4 binds parent death to *do NOT self-terminate* — the two policies are incompatible; (2) macOS has no `PR_SET_PDEATHSIG` equivalent, so the mechanism is non-portable and would require POSIX/Linux-only forks of the supervisor's startup path. The binding parent-death detection mechanism is the heartbeat poll per §2.1 `parent_death_grace_ms`; macOS MAY additionally use `kqueue NOTE_EXIT` per §3.5 (notification-only — supervisor still does NOT self-terminate per §1.4).
 
 **macOS-specific (parent death)**: `kqueue` with `EVFILT_PROC, NOTE_EXIT` on parent PID. Supervisor SHOULD register this on macOS to obtain immediate notification of parent death (vs heartbeat polling).
 
@@ -625,15 +617,15 @@ Two viable orderings exist:
 
 **Rationale**:
 
-- portable-pty's `MasterPty::kill()` sends **SIGHUP** by default (per docs.rs/portable-pty), not SIGKILL — see [portable-pty MasterPty][pp-master]. This means relying on master-close-first conflates two signal paths (SIGHUP from kernel + portable-pty SIGHUP), creating an ordering bug if the child's signal handler differentiates them.
+- portable-pty's child-kill API is `ChildKiller::kill` (the `MasterPty` trait does NOT expose a `kill` method — see [portable-pty ChildKiller][pp-childkiller] and §12.3 r1 corrected note); on Unix `ChildKiller::kill` sends SIGHUP first, then falls back to `std::process::Child::kill` which targets the direct pid (NOT pgrp-targeted) — neither is the right primitive for graceful kill of the child's pgrp. This means relying on `ChildKiller::kill` for the graceful path conflates two signal paths (SIGHUP from kernel + portable-pty SIGHUP) and misses pgrp scope, creating an ordering bug if the child's signal handler differentiates them.
 - Order A makes the signal explicit and observable in the wire frame `signal: "SIGTERM"` — orchestrator knows what was sent.
 - The 500 ms `pty_read_drain_deadline_ms` allows kernel to flush PTY buffers (final stdout/stderr from child arrives on supervisor's read side) before close.
 - Order A is what tokio-process-tools' `terminate(sigterm_timeout, sigkill_timeout)` pattern implements (see [tokio-process-tools][tpt]).
 
-[pp-master]: https://docs.rs/portable-pty/latest/portable_pty/trait.MasterPty.html "MasterPty in portable_pty (cited 2026-05-10)"
+[pp-childkiller]: https://docs.rs/portable-pty/latest/portable_pty/trait.ChildKiller.html "ChildKiller in portable_pty (cited 2026-05-12, codex r2 stale-API correction)"
 [tpt]: https://docs.rs/tokio-process-tools/latest/tokio_process_tools/ "tokio_process_tools (cited 2026-05-10)"
 
-**Important**: portable-pty's `kill()` method MUST NOT be relied on for graceful path because it sends SIGHUP, not SIGTERM. Spec mandates direct `nix::sys::signal::kill(Pid::from_raw(-pgid), Signal::SIGTERM)` for the graceful step.
+**Important**: `portable-pty::ChildKiller::kill` MUST NOT be relied on for the graceful path because (a) it sends SIGHUP first, not SIGTERM, and (b) its `std::process::Child::kill` fallback is direct-pid-targeted, not pgrp-targeted. Spec mandates direct `nix::sys::signal::kill(Pid::from_raw(-pgid), Signal::SIGTERM)` for the graceful step (pgrp-scoped via the negative pid argument).
 
 ### §5.2 Windows ConPTY close cascade (r1 — codex Issue 5)
 
@@ -1115,10 +1107,10 @@ This spec implements / extends the following V1 ADR mandates:
 | **M25** (protocol contract test) | §8 | Tests are M25-binding |
 | **M28** (cdylib + rlib) | §6.5 | jemalloc cleanup verified by C2 PoC |
 | **M29** (no N cap) | §2.1 | `orphan_detect_interval_ms = 5 s` × N=100 still negligible |
-| **M31** (jemalloc tuning) | §6.5 | RAM returned to OS within ms post-exit |
-| **M34** (crash detection + restart) | §1.5, §8.A5, §8.A5-respawn | Service manager respawn; manifest preserved |
+| **M31** (jemalloc tuning) | §6.6 | RAM cleanup is a Phase 4 measurement, NOT a per-kill invariant — see §6.6 r1 (codex Issue lower-sev) |
+| **M34** (crash detection + restart) | §1.5, §8.B1 | Orchestrator-driven respawn (default `restart_policy: "respawn"`); no OS service-manager dependency in Phase 1 — see §1.5 r1 (codex Issue 6, Q2 closed) |
 | **M36** (graceful drain on SIGTERM) | §1.2 | Drain → flush → ack → final manifest → exit |
-| **M37'/M38'** (NDJSON wire, kind-conditional) | §1.1–§1.3, §8.I, §8.J | All kill protocol messages are NDJSON with kind-conditional fields |
+| **M37'/M38'** (NDJSON wire, kind-conditional) | §1.1–§1.3, §8.A-schema, §8.A-trace-id, §8.A-windows-no-sigint | All kill protocol messages are NDJSON with kind-conditional fields; wire envelope uses `v:1` only (manifest `schema_version` is a separate disk schema) — see §6.4 r1 (codex Issue 3) |
 | **M40** (binary reachability, no mailbox) | §7.H | Cross-machine kill fails fast, no queue |
 
 ### §9.2 Section cross-references
