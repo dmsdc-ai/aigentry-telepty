@@ -76,6 +76,56 @@ test('REPORT-prefixed inject with matching reverse-match emits TASK_COMPLETE_WIT
   bus.close();
 });
 
+test('reverse-matched REPORT forces sender idle and control-only redraws do not re-mark working', async () => {
+  const senderId = createSessionId('wrapped-sender');
+  const receiverId = createSessionId('wrapped-receiver');
+
+  await harness.registerSession(senderId);
+  await harness.registerSession(receiverId);
+
+  const senderOwner = await harness.connectSession(senderId);
+  const receiverOwner = await harness.connectSession(receiverId);
+
+  senderOwner.send(JSON.stringify({ type: 'output', data: 'working on task\n' }));
+  await waitFor(async () => {
+    const state = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/state`);
+    return state.body.auto.state === 'working';
+  }, { timeoutMs: 2000, description: 'sender working state' });
+
+  const first = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/inject`, {
+    method: 'POST',
+    body: { prompt: 'please do work', from: receiverId, no_enter: true }
+  });
+  assert.equal(first.status, 200);
+
+  const report = await harness.request(`/api/sessions/${encodeURIComponent(receiverId)}/inject`, {
+    method: 'POST',
+    body: { prompt: 'REPORT: done', from: senderId, no_enter: true }
+  });
+  assert.equal(report.status, 200);
+
+  await waitFor(async () => {
+    const state = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/state`);
+    return state.body.auto.state === 'idle' && state.body.auto.detail.trigger === 'report_inject';
+  }, { timeoutMs: 2000, description: 'sender forced idle after report' });
+
+  senderOwner.send(JSON.stringify({ type: 'output', data: '\x1b[?25l\r\x1b[2K\x1b[?25h' }));
+  await delay(100);
+
+  const afterControl = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/state`);
+  assert.equal(afterControl.body.auto.state, 'idle');
+  assert.equal(afterControl.body.auto.detail.trigger, 'report_inject');
+
+  senderOwner.send(JSON.stringify({ type: 'output', data: 'new task output\n' }));
+  await waitFor(async () => {
+    const state = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/state`);
+    return state.body.auto.state === 'working';
+  }, { timeoutMs: 2000, description: 'sender working after meaningful output' });
+
+  senderOwner.close();
+  receiverOwner.close();
+});
+
 test('STATUS: blocked with matching reverse-match emits TASK_BLOCKED_WITH_REASON', async () => {
   const senderId = createSessionId('sender');
   const receiverId = createSessionId('receiver');

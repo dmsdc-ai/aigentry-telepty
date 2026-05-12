@@ -115,6 +115,19 @@ describe('working state', () => {
     assert.equal(state.confidence, 0.9);
     sm.destroy();
   });
+
+  it('does not transition idle to working on control-only output', () => {
+    const sm = createSM();
+    sm.feed('\x1b]133;B\x07');
+    assert.equal(sm.getState().state, 'idle');
+
+    sm.feed('\x1b[?25l\r\x1b[2K\x1b[?25h');
+
+    const state = sm.getState();
+    assert.equal(state.state, 'idle');
+    assert.equal(state.detail.trigger, 'osc_133_prompt');
+    sm.destroy();
+  });
 });
 
 // --- thinking detection ---
@@ -316,6 +329,28 @@ describe('SessionStateManager', () => {
     mgr.register('s1');
     mgr.markRestarting('s1');
     assert.equal(mgr.getState('s1').state, 'restarting');
+    mgr.destroyAll();
+  });
+
+  it('markIdle forces a working session to idle with semantic detail', () => {
+    const mgr = new SessionStateManager();
+    mgr.register('s1');
+    mgr.feed('s1', 'task output\n');
+    assert.equal(mgr.getState('s1').state, 'working');
+
+    const marked = mgr.markIdle('s1', 1.0, {
+      trigger: 'report_inject',
+      report_inject_id: 'report-1',
+      report_status: 'report_complete',
+      source: 'orchestrator',
+    });
+
+    const state = mgr.getState('s1');
+    assert.equal(marked, true);
+    assert.equal(state.state, 'idle');
+    assert.equal(state.confidence, 1.0);
+    assert.equal(state.detail.trigger, 'report_inject');
+    assert.equal(state.detail.report_inject_id, 'report-1');
     mgr.destroyAll();
   });
 

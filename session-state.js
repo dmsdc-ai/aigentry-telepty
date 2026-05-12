@@ -203,6 +203,9 @@ class SessionStateMachine {
 
     // Strip ANSI and split into lines for pattern analysis
     const cleaned = stripAnsi(data);
+    if (cleaned.trim().length === 0) {
+      return;
+    }
     const lines = cleaned.split(/\r?\n/).filter(l => l.trim().length > 0);
 
     for (const line of lines) {
@@ -267,6 +270,16 @@ class SessionStateMachine {
 
   markRestarting() {
     this._transition(STATES.RESTARTING, 1.0, { trigger: 'lifecycle' });
+  }
+
+  markIdle(confidence = 1.0, detail = {}) {
+    if (this._state === STATES.DEAD || this._state === STATES.RESTARTING) {
+      return;
+    }
+    this._transition(STATES.IDLE, confidence, {
+      trigger: 'manual_idle',
+      ...detail,
+    });
   }
 
   // --- Internal ---
@@ -536,6 +549,16 @@ class SessionStateManager {
   markRestarting(sessionId) {
     const sm = this._machines.get(sessionId);
     if (sm) sm.markRestarting();
+  }
+
+  /**
+   * Mark a session as idle from a semantic daemon event.
+   */
+  markIdle(sessionId, confidence = 1.0, detail = {}) {
+    const sm = this._machines.get(sessionId);
+    if (!sm) return false;
+    sm.markIdle(confidence, detail);
+    return true;
   }
 
   /**

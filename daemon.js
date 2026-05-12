@@ -1805,6 +1805,12 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
             delete pendingReports[senderAlias];
             const elapsedSecs = Number(((Date.now() - new Date(senderPending.injectedAt).getTime()) / 1000).toFixed(1));
             const senderSession = sessions[senderAlias];
+            sessionStateManager.markIdle(senderAlias, 1.0, {
+              trigger: 'report_inject',
+              report_inject_id: inject_id,
+              report_status: classification,
+              source: senderPending.source
+            });
             const eventType =
               classification === 'report_blocked' ? 'TASK_BLOCKED_WITH_REASON' :
               classification === 'report_dismissed' ? 'TASK_DISMISSED' :
