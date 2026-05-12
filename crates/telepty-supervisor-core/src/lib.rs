@@ -4,8 +4,11 @@
 //! - M1: `supervisor::spawn_observe` — spawn child via portable-pty, stream PTY.
 //! - M2: `manifest` + `kill_gate` + `supervisor::run` — graceful + forced kill,
 //!   atomic manifest write (F4), A8 unlink on clean / tombstone on abnormal.
-//! - M3 will add `wire` + `ipc`.
+//! - M3: `wire` (full A1/A2 schema) + `ipc` (UDS + NDJSON + mpsc ingest queue +
+//!   idempotency LRU) — contract conformance milestone.
 
+pub mod ipc;
 pub mod kill_gate;
 pub mod manifest;
 pub mod supervisor;
+pub mod wire;

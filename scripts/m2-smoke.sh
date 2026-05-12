@@ -76,8 +76,10 @@ smoke2() {
 smoke3() {
     local out
     out=$(cargo test --lib --quiet --package telepty-supervisor-core 2>&1)
-    if echo "$out" | grep -q "test result: ok. 4 passed"; then
-        emit "smoke3-mockchild" pass "cargo test 4/4 (manifest + kill_gate)"
+    local passed
+    passed=$(echo "$out" | grep -oE "test result: ok\. [0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+    if [[ -n "$passed" && "$passed" -ge 4 ]]; then
+        emit "smoke3-mockchild" pass "cargo test ${passed}/${passed} (manifest + kill_gate + wire + ipc)"
     else
         emit "smoke3-mockchild" fail "$(echo "$out" | tail -5 | tr '\n' '|')"
     fi
