@@ -403,6 +403,117 @@ test('inject keeps routing metadata out of wrapped prompt text and submits separ
   ownerWs.close();
 });
 
+test('known wrapped AI CLI queues inject until bootstrap ready', async () => {
+  const sessionId = createSessionId('bootstrap-claude');
+  await harness.registerSession(sessionId, { command: 'claude' });
+
+  const ownerWs = await harness.connectSession(sessionId);
+  const ownerMessages = collectJsonMessages(ownerWs);
+
+  const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    method: 'POST',
+    body: { prompt: 'bootstrap-task' }
+  });
+  assert.equal(inject.status, 200);
+  assert.equal(inject.body.success, true);
+  assert.equal(inject.body.bootstrap_queued, true);
+
+  await delay(250);
+  assert.equal(ownerMessages.filter((message) => message.type === 'inject').length, 0);
+
+  ownerWs.send(JSON.stringify({ type: 'ready' }));
+
+  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 2, {
+    timeoutMs: 5000,
+    description: 'bootstrap queued inject drained after ready'
+  });
+
+  const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
+  assert.equal(injectMessages[0], 'bootstrap-task');
+  assert.equal(injectMessages[1], '\r');
+
+  const detail = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  assert.equal(detail.body.transport.bootstrap.ready, true);
+  assert.equal(detail.body.transport.bootstrap.reason, 'bridge_ready');
+
+  ownerWs.close();
+});
+
+test('known wrapped AI CLI drains multiple bootstrap injects in FIFO order', async () => {
+  const sessionId = createSessionId('bootstrap-order');
+  await harness.registerSession(sessionId, { command: 'codex' });
+
+  const ownerWs = await harness.connectSession(sessionId);
+  const ownerMessages = collectJsonMessages(ownerWs);
+
+  for (const prompt of ['first', 'second', 'third']) {
+    const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+      method: 'POST',
+      body: { prompt, no_enter: true }
+    });
+    assert.equal(inject.status, 200);
+    assert.equal(inject.body.bootstrap_queued, true);
+  }
+
+  await delay(250);
+  assert.equal(ownerMessages.filter((message) => message.type === 'inject').length, 0);
+
+  ownerWs.send(JSON.stringify({ type: 'ready' }));
+
+  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 3, {
+    timeoutMs: 5000,
+    description: 'bootstrap FIFO drain'
+  });
+
+  const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
+  assert.deepEqual(injectMessages.slice(0, 3), ['first', 'second', 'third']);
+
+  ownerWs.close();
+});
+
+test('bootstrap queued submit waits behind queued text and preserves order', async () => {
+  const sessionId = createSessionId('bootstrap-submit');
+  await harness.registerSession(sessionId, { command: 'gemini' });
+
+  const ownerWs = await harness.connectSession(sessionId);
+  const ownerMessages = collectJsonMessages(ownerWs);
+
+  const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    method: 'POST',
+    body: { prompt: 'queued-submit', no_enter: true }
+  });
+  assert.equal(inject.status, 200);
+  assert.equal(inject.body.bootstrap_queued, true);
+
+  const submitPromise = harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
+    method: 'POST',
+    body: {
+      injected_body: 'queued-submit',
+      gate_timeout_ms: 5000
+    }
+  });
+
+  await delay(250);
+  assert.equal(ownerMessages.filter((message) => message.type === 'inject').length, 0);
+
+  ownerWs.send(JSON.stringify({ type: 'ready' }));
+  const submit = await submitPromise;
+  assert.equal(submit.status, 200);
+  assert.equal(submit.body.success, true);
+  assert.equal(submit.body.bootstrap_queued, true);
+
+  await waitFor(() => ownerMessages.filter((message) => message.type === 'inject').length >= 2, {
+    timeoutMs: 5000,
+    description: 'bootstrap queued text then submit'
+  });
+
+  const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
+  assert.equal(injectMessages[0], 'queued-submit');
+  assert.equal(injectMessages[1], '\r');
+
+  ownerWs.close();
+});
+
 test('bus auto-route uses wrapped WS split delivery instead of cmux direct injection', async () => {
   const sessionId = createSessionId('bus-route');
   await harness.registerSession(sessionId, {

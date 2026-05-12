@@ -20,6 +20,7 @@ const { runInteractiveSkillInstaller } = require('./skill-installer');
 const crossMachine = require('./cross-machine');
 const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec');
 const { FileMailbox } = require('./src/mailbox/index');
+const readyRegistry = require('./src/prompt-symbol-registry');
 const args = process.argv.slice(2);
 let pendingTerminalInputError = null;
 let simulatedPromptErrorInjected = false;
@@ -1080,15 +1081,14 @@ async function main() {
 
     spawnChild();
 
-    // Prompt-ready detection for safe inject delivery
-    const PROMPT_PATTERNS = {
-      claude: /[❯>]\s*$/,
-      gemini: /[❯>]\s*$/,
-      codex: /[❯>]\s*$/,
-    };
-    const cmdBase = path.basename(command).replace(/\..*$/, '');
-    const promptPattern = PROMPT_PATTERNS[cmdBase] || /[❯>$#%]\s*$/;
+    // Prompt-ready detection for safe inject delivery.
+    // Known AI CLIs use the centralized geometry-aware registry; generic
+    // commands keep the permissive legacy prompt regex for compatibility.
+    const knownAiCli = readyRegistry.isKnownAiCli(command);
+    const promptPattern = /[❯>$#%]\s*$/;
     let promptReady = false;  // wait for CLI prompt before accepting inject
+    let firstReadyObserved = false;
+    let outputTail = '';
     let lastUserInputTime = 0;  // timestamp of last user keystroke
     const IDLE_THRESHOLD = 2000; // ms after last user input to consider idle
 
@@ -1128,6 +1128,14 @@ async function main() {
       return promptReady && (Date.now() - lastUserInputTime > IDLE_THRESHOLD);
     }
 
+    function observePromptReady(data) {
+      if (knownAiCli) {
+        outputTail = (outputTail + data).slice(-20000);
+        return !!readyRegistry.detectOutput(command, outputTail).found;
+      }
+      return promptPattern.test(data);
+    }
+
     let queueFlushTimer = null;
     let idleCheckTimer = null;
 
@@ -1164,8 +1172,9 @@ async function main() {
           flushBridgeMailbox();
         }
       }, 500);
-      // Safety: flush after 5s regardless (prevent stuck queue when prompt not detected)
-      if (!queueFlushTimer) {
+      // Safety fallback is compatibility-only during known AI CLI bootstrap:
+      // first dispatch must wait for a strong ready signal.
+      if ((!knownAiCli || firstReadyObserved) && !queueFlushTimer) {
         queueFlushTimer = setTimeout(() => {
           queueFlushTimer = null;
           if (bridgePendingCount > 0) {
@@ -1238,10 +1247,16 @@ async function main() {
 
               const isCr = chunk === '\r';
               if (isCr && bridgePendingCount > 0) {
-                // CR with pending queued text — queue CR too and flush immediately.
+                // CR with pending queued text — queue CR too and wait for the
+                // same readiness gate as the text. This preserves order during
+                // bootstrap and busy-session delivery.
                 enqueueBridgeMessage(chunk);
-                if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
-                flushBridgeMailbox();
+                if (isIdle()) {
+                  if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
+                  flushBridgeMailbox();
+                } else {
+                  scheduleIdleFlush();
+                }
               } else if (isCr) {
                 // CR always written immediately — never idle-gated.
                 child.write(chunk);
@@ -1353,8 +1368,9 @@ async function main() {
         daemonWs.send(JSON.stringify({ type: 'output', data }));
       }
       // Detect prompt in output to enable inject delivery
-      if (promptPattern.test(data)) {
+      if (observePromptReady(data)) {
         promptReady = true;
+        firstReadyObserved = true;
         flushBridgeMailbox();
         // Notify daemon that CLI is ready for inject
         if (!readyNotified && wsReady && daemonWs.readyState === 1) {
@@ -1383,6 +1399,10 @@ async function main() {
           setTimeout(() => {
             try {
               spawnChild();
+              promptReady = false;
+              firstReadyObserved = false;
+              readyNotified = false;
+              outputTail = '';
               // Re-attach output relay, prompt detection, and exit handler
               child.onData((data) => {
                 const rewritten = rewriteTitleSequences(data);
@@ -1390,8 +1410,9 @@ async function main() {
                 if (wsReady && daemonWs.readyState === 1) {
                   daemonWs.send(JSON.stringify({ type: 'output', data }));
                 }
-                if (promptPattern.test(data)) {
+                if (observePromptReady(data)) {
                   promptReady = true;
+                  firstReadyObserved = true;
                   flushBridgeMailbox();
                   if (wsReady && daemonWs.readyState === 1) {
                     daemonWs.send(JSON.stringify({ type: 'ready' }));

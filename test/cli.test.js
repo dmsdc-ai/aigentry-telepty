@@ -57,6 +57,36 @@ function createSubmitCaptureScript() {
   ].join(' ');
 }
 
+function writeFakeClaudeCommand(dir) {
+  const filePath = path.join(dir, 'claude');
+  const script = `#!/usr/bin/env node
+process.stdin.setEncoding('utf8');
+process.stdin.resume();
+let ready = false;
+let buffer = '';
+process.stdout.write('Claude welcome\\n❯ welcome input\\n');
+setTimeout(() => {
+  ready = true;
+  buffer = '';
+  process.stdout.write('\\n────────────────\\n❯\\n────────────────\\n');
+}, 700);
+process.stdin.on('data', (chunk) => {
+  if (!ready) return;
+  for (const ch of chunk) {
+    if (ch === '\\r' || ch === '\\n') {
+      process.stdout.write('\\nSUBMIT:' + buffer + '\\n');
+      process.exit(0);
+      return;
+    }
+    buffer += ch;
+  }
+});
+`;
+  fs.writeFileSync(filePath, script, 'utf8');
+  fs.chmodSync(filePath, 0o755);
+  return filePath;
+}
+
 beforeEach(async () => {
   harness = await startTestDaemon();
 });
@@ -526,6 +556,61 @@ test('telepty allow inject submits once without exposing routing metadata', asyn
     assert.equal(normalized.includes('[from:'), false);
     assert.equal(normalized.includes('reply-to:'), false);
     assert.equal(normalized.includes('telepty inject --from'), false);
+  } finally {
+    cli.kill();
+  }
+});
+
+test('telepty allow queues first fake-claude inject until welcome bootstrap ready', async () => {
+  const sessionId = createSessionId('cli-allow-bootstrap');
+  const fakeClaude = writeFakeClaudeCommand(harness.homeDir);
+
+  const cli = pty.spawn(process.execPath, [
+    'cli.js',
+    'allow',
+    '--id',
+    sessionId,
+    fakeClaude
+  ], {
+    cwd: projectRoot,
+    cols: 80,
+    rows: 24,
+    name: process.platform === 'win32' ? 'xterm' : 'xterm-256color',
+    env: {
+      ...process.env,
+      HOME: harness.homeDir,
+      USERPROFILE: harness.homeDir,
+      TELEPTY_HOST: harness.host,
+      TELEPTY_PORT: String(harness.port),
+      NO_UPDATE_NOTIFIER: '1',
+      TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
+    }
+  });
+
+  let output = '';
+  cli.onData((chunk) => {
+    output += chunk;
+  });
+
+  try {
+    await waitFor(async () => {
+      const list = await harness.request('/api/sessions');
+      return list.body.some((session) => session.id === sessionId);
+    }, {
+      timeoutMs: 7000,
+      description: 'fake claude registered'
+    });
+
+    const inject = await harness.runCli(['inject', sessionId, 'dispatch-token'], { timeoutMs: 10000 });
+    assert.equal(inject.code, 0, inject.stderr);
+
+    await waitFor(() => stripAnsi(output).includes('SUBMIT:dispatch-token'), {
+      timeoutMs: 10000,
+      description: 'fake claude post-bootstrap submit'
+    });
+
+    const normalized = stripAnsi(output);
+    assert.equal(countOccurrences(normalized, 'SUBMIT:'), 1);
   } finally {
     cli.kill();
   }

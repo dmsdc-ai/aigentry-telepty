@@ -15,6 +15,7 @@ const { UnixSocketNotifier } = require('./src/mailbox/notifier');
 const { SessionStateManager, STATE_DISPLAY, stripAnsi: stripAnsiState } = require('./session-state');
 const { classifyReportPrompt, buildAutoSummary } = require('./src/report-enforcement');
 const submitGate = require('./src/submit-gate');
+const readyRegistry = require('./src/prompt-symbol-registry');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -26,6 +27,8 @@ const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STA
 const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
 const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
 const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS || 10000));
+const BOOTSTRAP_READY_TIMEOUT_MS = Math.max(500, Number(process.env.TELEPTY_BOOTSTRAP_READY_TIMEOUT_MS || 30000));
+const WRAPPED_SUBMIT_DELAY_MS = 500;
 
 // Session state machine manager — auto-detects session state from PTY output
 const sessionStateManager = new SessionStateManager({
@@ -354,6 +357,292 @@ function getSessionHealthReason(session, healthStatus) {
   return session.ptyProcess && !session.ptyProcess.killed ? 'PTY_RUNNING' : 'PTY_EXITED';
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isBootstrapGatedSession(session) {
+  return !!(session && session.type === 'wrapped' && readyRegistry.isKnownAiCli(session.command));
+}
+
+function initializeBootstrapState(session) {
+  if (!session) return session;
+  if (!Array.isArray(session.bootstrapQueue)) {
+    session.bootstrapQueue = [];
+  }
+  session.bootstrapDraining = session.bootstrapDraining === true;
+  session.bootstrapDrainPromise = session.bootstrapDrainPromise || null;
+  session.bootstrapPromptPoll = session.bootstrapPromptPoll || null;
+
+  if (isBootstrapGatedSession(session)) {
+    session.bootstrapReady = session.bootstrapReady === true;
+    session.bootstrapReadyAt = session.bootstrapReadyAt || null;
+    session.bootstrapReadyReason = session.bootstrapReadyReason || null;
+    session.ready = session.bootstrapReady === true;
+  } else {
+    session.bootstrapReady = true;
+    session.bootstrapReadyAt = session.bootstrapReadyAt || new Date().toISOString();
+    session.bootstrapReadyReason = session.bootstrapReadyReason || 'generic_command_compat';
+    session.ready = true;
+  }
+  return session;
+}
+
+function isBootstrapReady(session) {
+  return !isBootstrapGatedSession(session) || session.bootstrapReady === true;
+}
+
+function buildBootstrapBlock(session) {
+  return {
+    gated: isBootstrapGatedSession(session),
+    ready: isBootstrapReady(session),
+    ready_at: session.bootstrapReadyAt || null,
+    reason: session.bootstrapReadyReason || null,
+    queued: Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0,
+    draining: session.bootstrapDraining === true
+  };
+}
+
+function shouldQueueBootstrapOperation(session) {
+  return isBootstrapGatedSession(session) && !isBootstrapReady(session);
+}
+
+function hasBootstrapBacklog(session) {
+  return !!(session && Array.isArray(session.bootstrapQueue) && session.bootstrapQueue.length > 0);
+}
+
+function emitBootstrapEvent(eventType, sessionId, session, extra = {}) {
+  broadcastSessionEvent(eventType, sessionId, session, {
+    extra: {
+      bootstrap: buildBootstrapBlock(session),
+      ...extra
+    }
+  });
+}
+
+function enqueueBootstrapOperation(sessionId, session, operation) {
+  initializeBootstrapState(session);
+  const op = {
+    op_id: crypto.randomUUID(),
+    queued_at: new Date().toISOString(),
+    ...operation
+  };
+
+  if (op.type === 'submit') {
+    op.promise = new Promise((resolve) => {
+      op.resolve = resolve;
+    });
+  }
+
+  session.bootstrapQueue.push(op);
+  emitBootstrapEvent('bootstrap_queue_queued', sessionId, session, {
+    op_id: op.op_id,
+    operation: op.type,
+    depth: session.bootstrapQueue.length
+  });
+  scheduleBootstrapPromptPoll(sessionId, session);
+  return op;
+}
+
+function resolveBootstrapSubmit(op, result) {
+  if (op && typeof op.resolve === 'function') {
+    op.resolve(result);
+    op.resolve = null;
+  }
+}
+
+function bootstrapQueuedResponse(op, extra = {}) {
+  return {
+    success: true,
+    strategy: 'bootstrap_queue',
+    queued: true,
+    bootstrap_queued: true,
+    bootstrap_op_id: op.op_id,
+    ...extra
+  };
+}
+
+async function executeBootstrapInject(sessionId, session, op) {
+  const prompt = typeof op.prompt === 'string' ? op.prompt : '';
+  const textResult = await writeDataToSession(sessionId, session, prompt);
+  if (!textResult.success) return textResult;
+
+  if (!op.noEnter) {
+    await sleep(WRAPPED_SUBMIT_DELAY_MS);
+    const submitResult = await writeDataToSession(sessionId, session, '\r');
+    if (!submitResult.success) return submitResult;
+  }
+
+  session.lastActivityAt = new Date().toISOString();
+  return {
+    success: true,
+    strategy: 'bootstrap_direct',
+    submit: op.noEnter ? 'skipped' : 'sent'
+  };
+}
+
+async function executeBootstrapSubmit(sessionId, session, op) {
+  const strategy = terminalLevelSubmit(sessionId, session);
+  if (!strategy) {
+    return {
+      status: 503,
+      body: {
+        error: 'Submit failed via all strategies (kitty/cmux/pty)',
+        strategy: 'none',
+        attempts: 0,
+        gated: false,
+        bootstrap_queued: true
+      }
+    };
+  }
+  return {
+    status: 200,
+    body: {
+      success: true,
+      strategy,
+      attempts: 1,
+      gated: false,
+      verify: null,
+      bootstrap_queued: true
+    }
+  };
+}
+
+async function drainBootstrapQueue(sessionId, session) {
+  if (!session || session.bootstrapDraining) {
+    return session ? session.bootstrapDrainPromise : null;
+  }
+  if (!isBootstrapReady(session)) {
+    return null;
+  }
+
+  session.bootstrapDraining = true;
+  session.bootstrapDrainPromise = (async () => {
+    while (hasBootstrapBacklog(session)) {
+      const op = session.bootstrapQueue.shift();
+      try {
+        if (op.cancelled) {
+          continue;
+        }
+        if (op.type === 'inject') {
+          const result = await executeBootstrapInject(sessionId, session, op);
+          if (!result.success) {
+            emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
+              op_id: op.op_id,
+              operation: op.type,
+              code: result.code || 'DELIVERY_FAILED',
+              error: result.error || 'bootstrap delivery failed'
+            });
+          }
+        } else if (op.type === 'submit') {
+          const result = await executeBootstrapSubmit(sessionId, session, op);
+          resolveBootstrapSubmit(op, result);
+          if (result.status >= 400) {
+            emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
+              op_id: op.op_id,
+              operation: op.type,
+              code: result.body.code || 'SUBMIT_FAILED',
+              error: result.body.error || 'bootstrap submit failed'
+            });
+          }
+        }
+      } catch (error) {
+        if (op.type === 'submit') {
+          resolveBootstrapSubmit(op, {
+            status: 500,
+            body: {
+              error: error.message || 'bootstrap submit failed',
+              strategy: 'none',
+              attempts: 0,
+              gated: false,
+              bootstrap_queued: true
+            }
+          });
+        }
+        emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
+          op_id: op.op_id,
+          operation: op.type,
+          code: 'BOOTSTRAP_DRAIN_FAILED',
+          error: error.message || 'bootstrap drain failed'
+        });
+      }
+    }
+
+    emitBootstrapEvent('bootstrap_queue_drained', sessionId, session);
+  })().finally(() => {
+    session.bootstrapDraining = false;
+    session.bootstrapDrainPromise = null;
+  });
+
+  return session.bootstrapDrainPromise;
+}
+
+function markBootstrapReady(sessionId, session, reason) {
+  if (!session) return false;
+  initializeBootstrapState(session);
+  if (!isBootstrapGatedSession(session)) {
+    return false;
+  }
+  if (session.bootstrapReady === true) {
+    return false;
+  }
+
+  session.bootstrapReady = true;
+  session.bootstrapReadyAt = new Date().toISOString();
+  session.bootstrapReadyReason = reason || 'ready';
+  session.ready = true;
+  emitBootstrapEvent('bootstrap_ready', sessionId, session, { reason: session.bootstrapReadyReason });
+  drainBootstrapQueue(sessionId, session);
+  return true;
+}
+
+function scheduleBootstrapPromptPoll(sessionId, session) {
+  if (!session || !isBootstrapGatedSession(session) || isBootstrapReady(session)) return;
+  if (session.bootstrapPromptPoll || session.backend !== 'cmux' || !session.cmuxWorkspaceId) return;
+  if (!isOpenWebSocket(session.ownerWs)) return;
+
+  session.bootstrapPromptPoll = submitGate.awaitPromptSymbol(session, {
+    timeoutMs: BOOTSTRAP_READY_TIMEOUT_MS
+  }).then((result) => {
+    session.bootstrapPromptPoll = null;
+    if (result && result.ready && isOpenWebSocket(session.ownerWs)) {
+      markBootstrapReady(sessionId, session, 'cmux_prompt_symbol');
+    } else if (result && result.reason) {
+      emitBootstrapEvent('bootstrap_ready_timeout', sessionId, session, {
+        reason: result.reason,
+        waited_ms: result.waited_ms || 0
+      });
+    }
+  }).catch((error) => {
+    session.bootstrapPromptPoll = null;
+    emitBootstrapEvent('bootstrap_ready_timeout', sessionId, session, {
+      reason: 'prompt_symbol_error',
+      error: error.message || String(error)
+    });
+  });
+}
+
+async function waitForBootstrapSubmit(op, session, timeoutMs) {
+  const timeout = sleep(timeoutMs).then(() => {
+    op.cancelled = true;
+    return {
+      status: 504,
+      body: {
+        error: 'Submit bootstrap-timeout — target CLI did not become ready',
+        reason: 'bootstrap_not_ready',
+        last_state: sessionStateManager.getState(session.id)?.state || null,
+        strategy: 'none',
+        attempts: 0,
+        gated: true,
+        bootstrap_queued: true,
+        bootstrap_op_id: op.op_id,
+        bootstrap: buildBootstrapBlock(session)
+      }
+    };
+  });
+  return Promise.race([op.promise, timeout]);
+}
+
 function buildSessionTransportBlock(session, options = {}) {
   if (!session) {
     return null;
@@ -380,7 +669,8 @@ function buildSessionTransportBlock(session, options = {}) {
     last_disconnected_at: session.lastDisconnectedAt || null,
     last_inject_from: session.lastInjectFrom || null,
     last_reply_to: session.lastInjectReplyTo || null,
-    last_thread_id: session.lastThreadId || null
+    last_thread_id: session.lastThreadId || null,
+    bootstrap: buildBootstrapBlock(session)
   };
 }
 
@@ -645,6 +935,28 @@ function terminalLevelSubmit(id, session) {
 
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
   const now = Date.now();
+  if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
+    const healthStatus = getSessionHealthStatus(session, { nowMs: now });
+    if (healthStatus === 'STALE') {
+      return { success: false, httpStatus: 410, code: 'STALE', error: 'Session is stale and awaiting cleanup.' };
+    }
+    const op = enqueueBootstrapOperation(id, session, {
+      type: 'inject',
+      prompt,
+      noEnter: !!options.noEnter,
+      options: {
+        source: options.source || 'inject',
+        from: options.from || 'daemon'
+      }
+    });
+    session.lastActivityAt = new Date(now).toISOString();
+    return bootstrapQueuedResponse(op, {
+      msg_id: op.op_id,
+      pending: session.bootstrapQueue.length,
+      submit: options.noEnter ? 'skipped' : 'queued'
+    });
+  }
+
   const injectFailure = getInjectFailure(session, { nowMs: now });
   if (injectFailure) {
     return { success: false, ...injectFailure };
@@ -834,6 +1146,7 @@ for (const [id, meta] of Object.entries(_persisted)) {
       lastStateReportAt: meta.lastStateReportAt || null,
       stateReport: meta.stateReport || null,
       clients: new Set(), isClosing: false, outputRing: [], ready: true,     };
+    initializeBootstrapState(sessions[id]);
     console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
   }
 }
@@ -1020,6 +1333,7 @@ app.post('/api/sessions/register', (req, res) => {
       existing.ready = true;
       markSessionConnected(existing);
     }
+    initializeBootstrapState(existing);
     console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
     return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true });
   }
@@ -1049,8 +1363,9 @@ app.post('/api/sessions/register', (req, res) => {
     clients: new Set(),
     isClosing: false,
     outputRing: [],
-    ready: true,  // all sessions are injectable once registered (#150)
-      };
+    ready: true,  // unknown commands remain injectable once registered (#150)
+  };
+  initializeBootstrapState(sessionRecord);
   // Check for existing session with same base alias and emit replaced event
   const baseAlias = session_id.replace(/-\d+$/, '');
   const replaced = Object.keys(sessions).find(id => {
@@ -1521,6 +1836,18 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
 
   console.log(`[SUBMIT] Session ${id} (${session.command})${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}${gateOff ? ' [gate=off]' : ''}`);
 
+  if (isBootstrapGatedSession(session) && (!isBootstrapReady(session) || hasBootstrapBacklog(session) || session.bootstrapDraining)) {
+    const op = enqueueBootstrapOperation(id, session, {
+      type: 'submit',
+      body: { ...(req.body || {}) }
+    });
+    if (isBootstrapReady(session)) {
+      drainBootstrapQueue(id, session);
+    }
+    const queuedSubmit = await waitForBootstrapSubmit(op, session, gateTimeoutMs);
+    return res.status(queuedSubmit.status).json(queuedSubmit.body);
+  }
+
   function emitSubmitBus(payload) {
     const busMsg = JSON.stringify({
       type: 'submit',
@@ -1887,7 +2214,17 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       });
     }
 
-    res.json({ success: true, inject_id, strategy: delivery.strategy, submit: delivery.submit });
+    res.json({
+      success: true,
+      inject_id,
+      strategy: delivery.strategy,
+      submit: delivery.submit,
+      ...(delivery.bootstrap_queued ? {
+        bootstrap_queued: true,
+        bootstrap_op_id: delivery.bootstrap_op_id || delivery.msg_id,
+        pending: delivery.pending
+      } : {})
+    });
   } catch (err) {
     emitInjectFailureEvent(id, 'DELIVERY_FAILED', err.message, { inject_id }, session);
     res.status(500).json(buildErrorBody('DELIVERY_FAILED', err.message));
@@ -2613,6 +2950,7 @@ wss.on('connection', (ws, req) => {
       outputRing: [],
       ready: true,
           };
+    initializeBootstrapState(autoSession);
     sessions[sessionId] = autoSession;
     console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect`);
     // Set tab title via kitty (no \x0c redraw — it causes flickering on multi-session reconnect)
@@ -2645,7 +2983,9 @@ wss.on('connection', (ws, req) => {
     }
     activeSession.ownerWs = ws;
     markSessionConnected(activeSession);
+    initializeBootstrapState(activeSession);
     console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
+    scheduleBootstrapPromptPoll(sessionId, activeSession);
     if (hadDisconnectedOwner) {
       emitSessionLifecycleEvent('session_reconnect', sessionId, activeSession);
     }
@@ -2671,7 +3011,11 @@ wss.on('connection', (ws, req) => {
               }
             });
           } else if (type === 'ready') {
-            activeSession.ready = true;
+            if (isBootstrapGatedSession(activeSession)) {
+              markBootstrapReady(sessionId, activeSession, 'bridge_ready');
+            } else {
+              activeSession.ready = true;
+            }
             activeSession.lastActivityAt = new Date().toISOString();
             console.log(`[READY] Session ${sessionId} CLI is ready for inject`);
             // Broadcast readiness to bus (cmux/kitty paths now enabled for this session)

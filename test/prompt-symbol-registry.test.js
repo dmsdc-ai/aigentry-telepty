@@ -3,7 +3,14 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { lookup, ENTRIES } = require('../src/prompt-symbol-registry');
+const {
+  lookup,
+  commandKey,
+  isKnownAiCli,
+  detectOutput,
+  normalizeOutputForDetection,
+  ENTRIES
+} = require('../src/prompt-symbol-registry');
 
 // ---------------------------------------------------------------------------
 // Inline fixtures — captured 2026-04-26 from `cmux read-screen`.
@@ -114,6 +121,25 @@ test('lookup returns null for empty/whitespace/null input', () => {
   assert.equal(lookup('   '), null);
   assert.equal(lookup(null), null);
   assert.equal(lookup(undefined), null);
+});
+
+test('isKnownAiCli and commandKey classify registered AI CLIs only', () => {
+  assert.equal(isKnownAiCli('/tmp/claude'), true);
+  assert.equal(isKnownAiCli('codex resume'), true);
+  assert.equal(isKnownAiCli('gemini'), true);
+  assert.equal(isKnownAiCli('bash'), false);
+  assert.equal(commandKey('/tmp/claude --resume'), 'claude');
+});
+
+test('detectOutput uses shared geometry rules for bridge readiness', () => {
+  const raw = `\x1b[32m${CLAUDE_IDLE}\x1b[0m\r\n`;
+  assert.equal(detectOutput('/tmp/claude', raw).found, true);
+  assert.equal(detectOutput('/tmp/claude', CLAUDE_BANNER_NO_BORDER).found, false);
+  assert.equal(detectOutput('bash', CLAUDE_IDLE).reason, 'unknown_cli');
+});
+
+test('normalizeOutputForDetection strips ANSI and converts CR to LF', () => {
+  assert.equal(normalizeOutputForDetection('\x1b[31mhello\x1b[0m\rworld'), 'hello\nworld');
 });
 
 // ---------------------------------------------------------------------------

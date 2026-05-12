@@ -94,4 +94,46 @@ function lookup(command) {
   return null;
 }
 
-module.exports = { lookup, ENTRIES };
+function commandKey(command) {
+  const entry = lookup(command);
+  if (!entry) return null;
+  for (const [key, value] of Object.entries(ENTRIES)) {
+    if (value === entry) return key;
+  }
+  return null;
+}
+
+function isKnownAiCli(command) {
+  return !!lookup(command);
+}
+
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[()][AB012]|\x1b[>=<78DMEHcNOZ~}|]/g;
+
+function stripAnsi(value) {
+  return String(value == null ? '' : value).replace(ANSI_RE, '');
+}
+
+function normalizeOutputForDetection(output) {
+  return stripAnsi(output)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\n{2,}/g, '\n');
+}
+
+function detectOutput(command, output) {
+  const entry = lookup(command);
+  if (!entry) {
+    return { found: false, reason: 'unknown_cli' };
+  }
+  const screenLike = normalizeOutputForDetection(output);
+  return entry.detect(screenLike);
+}
+
+module.exports = {
+  lookup,
+  commandKey,
+  isKnownAiCli,
+  detectOutput,
+  normalizeOutputForDetection,
+  ENTRIES,
+};
