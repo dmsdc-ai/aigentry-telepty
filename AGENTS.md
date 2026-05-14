@@ -36,7 +36,8 @@ busy 세션: CR은 큐에 대기 중인 텍스트와 함께 큐잉 후 올바른
 ## Commands
 
 ```bash
-npm test                    # 43 tests (node:test)
+npm test                    # full suite (file list in package.json)
+npm run test:watch          # watch mode
 telepty daemon              # daemon 시작 (포트 3848)
 telepty allow --id <name> claude  # 세션 래핑
 telepty tui                 # TUI 대시보드
@@ -51,6 +52,11 @@ telepty session start --launch  # kitty 탭으로 다중 세션 시작
 - inject 후 submit은 항상 `osascript`로 통일 (`--no-enter` + osascript keystroke)
 - inject 시 발신자 session ID (`--from`)를 항상 포함
 - PTY `\r` 직접 의존 금지
+
+## Session Environment
+
+- `$TELEPTY_SESSION_ID` — this session's ID (e.g. `aigentry-telepty-claude`); use in `--from`.
+- `$TELEPTY_AVAILABLE` — `"true"` when daemon is reachable. Guard telepty calls in scripts.
 
 ## Session Communication
 
@@ -76,9 +82,10 @@ telepty inject --ref --from aigentry-telepty-{cli} aigentry-orchestrator-claude 
 ## Legacy exception — `skill-installer.js`
 
 `skill-installer.js` is a **named legacy exception** grandfathered by
-**ADR 2026-05-05-telepty-devkit-boundary §6.2.1**. It is the single
-exception to the telepty/devkit boundary rule and is NOT precedent for
-new placements.
+**ADR 2026-05-05-telepty-devkit-boundary §6.2.1**
+(canonical location: `../aigentry-orchestrator/docs/adr/2026-05-05-telepty-devkit-boundary.md`).
+It is the single exception to the telepty/devkit boundary rule and is
+NOT precedent for new placements.
 
 - **Scope**: bugfixes, security patches, dependency upgrades only.
 - **No new feature expansion**: net-new functionality (new CLI detection,
