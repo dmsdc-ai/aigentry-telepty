@@ -2,6 +2,59 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.4.0] — 2026-05-15
+
+### Added — Phase 1 sidecar supervisor spike (M1–M5)
+
+Out-of-process Rust supervisor (`crates/telepty-supervisor-{core,bin}`)
+incubating the future spawn/kill/IPC backend for `daemon.js`. Five
+milestones complete; **incubating only — not on the request path** in
+0.4.0. Daemon (`daemon.js`) and CLI (`cli.js`) routing is unchanged.
+
+- **M1** — spawn + observe (commit `07cd2e7`).
+- **M2** — graceful + forced kill gate, manifest cleanup invariant A8
+  (commit `ec00412`).
+- **M3** — IPC + wire contract conformance, NDJSON UDS frames + golden
+  fixtures (commit `76cde35`).
+- **M4** — cross-OS POSIX parity + reproducible RSS measurement, GitHub
+  Actions matrix (`.github/workflows/phase1-spike-ci.yml`); RSS PASS at
+  2.9–3.0 MiB / supervisor on macOS arm64 (commit `eb04c73`).
+- **M5** — manual integration bridge (`scripts/bridge-phase1.js`, 194
+  LOC Node stdlib only) — four parity scenarios A/B/C/D, exit 0 iff all
+  PASS; one-line Rust correctness fix (emit `shutdown_drain` before IPC
+  shutdown so connected clients receive the frame) (commit `be091e0`).
+
+Phase 1 LOC ceiling 1500 honored (Rust src/ tokei = 1240, 260 LOC
+headroom unused). Test suite: 23/23 (lib unit 12 + wire_golden 6 +
+ipc_protocol 5). Spec: `docs/specs/2026-05-10-supervisor-c3-kill-gate-spec.md`.
+Plan: `docs/plans/2026-05-12-phase1-sidecar-spike-plan.md`.
+
+### Fixed
+
+- **#18** — Bootstrap inject queue race. Welcome-banner bypass via
+  positive-override `is_ready` so queued injects flush in the correct
+  order without colliding with the banner (commit `744ad6a`).
+- **#16** — REPORT-based idle status detection. Replaces heuristic
+  prompt-symbol detection with explicit REPORT-frame anchoring
+  (commit `3ed1e83`).
+
+### Build
+
+- `package.json` — added `files` whitelist (22 entries) to constrain
+  npm-published surface to actual runtime distribution. Tarball
+  reduction: 228 MB → 123 kB (1850×). The Rust spike artifacts
+  (`target/`, `crates/`, `Cargo.lock/Cargo.toml`, `rust-toolchain.toml`)
+  ship in git but **not** to npm (commit `a0baf84`).
+
+### Docs
+
+- MD audit wave-2 fix: `CLAUDE.md` converted to `@AGENTS.md` stub
+  (101 → 27 lines), `AGENTS.md` gained Session Environment section
+  (`$TELEPTY_SESSION_ID`, `$TELEPTY_AVAILABLE`) and disclosed
+  cross-repo ADR location for `2026-05-05-telepty-devkit-boundary §6.2.1`.
+  Score delta `AGENTS.md` 80 → 87, `CLAUDE.md` 66 → 87 (commit `74a6374`,
+  full report `docs/reports/2026-05-14-md-audit.md`).
+
 ## [0.3.5] — 2026-05-05
 
 ### Added — `telepty init --print-snippet` (Issue #8)
