@@ -55,6 +55,25 @@ Plan: `docs/plans/2026-05-12-phase1-sidecar-spike-plan.md`.
   Score delta `AGENTS.md` 80 → 87, `CLAUDE.md` 66 → 87 (commit `74a6374`,
   full report `docs/reports/2026-05-14-md-audit.md`).
 
+### Notes
+
+- **Snyk SAST deferred for this release** — see follow-up task #130.
+  Waiver basis (Rule 32-A track B):
+  - M1–M5 spike code is Rust and is **excluded from the npm tarball** by
+    the new `files` whitelist — first-party code shipped to consumers is
+    JS only.
+  - The shipped JS files are unchanged or only minimally changed since
+    `0.3.5` (cli.js +51 / daemon.js +360 / src/prompt-symbol-registry.js
+    +44 / new session-state.js — additive, no breaks per Phase 1 audit).
+  - Dependency-side coverage exists via `npm audit` (10 pre-existing
+    vulns documented; not introduced by this release).
+  - Per CLAUDE.md user-instruction "Snyk At Inception" scope = *new
+    first-party code shipped* — 0 net-new shipped JS code in this
+    release, so the at-inception rule does not bind here. Follow-up
+    task #130 will land the standing SAST gate as a release-script
+    primitive (so future releases scan automatically without per-run
+    auth steps).
+
 ## [0.3.5] — 2026-05-05
 
 ### Added — `telepty init --print-snippet` (Issue #8)
