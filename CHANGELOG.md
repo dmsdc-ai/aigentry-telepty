@@ -22,6 +22,20 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   `attach` / `read-screen` / `rename` / `destroy` / `state` /
   `session info` share the same gap but are deferred to v0.4.3+.
 
+### Notes
+
+- **Snyk SAST scan on changed files** — `cross-machine.js` +
+  `session-routing.js` + `test/cross-machine-ssh-routing.test.js` +
+  `test/session-routing.test.js` = **0 findings** (At-Inception clean).
+  `cli.js` shows **5 pre-existing findings** (2 Medium Command Injection
+  at `execSync` L469 + `pty.spawn` L1096, 3 Low Path Traversal at
+  L2308/L2310/L2619) with **identical fingerprints** vs HEAD~1 (5/5
+  verified). Line numbers for sinks below L543 shifted +21 from the
+  `resolveSessionTarget` enrichment block (cli.js L543–L566) — logical
+  source→sink unchanged; no new sink call sites added. Out of #28
+  surgical scope. Tracked in **dmsdc-ai/aigentry-telepty#26** for
+  follow-up PR.
+
 ## [0.4.1] - 2026-05-17
 
 ### Fixed
