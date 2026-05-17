@@ -164,6 +164,25 @@ test('Windows: missing PATH yields PATHEXT-walk failure (not crash)', () => {
   );
 });
 
+test('Windows: extensionless sibling does NOT shadow .CMD shim for bare name', () => {
+  // npm-global publishes both an extensionless POSIX shell script `claude`
+  // AND `claude.cmd` in the same directory. cmd.exe shell only matches
+  // PATHEXT entries for bare names, so `telepty allow ... claude` must
+  // resolve to claude.CMD — not the shell script that node-pty (and cmd)
+  // cannot execute.
+  const dir = 'C:\\Users\\u\\AppData\\Roaming\\npm';
+  const bareScript = winPath.join(dir, 'claude');
+  const cmdShim = winPath.join(dir, 'claude.CMD');
+  const result = resolveWindowsExecutable('claude', {
+    PATH: dir,
+    PATHEXT: '.COM;.EXE;.BAT;.CMD',
+  }, {
+    platform: 'win32',
+    existsSync: makeExistsSync(new Set([bareScript, cmdShim])),
+  });
+  assert.equal(result, cmdShim);
+});
+
 test('Windows: PATHEXT entries with whitespace are trimmed', () => {
   const dir = 'C:\\bin';
   const expected = winPath.join(dir, 'tool.CMD');

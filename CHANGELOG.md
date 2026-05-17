@@ -2,6 +2,32 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.4.2] - 2026-05-17
+
+### Fixed
+
+- **#25 follow-up** — Windows `.cmd`/`.bat`/`.ps1` shim spawn failure. 0.4.1
+  resolved bare names through `PATH × PATHEXT`, but the resulting `.cmd`
+  shim (e.g. `claude.cmd`) still failed at `pty.spawn` with
+  `Cannot create process, error code: 193` because node-pty's
+  `CreateProcessW` cannot execute non-`.exe`/`.com` targets. 0.4.2 wraps
+  the resolved target in the appropriate interpreter:
+  - `.exe` / `.com` → spawn directly (unchanged)
+  - `.cmd` / `.bat` / anything else → `cmd.exe /d /s /c "<quoted-cmdline>"`
+  - `.ps1` → `powershell.exe -NoLogo -ExecutionPolicy Bypass -File <path> <args>`
+
+  Quoting follows the proven cross-spawn pattern (CreateProcessW
+  backslash-quote encoding + caret-escape for cmd meta chars), so paths
+  with spaces and args containing quotes or shell metacharacters round-trip
+  correctly through `cmd /s /c`. macOS/Linux behavior unchanged (POSIX
+  branch is a pass-through). New module: `src/win-spawn-target.js`
+  (≤80 LOC, no new deps) + `test/win-spawn-target.test.js` (16 unit tests).
+  Wired into `cli.js` `spawnChild()` only — `daemon.js:1213` already used
+  its own `cmd.exe /c` wrap for the `/api/sessions/spawn` REST path.
+
+  Net effect: `telepty allow --id <name> claude --dangerously-skip-permissions
+  --continue` now produces the same UX on macOS, Linux, and Windows.
+
 ## [0.4.1] - 2026-05-17
 
 ### Fixed
