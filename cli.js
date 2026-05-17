@@ -17,6 +17,7 @@ const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
+const { resolveWindowsExecutable } = require('./src/win-resolve-executable');
 const crossMachine = require('./cross-machine');
 const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec');
 const { FileMailbox } = require('./src/mailbox/index');
@@ -1068,7 +1069,10 @@ async function main() {
     }
 
     function spawnChild() {
-      child = pty.spawn(command, cmdArgs, {
+      // Windows: walk %PATHEXT% so bare names (`claude`, `codex`, `gemini`)
+      // resolve to their npm-global `.cmd`/`.ps1` shims. POSIX: no-op. (#25)
+      const resolvedCommand = resolveWindowsExecutable(command, process.env);
+      child = pty.spawn(resolvedCommand, cmdArgs, {
         name: 'xterm-256color',
         cols: process.stdout.columns || 80,
         rows: process.stdout.rows || 30,

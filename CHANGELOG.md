@@ -2,6 +2,20 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.4.1] - 2026-05-17
+
+### Fixed
+
+- **#25** — Windows PATHEXT resolution for `telepty allow`. npm-global CLIs
+  (`claude`, `codex`, `gemini`) now spawn correctly with bare names on
+  Windows. Previously `telepty allow … claude` failed with
+  `Cannot create process, error code: 2` (ERROR_FILE_NOT_FOUND) because
+  node-pty's `CreateProcessW` does not walk `%PATHEXT%` the way `cmd.exe`
+  does, so the npm-global `claude.cmd` shim was unreachable from the bare
+  name. New: `src/win-resolve-executable.js` resolver (Windows-only branch
+  walks `PATH` × `PATHEXT`; POSIX no-op) + 14 unit tests. macOS/Linux
+  behavior unchanged.
+
 ## [0.4.0] — 2026-05-15
 
 ### Added — Phase 1 sidecar supervisor spike (M1–M5)
