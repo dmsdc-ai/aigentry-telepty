@@ -37,6 +37,37 @@ function savePeers(data) {
 // In-memory active peers
 const activePeers = new Map(); // name -> { target, controlSocket, connectedAt, machineId }
 
+// File-backed SSH peer enumeration. Required because CLI subprocesses (fresh
+// node procs) start with an empty `activePeers` Map — only the process that
+// called connect() has it populated. peers.json is the cross-process source of
+// truth. controlPath(target) is deterministic, so any process can reuse the
+// ControlMaster socket established by an earlier connect() as long as
+// ControlPersist hasn't expired. See #411.
+function listSshPeers() {
+  const peers = loadPeers().peers || {};
+  return Object.entries(peers)
+    .filter(([, entry]) => getPeerTransport(entry) === 'ssh' && entry && entry.target)
+    .map(([name, entry]) => ({
+      name,
+      target: entry.target,
+      machineId: entry.machineId || name,
+      lastConnected: entry.lastConnected
+    }));
+}
+
+function getSshPeerHandle(name) {
+  if (activePeers.has(name)) return activePeers.get(name);
+  const peers = loadPeers().peers || {};
+  const entry = peers[name];
+  if (!entry || getPeerTransport(entry) !== 'ssh' || !entry.target) return null;
+  return {
+    target: entry.target,
+    controlSocket: controlPath(entry.target),
+    name,
+    machineId: entry.machineId || name
+  };
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
@@ -175,14 +206,11 @@ function disconnectAll() {
  * @returns {Array} sessions with host info
  */
 function listRemoteSessions(name) {
-  const peer = activePeers.get(name);
+  const peer = getSshPeerHandle(name);
   if (!peer) return [];
 
   try {
-    const output = execSync(
-      `ssh -o ControlPath=${peer.controlSocket} ${peer.target} "telepty list --json"`,
-      { timeout: 10000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-    );
+    const output = runRemoteCommand(peer, 'telepty list --json', { timeout: 10000 });
     const sessions = JSON.parse(output);
     return sessions.map(s => ({ ...s, host: peer.target, peerName: name, remote: true }));
   } catch {
@@ -191,13 +219,21 @@ function listRemoteSessions(name) {
 }
 
 /**
- * Discover sessions across all connected peers.
+ * Discover sessions across all connected peers, including SSH peers that are
+ * persisted in peers.json but not in this process's activePeers Map. Fresh
+ * CLI subprocesses depend on the file-backed path — #411.
  * @returns {Array} all remote sessions
  */
 function discoverAllRemoteSessions() {
   const allSessions = [];
+  const seen = new Set();
   for (const [name] of activePeers) {
     allSessions.push(...listRemoteSessions(name));
+    seen.add(name);
+  }
+  for (const peer of listSshPeers()) {
+    if (seen.has(peer.name)) continue;
+    allSessions.push(...listRemoteSessions(peer.name));
   }
   return allSessions;
 }
@@ -206,7 +242,7 @@ function discoverAllRemoteSessions() {
  * Inject text into a remote session via SSH.
  */
 function remoteInject(name, sessionId, prompt, options = {}) {
-  const peer = activePeers.get(name);
+  const peer = getSshPeerHandle(name);
   if (!peer) return { success: false, error: `Not connected to ${name}` };
 
   try {
@@ -227,7 +263,7 @@ function remoteInject(name, sessionId, prompt, options = {}) {
 }
 
 function remoteEnsureSharedContext(name, descriptor) {
-  const peer = activePeers.get(name);
+  const peer = getSshPeerHandle(name);
   if (!peer) return { success: false, error: `Not connected to ${name}` };
 
   try {
@@ -454,6 +490,9 @@ module.exports = {
   listHttpPeers,
   listHttpRemoteSessions,
   discoverHttpRemoteSessions,
+  // File-backed SSH peer enumeration (cross-process — #411)
+  listSshPeers,
+  getSshPeerHandle,
   getPeerTransport,
   PEERS_PATH
 };

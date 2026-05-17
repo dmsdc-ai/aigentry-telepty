@@ -2,6 +2,26 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.4.2] - 2026-05-17
+
+### Fixed
+
+- **#28** — SSH-peer routing for `telepty inject` / `list` / `enter`
+  cross-machine: file-backed `peers.json` fallback resolves the prior
+  `fetch failed` against SSH peers in fresh CLI subprocesses. Previously
+  `cross-machine.js` consulted only the in-memory `activePeers` Map, which
+  is process-local and empty for every CLI subprocess spawned after
+  `telepty connect`. New: `listSshPeers` + `getSshPeerHandle` helpers
+  (`cross-machine.js`) make SSH-peer discovery/inject symmetric with the
+  existing HTTP-peer path; `pickSessionTarget` (`session-routing.js`)
+  matches `<id>@<peerName>` against the peer alias; `resolveSessionTarget`
+  (`cli.js`) enriches synthetic targets with `peerName` when the host
+  matches a known SSH peer. 7 new unit tests
+  (`test/cross-machine-ssh-routing.test.js`) + 1 new peer-alias test
+  (`test/session-routing.test.js`). Scope: `inject` / `list` / `enter`;
+  `attach` / `read-screen` / `rename` / `destroy` / `state` /
+  `session info` share the same gap but are deferred to v0.4.3+.
+
 ## [0.4.1] - 2026-05-17
 
 ### Fixed

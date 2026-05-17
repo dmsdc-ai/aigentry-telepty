@@ -51,3 +51,19 @@ test('pickSessionTarget rejects ambiguous ids found on multiple hosts', () => {
 
   assert.throws(() => pickSessionTarget('shared', sessions), /multiple hosts/i);
 });
+
+test('pickSessionTarget matches `<id>@<peerName>` against session.peerName alias (#411)', () => {
+  // Discovered SSH-peer session: host is `user@FQDN`, peerName is the
+  // friendly alias from peers.json.
+  const sessions = [
+    { id: 'orchestrator-winsvr', host: 'Administrator@win.tail.ts.net', peerName: 'winserver', remote: true }
+  ];
+
+  // `<id>@<peerName>` syntax must match the alias rather than falling through
+  // to a synthetic {host: 'winserver'} target.
+  const resolved = pickSessionTarget('orchestrator-winsvr@winserver', sessions);
+  assert.equal(resolved.id, 'orchestrator-winsvr');
+  assert.equal(resolved.peerName, 'winserver');
+  assert.equal(resolved.host, 'Administrator@win.tail.ts.net');
+  assert.equal(resolved.remote, true);
+});

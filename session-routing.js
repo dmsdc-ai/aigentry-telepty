@@ -38,7 +38,12 @@ function pickSessionTarget(sessionRef, sessions, defaultHost = '127.0.0.1') {
   }
 
   if (parsed.host) {
-    const exactMatch = sessions.find((session) => session.id === parsed.id && session.host === parsed.host);
+    // Match by host or by peerName alias (e.g. `sid@winserver` where
+    // winserver is the SSH peer name and session.host is `user@FQDN`). #411
+    const exactMatch = sessions.find((session) =>
+      session.id === parsed.id &&
+      (session.host === parsed.host || session.peerName === parsed.host)
+    );
     return exactMatch || { id: parsed.id, host: parsed.host };
   }
 

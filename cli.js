@@ -542,7 +542,28 @@ function isRemoteSession(session) {
 
 async function resolveSessionTarget(sessionRef, options = {}) {
   const sessions = options.sessions || await discoverSessions({ silent: true });
-  return pickSessionTarget(sessionRef, sessions, REMOTE_HOST);
+  const target = pickSessionTarget(sessionRef, sessions, REMOTE_HOST);
+  // When <id>@<peerName> uses an SSH peer alias (e.g. `winserver`) and the
+  // session is not in `sessions` (discovery missed it, ControlMaster expired,
+  // or remote has no such session), pickSessionTarget returns a synthetic
+  // target with no peerName/remote flag. Detect SSH peer alias here so the
+  // caller routes through cross-machine.remoteInject (SSH path) rather than
+  // falling into the HTTP fetch path with `http://winserver:3848/...`. #411
+  if (
+    target &&
+    !target.peerName &&
+    target.host &&
+    target.host !== '127.0.0.1' &&
+    !target.host.includes(':') &&
+    !target.host.includes('@')
+  ) {
+    const sshPeer = crossMachine.getSshPeerHandle(target.host);
+    if (sshPeer) {
+      target.peerName = target.host;
+      target.remote = true;
+    }
+  }
+  return target;
 }
 
 async function ensureDaemonRunning(options = {}) {
