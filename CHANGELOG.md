@@ -16,6 +16,16 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   walks `PATH` × `PATHEXT`; POSIX no-op) + 14 unit tests. macOS/Linux
   behavior unchanged.
 
+### Notes
+
+- **Snyk SAST scan on changed files** — `src/win-resolve-executable.js`
+  + `test/win-resolve-executable.test.js` = **0 findings** (At-Inception
+  clean). `cli.js` shows **5 pre-existing findings** (2 Medium Command
+  Injection at `execSync` L469 + `pty.spawn` L1075, 3 Low Path Traversal
+  at L2287/L2289/L2598) verified identical fingerprint vs HEAD~1 — out
+  of #25 surgical scope. Tracked in **dmsdc-ai/aigentry-telepty#26** for
+  follow-up PR.
+
 ## [0.4.0] — 2026-05-15
 
 ### Added — Phase 1 sidecar supervisor spike (M1–M5)
