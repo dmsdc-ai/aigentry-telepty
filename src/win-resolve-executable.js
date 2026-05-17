@@ -51,8 +51,14 @@ function resolveWindowsExecutable(command, env, opts) {
     return existsSync(abs) ? abs : tryWithExt(abs, e, existsSync, command);
   }
 
-  // Bare name → walk PATH × PATHEXT.
-  const exts = parseExts(e.PATHEXT || DEFAULT_PATHEXT);
+  // Bare name → walk PATH × PATHEXT. If the bare name has an explicit
+  // extension (e.g., `claude.cmd`) probe as-is first via empty-ext; else
+  // skip empty-ext so an extensionless sibling (npm ships a POSIX shell
+  // script `claude` alongside `claude.cmd`) does NOT shadow the PATHEXT
+  // match — matches real cmd.exe shell semantics.
+  const allExts = parseExts(e.PATHEXT || DEFAULT_PATHEXT);
+  const hasOwnExt = p.extname(command) !== '';
+  const exts = hasOwnExt ? allExts : allExts.filter((x) => x !== '');
   const dirs = (e.PATH || '').split(';').filter(Boolean);
   for (const dir of dirs) {
     for (const ext of exts) {

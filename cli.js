@@ -17,7 +17,7 @@ const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
-const { resolveWindowsExecutable } = require('./src/win-resolve-executable');
+const { buildPtySpawnTarget } = require('./src/win-spawn-target');
 const crossMachine = require('./cross-machine');
 const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec');
 const { FileMailbox } = require('./src/mailbox/index');
@@ -1069,10 +1069,13 @@ async function main() {
     }
 
     function spawnChild() {
-      // Windows: walk %PATHEXT% so bare names (`claude`, `codex`, `gemini`)
-      // resolve to their npm-global `.cmd`/`.ps1` shims. POSIX: no-op. (#25)
-      const resolvedCommand = resolveWindowsExecutable(command, process.env);
-      child = pty.spawn(resolvedCommand, cmdArgs, {
+      // Windows: walk %PATHEXT% to find the .cmd/.ps1/.bat shim for bare
+      // names (`claude`, `codex`, `gemini`), then wrap in cmd.exe or
+      // powershell.exe so node-pty's CreateProcessW can launch it —
+      // CreateProcessW cannot execute non-.exe directly (error 193).
+      // POSIX: pass-through. (#25 follow-up)
+      const target = buildPtySpawnTarget(command, cmdArgs, process.env);
+      child = pty.spawn(target.file, target.args, {
         name: 'xterm-256color',
         cols: process.stdout.columns || 80,
         rows: process.stdout.rows || 30,
