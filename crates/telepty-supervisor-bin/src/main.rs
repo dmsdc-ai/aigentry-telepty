@@ -10,24 +10,32 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use telepty_supervisor_core::kill_gate::KillTimeouts;
-use telepty_supervisor_core::manifest::KillGateConfig;
+use telepty_supervisor_core::manifest::{scan_sessions, KillGateConfig};
 use telepty_supervisor_core::supervisor::{run, SupervisorConfig};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "telepty-supervisor-bin",
-    about = "Phase 1 sidecar supervisor — M2 spawn+observe+kill_gate",
+    about = "Phase 1 sidecar supervisor — spawn+observe+kill_gate (default) or --list",
     trailing_var_arg = true
 )]
 struct Args {
+    /// A7: scan ~/.telepty/sessions/*/manifest.json and emit a JSON array of
+    /// supervisor-managed sessions, then exit. Mutually exclusive with run mode.
+    /// Output shape: bare JSON array of `Manifest`. This is the **supervisor-
+    /// owned** view; the legacy `telepty list --json` daemon view is a
+    /// superset that P3 cli refactor will reconcile (per dispatch §6.1).
+    #[arg(long)]
+    list: bool,
     #[arg(long, default_value = "demo")]
     sid: String,
     #[arg(long)]
     cwd: Option<PathBuf>,
-    #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
+    /// argv to wrap. Required unless --list is set.
+    #[arg(num_args = 0.., allow_hyphen_values = true)]
     argv: Vec<OsString>,
 }
 
@@ -44,6 +52,14 @@ fn main() -> ExitCode {
 }
 
 fn drive(args: Args) -> Result<i32> {
+    if args.list {
+        return drive_list();
+    }
+    if args.argv.is_empty() {
+        return Err(anyhow!(
+            "no argv supplied; pass a command to wrap or use --list"
+        ));
+    }
     let cfg = SupervisorConfig {
         sid: args.sid,
         cwd: args.cwd,
@@ -56,6 +72,15 @@ fn drive(args: Args) -> Result<i32> {
         .build()?;
     let outcome = runtime.block_on(run(cfg))?;
     Ok(outcome.exit_code())
+}
+
+fn drive_list() -> Result<i32> {
+    let sessions = scan_sessions()?;
+    // Bare JSON array per existing `telepty list --json` style. Pretty for
+    // operator readability; downstream consumers can pipe through `jq`.
+    let json = serde_json::to_string_pretty(&sessions)?;
+    println!("{}", json);
+    Ok(0)
 }
 
 fn init_tracing() {

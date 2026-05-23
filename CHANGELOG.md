@@ -2,6 +2,115 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [Unreleased]
+
+### Added — Phase 1 supervisor-core-finish (task #430 P1)
+
+- **A5 detach/reattach via UDS reconnection + log offset replay** —
+  `wire::Kind::Resume` frame with optional `from_seq: u64` lets a
+  reconnecting client request replay of `Output` frames whose `seq` is
+  greater than `from_seq` from `~/.telepty/sessions/<sid>/log.jsonl`
+  before subscribing to the live broadcast. Replay is per-connection
+  sequential (handler-local) — no broadcast race. Seq-less audit
+  frames (`shutdown_drain`) are forwarded unconditionally so a late
+  reattach observes terminal state.
+- **A7 list discovery via filesystem manifest scan** —
+  `manifest::scan_sessions()` walks `~/.telepty/sessions/*/manifest.json`
+  with atomic per-file reads; missing / unparseable manifests are
+  skipped (never panics). New `telepty-supervisor-bin --list` flat
+  flag emits a JSON array of `Manifest` to stdout. Output shape is
+  the **supervisor-owned** view; the legacy `telepty list --json`
+  daemon view will be reconciled by the P3 cli refactor (per dispatch
+  §6.1). `--list` is mutually exclusive with run-mode argv.
+- **A8 delete graceful drain integration test** —
+  `tests/delete_drain.rs` end-to-end (no goldens): graceful (SIGTERM)
+  and forced (SIGKILL) variants both assert manifest unlinked + socket
+  unlinked + `log.jsonl` contains `shutdown_drain` with correct
+  `exit_reason` + supervisor exits within 3 s. Production code already
+  existed in `supervisor::run` (kill_outcome → unlink_clean branch).
+- **B3 trace_id enforcement extended to signal/kill/delete** —
+  `wire::validate_incoming` now rejects `Kind::Signal`, `Kind::Kill`,
+  `Kind::Delete` lacking `trace_id` with explicit error codes
+  (`signal_missing_trace_id`, `kill_missing_trace_id`,
+  `delete_missing_trace_id`) per C3 spec §1002 audit linkage
+  (`kind:"signal"` event matches originating injector trace_id;
+  `kind:"shutdown_drain"` carries parent_trace_id). Rejection reason
+  is ALSO appended to `log.jsonl` so the audit trail captures *why* a
+  frame was rejected even if the client disconnects before reading
+  the error response.
+- **F3 atomic manifest write contract test** —
+  `tests/atomic_manifest.rs` (5 tests). Headline test
+  `concurrent_readers_never_observe_partial_json` runs 1 writer thread
+  + 6 reader threads × 800 ms; readers always see a complete-old or
+  complete-new manifest, never partial JSON (the rename-atomicity
+  guarantee). Plus golden tests for `.json.tmp` cleanup, missing-
+  parent-dir creation, `unlink_clean` idempotency, and tombstone
+  audit-field roundtrip.
+- **G3 audit trail expansion** — `dispatch_ingest` now logs each
+  validated ingest event (`Inject` / `Signal` / `Kill` / `Delete`) to
+  `log.jsonl` right after `validate_incoming` passes. Ping is
+  intentionally skipped (heartbeat noise). Validation rejections are
+  also logged (closes the silent-drop gap from earlier milestones).
+  `audit.rs` was extended (single module per Constitution §1
+  lightweight) rather than fragmenting into a new audit/ submodule.
+  R4 TelemetryEvent translation deferred to the P3 cli bridge per
+  orchestrator Phase 4 decision.
+- **§8.A1 Normal termination contract test** —
+  `tests/normal_termination.rs` (2 tests). Covers child exits 0
+  (assert `exit_reason: normal`, `exit_code: 0`, escalated false,
+  manifest unlinked) and nonzero-but-natural exit (`sh -c 'exit 7'`
+  — assert exit_code propagated; `Normal` is the exit *mechanism*,
+  not the exit *code*).
+
+### Performance — E1 local-inject latency bench
+
+- New `crates/telepty-supervisor-core/benches/inject_e1.rs` custom
+  harness (no criterion — Constitution §17 no new Rust deps).
+  `[[bench]] harness = false`. Run with `cargo bench --bench inject_e1`.
+  100 warmup + 1000 measured roundtrips through real supervisor
+  wrapping `cat`.
+- **E1-p50: 0.025 ms** (p90 0.057 ms, p99 0.091 ms) on
+  macos/aarch64 / Mac16,8 / Apple M4 Pro — **40× under the 1 ms
+  target**.
+- Exit code 0 iff p50 < 1 ms (CI-gateable).
+
+### Notes — Phase 1 supervisor-core-finish
+
+- **No new Rust deps** (Constitution §17). `tokio` `fs` feature
+  enabled in workspace deps (feature flag only). `serde_json` added
+  to `telepty-supervisor-bin` (was already a workspace dep).
+- **Rule 29 surgical** — changes scoped to
+  `crates/telepty-supervisor-core/` (src + tests + benches) and
+  `crates/telepty-supervisor-bin/`. No daemon.js / cli.js changes
+  (those land in P2/P3). No Windows code paths (P4 scope; cargo
+  features can gate but no implementation in this phase).
+- **Tests** — 42 / 42 pass (23 baseline preserved + 19 new):
+  - Unit: +4 wire B3 (signal/kill/delete trace_id), +2 audit, +1
+    scan_sessions
+  - Integration: +3 reattach_replay (A5), +2 delete_drain (A8), +5
+    atomic_manifest (F3), +2 normal_termination (§8.A1)
+- **Snyk SAST** — `snyk_code_scan` on `crates/` → 0 findings across
+  both crates. Run at each phase boundary (Phase 4+).
+- **§8.A contract test parity** (per C3 spec
+  `docs/specs/2026-05-10-supervisor-c3-kill-gate-spec.md` §8.A): 7
+  of 13 Bucket-A scenarios covered + 2 extras (A5 reattach, F3
+  atomic) + 4 correctly deferred (Windows = P4 / Bucket B =
+  controlled-host out of Phase 1 spike scope). **2 follow-up
+  carry-overs documented**: §8.A3-tree (grandchild-cascade
+  killpg semantics — code already correct; explicit fixture
+  needed) and §8.A-reactor-stall (single-thread reactor
+  non-blocking invariant — code-review-only invariant; runtime
+  probe optional).
+- **Sources of truth** — the synthesis ADR referenced in dispatch
+  (`docs/adr/2026-05-10-telepty-l2-architecture-q-prime-bis.md`)
+  and 6-phase plan (`docs/reports/2026-05-23-telepty-l2-supervisor-plan.md`)
+  live in the orchestrator repo, not visible from this repo.
+  Per Phase 1 CLDR + orchestrator hybrid (b)+(c) decision, this
+  work derives §19.2 contract requirements from the local
+  `docs/specs/2026-05-10-supervisor-c3-kill-gate-spec.md` (which
+  the code already cited as `SPEC-C3-r1`) plus the dispatch text
+  itself.
+
 ## [0.4.3] - 2026-05-23
 
 ### Fixed

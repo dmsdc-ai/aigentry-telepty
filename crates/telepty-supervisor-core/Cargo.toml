@@ -19,3 +19,9 @@ nix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
+
+# E1 bench: custom harness (no criterion — Constitution §17 no new deps).
+# Run with `cargo bench --bench inject_e1`; harness=false means main() drives.
+[[bench]]
+name = "inject_e1"
+harness = false

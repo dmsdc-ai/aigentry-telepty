@@ -26,6 +26,10 @@ pub enum Kind {
     Error,
     Kill,
     ShutdownDrain,
+    /// A5 reattach — client requests replay of Output frames with `seq > from_seq`
+    /// from the supervisor's `log.jsonl` before subscribing to the live broadcast.
+    /// Per C3 spec §1.4 reattach semantics + dispatch §A5 (P1 surface).
+    Resume,
     #[serde(other)]
     Unknown,
 }
@@ -142,6 +146,10 @@ pub struct Frame {
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub escalated: Option<bool>,
+    /// A5 reattach: client-supplied last-seen seq for log replay. Replay emits
+    /// frames where `seq > from_seq`. None or 0 ⇒ replay from beginning.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub from_seq: Option<u64>,
 }
 
 impl Frame {
@@ -167,6 +175,7 @@ impl Frame {
             exit_reason: None,
             exit_code: None,
             escalated: None,
+            from_seq: None,
         }
     }
 
@@ -237,16 +246,44 @@ pub fn validate_incoming(frame: &Frame) -> Result<Kind, (ErrorCode, &'static str
             Ok(Kind::Output)
         }
         Kind::Signal => {
+            // B3 (C3 spec §1002 audit linkage): signal frames must carry trace_id
+            // so the log.jsonl `kind:"signal"` event correlates with the
+            // originating injector. Per C3 spec §1002.
+            if frame.trace_id.is_none() {
+                return Err((ErrorCode::BadFrame, "signal_missing_trace_id"));
+            }
             if frame.signal.is_none() {
                 return Err((ErrorCode::BadFrame, "signal_missing_field"));
             }
             Ok(Kind::Signal)
+        }
+        Kind::Kill => {
+            // B3 audit linkage: kill frames require trace_id (same rationale as signal).
+            if frame.trace_id.is_none() {
+                return Err((ErrorCode::BadFrame, "kill_missing_trace_id"));
+            }
+            Ok(Kind::Kill)
+        }
+        Kind::Delete => {
+            // B3 audit linkage: delete frames require trace_id so the resulting
+            // shutdown_drain event can reference the originating delete operation
+            // (C3 spec §1002 parent_trace_id pattern).
+            if frame.trace_id.is_none() {
+                return Err((ErrorCode::BadFrame, "delete_missing_trace_id"));
+            }
+            Ok(Kind::Delete)
         }
         Kind::Resize => {
             if frame.cols.is_none() || frame.rows.is_none() {
                 return Err((ErrorCode::BadFrame, "resize_missing_dims"));
             }
             Ok(Kind::Resize)
+        }
+        Kind::Resume => {
+            // `from_seq` optional — None ⇒ replay from beginning. `trace_id`
+            // recommended for client-side correlation but not strictly required;
+            // P1 keeps it optional to lower the reattach friction.
+            Ok(Kind::Resume)
         }
         // Optional/None-required kinds.
         k => Ok(k),
@@ -334,5 +371,40 @@ mod tests {
             serde_json::from_str(r#"{"v":1,"kind":"inject","sid":"x","trace_id":"t","data":"hi"}"#)
                 .unwrap();
         assert_eq!(validate_incoming(&f).unwrap(), Kind::Inject);
+    }
+
+    #[test]
+    fn signal_without_trace_id_rejected() {
+        let f: Frame =
+            serde_json::from_str(r#"{"v":1,"kind":"signal","sid":"x","signal":"SIGTERM"}"#)
+                .unwrap();
+        let err = validate_incoming(&f).unwrap_err();
+        assert_eq!(err.0, ErrorCode::BadFrame);
+        assert_eq!(err.1, "signal_missing_trace_id");
+    }
+
+    #[test]
+    fn kill_without_trace_id_rejected() {
+        let f: Frame = serde_json::from_str(r#"{"v":1,"kind":"kill","sid":"x"}"#).unwrap();
+        let err = validate_incoming(&f).unwrap_err();
+        assert_eq!(err.0, ErrorCode::BadFrame);
+        assert_eq!(err.1, "kill_missing_trace_id");
+    }
+
+    #[test]
+    fn delete_without_trace_id_rejected() {
+        let f: Frame = serde_json::from_str(r#"{"v":1,"kind":"delete","sid":"x"}"#).unwrap();
+        let err = validate_incoming(&f).unwrap_err();
+        assert_eq!(err.0, ErrorCode::BadFrame);
+        assert_eq!(err.1, "delete_missing_trace_id");
+    }
+
+    #[test]
+    fn delete_with_trace_id_ok() {
+        let f: Frame = serde_json::from_str(
+            r#"{"v":1,"kind":"delete","sid":"x","trace_id":"t","force":true}"#,
+        )
+        .unwrap();
+        assert_eq!(validate_incoming(&f).unwrap(), Kind::Delete);
     }
 }

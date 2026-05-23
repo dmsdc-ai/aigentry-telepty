@@ -11,8 +11,11 @@
 //!
 //! Invariants (plan §3.1, codex F5, SPEC-C3-r1 §0.3 / §4.1.1 / §5.1 Order A):
 //! - Caller drives a `tokio` current_thread runtime.
-//! - All blocking syscalls (`Child::wait`, `Read::read`, `killpg`) go through
-//!   `tokio::task::spawn_blocking`; the reactor never blocks.
+//! - All blocking syscalls (`Child::wait`, `Read::read`, `killpg`,
+//!   `AuditLogger::append`) go through `tokio::task::spawn_blocking` or run on
+//!   `spawn_blocking`-driven worker tasks; the reactor never blocks. (Covers
+//!   C3 spec §8.A-reactor-stall — code-review-only invariant per orchestrator
+//!   Phase 6 disposition; no runtime probe test.)
 //! - `pair.slave` dropped immediately after spawn (§5.4).
 //! - POSIX: portable-pty's slave-spawn calls `setsid()` → `child.process_id() == pgid`.
 
@@ -27,6 +30,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task;
 use tokio::time::Duration;
 
+use crate::audit::{self, AuditLogger};
 use crate::ipc::{
     self, frame_op_key, IdempotencyLru, Ingest, IPC_QUEUE_DEPTH, OUTPUT_BROADCAST_DEPTH,
 };
@@ -173,11 +177,14 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
     let (ingest_tx, mut ingest_rx) = mpsc::channel::<Ingest>(IPC_QUEUE_DEPTH);
     let (output_tx, _output_rx0) = broadcast::channel::<Frame>(OUTPUT_BROADCAST_DEPTH);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let log_path = audit::log_path(&session_dir);
+    let audit_logger = std::sync::Arc::new(AuditLogger::open(&session_dir)?);
     let ipc_task = tokio::spawn(ipc::serve(
         listener,
         ingest_tx.clone(),
         output_tx.clone(),
         shutdown_rx,
+        log_path,
     ));
 
     // PTY reader: broadcast as Frame::output + mirror to stdout for M1/M2 smoke parity.
@@ -185,8 +192,10 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
     let writer = pair.master.take_writer().context("take_writer")?;
     let sid_for_reader = cfg.sid.clone();
     let output_tx_reader = output_tx.clone();
-    let read_task =
-        task::spawn_blocking(move || drain_pty_dual(reader, output_tx_reader, sid_for_reader));
+    let audit_for_reader = audit_logger.clone();
+    let read_task = task::spawn_blocking(move || {
+        drain_pty_dual(reader, output_tx_reader, sid_for_reader, audit_for_reader)
+    });
     drop(pair.master);
 
     let (wait_tx, mut wait_rx) = oneshot::channel::<std::io::Result<ExitStatus>>();
@@ -223,7 +232,7 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
             }
             ingest = ingest_rx.recv() => {
                 let Some(Ingest { frame, .. }) = ingest else { continue };
-                if let Some(triggered) = dispatch_ingest(frame, &cfg.sid, &output_tx, &pty_writer, &mut lru).await {
+                if let Some(triggered) = dispatch_ingest(frame, &cfg.sid, &output_tx, &pty_writer, &mut lru, &audit_logger).await {
                     tracing::info!(?triggered, "ingest triggered terminal kill");
                     break perform_kill(pgid, &mut wait_rx, triggered, cfg.kill_timeouts).await?;
                 }
@@ -257,7 +266,8 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
     };
 
     // Emit shutdown_drain BEFORE the IPC server tears down so connected
-    // clients receive it (SPEC §1.1 step 4 / §1.2 step 6).
+    // clients receive it (SPEC §1.1 step 4 / §1.2 step 6). Append to audit log
+    // first so a reattach after supervisor exit can still observe terminal state.
     let wire_reason = to_wire_reason(exit_reason);
     let drain_frame = Frame::shutdown_drain(
         &cfg.sid,
@@ -265,6 +275,9 @@ pub async fn run(cfg: SupervisorConfig) -> Result<RunOutcome> {
         exit_status.as_ref().map(|s| s.exit_code() as i32),
         escalated,
     );
+    if let Err(e) = audit_logger.append(&drain_frame) {
+        tracing::warn!(error = %e, "audit append failed for shutdown_drain");
+    }
     let _ = output_tx.send(drain_frame);
     // Brief flush window for per-connection tasks to forward the broadcast.
     tokio::time::sleep(Duration::from_millis(120)).await;
@@ -314,13 +327,30 @@ async fn dispatch_ingest(
     output_tx: &broadcast::Sender<Frame>,
     pty_writer: &std::sync::Arc<tokio::sync::Mutex<Box<dyn Write + Send>>>,
     lru: &mut IdempotencyLru,
+    audit_logger: &std::sync::Arc<AuditLogger>,
 ) -> Option<KillKind> {
     if let Err((code, detail)) = crate::wire::validate_incoming(&frame) {
         let mut err = Frame::error(code, detail);
-        err.trace_id = frame.trace_id;
-        err.frame_ref = frame.op_id;
+        err.trace_id = frame.trace_id.clone();
+        err.frame_ref = frame.op_id.clone();
+        // G3: log validation rejection so audit trail records the reason —
+        // no silent drop per orchestrator §(a) Phase 4 directive.
+        if let Err(e) = audit_logger.append(&err) {
+            tracing::warn!(error = %e, "audit append failed for rejection");
+        }
         let _ = output_tx.send(err);
         return None;
+    }
+    // G3: log validated ingest events (inject/signal/kill/delete/resume) for
+    // audit linkage. Skip Ping (heartbeat noise) and frames the server emits
+    // (Output / ShutdownDrain are logged at their emission site).
+    if matches!(
+        frame.kind,
+        Kind::Inject | Kind::Signal | Kind::Kill | Kind::Delete
+    ) {
+        if let Err(e) = audit_logger.append(&frame) {
+            tracing::warn!(error = %e, "audit append failed for ingest event");
+        }
     }
     match frame.kind {
         Kind::Inject => {
@@ -375,6 +405,9 @@ async fn dispatch_ingest(
         | Kind::ShutdownDrain
         | Kind::Spawn
         | Kind::Resize => None,
+        // Resume is intercepted at the connection handler (see ipc::handle_connection);
+        // it never reaches dispatch. Defensive no-op if it does.
+        Kind::Resume => None,
         Kind::Unknown => unreachable!("validate_incoming should have rejected Unknown"),
     }
 }
@@ -396,13 +429,15 @@ fn drain_pty_to_stdout(mut reader: Box<dyn Read + Send>) -> Result<()> {
     Ok(())
 }
 
-/// Dual sink: raw bytes to stdout (M1/M2 smoke compat) + Frame::output broadcast
-/// to UDS clients. Trace_id is None for unsolicited PTY emissions — clients can
-/// mint downstream context. `seq` is a monotonic counter scoped to this reader.
+/// Triple sink: raw bytes to stdout (M1/M2 smoke compat) + Frame::output broadcast
+/// to UDS clients + audit log append for A5 reattach replay. Trace_id is None
+/// for unsolicited PTY emissions — clients can mint downstream context. `seq`
+/// is a monotonic counter scoped to this reader.
 fn drain_pty_dual(
     mut reader: Box<dyn Read + Send>,
     output_tx: broadcast::Sender<Frame>,
     sid: String,
+    audit_logger: std::sync::Arc<AuditLogger>,
 ) -> Result<()> {
     let mut buf = [0u8; 4096];
     let mut stdout = std::io::stdout().lock();
@@ -415,7 +450,13 @@ fn drain_pty_dual(
                 stdout.flush()?;
                 seq += 1;
                 let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                let _ = output_tx.send(Frame::output(&sid, text, None, seq));
+                let frame = Frame::output(&sid, text, None, seq);
+                // Audit append BEFORE broadcast — late reattach observes the
+                // same prefix even if broadcast subscribers raced ahead.
+                if let Err(e) = audit_logger.append(&frame) {
+                    tracing::warn!(error = %e, "audit append failed for output frame");
+                }
+                let _ = output_tx.send(frame);
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
