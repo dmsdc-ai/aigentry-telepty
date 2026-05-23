@@ -152,6 +152,45 @@ pub fn write_tombstone(path: &Path, m: &Manifest) -> Result<()> {
     write_atomic(path, m)
 }
 
+/// A7 list discovery — scan `~/.telepty/sessions/*/manifest.json` and return all
+/// readable+parseable manifests. Unreadable directories, missing manifests, and
+/// parse failures are skipped (logged at debug) so a partial corruption never
+/// breaks discovery. Returns empty vec if the sessions root doesn't exist.
+pub fn scan_sessions() -> Result<Vec<Manifest>> {
+    let home = std::env::var_os("HOME").context("HOME env unset")?;
+    let mut root = PathBuf::from(home);
+    root.push(".telepty");
+    root.push("sessions");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let entries = fs::read_dir(&root)
+        .with_context(|| format!("read_dir {}", root.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let mp = path.join("manifest.json");
+        let bytes = match fs::read(&mp) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::debug!(path = %mp.display(), error = %e, "scan_sessions: read failed");
+                continue;
+            }
+        };
+        match serde_json::from_slice::<Manifest>(&bytes) {
+            Ok(m) => out.push(m),
+            Err(e) => {
+                tracing::debug!(path = %mp.display(), error = %e, "scan_sessions: parse failed");
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn fsync_dir(dir: &Path) -> Result<()> {
     let f = fs::File::open(dir).with_context(|| format!("open dir for fsync {}", dir.display()))?;
     f.sync_all().context("fsync parent dir")?;
@@ -199,5 +238,19 @@ mod tests {
         assert!(ExitReason::Killed.is_clean());
         assert!(!ExitReason::Crashed.is_clean());
         assert!(!ExitReason::Unkillable.is_clean());
+    }
+
+    #[test]
+    fn scan_sessions_handles_missing_root_gracefully() {
+        // We can't truly test against ~/.telepty/sessions in unit context (other
+        // tests may have written there), but we can verify the function returns
+        // Ok with a vec (possibly populated by other concurrent tests) and never
+        // panics. The empty-root branch is exercised when the dir doesn't exist.
+        let out = scan_sessions().expect("scan_sessions must not error");
+        // Every returned manifest has a non-empty id (sanity check on shape).
+        for m in &out {
+            assert!(!m.id.is_empty(), "scan_sessions returned manifest with empty id");
+            assert_eq!(m.schema_version, SCHEMA_VERSION, "schema version mismatch");
+        }
     }
 }

@@ -24,7 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::wire::{ErrorCode, Frame};
+use crate::wire::{ErrorCode, Frame, Kind};
 
 pub const IPC_QUEUE_DEPTH: usize = 256;
 pub const OUTPUT_BROADCAST_DEPTH: usize = 256;
@@ -81,6 +81,7 @@ pub async fn serve(
     ingest_tx: mpsc::Sender<Ingest>,
     output_tx: broadcast::Sender<Frame>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    log_path: PathBuf,
 ) {
     let mut next_conn_id: ConnId = 0;
     loop {
@@ -96,7 +97,8 @@ pub async fn serve(
                         let cid = next_conn_id;
                         let ingest_tx = ingest_tx.clone();
                         let output_rx = output_tx.subscribe();
-                        tokio::spawn(handle_connection(cid, stream, ingest_tx, output_rx));
+                        let log_path = log_path.clone();
+                        tokio::spawn(handle_connection(cid, stream, ingest_tx, output_rx, log_path));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "UDS accept failed; continuing");
@@ -112,6 +114,7 @@ async fn handle_connection(
     stream: UnixStream,
     ingest_tx: mpsc::Sender<Ingest>,
     mut output_rx: broadcast::Receiver<Frame>,
+    log_path: PathBuf,
 ) {
     let (reader_half, mut writer_half) = stream.into_split();
     let reader = BufReader::new(reader_half);
@@ -158,6 +161,16 @@ async fn handle_connection(
                             continue;
                         }
                     };
+                    // A5: Resume is handler-local — replay log.jsonl, do not enqueue.
+                    if frame.kind == Kind::Resume {
+                        let from_seq = frame.from_seq.unwrap_or(0);
+                        if let Err(e) = replay_log(&log_path, from_seq, &mut writer_half).await {
+                            tracing::warn!(conn_id, error = %e, "A5 replay failed");
+                            let err = Frame::error(ErrorCode::BadFrame, format!("replay: {}", e));
+                            let _ = writer_half.write_all(err.to_ndjson_line().as_bytes()).await;
+                        }
+                        continue;
+                    }
                     let send = Ingest { conn_id, frame, raw_line: raw };
                     if ingest_tx.send(send).await.is_err() { break; }
                 }
@@ -181,6 +194,47 @@ async fn handle_connection(
             }
         }
     }
+}
+
+/// A5 replay: read `log.jsonl` line-by-line and forward frames whose seq is
+/// > `from_seq` to the writer half. Output frames are the primary replay
+/// target; other audit kinds (shutdown_drain, etc.) are also forwarded so a
+/// late reattach observes terminal events. ENOENT (log not yet written) is
+/// treated as empty replay per spike-lightweight semantics.
+async fn replay_log(
+    log_path: &Path,
+    from_seq: u64,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    use tokio::fs;
+    use tokio::io::AsyncBufReadExt as _;
+    let file = match fs::File::open(log_path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("open log.jsonl"),
+    };
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    while let Some(line) = lines.next_line().await.context("read log line")? {
+        let Ok(frame): Result<Frame, _> = serde_json::from_str(&line) else { continue };
+        match frame.seq {
+            Some(s) if s > from_seq => {
+                writer
+                    .write_all(frame.to_ndjson_line().as_bytes())
+                    .await
+                    .context("replay write")?;
+            }
+            None => {
+                // Seq-less frames (e.g., shutdown_drain) — forward unconditionally
+                // so late reattach sees terminal events.
+                writer
+                    .write_all(frame.to_ndjson_line().as_bytes())
+                    .await
+                    .context("replay write seq-less")?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// O(N) LRU for idempotency keys. N ≤ 64 so the linear scan is negligible.

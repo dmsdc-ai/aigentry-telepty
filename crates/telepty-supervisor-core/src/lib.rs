@@ -7,6 +7,7 @@
 //! - M3: `wire` (full A1/A2 schema) + `ipc` (UDS + NDJSON + mpsc ingest queue +
 //!   idempotency LRU) — contract conformance milestone.
 
+pub mod audit;
 pub mod ipc;
 pub mod kill_gate;
 pub mod manifest;
