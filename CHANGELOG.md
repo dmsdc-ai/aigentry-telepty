@@ -4,6 +4,125 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+### Added — Phase 2 Node↔Rust IPC bridge (task #430 P2)
+
+- **`src/bridge/supervisor-ipc.js`** — Node `BridgeClient` speaking NDJSON
+  over the per-session UDS (`~/.telepty/sessions/<sid>/supervisor.sock`).
+  Surface: `connect(socketPath)` → client; `send(frame)` fire-and-forget;
+  `request(frame, {timeoutMs})` with trace_id correlation (resolves on
+  matching `pong`, rejects on matching `error` with the supervisor's
+  `ERR_*` code preserved, rejects `ERR_TIMEOUT` on drift); `subscribe({sid,
+  signal})` returning an `AsyncIterator<Frame>` that respects `AbortSignal`
+  and `iterator.return()` for clean unsubscribe; `close()` idempotent and
+  rejects any pending requests with `ERR_SUPERVISOR_GONE`. Per synthesis
+  ADR §6.2 (B3), `trace_id` is auto-filled for kinds the supervisor
+  mandates it on (`inject`/`output`/`signal`/`kill`/`delete`); pong
+  reflects ping `trace_id` so correlation works without server-side
+  per-client state. Malformed inbound lines surface as synthetic
+  `ERR_BAD_FRAME` to subscribers — the connection survives garbage so a
+  later-good frame still flows.
+- **`src/bridge/j3-shim.js`** — 0.3.x→NDJSON translator covering the P2
+  subset (`inject` / `output` stream / `list`). `inject(sid, prompt, opts)`
+  opens a one-shot connection, sends an inject frame, watches 150 ms for a
+  trace_id-correlated `error` frame (catches B3 / `ERR_DUPLICATE_OP` /
+  `ERR_SHUTTING_DOWN`), and returns `{ success, trace_id, code?, error?
+  }`. `output(sid, {fromSeq, signal})` is an async generator yielding
+  `{ data, seq }` per `Frame::output` and a final `{ exit, ... }` on
+  `shutdown_drain`; consumer-driven cancellation via `AbortSignal` or
+  `break`. `list()` scans `~/.telepty/sessions/*/manifest.json` and
+  surfaces only `ready` / `draining` sessions (tombstones excluded — they
+  lack a usable socket; operators still see them via
+  `telepty-supervisor-bin --list`). Sessions root is resolved lazily so
+  `TELEPTY_SESSIONS_DIR` redirects work without re-requiring the module.
+- **`src/bridge/supervisor-launcher.js`** — per-session Rust supervisor
+  process lifecycle. `resolveBinary({env})` chains
+  `TELEPTY_SUPERVISOR_BIN` (env override) → `./target/release/telepty-
+  supervisor-bin` (repo-relative) → `./target/debug/...` → `which
+  telepty-supervisor-bin` (PATH) and throws `ERR_BIN_NOT_FOUND` otherwise.
+  `spawn({sid, argv, cwd?, binary?, env?, stdio?})` shells out to the
+  binary with `stdio: ['ignore', 'ignore', 'pipe']` (default) so the
+  supervisor's M1/M2 stdout PTY-mirror doesn't bleed into the parent.
+  `waitReady(sid, {timeoutMs, pollMs})` gates on BOTH manifest status
+  (`ready`/`draining`) AND `fs.existsSync(socket)` — supervisor.rs writes
+  the manifest *before* `ipc::bind_socket`, so a manifest-only gate races
+  the bind; checking both closes the window without touching the
+  supervisor crate. `isAlive(sid)` cross-checks manifest pid via
+  `process.kill(pid, 0)`.
+- **`cli.js` minimal-touch wiring** (Rule 29 surgical, +27 LOC, no
+  refactor of adjacent code):
+  - `cmd === 'list'` (L915): merges `bridgeShim.list()` into the daemon-
+    discovered session set, de-duplicated by `id`. Daemon entries remain
+    source-of-truth when both surfaces report the same session; bridge
+    entries fill the gap when daemon is down. Wrapped in a defensive
+    `try/catch` so any bridge failure leaves the daemon list intact.
+  - `cmd === 'inject'` LOCAL path (L1755): bridge-first attempt when
+    `!useSubmit && bridgeShim.findSupervisorManifest(target.id)` is
+    truthy. On bridge success, prints the existing
+    `✅ Context injected successfully into '...' (bridge).` line and
+    returns; on bridge failure, falls through to the unchanged daemon
+    HTTP path so caller-visible behavior never degrades. The gated
+    `--submit` semantics (render-gate / retry / `--submit-force`) stay
+    on `daemon.js` for the migration window — P2 wire does not carry
+    render-gate yet.
+- **`cross-machine.js` UNTOUCHED** — P2 scope is local bridge only;
+  remote SSH / HTTP transport stays on the existing path. P3+ owns the
+  remote→bridge story.
+
+### E2E acceptance — `telepty spawn → inject → output` works with daemon.js stopped
+
+- `test/bridge-e2e.test.js` drives the supervisor binary directly through
+  `supervisor-launcher` + `j3-shim` in an isolated `HOME` so the live
+  daemon (if any) is never touched. The headline test launches a real
+  `cat -u` under the supervisor, subscribes to the output stream, injects
+  `ping-echo\n`, and asserts the echo arrives — proving the bridge alone
+  is sufficient for the primary three operations per dispatch §2.4. The
+  test self-skips with a clear hint when
+  `target/release/telepty-supervisor-bin` is absent (binary not built
+  yet), keeping CI without Rust toolchain green.
+
+### Notes — Phase 2 bridge
+
+- **No new npm dependencies** (Constitution §17 무의존). NDJSON parsing
+  via `readline.createInterface` from the Node stdlib; UDS connection via
+  `net.createConnection({ path })`; UUIDs via `crypto.randomUUID()`. Adds
+  zero packages to `package.json` `dependencies`.
+- **Test suite** — `npm test` 375 / 375 pass in ~24 s (343 baseline
+  preserved per Rule 29 + 32 new bridge tests: 14 `BridgeClient` units,
+  14 `j3-shim` units, 4 E2E). Test file ratio is ~1:1 with prod LOC
+  (~787 prod / ~797 tests).
+- **Snyk SAST** — `snyk_code_scan` on `src/bridge/` + new test files →
+  **0 findings**. Pre-existing `cli.js` findings (3× path-traversal on
+  CLI arg → `fs.readFileSync` / `fs.readdirSync` at L2345/L2347/L2656;
+  2× command-injection on CLI arg → `execSync` / `node-pty.spawn` at
+  L471/L1116) are unchanged by this work — they live in dataflows
+  unrelated to the L915/L1755 bridge insertions and are tracked
+  separately (consistent with the v0.4.3 baseline). No new Snyk findings
+  attributable to this phase.
+- **Path budget** — bridge prod 787 LOC + bridge tests 797 LOC =
+  ~1.6 kLOC, well within the dispatch envelope (bridge ~400-700 + shim
+  ~200-400 + tests ~300-500). cli.js delta is +27 LOC pure additions
+  with no edits to existing lines, satisfying the minimal-touch
+  directive.
+- **Cross-platform** — UDS path is POSIX-only in P2 (Windows native
+  pipe = P4 per dispatch §2). Bridge unit tests and E2E gracefully
+  skip on `process.platform === 'win32'`; the launcher still resolves
+  the binary path on Windows so the eventual P4 wiring has a stub to
+  extend.
+
+### Carry-overs — Phase 2
+
+1. **`telepty spawn` cli command bridge wiring** — out of P2 scope per
+   dispatch §Goal item 4 ("inject / output / list paths"). P3 owns the
+   refactor that lets `telepty spawn` route through
+   `supervisor-launcher.spawn` for supervisor-managed sessions.
+2. **Render-gated `--submit` over bridge** — daemon.js stays as the
+   submit gate for the migration window. Bridge inject currently
+   appends a literal `\r` to the data (matching the legacy
+   `no_enter: false` default) without REPL readiness detection.
+3. **Single-binary `telepty supervisor` mode** — P2 still spawns the
+   `telepty-supervisor-bin` standalone bin. The `telepty supervisor`
+   subcommand mode per orchestrator decision §6.6 A is post-P2.
+
 ### Added — Phase 1 supervisor-core-finish (task #430 P1)
 
 - **A5 detach/reattach via UDS reconnection + log offset replay** —

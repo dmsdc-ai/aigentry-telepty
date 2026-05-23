@@ -915,6 +915,22 @@ async function main() {
   if (cmd === 'list') {
     try {
       const sessions = await discoverSessions({ silent: true });
+      // Bridge merge: surface supervisor-managed sessions discovered via
+      // filesystem manifest scan. De-dup with daemon entries by session id.
+      // Daemon path remains source-of-truth when both surfaces report the
+      // same session; bridge fills the gap when daemon is down (P2 #430).
+      try {
+        const bridgeSessions = require('./src/bridge/j3-shim').list();
+        const seenIds = new Set(sessions.map((s) => s.id));
+        for (const bs of bridgeSessions) {
+          if (!seenIds.has(bs.id)) {
+            sessions.push(bs);
+            seenIds.add(bs.id);
+          }
+        }
+      } catch {
+        // Best-effort: daemon list still surfaced above.
+      }
       if (args.includes('--json')) {
         console.log(JSON.stringify(sessions, null, 2));
         return;
@@ -1735,6 +1751,23 @@ async function main() {
         const reference = ensureLocalSharedReference(refDescriptor, refFilePath ? prompt : '');
         injectPrompt = reference.prompt;
         referencePath = reference.referencePath;
+      }
+
+      // Bridge-first attempt for local supervisor-managed sessions (P2 #430).
+      // Gated submit semantics (render-gate, retry, submit-force) stay on
+      // daemon.js — P2 wire does not carry those yet — so we only bridge the
+      // basic inject path. Bridge failure (no manifest, supervisor crashed
+      // mid-call, etc.) falls through to the daemon HTTP path below.
+      if (!useSubmit) {
+        const bridgeShim = require('./src/bridge/j3-shim');
+        if (bridgeShim.findSupervisorManifest(target.id)) {
+          const bridgeRes = await bridgeShim.inject(target.id, `${injectPrompt}\r`, {});
+          if (bridgeRes.success) {
+            const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
+            console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m' (bridge).${refSuffix}`);
+            return;
+          }
+        }
       }
 
       const body = buildInjectRequestBody(injectPrompt, {
