@@ -18,6 +18,7 @@ const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./s
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const { resolveWindowsExecutable } = require('./src/win-resolve-executable');
+const { decideVersionAction } = require('./src/version-handshake');
 const crossMachine = require('./cross-machine');
 const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec');
 const { FileMailbox } = require('./src/mailbox/index');
@@ -426,7 +427,8 @@ async function restartDaemonGraceful(options = {}) {
     // Retry with backoff
     if (attempt < maxAttempts) {
       const backoff = 1000 * attempt;
-      process.stdout.write(`\x1b[33m⚠️ Daemon restart attempt ${attempt}/${maxAttempts} failed. Retrying in ${backoff / 1000}s...\x1b[0m\n`);
+      // stderr (not stdout): banner must not contaminate `telepty list --json` (task #400, telepty#15)
+      process.stderr.write(`\x1b[33m⚠️ Daemon restart attempt ${attempt}/${maxAttempts} failed. Retrying in ${backoff / 1000}s...\x1b[0m\n`);
       await new Promise(r => setTimeout(r, backoff));
     }
   }
@@ -580,24 +582,26 @@ async function ensureDaemonRunning(options = {}) {
     });
 
     if (sessionsRes.ok && hasCapabilities) {
-      // Version mismatch: running daemon is older than installed CLI
-      if (meta && meta.version !== pkg.version) {
-        process.stdout.write(`\x1b[33m⚙️ Daemon version mismatch (running v${meta.version}, installed v${pkg.version}). Restarting...\x1b[0m\n`);
+      // Delegate decision to pure-functional handshake so the policy is unit-testable
+      // and consistent across CLI invocations.
+      const decision = decideVersionAction({ daemonVersion: meta && meta.version, cliVersion: pkg.version });
+      if (decision.action === 'restart') {
+        // stderr (not stdout): banner must not contaminate `telepty list --json` (task #400, telepty#15)
+        process.stderr.write(`\x1b[33m⚙️ Daemon version mismatch (running v${meta.version}, installed v${pkg.version}). Restarting...\x1b[0m\n`);
         await restartDaemonGraceful({ requiredCapabilities });
         return;
-      } else {
-        return;
       }
+      return;
     } else if (sessionsRes.ok && !meta) {
-      process.stdout.write('\x1b[33m⚙️ Found an older local telepty daemon. Restarting it...\x1b[0m\n');
+      process.stderr.write('\x1b[33m⚙️ Found an older local telepty daemon. Restarting it...\x1b[0m\n');
     } else if (sessionsRes.ok && meta) {
-      process.stdout.write('\x1b[33m⚙️ Found a local telepty daemon without the required features. Restarting it...\x1b[0m\n');
+      process.stderr.write('\x1b[33m⚙️ Found a local telepty daemon without the required features. Restarting it...\x1b[0m\n');
     }
   } catch (e) {
     // Continue to auto-start below.
   }
 
-  process.stdout.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
+  process.stderr.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
   await restartDaemonGraceful({ requiredCapabilities });
 }
 

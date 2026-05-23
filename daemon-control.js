@@ -3,10 +3,19 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const http = require('http');
 const { execFileSync, execSync } = require('child_process');
+const { killWindowsProcess } = require('./src/win-kill-process');
 
 const TELEPTY_DIR = path.join(os.homedir(), '.telepty');
 const DAEMON_STATE_FILE = path.join(TELEPTY_DIR, 'daemon-state.json');
+const DEFAULT_KILL_GRACE_MS = 5000;
+
+function killGraceMs() {
+  const raw = Number(process.env.TELEPTY_DAEMON_KILL_GRACE_MS);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return DEFAULT_KILL_GRACE_MS;
+}
 
 function ensureTeleptyDir() {
   fs.mkdirSync(TELEPTY_DIR, { recursive: true, mode: 0o700 });
@@ -159,12 +168,12 @@ function stopDaemonProcess(pid) {
 
   try {
     if (process.platform === 'win32') {
-      execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: ['ignore', 'ignore', 'ignore'] });
-      return true;
+      // Windows: delegate to dedicated module so taskkill args are unit-testable.
+      return killWindowsProcess(pid);
     }
 
     process.kill(pid, 'SIGTERM');
-    const deadline = Date.now() + 1500;
+    const deadline = Date.now() + killGraceMs();
     while (Date.now() < deadline) {
       if (!isProcessRunning(pid)) {
         return true;
@@ -179,17 +188,125 @@ function stopDaemonProcess(pid) {
   }
 }
 
-function cleanupDaemonProcesses() {
+// Port-owner discovery for telepty#15 port-owner fallback.
+// Returns the LISTEN-state pid bound to `port` on the local machine, or null
+// if no listener can be identified (or detection failed).
+function findPortOwnerPid(port, opts) {
+  if (!Number.isInteger(port) || port <= 0) return null;
+  const o = opts || {};
+  const platform = o.platform || process.platform;
+  const exec = o.execSync || execSync;
+
+  try {
+    if (platform === 'win32') {
+      // PowerShell: Get-NetTCPConnection guarantees LISTEN-state filter.
+      const script =
+        `Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue ` +
+        `| Select-Object -First 1 -ExpandProperty OwningProcess`;
+      const output = String(exec(`powershell.exe -NoProfile -Command "${script}"`, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      })).trim();
+      const pid = Number(output);
+      return Number.isInteger(pid) && pid > 0 ? pid : null;
+    }
+
+    // POSIX: lsof -t prints only PIDs; -sTCP:LISTEN narrows to listeners.
+    const output = String(exec(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    })).trim();
+    if (!output) return null;
+    const pid = Number(output.split(/\s+/)[0]);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+// Confirm via HTTP probe that the listener on `port` is actually a telepty
+// daemon (token-less /api/health endpoint is enough — daemon.js:2891 path).
+function probeTeleptyOnPort(port, opts) {
+  if (!Number.isInteger(port) || port <= 0) return Promise.resolve(false);
+  const o = opts || {};
+  const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : 1500;
+  const httpGet = o.httpGet || http.get;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    let req;
+    try {
+      req = httpGet({ hostname: '127.0.0.1', port, path: '/api/health', timeout: timeoutMs }, (res) => {
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(body);
+            finish(Boolean(data && data.status === 'ok'));
+          } catch {
+            finish(false);
+          }
+        });
+      });
+    } catch {
+      finish(false);
+      return;
+    }
+
+    req.on('error', () => finish(false));
+    req.on('timeout', () => {
+      try { req.destroy(); } catch {}
+      finish(false);
+    });
+  });
+}
+
+// Confirm via local process scan that `pid`'s command line looks like a
+// telepty daemon (fallback when HTTP probe fails — daemon may be stuck).
+function pidMatchesTeleptyCmdline(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    const processes = process.platform === 'win32' ? listWindowsProcesses() : listUnixProcesses();
+    const match = processes.find((item) => item.pid === pid);
+    return Boolean(match && isLikelyTeleptyDaemon(match.commandLine));
+  } catch {
+    return false;
+  }
+}
+
+function cleanupDaemonProcesses(opts) {
+  const o = opts || {};
   const targets = new Map();
-  const state = readDaemonState();
+  const state = (o.readDaemonState || readDaemonState)();
 
   if (state && Number.isInteger(state.pid) && state.pid > 0 && state.pid !== process.pid) {
     targets.set(state.pid, { pid: state.pid, source: 'state-file' });
   }
 
-  for (const item of listDaemonProcesses()) {
+  for (const item of (o.listDaemonProcesses || listDaemonProcesses)()) {
     if (!targets.has(item.pid)) {
       targets.set(item.pid, { pid: item.pid, source: 'process-scan', commandLine: item.commandLine });
+    }
+  }
+
+  // 3rd source: port-owner fallback (telepty#15).
+  // Only consider it a kill candidate after a confirmation step so we never
+  // SIGTERM an arbitrary process that happens to own the port.
+  // Confirmation order: HTTP /api/health probe → ps cmdline match.
+  // Sync-friendly: HTTP probe is opt-in (port-owner kept disabled in tests).
+  if (o.includePortOwner !== false) {
+    const portOwnerPid = (o.findPortOwnerPid || findPortOwnerPid)(o.port || 3848);
+    if (portOwnerPid && portOwnerPid !== process.pid && !targets.has(portOwnerPid)) {
+      const confirmCmdline = (o.pidMatchesTeleptyCmdline || pidMatchesTeleptyCmdline);
+      if (confirmCmdline(portOwnerPid)) {
+        targets.set(portOwnerPid, { pid: portOwnerPid, source: 'port-owner' });
+      }
     }
   }
 
@@ -197,7 +314,8 @@ function cleanupDaemonProcesses() {
   const failed = [];
 
   for (const item of targets.values()) {
-    if (stopDaemonProcess(item.pid)) {
+    const killer = o.stopDaemonProcess || stopDaemonProcess;
+    if (killer(item.pid)) {
       stopped.push(item);
     } else {
       failed.push(item);
@@ -217,7 +335,10 @@ module.exports = {
   claimDaemonState,
   cleanupDaemonProcesses,
   clearDaemonState,
+  findPortOwnerPid,
   isProcessRunning,
   listDaemonProcesses,
+  pidMatchesTeleptyCmdline,
+  probeTeleptyOnPort,
   readDaemonState
 };

@@ -2,6 +2,60 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.4.3] - 2026-05-23
+
+### Fixed
+
+- **telepty#15** — Daemon version mismatch auto-restart + port-owner
+  fallback + banner-to-stderr (root-cause fix for task #400).
+  - All five daemon-related banners in `cli.js` (lines 429, 585, 592,
+    594, 600) now emit to `process.stderr` instead of `process.stdout`.
+    Closes task #400 (banner contaminated `telepty list --json | jq`
+    stdin → `Invalid numeric literal`). A new lint-style regression
+    test (`test/banner-stderr-jq-safety.test.js`) statically scans
+    `cli.js` and fails CI if any "⚙️/⚠️ Daemon…" banner regresses
+    back to `process.stdout.write`.
+  - New pure-functional `src/version-handshake.js` exposes
+    `decideVersionAction({ daemonVersion, cliVersion })` returning a
+    stable action enum (`START` / `RESTART` / `NOOP`) plus reason.
+    Six-cell decision matrix: daemon unreachable, CLI-version missing,
+    versions equal, daemon older (newer-wins → restart), daemon newer
+    (preserve newer daemon → noop), non-semver (string compare).
+    Wired into `cli.js` `ensureDaemonRunning` so the previously-inline
+    `meta.version !== pkg.version` check now delegates to the module.
+  - New port-owner fallback in `daemon-control.js`:
+    `findPortOwnerPid(port)` uses `lsof -nP -iTCP:<port> -sTCP:LISTEN -t`
+    on POSIX and `Get-NetTCPConnection -State Listen -LocalPort <port>`
+    on Windows. `cleanupDaemonProcesses` now treats the listener as a
+    third kill candidate (`source: 'port-owner'`) — but only after
+    confirming the PID is actually a telepty daemon via
+    `pidMatchesTeleptyCmdline`. Unconfirmed port-owners are never
+    killed (zero-arbitrary-kill safety). `probeTeleptyOnPort` (HTTP
+    `/api/health`) is exported for future async-aware callers.
+  - SIGTERM → SIGKILL grace period bumped from 1500 ms to 5000 ms
+    (POSIX). Configurable via `TELEPTY_DAEMON_KILL_GRACE_MS` env.
+  - New `src/win-kill-process.js` (parallel to existing
+    `src/win-resolve-executable.js`) provides `buildTaskkillArgs(pid)`
+    and `killWindowsProcess(pid, opts)`. Unit-testable taskkill args
+    generator with injectable `execFileSync`. `daemon-control.js`
+    Windows branch now delegates to this module.
+  - `cleanupDaemonProcesses(opts)` accepts injectors
+    (`readDaemonState`, `listDaemonProcesses`, `findPortOwnerPid`,
+    `pidMatchesTeleptyCmdline`, `stopDaemonProcess`, `includePortOwner`,
+    `port`) for unit-testable source attribution.
+  - **Tests**: 343 / 343 pass (301 baseline preserved + 42 new across
+    four files: `test/version-handshake.test.js` (16),
+    `test/win-kill-process.test.js` (10),
+    `test/daemon-control-port-owner.test.js` (10),
+    `test/banner-stderr-jq-safety.test.js` (6)).
+
+### Notes
+
+- No new npm dependencies (Constitution §17 무의존).
+- No drive-by refactors (Rule 29 surgical); changes limited to
+  `cli.js`, `daemon-control.js`, `src/version-handshake.js` (NEW),
+  `src/win-kill-process.js` (NEW), and four new test files.
+
 ## [0.4.2] - 2026-05-17
 
 ### Fixed
