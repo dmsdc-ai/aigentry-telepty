@@ -55,6 +55,26 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 - No drive-by refactors (Rule 29 surgical); changes limited to
   `cli.js`, `daemon-control.js`, `src/version-handshake.js` (NEW),
   `src/win-kill-process.js` (NEW), and four new test files.
+- **Snyk SAST scan on changed files** — `daemon-control.js` +
+  `src/version-handshake.js` + `src/win-kill-process.js` +
+  `test/version-handshake.test.js` +
+  `test/win-kill-process.test.js` +
+  `test/daemon-control-port-owner.test.js` +
+  `test/banner-stderr-jq-safety.test.js` = **0 findings**
+  (At-Inception clean). `cli.js` shows the same **5 pre-existing
+  findings** carried from v0.4.2 (2 Medium Command Injection at
+  `execSync` (was L469 → now L471) and `pty.spawn` (was L1096 → now
+  L1100); 3 Low Path Traversal at `fs.readFileSync`/`fs.readdirSync`
+  (was L2308/L2310/L2619 → now L2312/L2314/L2623)) with **identical
+  fingerprints** vs HEAD~1 (5/5 verified by direct rescan of HEAD~1
+  `cli.js`: fingerprint leading hashes `6eb481d6`, `24799351`,
+  `11a45176`, `11a45176`, `e0fda459` all match). Line numbers
+  downstream of `cli.js:21` shifted +2/+4 due to the new
+  `version-handshake` require + the expanded
+  `restartDaemonGraceful` banner/comment paths; logical
+  source→sink unchanged, no new sink call sites added. Out of
+  telepty#15 surgical scope. Tracked in
+  **dmsdc-ai/aigentry-telepty#26** (task #408) for follow-up PR.
 
 ## [0.4.2] - 2026-05-17
 
