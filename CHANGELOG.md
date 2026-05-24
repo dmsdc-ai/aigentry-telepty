@@ -4,6 +4,35 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+### Added — Phase 5a-prime (task #430 P5a-prime)
+
+- **`crates/telepty-cross-machine/`** — standalone Rust library plus
+  `telepty-cross-machine-bin` for manual HTTP peer operations only. Scope is
+  deliberately reduced from the two rejected Phase 5 drafts: no JS bridge, no
+  subprocess envelope contract, no outbox queue, no npm distribution, no SSH
+  transport, and no `cli.js` / `daemon.js` / `cross-machine.js` changes. This
+  follows the review basis in
+  `docs/reports/2026-05-24-phase5-spec-codex-review.md` and
+  `docs/reports/2026-05-24-phase5a-spec-codex-rereview.md`, which identified
+  bridge-consumed binary contracts as the unstable surface.
+- **Manual HTTP subcommands** — `connect-http`, `list-peer-sessions`,
+  `inject-peer`, `list-peers`, and `remove-peer`. `connect-http` probes
+  `/api/health`, treats `/api/meta` as non-fatal, persists token-backed HTTP
+  peers to `~/.telepty/peers.json`, and prints human-friendly status. List
+  commands support free-form `--json` output without an envelope contract.
+  `inject-peer` fails fast on unreachable peers; there is no queueing.
+- **Backward-compatible `peers.json` handling** — missing `transport` defaults
+  to SSH and round-trips without injecting a `transport` field, preserving the
+  JS-era legacy schema used by the SSH path. HTTP operations on SSH peers exit
+  4 with the explicit JS-path diagnostic required by Phase 5a-prime.
+- **Addressing and atomic-write parity** — Rust host parsing mirrors
+  `host-spec.js` URL stripping, embedded-port, and IPv6 behavior. Peer updates
+  use the fsync-backed `tmp + fsync(tmp) + rename + fsync(parent_dir)` pattern
+  copied from `crates/telepty-supervisor-core/src/manifest.rs`.
+- **Build metadata** — `build.rs` embeds git hash, dirty flag, and build
+  timestamp. `telepty-cross-machine-bin --version` prints
+  `telepty-cross-machine 0.0.1 (<git-hash>[, dirty])`.
+
 ### Added — Phase 2 Node↔Rust IPC bridge (task #430 P2)
 
 - **`src/bridge/supervisor-ipc.js`** — Node `BridgeClient` speaking NDJSON
