@@ -157,6 +157,11 @@ const fetchWithAuth = (url, options = {}) => {
   return fetch(url, { ...options, headers });
 };
 
+function isSubmitForceDefaultEnabled(env = process.env) {
+  const value = (env.TELEPTY_SUBMIT_FORCE_DEFAULT || '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
 async function getDaemonMeta(host = REMOTE_HOST) {
   try {
     const res = await fetchWithAuth(`${daemonUrl(host)}/api/meta`, {
@@ -1728,8 +1733,14 @@ async function main() {
     // caller is confident the target REPL is ready (e.g., orchestrator is
     // visibly idle). See specs/2026-05-02-submit-force-and-retry.md
     const submitForceIndex = args.indexOf('--submit-force');
-    const submitForce = submitForceIndex !== -1;
-    if (submitForce) args.splice(submitForceIndex, 1);
+    const noSubmitForceIndex = args.indexOf('--no-submit-force');
+    const explicitSubmitForce = submitForceIndex !== -1;
+    const explicitNoSubmitForce = noSubmitForceIndex !== -1;
+    for (const index of [submitForceIndex, noSubmitForceIndex].filter((i) => i !== -1).sort((a, b) => b - a)) {
+      args.splice(index, 1);
+    }
+    const submitForceFromEnv = !explicitSubmitForce && !explicitNoSubmitForce && isSubmitForceDefaultEnabled();
+    const submitForce = explicitSubmitForce || submitForceFromEnv;
 
     // Extract --submit-retry N flag (default 1, clamp [0, 3]). On a 504
     // gated-failure with a retry-safe reason (gate timed out and body is
@@ -1865,6 +1876,9 @@ async function main() {
       // an Enter that genuinely never landed cannot double-submit.
       // See docs/superpowers/specs/2026-04-26-inject-submit-enter-reliability.md
       if (useSubmit) {
+        if (submitForceFromEnv) {
+          console.error('[telepty inject] submit-force=env-default (TELEPTY_SUBMIT_FORCE_DEFAULT=1)');
+        }
         const submitBody = {
           injected_body: injectPrompt || '',
           retries: 1,
