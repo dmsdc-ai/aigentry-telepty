@@ -16,6 +16,8 @@ const { SessionStateManager, STATE_DISPLAY, stripAnsi: stripAnsiState } = requir
 const { classifyReportPrompt, buildAutoSummary } = require('./src/report-enforcement');
 const submitGate = require('./src/submit-gate');
 const readyRegistry = require('./src/prompt-symbol-registry');
+const lifecycle = require('./src/lifecycle');
+const { loadTeleptyConfig } = require('./src/config-file');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -27,6 +29,7 @@ const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STA
 const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
 const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
 const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS || 10000));
+const IDLE_REAPER_POLL_MS = Math.max(100, Number(process.env.TELEPTY_IDLE_REAPER_POLL_MS || 60000));
 const BOOTSTRAP_READY_TIMEOUT_MS = Math.max(500, Number(process.env.TELEPTY_BOOTSTRAP_READY_TIMEOUT_MS || 30000));
 const WRAPPED_SUBMIT_DELAY_MS = 500;
 
@@ -139,7 +142,11 @@ function persistSessions() {
         lastConnectedAt: s.lastConnectedAt || null,
         lastDisconnectedAt: s.lastDisconnectedAt || null,
         lastStateReportAt: s.lastStateReportAt || null,
-        stateReport: s.stateReport || null
+        stateReport: s.stateReport || null,
+        idleTtl: s.idleTtl || null,
+        idleTtlMs: s.idleTtlMs == null ? null : s.idleTtlMs,
+        ownerPid: s.ownerPid || null,
+        ptyPid: s.ptyPid || null
       };
     }
     fs.mkdirSync(require('path').dirname(SESSION_PERSIST_PATH), { recursive: true });
@@ -266,6 +273,13 @@ const AUTO_REPORT_IDLE_SECONDS = Number(process.env.TELEPTY_AUTO_REPORT_IDLE_SEC
 const sessions = {};
 const handoffs = {};
 const threads = {};
+let teleptyConfig;
+try {
+  teleptyConfig = loadTeleptyConfig();
+} catch (err) {
+  console.error(`[CONFIG] Failed to load telepty config: ${err.message}`);
+  process.exit(1);
+}
 
 function broadcastBusEvent(event) {
   const serialized = JSON.stringify(event);
@@ -355,6 +369,53 @@ function getSessionHealthReason(session, healthStatus) {
   }
 
   return session.ptyProcess && !session.ptyProcess.killed ? 'PTY_RUNNING' : 'PTY_EXITED';
+}
+
+function parseOptionalIdleTtl(body) {
+  if (!body || !Object.prototype.hasOwnProperty.call(body, 'idle_ttl')) {
+    return { present: false };
+  }
+  try {
+    return {
+      present: true,
+      raw: body.idle_ttl == null ? 'off' : String(body.idle_ttl),
+      ms: lifecycle.parseDuration(body.idle_ttl == null ? 'off' : body.idle_ttl, { fieldName: 'idle_ttl' })
+    };
+  } catch (err) {
+    return { present: true, error: err.message };
+  }
+}
+
+function applyProcessMetadata(session, body) {
+  if (!session || !body) return;
+  const ownerPid = Number(body.owner_pid);
+  const ptyPid = Number(body.pty_pid);
+  if (Number.isInteger(ownerPid) && ownerPid > 0) {
+    session.ownerPid = ownerPid;
+  }
+  if (Number.isInteger(ptyPid) && ptyPid > 0) {
+    session.ptyPid = ptyPid;
+  }
+}
+
+function applyIdleTtlMetadata(session, parsedIdleTtl) {
+  if (!session || !parsedIdleTtl || !parsedIdleTtl.present || parsedIdleTtl.error) return;
+  session.idleTtl = parsedIdleTtl.raw;
+  session.idleTtlMs = parsedIdleTtl.ms;
+}
+
+function applyTimestampMetadata(session, body) {
+  if (!session || !body) return;
+  for (const [field, prop] of [
+    ['created_at', 'createdAt'],
+    ['last_activity_at', 'lastActivityAt']
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(body, field)) continue;
+    const value = body[field] == null ? null : String(body[field]);
+    if (value && Number.isFinite(new Date(value).getTime())) {
+      session[prop] = value;
+    }
+  }
 }
 
 function sleep(ms) {
@@ -1104,6 +1165,11 @@ function serializeSession(id, session, options = {}) {
     healthReason,
     disconnectedSeconds: disconnectedMs === null ? null : Math.floor(disconnectedMs / 1000),
     lastStateReportAt: session.lastStateReportAt || null,
+    idleTtl: session.idleTtl || null,
+    idleTtlMs: session.idleTtlMs == null ? null : session.idleTtlMs,
+    effectiveIdleTtlMs: lifecycle.effectiveIdleTtlMs(session, teleptyConfig),
+    ownerPid: session.ownerPid || null,
+    ptyPid: session.ptyPid || (session.ptyProcess && session.ptyProcess.pid) || null,
     transport,
     semantic,
     autoState: autoState ? {
@@ -1120,6 +1186,53 @@ function serializeSession(id, session, options = {}) {
         return { pending: pending.length, dead_letter: deadLetter.length };
       } catch { return { pending: 0, dead_letter: 0 }; }
     })()
+  };
+}
+
+async function teardownSessionById(id, options = {}) {
+  const session = sessions[id];
+  if (!session) {
+    return { success: false, httpStatus: 404, error: 'Session not found' };
+  }
+
+  const timeoutMs = Math.max(0, Number(options.timeoutMs ?? 5000));
+  const force = options.force === true;
+  const reason = options.reason || (force ? 'manual_force' : 'manual');
+  session.isClosing = true;
+
+  const kill = await lifecycle.killSessionProcess(session, { timeoutMs, force });
+  emitSessionLifecycleEvent('session_closed', id, session, {
+    reason,
+    force,
+    pid: kill.pid,
+    signal: kill.signal || null,
+    escalated: kill.escalated === true,
+    source: options.source || 'daemon'
+  });
+
+  if (session.clients) {
+    session.clients.forEach(ws => {
+      try { ws.close(1000, 'Session destroyed'); } catch {}
+    });
+  }
+  if (session.ownerWs) {
+    try { session.ownerWs.close(1000, 'Session destroyed'); } catch {}
+  }
+
+  delete sessions[id];
+  sessionStateManager.unregister(id);
+  try { mailbox.purge(id); } catch {}
+  lifecycle.cleanupSessionArtifacts(id);
+  persistSessions();
+
+  return {
+    success: true,
+    session_id: id,
+    status: 'closed',
+    reason,
+    force,
+    timeout_ms: timeoutMs,
+    kill
   };
 }
 
@@ -1145,6 +1258,10 @@ for (const [id, meta] of Object.entries(_persisted)) {
       lastDisconnectedAt: meta.lastDisconnectedAt || meta.lastActivityAt || new Date().toISOString(),
       lastStateReportAt: meta.lastStateReportAt || null,
       stateReport: meta.stateReport || null,
+      idleTtl: meta.idleTtl || null,
+      idleTtlMs: meta.idleTtlMs == null ? null : meta.idleTtlMs,
+      ownerPid: meta.ownerPid || null,
+      ptyPid: meta.ptyPid || null,
       clients: new Set(), isClosing: false, outputRing: [], ready: true,     };
     initializeBootstrapState(sessions[id]);
     console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
@@ -1242,6 +1359,7 @@ app.post('/api/sessions/spawn', (req, res) => {
       id: session_id,
       type: 'spawned',
       ptyProcess,
+      ptyPid: ptyProcess.pid || null,
       command,
       cwd,
       createdAt: new Date().toISOString(),
@@ -1311,6 +1429,10 @@ app.post('/api/sessions/spawn', (req, res) => {
 app.post('/api/sessions/register', (req, res) => {
   const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id, term_program, term } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+  const parsedIdleTtl = parseOptionalIdleTtl(req.body);
+  if (parsedIdleTtl.error) {
+    return res.status(400).json({ error: parsedIdleTtl.error, code: 'INVALID_IDLE_TTL' });
+  }
   // Idempotent: allow re-registration (update command/cwd, keep clients)
   if (sessions[session_id]) {
     const existing = sessions[session_id];
@@ -1333,6 +1455,9 @@ app.post('/api/sessions/register', (req, res) => {
       existing.ready = true;
       markSessionConnected(existing);
     }
+    applyProcessMetadata(existing, req.body);
+    applyIdleTtlMetadata(existing, parsedIdleTtl);
+    applyTimestampMetadata(existing, req.body);
     initializeBootstrapState(existing);
     console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
     return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true });
@@ -1360,12 +1485,17 @@ app.post('/api/sessions/register', (req, res) => {
     lastDisconnectedAt: delivery_type === 'aterm' ? null : new Date().toISOString(),
     lastStateReportAt: null,
     stateReport: null,
+    idleTtl: parsedIdleTtl.present ? parsedIdleTtl.raw : null,
+    idleTtlMs: parsedIdleTtl.present ? parsedIdleTtl.ms : null,
+    ownerPid: Number.isInteger(Number(req.body.owner_pid)) && Number(req.body.owner_pid) > 0 ? Number(req.body.owner_pid) : null,
+    ptyPid: Number.isInteger(Number(req.body.pty_pid)) && Number(req.body.pty_pid) > 0 ? Number(req.body.pty_pid) : null,
     clients: new Set(),
     isClosing: false,
     outputRing: [],
     ready: true,  // unknown commands remain injectable once registered (#150)
   };
   initializeBootstrapState(sessionRecord);
+  applyTimestampMetadata(sessionRecord, req.body);
   // Check for existing session with same base alias and emit replaced event
   const baseAlias = session_id.replace(/-\d+$/, '');
   const replaced = Object.keys(sessions).find(id => {
@@ -2364,6 +2494,35 @@ app.patch('/api/sessions/:id', (req, res) => {
   res.json({ success: true, old_id: id, new_id });
 });
 
+app.post('/api/sessions/:id/kill', async (req, res) => {
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+
+  try {
+    const timeoutSeconds = req.body && req.body.timeout != null
+      ? Number(req.body.timeout)
+      : (req.body && req.body.timeout_sec != null ? Number(req.body.timeout_sec) : 5);
+    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) {
+      return res.status(400).json({ error: 'timeout must be a non-negative number of seconds', code: 'INVALID_TIMEOUT' });
+    }
+
+    const result = await teardownSessionById(resolvedId, {
+      force: req.body && req.body.force === true,
+      timeoutMs: Math.floor(timeoutSeconds * 1000),
+      reason: req.body && req.body.reason ? String(req.body.reason) : 'manual',
+      source: req.body && req.body.source ? String(req.body.source) : 'api'
+    });
+    if (!result.success) {
+      return res.status(result.httpStatus || 500).json({ error: result.error || 'Failed to kill session' });
+    }
+    console.log(`[KILL] Session ${resolvedId} closed (reason=${result.reason}, force=${result.force}, pid=${result.kill.pid || 'none'})`);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to kill session' });
+  }
+});
+
 app.delete('/api/sessions/:id', (req, res) => {
   const requestedId = req.params.id;
   const resolvedId = resolveSessionAlias(requestedId);
@@ -2381,6 +2540,7 @@ app.delete('/api/sessions/:id', (req, res) => {
     delete sessions[id];
     sessionStateManager.unregister(id);
     try { mailbox.purge(id); } catch {}
+    lifecycle.cleanupSessionArtifacts(id);
     console.log(`[KILL] Session ${id} removed`);
     persistSessions();
     res.json({ success: true, status: 'closing' });
@@ -2389,6 +2549,7 @@ app.delete('/api/sessions/:id', (req, res) => {
     delete sessions[id];
     sessionStateManager.unregister(id);
     try { mailbox.purge(id); } catch {}
+    lifecycle.cleanupSessionArtifacts(id);
     persistSessions();
     console.log(`[KILL] Session ${id} force-removed (process cleanup error: ${err.message})`);
     res.json({ success: true, status: 'force-removed' });
@@ -2769,6 +2930,43 @@ if (staleBroken > 0) {
 mailboxDelivery.start();
 
 const IDLE_THRESHOLD_SECONDS = 60;
+async function runIdleTtlSweep(nowMs = Date.now()) {
+  const victims = lifecycle.selectIdleTtlVictims(sessions, teleptyConfig, { nowMs });
+  for (const victim of victims) {
+    const session = sessions[victim.id];
+    if (!session || session._idleTtlKilling) continue;
+    session._idleTtlKilling = true;
+    broadcastSessionEvent('tracing', victim.id, session, {
+      nowMs,
+      extra: {
+        action: 'idle_ttl_auto_kill',
+        reason: 'IDLE_TTL',
+        idle_duration: victim.idleSeconds,
+        idle_duration_seconds: victim.idleSeconds,
+        idle_ttl_ms: victim.ttlMs
+      }
+    });
+    try {
+      await teardownSessionById(victim.id, {
+        force: false,
+        timeoutMs: 5000,
+        reason: 'IDLE_TTL',
+        source: 'idle_reaper'
+      });
+      console.log(`[REAPER] Auto-killed ${victim.id} after ${victim.idleSeconds}s idle (ttl=${victim.ttlMs}ms)`);
+    } catch (err) {
+      session._idleTtlKilling = false;
+      console.error(`[REAPER] Failed to auto-kill ${victim.id}: ${err.message}`);
+    }
+  }
+}
+
+setInterval(() => {
+  runIdleTtlSweep().catch((err) => {
+    console.error(`[REAPER] Idle TTL sweep failed: ${err.message}`);
+  });
+}, IDLE_REAPER_POLL_MS);
+
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of Object.entries(sessions)) {

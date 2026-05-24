@@ -4,6 +4,43 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+### Added — Idle session cleanup (issue #34)
+
+- **Idle visibility in `telepty list`** — session rows now append
+  `💤 idle (Xh Ym)` when `lastActivityAt` is more than 60 seconds old.
+  `telepty list --json` preserves `lastActivityAt` and adds
+  `idle_seconds` for machine consumers.
+- **Transport-agnostic lifecycle helpers** — `src/lifecycle.js` centralizes
+  duration parsing, idle-victim selection, older-than cleanup selection, and
+  PTY/process-level teardown. It uses native POSIX signals and the existing
+  Windows `taskkill` helper; it does not call cmux or any workspace-host API.
+- **`telepty kill <id> [--force] [--timeout <sec>]`** — graceful teardown
+  sends SIGTERM, waits up to the configured timeout, then escalates to
+  SIGKILL. `--force` sends SIGKILL immediately. Successful teardown removes
+  the daemon registry entry and session socket artifacts.
+- **Opt-in idle TTL** — daemon config loads `~/.telepty/config.json` or a
+  simple `config.yaml` / `config.yml` with `idle_ttl_default` (`off` by
+  default). `telepty allow --idle-ttl <duration|off>` stores a per-session
+  override. The daemon reaper emits a `tracing` event with
+  `action: "idle_ttl_auto_kill"` before auto-teardown.
+- **`telepty clean --older-than <duration> [--idle] [--dry-run]`** — default
+  ghost-only cleanup remains unchanged. The new opt-in path removes sessions
+  older than the threshold by `createdAt`, or by `lastActivityAt` when
+  `--idle` is set; `--dry-run` reports targets without deleting them.
+
+### Notes — Idle session cleanup
+
+- **Test suite** — `npm test` passes 397 / 397, including transport-agnostic
+  lifecycle coverage for headless and cmux-backed fixtures.
+- **Snyk SAST** — the requested `snyk_code_scan` MCP tool was not available in
+  this session, so the installed Snyk CLI was used. New standalone files
+  (`src/lifecycle.js`, `src/config-file.js`, and the new lifecycle tests)
+  scan with 0 findings. Scanning changed legacy entrypoints (`daemon.js` and
+  `cli.js`) still reports the repo's pre-existing baseline findings
+  previously noted for Phase 2: CLI path-traversal / command-injection flows
+  and daemon route-level prototype-pollution / throttling / command-execution
+  warnings. No suppressions were added.
+
 ### Added — Phase 5a-prime (task #430 P5a-prime)
 
 - **`crates/telepty-cross-machine/`** — standalone Rust library plus

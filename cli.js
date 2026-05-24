@@ -23,6 +23,7 @@ const crossMachine = require('./cross-machine');
 const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec');
 const { FileMailbox } = require('./src/mailbox/index');
 const readyRegistry = require('./src/prompt-symbol-registry');
+const lifecycle = require('./src/lifecycle');
 const args = process.argv.slice(2);
 let pendingTerminalInputError = null;
 let simulatedPromptErrorInjected = false;
@@ -204,6 +205,26 @@ function formatSessionHealth(session) {
     return `${status} (${reason})`;
   }
   return status;
+}
+
+function enrichSessionIdle(session, nowMs = Date.now()) {
+  const idleSeconds = typeof session.idleSeconds === 'number'
+    ? session.idleSeconds
+    : lifecycle.computeIdleSeconds(session.lastActivityAt, nowMs);
+  return {
+    ...session,
+    idleSeconds,
+    idle_seconds: idleSeconds
+  };
+}
+
+function formatSessionStatusWithIdle(session) {
+  const base = formatSessionHealth(session);
+  const idleSeconds = typeof session.idleSeconds === 'number' ? session.idleSeconds : null;
+  if (idleSeconds !== null && idleSeconds > 60) {
+    return `${base} 💤 idle (${lifecycle.formatIdleDuration(idleSeconds)})`;
+  }
+  return base;
 }
 
 function formatApiError(data, fallback = 'Request failed.') {
@@ -914,7 +935,7 @@ async function main() {
 
   if (cmd === 'list') {
     try {
-      const sessions = await discoverSessions({ silent: true });
+      let sessions = await discoverSessions({ silent: true });
       // Bridge merge: surface supervisor-managed sessions discovered via
       // filesystem manifest scan. De-dup with daemon entries by session id.
       // Daemon path remains source-of-truth when both surfaces report the
@@ -931,6 +952,8 @@ async function main() {
       } catch {
         // Best-effort: daemon list still surfaced above.
       }
+      const nowMs = Date.now();
+      sessions = sessions.map((session) => enrichSessionIdle(session, nowMs));
       if (args.includes('--json')) {
         console.log(JSON.stringify(sessions, null, 2));
         return;
@@ -943,7 +966,7 @@ async function main() {
         console.log(`    Command: ${s.command}`);
         const autoEmoji = s.autoState ? s.autoState.emoji : '';
       const autoLabel = s.autoState ? s.autoState.state : '';
-      console.log(`    Status: ${formatSessionHealth(s)}${autoLabel ? ` ${autoEmoji} ${autoLabel}` : ''}`);
+      console.log(`    Status: ${formatSessionStatusWithIdle(s)}${autoLabel ? ` ${autoEmoji} ${autoLabel}` : ''}`);
         console.log(`    Terminal: ${formatSessionTerminal(s)}`);
         console.log(`    CWD: ${s.cwd}`);
         console.log(`    Clients: ${s.active_clients}`);
@@ -991,6 +1014,24 @@ async function main() {
     if (idIndex !== -1 && allowArgs[idIndex + 1]) {
       sessionId = allowArgs[idIndex + 1];
       allowArgs.splice(idIndex, 2);
+    }
+
+    // Extract per-session idle TTL override
+    let idleTtl = null;
+    const idleTtlIndex = allowArgs.indexOf('--idle-ttl');
+    if (idleTtlIndex !== -1) {
+      if (!allowArgs[idleTtlIndex + 1]) {
+        console.error('❌ Usage: telepty allow [--id <session_id>] [--idle-ttl <duration|off>] <command> [args...]');
+        process.exit(1);
+      }
+      idleTtl = allowArgs[idleTtlIndex + 1];
+      try {
+        lifecycle.parseDuration(idleTtl, { fieldName: 'idle_ttl' });
+      } catch (err) {
+        console.error(`❌ ${err.message}`);
+        process.exit(1);
+      }
+      allowArgs.splice(idleTtlIndex, 2);
     }
 
     // Extract --auto-restart flag
@@ -1053,7 +1094,9 @@ async function main() {
           cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
           cmux_surface_id: process.env.CMUX_SURFACE_ID || null,
           term_program: terminalProgram,
-          term: terminalType
+          term: terminalType,
+          owner_pid: process.pid,
+          ...(idleTtl !== null ? { idle_ttl: idleTtl } : {})
         })
       });
       const data = await res.json();
@@ -1075,6 +1118,27 @@ async function main() {
     let crashCount = 0;
     const MAX_CRASHES = 3;
     const DEATH_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'session-deaths.log');
+
+    function updateDaemonProcessMetadata() {
+      const body = {
+        session_id: sessionId,
+        command,
+        cwd: process.cwd(),
+        backend: detectedBackend,
+        cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
+        cmux_surface_id: process.env.CMUX_SURFACE_ID || null,
+        term_program: terminalProgram,
+        term: terminalType,
+        owner_pid: process.pid,
+        ...(child && child.pid ? { pty_pid: child.pid } : {}),
+        ...(idleTtl !== null ? { idle_ttl: idleTtl } : {})
+      };
+      fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      }).catch(() => {});
+    }
 
     function logSessionDeath(exitCode, signal, duration) {
       try {
@@ -1121,6 +1185,7 @@ async function main() {
         env: sessionEnv
       });
       sessionStartTime = Date.now();
+      updateDaemonProcessMetadata();
       return child;
     }
 
@@ -1255,7 +1320,10 @@ async function main() {
               cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
               cmux_surface_id: process.env.CMUX_SURFACE_ID || null,
               term_program: terminalProgram,
-              term: terminalType
+              term: terminalType,
+              owner_pid: process.pid,
+              ...(child && child.pid ? { pty_pid: child.pid } : {}),
+              ...(idleTtl !== null ? { idle_ttl: idleTtl } : {})
             })
           });
         } catch (e) {
@@ -2241,10 +2309,111 @@ async function main() {
     return;
   }
 
+  if (cmd === 'kill') {
+    const killArgs = args.slice(1);
+    const force = killArgs.includes('--force');
+    const timeoutIndex = killArgs.indexOf('--timeout');
+    let timeout = 5;
+    if (timeoutIndex !== -1) {
+      if (!killArgs[timeoutIndex + 1]) {
+        console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]');
+        process.exit(1);
+      }
+      timeout = Number(killArgs[timeoutIndex + 1]);
+      if (!Number.isFinite(timeout) || timeout < 0) {
+        console.error('❌ --timeout must be a non-negative number of seconds.');
+        process.exit(1);
+      }
+      killArgs.splice(timeoutIndex, 2);
+    }
+    const filtered = killArgs.filter((item) => item !== '--force');
+    const sessionRef = filtered[0];
+    if (!sessionRef) { console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]'); process.exit(1); }
+
+    try {
+      const target = await resolveSessionTarget(sessionRef);
+      if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exit(1); }
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/kill`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force, timeout, source: 'cli' })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.error(`❌ Error: ${data.error || 'Failed to kill session.'}`);
+        process.exit(1);
+      }
+      console.log(`✅ Session '\x1b[36m${target.id}\x1b[0m' killed${data.kill && data.kill.escalated ? ' (escalated)' : ''}.`);
+    } catch (e) {
+      console.error(`❌ ${e.message || 'Failed to kill session.'}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   if (cmd === 'clean') {
     try {
+      const cleanArgs = args.slice(1);
+      const dryRun = cleanArgs.includes('--dry-run');
+      const idle = cleanArgs.includes('--idle');
+      const olderThanIndex = cleanArgs.indexOf('--older-than');
+      let olderThanMs = null;
+      if (olderThanIndex !== -1) {
+        if (!cleanArgs[olderThanIndex + 1]) {
+          console.error('❌ Usage: telepty clean [--older-than <duration>] [--idle] [--dry-run]');
+          process.exit(1);
+        }
+        try {
+          olderThanMs = lifecycle.parseDuration(cleanArgs[olderThanIndex + 1], { fieldName: '--older-than' });
+        } catch (err) {
+          console.error(`❌ ${err.message}`);
+          process.exit(1);
+        }
+        if (olderThanMs == null) {
+          console.error('❌ --older-than must be a duration like 30m, 1h, or 2d.');
+          process.exit(1);
+        }
+      }
+
       const sessions = await discoverSessions({ silent: true });
       if (sessions.length === 0) { console.log('No sessions found.'); return; }
+      if (olderThanMs !== null) {
+        const targets = lifecycle.selectCleanOlderThanTargets(sessions, {
+          olderThanMs,
+          idle,
+          nowMs: Date.now()
+        });
+        if (targets.length === 0) {
+          console.log(`✅ No ${idle ? 'idle ' : ''}sessions older than ${cleanArgs[olderThanIndex + 1]} found.`);
+          return;
+        }
+        if (dryRun) {
+          targets.forEach((target) => {
+            console.log(`  Would remove: \x1b[36m${target.id}\x1b[0m (${target.reference}, ${Math.floor(target.ageSeconds / 60)}m old)`);
+          });
+          console.log(`✅ Dry run: ${targets.length} session(s) would be removed.`);
+          return;
+        }
+
+        let cleaned = 0;
+        for (const target of targets) {
+          try {
+            const host = target.session.host || '127.0.0.1';
+            const res = await fetchWithAuth(`${daemonUrl(host)}/api/sessions/${encodeURIComponent(target.id)}/kill`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ force: false, timeout: 5, source: 'clean', reason: idle ? 'CLEAN_IDLE_OLDER_THAN' : 'CLEAN_OLDER_THAN' })
+            });
+            if (res.ok) {
+              console.log(`  🗑  Removed session: \x1b[36m${target.id}\x1b[0m (${target.reference})`);
+              cleaned++;
+            }
+          } catch (_) {}
+        }
+        console.log(cleaned > 0 ? `✅ Cleaned ${cleaned} session(s).` : '✅ No sessions cleaned.');
+        return;
+      }
+
       let cleaned = 0;
       for (const s of sessions) {
         if (s.healthStatus === 'STALE' || s.healthStatus === 'DISCONNECTED') {
@@ -3204,10 +3373,12 @@ Discuss the following topic from your project's perspective. Engage with other s
 \x1b[1mSession Management:\x1b[0m
   telepty daemon                                 Start the background daemon (port 3848)
   telepty spawn --id <id> <command> [args...]    Spawn a new background session
-  telepty allow [--id <id>] [--auto-restart] <command> [args...]  Wrap a CLI for remote control
+  telepty allow [--id <id>] [--idle-ttl 1h|off] [--auto-restart] <command> [args...]  Wrap a CLI for remote control
   telepty list [--json]                          List sessions (local + Tailnet)
   telepty attach [id[@host]]                     Attach interactively (picker if no ID)
   telepty rename <old_id[@host]> <new_id>        Rename a session
+  telepty kill <id[@host]> [--force] [--timeout N]  Gracefully terminate a session
+  telepty clean [--older-than 7d] [--idle] [--dry-run]  Clean ghost or old sessions
   telepty session info <id[@host]> [--json]      Show session metadata
 
 \x1b[1mInject & Communicate:\x1b[0m

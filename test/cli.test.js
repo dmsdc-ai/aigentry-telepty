@@ -133,6 +133,37 @@ test('telepty list --json includes terminal metadata', async () => {
   assert.equal(session.semantic, null);
 });
 
+test('telepty list shows idle duration for sessions idle over 60 seconds', async () => {
+  const sessionId = createSessionId('cli-list-idle');
+  const lastActivityAt = new Date(Date.now() - ((2 * 60 + 5) * 60 * 1000)).toISOString();
+  await harness.registerSession(sessionId, {
+    term_program: 'kitty',
+    term: 'xterm-kitty',
+    last_activity_at: lastActivityAt
+  });
+
+  const result = await harness.runCli(['list']);
+  assert.equal(result.code, 0, result.stderr);
+
+  const output = stripAnsi(`${result.stdout}\n${result.stderr}`);
+  assert.match(output, new RegExp(sessionId));
+  assert.match(output, /Status: .*💤 idle \(2h 5m\)/);
+});
+
+test('telepty list --json includes computed idle_seconds', async () => {
+  const sessionId = createSessionId('cli-list-idle-json');
+  const lastActivityAt = new Date(Date.now() - (10 * 60 * 1000)).toISOString();
+  await harness.registerSession(sessionId, { last_activity_at: lastActivityAt });
+
+  const result = await harness.runCli(['list', '--json']);
+  assert.equal(result.code, 0, result.stderr);
+
+  const parsed = JSON.parse(result.stdout);
+  const session = parsed.find((item) => item.id === sessionId);
+  assert.equal(session.lastActivityAt, lastActivityAt);
+  assert.ok(session.idle_seconds >= 590, `idle_seconds=${session.idle_seconds}`);
+});
+
 test('telepty session info prints terminal metadata', async () => {
   const sessionId = createSessionId('cli-session-info');
   await harness.registerSession(sessionId, {
@@ -480,6 +511,8 @@ test('telepty allow works without a TTY by using fallback terminal dimensions', 
     'allow',
     '--id',
     sessionId,
+    '--idle-ttl',
+    '1h',
     process.execPath,
     '-e',
     'console.log("allow-ok")'
@@ -499,6 +532,24 @@ test('telepty allow works without a TTY by using fallback terminal dimensions', 
     const list = await harness.request('/api/sessions');
     return list.status === 200 && !list.body.some((session) => session.id === sessionId);
   }, { description: 'wrapped session cleanup after non-interactive allow' });
+});
+
+test('telepty allow rejects malformed --idle-ttl before spawning', async () => {
+  const result = await harness.runCli([
+    'allow',
+    '--id',
+    createSessionId('cli-allow-bad-idle-ttl'),
+    '--idle-ttl',
+    'forever',
+    process.execPath,
+    '-e',
+    'console.log("should-not-run")'
+  ]);
+
+  assert.equal(result.code, 1);
+  const output = stripAnsi(`${result.stdout}\n${result.stderr}`);
+  assert.match(output, /idle_ttl must be a duration/);
+  assert.doesNotMatch(output, /should-not-run/);
 });
 
 test('telepty allow inject submits once without exposing routing metadata', async () => {
