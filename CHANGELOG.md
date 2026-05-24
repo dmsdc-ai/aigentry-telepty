@@ -4,6 +4,25 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+### Added — TELEPTY_SUBMIT_FORCE_DEFAULT env var (task #453)
+
+- **Environment default for forced submit** —
+  `TELEPTY_SUBMIT_FORCE_DEFAULT=1` makes `telepty inject --submit` behave as
+  if `--submit-force` was passed, without changing behavior for users who leave
+  the env var unset. Accepted truthy values are `1`, `true`, `yes`, and `on`
+  after whitespace trimming and case normalization.
+- **Per-call opt-out** — `telepty inject --submit --no-submit-force ...`
+  restores the normal gated submit behavior even when the environment default
+  is enabled. Explicit `--submit-force` remains valid and wins when supplied.
+- **Automation caveat** — this is intended for orchestrators that already know
+  their targets are real, initialized REPLs. It bypasses the safety gate that
+  prevents submit during target boot, avoiding the transient 504
+  `bootstrap_not_ready` path where text lands in the input box but Enter is not
+  sent.
+- **Observability** — env-driven calls emit
+  `[telepty inject] submit-force=env-default (TELEPTY_SUBMIT_FORCE_DEFAULT=1)`
+  to stderr before posting `/submit`.
+
 ### Added — Idle session cleanup (issue #34)
 
 - **Idle visibility in `telepty list`** — session rows now append

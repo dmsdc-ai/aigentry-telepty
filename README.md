@@ -68,6 +68,23 @@ telepty broadcast "status report"
 | `telepty layout [grid\|tall\|stack]` | Arrange kitty windows |
 | `telepty update` | Update to latest version |
 
+## Environment variables
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `TELEPTY_SUBMIT_FORCE_DEFAULT` | `1`, `true`, `yes`, `on` to enable; unset, `0`, or `off` to disable | unset | Makes `telepty inject --submit <id> "text"` behave as if `--submit-force` was passed. |
+
+`TELEPTY_SUBMIT_FORCE_DEFAULT=1` is for orchestrators and automation that
+already know their targets are real, initialized REPLs. It avoids the transient
+504 `bootstrap_not_ready` path where injected text lands in the target input box
+but the render-gated submit refuses to press Enter while the target session is in
+a temporary working state.
+
+This bypasses the safety gate that protects sessions still booting. Set it only
+when you understand that trade-off. Use `--no-submit-force` on a specific
+`telepty inject --submit` call to restore the gated behavior even when the
+environment default is enabled.
+
 ## Cross-Machine Sessions
 
 telepty auto-discovers sessions across your Tailnet. All commands (`list`, `attach`, `inject`, `rename`, `multicast`, `broadcast`) work seamlessly across machines.
