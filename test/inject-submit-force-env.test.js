@@ -6,8 +6,9 @@
 
 const { afterEach, beforeEach, test } = require('node:test');
 const assert = require('node:assert/strict');
+const { randomUUID } = require('crypto');
 const fs = require('fs');
-const http = require('http');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -22,40 +23,30 @@ function createMockId(prefix = 'mock') {
   return `${prefix}-${process.pid}-${Date.now()}-${counter}`;
 }
 
-function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    let buf = '';
-    req.on('data', (chunk) => { buf += chunk; });
-    req.on('end', () => {
-      if (!buf) return resolve(null);
-      try {
-        resolve(JSON.parse(buf));
-      } catch (e) {
-        reject(e);
-      }
-    });
-    req.on('error', reject);
-  });
-}
-
 function startMockDaemon({ sessionId, submitHandler }) {
   const submitCalls = [];
   const injectCalls = [];
 
-  const server = http.createServer(async (req, res) => {
-    res.setHeader('Content-Type', 'application/json');
-    const url = req.url || '';
-    const method = req.method || 'GET';
+  function writeJson(socket, statusCode, payload) {
+    const body = JSON.stringify(payload);
+    socket.end([
+      `HTTP/1.1 ${statusCode} OK`,
+      'Content-Type: application/json',
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      'Connection: close',
+      '',
+      body,
+    ].join('\r\n'));
+  }
 
+  function handleRequest(socket, method, url, body) {
     if (method === 'GET' && url === '/api/meta') {
-      res.statusCode = 200;
-      res.end(JSON.stringify({ version: pkg.version, capabilities: [] }));
+      writeJson(socket, 200, { version: pkg.version, capabilities: [] });
       return;
     }
 
     if (method === 'GET' && url.startsWith('/api/sessions') && !url.includes('/inject') && !url.includes('/submit') && !url.includes('/screen')) {
-      res.statusCode = 200;
-      res.end(JSON.stringify([{
+      writeJson(socket, 200, [{
         id: sessionId,
         host: '127.0.0.1',
         command: 'mock',
@@ -63,29 +54,55 @@ function startMockDaemon({ sessionId, submitHandler }) {
         pid: 1234,
         active_clients: 1,
         backend: 'pty',
-      }]));
+      }]);
       return;
     }
 
     if (method === 'POST' && url.includes('/inject')) {
-      const body = await readJsonBody(req).catch(() => null);
       injectCalls.push({ url, body });
-      res.statusCode = 200;
-      res.end(JSON.stringify({ success: true, written: true }));
+      writeJson(socket, 200, { success: true, written: true });
       return;
     }
 
     if (method === 'POST' && url.includes('/submit')) {
-      const body = await readJsonBody(req).catch(() => null);
       submitCalls.push({ url, body });
       const next = submitHandler(submitCalls.length, body);
-      res.statusCode = next.status;
-      res.end(JSON.stringify(next.payload));
+      writeJson(socket, next.status, next.payload);
       return;
     }
 
-    res.statusCode = 404;
-    res.end(JSON.stringify({ error: 'not_found', url }));
+    writeJson(socket, 404, { error: 'not_found', url });
+  }
+
+  const server = net.createServer((socket) => {
+    let buf = '';
+    socket.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      const headerEnd = buf.indexOf('\r\n\r\n');
+      if (headerEnd === -1) return;
+      const header = buf.slice(0, headerEnd);
+      const [requestLine, ...headerLines] = header.split('\r\n');
+      const [method, url] = requestLine.split(' ');
+      const headers = Object.create(null);
+      for (const line of headerLines) {
+        const sep = line.indexOf(':');
+        if (sep === -1) continue;
+        headers[line.slice(0, sep).trim().toLowerCase()] = line.slice(sep + 1).trim();
+      }
+      const contentLength = Number(headers['content-length'] || 0);
+      const bodyStart = headerEnd + 4;
+      if (buf.length < bodyStart + contentLength) return;
+      let body = null;
+      const bodyText = buf.slice(bodyStart, bodyStart + contentLength);
+      if (bodyText) {
+        try {
+          body = JSON.parse(bodyText);
+        } catch {
+          body = null;
+        }
+      }
+      handleRequest(socket, method, url, body);
+    });
   });
 
   return new Promise((resolve) => {
@@ -106,7 +123,7 @@ function createTempHome() {
   fs.mkdirSync(path.join(homeDir, '.telepty'), { recursive: true, mode: 0o700 });
   fs.writeFileSync(
     path.join(homeDir, '.telepty', 'config.json'),
-    JSON.stringify({ authToken: 'mock-token-for-tests', createdAt: new Date().toISOString() }),
+    JSON.stringify({ authToken: randomUUID(), createdAt: new Date().toISOString() }),
     { mode: 0o600 }
   );
   return homeDir;

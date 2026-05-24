@@ -23,6 +23,20 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   `[telepty inject] submit-force=env-default (TELEPTY_SUBMIT_FORCE_DEFAULT=1)`
   to stderr before posting `/submit`.
 
+### Notes — TELEPTY_SUBMIT_FORCE_DEFAULT env var
+
+- **Test suite** — `npm test --silent` passes 403 / 403, including the new
+  `test/inject-submit-force-env.test.js` coverage for env-off, env-on,
+  `--no-submit-force`, explicit `--submit-force`, and value normalization.
+- **Snyk SAST** — the requested `snyk_code_scan` MCP tool was not available in
+  this session, so the installed Snyk CLI was used. After replacing the new
+  localhost HTTP fixture with a loopback `net` test server and generating the
+  test auth token at runtime, `test/inject-submit-force-env.test.js` has 0
+  findings and the changed `cli.js` line ranges have 0 findings. The full repo
+  CLI scan still reports the pre-existing baseline findings in legacy `cli.js`,
+  `daemon.js`, existing HTTP test fixtures, and `scripts/bridge-phase1.js`. No
+  suppressions were added.
+
 ### Added — Idle session cleanup (issue #34)
 
 - **Idle visibility in `telepty list`** — session rows now append
