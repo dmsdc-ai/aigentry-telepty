@@ -4,6 +4,8 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-05-25
+
 ### Added — TELEPTY_SUBMIT_FORCE_DEFAULT env var (task #453)
 
 - **Environment default for forced submit** —
