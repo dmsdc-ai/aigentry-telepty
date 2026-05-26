@@ -33,19 +33,49 @@ const ENTRIES = {
       return { found: false };
     },
   },
-  // codex renders idle as " › <placeholder>" (column 2). Status footer
-  // ("gpt-5.5 …" or "gpt-5 …") sits 1–2 lines below.
+  // #472 (0.4.5): codex previously matched on a strict line-leading "^ › "
+  // shape; on real cmux captures the '›' tail-renders on the same row as the
+  // model-status footer and DECRQM/cursor-pos fragments leak in, so that
+  // strict matcher misses. Multi-signal tolerant matcher: picker anti-pattern
+  // first (resume-picker UI must NOT be considered ready), then a tolerant
+  // (a + b) signal pair, then the legacy strict scan as a back-compat
+  // fallback. Reason field surfaces which signal fired for log-attribution.
   codex: {
     symbol: '›',
     byteSeq: Buffer.from([0xE2, 0x80, 0xBA]),
     detect(screen) {
-      const lines = String(screen == null ? '' : screen).split('\n');
+      const text = String(screen == null ? '' : screen);
+
+      // Step 1: modal-UI anti-pattern. Resume picker, first-run directory
+      // trust prompt, and generic "Press enter to continue" modals are all
+      // pre-prompt UIs where Enter would not submit a user message. Treat
+      // any of them as NOT ready.
+      if (
+        /Resume a previous session/.test(text) ||
+        /^Filter:/m.test(text) ||
+        /Do you trust the contents/i.test(text) ||
+        /Press enter to continue/i.test(text)
+      ) {
+        return { found: false, reason: 'codex_modal_ui' };
+      }
+
+      // Step 2: multi-signal tolerant. The codex boot box contains
+      // "OpenAI Codex (v<version>)" and the status row contains
+      // "gpt-<ver> <profile> fast". Both present anywhere on the captured
+      // screen → ready, regardless of where the literal '›' rendered.
+      if (/OpenAI Codex \(v/.test(text) && /gpt-[0-9.]+\s+\w+\s+fast/.test(text)) {
+        return { found: true, reason: 'codex_multi_signal' };
+      }
+
+      // Step 3: legacy strict line-leading scan — preserved for back-compat
+      // on clean cmux captures where the original matcher already worked.
+      const lines = text.split('\n');
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i];
         if (!/^ › /.test(line)) continue;
         const footer = (lines[i + 1] || '') + '\n' + (lines[i + 2] || '');
         if (/gpt-\d/.test(footer)) {
-          return { found: true, line_index: i, col: 2 };
+          return { found: true, line_index: i, col: 2, reason: 'codex_strict_line' };
         }
       }
       return { found: false };

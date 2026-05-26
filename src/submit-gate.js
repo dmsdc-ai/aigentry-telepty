@@ -227,7 +227,13 @@ async function awaitPromptSymbol(session, opts = {}) {
         if (lastSeenAt === null) {
           lastSeenAt = now();
         } else if (now() - lastSeenAt >= stabilityMs) {
-          return { ready: true, last_seen_at: lastSeenAt, waited_ms: now() - start };
+          // #472 (0.4.5): tag the success reason for debuggability — pairs
+          // with daemon.js startup-restore optimistic-ready logging so we
+          // can attribute every bootstrap_ready flip to a concrete signal.
+          if (match.reason && typeof console !== 'undefined' && console.log) {
+            console.log(`[bootstrap] ${session.command} ready via: ${match.reason}`);
+          }
+          return { ready: true, last_seen_at: lastSeenAt, waited_ms: now() - start, reason: match.reason };
         }
       } else {
         // symbol disappeared — reset the stability streak

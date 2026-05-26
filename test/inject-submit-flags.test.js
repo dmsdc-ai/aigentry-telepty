@@ -206,6 +206,11 @@ test('telepty inject --submit --submit-force passes force=true to /submit', asyn
 });
 
 test('telepty inject --submit (no force) does NOT include force in /submit body', async () => {
+  // Env-resistant: TELEPTY_SUBMIT_FORCE_DEFAULT=1 in the host shell would
+  // flip the CLI default to force and break this test's intent. Pin it off
+  // for the test scope only.
+  const priorForceDefault = process.env.TELEPTY_SUBMIT_FORCE_DEFAULT;
+  process.env.TELEPTY_SUBMIT_FORCE_DEFAULT = '0';
   const sessionId = createMockId('noforce');
   const mock = await startMockDaemon({
     sessionId,
@@ -231,6 +236,11 @@ test('telepty inject --submit (no force) does NOT include force in /submit body'
     assert.equal(mock.submitCalls[0].body.force, undefined);
   } finally {
     await mock.close();
+    if (priorForceDefault === undefined) {
+      delete process.env.TELEPTY_SUBMIT_FORCE_DEFAULT;
+    } else {
+      process.env.TELEPTY_SUBMIT_FORCE_DEFAULT = priorForceDefault;
+    }
   }
 });
 

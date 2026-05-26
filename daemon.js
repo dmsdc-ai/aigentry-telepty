@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const { getConfig } = require('./auth');
 const pkg = require('./package.json');
-const { claimDaemonState, clearDaemonState } = require('./daemon-control');
+const { claimDaemonState, clearDaemonState, isProcessRunning } = require('./daemon-control');
 const { checkEntitlement } = require('./entitlement');
 const terminalBackend = require('./terminal-backend');
 const { FileMailbox } = require('./src/mailbox/index');
@@ -1966,7 +1966,10 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
 
   console.log(`[SUBMIT] Session ${id} (${session.command})${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}${gateOff ? ' [gate=off]' : ''}`);
 
-  if (isBootstrapGatedSession(session) && (!isBootstrapReady(session) || hasBootstrapBacklog(session) || session.bootstrapDraining)) {
+  // #471 (0.4.5): force=true must bypass the bootstrap gate. Without `!force`
+  // here the per-request escape hatch (cli.js --submit-force) is enqueued and
+  // 504s before the force-bypass block below ever runs.
+  if (!force && isBootstrapGatedSession(session) && (!isBootstrapReady(session) || hasBootstrapBacklog(session) || session.bootstrapDraining)) {
     const op = enqueueBootstrapOperation(id, session, {
       type: 'submit',
       body: { ...(req.body || {}) }
@@ -2882,7 +2885,43 @@ app.patch('/api/threads/:id', (req, res) => {
 
 const server = app.listen(PORT, HOST, () => {
   console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
+  runStartupBootstrapRestore();
 });
+
+// #470 (0.4.5): when the daemon restarts under existing telepty allow workers,
+// persisted sessions are restored at daemon.js:1244 but bootstrapReady stays
+// false until the owner WS reconnects — leaving every survivor session stuck
+// at ready:false indefinitely. Re-probe on startup: for cmux sessions whose
+// owner PID is still alive, run the WS-independent prompt-symbol probe; for
+// non-cmux survivors, optimistically mark ready (the underlying CLI is alive
+// and no probe primitive is available).
+function runStartupBootstrapRestore() {
+  for (const [id, session] of Object.entries(sessions)) {
+    if (!isBootstrapGatedSession(session) || isBootstrapReady(session)) continue;
+    const ownerPid = Number(session.ownerPid);
+    if (!Number.isInteger(ownerPid) || ownerPid <= 0 || !isProcessRunning(ownerPid)) {
+      continue;
+    }
+    if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+      submitGate.awaitPromptSymbol(session, { timeoutMs: 5000 })
+        .then((result) => {
+          if (result && result.ready) {
+            markBootstrapReady(id, session, 'startup_restore');
+          } else {
+            markBootstrapReady(id, session, 'startup_owner_alive');
+            console.log(`[BOOTSTRAP] Optimistic ready for ${id} (ownerPid=${ownerPid}, probe=${result?.reason || 'timeout'})`);
+          }
+        })
+        .catch(() => {
+          markBootstrapReady(id, session, 'startup_owner_alive');
+          console.log(`[BOOTSTRAP] Optimistic ready for ${id} (ownerPid=${ownerPid}, probe=error)`);
+        });
+    } else {
+      markBootstrapReady(id, session, 'startup_owner_alive');
+      console.log(`[BOOTSTRAP] Optimistic ready for ${id} (ownerPid=${ownerPid}, backend=${session.backend || 'unknown'})`);
+    }
+  }
+}
 
 // --- Mailbox system initialization ---
 const mailbox = new FileMailbox();

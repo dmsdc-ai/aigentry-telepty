@@ -4,6 +4,62 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-05-26
+
+### Fixed — Stale-daemon, restart-recovery, force-bypass, codex matcher (tasks #469 #470 #471 #472)
+
+- **#469 — npm postinstall hook restarts a stale daemon (`scripts/postinstall.js`).**
+  `npm install -g @dmsdc-ai/aigentry-telepty@X` previously overwrote files but
+  never signalled the running `telepty-daemon`, so the daemon kept executing
+  the previously-loaded code (observed: PID 3222 ran 22 days through 4
+  upgrades). The new postinstall script reads `~/.telepty/daemon-state.json`,
+  compares the running daemon's reported version to the just-installed
+  `package.json` version, and on mismatch invokes the existing
+  `cleanupDaemonProcesses()` primitive plus a detached respawn. Skips on
+  `TELEPTY_SKIP_POSTINSTALL=1` and on non-global installs
+  (`npm_config_global!=='true'`).
+- **#470 — daemon restart re-bootstraps existing sessions
+  (`daemon.js` `runStartupBootstrapRestore()`).** After a daemon restart,
+  persisted-and-restored sessions remained `ready:false` indefinitely because
+  the bootstrap prompt-symbol probe only fired on owner-WebSocket reconnect.
+  On startup, each restored gated session whose `ownerPid` is still alive is
+  now actively probed (cmux path) or optimistically marked ready (non-cmux
+  path), with the chosen reason recorded for log attribution. Sessions whose
+  owner process is dead remain unready, matching the prior unready semantics.
+- **#471 — `force: true` bypasses the bootstrap gate (`daemon.js:1969`).**
+  The per-request `force` escape hatch (`cli.js --submit-force`,
+  `TELEPTY_SUBMIT_FORCE_DEFAULT=1` from 0.4.4) was parsed correctly but the
+  bootstrap gate enqueued it and returned 504 long before the force-bypass
+  block at L1998 could run. Surgical 1-line condition edit: gate fires only
+  when `!force`. The force-bypass code path is now exercisable as documented.
+- **#472 — codex prompt-symbol matcher normalized across environments
+  (`src/prompt-symbol-registry.js`).** On real cmux captures the codex `›`
+  glyph tail-renders on the same row as the model-status footer and DECRQM /
+  cursor-position-query fragments (`>4;0m>7u`, `0 q`) leak into the screen
+  buffer, so the prior strict line-leading scan permanently missed and the
+  session stuck at `ready:false`. New tolerant detector: (1) modal-UI
+  anti-pattern guard for resume picker, first-run directory-trust prompt and
+  generic press-enter-to-continue modals (treated as NOT ready); (2)
+  multi-signal match on `"OpenAI Codex (v"` plus `/gpt-[0-9.]+\s+\w+\s+fast/`
+  anywhere on the screen; (3) legacy strict line-leading scan preserved as a
+  back-compat fallback. `awaitPromptSymbol` now emits a single
+  `[bootstrap] <cli> ready via: <reason>` log line on stabilize, paired with
+  the #470 optimistic-ready logging for unified debuggability.
+
+### Notes — 0.4.5
+
+- **Tests** — `npm test` passes 416 / 416 (was 411 / 411 in 0.4.4; +5 new
+  cases in `test/release-0.4.5-bugfixes.test.js` covering #469/#470/#471/#472
+  including env-resistance regression guard on the existing noforce test).
+- **Snyk Code SAST** — all newly authored or modified JS files
+  (`scripts/postinstall.js`, `src/prompt-symbol-registry.js`,
+  `src/submit-gate.js`, new `daemon.js` line ranges, and
+  `test/release-0.4.5-bugfixes.test.js`) report 0 findings. The 55
+  pre-existing repo-wide findings in unchanged code are tracked separately as
+  task #474 (security cleanup track) and are not part of this release.
+- **Out of scope, tracked separately** — task #473 (session-ID reuse → stale
+  command metadata) is queued for a 0.4.6 dispatch and is not addressed here.
+
 ## [0.4.4] - 2026-05-25
 
 ### Added — TELEPTY_SUBMIT_FORCE_DEFAULT env var (task #453)
