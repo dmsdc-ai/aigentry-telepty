@@ -1464,8 +1464,11 @@ async function main() {
       return true;
     }
 
-    function exitAllowSession(code) {
-      setTimeout(() => process.exit(code), 25);
+    function exitAllowSession(code, exitCtx) {
+      if (exitCtx) {
+        logSessionDeath(exitCtx.exitCode, exitCtx.signal, exitCtx.duration);
+      }
+      process.exit(code);
     }
 
     // Intercept terminal title escape sequences and prefix with session ID
@@ -1562,14 +1565,25 @@ async function main() {
     }
     attachChildExitHandler();
 
-    for (const signalName of ['SIGTERM', 'SIGHUP', 'SIGQUIT']) {
+    process.on('SIGHUP', () => {
+      // Explicit no-op: decouples telepty-allow lifecycle from parent terminal app.
+      // Node default for SIGHUP is process.exit; this handler overrides that default.
+      // See ADR 2026-05-27-cmux-telepty-session-boundary §4.
+    });
+    process.stdout.on('error', () => {});
+
+    for (const signalName of ['SIGTERM', 'SIGQUIT']) {
       const handler = () => {
         closeAllowSession();
         try {
           child.kill(signalName);
         } catch {}
         const signalCode = osConstants.signals[signalName] || 1;
-        exitAllowSession(128 + signalCode);
+        exitAllowSession(128 + signalCode, {
+          exitCode: null,
+          signal: signalName,
+          duration: Date.now() - sessionStartTime
+        });
       };
       allowSignalHandlers.set(signalName, handler);
       process.on(signalName, handler);
