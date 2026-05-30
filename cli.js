@@ -966,6 +966,10 @@ async function main() {
 
   if (cmd === 'daemon') {
     console.log('Starting telepty daemon...');
+    // daemon.js binds the port only when launched as the daemon. The CLI reaches
+    // it via require() (not as require.main), so signal intent explicitly — tests
+    // that `require('./daemon.js')` without this env stay side-effect-free. (#15 / 0.5.0 daemon-never-listened regression)
+    process.env.AIGENTRY_TELEPTY_DAEMON_MAIN = '1';
     require('./daemon.js');
     return;
   }

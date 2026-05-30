@@ -4,6 +4,25 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-30
+
+### Fixed — daemon never started (CRITICAL, regresses 0.5.0)
+
+- **The daemon failed to start for all users on 0.5.0.** `daemon.js` guarded
+  `app.listen()` behind `require.main === module` (added in 0.5.0 for test
+  isolation so `require('./daemon.js')` is side-effect-free). But the production
+  CLI launches the daemon via `require('./daemon.js')` (`telepty daemon`, and the
+  auto-start spawns `node cli.js daemon`), so `require.main` is always `cli.js` —
+  `app.listen` never ran, the process exited 0 right after `[PERSIST] Restored
+  session … (awaiting reconnect)`, and every CLI reported `Daemon restart failed
+  after 3 attempts` / `fetch failed`. **Fix:** `cli.js` sets
+  `AIGENTRY_TELEPTY_DAEMON_MAIN=1` before requiring `daemon.js`; the guard is now
+  `require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1'`.
+  Tests that `require()` daemon.js without the env stay side-effect-free. (telepty#15)
+- Follow-up (tracked): a daemon-launch integration smoke test — assert the HTTP
+  endpoint responds when the daemon is launched via the real CLI path. The unit-test
+  guard masked this regression; an integration test would have caught it.
+
 ## [0.5.0] - 2026-05-30
 
 ### Changed — Surface-ownership boundary (ADR 2026-05-30)

@@ -3017,11 +3017,13 @@ app.patch('/api/threads/:id', (req, res) => {
   res.json({ success: true, thread_id: thread.id, status: thread.status });
 });
 
-// Bind the port only under the require.main guard — a test can `require('./daemon.js')` to
-// reach the exported decision functions without starting the daemon. `server` stays undefined
-// when required, so the WS upgrade/error handlers below attach only when run as the daemon.
+// Bind the port when launched as the daemon. A test can `require('./daemon.js')` to reach the
+// exported decision functions WITHOUT starting the daemon — it just must not set the env below.
+// The production CLI reaches daemon.js via require() (cli.js `cmd==='daemon'`), so require.main is
+// cli.js, never this module — hence the explicit AIGENTRY_TELEPTY_DAEMON_MAIN signal. Guarding on
+// require.main ALONE (0.5.0 regression) meant app.listen never ran in production → daemon exited 0.
 let server;
-if (require.main === module) {
+if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
   server = app.listen(PORT, HOST, () => {
     console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
     runStartupBootstrapRestore();
