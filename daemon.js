@@ -19,13 +19,14 @@ const readyRegistry = require('./src/prompt-symbol-registry');
 const lifecycle = require('./src/lifecycle');
 const { SURFACE_ORPHAN_SECONDS, decideSurfaceGc } = lifecycle;
 const { loadTeleptyConfig } = require('./src/config-file');
+const sessionPersistence = require('./src/session-store/persistence');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
 const net = require('net');
 const fs = require('fs');
-const SESSION_PERSIST_PATH = require('path').join(os.homedir(), '.config', 'aigentry-telepty', 'sessions.json');
+const SESSION_PERSIST_PATH = sessionPersistence.defaultSessionPersistPath();
 const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STALE_SECONDS || 60));
 const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
 const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
@@ -103,43 +104,11 @@ sessionStateManager.onTransition((sessionId, from, to, detail) => {
 });
 
 function persistSessions() {
-  try {
-    const data = {};
-    for (const [id, s] of Object.entries(sessions)) {
-      data[id] = {
-        id,
-        type: s.type,
-        command: s.command,
-        cwd: s.cwd,
-        backend: s.backend || null,
-        cmuxWorkspaceId: s.cmuxWorkspaceId || null,
-        cmuxSurfaceId: s.cmuxSurfaceId || null,
-        termProgram: s.termProgram || null,
-        term: s.term || null,
-        delivery: s.delivery || null,
-        deliveryEndpoint: s.deliveryEndpoint || null,
-        createdAt: s.createdAt,
-        lastActivityAt: s.lastActivityAt || null,
-        lastConnectedAt: s.lastConnectedAt || null,
-        lastDisconnectedAt: s.lastDisconnectedAt || null,
-        lastStateReportAt: s.lastStateReportAt || null,
-        stateReport: s.stateReport || null,
-        idleTtl: s.idleTtl || null,
-        idleTtlMs: s.idleTtlMs == null ? null : s.idleTtlMs,
-        ownerPid: s.ownerPid || null,
-        ptyPid: s.ptyPid || null
-      };
-    }
-    fs.mkdirSync(require('path').dirname(SESSION_PERSIST_PATH), { recursive: true });
-    fs.writeFileSync(SESSION_PERSIST_PATH, JSON.stringify(data, null, 2));
-  } catch {}
+  sessionPersistence.savePersistedSessions(sessions, SESSION_PERSIST_PATH);
 }
 
 function loadPersistedSessions() {
-  try {
-    if (!fs.existsSync(SESSION_PERSIST_PATH)) return {};
-    return JSON.parse(fs.readFileSync(SESSION_PERSIST_PATH, 'utf8'));
-  } catch { return {}; }
+  return sessionPersistence.loadPersistedSessions(SESSION_PERSIST_PATH);
 }
 
 const app = express();
@@ -1352,29 +1321,11 @@ console.log(`[DAEMON] Terminal backend: ${DETECTED_TERMINAL}`);
 // Restore persisted session metadata (wrapped sessions await reconnect)
 const _persisted = loadPersistedSessions();
 for (const [id, meta] of Object.entries(_persisted)) {
-  if (meta.type === 'wrapped') {
-    sessions[id] = {
-      id, type: 'wrapped', ptyProcess: null, ownerWs: null,
-      command: meta.command || 'wrapped', cwd: meta.cwd || process.cwd(),
-      backend: meta.backend || 'kitty',
-      cmuxWorkspaceId: meta.cmuxWorkspaceId || null,
-      cmuxSurfaceId: meta.cmuxSurfaceId || null,
-      termProgram: meta.termProgram || null,
-      term: meta.term || null,
-      createdAt: meta.createdAt || new Date().toISOString(),
-      lastActivityAt: meta.lastActivityAt || new Date().toISOString(),
-      lastConnectedAt: meta.lastConnectedAt || null,
-      lastDisconnectedAt: meta.lastDisconnectedAt || meta.lastActivityAt || new Date().toISOString(),
-      lastStateReportAt: meta.lastStateReportAt || null,
-      stateReport: meta.stateReport || null,
-      idleTtl: meta.idleTtl || null,
-      idleTtlMs: meta.idleTtlMs == null ? null : meta.idleTtlMs,
-      ownerPid: meta.ownerPid || null,
-      ptyPid: meta.ptyPid || null,
-      clients: new Set(), isClosing: false, outputRing: [], ready: true,     };
-    initializeBootstrapState(sessions[id]);
-    console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
-  }
+  const restored = sessionPersistence.buildRestoredWrappedSession(id, meta, { cwd: process.cwd() });
+  if (!restored) continue;
+  sessions[id] = restored;
+  initializeBootstrapState(sessions[id]);
+  console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
 }
 const STRIPPED_SESSION_ENV_KEYS = [
   'CLAUDECODE',
