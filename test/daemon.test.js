@@ -566,6 +566,26 @@ test('wrapped session owner output broadcasts to attached clients', async () => 
   viewerWs.close();
 });
 
+test('session WebSocket roundtrip relays an owner output frame', async () => {
+  const sessionId = createSessionId('ws-roundtrip');
+  await harness.registerSession(sessionId);
+
+  const ownerWs = await harness.connectSession(sessionId);
+  const viewerWs = await harness.connectSession(sessionId);
+  const viewerMessages = collectJsonMessages(viewerWs);
+  const token = createSessionId('ws-roundtrip-token');
+
+  ownerWs.send(JSON.stringify({ type: 'output', data: token }));
+
+  const frame = await waitFor(() => viewerMessages.find((message) => (
+    message.type === 'output' && message.data === token
+  )), { description: 'session WS owner output roundtrip' });
+  assert.equal(frame.data, token);
+
+  ownerWs.close();
+  viewerWs.close();
+});
+
 test('wrapped session non-owner input forwards to owner as inject', async () => {
   const sessionId = createSessionId('viewer-input');
   await harness.registerSession(sessionId);
