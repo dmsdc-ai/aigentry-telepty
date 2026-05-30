@@ -17,6 +17,7 @@ const { classifyReportPrompt, buildAutoSummary } = require('./src/report-enforce
 const submitGate = require('./src/submit-gate');
 const readyRegistry = require('./src/prompt-symbol-registry');
 const lifecycle = require('./src/lifecycle');
+const { SURFACE_ORPHAN_SECONDS, decideSurfaceGc } = lifecycle;
 const { loadTeleptyConfig } = require('./src/config-file');
 
 const config = getConfig();
@@ -27,23 +28,6 @@ const fs = require('fs');
 const SESSION_PERSIST_PATH = require('path').join(os.homedir(), '.config', 'aigentry-telepty', 'sessions.json');
 const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STALE_SECONDS || 60));
 const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
-// #17: grace window before a cmux session whose workspace was explicitly closed (bridge
-// survived → headless zombie) is reclaimed. Shorter than the 300s disconnect-GC: the surface
-// is confirmed gone (not merely disconnected). The window absorbs cmux transient hiccups.
-const SURFACE_ORPHAN_SECONDS = Math.max(5, Number(process.env.TELEPTY_SURFACE_ORPHAN_SECONDS || 30));
-// #17: pure verdict→action mapping for the surface-liveness GC, exposed for unit-testing.
-// Returns 'mark' (start the grace window), 'reclaim' (grace elapsed → teardown), 'recover'
-// (surface returned within grace → clear), or 'skip'. INV-17: 'unknown' (cmux unreachable)
-// always maps to 'skip' — GC nothing. Pure, no side effects; the caller performs the action.
-function decideSurfaceGc(liveness, session, nowMs, graceSeconds = SURFACE_ORPHAN_SECONDS) {
-  if (liveness === 'gone') {
-    if (!session.surfaceGoneAt) return 'mark';
-    const goneSeconds = Math.floor((nowMs - new Date(session.surfaceGoneAt).getTime()) / 1000);
-    return goneSeconds >= graceSeconds ? 'reclaim' : 'skip';
-  }
-  if (liveness === 'alive' && session.surfaceGoneAt) return 'recover';
-  return 'skip';
-}
 const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
 const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS || 10000));
 const IDLE_REAPER_POLL_MS = Math.max(100, Number(process.env.TELEPTY_IDLE_REAPER_POLL_MS || 60000));

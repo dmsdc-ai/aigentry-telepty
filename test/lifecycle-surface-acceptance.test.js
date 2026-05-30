@@ -9,9 +9,8 @@
 // (no surface close, no focus-steal, no app dependency).
 //
 // The daemon.js GC-loop wiring, cli.js close-handler, the #29 owner_alive floor,
-// #31 focus GATE, #31.4 queue-flush and #32 provenance live in UNEXPORTED
-// daemon.js/cli.js functions and are NOT covered here — they require a coder
-// test-export (HOLD-injected to the orchestrator). See the dispatch ref.
+// #31 focus GATE, #31.4 queue-flush and #32 provenance are covered by their own
+// focused seams. The pure surface-GC verdict mapping lives in src/lifecycle.js.
 
 const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -20,12 +19,6 @@ const os = require('os');
 const path = require('path');
 
 const backend = require('../terminal-backend.js');
-// NOTE: decideSurfaceGc lives in daemon.js but `require('../daemon.js')` has side effects
-// (runs session-restore + arms bootstrap timers — not fully require.main-guarded), so it is
-// NOT imported here. The #486 INV-17 gate is covered at the probe level by the isSurfaceAlive
-// tests below (cmux UNREACHABLE → 'unknown' → PRESERVE); decideSurfaceGc('unknown')='skip' was
-// verified out-of-band (isolated `node -e` + coder report). TODO(coder): guard daemon.js
-// session-restore behind require.main so decideSurfaceGc becomes unit-testable in-suite.
 
 // ── Fake cmux harness ────────────────────────────────────────────────────────
 // A node script named `cmux` reads control.json to decide ping/list/close/focus
@@ -193,4 +186,3 @@ test('verdict-2026-05-30: focusSurface is REMOVED from terminal-backend (focus a
   assert.equal(typeof backend.focusSurface, 'undefined',
     'telepty must no longer expose focusSurface — surface focus is owned by workspace-host.sh wh_focus');
 });
-

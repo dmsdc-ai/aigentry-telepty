@@ -5,6 +5,46 @@ const assert = require('node:assert/strict');
 
 const lifecycle = require('../src/lifecycle');
 
+test('surface GC marks a newly gone cmux surface', () => {
+  assert.equal(lifecycle.decideSurfaceGc('gone', {}, Date.now(), 30), 'mark');
+});
+
+test('surface GC skips a gone cmux surface still inside the grace window', () => {
+  const nowMs = Date.now();
+  const session = {
+    surfaceGoneAt: new Date(nowMs - 29 * 1000).toISOString()
+  };
+
+  assert.equal(lifecycle.decideSurfaceGc('gone', session, nowMs, 30), 'skip');
+});
+
+test('surface GC reclaims a gone cmux surface after the grace window', () => {
+  const nowMs = Date.now();
+  const session = {
+    surfaceGoneAt: new Date(nowMs - 30 * 1000).toISOString()
+  };
+
+  assert.equal(lifecycle.decideSurfaceGc('gone', session, nowMs, 30), 'reclaim');
+});
+
+test('surface GC recovers when a previously gone cmux surface returns', () => {
+  const nowMs = Date.now();
+  const session = {
+    surfaceGoneAt: new Date(nowMs - 5 * 1000).toISOString()
+  };
+
+  assert.equal(lifecycle.decideSurfaceGc('alive', session, nowMs, 30), 'recover');
+});
+
+test('surface GC skips unknown liveness to preserve INV-17', () => {
+  const nowMs = Date.now();
+  const session = {
+    surfaceGoneAt: new Date(nowMs - 60 * 1000).toISOString()
+  };
+
+  assert.equal(lifecycle.decideSurfaceGc('unknown', session, nowMs, 30), 'skip');
+});
+
 test('idle TTL victim selection is independent of workspace host metadata', () => {
   const nowMs = Date.now();
   const old = new Date(nowMs - 2 * 60 * 60 * 1000).toISOString();

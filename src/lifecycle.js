@@ -6,6 +6,11 @@ const os = require('node:os');
 
 const { killWindowsProcess } = require('./win-kill-process');
 
+// #17: grace window before a cmux session whose workspace was explicitly closed (bridge
+// survived → headless zombie) is reclaimed. Shorter than the 300s disconnect-GC: the surface
+// is confirmed gone (not merely disconnected). The window absorbs cmux transient hiccups.
+const SURFACE_ORPHAN_SECONDS = Math.max(5, Number(process.env.TELEPTY_SURFACE_ORPHAN_SECONDS || 30));
+
 const DURATION_RE = /^(\d+)(ms|s|m|h|d)$/i;
 const UNIT_MS = {
   ms: 1,
@@ -223,7 +228,22 @@ function selectCleanOlderThanTargets(sessions, options = {}) {
   return targets;
 }
 
+// #17: pure verdict→action mapping for the surface-liveness GC, exposed for unit-testing.
+// Returns 'mark' (start the grace window), 'reclaim' (grace elapsed → teardown), 'recover'
+// (surface returned within grace → clear), or 'skip'. INV-17: 'unknown' (cmux unreachable)
+// always maps to 'skip' — GC nothing. Pure, no side effects; the caller performs the action.
+function decideSurfaceGc(liveness, session, nowMs, graceSeconds = SURFACE_ORPHAN_SECONDS) {
+  if (liveness === 'gone') {
+    if (!session.surfaceGoneAt) return 'mark';
+    const goneSeconds = Math.floor((nowMs - new Date(session.surfaceGoneAt).getTime()) / 1000);
+    return goneSeconds >= graceSeconds ? 'reclaim' : 'skip';
+  }
+  if (liveness === 'alive' && session.surfaceGoneAt) return 'recover';
+  return 'skip';
+}
+
 module.exports = {
+  SURFACE_ORPHAN_SECONDS,
   parseDuration,
   computeIdleSeconds,
   formatIdleDuration,
@@ -233,5 +253,6 @@ module.exports = {
   cleanupSessionArtifacts,
   effectiveIdleTtlMs,
   selectIdleTtlVictims,
-  selectCleanOlderThanTargets
+  selectCleanOlderThanTargets,
+  decideSurfaceGc
 };
