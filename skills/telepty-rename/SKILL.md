@@ -1,6 +1,6 @@
 ---
 name: telepty-rename
-description: Rename, delete, and clean up telepty sessions. Session lifecycle management. 키워드: 세션 이름 변경, 세션 삭제, 세션 정리, 세션 청소, rename, 라이프사이클
+description: 'Rename, delete, and clean up telepty sessions. Session lifecycle management. 키워드: 세션 이름 변경, 세션 삭제, 세션 정리, 세션 청소, rename, 라이프사이클'
 ---
 
 # telepty-rename — Session Lifecycle Management

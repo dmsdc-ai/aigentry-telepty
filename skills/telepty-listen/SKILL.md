@@ -1,6 +1,6 @@
 ---
 name: telepty-listen
-description: Monitor telepty events and read session screen output. Covers listen (event bus) and read-screen commands. 키워드: 이벤트 모니터, 화면 확인, 화면 읽기, 이벤트 스트림, listen, read-screen, 모니터링
+description: 'Monitor telepty events and read session screen output. Covers listen (event bus) and read-screen commands. 키워드: 이벤트 모니터, 화면 확인, 화면 읽기, 이벤트 스트림, listen, read-screen, 모니터링'
 ---
 
 # telepty-listen — Event Monitoring and Screen Reading

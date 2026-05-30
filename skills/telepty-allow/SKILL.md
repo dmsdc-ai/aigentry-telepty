@@ -1,6 +1,6 @@
 ---
 name: telepty-allow
-description: Create telepty sessions by wrapping CLI processes. Covers the allow/enable/wrap command for session creation and PTY management. 키워드: 세션 생성, 세션 래핑, CLI 래핑, allow, 세션 만들기, PTY
+description: 'Create telepty sessions by wrapping CLI processes. Covers the allow/enable/wrap command for session creation and PTY management. 키워드: 세션 생성, 세션 래핑, CLI 래핑, allow, 세션 만들기, PTY'
 ---
 
 # telepty-allow — Create and Manage Sessions

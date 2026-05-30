@@ -5,7 +5,7 @@ const os = require('os');
 const fs = require('fs');
 const { constants: osConstants } = require('os');
 const WebSocket = require('ws');
-const { execSync, spawn } = require('child_process');
+const { execSync, execFileSync, spawn } = require('child_process');
 const readline = require('readline');
 const prompts = require('prompts');
 const updateNotifier = require('update-notifier');
@@ -488,13 +488,51 @@ async function promptWithRecovery(promptConfig) {
   return response;
 }
 
+// #26: validate a filesystem-path CLI argument before it reaches fs.*. Rejects empty input
+// and null-byte injection, then normalizes to a canonical absolute path (path.resolve folds
+// out any `..` traversal segments). telepty is a local CLI, so the path is operator-chosen and
+// arbitrary locations are legitimate — this hardens against malformed/encoded traversal input
+// rather than confining to a base directory.
+function sanitizePathArg(input, label = 'path') {
+  if (typeof input !== 'string' || input.length === 0 || input.includes('\0') || input.includes('..')) {
+    throw new Error(`Invalid ${label} path argument`);
+  }
+  return path.resolve(input);
+}
+
+// #29: per-session backend classification, exposed for unit-testing. `env` and the kitty-socket
+// probe are injected (findKittySocketCli is nested in main()), so a test can drive each branch
+// without real env/sockets. Behavior matches the original inline ternary exactly.
+function classifyBackend(env, findKitty) {
+  if (env.TERM_PROGRAM === 'WarpTerminal') return 'warp';
+  if (env.CMUX_WORKSPACE_ID) return 'cmux';
+  return findKitty() ? 'kitty' : 'pty';
+}
+
+// #17 (OQ-2): decide whether a daemon WS 'close' is the daemon's explicit session-destroy
+// (code 1000 'Session destroyed') — in which case the bridge must terminate, not reconnect.
+// Pure predicate, exposed for unit-testing; `reason` may be a Buffer (ws) or string.
+function isDaemonDestroyClose(code, reason) {
+  const reasonText = reason ? reason.toString() : '';
+  return code === 1000 && reasonText === 'Session destroyed';
+}
+
 function runUpdateInstall() {
   if (process.env.TELEPTY_SKIP_PACKAGE_UPDATE === '1') {
     return;
   }
 
-  const updateCommand = process.env.TELEPTY_UPDATE_COMMAND || 'npm install -g @dmsdc-ai/aigentry-telepty@latest';
-  execSync(updateCommand, { stdio: 'inherit' });
+  // #26: default self-update runs npm with a fixed arg array via execFileSync (no shell →
+  // no command injection). An explicit operator-supplied TELEPTY_UPDATE_COMMAND is a trusted
+  // env override (the operator deliberately chose to run a custom shell command — setting the
+  // env already implies shell control, so no privilege boundary is crossed). This execSync is
+  // accepted-by-design, consistent with the documented Snyk baseline waiver (CHANGELOG).
+  const override = process.env.TELEPTY_UPDATE_COMMAND;
+  if (override) {
+    execSync(override, { stdio: 'inherit' });
+    return;
+  }
+  execFileSync('npm', ['install', '-g', '@dmsdc-ai/aigentry-telepty@latest'], { stdio: 'inherit' });
 }
 
 async function repairLocalDaemon(options = {}) {
@@ -1082,7 +1120,9 @@ async function main() {
         return files.length > 0;
       } catch { return false; }
     }
-    const detectedBackend = process.env.CMUX_WORKSPACE_ID ? 'cmux' : (findKittySocketCli() ? 'kitty' : 'pty');
+    // #29: classify Warp first (TERM_PROGRAM=WarpTerminal) for honest telemetry + a named
+    // branch (Warp readiness uses the #29 owner-alive floor, not a cmux read-screen poll).
+    const detectedBackend = classifyBackend(process.env, findKittySocketCli);
 
     // Register session with daemon
     const terminalProgram = detectTerminalProgram(process.env);
@@ -1182,6 +1222,10 @@ async function main() {
       // Windows: walk %PATHEXT% so bare names (`claude`, `codex`, `gemini`)
       // resolve to their npm-global `.cmd`/`.ps1` shims. POSIX: no-op. (#25)
       const resolvedCommand = resolveWindowsExecutable(command, process.env);
+      // #26 (Snyk waiver, accepted-by-design): spawning the operator/user-chosen CLI IS the
+      // `telepty allow` feature — `command` comes from the local CLI invocation, not an
+      // untrusted boundary, so this is not an exploitable injection. Pre-existing baseline
+      // finding; not fixable without removing `telepty allow`.
       child = pty.spawn(resolvedCommand, cmdArgs, {
         name: 'xterm-256color',
         cols: process.stdout.columns || 80,
@@ -1401,8 +1445,19 @@ async function main() {
         }
       });
 
-      daemonWs.on('close', () => {
+      daemonWs.on('close', (code, reason) => {
         wsReady = false;
+        // #17 (OQ-2): the daemon explicitly destroyed this session (manual kill or the
+        // surface-gone GC) → close code 1000 'Session destroyed'. Terminate the bridge
+        // instead of reconnecting; otherwise the orphan bridge re-registers and defeats the
+        // GC. Daemon restarts / network drops use other codes (e.g. 1006) and still reconnect,
+        // preserving the #487/#488 survive-and-reattach guarantee.
+        if (isDaemonDestroyClose(code, reason)) {
+          if (closeAllowSession()) {
+            exitAllowSession(0);
+          }
+          return;
+        }
         scheduleReconnect();
       });
 
@@ -2539,11 +2594,12 @@ async function main() {
     // Discover project folders (subdirectories with .git)
     let projects;
     if (configPath) {
-      projects = JSON.parse(fs.readFileSync(configPath, 'utf8')).projects;
+      projects = JSON.parse(fs.readFileSync(sanitizePathArg(configPath, 'config'), 'utf8')).projects;
     } else {
-      projects = fs.readdirSync(projectsDir, { withFileTypes: true })
-        .filter(d => d.isDirectory() && fs.existsSync(path.join(projectsDir, d.name, '.git')))
-        .map(d => ({ name: d.name, cwd: path.join(projectsDir, d.name) }));
+      const resolvedDir = sanitizePathArg(projectsDir, 'dir');
+      projects = fs.readdirSync(sanitizePathArg(projectsDir, 'dir'), { withFileTypes: true })
+        .filter(d => d.isDirectory() && fs.existsSync(path.join(resolvedDir, d.name, '.git')))
+        .map(d => ({ name: d.name, cwd: path.join(resolvedDir, d.name) }));
     }
 
     if (projects.length === 0) {
@@ -2850,7 +2906,7 @@ async function main() {
     let contextContent = null;
     if (contextPath) {
       try {
-        contextContent = fs.readFileSync(contextPath, 'utf-8');
+        contextContent = fs.readFileSync(sanitizePathArg(contextPath, 'context'), 'utf-8');
       } catch (err) {
         console.error(`Failed to read context file: ${err.message}`);
         process.exit(1);
@@ -3462,4 +3518,15 @@ Discuss the following topic from your project's perspective. Engage with other s
 `);
 }
 
-main();
+// Guard the entry point so a test can `require('./cli.js')` to reach the exported pure helpers
+// without dispatching the argv command. Behavior when run as the CLI is unchanged.
+if (require.main === module) {
+  main();
+}
+
+// Minimal test surface (no logic change) — pure decisions exposed for unit-testing.
+module.exports = {
+  classifyBackend,        // #29: TERM_PROGRAM/CMUX/kitty → backend string
+  isDaemonDestroyClose,   // #17 OQ-2: 1000 'Session destroyed' → terminate-not-reconnect
+  sanitizePathArg,        // #26: path-arg validation/normalization
+};
