@@ -1,6 +1,6 @@
 ---
 name: telepty-list
-description: Discover telepty sessions, check status and health. Covers list, session info, and status commands. 키워드: 세션 목록, 활성 세션, 세션 조회, 세션 상태, 세션 확인, 리스트
+description: 'Discover telepty sessions, check status and health. Covers list, session info, and status commands. 키워드: 세션 목록, 활성 세션, 세션 조회, 세션 상태, 세션 확인, 리스트'
 ---
 
 # telepty-list — Discover Sessions and Check Status

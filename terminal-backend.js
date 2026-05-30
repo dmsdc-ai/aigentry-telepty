@@ -1,6 +1,15 @@
 'use strict';
 
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
+
+// #17/#30/#31: validate a cmux id before it flows into a cmux invocation. cmux ids are
+// UUIDs, typed short-refs (workspace:N / surface:N / pane:N / window:N / tab:N), or numeric
+// indexes. New surface-lifecycle methods shell out via execFileSync (arg arrays, no shell),
+// and this allowlist additionally rejects anything malformed.
+const CMUX_REF_RE = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|(?:workspace|surface|pane|window|tab):\d+|\d+)$/;
+function isCmuxRef(id) {
+  return typeof id === 'string' && CMUX_REF_RE.test(id);
+}
 
 // Detect terminal environment at daemon level
 function detectTerminal() {
@@ -126,6 +135,63 @@ function clearCache() {
   lastCacheRefresh = 0;
 }
 
+// #17/#30: liveness of a session's cmux workspace surface (forced, cache-bypassing).
+//   'unknown' — non-cmux backend, missing/invalid id, OR cmux itself unreachable. The last
+//               case is the INV-17 gate: a cmux app-quit/restart makes ALL surfaces vanish at
+//               once, so an unreachable cmux means INDETERMINATE → caller must PRESERVE (GC
+//               nothing), preserving the #486/#488 survival guarantee.
+//   'gone'    — cmux reachable but this session's workspace UUID is absent from the live list
+//               (an explicit single-workspace close while the bridge survived).
+//   'alive'   — cmux reachable and the workspace is present.
+function isSurfaceAlive(session) {
+  if (!session || session.backend !== 'cmux') return 'unknown';
+  const wid = session.cmuxWorkspaceId;
+  if (!isCmuxRef(wid)) return 'unknown';
+  // INV-17 gate: cmux unreachable → INDETERMINATE.
+  try {
+    execFileSync('cmux', ['ping'], { timeout: 2000, stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch {
+    return 'unknown';
+  }
+  // Enumerate live workspace UUIDs. A failure here (pinged OK but list errored) is still
+  // treated as INDETERMINATE rather than 'gone', so a transient cmux hiccup never GCs.
+  let listing;
+  try {
+    listing = execFileSync('cmux', ['--id-format', 'uuids', 'list-workspaces'], {
+      timeout: 5000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe']
+    });
+  } catch {
+    return 'unknown';
+  }
+  const needle = String(wid).toLowerCase();
+  const present = listing.split('\n').some(line => line.toLowerCase().includes(needle));
+  return present ? 'alive' : 'gone';
+}
+
+// Terminal-surface CLOSE is owned by the orchestrator's Workspace Host adapter
+// (workspace-host.sh `wh_close`), per the 2026-05-30 surface-ownership verdict — telepty
+// probes liveness and emits `surface_orphaned`, it does not actuate surface close on the
+// managed path. This function is a STANDALONE-ONLY fallback (orchestrator-absent): it stays a
+// no-op unless AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1, so a single-installed telepty can opt in
+// to closing its own orphan tab. Default off → no managed-path double-close.
+function closeSurface(session) {
+  if (process.env.AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE !== '1') return true; // managed default: no-op
+  if (!session || session.backend !== 'cmux') return true; // kitty/headless: no-op
+  const wid = session.cmuxWorkspaceId;
+  if (!isCmuxRef(wid)) return true; // nothing addressable to close
+  try {
+    execFileSync('cmux', ['close-workspace', '--workspace', String(wid)], {
+      timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+    });
+    console.log(`[BACKEND] cmux close-workspace ${wid} (self-close opt-in)`);
+    return true;
+  } catch (err) {
+    // Already-gone / transient: harmless no-op, never blocks the destroy.
+    console.log(`[BACKEND] cmux close-workspace ${wid} no-op (${err.message})`);
+    return true;
+  }
+}
+
 module.exports = {
   detectTerminal,
   findSurface,
@@ -133,5 +199,7 @@ module.exports = {
   cmuxSendEnter,
   refreshSurfaceCache,
   invalidateCache,
-  clearCache
+  clearCache,
+  isSurfaceAlive,
+  closeSurface
 };

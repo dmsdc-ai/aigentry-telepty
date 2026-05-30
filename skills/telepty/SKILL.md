@@ -1,6 +1,6 @@
 ---
 name: telepty
-description: Overview of telepty — PTY multiplexer for AI session orchestration. Use this when user asks "what is telepty" or needs a getting-started guide. 키워드: 텔레프티, 텔레프티 개요, 시작하기, telepty 소개, 사용법, 가이드
+description: 'Overview of telepty — PTY multiplexer for AI session orchestration. Use this when user asks "what is telepty" or needs a getting-started guide. 키워드: 텔레프티, 텔레프티 개요, 시작하기, telepty 소개, 사용법, 가이드'
 ---
 
 # telepty — Overview

@@ -1,6 +1,6 @@
 ---
 name: telepty-attach
-description: Attach interactively to a telepty session to view output and send input in real-time. 키워드: 세션 접속, 세션 연결, 세션 들어가기, 어태치, attach, 실시간 보기
+description: 'Attach interactively to a telepty session to view output and send input in real-time. 키워드: 세션 접속, 세션 연결, 세션 들어가기, 어태치, attach, 실시간 보기'
 ---
 
 # telepty-attach — Interactive Session Attachment

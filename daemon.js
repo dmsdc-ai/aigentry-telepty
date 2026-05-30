@@ -27,10 +27,29 @@ const fs = require('fs');
 const SESSION_PERSIST_PATH = require('path').join(os.homedir(), '.config', 'aigentry-telepty', 'sessions.json');
 const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STALE_SECONDS || 60));
 const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
+// #17: grace window before a cmux session whose workspace was explicitly closed (bridge
+// survived → headless zombie) is reclaimed. Shorter than the 300s disconnect-GC: the surface
+// is confirmed gone (not merely disconnected). The window absorbs cmux transient hiccups.
+const SURFACE_ORPHAN_SECONDS = Math.max(5, Number(process.env.TELEPTY_SURFACE_ORPHAN_SECONDS || 30));
+// #17: pure verdict→action mapping for the surface-liveness GC, exposed for unit-testing.
+// Returns 'mark' (start the grace window), 'reclaim' (grace elapsed → teardown), 'recover'
+// (surface returned within grace → clear), or 'skip'. INV-17: 'unknown' (cmux unreachable)
+// always maps to 'skip' — GC nothing. Pure, no side effects; the caller performs the action.
+function decideSurfaceGc(liveness, session, nowMs, graceSeconds = SURFACE_ORPHAN_SECONDS) {
+  if (liveness === 'gone') {
+    if (!session.surfaceGoneAt) return 'mark';
+    const goneSeconds = Math.floor((nowMs - new Date(session.surfaceGoneAt).getTime()) / 1000);
+    return goneSeconds >= graceSeconds ? 'reclaim' : 'skip';
+  }
+  if (liveness === 'alive' && session.surfaceGoneAt) return 'recover';
+  return 'skip';
+}
 const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
 const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS || 10000));
 const IDLE_REAPER_POLL_MS = Math.max(100, Number(process.env.TELEPTY_IDLE_REAPER_POLL_MS || 60000));
 const BOOTSTRAP_READY_TIMEOUT_MS = Math.max(500, Number(process.env.TELEPTY_BOOTSTRAP_READY_TIMEOUT_MS || 30000));
+// Surface FOCUS is owned by the orchestrator's Workspace Host adapter (`wh_focus`), per the
+// 2026-05-30 surface-ownership verdict — telepty no longer foregrounds surfaces.
 const WRAPPED_SUBMIT_DELAY_MS = 500;
 
 // Session state machine manager — auto-detects session state from PTY output
@@ -73,30 +92,8 @@ sessionStateManager.onTransition((sessionId, from, to, detail) => {
     // Mark as idle-notified (but keep the entry — REPORT is still pending).
     // Entry is cleared when REPORT arrives (via inject endpoint) OR session dies.
     if (pendingReport.idleNotified) return; // only fire once
-    pendingReport.idleNotified = true;
-    pendingReport.idleAt = new Date().toISOString();
-
-    const elapsed = ((Date.now() - new Date(pendingReport.injectedAt).getTime()) / 1000).toFixed(1);
-
-    // New bus event: TASK_IDLE_NO_REPORT (richer observability)
-    broadcastSessionEvent('TASK_IDLE_NO_REPORT', sessionId, session, {
-      extra: {
-        source: pendingReport.source,
-        inject_id: pendingReport.injectId,
-        elapsed_secs: Number(elapsed),
-        injected_at: pendingReport.injectedAt
-      }
-    });
-    console.log(`[ENFORCE-REPORT] ${sessionId} idle after ${elapsed}s — awaiting REPORT from ${pendingReport.source}`);
-
-    // Legacy text-inject for back-compat (grandfather period 0.2.x)
-    const reportMsg = `TASK_COMPLETE: ${sessionId} is now idle after processing inject (${elapsed}s)`;
-    const srcId = resolveSessionAlias(pendingReport.source) || pendingReport.source;
-    const srcSession = sessions[srcId];
-    if (srcSession) {
-      deliverInjectionToSession(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
-      console.log(`[AUTO-REPORT] ${sessionId} → ${srcId}: idle after ${elapsed}s (legacy text-inject)`);
-    }
+    // real-idle: the state manager observed a genuine busy→idle transition.
+    fireAutoReport(sessionId, session, pendingReport, 'real-idle');
   }
 
   // Fire TASK_DEAD_NO_REPORT when session dies with a pending report
@@ -260,15 +257,68 @@ const PORT = process.env.PORT || 3848;
 const HOST = process.env.HOST || '0.0.0.0';
 process.title = 'telepty-daemon';
 
-const daemonClaim = claimDaemonState({ host: HOST, port: Number(PORT), version: pkg.version });
-if (!daemonClaim.claimed) {
-  const current = daemonClaim.current;
-  console.log(`[DAEMON] telepty daemon already running (pid ${current.pid}, port ${current.port}). Exiting.`);
-  process.exit(0);
+// Singleton claim — guarded so a test require neither exits (when a daemon is running) nor
+// overwrites a live daemon's on-disk state claim (when one is). Only the real daemon claims.
+if (require.main === module) {
+  const daemonClaim = claimDaemonState({ host: HOST, port: Number(PORT), version: pkg.version });
+  if (!daemonClaim.claimed) {
+    const current = daemonClaim.current;
+    console.log(`[DAEMON] telepty daemon already running (pid ${current.pid}, port ${current.port}). Exiting.`);
+    process.exit(0);
+  }
 }
 
 const pendingReports = {}; // {targetSessionId: {source, injectedAt, injectId}}
 const AUTO_REPORT_IDLE_SECONDS = Number(process.env.TELEPTY_AUTO_REPORT_IDLE_SECONDS) || 10;
+// #32: a legacy auto-report can fire ~0.0s after the inject (silence-timeout / ready-signal)
+// even when the inject never reached the target TUI — indistinguishable from a real completion
+// by the recipient. Below this elapsed floor the idle is NOT trusted as a processed-inject
+// completion; the text-inject is relabeled so a stuck/hung target is never reported as DONE.
+const AUTO_REPORT_MIN_REAL_SECONDS = Number(process.env.TELEPTY_AUTO_REPORT_MIN_REAL_SECONDS) || 1.0;
+
+// #32: single provenance-tagged auto-report path (was 3 byte-identical builders at the
+// onTransition-idle / silence-timeout / ready-signal sites). `trigger` distinguishes the
+// originating path; sub-floor elapsed is relabeled TASK_IDLE_UNCONFIRMED instead of TASK_COMPLETE.
+// Caller is responsible for the `!pendingReport.idleNotified` once-only guard.
+// `deps` is a thin DI seam (defaults = module globals) so the elapsed→label decision is
+// unit-testable with an injected clock and a captured deliver fn — behavior is byte-identical
+// for the production callers, which pass no deps.
+function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = {}) {
+  const _now = deps.now || Date.now;
+  const _broadcast = deps.broadcastSessionEvent || broadcastSessionEvent;
+  const _resolveAlias = deps.resolveSessionAlias || resolveSessionAlias;
+  const _sessions = deps.sessions || sessions;
+  const _deliver = deps.deliverInjectionToSession || deliverInjectionToSession;
+
+  pendingReport.idleNotified = true;
+  pendingReport.idleAt = new Date(_now()).toISOString();
+  const elapsedNum = (_now() - new Date(pendingReport.injectedAt).getTime()) / 1000;
+  const elapsed = elapsedNum.toFixed(1);
+
+  // Richer bus event (observability) — now also carries the trigger provenance.
+  _broadcast('TASK_IDLE_NO_REPORT', targetId, targetSession, {
+    extra: {
+      source: pendingReport.source,
+      inject_id: pendingReport.injectId,
+      elapsed_secs: Number(elapsed),
+      injected_at: pendingReport.injectedAt,
+      trigger
+    }
+  });
+  console.log(`[ENFORCE-REPORT] ${targetId} idle after ${elapsed}s (trigger=${trigger}) — awaiting REPORT from ${pendingReport.source}`);
+
+  const srcId = _resolveAlias(pendingReport.source) || pendingReport.source;
+  const srcSession = _sessions[srcId];
+  if (!srcSession) return;
+
+  const confirmed = elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS;
+  const injTag = pendingReport.injectId ? ` inject=${pendingReport.injectId}` : '';
+  const reportMsg = confirmed
+    ? `TASK_COMPLETE: ${targetId} is now idle after processing inject (${elapsed}s, via ${trigger}${injTag})`
+    : `TASK_IDLE_UNCONFIRMED: ${targetId} signaled idle ${elapsed}s after inject (via ${trigger}${injTag}) — inject may NOT have been processed; verify before treating as done`;
+  _deliver(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
+  console.log(`[AUTO-REPORT] ${targetId} → ${srcId}: ${confirmed ? 'TASK_COMPLETE' : 'TASK_IDLE_UNCONFIRMED'} after ${elapsed}s (trigger=${trigger})`);
+}
 
 const sessions = {};
 const handoffs = {};
@@ -657,30 +707,104 @@ function markBootstrapReady(sessionId, session, reason) {
   return true;
 }
 
-function scheduleBootstrapPromptPoll(sessionId, session) {
-  if (!session || !isBootstrapGatedSession(session) || isBootstrapReady(session)) return;
-  if (session.bootstrapPromptPoll || session.backend !== 'cmux' || !session.cmuxWorkspaceId) return;
-  if (!isOpenWebSocket(session.ownerWs)) return;
-
-  session.bootstrapPromptPoll = submitGate.awaitPromptSymbol(session, {
-    timeoutMs: BOOTSTRAP_READY_TIMEOUT_MS
-  }).then((result) => {
-    session.bootstrapPromptPoll = null;
-    if (result && result.ready && isOpenWebSocket(session.ownerWs)) {
-      markBootstrapReady(sessionId, session, 'cmux_prompt_symbol');
-    } else if (result && result.reason) {
-      emitBootstrapEvent('bootstrap_ready_timeout', sessionId, session, {
-        reason: result.reason,
-        waited_ms: result.waited_ms || 0
+// #31 (AC-31.4): a session stuck past the bootstrap timeout must surface an ACTIONABLE error
+// and stop queuing forever. Emit an actionable bootstrap_ready_timeout (hint + dropped count)
+// and FLUSH the queue: submit ops resolve 504, inject ops fail — instead of silently
+// accumulating until the process is killed. The caller can re-inject if the target recovers.
+function failBootstrapQueueOnTimeout(sessionId, session, detail = {}) {
+  const queued = Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0;
+  emitBootstrapEvent('bootstrap_ready_timeout', sessionId, session, {
+    ...detail,
+    actionable: true,
+    queued_dropped: queued,
+    hint: `Session '${sessionId}' did not become inject-ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms — the target CLI (e.g. codex MCP init) may be hung. Inspect the surface and re-spawn if needed; queued injects were flushed.`
+  });
+  if (queued === 0) return;
+  const drained = session.bootstrapQueue.splice(0, queued);
+  for (const op of drained) {
+    if (op.type === 'submit') {
+      resolveBootstrapSubmit(op, {
+        status: 504,
+        body: {
+          error: `bootstrap_ready_timeout — '${sessionId}' not ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms`,
+          reason: detail.reason || 'bootstrap_ready_timeout',
+          strategy: 'none',
+          attempts: 0,
+          gated: true,
+          bootstrap_queued: false,
+          bootstrap: buildBootstrapBlock(session)
+        }
       });
     }
-  }).catch((error) => {
-    session.bootstrapPromptPoll = null;
-    emitBootstrapEvent('bootstrap_ready_timeout', sessionId, session, {
-      reason: 'prompt_symbol_error',
-      error: error.message || String(error)
+    emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
+      op_id: op.op_id,
+      operation: op.type,
+      code: 'BOOTSTRAP_READY_TIMEOUT',
+      error: `target '${sessionId}' not ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms`
     });
-  });
+  }
+}
+
+// #29: pure decision for the non-cmux owner-alive optimistic floor — returns true iff the
+// armed timer should flip bootstrapReady (not already ready; owner PID valid + alive; owner WS
+// open). `deps` injects the liveness predicates for unit-testing (defaults = module globals),
+// mirroring submit-gate.js's opts DI seam. No side effects — pure predicate.
+function shouldApplyOwnerAliveFloor(session, deps = {}) {
+  const _isBootstrapReady = deps.isBootstrapReady || isBootstrapReady;
+  const _isProcessRunning = deps.isProcessRunning || isProcessRunning;
+  const _isOpenWebSocket = deps.isOpenWebSocket || isOpenWebSocket;
+  if (_isBootstrapReady(session)) return false;          // bridge_ready already won
+  const ownerPid = Number(session.ownerPid);
+  if (!Number.isInteger(ownerPid) || ownerPid <= 0 || !_isProcessRunning(ownerPid)) return false;
+  if (!_isOpenWebSocket(session.ownerWs)) return false;
+  return true;
+}
+
+function scheduleBootstrapPromptPoll(sessionId, session, deps = {}) {
+  const _setTimeout = deps.setTimeout || setTimeout;
+  if (!session || !isBootstrapGatedSession(session) || isBootstrapReady(session)) return;
+  if (!isOpenWebSocket(session.ownerWs)) return;
+
+  // cmux: rendered-screen prompt poll (the cmux-only read-screen primitive). Unchanged,
+  // including the #31 actionable bootstrap-timeout on miss/error.
+  if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
+    if (session.bootstrapPromptPoll) return;
+    session.bootstrapPromptPoll = submitGate.awaitPromptSymbol(session, {
+      timeoutMs: BOOTSTRAP_READY_TIMEOUT_MS
+    }).then((result) => {
+      session.bootstrapPromptPoll = null;
+      if (result && result.ready && isOpenWebSocket(session.ownerWs)) {
+        markBootstrapReady(sessionId, session, 'cmux_prompt_symbol');
+      } else if (result && result.reason) {
+        failBootstrapQueueOnTimeout(sessionId, session, {
+          reason: result.reason,
+          waited_ms: result.waited_ms || 0
+        });
+      }
+    }).catch((error) => {
+      session.bootstrapPromptPoll = null;
+      failBootstrapQueueOnTimeout(sessionId, session, {
+        reason: 'prompt_symbol_error',
+        error: error.message || String(error)
+      });
+    });
+    return;
+  }
+
+  // #29: non-cmux (warp/pty/kitty) has NO rendered-screen read primitive, so the cmux poll
+  // would early-return and bootstrapReady could stay false forever (inject queues forever on
+  // Warp). The fast path stays the bridge 'ready' frame; this arms an idempotent owner-alive
+  // optimistic FLOOR — byte-for-byte the shipped runStartupBootstrapRestore precedent
+  // (markBootstrapReady('startup_owner_alive') ~daemon.js:2997) — applied at the LIVE owner
+  // WS-connect path. markBootstrapReady is idempotent, so a late timer after bridge_ready is a
+  // harmless no-op. submit-gate.js read-screen guard stays cmux-only (untouched).
+  if (session.bootstrapOptimisticTimer) return;
+  session.bootstrapOptimisticTimer = _setTimeout(() => {
+    session.bootstrapOptimisticTimer = null;
+    if (!shouldApplyOwnerAliveFloor(session, deps)) return;
+    markBootstrapReady(sessionId, session, 'owner_alive');
+    console.log(`[BOOTSTRAP] Optimistic ready for ${sessionId} (ownerPid=${Number(session.ownerPid)}, backend=${session.backend || 'unknown'})`);
+  }, BOOTSTRAP_READY_TIMEOUT_MS);
 }
 
 async function waitForBootstrapSubmit(op, session, timeoutMs) {
@@ -1218,6 +1342,11 @@ async function teardownSessionById(id, options = {}) {
   if (session.ownerWs) {
     try { session.ownerWs.close(1000, 'Session destroyed'); } catch {}
   }
+
+  // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
+  // verdict — this call is a NO-OP on the managed path. It actuates only for a standalone
+  // telepty that opted in via AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
+  try { terminalBackend.closeSurface(session); } catch {}
 
   delete sessions[id];
   sessionStateManager.unregister(id);
@@ -2540,6 +2669,11 @@ app.delete('/api/sessions/:id', (req, res) => {
     } else if (session.ptyProcess) {
       session.ptyProcess.kill();
     }
+    // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
+    // verdict — NO-OP on the managed path. The orchestrator's session-cleanup.sh closes the
+    // surface on this normal CLI-exit (CLEANUP_REQUEST→wh_close). Actuates only for a standalone
+    // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
+    try { terminalBackend.closeSurface(session); } catch {}
     delete sessions[id];
     sessionStateManager.unregister(id);
     try { mailbox.purge(id); } catch {}
@@ -2883,10 +3017,16 @@ app.patch('/api/threads/:id', (req, res) => {
   res.json({ success: true, thread_id: thread.id, status: thread.status });
 });
 
-const server = app.listen(PORT, HOST, () => {
-  console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
-  runStartupBootstrapRestore();
-});
+// Bind the port only under the require.main guard — a test can `require('./daemon.js')` to
+// reach the exported decision functions without starting the daemon. `server` stays undefined
+// when required, so the WS upgrade/error handlers below attach only when run as the daemon.
+let server;
+if (require.main === module) {
+  server = app.listen(PORT, HOST, () => {
+    console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
+    runStartupBootstrapRestore();
+  });
+}
 
 // #470 (0.4.5): when the daemon restarts under existing telepty allow workers,
 // persisted sessions are restored at daemon.js:1244 but bootstrapReady stays
@@ -2961,12 +3101,15 @@ const mailboxDelivery = new DeliveryEngine(mailbox, {
     }
   },
 });
-// Startup sweep: break stale lock files before starting delivery
-const staleBroken = mailbox.breakStaleLocks();
-if (staleBroken > 0) {
-  console.log(`[MAILBOX] Startup sweep: broke ${staleBroken} stale lock(s)`);
+// Startup sweep: break stale lock files before starting delivery. Guarded so a test require
+// of this module neither breaks on-disk locks nor starts the delivery loop.
+if (require.main === module) {
+  const staleBroken = mailbox.breakStaleLocks();
+  if (staleBroken > 0) {
+    console.log(`[MAILBOX] Startup sweep: broke ${staleBroken} stale lock(s)`);
+  }
+  mailboxDelivery.start();
 }
-mailboxDelivery.start();
 
 const IDLE_THRESHOLD_SECONDS = 60;
 async function runIdleTtlSweep(nowMs = Date.now()) {
@@ -3000,13 +3143,14 @@ async function runIdleTtlSweep(nowMs = Date.now()) {
   }
 }
 
-setInterval(() => {
+// Guarded: timers must not run (and keep the event loop alive) on a test require.
+if (require.main === module) setInterval(() => {
   runIdleTtlSweep().catch((err) => {
     console.error(`[REAPER] Idle TTL sweep failed: ${err.message}`);
   });
 }, IDLE_REAPER_POLL_MS);
 
-setInterval(() => {
+if (require.main === module) setInterval(() => {
   const now = Date.now();
   for (const [id, session] of Object.entries(sessions)) {
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
@@ -3051,25 +3195,8 @@ setInterval(() => {
     // Skip if onTransition already fired the idle notification.
     const pendingRpt = pendingReports[id];
     if (pendingRpt && !pendingRpt.idleNotified && session.type !== 'wrapped' && idleSeconds !== null && idleSeconds >= AUTO_REPORT_IDLE_SECONDS) {
-      pendingRpt.idleNotified = true;
-      pendingRpt.idleAt = new Date().toISOString();
-      const elapsed = ((Date.now() - new Date(pendingRpt.injectedAt).getTime()) / 1000).toFixed(1);
-      // Fire new bus event + legacy text-inject
-      broadcastSessionEvent('TASK_IDLE_NO_REPORT', id, session, {
-        extra: {
-          source: pendingRpt.source,
-          inject_id: pendingRpt.injectId,
-          elapsed_secs: Number(elapsed),
-          injected_at: pendingRpt.injectedAt
-        }
-      });
-      const reportMsg = `TASK_COMPLETE: ${id} is now idle after processing inject (${elapsed}s)`;
-      const srcId = resolveSessionAlias(pendingRpt.source) || pendingRpt.source;
-      const srcSession = sessions[srcId];
-      if (srcSession) {
-        deliverInjectionToSession(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
-        console.log(`[AUTO-REPORT] ${id} → ${srcId}: idle after ${elapsed}s (threshold)`);
-      }
+      // silence-timeout: session has been quiet past the threshold without a REPORT.
+      fireAutoReport(id, session, pendingRpt, 'silence-timeout');
     }
     // Reset idle flag when activity resumes
     if (idleSeconds !== null && idleSeconds < IDLE_THRESHOLD_SECONDS) {
@@ -3099,6 +3226,49 @@ setInterval(() => {
       }
     }
 
+    // #17: CONNECTED-zombie GC via cmux surface-liveness. Post-08cd796 a wrapped cmux bridge
+    // SURVIVES its terminal app's death, so ownerWs stays OPEN and the 300s disconnect-GC
+    // (below) never fires. If the workspace was EXPLICITLY closed while cmux itself is alive,
+    // the session is a headless zombie → reclaim it after a grace window. INV-17: isSurfaceAlive
+    // returns 'unknown' when cmux is unreachable (app-quit/restart vanishes ALL surfaces at
+    // once), so this GCs NOTHING in that case — preserving the #486/#488 survival guarantee.
+    if (session.type === 'wrapped' && session.backend === 'cmux' && session.cmuxWorkspaceId
+        && isOpenWebSocket(session.ownerWs)) {
+      const liveness = terminalBackend.isSurfaceAlive(session);
+      const gcAction = decideSurfaceGc(liveness, session, now);
+      if (gcAction === 'mark') {
+        session.surfaceGoneAt = new Date().toISOString();
+        console.log(`[SURFACE-GC] cmux workspace gone for ${id} (${session.cmuxWorkspaceId}) — ${SURFACE_ORPHAN_SECONDS}s grace started`);
+      } else if (gcAction === 'reclaim') {
+        const goneSeconds = Math.floor((now - new Date(session.surfaceGoneAt).getTime()) / 1000);
+        console.log(`[SURFACE-GC] Reclaiming headless cmux zombie ${id} after ${goneSeconds}s surface-gone`);
+        emitSessionLifecycleEvent('session_cleanup', id, session, {
+          reason: 'SURFACE_GONE',
+          surfaceGoneSeconds: goneSeconds
+        });
+        // Surface-ownership verdict (2026-05-30): telepty reclaims the zombie SESSION but does
+        // NOT close the surface. Emit the orphan SIGNAL so the orchestrator's reconciler closes
+        // the surface (wh_close). telepty signals; the orchestrator actuates.
+        broadcastSessionEvent('surface_orphaned', id, session, {
+          extra: {
+            sid: id,
+            backend: session.backend || null,
+            cmuxWorkspaceId: session.cmuxWorkspaceId || null,
+            surfaceGoneSeconds: goneSeconds,
+            livenessVerdict: liveness
+          }
+        });
+        teardownSessionById(id, { force: true, timeoutMs: 5000, reason: 'SURFACE_GONE', source: 'surface_gc' })
+          .catch(err => console.error(`[SURFACE-GC] teardown failed for ${id}: ${err.message}`));
+        continue; // being destroyed — skip remaining checks for this session this tick
+      } else if (gcAction === 'recover') {
+        // Recovery within the grace window (mirrors the aterm socket-recover above).
+        console.log(`[SURFACE-GC] cmux workspace recovered for ${id} — clearing grace window`);
+        session.surfaceGoneAt = null;
+      }
+      // 'skip' (incl. 'unknown' — INV-17 gate) → leave surfaceGoneAt unchanged, GC nothing.
+    }
+
     if (healthStatus === 'STALE' && !session._staleEmitted) {
       session._staleEmitted = true;
       emitSessionLifecycleEvent('session_stale', id, session, {
@@ -3125,7 +3295,7 @@ setInterval(() => {
   }
 }, HEALTH_POLL_MS);
 
-server.on('error', async (error) => {
+if (server) server.on('error', async (error) => {
   clearDaemonState(process.pid);
 
   if (error && error.code === 'EADDRINUSE') {
@@ -3269,25 +3439,8 @@ wss.on('connection', (ws, req) => {
             // fired (pendingReports[sessionId].idleNotified === true).
             const pendingReport = pendingReports[sessionId];
             if (pendingReport && !pendingReport.idleNotified) {
-              pendingReport.idleNotified = true;
-              pendingReport.idleAt = new Date().toISOString();
-              const elapsed = ((Date.now() - new Date(pendingReport.injectedAt).getTime()) / 1000).toFixed(1);
-              // Fire new bus event + legacy text-inject
-              broadcastSessionEvent('TASK_IDLE_NO_REPORT', sessionId, activeSession, {
-                extra: {
-                  source: pendingReport.source,
-                  inject_id: pendingReport.injectId,
-                  elapsed_secs: Number(elapsed),
-                  injected_at: pendingReport.injectedAt
-                }
-              });
-              const reportMsg = `TASK_COMPLETE: ${sessionId} is now idle after processing inject (${elapsed}s)`;
-              const srcId = resolveSessionAlias(pendingReport.source) || pendingReport.source;
-              const srcSession = sessions[srcId];
-              if (srcSession) {
-                deliverInjectionToSession(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
-                console.log(`[AUTO-REPORT] ${sessionId} → ${srcId}: idle after ${elapsed}s (ready signal)`);
-              }
+              // ready-signal: cli.js bridge emitted a 'ready' WS frame.
+              fireAutoReport(sessionId, activeSession, pendingReport, 'ready-signal');
             }
           }
         } else {
@@ -3316,6 +3469,13 @@ wss.on('connection', (ws, req) => {
     activeSession.clients.delete(ws);
     if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
       activeSession.ownerWs = null;
+      // #29: cancel any pending owner-alive optimistic timer — the owner is gone, so the
+      // floor must not flip a disconnected session ready (hygiene; the timer also re-guards
+      // on isOpenWebSocket, but clearing avoids a dangling handle).
+      if (activeSession.bootstrapOptimisticTimer) {
+        clearTimeout(activeSession.bootstrapOptimisticTimer);
+        activeSession.bootstrapOptimisticTimer = null;
+      }
       markSessionDisconnected(activeSession);
       console.log(`[WS] Wrap owner disconnected from session ${sessionId} (Total: ${activeSession.clients.size})`);
       emitSessionLifecycleEvent('session_disconnect', sessionId, activeSession, {
@@ -3376,7 +3536,7 @@ busWss.on('connection', (ws, req) => {
   });
 });
 
-server.on('upgrade', (req, socket, head) => {
+if (server) server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://' + req.headers.host);
   const token = url.searchParams.get('token');
   
@@ -3408,8 +3568,23 @@ function shutdown(code) {
   process.exit(code);
 }
 
-process.on('SIGINT', () => shutdown(0));
-process.on('SIGTERM', () => shutdown(0));
-process.on('exit', () => {
-  clearDaemonState(process.pid);
-});
+// Daemon-lifecycle signal/exit handlers — only when run as the daemon, so a test require does
+// not register them (and does not clear on-disk daemon-state at the test process's exit).
+if (require.main === module) {
+  process.on('SIGINT', () => shutdown(0));
+  process.on('SIGTERM', () => shutdown(0));
+  process.on('exit', () => {
+    clearDaemonState(process.pid);
+  });
+}
+
+// Minimal test surface (no logic change): expose the pure lifecycle decisions + DI-seamed
+// helpers so the daemon ACs are unit-testable without starting the daemon. Behavior for the
+// production call sites is unchanged. NOT a public API — internal/test use only.
+module.exports = {
+  fireAutoReport,                 // #32: provenance-tagged auto-report (deps DI: now/deliver/...)
+  failBootstrapQueueOnTimeout,    // #31: actionable bootstrap-timeout queue flush
+  shouldApplyOwnerAliveFloor,     // #29: owner-alive optimistic-floor decision (deps DI: isProcessRunning/...)
+  scheduleBootstrapPromptPoll,    // #29: arms the floor timer (deps DI: setTimeout/...)
+  decideSurfaceGc,                // #17: surface-liveness verdict→action (incl. INV-17 unknown→skip)
+};

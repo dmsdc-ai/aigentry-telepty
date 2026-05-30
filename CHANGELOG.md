@@ -4,6 +4,26 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+### Security — Snyk cli.js posture (task #26)
+
+- **Fixed — 3 path-traversal findings** (`fs.readFileSync`/`fs.readdirSync` on the
+  `--config=` / `--dir=` (`telepty session start`) and `--context` (`telepty
+  deliberate`) CLI path arguments). A new `sanitizePathArg()` rejects empty input,
+  null-byte injection, and `..` traversal segments, then normalizes via
+  `path.resolve()`; applied at each `fs.*` call site. Snyk path-traversal count is
+  now **0**.
+- **Hardened — self-update default** (`runUpdateInstall`): the default
+  `npm install -g` now runs via `execFileSync` with a fixed argument array (no
+  shell), removing the default-path command-injection surface.
+- **By-design waivers (operator-trusted, no privilege boundary; pre-existing
+  baseline, not introduced by this work):** two `IndirectCommandInjection`
+  findings remain and are accepted by design — (1) `pty.spawn` of the
+  operator/user-chosen CLI, which *is* the `telepty allow` feature; and (2) the
+  explicit `TELEPTY_UPDATE_COMMAND` self-update override, an operator-set env var
+  (setting it already implies shell control, so no boundary is crossed). Both are
+  annotated in code so they are not mistaken for an oversight. **Net: 0
+  newly-introduced and 0 non-by-design findings.**
+
 ## [0.4.5] - 2026-05-26
 
 ### Fixed — Stale-daemon, restart-recovery, force-bypass, codex matcher (tasks #469 #470 #471 #472)
