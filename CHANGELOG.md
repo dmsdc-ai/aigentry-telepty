@@ -4,6 +4,40 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-30
+
+### Changed — Surface-ownership boundary (ADR 2026-05-30)
+
+- **Orchestrator Workspace Host now owns surface close/focus; telepty no longer
+  actuates them.** Daemon focus actuation and `focusSurface` are removed
+  (focus moves to the orchestrator `wh_focus` path). `closeSurface` is gated
+  behind `AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE` — a no-op on the managed path,
+  opt-in for standalone use. The `isSurfaceAlive` cmux liveness probe,
+  `decideSurfaceGc`, and session-side zombie reclaim are retained; telepty now
+  emits a `surface_orphaned` bus event for the orchestrator reconciler to
+  actuate the close. INV-17 / #486 preserved (probe unknown → skip gate intact).
+
+### Fixed — Lifecycle / bootstrap / skill-loading (tasks #35 #20 #32 #17 #29 #31 #19)
+
+- **#35 / #20 — Codex skill loading.** Single-quote the `description` YAML
+  scalars in the bundled `SKILL.md` files so a Korean `키워드:` colon is no
+  longer parsed as a nested mapping; Codex now loads all bundled skills.
+- **#32 — auto-report consolidation.** Three byte-identical auto-report
+  builders are consolidated into one provenance-tagged `fireAutoReport`;
+  sub-1s elapsed is relabelled `TASK_IDLE_UNCONFIRMED` so a stuck target is
+  never reported as `TASK_COMPLETE`.
+- **#17 — surface-liveness GC.** New cmux surface-liveness probe
+  (`isSurfaceAlive`, INV-17 unknown-on-unreachable gate) plus `decideSurfaceGc`
+  and session-side SURFACE-GC reclaim of the headless zombie; the cli.js bridge
+  terminates (no reconnect) on a 1000 `Session destroyed` close.
+- **#29 — Warp bootstrap.** Non-cmux (Warp) owner-alive optimistic bootstrap
+  floor (mirrors `runStartupBootstrapRestore`) plus `TERM_PROGRAM=WarpTerminal`
+  backend classification — fixes inject-queues-forever on Warp.
+- **#31 — bootstrap timeout.** Actionable bootstrap-timeout
+  (`failBootstrapQueueOnTimeout` flushes the queue instead of hanging).
+- **#19 — Windows codex PATH.** Verified already-fixed by `874d14a`
+  (no code change).
+
 ### Security — Snyk cli.js posture (task #26)
 
 - **Fixed — 3 path-traversal findings** (`fs.readFileSync`/`fs.readdirSync` on the
