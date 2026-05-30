@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    // Wave 1 installs a green CI gate without doing the Wave 3 JSDoc typedef rollout.
+    // The existing JS baseline is noisy even with strict:false, so global checkJs starts
+    // disabled while explicit @ts-check files provide the ratchet point for later waves.
+    "strict": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "types": ["node"]
+  },
+  "include": [
+    "*.js",
+    "mcp-server/**/*.mjs",
+    "scripts/**/*.js",
+    "src/**/*.js",
+    "test/**/*.js",
+    "test-support/**/*.js"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
