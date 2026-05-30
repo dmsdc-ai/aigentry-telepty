@@ -9,6 +9,7 @@ const { claimDaemonState, clearDaemonState, isProcessRunning } = require('./daem
 const { checkEntitlement } = require('./entitlement');
 const terminalBackend = require('./terminal-backend');
 const { installWebSocketTransport, isOpenWebSocket } = require('./src/transport/websocket');
+const { createPeerRelay, relayPeersFromEnv } = require('./src/transport/peer-relay');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
@@ -119,34 +120,13 @@ app.use(express.json());
 const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Cross-machine bus relay: forward bus events to peer daemons
-const RELAY_PEERS = (process.env.TELEPTY_RELAY_PEERS || '').split(',').map(s => s.trim()).filter(Boolean);
-const RELAY_SEEN = new Set(); // dedup by message_id
-
-function relayToPeers(msg) {
-  if (RELAY_PEERS.length === 0) return;
-  if (!msg.message_id) msg.message_id = crypto.randomUUID();
-  if (RELAY_SEEN.has(msg.message_id)) return; // already relayed
-  RELAY_SEEN.add(msg.message_id);
-  // Prevent unbounded growth
-  if (RELAY_SEEN.size > 10000) {
-    const arr = [...RELAY_SEEN];
-    arr.splice(0, 5000);
-    RELAY_SEEN.clear();
-    arr.forEach(id => RELAY_SEEN.add(id));
-  }
-
-  msg.source_host = msg.source_host || MACHINE_ID;
-  msg._relayed_from = MACHINE_ID;
-
-  for (const peer of RELAY_PEERS) {
-    fetch(`http://${peer}:${PORT}/api/bus/publish`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-telepty-token': EXPECTED_TOKEN },
-      body: JSON.stringify(msg),
-      signal: AbortSignal.timeout(3000)
-    }).catch(() => {}); // fire-and-forget
-  }
-}
+const relayToPeers = createPeerRelay({
+  relayPeers: relayPeersFromEnv(process.env),
+  relaySeen: new Set(), // dedup by message_id
+  machineId: MACHINE_ID,
+  expectedToken: EXPECTED_TOKEN,
+  getPort: () => PORT
+});
 
 // JWT auth: set TELEPTY_JWT_SECRET to enable. Tokens in Authorization: Bearer <token>
 const JWT_SECRET = process.env.TELEPTY_JWT_SECRET || null;
