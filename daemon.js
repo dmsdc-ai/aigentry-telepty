@@ -10,6 +10,7 @@ const { checkEntitlement } = require('./entitlement');
 const terminalBackend = require('./terminal-backend');
 const { installWebSocketTransport, isOpenWebSocket } = require('./src/transport/websocket');
 const { createPeerRelay, relayPeersFromEnv } = require('./src/transport/peer-relay');
+const { createAuthMiddleware, createIsAllowedPeer, createVerifyJwt } = require('./src/protocol/http-auth');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
@@ -131,31 +132,8 @@ const relayToPeers = createPeerRelay({
 // JWT auth: set TELEPTY_JWT_SECRET to enable. Tokens in Authorization: Bearer <token>
 const JWT_SECRET = process.env.TELEPTY_JWT_SECRET || null;
 
-function verifyJwt(token) {
-  if (!JWT_SECRET || !token) return false;
-  try {
-    // Simple HS256 JWT verification (no external deps)
-    const [headerB64, payloadB64, sigB64] = token.split('.');
-    if (!headerB64 || !payloadB64 || !sigB64) return false;
-    const expected = crypto.createHmac('sha256', JWT_SECRET)
-      .update(`${headerB64}.${payloadB64}`).digest('base64url');
-    if (sigB64 !== expected) return false;
-    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString());
-    if (payload.exp && Date.now() / 1000 > payload.exp) return false;
-    return payload;
-  } catch { return false; }
-}
-
-function isAllowedPeer(ip) {
-  if (!ip) return false;
-  const cleanIp = ip.replace('::ffff:', '');
-  // Localhost always allowed (includes SSH tunnel traffic)
-  if (cleanIp === '127.0.0.1' || ip === '::1') return true;
-  // Peer allowlist
-  if (PEER_ALLOWLIST.length > 0) return PEER_ALLOWLIST.includes(cleanIp);
-  // No allowlist = allow all authenticated
-  return true;
-}
+const verifyJwt = createVerifyJwt(JWT_SECRET);
+const isAllowedPeer = createIsAllowedPeer(PEER_ALLOWLIST);
 
 // Health check – no auth required
 app.get('/api/health', (req, res) => {
@@ -163,27 +141,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // Authentication Middleware
-app.use((req, res, next) => {
-  const clientIp = req.ip;
-
-  if (isAllowedPeer(clientIp)) {
-    return next(); // Trust local and allowlisted peers (SSH tunnels arrive as localhost)
-  }
-
-  const token = req.headers['x-telepty-token'] || req.query.token;
-  if (token === EXPECTED_TOKEN) {
-    return next();
-  }
-
-  // JWT Bearer token
-  const authHeader = req.headers['authorization'] || '';
-  if (authHeader.startsWith('Bearer ') && verifyJwt(authHeader.slice(7))) {
-    return next();
-  }
-
-  console.warn(`[AUTH] Rejected unauthorized request from ${clientIp}`);
-  res.status(401).json({ error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED' });
-});
+app.use(createAuthMiddleware({ isAllowedPeer, expectedToken: EXPECTED_TOKEN, verifyJwt }));
 
 const PORT = process.env.PORT || 3848;
 
