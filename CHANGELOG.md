@@ -4,6 +4,20 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-06-06
+
+### Fixed — submit handshake confirmation (#507-B / #508)
+
+- **`--submit` Enter sometimes did not register in a CLI's TUI** (the recurring
+  "Enter 안눌림" bug). `inject --submit` wrote the carriage return but did not
+  confirm the target actually consumed it, so under timing pressure the submit
+  could be dropped and the injected prompt left sitting unsubmitted. **Fix:** a
+  submit-gate handshake in `src/submit-gate.js` confirms the submit landed, with
+  `cli.js` / `daemon.js` wiring the gate into the inject path. Landed on `main`
+  at commit `2a21265`. This release ships that already-tested fix (npm 0.5.1
+  still served the pre-fix code; the running daemon must be restarted separately
+  to pick it up). (telepty#512)
+
 ## [0.5.1] - 2026-05-30
 
 ### Fixed — daemon never started (CRITICAL, regresses 0.5.0)
