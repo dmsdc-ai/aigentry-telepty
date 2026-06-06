@@ -71,6 +71,15 @@ sessionStateManager.onTransition((sessionId, from, to, detail) => {
     extra: { auto_state: to, auto_state_from: from, auto_detail: detail }
   });
 
+  const transitionPendingReport = getPendingReport(sessionId);
+  if ((to === 'working' || to === 'thinking') && transitionPendingReport) {
+    const pendingReport = transitionPendingReport;
+    if (!pendingReport.submitExpected || pendingReport.submitStartedAt) {
+      pendingReport.sawWorkingAfterInject = true;
+      pendingReport.workingAfterInjectAt = new Date().toISOString();
+    }
+  }
+
   // Fire TASK_IDLE_NO_REPORT on idle transition (for sessions with pendingReports).
   // Session still needs to self-inject a content REPORT — this event only observes.
   // Legacy TASK_COMPLETE text-inject is also fired for back-compat (0.2.x grandfather).
@@ -159,13 +168,69 @@ if (require.main === module) {
   }
 }
 
-const pendingReports = {}; // {targetSessionId: {source, injectedAt, injectId}}
+const pendingReports = Object.create(null); // {targetSessionId: {source, injectedAt, injectId}}
 const AUTO_REPORT_IDLE_SECONDS = Number(process.env.TELEPTY_AUTO_REPORT_IDLE_SECONDS) || 10;
 // #32: a legacy auto-report can fire ~0.0s after the inject (silence-timeout / ready-signal)
 // even when the inject never reached the target TUI — indistinguishable from a real completion
 // by the recipient. Below this elapsed floor the idle is NOT trusted as a processed-inject
 // completion; the text-inject is relabeled so a stuck/hung target is never reported as DONE.
 const AUTO_REPORT_MIN_REAL_SECONDS = Number(process.env.TELEPTY_AUTO_REPORT_MIN_REAL_SECONDS) || 1.0;
+
+function pendingReportHasSubmitEvidence(pendingReport) {
+  return !!(pendingReport && (
+    pendingReport.submitConfirmedAt ||
+    pendingReport.sawWorkingAfterInject ||
+    (pendingReport.submitConfirm && pendingReport.submitConfirm.accepted === true)
+  ));
+}
+
+function getPendingReport(sessionId, registry = pendingReports) {
+  if (typeof sessionId !== 'string') return null;
+  if (sessionId === '__proto__' || sessionId === 'prototype' || sessionId === 'constructor') return null;
+  if (!registry || !Object.prototype.hasOwnProperty.call(registry, sessionId)) return null;
+  return registry[sessionId];
+}
+
+function markPendingReportSubmitStarted(sessionId, bodyText) {
+  const pendingReport = getPendingReport(sessionId);
+  if (!pendingReport) return;
+  pendingReport.submitExpected = true;
+  pendingReport.submitInProgress = true;
+  pendingReport.submitStartedAt = new Date().toISOString();
+  if (typeof bodyText === 'string') {
+    pendingReport.injectedBodyPreview = bodyText.slice(0, 500);
+  }
+}
+
+function markPendingReportSubmitConfirmed(sessionId, confirm) {
+  const pendingReport = getPendingReport(sessionId);
+  if (!pendingReport) return;
+  pendingReport.submitExpected = true;
+  pendingReport.submitInProgress = false;
+  pendingReport.submitFinishedAt = new Date().toISOString();
+  pendingReport.submitConfirmedAt = pendingReport.submitFinishedAt;
+  pendingReport.submitConfirm = {
+    accepted: true,
+    reason: confirm && confirm.reason ? confirm.reason : 'confirmed',
+    attempts: confirm && confirm.attempts ? confirm.attempts : undefined,
+    ambiguous: !!(confirm && confirm.ambiguous),
+  };
+}
+
+function markPendingReportSubmitUnconfirmed(sessionId, confirm) {
+  const pendingReport = getPendingReport(sessionId);
+  if (!pendingReport) return;
+  pendingReport.submitExpected = true;
+  pendingReport.submitInProgress = false;
+  pendingReport.submitFinishedAt = new Date().toISOString();
+  pendingReport.submitUnconfirmedAt = pendingReport.submitFinishedAt;
+  pendingReport.submitConfirm = {
+    accepted: false,
+    reason: confirm && confirm.reason ? confirm.reason : 'submit_unconfirmed',
+    attempts: confirm && confirm.attempts ? confirm.attempts : undefined,
+    retryable: !!(confirm && confirm.retryable),
+  };
+}
 
 // #32: single provenance-tagged auto-report path (was 3 byte-identical builders at the
 // onTransition-idle / silence-timeout / ready-signal sites). `trigger` distinguishes the
@@ -176,15 +241,46 @@ const AUTO_REPORT_MIN_REAL_SECONDS = Number(process.env.TELEPTY_AUTO_REPORT_MIN_
 // for the production callers, which pass no deps.
 function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = {}) {
   const _now = deps.now || Date.now;
+  const _setTimeout = deps.setTimeout || setTimeout;
   const _broadcast = deps.broadcastSessionEvent || broadcastSessionEvent;
   const _resolveAlias = deps.resolveSessionAlias || resolveSessionAlias;
   const _sessions = deps.sessions || sessions;
+  const _pendingReports = deps.pendingReports || pendingReports;
   const _deliver = deps.deliverInjectionToSession || deliverInjectionToSession;
+
+  const elapsedNum = (_now() - new Date(pendingReport.injectedAt).getTime()) / 1000;
+  const elapsed = elapsedNum.toFixed(1);
+  const hasSubmitEvidence = pendingReportHasSubmitEvidence(pendingReport);
+
+  if (trigger === 'ready-signal' && pendingReport.submitExpected) {
+    if (hasSubmitEvidence) {
+      console.log(`[AUTO-REPORT] ${targetId} ready-signal suppressed; submit already confirmed`);
+      return;
+    }
+
+    const shouldWaitForSubmit = pendingReport.submitInProgress === true || elapsedNum < AUTO_REPORT_MIN_REAL_SECONDS;
+    if (shouldWaitForSubmit) {
+      if (!pendingReport.readySignalTimer) {
+        const floorDelayMs = Math.max(50, Math.ceil((AUTO_REPORT_MIN_REAL_SECONDS - elapsedNum) * 1000));
+        const delayMs = pendingReport.submitInProgress === true ? Math.min(250, Math.max(50, floorDelayMs)) : floorDelayMs;
+        pendingReport.readySignalTimer = _setTimeout(() => {
+          pendingReport.readySignalTimer = null;
+          const currentPending = getPendingReport(targetId, _pendingReports);
+          if (!currentPending || currentPending.idleNotified) return;
+          if (pendingReportHasSubmitEvidence(currentPending)) {
+            console.log(`[AUTO-REPORT] ${targetId} ready-signal dwell suppressed; submit confirmed`);
+            return;
+          }
+          fireAutoReport(targetId, _sessions[targetId] || targetSession, currentPending, 'ready-signal', deps);
+        }, delayMs);
+      }
+      console.log(`[AUTO-REPORT] ${targetId} ready-signal deferred; awaiting submit confirmation`);
+      return;
+    }
+  }
 
   pendingReport.idleNotified = true;
   pendingReport.idleAt = new Date(_now()).toISOString();
-  const elapsedNum = (_now() - new Date(pendingReport.injectedAt).getTime()) / 1000;
-  const elapsed = elapsedNum.toFixed(1);
 
   // Richer bus event (observability) — now also carries the trigger provenance.
   _broadcast('TASK_IDLE_NO_REPORT', targetId, targetSession, {
@@ -202,7 +298,9 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
   const srcSession = _sessions[srcId];
   if (!srcSession) return;
 
-  const confirmed = elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS;
+  const confirmed = trigger === 'ready-signal' && pendingReport.submitExpected
+    ? false
+    : (elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS || hasSubmitEvidence);
   const injTag = pendingReport.injectId ? ` inject=${pendingReport.injectId}` : '';
   const reportMsg = confirmed
     ? `TASK_COMPLETE: ${targetId} is now idle after processing inject (${elapsed}s, via ${trigger}${injTag})`
@@ -479,9 +577,57 @@ async function executeBootstrapInject(sessionId, session, op) {
   };
 }
 
+function parseSubmitRetryOptions(body = {}, injectedBody = null) {
+  const hasExplicitRetries = body && body.retries !== undefined && body.retries !== null;
+  const retries = Math.min(Math.max(Number(hasExplicitRetries ? body.retries : (injectedBody ? 1 : 0)) || 0, 0), 3);
+  const retryDelayMs = Math.min(Math.max(Number(body?.retry_delay_ms) || 500, 100), 2000);
+  const verifyTimeoutMs = Math.min(Math.max(Number(body?.verify_timeout_ms) || 1500, 200), 5000);
+  return { retries, retryDelayMs, verifyTimeoutMs };
+}
+
+function buildSubmitVerify(confirm) {
+  if (!confirm) return null;
+  return {
+    consumed: confirm.accepted === true,
+    waited_ms: confirm.waited_ms || 0,
+    reason: confirm.reason || null,
+    source: confirm.visibility && confirm.visibility.source ? confirm.visibility.source : undefined,
+    ambiguous: confirm.ambiguous === true || undefined,
+    retryable: confirm.retryable === true || undefined,
+  };
+}
+
+function buildSubmitConfirmOptions(id, session, submittedAtMs, verifyTimeoutMs) {
+  return {
+    timeoutMs: verifyTimeoutMs,
+    intervalMs: 50,
+    submittedAtMs,
+    stripAnsi: stripAnsiState,
+    getState: () => sessionStateManager.getState(id),
+  };
+}
+
+async function confirmSubmitAfterDispatch(id, session, injectedBody, submittedAtMs, verifyTimeoutMs) {
+  if (!injectedBody || injectedBody.length === 0) {
+    return null;
+  }
+  return submitGate.confirmSubmitAccepted(session, injectedBody, buildSubmitConfirmOptions(id, session, submittedAtMs, verifyTimeoutMs));
+}
+
 async function executeBootstrapSubmit(sessionId, session, op) {
-  const strategy = terminalLevelSubmit(sessionId, session);
+  const body = op.body || {};
+  const injectedBody = typeof body.injected_body === 'string' ? body.injected_body : null;
+  const { retries, retryDelayMs, verifyTimeoutMs } = parseSubmitRetryOptions(body, injectedBody);
+  if (injectedBody) {
+    markPendingReportSubmitStarted(sessionId, injectedBody);
+  }
+
+  const submittedAtMs = Date.now();
+  let strategy = terminalLevelSubmit(sessionId, session);
   if (!strategy) {
+    if (injectedBody) {
+      markPendingReportSubmitUnconfirmed(sessionId, { reason: 'strategy_failed', attempts: 0, retryable: false });
+    }
     return {
       status: 503,
       body: {
@@ -493,14 +639,47 @@ async function executeBootstrapSubmit(sessionId, session, op) {
       }
     };
   }
+  let attempts = 1;
+  let confirm = await confirmSubmitAfterDispatch(sessionId, session, injectedBody, submittedAtMs, verifyTimeoutMs);
+  while (confirm && !confirm.accepted && confirm.retryable && attempts <= retries) {
+    await sleep(retryDelayMs);
+    const retrySubmittedAtMs = Date.now();
+    const retryStrategy = terminalLevelSubmit(sessionId, session);
+    if (!retryStrategy) break;
+    strategy = retryStrategy;
+    attempts++;
+    confirm = await confirmSubmitAfterDispatch(sessionId, session, injectedBody, retrySubmittedAtMs, verifyTimeoutMs);
+  }
+
+  if (confirm && !confirm.accepted) {
+    markPendingReportSubmitUnconfirmed(sessionId, { ...confirm, attempts });
+    return {
+      status: 504,
+      body: {
+        error: 'Submit body still visible after bounded confirmation retry',
+        reason: 'submit_unconfirmed',
+        strategy,
+        attempts,
+        gated: false,
+        verify: buildSubmitVerify(confirm),
+        confirm,
+        bootstrap_queued: true
+      }
+    };
+  }
+
+  if (injectedBody) {
+    markPendingReportSubmitConfirmed(sessionId, { ...(confirm || { reason: 'empty_body' }), attempts });
+  }
   return {
     status: 200,
     body: {
       success: true,
       strategy,
-      attempts: 1,
+      attempts,
       gated: false,
-      verify: null,
+      verify: buildSubmitVerify(confirm),
+      confirm,
       bootstrap_queued: true
     }
   };
@@ -1944,15 +2123,13 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   const session = sessions[resolvedId];
   const id = resolvedId;
 
-  const retries = Math.min(Math.max(Number(req.body?.retries) || 0, 0), 3);
-  const retryDelayMs = Math.min(Math.max(Number(req.body?.retry_delay_ms) || 500, 100), 2000);
   const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
   // Default raised 5000 → 10000 (0.3.1) to cover empirical claude REPL
   // ready window (3-6s on fresh spawn) with margin. Upper clamp raised
   // 15000 → 30000 for the rare extreme-cold case.
   const gateTimeoutMs = Math.min(Math.max(Number(req.body?.gate_timeout_ms) || 10000, 500), 30000);
-  const verifyTimeoutMs = Math.min(Math.max(Number(req.body?.verify_timeout_ms) || 1500, 200), 5000);
   const injectedBody = typeof req.body?.injected_body === 'string' ? req.body.injected_body : null;
+  const { retries, retryDelayMs, verifyTimeoutMs } = parseSubmitRetryOptions(req.body || {}, injectedBody);
   const minConfidence = req.body?.min_confidence != null
     ? Math.min(Math.max(Number(req.body.min_confidence), 0), 1)
     : undefined;
@@ -1963,6 +2140,10 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   const gateOff = String(process.env.TELEPTY_SUBMIT_GATE || '').toLowerCase() === 'off';
 
   console.log(`[SUBMIT] Session ${id} (${session.command})${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}${gateOff ? ' [gate=off]' : ''}`);
+
+  if (injectedBody) {
+    markPendingReportSubmitStarted(id, injectedBody);
+  }
 
   // #471 (0.4.5): force=true must bypass the bootstrap gate. Without `!force`
   // here the per-request escape hatch (cli.js --submit-force) is enqueued and
@@ -1976,6 +2157,13 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
       drainBootstrapQueue(id, session);
     }
     const queuedSubmit = await waitForBootstrapSubmit(op, session, gateTimeoutMs);
+    if (queuedSubmit.status >= 400 && injectedBody) {
+      markPendingReportSubmitUnconfirmed(id, {
+        reason: queuedSubmit.body && queuedSubmit.body.reason ? queuedSubmit.body.reason : 'bootstrap_submit_failed',
+        attempts: queuedSubmit.body && queuedSubmit.body.attempts ? queuedSubmit.body.attempts : 0,
+        retryable: false
+      });
+    }
     return res.status(queuedSubmit.status).json(queuedSubmit.body);
   }
 
@@ -1997,10 +2185,19 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   // escape-hatch but at request scope.
   // See: docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md §3.1
   if (force) {
+    if (injectedBody) {
+      markPendingReportSubmitStarted(id, injectedBody);
+    }
     const strategy = terminalLevelSubmit(id, session);
     if (strategy) {
+      if (injectedBody) {
+        markPendingReportSubmitConfirmed(id, { reason: 'force', attempts: 1 });
+      }
       emitSubmitBus({ strategy, attempts: 1, gated: false, forced: true });
       return res.json({ success: true, strategy, attempts: 1, gated: false, forced: true });
+    }
+    if (injectedBody) {
+      markPendingReportSubmitUnconfirmed(id, { reason: 'strategy_failed', attempts: 0, retryable: false });
     }
     return res.status(503).json({
       error: 'Submit failed via all strategies (kitty/cmux/pty)',
@@ -2013,6 +2210,9 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
 
   // ── Legacy escape-hatch path: blind pre-delay + retries (0.2.x behavior) ──
   if (gateOff) {
+    if (injectedBody) {
+      markPendingReportSubmitStarted(id, injectedBody);
+    }
     if (preDelayMs > 0) {
       await new Promise(resolve => setTimeout(resolve, preDelayMs));
     }
@@ -2024,8 +2224,14 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
       legacyAttempts++;
     }
     if (legacyStrategy) {
+      if (injectedBody) {
+        markPendingReportSubmitConfirmed(id, { reason: 'gate_off', attempts: legacyAttempts });
+      }
       emitSubmitBus({ strategy: legacyStrategy, attempts: legacyAttempts, gated: false });
       return res.json({ success: true, strategy: legacyStrategy, attempts: legacyAttempts, gated: false });
+    }
+    if (injectedBody) {
+      markPendingReportSubmitUnconfirmed(id, { reason: 'strategy_failed', attempts: legacyAttempts, retryable: false });
     }
     return res.status(503).json({
       error: 'Submit failed via all strategies (kitty/cmux/pty)',
@@ -2094,9 +2300,16 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   }
 
   // Step 2: dispatch Enter via existing kitty → cmux → PTY chain.
+  if (injectedBody) {
+    markPendingReportSubmitStarted(id, injectedBody);
+  }
+  let submittedAtMs = Date.now();
   let strategy = terminalLevelSubmit(id, session);
   let attempts = strategy ? 1 : 0;
   if (!strategy) {
+    if (injectedBody) {
+      markPendingReportSubmitUnconfirmed(id, { reason: 'strategy_failed', attempts: 0, retryable: false });
+    }
     return res.status(503).json({
       error: 'Submit failed via all strategies (kitty/cmux/pty)',
       strategy: 'none',
@@ -2107,47 +2320,51 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     });
   }
 
-  // Step 3: verify body consumption (only when the caller provided the body).
+  // Step 3: confirm the submit was accepted (only when caller provided body).
   // Without `injected_body`, this is a bare Enter press (`telepty enter` or
-  // `telepty send-key` without force) — there is nothing to verify and one
-  // shot is enough.
+  // `telepty send-key` without force) — there is nothing to confirm and one
+  // shot is enough. A retry is idempotent only when the body is still visible.
   let verify = null;
+  let confirm = null;
   if (injectedBody && injectedBody.length > 0) {
-    verify = await submitGate.verifyBodyConsumed(session, injectedBody, {
-      timeoutMs: verifyTimeoutMs,
-      stripAnsi: stripAnsiState,
-    });
-    if (!verify.consumed) {
+    confirm = await confirmSubmitAfterDispatch(id, session, injectedBody, submittedAtMs, verifyTimeoutMs);
+    while (confirm && !confirm.accepted && confirm.retryable && attempts <= retries) {
       await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      submittedAtMs = Date.now();
       const retryStrategy = terminalLevelSubmit(id, session);
-      if (retryStrategy) {
-        strategy = retryStrategy;
-        attempts++;
-        verify = await submitGate.verifyBodyConsumed(session, injectedBody, {
-          timeoutMs: verifyTimeoutMs,
-          stripAnsi: stripAnsiState,
-        });
-      }
+      if (!retryStrategy) break;
+      strategy = retryStrategy;
+      attempts++;
+      confirm = await confirmSubmitAfterDispatch(id, session, injectedBody, submittedAtMs, verifyTimeoutMs);
     }
-    // Honest 504: gate timed out AND the body never left the input box even
-    // after the best-effort dispatch + verify. Distinguishable from the legacy
-    // `gate_timeout` reason (which dropped dispatch entirely).
-    if (gatedDispatchAfterTimeout && !verify.consumed) {
+    verify = buildSubmitVerify(confirm);
+
+    if (confirm && !confirm.accepted) {
+      const reason = gatedDispatchAfterTimeout ? 'gated_dispatch_unconsumed' : 'submit_unconfirmed';
       const failBody = {
-        error: 'Submit gated-timeout and body not consumed after best-effort dispatch',
-        reason: 'gated_dispatch_unconsumed',
+        error: gatedDispatchAfterTimeout
+          ? 'Submit gated-timeout and body not consumed after best-effort dispatch'
+          : 'Submit body still visible after bounded confirmation retry',
+        reason,
         last_state: gateResult.last_state,
         strategy,
         attempts,
         gated: true,
         gate_wait_ms: gateResult.waited_ms,
         verify,
+        confirm,
         gated_dispatch_after_timeout: true,
         ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
       };
+      if (!gatedDispatchAfterTimeout) {
+        delete failBody.gated_dispatch_after_timeout;
+      }
+      markPendingReportSubmitUnconfirmed(id, { ...confirm, attempts });
       emitSubmitBus(failBody);
       return res.status(504).json(failBody);
     }
+
+    markPendingReportSubmitConfirmed(id, { ...(confirm || { reason: 'empty_body' }), attempts });
   }
 
   const responseBody = {
@@ -2157,6 +2374,7 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     gated: true,
     gate_wait_ms: gateResult.waited_ms,
     verify,
+    confirm,
     ...(gatedDispatchAfterTimeout ? { gated_dispatch_after_timeout: true } : {}),
     ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
   };
@@ -2301,6 +2519,9 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
         source: from,
         injectedAt: injectTimestamp,
         injectId: inject_id,
+        submitExpected: !!no_enter,
+        noEnter: !!no_enter,
+        injectedBodyPreview: prompt.slice(0, 500),
         awaitingReport: true,
         idleNotified: false
       };
@@ -2380,6 +2601,11 @@ app.get('/api/pendingReports/:id', (req, res) => {
     idle_notified: !!entry.idleNotified,
     idle_at: entry.idleAt || null,
     awaiting_report: !!entry.awaitingReport,
+    submit_expected: !!entry.submitExpected,
+    submit_in_progress: !!entry.submitInProgress,
+    submit_confirmed_at: entry.submitConfirmedAt || null,
+    submit_unconfirmed_at: entry.submitUnconfirmedAt || null,
+    saw_working_after_inject: !!entry.sawWorkingAfterInject,
     auto_summary: autoSummary
   });
 });

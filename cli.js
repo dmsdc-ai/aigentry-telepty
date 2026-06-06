@@ -1872,43 +1872,26 @@ async function main() {
         }
         const submitBody = {
           injected_body: injectPrompt || '',
-          retries: 1,
+          retries: submitRetries,
           retry_delay_ms: 500,
           ...(submitForce ? { force: true } : {}),
         };
-        const RETRY_DELAY_MS = 300;
-        const RETRY_SAFE_REASONS = new Set([
-          'gated_dispatch_unconsumed',
-          'gate_timeout',
-          'no_prompt_symbol_seen',
-        ]);
-        const maxAttempts = 1 + submitRetries;
         let submitRes = null;
         let submitData = null;
         let attemptsMade = 0;
         let lastError = null;
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-          if (attempt > 0) {
-            await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-          }
-          attemptsMade = attempt + 1;
-          try {
-            submitRes = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(submitBody),
-            });
-            submitData = await submitRes.json();
-          } catch (submitErr) {
-            lastError = submitErr;
-            submitRes = null;
-            submitData = null;
-            break;
-          }
-          if (submitRes.ok) break;
-          if (submitRes.status !== 504) break;
-          const retryReason = submitData && typeof submitData.reason === 'string' ? submitData.reason : null;
-          if (!RETRY_SAFE_REASONS.has(retryReason)) break;
+        try {
+          attemptsMade = 1;
+          submitRes = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/submit`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(submitBody),
+          });
+          submitData = await submitRes.json();
+        } catch (submitErr) {
+          lastError = submitErr;
+          submitRes = null;
+          submitData = null;
         }
         if (lastError) {
           console.error(`⚠️  Submit failed: ${lastError.message}`);
@@ -1920,16 +1903,16 @@ async function main() {
             ? ' (dispatched-after-gate-timeout)'
             : '';
           const attemptsNote = submitData.attempts > 1 ? ` (${submitData.attempts} attempts)` : '';
-          const retryNote = attemptsMade > 1 ? ` [retry ${attemptsMade - 1}/${submitRetries}]` : '';
           const forcedNote = submitData.forced ? ' [forced]' : '';
-          console.log(`✅ Submitted via ${submitData.strategy}${attemptsNote}${gateNote}${lateNote}${retryNote}${forcedNote}.`);
+          console.log(`✅ Submitted via ${submitData.strategy}${attemptsNote}${gateNote}${lateNote}${forcedNote}.`);
         } else if (submitRes && submitRes.status === 504) {
           // Soft failure: REPL never readied. Orchestrator scripts depend on
           // exit 0 here — surface a clear remediation hint but do not exit
           // non-zero.
           const reason = (submitData && submitData.reason) || 'gate_timeout';
           const lastState = (submitData && submitData.last_state) || 'unknown';
-          const retriesNote = attemptsMade > 1 ? ` after ${attemptsMade} attempts` : '';
+          const daemonAttempts = submitData && Number.isFinite(Number(submitData.attempts)) ? Number(submitData.attempts) : attemptsMade;
+          const retriesNote = daemonAttempts > 1 ? ` after ${daemonAttempts} attempts` : '';
           const hint = submitForce
             ? ''
             : ` Try \`telepty inject --submit --submit-force ${target.id} ...\` or manual \`telepty send-key ${target.id} enter\`.`;

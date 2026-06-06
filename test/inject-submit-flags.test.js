@@ -245,30 +245,17 @@ test('telepty inject --submit (no force) does NOT include force in /submit body'
 });
 
 // ---------------------------------------------------------------------------
-// --submit-retry — idempotent retry on safe-reason 504
+// --submit-retry — daemon-owned confirmed CR retry budget
 // ---------------------------------------------------------------------------
 
-test('telepty inject --submit retries once by default on gated_dispatch_unconsumed 504', async () => {
+test('telepty inject --submit passes one confirmed retry by default', async () => {
   const sessionId = createMockId('retry-default');
   const mock = await startMockDaemon({
     sessionId,
-    submitHandler: (callIndex) => {
-      if (callIndex === 1) {
-        return {
-          status: 504,
-          payload: {
-            error: 'gate timeout',
-            reason: 'gated_dispatch_unconsumed',
-            last_state: 'idle',
-            verify: { consumed: false },
-          },
-        };
-      }
-      return {
-        status: 200,
-        payload: { success: true, strategy: 'kitty_send_text', attempts: 1, gated: true, gate_wait_ms: 0 },
-      };
-    },
+    submitHandler: () => ({
+      status: 200,
+      payload: { success: true, strategy: 'kitty_send_text', attempts: 2, gated: true, gate_wait_ms: 0 },
+    }),
   });
 
   try {
@@ -277,9 +264,9 @@ test('telepty inject --submit retries once by default on gated_dispatch_unconsum
       { homeDir, port: mock.port }
     );
     assert.equal(result.code, 0, result.stderr);
-    // Default --submit-retry is 1 → exactly 2 /submit calls.
-    assert.equal(mock.submitCalls.length, 2);
-    assert.match(result.stdout, /\[retry 1\/1\]/);
+    assert.equal(mock.submitCalls.length, 1);
+    assert.equal(mock.submitCalls[0].body.retries, 1);
+    assert.match(result.stdout, /\(2 attempts\)/);
   } finally {
     await mock.close();
   }
@@ -295,6 +282,7 @@ test('telepty inject --submit-retry 2 retries up to 3 times then gives up cleanl
         error: 'gate timeout',
         reason: 'gated_dispatch_unconsumed',
         last_state: 'idle',
+        attempts: 3,
         verify: { consumed: false },
       },
     }),
@@ -307,7 +295,8 @@ test('telepty inject --submit-retry 2 retries up to 3 times then gives up cleanl
     );
     // Soft failure: prints warning but exits 0.
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(mock.submitCalls.length, 3); // 1 initial + 2 retries
+    assert.equal(mock.submitCalls.length, 1);
+    assert.equal(mock.submitCalls[0].body.retries, 2);
     assert.match(result.stdout, /Submit gated-timeout/);
     assert.match(result.stdout, /after 3 attempts/);
   } finally {
@@ -332,6 +321,7 @@ test('telepty inject --submit-retry 0 does NOT retry on a safe-reason 504', asyn
     );
     assert.equal(result.code, 0, result.stderr);
     assert.equal(mock.submitCalls.length, 1);
+    assert.equal(mock.submitCalls[0].body.retries, 0);
     assert.match(result.stdout, /Submit gated-timeout/);
     assert.doesNotMatch(result.stdout, /\[retry/);
   } finally {
@@ -340,7 +330,7 @@ test('telepty inject --submit-retry 0 does NOT retry on a safe-reason 504', asyn
 });
 
 // ---------------------------------------------------------------------------
-// Hard-fail reasons must NOT trigger client-side retry
+// Hard-fail reasons still return after one HTTP submit request
 // ---------------------------------------------------------------------------
 
 test('telepty inject --submit does NOT retry on session_dead 504', async () => {
@@ -360,6 +350,7 @@ test('telepty inject --submit does NOT retry on session_dead 504', async () => {
     );
     assert.equal(result.code, 0, result.stderr);
     assert.equal(mock.submitCalls.length, 1);
+    assert.equal(mock.submitCalls[0].body.retries, 3);
     assert.match(result.stdout, /session_dead/);
   } finally {
     await mock.close();
@@ -383,6 +374,7 @@ test('telepty inject --submit does NOT retry on no_state 504', async () => {
     );
     assert.equal(result.code, 0, result.stderr);
     assert.equal(mock.submitCalls.length, 1);
+    assert.equal(mock.submitCalls[0].body.retries, 3);
   } finally {
     await mock.close();
   }
@@ -392,22 +384,14 @@ test('telepty inject --submit does NOT retry on no_state 504', async () => {
 // Composability — --submit-force + --submit-retry
 // ---------------------------------------------------------------------------
 
-test('telepty inject --submit --submit-force --submit-retry preserves force on retries', async () => {
+test('telepty inject --submit --submit-force --submit-retry preserves force and retry budget', async () => {
   const sessionId = createMockId('force-retry');
   const mock = await startMockDaemon({
     sessionId,
-    submitHandler: (callIndex) => {
-      if (callIndex === 1) {
-        // Force never produces a gated 504 in real daemon, but the client
-        // must not strip force on retry — verify by simulating a 504
-        // (artificial) and asserting force=true on attempt 2.
-        return {
-          status: 504,
-          payload: { reason: 'gated_dispatch_unconsumed', last_state: 'idle', verify: { consumed: false } },
-        };
-      }
-      return { status: 200, payload: { success: true, strategy: 'pty_cr', attempts: 1, gated: false, forced: true } };
-    },
+    submitHandler: () => ({
+      status: 200,
+      payload: { success: true, strategy: 'pty_cr', attempts: 1, gated: false, forced: true },
+    }),
   });
 
   try {
@@ -416,9 +400,9 @@ test('telepty inject --submit --submit-force --submit-retry preserves force on r
       { homeDir, port: mock.port }
     );
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(mock.submitCalls.length, 2);
+    assert.equal(mock.submitCalls.length, 1);
     assert.equal(mock.submitCalls[0].body.force, true);
-    assert.equal(mock.submitCalls[1].body.force, true);
+    assert.equal(mock.submitCalls[0].body.retries, 2);
   } finally {
     await mock.close();
   }

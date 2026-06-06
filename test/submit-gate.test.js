@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const {
   awaitReplReady,
   verifyBodyConsumed,
+  confirmSubmitAccepted,
   awaitPromptSymbol,
   isReady,
   isFailed,
@@ -284,6 +285,86 @@ test('verifyBodyConsumed honors injectable now/sleep for deterministic timing (i
   assert.equal(result.consumed, false);
   assert.equal(result.reason, 'still_visible');
   assert.ok(result.waited_ms >= 100);
+});
+
+// ---------------------------------------------------------------------------
+// confirmSubmitAccepted — accepted signal + idempotent retry guard
+// ---------------------------------------------------------------------------
+
+test('confirmSubmitAccepted fast-paths when body is absent', async () => {
+  const session = { outputRing: ['codex prompt ›'] };
+  const result = await confirmSubmitAccepted(session, '[context-ref] Read ~/.telepty/shared/hash.md', {
+    timeoutMs: 500,
+    intervalMs: 20,
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.retryable, false);
+  assert.equal(result.reason, 'body_absent');
+  assert.equal(result.waited_ms < 100, true);
+});
+
+test('confirmSubmitAccepted returns retryable only when body stays visible', async () => {
+  const body = '[context-ref] Read ~/.telepty/shared/hash.md';
+  const session = { outputRing: [`› ${body}`] };
+  const result = await confirmSubmitAccepted(session, body, {
+    timeoutMs: 60,
+    intervalMs: 15,
+  });
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.retryable, true);
+  assert.equal(result.reason, 'body_still_visible');
+  assert.equal(result.visibility.visible, true);
+});
+
+test('confirmSubmitAccepted accepts working transition even when body remains in history', async () => {
+  const body = '[context-ref] Read ~/.telepty/shared/hash.md';
+  const session = { outputRing: [`› ${body}`] };
+  const submittedAtMs = Date.now();
+  let state = { state: 'idle', confidence: 0.9, since_ms: submittedAtMs - 10 };
+  setTimeout(() => {
+    state = { state: 'working', confidence: 0.9, since_ms: Date.now() };
+  }, 20);
+
+  const result = await confirmSubmitAccepted(session, body, {
+    submittedAtMs,
+    timeoutMs: 250,
+    intervalMs: 10,
+    getState: () => state,
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.retryable, false);
+  assert.equal(result.reason, 'state_working');
+});
+
+test('confirmSubmitAccepted accepts post-submit output while state remains working', async () => {
+  const body = '[context-ref] Read ~/.telepty/shared/hash.md';
+  const session = { outputRing: [`› ${body}`] };
+  const submittedAtMs = Date.now();
+  let state = {
+    state: 'working',
+    confidence: 0.9,
+    since_ms: submittedAtMs - 100,
+    last_output_at: new Date(submittedAtMs - 100).toISOString(),
+  };
+  setTimeout(() => {
+    state = {
+      ...state,
+      last_output_at: new Date(Date.now()).toISOString(),
+    };
+  }, 20);
+
+  const result = await confirmSubmitAccepted(session, body, {
+    submittedAtMs,
+    timeoutMs: 250,
+    intervalMs: 10,
+    getState: () => state,
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.reason, 'state_working');
 });
 
 // ---------------------------------------------------------------------------

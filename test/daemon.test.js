@@ -514,6 +514,137 @@ test('bootstrap queued submit waits behind queued text and preserves order', asy
   ownerWs.close();
 });
 
+test('codex submit confirmation resends CR when context-ref remains visible and suppresses ready-signal warning after acceptance', async () => {
+  const sessionId = createSessionId('codex-submit-resend');
+  const sourceId = createSessionId('submit-source');
+  const body = '[context-ref] Read ~/.telepty/shared/6516f10fb6850f9c9c18f3aa238c0060cc3f5d6b781ba1dca79dd2a12e77d81d.md';
+
+  await harness.registerSession(sessionId, { command: 'codex', backend: 'pty' });
+  const ownerWs = await harness.connectSession(sessionId);
+  const ownerMessages = collectJsonMessages(ownerWs);
+
+  const bus = await harness.connectBus();
+  const busMessages = collectJsonMessages(bus);
+
+  ownerWs.send(JSON.stringify({ type: 'ready' }));
+  await waitFor(async () => {
+    const detail = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    return detail.body && detail.body.transport && detail.body.transport.bootstrap.ready;
+  }, { timeoutMs: 5000, description: 'codex bootstrap ready' });
+
+  const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    method: 'POST',
+    body: { prompt: body, from: sourceId, no_enter: true }
+  });
+  assert.equal(inject.status, 200);
+
+  await waitFor(() => ownerMessages.find((message) => message.type === 'inject' && message.data === body), {
+    timeoutMs: 5000,
+    description: 'codex context-ref delivered'
+  });
+
+  ownerWs.send(JSON.stringify({
+    type: 'output',
+    data: `OpenAI Codex (v0.0.0)\n› ${body}\n  gpt-5 high fast\n`
+  }));
+  ownerWs.send(JSON.stringify({ type: 'ready' }));
+
+  let crCount = 0;
+  ownerWs.on('message', (chunk) => {
+    try {
+      const message = JSON.parse(chunk.toString());
+      if (message.type === 'inject' && message.data === '\r') {
+        crCount += 1;
+        if (crCount === 2) {
+          ownerWs.send(JSON.stringify({ type: 'output', data: 'Working on accepted context\n' }));
+        }
+      }
+    } catch {
+      // Ignore malformed frames in the fixture.
+    }
+  });
+
+  const submit = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
+    method: 'POST',
+    body: {
+      injected_body: body,
+      prompt_symbol_gate: false,
+      gate_timeout_ms: 1000,
+      verify_timeout_ms: 200,
+      retry_delay_ms: 100,
+      retries: 2
+    }
+  });
+
+  assert.equal(submit.status, 200, JSON.stringify(submit.body));
+  assert.equal(submit.body.success, true);
+  assert.equal(submit.body.attempts, 2);
+  assert.equal(submit.body.confirm.accepted, true);
+  assert.equal(submit.body.confirm.reason, 'state_working');
+  assert.equal(crCount, 2);
+
+  await delay(1300);
+  assert.equal(
+    busMessages.some((message) => message.type === 'TASK_IDLE_NO_REPORT' && message.session_id === sessionId),
+    false,
+    'ready-signal should not emit TASK_IDLE_NO_REPORT after accepted resend'
+  );
+
+  bus.close();
+  ownerWs.close();
+});
+
+test('codex submit confirmation returns 504 when context-ref remains unsubmitted after bounded CR retries', async () => {
+  const sessionId = createSessionId('codex-submit-stuck');
+  const body = '[context-ref] Read ~/.telepty/shared/stuck.md';
+
+  await harness.registerSession(sessionId, { command: 'codex', backend: 'pty' });
+  const ownerWs = await harness.connectSession(sessionId);
+  const ownerMessages = collectJsonMessages(ownerWs);
+
+  ownerWs.send(JSON.stringify({ type: 'ready' }));
+  await waitFor(async () => {
+    const detail = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    return detail.body && detail.body.transport && detail.body.transport.bootstrap.ready;
+  }, { timeoutMs: 5000, description: 'codex bootstrap ready' });
+
+  const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    method: 'POST',
+    body: { prompt: body, no_enter: true }
+  });
+  assert.equal(inject.status, 200);
+  await waitFor(() => ownerMessages.find((message) => message.type === 'inject' && message.data === body), {
+    timeoutMs: 5000,
+    description: 'stuck context-ref delivered'
+  });
+
+  ownerWs.send(JSON.stringify({
+    type: 'output',
+    data: `OpenAI Codex (v0.0.0)\n› ${body}\n  gpt-5 high fast\n`
+  }));
+  ownerWs.send(JSON.stringify({ type: 'output', data: '\x1b]133;B\x07' }));
+
+  const submit = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
+    method: 'POST',
+    body: {
+      injected_body: body,
+      prompt_symbol_gate: false,
+      gate_timeout_ms: 1000,
+      verify_timeout_ms: 200,
+      retry_delay_ms: 100,
+      retries: 1
+    }
+  });
+
+  assert.equal(submit.status, 504);
+  assert.equal(submit.body.reason, 'submit_unconfirmed');
+  assert.equal(submit.body.attempts, 2);
+  assert.equal(submit.body.confirm.retryable, true);
+  assert.equal(submit.body.verify.consumed, false);
+
+  ownerWs.close();
+});
+
 test('bus auto-route uses wrapped WS split delivery instead of cmux direct injection', async () => {
   const sessionId = createSessionId('bus-route');
   await harness.registerSession(sessionId, {

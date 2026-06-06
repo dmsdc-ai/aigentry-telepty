@@ -8,6 +8,7 @@
 // Exports:
 //   - awaitReplReady(sessionId, stateManager, opts) → Promise<{ ready, last_state, waited_ms, reason? }>
 //   - verifyBodyConsumed(session, bodyText, opts)   → Promise<{ consumed, waited_ms, reason? }>
+//   - confirmSubmitAccepted(session, bodyText, opts) → Promise<{ accepted, retryable, waited_ms, reason? }>
 //   - isReady(state, minConfidence)                  (test surface)
 //   - isFailed(state)                                (test surface)
 //   - READY_STATES, FAIL_STATES                      (test surface)
@@ -21,6 +22,7 @@ const READY_STATES = new Set(['idle', 'waiting']);
 
 // States where waiting will never produce readiness; resolve immediately.
 const FAIL_STATES = new Set(['dead', 'error', 'restarting']);
+const ACCEPTED_AFTER_SUBMIT_STATES = new Set(['working', 'thinking']);
 
 function isReady(state, minConfidence) {
   if (!state) return false;
@@ -167,6 +169,158 @@ async function verifyBodyConsumed(session, bodyText, opts = {}) {
   }
 }
 
+/**
+ * Confirm that a submitted prompt was accepted by the target TUI.
+ *
+ * Accepted signals short-circuit immediately:
+ *   - the injected body is absent from the current screen/output tail;
+ *   - the session transitions to working/thinking after the CR was sent.
+ *
+ * The only retryable failure is confirmed-unsubmitted: the body stayed visible
+ * for the whole bounded window. Ambiguous/no-observable cases are treated as
+ * success for back-compat, but marked `ambiguous` so callers can report that
+ * the success was optimistic. This keeps CR resend idempotent: resend only
+ * when `retryable === true`.
+ *
+ * @param {{ outputRing?: string[], backend?: string, cmuxWorkspaceId?: string|null }} session
+ * @param {string} bodyText
+ * @param {{ timeoutMs?: number, intervalMs?: number, tailBytes?: number, stripAnsi?: Function, readScreen?: Function, tailLines?: number, getState?: Function, submittedAtMs?: number, now?: Function, sleep?: Function }} [opts]
+ * @returns {Promise<{ accepted: boolean, retryable: boolean, waited_ms: number, reason?: string, ambiguous?: boolean, visibility?: object, state?: object }>}
+ */
+async function confirmSubmitAccepted(session, bodyText, opts = {}) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 1500;
+  const intervalMs = Number.isFinite(opts.intervalMs) ? opts.intervalMs : 50;
+  const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
+  const sleep = typeof opts.sleep === 'function' ? opts.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+  const getState = typeof opts.getState === 'function' ? opts.getState : null;
+  const submittedAtMs = Number.isFinite(opts.submittedAtMs) ? opts.submittedAtMs : now();
+  const start = now();
+
+  let lastVisibility = null;
+  let everVisible = false;
+
+  while (true) {
+    const state = getState ? getState() : null;
+    if (isAcceptedSubmitState(state, submittedAtMs)) {
+      return {
+        accepted: true,
+        retryable: false,
+        waited_ms: now() - start,
+        reason: `state_${state.state}`,
+        state,
+        visibility: lastVisibility || undefined,
+      };
+    }
+
+    const visibility = observeBodyVisibility(session, bodyText, opts);
+    lastVisibility = visibility;
+    if (visibility.reason === 'empty_body') {
+      return {
+        accepted: true,
+        retryable: false,
+        waited_ms: now() - start,
+        reason: 'empty_body',
+        visibility,
+      };
+    }
+    if (!visibility.observable) {
+      return {
+        accepted: true,
+        retryable: false,
+        waited_ms: now() - start,
+        reason: visibility.reason || 'no_observable',
+        ambiguous: true,
+        visibility,
+      };
+    }
+    if (visibility.visible) {
+      everVisible = true;
+    } else {
+      return {
+        accepted: true,
+        retryable: false,
+        waited_ms: now() - start,
+        reason: everVisible ? 'body_consumed' : 'body_absent',
+        visibility,
+      };
+    }
+
+    if (now() - start >= timeoutMs) {
+      return {
+        accepted: false,
+        retryable: true,
+        waited_ms: now() - start,
+        reason: 'body_still_visible',
+        visibility,
+        state: state || undefined,
+      };
+    }
+
+    await sleep(intervalMs);
+  }
+}
+
+function isAcceptedSubmitState(state, submittedAtMs) {
+  if (!state || !ACCEPTED_AFTER_SUBMIT_STATES.has(state.state)) return false;
+  if (!Number.isFinite(submittedAtMs)) {
+    return true;
+  }
+  if (Number.isFinite(state.since_ms) && state.since_ms >= submittedAtMs) {
+    return true;
+  }
+  const lastOutputMs = state.last_output_at ? new Date(state.last_output_at).getTime() : NaN;
+  if (Number.isFinite(lastOutputMs) && lastOutputMs >= submittedAtMs) {
+    return true;
+  }
+  if (Number.isFinite(state.since_ms) && state.since_ms < submittedAtMs) {
+    return false;
+  }
+  return false;
+}
+
+function observeBodyVisibility(session, bodyText, opts = {}) {
+  const needle = normalize(bodyText);
+  if (!needle) {
+    return { observable: true, visible: false, source: 'body', reason: 'empty_body' };
+  }
+
+  const stripAnsi = typeof opts.stripAnsi === 'function' ? opts.stripAnsi : (s) => s;
+  const screen = readCurrentScreen(session, opts);
+  if (typeof screen === 'string' && screen.length > 0) {
+    const haystack = normalize(stripAnsi(screen));
+    return {
+      observable: true,
+      visible: haystack.indexOf(needle) !== -1,
+      source: 'screen',
+    };
+  }
+
+  if (!session || !Array.isArray(session.outputRing)) {
+    return { observable: false, visible: false, source: 'none', reason: 'no_ring' };
+  }
+
+  const tailBytes = Number.isFinite(opts.tailBytes) ? opts.tailBytes : 8192;
+  const haystack = normalize(stripAnsi(readTail(session, tailBytes)));
+  return {
+    observable: true,
+    visible: haystack.indexOf(needle) !== -1,
+    source: 'output_ring',
+  };
+}
+
+function readCurrentScreen(session, opts = {}) {
+  const readScreen = typeof opts.readScreen === 'function'
+    ? opts.readScreen
+    : (session && session.backend === 'cmux' && session.cmuxWorkspaceId ? defaultReadScreen : null);
+  if (!readScreen || !session || !session.cmuxWorkspaceId) return null;
+  const tailLines = Number.isFinite(opts.tailLines) ? opts.tailLines : 30;
+  try {
+    return readScreen(session.cmuxWorkspaceId, tailLines);
+  } catch (_err) {
+    return null;
+  }
+}
+
 function normalize(s) {
   return String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
 }
@@ -266,10 +420,13 @@ function defaultReadScreen(workspaceId, lines) {
 module.exports = {
   awaitReplReady,
   verifyBodyConsumed,
+  confirmSubmitAccepted,
+  observeBodyVisibility,
   awaitPromptSymbol,
   defaultReadScreen,
   isReady,
   isFailed,
   READY_STATES,
   FAIL_STATES,
+  ACCEPTED_AFTER_SUBMIT_STATES,
 };
