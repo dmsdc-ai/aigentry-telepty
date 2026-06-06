@@ -10,6 +10,7 @@ const { killWindowsProcess } = require('./win-kill-process');
 // survived → headless zombie) is reclaimed. Shorter than the 300s disconnect-GC: the surface
 // is confirmed gone (not merely disconnected). The window absorbs cmux transient hiccups.
 const SURFACE_ORPHAN_SECONDS = Math.max(5, Number(process.env.TELEPTY_SURFACE_ORPHAN_SECONDS || 30));
+const SURFACE_MISMATCH_SECONDS = Math.max(1, Number(process.env.TELEPTY_SURFACE_MISMATCH_SECONDS || 10));
 
 const DURATION_RE = /^(\d+)(ms|s|m|h|d)$/i;
 const UNIT_MS = {
@@ -242,8 +243,96 @@ function decideSurfaceGc(liveness, session, nowMs, graceSeconds = SURFACE_ORPHAN
   return 'skip';
 }
 
+function clearSurfaceMismatchState(session) {
+  if (!session) return;
+  session.surfaceMismatchAt = null;
+  session.surfaceMismatchObserved = null;
+  session.surfaceMismatchEmitted = false;
+}
+
+function getExpectedPtyPidFromProbe(session, probe) {
+  const candidates = [
+    probe && probe.expectedPtyPid,
+    session && session.ptyPid,
+    session && session.pty_pid,
+    session && session.ptyProcess && session.ptyProcess.pid,
+    session && session.pid
+  ];
+  for (const pid of candidates) {
+    const n = Number(pid);
+    if (Number.isInteger(n) && n > 0) return n;
+  }
+  return null;
+}
+
+function buildSurfaceMismatchExtra(sessionId, session, probe, mismatchSeconds) {
+  return {
+    sid: sessionId,
+    backend: 'cmux',
+    cmuxWorkspaceId: session && session.cmuxWorkspaceId ? session.cmuxWorkspaceId : null,
+    expectedPtyPid: getExpectedPtyPidFromProbe(session, probe),
+    observedSurface: probe && probe.observedSurface ? probe.observedSurface : null,
+    mismatchSeconds
+  };
+}
+
+function getSurfaceMismatchObservedKey(probe) {
+  if (!probe || typeof probe !== 'object') return null;
+  return probe.observedSurfaceKey || probe.observedSurface || null;
+}
+
+function applySurfaceMismatchProbe(sessionId, session, probe, options = {}) {
+  if (!session) return { action: 'skip', reason: 'missing_session' };
+  const nowMs = options.nowMs ?? Date.now();
+  const debounceSeconds = options.debounceSeconds ?? SURFACE_MISMATCH_SECONDS;
+
+  if (!probe || probe.status !== 'mismatch') {
+    const hadState = !!(session.surfaceMismatchAt || session.surfaceMismatchObserved || session.surfaceMismatchEmitted);
+    clearSurfaceMismatchState(session);
+    return { action: hadState ? 'recover' : 'skip', reason: (probe && (probe.reason || probe.status)) || 'not_mismatch' };
+  }
+
+  const observedKey = getSurfaceMismatchObservedKey(probe);
+  if (!observedKey) {
+    clearSurfaceMismatchState(session);
+    return { action: 'skip', reason: 'observed_surface_unknown' };
+  }
+
+  if (!session.surfaceMismatchAt || session.surfaceMismatchObserved !== observedKey) {
+    session.surfaceMismatchAt = new Date(nowMs).toISOString();
+    session.surfaceMismatchObserved = observedKey;
+    session.surfaceMismatchEmitted = false;
+    return { action: 'mark', reason: probe.reason || 'mismatch', mismatchSeconds: 0 };
+  }
+
+  const startedMs = new Date(session.surfaceMismatchAt).getTime();
+  if (!Number.isFinite(startedMs)) {
+    session.surfaceMismatchAt = new Date(nowMs).toISOString();
+    session.surfaceMismatchObserved = observedKey;
+    session.surfaceMismatchEmitted = false;
+    return { action: 'mark', reason: 'invalid_start_reset', mismatchSeconds: 0 };
+  }
+
+  const mismatchSeconds = Math.max(0, Math.floor((nowMs - startedMs) / 1000));
+  if (session.surfaceMismatchEmitted) {
+    return { action: 'skip', reason: 'already_emitted', mismatchSeconds };
+  }
+  if (mismatchSeconds < debounceSeconds) {
+    return { action: 'skip', reason: 'debouncing', mismatchSeconds };
+  }
+
+  const extra = buildSurfaceMismatchExtra(sessionId, session, probe, mismatchSeconds);
+  let event = null;
+  if (typeof options.emit === 'function') {
+    event = options.emit(extra);
+  }
+  session.surfaceMismatchEmitted = true;
+  return { action: 'emit', reason: probe.reason || 'mismatch', mismatchSeconds, extra, event };
+}
+
 module.exports = {
   SURFACE_ORPHAN_SECONDS,
+  SURFACE_MISMATCH_SECONDS,
   parseDuration,
   computeIdleSeconds,
   formatIdleDuration,
@@ -254,5 +343,8 @@ module.exports = {
   effectiveIdleTtlMs,
   selectIdleTtlVictims,
   selectCleanOlderThanTargets,
-  decideSurfaceGc
+  decideSurfaceGc,
+  clearSurfaceMismatchState,
+  buildSurfaceMismatchExtra,
+  applySurfaceMismatchProbe
 };

@@ -19,7 +19,7 @@ const { classifyReportPrompt, buildAutoSummary } = require('./src/report-enforce
 const submitGate = require('./src/submit-gate');
 const readyRegistry = require('./src/prompt-symbol-registry');
 const lifecycle = require('./src/lifecycle');
-const { SURFACE_ORPHAN_SECONDS, decideSurfaceGc } = lifecycle;
+const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, applySurfaceMismatchProbe } = lifecycle;
 const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
 
@@ -3105,6 +3105,19 @@ if (require.main === module) setInterval(() => {
     // once), so this GCs NOTHING in that case — preserving the #486/#488 survival guarantee.
     if (session.type === 'wrapped' && session.backend === 'cmux' && session.cmuxWorkspaceId
         && isOpenWebSocket(session.ownerWs)) {
+      const mismatchProbe = terminalBackend.detectSurfaceMismatch(session, { sessionId: id });
+      const mismatchAction = applySurfaceMismatchProbe(id, session, mismatchProbe, {
+        nowMs: now,
+        emit: (extra) => broadcastSessionEvent('surface_mismatched', id, session, { nowMs: now, extra })
+      });
+      if (mismatchAction.action === 'mark') {
+        console.log(`[SURFACE-MISMATCH] mismatch candidate for ${id} (${mismatchProbe.observedSurface}) — ${SURFACE_MISMATCH_SECONDS}s debounce started`);
+      } else if (mismatchAction.action === 'emit') {
+        console.log(`[SURFACE-MISMATCH] emitted surface_mismatched for ${id}: ${mismatchProbe.observedSurface} (${mismatchAction.mismatchSeconds}s)`);
+      } else if (mismatchAction.action === 'recover') {
+        console.log(`[SURFACE-MISMATCH] ${id} recovered/indeterminate — clearing mismatch debounce`);
+      }
+
       const liveness = terminalBackend.isSurfaceAlive(session);
       const gcAction = decideSurfaceGc(liveness, session, now);
       if (gcAction === 'mark') {
@@ -3241,4 +3254,5 @@ module.exports = {
   shouldApplyOwnerAliveFloor,     // #29: owner-alive optimistic-floor decision (deps DI: isProcessRunning/...)
   scheduleBootstrapPromptPoll,    // #29: arms the floor timer (deps DI: setTimeout/...)
   decideSurfaceGc,                // #17: surface-liveness verdict→action (incl. INV-17 unknown→skip)
+  applySurfaceMismatchProbe,      // surface_mismatched debounce + payload helper (deps DI: emit/clock)
 };

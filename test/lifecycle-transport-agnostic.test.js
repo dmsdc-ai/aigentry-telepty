@@ -45,6 +45,97 @@ test('surface GC skips unknown liveness to preserve INV-17', () => {
   assert.equal(lifecycle.decideSurfaceGc('unknown', session, nowMs, 30), 'skip');
 });
 
+test('surface mismatch debounce emits fixed payload after threshold and suppresses repeats', () => {
+  const startedMs = Date.parse('2026-06-06T00:00:00.000Z');
+  const session = {
+    backend: 'cmux',
+    cmuxWorkspaceId: 'workspace:7',
+    ptyPid: 4242
+  };
+  const probe = {
+    status: 'mismatch',
+    reason: 'tty_mismatch',
+    expectedPtyPid: 4242,
+    observedSurface: 'surface:9 "stray shell" tty=ttys999'
+  };
+  const emitted = [];
+  const emit = (extra) => {
+    const event = { type: 'surface_mismatched', ...extra };
+    emitted.push(event);
+    return event;
+  };
+
+  assert.deepEqual(
+    lifecycle.applySurfaceMismatchProbe('worker-codex', session, probe, {
+      nowMs: startedMs,
+      debounceSeconds: 10,
+      emit
+    }),
+    { action: 'mark', reason: 'tty_mismatch', mismatchSeconds: 0 }
+  );
+  assert.equal(emitted.length, 0);
+
+  const beforeThreshold = lifecycle.applySurfaceMismatchProbe('worker-codex', session, probe, {
+    nowMs: startedMs + 9999,
+    debounceSeconds: 10,
+    emit
+  });
+  assert.equal(beforeThreshold.action, 'skip');
+  assert.equal(beforeThreshold.reason, 'debouncing');
+  assert.equal(emitted.length, 0);
+
+  const atThreshold = lifecycle.applySurfaceMismatchProbe('worker-codex', session, probe, {
+    nowMs: startedMs + 10000,
+    debounceSeconds: 10,
+    emit
+  });
+  assert.equal(atThreshold.action, 'emit');
+  assert.deepEqual(atThreshold.extra, {
+    sid: 'worker-codex',
+    backend: 'cmux',
+    cmuxWorkspaceId: 'workspace:7',
+    expectedPtyPid: 4242,
+    observedSurface: 'surface:9 "stray shell" tty=ttys999',
+    mismatchSeconds: 10
+  });
+  assert.deepEqual(emitted, [{ type: 'surface_mismatched', ...atThreshold.extra }]);
+
+  const repeat = lifecycle.applySurfaceMismatchProbe('worker-codex', session, probe, {
+    nowMs: startedMs + 20000,
+    debounceSeconds: 10,
+    emit
+  });
+  assert.equal(repeat.action, 'skip');
+  assert.equal(repeat.reason, 'already_emitted');
+  assert.equal(emitted.length, 1);
+});
+
+test('surface mismatch debounce clears on match or unknown observations', () => {
+  const nowMs = Date.parse('2026-06-06T00:00:00.000Z');
+  const session = {
+    backend: 'cmux',
+    cmuxWorkspaceId: 'workspace:7',
+    ptyPid: 4242
+  };
+
+  lifecycle.applySurfaceMismatchProbe('worker-codex', session, {
+    status: 'mismatch',
+    expectedPtyPid: 4242,
+    observedSurface: 'surface:9 "stray shell"'
+  }, { nowMs, debounceSeconds: 10 });
+
+  const cleared = lifecycle.applySurfaceMismatchProbe('worker-codex', session, {
+    status: 'unknown',
+    reason: 'cmux_unreachable',
+    expectedPtyPid: 4242
+  }, { nowMs: nowMs + 1000, debounceSeconds: 10 });
+
+  assert.equal(cleared.action, 'recover');
+  assert.equal(session.surfaceMismatchAt, null);
+  assert.equal(session.surfaceMismatchObserved, null);
+  assert.equal(session.surfaceMismatchEmitted, false);
+});
+
 test('idle TTL victim selection is independent of workspace host metadata', () => {
   const nowMs = Date.now();
   const old = new Date(nowMs - 2 * 60 * 60 * 1000).toISOString();
