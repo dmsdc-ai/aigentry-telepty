@@ -44,6 +44,11 @@ if (has('list-workspaces')) {
   process.stdout.write(ctrl.workspaces || '');
   process.exit(0);
 }
+if (has('tree')) {
+  if (ctrl.tree === 'fail') process.exit(1);
+  process.stdout.write(ctrl.treeJson || '{}');
+  process.exit(0);
+}
 if (has('close-workspace')) process.exit(ctrl.close === 'fail' ? 1 : 0);
 if (has('select-workspace')) process.exit(ctrl.select === 'fail' ? 1 : 0);
 if (has('focus-pane')) process.exit(ctrl.focus === 'fail' ? 1 : 0);
@@ -132,6 +137,106 @@ test('AC-17.4 (recovery): cmux reachable + workspace PRESENT → alive (no GC)',
 test('AC-17.x: UUID match is case-insensitive', () => {
   setControl({ ping: 'ok', workspaces: `workspace:1 ${UUID_A.toUpperCase()}\n` });
   assert.equal(backend.isSurfaceAlive({ backend: 'cmux', cmuxWorkspaceId: UUID_A }), 'alive');
+});
+
+// ── surface_mismatched predicate (read-only probe) ───────────────────────────
+
+function alivePtyOptions(tty = 'ttys007') {
+  return {
+    sessionId: 'worker-codex',
+    processKill: () => true,
+    readProcessTty: () => tty
+  };
+}
+
+function wrappedCmuxSession(extra = {}) {
+  return {
+    id: 'worker-codex',
+    type: 'wrapped',
+    backend: 'cmux',
+    cmuxWorkspaceId: UUID_A,
+    cmuxSurfaceId: 'surface:1',
+    ptyPid: 4242,
+    ...extra
+  };
+}
+
+function setTree(workspace) {
+  setControl({ ping: 'ok', treeJson: JSON.stringify({ workspaces: [workspace] }) });
+}
+
+test('detectSurfaceMismatch: selected surface tty matching expected PTY tty → match', () => {
+  setTree({
+    type: 'workspace',
+    ref: UUID_A,
+    surfaces: [
+      { type: 'surface', ref: 'surface:1', title: '⚡ telepty :: worker-codex', selected: true, tty: 'ttys007' }
+    ]
+  });
+
+  const verdict = backend.detectSurfaceMismatch(wrappedCmuxSession(), alivePtyOptions('ttys007'));
+  assert.equal(verdict.status, 'match');
+  assert.equal(verdict.method, 'tty');
+  assert.equal(verdict.reason, 'tty_match');
+});
+
+test('detectSurfaceMismatch: selected surface tty differing from expected PTY tty → mismatch', () => {
+  setTree({
+    type: 'workspace',
+    ref: UUID_A,
+    surfaces: [
+      { type: 'surface', ref: 'surface:9', title: 'stray shell', selected: true, tty: 'ttys999' }
+    ]
+  });
+
+  const verdict = backend.detectSurfaceMismatch(wrappedCmuxSession(), alivePtyOptions('ttys007'));
+  assert.equal(verdict.status, 'mismatch');
+  assert.equal(verdict.method, 'tty');
+  assert.equal(verdict.reason, 'tty_mismatch');
+  assert.equal(verdict.expectedPtyPid, 4242);
+  assert.match(verdict.observedSurface, /surface:9/);
+  assert.match(verdict.observedSurface, /tty=ttys999/);
+});
+
+test('detectSurfaceMismatch: no tty metadata falls back to selected surface ref/title marker', () => {
+  setTree({
+    type: 'workspace',
+    ref: UUID_A,
+    surfaces: [
+      { type: 'surface', ref: 'surface:2', title: 'stray shell', selected: true }
+    ]
+  });
+
+  const verdict = backend.detectSurfaceMismatch(wrappedCmuxSession(), alivePtyOptions('ttys007'));
+  assert.equal(verdict.status, 'mismatch');
+  assert.equal(verdict.method, 'title');
+  assert.equal(verdict.reason, 'surface_ref_mismatch');
+  assert.match(verdict.observedSurface, /surface:2/);
+});
+
+test('detectSurfaceMismatch: cmux unreachable remains unknown and never enumerates tree', () => {
+  setControl({ ping: 'fail' });
+  const verdict = backend.detectSurfaceMismatch(wrappedCmuxSession(), alivePtyOptions('ttys007'));
+  assert.equal(verdict.status, 'unknown');
+  assert.equal(verdict.reason, 'cmux_unreachable');
+  const seen = calls();
+  assert.ok(seen.some((c) => c.includes('ping')), 'ping should have been attempted');
+  assert.ok(!seen.some((c) => c.includes('tree')), 'must not inspect tree once ping failed');
+});
+
+test('detectSurfaceMismatch: dead expected PTY remains unknown and never touches cmux', () => {
+  const verdict = backend.detectSurfaceMismatch(wrappedCmuxSession(), {
+    sessionId: 'worker-codex',
+    processKill: () => {
+      const err = new Error('dead');
+      err.code = 'ESRCH';
+      throw err;
+    },
+    readProcessTty: () => 'ttys007'
+  });
+  assert.equal(verdict.status, 'unknown');
+  assert.equal(verdict.reason, 'expected_pty_dead');
+  assert.deepEqual(calls(), []);
 });
 
 // ── #30 — closeSurface: GATED (orchestrator owns surface close; verdict 2026-05-30) ──────────
