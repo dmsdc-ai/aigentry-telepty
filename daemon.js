@@ -2757,6 +2757,18 @@ app.delete('/api/sessions/:id', (req, res) => {
   const session = sessions[resolvedId];
   const id = resolvedId;
   if (session.isClosing) return res.json({ success: true, status: 'closing' });
+  // BUG-C (shared-fate): a wrapped session can be co-bound by a stale/displaced owner bridge
+  // (duplicate --id). A DELETE carrying a token that is NOT the current owner's, while a live
+  // owner ws is still open, is that stale bridge exiting — it must NOT tear down the live owner.
+  // Detach-only (no-op): leave the record and every client untouched. Tokenless callers
+  // (operator `telepty delete`, ghost clean) and matching-token current-owner exits are
+  // unaffected. Forceful kills go through POST /:id/kill (teardownSessionById), not here.
+  const ownerToken = req.query.owner_token;
+  if (session.type === 'wrapped'
+      && ownerToken && session.ownerToken && ownerToken !== session.ownerToken
+      && isOpenWebSocket(session.ownerWs)) {
+    return res.json({ success: true, status: 'stale-detached' });
+  }
   try {
     session.isClosing = true;
     if (session.type === 'wrapped') {

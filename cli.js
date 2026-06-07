@@ -1273,6 +1273,10 @@ async function main() {
     let wsReady = false;
     let reconnectAttempts = 0;
     let reconnectTimer = null;
+    // BUG-C: the daemon mints a per-owner token on each owner claim/reclaim and pushes it here.
+    // We echo it on the teardown DELETE so the daemon can tell our (current-owner) exit apart
+    // from a stale/displaced owner's exit and avoid the shared-fate teardown.
+    let currentOwnerToken = null;
     let lastInjectTextTime = 0;
     const MAX_RECONNECT_DELAY = 30000;
 
@@ -1318,6 +1322,10 @@ async function main() {
       daemonWs.on('message', (message) => {
         try {
           const msg = JSON.parse(message);
+          if (msg.type === 'owner_token') {
+            currentOwnerToken = msg.token || null;
+            return;
+          }
           if (msg.type === 'inject') {
             const chunks = [];
             const rawData = typeof msg.data === 'string' ? msg.data : String(msg.data ?? '');
@@ -1430,7 +1438,12 @@ async function main() {
       // Purge bridge mailbox on clean exit (undelivered messages are stale)
       try { bridgeMailbox.purge(bridgeTarget); } catch {}
       process.stdout.write(`\x1b]0;\x07`);
-      fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }).catch(() => {});
+      // BUG-C: carry our owner token so the daemon destroys only on the CURRENT owner's exit;
+      // a stale/displaced owner's DELETE (mismatched token) must not tear down the live owner.
+      const deleteUrl = currentOwnerToken
+        ? `${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}?owner_token=${encodeURIComponent(currentOwnerToken)}`
+        : `${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`;
+      fetchWithAuth(deleteUrl, { method: 'DELETE' }).catch(() => {});
       if (reconnectTimer) clearTimeout(reconnectTimer);
       try {
         daemonWs.close();

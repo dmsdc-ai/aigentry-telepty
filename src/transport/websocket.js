@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const { WebSocketServer } = require('ws');
 
 function isOpenWebSocket(ws) {
@@ -107,6 +108,13 @@ function installWebSocketTransport(deps) {
         activeSession.ownerWs.terminate();
       }
       activeSession.ownerWs = ws;
+      // BUG-C: mint a fresh per-owner token on every claim/reclaim and push it to this owner.
+      // The token is the exact "are-you-the-current-owner" discriminator the DELETE guard uses
+      // to suppress a stale/displaced owner's teardown (shared-fate fix). Reclaim refreshes it,
+      // so the live current owner always holds the current token while a displaced owner keeps a
+      // stale one.
+      activeSession.ownerToken = crypto.randomUUID();
+      try { ws.send(JSON.stringify({ type: 'owner_token', token: activeSession.ownerToken })); } catch {}
       markSessionConnected(activeSession);
       initializeBootstrapState(activeSession);
       console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);

@@ -3,6 +3,7 @@
 const { afterEach, beforeEach, test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('http');
+const WebSocket = require('ws');
 const { createSessionId, delay, startTestDaemon, waitFor } = require('../test-support/daemon-harness');
 
 let harness;
@@ -1132,4 +1133,130 @@ test('auto-report: inject with from triggers TASK_COMPLETE when target goes idle
   assert.ok(allOutput.includes(targetId));
 
   sourceWs.close();
+});
+
+// --- BUG-C: duplicate --id shared-fate (a stale owner's DELETE must not kill the live owner) ---
+
+// Connect a wrapped owner bridge (?owner=1), wait for open, and return the ws plus a live record
+// of every JSON frame and close event it sees. No auth token needed — the daemon allows loopback.
+async function connectOwner(sessionId) {
+  const ws = new WebSocket(`ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}?owner=1`);
+  const frames = [];
+  const closes = [];
+  ws.on('message', (chunk) => {
+    try { frames.push(JSON.parse(chunk.toString())); } catch {}
+  });
+  ws.on('close', (code, reason) => {
+    closes.push({ code, reason: reason ? reason.toString() : '' });
+  });
+  await new Promise((resolve, reject) => {
+    ws.once('open', resolve);
+    ws.once('error', reject);
+  });
+  return { ws, frames, closes };
+}
+
+async function waitForOwnerToken(owner, description) {
+  await waitFor(() => owner.frames.some((m) => m.type === 'owner_token' && m.token), { description });
+  return owner.frames.find((m) => m.type === 'owner_token' && m.token).token;
+}
+
+test('BUG-C: a displaced owner DELETE (stale token) does not tear down the live current owner', async () => {
+  const sessionId = createSessionId('dupid-stale');
+  await harness.registerSession(sessionId);
+
+  // Owner A claims first, then owner B reclaims (the legitimate reconnect/reclaim path).
+  const ownerA = await connectOwner(sessionId);
+  const tokenA = await waitForOwnerToken(ownerA, 'owner A token');
+
+  const ownerB = await connectOwner(sessionId);
+  const tokenB = await waitForOwnerToken(ownerB, 'owner B token (reclaim)');
+
+  // Reclaim minted a fresh token for the new live owner — the discriminator the guard relies on.
+  assert.notEqual(tokenA, tokenB, 'reclaim must mint a fresh owner token');
+
+  // The stale/displaced owner A exits → DELETE carrying its now-stale token. Must be a no-op.
+  const detach = await harness.request(
+    `/api/sessions/${encodeURIComponent(sessionId)}?owner_token=${encodeURIComponent(tokenA)}`,
+    { method: 'DELETE' }
+  );
+  assert.equal(detach.status, 200);
+  assert.equal(detach.body.status, 'stale-detached');
+
+  // The live owner B must NOT have been closed with the lethal destroy frame, and the record stays.
+  await delay(200);
+  assert.ok(
+    !ownerB.closes.some((c) => c.code === 1000 && c.reason === 'Session destroyed'),
+    'live owner B must not receive the Session destroyed close'
+  );
+  assert.equal(ownerB.ws.readyState, WebSocket.OPEN, 'live owner B socket must stay open');
+  const stillThere = await harness.request('/api/sessions');
+  assert.ok(stillThere.body.some((s) => s.id === sessionId), 'session record must survive a stale DELETE');
+
+  ownerB.ws.close();
+});
+
+test('BUG-C: reclaim re-mints the owner token and reattaches the new live owner', async () => {
+  const sessionId = createSessionId('dupid-reclaim');
+  await harness.registerSession(sessionId);
+
+  const ownerA = await connectOwner(sessionId);
+  const tokenA = await waitForOwnerToken(ownerA, 'owner A token');
+
+  // Owner B reconnects/reclaims with ?owner=1 — must become the owner and get a fresh token.
+  const ownerB = await connectOwner(sessionId);
+  const tokenB = await waitForOwnerToken(ownerB, 'owner B token after reclaim');
+  assert.notEqual(tokenA, tokenB, 'reclaim must mint a fresh owner token');
+
+  // An inject now routes to the reclaimed owner B (reattach is intact).
+  const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    method: 'POST',
+    body: { prompt: 'hi-reclaim' }
+  });
+  assert.equal(inject.status, 200);
+  await waitFor(() => ownerB.frames.some((m) => m.type === 'inject'),
+    { description: 'reclaimed owner B receives the inject' });
+
+  ownerB.ws.close();
+});
+
+test('BUG-C: the current owner DELETE (matching token) destroys the session normally', async () => {
+  const sessionId = createSessionId('dupid-owner');
+  await harness.registerSession(sessionId);
+
+  const owner = await connectOwner(sessionId);
+  const token = await waitForOwnerToken(owner, 'owner token');
+
+  const destroy = await harness.request(
+    `/api/sessions/${encodeURIComponent(sessionId)}?owner_token=${encodeURIComponent(token)}`,
+    { method: 'DELETE' }
+  );
+  assert.equal(destroy.status, 200);
+
+  // The owner receives the destroy frame and the record is gone — normal single-owner teardown.
+  await waitFor(() => owner.closes.some((c) => c.code === 1000 && c.reason === 'Session destroyed'),
+    { description: 'current owner receives Session destroyed' });
+  await waitFor(async () => {
+    const list = await harness.request('/api/sessions');
+    return list.status === 200 && !list.body.some((s) => s.id === sessionId);
+  }, { description: 'session removed after current-owner delete' });
+});
+
+test('BUG-C: a tokenless DELETE still destroys a wrapped session (operator delete unchanged)', async () => {
+  const sessionId = createSessionId('dupid-tokenless');
+  await harness.registerSession(sessionId);
+
+  const owner = await connectOwner(sessionId);
+  await waitForOwnerToken(owner, 'owner token');
+
+  // No owner_token → guard does not trigger → legacy destroy behavior is preserved.
+  const destroy = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+  assert.equal(destroy.status, 200);
+
+  await waitFor(() => owner.closes.some((c) => c.code === 1000 && c.reason === 'Session destroyed'),
+    { description: 'tokenless delete closes the owner' });
+  await waitFor(async () => {
+    const list = await harness.request('/api/sessions');
+    return list.status === 200 && !list.body.some((s) => s.id === sessionId);
+  }, { description: 'session removed after tokenless delete' });
 });
