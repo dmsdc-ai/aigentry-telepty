@@ -298,9 +298,20 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
   const srcSession = _sessions[srcId];
   if (!srcSession) return;
 
+  // #537 / Bug B: a never-started worker (transient submit failure → claude startup
+  // busy→idle settle at ~4.5s) must NOT be reported TASK_COMPLETE. When a submit was
+  // expected, the elapsed floor and startup-polluted sawWorkingAfterInject are NOT trusted
+  // as proof of processing — require positive submit confirmation (screen-poll verify /
+  // honest force / gate-off). Paths with no submit expected keep the legacy floor/work rule.
+  const strongSubmitConfirmed = !!(
+    pendingReport.submitConfirmedAt ||
+    (pendingReport.submitConfirm && pendingReport.submitConfirm.accepted === true)
+  );
   const confirmed = trigger === 'ready-signal' && pendingReport.submitExpected
     ? false
-    : (elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS || hasSubmitEvidence);
+    : pendingReport.submitExpected
+      ? strongSubmitConfirmed
+      : (elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS || hasSubmitEvidence);
   const injTag = pendingReport.injectId ? ` inject=${pendingReport.injectId}` : '';
   const reportMsg = confirmed
     ? `TASK_COMPLETE: ${targetId} is now idle after processing inject (${elapsed}s, via ${trigger}${injTag})`
@@ -1182,6 +1193,19 @@ function terminalLevelSubmit(id, session) {
   // Priority 3: PTY \r
   if (submitViaPty(session)) return 'pty_cr';
   return null;
+}
+
+// #537 / Bug B: a forced submit is only HONESTLY confirmed when its strategy actually
+// reached the rendered surface. On a cmux-backed session the surface is cmux; a `pty_cr`
+// fallback means `cmux send-key` failed ("Failed to write to socket") and the live CLI
+// never received Enter. Terminal-level strategies (kitty/cmux) are real delivery; a pty_cr
+// fallback on a cmux surface is NOT. Pure + exported so the decision is unit-testable.
+function forceSubmitDeliveredToSurface(session, strategy) {
+  if (!strategy) return false;
+  if (session && session.backend === 'cmux' && session.cmuxWorkspaceId && strategy === 'pty_cr') {
+    return false;
+  }
+  return true;
 }
 
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
@@ -2190,11 +2214,19 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     }
     const strategy = terminalLevelSubmit(id, session);
     if (strategy) {
+      // #537 / Bug B: force-confirm must reflect ACTUAL delivery. A pty_cr fallback on a
+      // cmux surface means cmux send-key failed and Enter never reached the CLI — record
+      // UNCONFIRMED so the ENFORCE-REPORT gate never labels a never-delivered inject DONE.
+      const deliveredToSurface = forceSubmitDeliveredToSurface(session, strategy);
       if (injectedBody) {
-        markPendingReportSubmitConfirmed(id, { reason: 'force', attempts: 1 });
+        if (deliveredToSurface) {
+          markPendingReportSubmitConfirmed(id, { reason: 'force', attempts: 1 });
+        } else {
+          markPendingReportSubmitUnconfirmed(id, { reason: 'cmux_send_failed', attempts: 1, retryable: true });
+        }
       }
-      emitSubmitBus({ strategy, attempts: 1, gated: false, forced: true });
-      return res.json({ success: true, strategy, attempts: 1, gated: false, forced: true });
+      emitSubmitBus({ strategy, attempts: 1, gated: false, forced: true, submit_confirmed: deliveredToSurface });
+      return res.json({ success: true, strategy, attempts: 1, gated: false, forced: true, submit_confirmed: deliveredToSurface });
     }
     if (injectedBody) {
       markPendingReportSubmitUnconfirmed(id, { reason: 'strategy_failed', attempts: 0, retryable: false });
@@ -3488,6 +3520,7 @@ if (require.main === module) {
 // production call sites is unchanged. NOT a public API — internal/test use only.
 module.exports = {
   fireAutoReport,                 // #32: provenance-tagged auto-report (deps DI: now/deliver/...)
+  forceSubmitDeliveredToSurface,  // #537/Bug B: honest force-confirm (pty_cr on cmux = not delivered)
   failBootstrapQueueOnTimeout,    // #31: actionable bootstrap-timeout queue flush
   shouldApplyOwnerAliveFloor,     // #29: owner-alive optimistic-floor decision (deps DI: isProcessRunning/...)
   scheduleBootstrapPromptPoll,    // #29: arms the floor timer (deps DI: setTimeout/...)
