@@ -1180,32 +1180,37 @@ async function writeDataToSession(id, session, data) {
 }
 
 /**
- * Submit Enter to a session using terminal-level methods.
+ * Submit Enter to a session via the PTY/context layer.
  * Used by POST /submit endpoint for explicit terminal-level submit.
- * Priority: kitty send-text → cmux send-key → PTY \r fallback.
- * Returns the strategy name or null on failure.
+ *
+ * Submit is a CONTEXT operation (telepty-owned), not a SURFACE operation
+ * (cmux/kitty adaptor-owned). Deliver the submit Enter via the PTY only — a bare
+ * 0x0D into the CLI's innermost node-pty. The former kitty `send-text` (P1) and
+ * `cmux send-key` (P2) branches were SURFACE ops on a flaky side channel (75×
+ * "Failed to write to socket" vs 0× for pty_cr in a 222k-line run; live
+ * 2026-06-07 confirmed pty-only works 3/3). `submitViaCmux`/`sendViaKitty` defs
+ * are kept (non-submit callers); codebase removal is gated on the warp/tmux
+ * matrix. See docs/adr/2026-06-07-submit-via-pty-context-layer.md.
+ *
+ * Returns the strategy name ('pty_cr') or null on failure.
  */
 function terminalLevelSubmit(id, session) {
-  // Priority 1: kitty send-text (terminal-level, bypasses PTY raw mode quirks)
-  if (session.type === 'wrapped' && sendViaKitty(id, '\r')) return 'kitty';
-  // Priority 2: cmux send-key
-  if (session.backend === 'cmux' && session.cmuxWorkspaceId && submitViaCmux(id)) return 'cmux';
-  // Priority 3: PTY \r
   if (submitViaPty(session)) return 'pty_cr';
   return null;
 }
 
-// #537 / Bug B: a forced submit is only HONESTLY confirmed when its strategy actually
-// reached the rendered surface. On a cmux-backed session the surface is cmux; a `pty_cr`
-// fallback means `cmux send-key` failed ("Failed to write to socket") and the live CLI
-// never received Enter. Terminal-level strategies (kitty/cmux) are real delivery; a pty_cr
-// fallback on a cmux surface is NOT. Pure + exported so the decision is unit-testable.
+// #544 / #537 / Bug B: with PTY-native submit (terminalLevelSubmit → pty_cr only),
+// a successful pty_cr IS real delivery on every backend — the bare 0x0D reaches the
+// CLI's innermost node-pty directly (live 2026-06-07: pty-only delivered 3/3 even
+// when cmux send-key failed). The honest "was it accepted?" signal is the
+// PTY-derived confirm (confirmSubmitAccepted: state∈{working,thinking} since≥
+// submittedAt, or body consumed from outputRing) — NOT the strategy name. We no
+// longer special-case pty_cr-on-cmux as undelivered; that false-negative was the
+// direct cause of the BUG B bogus UNCONFIRMED reports + worker re-send loops.
+// Pure + exported so the decision is unit-testable.
+// See docs/adr/2026-06-07-submit-via-pty-context-layer.md.
 function forceSubmitDeliveredToSurface(session, strategy) {
-  if (!strategy) return false;
-  if (session && session.backend === 'cmux' && session.cmuxWorkspaceId && strategy === 'pty_cr') {
-    return false;
-  }
-  return true;
+  return !!strategy;
 }
 
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
@@ -3520,7 +3525,9 @@ if (require.main === module) {
 // production call sites is unchanged. NOT a public API — internal/test use only.
 module.exports = {
   fireAutoReport,                 // #32: provenance-tagged auto-report (deps DI: now/deliver/...)
-  forceSubmitDeliveredToSurface,  // #537/Bug B: honest force-confirm (pty_cr on cmux = not delivered)
+  forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
+  terminalLevelSubmit,            // #544: PTY-only submit path (pty_cr | null)
+  submitViaPty,                   // #544: bare-0x0D submit into the innermost node-pty
   failBootstrapQueueOnTimeout,    // #31: actionable bootstrap-timeout queue flush
   shouldApplyOwnerAliveFloor,     // #29: owner-alive optimistic-floor decision (deps DI: isProcessRunning/...)
   scheduleBootstrapPromptPoll,    // #29: arms the floor timer (deps DI: setTimeout/...)

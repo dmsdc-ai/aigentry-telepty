@@ -308,10 +308,16 @@ function observeBodyVisibility(session, bodyText, opts = {}) {
   };
 }
 
+// PTY-native confirm (#544): do NOT shell to `cmux read-screen` for the submit
+// confirm. The body-visibility source is the PTY-fed outputRing
+// (observeBodyVisibility falls through to it when this returns null). An explicit
+// opts.readScreen seam is still honored (tests / future surface adaptors); the
+// cmux default is dropped so confirmation is screen-free and no longer depends on
+// the flaky cmux surface. The pre-submit readiness probe (awaitPromptSymbol) keeps
+// its own defaultReadScreen — that is a separate concern, out of scope here.
+// See docs/adr/2026-06-07-submit-via-pty-context-layer.md.
 function readCurrentScreen(session, opts = {}) {
-  const readScreen = typeof opts.readScreen === 'function'
-    ? opts.readScreen
-    : (session && session.backend === 'cmux' && session.cmuxWorkspaceId ? defaultReadScreen : null);
+  const readScreen = typeof opts.readScreen === 'function' ? opts.readScreen : null;
   if (!readScreen || !session || !session.cmuxWorkspaceId) return null;
   const tailLines = Number.isFinite(opts.tailLines) ? opts.tailLines : 30;
   try {

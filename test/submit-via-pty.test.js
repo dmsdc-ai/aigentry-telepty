@@ -1,0 +1,246 @@
+'use strict';
+
+// #544 / #537 (BUG B): submit via the PTY/context layer (pty-only) + PTY-native confirm.
+//
+// Codifies the 2026-06-07 validation: telepty delivers the submit Enter as a bare 0x0D into
+// the CLI's innermost node-pty (no kitty send-text / cmux send-key surface ops), confirmation
+// is screen-free (state + outputRing, no `cmux read-screen`), and the UNCONFIRMED-race accept
+// signal stays pinned to RELIABLE evidence only — a never-started worker's startup spinner
+// must NOT be reported TASK_COMPLETE.
+//
+// Fully hermetic: no daemon spawn, no PTY, no cmux/kitty binaries. See
+// docs/adr/2026-06-07-submit-via-pty-context-layer.md and
+// docs/superpowers/specs/2026-06-07-submit-via-pty-context-layer.md.
+
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const child_process = require('node:child_process');
+
+const daemon = require('../daemon');
+const { terminalLevelSubmit, submitViaPty, forceSubmitDeliveredToSurface, fireAutoReport } = daemon;
+const { confirmSubmitAccepted, observeBodyVisibility } = require('../src/submit-gate');
+
+// ---------------------------------------------------------------------------
+// 1) pty-only submit: single 0x0D, separate write, no surface shell-out
+// ---------------------------------------------------------------------------
+
+function captureWrappedOwnerWs() {
+  const sent = [];
+  return {
+    sent,
+    session: {
+      type: 'wrapped',
+      // Deliberately ALSO set the cmux + kitty handles: pre-#544 these would have
+      // been tried first (P1 kitty / P2 cmux). PTY-only must ignore them.
+      backend: 'cmux',
+      cmuxWorkspaceId: 'workspace:1',
+      ownerWs: { readyState: 1, send: (m) => sent.push(m) },
+    },
+  };
+}
+
+test('terminalLevelSubmit returns pty_cr and emits a SINGLE 0x0D via ownerWs (wrapped)', () => {
+  const { sent, session } = captureWrappedOwnerWs();
+  const strategy = terminalLevelSubmit('s1', session);
+
+  assert.equal(strategy, 'pty_cr');
+  assert.equal(sent.length, 1, 'exactly one inject write');
+  const msg = JSON.parse(sent[0]);
+  assert.equal(msg.type, 'inject');
+  assert.equal(msg.data, '\r');
+  const bytes = Buffer.from(msg.data, 'utf8');
+  assert.equal(bytes.length, 1, 'submit is a single byte');
+  assert.equal(bytes[0], 0x0d, 'submit byte is 0x0D (CR / Ink "return" = SUBMIT)');
+  assert.notEqual(bytes[0], 0x0a, 'submit byte is NOT 0x0A (LF / Ink "enter" = newline)');
+  assert.notEqual(msg.data, '\r\n', 'submit is bare CR, never CRLF');
+});
+
+test('terminalLevelSubmit performs NO cmux/kitty surface shell-out (no child_process.execSync)', () => {
+  const { session } = captureWrappedOwnerWs();
+  const realExecSync = child_process.execSync;
+  let execCalls = 0;
+  child_process.execSync = (...args) => { execCalls++; return realExecSync.apply(child_process, args); };
+  try {
+    const strategy = terminalLevelSubmit('s1', session);
+    assert.equal(strategy, 'pty_cr');
+  } finally {
+    child_process.execSync = realExecSync;
+  }
+  assert.equal(execCalls, 0, 'submit must not shell to cmux send-key / kitty send-text');
+});
+
+test('submitViaPty writes a SINGLE 0x0D into the spawned ptyProcess (non-wrapped)', () => {
+  const writes = [];
+  const session = { type: 'pty', ptyProcess: { write: (d) => writes.push(d) } };
+  const ok = submitViaPty(session);
+
+  assert.equal(ok, true);
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0], '\r');
+  const bytes = Buffer.from(writes[0], 'utf8');
+  assert.equal(bytes.length, 1);
+  assert.equal(bytes[0], 0x0d);
+});
+
+test('submitViaPty returns false (no submit) when the wrapped ownerWs is not connected', () => {
+  const session = { type: 'wrapped', ownerWs: { readyState: 0, send: () => { throw new Error('must not send'); } } };
+  assert.equal(submitViaPty(session), false);
+  assert.equal(terminalLevelSubmit('s1', session), null, 'no fallback surface path remains');
+});
+
+// ---------------------------------------------------------------------------
+// 2) per-backend matrix (PTY path is backend-agnostic) + aterm EXCLUDED
+// ---------------------------------------------------------------------------
+// cmux is live-proven (2026-06-07). warp/tmux are DESIGN HOOKS only: the PTY
+// submit is identical across backends, but cmux send-key removal from the
+// codebase stays gated on a live warp/tmux regression matrix (not asserted here).
+
+for (const backend of ['cmux', 'warp', 'tmux']) {
+  test(`terminalLevelSubmit → pty_cr for a wrapped ${backend} session (backend-agnostic 0x0D)`, () => {
+    const sent = [];
+    const session = { type: 'wrapped', backend, cmuxWorkspaceId: backend === 'cmux' ? 'workspace:9' : null,
+      ownerWs: { readyState: 1, send: (m) => sent.push(m) } };
+    assert.equal(terminalLevelSubmit('s', session), 'pty_cr');
+    assert.equal(JSON.parse(sent[0]).data, '\r');
+  });
+}
+
+test('aterm is EXCLUDED from the PTY submit path (no ownerWs, no ptyProcess → no submit)', () => {
+  // The daemon delivery path guards `session.type !== 'aterm'` BEFORE submit, so
+  // terminalLevelSubmit is never invoked for aterm (UDS Inject, submit intentionally
+  // skipped). An aterm session has neither a wrapped ownerWs nor a spawned ptyProcess,
+  // so any accidental routing here cannot silently deliver a CR — it throws. This pins
+  // the exclusion: aterm must be filtered upstream, never reach submitViaPty.
+  const aterm = { type: 'aterm', backend: 'aterm' };
+  assert.throws(() => terminalLevelSubmit('a1', aterm), /ptyProcess|Cannot read|undefined/);
+});
+
+// ---------------------------------------------------------------------------
+// 3) PTY-native confirm: state + outputRing, NO `cmux read-screen` shell-out
+// ---------------------------------------------------------------------------
+
+test('confirmSubmitAccepted confirms a cmux session via outputRing — NO cmux read-screen', async () => {
+  const body = '[context-ref] Read ~/.telepty/shared/hash.md';
+  // Body was visible (in history) then state moves to working — accepted via state, source
+  // must be the PTY-fed outputRing, never a screen shell-out.
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:7', outputRing: [`› ${body}`] };
+  const submittedAtMs = Date.now();
+  let state = { state: 'idle', confidence: 0.9, since_ms: submittedAtMs - 10 };
+  setTimeout(() => { state = { state: 'working', confidence: 0.9, since_ms: Date.now() }; }, 15);
+
+  const realExecSync = child_process.execSync;
+  let execCalls = 0;
+  child_process.execSync = (...args) => { execCalls++; return realExecSync.apply(child_process, args); };
+  let result;
+  try {
+    result = await confirmSubmitAccepted(session, body, {
+      submittedAtMs, timeoutMs: 250, intervalMs: 10, getState: () => state,
+    });
+  } finally {
+    child_process.execSync = realExecSync;
+  }
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.reason, 'state_working');
+  assert.equal(execCalls, 0, 'confirm must not shell to `cmux read-screen`');
+});
+
+test('observeBodyVisibility sources from outputRing (not screen) for a cmux session with no readScreen', () => {
+  const body = 'unique-needle-xyz';
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:7', outputRing: [`› ${body} still here`] };
+  const realExecSync = child_process.execSync;
+  let execCalls = 0;
+  child_process.execSync = (...args) => { execCalls++; return realExecSync.apply(child_process, args); };
+  let vis;
+  try {
+    vis = observeBodyVisibility(session, body);
+  } finally {
+    child_process.execSync = realExecSync;
+  }
+  assert.equal(vis.observable, true);
+  assert.equal(vis.visible, true);
+  assert.equal(vis.source, 'output_ring', 'confirm source is the PTY-fed outputRing, not screen');
+  assert.equal(execCalls, 0, 'no cmux read-screen shell-out');
+});
+
+test('confirmSubmitAccepted still honors an explicit opts.readScreen seam (future surface adaptors)', async () => {
+  const body = 'screen-needle';
+  const session = { backend: 'cmux', cmuxWorkspaceId: 'workspace:7', outputRing: [] };
+  // Screen shows the body gone → consumed/absent → accepted via the injected reader.
+  const result = await confirmSubmitAccepted(session, body, {
+    timeoutMs: 100, intervalMs: 10, readScreen: () => 'prompt › (empty)',
+  });
+  assert.equal(result.accepted, true);
+});
+
+// ---------------------------------------------------------------------------
+// 4) #537 / BUG B regression (CONDITION-mandated): never-started worker stays UNCONFIRMED
+// ---------------------------------------------------------------------------
+
+const NOW = 1_700_000_000_000;
+
+function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4.5 } = {}) {
+  const captured = [];
+  const pendingReport = {
+    source: 'orch',
+    injectId: 'inj-1',
+    injectedAt: new Date(NOW - elapsedSec * 1000).toISOString(),
+    ...pendingReportOverrides,
+  };
+  const deps = {
+    now: () => NOW,
+    setTimeout: () => 0,
+    broadcastSessionEvent: () => {},
+    resolveSessionAlias: (s) => s,
+    sessions: { orch: { id: 'orch' } },
+    pendingReports: {},
+    deliverInjectionToSession: (srcId, _s, msg) => captured.push({ srcId, msg }),
+  };
+  fireAutoReport('worker-1', { id: 'worker-1' }, pendingReport, trigger, deps);
+  return captured.length ? captured[0].msg : null;
+}
+
+test('BUG B: never-started worker (submit failed, only a startup spinner) → TASK_IDLE_UNCONFIRMED, never TASK_COMPLETE [real-idle]', () => {
+  // Submit was expected but never strong-confirmed (no submitConfirmedAt, accepted:false).
+  // The ONLY positive signal is sawWorkingAfterInject — a startup-spinner-polluted transition.
+  // The accept gate must stay pinned to RELIABLE evidence, so this remains UNCONFIRMED.
+  const msg = runGate({
+    submitExpected: true,
+    sawWorkingAfterInject: true,
+    submitConfirm: { accepted: false, reason: 'strategy_failed' },
+  });
+  assert.ok(msg);
+  assert.match(msg, /^TASK_IDLE_UNCONFIRMED:/);
+  assert.doesNotMatch(msg, /^TASK_COMPLETE:/);
+});
+
+test('BUG B: never-started worker stays UNCONFIRMED on the silence-timeout trigger too', () => {
+  const msg = runGate({ submitExpected: true, sawWorkingAfterInject: true }, { trigger: 'silence-timeout', elapsedSec: 12 });
+  assert.ok(msg);
+  assert.match(msg, /^TASK_IDLE_UNCONFIRMED:/);
+});
+
+test('positive: a strong-confirmed pty_cr submit (post-#544) → TASK_COMPLETE', () => {
+  // Change 2a: a delivered pty_cr now sets submitConfirmedAt at submit time, so the
+  // existing reliable-evidence gate correctly reports completion — no false UNCONFIRMED.
+  const msg = runGate({
+    submitExpected: true,
+    submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
+    submitConfirm: { accepted: true, reason: 'force' },
+  }, { elapsedSec: 30 });
+  assert.match(msg, /^TASK_COMPLETE:/);
+});
+
+// ---------------------------------------------------------------------------
+// 5) force-confirm: pty_cr IS delivery on every backend (#544 flip)
+// ---------------------------------------------------------------------------
+
+test('forceSubmitDeliveredToSurface: pty_cr is delivered on cmux (PTY-native) and everywhere', () => {
+  assert.equal(forceSubmitDeliveredToSurface({ backend: 'cmux', cmuxWorkspaceId: 'w1' }, 'pty_cr'), true);
+  assert.equal(forceSubmitDeliveredToSurface({ type: 'pty' }, 'pty_cr'), true);
+  assert.equal(forceSubmitDeliveredToSurface({ backend: 'cmux', cmuxWorkspaceId: 'w1' }, null), false);
+});
+
+// Requiring daemon.js loads persisted sessions for read-only inspection; ensure the test
+// process exits even if module-load left background handles open.
+test.after(() => { setImmediate(() => process.exit(0)); });

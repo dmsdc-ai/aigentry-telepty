@@ -9,7 +9,8 @@
 //
 // Two surgical guards are verified here, both fully hermetic (no daemon spawn, no PTY):
 //   1) fireAutoReport()'s real-idle gate — via the exported deps DI seam.
-//   2) forceSubmitDeliveredToSurface() — honest force-confirm (pty_cr on cmux = not delivered).
+//   2) forceSubmitDeliveredToSurface() — PTY-native force-confirm (#544: a successful
+//      pty_cr IS real delivery on every backend; honesty comes from the PTY-derived confirm).
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -85,11 +86,15 @@ test('D2: real-idle, no submit expected, above elapsed floor → TASK_COMPLETE (
 
 // ---------------- honest force-confirm: delivery to rendered surface ----------------
 
-test('E: force pty_cr fallback on a cmux surface is NOT delivered (cmux send-key failed)', () => {
-  assert.equal(forceSubmitDeliveredToSurface({ backend: 'cmux', cmuxWorkspaceId: 'w1' }, 'pty_cr'), false);
+// #544: PTY-native submit flips this. terminalLevelSubmit now emits pty_cr ONLY, and a
+// successful pty_cr writes the bare 0x0D into the CLI's innermost node-pty — real delivery
+// even on a cmux surface (live 2026-06-07: 3/3 with cmux send-key failing). The former
+// false-negative here was the direct cause of BUG B's bogus UNCONFIRMED reports.
+test('E: force pty_cr on a cmux surface IS delivered (PTY-native submit, #544)', () => {
+  assert.equal(forceSubmitDeliveredToSurface({ backend: 'cmux', cmuxWorkspaceId: 'w1' }, 'pty_cr'), true);
 });
 
-test('F: force via cmux strategy IS delivered', () => {
+test('F: force via cmux strategy IS delivered (pure-fn: any truthy strategy delivers)', () => {
   assert.equal(forceSubmitDeliveredToSurface({ backend: 'cmux', cmuxWorkspaceId: 'w1' }, 'cmux'), true);
 });
 
