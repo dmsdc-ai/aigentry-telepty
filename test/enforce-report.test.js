@@ -6,6 +6,14 @@ const { createSessionId, delay, startTestDaemon, waitFor } = require('../test-su
 
 let harness;
 
+// #533 Phase 2: these tests model orchestrator→worker REPORT enforcement. The
+// work-INJECTOR (the "source" that later receives the report) plays the orchestrator
+// role, so it must classify as orch-lane (not peer-lane) under the inject guardrail.
+// ORCH/ORCH2 are the fixture orchestrator sids, registered via AIGENTRY_ORCHESTRATOR_SIDS
+// in beforeEach. ORCH2 is a second distinct orchestrator sid for the overwrite test.
+const ORCH = 'orch';
+const ORCH2 = 'orch2';
+
 function collectJsonMessages(ws) {
   const messages = [];
   ws.on('message', (chunk) => {
@@ -23,6 +31,9 @@ beforeEach(async () => {
   harness = await startTestDaemon({
     env: {
       TELEPTY_STATE_IDLE_TIMEOUT_MS: '300', // fast idle for tests
+      // Register the fixture orchestrator sids so orchestrator→worker injects
+      // classify as orch-lane (allowed), not peer-lane-blocked (#533 Phase 2).
+      AIGENTRY_ORCHESTRATOR_SIDS: `orchestrator aigentry-orchestrator-claude ${ORCH} ${ORCH2}`,
     }
   });
 });
@@ -35,7 +46,7 @@ afterEach(async () => {
 
 test('REPORT-prefixed inject with matching reverse-match emits TASK_COMPLETE_WITH_REPORT', async () => {
   const senderId = createSessionId('sender');
-  const receiverId = createSessionId('receiver');
+  const receiverId = ORCH;
 
   // Register both as wrapped sessions
   await harness.spawnSession(senderId);
@@ -78,7 +89,7 @@ test('REPORT-prefixed inject with matching reverse-match emits TASK_COMPLETE_WIT
 
 test('reverse-matched REPORT forces sender idle and control-only redraws do not re-mark working', async () => {
   const senderId = createSessionId('wrapped-sender');
-  const receiverId = createSessionId('wrapped-receiver');
+  const receiverId = ORCH;
 
   await harness.registerSession(senderId);
   await harness.registerSession(receiverId);
@@ -128,7 +139,7 @@ test('reverse-matched REPORT forces sender idle and control-only redraws do not 
 
 test('STATUS: blocked with matching reverse-match emits TASK_BLOCKED_WITH_REASON', async () => {
   const senderId = createSessionId('sender');
-  const receiverId = createSessionId('receiver');
+  const receiverId = ORCH;
   await harness.spawnSession(senderId);
   await harness.spawnSession(receiverId);
 
@@ -157,7 +168,7 @@ test('STATUS: blocked with matching reverse-match emits TASK_BLOCKED_WITH_REASON
 
 test('STATUS: dismissed with matching reverse-match emits TASK_DISMISSED', async () => {
   const senderId = createSessionId('sender');
-  const receiverId = createSessionId('receiver');
+  const receiverId = ORCH;
   await harness.spawnSession(senderId);
   await harness.spawnSession(receiverId);
 
@@ -185,7 +196,7 @@ test('STATUS: dismissed with matching reverse-match emits TASK_DISMISSED', async
 
 test('REPORT prefix WITHOUT matching reverse-match is treated as regular inject (no enforcement event)', async () => {
   const senderId = createSessionId('sender');
-  const receiverId = createSessionId('receiver');
+  const receiverId = ORCH;
   const unrelatedId = createSessionId('unrelated');
   await harness.spawnSession(senderId);
   await harness.spawnSession(receiverId);
@@ -216,7 +227,7 @@ test('REPORT prefix WITHOUT matching reverse-match is treated as regular inject 
 
 test('DELETE /api/pendingReports/:id fires TASK_DISMISSED and clears entry', async () => {
   const senderId = createSessionId('sender');
-  const receiverId = createSessionId('receiver');
+  const receiverId = ORCH;
   await harness.spawnSession(senderId);
   await harness.spawnSession(receiverId);
 
@@ -256,7 +267,7 @@ test('DELETE /api/pendingReports/:id fires TASK_DISMISSED and clears entry', asy
 
 test('GET /api/pendingReports/:id returns pending entry with auto_summary', async () => {
   const senderId = createSessionId('sender');
-  const receiverId = createSessionId('receiver');
+  const receiverId = ORCH;
   await harness.spawnSession(senderId);
   await harness.spawnSession(receiverId);
 
@@ -282,8 +293,8 @@ test('GET /api/pendingReports/:id returns 404 when no pending entry', async () =
 
 test('Duplicate pendingReport overwrites without error (warning path)', async () => {
   const senderId = createSessionId('sender');
-  const firstSource = createSessionId('src1');
-  const secondSource = createSessionId('src2');
+  const firstSource = ORCH;
+  const secondSource = ORCH2;
   await harness.spawnSession(senderId);
   await harness.spawnSession(firstSource);
   await harness.spawnSession(secondSource);
@@ -339,7 +350,7 @@ test('Legacy TASK_COMPLETE text is still emitted for back-compat', async () => {
   // We use a spawned session (shell) since the state machine idle timeout triggers
   // the legacy path reliably.
   const senderId = createSessionId('legacy-sender');
-  const receiverId = createSessionId('legacy-receiver');
+  const receiverId = ORCH;
 
   // Spawn two shell sessions
   await harness.spawnSession(senderId);

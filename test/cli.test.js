@@ -88,7 +88,13 @@ process.stdin.on('data', (chunk) => {
 }
 
 beforeEach(async () => {
-  harness = await startTestDaemon();
+  // #533 Phase 2: register the fixture orchestrator literal 'orch' (used as the
+  // work-injecting `from`/`reply_to` in these tests) as an orchestrator sid, so
+  // orchestrator→worker injects classify as orch-lane (allowed) instead of being
+  // blocked by the peer-lane guardrail.
+  harness = await startTestDaemon({
+    env: { AIGENTRY_ORCHESTRATOR_SIDS: 'orchestrator aigentry-orchestrator-claude orch orch2' }
+  });
 });
 
 afterEach(async () => {

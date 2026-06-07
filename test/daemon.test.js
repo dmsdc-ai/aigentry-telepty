@@ -40,7 +40,13 @@ function createSubmitCaptureScript() {
 }
 
 beforeEach(async () => {
-  harness = await startTestDaemon();
+  // #533 Phase 2: register the fixture orchestrator literal 'orch' (used as the
+  // work-injecting `from` in orchestrator→worker inject tests) as an orchestrator
+  // sid so those injects classify as orch-lane (allowed) instead of being blocked
+  // by the peer-lane guardrail.
+  harness = await startTestDaemon({
+    env: { AIGENTRY_ORCHESTRATOR_SIDS: 'orchestrator aigentry-orchestrator-claude orch orch2' }
+  });
 });
 
 afterEach(async () => {
@@ -517,7 +523,7 @@ test('bootstrap queued submit waits behind queued text and preserves order', asy
 
 test('codex submit confirmation resends CR when context-ref remains visible and suppresses ready-signal warning after acceptance', async () => {
   const sessionId = createSessionId('codex-submit-resend');
-  const sourceId = createSessionId('submit-source');
+  const sourceId = 'orch'; // orchestrator dispatching a context-ref (orch-lane, registered in beforeEach)
   const body = '[context-ref] Read ~/.telepty/shared/6516f10fb6850f9c9c18f3aa238c0060cc3f5d6b781ba1dca79dd2a12e77d81d.md';
 
   await harness.registerSession(sessionId, { command: 'codex', backend: 'pty' });
@@ -1091,7 +1097,7 @@ test('GET /api/health returns status ok and version', async () => {
 });
 
 test('auto-report: inject with from triggers TASK_COMPLETE when target goes idle', async () => {
-  const sourceId = `auto-rpt-source-${Date.now()}`;
+  const sourceId = 'orch'; // orchestrator dispatching work (orch-lane, registered in beforeEach)
   const targetId = `auto-rpt-target-${Date.now()}`;
 
   // Spawn both sessions - target does a quick task then goes idle

@@ -139,6 +139,13 @@ app.use(express.json());
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
 const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
 
+// #533 Phase 2 — peer-lane inject guardrail. The orchestrator sid(s) define the
+// ORCH LANE (always allowed). Space-separated; default matches aigentry-orchestrator
+// bin/ask.sh so both ends agree on "who is the orchestrator" from one config. If this
+// resolves empty the guardrail fails OPEN (see classifyPeerLaneInject).
+const ORCHESTRATOR_SIDS = (process.env.AIGENTRY_ORCHESTRATOR_SIDS || 'orchestrator aigentry-orchestrator-claude')
+  .split(/\s+/).map(s => s.trim()).filter(Boolean);
+
 // Cross-machine bus relay: forward bus events to peer daemons
 const relayToPeers = createPeerRelay({
   relayPeers: relayPeersFromEnv(process.env),
@@ -366,6 +373,68 @@ function buildErrorBody(code, error, extra = {}) {
 
 function respondWithError(res, httpStatus, code, error, extra = {}) {
   return res.status(httpStatus).json(buildErrorBody(code, error, extra));
+}
+
+// #533 Phase 2 — pure peer-lane inject policy verdict (self-contained; no parser
+// dependency). The PEER LANE is sender ≠ orchestrator AND target ≠ orchestrator.
+// On that lane the body MUST be a sanctioned compact-JSON envelope (the shape
+// produced by aigentry-orchestrator bin/ask.sh build_envelope); anything else is
+// out-of-policy peer→peer traffic (e.g. work-delegation) and is blocked.
+// Returns { lane, decision, reason, kind, envelopePresent }:
+//   lane ∈ 'orchestrator' | 'peer' | 'disabled'
+//   decision ∈ 'allow' | 'block'
+//   kind ∈ 'ask-request' | 'ask-reply' | null
+const PEER_INJECT_KINDS = new Set(['ask-request', 'ask-reply']);
+
+function classifyPeerLaneInject({ from, to, prompt, orchestratorSids } = {}) {
+  const orchSet = Array.isArray(orchestratorSids) ? orchestratorSids : [];
+  // Fail-OPEN: with no known orchestrator sid we cannot tell the orch lane apart
+  // from the peer lane (every inject would look peer-lane), which would over-block
+  // legitimate orchestrator traffic and brick the mesh. Degrade to allow + warn;
+  // the Phase-1 orchestrator-side auditor still detects raw bypass (defense in depth).
+  if (orchSet.length === 0) {
+    return { lane: 'disabled', decision: 'allow', reason: 'orch-sid-unconfigured-fail-open', kind: null, envelopePresent: false };
+  }
+  // No sender → operator/CLI/multicast/broadcast, never peer-lane.
+  if (!from) {
+    return { lane: 'orchestrator', decision: 'allow', reason: 'no-sender', kind: null, envelopePresent: false };
+  }
+  // Orchestrator lane (either end is the orchestrator) → always allowed, untouched.
+  if (orchSet.includes(from) || orchSet.includes(to)) {
+    return { lane: 'orchestrator', decision: 'allow', reason: 'orch-lane', kind: null, envelopePresent: false };
+  }
+
+  // Peer lane: require a sanctioned envelope on the first non-empty line.
+  let env = null;
+  try {
+    const firstLine = String(prompt || '').split(/\r?\n/).map(l => l.trim()).find(l => l.length > 0);
+    if (firstLine) {
+      const parsed = JSON.parse(firstLine);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) env = parsed;
+    }
+  } catch {
+    env = null;
+  }
+  if (!env) {
+    return { lane: 'peer', decision: 'block', reason: 'malformed-envelope', kind: null, envelopePresent: false };
+  }
+  if (!PEER_INJECT_KINDS.has(env.kind)) {
+    return { lane: 'peer', decision: 'block', reason: 'wrong-kind', kind: null, envelopePresent: true };
+  }
+  // Common required fields + per-kind payload (matches ask.sh build_envelope).
+  const nonEmptyStr = (v) => typeof v === 'string' && v.length > 0;
+  const baseOk = nonEmptyStr(env.from) && nonEmptyStr(env.to) && nonEmptyStr(env.thread_id) && Number.isInteger(env.round);
+  const payloadOk = env.kind === 'ask-request' ? nonEmptyStr(env.question) : nonEmptyStr(env.answer);
+  if (!baseOk || !payloadOk) {
+    return { lane: 'peer', decision: 'block', reason: 'invalid-field', kind: null, envelopePresent: true };
+  }
+  // Sender-consistency: the envelope's declared sender must match the inject's
+  // from (cheap anti-spoof). `to` is NOT cross-checked — the route resolves aliases,
+  // which would false-block legitimate aliased targets.
+  if (env.from !== from) {
+    return { lane: 'peer', decision: 'block', reason: 'from-mismatch', kind: null, envelopePresent: true };
+  }
+  return { lane: 'peer', decision: 'allow', reason: 'sanctioned-envelope', kind: env.kind, envelopePresent: true };
 }
 
 function normalizeNullableText(value) {
@@ -2435,6 +2504,32 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
   // Routing metadata stays in session/bus state, not in the visible prompt text.
   const finalPrompt = prompt;
   const inject_id = crypto.randomUUID();
+
+  // #533 Phase 2 — peer-lane inject guardrail (in-band hard block, before delivery).
+  // Out-of-policy peer→peer injects (no sanctioned ask-request/ask-reply envelope)
+  // are blocked here so raw work-delegation bypass is prevented, not just detected.
+  // Orchestrator↔peer, broadcast/multicast (no `from`), and existing kinds are untouched.
+  const peerVerdict = classifyPeerLaneInject({ from, to: requestedId, prompt, orchestratorSids: ORCHESTRATOR_SIDS });
+  if (peerVerdict.decision === 'block') {
+    broadcastSessionEvent('peer_inject_blocked', id, session, {
+      extra: {
+        target_agent: id,
+        from: from || null,
+        reason: peerVerdict.reason,
+        attempted_kind: peerVerdict.kind,
+        envelope_present: peerVerdict.envelopePresent,
+        inject_id
+      }
+    });
+    console.warn(`[PEER-GUARD] blocked peer inject ${from} → ${id} (${peerVerdict.reason})`);
+    return respondWithError(res, 403, 'PEER_INJECT_BLOCKED',
+      'Peer-lane inject blocked: not a sanctioned ask-request/ask-reply envelope. Use bin/ask.sh.',
+      { reason: peerVerdict.reason, sanctioned_channel: 'bin/ask.sh' });
+  }
+  if (peerVerdict.lane === 'disabled') {
+    console.warn('[PEER-GUARD] orchestrator sid unconfigured (AIGENTRY_ORCHESTRATOR_SIDS empty) — peer guardrail disabled (fail-open)');
+  }
+
   try {
     const delivery = await deliverInjectionToSession(id, session, finalPrompt, {
       noEnter: !!no_enter,
@@ -3502,4 +3597,5 @@ module.exports = {
   scheduleBootstrapPromptPoll,    // #29: arms the floor timer (deps DI: setTimeout/...)
   decideSurfaceGc,                // #17: surface-liveness verdict→action (incl. INV-17 unknown→skip)
   applySurfaceMismatchProbe,      // surface_mismatched debounce + payload helper (deps DI: emit/clock)
+  classifyPeerLaneInject,         // #533 Phase 2: pure peer-lane inject policy verdict
 };
