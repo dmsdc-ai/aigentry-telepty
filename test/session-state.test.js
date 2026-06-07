@@ -158,6 +158,60 @@ describe('thinking state', () => {
   });
 });
 
+// --- #558: non-claude CLI state classification (codex / gemini) ---
+// codex and gemini emit NO OSC 133 prompt mark. gemini drives a braille spinner (already matched),
+// but codex uses none — its active state is only conveyed by text markers ("esc to interrupt",
+// "Starting MCP servers", activity verbs). Without these the codex sidebar pill stays blank.
+
+describe('codex CLI state classification', () => {
+  it('classifies active codex generation ("esc to interrupt") as thinking', () => {
+    const sm = createSM();
+    sm.feed('Implementing the change… (12s • esc to interrupt)');
+    assert.equal(sm.getState().state, 'thinking');
+    sm.destroy();
+  });
+
+  it('classifies codex MCP bootstrap as thinking', () => {
+    const sm = createSM();
+    sm.feed('• Starting MCP servers (1/6): aigentry-brain, codex_apps, context7');
+    assert.equal(sm.getState().state, 'thinking');
+    sm.destroy();
+  });
+
+  it('classifies codex "Exploring" activity as thinking', () => {
+    const sm = createSM();
+    sm.feed('Exploring the repository structure');
+    assert.equal(sm.getState().state, 'thinking');
+    sm.destroy();
+  });
+
+  it('settles to idle at the codex "›" prompt after silence', async () => {
+    const sm = createSM({ idle_timeout_ms: 100, poll_interval_ms: 30 });
+    sm.feed('Exploring the repository structure'); // active → thinking
+    assert.equal(sm.getState().state, 'thinking');
+    sm.feed('›'); // codex idle composer prompt (no OSC 133) → working, then silence → idle
+    await sleep(250);
+    assert.equal(sm.getState().state, 'idle');
+    sm.destroy();
+  });
+
+  it('does NOT misclassify "working tree"/"working directory" as thinking', () => {
+    const sm = createSM();
+    sm.feed('On branch main; your working tree is clean');
+    assert.equal(sm.getState().state, 'working');
+    sm.destroy();
+  });
+});
+
+describe('gemini CLI state classification', () => {
+  it('classifies gemini braille spinner as thinking (already supported)', () => {
+    const sm = createSM();
+    sm.feed('⠹ Thinking… (Press Esc to cancel)');
+    assert.equal(sm.getState().state, 'thinking');
+    sm.destroy();
+  });
+});
+
 // --- waiting detection ---
 
 describe('waiting state', () => {

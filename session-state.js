@@ -96,6 +96,14 @@ const THINKING_PATTERNS = [
   /\breading\b/i,              // Claude Code "Reading..."
   /\bsearching\b/i,            // Claude Code "Searching..."
   /\bplanning\b/i,             // Claude Code "Planning..."
+  // codex CLI active-work markers (#558): codex emits NO braille spinner and NO OSC 133, so its
+  // "busy" state went unrecognized → blank sidebar pill. These are high-signal codex/claude markers
+  // shown ONLY while actively generating/running tools. ("Working" is intentionally NOT matched —
+  // it false-positives on common dev output like "working tree" / "working directory".)
+  /\besc to interrupt\b/i,     // codex + claude: shown only during active generation / tool run
+  /\bstarting mcp servers?\b/i,// codex: MCP bootstrap on launch
+  /\bbooting mcp server\b/i,   // codex: MCP server boot
+  /\bexploring\b/i,            // codex activity verb (parallels Claude Code "Searching")
   /\.{3,}\s*$/,                // trailing dots "..."
 ];
 
