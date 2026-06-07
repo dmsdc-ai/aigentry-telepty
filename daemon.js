@@ -88,8 +88,18 @@ sessionStateManager.onTransition((sessionId, from, to, detail) => {
     // Mark as idle-notified (but keep the entry — REPORT is still pending).
     // Entry is cleared when REPORT arrives (via inject endpoint) OR session dies.
     if (pendingReport.idleNotified) return; // only fire once
+    // #545: only an OSC133-marked idle with the injected body consumed from the PTY outputRing
+    // is trustworthy enough to report TASK_COMPLETE. A weak prompt-glyph / silence flip (the
+    // residual WORKING case the THINKING-only state guard doesn't cover) stays
+    // TASK_IDLE_UNCONFIRMED — never a false complete.
+    const idleTrigger = detail && detail.detail ? detail.detail.trigger : null;
+    const bodyText = pendingReport.injectedBodyPreview;
+    const bodyVisible = bodyText
+      ? submitGate.observeBodyVisibility(session, bodyText).visible === true
+      : false;
+    const idleEvidenceReliable = idleTrigger === 'osc_133_prompt' && !bodyVisible;
     // real-idle: the state manager observed a genuine busy→idle transition.
-    fireAutoReport(sessionId, session, pendingReport, 'real-idle');
+    fireAutoReport(sessionId, session, pendingReport, 'real-idle', { idleEvidenceReliable });
   }
 
   // Fire TASK_DEAD_NO_REPORT when session dies with a pending report
@@ -307,11 +317,23 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
     pendingReport.submitConfirmedAt ||
     (pendingReport.submitConfirm && pendingReport.submitConfirm.accepted === true)
   );
+  // #545: a `real-idle` flip with weak evidence (no OSC133 REPL-done mark / injected body still
+  // visible in the PTY outputRing) must NOT be reported TASK_COMPLETE — a still-busy worker that
+  // merely paused output gets the honest TASK_IDLE_UNCONFIRMED. The caller (onTransition) sets
+  // deps.idleEvidenceReliable; === false forces the downgrade. Scoped to submitExpected (the #545
+  // symptom — a submit-confirmed worker still thinking), consistent with the BUG-B confirm gate;
+  // plain non-submit injects keep their existing floor-based completion. Absent flag / other
+  // triggers preserve prior behavior.
+  const idleEvidenceUnreliable = trigger === 'real-idle'
+    && pendingReport.submitExpected
+    && deps.idleEvidenceReliable === false;
   const confirmed = trigger === 'ready-signal' && pendingReport.submitExpected
     ? false
-    : pendingReport.submitExpected
-      ? strongSubmitConfirmed
-      : (elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS || hasSubmitEvidence);
+    : idleEvidenceUnreliable
+      ? false
+      : pendingReport.submitExpected
+        ? strongSubmitConfirmed
+        : (elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS || hasSubmitEvidence);
   const injTag = pendingReport.injectId ? ` inject=${pendingReport.injectId}` : '';
   const reportMsg = confirmed
     ? `TASK_COMPLETE: ${targetId} is now idle after processing inject (${elapsed}s, via ${trigger}${injTag})`

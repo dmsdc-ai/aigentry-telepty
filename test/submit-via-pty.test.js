@@ -179,7 +179,7 @@ test('confirmSubmitAccepted still honors an explicit opts.readScreen seam (futur
 
 const NOW = 1_700_000_000_000;
 
-function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4.5 } = {}) {
+function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4.5, idleEvidenceReliable } = {}) {
   const captured = [];
   const pendingReport = {
     source: 'orch',
@@ -195,6 +195,7 @@ function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4
     sessions: { orch: { id: 'orch' } },
     pendingReports: {},
     deliverInjectionToSession: (srcId, _s, msg) => captured.push({ srcId, msg }),
+    idleEvidenceReliable, // #545: real-idle reliability gate (undefined = ungated, prior behavior)
   };
   fireAutoReport('worker-1', { id: 'worker-1' }, pendingReport, trigger, deps);
   return captured.length ? captured[0].msg : null;
@@ -228,6 +229,44 @@ test('positive: a strong-confirmed pty_cr submit (post-#544) → TASK_COMPLETE',
     submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
   }, { elapsedSec: 30 });
+  assert.match(msg, /^TASK_COMPLETE:/);
+});
+
+// ---------------------------------------------------------------------------
+// 4b) #545 DEFENSE: real-idle with weak idle evidence → UNCONFIRMED, never TASK_COMPLETE
+// ---------------------------------------------------------------------------
+// The THINKING-only state guard (session-state.js) covers the spinner case; this daemon gate
+// covers the residual WORKING-silence/prompt_detected flip: a worker whose submit IS confirmed
+// but whose idle was NOT a reliable OSC133-marked / body-consumed transition must report the
+// honest TASK_IDLE_UNCONFIRMED, never a false TASK_COMPLETE.
+
+test('#545: real-idle with unreliable idle evidence → TASK_IDLE_UNCONFIRMED even when submit confirmed', () => {
+  const msg = runGate({
+    submitExpected: true,
+    submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
+    submitConfirm: { accepted: true, reason: 'force' },
+  }, { elapsedSec: 30, idleEvidenceReliable: false });
+  assert.ok(msg);
+  assert.match(msg, /^TASK_IDLE_UNCONFIRMED:/);
+  assert.doesNotMatch(msg, /^TASK_COMPLETE:/);
+});
+
+test('#545: real-idle with reliable idle evidence (OSC133 + body consumed) → TASK_COMPLETE', () => {
+  const msg = runGate({
+    submitExpected: true,
+    submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
+    submitConfirm: { accepted: true, reason: 'force' },
+  }, { elapsedSec: 30, idleEvidenceReliable: true });
+  assert.match(msg, /^TASK_COMPLETE:/);
+});
+
+test('#545: the gate is real-idle-scoped — silence-timeout reports are unaffected by the flag', () => {
+  // A non-real-idle trigger must not be downgraded by idleEvidenceReliable.
+  const msg = runGate({
+    submitExpected: true,
+    submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
+    submitConfirm: { accepted: true, reason: 'force' },
+  }, { trigger: 'silence-timeout', elapsedSec: 30, idleEvidenceReliable: false });
   assert.match(msg, /^TASK_COMPLETE:/);
 });
 

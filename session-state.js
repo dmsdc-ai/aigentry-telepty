@@ -356,8 +356,7 @@ class SessionStateMachine {
     });
   }
 
-  _tick() {
-    const now = Date.now();
+  _tick(now = Date.now()) {
     const silenceMs = now - this._lastOutputAt;
 
     // Don't override lifecycle states
@@ -389,6 +388,16 @@ class SessionStateMachine {
         : '';
 
       const hasOsc133 = this._lastOsc133At && (now - this._lastOsc133At) < this.config.idle_timeout_ms * 2;
+
+      // #545: a THINKING session that merely went quiet is STILL thinking. The claude TUI
+      // input-box glyph (›/❯) false-matches PROMPT_PATTERNS and pure silence flips at 0.6, so
+      // a weak signal would wrongly end thinking. Only a reliable REPL-done mark (OSC 133) may.
+      // WORKING is intentionally NOT guarded — a real shell prompt `$ ` legitimately settles
+      // working→idle (test 255); the daemon real-idle gate covers the residual WORKING case.
+      if (this._state === STATES.THINKING && !hasOsc133) {
+        return;
+      }
+
       const hasPrompt = this._matchesAny(lastLine, PROMPT_PATTERNS);
       const confidence = hasOsc133 ? 0.95 : (hasPrompt ? 0.9 : 0.6);
 

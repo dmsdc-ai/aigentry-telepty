@@ -271,6 +271,33 @@ describe('idle via silence timeout', () => {
   });
 });
 
+// --- #545: THINKING must not silence-idle without a reliable OSC133 mark ---
+// A real claude worker that is still thinking (spinner shown) but whose PTY output pauses
+// > idle_timeout was being flipped to idle (the claude TUI input-box glyph ›/❯ false-matches
+// PROMPT_PATTERNS, and pure silence flips at confidence 0.6). Only OSC 133 (REPL-done) may end
+// THINKING. WORKING is intentionally NOT guarded — a real shell prompt still settles idle.
+describe('#545 idle gate: THINKING-only OSC133 guard', () => {
+  it('a still-THINKING session that goes silent without OSC133 STAYS thinking (never idle)', () => {
+    const sm = createSM({ idle_timeout_ms: 1000, thinking_timeout_ms: 60000, poll_interval_ms: 60000 });
+    sm.feed('⠋ Thinking…');           // braille spinner → thinking
+    assert.equal(sm.getState().state, 'thinking');
+    // Drive the tick deterministically past idle_timeout (but under thinking_timeout), no
+    // OSC133, non-prompt last line.
+    sm._tick(Date.now() + 5000);
+    assert.equal(sm.getState().state, 'thinking', 'a still-thinking worker must NOT be flipped idle by silence');
+    sm.destroy();
+  });
+
+  it('no-regression (Option B): a WORKING session with a shell prompt still settles idle on silence', () => {
+    const sm = createSM({ idle_timeout_ms: 1000, poll_interval_ms: 60000 });
+    sm.feed('$ ');
+    assert.equal(sm.getState().state, 'working');
+    sm._tick(Date.now() + 5000);
+    assert.equal(sm.getState().state, 'idle', 'legitimate shell prompt idle-detection must NOT regress');
+    sm.destroy();
+  });
+});
+
 // --- transition callbacks ---
 
 describe('transition callbacks', () => {
