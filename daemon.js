@@ -1617,6 +1617,24 @@ function resolveSessionAlias(requestedId) {
   return candidates[0];
 }
 
+// #548 (alias-cascade shared-fate): resolveSessionAlias' most-recent-wins fuzzy match is correct for
+// READ/inject ("talk to the current `coder`"), but DESTRUCTIVE ops (DELETE / kill) must NEVER cascade
+// across distinct sids that merely share an alias. The incident: cleaning an already-gone `coder-532`
+// fuzzy-fell-through to its live sibling `coder-533` (same `coder` track) and KILLED it. Distinct sids
+// = distinct lifecycles. This resolver enforces "destroy exactly the session you named":
+//   - exact sid match → that sid;
+//   - a fully-qualified sid (ends in `-<digits>`) with no exact match → null (a stale/duplicate DELETE
+//     of a gone sid must NOT fall through to a sibling — this is the exact #548 cascade);
+//   - a bare alias → resolve ONLY when a single session carries it (unambiguous); multiple siblings → null
+//     (refuse rather than silently pick most-recent and kill the wrong one).
+function resolveSessionForDestroy(requestedId) {
+  if (sessions[requestedId]) return requestedId;
+  if (/-\d+$/.test(requestedId)) return null;
+  const baseAlias = requestedId.replace(/-\d+$/, '');
+  const candidates = Object.keys(sessions).filter(id => id.replace(/-\d+$/, '') === baseAlias);
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 app.post('/api/sessions/spawn', (req, res) => {
   const { session_id, command, args = [], cwd = process.cwd(), cols = 80, rows = 30, type = 'AGENT' } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is strictly required.' });
@@ -2823,7 +2841,8 @@ app.patch('/api/sessions/:id', (req, res) => {
 
 app.post('/api/sessions/:id/kill', async (req, res) => {
   const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
+  // #548: destructive op — must not cascade across alias-sharing siblings.
+  const resolvedId = resolveSessionForDestroy(requestedId);
   if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
 
   try {
@@ -2852,7 +2871,8 @@ app.post('/api/sessions/:id/kill', async (req, res) => {
 
 app.delete('/api/sessions/:id', (req, res) => {
   const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
+  // #548: destructive op — must not cascade across alias-sharing siblings.
+  const resolvedId = resolveSessionForDestroy(requestedId);
   if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
   const session = sessions[resolvedId];
   const id = resolvedId;

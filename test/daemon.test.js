@@ -1266,3 +1266,111 @@ test('BUG-C: a tokenless DELETE still destroys a wrapped session (operator delet
     return list.status === 200 && !list.body.some((s) => s.id === sessionId);
   }, { description: 'session removed after tokenless delete' });
 });
+
+// --- #548: alias-cascade shared-fate (a DELETE/kill of sid X must not kill a sibling sharing X's alias) ---
+//
+// Two distinct sids share one alias when they collapse to the same base after stripping a trailing
+// `-<digits>` (e.g. `coder-532` and `coder-533` both share track `coder`). `aliasBase` ends in a
+// non-digit so it has no trailing `-<digits>` of its own: stripping leaves it unchanged, so it is the
+// shared bare alias of `${aliasBase}-1` and `${aliasBase}-2`.
+function makeAliasSiblings() {
+  const aliasBase = `${createSessionId('t548')}x`; // ...-<n>x → no trailing `-<digits>` → stable bare alias
+  return { aliasBase, sidA: `${aliasBase}-1`, sidB: `${aliasBase}-2` };
+}
+
+test('#548: DELETE of a gone sid does NOT cascade-kill a live sibling sharing its alias', async () => {
+  const { aliasBase, sidA, sidB } = makeAliasSiblings();
+  await harness.registerSession(sidA);
+  await harness.registerSession(sidB); // B reclaims the alias (register emits the [ALIAS] replaced event)
+  const ownerB = await connectOwner(sidB);
+  await waitForOwnerToken(ownerB, 'sibling B owner token');
+
+  // Normal exact delete of A removes only A; B stays alive.
+  const delA = await harness.request(`/api/sessions/${encodeURIComponent(sidA)}`, { method: 'DELETE' });
+  assert.equal(delA.status, 200);
+  let list = await harness.request('/api/sessions');
+  assert.ok(list.body.some((s) => s.id === sidB), 'B survives the delete of A');
+  assert.ok(!list.body.some((s) => s.id === sidA), 'A is gone after its own delete');
+
+  // The real cascade: a stale/duplicate DELETE for the now-gone A must NOT fall through to live sibling B.
+  const stale = await harness.request(`/api/sessions/${encodeURIComponent(sidA)}`, { method: 'DELETE' });
+  assert.equal(stale.status, 404, 'a gone fully-qualified sid must 404, never resolve to a sibling');
+
+  await delay(200);
+  assert.ok(
+    !ownerB.closes.some((c) => c.code === 1000 && c.reason === 'Session destroyed'),
+    'sibling B must not receive the Session destroyed close'
+  );
+  assert.equal(ownerB.ws.readyState, WebSocket.OPEN, 'sibling B socket must stay open');
+  list = await harness.request('/api/sessions');
+  assert.ok(list.body.some((s) => s.id === sidB), 'sibling B record must survive a stale DELETE of A');
+  ownerB.ws.close();
+});
+
+test('#548: POST /:id/kill of a gone sid does NOT cascade-kill a live sibling sharing its alias', async () => {
+  const { sidA, sidB } = makeAliasSiblings();
+  await harness.registerSession(sidB); // only the live sibling exists; A was never/no-longer registered
+  const ownerB = await connectOwner(sidB);
+  await waitForOwnerToken(ownerB, 'sibling B owner token');
+
+  const kill = await harness.request(`/api/sessions/${encodeURIComponent(sidA)}/kill`, {
+    method: 'POST',
+    body: { force: true }
+  });
+  assert.equal(kill.status, 404, 'kill of a gone fully-qualified sid must 404, never resolve to a sibling');
+
+  await delay(200);
+  assert.ok(
+    !ownerB.closes.some((c) => c.code === 1000 && c.reason === 'Session destroyed'),
+    'sibling B must survive a kill aimed at its gone alias-sibling'
+  );
+  assert.equal(ownerB.ws.readyState, WebSocket.OPEN, 'sibling B socket must stay open');
+  const list = await harness.request('/api/sessions');
+  assert.ok(list.body.some((s) => s.id === sidB), 'sibling B record must survive a sibling kill');
+  ownerB.ws.close();
+});
+
+test('#548: alias-replace (B reclaims the alias) must NOT kill the older sibling A', async () => {
+  const { sidA, sidB } = makeAliasSiblings();
+  await harness.registerSession(sidA);
+  const ownerA = await connectOwner(sidA);
+  await waitForOwnerToken(ownerA, 'older sibling A owner token');
+
+  // Registering B with the same base alias is the [ALIAS] replace path — it must only reassign the
+  // alias pointer (broadcast session.replaced), never close/kill A's owner or remove A's record.
+  await harness.registerSession(sidB);
+
+  await delay(200);
+  assert.ok(
+    !ownerA.closes.some((c) => c.code === 1000 && c.reason === 'Session destroyed'),
+    'older sibling A must not be destroyed by alias-replace'
+  );
+  assert.equal(ownerA.ws.readyState, WebSocket.OPEN, 'older sibling A socket must stay open');
+  const list = await harness.request('/api/sessions');
+  assert.ok(list.body.some((s) => s.id === sidA), 'A record must survive B reclaiming the alias');
+  assert.ok(list.body.some((s) => s.id === sidB), 'B record must exist after registration');
+  ownerA.ws.close();
+});
+
+test('#548: a bare-alias DELETE is refused when multiple siblings share it (no most-recent cascade)', async () => {
+  const { aliasBase, sidA, sidB } = makeAliasSiblings();
+  await harness.registerSession(sidA);
+  await harness.registerSession(sidB);
+
+  // Old behavior fuzzy-resolved the bare alias to the most-recent sibling and killed it. Now ambiguous → 404.
+  const del = await harness.request(`/api/sessions/${encodeURIComponent(aliasBase)}`, { method: 'DELETE' });
+  assert.equal(del.status, 404, 'an ambiguous bare-alias DELETE must be refused, not pick a sibling');
+  const list = await harness.request('/api/sessions');
+  assert.ok(list.body.some((s) => s.id === sidA), 'A survives the ambiguous bare-alias delete');
+  assert.ok(list.body.some((s) => s.id === sidB), 'B survives the ambiguous bare-alias delete');
+});
+
+test('#548: a bare-alias DELETE still works when exactly one session carries the alias', async () => {
+  const { aliasBase, sidA } = makeAliasSiblings();
+  await harness.registerSession(sidA); // single unambiguous holder of the alias
+
+  const del = await harness.request(`/api/sessions/${encodeURIComponent(aliasBase)}`, { method: 'DELETE' });
+  assert.equal(del.status, 200, 'an unambiguous bare-alias DELETE remains supported');
+  const list = await harness.request('/api/sessions');
+  assert.ok(!list.body.some((s) => s.id === sidA), 'the single alias holder is removed by its bare-alias delete');
+});
