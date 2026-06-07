@@ -2018,45 +2018,6 @@ function findKittyWindowId(socket, sessionId) {
   return null;
 }
 
-function sendViaKitty(sessionId, text) {
-  const { execSync } = require('child_process');
-  const socket = findKittySocket();
-  if (!socket) return false;
-
-  const windowId = findKittyWindowId(socket, sessionId);
-  if (!windowId) {
-    console.error(`[KITTY] No window found for ${sessionId}`);
-    return false;
-  }
-
-  try {
-    // Split text and CR — send-text for both (send-key corrupts keyboard protocol)
-    const hasCr = text.endsWith('\r') || text.endsWith('\n');
-    const textOnly = hasCr ? text.slice(0, -1) : text;
-    if (textOnly.length > 0) {
-      const escaped = textOnly.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
-      execSync(`kitty @ --to unix:${socket} send-text --match id:${windowId} '${escaped}'`, {
-        timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
-      });
-    }
-    if (hasCr) {
-      // Delay before sending Return — only when text was sent in the same call
-      // (when CR-only, text was already delivered via a different path)
-      if (textOnly.length > 0) {
-        execSync('sleep 0.5', { timeout: 2000 });
-      }
-      execSync(`kitty @ --to unix:${socket} send-text --match id:${windowId} $'\\r'`, {
-        timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-      });
-    }
-    console.log(`[KITTY] Sent ${textOnly.length} chars${hasCr ? ' + Return' : ''} to ${sessionId} (window ${windowId})`);
-    return true;
-  } catch (err) {
-    console.error(`[KITTY] Failed for ${sessionId}:`, err.message);
-    return false;
-  }
-}
-
 function submitViaOsascript(sessionId, keyCombo) {
   const { execSync } = require('child_process');
   const session = sessions[sessionId];
