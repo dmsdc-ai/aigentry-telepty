@@ -107,24 +107,6 @@ function cmuxSendText(sessionId, text) {
   }
 }
 
-// Send enter key to a cmux surface
-function cmuxSendEnter(sessionId) {
-  const surface = findSurface(sessionId);
-  if (!surface) return false;
-
-  try {
-    execSync(`cmux send-key --surface ${surface} return`, {
-      timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
-    });
-    console.log(`[BACKEND] cmux send-key return to ${sessionId} (${surface})`);
-    return true;
-  } catch (err) {
-    console.error(`[BACKEND] cmux send-key failed for ${sessionId}:`, err.message);
-    surfaceCache.delete(sessionId);
-    return false;
-  }
-}
-
 // Invalidate cache for a session (e.g., when surface changes)
 function invalidateCache(sessionId) {
   surfaceCache.delete(sessionId);
@@ -534,7 +516,6 @@ module.exports = {
   detectTerminal,
   findSurface,
   cmuxSendText,
-  cmuxSendEnter,
   refreshSurfaceCache,
   invalidateCache,
   clearCache,
