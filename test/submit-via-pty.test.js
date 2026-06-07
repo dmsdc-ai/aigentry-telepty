@@ -17,7 +17,7 @@ const assert = require('node:assert/strict');
 const child_process = require('node:child_process');
 
 const daemon = require('../daemon');
-const { terminalLevelSubmit, submitViaPty, forceSubmitDeliveredToSurface, fireAutoReport } = daemon;
+const { terminalLevelSubmit, submitViaPty, forceSubmitDeliveredToSurface, fireAutoReport, runSubmitAll } = daemon;
 const { confirmSubmitAccepted, observeBodyVisibility } = require('../src/submit-gate');
 
 // ---------------------------------------------------------------------------
@@ -278,6 +278,45 @@ test('forceSubmitDeliveredToSurface: pty_cr is delivered on cmux (PTY-native) an
   assert.equal(forceSubmitDeliveredToSurface({ backend: 'cmux', cmuxWorkspaceId: 'w1' }, 'pty_cr'), true);
   assert.equal(forceSubmitDeliveredToSurface({ type: 'pty' }, 'pty_cr'), true);
   assert.equal(forceSubmitDeliveredToSurface({ backend: 'cmux', cmuxWorkspaceId: 'w1' }, null), false);
+});
+
+// ---------------------------------------------------------------------------
+// 6) #546: submit-all routes EVERY backend through the PTY path (zero cmux send-key)
+// ---------------------------------------------------------------------------
+// The last surface-op submit caller (cmux `send-key --surface return`) is removed; submit-all
+// now delivers a bare 0x0D via the PTY/context path per session — the same path validated 3/3
+// live for per-session submit (#544). submitViaCmux is deleted (0 live callers).
+
+test('#546: submit-all delivers a single 0x0D via the PTY path to ≥2 wrapped sessions (no cmux send-key)', () => {
+  const sentA = [];
+  const sentB = [];
+  const sessionsMap = {
+    a: { type: 'wrapped', command: 'claude', backend: 'cmux', cmuxWorkspaceId: 'ws:1',
+         ownerWs: { readyState: 1, send: (m) => sentA.push(m) } },
+    b: { type: 'wrapped', command: 'codex', backend: 'cmux', cmuxWorkspaceId: 'ws:2',
+         ownerWs: { readyState: 1, send: (m) => sentB.push(m) } },
+  };
+  const realExecSync = child_process.execSync;
+  let execCalls = 0;
+  child_process.execSync = (...args) => { execCalls++; return realExecSync.apply(child_process, args); };
+  let results;
+  try {
+    results = runSubmitAll(sessionsMap);
+  } finally {
+    child_process.execSync = realExecSync;
+  }
+
+  assert.equal(results.successful.length, 2, 'both sessions submitted');
+  assert.equal(results.failed.length, 0);
+  assert.equal(execCalls, 0, 'submit-all must NOT shell to cmux send-key');
+  for (const sent of [sentA, sentB]) {
+    assert.equal(sent.length, 1, 'exactly one inject write per session');
+    const msg = JSON.parse(sent[0]);
+    assert.equal(msg.type, 'inject');
+    const bytes = Buffer.from(msg.data, 'utf8');
+    assert.equal(bytes.length, 1, 'single byte');
+    assert.equal(bytes[0], 0x0d, 'submit byte is 0x0D via the PTY path');
+  }
 });
 
 // Requiring daemon.js loads persisted sessions for read-only inspection; ensure the test

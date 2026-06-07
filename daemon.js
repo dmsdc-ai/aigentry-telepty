@@ -1210,9 +1210,10 @@ async function writeDataToSession(id, session, data) {
  * 0x0D into the CLI's innermost node-pty. The former kitty `send-text` (P1) and
  * `cmux send-key` (P2) branches were SURFACE ops on a flaky side channel (75×
  * "Failed to write to socket" vs 0× for pty_cr in a 222k-line run; live
- * 2026-06-07 confirmed pty-only works 3/3). `submitViaCmux`/`sendViaKitty` defs
- * are kept (non-submit callers); codebase removal is gated on the warp/tmux
- * matrix. See docs/adr/2026-06-07-submit-via-pty-context-layer.md.
+ * 2026-06-07 confirmed pty-only works 3/3). The `submitViaCmux`/`sendViaKitty`
+ * defs were since removed (#544/#546 — submit-all also migrated to PTY, leaving
+ * zero cmux send-key in the submit path). See
+ * docs/adr/2026-06-07-submit-via-pty-context-layer.md.
  *
  * Returns the strategy name ('pty_cr') or null on failure.
  */
@@ -2090,22 +2091,6 @@ function submitViaOsascript(sessionId, keyCombo) {
   }
 }
 
-function submitViaCmux(sessionId) {
-  const { execSync } = require('child_process');
-  const session = sessions[sessionId];
-  if (!session || !session.cmuxWorkspaceId) return false;
-  try {
-    execSync(`cmux send-key --workspace ${session.cmuxWorkspaceId} return`, {
-      timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
-    });
-    console.log(`[SUBMIT] cmux send-key return for ${sessionId} (workspace ${session.cmuxWorkspaceId})`);
-    return true;
-  } catch (err) {
-    console.error(`[SUBMIT] cmux send-key failed for ${sessionId}:`, err.message);
-    return false;
-  }
-}
-
 // POST /api/sessions/:id/submit — render-gated CLI-aware submit
 //
 // Default behavior (0.3.0+): wait for the target REPL to be ready (sessionStateManager
@@ -2402,27 +2387,22 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   return res.json(responseBody);
 });
 
-// POST /api/sessions/submit-all — Submit all active sessions
-app.post('/api/sessions/submit-all', (req, res) => {
+// Submit Enter to every active session. #546: submit is a PTY/context op (bare 0x0D) for every
+// wrapped + spawned backend INCLUDING cmux — the path validated 3/3 live for per-session submit
+// (#544). The cmux `send-key --surface return` surface op is removed (ZERO cmux send-key);
+// osascript Cmd+Enter remains only for app-window sessions with no PTY bridge. Exported (pure
+// over the passed sessions map) so the dispatch is unit-testable without starting the daemon.
+function runSubmitAll(sessionsMap) {
   const results = { successful: [], failed: [] };
 
-  for (const [id, session] of Object.entries(sessions)) {
+  for (const [id, session] of Object.entries(sessionsMap)) {
     const strategy = getSubmitStrategy(session.command);
     let success = false;
 
-    // cmux per-session backend
-    if (session.backend === 'cmux') {
-      success = terminalBackend.cmuxSendEnter(id);
-    }
-    if (!success && session.backend === 'cmux' && session.cmuxWorkspaceId) {
-      success = submitViaCmux(id);
-    }
-    if (!success) {
-      if (strategy === 'pty_cr') {
-        success = submitViaPty(session);
-      } else if (strategy === 'osascript_cmd_enter') {
-        success = submitViaOsascript(id, 'cmd_enter');
-      }
+    if (strategy === 'pty_cr') {
+      success = submitViaPty(session);
+    } else if (strategy === 'osascript_cmd_enter') {
+      success = submitViaOsascript(id, 'cmd_enter');
     }
 
     if (success) {
@@ -2432,7 +2412,12 @@ app.post('/api/sessions/submit-all', (req, res) => {
     }
   }
 
-  res.json({ success: true, results });
+  return results;
+}
+
+// POST /api/sessions/submit-all — Submit all active sessions
+app.post('/api/sessions/submit-all', (req, res) => {
+  res.json({ success: true, results: runSubmitAll(sessions) });
 });
 
 app.post('/api/sessions/:id/inject', async (req, res) => {
@@ -3511,6 +3496,7 @@ module.exports = {
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
   terminalLevelSubmit,            // #544: PTY-only submit path (pty_cr | null)
   submitViaPty,                   // #544: bare-0x0D submit into the innermost node-pty
+  runSubmitAll,                   // #546: submit-all via PTY for every backend (no cmux send-key)
   failBootstrapQueueOnTimeout,    // #31: actionable bootstrap-timeout queue flush
   shouldApplyOwnerAliveFloor,     // #29: owner-alive optimistic-floor decision (deps DI: isProcessRunning/...)
   scheduleBootstrapPromptPoll,    // #29: arms the floor timer (deps DI: setTimeout/...)
