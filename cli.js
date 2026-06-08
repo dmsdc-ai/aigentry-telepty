@@ -164,6 +164,98 @@ const fetchWithAuth = (url, options = {}) => {
   return fetch(url, { ...options, headers });
 };
 
+function normalizeBrokerUrl(url) {
+  const value = String(url || '').trim();
+  if (!value) return '';
+  try {
+    return new URL(value).toString().replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function readBrokerEnrollSecret(value) {
+  const spec = String(value || '');
+  if (!spec) throw new Error('--enroll-secret is required');
+  if (spec.startsWith('env:')) {
+    const name = spec.slice(4);
+    const secret = process.env[name];
+    if (!secret) throw new Error(`Environment variable ${name} is empty or unset`);
+    return secret;
+  }
+  if (spec.startsWith('@')) {
+    return fs.readFileSync(spec.slice(1), 'utf8').trim();
+  }
+  return spec;
+}
+
+function readJsonFile(filePath, fallback) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(filePath, 0o600); } catch {}
+}
+
+function brokerAclPath() {
+  return process.env.TELEPTY_BROKER_ACL || path.join(os.homedir(), '.telepty', 'broker-acl.json');
+}
+
+function brokerRevokedPath() {
+  return process.env.TELEPTY_BROKER_REVOKED || path.join(os.homedir(), '.telepty', 'broker-revoked.json');
+}
+
+function brokerAllow(fromNode, toNodes) {
+  const acl = readJsonFile(brokerAclPath(), {});
+  const existing = Array.isArray(acl[fromNode]) ? acl[fromNode] : [];
+  acl[fromNode] = Array.from(new Set([...existing, ...toNodes]));
+  writeJsonFile(brokerAclPath(), acl);
+  return acl[fromNode];
+}
+
+function brokerDeny(node) {
+  const acl = readJsonFile(brokerAclPath(), {});
+  delete acl[node];
+  writeJsonFile(brokerAclPath(), acl);
+}
+
+function brokerRevoke(node) {
+  const revoked = readJsonFile(brokerRevokedPath(), []);
+  const list = Array.isArray(revoked) ? revoked : [];
+  if (!list.includes(node)) list.push(node);
+  writeJsonFile(brokerRevokedPath(), list);
+  return list;
+}
+
+async function enrollBrokerNode(url, node, enrollSecret, pin) {
+  const brokerUrl = normalizeBrokerUrl(url);
+  if (!brokerUrl) throw new Error('connect-broker requires a valid broker URL');
+  const res = await fetch(`${brokerUrl}/broker/enroll`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(10000),
+    headers: {
+      'Content-Type': 'application/json',
+      'x-telepty-enroll': enrollSecret
+    },
+    body: JSON.stringify({ node, pin_ack: pin || null })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || data.code || `Broker enroll failed with HTTP ${res.status}`);
+  }
+  if (!data || typeof data.jwt !== 'string' || !data.jwt) {
+    throw new Error('Broker enroll response did not include a node JWT');
+  }
+  return { ...data, url: brokerUrl };
+}
+
 function isSubmitForceDefaultEnabled(env = process.env) {
   const value = (env.TELEPTY_SUBMIT_FORCE_DEFAULT || '').trim().toLowerCase();
   return value === '1' || value === 'true' || value === 'yes' || value === 'on';
@@ -515,6 +607,15 @@ async function discoverSessions(options = {}) {
     allSessions.push(...httpSessions);
   } catch {
     // HTTP peer discovery is best-effort.
+  }
+
+  // Remote peer sessions via broker relay. Default-OFF: without a
+  // transport='broker' peer in peers.json, this performs no broker call.
+  try {
+    const brokerSessions = await crossMachine.discoverBrokerRemoteSessions();
+    allSessions.push(...brokerSessions);
+  } catch {
+    // Broker peer discovery is best-effort.
   }
 
   return allSessions;
@@ -887,6 +988,57 @@ async function main() {
     // daemon.js binds the port only when launched as the daemon. The CLI reaches
     // it via require() (not as require.main), so signal intent explicitly — tests
     // that `require('./daemon.js')` without this env stay side-effect-free. (#15 / 0.5.0 daemon-never-listened regression)
+    process.env.AIGENTRY_TELEPTY_DAEMON_MAIN = '1';
+    require('./daemon.js');
+    return;
+  }
+
+  if (cmd === 'broker') {
+    const subcmd = args[1];
+    if (subcmd === 'allow') {
+      const fromNode = args[2];
+      const toFlag = args.indexOf('--to');
+      const toNodes = toFlag !== -1 && args[toFlag + 1]
+        ? args[toFlag + 1].split(',').map((item) => item.trim()).filter(Boolean)
+        : [];
+      if (!fromNode || toNodes.length === 0) {
+        console.error('❌ Usage: telepty broker allow <fromNode> --to <nodeA,nodeB>');
+        process.exit(1);
+      }
+      const allowed = brokerAllow(fromNode, toNodes);
+      console.log(`\x1b[32m✅ Broker ACL: ${fromNode} may inject ${allowed.join(', ')}\x1b[0m`);
+      return;
+    }
+
+    if (subcmd === 'deny') {
+      const node = args[2];
+      if (!node) {
+        console.error('❌ Usage: telepty broker deny <node>');
+        process.exit(1);
+      }
+      brokerDeny(node);
+      console.log(`\x1b[32m✅ Broker ACL: ${node} denied\x1b[0m`);
+      return;
+    }
+
+    if (subcmd === 'revoke') {
+      const node = args[2];
+      if (!node) {
+        console.error('❌ Usage: telepty broker revoke <node>');
+        process.exit(1);
+      }
+      brokerRevoke(node);
+      console.log(`\x1b[32m✅ Broker revocation: ${node} revoked\x1b[0m`);
+      return;
+    }
+
+    if (subcmd) {
+      console.error('❌ Usage: telepty broker [allow <fromNode> --to <nodeA,nodeB> | deny <node> | revoke <node>]');
+      process.exit(1);
+    }
+
+    console.log('Starting telepty broker...');
+    process.env.TELEPTY_BROKER_MODE = '1';
     process.env.AIGENTRY_TELEPTY_DAEMON_MAIN = '1';
     require('./daemon.js');
     return;
@@ -3237,6 +3389,47 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
+  // telepty connect-broker <url> --node <name> --enroll-secret <secret|@file|env:VAR> [--pin <sha256>]
+  // One-click broker enrollment: POST /broker/enroll with the fleet enroll
+  // secret, then persist the minted node JWT in ~/.telepty/broker.json (0600)
+  // and a non-secret transport='broker' peer in peers.json.
+  if (cmd === 'connect-broker') {
+    const target = args[1];
+    const nodeFlag = args.indexOf('--node');
+    const secretFlag = args.indexOf('--enroll-secret');
+    const pinFlag = args.indexOf('--pin');
+    const node = nodeFlag !== -1 ? args[nodeFlag + 1] : null;
+    const secretSpec = secretFlag !== -1 ? args[secretFlag + 1] : null;
+    const pin = pinFlag !== -1 ? args[pinFlag + 1] : null;
+    if (!target || !node || !secretSpec) {
+      console.error('❌ Usage: telepty connect-broker <url> --node <name> --enroll-secret <secret|@file|env:VAR> [--pin <sha256>]');
+      process.exit(1);
+    }
+
+    process.stdout.write(`\x1b[36m🔗 Enrolling ${node} with broker ${target}...\x1b[0m\n`);
+    try {
+      const enrollSecret = readBrokerEnrollSecret(secretSpec);
+      const enroll = await enrollBrokerNode(target, node, enrollSecret, pin);
+      const result = await crossMachine.connectBroker(enroll.url, {
+        node,
+        jwt: enroll.jwt,
+        pin
+      });
+      if (result.success) {
+        console.log(`\x1b[32m✅ Connected ${result.node} to broker\x1b[0m`);
+        console.log(`   Broker: ${result.url}`);
+        console.log(`\nBroker sessions are now discoverable via \x1b[36mtelepty list\x1b[0m`);
+      } else {
+        console.error(`\x1b[31m❌ ${result.error}\x1b[0m`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`\x1b[31m❌ ${err.message}\x1b[0m`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // telepty disconnect [<name> | --all]
   if (cmd === 'disconnect') {
     if (args[1] === '--all') {
@@ -3394,6 +3587,8 @@ Discuss the following topic from your project's perspective. Engage with other s
 \x1b[1mCross-Machine:\x1b[0m
   telepty connect <user@host> [--name N] [--port P]      SSH tunnel to remote host
   telepty connect-http <host>[:port] [--name N] [--token T]  Register remote daemon via HTTP (no SSH)
+  telepty connect-broker <url> --node N --enroll-secret S [--pin P]  Enroll with broker relay
+  telepty broker [allow <from> --to a,b | deny <node> | revoke <node>]  Start/admin broker
   telepty disconnect <name> | --all              Disconnect remote host
   telepty peers [--remove <name>]                List connected peers
 

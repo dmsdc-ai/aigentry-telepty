@@ -8,6 +8,7 @@ const { getSharedContextPromptPath } = require('./shared-context');
 const { parseHostSpec } = require('./host-spec');
 
 const PEERS_PATH = path.join(os.homedir(), '.telepty', 'peers.json');
+const BROKER_CONFIG_PATH = path.join(os.homedir(), '.telepty', 'broker.json');
 const CONTROL_DIR = path.join(os.homedir(), '.telepty', 'ssh');
 
 function getPeerTransport(entry) {
@@ -32,6 +33,30 @@ function savePeers(data) {
     fs.mkdirSync(path.dirname(PEERS_PATH), { recursive: true });
     fs.writeFileSync(PEERS_PATH, JSON.stringify(data, null, 2));
   } catch {}
+}
+
+function normalizeBrokerUrl(url) {
+  const value = String(url || '').trim();
+  if (!value) return '';
+  try {
+    const parsed = new URL(value);
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function loadBrokerConfig() {
+  try {
+    if (!fs.existsSync(BROKER_CONFIG_PATH)) return null;
+    return JSON.parse(fs.readFileSync(BROKER_CONFIG_PATH, 'utf8'));
+  } catch { return null; }
+}
+
+function saveBrokerConfig(config) {
+  fs.mkdirSync(path.dirname(BROKER_CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(BROKER_CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(BROKER_CONFIG_PATH, 0o600); } catch {}
 }
 
 // In-memory active peers
@@ -469,6 +494,97 @@ async function discoverHttpRemoteSessions(options = {}) {
   return results.flat();
 }
 
+// ── Broker peer support (opt-in relay discovery) ────────────────────────────
+// connect-broker stores the node's broker credentials in broker.json (0600) and
+// records a non-secret transport='broker' peer in peers.json. Discovery remains
+// default-OFF: no broker peer entry means list discovery never calls the broker.
+
+async function connectBroker(url, options = {}) {
+  const brokerUrl = normalizeBrokerUrl(url);
+  if (!brokerUrl) {
+    return { success: false, error: 'connect-broker requires a valid broker URL.' };
+  }
+
+  const node = String(options.node || '').trim();
+  if (!node) {
+    return { success: false, error: 'connect-broker requires --node <name>.' };
+  }
+
+  const jwt = String(options.jwt || '').trim();
+  if (!jwt) {
+    return { success: false, error: 'connect-broker requires a node JWT.' };
+  }
+
+  const connectedAt = new Date().toISOString();
+  const config = {
+    url: brokerUrl,
+    node,
+    jwt,
+    pin: options.pin || null,
+    accept_from: null
+  };
+  saveBrokerConfig(config);
+
+  const peers = loadPeers();
+  peers.peers[node] = {
+    transport: 'broker',
+    node,
+    url: brokerUrl,
+    machineId: node,
+    lastConnected: connectedAt
+  };
+  savePeers(peers);
+
+  return { success: true, name: node, node, url: brokerUrl };
+}
+
+function listBrokerPeers() {
+  const peers = loadPeers().peers || {};
+  return Object.entries(peers)
+    .filter(([, entry]) => getPeerTransport(entry) === 'broker')
+    .map(([name, entry]) => ({
+      name,
+      node: entry.node || entry.machineId || name,
+      url: entry.url,
+      machineId: entry.machineId || entry.node || name,
+      lastConnected: entry.lastConnected
+    }));
+}
+
+async function listBrokerRemoteSessions(options = {}) {
+  const config = options.config || loadBrokerConfig();
+  const brokerUrl = normalizeBrokerUrl(options.url || (config && config.url));
+  const jwt = String(options.jwt || (config && config.jwt) || '').trim();
+  if (!brokerUrl || !jwt) return [];
+
+  try {
+    const res = await fetch(`${brokerUrl}/broker/sessions`, {
+      signal: AbortSignal.timeout(options.timeoutMs || 3000),
+      headers: { Authorization: `Bearer ${jwt}` }
+    });
+    if (!res.ok) return [];
+    const body = await res.json();
+    const sessions = Array.isArray(body) ? body : body && body.sessions;
+    if (!Array.isArray(sessions)) return [];
+    return sessions.map((session) => {
+      const base = (session && typeof session === 'object') ? session : { id: session };
+      const node = base.peerName || base.host || base.node || base.machineId || base.machine_id;
+      return {
+        ...base,
+        host: node,
+        peerName: node
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function discoverBrokerRemoteSessions(options = {}) {
+  if (listBrokerPeers().length === 0) return [];
+  return listBrokerRemoteSessions(options);
+}
+
 module.exports = {
   connect,
   disconnect,
@@ -490,9 +606,16 @@ module.exports = {
   listHttpPeers,
   listHttpRemoteSessions,
   discoverHttpRemoteSessions,
+  // Broker peer transport (opt-in relay discovery)
+  connectBroker,
+  listBrokerPeers,
+  listBrokerRemoteSessions,
+  discoverBrokerRemoteSessions,
+  loadBrokerConfig,
   // File-backed SSH peer enumeration (cross-process — #411)
   listSshPeers,
   getSshPeerHandle,
   getPeerTransport,
-  PEERS_PATH
+  PEERS_PATH,
+  BROKER_CONFIG_PATH
 };
