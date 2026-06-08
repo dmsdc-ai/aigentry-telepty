@@ -4,6 +4,29 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-06-08
+
+### Fixed — managed service install never started the daemon (#41)
+
+- **The launchd/systemd/Windows service install generated an `env: node`
+  invocation that exited 127** under a minimal service-manager PATH (the daemon
+  never started when managed by launchd/systemd). **Fix:** `install.js` now uses
+  the absolute `process.execPath` + `cli.js` path for launchd/systemd/Windows
+  service generation, sets the daemon `PATH` via EnvironmentVariables, and adds
+  managed-instance live assertions so a managed daemon actually starts. Landed on
+  `main` at commit `7b2ab92`.
+
+### Changed — CI test wiring
+
+- Wired `test/install-service-generation.test.js` (the #41 regression test) into
+  the `test`, `test:ci`, and `test:watch` script file lists so CI's
+  `npm run test:ci` actually exercises the service-install generation.
+
+### Docs
+
+- Landed the #42 cross-machine relay/broker (hub) mode ADR and MVP
+  implementation spec.
+
 ## [0.5.2] - 2026-06-06
 
 ### Fixed — submit handshake confirmation (#507-B / #508)
