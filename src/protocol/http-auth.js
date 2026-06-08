@@ -21,6 +21,38 @@ function createVerifyJwt(JWT_SECRET) {
   return verifyJwt;
 }
 
+function createBrokerAcl(aclTable = {}) {
+  return {
+    canInject(fromNode, toNode) {
+      if (!fromNode || !toNode) return false;
+      const allowedTargets = aclTable[fromNode];
+      if (Array.isArray(allowedTargets)) return allowedTargets.includes(toNode);
+      if (allowedTargets instanceof Set) return allowedTargets.has(toNode);
+      return false;
+    }
+  };
+}
+
+function signNodeJwt(secret, claims) {
+  if (!secret) throw new Error('JWT secret is required');
+  if (!claims || typeof claims !== 'object') throw new Error('JWT claims are required');
+
+  const headerB64 = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payloadB64 = Buffer.from(JSON.stringify(claims)).toString('base64url');
+  const sigB64 = crypto.createHmac('sha256', secret)
+    .update(`${headerB64}.${payloadB64}`)
+    .digest('base64url');
+  return `${headerB64}.${payloadB64}.${sigB64}`;
+}
+
+function isRevokedNode(revokedNodes, decodedJwtOrSub) {
+  const sub = typeof decodedJwtOrSub === 'string' ? decodedJwtOrSub : decodedJwtOrSub && decodedJwtOrSub.sub;
+  if (!sub || !revokedNodes) return false;
+  if (Array.isArray(revokedNodes)) return revokedNodes.includes(sub);
+  if (revokedNodes instanceof Set) return revokedNodes.has(sub);
+  return false;
+}
+
 function createIsAllowedPeer(PEER_ALLOWLIST) {
   function isAllowedPeer(ip) {
     if (!ip) return false;
@@ -66,6 +98,9 @@ function createAuthMiddleware(options) {
 
 module.exports = {
   createAuthMiddleware,
+  createBrokerAcl,
   createIsAllowedPeer,
-  createVerifyJwt
+  createVerifyJwt,
+  isRevokedNode,
+  signNodeJwt
 };
