@@ -1,6 +1,6 @@
 # Spec — telepty #42 broker MVP: cross-machine relay (hub) for `inject` under client-isolation
 
-- **Date:** 2026-06-08
+- **Date:** 2026-06-08 (rev. 2 — folds in the 3 USER decisions: TLS self-signed+pin LOCKED, sync-ack-15s LOCKED, **automated `/broker/enroll`** with new security design §4.6)
 - **Status:** SPEC FIRST — awaiting user approval (no impl until approved; orchestrator surfaces this spec to the USER)
 - **Author role:** architect (`telepty-42-architect`)
 - **Branch:** `wt/telepty-42-broker-adr` (commit ONLY this spec; NO push — orchestrator lands)
@@ -63,6 +63,7 @@ All broker traffic is **TLS (HTTPS/`wss`-free — SSE over HTTPS)**. Node→brok
 
 | Method · Path | Auth | Purpose |
 |---|---|---|
+| `POST /broker/enroll` | **enroll-secret** (not node-JWT) | **Automated one-click enrollment** (§4.6). Node presents the fleet enroll-secret + a chosen name → broker mints & returns a node-JWT. **Enrolled ≠ authorized** (ACL starts empty — default-deny). Rate-limited + audit-logged. |
 | `POST /broker/register` | node-JWT | Node enrolls its presence + pushes session list. Returns `{ ok, node, since }`. Broker records `{node → {sub, sessions, lastSeen}}`. |
 | `GET /broker/stream` | node-JWT + `Last-Event-ID` | The **held SSE downstream**. Broker pushes `inject` events down it. `text/event-stream`, heartbeat comments. |
 | `POST /broker/inject` | node-JWT | Originating node asks broker to forward an inject to `id@<targetNode>`. Broker **authorizes** (ACL), enqueues to target's channel, **holds the response** until the target acks (or timeout). Returns the delivery result (synchronous parity with direct inject). |
@@ -121,37 +122,63 @@ Defense-in-depth, mapped to ADR threats. **The broker is a semi-trusted router, 
 
 ### 4.4 Transport encryption (T1, broker-impersonation)
 - **TLS mandatory day 1.** Broker URL is `https://`. Broker host loads `TELEPTY_TLS_CERT` / `TELEPTY_TLS_KEY`. Node **validates the broker cert** (CA-trust, or pinned fingerprint in `broker.json` for self-signed) to stop a DNS/route attacker impersonating the broker the nodes trust as router.
-- **MVP default (no external CA — §17):** self-signed cert on the broker host + **fingerprint pin** in each node's `broker.json`. Internal-CA is supported (set node trust store) but not required.
+- **LOCKED MVP default (no external CA — §17):** self-signed cert on the broker host + **fingerprint pin** in each node's `broker.json`. Internal-CA is config-swappable (set node trust store) but not required.
 
 ### 4.5 Replay / DoS (T3, T6)
 - **Replay:** `message_id` dedup (reused) on the receiving node; nonce+timestamp on the register handshake; JWT `exp` bounds token lifetime.
 - **DoS / SPOF:** per-node rate-limit on `/broker/inject`; bounded queues (3.3). **Graceful degradation:** broker down → broker-client retries; cross-machine inject fails with a clear error; **local inject is unaffected**; and because broker mode is **default-OFF**, existing P2P users are entirely unaffected (제9조 — system works without the broker component).
 
-### 4.6 Threat → control map
+### 4.6 Automated self-enroll endpoint (`POST /broker/enroll`) — one-click UX, security-bounded
+
+The USER chose **automated self-enroll** over manual JWT copy (one-click UX). This adds a new attack surface; the design below keeps it MVP-minimal (a token + default-deny — **not** a full identity service).
+
+**Core safety argument (why automated enroll is safe here):** authorization is **decoupled** from identity (§4.1). `/broker/enroll` grants only an **identity** (a node-JWT, `sub=<name>`); it writes an **EMPTY ACL entry** for the new node. **Default-deny (§4.1) means an enrolled node can inject NOBODY** until an admin explicitly adds targets to `broker-acl.json`. Therefore enroll **cannot escalate to injection** — its residual risks are **registration spam / DoS / identity-squatting**, not unauthorized inject. This is the load-bearing argument; everything below hardens those residual risks.
+
+**(a) Bootstrap authn — chosen: shared fleet enroll-secret + node-chosen name (lightest correct, Art.1).**
+- Node calls `POST /broker/enroll` with header `x-telepty-enroll: <fleet-enroll-secret>` and body `{ node: "<name>", pin_ack: "<broker-cert-sha256>" }`. Broker verifies the secret (constant-time compare), rejects duplicate names, mints the JWT, returns it.
+- **Why a shared secret, not per-node one-time tokens:** one secret to provision (Wi-Fi-password model) = the closest to one-click for the whole fleet, and **default-deny removes the secret's blast radius** — a leaked enroll-secret yields only enroll-spam (rate-limited, audited, injects nothing), not compromise. Per-node single-use enrollment tokens are **stronger but heavier** (admin mints+distributes one per node = re-introduces the manual friction the user rejected) → **noted as a Phase-2 hardening** for high-security fleets, not MVP.
+- **Anti-squat:** node-name is first-come; a second enroll of an existing name is **rejected** unless the request also carries the **current valid JWT** for that name (proves ownership → this is also the rotation path). So once `nodeA` enrolls, nobody else can take `nodeA`, and a squatted free name still injects nothing (default-deny).
+
+**(b) Abuse controls:**
+- **Rate-limit** `/broker/enroll` per source-IP (e.g. 5/min) + a **global enroll cap** (max fleet size, e.g. 256) → reject beyond with `429`.
+- **Audit-log** every attempt (name, source-IP, timestamp, result) to `~/.telepty/broker-enroll.log` on the broker host **and** emit a `broker_enroll` bus event (reuses `broadcastBusEvent`).
+- **Bounded pending/active node set** (the global cap above).
+- **TLS-pin still required** — enroll is over TLS; the node still pins the broker cert (`pin_ack` echoes the fingerprint it pinned, letting the broker detect a MITM that re-terminated TLS).
+- **Optional admin-approval queue** (enroll → `pending`, admin approves before JWT issuance) — **Phase 2**, not MVP (MVP auto-issues on valid secret).
+
+**(c) Lifecycle:**
+- **Issuance:** on success, broker mints an HS256 node-JWT with `TELEPTY_JWT_SECRET` — `{ sub:<name>, fleet, iat, exp }`, `exp` = enroll TTL (default 30d). Minting is the sign-side of the reused HS256 primitive; add a small `signNodeJwt(secret, claims)` next to **`createVerifyJwt`** in `http-auth.js` (no new dep — §17). Node stores the JWT in `~/.telepty/broker.json` (mode 0600).
+- **Rotation:** re-call `/broker/enroll` authenticated by the **current valid JWT** (Bearer) instead of the enroll-secret → new JWT, fresh `exp`. No secret needed for rotation; supports near-exp auto-renew by the node broker-client.
+- **Revocation:** **(i) authz kill — immediate:** admin removes the node from `broker-acl.json` → it can inject nothing *now* (the thing that matters). **(ii) identity kill:** since HS256 JWTs are stateless, the broker checks `sub` against a small **revocation set** (`~/.telepty/broker-revoked.json`) on every `/broker/*` request; admin adds a name to revoke its channel before `exp`. (Short `exp` is the backstop.)
+- **De-enroll:** `DELETE /broker/enroll` (node-JWT) or admin removal → drop from routing table + ACL + add to revocation set.
+
+### 4.7 Threat → control map
 | Threat (ADR §3) | MVP control |
 |---|---|
 | **T1** broker-as-MITM / confidentiality | TLS mandatory (4.4) + first-party self-hosted broker on the dedicated host (operator == fleet owner). |
-| **T2** flat-token → fleet-wide inject escalation | Per-node JWT identity (4.1) + broker default-deny ACL (4.1) + receiving-daemon `accept_from` last line (4.2). |
-| **T3** node spoof / name-squat / replay | JWT `sub` binds identity (4.1) + `message_id` dedup + nonce/`exp` (4.5). |
+| **T2** flat-token → fleet-wide inject escalation | Per-node JWT identity (4.1) + broker default-deny ACL (4.1) + receiving-daemon `accept_from` last line (4.2). **Automated enroll does NOT widen T2: an enrolled node's ACL starts EMPTY → it can inject nobody until an admin grant (§4.6).** |
+| **T3** node spoof / name-squat / replay | JWT `sub` binds identity (4.1) + `message_id` dedup + nonce/`exp` (4.5). **Enroll name-squatting** blocked by first-come duplicate-name rejection + ownership-proof (current valid JWT) required to re-claim a name (§4.6). |
 | **T6** SPOF / DoS / amplification | Rate-limit + bounded queue (4.5) + graceful degradation, default-OFF (4.5). |
+| **T7** *(new — enroll endpoint)* enroll spam / DoS / identity-squat | enroll-secret authn (only fleet members enroll) + per-IP & global rate-limit + bounded node cap + audit-log every attempt + duplicate-name rejection + **default-deny ACL neutralizes the payoff** (a spammed/squatted enroll grants identity, never injection). TLS-pin still required (§4.6). |
 
 ---
 
 ## 5. Config & opt-in (default-OFF; backward-compat)
 
-### Node side
-- Enroll once: `telepty connect-broker https://broker.intranet:8443 --node <name> --jwt <path|inline> [--pin <sha256>]` → writes `~/.telepty/broker.json` (mode 0600):
+### Node side (one-click — automated self-enroll)
+- One command: `telepty connect-broker https://broker.intranet:8443 --node <name> --enroll-secret <secret|@file|env:VAR> [--pin <sha256>]`. This **auto-enrolls** (POST `/broker/enroll` with the enroll-secret, §4.6), receives the minted node-JWT, and writes `~/.telepty/broker.json` (mode 0600):
   ```json
-  { "url": "https://broker.intranet:8443", "node": "nodeA", "jwt_path": "~/.telepty/broker.jwt",
+  { "url": "https://broker.intranet:8443", "node": "nodeA", "jwt": "<minted-node-JWT>",
     "pin": "sha256:…", "accept_from": null }
   ```
-  Also records a `transport:'broker'` entry in `peers.json` for discovery symmetry.
-- Daemon reads `broker.json` (or env `TELEPTY_BROKER_URL` + `TELEPTY_BROKER_JWT`) **on start/reload**; if absent → **broker-client not started** (default-OFF, zero new behavior).
+  Also records a `transport:'broker'` entry in `peers.json` for discovery symmetry. **No manual JWT copy** — the enroll-secret is the only thing the user supplies (one shared fleet value).
+- Daemon reads `broker.json` (or env `TELEPTY_BROKER_URL` + `TELEPTY_BROKER_JWT`) **on start/reload**; if absent → **broker-client not started** (default-OFF, zero new behavior). The broker-client auto-rotates the JWT before `exp` (re-enroll authenticated by the current JWT, §4.6c).
 
 ### Broker host side
 - `telepty broker` (mirrors the `daemon` command, line 884: sets `TELEPTY_BROKER_MODE=1` + `AIGENTRY_TELEPTY_DAEMON_MAIN=1`, then `require('./daemon.js')`).
-- Env: `TELEPTY_JWT_SECRET` (required — mints/verifies node JWTs), `TELEPTY_TLS_CERT`/`TELEPTY_TLS_KEY` (required), `TELEPTY_BROKER_ACL` (path, default `~/.telepty/broker-acl.json`), `PORT` (e.g. 8443).
-- Mint a node identity: `telepty broker enroll <node> --allow nodeB,nodeC [--ttl 30d]` → signs a JWT with `TELEPTY_JWT_SECRET`, **prints it once** (copied to the node out-of-band, like an SSH key), and adds `<node>: [nodeB,nodeC]` to the ACL. Rotation = re-enroll (new `exp`); revoke = remove from ACL (effective immediately, no re-mint needed since authz is broker-side).
+- Env: `TELEPTY_JWT_SECRET` (required — signs/verifies node JWTs), **`TELEPTY_ENROLL_SECRET`** (required — gates automated `/broker/enroll`; the one shared fleet value), `TELEPTY_TLS_CERT`/`TELEPTY_TLS_KEY` (required), `TELEPTY_BROKER_ACL` (path, default `~/.telepty/broker-acl.json`), `TELEPTY_ENROLL_MAX_NODES` (global cap, default 256), `PORT` (e.g. 8443).
+- **Grant injection authz** (the only manual admin step, and it is authz-not-identity): `telepty broker allow <fromNode> --to nodeB,nodeC` edits `broker-acl.json`. Until this runs, an enrolled node injects nobody (default-deny). Revoke = `telepty broker deny <node>` (removes from ACL — immediate authz kill) and/or `telepty broker revoke <node>` (adds to `broker-revoked.json` — identity kill before `exp`).
+- *(Optional)* `telepty broker enroll <node> [--ttl]` remains as an **admin-side pre-provision** path (mints a JWT directly for fleets that prefer pre-issued identities) — but the **primary path is the node's automated self-enroll**.
 
 ### Backward-compat (REQUIRED)
 - No broker config ⇒ **no code path changes**: `connect`/`connectHttp`/`remoteInject`/`discoverAllRemoteSessions` are untouched; the broker-client/server are inert. The `list`/`inject` flows add broker discovery **only when** a `transport:'broker'` peer exists.
@@ -162,7 +189,8 @@ Defense-in-depth, mapped to ADR threats. **The broker is a semi-trusted router, 
 
 - The always-on intranet server runs **`telepty broker`** under a service (launchd/systemd) — extend `install.js` (#41) with a broker variant whose `ExecStart`/`ProgramArguments` is `telepty broker` instead of `telepty daemon` (the post-fix #41 service-install path applies to the broker daemon too). Selected via `telepty install --broker` or env.
 - **Firewall / outbound assumptions:** the broker listens on its TLS port (e.g. 8443) reachable from the intranet; **WFH nodes need outbound-only** reachability to that host (the exact shape the spike verified: laptop → `172.28.2.31` works, laptop↔laptop blocked). No inbound to nodes required — the whole point.
-- **Provision TLS** on the broker host (self-signed + node pin for MVP; internal CA optional). Set `TELEPTY_JWT_SECRET` (kept ONLY on the broker host). Enroll each node (§5).
+- **Provision on the broker host (all kept ONLY there):** TLS cert/key (**self-signed + node fingerprint-pin — LOCKED MVP default**, §4.4; internal CA config-swappable later), `TELEPTY_JWT_SECRET` (signs node JWTs), and **`TELEPTY_ENROLL_SECRET`** (the one shared fleet value handed to operators to bring nodes online — e.g. via the same channel as the broker URL). Optionally seed `broker-acl.json` for known node pairs.
+- **Bring a node online (one-click):** on each WFH node run `telepty connect-broker <url> --node <name> --enroll-secret <secret> --pin <fp>` (§5) — it self-enrolls; then the admin runs `telepty broker allow <name> --to <targets>` once to grant injection authz (default-deny until then).
 
 ---
 
@@ -173,6 +201,7 @@ Defense-in-depth, mapped to ADR threats. **The broker is a semi-trusted router, 
 - **Unit (routing):** `pickSessionTarget` resolves `id@nodeB` against a broker-tagged session (`peerName='nodeB'`) — **proves the unchanged reuse**.
 - **Integration (loopback, no real network):** spin one broker daemon + two node daemons on distinct localhost ports; nodes connect **only** to the broker (no SSH/http peer between them). Assert `inject A→broker→B` delivers to B's session and A receives the ack; assert reconnect after dropping/reopening B's SSE channel redelivers buffered injects (dedup → single delivery). TLS via self-signed cert + pin.
 - **Security (host-runnable):** (a) node with bad/expired JWT → `/broker/register` & `/broker/stream` return **401**; (b) node injecting into a target **not in its ACL** → **403** (cross-node escalation blocked = T2); (c) plain `http://` rejected when TLS configured (T1/T4); (d) duplicate `message_id` deduped (T3); (e) **credential-boundary assertion**: capture broker-client outbound requests and assert they carry **only** the node-JWT, **never** `EXPECTED_TOKEN` (the daemon token) — locks the §4.3 invariant.
+- **Enroll security (host-runnable, T7):** (f) `/broker/enroll` with the correct enroll-secret mints a JWT (200); (g) wrong/missing enroll-secret → **401**; (h) **default-deny proof** — a freshly-enrolled node (no ACL grant) attempting `inject` → **403** (enroll grants identity, never injection — the core §4.6 safety argument); (i) **duplicate-name** enroll without ownership-JWT → **409/403** (anti-squat T3); rotation with the current valid JWT → new JWT (200); (j) enroll **rate-limit** (>N/min from one IP) → **429**, and global cap exceeded → **429**; (k) **revocation** — a revoked node's JWT is rejected on `/broker/*` (T3); (l) audit-log/`broker_enroll` event emitted per attempt.
 - **Regression:** full `npm test` → no new reds; `node --check` on changed files; Snyk on changed `.js` → 0 new findings.
 
 ### Need-real-topology (NOT host-runnable — FLAG, do not block CI)
@@ -190,15 +219,15 @@ Coder-sized tasks. **T1 is the sequential gate** (shapes); then parallel where f
 | **T1** | Broker wire-protocol + envelope + dedup helper (pure) | A | — | gate (do first) |
 | **T2** | Broker-server: endpoints, routing table, per-node queue | B | T1 | ∥ with T3,T4,T6 |
 | **T3** | Node broker-client: SSE hold, reconnect, in-process deliver, ack | C | T1 | ∥ with T2,T4,T6 |
-| **T4** | CLI `connect-broker`/`broker`/`broker enroll` + `cross-machine.js` `connectBroker`/`listBrokerRemoteSessions` + peers.json | D, E | T1 | ∥ with T2,T3,T6 |
-| **T6** | Auth: JWT enroll/mint, `createBrokerAcl`, ACL loader, reuse `createVerifyJwt` | G | T1 | ∥ with T2,T3,T4 |
+| **T4** | CLI `connect-broker` (auto-enroll: POST `/broker/enroll` → store JWT) + `broker`/`broker allow`/`deny`/`revoke` admin cmds + `cross-machine.js` `connectBroker`/`listBrokerRemoteSessions` + peers.json | D, E | T1, T6 | after T6 (enroll client) |
+| **T6** | Auth: **`/broker/enroll` endpoint logic** (enroll-secret verify, duplicate-name reject, rate-limit, audit-log, global cap), `signNodeJwt` mint + reuse `createVerifyJwt`, `createBrokerAcl` (default-deny), ACL loader, **revocation set** check | G (+ endpoint wiring in B) | T1 | ∥ with T2,T3 |
 | **T5** | `daemon.js` wiring (mount server in broker mode / start client in node mode) + config block | F | T2, T3, T6 | join |
 | **T7** | Discovery: integrate `listBrokerRemoteSessions` into `list` path | E | T2, T3 | after T5 |
 | **T8** | `install.js` broker-host service variant (#41) + deployment docs | H | T5 | ∥ with T7,T9,T10 |
 | **T9** | Tests: unit (per module, TDD) + integration + security | tests | per module | rolling; integration after T5 |
 | **T10** | `BUS_EVENT_SCHEMA.md` + config/deploy docs | I | T1 | ∥ throughout (doc) |
 
-**Critical path:** T1 → {T2 ∥ T3 ∥ T6} → T5 → T7 → T9(integration). T4/T8/T10 ride alongside.
+**Critical path:** T1 → {T2 ∥ T3 ∥ T6} → {T4 (needs T6's enroll client) ∥ T5} → T7 → T9(integration). T8/T10 ride alongside.
 
 ---
 
@@ -216,18 +245,23 @@ Coder-sized tasks. **T1 is the sequential gate** (shapes); then parallel where f
 - **Single fleet:** one ACL table, one JWT secret, one broker — no tenancy namespace. ✓
 - **Reuse over rebuild:** routing (`pickSessionTarget`), dedup (peer-relay pattern), JWT (`createVerifyJwt`), delivery (`deliverInjectionToSession`) all reused — net-new is two transport modules + thin wiring. ✓
 - **No external dependency (§17):** SSE on Node core `http`, HS256 JWT in-house, self-signed-cert+pin — **no message-broker lib, no external relay/IdP/CA**. ✓
+- **Automated enroll stays minimal (§4.6):** a shared enroll-secret + default-deny ACL + rate-limit — **a token, not an identity service**. No external IdP/OAuth/SCIM. ✓ (Drift-watch: if `/broker/enroll` grows approval workflows / role hierarchies / per-session ACL → that's Phase-2 surface, stop and re-scope.)
 - **Default-OFF (§2):** zero behavior change when unconfigured. ✓
 - **Drift watch:** if T2 (broker-server) starts growing topic routing / fan-out subscriptions / tenant partitions → that is the message-bus 위헌 line; STOP and re-scope.
 
 ---
 
-## 11. Open risks / decisions still needed
+## 11. Resolved decisions (LOCKED) & residual notes
 
-These are flagged for the USER/orchestrator (HOLD candidates — not guessed past):
+**All three prior open questions are now USER-decided and LOCKED into the spec:**
 
-1. **TLS PKI choice (proposed default, confirm):** MVP defaults to **self-signed cert on the broker + fingerprint pin in each node's `broker.json`** (keeps §17 — no external CA). If the fleet has an internal CA it should be used instead. *Need:* confirm self-signed+pin is acceptable for MVP, or specify the internal CA.
-2. **JWT secret distribution:** `TELEPTY_JWT_SECRET` lives only on the broker host; `enroll` prints the node JWT once for out-of-band copy (SSH-key-style). *Need:* confirm this manual enroll is acceptable for MVP (vs an automated enrollment endpoint — which is more surface, deferred).
-3. **Ack timeout / UX:** `/broker/inject` holds synchronously for the target ack to preserve direct-inject UX parity. Proposed default timeout 15s (matches existing SSH `remoteInject` timeout). *Need:* confirm synchronous-with-timeout is desired (vs 202-accepted fire-and-forget, which regresses delivery confirmation).
-4. **(Not an open question — stated):** authz is **node-granularity** in MVP (per-session is Phase 2). This is exactly the approved "per-node identity" (locked decision 3) and fully closes T2 fleet-wide escalation.
+1. **TLS PKI → self-signed + fingerprint-pin** (LOCKED, §4.4/§6). MVP default; §17 무의존, no external CA. Config-swappable to an internal CA later.
+2. **Enrollment → automated `/broker/enroll`** (LOCKED, §4.6/§5/§6). User overrode the manual JWT-copy proposal for one-click UX; the new endpoint's security is designed in §4.6 (enroll-secret authn + default-deny + abuse controls + T7).
+3. **inject-ack → synchronous with 15s timeout** (LOCKED, §3.1/§3.3). §2 크로스 — identical UX to local inject; parity with the existing SSH `remoteInject` 15s timeout.
 
-If any of #1–#3 needs a call beyond the constitution, HOLD-inject to `orchestrator` before a coder is dispatched.
+**Residual notes (no user call needed — design judgement, flagged for awareness):**
+- **(Stated, not open) authz granularity:** **node-level** in MVP (per-session = Phase 2). This is exactly the approved "per-node identity" (locked decision 3) and fully closes T2 fleet-wide escalation.
+- **(비판적 — enroll trade-off, designed-as-decided):** automated self-enroll with a **shared** enroll-secret is one-click but trades off vs per-node single-use tokens. The risk is bounded because **default-deny means enroll grants identity, never injection** (§4.6 core argument) — a leaked enroll-secret yields only rate-limited, audited registration spam. For a higher-security fleet, swap to per-node one-time enrollment tokens (Phase-2 hardening, noted §4.6a). **No MVP scope/risk increase beyond the locked decision** given default-deny.
+- **(GA gate, carried from ADR §8):** confirm the **SSE-framed** channel (not just raw-chunked) survives the real corp EDR before GA (a need-real-topology test, §7) — not blocking the build.
+
+No open items require a HOLD-inject; the spec is ready for coder dispatch on approval.
