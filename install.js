@@ -91,9 +91,14 @@ function buildLaunchdPlist(options = {}) {
   const nodeBin = options.nodeBin || process.execPath;
   const cliJs = options.cliJs || path.join(__dirname, 'cli.js');
   const logDir = options.logDir || path.join(os.homedir(), '.telepty', 'logs');
+  const command = options.command || 'daemon';
   const daemonPath = buildDaemonPath(nodeBin, ['/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin']);
   const stdoutPath = path.join(logDir, 'launchd.out.log');
   const stderrPath = path.join(logDir, 'launchd.err.log');
+  const envPairs = [['PATH', daemonPath], ...Object.entries(options.extraEnv || {})];
+  const envXml = envPairs
+    .map(([key, value]) => `        <key>${escapeXml(key)}</key>\n        <string>${escapeXml(value)}</string>`)
+    .join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -105,12 +110,11 @@ function buildLaunchdPlist(options = {}) {
     <array>
         <string>${escapeXml(nodeBin)}</string>
         <string>${escapeXml(cliJs)}</string>
-        <string>daemon</string>
+        <string>${escapeXml(command)}</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>PATH</key>
-        <string>${escapeXml(daemonPath)}</string>
+${envXml}
     </dict>
     <key>StandardOutPath</key>
     <string>${escapeXml(stdoutPath)}</string>
@@ -124,6 +128,11 @@ function buildLaunchdPlist(options = {}) {
 </plist>`;
 }
 
+function systemdEnvLine(key, value) {
+  const escaped = String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return `Environment="${key}=${escaped}"`;
+}
+
 function buildSystemdService(options = {}) {
   const nodeBin = options.nodeBin || process.execPath;
   const cliJs = options.cliJs || path.join(__dirname, 'cli.js');
@@ -131,17 +140,22 @@ function buildSystemdService(options = {}) {
   const userLine = user ? `User=${user}\n` : '';
   const daemonPath = buildDaemonPath(nodeBin, ['/usr/local/bin', '/usr/bin', '/bin']);
   const wantedBy = options.wantedBy || 'multi-user.target';
+  const command = options.command || 'daemon';
+  const description = options.description || 'Telepty Daemon';
+  const extraEnvLines = Object.entries(options.extraEnv || {})
+    .map(([key, value]) => `${systemdEnvLine(key, value)}\n`)
+    .join('');
 
   return `[Unit]
-Description=Telepty Daemon
+Description=${description}
 After=network.target
 
 [Service]
-ExecStart=${systemdExecArg(nodeBin)} ${systemdExecArg(cliJs)} daemon
+ExecStart=${systemdExecArg(nodeBin)} ${systemdExecArg(cliJs)} ${systemdExecArg(command)}
 Restart=always
 ${userLine}Environment=PATH=${daemonPath}
 Environment=NODE_ENV=production
-
+${extraEnvLines}
 [Install]
 WantedBy=${wantedBy}`;
 }
@@ -150,7 +164,8 @@ function buildWindowsAutostartCommand(options = {}) {
   const nodeBin = options.nodeBin || process.execPath;
   const cliJs = options.cliJs || path.join(__dirname, 'cli.js');
   const taskName = options.taskName || 'telepty-daemon';
-  const taskCommand = `${quoteWindowsArg(nodeBin)} ${quoteWindowsArg(cliJs)} daemon`;
+  const command = options.command || 'daemon';
+  const taskCommand = `${quoteWindowsArg(nodeBin)} ${quoteWindowsArg(cliJs)} ${command}`;
 
   return `schtasks /create /tn ${quoteWindowsArg(taskName)} /sc onlogon /rl LIMITED /f /tr ${quoteWindowsArg(taskCommand)}`;
 }
@@ -163,6 +178,91 @@ function buildWindowsRunTaskCommand(options = {}) {
 function buildWindowsQueryTaskCommand(options = {}) {
   const taskName = options.taskName || 'telepty-daemon';
   return `schtasks /query /tn ${quoteWindowsArg(taskName)} /fo LIST`;
+}
+
+// --- Broker-host service variant (telepty #42 broker MVP — spec §6 + §2 H; reuses #41 hardening) ---
+// The broker runs the SAME hardened service definition as the daemon, but executes
+// `<node> <cli.js> broker` (spec §5/§6) and carries the broker host env (TLS + JWT/enroll
+// secrets, spec §6). Selected via `telepty install --broker` or env TELEPTY_BROKER_MODE.
+const BROKER_LAUNCHD_LABEL = 'com.aigentry.telepty-broker';
+const BROKER_SYSTEMD_SERVICE = 'telepty-broker';
+const BROKER_WINDOWS_TASK = 'telepty-broker';
+
+// Pass-through env keys for the broker host service (spec §5/§6). Secrets are NEVER
+// hardcoded — they are read from the install-time environment and forwarded into the
+// generated service definition so the always-on broker host loads them on start.
+const BROKER_ENV_KEYS = [
+  'TELEPTY_JWT_SECRET',
+  'TELEPTY_ENROLL_SECRET',
+  'TELEPTY_TLS_CERT',
+  'TELEPTY_TLS_KEY',
+  'TELEPTY_BROKER_ACL',
+  'TELEPTY_ENROLL_MAX_NODES',
+  'PORT',
+];
+
+function collectBrokerServiceEnv(env = process.env) {
+  const result = { TELEPTY_BROKER_MODE: '1' };
+  for (const key of BROKER_ENV_KEYS) {
+    const value = env[key];
+    if (value !== undefined && value !== '') {
+      result[key] = String(value);
+    }
+  }
+  return result;
+}
+
+function buildBrokerLaunchdPlist(options = {}) {
+  return buildLaunchdPlist({
+    ...options,
+    label: options.label || BROKER_LAUNCHD_LABEL,
+    command: 'broker',
+    extraEnv: { ...collectBrokerServiceEnv(options.env), ...(options.extraEnv || {}) },
+  });
+}
+
+function buildBrokerSystemdService(options = {}) {
+  return buildSystemdService({
+    ...options,
+    command: 'broker',
+    description: options.description || 'Telepty Broker',
+    extraEnv: { ...collectBrokerServiceEnv(options.env), ...(options.extraEnv || {}) },
+  });
+}
+
+function buildBrokerWindowsAutostartCommand(options = {}) {
+  return buildWindowsAutostartCommand({
+    ...options,
+    taskName: options.taskName || BROKER_WINDOWS_TASK,
+    command: 'broker',
+  });
+}
+
+// Resolve the active service profile (daemon vs broker) so main() can install either
+// variant from one code path. The daemon profile reproduces the exact pre-#42 values
+// (no behavior change for existing installs); the broker profile selects distinct
+// label/service/task names, the `broker` command, and the broker host env.
+function resolveServiceProfile(options = {}) {
+  if (options.broker) {
+    return {
+      command: 'broker',
+      launchdLabel: BROKER_LAUNCHD_LABEL,
+      launchdPlistName: `${BROKER_LAUNCHD_LABEL}.plist`,
+      systemdService: BROKER_SYSTEMD_SERVICE,
+      windowsTask: BROKER_WINDOWS_TASK,
+      description: 'Telepty Broker',
+      extraEnv: collectBrokerServiceEnv(options.env),
+    };
+  }
+  return {
+    command: 'daemon',
+    launchdLabel: 'com.aigentry.telepty',
+    launchdPlistName: 'com.aigentry.telepty.plist',
+    systemdService: 'telepty',
+    windowsTask: 'telepty-daemon',
+    description: 'Telepty Daemon',
+    extraEnv: {},
+  };
 }
 
 function assertLaunchdServiceLive(label = 'com.aigentry.telepty') {
@@ -224,6 +324,16 @@ async function installSkills() {
 async function main() {
   console.log("🚀 Installing @dmsdc-ai/aigentry-telepty...");
 
+  // Broker-host variant (telepty #42): `telepty install --broker` or env TELEPTY_BROKER_MODE
+  // installs the SAME hardened service running `telepty broker` instead of `telepty daemon`.
+  // Default-OFF — existing daemon installs are entirely unaffected (additive).
+  const wantsBroker = process.argv.slice(2).includes('--broker')
+    || process.env.TELEPTY_BROKER_MODE === '1';
+  const profile = resolveServiceProfile({ broker: wantsBroker });
+  if (wantsBroker) {
+    console.log(`🛰️  Broker-host mode: installing service '${profile.launchdLabel}' (runs 'telepty broker').`);
+  }
+
   // 1. Install globally via npm
   console.log("📦 Installing package globally...");
   run("npm install -g @dmsdc-ai/aigentry-telepty");
@@ -243,24 +353,29 @@ async function main() {
   if (platform === 'win32') {
     cleanupLocalDaemons();
     console.log("⚙️ Setting up Windows scheduled task...");
-    run(buildWindowsAutostartCommand(launchOptions));
-    run(buildWindowsRunTaskCommand());
-    assertWindowsTaskRunning();
+    run(buildWindowsAutostartCommand({ ...launchOptions, taskName: profile.windowsTask, command: profile.command }));
+    run(buildWindowsRunTaskCommand({ taskName: profile.windowsTask }));
+    assertWindowsTaskRunning(profile.windowsTask);
     console.log("✅ Windows scheduled task installed and started.");
 
   } else if (platform === 'darwin') {
     console.log("⚙️ Setting up macOS launchd service...");
-    const plistPath = path.join(os.homedir(), 'Library', 'LaunchAgents', 'com.aigentry.telepty.plist');
+    const plistPath = path.join(os.homedir(), 'Library', 'LaunchAgents', profile.launchdPlistName);
     fs.mkdirSync(path.dirname(plistPath), { recursive: true });
     fs.mkdirSync(launchOptions.logDir, { recursive: true });
     try { execSync(`launchctl unload ${shellQuote(plistPath)} 2>/dev/null`); } catch(e){}
     cleanupLocalDaemons();
 
-    const plistContent = buildLaunchdPlist(launchOptions);
+    const plistContent = buildLaunchdPlist({
+      ...launchOptions,
+      label: profile.launchdLabel,
+      command: profile.command,
+      extraEnv: profile.extraEnv,
+    });
 
     fs.writeFileSync(plistPath, plistContent);
     run(`launchctl load ${shellQuote(plistPath)}`);
-    assertLaunchdServiceLive();
+    assertLaunchdServiceLive(profile.launchdLabel);
     console.log("✅ macOS LaunchAgent installed and started.");
 
   } else {
@@ -274,34 +389,40 @@ async function main() {
     if (hasSystemd) {
       if (process.getuid && process.getuid() === 0) {
         console.log("⚙️ Setting up systemd service for Linux...");
-        try { execSync('systemctl stop telepty', { stdio: 'ignore' }); } catch(e) {}
+        try { execSync(`systemctl stop ${profile.systemdService}`, { stdio: 'ignore' }); } catch(e) {}
         cleanupLocalDaemons();
         const serviceContent = buildSystemdService({
           ...launchOptions,
-          user: process.env.SUDO_USER || process.env.USER || 'root'
+          user: process.env.SUDO_USER || process.env.USER || 'root',
+          command: profile.command,
+          description: profile.description,
+          extraEnv: profile.extraEnv,
         });
 
-        fs.writeFileSync('/etc/systemd/system/telepty.service', serviceContent);
+        fs.writeFileSync(`/etc/systemd/system/${profile.systemdService}.service`, serviceContent);
         run('systemctl daemon-reload');
-        run('systemctl enable telepty');
-        run('systemctl start telepty');
-        assertSystemdServiceLive();
+        run(`systemctl enable ${profile.systemdService}`);
+        run(`systemctl start ${profile.systemdService}`);
+        assertSystemdServiceLive(profile.systemdService);
         console.log("✅ Systemd service installed and started.");
         process.exit(0);
       }
 
       console.log("⚙️ Setting up user systemd service for Linux...");
-      const userServicePath = path.join(os.homedir(), '.config', 'systemd', 'user', 'telepty.service');
+      const userServicePath = path.join(os.homedir(), '.config', 'systemd', 'user', `${profile.systemdService}.service`);
       fs.mkdirSync(path.dirname(userServicePath), { recursive: true });
       cleanupLocalDaemons();
       fs.writeFileSync(userServicePath, buildSystemdService({
         ...launchOptions,
-        wantedBy: 'default.target'
+        wantedBy: 'default.target',
+        command: profile.command,
+        description: profile.description,
+        extraEnv: profile.extraEnv,
       }));
       run('systemctl --user daemon-reload');
-      run('systemctl --user enable telepty');
-      run('systemctl --user start telepty');
-      assertSystemdServiceLive('telepty', { user: true });
+      run(`systemctl --user enable ${profile.systemdService}`);
+      run(`systemctl --user start ${profile.systemdService}`);
+      assertSystemdServiceLive(profile.systemdService, { user: true });
       console.log("✅ User systemd service installed and started.");
       process.exit(0);
     }
@@ -309,9 +430,10 @@ async function main() {
     // Fallback for Linux without systemd
     console.log("⚠️ Skipping persistent systemd setup. Starting daemon for this session only...");
     cleanupLocalDaemons();
-    const subprocess = spawn(launchOptions.nodeBin, [launchOptions.cliJs, 'daemon'], {
+    const subprocess = spawn(launchOptions.nodeBin, [launchOptions.cliJs, profile.command], {
       detached: true,
-      stdio: 'ignore'
+      stdio: 'ignore',
+      env: { ...process.env, ...profile.extraEnv }
     });
     subprocess.unref();
     console.log("✅ Linux daemon started in background for the current session.");
@@ -333,4 +455,12 @@ module.exports = {
   buildSystemdService,
   buildWindowsAutostartCommand,
   resolveDaemonLaunchOptions,
+  buildBrokerLaunchdPlist,
+  buildBrokerSystemdService,
+  buildBrokerWindowsAutostartCommand,
+  collectBrokerServiceEnv,
+  resolveServiceProfile,
+  BROKER_LAUNCHD_LABEL,
+  BROKER_SYSTEMD_SERVICE,
+  BROKER_WINDOWS_TASK,
 };
