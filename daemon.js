@@ -694,9 +694,15 @@ async function executeBootstrapInject(sessionId, session, op) {
 
 function parseSubmitRetryOptions(body = {}, injectedBody = null) {
   const hasExplicitRetries = body && body.retries !== undefined && body.retries !== null;
-  const retries = Math.min(Math.max(Number(hasExplicitRetries ? body.retries : (injectedBody ? 1 : 0)) || 0, 0), 3);
-  const retryDelayMs = Math.min(Math.max(Number(body?.retry_delay_ms) || 500, 100), 2000);
-  const verifyTimeoutMs = Math.min(Math.max(Number(body?.verify_timeout_ms) || 1500, 200), 5000);
+  // #568: raise the retry-budget ceiling so a momentarily-busy CLI still gets a
+  // render-gated CR before we return 504 (each retry re-gates on input-ready, so
+  // more attempts = more quiet-window chances to land). Ceilings only — the
+  // default stays 1 for the injected case (behavior-preserving common path);
+  // heavier callers opt into the bigger budget via retries/retry_delay_ms/
+  // verify_timeout_ms. Total worst-case budget stays bounded (~10 attempts).
+  const retries = Math.min(Math.max(Number(hasExplicitRetries ? body.retries : (injectedBody ? 1 : 0)) || 0, 0), 10);
+  const retryDelayMs = Math.min(Math.max(Number(body?.retry_delay_ms) || 500, 100), 3000);
+  const verifyTimeoutMs = Math.min(Math.max(Number(body?.verify_timeout_ms) || 1500, 200), 8000);
   return { retries, retryDelayMs, verifyTimeoutMs };
 }
 
@@ -729,6 +735,29 @@ async function confirmSubmitAfterDispatch(id, session, injectedBody, submittedAt
   return submitGate.confirmSubmitAccepted(session, injectedBody, buildSubmitConfirmOptions(id, session, submittedAtMs, verifyTimeoutMs));
 }
 
+// #568 — render-gate the submit CR. Before writing the bare 0x0D, wait (bounded)
+// until the injected body is echoed in the PTY outputRing AND the render has gone
+// quiet, so the CR does not land mid-render and get dropped (FM1; same gate before
+// each retry CR, FM2). Best-effort + bounded: on timeout / no body / no ring we
+// fall through and still write the CR — never worse than the pre-gate behavior.
+// pty_cr stays the ONLY write path (terminalLevelSubmit); this only times WHEN.
+// Per-request opt-out via `input_settle_gate: false` (rollback/parity escape hatch).
+async function gatedTerminalSubmit(id, session, injectedBody, settleEnabled) {
+  if (injectedBody && injectedBody.length > 0 && settleEnabled !== false) {
+    const settle = await submitGate.awaitInputSettled(session, injectedBody, {
+      timeoutMs: 1200,
+      quietWindowMs: 100,
+      echoGraceMs: 400,
+      pollIntervalMs: 30,
+      stripAnsi: stripAnsiState,
+    });
+    if (!settle.ready) {
+      console.log(`[SUBMIT] input-settle gate timed out for ${id} (${settle.waited_ms}ms, echoed=${settle.echoed}) — sending CR best-effort`);
+    }
+  }
+  return terminalLevelSubmit(id, session);
+}
+
 async function executeBootstrapSubmit(sessionId, session, op) {
   const body = op.body || {};
   const injectedBody = typeof body.injected_body === 'string' ? body.injected_body : null;
@@ -737,8 +766,9 @@ async function executeBootstrapSubmit(sessionId, session, op) {
     markPendingReportSubmitStarted(sessionId, injectedBody);
   }
 
+  const settleEnabled = body.input_settle_gate !== false;
+  let strategy = await gatedTerminalSubmit(sessionId, session, injectedBody, settleEnabled);
   const submittedAtMs = Date.now();
-  let strategy = terminalLevelSubmit(sessionId, session);
   if (!strategy) {
     if (injectedBody) {
       markPendingReportSubmitUnconfirmed(sessionId, { reason: 'strategy_failed', attempts: 0, retryable: false });
@@ -758,8 +788,8 @@ async function executeBootstrapSubmit(sessionId, session, op) {
   let confirm = await confirmSubmitAfterDispatch(sessionId, session, injectedBody, submittedAtMs, verifyTimeoutMs);
   while (confirm && !confirm.accepted && confirm.retryable && attempts <= retries) {
     await sleep(retryDelayMs);
+    const retryStrategy = await gatedTerminalSubmit(sessionId, session, injectedBody, settleEnabled);
     const retrySubmittedAtMs = Date.now();
-    const retryStrategy = terminalLevelSubmit(sessionId, session);
     if (!retryStrategy) break;
     strategy = retryStrategy;
     attempts++;
@@ -2404,12 +2434,13 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     console.log(`[SUBMIT] gate timeout ${id}: dispatching anyway (last_state=${gateResult.last_state})`);
   }
 
-  // Step 2: dispatch Enter via existing kitty → cmux → PTY chain.
+  // Step 2: dispatch Enter via the PTY/context path, render-gated (#568).
   if (injectedBody) {
     markPendingReportSubmitStarted(id, injectedBody);
   }
+  const settleEnabled = req.body?.input_settle_gate !== false;
+  let strategy = await gatedTerminalSubmit(id, session, injectedBody, settleEnabled);
   let submittedAtMs = Date.now();
-  let strategy = terminalLevelSubmit(id, session);
   let attempts = strategy ? 1 : 0;
   if (!strategy) {
     if (injectedBody) {
@@ -2435,8 +2466,8 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     confirm = await confirmSubmitAfterDispatch(id, session, injectedBody, submittedAtMs, verifyTimeoutMs);
     while (confirm && !confirm.accepted && confirm.retryable && attempts <= retries) {
       await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      const retryStrategy = await gatedTerminalSubmit(id, session, injectedBody, settleEnabled);
       submittedAtMs = Date.now();
-      const retryStrategy = terminalLevelSubmit(id, session);
       if (!retryStrategy) break;
       strategy = retryStrategy;
       attempts++;

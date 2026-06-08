@@ -198,6 +198,7 @@ async function confirmSubmitAccepted(session, bodyText, opts = {}) {
 
   let lastVisibility = null;
   let everVisible = false;
+  let everObservedOutput = false;
 
   while (true) {
     const state = getState ? getState() : null;
@@ -214,6 +215,7 @@ async function confirmSubmitAccepted(session, bodyText, opts = {}) {
 
     const visibility = observeBodyVisibility(session, bodyText, opts);
     lastVisibility = visibility;
+    if (visibility.observable && visibility.empty === false) everObservedOutput = true;
     if (visibility.reason === 'empty_body') {
       return {
         accepted: true,
@@ -235,28 +237,145 @@ async function confirmSubmitAccepted(session, bodyText, opts = {}) {
     }
     if (visibility.visible) {
       everVisible = true;
-    } else {
+    } else if (everVisible) {
+      // Body was visible then disappeared — the CR consumed the input line.
       return {
         accepted: true,
         retryable: false,
         waited_ms: now() - start,
-        reason: everVisible ? 'body_consumed' : 'body_absent',
+        reason: 'body_consumed',
+        visibility,
+      };
+    } else if (!getState) {
+      // No state probe → preserve the optimistic body-absent accept so callers
+      // without a sessionStateManager keep the prior screen-free behavior.
+      return {
+        accepted: true,
+        retryable: false,
+        waited_ms: now() - start,
+        reason: 'body_absent',
         visibility,
       };
     }
+    // else: body never observably present AND a state probe IS available — do NOT
+    // optimistically accept on absence. A dropped CR on codex alt-screen renders
+    // the body OFF the outputRing tail, so absence is not positive submit evidence
+    // (#568 FM3). Keep polling within the window for the primary signal — a state
+    // transition idle→working/thinking. If none arrives, fall through to no_land.
 
     if (now() - start >= timeoutMs) {
+      if (visibility.visible) {
+        // Body stayed in the input box the whole window — the CR was not consumed.
+        return {
+          accepted: false,
+          retryable: true,
+          waited_ms: now() - start,
+          reason: 'body_still_visible',
+          visibility,
+          state: state || undefined,
+        };
+      }
+      if (everObservedOutput) {
+        // The terminal produced output (it is alive) but the body was never consumed
+        // AND no state transition occurred — the CR did not land (#568 FM3, e.g. a
+        // dropped CR on codex alt-screen). Truthful retryable failure, never a false
+        // success on an unsent CR.
+        return {
+          accepted: false,
+          retryable: true,
+          waited_ms: now() - start,
+          reason: 'no_land',
+          visibility,
+          state: state || undefined,
+        };
+      }
+      // No observable terminal output at all for the whole window — we have zero
+      // screen evidence either way. Preserve the long-standing optimistic accept
+      // (back-compat: a wrapped session that never echoes), but mark it ambiguous.
       return {
-        accepted: false,
-        retryable: true,
+        accepted: true,
+        retryable: false,
         waited_ms: now() - start,
-        reason: 'body_still_visible',
+        reason: 'no_observable',
+        ambiguous: true,
         visibility,
         state: state || undefined,
       };
     }
 
     await sleep(intervalMs);
+  }
+}
+
+/**
+ * Render-gate the submit CR (#568). Resolve `ready` only when the input is
+ * settled enough to safely receive a bare 0x0D:
+ *   - the injected body is echoed in the outputRing tail (the input is present), AND
+ *   - the render has gone quiet — the tail is unchanged for ≥ quietWindowMs.
+ *
+ * This closes the FM1 busy-render race: the pre-#568 submit fired the CR with no
+ * readiness gate, so under load the CR landed mid-render and the TUI dropped it.
+ * The daemon applies the same gate before each retry CR (FM2).
+ *
+ * Bounded + best-effort: if the render never goes quiet within timeoutMs (e.g. a
+ * continuous spinner), resolve { ready:false, reason:'timeout' } so the caller
+ * STILL writes the CR — never worse than the pre-gate behavior. When the body
+ * never echoes into the tail (alt-screen / non-echoing TUI), settle on the quiet
+ * window alone once echoGraceMs has elapsed (reason:'settled_no_echo').
+ *
+ * Pure: outputRing-only, DI now/sleep — no I/O, no daemon coupling.
+ *
+ * @param {{ outputRing?: string[] }} session
+ * @param {string} bodyText
+ * @param {{ timeoutMs?: number, quietWindowMs?: number, echoGraceMs?: number, pollIntervalMs?: number, tailBytes?: number, stripAnsi?: Function, now?: Function, sleep?: Function }} [opts]
+ * @returns {Promise<{ ready: boolean, reason: string, echoed: boolean, settled: boolean, waited_ms: number }>}
+ */
+async function awaitInputSettled(session, bodyText, opts = {}) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 1500;
+  const quietWindowMs = Number.isFinite(opts.quietWindowMs) ? opts.quietWindowMs : 100;
+  const echoGraceMs = Number.isFinite(opts.echoGraceMs) ? opts.echoGraceMs : 400;
+  const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) ? opts.pollIntervalMs : 30;
+  const tailBytes = Number.isFinite(opts.tailBytes) ? opts.tailBytes : 8192;
+  const stripAnsi = typeof opts.stripAnsi === 'function' ? opts.stripAnsi : (s) => s;
+  const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
+  const sleep = typeof opts.sleep === 'function' ? opts.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const needle = normalize(bodyText);
+  if (!needle) {
+    return { ready: true, reason: 'empty_body', echoed: false, settled: true, waited_ms: 0 };
+  }
+  if (!session || !Array.isArray(session.outputRing)) {
+    // No ring to observe — cannot gate; stay optimistic and never block the CR.
+    return { ready: true, reason: 'no_ring', echoed: false, settled: false, waited_ms: 0 };
+  }
+
+  const start = now();
+  let lastTail = null;
+  let lastChangeAt = start;
+  let everEchoed = false;
+
+  while (true) {
+    const tail = normalize(stripAnsi(readTail(session, tailBytes)));
+    if (tail.indexOf(needle) !== -1) everEchoed = true;
+
+    if (lastTail === null || tail !== lastTail) {
+      // Render still active — reset the quiet-window timer.
+      lastTail = tail;
+      lastChangeAt = now();
+    } else if (now() - lastChangeAt >= quietWindowMs) {
+      // Tail unchanged for the full quiet window → render settled.
+      if (everEchoed) {
+        return { ready: true, reason: 'settled', echoed: true, settled: true, waited_ms: now() - start };
+      }
+      if (now() - start >= echoGraceMs) {
+        return { ready: true, reason: 'settled_no_echo', echoed: false, settled: true, waited_ms: now() - start };
+      }
+    }
+
+    if (now() - start >= timeoutMs) {
+      return { ready: false, reason: 'timeout', echoed: everEchoed, settled: false, waited_ms: now() - start };
+    }
+    await sleep(pollIntervalMs);
   }
 }
 
@@ -292,6 +411,7 @@ function observeBodyVisibility(session, bodyText, opts = {}) {
       observable: true,
       visible: haystack.indexOf(needle) !== -1,
       source: 'screen',
+      empty: haystack.length === 0,
     };
   }
 
@@ -305,6 +425,10 @@ function observeBodyVisibility(session, bodyText, opts = {}) {
     observable: true,
     visible: haystack.indexOf(needle) !== -1,
     source: 'output_ring',
+    // #568: distinguish "terminal alive but body off-screen" (empty=false → a
+    // dropped CR is no_land) from "no screen evidence at all" (empty=true → stay
+    // optimistic). Used by confirmSubmitAccepted's bounded timeout fallback.
+    empty: haystack.length === 0,
   };
 }
 
@@ -425,6 +549,7 @@ function defaultReadScreen(workspaceId, lines) {
 
 module.exports = {
   awaitReplReady,
+  awaitInputSettled,
   verifyBodyConsumed,
   confirmSubmitAccepted,
   observeBodyVisibility,
