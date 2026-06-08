@@ -651,41 +651,99 @@ async function resolveSessionTarget(sessionRef, options = {}) {
   return target;
 }
 
+// #567: pure restart-decision policy. Separates a "slow-but-healthy" daemon from a
+// "genuinely-wrong/dead" one so a transient health-probe timeout under concurrent-
+// spawn load never kills a correct daemon. Exposed for unit-testing (no I/O).
+//
+//   meta                 - daemon /api/meta object ({version, capabilities}) or null
+//   requiredCapabilities - capabilities this spawn needs
+//   cliVersion           - local CLI version (pkg.version)
+//   sessionsReachable    - whether /api/sessions answered; ONLY consulted when meta
+//                          is null, to tell an older daemon that lacks /api/meta apart
+//                          from no daemon at all
+function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessionsReachable = false } = {}) {
+  if (meta && meta.version) {
+    // PRIMARY, definitive signal. A daemon reporting a matching version AND all
+    // required capabilities is healthy+correct → never restart, even if a follow-up
+    // probe (e.g. /api/sessions) is slow or times out (#567 core fix). Version policy
+    // is delegated to decideVersionAction so newer-wins semantics stay unchanged.
+    const decision = decideVersionAction({ daemonVersion: meta.version, cliVersion });
+    if (decision.action === 'restart') {
+      return { action: 'restart', reason: `version-${decision.reason}` };
+    }
+    const missingCap = requiredCapabilities.find((cap) => !(meta.capabilities || []).includes(cap));
+    if (missingCap) {
+      return { action: 'restart', reason: `capability-missing:${missingCap}` };
+    }
+    return { action: 'noop', reason: 'healthy' };
+  }
+
+  // No meta after probing. An older daemon (answers /api/sessions, lacks /api/meta)
+  // gets a legit restart; a genuinely absent/unreachable daemon gets auto-started.
+  if (sessionsReachable) {
+    return { action: 'restart', reason: 'legacy-daemon-no-meta' };
+  }
+  return { action: 'start', reason: 'daemon-unreachable' };
+}
+
 async function ensureDaemonRunning(options = {}) {
   if (REMOTE_HOST !== '127.0.0.1') return; // Only auto-start local daemon
 
   const requiredCapabilities = options.requiredCapabilities || [];
+  // Injectable seams (default to the real implementations) so the restart decision
+  // is unit-testable without touching a real daemon or making a real network call (#567).
+  const getMeta = options._getDaemonMeta || getDaemonMeta;
+  const fetchAuth = options._fetchWithAuth || fetchWithAuth;
+  const doRestart = options._restartDaemonGraceful || restartDaemonGraceful;
+  const probe = options._probe || {};
+  const attempts = probe.attempts || 3;
+  const backoffMs = probe.backoffMs == null ? 200 : probe.backoffMs;
 
-  try {
-    const meta = await getDaemonMeta('127.0.0.1');
-    const hasCapabilities = meta && requiredCapabilities.every((item) => meta.capabilities.includes(item));
-
-    const sessionsRes = await fetchWithAuth(`${DAEMON_URL}/api/sessions`, {
-      signal: AbortSignal.timeout(1500)
-    });
-
-    if (sessionsRes.ok && hasCapabilities) {
-      // Delegate decision to pure-functional handshake so the policy is unit-testable
-      // and consistent across CLI invocations.
-      const decision = decideVersionAction({ daemonVersion: meta && meta.version, cliVersion: pkg.version });
-      if (decision.action === 'restart') {
-        // stderr (not stdout): banner must not contaminate `telepty list --json` (task #400, telepty#15)
-        process.stderr.write(`\x1b[33m⚙️ Daemon version mismatch (running v${meta.version}, installed v${pkg.version}). Restarting...\x1b[0m\n`);
-        await restartDaemonGraceful({ requiredCapabilities });
-        return;
-      }
-      return;
-    } else if (sessionsRes.ok && !meta) {
-      process.stderr.write('\x1b[33m⚙️ Found an older local telepty daemon. Restarting it...\x1b[0m\n');
-    } else if (sessionsRes.ok && meta) {
-      process.stderr.write('\x1b[33m⚙️ Found a local telepty daemon without the required features. Restarting it...\x1b[0m\n');
+  // (1) PRIMARY signal: the daemon version/capability meta, with bounded retries to
+  // ride out a transient timeout under concurrent-spawn load before concluding (#567).
+  // getDaemonMeta already swallows timeouts/refusals and returns null, so a null here
+  // means "not (yet) confirmed healthy", not "definitely dead".
+  let meta = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    meta = await getMeta('127.0.0.1');
+    if (meta && meta.version) break;
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
     }
-  } catch (e) {
-    // Continue to auto-start below.
   }
 
-  process.stderr.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
-  await restartDaemonGraceful({ requiredCapabilities });
+  // (2) Only when meta never came back do we consult /api/sessions — purely to tell an
+  // older daemon (answers sessions, lacks /api/meta) apart from no daemon at all. A slow
+  // sessions probe on an otherwise-confirmed daemon is irrelevant and never reached here.
+  let sessionsReachable = false;
+  if (!(meta && meta.version)) {
+    try {
+      const sessionsRes = await fetchAuth(`${DAEMON_URL}/api/sessions`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      sessionsReachable = !!(sessionsRes && sessionsRes.ok);
+    } catch {
+      sessionsReachable = false; // timeout/refused while probing the legacy fallback
+    }
+  }
+
+  const decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable });
+
+  if (decision.action === 'noop') {
+    return; // healthy + correct version + all capabilities → leave the daemon alone (#567)
+  }
+
+  // stderr (not stdout): banner must not contaminate `telepty list --json` (task #400, telepty#15)
+  if (decision.action === 'restart' && decision.reason.startsWith('version-')) {
+    process.stderr.write(`\x1b[33m⚙️ Daemon version mismatch (running v${meta.version}, installed v${pkg.version}). Restarting...\x1b[0m\n`);
+  } else if (decision.reason === 'legacy-daemon-no-meta') {
+    process.stderr.write('\x1b[33m⚙️ Found an older local telepty daemon. Restarting it...\x1b[0m\n');
+  } else if (decision.action === 'restart') {
+    process.stderr.write('\x1b[33m⚙️ Found a local telepty daemon without the required features. Restarting it...\x1b[0m\n');
+  } else {
+    process.stderr.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
+  }
+  await doRestart({ requiredCapabilities });
 }
 
 async function manageInteractiveAttach(sessionId, targetHost) {
@@ -3642,4 +3700,6 @@ module.exports = {
   classifyBackend,        // #29: TERM_PROGRAM/CMUX/kitty → backend string
   isDaemonDestroyClose,   // #17 OQ-2: 1000 'Session destroyed' → terminate-not-reconnect
   sanitizePathArg,        // #26: path-arg validation/normalization
+  decideDaemonAction,     // #567: pure restart-decision policy (meta-primary; no I/O)
+  ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
 };
