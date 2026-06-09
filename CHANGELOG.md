@@ -4,6 +4,33 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-09
+
+### Added — delivery provenance wrapper + audit seams (#47, P4+P5)
+
+- **`src/audit/provenance.js`**: a nonce-gated, tamper-**evident** provenance banner around
+  delivered bytes (NOT a signature — strength = secrecy of the per-session nonce; the authoritative
+  provenance path remains the out-of-band `GET /api/injects`). Capability-gated in
+  `deliverInjectionToSession`, **opt-in via `TELEPTY_PROVENANCE=1`, default-OFF**; legacy/byte-exact
+  sessions receive raw bytes unchanged. Per-session nonce minted at `/api/sessions/register`.
+- Broker `onInjectAudit` seam emits the shared `injects.jsonl` schema for cross-machine deliveries
+  (`origin=untrusted-remote`, `verified_sender_sid=node:<sub>`).
+- #45 blocked `broadcast`/`multicast` now also writes `delivery_result:blocked:<reason>` audit lines.
+
+### Changed — daemon reports its bound port under `PORT=0` (#576)
+
+- When launched with `PORT=0`, the daemon now reports the OS-assigned bound port via `/api/meta` and
+  the startup banner (address-null-safe). This enables race-free ephemeral-port test harnesses (the
+  root cause of CI flake). The default port (3848) and normal startup are unchanged.
+
+### Fixed (CI / test harness) — #576 / #577
+
+- The test daemon harness now uses an OS-assigned port instead of an unchecked random one, eliminating
+  the `EADDRINUSE`/`EACCES` port races that made the CI "Regression Tests" suite flaky/red on
+  ubuntu+windows. Snippet fixtures are pinned to LF (`.gitattributes`), and win32-incompatible UDS
+  tests are OS-gated. ubuntu + macOS are now green; windows-latest is temporarily quarantined as
+  non-blocking (windows-specific reds tracked in #577). (CI-only — not shipped in the package.)
+
 ## [0.6.0] - 2026-06-09
 
 ### Added — inject audit log + verified sender identity (#43, P1–P3)
