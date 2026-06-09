@@ -27,13 +27,15 @@ test('POSIX (darwin): returns command unchanged even with absolute path', () => 
   assert.equal(result, '/usr/local/bin/claude');
 });
 
-test('Windows: bare name resolves to PATHEXT .CMD match (npm-global claude.cmd)', () => {
+test('Windows: bare name chooses .CMD before extensionless npm shim', () => {
   // PATHEXT walker uses ext strings verbatim from env, so the candidate matches
   // the casing of the PATHEXT entry. (Real Windows fs is case-insensitive; the
   // test mock uses Set lookup which is case-sensitive, so cases must match.)
-  const expected = winPath.join('C:\\Users\\u\\AppData\\Roaming\\npm', 'claude.CMD');
-  const present = new Set([expected]);
-  const result = resolveWindowsExecutable('claude', {
+  const npmDir = 'C:\\Users\\u\\AppData\\Roaming\\npm';
+  const shim = winPath.join(npmDir, 'codex');
+  const expected = winPath.join(npmDir, 'codex.CMD');
+  const present = new Set([shim, expected]);
+  const result = resolveWindowsExecutable('codex', {
     PATH: 'C:\\Windows\\System32;C:\\Users\\u\\AppData\\Roaming\\npm',
     PATHEXT: '.COM;.EXE;.BAT;.CMD;.VBS;.JS',
   }, {
@@ -120,6 +122,18 @@ test('Windows: absolute path with extension returned as-is when present', () => 
   const result = resolveWindowsExecutable(absolute, {
     PATH: '',
     PATHEXT: '.EXE',
+  }, {
+    platform: 'win32',
+    existsSync: makeExistsSync(new Set([absolute])),
+  });
+  assert.equal(result, absolute);
+});
+
+test('Windows: absolute path without extension returned as-is when present', () => {
+  const absolute = 'C:\\tools\\my';
+  const result = resolveWindowsExecutable(absolute, {
+    PATH: '',
+    PATHEXT: '.EXE;.CMD',
   }, {
     platform: 'win32',
     existsSync: makeExistsSync(new Set([absolute])),

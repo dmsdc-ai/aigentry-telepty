@@ -52,7 +52,7 @@ function resolveWindowsExecutable(command, env, opts) {
   }
 
   // Bare name → walk PATH × PATHEXT.
-  const exts = parseExts(e.PATHEXT || DEFAULT_PATHEXT);
+  const exts = parseExtsForPathWalk(e.PATHEXT || DEFAULT_PATHEXT);
   const dirs = (e.PATH || '').split(';').filter(Boolean);
   for (const dir of dirs) {
     for (const ext of exts) {
@@ -82,6 +82,11 @@ function parseExts(pathext) {
   // matches before the PATHEXT-suffixed candidates.
   const list = pathext.split(';').map((s) => s.trim()).filter(Boolean);
   return ['', ...list];
+}
+
+function parseExtsForPathWalk(pathext) {
+  const list = pathext.split(';').map((s) => s.trim()).filter(Boolean);
+  return [...list, ''];
 }
 
 module.exports = { resolveWindowsExecutable };
