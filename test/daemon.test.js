@@ -203,6 +203,126 @@ test('broadcast inject publishes a single bus event with all successful target I
   bus.close();
 });
 
+// ── #45: fan-out (broadcast/multicast) is OPERATOR-ONLY; peer-lane fan-out blocked ──
+// The single-inject path hard-blocks off-policy peer→peer traffic (#533 Phase 2). These
+// assert the same guardrail now covers the one→many fan-out endpoints (the worm/fan-out
+// primitive): a non-orchestrator `from` is the peer lane and is rejected outright.
+test('#45 peer-lane broadcast is BLOCKED (403, reaches zero sessions, per-target bus event)', async () => {
+  const sessionA = createSessionId('fanout-peer-a');
+  const sessionB = createSessionId('fanout-peer-b');
+  await harness.spawnSession(sessionA);
+  await harness.spawnSession(sessionB);
+
+  const bus = await harness.connectBus();
+  const messages = collectJsonMessages(bus);
+
+  const prompt = `echo ${createSessionId('peer-fanout-token')}`;
+  const result = await harness.request('/api/sessions/broadcast/inject', {
+    method: 'POST',
+    body: { prompt, from: 'coder-a' } // non-orchestrator sender → peer lane
+  });
+
+  assert.equal(result.status, 403);
+  assert.equal(result.body.code, 'PEER_INJECT_BLOCKED');
+  assert.equal(result.body.success, false);
+  // partial-failure reporting: every target reported blocked, none delivered
+  assert.equal(result.body.results.successful.length, 0);
+  assert.deepEqual(result.body.results.failed.map((f) => f.id).sort(), [sessionA, sessionB].sort());
+
+  // per-target peer_inject_blocked bus event for each intended target
+  await waitFor(() => (
+    messages.some((m) => m.type === 'peer_inject_blocked' && m.session_id === sessionA && m.source === 'broadcast') &&
+    messages.some((m) => m.type === 'peer_inject_blocked' && m.session_id === sessionB && m.source === 'broadcast')
+  ), { description: 'per-target broadcast peer_inject_blocked bus events' });
+
+  await delay(150);
+  // ZERO delivery: no injection bus event reached any session
+  assert.equal(messages.some((m) => m.type === 'injection' && m.content === prompt), false);
+
+  bus.close();
+});
+
+test('#45 peer-lane multicast is BLOCKED (403, per-target block + bus event, zero delivery)', async () => {
+  const sessionA = createSessionId('mc-peer-a');
+  const sessionB = createSessionId('mc-peer-b');
+  await harness.spawnSession(sessionA);
+  await harness.spawnSession(sessionB);
+
+  const bus = await harness.connectBus();
+  const messages = collectJsonMessages(bus);
+
+  const prompt = `echo ${createSessionId('mc-peer-token')}`;
+  const result = await harness.request('/api/sessions/multicast/inject', {
+    method: 'POST',
+    body: { session_ids: [sessionA, sessionB], prompt, from: 'coder-a' }
+  });
+
+  assert.equal(result.status, 403);
+  assert.equal(result.body.code, 'PEER_INJECT_BLOCKED');
+  assert.deepEqual(result.body.results.failed.map((f) => f.code), ['PEER_INJECT_BLOCKED', 'PEER_INJECT_BLOCKED']);
+
+  await waitFor(() => (
+    messages.some((m) => m.type === 'peer_inject_blocked' && m.session_id === sessionA && m.source === 'multicast') &&
+    messages.some((m) => m.type === 'peer_inject_blocked' && m.session_id === sessionB && m.source === 'multicast')
+  ), { description: 'per-target multicast peer_inject_blocked bus events' });
+
+  await delay(150);
+  assert.equal(messages.some((m) => m.type === 'injection' && m.content === prompt), false);
+
+  bus.close();
+});
+
+test('#45 a sanctioned peer ask-envelope STILL cannot fan out (fan-out is operator-only)', async () => {
+  // Even a payload that single-inject WOULD allow on the peer lane is blocked for fan-out:
+  // the gate is the LANE, not the per-target envelope decision.
+  const sessionA = createSessionId('fanout-env-a');
+  await harness.spawnSession(sessionA);
+
+  const envelope = JSON.stringify({
+    kind: 'ask-request', from: 'coder-a', to: 'coder-b',
+    thread_id: 't1', round: 1, question: 'what is X?'
+  });
+  const result = await harness.request('/api/sessions/broadcast/inject', {
+    method: 'POST',
+    body: { prompt: envelope, from: 'coder-a' }
+  });
+
+  assert.equal(result.status, 403);
+  assert.equal(result.body.code, 'PEER_INJECT_BLOCKED');
+});
+
+test('#45 operator-lane broadcast (from orchestrator) STILL delivers (no regression)', async () => {
+  const sessionA = createSessionId('fanout-op-a');
+  const sessionB = createSessionId('fanout-op-b');
+  await harness.spawnSession(sessionA);
+  await harness.spawnSession(sessionB);
+
+  const prompt = `echo ${createSessionId('op-fanout-token')}`;
+  const result = await harness.request('/api/sessions/broadcast/inject', {
+    method: 'POST',
+    body: { prompt, from: 'orchestrator' }
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.results.successful.length, 2);
+});
+
+test('#45 operator-lane multicast (from orchestrator) STILL delivers (no regression)', async () => {
+  const sessionA = createSessionId('mc-op-a');
+  const sessionB = createSessionId('mc-op-b');
+  await harness.spawnSession(sessionA);
+  await harness.spawnSession(sessionB);
+
+  const prompt = `echo ${createSessionId('mc-op-token')}`;
+  const result = await harness.request('/api/sessions/multicast/inject', {
+    method: 'POST',
+    body: { session_ids: [sessionA, sessionB], prompt, from: 'orchestrator' }
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.results.successful.length, 2);
+});
+
 test('session WebSocket updates active client counts and relays PTY output', async () => {
   const sessionId = createSessionId('ws');
   await harness.spawnSession(sessionId);

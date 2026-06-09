@@ -159,6 +159,12 @@ const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map
 const ORCHESTRATOR_SIDS = (process.env.AIGENTRY_ORCHESTRATOR_SIDS || 'orchestrator aigentry-orchestrator-claude')
   .split(/\s+/).map(s => s.trim()).filter(Boolean);
 
+// #45 — defense-in-depth blast-radius cap for operator-lane fan-out (broadcast/
+// multicast). Even legitimate operator fan-out is bounded so a single compromised
+// fan-out call cannot hit an unbounded number of sessions in one hop. Generous
+// default (operator broadcasts hit only the live mesh); tune via env.
+const FANOUT_MAX_TARGETS = Math.max(1, Number(process.env.TELEPTY_FANOUT_MAX_TARGETS || 100));
+
 // Cross-machine bus relay: forward bus events to peer daemons
 const relayToPeers = createPeerRelay({
   relayPeers: relayPeersFromEnv(process.env),
@@ -2034,10 +2040,61 @@ app.get('/api/peers', (req, res) => {
   }
 });
 
+// #45 — fan-out (broadcast/multicast) is OPERATOR/ORCHESTRATOR-ONLY. The single-inject
+// path hard-blocks off-policy peer→peer traffic via classifyPeerLaneInject; fan-out
+// one→many is strictly more dangerous (a worm/fan-out primitive), so the peer lane is
+// blocked OUTRIGHT here — even a sanctioned ask-envelope may not fan out. We reuse the
+// SAME classifier (DRY, no second policy) and gate on the LANE, not the per-target
+// decision: classify by SENDER (`to: null`) so the verdict is the sender's lane,
+// independent of any individual target. This is what makes broadcast all-or-nothing on
+// the lane — a peer cannot earn fan-out rights by listing the orchestrator as one
+// target. Operator lane (no `from`, or `from` ∈ orchestrator sids) and the fail-open
+// `disabled` lane proceed to delivery, exactly as single-inject allows them. #533 Phase 2.
+function isPeerLaneFanout(from, prompt) {
+  return classifyPeerLaneInject({ from, to: null, prompt, orchestratorSids: ORCHESTRATOR_SIDS });
+}
+
+// Reject a peer-lane fan-out: emit a per-target peer_inject_blocked bus event for every
+// intended target (mirrors the single-inject block event for reporting parity) and return
+// the same 403 PEER_INJECT_BLOCKED shape, reaching ZERO sessions. `targetIds` is the full
+// intended target set (broadcast = all sessions, multicast = requested session_ids).
+function rejectPeerLaneFanout(res, { from, reason, targetIds, source }) {
+  const inject_id = crypto.randomUUID();
+  const failed = [];
+  for (const id of targetIds) {
+    broadcastSessionEvent('peer_inject_blocked', id, sessions[id] || null, {
+      extra: {
+        target_agent: id,
+        from: from || null,
+        reason,
+        source,
+        inject_id
+      }
+    });
+    failed.push({ id, code: 'PEER_INJECT_BLOCKED', error: 'Peer-lane fan-out blocked' });
+  }
+  console.warn(`[PEER-GUARD] blocked peer-lane ${source} from ${from || '(none)'} → ${targetIds.length} target(s) (${reason})`);
+  return respondWithError(res, 403, 'PEER_INJECT_BLOCKED',
+    'Peer-lane fan-out blocked: broadcast/multicast is operator-only. Use bin/ask.sh for peer→peer.',
+    { reason, sanctioned_channel: 'bin/ask.sh', results: { successful: [], failed } });
+}
+
 app.post('/api/sessions/multicast/inject', async (req, res) => {
-  const { session_ids, prompt } = req.body;
+  const { session_ids, prompt, from } = req.body;
   if (typeof prompt !== 'string' || prompt.length === 0) return respondWithError(res, 400, 'INVALID_REQUEST', 'prompt is required');
   if (!Array.isArray(session_ids)) return res.status(400).json({ error: 'session_ids must be an array' });
+
+  // #45 — operator-only fan-out gate (peer lane blocked outright, before any delivery).
+  const verdict = isPeerLaneFanout(from, prompt);
+  if (verdict.lane === 'peer') {
+    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds: session_ids, source: 'multicast' });
+  }
+  // #45 — defense-in-depth blast-radius cap (operator lane too).
+  if (session_ids.length > FANOUT_MAX_TARGETS) {
+    return respondWithError(res, 429, 'FANOUT_TARGET_CAP',
+      `multicast target count ${session_ids.length} exceeds cap ${FANOUT_MAX_TARGETS}`,
+      { cap: FANOUT_MAX_TARGETS, requested: session_ids.length });
+  }
 
   const results = { successful: [], failed: [] };
 
@@ -2075,12 +2132,26 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
 });
 
 app.post('/api/sessions/broadcast/inject', async (req, res) => {
-  const { prompt } = req.body;
+  const { prompt, from } = req.body;
   if (typeof prompt !== 'string' || prompt.length === 0) return respondWithError(res, 400, 'INVALID_REQUEST', 'prompt is required');
+
+  // #45 — operator-only fan-out gate (peer lane blocked outright, before any delivery).
+  // Broadcast is all-or-nothing on the lane: a peer-lane sender reaches ZERO sessions.
+  const targetIds = Object.keys(sessions);
+  const verdict = isPeerLaneFanout(from, prompt);
+  if (verdict.lane === 'peer') {
+    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds, source: 'broadcast' });
+  }
+  // #45 — defense-in-depth blast-radius cap (operator lane too).
+  if (targetIds.length > FANOUT_MAX_TARGETS) {
+    return respondWithError(res, 429, 'FANOUT_TARGET_CAP',
+      `broadcast target count ${targetIds.length} exceeds cap ${FANOUT_MAX_TARGETS}`,
+      { cap: FANOUT_MAX_TARGETS, requested: targetIds.length });
+  }
 
   const results = { successful: [], failed: [] };
 
-  for (const id of Object.keys(sessions)) {
+  for (const id of targetIds) {
     const session = sessions[id];
     try {
       const delivery = await deliverInjectionToSession(id, session, prompt, {

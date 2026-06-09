@@ -198,3 +198,50 @@ test('malformed JSON on the peer lane is BLOCKED (envelopePresent false)', () =>
   assert.equal(v.decision, 'block');
   assert.equal(v.envelopePresent, false);
 });
+
+// ── #45: fan-out (broadcast/multicast) gate — sender-lane classification (to:null) ──
+// The fan-out handlers classify by SENDER only (to:null) so a peer cannot earn fan-out
+// rights by listing the orchestrator as one target. These lock that verdict contract.
+test('#45 peer sender with no target (to:null) classifies as the PEER lane', () => {
+  const v = classifyPeerLaneInject({
+    from: 'coder-a',
+    to: null,
+    prompt: 'echo anything',
+    orchestratorSids: ORCH,
+  });
+  assert.equal(v.lane, 'peer');
+});
+
+test('#45 peer sender with a sanctioned envelope is STILL the peer lane (fan-out operator-only)', () => {
+  // decision may be 'allow' for single-inject, but lane stays 'peer' — the fan-out
+  // gate blocks on lane, so a sanctioned peer envelope cannot fan out.
+  const v = classifyPeerLaneInject({
+    from: 'coder-a',
+    to: null,
+    prompt: askRequest(),
+    orchestratorSids: ORCH,
+  });
+  assert.equal(v.lane, 'peer');
+});
+
+test('#45 orchestrator sender with no target (to:null) is the ORCHESTRATOR lane (fan-out allowed)', () => {
+  const v = classifyPeerLaneInject({
+    from: 'orchestrator',
+    to: null,
+    prompt: 'broadcast to the mesh',
+    orchestratorSids: ORCH,
+  });
+  assert.equal(v.lane, 'orchestrator');
+  assert.equal(v.decision, 'allow');
+});
+
+test('#45 no-sender fan-out (operator/CLI, to:null) is the ORCHESTRATOR lane (allowed)', () => {
+  const v = classifyPeerLaneInject({
+    from: undefined,
+    to: null,
+    prompt: 'broadcast to the mesh',
+    orchestratorSids: ORCH,
+  });
+  assert.equal(v.lane, 'orchestrator');
+  assert.equal(v.decision, 'allow');
+});
