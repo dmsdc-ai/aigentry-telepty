@@ -4,6 +4,65 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-09
+
+### Added — inject audit log + verified sender identity (#43, P1–P3)
+
+- **Append-only inject audit log** (`src/audit/inject-log.js`): every delivery is
+  recorded to `~/.telepty/logs/injects.jsonl` (schema v1, one line per delivery —
+  one line per target for multicast/broadcast), file `0600` / dir `0700`. Default
+  is **hash-only** (`payload_sha256` always; no payload content on disk) — opt into
+  a truncated preview with `TELEPTY_AUDIT_PREVIEW=1`. Bounded async writer with
+  size+age rotation (`TELEPTY_AUDIT_*` env, default 30 days / 50 MB × 5); never
+  blocks the delivery hot path.
+- **Verified sender identity**: a per-session token is minted at
+  `/api/sessions/register` and carried in the parent-hijack-protected env beside
+  `TELEPTY_SESSION_ID`; the daemon maps it to a `verified_sender_sid` and flags
+  `spoof_suspected` when the caller-supplied `--from` disagrees with the verified
+  identity. Both `claimed_from` and `verified_sender_sid` are logged.
+- **Read API + CLI**: token-gated `GET /api/injects` (filter by `since`/`until`/
+  `to`/`from`/`spoof`, with cursor pagination) and a `telepty injects
+  [--tail --since --to --from --spoof --json]` subcommand for incident response.
+- The delivery provenance wrapper (P4) and broker/#45 audit seams (P5) are tracked
+  separately in #47 (deferred).
+
+### Security — operator-only fan-out (#45)
+
+- **`broadcast` / `multicast` now go through the peer-lane guardrail.** Previously
+  these handlers called delivery directly, bypassing `classifyPeerLaneInject` — a
+  fan-out escape past the peer-inject policy. **Behavior change:** fan-out
+  (`broadcast`/`multicast`) is now **operator/orchestrator-only**; a peer-lane
+  sender is rejected with `403 PEER_INJECT_BLOCKED` reaching **zero** sessions
+  (gate is by lane, not envelope). Per-target `peer_inject_blocked` bus events and
+  a `TELEPTY_FANOUT_MAX_TARGETS` (default 100) blast-radius cap were added.
+
+### Fixed
+
+- **Daemon restart never stopped the running daemon on macOS/Linux (#44).** The
+  daemon's `process.title = 'telepty-daemon'` defeated the `isLikelyTeleptyDaemon`
+  command-line heuristic, so the restart path could not find the old daemon to
+  stop. Recognize the title token (additive; the `aigentry-telepty` path is
+  preserved) and name the surviving state-file PID / port-3848 owner in the restart
+  failure message. Windows (`Win32_Process.CommandLine`) is unaffected.
+- **`[Windows] resolveWindowsExecutable` picked the extensionless npm shim (#46).**
+  The bare-name `PATH × PATHEXT` walk tried `''` first and matched npm's
+  extensionless `/bin/sh` shim before `.CMD`, crashing `CreateProcessW` with
+  `ERROR_BAD_EXE_FORMAT (193)`. The bare-name walk now tries real `PATHEXT`
+  extensions first (`''` last); the absolute/relative-path case is unchanged.
+- **Spurious daemon restart on a transient health-probe timeout (#567)** — ships
+  the previously-unreleased fix (meta-primary decision + bounded retry; restart
+  only on a real version/capability mismatch).
+- **`--submit` PTY 0x0D Enter intermittently not consumed (#568)** — ships the
+  previously-unreleased fix (render-gate input-ready before each CR +
+  state-transition-primary confirm + adaptive retry; telepty-PTY only).
+
+### Experimental (opt-in, default-OFF, not GA)
+
+- **Cross-machine relay/broker (hub) mode (#42)** is included in the package but is
+  **disabled by default** and opt-in only (enable via `AIGENTRY_BROKER_*` env). It
+  is not yet generally available or supported for general use; the code is dormant
+  unless explicitly enabled. GA gating remains pending a real-topology validation.
+
 ## [0.5.9] - 2026-06-08
 
 ### Fixed — managed service install never started the daemon (#41)
