@@ -153,8 +153,35 @@ Emitted by telepty after successful auto-route delivery.
 
 ### `inject_written`
 ```json
-{ "type": "inject_written", "inject_id": "UUID", "sender": "daemon", "target_agent": "string", "content": "string", "from": "string|null", "reply_to": "string|null", "thread_id": "string|null", "reply_expected": "boolean", "timestamp": "ISO 8601" }
+{ "type": "inject_written", "inject_id": "UUID", "sender": "daemon", "target_agent": "string", "content": "string", "from": "string|null", "verified_sender_sid": "string|null", "spoof_suspected": "boolean", "origin": "trusted-local|untrusted-remote", "reply_to": "string|null", "thread_id": "string|null", "reply_expected": "boolean", "timestamp": "ISO 8601" }
 ```
+- `from` is the **claimed** sender (`body.from`, spoofable). `verified_sender_sid` is the
+  **daemon-verified** identity (mapped from the per-session token presented as
+  `x-telepty-session-token`), or `null` when unverifiable (operator/human shell). `spoof_suspected`
+  = `from && verified_sender_sid && from !== verified_sender_sid`. (telepty #43 P2.)
+
+### `audit_overflow` (telepty #43)
+```json
+{ "type": "audit_overflow", "sender": "daemon", "dropped": "number", "queue_max": "number", "timestamp": "ISO 8601" }
+```
+- Emitted when the bounded inject-audit queue overflows and drops the oldest record(s). The audit
+  log never silently truncates: a gap is always surfaced (spec §8 T4).
+
+### Inject audit log — `~/.telepty/logs/injects.jsonl` (telepty #43)
+Append-only, one compact JSON line **per delivery** (multicast/broadcast = one line **per target**,
+sharing `inject_id`). File mode `0600`, dir `0700`. Schema v1:
+```jsonc
+{ "v": 1, "ts": "ISO 8601", "inject_id": "UUID", "kind": "inject|multicast|broadcast|reply",
+  "source": "inject|multicast|broadcast|mailbox|broker", "claimed_from": "string|null",
+  "verified_sender_sid": "string|null", "spoof_suspected": "boolean", "to": "string",
+  "to_alias": "string|null", "origin": "trusted-local|untrusted-remote", "origin_host": "string|null",
+  "ref_path": "string|null", "payload_sha256": "hex", "payload_bytes": "number",
+  "payload_preview": "null (hash-only default) | string (truncated, opt-in TELEPTY_AUDIT_PREVIEW=1)",
+  "delivery_result": "success | failed:<CODE> | blocked:<reason>" }
+```
+Query via `GET /api/injects?since=&until=&to=&from=&spoof=&limit=&cursor=` (token-gated) or
+`telepty injects [--tail] [--since] [--to] [--from] [--spoof] [--json]`. See
+`docs/specs/2026-06-09-inject-audit-provenance.md`.
 
 ### `message_routed`
 ```json

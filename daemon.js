@@ -23,6 +23,7 @@ const lifecycle = require('./src/lifecycle');
 const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, applySurfaceMismatchProbe } = lifecycle;
 const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
+const { createAuditWriter, readInjectLog } = require('./src/audit/inject-log');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -164,6 +165,61 @@ const ORCHESTRATOR_SIDS = (process.env.AIGENTRY_ORCHESTRATOR_SIDS || 'orchestrat
 // fan-out call cannot hit an unbounded number of sessions in one hop. Generous
 // default (operator broadcasts hit only the live mesh); tune via env.
 const FANOUT_MAX_TARGETS = Math.max(1, Number(process.env.TELEPTY_FANOUT_MAX_TARGETS || 100));
+
+// #43 — inject audit spine (spec §5/§8). One JSONL line per delivery into
+// ~/.telepty/logs/injects.jsonl (0600). Defaults locked (hash-only preview, 30d / 50MB × 5);
+// env-overridable. The writer is off the delivery hot path: auditAppend() never blocks or
+// throws into a handler. P1 records claimed_from only (verified_sender_sid wired in P2).
+const AUDIT_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'injects.jsonl');
+const auditWriter = createAuditWriter({
+  path: AUDIT_LOG_PATH,
+  preview: process.env.TELEPTY_AUDIT_PREVIEW === '1',
+  previewBytes: Number(process.env.TELEPTY_AUDIT_PREVIEW_BYTES) || 200,
+  flushMs: Number(process.env.TELEPTY_AUDIT_FLUSH_MS) || 250,
+  queueMax: Number(process.env.TELEPTY_AUDIT_QUEUE_MAX) || 10000,
+  maxBytes: Number(process.env.TELEPTY_AUDIT_MAX_BYTES) || 50 * 1024 * 1024,
+  maxFiles: Number(process.env.TELEPTY_AUDIT_MAX_FILES) || 5,
+  maxAgeDays: Number(process.env.TELEPTY_AUDIT_MAX_AGE_DAYS) || 30
+});
+// Overflow is visible, never silent: surface a single bus event per drop (spec §8 T4).
+auditWriter.on('audit_overflow', (info) => {
+  try {
+    broadcastBusEvent({ type: 'audit_overflow', sender: 'daemon', dropped: info.dropped, queue_max: info.queueMax, timestamp: new Date().toISOString() });
+  } catch { /* bus best-effort */ }
+});
+auditWriter.on('audit_error', (err) => {
+  console.warn(`[AUDIT] write error: ${err && err.message ? err.message : err}`);
+});
+// Fire-and-forget append — swallow any sync error so the audit log can never break delivery.
+function auditAppend(record) {
+  try { auditWriter.append(record); } catch { /* audit must never throw into a handler */ }
+}
+
+// #43 P2 — per-session verified-sender tokens (spec §4, ADR D1). The daemon mints a random
+// token at /api/sessions/register and maps token→sid; the `allow` wrapper carries it in the
+// parent-hijack-protected env beside TELEPTY_SESSION_ID; `inject` presents x-telepty-session-token.
+// `verified_sender_sid` = the mapped sid (the daemon's own truth) or null when unverifiable.
+// Issuance is idempotent per sid so the periodic metadata re-register (cli.js
+// updateDaemonProcessMetadata) does NOT rotate the token out from under the carried env.
+const sessionTokens = new Map(); // token → sid
+const sidTokens = new Map();     // sid → token
+function mintSessionToken(sid) {
+  const existing = sidTokens.get(sid);
+  if (existing) return existing;
+  const token = crypto.randomBytes(32).toString('base64url');
+  sessionTokens.set(token, sid);
+  sidTokens.set(sid, token);
+  return token;
+}
+function resolveVerifiedSender(token) {
+  if (!token) return null;
+  return sessionTokens.get(token) || null;
+}
+// Extract the presented session token from an inject request (header only — never the body,
+// which is attacker-controlled). Returns the daemon-verified sid or null.
+function verifiedSenderFromReq(req) {
+  return resolveVerifiedSender(req.headers && req.headers['x-telepty-session-token']);
+}
 
 // Cross-machine bus relay: forward bus events to peer daemons
 const relayToPeers = createPeerRelay({
@@ -1825,7 +1881,7 @@ app.post('/api/sessions/register', (req, res) => {
     applyTimestampMetadata(existing, req.body);
     initializeBootstrapState(existing);
     console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
-    return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true });
+    return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_token: mintSessionToken(session_id) });
   }
 
   const { delivery_type, delivery_endpoint, delivery } = req.body;
@@ -1898,7 +1954,7 @@ app.post('/api/sessions/register', (req, res) => {
 
   console.log(`[REGISTER] Registered wrapped session ${session_id}`);
   persistSessions();
-  res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd });
+  res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd, session_token: mintSessionToken(session_id) });
 });
 
 app.get('/api/sessions', (req, res) => {
@@ -1909,6 +1965,27 @@ app.get('/api/sessions', (req, res) => {
     list = list.filter(s => s.idleSeconds !== null && s.idleSeconds > idleGt);
   }
   res.json(list);
+});
+
+// #43 P3 — token-gated historical inject audit query (spec §7). Behind the SAME shared auth
+// middleware as every /api/* route (app.use(createAuthMiddleware) above), so it is 401 for an
+// unauthorized non-local request and open to localhost/allowlisted peers. Filters: since/until,
+// to (alias-resolved), from (claimed OR verified), spoof; pagination via limit/cursor (newest
+// first). Reads the live injects.jsonl (one write path, file-backed) — separate lifecycle from
+// the ephemeral /api/events live bus, so the two are not conflated.
+app.get('/api/injects', (req, res) => {
+  const q = req.query || {};
+  const to = q.to ? (resolveSessionAlias(q.to) || q.to) : undefined;
+  const result = readInjectLog(AUDIT_LOG_PATH, {
+    since: q.since,
+    until: q.until,
+    to,
+    from: q.from,
+    spoof: q.spoof === '1' || q.spoof === 'true',
+    limit: q.limit,
+    cursor: q.cursor
+  });
+  res.json(result);
 });
 
 app.get('/api/sessions/:id', (req, res) => {
@@ -2097,6 +2174,9 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
   }
 
   const results = { successful: [], failed: [] };
+  // #43 — one inject_id for the whole fan-out; one audit line per target (group by inject_id).
+  const inject_id = crypto.randomUUID();
+  const verifiedSenderSid = verifiedSenderFromReq(req);
 
   for (const id of session_ids) {
     const session = sessions[id];
@@ -2107,10 +2187,12 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
         });
         if (!delivery.success) {
           results.failed.push({ id, code: delivery.code, error: delivery.error });
+          auditMulticastTarget(inject_id, 'multicast', from, verifiedSenderSid, id, prompt, `failed:${delivery.code || 'DELIVERY_FAILED'}`);
           continue;
         }
 
         results.successful.push({ id, strategy: delivery.strategy });
+        auditMulticastTarget(inject_id, 'multicast', from, verifiedSenderSid, id, prompt, 'success');
 
         // Broadcast injection to bus
         broadcastBusEvent({
@@ -2122,14 +2204,27 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
         });
       } catch (err) {
         results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
+        auditMulticastTarget(inject_id, 'multicast', from, verifiedSenderSid, id, prompt, 'failed:DELIVERY_FAILED');
       }
     } else {
       results.failed.push({ id, code: 'SESSION_NOT_FOUND', error: 'Session not found' });
+      auditMulticastTarget(inject_id, 'multicast', from, verifiedSenderSid, id, prompt, 'failed:SESSION_NOT_FOUND');
     }
   }
 
   res.json({ success: true, results });
 });
+
+// #43 — shared per-target audit helper for the fan-out handlers (multicast/broadcast). One
+// JSONL line per target so blast-radius is queryable per session; all share `inject_id`.
+function auditMulticastTarget(inject_id, kind, from, verifiedSenderSid, id, prompt, delivery_result) {
+  auditAppend({
+    ts: new Date().toISOString(), inject_id, kind, source: kind,
+    claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+    to: id, to_alias: null, origin: 'trusted-local', origin_host: MACHINE_ID,
+    payload: prompt, delivery_result
+  });
+}
 
 app.post('/api/sessions/broadcast/inject', async (req, res) => {
   const { prompt, from } = req.body;
@@ -2150,6 +2245,9 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
   }
 
   const results = { successful: [], failed: [] };
+  // #43 — one inject_id for the whole broadcast; one audit line per target.
+  const inject_id = crypto.randomUUID();
+  const verifiedSenderSid = verifiedSenderFromReq(req);
 
   for (const id of targetIds) {
     const session = sessions[id];
@@ -2159,12 +2257,15 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
       });
       if (!delivery.success) {
         results.failed.push({ id, code: delivery.code, error: delivery.error });
+        auditMulticastTarget(inject_id, 'broadcast', from, verifiedSenderSid, id, prompt, `failed:${delivery.code || 'DELIVERY_FAILED'}`);
         continue;
       }
 
       results.successful.push({ id, strategy: delivery.strategy });
+      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSenderSid, id, prompt, 'success');
     } catch (err) {
       results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
+      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSenderSid, id, prompt, 'failed:DELIVERY_FAILED');
     }
   }
 
@@ -2637,6 +2738,8 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
   // Routing metadata stays in session/bus state, not in the visible prompt text.
   const finalPrompt = prompt;
   const inject_id = crypto.randomUUID();
+  // #43 P2 — daemon-verified sender identity (from the presented token, never body.from).
+  const verifiedSenderSid = verifiedSenderFromReq(req);
 
   // #533 Phase 2 — peer-lane inject guardrail (in-band hard block, before delivery).
   // Out-of-policy peer→peer injects (no sanctioned ask-request/ask-reply envelope)
@@ -2675,6 +2778,13 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
         from: from || null,
         reply_to: reply_to || null
       }, session);
+      auditAppend({
+        ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
+        claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+        to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
+        origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
+        payload: finalPrompt, delivery_result: `failed:${delivery.code || 'DELIVERY_FAILED'}`
+      });
       return respondWithError(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error);
     }
 
@@ -2685,6 +2795,14 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
     console.log(`[INJECT] Wrote to session ${id} (inject_id: ${inject_id})`);
 
     const injectTimestamp = new Date().toISOString();
+    // #43 P1/P2 — one audit line per delivery (claimed + daemon-verified sender, hash-only).
+    auditAppend({
+      ts: injectTimestamp, inject_id, kind: 'inject', source: 'inject',
+      claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+      to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
+      origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
+      payload: finalPrompt, delivery_result: 'success'
+    });
     broadcastSessionEvent('inject_written', id, session, {
       timestamp: injectTimestamp,
       extra: {
@@ -2692,6 +2810,10 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
         target_agent: id,
         content: prompt,
         from: from || null,
+        // #43 — live bus event enriched with daemon-verified provenance (spec §7).
+        verified_sender_sid: verifiedSenderSid,
+        spoof_suspected: !!(from && verifiedSenderSid && from !== verifiedSenderSid),
+        origin: 'trusted-local',
         reply_to: reply_to || null,
         thread_id: thread_id || null,
         reply_expected: !!reply_expected

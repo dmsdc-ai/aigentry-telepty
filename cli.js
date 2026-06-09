@@ -161,6 +161,11 @@ function getAuthToken() {
 
 const fetchWithAuth = (url, options = {}) => {
   const headers = { ...options.headers, 'x-telepty-token': getAuthToken() };
+  // #43 P2 — present the per-session verified-sender token (minted at register, carried in the
+  // parent-hijack-protected env beside TELEPTY_SESSION_ID) so the daemon can map token→sid and
+  // record verified_sender_sid. Header only, never the body. Absent for operator/human shells.
+  const sessionToken = process.env.TELEPTY_SESSION_TOKEN;
+  if (sessionToken) headers['x-telepty-session-token'] = sessionToken;
   return fetch(url, { ...options, headers });
 };
 
@@ -1165,6 +1170,90 @@ async function main() {
     return;
   }
 
+  if (cmd === 'injects') {
+    // #43 P3 — query the inject audit log (GET /api/injects). Filters: --to/--from/--since/--spoof;
+    // --json for piping; --tail follows live (poll). Mirrors the list/status command blocks.
+    function flagValue(name) {
+      const i = args.indexOf(name);
+      return i !== -1 && args[i + 1] ? args[i + 1] : null;
+    }
+    const asJson = args.includes('--json');
+    const tail = args.includes('--tail');
+    const toFilter = flagValue('--to');
+    const fromFilter = flagValue('--from');
+    const spoofOnly = args.includes('--spoof');
+    const limit = flagValue('--limit');
+    let since = flagValue('--since');
+    // --since accepts a relative duration ("1h", "30m") or an ISO/epoch value. Convert a
+    // duration to an absolute ISO timestamp using the same parser as --idle-ttl (reuse).
+    if (since) {
+      try {
+        const ms = lifecycle.parseDuration(since, { fieldName: 'since' });
+        if (Number.isFinite(ms) && ms > 0) since = new Date(Date.now() - ms).toISOString();
+      } catch { /* not a duration — pass through as ISO/epoch */ }
+    }
+
+    function buildQuery(cursor) {
+      const p = new URLSearchParams();
+      if (since) p.set('since', since);
+      if (toFilter) p.set('to', toFilter);
+      if (fromFilter) p.set('from', fromFilter);
+      if (spoofOnly) p.set('spoof', '1');
+      if (limit) p.set('limit', limit);
+      if (cursor != null) p.set('cursor', String(cursor));
+      const qs = p.toString();
+      return `${DAEMON_URL}/api/injects${qs ? `?${qs}` : ''}`;
+    }
+
+    function formatRow(l) {
+      const spoofTag = l.spoof_suspected ? ' \x1b[31m⚠ SPOOF\x1b[0m' : '';
+      const verified = l.verified_sender_sid || '\x1b[90mnull\x1b[0m';
+      return `  ${l.ts}  \x1b[36m${l.claimed_from || '-'}\x1b[0m→${l.to}  verified=${verified}  ${l.kind}/${l.delivery_result}${spoofTag}`;
+    }
+
+    try {
+      if (tail) {
+        // Poll newest lines and print rows as they appear (dedup by inject_id+to).
+        const seen = new Set();
+        let firstPass = true;
+        console.log('\x1b[1mTailing inject audit log (Ctrl-C to stop)...\x1b[0m');
+        for (;;) {
+          const res = await fetchWithAuth(buildQuery());
+          if (res.ok) {
+            const data = await res.json();
+            const fresh = (data.injects || []).slice().reverse(); // oldest→newest for display
+            for (const l of fresh) {
+              const key = `${l.inject_id}|${l.to}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              if (!firstPass) console.log(asJson ? JSON.stringify(l) : formatRow(l));
+            }
+            if (firstPass) {
+              // Print the initial window once, then stream only newer lines.
+              for (const l of fresh) console.log(asJson ? JSON.stringify(l) : formatRow(l));
+              firstPass = false;
+            }
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      }
+
+      const res = await fetchWithAuth(buildQuery());
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); process.exit(1); }
+      if (asJson) { console.log(JSON.stringify(data, null, 2)); return; }
+      const injects = data.injects || [];
+      if (injects.length === 0) { console.log('No inject audit records found.'); return; }
+      console.log('\x1b[1mInject audit log (newest first):\x1b[0m');
+      injects.forEach((l) => console.log(formatRow(l)));
+      if (data.next_cursor != null) console.log(`  … more (--limit/cursor ${data.next_cursor})`);
+    } catch (e) {
+      console.error(`❌ ${e.message || 'Failed to query inject audit log.'}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   if (cmd === 'spawn') {
     const idIndex = args.indexOf('--id');
     if (idIndex === -1 || !args[idIndex + 1]) { console.error('❌ Usage: telepty spawn --id <session_id> <command> [args...]'); process.exit(1); }
@@ -1253,6 +1342,10 @@ async function main() {
     delete process.env.TELEPTY_SESSION_ID;
     process.env.TELEPTY_SESSION_ID = sessionId;
     process.env.TELEPTY_AVAILABLE = 'true';
+    // #43 P2 — drop any inherited verified-sender token so a parent process cannot smuggle one
+    // in; the daemon mints the real one at register (below) and we set it into the same
+    // protected env. (Leaves room for a future per-session nonce — banner is P4, not built.)
+    delete process.env.TELEPTY_SESSION_TOKEN;
 
     await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
@@ -1292,6 +1385,9 @@ async function main() {
         console.error(`❌ Error: ${data.error}`);
         process.exit(1);
       }
+      // #43 P2 — store the daemon-minted verified-sender token beside TELEPTY_SESSION_ID so the
+      // wrapped CLI (and any `telepty inject` it spawns) inherits it via sessionEnv below.
+      if (data.session_token) process.env.TELEPTY_SESSION_TOKEN = data.session_token;
     } catch (e) {
       console.error('❌ Failed to register with daemon:', e.message);
       process.exit(1);
@@ -1300,7 +1396,7 @@ async function main() {
     // Spawn local PTY (preserves isTTY, env, shell config)
     const pty = require('node-pty');
     const sessionCwd = process.cwd();
-    const sessionEnv = { ...process.env, TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true' };
+    const sessionEnv = { ...process.env, TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true', ...(process.env.TELEPTY_SESSION_TOKEN ? { TELEPTY_SESSION_TOKEN: process.env.TELEPTY_SESSION_TOKEN } : {}) };
     let child = null;
     let sessionStartTime = Date.now();
     let crashCount = 0;
