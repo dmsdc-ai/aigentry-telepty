@@ -68,9 +68,9 @@ function createTempHome() {
   };
 }
 
-function randomPort() {
-  return 30000 + Math.floor(Math.random() * 20000);
-}
+// Match the daemon's startup banner ("… listening on http://<host>:<port>") to
+// read back the OS-assigned port when the daemon is launched with PORT=0.
+const LISTENING_BANNER = /listening on https?:\/\/[^\s]+:(\d+)/;
 
 async function parseResponse(response) {
   const text = await response.text();
@@ -94,8 +94,17 @@ async function parseResponse(response) {
 }
 
 async function startTestDaemon(options = {}) {
-  const port = options.port ?? randomPort();
+  // Bind an OS-assigned ephemeral port (PORT=0) unless the caller pins one. This is
+  // collision-free: the daemon holds the socket continuously from the moment the kernel
+  // assigns the port, so no other process or test can ever take it (unlike picking a
+  // random/probed port, which leaves a TOCTOU window — the source of the CI EADDRINUSE
+  // flake on ubuntu and the systematic EACCES on Windows reserved ranges). The actual
+  // port is read back from the daemon's startup banner below.
+  const requestedPort = options.port ?? 0;
   const host = options.host ?? '127.0.0.1';
+  // Resolved to the real OS-assigned port after read-back when requestedPort === 0.
+  let port = requestedPort;
+  let portResolved = requestedPort !== 0;
   const { homeDir, env: homeEnv } = createTempHome();
   const sharedEnv = {
     ...process.env,
@@ -106,7 +115,7 @@ async function startTestDaemon(options = {}) {
   };
   const daemonEnv = {
     ...sharedEnv,
-    PORT: String(port),
+    PORT: String(requestedPort),
     HOST: host
   };
 
@@ -146,6 +155,15 @@ async function startTestDaemon(options = {}) {
   await waitFor(async () => {
     if (child.exitCode !== null) {
       throw new Error(`Daemon exited early.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
+
+    if (!portResolved) {
+      const match = stdout.match(LISTENING_BANNER);
+      if (!match) {
+        return false; // banner not printed yet — keep waiting
+      }
+      port = Number(match[1]);
+      portResolved = true;
     }
 
     try {

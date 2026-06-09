@@ -260,6 +260,10 @@ app.get('/api/health', (req, res) => {
 app.use(createAuthMiddleware({ isAllowedPeer, expectedToken: EXPECTED_TOKEN, verifyJwt }));
 
 const PORT = process.env.PORT || 3848;
+// Actual bound port. Equals PORT for a fixed port; when PORT=0 the OS assigns an
+// ephemeral port and this is resolved to the real value in the listen callback.
+// Reported by /api/meta so callers (e.g. the test harness) can read it back.
+let boundPort = Number(PORT);
 
 const HOST = process.env.HOST || '0.0.0.0';
 process.title = 'telepty-daemon';
@@ -2086,7 +2090,7 @@ app.get('/api/meta', (req, res) => {
     version: pkg.version,
     pid: process.pid,
     host: HOST,
-    port: Number(PORT),
+    port: boundPort,
     machine_id: MACHINE_ID,
     terminal: DETECTED_TERMINAL,
     capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox']
@@ -3694,12 +3698,16 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
     const benv = brokerEnv();
     const tlsOptions = { cert: fs.readFileSync(benv.tlsCert), key: fs.readFileSync(benv.tlsKey) };
     server = https.createServer(tlsOptions, app).listen(PORT, HOST, () => {
-      console.log(`🔐 aigentry-telepty broker listening on https://${HOST}:${PORT} (/broker/*)`);
+      const address = server.address();
+      boundPort = (address && address.port) || Number(PORT);
+      console.log(`🔐 aigentry-telepty broker listening on https://${HOST}:${boundPort} (/broker/*)`);
       runStartupBootstrapRestore();
     });
   } else {
     server = app.listen(PORT, HOST, () => {
-      console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${PORT}`);
+      const address = server.address();
+      boundPort = (address && address.port) || Number(PORT);
+      console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${boundPort}`);
       runStartupBootstrapRestore();
       // #42 node-mode (§2F-ii): start the broker-client if broker config is present.
       // Absent ⇒ no-op (default-OFF). Started after listen so sessions/delivery are live.
