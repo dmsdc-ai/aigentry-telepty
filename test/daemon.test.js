@@ -1080,7 +1080,11 @@ test('aterm delivery timeouts surface a TIMEOUT error code', async () => {
   }
 });
 
-test('aterm registration with delivery unix_socket stores delivery and enables UDS inject', async () => {
+test('aterm registration with delivery unix_socket stores delivery and enables UDS inject', {
+  // Unix domain sockets are not bindable on Windows (listen EACCES on the temp .sock path).
+  // OS-gate this UDS-only path. (#576 P1, triage RC-3)
+  skip: process.platform === 'win32' ? 'unix domain sockets unavailable on Windows' : false
+}, async () => {
   const net = require('net');
   const os = require('os');
   const path = require('path');
@@ -1139,7 +1143,11 @@ test('aterm registration with delivery unix_socket stores delivery and enables U
   }
 });
 
-test('aterm UDS inject propagates error when target rejects payload', async () => {
+test('aterm UDS inject propagates error when target rejects payload', {
+  // Unix domain sockets are not bindable on Windows (listen EACCES on the temp .sock path).
+  // OS-gate this UDS-only path. (#576 P1, triage RC-3)
+  skip: process.platform === 'win32' ? 'unix domain sockets unavailable on Windows' : false
+}, async () => {
   const net = require('net');
   const os = require('os');
   const path = require('path');

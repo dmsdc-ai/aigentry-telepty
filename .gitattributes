@@ -1,0 +1,6 @@
+# Force LF on the snippet-protocol golden fixtures. Without this, a Windows checkout
+# (actions/checkout sets core.autocrlf=true) rewrites them to CRLF, which fails the
+# `snippet bodies are LF-only` / `golden snippet fixtures match runtime output` tests
+# and the trailing `git diff --exit-code tests/snippet-protocol/v1/` gate in `test:ci`.
+# (#576 P1, triage RC-2)
+tests/snippet-protocol/v1/** text eol=lf
