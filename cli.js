@@ -11,7 +11,7 @@ const prompts = require('prompts');
 const updateNotifier = require('update-notifier');
 const pkg = require('./package.json');
 const { getConfig } = require('./auth');
-const { cleanupDaemonProcesses } = require('./daemon-control');
+const { cleanupDaemonProcesses, readDaemonState, findPortOwnerPid } = require('./daemon-control');
 const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
 const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
@@ -469,7 +469,18 @@ async function restartDaemonGraceful(options = {}) {
     }
   }
 
-  console.error(`\x1b[31m❌ Daemon restart failed after ${maxAttempts} attempts. Run "telepty daemon" manually to start.\x1b[0m`);
+  // telepty#44: name the surviving daemon (state-file pid and/or current port owner) so
+  // manual recovery is obvious — `kill <pid>` then `telepty daemon`. Best-effort only.
+  let survivor = '';
+  try {
+    const statePid = (readDaemonState() || {}).pid;
+    const portOwner = findPortOwnerPid(3848);
+    const parts = [];
+    if (Number.isInteger(statePid) && statePid > 0) parts.push(`state-file pid ${statePid}`);
+    if (Number.isInteger(portOwner) && portOwner > 0 && portOwner !== statePid) parts.push(`port 3848 owner pid ${portOwner}`);
+    if (parts.length) survivor = ` Old daemon still alive (${parts.join(', ')}) — run "kill ${portOwner || statePid}" then "telepty daemon".`;
+  } catch {}
+  console.error(`\x1b[31m❌ Daemon restart failed after ${maxAttempts} attempts. Run "telepty daemon" manually to start.${survivor}\x1b[0m`);
   return { success: false, meta: null, attempt: maxAttempts };
 }
 

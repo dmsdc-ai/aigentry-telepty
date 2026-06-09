@@ -102,6 +102,14 @@ function isLikelyTeleptyDaemon(commandLine) {
     return false;
   }
 
+  // telepty#44: the running daemon sets process.title = 'telepty-daemon' (daemon.js:188).
+  // On macOS/Linux that REPLACES the command field `ps -axo command=` returns, so the
+  // daemon's own title (hyphen) — not its launch command line — is what the process scan
+  // and port-owner confirmation see. Recognize it so the stop path is no longer blind to it.
+  if (text.includes('telepty-daemon')) {
+    return true;
+  }
+
   if (text.includes('telepty daemon')) {
     return true;
   }
@@ -336,6 +344,7 @@ module.exports = {
   cleanupDaemonProcesses,
   clearDaemonState,
   findPortOwnerPid,
+  isLikelyTeleptyDaemon,
   isProcessRunning,
   listDaemonProcesses,
   pidMatchesTeleptyCmdline,
