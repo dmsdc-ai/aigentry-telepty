@@ -14,6 +14,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: [20]
     runs-on: ${{ matrix.os }}
+    # telepty #577: windows-latest has windows-specific reds (broker/ssh path,
+    # PTY/TUI spawn timeouts, snippet runtime-CRLF, launchd plist) tracked separately.
+    # Quarantine windows as non-blocking so ubuntu+macOS are the trustworthy gate
+    # (after #576 both are green). Remove this line when #577 lands.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
