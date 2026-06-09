@@ -24,6 +24,7 @@ const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, apply
 const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
 const { createAuditWriter, readInjectLog } = require('./src/audit/inject-log');
+const { mintSessionNonce, applyProvenance } = require('./src/audit/provenance');
 
 const config = getConfig();
 const EXPECTED_TOKEN = config.authToken;
@@ -210,6 +211,20 @@ function mintSessionToken(sid) {
   sessionTokens.set(token, sid);
   sidTokens.set(sid, token);
   return token;
+}
+
+// #47 P4 — per-session provenance nonce (spec §6, ADR §3 D3). The daemon mints one nonce per
+// sid at register and delivers it to the agent ONCE over the trusted bootstrap/onboarding channel
+// (the protected env, not any deliverable payload). The receiving agent trusts a delivery's origin
+// banner ONLY if it carries this nonce. Issuance is idempotent per sid so the periodic metadata
+// re-register does not rotate the nonce out from under the carried env (matches the token above).
+const sidNonces = new Map(); // sid → nonce
+function ensureSessionNonce(sid) {
+  const existing = sidNonces.get(sid);
+  if (existing) return existing;
+  const nonce = mintSessionNonce();
+  sidNonces.set(sid, nonce);
+  return nonce;
 }
 function resolveVerifiedSender(token) {
   if (!token) return null;
@@ -1445,12 +1460,27 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   const from = options.from || 'daemon';
   const msgId = `${from}:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
 
+  // #47 P4 — capability-gated delivery provenance banner (spec §6). Default-OFF: only sessions
+  // that registered as provenance-capable (and have a minted nonce) get the nonce-gated banner;
+  // legacy/byte-exact-sensitive sessions receive `prompt` byte-for-byte (regression guard). The
+  // audit log below still hashes the RAW `prompt`, not the banner — provenance is a delivery
+  // wrapper, not a content change. `from`='daemon'/'inject' are routing sentinels, not real
+  // claimed senders, so they are not surfaced as a `claimed:` label.
+  const claimedSender = (from && from !== 'daemon' && from !== 'inject') ? from : null;
+  const deliveredPrompt = applyProvenance(prompt, {
+    capable: !!(session && session.provenanceCapable),
+    nonce: session && session.provenanceNonce,
+    verified: options.verifiedSenderSid || null,
+    claimed: claimedSender,
+    origin: options.origin
+  }).payload;
+
   try {
     const ack = mailbox.enqueue({
       msg_id: msgId,
       from,
       to: id,
-      payload: prompt,
+      payload: deliveredPrompt,
       created_at: Math.floor(now / 1000),
       attempt: 0,
     });
@@ -1491,7 +1521,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   } catch (err) {
     console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
     // Fallback: direct delivery (backward compat during migration)
-    const textResult = await writeDataToSession(id, session, prompt);
+    const textResult = await writeDataToSession(id, session, deliveredPrompt);
     if (!textResult.success) return textResult;
 
     if (!options.noEnter && session.type !== 'aterm') {
@@ -1880,8 +1910,12 @@ app.post('/api/sessions/register', (req, res) => {
     applyIdleTtlMetadata(existing, parsedIdleTtl);
     applyTimestampMetadata(existing, req.body);
     initializeBootstrapState(existing);
+    // #47 P4 — provenance capability is opt-in (default-OFF). Only flip it ON; never silently OFF
+    // on a metadata re-register, or a session's delivered bytes would change mid-flight.
+    if (req.body.provenance_capable === true) existing.provenanceCapable = true;
+    existing.provenanceNonce = ensureSessionNonce(session_id);
     console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
-    return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_token: mintSessionToken(session_id) });
+    return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_token: mintSessionToken(session_id), session_nonce: existing.provenanceNonce, provenance_capable: !!existing.provenanceCapable });
   }
 
   const { delivery_type, delivery_endpoint, delivery } = req.body;
@@ -1914,6 +1948,10 @@ app.post('/api/sessions/register', (req, res) => {
     isClosing: false,
     outputRing: [],
     ready: true,  // unknown commands remain injectable once registered (#150)
+    // #47 P4 — provenance banner is opt-in per session (default-OFF, spec §6 rollout). A nonce is
+    // always minted (cheap) but the capability-gated banner only wraps deliveries when capable.
+    provenanceCapable: req.body.provenance_capable === true,
+    provenanceNonce: ensureSessionNonce(session_id),
   };
   initializeBootstrapState(sessionRecord);
   applyTimestampMetadata(sessionRecord, req.body);
@@ -1954,7 +1992,7 @@ app.post('/api/sessions/register', (req, res) => {
 
   console.log(`[REGISTER] Registered wrapped session ${session_id}`);
   persistSessions();
-  res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd, session_token: mintSessionToken(session_id) });
+  res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd, session_token: mintSessionToken(session_id), session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
 });
 
 app.get('/api/sessions', (req, res) => {
@@ -2135,7 +2173,7 @@ function isPeerLaneFanout(from, prompt) {
 // intended target (mirrors the single-inject block event for reporting parity) and return
 // the same 403 PEER_INJECT_BLOCKED shape, reaching ZERO sessions. `targetIds` is the full
 // intended target set (broadcast = all sessions, multicast = requested session_ids).
-function rejectPeerLaneFanout(res, { from, reason, targetIds, source }) {
+function rejectPeerLaneFanout(res, { from, reason, targetIds, source, verifiedSenderSid = null, prompt = '' }) {
   const inject_id = crypto.randomUUID();
   const failed = [];
   for (const id of targetIds) {
@@ -2147,6 +2185,14 @@ function rejectPeerLaneFanout(res, { from, reason, targetIds, source }) {
         source,
         inject_id
       }
+    });
+    // #47 P5 — one shared-schema audit line per blocked target (mirrors the success per-target
+    // fan-out audit), so a blocked fan-out's blast-radius is queryable just like a delivered one.
+    auditAppend({
+      ts: new Date().toISOString(), inject_id, kind: source, source,
+      claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+      to: id, to_alias: null, origin: 'trusted-local', origin_host: MACHINE_ID,
+      payload: prompt, delivery_result: `blocked:${reason}`
     });
     failed.push({ id, code: 'PEER_INJECT_BLOCKED', error: 'Peer-lane fan-out blocked' });
   }
@@ -2164,7 +2210,7 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
   // #45 — operator-only fan-out gate (peer lane blocked outright, before any delivery).
   const verdict = isPeerLaneFanout(from, prompt);
   if (verdict.lane === 'peer') {
-    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds: session_ids, source: 'multicast' });
+    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds: session_ids, source: 'multicast', verifiedSenderSid: verifiedSenderFromReq(req), prompt });
   }
   // #45 — defense-in-depth blast-radius cap (operator lane too).
   if (session_ids.length > FANOUT_MAX_TARGETS) {
@@ -2183,7 +2229,9 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
     if (session) {
       try {
         const delivery = await deliverInjectionToSession(id, session, prompt, {
-          source: 'multicast'
+          source: 'multicast',
+          from: from || 'inject',
+          verifiedSenderSid // #47 P4 — label the provenance banner with the verified sender
         });
         if (!delivery.success) {
           results.failed.push({ id, code: delivery.code, error: delivery.error });
@@ -2235,7 +2283,7 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
   const targetIds = Object.keys(sessions);
   const verdict = isPeerLaneFanout(from, prompt);
   if (verdict.lane === 'peer') {
-    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds, source: 'broadcast' });
+    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds, source: 'broadcast', verifiedSenderSid: verifiedSenderFromReq(req), prompt });
   }
   // #45 — defense-in-depth blast-radius cap (operator lane too).
   if (targetIds.length > FANOUT_MAX_TARGETS) {
@@ -2253,7 +2301,9 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
     const session = sessions[id];
     try {
       const delivery = await deliverInjectionToSession(id, session, prompt, {
-        source: 'broadcast'
+        source: 'broadcast',
+        from: from || 'inject',
+        verifiedSenderSid // #47 P4 — label the provenance banner with the verified sender
       });
       if (!delivery.success) {
         results.failed.push({ id, code: delivery.code, error: delivery.error });
@@ -2758,6 +2808,16 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       }
     });
     console.warn(`[PEER-GUARD] blocked peer inject ${from} → ${id} (${peerVerdict.reason})`);
+    // #47 P5 — a blocked bypass attempt is auditable too, not just successful deliveries (spec
+    // §5/§9). One shared-schema line with delivery_result:"blocked:<reason>" — the #45 gate logic
+    // itself is unchanged; this only records the attempt.
+    auditAppend({
+      ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
+      claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+      to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
+      origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
+      payload: finalPrompt, delivery_result: `blocked:${peerVerdict.reason}`
+    });
     return respondWithError(res, 403, 'PEER_INJECT_BLOCKED',
       'Peer-lane inject blocked: not a sanctioned ask-request/ask-reply envelope. Use bin/ask.sh.',
       { reason: peerVerdict.reason, sanctioned_channel: 'bin/ask.sh' });
@@ -2770,7 +2830,9 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
     const delivery = await deliverInjectionToSession(id, session, finalPrompt, {
       noEnter: !!no_enter,
       source: 'inject',
-      from: from || 'inject'
+      from: from || 'inject',
+      // #47 P4 — the daemon-verified sender (never body.from) labels the provenance banner.
+      verifiedSenderSid
     });
     if (!delivery.success) {
       emitInjectFailureEvent(id, delivery.code, delivery.error, {
@@ -3550,6 +3612,10 @@ function mountBrokerMode(app, deps = {}) {
     maxNodes: env.maxNodes,
     requireTls,
     broadcastBusEvent: bus,
+    // #47 P5 — funnel cross-machine deliveries through the SAME inject audit writer as local
+    // ones (one schema, one file, three producers: local deliver, #45 block, broker). The
+    // broker owns no fs (pure); the daemon owns the writer.
+    onInjectAudit: deps.auditAppend || auditAppend,
   });
 
   // Mount the raw handler at /broker/* (full path preserved so the broker router

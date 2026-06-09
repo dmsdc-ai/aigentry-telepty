@@ -104,6 +104,10 @@ function createBrokerServer(options = {}) {
     now = () => Date.now(),
     randomUUID = () => crypto.randomUUID(),
     onAudit = null,
+    // #47 P5 — cross-machine delivery audit seam (spec §9). The broker is pure (no fs), so it
+    // delegates to a daemon-supplied sink that funnels the record through the SAME inject-log
+    // buildAuditLine + writer as local deliveries. Default null = no emission (no #42 redesign).
+    onInjectAudit = null,
   } = options;
 
   if (!jwtSecret) throw new Error('createBrokerServer requires jwtSecret');
@@ -394,6 +398,28 @@ function createBrokerServer(options = {}) {
     const frame = buildSseInjectFrame(seq, envelope);
     pushReplay(target, seq, frame);
     target.stream.write(frame);
+
+    // #47 P5 — emit a shared-schema audit line for this cross-machine delivery (spec §9). The
+    // sender is broker-verified by JWT `sub` regardless of the spoofable payload `from`, so
+    // verified_sender_sid = node:<sub> and origin = untrusted-remote. The sink must never break
+    // delivery.
+    if (typeof onInjectAudit === 'function') {
+      try {
+        onInjectAudit({
+          inject_id: injectId,
+          kind: 'inject',
+          source: 'broker',
+          claimed_from: (body.payload && body.payload.from) || null,
+          verified_sender_sid: `node:${fromNode}`,
+          to: toSession,
+          to_alias: typeof body.target === 'string' ? body.target : null,
+          origin: 'untrusted-remote',
+          origin_host: fromNode,
+          payload: (body.payload && body.payload.prompt) || '',
+          delivery_result: 'success',
+        });
+      } catch { /* audit sink must never break broker delivery */ }
+    }
 
     // Hold the response until the target acks or the 15s timeout (§3.1 sync parity).
     const timer = setTimeout(() => settlePending(injectId, 'timeout'), injectTimeoutMs);
