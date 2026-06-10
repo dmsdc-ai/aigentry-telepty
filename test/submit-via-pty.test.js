@@ -181,6 +181,7 @@ const NOW = 1_700_000_000_000;
 
 function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4.5, idleEvidenceReliable } = {}) {
   const captured = [];
+  const timers = []; // #48: settle-and-recheck defers UNCONFIRMED — capture and flush below
   const pendingReport = {
     source: 'orch',
     injectId: 'inj-1',
@@ -189,15 +190,17 @@ function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4
   };
   const deps = {
     now: () => NOW,
-    setTimeout: () => 0,
+    setTimeout: (fn) => { timers.push(fn); return 0; },
     broadcastSessionEvent: () => {},
     resolveSessionAlias: (s) => s,
     sessions: { orch: { id: 'orch' } },
-    pendingReports: {},
+    pendingReports: { 'worker-1': pendingReport },
     deliverInjectionToSession: (srcId, _s, msg) => captured.push({ srcId, msg }),
     idleEvidenceReliable, // #545: real-idle reliability gate (undefined = ungated, prior behavior)
+    getAutoState: () => 'idle', // #48: still idle at recheck → the honest label fires
   };
   fireAutoReport('worker-1', { id: 'worker-1' }, pendingReport, trigger, deps);
+  while (timers.length) timers.shift()(); // #48: run the settle recheck
   return captured.length ? captured[0].msg : null;
 }
 

@@ -286,6 +286,14 @@ const AUTO_REPORT_IDLE_SECONDS = Number(process.env.TELEPTY_AUTO_REPORT_IDLE_SEC
 // by the recipient. Below this elapsed floor the idle is NOT trusted as a processed-inject
 // completion; the text-inject is relabeled so a stuck/hung target is never reported as DONE.
 const AUTO_REPORT_MIN_REAL_SECONDS = Number(process.env.TELEPTY_AUTO_REPORT_MIN_REAL_SECONDS) || 1.0;
+// #48: a momentary idle/ready snapshot right after an inject (the bridge re-sends 'ready' on a
+// TUI prompt-glyph redraw; codex's silence+glyph flips real-idle mid-work) is almost always a
+// transition-gap false positive — the session is, or moments later is, working. Before emitting
+// TASK_IDLE_UNCONFIRMED, hold for this settle window and recheck the LIVE session state.
+const IDLE_UNCONFIRMED_SETTLE_SECONDS = Number(process.env.TELEPTY_IDLE_UNCONFIRMED_SETTLE_SECONDS) || 5;
+// Output advanced during the settle window while still idle-classified (sparse TUI redraw) →
+// re-settle, bounded so periodic idle redraws cannot starve the genuinely-unconsumed signal.
+const IDLE_UNCONFIRMED_SETTLE_MAX_REARMS = Math.max(0, Number(process.env.TELEPTY_IDLE_UNCONFIRMED_SETTLE_MAX_REARMS) || 3);
 
 function pendingReportHasSubmitEvidence(pendingReport) {
   return !!(pendingReport && (
@@ -358,6 +366,11 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
   const _sessions = deps.sessions || sessions;
   const _pendingReports = deps.pendingReports || pendingReports;
   const _deliver = deps.deliverInjectionToSession || deliverInjectionToSession;
+  // #48: live auto-state lookup for the settle recheck (DI for unit tests).
+  const _getAutoState = deps.getAutoState || ((sid) => {
+    const st = sessionStateManager.getState(sid);
+    return st && st.state ? st.state : null;
+  });
 
   const elapsedNum = (_now() - new Date(pendingReport.injectedAt).getTime()) / 1000;
   const elapsed = elapsedNum.toFixed(1);
@@ -390,25 +403,6 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
     }
   }
 
-  pendingReport.idleNotified = true;
-  pendingReport.idleAt = new Date(_now()).toISOString();
-
-  // Richer bus event (observability) — now also carries the trigger provenance.
-  _broadcast('TASK_IDLE_NO_REPORT', targetId, targetSession, {
-    extra: {
-      source: pendingReport.source,
-      inject_id: pendingReport.injectId,
-      elapsed_secs: Number(elapsed),
-      injected_at: pendingReport.injectedAt,
-      trigger
-    }
-  });
-  console.log(`[ENFORCE-REPORT] ${targetId} idle after ${elapsed}s (trigger=${trigger}) — awaiting REPORT from ${pendingReport.source}`);
-
-  const srcId = _resolveAlias(pendingReport.source) || pendingReport.source;
-  const srcSession = _sessions[srcId];
-  if (!srcSession) return;
-
   // #537 / Bug B: a never-started worker (transient submit failure → claude startup
   // busy→idle settle at ~4.5s) must NOT be reported TASK_COMPLETE. When a submit was
   // expected, the elapsed floor and startup-polluted sawWorkingAfterInject are NOT trusted
@@ -428,13 +422,80 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
   const idleEvidenceUnreliable = trigger === 'real-idle'
     && pendingReport.submitExpected
     && deps.idleEvidenceReliable === false;
-  const confirmed = trigger === 'ready-signal' && pendingReport.submitExpected
+  // #48: a settled recheck re-enters ONLY to emit the UNCONFIRMED label — pinned at arm time,
+  // so elapsed growing past the floor during the settle window can never promote a stale idle
+  // snapshot to TASK_COMPLETE (never a false complete).
+  const confirmed = pendingReport.unconfirmedSettleDone
     ? false
-    : idleEvidenceUnreliable
+    : trigger === 'ready-signal' && pendingReport.submitExpected
       ? false
-      : pendingReport.submitExpected
-        ? strongSubmitConfirmed
-        : (elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS || hasSubmitEvidence);
+      : idleEvidenceUnreliable
+        ? false
+        : pendingReport.submitExpected
+          ? strongSubmitConfirmed
+          : (elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS || hasSubmitEvidence);
+
+  // #48: settle-and-recheck before any UNCONFIRMED notification. The first weak idle/ready
+  // snapshot right after an inject is almost always a transition gap — the bridge re-sends
+  // 'ready' on a TUI prompt-glyph redraw (with no state transition, no evidence flag is ever
+  // set even though the session IS working), and codex's silence+glyph heuristic flips
+  // real-idle mid-work. Hold the notification for a settle window and recheck the LIVE
+  // session: notify only when it is still not working AND its output has not advanced.
+  // Suppression does NOT consume the once-only idleNotified guard, so a later genuine
+  // busy→idle transition re-enters this path (and an evidence-backed one reports COMPLETE).
+  if (!confirmed && !pendingReport.unconfirmedSettleDone) {
+    if (pendingReport.unconfirmedSettleTimer) return; // settle window already open
+    const settleMs = Math.max(50, Math.round(IDLE_UNCONFIRMED_SETTLE_SECONDS * 1000));
+    const armSettle = () => {
+      const liveAtArm = _sessions[targetId] || targetSession;
+      const activityAtArm = liveAtArm ? liveAtArm.lastActivityAt : null;
+      pendingReport.unconfirmedSettleTimer = _setTimeout(() => {
+        pendingReport.unconfirmedSettleTimer = null;
+        const currentPending = getPendingReport(targetId, _pendingReports);
+        // REPORT arrived / entry replaced / another path already notified — stand down.
+        if (currentPending !== pendingReport || currentPending.idleNotified) return;
+        const liveSession = _sessions[targetId] || targetSession;
+        const autoState = _getAutoState(targetId);
+        if (autoState === 'working' || autoState === 'thinking') {
+          console.log(`[AUTO-REPORT] ${targetId} idle-unconfirmed suppressed after settle — session is ${autoState} (trigger=${trigger})`);
+          return;
+        }
+        const activityNow = liveSession ? liveSession.lastActivityAt : null;
+        if (activityNow !== activityAtArm
+            && (pendingReport.unconfirmedSettleRearms || 0) < IDLE_UNCONFIRMED_SETTLE_MAX_REARMS) {
+          pendingReport.unconfirmedSettleRearms = (pendingReport.unconfirmedSettleRearms || 0) + 1;
+          console.log(`[AUTO-REPORT] ${targetId} output advanced during settle — re-settling (${pendingReport.unconfirmedSettleRearms}/${IDLE_UNCONFIRMED_SETTLE_MAX_REARMS})`);
+          armSettle();
+          return;
+        }
+        pendingReport.unconfirmedSettleDone = true;
+        fireAutoReport(targetId, liveSession || targetSession, currentPending, trigger, deps);
+      }, settleMs);
+    };
+    armSettle();
+    console.log(`[AUTO-REPORT] ${targetId} idle unconfirmed at ${elapsed}s (trigger=${trigger}) — settling ${IDLE_UNCONFIRMED_SETTLE_SECONDS}s before notify`);
+    return;
+  }
+
+  pendingReport.idleNotified = true;
+  pendingReport.idleAt = new Date(_now()).toISOString();
+
+  // Richer bus event (observability) — now also carries the trigger provenance.
+  _broadcast('TASK_IDLE_NO_REPORT', targetId, targetSession, {
+    extra: {
+      source: pendingReport.source,
+      inject_id: pendingReport.injectId,
+      elapsed_secs: Number(elapsed),
+      injected_at: pendingReport.injectedAt,
+      trigger
+    }
+  });
+  console.log(`[ENFORCE-REPORT] ${targetId} idle after ${elapsed}s (trigger=${trigger}) — awaiting REPORT from ${pendingReport.source}`);
+
+  const srcId = _resolveAlias(pendingReport.source) || pendingReport.source;
+  const srcSession = _sessions[srcId];
+  if (!srcSession) return;
+
   const injTag = pendingReport.injectId ? ` inject=${pendingReport.injectId}` : '';
   const reportMsg = confirmed
     ? `TASK_COMPLETE: ${targetId} is now idle after processing inject (${elapsed}s, via ${trigger}${injTag})`
