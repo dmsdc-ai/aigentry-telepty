@@ -24,6 +24,20 @@ CLI (cli.js) ──→ HTTP/WS ──→ Daemon (daemon.js:3848)
 | `auth.js` | UUID 토큰 기반 인증 |
 | `interactive-terminal.js` | raw mode stdin/stdout 관리 |
 | `skill-installer.js` | CLI별 스킬 설치 (Claude/Codex/Gemini) |
+| `session-state.js` | PTY 출력 → 8-state 세션 FSM |
+| `cross-machine.js` | SSH/HTTP 피어 연결, 원격 inject |
+| `terminal-backend.js` | 터미널(kitty/cmux 등) 백엔드 어댑터 |
+| `src/mailbox/` | 파일 기반 메시지 큐 (retry/ack/DLQ — BOUNDARY.md KNOWN DIVERGENCE 참조) |
+| `src/transport/` | broker 모드 (server/client/protocol, #42 opt-in default-OFF) + peer-relay |
+| `src/bridge/` | Node↔Rust supervisor IPC (launcher/ipc/j3-shim) |
+| `src/audit/` | inject 감사 로그 + provenance (#43/#47, opt-in) |
+| `src/submit-gate.js` | submit 게이팅 (REPL-ready/echo/settle 감지) |
+| `src/session-store/` | 세션 디스크 영속 (BOUNDARY.md KNOWN DIVERGENCE 참조) |
+| `src/report-enforcement.js` | REPORT 정책 (분류/요약 — BOUNDARY.md KNOWN DIVERGENCE 참조) |
+| `mcp-server/` | MCP 서버 인터페이스 |
+
+> 위 표는 2026-06-10 구조 감사(RISK 3)가 지적한 핵심 누락 모듈을 반영한 것이며 전수는 아니다
+> (`src/` 세부 모듈 전체 문서화는 별도 태스크). 근거: `docs/reports/2026-06-10-structure-audit.md`.
 
 ## Inject 전달 경로 (wrapped session)
 

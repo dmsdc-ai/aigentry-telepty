@@ -1,12 +1,24 @@
 # ADR 2026-06-09 — Inject provenance trust model: verified-sender vs claimed-from, and the delivery wrapper
 
-- **Status:** Proposed (SPEC-FIRST — awaiting USER approval; NO implementation in this dispatch)
-- **Date:** 2026-06-09
+- **Status:** Accepted — IMPLEMENTED (shipped **opt-in**: #43 P1–P3 inject audit log + verified-sender token + read API in 0.6.0, commit `f91e71a`; #47 P4–P5 nonce-gated delivery provenance banner + broker/blocked audit seams in 0.6.1, commit `0e587f1`)
+- **Date:** 2026-06-09 (status header corrected 2026-06-10 — task #588)
 - **Repo:** `aigentry-telepty` (branch `wt/telepty-43-audit-spec`, off `main`@`3f5e5f2`)
 - **Tasks:** #573 / #43 (inject audit log + verified sender identity + delivery provenance wrapper)
 - **Author role:** architect (`telepty-43-audit-spec`)
 - **Spec (companion):** `docs/specs/2026-06-09-inject-audit-provenance.md`
 - **Relates:** #42 (broker — already carries JWT `sub` node identity + an `audit()` hook), #45 (fan-out gate — `peer_inject_blocked`), `classifyPeerLaneInject` (`daemon.js:402`), `src/protocol/http-auth.js` (auth middleware, `signNodeJwt`)
+
+> **2026-06-10 correction (task #588, per `docs/reports/2026-06-10-structure-audit.md` RISK 3):**
+> This ADR's original header ("Proposed — NO implementation in this dispatch") was true for the
+> spec-only authoring dispatch but went stale after implementation shipped: `src/audit/inject-log.js`
+> and `src/audit/provenance.js` plus audit/provenance test files landed 2026-06-09 — #43 P1–P3
+> (inject audit log + verified-sender token + read API, `f91e71a`, release 0.6.0 `3255c41`) and
+> #47 P4–P5 (nonce-gated delivery provenance banner + broker/blocked audit seams, `0e587f1`,
+> release 0.6.1 `d0e5338`). The feature is **shipped but opt-in** (banner is capability-gated per
+> §5 "must be opt-in"). Note: the 2026-06-10 structure audit assessed the implementation as
+> *partial* ("banner prepend and session-token validation not yet visible" in its module reads) —
+> if portions remain unimplemented, that is an implementation-completeness question, not a license
+> to read this ADR as unimplemented.
 
 ---
 

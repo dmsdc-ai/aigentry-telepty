@@ -1,11 +1,22 @@
 # ADR 2026-06-08 — Cross-machine relay / broker (hub) mode for `inject`/`broadcast` under client-isolation
 
-- **Status:** Proposed (SPEC-FIRST — awaiting user approval; NO implementation in this dispatch)
-- **Date:** 2026-06-08
+- **Status:** Accepted — IMPLEMENTED (shipped 0.6.0 dark-launch: **opt-in, default-OFF, not GA**; broker #42 commits `e59112e`/`b195e6e`/`60e3695`/`331e748`/`835e7b2`/`dc0612c`/`1b5fa12`, release `3255c41`; broker/blocked audit seams shipped 0.6.1, commit `0e587f1`)
+- **Date:** 2026-06-08 (status header corrected 2026-06-10 — task #588)
 - **Repo:** `aigentry-telepty` (branch `wt/telepty-42-broker-adr`, off `main`@`8f3bf17`)
 - **Tasks:** #564 / #42 (telepty cross-machine relay/broker)
 - **Author role:** architect (`telepty-42-architect`)
 - **Relates:** #13 (`connect-http` — transport, not topology), ADR 2026-05-30 (tech stack — stay Node, §17/§1), `BUS_EVENT_SCHEMA.md` (locator triple, `@host` routing, peer auth)
+
+> **2026-06-10 correction (task #588, per `docs/reports/2026-06-10-structure-audit.md` RISK 3):**
+> This ADR's original header ("Proposed — NO implementation in this dispatch") was true for the
+> spec-only authoring dispatch but went stale after the broker MVP was implemented and shipped:
+> `src/transport/broker-protocol.js` / `broker-server.js` / `broker-client.js`, CLI wiring
+> (`connect-broker`, broker admin commands, ACL), daemon broker-mode mount, install service variant,
+> and an end-to-end + security test suite — landed 2026-06-09 in release 0.6.0 (`3255c41`,
+> "broker (#42) dark-launch (opt-in, default-OFF, not GA)"), with broker/blocked audit seams in
+> 0.6.1 (`0e587f1`). The feature is **shipped but default-OFF / opt-in** — the Phase 0 MVP scope of
+> §7. "No implementation in this dispatch" statements in the body below refer to the original
+> spec dispatch, not to the current tree.
 
 ## 1. Context — problem & topology
 
