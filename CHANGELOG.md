@@ -4,6 +4,24 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-10
+
+### Fixed — TASK_IDLE_UNCONFIRMED false positives (#48)
+
+- **`TASK_IDLE_UNCONFIRMED` fired ~0–0.5s after nearly every inject** even when the inject was
+  processed, destroying the signal's value. Two proven causes: (a) the bridge re-sends `ready` on
+  every TUI prompt-glyph redraw after an inject, and "working" evidence was only recorded on a
+  transition *into* working — so an inject landing on an already-working session left zero evidence
+  and the notifier fired on the first weak snapshot; (b) codex's spinner-less TUI (5s silence +
+  `›` prompt glyph) flips the real-idle classifier mid-work.
+- **Fix: settle-and-recheck.** A would-be `TASK_IDLE_UNCONFIRMED` is held for
+  `TELEPTY_IDLE_UNCONFIRMED_SETTLE_SECONDS` (default 5) and re-checked against the **live** session
+  state: working/thinking → suppressed; output advanced while idle-classified → bounded re-settle
+  (`TELEPTY_IDLE_UNCONFIRMED_SETTLE_MAX_REARMS`, default 3); still idle and stalled → notify, so the
+  genuine "inject not consumed" signal is preserved. The report label is pinned at arm time, so the
+  settle window can never promote a stale idle snapshot to `TASK_COMPLETE` (the never-false-complete
+  invariant is kept). Message format is unchanged.
+
 ## [0.6.1] - 2026-06-09
 
 ### Added — delivery provenance wrapper + audit seams (#47, P4+P5)
