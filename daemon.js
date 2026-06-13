@@ -265,7 +265,25 @@ const PORT = process.env.PORT || 3848;
 // Reported by /api/meta so callers (e.g. the test harness) can read it back.
 let boundPort = Number(PORT);
 
-const HOST = process.env.HOST || '0.0.0.0';
+// telepty#50: bind loopback by default — a fresh install must not expose the
+// inject/control API to the local network. Network exposure is an explicit
+// opt-in: TELEPTY_BIND=0.0.0.0 (preferred) or the legacy HOST override.
+// BREAKING: cross-machine peers that dialed this daemon directly over LAN
+// need the opt-in on the daemon host after a restart (see CHANGELOG).
+function resolveBindHost(env) {
+  return env.TELEPTY_BIND || env.HOST || '127.0.0.1';
+}
+
+// One-line bind-address banner so operators can see (and fix) their exposure
+// posture at startup without reading docs.
+function formatBindHint(host) {
+  if (host === '127.0.0.1' || host === 'localhost' || host === '::1') {
+    return `   bind: ${host} (loopback only) — LAN peers cannot connect; opt in with TELEPTY_BIND=0.0.0.0`;
+  }
+  return `   bind: ${host} — reachable from the network (TELEPTY_BIND/HOST opt-in)`;
+}
+
+const HOST = resolveBindHost(process.env);
 process.title = 'telepty-daemon';
 
 // Singleton claim — guarded so a test require neither exits (when a daemon is running) nor
@@ -3762,6 +3780,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
       const address = server.address();
       boundPort = (address && address.port) || Number(PORT);
       console.log(`🔐 aigentry-telepty broker listening on https://${HOST}:${boundPort} (/broker/*)`);
+      console.log(formatBindHint(HOST)); // telepty#50
       runStartupBootstrapRestore();
     });
   } else {
@@ -3769,6 +3788,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
       const address = server.address();
       boundPort = (address && address.port) || Number(PORT);
       console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${boundPort}`);
+      console.log(formatBindHint(HOST)); // telepty#50
       runStartupBootstrapRestore();
       // #42 node-mode (§2F-ii): start the broker-client if broker config is present.
       // Absent ⇒ no-op (default-OFF). Started after listen so sessions/delivery are live.
@@ -4151,4 +4171,6 @@ module.exports = {
   loadNodeBrokerConfig,           // node-mode: resolve broker.json / env config (or null)
   startNodeBrokerClient,          // node-mode: start createBrokerClient (default-OFF; in-process deliver)
   deliverInjectionToSession,      // §4.3: the in-process delivery wired into the broker-client
+  resolveBindHost,                // telepty#50: pure bind-address policy (loopback default, env opt-in)
+  formatBindHint,                 // telepty#50: startup bind/exposure banner line
 };

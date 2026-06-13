@@ -4,6 +4,25 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+### ⚠️ BREAKING — daemon binds 127.0.0.1 by default (#50)
+
+- **The daemon (and broker host) now binds `127.0.0.1` instead of `0.0.0.0`.** A fresh install no
+  longer exposes the inject/control API to the local network. **Cross-machine setups where a peer
+  dials this daemon directly over LAN will stop working after the daemon restarts** — opt back in
+  explicitly on the daemon host with `TELEPTY_BIND=0.0.0.0` (the legacy `HOST` env override is
+  still honored; `TELEPTY_BIND` wins when both are set). The startup banner now prints the bind
+  address and a one-line exposure hint. SSH-tunnel peers (`telepty connect`) and the #42 broker
+  node mode (outbound-only) are unaffected.
+
+### Fixed — `--help` is now always safe on payload subcommands (#51)
+
+- `telepty broadcast --help` used to **broadcast the literal string `--help` to every active
+  session**, and `telepty allow --help` spawned a junk `<dir>---help` session. A bare `-h`/`--help`
+  before an explicit `--` separator now always prints the subcommand usage with zero network or
+  fan-out side effects (broadcast/multicast/inject/allow + aliases). Sending the literal text
+  requires the explicit separator: `telepty broadcast -- --help`. Defense-in-depth: broadcast and
+  multicast refuse a payload that is exactly a help flag unless `--` was used.
+
 ## [0.6.2] - 2026-06-10
 
 ### Fixed — TASK_IDLE_UNCONFIRMED false positives (#48)
