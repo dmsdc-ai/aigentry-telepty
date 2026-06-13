@@ -517,6 +517,92 @@ async function classifyInjectConsumption(session, bodyText, opts = {}) {
   }
 }
 
+// #617 hold-and-redeliver — close the gap between #53 DETECTION and ACTION.
+//
+// A recipient that is BUSY when the inject CR is written parks the body in its
+// composer ("Press up to edit queued messages") and never starts a turn (#53 fact 1).
+// classifyInjectConsumption already DETECTS this (`queued`), but 0.6.4 only reports
+// the status — the worker's `telepty inject` never reads it and exits, so the parked
+// REPORT turn is silently dropped. This loop is the ACTION: hold the parked body,
+// wait for the recipient's busy→idle transition, then re-fire the CR so the queued
+// turn finally fires. The body is ALREADY in the composer, so a bare CR (fireCR)
+// fires it — never re-inject the body (that would duplicate text).
+//
+// Invariants:
+//   - bounded: at most `maxAttempts` CR re-fires AND a `totalTimeoutMs` deadline —
+//     never an unbounded redeliver loop (Rule 27: redelivery is the fix, not a
+//     forever-retry workaround).
+//   - never-double-deliver: re-fire ONLY while the body is still parked
+//     (`isStillParked`, reusing #52/#53 echo observation at the daemon seam). The
+//     gate is checked before the idle wait AND again right after idle — a turn that
+//     auto-consumed the queue as it ended must not get a second CR.
+//   - back-compat: the daemon runs this DETACHED from the /submit response; a caller
+//     that ignores `consumption` is wholly unaffected.
+//
+// Pure: every effect (idle watch, parked check, CR fire) is injected; DI now. No
+// daemon coupling — the daemon wires real implementations, tests wire doubles.
+//
+// @param {{
+//   waitForIdle: (remainingMs: number) => Promise<{ ready: boolean, reason?: string }>,
+//   isStillParked: () => boolean,
+//   fireCR: () => Promise<{ redelivered: boolean, reason?: string }>,
+//   maxAttempts?: number, totalTimeoutMs?: number,
+//   onAttempt?: Function, onExhausted?: Function, now?: Function
+// }} opts
+// @returns {Promise<{ status: 'redelivered'|'already_consumed'|'exhausted', reason: string, attempts: number, waited_ms: number }>}
+async function holdAndRedeliver(opts = {}) {
+  const maxAttempts    = Number.isFinite(opts.maxAttempts)    ? opts.maxAttempts    : 3;
+  const totalTimeoutMs = Number.isFinite(opts.totalTimeoutMs) ? opts.totalTimeoutMs : 600000;
+  const now           = typeof opts.now === 'function' ? opts.now : () => Date.now();
+  const waitForIdle   = typeof opts.waitForIdle === 'function' ? opts.waitForIdle : null;
+  const isStillParked = typeof opts.isStillParked === 'function' ? opts.isStillParked : () => true;
+  const fireCR        = typeof opts.fireCR === 'function' ? opts.fireCR : null;
+  const onAttempt     = typeof opts.onAttempt === 'function' ? opts.onAttempt : () => {};
+  const onExhausted   = typeof opts.onExhausted === 'function' ? opts.onExhausted : () => {};
+
+  const start = now();
+  if (!waitForIdle || !fireCR) {
+    return { status: 'exhausted', reason: 'no_dependencies', attempts: 0, waited_ms: 0 };
+  }
+
+  let attempts = 0;
+  while (attempts < maxAttempts) {
+    if (now() - start >= totalTimeoutMs) {
+      onExhausted({ reason: 'deadline', attempts });
+      return { status: 'exhausted', reason: 'deadline', attempts, waited_ms: now() - start };
+    }
+
+    // never-double-deliver (pre-wait): if the body already left the composer, stop.
+    if (!isStillParked()) {
+      return { status: 'already_consumed', reason: 'not_parked', attempts, waited_ms: now() - start };
+    }
+
+    const remaining = totalTimeoutMs - (now() - start);
+    const idle = await waitForIdle(remaining);
+    if (!idle || !idle.ready) {
+      onExhausted({ reason: (idle && idle.reason) || 'idle_timeout', attempts });
+      return { status: 'exhausted', reason: 'idle_timeout', attempts, waited_ms: now() - start };
+    }
+
+    // never-double-deliver (post-idle): the turn that just ended may have auto-fired
+    // the queued body. Re-check before committing a CR.
+    if (!isStillParked()) {
+      return { status: 'already_consumed', reason: 'consumed_on_idle', attempts, waited_ms: now() - start };
+    }
+
+    attempts++;
+    onAttempt({ attempt: attempts });
+    const fired = await fireCR();
+    if (fired && fired.redelivered) {
+      return { status: 'redelivered', reason: fired.reason || 'consumed', attempts, waited_ms: now() - start };
+    }
+    // still queued/unknown — loop to await the next idle window (bounded by maxAttempts).
+  }
+
+  onExhausted({ reason: 'max_attempts', attempts });
+  return { status: 'exhausted', reason: 'max_attempts', attempts, waited_ms: now() - start };
+}
+
 function isAcceptedSubmitState(state, submittedAtMs) {
   if (!state || !ACCEPTED_AFTER_SUBMIT_STATES.has(state.state)) return false;
   if (!Number.isFinite(submittedAtMs)) {
@@ -693,6 +779,7 @@ module.exports = {
   observeBodyVisibility,
   observeInjectEcho,
   classifyInjectConsumption,
+  holdAndRedeliver,
   awaitPromptSymbol,
   defaultReadScreen,
   isReady,

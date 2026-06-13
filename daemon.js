@@ -43,6 +43,16 @@ const BOOTSTRAP_READY_TIMEOUT_MS = Math.max(500, Number(process.env.TELEPTY_BOOT
 // 2026-05-30 surface-ownership verdict — telepty no longer foregrounds surfaces.
 const WRAPPED_SUBMIT_DELAY_MS = 500;
 
+// #617 hold-and-redeliver — when an inject(--submit) is classified `queued` (busy
+// recipient parked the CR'd body in its composer, no turn fired), the daemon holds the
+// parked body and re-fires the CR on the recipient's next busy→idle transition so the
+// dropped REPORT turn finally starts. Bounded + never-double-deliver. Kill-switch
+// TELEPTY_REDELIVER=off restores the pre-0.6.5 detect-only behavior (back-compat).
+const REDELIVER_ENABLED = String(process.env.TELEPTY_REDELIVER || '').toLowerCase() !== 'off';
+const REDELIVER_MAX_ATTEMPTS = Math.max(1, Number(process.env.TELEPTY_REDELIVER_MAX_ATTEMPTS || 3));
+const REDELIVER_TOTAL_TIMEOUT_MS = Math.max(1000, Number(process.env.TELEPTY_REDELIVER_TOTAL_TIMEOUT_MS || 600000));
+const REDELIVER_IDLE_WAIT_MS = Math.max(1000, Number(process.env.TELEPTY_REDELIVER_IDLE_WAIT_MS || 120000));
+
 // Session state machine manager — auto-detects session state from PTY output
 const sessionStateManager = new SessionStateManager({
   idle_timeout_ms:      Number(process.env.TELEPTY_STATE_IDLE_TIMEOUT_MS || 5000),
@@ -982,6 +992,97 @@ async function gatedTerminalSubmit(id, session, injectedBody, settleEnabled) {
     }
   }
   return terminalLevelSubmit(id, session);
+}
+
+// #617 — detached hold-and-redeliver for a `queued` inject. The /submit response has
+// already returned (the worker's `telepty inject` got consumption='queued' / a plain
+// force success and EXITS), so the daemon owns delivery from here: it re-classifies
+// when the status is unknown (the force path skips the synchronous classify), and if
+// `queued`, runs the bounded submitGate.holdAndRedeliver loop — watching the recipient's
+// auto-state for busy→idle (awaitReplReady) and re-firing the bare CR (the body is still
+// parked in the composer) until it is consumed as a fresh turn. Fire-and-forget: never
+// awaited by the handler, so it cannot affect the response or block the caller.
+function scheduleQueuedRedeliver(id, session, injectedBody, opts = {}) {
+  if (!REDELIVER_ENABLED) return;
+  if (!injectedBody || injectedBody.length === 0) return;
+  if (!session) return;
+  // One in-flight redeliver per session — never stack idle-watchers for the same composer.
+  if (session._redeliverInFlight) return;
+  session._redeliverInFlight = true;
+
+  const emitSubmitBus = typeof opts.emitSubmitBus === 'function' ? opts.emitSubmitBus : () => {};
+  const knownConsumption = opts.knownConsumption || null;
+
+  const isParked = () =>
+    submitGate.observeBodyVisibility(session, injectedBody, { stripAnsi: stripAnsiState }).visible === true;
+
+  // Re-fire a bare CR (body already parked) then re-classify against a FRESH watermark:
+  // the recipient is now idle, so a genuine idle→working/thinking turn is observable as
+  // `consumed` (#53). A still-`queued` result means the CR did not fire the composer — retry.
+  const fireCR = async () => {
+    const strategy = await gatedTerminalSubmit(id, session, injectedBody, true);
+    if (!strategy) return { redelivered: false, reason: 'strategy_failed' };
+    const submittedAtMs = Date.now();
+    const sinceBytes = session.outputRingTotalBytes || 0;
+    const c = await submitGate.classifyInjectConsumption(session, injectedBody, {
+      submittedAtMs,
+      sinceBytes,
+      getState: () => sessionStateManager.getState(id),
+      stripAnsi: stripAnsiState,
+    });
+    return { redelivered: c.status === 'consumed', reason: c.reason };
+  };
+
+  const waitForIdle = (remainingMs) =>
+    submitGate.awaitReplReady(id, sessionStateManager, {
+      timeoutMs: Math.min(remainingMs, REDELIVER_IDLE_WAIT_MS),
+    });
+
+  const run = async () => {
+    // Force path skips the synchronous classify — establish the `queued` precondition here
+    // before holding an idle-watcher. Only a busy-parked body needs rescue.
+    if (knownConsumption !== 'queued') {
+      if (Number.isFinite(opts.submittedAtMs)) {
+        const c = await submitGate.classifyInjectConsumption(session, injectedBody, {
+          submittedAtMs: opts.submittedAtMs,
+          sinceBytes: Number.isFinite(opts.ringBytesAtSubmit) ? opts.ringBytesAtSubmit : (session.outputRingTotalBytes || 0),
+          getState: () => sessionStateManager.getState(id),
+          stripAnsi: stripAnsiState,
+        });
+        if (c.status !== 'queued') return; // consumed / unknown — nothing to redeliver
+      } else {
+        return; // no watermark to classify against — cannot safely redeliver
+      }
+    }
+
+    console.log(`[REDELIVER] ${id} inject queued on busy recipient — holding for idle to re-fire`);
+    const result = await submitGate.holdAndRedeliver({
+      waitForIdle,
+      isStillParked: isParked,
+      fireCR,
+      maxAttempts: REDELIVER_MAX_ATTEMPTS,
+      totalTimeoutMs: REDELIVER_TOTAL_TIMEOUT_MS,
+      onAttempt: ({ attempt }) =>
+        console.log(`[REDELIVER] ${id} idle — re-firing queued inject (attempt ${attempt}/${REDELIVER_MAX_ATTEMPTS})`),
+      onExhausted: ({ reason, attempts }) => {
+        console.log(`[REDELIVER] ${id} redeliver-exhausted (${reason}, attempts=${attempts})`);
+        emitSubmitBus({ redeliver: 'exhausted', redeliver_reason: reason, redeliver_attempts: attempts });
+      },
+    });
+
+    if (result.status === 'redelivered') {
+      console.log(`[REDELIVER] ${id} queued inject redelivered after ${result.attempts} attempt(s)`);
+      markPendingReportSubmitConfirmed(id, { reason: 'redelivered', attempts: result.attempts });
+      emitSubmitBus({ redeliver: 'redelivered', redeliver_attempts: result.attempts });
+    } else if (result.status === 'already_consumed') {
+      console.log(`[REDELIVER] ${id} queued inject already consumed (${result.reason}) — no re-fire`);
+    }
+  };
+
+  Promise.resolve()
+    .then(run)
+    .catch((err) => console.log(`[REDELIVER] ${id} redeliver error: ${err && err.message}`))
+    .finally(() => { session._redeliverInFlight = false; });
 }
 
 async function executeBootstrapSubmit(sessionId, session, op) {
@@ -2689,7 +2790,9 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     if (injectedBody) {
       markPendingReportSubmitStarted(id, injectedBody);
     }
+    const forceRingBytesAtSubmit = session.outputRingTotalBytes || 0;
     const strategy = terminalLevelSubmit(id, session);
+    const forceSubmittedAtMs = Date.now();
     if (strategy) {
       // #537 / Bug B: force-confirm must reflect ACTUAL delivery. A pty_cr fallback on a
       // cmux surface means cmux send-key failed and Enter never reached the CLI — record
@@ -2701,6 +2804,17 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
         } else {
           markPendingReportSubmitUnconfirmed(id, { reason: 'cmux_send_failed', attempts: 1, retryable: true });
         }
+      }
+      // #617: the force path skips the synchronous consumption classify, so a busy-parked
+      // body would silently drop (this IS the worker's `--submit-force` REPORT path). Hand it
+      // to the detached redeliver — it classifies against the CR watermark and only re-fires
+      // if `queued`. No-op when the body was consumed/unknown or absent.
+      if (injectedBody && deliveredToSurface) {
+        scheduleQueuedRedeliver(id, session, injectedBody, {
+          submittedAtMs: forceSubmittedAtMs,
+          ringBytesAtSubmit: forceRingBytesAtSubmit,
+          emitSubmitBus,
+        });
       }
       emitSubmitBus({ strategy, attempts: 1, gated: false, forced: true, submit_confirmed: deliveredToSurface });
       return res.json({ success: true, strategy, attempts: 1, gated: false, forced: true, submit_confirmed: deliveredToSurface });
@@ -2872,6 +2986,19 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     if (verify) {
       verify.consumption = consumptionResult.status;
       verify.consumption_reason = consumptionResult.reason;
+    }
+
+    // #617: a `queued` body was parked on a busy recipient and will never fire on its own.
+    // Hand it to the detached hold-and-redeliver loop (re-fires the CR on busy→idle). This
+    // runs independent of whether the handler returns 200 or 504 below — delivery is the
+    // daemon's responsibility now that the worker no longer needs to poll the status.
+    if (consumption === 'queued') {
+      scheduleQueuedRedeliver(id, session, injectedBody, {
+        knownConsumption: 'queued',
+        submittedAtMs,
+        ringBytesAtSubmit,
+        emitSubmitBus,
+      });
     }
 
     if (confirm && !confirm.accepted) {
