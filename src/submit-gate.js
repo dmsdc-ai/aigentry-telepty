@@ -379,6 +379,65 @@ async function awaitInputSettled(session, bodyText, opts = {}) {
   }
 }
 
+// #52: observe whether the injected body was ECHOED by the target TUI in frames
+// appended AFTER the inject (composer/transcript redraw) — consumption evidence that
+// gates the TASK_IDLE_UNCONFIRMED warning. Conservative by design (never-false-complete):
+//   - the normalized body must be ≥ minChars (short/common strings claim nothing);
+//   - matching samples fixed-length windows of the body (step minChars/2) so a echo
+//     wrapped across bordered composer lines is still observed, while requiring
+//     `needed` distinct window hits for long bodies;
+//   - only frames past the `sinceBytes` watermark count, and a window that ALSO appears
+//     in the pre-inject portion of the ring is discarded — a redraw of an identical
+//     earlier message is NOT fresh echo.
+// Pure: outputRing-only, DI stripAnsi — no I/O, no daemon coupling.
+function observeInjectEcho(session, bodyText, opts = {}) {
+  const minChars = Number.isFinite(opts.minChars) ? opts.minChars : 24;
+  const stripAnsi = typeof opts.stripAnsi === 'function' ? opts.stripAnsi : (s) => s;
+  const sinceBytes = Number.isFinite(opts.sinceBytes) ? opts.sinceBytes : null;
+
+  const body = normalize(bodyText);
+  if (body.length < minChars) {
+    return { observed: false, reason: body.length === 0 ? 'empty_body' : 'body_too_short' };
+  }
+  if (!session || !Array.isArray(session.outputRing) || session.outputRing.length === 0) {
+    return { observed: false, reason: 'no_ring' };
+  }
+
+  // Split the ring at the inject watermark: only post-inject frames may witness echo,
+  // and pre-inject frames veto windows that already existed on screen before the inject.
+  let preRaw = '';
+  let postRaw = '';
+  if (sinceBytes !== null && Number.isFinite(session.outputRingTotalBytes)) {
+    const appended = Math.max(0, session.outputRingTotalBytes - sinceBytes);
+    if (appended === 0) return { observed: false, reason: 'no_frames_since_inject' };
+    const all = session.outputRing.join('');
+    const splitAt = Math.max(0, all.length - appended);
+    preRaw = all.slice(0, splitAt);
+    postRaw = all.slice(splitAt);
+  } else {
+    // No watermark (legacy entry) — treat the whole ring as post-inject, with no veto.
+    postRaw = session.outputRing.join('');
+  }
+  const post = normalize(stripAnsi(postRaw));
+  const pre = normalize(stripAnsi(preRaw));
+
+  const step = Math.max(1, Math.floor(minChars / 2));
+  const windows = [];
+  for (let i = 0; i + minChars <= body.length; i += step) {
+    windows.push(body.slice(i, i + minChars));
+  }
+
+  const needed = body.length >= minChars * 2 ? 2 : 1;
+  let hits = 0;
+  for (const w of windows) {
+    if (post.indexOf(w) !== -1 && pre.indexOf(w) === -1) {
+      hits++;
+      if (hits >= needed) return { observed: true, reason: 'echo', windows_matched: hits };
+    }
+  }
+  return { observed: false, reason: 'no_echo', windows_matched: hits };
+}
+
 function isAcceptedSubmitState(state, submittedAtMs) {
   if (!state || !ACCEPTED_AFTER_SUBMIT_STATES.has(state.state)) return false;
   if (!Number.isFinite(submittedAtMs)) {
@@ -553,6 +612,7 @@ module.exports = {
   verifyBodyConsumed,
   confirmSubmitAccepted,
   observeBodyVisibility,
+  observeInjectEcho,
   awaitPromptSymbol,
   defaultReadScreen,
   isReady,

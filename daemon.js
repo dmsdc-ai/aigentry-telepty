@@ -18,6 +18,7 @@ const { UnixSocketNotifier } = require('./src/mailbox/notifier');
 const { SessionStateManager, STATE_DISPLAY, stripAnsi: stripAnsiState } = require('./session-state');
 const { classifyReportPrompt, buildAutoSummary } = require('./src/report-enforcement');
 const submitGate = require('./src/submit-gate');
+const { sampleChildCpuSeconds } = require('./src/child-cpu'); // #52: quiet-thinking CPU recheck
 const readyRegistry = require('./src/prompt-symbol-registry');
 const lifecycle = require('./src/lifecycle');
 const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, applySurfaceMismatchProbe } = lifecycle;
@@ -312,6 +313,13 @@ const IDLE_UNCONFIRMED_SETTLE_SECONDS = Number(process.env.TELEPTY_IDLE_UNCONFIR
 // Output advanced during the settle window while still idle-classified (sparse TUI redraw) →
 // re-settle, bounded so periodic idle redraws cannot starve the genuinely-unconsumed signal.
 const IDLE_UNCONFIRMED_SETTLE_MAX_REARMS = Math.max(0, Number(process.env.TELEPTY_IDLE_UNCONFIRMED_SETTLE_MAX_REARMS) || 3);
+// #52: codex quiet-thinking (no output, no spinner) outlasts the settle chain — the recheck
+// consults the same screen classifier that produced the false idle. Auxiliary heuristic: a
+// wrapped child whose CPU time advanced ≥ this delta across the settle window is working
+// (quiet thinking) — re-settle instead of notifying, on its own (larger) bound so a long
+// no-output stretch is survivable while a pathological always-busy child still signals.
+const IDLE_UNCONFIRMED_CPU_DELTA_SECONDS = Number(process.env.TELEPTY_IDLE_UNCONFIRMED_CPU_DELTA_SECONDS) || 0.1;
+const IDLE_UNCONFIRMED_CPU_MAX_REARMS = Math.max(0, Number(process.env.TELEPTY_IDLE_UNCONFIRMED_CPU_MAX_REARMS) || 24);
 
 function pendingReportHasSubmitEvidence(pendingReport) {
   return !!(pendingReport && (
@@ -319,6 +327,31 @@ function pendingReportHasSubmitEvidence(pendingReport) {
     pendingReport.sawWorkingAfterInject ||
     (pendingReport.submitConfirm && pendingReport.submitConfirm.accepted === true)
   ));
+}
+
+// #52: the TASK_IDLE_UNCONFIRMED semantic is "inject may NOT have been processed" — gate it
+// on CONSUMPTION evidence the daemon already owns instead of screen idleness. Evidence:
+//   - a screen-VERIFIED submit confirmation (body consumed from the composer, or a state
+//     transition observed after the CR) — 'force'/ambiguous accepts are NOT verification;
+//   - the injected body echoed in PTY frames appended after the inject (composer/transcript
+//     redraw), matched conservatively (submit-gate observeInjectEcho).
+// A definitively failed submit (accepted:false — body observed stuck in the composer /
+// no-land) is positive NON-consumption and can never be overridden by echo, so the
+// never-false-complete invariant of #48 holds: a genuinely unconsumed inject still signals.
+function observeConsumptionEvidence(pendingReport, session) {
+  const confirm = pendingReport.submitConfirm;
+  if (confirm && confirm.accepted === false) {
+    return { observed: false, reason: 'submit_failed' };
+  }
+  if (confirm && confirm.accepted === true && !confirm.ambiguous
+      && (confirm.reason === 'body_consumed' || /^state_(working|thinking)$/.test(String(confirm.reason)))) {
+    return { observed: true, reason: `submit_${confirm.reason}` };
+  }
+  const echo = submitGate.observeInjectEcho(session, pendingReport.injectedBodyPreview, {
+    sinceBytes: Number.isFinite(pendingReport.ringBytesAtInject) ? pendingReport.ringBytesAtInject : null,
+    stripAnsi: stripAnsiState,
+  });
+  return { observed: echo.observed === true, reason: echo.reason };
 }
 
 function getPendingReport(sessionId, registry = pendingReports) {
@@ -389,6 +422,9 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
     const st = sessionStateManager.getState(sid);
     return st && st.state ? st.state : null;
   });
+  // #52: wrapped-child CPU sampler for the quiet-thinking recheck (DI for unit tests).
+  const _sampleChildCpu = deps.sampleChildCpu || ((sess) =>
+    sampleChildCpuSeconds(sess ? (sess.ptyPid || (sess.ptyProcess && sess.ptyProcess.pid) || null) : null));
 
   const elapsedNum = (_now() - new Date(pendingReport.injectedAt).getTime()) / 1000;
   const elapsed = elapsedNum.toFixed(1);
@@ -467,6 +503,7 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
     const armSettle = () => {
       const liveAtArm = _sessions[targetId] || targetSession;
       const activityAtArm = liveAtArm ? liveAtArm.lastActivityAt : null;
+      const cpuAtArm = _sampleChildCpu(liveAtArm); // #52: null when unobservable
       pendingReport.unconfirmedSettleTimer = _setTimeout(() => {
         pendingReport.unconfirmedSettleTimer = null;
         const currentPending = getPendingReport(targetId, _pendingReports);
@@ -486,6 +523,18 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
           armSettle();
           return;
         }
+        // #52: screen idle + output stalled, but the wrapped child's CPU time advanced
+        // across the settle window → quiet thinking (codex no-spinner blind spot). Treat
+        // as working: re-settle on its own bound instead of notifying.
+        const cpuNow = _sampleChildCpu(liveSession);
+        if (cpuAtArm != null && cpuNow != null
+            && (cpuNow - cpuAtArm) >= IDLE_UNCONFIRMED_CPU_DELTA_SECONDS
+            && (pendingReport.unconfirmedCpuRearms || 0) < IDLE_UNCONFIRMED_CPU_MAX_REARMS) {
+          pendingReport.unconfirmedCpuRearms = (pendingReport.unconfirmedCpuRearms || 0) + 1;
+          console.log(`[AUTO-REPORT] ${targetId} child CPU advanced ${(cpuNow - cpuAtArm).toFixed(2)}s during settle — quiet-thinking; re-settling (${pendingReport.unconfirmedCpuRearms}/${IDLE_UNCONFIRMED_CPU_MAX_REARMS})`);
+          armSettle();
+          return;
+        }
         pendingReport.unconfirmedSettleDone = true;
         fireAutoReport(targetId, liveSession || targetSession, currentPending, trigger, deps);
       }, settleMs);
@@ -493,6 +542,23 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
     armSettle();
     console.log(`[AUTO-REPORT] ${targetId} idle unconfirmed at ${elapsed}s (trigger=${trigger}) — settling ${IDLE_UNCONFIRMED_SETTLE_SECONDS}s before notify`);
     return;
+  }
+
+  // #52: before emitting the unconfirmed-DELIVERY warning, check for inject-consumption
+  // evidence (screen-verified submit / post-inject echo). Idle-looking + consumed is at
+  // most a TASK_IDLE fact — not "inject may NOT have been processed". Suppression does not
+  // consume the once-only idleNotified guard, so a later evidence-backed genuine busy→idle
+  // transition can still report TASK_COMPLETE, and the pending entry stays armed until the
+  // worker's content REPORT arrives. Confirmed completions (confirmed === true) are
+  // untouched — this gate only ever silences a would-be false warning, never a signal that
+  // a genuinely unconsumed inject produced (no echo + no verified submit ⇒ falls through).
+  if (!confirmed) {
+    const _observeConsumption = deps.observeConsumptionEvidence || observeConsumptionEvidence;
+    const consumption = _observeConsumption(pendingReport, _sessions[targetId] || targetSession);
+    if (consumption.observed) {
+      console.log(`[AUTO-REPORT] ${targetId} idle-unconfirmed suppressed — inject consumption observed (${consumption.reason}, trigger=${trigger})`);
+      return;
+    }
   }
 
   pendingReport.idleNotified = true;
@@ -1631,6 +1697,9 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
 
 function appendToOutputRing(session, data) {
   if (!session.outputRing) session.outputRing = [];
+  // #52: monotonic byte counter — the inject-time watermark that scopes echo-evidence
+  // matching to frames appended AFTER the inject (survives ring trimming below).
+  session.outputRingTotalBytes = (session.outputRingTotalBytes || 0) + data.length;
   session.outputRing.push(data);
   // Keep total data under ~200KB limit by trimming old entries
   let totalLen = session.outputRing.reduce((sum, d) => sum + d.length, 0);
@@ -3022,6 +3091,8 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
         submitExpected: !!no_enter,
         noEnter: !!no_enter,
         injectedBodyPreview: prompt.slice(0, 500),
+        // #52: echo-evidence watermark — only frames appended after this inject count.
+        ringBytesAtInject: session.outputRingTotalBytes || 0,
         awaitingReport: true,
         idleNotified: false
       };
