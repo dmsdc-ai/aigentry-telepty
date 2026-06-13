@@ -2,7 +2,7 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## [Unreleased]
+## [0.6.3] - 2026-06-13
 
 ### ⚠️ BREAKING — daemon binds 127.0.0.1 by default (#50)
 
