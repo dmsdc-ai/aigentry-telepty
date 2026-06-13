@@ -2,6 +2,20 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.6.4] - 2026-06-13
+
+### Added — inject consumption-evidence: consumed | queued | unknown (#53)
+
+- **`telepty inject` now distinguishes "delivered" from "consumed".** After the CR
+  (`pty_cr`), the daemon captures an output-ring watermark and `classifyInjectConsumption()`
+  / `verifyBodyConsumed()` (reusing the #52 echo-watermark technique) classify the result:
+  **consumed** (composer cleared + new turn rendered), **queued** (injected text persists
+  in a busy TUI composer), or **unknown** (conservative). The `/submit` response and CLI
+  output now carry this status; a `queued` result on a busy orchestrator TUI prints a
+  pull-fallback hint. Closes the "`Submitted` reads as success but the busy recipient never
+  consumed it" gap (observed 3+ times in a single orchestration wave). Backward-compatible
+  (accepted/retryable semantics and exit codes unchanged; response is a superset).
+
 ## [0.6.3] - 2026-06-13
 
 ### ⚠️ BREAKING — daemon binds 127.0.0.1 by default (#50)
