@@ -92,6 +92,11 @@ sessionStateManager.onTransition((sessionId, from, to, detail) => {
       pendingReport.sawWorkingAfterInject = true;
       pendingReport.workingAfterInjectAt = new Date().toISOString();
     }
+    // #619: capture the durable early-consumption fact the instant a genuine fresh turn
+    // fires, so the idle-gate (evaluated minutes later on a scrolled-off ring) reads the
+    // stored fact instead of failing to re-derive it. since_ms is set at this transition.
+    const consumedSinceMs = sessionStateManager.getState(sessionId)?.since_ms;
+    maybeRecordInjectConsumption(pendingReport, from, to, consumedSinceMs);
   }
 
   // Fire TASK_IDLE_NO_REPORT on idle transition (for sessions with pendingReports).
@@ -339,6 +344,35 @@ function pendingReportHasSubmitEvidence(pendingReport) {
   ));
 }
 
+// #619: persist inject-CONSUMPTION as a DURABLE FACT at consumption-time. The #52/#545 idle-
+// gate re-derives consumption from the outputRing/OSC133 marks AT IDLE-TIME; on a long Claude
+// turn (idle at T+13-23min) the injected body has scrolled off the ring, so the gate fails to
+// re-derive a genuine completion → false TASK_IDLE_UNCONFIRMED. Recording the fact the instant
+// the turn fires makes the idle-gate decay-proof (it reads the stored fact instead).
+//
+// never-false-complete (the #52 invariant) is preserved by recording ONLY the #615 `consumed`
+// signal — a genuine FRESH turn that started at/after the inject CR:
+//   - the transition must enter a turn (→ working/thinking) FROM a non-busy state (idle/waiting);
+//     a `starting`→working startup flip (#537 pollution) and a working↔thinking mid-turn sub-
+//     state flip (an already-running turn, NOT ours) are both excluded;
+//   - the turn's since_ms must be ≥ the inject's submit-start (a turn that predates our CR is the
+//     #617 busy-park case — never our consumption);
+//   - a submit must have been attempted (submitStartedAt) — a non-submit text-inject records nothing.
+// A never-consumed inject therefore never gets a fact and still signals UNCONFIRMED. Pure +
+// idempotent (first genuine turn wins); mutates the passed pendingReport, returns whether it recorded.
+function maybeRecordInjectConsumption(pendingReport, fromState, toState, transitionSinceMs) {
+  if (!pendingReport || pendingReport.injectConsumedAt) return false;
+  if (toState !== 'working' && toState !== 'thinking') return false;
+  if (fromState !== 'idle' && fromState !== 'waiting') return false;
+  if (!pendingReport.submitStartedAt) return false;
+  const submitStartedMs = new Date(pendingReport.submitStartedAt).getTime();
+  if (!Number.isFinite(submitStartedMs)) return false;
+  if (!Number.isFinite(transitionSinceMs) || transitionSinceMs < submitStartedMs) return false;
+  pendingReport.injectConsumedAt = new Date(transitionSinceMs).toISOString();
+  pendingReport.injectConsumedSinceMs = transitionSinceMs;
+  return true;
+}
+
 // #52: the TASK_IDLE_UNCONFIRMED semantic is "inject may NOT have been processed" — gate it
 // on CONSUMPTION evidence the daemon already owns instead of screen idleness. Evidence:
 //   - a screen-VERIFIED submit confirmation (body consumed from the composer, or a state
@@ -349,6 +383,12 @@ function pendingReportHasSubmitEvidence(pendingReport) {
 // no-land) is positive NON-consumption and can never be overridden by echo, so the
 // never-false-complete invariant of #48 holds: a genuinely unconsumed inject still signals.
 function observeConsumptionEvidence(pendingReport, session) {
+  // #619: a durable early-consumption fact (recorded at turn-start) is decay-proof — prefer it
+  // over re-deriving from the possibly scrolled-off outputRing at idle-time. This also covers the
+  // #48 settle re-entry path (where `confirmed` is force-false) as a suppression backstop.
+  if (pendingReport.injectConsumedAt) {
+    return { observed: true, reason: 'consumed_recorded' };
+  }
   const confirm = pendingReport.submitConfirm;
   if (confirm && confirm.accepted === false) {
     return { observed: false, reason: 'submit_failed' };
@@ -473,6 +513,11 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
   // as proof of processing — require positive submit confirmation (screen-poll verify /
   // honest force / gate-off). Paths with no submit expected keep the legacy floor/work rule.
   const strongSubmitConfirmed = !!(
+    // #619: a durable early-consumption fact (a genuine fresh turn fired by the inject) is
+    // the strongest completion proof there is — stronger than a screen-derived submit confirm
+    // and decay-proof at idle-time. Recorded conservatively (maybeRecordInjectConsumption), so
+    // this never promotes a never-consumed inject.
+    pendingReport.injectConsumedAt ||
     pendingReport.submitConfirmedAt ||
     (pendingReport.submitConfirm && pendingReport.submitConfirm.accepted === true)
   );
@@ -483,9 +528,14 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
   // symptom — a submit-confirmed worker still thinking), consistent with the BUG-B confirm gate;
   // plain non-submit injects keep their existing floor-based completion. Absent flag / other
   // triggers preserve prior behavior.
+  // #619: a recorded early-consumption fact overrides the decayed at-idle evidence. The
+  // `idleEvidenceReliable === false` downgrade exists because the screen-derived evidence is
+  // weak; a stored consumption fact IS the (decay-proof) evidence, so the downgrade no longer
+  // applies. Without a recorded fact, behavior is unchanged (#545/#52 conservative UNCONFIRMED).
   const idleEvidenceUnreliable = trigger === 'real-idle'
     && pendingReport.submitExpected
-    && deps.idleEvidenceReliable === false;
+    && deps.idleEvidenceReliable === false
+    && !pendingReport.injectConsumedAt;
   // #48: a settled recheck re-enters ONLY to emit the UNCONFIRMED label — pinned at arm time,
   // so elapsed growing past the floor during the settle window can never promote a stale idle
   // snapshot to TASK_COMPLETE (never a false complete).
@@ -4380,6 +4430,7 @@ if (require.main === module) {
 // production call sites is unchanged. NOT a public API — internal/test use only.
 module.exports = {
   fireAutoReport,                 // #32: provenance-tagged auto-report (deps DI: now/deliver/...)
+  maybeRecordInjectConsumption,   // #619: durable early-consumption fact capture (idle-gate decay-proofing)
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
   terminalLevelSubmit,            // #544: PTY-only submit path (pty_cr | null)
   submitViaPty,                   // #544: bare-0x0D submit into the innermost node-pty
