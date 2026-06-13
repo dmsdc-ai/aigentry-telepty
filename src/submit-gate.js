@@ -438,6 +438,85 @@ function observeInjectEcho(session, bodyText, opts = {}) {
   return { observed: false, reason: 'no_echo', windows_matched: hits };
 }
 
+// #53: classify whether an injected+submitted body was CONSUMED as a new turn by the
+// recipient TUI, vs QUEUED in a busy composer, vs UNKNOWN. This is the DELIVERY-side dual
+// of #52 (which gates the IDLE signal on consumption evidence). A bare `Submitted via
+// pty_cr` only proves bytes reached the PTY master; a BUSY Claude Code TUI parks the CR'd
+// text in its composer ("Press up to edit queued messages") and never starts a turn, so the
+// sender must be able to tell `queued` from `consumed`.
+//
+// Hard boundary (#53): telepty cannot see inside the TUI's turn loop, so `consumed` is only
+// claimable from OBSERVABLE evidence, and never-false-consumed is conservative:
+//
+//   consumed — the recipient was NOT already busy at the CR and then began a FRESH turn:
+//              an idle→working/thinking transition whose since_ms ≥ submittedAtMs (a genuine
+//              new turn, NOT mere continued output from a turn already running — the leak
+//              that made `last_output_at ≥ submittedAtMs` read a busy queue as success).
+//   queued   — the injected body is still observably PARKED on screen after a short settle
+//              (windowed echo match — #52 technique — tolerates composer line-wrap/borders).
+//              A recipient already busy at the CR can only ever land here (fact 1: busy CR
+//              queues, never fires), never in `consumed`.
+//   unknown  — neither positive signal within the window (conservative default).
+//
+// Pure: DI getState + outputRing-only, DI now/sleep/stripAnsi — no I/O, no daemon coupling.
+async function classifyInjectConsumption(session, bodyText, opts = {}) {
+  const timeoutMs   = Number.isFinite(opts.timeoutMs)   ? opts.timeoutMs   : 1200;
+  const settleMs    = Number.isFinite(opts.settleMs)    ? opts.settleMs    : 250;
+  const intervalMs  = Number.isFinite(opts.intervalMs)  ? opts.intervalMs  : 80;
+  const minChars    = Number.isFinite(opts.minChars)    ? opts.minChars    : 24;
+  const stripAnsi   = typeof opts.stripAnsi === 'function' ? opts.stripAnsi : (s) => s;
+  const now         = typeof opts.now   === 'function' ? opts.now   : () => Date.now();
+  const sleep       = typeof opts.sleep === 'function' ? opts.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+  const getState    = typeof opts.getState === 'function' ? opts.getState : null;
+  const submittedAtMs = Number.isFinite(opts.submittedAtMs) ? opts.submittedAtMs : now();
+  const sinceBytes  = Number.isFinite(opts.sinceBytes) ? opts.sinceBytes : null;
+
+  const body = normalize(bodyText);
+  if (body.length === 0)        return { status: 'unknown', reason: 'empty_body', waited_ms: 0 };
+  if (body.length < minChars)   return { status: 'unknown', reason: 'body_too_short', waited_ms: 0 };
+  if (!session || !Array.isArray(session.outputRing)) {
+    return { status: 'unknown', reason: 'no_ring', waited_ms: 0 };
+  }
+
+  // Was the recipient ALREADY busy when the CR was written? A busy claude-code TUI parks the
+  // CR'd text and never starts a turn (#53 fact 1), so we may observe `queued` there but must
+  // NEVER claim `consumed` — that is the hard boundary that produced the false success.
+  const initial = getState ? getState() : null;
+  const startedBusy = !!(initial && ACCEPTED_AFTER_SUBMIT_STATES.has(initial.state)
+    && Number.isFinite(initial.since_ms) && initial.since_ms < submittedAtMs);
+
+  const observeParked = () => observeInjectEcho(session, bodyText, { stripAnsi, sinceBytes, minChars });
+
+  const start = now();
+  while (true) {
+    // consumed — only from a non-busy start that produced a fresh idle→working/thinking turn.
+    if (!startedBusy && getState) {
+      const st = getState();
+      if (st && ACCEPTED_AFTER_SUBMIT_STATES.has(st.state)
+          && Number.isFinite(st.since_ms) && st.since_ms >= submittedAtMs) {
+        return { status: 'consumed', reason: `turn_started_${st.state}`, waited_ms: now() - start };
+      }
+    }
+
+    const elapsed = now() - start;
+    // Busy recipient cannot consume — short-circuit to `queued` as soon as the parked body
+    // settles, instead of waiting out the full window for a turn that will never come.
+    if (startedBusy && elapsed >= settleMs) {
+      const echo = observeParked();
+      if (echo.observed) return { status: 'queued', reason: 'busy_parked', waited_ms: elapsed };
+    }
+
+    if (elapsed >= timeoutMs) {
+      const echo = observeParked();
+      if (echo.observed) {
+        return { status: 'queued', reason: startedBusy ? 'busy_parked' : 'body_parked', waited_ms: elapsed };
+      }
+      return { status: 'unknown', reason: startedBusy ? 'busy_no_evidence' : 'no_turn', waited_ms: elapsed };
+    }
+    await sleep(intervalMs);
+  }
+}
+
 function isAcceptedSubmitState(state, submittedAtMs) {
   if (!state || !ACCEPTED_AFTER_SUBMIT_STATES.has(state.state)) return false;
   if (!Number.isFinite(submittedAtMs)) {
@@ -613,6 +692,7 @@ module.exports = {
   confirmSubmitAccepted,
   observeBodyVisibility,
   observeInjectEcho,
+  classifyInjectConsumption,
   awaitPromptSymbol,
   defaultReadScreen,
   isReady,

@@ -2423,7 +2423,21 @@ async function main() {
             : '';
           const attemptsNote = submitData.attempts > 1 ? ` (${submitData.attempts} attempts)` : '';
           const forcedNote = submitData.forced ? ' [forced]' : '';
-          console.log(`✅ Submitted via ${submitData.strategy}${attemptsNote}${gateNote}${lateNote}${forcedNote}.`);
+          const tail = `${attemptsNote}${gateNote}${lateNote}${forcedNote}`;
+          // #53: distinguish CONSUMED-as-a-turn from QUEUED-in-a-busy-composer. A bare
+          // "Submitted via pty_cr" only proves bytes reached the PTY; a busy recipient TUI
+          // parks the text without firing a turn, so report that instead of a false success.
+          const consumption = submitData.consumption
+            || (submitData.verify && submitData.verify.consumption) || null;
+          if (consumption === 'queued') {
+            console.log(`⚠️  Submitted via ${submitData.strategy}${tail}, but recipient is BUSY — text QUEUED, NOT consumed as a new turn. It will be processed after the current turn ends; if a reply is expected, fall back to pulling the recipient's state.`);
+          } else if (consumption === 'consumed') {
+            console.log(`✅ Submitted via ${submitData.strategy}${tail} — consumed as a new turn.`);
+          } else if (consumption === 'unknown') {
+            console.log(`✅ Submitted via ${submitData.strategy}${tail} (consumption=unknown — delivered to PTY; turn-consumption not observable).`);
+          } else {
+            console.log(`✅ Submitted via ${submitData.strategy}${tail}.`);
+          }
         } else if (submitRes && submitRes.status === 504) {
           // Soft failure: REPL never readied. Orchestrator scripts depend on
           // exit 0 here — surface a clear remediation hint but do not exit

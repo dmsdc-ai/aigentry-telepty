@@ -2815,6 +2815,9 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   const settleEnabled = req.body?.input_settle_gate !== false;
   let strategy = await gatedTerminalSubmit(id, session, injectedBody, settleEnabled);
   let submittedAtMs = Date.now();
+  // #53: outputRing watermark at the CR — scopes consumption-evidence matching to frames
+  // appended AFTER this submit (composer redraw / new-turn render), surviving ring trimming.
+  let ringBytesAtSubmit = session.outputRingTotalBytes || 0;
   let attempts = strategy ? 1 : 0;
   if (!strategy) {
     if (injectedBody) {
@@ -2836,18 +2839,40 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   // shot is enough. A retry is idempotent only when the body is still visible.
   let verify = null;
   let confirm = null;
+  let consumption = null;        // #53: 'consumed' | 'queued' | 'unknown'
+  let consumptionReason = null;
   if (injectedBody && injectedBody.length > 0) {
     confirm = await confirmSubmitAfterDispatch(id, session, injectedBody, submittedAtMs, verifyTimeoutMs);
     while (confirm && !confirm.accepted && confirm.retryable && attempts <= retries) {
       await new Promise(resolve => setTimeout(resolve, retryDelayMs));
       const retryStrategy = await gatedTerminalSubmit(id, session, injectedBody, settleEnabled);
       submittedAtMs = Date.now();
+      ringBytesAtSubmit = session.outputRingTotalBytes || 0;
       if (!retryStrategy) break;
       strategy = retryStrategy;
       attempts++;
       confirm = await confirmSubmitAfterDispatch(id, session, injectedBody, submittedAtMs, verifyTimeoutMs);
     }
     verify = buildSubmitVerify(confirm);
+
+    // #53: consumption-evidence on the DELIVERY path. `confirm.accepted` can read a BUSY
+    // recipient's mid-turn output as success (the isAcceptedSubmitState last_output_at leak),
+    // so additionally classify whether the body was CONSUMED as a fresh turn vs QUEUED in a
+    // busy composer vs UNKNOWN — and surface it to the caller. Advisory + additive: it does
+    // NOT change accepted/retryable (back-compat); it only tells the sender what telepty can
+    // actually observe past the PTY layer. Conservative (never-false-consumed).
+    const consumptionResult = await submitGate.classifyInjectConsumption(session, injectedBody, {
+      submittedAtMs,
+      sinceBytes: ringBytesAtSubmit,
+      getState: () => sessionStateManager.getState(id),
+      stripAnsi: stripAnsiState,
+    });
+    consumption = consumptionResult.status;
+    consumptionReason = consumptionResult.reason;
+    if (verify) {
+      verify.consumption = consumptionResult.status;
+      verify.consumption_reason = consumptionResult.reason;
+    }
 
     if (confirm && !confirm.accepted) {
       const reason = gatedDispatchAfterTimeout ? 'gated_dispatch_unconsumed' : 'submit_unconfirmed';
@@ -2863,6 +2888,7 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
         gate_wait_ms: gateResult.waited_ms,
         verify,
         confirm,
+        ...(consumption ? { consumption, consumption_reason: consumptionReason } : {}),
         gated_dispatch_after_timeout: true,
         ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
       };
@@ -2885,6 +2911,7 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     gate_wait_ms: gateResult.waited_ms,
     verify,
     confirm,
+    ...(consumption ? { consumption, consumption_reason: consumptionReason } : {}),
     ...(gatedDispatchAfterTimeout ? { gated_dispatch_after_timeout: true } : {}),
     ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
   };
