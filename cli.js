@@ -11,7 +11,15 @@ const prompts = require('prompts');
 const updateNotifier = require('update-notifier');
 const pkg = require('./package.json');
 const { getConfig } = require('./auth');
-const { cleanupDaemonProcesses, readDaemonState, findPortOwnerPid } = require('./daemon-control');
+const {
+  cleanupDaemonProcesses,
+  clearRestartFailureMarker,
+  findParentProcessInfo,
+  findPortOwnerPid,
+  readDaemonState,
+  readRestartFailureMarker,
+  writeRestartFailureMarker
+} = require('./daemon-control');
 const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
 const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
@@ -434,13 +442,31 @@ async function waitForDaemonHealth(maxMs = 5000) {
   return null;
 }
 
+// telepty#15: actionable diagnostic for a daemon the CLI cannot stop (foreign
+// parent app owns it, EPERM, parent respawns it). Pure formatter, exposed for
+// unit-testing — `parent` is findParentProcessInfo's { ppid, command } or null.
+function formatDaemonStopDiagnostic({ pid, parent }) {
+  if (parent && parent.command) {
+    return `Daemon (PID ${pid}) is owned by parent ${parent.command} (pid ${parent.ppid}) — restart that app to update its bundled daemon, or run: kill ${pid} && telepty daemon`;
+  }
+  return `Daemon (PID ${pid}) could not be stopped — run: kill ${pid} && telepty daemon`;
+}
+
 async function restartDaemonGraceful(options = {}) {
   const maxAttempts = options.maxAttempts || 3;
   const requiredCapabilities = options.requiredCapabilities || [];
+  // Injectable seams (default to the real implementations) so the blocked-restart
+  // path is unit-testable without touching a real daemon or process table (#15;
+  // same pattern as ensureDaemonRunning #567).
+  const cleanup = options._cleanupDaemonProcesses || cleanupDaemonProcesses;
+  const startDaemon = options._startDetachedDaemon || startDetachedDaemon;
+  const waitHealth = options._waitForDaemonHealth || waitForDaemonHealth;
+  const portOwner = options._findPortOwnerPid || findPortOwnerPid;
+  const parentInfo = options._findParentProcessInfo || findParentProcessInfo;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     // (a) Kill existing daemon processes
-    const results = cleanupDaemonProcesses();
+    const results = cleanup();
 
     // (b) Wait up to 3s for old processes to fully exit
     if (results.stopped.length > 0) {
@@ -453,11 +479,22 @@ async function restartDaemonGraceful(options = {}) {
       }
     }
 
+    // telepty#15 fail-fast: when the port is still owned by a process cleanup did
+    // not stop (state file absent and unkillable, EPERM, foreign parent), starting
+    // a new daemon can never bind — the old "3 attempts with backoff" was pure
+    // noise. Stop retrying and emit one actionable diagnostic instead.
+    const survivingOwner = portOwner(Number(PORT));
+    if (Number.isInteger(survivingOwner) && survivingOwner > 0 && survivingOwner !== process.pid) {
+      const diagnostic = formatDaemonStopDiagnostic({ pid: survivingOwner, parent: parentInfo(survivingOwner) });
+      console.error(`\x1b[31m❌ Daemon restart blocked: ${diagnostic}\x1b[0m`);
+      return { success: false, meta: null, attempt, blockedPid: survivingOwner, diagnostic };
+    }
+
     // (c) Start new daemon
-    startDetachedDaemon();
+    startDaemon();
 
     // (d) Wait for new daemon to respond with correct version
-    const meta = await waitForDaemonHealth(5000);
+    const meta = await waitHealth(5000);
     if (meta && meta.version === pkg.version) {
       const hasCapabilities = requiredCapabilities.every(c => (meta.capabilities || []).includes(c));
       if (hasCapabilities || requiredCapabilities.length === 0) {
@@ -711,6 +748,10 @@ async function ensureDaemonRunning(options = {}) {
   const getMeta = options._getDaemonMeta || getDaemonMeta;
   const fetchAuth = options._fetchWithAuth || fetchWithAuth;
   const doRestart = options._restartDaemonGraceful || restartDaemonGraceful;
+  const portOwner = options._findPortOwnerPid || findPortOwnerPid;
+  const readFailureMarker = options._readRestartFailureMarker || readRestartFailureMarker;
+  const writeFailureMarker = options._writeRestartFailureMarker || writeRestartFailureMarker;
+  const clearFailureMarker = options._clearRestartFailureMarker || clearRestartFailureMarker;
   const probe = options._probe || {};
   const attempts = probe.attempts || 3;
   const backoffMs = probe.backoffMs == null ? 200 : probe.backoffMs;
@@ -749,6 +790,21 @@ async function ensureDaemonRunning(options = {}) {
     return; // healthy + correct version + all capabilities → leave the daemon alone (#567)
   }
 
+  // telepty#15: a restart blocked by a daemon the CLI cannot stop (foreign parent
+  // app, EPERM) used to re-warn and re-fail on EVERY command. After warning once,
+  // an identical blocked state (same versions + same blocking pid) stays silent —
+  // sessions keep working through the old daemon — until the signature changes
+  // (daemon upgraded/killed, parent restarted) or a restart succeeds.
+  let signature = null;
+  if (decision.action === 'restart') {
+    const ownerPid = portOwner(Number(PORT));
+    signature = `${decision.reason}:${meta && meta.version ? meta.version : 'none'}->${pkg.version}:pid${ownerPid || 0}`;
+    const marker = readFailureMarker();
+    if (marker && marker.signature === signature) {
+      return; // already warned for exactly this blocked state — stay quiet
+    }
+  }
+
   // stderr (not stdout): banner must not contaminate `telepty list --json` (task #400, telepty#15)
   if (decision.action === 'restart' && decision.reason.startsWith('version-')) {
     process.stderr.write(`\x1b[33m⚙️ Daemon version mismatch (running v${meta.version}, installed v${pkg.version}). Restarting...\x1b[0m\n`);
@@ -759,7 +815,16 @@ async function ensureDaemonRunning(options = {}) {
   } else {
     process.stderr.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
   }
-  await doRestart({ requiredCapabilities });
+  const result = await doRestart({ requiredCapabilities });
+  if (signature && result && result.success === false && result.blockedPid) {
+    writeFailureMarker({
+      signature: `${decision.reason}:${meta && meta.version ? meta.version : 'none'}->${pkg.version}:pid${result.blockedPid}`,
+      diagnostic: result.diagnostic || null,
+      warnedAt: new Date().toISOString()
+    });
+  } else if (result && result.success) {
+    clearFailureMarker();
+  }
 }
 
 async function manageInteractiveAttach(sessionId, targetHost) {
@@ -3912,4 +3977,6 @@ module.exports = {
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
   helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
+  formatDaemonStopDiagnostic, // telepty#15: actionable can't-stop-daemon diagnostic (pure)
+  restartDaemonGraceful,  // telepty#15: injectable seams for the blocked-restart fail-fast path
 };

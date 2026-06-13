@@ -14,6 +14,19 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   address and a one-line exposure hint. SSH-tunnel peers (`telepty connect`) and the #42 broker
   node mode (outbound-only) are unaffected.
 
+### Fixed — blocked daemon restarts: actionable diagnostic, no per-command noise (#15)
+
+- When the running daemon cannot be stopped (no `daemon-state.json`, owned by a parent app such as
+  an aterm bundle, EPERM), the CLI used to retry the restart **3 times with backoff and repeat the
+  full mismatch + failure banner on every command**, even though sessions kept working. Now: the
+  discovery chain (state file → process-title scan → port-owner via `lsof`/`Get-NetTCPConnection`)
+  is checked once — if the port owner survives cleanup, the restart **fails fast** with one
+  actionable diagnostic naming the parent process (`Daemon (PID X) is owned by parent Y (pid Z) —
+  restart that app … or run: kill X && telepty daemon`), discovered via new
+  `findParentProcessInfo` (PPID lookup). An identical blocked state (same versions + blocking pid)
+  warns **once** and is then silent (`~/.telepty/restart-failure.json` marker) until the state
+  changes or a restart succeeds.
+
 ### Fixed — `--help` is now always safe on payload subcommands (#51)
 
 - `telepty broadcast --help` used to **broadcast the literal string `--help` to every active

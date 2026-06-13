@@ -275,6 +275,85 @@ function probeTeleptyOnPort(port, opts) {
   });
 }
 
+// telepty#15: identify who launched a daemon we cannot stop (e.g. an older
+// daemon bundled inside a parent app such as aterm), so the CLI can print an
+// actionable diagnostic instead of retrying blindly. Returns
+// { ppid, command } for `pid`'s parent, or null when it cannot be resolved.
+function findParentProcessInfo(pid, opts) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const o = opts || {};
+  const platform = o.platform || process.platform;
+  const exec = o.execSync || execSync;
+
+  try {
+    if (platform === 'win32') {
+      const script =
+        `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; ` +
+        `if ($p) { $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.ParentProcessId)"; ` +
+        `"$($p.ParentProcessId)|$(if ($pp) { $pp.Name } else { '' })" }`;
+      const output = String(exec(`powershell.exe -NoProfile -Command "${script}"`, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      })).trim();
+      if (!output) return null;
+      const [ppidRaw, name] = output.split('|');
+      const ppid = Number(ppidRaw);
+      if (!Number.isInteger(ppid) || ppid <= 0) return null;
+      return { ppid, command: (name || '').trim() || null };
+    }
+
+    const ppidRaw = String(exec(`ps -p ${pid} -o ppid=`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    })).trim();
+    const ppid = Number(ppidRaw);
+    if (!Number.isInteger(ppid) || ppid <= 0) return null;
+    const command = String(exec(`ps -p ${ppid} -o comm=`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    })).trim() || null;
+    return { ppid, command };
+  } catch {
+    return null;
+  }
+}
+
+// telepty#15: once-per-mismatch warning marker. A daemon the CLI cannot stop
+// (foreign-owned port, EPERM, parent respawns it) used to produce the full
+// mismatch + 3-retries + failure banner on EVERY command. The CLI records the
+// blocked state's signature here after warning once; identical signatures are
+// then silent until the blocking pid / version pair changes or a restart
+// succeeds. `opts.file` is an injectable path so tests never touch ~/.telepty.
+const RESTART_FAILURE_FILE = path.join(TELEPTY_DIR, 'restart-failure.json');
+
+function readRestartFailureMarker(opts) {
+  const file = (opts && opts.file) || RESTART_FAILURE_FILE;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeRestartFailureMarker(marker, opts) {
+  const file = (opts && opts.file) || RESTART_FAILURE_FILE;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, JSON.stringify(marker, null, 2), { mode: 0o600 });
+  } catch {
+    // Best-effort: losing the marker only means a repeated warning, never a failure.
+  }
+}
+
+function clearRestartFailureMarker(opts) {
+  const file = (opts && opts.file) || RESTART_FAILURE_FILE;
+  try {
+    fs.rmSync(file, { force: true });
+  } catch {
+    // Best-effort (see writeRestartFailureMarker).
+  }
+}
+
 // Confirm via local process scan that `pid`'s command line looks like a
 // telepty daemon (fallback when HTTP probe fails — daemon may be stuck).
 function pidMatchesTeleptyCmdline(pid) {
@@ -343,11 +422,15 @@ module.exports = {
   claimDaemonState,
   cleanupDaemonProcesses,
   clearDaemonState,
+  clearRestartFailureMarker,
+  findParentProcessInfo,
   findPortOwnerPid,
   isLikelyTeleptyDaemon,
   isProcessRunning,
   listDaemonProcesses,
   pidMatchesTeleptyCmdline,
   probeTeleptyOnPort,
-  readDaemonState
+  readDaemonState,
+  readRestartFailureMarker,
+  writeRestartFailureMarker
 };
