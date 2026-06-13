@@ -1173,6 +1173,53 @@ async function main() {
     return;
   }
 
+  if (cmd === 'uninstall') {
+    // telepty#49: stop the daemon, unload+remove the launchd plist (macOS), and
+    // report the state dirs. User data is KEPT by default — deleted only with
+    // --purge. --dry-run prints what would happen without touching anything.
+    const purge = args.includes('--purge');
+    const dryRun = args.includes('--dry-run');
+    const { runUninstall } = require('./src/uninstall');
+    const result = runUninstall({ purge, dryRun });
+    const would = dryRun ? 'Would ' : '';
+
+    if (dryRun) {
+      console.log('🔎 Dry run — nothing was stopped, unloaded, or deleted.');
+      console.log(`${would}stop any running telepty daemons (state file → process scan → port owner).`);
+    } else {
+      console.log(`Stopped ${result.stopped.length} telepty daemon(s).`);
+      if (result.failed.length > 0) {
+        console.log(`⚠️ Failed to stop ${result.failed.length} daemon(s) — run "telepty cleanup-daemons" or kill them manually.`);
+      }
+    }
+
+    for (const plist of result.plists) {
+      if (!plist.existed) continue;
+      if (dryRun) {
+        console.log(`${would}unload and remove launchd service: ${plist.path}`);
+      } else {
+        console.log(`Launchd service ${plist.removed ? 'unloaded and removed' : (plist.unloaded ? 'unloaded (file not removed)' : 'removal attempted')}: ${plist.path}`);
+      }
+    }
+
+    const existingDirs = result.stateDirs.filter((d) => d.exists);
+    if (purge) {
+      for (const dir of existingDirs) {
+        console.log(dryRun ? `${would}delete state directory: ${dir.path}` : `${dir.purged ? 'Deleted' : '⚠️ Failed to delete'} state directory: ${dir.path}`);
+      }
+    } else if (existingDirs.length > 0) {
+      console.log('State directories kept (user data — delete with `telepty uninstall --purge`):');
+      for (const dir of existingDirs) {
+        console.log(`  - ${dir.path}`);
+      }
+    }
+
+    if (!dryRun) {
+      console.log('\nNow remove the package: npm rm -g @dmsdc-ai/aigentry-telepty');
+    }
+    return;
+  }
+
   if (cmd === 'cleanup-daemons') {
     const results = cleanupDaemonProcesses();
     console.log(`Stopped ${results.stopped.length} telepty daemon(s).`);
@@ -3941,6 +3988,7 @@ Discuss the following topic from your project's perspective. Engage with other s
 
 \x1b[1mOther:\x1b[0m
   telepty update                                 Update to latest version
+  telepty uninstall [--purge] [--dry-run]        Stop daemon + unload service; keep user data unless --purge
   telepty layout [grid|tall|stack]               Arrange terminal windows
   telepty status-report --phase <p> [options]    Emit structured status event
 

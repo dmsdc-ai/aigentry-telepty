@@ -14,6 +14,17 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   address and a one-line exposure hint. SSH-tunnel peers (`telepty connect`) and the #42 broker
   node mode (outbound-only) are unaffected.
 
+### Added — `telepty uninstall` + npm preuninstall hook (#49)
+
+- **`telepty uninstall [--purge] [--dry-run]`**: stops running daemons (full discovery chain),
+  unloads **and removes** the launchd plists (`com.aigentry.telepty`, `com.aigentry.telepty-broker`)
+  on macOS, and reports the 3 state directories (`~/.telepty`, `~/.aigentry`,
+  `~/.config/aigentry-telepty`). **User data is kept by default** — the paths are printed; deletion
+  requires the explicit `--purge`. `--dry-run` reports without touching anything.
+- **npm `preuninstall` hook**: daemon stop + plist unload only, quietly; it can never fail (a broken
+  hook would break `npm rm` itself). Note: npm 7+ no longer executes uninstall lifecycle scripts —
+  the reliable path is running `telepty uninstall` before `npm rm -g`.
+
 ### Fixed — blocked daemon restarts: actionable diagnostic, no per-command noise (#15)
 
 - When the running daemon cannot be stopped (no `daemon-state.json`, owned by a parent app such as
