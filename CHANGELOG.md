@@ -2,6 +2,34 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.6.5] - 2026-06-13
+
+### Fixed — orchestrator REPORT loss: hold-and-redeliver queued injects until idle (#617)
+
+- **A REPORT injected into a busy orchestrator TUI is no longer lost.** When `inject --submit`
+  is classified `queued` (consumed=false, recipient busy), the daemon now watches the
+  recipient's auto-state and **re-fires the CR when it transitions to idle** — bounded
+  (`MAX_REDELIVER=3` + total-time deadline; never an unbounded loop), and never-double-deliver
+  (re-fires only while the body is still parked, gated by the #615 consumption check before
+  AND after idle). Detached fire-and-forget; kill-switch `TELEPTY_REDELIVER=off`. Closes the
+  "`Submitted via pty_cr` succeeds but the busy recipient never starts a new turn" gap that
+  forced manual pull-fallback in every orchestration wave.
+
+### Fixed — TASK_IDLE_UNCONFIRMED cry-wolf on long-running Claude turns (#619, telepty#54)
+
+- **A genuinely-completed long Claude TUI turn no longer reports `TASK_IDLE_UNCONFIRMED`.**
+  Consumption is an EARLY event (the turn fires ~T+2s after inject) but the #52/#545 idle-gate
+  evaluated it LATE (at idle, often 13–23 min later) by re-deriving from the output-ring /
+  OSC133 marks — by then a long turn's injected body has scrolled off and no fresh REPL-done
+  mark remains, so the gate fell back to UNCONFIRMED on every long completion (cry-wolf, which
+  trains the orchestrator to ignore the signal and defeats #52's own safety purpose). The
+  daemon now **persists the consumption fact at consumption-time** (`maybeRecordInjectConsumption()`
+  records `injectConsumedAt` on the first genuine non-busy→working/thinking turn after the CR,
+  reusing the #615 consumed signal) and the idle-gate reads that **decay-proof stored fact**
+  instead of re-deriving from a stale screen. **#52 guarantee preserved — never a false
+  COMPLETE**: the fact is only recorded for a real turn AFTER the CR (startup / sub-state flips
+  and busy-park excluded), so a never-consumed inject still yields UNCONFIRMED.
+
 ## [0.6.4] - 2026-06-13
 
 ### Added — inject consumption-evidence: consumed | queued | unknown (#53)
