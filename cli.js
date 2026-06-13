@@ -1013,9 +1013,70 @@ async function manageInteractive() {
   }
 }
 
+// telepty#51: trailing-payload subcommands (broadcast/multicast/inject/allow) collect
+// free-form text, which swallowed `--help`/`-h` as DATA — `telepty broadcast --help`
+// fanned the literal string out to every active session, and `telepty allow --help`
+// spawned a junk `<dir>---help` session. One shared interceptor (DRY) runs BEFORE each
+// payload parser: a bare `-h`/`--help` appearing before an explicit `--` separator
+// prints the subcommand usage and stops — zero network / fan-out side effects.
+// `telepty <subcommand> -- --help` remains the deliberate way to send the literal text.
+const TRAILING_PAYLOAD_HELP = {
+  allow: [
+    'Usage: telepty allow [--id <session_id>] [--idle-ttl <duration|off>] [--auto-restart] <command> [args...]',
+    '',
+    'Wrap a CLI so other sessions can inject into it. Aliases: enable, wrap.',
+    'Use `--` before the command to pass hyphenated arguments literally:',
+    '  telepty allow -- claude --help'
+  ],
+  inject: [
+    'Usage: telepty inject [--ref [file]] [--from <id>] [--reply-to <id>] [--submit] [--submit-force] [--submit-retry N] <session_id> "<prompt text>"',
+    '',
+    'Inject prompt text into a session. Use `--` before the prompt to send a payload',
+    'that starts with a hyphen: telepty inject my-session -- --help'
+  ],
+  multicast: [
+    'Usage: telepty multicast <id1,id2,...> "<prompt text>"',
+    '',
+    'Inject prompt text into multiple sessions. Use `--` before the prompt to send',
+    'a payload that starts with a hyphen: telepty multicast id1,id2 -- --help'
+  ],
+  broadcast: [
+    'Usage: telepty broadcast [--ref [file]] "<prompt text>"',
+    '',
+    'Inject prompt text into ALL active sessions. Use `--` before the prompt to send',
+    'a payload that starts with a hyphen: telepty broadcast -- --help'
+  ]
+};
+
+// True when a bare `-h`/`--help` token appears before the first `--` separator
+// (everything after `--` is literal payload by universal CLI convention).
+function helpRequested(argv) {
+  for (const arg of argv) {
+    if (arg === '--') return false;
+    if (arg === '--help' || arg === '-h') return true;
+  }
+  return false;
+}
+
+function interceptSubcommandHelp(cmd, argv) {
+  const canonical = (cmd === 'enable' || cmd === 'wrap') ? 'allow' : cmd;
+  const lines = TRAILING_PAYLOAD_HELP[canonical];
+  if (!lines || !helpRequested(argv)) return false;
+  console.log(lines.join('\n'));
+  return true;
+}
+
+// telepty#51 defense-in-depth: even if help interception regresses, broadcast/multicast
+// must never fan out a bare help flag to every session. Literal sends remain possible
+// via the explicit `--` separator (which sets hadSeparator at the call site).
+function isHelpLikePayload(payload) {
+  const text = String(payload || '').trim();
+  return text === '--help' || text === '-h';
+}
+
 async function main() {
   const cmd = args[0];
-  
+
   if (!cmd) {
     return manageInteractive();
   }
@@ -1279,6 +1340,7 @@ async function main() {
   }
 
   if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap') {
+    if (interceptSubcommandHelp(cmd, args.slice(1))) return; // telepty#51: never wrap "--help" as a command
     // Parse arguments: telepty allow [--id <session_id>] <command> [args...]
     // Also supports legacy: telepty allow [--id <session_id>] -- <command> [args...]
     const allowArgs = args.slice(1);
@@ -2046,6 +2108,11 @@ async function main() {
   }
 
   if (cmd === 'inject') {
+    if (interceptSubcommandHelp(cmd, args.slice(1))) return; // telepty#51: help must never become the injected prompt
+    // telepty#51: an explicit `--` separator marks the rest as literal payload
+    // (e.g. `telepty inject my-session -- --help` sends the literal text).
+    const injectSepIndex = args.indexOf('--');
+    if (injectSepIndex !== -1) args.splice(injectSepIndex, 1);
     const { useRef, refFilePath } = parseRefOption(args);
 
     if (args.includes('--no-enter')) {
@@ -2520,8 +2587,19 @@ async function main() {
   }
 
   if (cmd === 'multicast') {
+    if (interceptSubcommandHelp(cmd, args.slice(1))) return; // telepty#51: help must never fan out as data
+    const multicastSepIndex = args.indexOf('--');
+    const multicastHadSeparator = multicastSepIndex !== -1;
+    if (multicastHadSeparator) args.splice(multicastSepIndex, 1);
     const sessionIdsRaw = args[1]; const prompt = args.slice(2).join(' ');
     if (!sessionIdsRaw || !prompt) { console.error('❌ Usage: telepty multicast <id1,id2,...> "<prompt text>"'); process.exit(1); }
+    // telepty#51 defense-in-depth: a payload that is exactly a help flag is almost
+    // certainly a swallowed `--help`, never a real prompt. Refuse unless the caller
+    // opted into the literal send with an explicit `--`.
+    if (!multicastHadSeparator && isHelpLikePayload(prompt)) {
+      console.error('❌ Refusing to multicast a bare help flag. Use `telepty multicast --help` for usage, or `telepty multicast <ids> -- --help` to send the literal text.');
+      process.exit(1);
+    }
     const sessionRefs = sessionIdsRaw.split(',').map(s => s.trim()).filter(s => s);
     try {
       const discovered = await discoverSessions({ silent: true });
@@ -2561,10 +2639,21 @@ async function main() {
   }
 
   if (cmd === 'broadcast') {
+    if (interceptSubcommandHelp(cmd, args.slice(1))) return; // telepty#51: help must never fan out to every session
+    const broadcastSepIndex = args.indexOf('--');
+    const broadcastHadSeparator = broadcastSepIndex !== -1;
+    if (broadcastHadSeparator) args.splice(broadcastSepIndex, 1);
     const { useRef, refFilePath } = parseRefOption(args);
 
     const prompt = args.slice(1).join(' ');
     if (!prompt && !refFilePath) { console.error('❌ Usage: telepty broadcast [--ref [file]] "<prompt text>"'); process.exit(1); }
+    // telepty#51 defense-in-depth: a payload that is exactly a help flag is almost
+    // certainly a swallowed `--help`, never a real prompt. Refuse unless the caller
+    // opted into the literal send with an explicit `--`.
+    if (!broadcastHadSeparator && isHelpLikePayload(prompt)) {
+      console.error('❌ Refusing to broadcast a bare help flag to every session. Use `telepty broadcast --help` for usage, or `telepty broadcast -- --help` to send the literal text.');
+      process.exit(1);
+    }
     try {
       const discovered = await discoverSessions({ silent: true });
       const aggregate = { successful: [], failed: [] };
@@ -3821,4 +3910,6 @@ module.exports = {
   sanitizePathArg,        // #26: path-arg validation/normalization
   decideDaemonAction,     // #567: pure restart-decision policy (meta-primary; no I/O)
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
+  helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
+  isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
 };
