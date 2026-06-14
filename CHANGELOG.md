@@ -2,6 +2,40 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [0.6.6] - 2026-06-14
+
+### Fixed — duplicate same-id `allow` flap loop + `kill` doesn't stick (#56)
+
+- **A second `telepty allow --id <X>` no longer makes the session undeliverable-to.** Previously a
+  duplicate wrap-owner caused the daemon to oscillate between owners (`Total: 1 ↔ 2`, repeated
+  "Replacing stale ownerWs"), so the session never stayed `ready for inject` and **injects were
+  silently dropped**. The daemon now does a **durable last-writer-wins Replace**: the displaced
+  owner is closed with a dedicated **`4001 'Owner replaced'`** code (reason-independent — a bare
+  terminate delivered an empty reason that the bridge mis-read as a reconnect), and the CLI treats
+  `4001` as a clean exit with **no reconnect**. The `1000 'Session destroyed'` path is untouched;
+  the `#536` owner-token guard still suppresses the displaced bridge's stale-token DELETE (no
+  shared-fate cascade). Total settles at 1.
+- **`telepty kill --force` now sticks.** The owning wrap-owner PID is captured at `?owner=1` claim
+  time (previously only set on reconnect-register, so a first-connect owner had a null pid and could
+  re-register after a kill). Combined with the durable Replace, a killed session no longer respawns.
+  Cross-platform (`taskkill /T /F` on Windows).
+
+### Added — daemon lifecycle: `daemon start` (detached) / `stop` / `restart` (#55)
+
+- **`telepty daemon` is no longer foreground-only.** Previously the `daemon` command ignored its
+  subcommand argument and always started a foreground daemon (so `daemon stop` actually *started*
+  one, and there was no `restart`). Now:
+  - **`telepty daemon start`** — starts the daemon **detached/background** and returns control to the
+    shell immediately (prints pid + listen URL). Fixes one-command install/automation flows.
+  - **`telepty daemon stop`** — terminates the daemon process (SIGTERM → SIGKILL) and frees the port.
+    **Surgical**: it targets only the state-file pid / configured-port owner and force-disables the
+    system-wide process scan, so it can **never reap an unrelated telepty daemon**.
+  - **`telepty daemon restart`** — stop + detached start (a cross-platform restart; replaces the
+    mac-only `launchctl kickstart` and gives Windows a restart it never had).
+  - Bare `telepty daemon` keeps its foreground behavior (install/launchd flows depend on it); the
+    internal version-mismatch auto-restart (`ensureDaemonRunning`) is unchanged. `telepty allow`
+    (session bridges) stays foreground by design.
+
 ## [0.6.5] - 2026-06-13
 
 ### Fixed — orchestrator REPORT loss: hold-and-redeliver queued injects until idle (#617)
