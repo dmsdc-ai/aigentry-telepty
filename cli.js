@@ -580,6 +580,15 @@ function isDaemonDestroyClose(code, reason) {
   return code === 1000 && reasonText === 'Session destroyed';
 }
 
+// telepty#56: a dedicated 4001 close means the daemon deterministically replaced this wrap-owner
+// with a newer ?owner=1 claim (durable last-writer-wins). The displaced bridge must EXIT, not
+// reconnect — reconnecting would re-contend for the id and oscillate (Total flaps 1<->2). The code
+// is the discriminator (not the reason): a half-open socket may never deliver the close reason.
+// Pure predicate, exposed for unit-testing.
+function isOwnerReplacedClose(code) {
+  return code === 4001;
+}
+
 function runUpdateInstall() {
   if (process.env.TELEPTY_SKIP_PACKAGE_UPDATE === '1') {
     return;
@@ -1769,7 +1778,9 @@ async function main() {
     // Connect to daemon WebSocket with auto-reconnect
     // owner=1 tells daemon this is the allow bridge (owner), not an attach viewer.
     // Daemon uses this to reclaim ownership even if a stale ownerWs is still registered.
-    const wsUrl = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}&owner=1`;
+    // telepty#56: owner_pid lets the daemon record this bridge's PID at claim time so
+    // `kill --force` can SIGKILL the owning process (kill-stick), independent of register timing.
+    const wsUrl = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}&owner=1&owner_pid=${process.pid}`;
     let daemonWs = null;
     let wsReady = false;
     let reconnectAttempts = 0;
@@ -1884,6 +1895,16 @@ async function main() {
         // GC. Daemon restarts / network drops use other codes (e.g. 1006) and still reconnect,
         // preserving the #487/#488 survive-and-reattach guarantee.
         if (isDaemonDestroyClose(code, reason)) {
+          if (closeAllowSession()) {
+            exitAllowSession(0);
+          }
+          return;
+        }
+        // #56: the daemon replaced this owner with a newer ?owner=1 claim (close 4001). Exit
+        // cleanly without reconnecting — reconnecting re-contends and oscillates. The teardown
+        // DELETE carries our now-stale ownerToken and is suppressed by the daemon's #536 guard,
+        // so the live new owner is not torn down (no shared-fate cascade).
+        if (isOwnerReplacedClose(code)) {
           if (closeAllowSession()) {
             exitAllowSession(0);
           }
@@ -4034,6 +4055,7 @@ if (require.main === module) {
 module.exports = {
   classifyBackend,        // #29: TERM_PROGRAM/CMUX/kitty → backend string
   isDaemonDestroyClose,   // #17 OQ-2: 1000 'Session destroyed' → terminate-not-reconnect
+  isOwnerReplacedClose,   // #56: 4001 'Owner replaced' → exit-not-reconnect (durable Replace)
   sanitizePathArg,        // #26: path-arg validation/normalization
   decideDaemonAction,     // #567: pure restart-decision policy (meta-primary; no I/O)
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)

@@ -57,6 +57,22 @@ COLUMNS=120 LINES=40 telepty allow --id headless-session claude
 | `TELEPTY_SESSION_ID` | The session ID you specified |
 | `TELEPTY_AVAILABLE` | `true` |
 
+### Duplicate `--id` is last-writer-wins (deterministic replace)
+
+Running `telepty allow --id <X> …` again for an id that already has a live wrap-owner
+**deterministically replaces** the old owner (last-writer-wins): the newer allow takes over the id,
+and the **older bridge exits** (close code `4001 'Owner replaced'` — it does not reconnect). The
+session stays continuously `ready for inject`; there is no owner flap and no dropped injects.
+
+This is the intended path for a clean restart (e.g. `orchestrator-boot.sh` kill-9s a stale bridge
+then re-`allow`s). You do not need to `kill` the old session first — the new `allow` reclaims it.
+
+### kill stops the owning process (kill sticks)
+
+`telepty kill <X> --force` terminates the **owning wrap-owner process**, not just the session
+record. The owner's PID is captured when the bridge claims the id, so `--force` SIGKILLs it
+(cross-platform: `taskkill /T /F` on Windows). A killed session does not silently re-register.
+
 ### Aliases
 
 `telepty enable` and `telepty wrap` are aliases for `telepty allow`.

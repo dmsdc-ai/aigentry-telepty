@@ -103,11 +103,31 @@ function installWebSocketTransport(deps) {
     if (activeSession.type === 'wrapped' && (!activeSession.ownerWs || isOwnerConnect)) {
       const hadDisconnectedOwner = !isOpenWebSocket(activeSession.ownerWs) && activeSession.lastDisconnectedAt;
       if (isOwnerConnect && activeSession.ownerWs && activeSession.ownerWs !== ws) {
-        // Terminate the stale owner connection before claiming ownership
+        // telepty#56 (durable last-writer-wins Replace): close the displaced owner with the
+        // dedicated terminal code 4001 'Owner replaced' instead of a bare terminate(). A
+        // terminate() is an abnormal 1006 close, which a bridge reads as a transient drop and
+        // RECONNECTS — re-contending for the id and oscillating forever (Total flaps 1<->2,
+        // injects dropped). 4001 is reason-independent (WS 4000-4999 = app-reserved), so the
+        // displaced bridge exits without reconnecting even when the close reason is lost on a
+        // half-open TCP socket. The session RECORD survives under the new owner; no shared-fate
+        // cascade — the displaced bridge's now-stale ownerToken is suppressed by the #536 DELETE
+        // guard. A fallback terminate() reaps a half-open socket that never ACKs the close.
         console.log(`[WS] Replacing stale ownerWs for session ${sessionId}`);
-        activeSession.ownerWs.terminate();
+        const displaced = activeSession.ownerWs;
+        try { displaced.close(4001, 'Owner replaced'); } catch {}
+        setTimeout(() => {
+          if (displaced.readyState !== 3) { try { displaced.terminate(); } catch {} }
+        }, 1000);
       }
       activeSession.ownerWs = ws;
+      // telepty#56 (kill-stick): capture the owner PID at claim time. The reconnect-register POST
+      // only carries owner_pid on reconnect, so a first-connect owner would otherwise have a null
+      // ownerPid and `kill --force` could not SIGKILL the owning process. The bridge passes its pid
+      // on the ?owner=1 URL; record it so the kill path always has a process to signal.
+      const claimOwnerPid = Number(url.searchParams.get('owner_pid'));
+      if (Number.isInteger(claimOwnerPid) && claimOwnerPid > 0) {
+        activeSession.ownerPid = claimOwnerPid;
+      }
       // BUG-C: mint a fresh per-owner token on every claim/reclaim and push it to this owner.
       // The token is the exact "are-you-the-current-owner" discriminator the DELETE guard uses
       // to suppress a stale/displaced owner's teardown (shared-fate fix). Reclaim refreshes it,
