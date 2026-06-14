@@ -417,10 +417,32 @@ function cleanupDaemonProcesses(opts) {
   return { stopped, failed };
 }
 
+// telepty#55: user-facing `telepty daemon stop`. Unlike cleanupDaemonProcesses
+// (which ALSO sweeps the whole process table for ANY telepty daemon — the right
+// behavior for `cleanup-daemons` and internal repair), stop must be SURGICAL: it
+// targets only the daemon THIS CLI is configured for — the state-file pid and the
+// owner of the configured port (default 3848). It never blind-scans the process
+// table, so it can never reap an unrelated telepty daemon (e.g. another node's
+// daemon on a different port). This mirrors the #44/#15 survivor-detection surface
+// (state-file pid + port owner) and reuses cleanupDaemonProcesses' graceful
+// SIGTERM→SIGKILL kill path + stale-state cleanup with the global scan disabled.
+function stopDaemon(opts) {
+  const o = opts || {};
+  return cleanupDaemonProcesses({
+    ...o,
+    port: Number.isInteger(o.port) && o.port > 0 ? o.port : 3848,
+    // Force-disable the system-wide process scan unconditionally (never honor a
+    // caller-provided one) — this is the surgical guarantee: stop reaps only the
+    // state-file pid and the configured port's owner, never a table sweep.
+    listDaemonProcesses: () => []
+  });
+}
+
 module.exports = {
   DAEMON_STATE_FILE,
   claimDaemonState,
   cleanupDaemonProcesses,
+  stopDaemon,
   clearDaemonState,
   clearRestartFailureMarker,
   findParentProcessInfo,

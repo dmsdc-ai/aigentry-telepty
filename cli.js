@@ -18,6 +18,7 @@ const {
   findPortOwnerPid,
   readDaemonState,
   readRestartFailureMarker,
+  stopDaemon,
   writeRestartFailureMarker
 } = require('./daemon-control');
 const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
@@ -428,6 +429,7 @@ function startDetachedDaemon() {
     stdio: 'ignore'
   });
   cp.unref();
+  return cp;
 }
 
 async function waitForDaemonHealth(maxMs = 5000) {
@@ -1240,6 +1242,58 @@ async function main() {
   }
 
   if (cmd === 'daemon') {
+    // telepty#55: real daemon-lifecycle surface. Pre-0.6.6 this block ignored
+    // args[1] entirely and ALWAYS started a foreground daemon — so `daemon start`
+    // blocked the shell, `daemon stop` actually STARTED a daemon, and `restart`
+    // didn't exist. We now parse the subcommand; bare `telepty daemon` keeps the
+    // foreground behavior for back-compat (install/launchd flows depend on it).
+    const sub = args[1];
+
+    if (sub === 'start') {
+      // Detached/background start: return control to the shell immediately
+      // (cross-platform spawn with detached + stdio:'ignore' + unref). The child
+      // IS the daemon process, so cp.pid is the daemon's pid.
+      const cp = startDetachedDaemon();
+      console.log(`\x1b[32m✅ Telepty daemon started (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
+      return;
+    }
+
+    if (sub === 'stop') {
+      // Terminate the running daemon (state-file pid + configured-port owner),
+      // graceful SIGTERM→SIGKILL. Surgical: never a system-wide process sweep
+      // (that's `cleanup-daemons`). Internal auto-restart is untouched.
+      const results = stopDaemon({ port: Number(PORT) });
+      if (results.stopped.length === 0 && results.failed.length === 0) {
+        console.log('No telepty daemon running.');
+      } else {
+        if (results.stopped.length > 0) {
+          console.log(`\x1b[32m✅ Stopped telepty daemon (${results.stopped.map((d) => `pid ${d.pid}`).join(', ')}).\x1b[0m`);
+        }
+        if (results.failed.length > 0) {
+          console.error(`\x1b[31m❌ Failed to stop ${results.failed.length} daemon process(es): ${results.failed.map((d) => `pid ${d.pid}`).join(', ')}.\x1b[0m`);
+          process.exitCode = 1;
+        }
+      }
+      return;
+    }
+
+    if (sub === 'restart') {
+      // Clean cross-platform restart = surgical stop + detached start. Replaces
+      // the mac-only `launchctl kickstart` and gives Windows a restart it never
+      // had. Internal auto-restart (ensureDaemonRunning) is NOT touched.
+      stopDaemon({ port: Number(PORT) });
+      const cp = startDetachedDaemon();
+      console.log(`\x1b[32m✅ Telepty daemon restarted (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
+      return;
+    }
+
+    if (sub) {
+      console.error('❌ Usage: telepty daemon [start|stop|restart]');
+      process.exit(1);
+    }
+
+    // Bare `telepty daemon` — FOREGROUND (back-compat: install/launchd flows run
+    // this and expect a blocking process). `daemon start` is the detached path.
     console.log('Starting telepty daemon...');
     // daemon.js binds the port only when launched as the daemon. The CLI reaches
     // it via require() (not as require.main), so signal intent explicitly — tests
@@ -3979,7 +4033,8 @@ Discuss the following topic from your project's perspective. Engage with other s
 \x1b[1mtelepty\x1b[0m — Connect any terminal to any terminal, any machine.
 
 \x1b[1mSession Management:\x1b[0m
-  telepty daemon                                 Start the background daemon (port 3848)
+  telepty daemon                                 Start the daemon in the foreground (port 3848)
+  telepty daemon start|stop|restart              Start (detached) / stop / restart the background daemon
   telepty spawn --id <id> <command> [args...]    Spawn a new background session
   telepty allow [--id <id>] [--idle-ttl 1h|off] [--auto-restart] <command> [args...]  Wrap a CLI for remote control
   telepty list [--json]                          List sessions (local + Tailnet)

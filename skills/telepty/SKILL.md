@@ -10,8 +10,9 @@ telepty is a PTY multiplexer and session orchestrator. It creates, connects, and
 ## Quick Start
 
 ```bash
-# Start daemon
-telepty daemon
+# Start daemon in the background (detached; returns the shell immediately)
+telepty daemon start
+# (bare `telepty daemon` runs it in the FOREGROUND — used by install/launchd)
 
 # Create a session wrapping Claude Code
 telepty allow --id my-session claude
@@ -45,7 +46,7 @@ telepty tui
 
 - For humans: prefer natural-language examples and TUI, then raw CLI commands
 - For AI agents: use raw `telepty` commands directly for execution
-- When daemon is broken: repair first with `telepty cleanup-daemons && telepty daemon`
+- When daemon is broken: repair first with `telepty cleanup-daemons && telepty daemon start` (or `telepty daemon restart`)
 
 ## Related Skills
 
