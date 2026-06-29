@@ -2,7 +2,7 @@
 
 **Connect any terminal to any terminal, any machine.**
 
-telepty is a lightweight PTY multiplexer and session bridge. It lets you spawn, attach to, and inject commands into terminal sessions — locally or across machines via Tailscale.
+telepty is a PTY orchestration daemon and session bridge for AI CLI workflows. It lets you spawn, attach to, and inject commands into terminal sessions — locally or across machines via Tailscale.
 
 Built for AI CLI workflows (Claude Code, Codex, Gemini CLI), but works with any interactive terminal program.
 
@@ -42,6 +42,43 @@ telepty attach my-session
 # 6. Broadcast to all sessions
 telepty broadcast "status report"
 ```
+
+## What telepty is — and what it is not
+
+telepty is a **PTY orchestration daemon for AI CLI workflows**.
+It is **not** a terminal multiplexer and does not replace tmux.
+
+> **tmux is better at being a terminal. telepty is better at letting
+> software operate many terminals.**
+
+tmux owns terminal *fidelity*: panes, windows, full VT emulation, scrollback,
+copy-mode, capture-pane, local Unix-socket operation, zero runtime deps.
+telepty owns *automation*: HTTP/WS APIs, authenticated remote access,
+readiness-aware inject/submit, event streams, cross-machine session control.
+
+## telepty vs tmux
+
+| Area | tmux | telepty |
+|---|---|---|
+| Core layer | terminal multiplexer + emulator | PTY orchestration daemon |
+| Primary user | a human at a keyboard | software / an orchestrator |
+| Terminal fidelity | full VT/grid/scrollback/copy-mode | output stream + heuristic state |
+| IPC | local Unix socket | HTTP/WS/REST daemon (:3848) |
+| Input model | open-loop `send-keys` | readiness-gated inject/submit |
+| Multi-session fan-out | `synchronize-panes` (1 window, 1 host) | broadcast/multicast (cross-machine) |
+| Remote | via SSH | native daemon HTTP, no sshd |
+| Dependencies | zero runtime deps (C) | Node daemon + deps |
+
+## When to use which
+- **Use tmux** for panes, scrollback, copy-mode, capture-pane, and local
+  human terminal work — telepty does none of this and doesn't try to.
+- **Use telepty** when software needs to spawn, inspect, inject into, and
+  track many AI-CLI sessions over an API — across machines.
+
+## Limitations (honest)
+- No terminal emulation: no cell grid, cursor model, or copy-mode. Screen
+  reads are buffered bytes + heuristic state, not a ground-truth screen.
+- Requires a background daemon and a network port (:3848, auth-gated).
 
 ## Core Commands
 
