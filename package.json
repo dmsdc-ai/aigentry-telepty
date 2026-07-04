@@ -60,7 +60,7 @@
     "tailscale"
   ],
   "author": "dmsdc-ai",
-  "license": "ISC",
+  "license": "MIT",
   "description": "Universal terminal session bridge — connect any terminal to any terminal, any machine",
   "repository": {
     "type": "git",
