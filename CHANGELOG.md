@@ -4,6 +4,11 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-07-05
+
+### Fixed
+- **#679 M1 (PRIMARY):** claude prompt-symbol matcher now accepts the Windows/ConPTY ASCII `>` caret (0x3E) in addition to `❯` (U+276F). On Windows the caret renders as `>` (live hexdump: `❯` 0×), so the `❯`-only matcher never fired → `bootstrap_ready` never flipped → gated injects parked in the mailbox `pending` forever and never reached the PTY. The `─`-adjacency guard is preserved (a `> markdown blockquote` is still rejected). Fixes gated cross-machine inject to Windows.
+
 ## [0.6.10] - 2026-07-05
 
 ### Added — seamless cross-machine on Tailscale (auto bind + auto trust) (#672)
