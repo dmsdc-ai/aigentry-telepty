@@ -31,6 +31,17 @@ beforeEach(async () => {
   harness = await startTestDaemon({
     env: {
       TELEPTY_STATE_IDLE_TIMEOUT_MS: '300', // fast idle for tests
+      // #577 CI-flake fix: shrink the idle-unconfirmed settle debounce (default 5s,
+      // daemon.js IDLE_UNCONFIRMED_SETTLE_SECONDS) the same way TELEPTY_STATE_IDLE_TIMEOUT_MS
+      // shrinks the idle timeout for tests. Without it the idle→TASK_IDLE_NO_REPORT emit is
+      // bimodal (~1s confirmed vs a settle-debounced path). The settle path can RE-ARM up to
+      // IDLE_UNCONFIRMED_CPU_MAX_REARMS (24) times, each waiting one settle window, when the
+      // wrapped child's CPU sampling reads as advancing under a contended CI runner — so the
+      // worst-case emit is ~= 24 × settleMs. At 100ms that tail is bounded to ~2.4s (was 7.2s
+      // at 300ms — which is what timed out macOS at 8.1s), keeping total emit well under the
+      // budget below. Can't zero the rearm caps from env (daemon uses `Number(x) || 24`, so
+      // '0' → 24); shrinking the window is the clean lever. Idle path still genuinely exercised.
+      TELEPTY_IDLE_UNCONFIRMED_SETTLE_SECONDS: '0.1',
       // Register the fixture orchestrator sids so orchestrator→worker injects
       // classify as orch-lane (allowed), not peer-lane-blocked (#533 Phase 2).
       AIGENTRY_ORCHESTRATOR_SIDS: `orchestrator aigentry-orchestrator-claude ${ORCH} ${ORCH2}`,
@@ -366,8 +377,11 @@ test('Legacy TASK_COMPLETE text is still emitted for back-compat', async () => {
   });
 
   // Wait for idle (TELEPTY_STATE_IDLE_TIMEOUT_MS=300ms set in beforeEach)
+  // #577: 10000ms budget. With the shrunk settle above the daemon's bounded worst-case emit is
+  // ~detect(1-2s) + settle-rearms(3×0.1) + cpu-rearms(24×0.1) ≈ 4.5s; 10s covers that plus
+  // headroom for 1000ms state poll-tick scheduling jitter on a loaded CI runner (was 4000/8000).
   await waitFor(() => messages.some(m => m.type === 'TASK_IDLE_NO_REPORT'), {
-    timeoutMs: 4000,
+    timeoutMs: 10000,
     description: 'TASK_IDLE_NO_REPORT bus event'
   });
 

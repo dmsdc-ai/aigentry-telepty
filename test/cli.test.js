@@ -597,6 +597,20 @@ test('telepty allow inject submits once without exposing routing metadata', asyn
       description: 'allow bridge ready'
     });
 
+    // #577 CI-flake fix: the local "Inject allowed." banner does not guarantee the daemon-side
+    // owner WebSocket is connected yet. Injecting immediately raced ahead of it and returned 503
+    // DISCONNECTED on slow CI (ubuntu). Gate on the daemon reporting the session owner CONNECTED
+    // (healthStatus === 'CONNECTED' <=> isOpenWebSocket(ownerWs) — the exact predicate the inject
+    // endpoint checks) before POSTing, mirroring the sibling test's /api/sessions readiness gate.
+    await waitFor(async () => {
+      const list = await harness.request('/api/sessions');
+      return Array.isArray(list.body)
+        && list.body.some((session) => session.id === sessionId && session.healthStatus === 'CONNECTED');
+    }, {
+      timeoutMs: 7000,
+      description: 'allow session owner connected on daemon'
+    });
+
     const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
       method: 'POST',
       body: { prompt: 'hello-once', from: 'orch', reply_to: 'orch' }
