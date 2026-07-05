@@ -2375,7 +2375,14 @@ async function main() {
       const target = await resolveSessionTarget(sessionId);
       if (!target) {
         console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
-        process.exit(1);
+        // #691: drain-exit, do NOT process.exit() here. resolveSessionTarget →
+        // discoverSessions() leaves undici keep-alive sockets and AbortSignal.timeout
+        // timers still mid-close; a hard process.exit() races that teardown and trips a
+        // libuv double-close assertion (src/win/async.c:76 UV_HANDLE_CLOSING) on Windows,
+        // which wedges the session. Setting exitCode + returning lets the event loop close
+        // each handle exactly once. Same exit code (1); success path unchanged.
+        process.exitCode = 1;
+        return;
       }
 
       let injectPrompt = prompt;
@@ -2388,7 +2395,8 @@ async function main() {
         const ent = checkEntitlement({ feature: 'telepty.remote_sessions' });
         if (!ent.allowed) {
           console.error(`⚠️  ${ent.reason}\n   Upgrade: ${ent.upgrade_url}`);
-          process.exit(1);
+          process.exitCode = 1; // #691: drain-exit (see not-found above), not process.exit() mid-teardown
+          return;
         }
 
         if (useRef) {
