@@ -126,6 +126,34 @@ environment default is enabled.
 
 telepty auto-discovers sessions across your Tailnet. All commands (`list`, `attach`, `inject`, `rename`, `multicast`, `broadcast`) work seamlessly across machines.
 
+### Zero-config on Tailscale (auto bind + auto trust)
+
+On a host that is on a **Tailscale tailnet**, a fresh install is cross-machine-ready with
+**no manual env**. At startup the daemon detects its tailnet interface (a `100.64.0.0/10`
+address) and:
+
+- **binds :3848 to the tailnet IP only** (plus loopback) — LAN/public interfaces stay
+  closed, so the control API is reachable **only from your Tailnet**, never the flat LAN;
+- **trusts tailnet peers automatically** — Tailscale's own ACLs already gate who is on the
+  tailnet, so a tailnet peer needs no token or manual allowlist.
+
+> **Trust boundary:** on a Tailscale host, telepty auto-exposes :3848 to your **entire
+> tailnet** (every peer Tailscale's ACLs let onto it). If you share your tailnet with
+> machines you don't fully trust, set `TELEPTY_PEER_ALLOWLIST` to restrict to specific
+> peers/CIDRs, or `TELEPTY_NO_TAILNET_AUTO=1` to stay loopback-only.
+
+**Zero-config cross-machine is Tailscale-specific.** On a non-Tailscale host (plain LAN,
+other mesh VPNs) the daemon stays **loopback-only** (the safe default) — set `TELEPTY_BIND`
++ `TELEPTY_PEER_ALLOWLIST` manually to expose it. Manual `TELEPTY_BIND` / `HOST` /
+`TELEPTY_PEER_ALLOWLIST` always win over auto-detect.
+
+**Windows:** Defender Firewall blocks inbound on the tailnet interface by default. On the
+auto path the daemon adds the inbound allow-rule automatically when run elevated, otherwise
+it prints the exact one-time `netsh` command in the startup banner.
+
+Addressing stays **IP-free**: use MagicDNS / hostnames with `<id>@<host>` (below) — you
+never need to type a `100.x.y.z` address.
+
 ### `<id>@<host>` syntax
 
 To target a specific host (when the same session ID exists on multiple hosts,

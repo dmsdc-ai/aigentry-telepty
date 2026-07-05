@@ -121,3 +121,37 @@ test('allowlisted peer bypasses token checks', () => {
   assert.equal(result.nextCalled, true);
   assert.equal(result.res.statusCode, null);
 });
+
+// ── #672: CIDR-aware isAllowedPeer (net.BlockList) ──────────────────────────────
+
+test('isAllowedPeer: CIDR entry matches in-range peer, rejects out-of-range', () => {
+  const allowed = createIsAllowedPeer(['100.64.0.0/10']); // tailnet auto-trust CIDR
+  assert.equal(allowed('100.72.155.21'), true);           // in /10
+  assert.equal(allowed('::ffff:100.90.0.1'), true);       // v4-mapped in /10
+  assert.equal(allowed('100.128.0.1'), false);            // just outside /10
+  assert.equal(allowed('203.0.113.5'), false);            // unrelated LAN/public
+});
+
+test('isAllowedPeer: loopback always allowed regardless of allowlist (not tightened)', () => {
+  const allowed = createIsAllowedPeer(['100.64.0.0/10']);
+  assert.equal(allowed('127.0.0.1'), true);
+  assert.equal(allowed('::1'), true);
+});
+
+test('isAllowedPeer: empty allowlist preserves "allow all authenticated" branch', () => {
+  const allowed = createIsAllowedPeer([]);
+  assert.equal(allowed('203.0.113.5'), true);
+  assert.equal(allowed('100.72.0.1'), true);
+});
+
+test('isAllowedPeer: exact-IP entries keep exact-match semantics (no widening)', () => {
+  const allowed = createIsAllowedPeer(['100.72.9.9']);
+  assert.equal(allowed('100.72.9.9'), true);
+  assert.equal(allowed('100.72.9.10'), false); // sibling not implied by an exact entry
+});
+
+test('isAllowedPeer: a malformed allowlist entry is skipped, never crashes', () => {
+  const allowed = createIsAllowedPeer(['not-an-ip', '100.64.0.0/10']);
+  assert.equal(allowed('100.72.0.1'), true);   // valid CIDR still enforced
+  assert.equal(allowed('8.8.8.8'), false);
+});

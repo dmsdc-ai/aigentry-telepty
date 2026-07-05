@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const net = require('net');
 
 function createVerifyJwt(JWT_SECRET) {
   function verifyJwt(token) {
@@ -53,16 +54,47 @@ function isRevokedNode(revokedNodes, decodedJwtOrSub) {
   return false;
 }
 
+// Build a net.BlockList from allowlist entries so the ":170 comment"-promised
+// "IPs/CIDRs" actually work: `a.b.c.d/n` → subnet, plain IP → exact address (exact
+// entries keep the prior includes() semantics). Native (Node v15+), zero-dep. A
+// malformed entry is skipped, never fatal. Returns null when the list is empty so the
+// caller can preserve the "empty = allow all authenticated" branch.
+function buildAllowBlockList(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+  const bl = new net.BlockList();
+  for (const raw of entries) {
+    const entry = String(raw).trim();
+    if (!entry) continue;
+    try {
+      const slash = entry.indexOf('/');
+      if (slash !== -1) {
+        const addr = entry.slice(0, slash);
+        const prefix = Number(entry.slice(slash + 1));
+        const type = net.isIPv6(addr) ? 'ipv6' : 'ipv4';
+        bl.addSubnet(addr, prefix, type);
+      } else {
+        const type = net.isIPv6(entry) ? 'ipv6' : 'ipv4';
+        bl.addAddress(entry, type);
+      }
+    } catch { /* skip a malformed allowlist entry — never crash the daemon */ }
+  }
+  return bl;
+}
+
 function createIsAllowedPeer(PEER_ALLOWLIST) {
+  const blockList = buildAllowBlockList(PEER_ALLOWLIST);
   function isAllowedPeer(ip) {
     if (!ip) return false;
     const cleanIp = ip.replace('::ffff:', '');
-    // Localhost always allowed (includes SSH tunnel traffic)
+    // Localhost always allowed (includes SSH tunnel traffic). FIRST — auto-populating
+    // the allowlist can never tighten loopback.
     if (cleanIp === '127.0.0.1' || ip === '::1') return true;
-    // Peer allowlist
-    if (PEER_ALLOWLIST.length > 0) return PEER_ALLOWLIST.includes(cleanIp);
-    // No allowlist = allow all authenticated
-    return true;
+    // No allowlist = allow all authenticated (preserved)
+    if (!blockList) return true;
+    // Peer allowlist — CIDR + exact match
+    try {
+      return blockList.check(cleanIp, net.isIPv6(cleanIp) ? 'ipv6' : 'ipv4');
+    } catch { return false; }
   }
 
   return isAllowedPeer;
