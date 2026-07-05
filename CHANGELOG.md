@@ -4,6 +4,8 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-07-05
+
 ### Added — seamless cross-machine on Tailscale (auto bind + auto trust) (#672)
 
 - **On a Tailscale host, a fresh install is cross-machine-ready with zero manual env.** At
