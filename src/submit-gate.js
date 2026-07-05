@@ -35,6 +35,19 @@ function isFailed(state) {
   return !!(state && FAIL_STATES.has(state.state));
 }
 
+// #694: a "busy-dispatch" state — the recipient is mid-turn (working/thinking, the
+// ACCEPTED_AFTER_SUBMIT_STATES) and has been for at least graceMs. Used by the submit gate to
+// short-circuit the idle-wait on a genuinely-busy target: working/thinking are NOT READY_STATES,
+// so awaitReplReady can never pass mid-turn and would burn its full timeout before best-effort
+// dispatch. The graceMs floor is what distinguishes a REAL ongoing turn from the transient
+// `working` a target emits while echoing our OWN just-injected text (duration_ms ≈ 0) — so a
+// fresh inject never trips the fast-path prematurely, and idle/waiting never match at all.
+function isBusyDispatchState(state, graceMs) {
+  if (!state || !ACCEPTED_AFTER_SUBMIT_STATES.has(state.state)) return false;
+  const grace = Number.isFinite(graceMs) ? graceMs : 0;
+  return Number.isFinite(state.duration_ms) && state.duration_ms >= grace;
+}
+
 /**
  * Wait until the session's REPL is ready to accept Enter.
  *
@@ -784,6 +797,7 @@ module.exports = {
   defaultReadScreen,
   isReady,
   isFailed,
+  isBusyDispatchState,
   READY_STATES,
   FAIL_STATES,
   ACCEPTED_AFTER_SUBMIT_STATES,
