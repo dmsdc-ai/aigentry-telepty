@@ -1790,6 +1790,24 @@ function forceSubmitDeliveredToSurface(session, strategy) {
   return !!strategy;
 }
 
+// #678: which submit render-gate outcomes are TERMINAL (hard-fail 504, never dispatch the CR)
+// vs best-effort DISPATCH (fire the CR anyway). A missing render-state — `no_state` (no state
+// machine registered for the session) or `no_state_manager` — is NOT terminal: it says nothing
+// about PTY/ownerWs liveness. A wrapped session restored across a daemon restart has no machine
+// yet a perfectly live bridge/PTY, so we dispatch best-effort exactly like `timeout` (and if the
+// PTY/ownerWs really is gone, submitViaPty returns false → a clean 503, not a false success).
+// Only genuinely-terminal PTY states — session_dead / session_error / session_restarting — still
+// short-circuit, because writing a CR to a dead/errored/restarting PTY is pointless.
+const NON_TERMINAL_GATE_REASONS = new Set(['timeout', 'no_state', 'no_state_manager']);
+function isTerminalGateFailure(gateResult) {
+  return !!(
+    gateResult &&
+    gateResult.ready !== true &&
+    gateResult.reason &&
+    !NON_TERMINAL_GATE_REASONS.has(gateResult.reason)
+  );
+}
+
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
   const now = Date.now();
   if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
@@ -2066,6 +2084,11 @@ for (const [id, meta] of Object.entries(_persisted)) {
   if (!restored) continue;
   sessions[id] = restored;
   initializeBootstrapState(sessions[id]);
+  // #678: a session restored across a daemon restart must get a render-state machine,
+  // else the submit gate reads getState()=null → no_state and never fires the CR. The
+  // machine is otherwise created only at first register(), which the reconnecting bridge's
+  // idempotent re-register skips (see the /api/sessions/register early-return below).
+  sessionStateManager.register(id);
   console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
 }
 const STRIPPED_SESSION_ENV_KEYS = [
@@ -2282,6 +2305,12 @@ app.post('/api/sessions/register', (req, res) => {
     // on a metadata re-register, or a session's delivered bytes would change mid-flight.
     if (req.body.provenance_capable === true) existing.provenanceCapable = true;
     existing.provenanceNonce = ensureSessionNonce(session_id);
+    // #678: a bridge reconnecting to an already-known session (e.g. one restored across a
+    // daemon restart, or a re-`allow` of the same id) must still end up with a render-state
+    // machine. register() is idempotent (returns the existing machine untouched), so this is
+    // safe for the normal re-register too — and it is the ONLY thing that recreates the
+    // machine for a same-id reconnect, since a daemon restart is not required to reach here.
+    sessionStateManager.register(session_id);
     console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
     return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_token: mintSessionToken(session_id), session_nonce: existing.provenanceNonce, provenance_capable: !!existing.provenanceCapable });
   }
@@ -3020,7 +3049,7 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     ...(minConfidence !== undefined ? { minConfidence } : {}),
   });
   const gatedDispatchAfterTimeout = !gateResult.ready;
-  if (gatedDispatchAfterTimeout && gateResult.reason && gateResult.reason !== 'timeout') {
+  if (isTerminalGateFailure(gateResult)) {
     console.log(`[SUBMIT] gate hard-fail ${id}: ${gateResult.reason} (last_state=${gateResult.last_state})`);
     return res.status(504).json({
       error: 'Submit gated-timeout — target REPL not in a dispatchable state',
@@ -3034,7 +3063,9 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     });
   }
   if (gatedDispatchAfterTimeout) {
-    console.log(`[SUBMIT] gate timeout ${id}: dispatching anyway (last_state=${gateResult.last_state})`);
+    // #678: `no_state`/`no_state_manager` join `timeout` here — dispatch the CR best-effort
+    // rather than hard-fail, so a live-bridge session with no render-state machine still submits.
+    console.log(`[SUBMIT] gate ${gateResult.reason || 'not-ready'} ${id}: dispatching anyway (last_state=${gateResult.last_state})`);
   }
 
   // Step 2: dispatch Enter via the PTY/context path, render-gated (#568).
@@ -4523,6 +4554,7 @@ module.exports = {
   fireAutoReport,                 // #32: provenance-tagged auto-report (deps DI: now/deliver/...)
   maybeRecordInjectConsumption,   // #619: durable early-consumption fact capture (idle-gate decay-proofing)
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
+  isTerminalGateFailure,          // #678: submit-gate disposition — no_state is best-effort dispatch, not hard-fail
   terminalLevelSubmit,            // #544: PTY-only submit path (pty_cr | null)
   submitViaPty,                   // #544: bare-0x0D submit into the innermost node-pty
   runSubmitAll,                   // #546: submit-all via PTY for every backend (no cmux send-key)
