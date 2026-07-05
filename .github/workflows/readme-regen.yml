@@ -1,0 +1,36 @@
+name: readme-regen
+
+# telepty publishes manually (no CI publish). This workflow keeps README.md on main
+# synced to ecosystem.json + package.json. It runs when a GitHub Release is published
+# (around a manual publish) or on demand. Tarball freshness at publish time is handled
+# separately by the package.json `prepublishOnly` regen on the maintainer's machine.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Regenerate README
+        run: node scripts/gen-readme.mjs
+      # Push via github-actions[bot] (GITHUB_TOKEN pushes don't retrigger workflows;
+      # [skip ci] + no-op guard are belt-and-suspenders).
+      - name: Commit & push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- README.md; then echo "README already current"; exit 0; fi
+          git add README.md
+          git commit -m "docs: regen README [skip ci]"
+          git push origin HEAD:main

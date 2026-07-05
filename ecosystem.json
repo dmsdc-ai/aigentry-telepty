@@ -1,0 +1,55 @@
+{
+  "_comment": "Canonical aigentry ecosystem manifest. Source of truth for the shared README ecosystem table. Versions re-verified live via `npm view` on 2026-07-05 (telepty 0.6.9 -> 0.6.11; all others unchanged). Vendored byte-identical into each repo; refresh via aigentry-devkit/scripts/sync-readme-tooling.mjs on any version change. A repo's own row is overridden with its live package.json version at regen time.",
+  "modules": [
+    {
+      "name": "telepty",
+      "package": "@dmsdc-ai/aigentry-telepty",
+      "version": "0.6.11",
+      "role": "Cross-terminal / cross-machine prompt transport (PTY daemon)",
+      "maturity": "Shipping",
+      "license": "MIT"
+    },
+    {
+      "name": "brain",
+      "package": "@dmsdc-ai/aigentry-brain",
+      "version": "0.2.8",
+      "role": "Persistent cross-session memory (MCP server)",
+      "maturity": "Early",
+      "license": "MIT"
+    },
+    {
+      "name": "deliberation",
+      "package": "@dmsdc-ai/aigentry-deliberation",
+      "version": "0.0.47",
+      "role": "Multi-AI structured debate + synthesis (MCP server)",
+      "maturity": "Early",
+      "license": "MIT"
+    },
+    {
+      "name": "devkit",
+      "package": "@dmsdc-ai/aigentry-devkit",
+      "version": "0.0.22",
+      "role": "Installer/scaffold for the AI dev environment",
+      "maturity": "Early",
+      "license": "MIT"
+    },
+    {
+      "name": "aterm",
+      "package": "@dmsdc-ai/aterm",
+      "version": "0.2.14",
+      "role": "Terminal launcher with native session IPC",
+      "maturity": "Early",
+      "license": "UNLICENSED",
+      "note": "Published @dmsdc-ai/aterm 0.2.14 is UNLICENSED; local repo HEAD intends MIT (0.2.13). Table records the PUBLISHED reality per §13."
+    },
+    {
+      "name": "orchestrator",
+      "package": "aigentry-orchestrator",
+      "version": "—",
+      "role": "Control tower that drives sessions via telepty",
+      "maturity": "Internal",
+      "license": "MIT",
+      "published": false
+    }
+  ]
+}
