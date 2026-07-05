@@ -37,6 +37,25 @@ const CLAUDE_HISTORY_ECHO = [
   '  status footer',
 ].join('\n');
 
+// #679: Windows/ConPTY renders the caret as ASCII '>' (0x3E), not '❯'.
+// Same border geometry (U+2500 '─'), so the adjacency guard still applies.
+const CLAUDE_IDLE_WIN = [
+  '──────────────────────────────────────────────────',
+  '>                                                 ',
+  '──────────────────────────────────────────────────',
+  '  aigentry-architect | Opus 4.7 (1M context) | [█░░░░░░░░░░░░░░] 11% 113.4K/1.0M',
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)         new task? /clear to save 113.5k tokens',
+].join('\n');
+
+// A markdown blockquote in transcript output, even flanked by '─' rules, must
+// NOT be read as the ready prompt — the full-line anchor rejects trailing text.
+const CLAUDE_MD_BLOCKQUOTE = [
+  '──────────────────────────────────────────────────',
+  '> this is a markdown blockquote line, not the caret',
+  '──────────────────────────────────────────────────',
+  '  status footer',
+].join('\n');
+
 // Welcome banner stage — symbol drawn but no border geometry yet.
 const CLAUDE_BANNER_NO_BORDER = [
   ' ✻ Welcome to Claude Code',
@@ -154,6 +173,17 @@ test('claude.detect finds idle prompt with border geometry (col=1)', () => {
 
 test('claude.detect rejects banner-stage symbol with no border geometry', () => {
   const r = ENTRIES.claude.detect(CLAUDE_BANNER_NO_BORDER);
+  assert.equal(r.found, false);
+});
+
+test('#679 claude.detect finds Windows ASCII ">" caret with border geometry (col=1)', () => {
+  const r = ENTRIES.claude.detect(CLAUDE_IDLE_WIN);
+  assert.equal(r.found, true);
+  assert.equal(r.col, 1);
+});
+
+test('#679 claude.detect rejects "> markdown blockquote" even between border rules', () => {
+  const r = ENTRIES.claude.detect(CLAUDE_MD_BLOCKQUOTE);
   assert.equal(r.found, false);
 });
 

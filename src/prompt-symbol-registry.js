@@ -16,6 +16,11 @@
 const ENTRIES = {
   // claude renders an empty input row as "❯" + spaces, sandwiched between
   // two horizontal-rule lines made of U+2500 ('─').
+  // #679: on Windows/ConPTY the caret glyph falls back to ASCII '>' (0x3E) —
+  // `❯` renders 0×, `>` renders instead — so the ❯-only matcher never fired,
+  // bootstrap_ready never flipped, and gated injects parked in the mailbox
+  // forever. Accept both carets; the full-line `\s*$` anchor + `─`-rule
+  // adjacency guard still reject a stray '> markdown blockquote' in transcript.
   claude: {
     symbol: '❯',
     byteSeq: Buffer.from([0xE2, 0x9D, 0xAF]),
@@ -23,11 +28,12 @@ const ENTRIES = {
       const lines = String(screen == null ? '' : screen).split('\n');
       for (let i = lines.length - 1; i >= 1; i--) {
         const line = lines[i];
-        if (!/^❯\s*$/.test(line)) continue;
+        const m = /^([❯>])\s*$/.exec(line);
+        if (!m) continue;
         const above = lines[i - 1] || '';
         const below = lines[i + 1] || '';
         if (above.includes('─') || below.includes('─')) {
-          return { found: true, line_index: i, col: line.indexOf('❯') + 1 };
+          return { found: true, line_index: i, col: line.indexOf(m[1]) + 1 };
         }
       }
       return { found: false };
