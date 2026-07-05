@@ -2,6 +2,35 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## [Unreleased]
+
+### Added — seamless cross-machine on Tailscale (auto bind + auto trust) (#672)
+
+- **On a Tailscale host, a fresh install is cross-machine-ready with zero manual env.** At
+  startup the daemon detects its tailnet interface (a `100.64.0.0/10` address, via a pure
+  live scan of `os.networkInterfaces()` — no subprocess, no `tailscale` CLI dependency) and
+  **binds :3848 to the tailnet IP only, plus loopback**. LAN/public interfaces stay closed,
+  so the inject/control API is reachable **only from your Tailnet** — this does **not**
+  reopen the telepty#50 / audit hole (it never binds `0.0.0.0`). Tailnet peers are trusted
+  automatically (Tailscale ACLs already gate tailnet membership), so no token/allowlist is
+  needed. The tailnet IP is **discovered live every start, never persisted** — a
+  Tailscale-reassigned IP is followed automatically.
+- **Preserved safe defaults & overrides.** No tailnet detected ⇒ loopback-only (telepty#50
+  unchanged). Manual `TELEPTY_BIND` / `HOST` / `TELEPTY_PEER_ALLOWLIST` always win over
+  auto-detect. New `TELEPTY_NO_TAILNET_AUTO=1` forces loopback even on a tailnet.
+- **Detection hardened against ISP-CGNAT.** `100.64.0.0/10` is also the shared ISP-CGNAT
+  range; detection prefers a Tailscale-named interface (`tailscale*` / `utun*` / a
+  `Tailscale` adapter) and, when it can only match by range, flags it in the banner so an
+  operator on ISP-CGNAT can opt out.
+- **`TELEPTY_PEER_ALLOWLIST` now supports CIDRs** (via native `net.BlockList`) as the
+  `:170` comment always documented; exact-IP entries keep exact-match semantics.
+- **Windows:** on the auto path the daemon adds the inbound firewall allow-rule
+  automatically when elevated, otherwise prints the exact one-time `netsh` command.
+- **Trust boundary (docs):** a Tailscale host auto-exposes :3848 to the *entire* tailnet;
+  restrict with `TELEPTY_PEER_ALLOWLIST` or disable with `TELEPTY_NO_TAILNET_AUTO=1`.
+  Zero-config cross-machine is Tailscale-specific; other topologies use the manual
+  `TELEPTY_BIND` path. Addressing stays IP-free — use MagicDNS names with `<id>@<host>`.
+
 ## [0.6.6] - 2026-06-14
 
 ### Fixed — duplicate same-id `allow` flap loop + `kill` doesn't stick (#56)

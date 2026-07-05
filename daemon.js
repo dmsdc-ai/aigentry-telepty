@@ -12,6 +12,7 @@ const terminalBackend = require('./terminal-backend');
 const { installWebSocketTransport, isOpenWebSocket } = require('./src/transport/websocket');
 const { createPeerRelay, relayPeersFromEnv } = require('./src/transport/peer-relay');
 const { createAuthMiddleware, createIsAllowedPeer, createVerifyJwt } = require('./src/protocol/http-auth');
+const { detectTailnet, TAILNET_CIDR } = require('./src/net/tailnet');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
@@ -170,6 +171,19 @@ app.use(express.json());
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
 const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
 
+// #672 tailnet auto (seamless cross-machine): detect the tailnet interface once at boot
+// via a PURE live scan of os.networkInterfaces(). D1: the IP is discovered, never
+// configured — used only in-memory for this run, never persisted, and re-detected every
+// start so a Tailscale-reassigned IP is followed automatically. Broker mode has its own
+// network posture (HTTPS + per-node JWT) and is excluded from auto-bind/auto-trust.
+const TAILNET = brokerServer ? null : detectTailnet();
+const TAILNET_IP = TAILNET ? TAILNET.ip : null;
+const AUTO_TAILNET = isTailnetAuto(process.env, TAILNET_IP);
+// Auto-trust the tailnet CIDR on the auto path — safe because the socket is bound to the
+// tailnet interface only (§Q2). NEVER widen a manual allowlist: an operator's explicit
+// TELEPTY_PEER_ALLOWLIST is passed through verbatim.
+const effectivePeerAllowlist = resolveEffectivePeerAllowlist(PEER_ALLOWLIST, AUTO_TAILNET);
+
 // #533 Phase 2 — peer-lane inject guardrail. The orchestrator sid(s) define the
 // ORCH LANE (always allowed). Space-separated; default matches aigentry-orchestrator
 // bin/ask.sh so both ends agree on "who is the orchestrator" from one config. If this
@@ -265,7 +279,7 @@ const relayToPeers = createPeerRelay({
 const JWT_SECRET = process.env.TELEPTY_JWT_SECRET || null;
 
 const verifyJwt = createVerifyJwt(JWT_SECRET);
-const isAllowedPeer = createIsAllowedPeer(PEER_ALLOWLIST);
+const isAllowedPeer = createIsAllowedPeer(effectivePeerAllowlist);
 
 // Health check – no auth required
 app.get('/api/health', (req, res) => {
@@ -286,20 +300,71 @@ let boundPort = Number(PORT);
 // opt-in: TELEPTY_BIND=0.0.0.0 (preferred) or the legacy HOST override.
 // BREAKING: cross-machine peers that dialed this daemon directly over LAN
 // need the opt-in on the daemon host after a restart (see CHANGELOG).
-function resolveBindHost(env) {
-  return env.TELEPTY_BIND || env.HOST || '127.0.0.1';
+// Truthy for an opt-out/flag env var: set and not a falsey literal ('', '0', 'false').
+function isTruthyEnv(v) {
+  return v != null && v !== '' && v !== '0' && String(v).toLowerCase() !== 'false';
 }
 
-// One-line bind-address banner so operators can see (and fix) their exposure
-// posture at startup without reading docs.
-function formatBindHint(host) {
+// #672 tailnet auto: the zero-config tailnet path is active only when a tailnet IP was
+// detected AND the operator set no manual bind override AND did not opt out.
+function isTailnetAuto(env, tailnetIp) {
+  return !!tailnetIp && !env.TELEPTY_BIND && !env.HOST && !isTruthyEnv(env.TELEPTY_NO_TAILNET_AUTO);
+}
+
+// #672: auto-trust the tailnet CIDR ONLY when on the auto path with no manual allowlist.
+// A non-empty manual allowlist is respected verbatim (never widened to the whole /10).
+function resolveEffectivePeerAllowlist(peerAllowlist, autoTailnet) {
+  return (autoTailnet && peerAllowlist.length === 0) ? [TAILNET_CIDR] : peerAllowlist;
+}
+
+// telepty#50 + #672: loopback by default; explicit TELEPTY_BIND/HOST win; on a detected
+// tailnet with no override, bind the LIVE tailnet IP (never 0.0.0.0). The tailnetIp arg
+// is optional so legacy 1-arg callers keep the exact #50 behavior.
+function resolveBindHost(env, tailnetIp) {
+  if (env.TELEPTY_BIND) return env.TELEPTY_BIND;
+  if (env.HOST) return env.HOST;
+  if (isTailnetAuto(env, tailnetIp)) return tailnetIp;
+  return '127.0.0.1';
+}
+
+// Bind-address banner so operators can see (and fix) their exposure posture at startup
+// without reading docs. Multi-line for the tailnet/loopback cases (G2).
+function formatBindHint(host, tailnet) {
+  if (tailnet && host === tailnet.ip) {
+    const rangeNote = tailnet.nameMatched
+      ? ''
+      : `\n   note: tailnet IP matched by CGNAT range only (iface "${tailnet.iface}" not Tailscale-named) — if this is ISP-CGNAT, set TELEPTY_NO_TAILNET_AUTO=1`;
+    return `   bind: ${host} (tailnet auto) — reachable from your Tailnet only; LAN/public closed (loopback also served)${rangeNote}`;
+  }
   if (host === '127.0.0.1' || host === 'localhost' || host === '::1') {
-    return `   bind: ${host} (loopback only) — LAN peers cannot connect; opt in with TELEPTY_BIND=0.0.0.0`;
+    return `   bind: ${host} (loopback only) — LAN peers cannot connect; opt in with TELEPTY_BIND=0.0.0.0`
+      + `\n   cross-machine: zero-config needs Tailscale (auto-binds the tailnet); otherwise set TELEPTY_BIND + TELEPTY_PEER_ALLOWLIST`;
   }
   return `   bind: ${host} — reachable from the network (TELEPTY_BIND/HOST opt-in)`;
 }
 
-const HOST = resolveBindHost(process.env);
+// G1 (win32 only): a correct tailnet bind is not enough on Windows — Defender Firewall
+// blocks inbound on the tailnet iface by default. Detect the rule; auto-add if elevated,
+// else print the exact one-time command. Never fatal. No-op on mac/Linux.
+function maybeGuideWindowsFirewall(port) {
+  if (process.platform !== 'win32') return;
+  try {
+    const { ensureInboundRule } = require('./src/net/win-firewall');
+    const r = ensureInboundRule({ port });
+    if (r.action === 'exists') {
+      console.log(`   firewall: inbound rule "${r.ruleName}" present — tailnet peers can reach :${port}`);
+    } else if (r.action === 'added') {
+      console.log(`   firewall: added inbound allow rule "${r.ruleName}" for :${port} (TCP)`);
+    } else {
+      console.log(`   firewall: Windows blocks inbound on :${port} by default. Run once as Administrator:`);
+      console.log(`     ${r.command}`);
+    }
+  } catch (e) {
+    console.warn(`[FIREWALL] check skipped: ${e && e.message}`);
+  }
+}
+
+const HOST = resolveBindHost(process.env, TAILNET_IP);
 process.title = 'telepty-daemon';
 
 // Singleton claim — guarded so a test require neither exits (when a daemon is running) nor
@@ -4058,6 +4123,32 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
       console.log(formatBindHint(HOST)); // telepty#50
       runStartupBootstrapRestore();
     });
+  } else if (AUTO_TAILNET) {
+    // #672 tailnet auto path: bind loopback as the PRIMARY (drives bootstrap/boundPort
+    // and effectively never fails), then add an additive best-effort listener on the
+    // live tailnet IP so tailnet peers reach :3848 — LAN/public sockets stay closed. An
+    // IP flap between detect and listen degrades to loopback-only (logged), never a
+    // crash. ponytail: no auto-rebind on flap — a restart re-detects; add a re-detect
+    // loop only if flaps prove real in the field.
+    server = app.listen(PORT, '127.0.0.1', () => {
+      const address = server.address();
+      boundPort = (address && address.port) || Number(PORT);
+      console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${boundPort}`);
+      console.log(formatBindHint(HOST, TAILNET));
+      maybeGuideWindowsFirewall(boundPort); // G1: Windows inbound-rule guide/auto-add
+      runStartupBootstrapRestore();
+      nodeBrokerClient = startNodeBrokerClient();
+    });
+    // Additive tailnet listener — same HTTP posture as the loopback primary (the daemon
+    // is HTTP by design; TLS is broker-mode only, and tailnet transport is already
+    // WireGuard-encrypted). app.listen() returns a fresh server, so this is a second
+    // socket on the same app. ponytail: fixed-PORT production shares one port on both
+    // listeners; a PORT=0 ephemeral run would split ports, but the auto path is never
+    // taken under PORT=0 in the suite (TELEPTY_NO_TAILNET_AUTO=1 default in setup-env.js).
+    const tailnetServer = app.listen(Number(PORT), TAILNET_IP);
+    tailnetServer.on('error', (e) => {
+      console.warn(`[BIND] tailnet listener ${TAILNET_IP}:${Number(PORT)} unavailable (staying loopback-only): ${e && e.message}`);
+    });
   } else {
     server = app.listen(PORT, HOST, () => {
       const address = server.address();
@@ -4447,6 +4538,8 @@ module.exports = {
   loadNodeBrokerConfig,           // node-mode: resolve broker.json / env config (or null)
   startNodeBrokerClient,          // node-mode: start createBrokerClient (default-OFF; in-process deliver)
   deliverInjectionToSession,      // §4.3: the in-process delivery wired into the broker-client
-  resolveBindHost,                // telepty#50: pure bind-address policy (loopback default, env opt-in)
-  formatBindHint,                 // telepty#50: startup bind/exposure banner line
+  resolveBindHost,                // telepty#50 + #672: pure bind-address policy (loopback default, env opt-in, tailnet auto)
+  formatBindHint,                 // telepty#50 + #672: startup bind/exposure banner line
+  isTailnetAuto,                  // #672: pure predicate — is the zero-config tailnet path active
+  resolveEffectivePeerAllowlist,  // #672: pure allowlist policy — auto-trust tailnet without widening a manual set
 };

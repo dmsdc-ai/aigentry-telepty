@@ -39,6 +39,16 @@ test('parseHostSpec uses provided default port when none embedded', () => {
   assert.deepEqual(parseHostSpec('host:9090', 4000), { host: 'host', port: 9090 });
 });
 
+test('D2 (#672): MagicDNS / Tailnet names route by name, never require a raw tailnet IP', () => {
+  // The seamless-cross-machine feature must stay IP-free from the caller's side:
+  // `telepty inject worker@<magicdns-name>` resolves via Node's DNS (Tailscale's
+  // resolver serves MagicDNS), so parseHostSpec must preserve the name verbatim.
+  assert.deepEqual(parseHostSpec('windows-10-desktop'), { host: 'windows-10-desktop', port: 3848 });
+  assert.deepEqual(parseHostSpec('win-t6t20oikemr.tail44b67e.ts.net'), { host: 'win-t6t20oikemr.tail44b67e.ts.net', port: 3848 });
+  assert.deepEqual(parseHostSpec('macbook.tail44b67e.ts.net:9090'), { host: 'macbook.tail44b67e.ts.net', port: 9090 });
+  assert.equal(buildDaemonUrl('windows-10-desktop'), 'http://windows-10-desktop:3848');
+});
+
 test('parseHostSpec handles bracketed IPv6 with and without port', () => {
   assert.deepEqual(parseHostSpec('[::1]:3848'), { host: '::1', port: 3848 });
   assert.deepEqual(parseHostSpec('[::1]'), { host: '::1', port: 3848 });
