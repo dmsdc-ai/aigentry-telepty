@@ -31,6 +31,22 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   Zero-config cross-machine is Tailscale-specific; other topologies use the manual
   `TELEPTY_BIND` path. Addressing stays IP-free — use MagicDNS names with `<id>@<host>`.
 
+### Fixed — busy-target `--submit` latency (busy-dispatch fast-path) (#694)
+
+- **A gated `--submit` to a BUSY (mid-turn) recipient no longer burns the full gate timeout.**
+  A busy claude sits in `working`/`thinking` — neither is a ready state — so the render-gate
+  (`awaitReplReady`) could never pass mid-turn and waited out the entire `gate_timeout_ms`
+  (default 10s) before dispatching best-effort. A new busy-dispatch fast-path detects a
+  **genuine ongoing turn** (`working`/`thinking` held ≥ `TELEPTY_SUBMIT_BUSY_GRACE_MS`, default
+  250ms — which excludes the transient `working` a target emits while echoing our own
+  just-injected text) and dispatches after only the existing echo+micro-quiet settle
+  (`awaitInputSettled`), cutting the busy path from ~10s to **sub-second**.
+- **Never fires blindly, idle path unchanged.** The downstream `gatedTerminalSubmit` still
+  runs its own echo+quiet gate before the `\r`; a CR into a busy composer merely queues and the
+  #617 hold-and-redeliver loop re-fires it on idle (delivery reliability unchanged). `idle`/
+  `waiting` targets never match the fast-path, so the proven idle behavior is byte-for-byte
+  identical. Rollback via `TELEPTY_SUBMIT_BUSY_DISPATCH=off`.
+
 ## [0.6.6] - 2026-06-14
 
 ### Fixed — duplicate same-id `allow` flap loop + `kill` doesn't stick (#56)

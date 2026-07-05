@@ -53,6 +53,15 @@ const REDELIVER_ENABLED = String(process.env.TELEPTY_REDELIVER || '').toLowerCas
 const REDELIVER_MAX_ATTEMPTS = Math.max(1, Number(process.env.TELEPTY_REDELIVER_MAX_ATTEMPTS || 3));
 const REDELIVER_TOTAL_TIMEOUT_MS = Math.max(1000, Number(process.env.TELEPTY_REDELIVER_TOTAL_TIMEOUT_MS || 600000));
 const REDELIVER_IDLE_WAIT_MS = Math.max(1000, Number(process.env.TELEPTY_REDELIVER_IDLE_WAIT_MS || 120000));
+// #694: busy-dispatch fast-path — on a busy (mid-turn) recipient the render-gate (awaitReplReady)
+// can never reach idle/waiting, so it burns the full gate timeout before best-effort dispatch.
+// When enabled, a genuine ongoing turn (working/thinking held ≥ grace) dispatches after only the
+// echo+micro-quiet settle instead of the full timeout. `off` restores the pure-idle-gate behavior.
+const SUBMIT_BUSY_DISPATCH_ENABLED = String(process.env.TELEPTY_SUBMIT_BUSY_DISPATCH || '').toLowerCase() !== 'off';
+// Grace floor separating a REAL ongoing turn from the transient `working` a target emits while
+// echoing our OWN just-injected text (duration_ms ≈ 0). Default 250ms: above the echo transient,
+// below any human-perceptible latency.
+const SUBMIT_BUSY_GRACE_MS = Math.max(0, Number(process.env.TELEPTY_SUBMIT_BUSY_GRACE_MS || 250));
 
 // Session state machine manager — auto-detects session state from PTY output
 const sessionStateManager = new SessionStateManager({
@@ -1798,7 +1807,9 @@ function forceSubmitDeliveredToSurface(session, strategy) {
 // PTY/ownerWs really is gone, submitViaPty returns false → a clean 503, not a false success).
 // Only genuinely-terminal PTY states — session_dead / session_error / session_restarting — still
 // short-circuit, because writing a CR to a dead/errored/restarting PTY is pointless.
-const NON_TERMINAL_GATE_REASONS = new Set(['timeout', 'no_state', 'no_state_manager']);
+// #694: `busy_settled` (busy-dispatch fast-path) joins the best-effort DISPATCH set — the target is
+// alive and mid-turn, so firing the CR is correct (it queues + #617 redelivers), never a hard-fail.
+const NON_TERMINAL_GATE_REASONS = new Set(['timeout', 'no_state', 'no_state_manager', 'busy_settled']);
 function isTerminalGateFailure(gateResult) {
   return !!(
     gateResult &&
@@ -2843,8 +2854,10 @@ function submitViaOsascript(sessionId, keyCombo) {
 // POST /api/sessions/:id/submit — render-gated CLI-aware submit
 //
 // Default behavior (0.3.0+): wait for the target REPL to be ready (sessionStateManager
-// reports `idle`/`waiting` with confidence ≥ 0.85) before firing Enter. When the
-// caller passes `injected_body`, also verify the body has been consumed (i.e.
+// reports `idle`/`waiting` with confidence ≥ 0.5, the awaitReplReady default) before firing
+// Enter. #694: a BUSY recipient (working/thinking) is never idle/waiting, so the busy-dispatch
+// fast-path below dispatches best-effort after an echo+quiet settle instead of burning the gate
+// timeout. When the caller passes `injected_body`, also verify the body has been consumed (i.e.
 // disappeared from the input box) by polling the session output ring; if still
 // visible, perform one bounded retry.
 //
@@ -3044,10 +3057,38 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   // Hard-fail reasons (session_dead/error/restarting/no_state/no_state_manager)
   // still short-circuit to 504 because dispatching to a dead/missing PTY is
   // pointless. See spec §1.3 / §3.3.
-  const gateResult = await submitGate.awaitReplReady(id, sessionStateManager, {
-    timeoutMs: gateTimeoutMs,
-    ...(minConfidence !== undefined ? { minConfidence } : {}),
-  });
+  //
+  // #694 busy-dispatch fast-path: a BUSY (mid-turn) recipient sits in working/thinking — neither
+  // is a READY_STATE — so awaitReplReady can never pass mid-turn and would burn the FULL
+  // gateTimeoutMs (up to 10s) before best-effort dispatch. When the target is a GENUINE ongoing
+  // turn (isBusyDispatchState: working/thinking held ≥ SUBMIT_BUSY_GRACE_MS, which excludes the
+  // transient `working` from echoing our OWN just-injected text, duration_ms ≈ 0), wait ONLY for
+  // the input to settle (body echoed + micro-quiet, via awaitInputSettled) and dispatch
+  // best-effort — the same downstream path as a gate timeout, but in ~hundreds of ms. idle/waiting
+  // never match isBusyDispatchState, so the idle path is byte-unchanged. gatedTerminalSubmit below
+  // still runs its OWN echo+quiet gate before the \r (never fires blindly), and a CR into a busy
+  // composer merely queues → #617 redeliver fires it on idle. Rollback: TELEPTY_SUBMIT_BUSY_DISPATCH=off.
+  let gateResult = null;
+  if (injectedBody && SUBMIT_BUSY_DISPATCH_ENABLED) {
+    const cur = sessionStateManager.getState(id);
+    if (submitGate.isBusyDispatchState(cur, SUBMIT_BUSY_GRACE_MS)) {
+      const settle = await submitGate.awaitInputSettled(session, injectedBody, {
+        timeoutMs: 1200,
+        quietWindowMs: 100,
+        echoGraceMs: 400,
+        pollIntervalMs: 30,
+        stripAnsi: stripAnsiState,
+      });
+      gateResult = { ready: false, reason: 'busy_settled', last_state: cur.state, waited_ms: settle.waited_ms };
+      console.log(`[SUBMIT] busy-dispatch fast-path ${id}: state=${cur.state} (${cur.duration_ms}ms) settle=${settle.reason} (${settle.waited_ms}ms) — dispatching without idle-gate burn`);
+    }
+  }
+  if (!gateResult) {
+    gateResult = await submitGate.awaitReplReady(id, sessionStateManager, {
+      timeoutMs: gateTimeoutMs,
+      ...(minConfidence !== undefined ? { minConfidence } : {}),
+    });
+  }
   const gatedDispatchAfterTimeout = !gateResult.ready;
   if (isTerminalGateFailure(gateResult)) {
     console.log(`[SUBMIT] gate hard-fail ${id}: ${gateResult.reason} (last_state=${gateResult.last_state})`);
