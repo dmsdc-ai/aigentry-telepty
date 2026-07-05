@@ -31,6 +31,12 @@ beforeEach(async () => {
   harness = await startTestDaemon({
     env: {
       TELEPTY_STATE_IDLE_TIMEOUT_MS: '300', // fast idle for tests
+      // #577 CI-flake fix: shrink the idle-unconfirmed settle debounce (default 5s,
+      // daemon.js IDLE_UNCONFIRMED_SETTLE_SECONDS) the same way TELEPTY_STATE_IDLE_TIMEOUT_MS
+      // shrinks the idle timeout for tests. Without it the idle→TASK_IDLE_NO_REPORT emit is
+      // bimodal (~1s confirmed vs ~6s settle); on slow CI the settle bucket blew the 4000ms
+      // budget below. The idle path is still genuinely exercised — only the debounce is short.
+      TELEPTY_IDLE_UNCONFIRMED_SETTLE_SECONDS: '0.3',
       // Register the fixture orchestrator sids so orchestrator→worker injects
       // classify as orch-lane (allowed), not peer-lane-blocked (#533 Phase 2).
       AIGENTRY_ORCHESTRATOR_SIDS: `orchestrator aigentry-orchestrator-claude ${ORCH} ${ORCH2}`,
@@ -366,8 +372,10 @@ test('Legacy TASK_COMPLETE text is still emitted for back-compat', async () => {
   });
 
   // Wait for idle (TELEPTY_STATE_IDLE_TIMEOUT_MS=300ms set in beforeEach)
+  // #577: 8000ms (was 4000) is defense-in-depth headroom for the hardcoded 1000ms state
+  // poll-tick scheduling jitter under loaded CI runners; the settle env above is the primary fix.
   await waitFor(() => messages.some(m => m.type === 'TASK_IDLE_NO_REPORT'), {
-    timeoutMs: 4000,
+    timeoutMs: 8000,
     description: 'TASK_IDLE_NO_REPORT bus event'
   });
 
