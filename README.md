@@ -299,4 +299,4 @@ npm run test:watch    # Watch mode
 
 ## License
 
-ISC
+MIT
