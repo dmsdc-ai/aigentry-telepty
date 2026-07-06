@@ -125,17 +125,25 @@ test('#678(a,b) restart-restored wrapped session has a state machine (not no_sta
 // to recreate a machine for an already-existing, machine-less session.
 test('#678(b) SessionStateManager.register creates-when-absent and is idempotent', () => {
   const mgr = new SessionStateManager();
-  assert.equal(mgr.getState('x'), null, 'no machine before register');
-  mgr.register('x');
-  assert.notEqual(mgr.getState('x'), null, 'register creates a machine when absent');
+  try {
+    assert.equal(mgr.getState('x'), null, 'no machine before register');
+    mgr.register('x');
+    assert.notEqual(mgr.getState('x'), null, 'register creates a machine when absent');
 
-  // Evolve the machine, then re-register: it must return the SAME machine untouched (idempotent).
-  mgr.feed('x', 'busy output\n');
-  const evolved = mgr.getState('x');
-  mgr.register('x');
-  const afterReRegister = mgr.getState('x');
-  assert.notEqual(afterReRegister, null, 're-register keeps the machine');
-  assert.equal(afterReRegister.since, evolved.since, 're-register does not reset the existing machine');
+    // Evolve the machine, then re-register: it must return the SAME machine untouched (idempotent).
+    mgr.feed('x', 'busy output\n');
+    const evolved = mgr.getState('x');
+    mgr.register('x');
+    const afterReRegister = mgr.getState('x');
+    assert.notEqual(afterReRegister, null, 're-register keeps the machine');
+    assert.equal(afterReRegister.since, evolved.since, 're-register does not reset the existing machine');
+  } finally {
+    // register() starts a per-machine 1s poll setInterval (session-state.js) that is NOT unref'd;
+    // leaving it live keeps this file's `node --test` worker process alive after the tests pass,
+    // so the whole suite never exits and CI runs to the 6h job timeout (cancelled). destroyAll()
+    // clears every machine's timer. (#645 CI-hang root cause.)
+    mgr.destroyAll();
+  }
 });
 
 // (c) gate disposition: no_state / no_state_manager are best-effort DISPATCH (like timeout),

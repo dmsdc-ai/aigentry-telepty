@@ -14,6 +14,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: [20]
     runs-on: ${{ matrix.os }}
+    # Belt against a hung test never exiting (#645): green mac/ubuntu runs finish in ~2min,
+    # so a 20min cap fails a hang fast instead of burning the 6h job ceiling. This is a
+    # backstop, NOT the fix — the root cause (undisposed state-machine poll timer holding the
+    # test worker open) is fixed in test/submit-gate-restore-register-678.test.js.
+    timeout-minutes: 20
     # telepty #577: windows-latest has windows-specific reds (broker/ssh path,
     # PTY/TUI spawn timeouts, snippet runtime-CRLF, launchd plist) tracked separately.
     # Quarantine windows as non-blocking so ubuntu+macOS are the trustworthy gate
