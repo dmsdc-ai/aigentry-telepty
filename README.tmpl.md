@@ -2,6 +2,8 @@
 
 **Connect any terminal to any terminal, any machine.**
 
+![telepty demo — inject a prompt into a live AI CLI session and read its screen](docs/demo.gif)
+
 telepty is a PTY orchestration daemon and session bridge for AI CLI workflows. It lets you spawn, attach to, and inject commands into terminal sessions — locally or across machines via Tailscale.
 
 Built for AI CLI workflows (Claude Code, Codex, Gemini CLI), but works with any interactive terminal program.
