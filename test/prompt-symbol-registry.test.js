@@ -80,6 +80,49 @@ const CODEX_NO_FOOTER = [
   '  unrelated tail line',
 ].join('\n');
 
+// --- codex v0.142.5 real captures (2026-07-07) ---
+// Status row without fast-mode: no literal "fast", `·` separator instead.
+// Composer '›' renders line-leading with NO space. The pre-fix Step-2 regex
+// (required "fast") and Step-3 regex (required "^ › ") both miss these.
+
+// Multi-signal path: boot box + status footer, no strict '›' line at all.
+const CODEX_0142_MULTISIGNAL = [
+  'OpenAI Codex (v0.142.5)',
+  '',
+  '  gpt-5.5 xhigh · /tmp/demo714',
+].join('\n');
+
+// Strict path: line-leading '›' with NO leading space + gpt footer below.
+const CODEX_0142_STRICT_NOSPACE = [
+  '› Run /review on my current changes',
+  '',
+  '  gpt-5.5 xhigh · /tmp/demo714',
+].join('\n');
+
+// Regression: legacy fast-mode footer must still fire the multi-signal path.
+const CODEX_LEGACY_FAST = [
+  'OpenAI Codex (v0.140.0)',
+  '',
+  '  gpt-5.5 xhigh fast · ~/projects/x',
+].join('\n');
+
+// Anti-pattern: resume picker must stay NOT-ready even though it now contains
+// a '·'-separator footer + a '›' line the looser matchers would otherwise like.
+const CODEX_RESUME_PICKER = [
+  'Resume a previous session',
+  'Filter: ',
+  '  1. demo714   gpt-5.5 xhigh · /tmp/demo714',
+  '› ',
+].join('\n');
+
+// Anti-pattern: first-run folder-trust modal must stay NOT-ready.
+const CODEX_TRUST_MODAL = [
+  'Do you trust the contents of this folder?',
+  '',
+  '  gpt-5.5 xhigh · /tmp/demo714',
+  '› ',
+].join('\n');
+
 const GEMINI_EMPTY = [
   '▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀',
   ' *   Type your message or @path/to/file',
@@ -245,6 +288,39 @@ test('codex.detect handles gpt-4 / gpt-5 / gpt-5.5 footer variants', () => {
 
 test('codex.detect returns false on empty screen', () => {
   assert.equal(ENTRIES.codex.detect('').found, false);
+});
+
+// --- codex v0.142.5 (2026-07-07): stale-pattern fixes ---
+
+test('codex.detect finds v0.142.5 boot box + no-fast footer via multi-signal', () => {
+  const r = ENTRIES.codex.detect(CODEX_0142_MULTISIGNAL);
+  assert.equal(r.found, true);
+  assert.equal(r.reason, 'codex_multi_signal');
+});
+
+test('codex.detect finds v0.142.5 line-leading "›" (no space) via strict path', () => {
+  const r = ENTRIES.codex.detect(CODEX_0142_STRICT_NOSPACE);
+  assert.equal(r.found, true);
+  assert.equal(r.reason, 'codex_strict_line');
+  assert.equal(r.col, 2);
+});
+
+test('codex.detect regression: legacy fast-mode footer still matches multi-signal', () => {
+  const r = ENTRIES.codex.detect(CODEX_LEGACY_FAST);
+  assert.equal(r.found, true);
+  assert.equal(r.reason, 'codex_multi_signal');
+});
+
+test('codex.detect regression: resume picker stays NOT-ready (anti-pattern wins)', () => {
+  const r = ENTRIES.codex.detect(CODEX_RESUME_PICKER);
+  assert.equal(r.found, false);
+  assert.equal(r.reason, 'codex_modal_ui');
+});
+
+test('codex.detect regression: folder-trust modal stays NOT-ready (anti-pattern wins)', () => {
+  const r = ENTRIES.codex.detect(CODEX_TRUST_MODAL);
+  assert.equal(r.found, false);
+  assert.equal(r.reason, 'codex_modal_ui');
 });
 
 // ---------------------------------------------------------------------------
