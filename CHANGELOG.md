@@ -2,6 +2,11 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.6.13 — 2026-07-07
+
+### Fixed
+- **#719** The codex prompt matcher required the literal `fast` token in the status row and a leading space before `›`, both stale against codex v0.142.5 (non-fast footer `gpt-5.5 xhigh · <cwd>`, line-leading `›`). The bridge `promptReady` gate therefore never opened and injected messages parked in the mailbox indefinitely. Multi-signal now accepts the `·` separator tail and the strict scan's leading space is optional; modal anti-patterns unchanged.
+
 ## 0.6.12 — 2026-07-07
 
 ### Fixed
