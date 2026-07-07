@@ -67,9 +67,11 @@ const ENTRIES = {
 
       // Step 2: multi-signal tolerant. The codex boot box contains
       // "OpenAI Codex (v<version>)" and the status row contains
-      // "gpt-<ver> <profile> fast". Both present anywhere on the captured
-      // screen → ready, regardless of where the literal '›' rendered.
-      if (/OpenAI Codex \(v/.test(text) && /gpt-[0-9.]+\s+\w+\s+fast/.test(text)) {
+      // "gpt-<ver> <profile>" followed by either " fast" (fast-inference mode)
+      // or the " · <cwd>" separator. v0.142.5 omits "fast" when fast-mode is
+      // off ("gpt-5.5 xhigh · /tmp/demo714"), so match either tail. Both
+      // signals present anywhere → ready, regardless of where '›' rendered.
+      if (/OpenAI Codex \(v/.test(text) && /gpt-[0-9.]+\s+\S+(\s+fast|\s*·)/.test(text)) {
         return { found: true, reason: 'codex_multi_signal' };
       }
 
@@ -78,7 +80,9 @@ const ENTRIES = {
       const lines = text.split('\n');
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i];
-        if (!/^ › /.test(line)) continue;
+        // v0.142.5 renders the composer '›' line-leading with no space; older
+        // captures kept one leading space — accept both.
+        if (!/^ ?› /.test(line)) continue;
         const footer = (lines[i + 1] || '') + '\n' + (lines[i + 2] || '');
         if (/gpt-\d/.test(footer)) {
           return { found: true, line_index: i, col: 2, reason: 'codex_strict_line' };
