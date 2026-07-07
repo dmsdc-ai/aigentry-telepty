@@ -144,7 +144,10 @@ const ERROR_PATTERNS = [
 ];
 
 // ANSI escape stripper (preserves OSC 133 detection by running after OSC check)
-const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b\[[\?]?[0-9;]*[hlm]/g;
+// CSI branch = ECMA-48 CSI (see #715): params 0x30-0x3f (incl. < > = : ? used by
+// kitty-keyboard/modifyOtherKeys), intermediates 0x20-0x2f, final 0x40-0x7e. The
+// prior [0-9;] param class leaked claude v2.1.198's ESC[<u/ESC[>1u/ESC[>4;2m (#713).
+const ANSI_RE = /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b\][^\x07]*\x07|\x1b[()][AB012]/g;
 
 function stripAnsi(str) {
   return str.replace(ANSI_RE, '');

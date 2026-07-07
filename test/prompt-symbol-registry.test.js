@@ -161,6 +161,24 @@ test('normalizeOutputForDetection strips ANSI and converts CR to LF', () => {
   assert.equal(normalizeOutputForDetection('\x1b[31mhello\x1b[0m\rworld'), 'hello\nworld');
 });
 
+test('normalizeOutputForDetection strips kitty-keyboard / modifyOtherKeys CSI (< > = params) — #713', () => {
+  // claude v2.1.198 emits these on every render; the pre-#713 [0-9;?] param
+  // class left them in the detection text, gluing escapes onto the ❯ prompt.
+  assert.equal(normalizeOutputForDetection('A\x1b[<uB'), 'AB');
+  assert.equal(normalizeOutputForDetection('A\x1b[>1uB'), 'AB');
+  assert.equal(normalizeOutputForDetection('A\x1b[>7uB'), 'AB');
+  assert.equal(normalizeOutputForDetection('A\x1b[>4;2mB'), 'AB');
+  assert.equal(normalizeOutputForDetection('A\x1b[>0qB'), 'AB');
+});
+
+test('claude.detect finds prompt despite interspersed kitty-keyboard escapes — #713', () => {
+  // Real fresh claude v2.1.198 render: ESC[>1u/ESC[<u/ESC[>4;2m interleaved with
+  // the ❯ composer line. A leaking stripper glues them onto ❯ and the line
+  // anchor /^([❯>])\s*$/ fails → false "input blackhole" (TASK_IDLE_UNCONFIRMED).
+  const screen = '─────\n\x1b[>1u❯ \x1b[<u\x1b[>4;2m\n─────\n';
+  assert.equal(detectOutput('claude', screen).found, true);
+});
+
 // ---------------------------------------------------------------------------
 // claude.detect()
 // ---------------------------------------------------------------------------

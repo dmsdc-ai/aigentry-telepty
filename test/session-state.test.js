@@ -515,4 +515,20 @@ describe('stripAnsi', () => {
   it('preserves plain text', () => {
     assert.equal(stripAnsi('plain text'), 'plain text');
   });
+
+  it('removes kitty-keyboard / modifyOtherKeys CSI sequences (< > = params) — #713', () => {
+    // claude v2.1.198 and codex re-emit these every render. The <, >, = param
+    // bytes are valid ECMA-48 CSI parameter bytes (0x30-0x3f); the pre-#713
+    // [0-9;] class dropped them, leaking the escapes into state classification.
+    assert.equal(stripAnsi('A\x1b[<uB'), 'AB');    // kitty keyboard pop
+    assert.equal(stripAnsi('A\x1b[>1uB'), 'AB');   // kitty keyboard push flags=1
+    assert.equal(stripAnsi('A\x1b[>7uB'), 'AB');   // kitty keyboard push flags=7
+    assert.equal(stripAnsi('A\x1b[>4;2mB'), 'AB');  // modifyOtherKeys mode 2
+    assert.equal(stripAnsi('A\x1b[>0qB'), 'AB');   // XTVERSION query
+  });
+
+  it('still strips normal + truecolor SGR (no over-strip regression)', () => {
+    assert.equal(stripAnsi('A\x1b[39mB'), 'AB');
+    assert.equal(stripAnsi('A\x1b[38;2;215;119;87mB'), 'AB');
+  });
 });
