@@ -1820,6 +1820,22 @@ function isTerminalGateFailure(gateResult) {
   );
 }
 
+// #716: bracketed-paste submit envelope. codex/claude composers swallow a submit CR
+// that arrives coalesced with the injected text burst (paste-burst / coalesced read).
+// For a session the CLI marked paste-capable (it emitted ESC[?2004h — tracked in
+// appendToOutputRing), wrap the injected TEXT in bracketed-paste markers so the burst
+// is an explicit, delimited paste; the submit CR is written SEPARATELY and OUTSIDE
+// this envelope, so it is an unambiguous keystroke regardless of inter-write timing.
+// Non-paste-capable sessions (legacy claude/gemini/agy that never advertised ?2004h)
+// are byte-identical. An empty body is never wrapped.
+const BRACKETED_PASTE_START = '\x1b[200~';
+const BRACKETED_PASTE_END = '\x1b[201~';
+function maybeBracketedPaste(text, session) {
+  if (!text) return text;
+  if (!session || !session.bracketedPasteCapable) return text;
+  return BRACKETED_PASTE_START + text + BRACKETED_PASTE_END;
+}
+
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
   const now = Date.now();
   if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
@@ -1870,12 +1886,17 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
     origin: options.origin
   }).payload;
 
+  // #716: wrap the delivered text in bracketed paste for paste-capable CLIs so the
+  // deferred/gated submit CR (written separately, outside the 200~/201~ envelope)
+  // reliably fires instead of being swallowed into the paste burst. No-op otherwise.
+  const deliveredBody = maybeBracketedPaste(deliveredPrompt, session);
+
   try {
     const ack = mailbox.enqueue({
       msg_id: msgId,
       from,
       to: id,
-      payload: deliveredPrompt,
+      payload: deliveredBody,
       created_at: Math.floor(now / 1000),
       attempt: 0,
     });
@@ -1916,7 +1937,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   } catch (err) {
     console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
     // Fallback: direct delivery (backward compat during migration)
-    const textResult = await writeDataToSession(id, session, deliveredPrompt);
+    const textResult = await writeDataToSession(id, session, deliveredBody);
     if (!textResult.success) return textResult;
 
     if (!options.noEnter && session.type !== 'aterm') {
@@ -1943,6 +1964,12 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
 
 function appendToOutputRing(session, data) {
   if (!session.outputRing) session.outputRing = [];
+  // #716: track bracketed-paste capability from the CLI's own mode-set output so
+  // injects are wrapped (maybeBracketedPaste) only for paste-capable composers —
+  // codex/claude emit ESC[?2004h. Last h/l in the chunk wins.
+  const bpOn = data.lastIndexOf('\x1b[?2004h');
+  const bpOff = data.lastIndexOf('\x1b[?2004l');
+  if (bpOn !== -1 || bpOff !== -1) session.bracketedPasteCapable = bpOn > bpOff;
   // #52: monotonic byte counter — the inject-time watermark that scopes echo-evidence
   // matching to frames appended AFTER the inject (survives ring trimming below).
   session.outputRingTotalBytes = (session.outputRingTotalBytes || 0) + data.length;
@@ -4589,6 +4616,8 @@ module.exports = {
   loadNodeBrokerConfig,           // node-mode: resolve broker.json / env config (or null)
   startNodeBrokerClient,          // node-mode: start createBrokerClient (default-OFF; in-process deliver)
   deliverInjectionToSession,      // §4.3: the in-process delivery wired into the broker-client
+  appendToOutputRing,             // #716: seam that tracks bracketed-paste capability (?2004h)
+  maybeBracketedPaste,            // #716: capability-gated bracketed-paste wrap of injected text
   resolveBindHost,                // telepty#50 + #672: pure bind-address policy (loopback default, env opt-in, tailnet auto)
   formatBindHint,                 // telepty#50 + #672: startup bind/exposure banner line
   isTailnetAuto,                  // #672: pure predicate — is the zero-config tailnet path active
