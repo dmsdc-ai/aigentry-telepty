@@ -2,6 +2,16 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.6.12 — 2026-07-07
+
+### Fixed
+- **#715** `read-screen` leaked modern escape sequences (kitty keyboard protocol, DECSCUSR, colon sub-parameter SGR, DECRQM) as literal text — codex/claude screens showed `0 q`/`<u>1u`/`4:2m` garbage. The screen ANSI stripper now consumes the full ECMA-48 CSI grammar (params `0x30–0x3F`, intermediates `0x20–0x2F`, final `0x40–0x7E`), extracted to `src/screen-ansi.js` with a regression suite.
+- **#716** `inject --submit` into codex never registered: codex's composer paste-burst detection swallowed a CR coalesced with the injected text. Paste-capable CLIs (detected via `ESC[?2004h`) now receive the text wrapped in bracketed paste (`ESC[200~ … ESC[201~`) with the submit CR written separately outside the envelope — submission is timing-independent. Non-paste CLIs are byte-identical. Live-validated on codex 0.142.5.
+- **#713 (partial)** The same ECMA-48 gap in `session-state.js` / `prompt-symbol-registry.js` broke prompt/consumption detection for claude v2.1.198 (which emits kitty-protocol sequences every render). Both matchers aligned to the corrected CSI form. Note: fresh claude v2.1.198 sessions still gate on bridge `promptReady` prompt-symbol detection over the raw stream, which the new absolute-positioning composer defeats — full fix tracked separately.
+
+### Rollout
+- #715/#716 are daemon-side (daemon restart only). #713's bridge-side detection improvement additionally applies to newly started `telepty allow` bridges.
+
 ## [Unreleased]
 
 ## [0.6.11] - 2026-07-05
