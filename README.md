@@ -2,7 +2,7 @@
 
 **Connect any terminal to any terminal, any machine.**
 
-![telepty demo — inject a prompt into a live AI CLI session and read its screen](docs/demo.gif)
+![telepty demo — one Mac terminal injecting prompts into live AI CLI sessions on macOS (agy), Linux (codex), and Windows (claude) — all three answer in real time](docs/demo.gif)
 
 telepty is a PTY orchestration daemon and session bridge for AI CLI workflows. It lets you spawn, attach to, and inject commands into terminal sessions — locally or across machines via Tailscale.
 
@@ -305,7 +305,7 @@ telepty runs **standalone** — it needs none of the other aigentry modules and 
 
 | Module | Package | Version | Role | Maturity |
 | --- | --- | --- | --- | --- |
-| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.6.11 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
+| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.6.13 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
 | **brain** | `@dmsdc-ai/aigentry-brain` | 0.2.8 | Persistent cross-session memory (MCP server) | Early |
 | **deliberation** | `@dmsdc-ai/aigentry-deliberation` | 0.0.47 | Multi-AI structured debate + synthesis (MCP server) | Early |
 | **devkit** | `@dmsdc-ai/aigentry-devkit` | 0.0.22 | Installer/scaffold for the AI dev environment | Early |
