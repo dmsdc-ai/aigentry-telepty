@@ -19,6 +19,7 @@ const { UnixSocketNotifier } = require('./src/mailbox/notifier');
 const { SessionStateManager, STATE_DISPLAY, stripAnsi: stripAnsiState } = require('./session-state');
 const { classifyReportPrompt, buildAutoSummary } = require('./src/report-enforcement');
 const submitGate = require('./src/submit-gate');
+const { stripAnsiForScreen } = require('./src/screen-ansi'); // #715: read-screen ANSI/VT stripper
 const { sampleChildCpuSeconds } = require('./src/child-cpu'); // #52: quiet-thinking CPU recheck
 const readyRegistry = require('./src/prompt-symbol-registry');
 const lifecycle = require('./src/lifecycle');
@@ -3561,30 +3562,7 @@ app.get('/api/sessions/:id/screen', (req, res) => {
   // Join all buffered output
   const fullOutput = session.outputRing.join('');
 
-  // Strip ANSI escape sequences for clean text
-  function stripAnsi(str) {
-    return str
-      // Replace cursor-forward (ESC[NC, ESC[C) with N spaces to preserve whitespace
-      .replace(/\[(\d*)C/g, (_, n) => ' '.repeat(Number(n) || 1))
-      // CSI sequences: ESC [ ? (optional) params final_byte
-      .replace(/\[\??[0-9;]*[a-zA-Z@`]/g, '')
-      // OSC sequences: ESC ] ... BEL
-      .replace(/\][^]*/g, '')
-      // OSC sequences: ESC ] ... ST (ESC \)
-      .replace(/\][^]*\\/g, '')
-      // Character set selection: ESC ( / ) + charset
-      .replace(/[()][AB012]/g, '')
-      // Keypad and other 2-char ESC sequences
-      .replace(/[>=<78DMEHcNOZ~}|]/g, '')
-      // DCS / PM / APC sequences
-      .replace(/[P^_][^]*\\/g, '')
-      // Any remaining bare ESC + single char
-      .replace(/./g, '')
-      // Carriage returns
-      .replace(/\r/g, '');
-  }
-
-  const cleaned = raw ? fullOutput : stripAnsi(fullOutput);
+  const cleaned = raw ? fullOutput : stripAnsiForScreen(fullOutput);
 
   // Take last N lines
   const allLines = cleaned.split('\n');
