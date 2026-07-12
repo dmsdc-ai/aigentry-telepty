@@ -2,11 +2,37 @@
 
 **Connect any terminal to any terminal, any machine.**
 
-![telepty relay demo — three LLM agents (Grok on macOS, Codex on Linux, Claude on Windows) relaying messages to each other across machines by running telepty inject themselves, each pane a live attach of the original CLI TUI](docs/demo-relay.gif)
-
 telepty is a PTY orchestration daemon and session bridge for AI CLI workflows. It lets you spawn, attach to, and inject commands into terminal sessions — locally or across machines via Tailscale.
 
 Built for AI CLI workflows (Claude Code, Codex, Gemini CLI), but works with any interactive terminal program.
+
+## Demo — three machines, three AI CLIs, one relay
+
+Three LLM agents pass a baton around a Tailscale mesh **by running `telepty inject` themselves** — no SSH, no copy-paste. Each capture below is a live `telepty attach` of the original CLI TUI on that machine:
+
+```
+🍎 macOS (Grok) ──▶ 🐧 Linux (Codex) ──▶ 🪟 Windows (Claude) ──▶ 🍎 macOS … (loop)
+```
+
+### 1️⃣ macOS — Grok CLI (`100.72.155.21`)
+
+Grok receives the kickoff, then fires the baton at Codex on the Linux box — watch the `RELAY` messages arrive from Windows and leave for Linux:
+
+![macOS pane — Grok CLI receiving cross-machine RELAY messages and injecting Codex on Linux via telepty](docs/demo-relay-macos.gif)
+
+### 2️⃣ Linux — Codex CLI (`100.70.64.60`)
+
+Codex catches the `[MAC->LINUX]` message from Grok, replies, and runs `telepty inject` targeting Claude on the Windows box:
+
+![Linux pane — Codex CLI receiving RELAY messages from macOS and injecting Claude on Windows via telepty](docs/demo-relay-linux.gif)
+
+### 3️⃣ Windows — Claude CLI (`100.100.189.32`)
+
+Claude receives the `[LINUX->WIN]` baton and closes the loop — you can see the actual `telepty inject … relay-grok3@100.72.155.21` command it runs to send the message back to macOS:
+
+![Windows pane — Claude CLI receiving RELAY messages from Linux and injecting Grok on macOS via telepty](docs/demo-relay-windows.gif)
+
+All IPs are Tailscale CGNAT addresses (`100.64.0.0/10`) — private to the tailnet, unreachable from the public internet.
 
 ## Install
 
