@@ -10,6 +10,7 @@ function isOpenWebSocket(ws) {
 function installWebSocketTransport(deps) {
   const {
     server,
+    tailnetServer,
     sessions,
     busClients,
     expectedToken,
@@ -281,7 +282,12 @@ function installWebSocketTransport(deps) {
     });
   });
 
-  if (server) server.on('upgrade', (req, socket, head) => {
+  // Shared upgrade handler. Attached to every provided listener so a cross-host attach reaching
+  // the additive tailnet socket (daemon.js:4225) upgrades exactly like loopback — the auth check
+  // (isAllowedPeer || token || jwt) is identical to the inject/read-screen HTTP path, so attach
+  // gains no reach those already lack. Was bound to loopback only → tailnet WS fell through to
+  // Express GET /api/sessions/:id → HTTP 200 ("Unexpected server response: 200").
+  function handleUpgrade(req, socket, head) {
     const url = new URL(req.url, 'http://' + req.headers.host);
     const token = url.searchParams.get('token');
 
@@ -304,9 +310,13 @@ function installWebSocketTransport(deps) {
     } else {
       socket.destroy();
     }
-  });
+  }
 
-  return { wss, busWss };
+  for (const listener of [server, tailnetServer]) {
+    if (listener) listener.on('upgrade', handleUpgrade);
+  }
+
+  return { wss, busWss, handleUpgrade };
 }
 
 module.exports = {

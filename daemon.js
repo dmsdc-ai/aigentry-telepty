@@ -4185,6 +4185,7 @@ function startNodeBrokerClient(deps = {}) {
 // cli.js, never this module — hence the explicit AIGENTRY_TELEPTY_DAEMON_MAIN signal. Guarding on
 // require.main ALONE (0.5.0 regression) meant app.listen never ran in production → daemon exited 0.
 let server;
+let tailnetServer; // additive tailnet listener (AUTO_TAILNET path); needs the WS upgrade handler too
 let nodeBrokerClient = null;
 if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
   if (brokerServer) {
@@ -4222,7 +4223,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
     // socket on the same app. ponytail: fixed-PORT production shares one port on both
     // listeners; a PORT=0 ephemeral run would split ports, but the auto path is never
     // taken under PORT=0 in the suite (TELEPTY_NO_TAILNET_AUTO=1 default in setup-env.js).
-    const tailnetServer = app.listen(Number(PORT), TAILNET_IP);
+    tailnetServer = app.listen(Number(PORT), TAILNET_IP);
     tailnetServer.on('error', (e) => {
       console.warn(`[BIND] tailnet listener ${TAILNET_IP}:${Number(PORT)} unavailable (staying loopback-only): ${e && e.message}`);
     });
@@ -4544,6 +4545,7 @@ const busClients = new Set();
 
 installWebSocketTransport({
   server,
+  tailnetServer,
   sessions,
   busClients,
   expectedToken: EXPECTED_TOKEN,
