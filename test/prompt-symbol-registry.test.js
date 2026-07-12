@@ -106,6 +106,16 @@ const CODEX_LEGACY_FAST = [
   '  gpt-5.5 xhigh fast · ~/projects/x',
 ].join('\n');
 
+// Suffixed model name (2026-07-12 live footer): codex reports "gpt-5.6-sol".
+// The pre-fix Step-2 regex `gpt-[0-9.]+\s+` stops the model token at "5.6"
+// and the required `\s` never matches the "-sol" suffix → promptReady never
+// flips (same failure mode as #719). `gpt-\S+` spans the whole token.
+const CODEX_SUFFIXED_MODEL = [
+  'OpenAI Codex (v0.146.0)',
+  '',
+  '  gpt-5.6-sol xhigh · /tmp/demo',
+].join('\n');
+
 // Anti-pattern: resume picker must stay NOT-ready even though it now contains
 // a '·'-separator footer + a '›' line the looser matchers would otherwise like.
 const CODEX_RESUME_PICKER = [
@@ -307,6 +317,12 @@ test('codex.detect finds v0.142.5 line-leading "›" (no space) via strict path'
 
 test('codex.detect regression: legacy fast-mode footer still matches multi-signal', () => {
   const r = ENTRIES.codex.detect(CODEX_LEGACY_FAST);
+  assert.equal(r.found, true);
+  assert.equal(r.reason, 'codex_multi_signal');
+});
+
+test('codex.detect finds suffixed model "gpt-5.6-sol" footer via multi-signal', () => {
+  const r = ENTRIES.codex.detect(CODEX_SUFFIXED_MODEL);
   assert.equal(r.found, true);
   assert.equal(r.reason, 'codex_multi_signal');
 });

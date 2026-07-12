@@ -71,7 +71,11 @@ const ENTRIES = {
       // or the " · <cwd>" separator. v0.142.5 omits "fast" when fast-mode is
       // off ("gpt-5.5 xhigh · /tmp/demo714"), so match either tail. Both
       // signals present anywhere → ready, regardless of where '›' rendered.
-      if (/OpenAI Codex \(v/.test(text) && /gpt-[0-9.]+\s+\S+(\s+fast|\s*·)/.test(text)) {
+      // Model token is `gpt-\S+` not `gpt-[0-9.]+`: codex now ships suffixed
+      // names ("gpt-5.6-sol"), where `[0-9.]+` stopped at "5.6" and the `\s`
+      // never reached past the "-sol". `\S+` cannot cross whitespace, so the
+      // trailing `\s+\S+(\s+fast|\s*·)` profile/tail signal is preserved.
+      if (/OpenAI Codex \(v/.test(text) && /gpt-\S+\s+\S+(\s+fast|\s*·)/.test(text)) {
         return { found: true, reason: 'codex_multi_signal' };
       }
 
