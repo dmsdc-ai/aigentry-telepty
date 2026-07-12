@@ -2,6 +2,11 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.6.14 — 2026-07-12
+
+### Fixed
+- codex prompt matcher broke again on suffixed model names (`gpt-5.6-sol`): the multi-signal pattern assumed `gpt-<digits>` followed by whitespace. Now matches any `gpt-<token>` (`gpt-\S+`), so cosmetic model renames no longer close the `promptReady` gate and park injects (follow-up to 0.6.13's #719).
+
 ## 0.6.13 — 2026-07-07
 
 ### Fixed
