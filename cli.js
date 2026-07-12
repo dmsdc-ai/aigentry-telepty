@@ -38,6 +38,7 @@ const { decideVersionAction } = require('./src/version-handshake');
 const crossMachine = require('./cross-machine');
 const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec');
 const { FileMailbox } = require('./src/mailbox/index');
+const { filterBridgeBatch, bridgeInjectTtlSecs } = require('./src/mailbox/bridge-flush-filter');
 const readyRegistry = require('./src/prompt-symbol-registry');
 const lifecycle = require('./src/lifecycle');
 const args = process.argv.slice(2);
@@ -1797,7 +1798,19 @@ async function main() {
         batch.push(msg);
       }
       if (batch.length === 0) { bridgePendingCount = 0; return; }
-      for (const msg of batch) {
+      // #720: drop stale-parked and consecutive-duplicate injects before writing,
+      // so a long-closed gate does not deliver the same question N times or replay
+      // an inject that went stale while parked.
+      const nowSecs = Math.floor(Date.now() / 1000);
+      const { deliver, dropped } = filterBridgeBatch(batch, {
+        ttlSecs: bridgeInjectTtlSecs(process.env), nowSecs,
+      });
+      for (const { msg, reason } of dropped) {
+        // Ack so the dropped inject clears in_flight instead of lingering; never write it.
+        try { bridgeMailbox.ack(bridgeTarget, msg.msg_id); } catch {}
+        console.warn(`\x1b[33m[BRIDGE] dropped ${reason} inject ${msg.msg_id} (age=${nowSecs - msg.created_at}s)\x1b[0m`);
+      }
+      for (const msg of deliver) {
         const text = msg.payload;
         const msgId = msg.msg_id;
         setTimeout(() => {
