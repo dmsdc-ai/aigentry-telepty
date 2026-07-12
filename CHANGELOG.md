@@ -2,6 +2,15 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.6.15 — 2026-07-12
+
+### Fixed
+- **#724** Cross-host `telepty attach <sid>@<host>` failed with `Unexpected server response: 200` while local attach worked. On the AUTO_TAILNET path the daemon opens two sockets on the API port (loopback primary + additive tailnet IP), but the WS `upgrade` handler was bound to the loopback listener only — a cross-host handshake hit the tailnet socket, fell through to Express `GET /api/sessions/:id`, and got HTTP 200 instead of 101. The shared upgrade handler is now attached to both listeners. Auth unchanged (`isAllowedPeer || token || jwt`, identical to inject/read-screen); a new regression test asserts both listeners upgrade to 101 and an unauthorized cross-host upgrade still rejects (401).
+- **#720** Bridge mailbox flush now drops stale parked injects (TTL, default 600s, env `TELEPTY_BRIDGE_INJECT_TTL_SECS`) and collapses consecutive duplicate payloads before delivery, with `[BRIDGE] dropped <reason>` logs. Previously every parked inject flushed on gate-open regardless of age or repetition.
+
+### Rollout
+- Both daemon-side. #724 requires a daemon restart on the **owning** node (the one hosting the session being attached); the requesting node needs no change.
+
 ## 0.6.14 — 2026-07-12
 
 ### Fixed
