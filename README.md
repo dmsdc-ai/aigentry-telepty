@@ -47,6 +47,20 @@ Claude receives the `[LINUX->WIN]` baton in its composer, acknowledges, and clos
 
 > **Notes** · The IPs are Tailscale CGNAT addresses (`100.64.0.0/10`) — private to the tailnet and unreachable from the public internet. · Message frames are held ~2.5s for readability; spinners run at natural speed. · The agents' quips are their own — nobody scripted "baton airborne".
 
+### Bonus — same machine, session-to-session
+
+Cross-machine is not required: the same `telepty inject` works between sessions on **one** box. Here three different AI CLIs on a single Mac — **Grok 4.5**, **Claude (Fable 5)**, and **Codex (gpt-5.5)** — relay a baton locally. Same command, no `@ip` suffix, zero window switching:
+
+```
+grok (relay-grok3) ──▶ claude (demo-claude-loc) ──▶ codex (demo-codex-loc2) ──▶ grok … (loop)
+```
+
+What to watch: `LOCAL 2: [grok -> claude, same box]` lands in Claude's composer the moment Grok runs its inject; each pane is a separate telepty session on the same machine:
+
+![Same-machine relay — Grok, Claude and Codex sessions on one Mac injecting each other locally via telepty](docs/demo-relay-local.gif)
+
+This is the day-to-day shape of telepty: an orchestrator session driving worker sessions — dispatching prompts, reading screens, collecting reports — whether the workers live on the same machine or across a tailnet.
+
 ## Install
 
 ```bash
