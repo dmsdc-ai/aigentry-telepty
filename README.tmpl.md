@@ -8,31 +8,44 @@ Built for AI CLI workflows (Claude Code, Codex, Gemini CLI), but works with any 
 
 ## Demo — three machines, three AI CLIs, one relay
 
-Three LLM agents pass a baton around a Tailscale mesh **by running `telepty inject` themselves** — no SSH, no copy-paste. Each capture below is a live `telepty attach` of the original CLI TUI on that machine:
+Three LLM agents pass a baton around a Tailscale mesh **by running `telepty inject` themselves** — no SSH sessions, no copy-paste, no human typing after the kickoff:
 
 ```
 🍎 macOS (Grok) ──▶ 🐧 Linux (Codex) ──▶ 🪟 Windows (Claude) ──▶ 🍎 macOS … (loop)
 ```
 
+**How it works.** Each agent was given one rule (delivered via `telepty inject`, like everything else here): *"when a message containing `RELAY <n>:` arrives, reply, then run `telepty inject --submit <next-session>@<next-machine-ip> "RELAY <n+1>: …"` yourself."* The orchestrator sends a single `RELAY 1` kickoff — after that, every message you see crossing machines was sent by an LLM running the telepty CLI on its own.
+
+Each capture below is the **same relay seen from a different machine**, recorded as a live `telepty attach` of that machine's original CLI TUI (telepty's cross-host attach renders the real interface, not a scraped transcript).
+
 ### 1️⃣ macOS — Grok CLI (`100.72.155.21`)
 
-Grok receives the kickoff, then fires the baton at Codex on the Linux box — watch the `RELAY` messages arrive from Windows and leave for Linux:
+What to watch: the `RELAY 1` kickoff lands in Grok's message box → Grok answers → the footer shows `Relay hop … inject to demo-codex5` as Grok runs telepty against the Linux box. Later, `RELAY 4: [WIN->MAC …]` arrives **from Windows** and Grok fires the next lap:
 
-![macOS pane — Grok CLI receiving cross-machine RELAY messages and injecting Codex on Linux via telepty](docs/demo-relay-macos.gif)
+![macOS — Grok CLI: RELAY messages arriving from Windows and being relayed to Codex on Linux via telepty inject](docs/demo-relay-macos.gif)
 
 ### 2️⃣ Linux — Codex CLI (`100.70.64.60`)
 
-Codex catches the `[MAC->LINUX]` message from Grok, replies, and runs `telepty inject` targeting Claude on the Windows box:
+The full story on one screen: Codex's welcome box (`/tmp/demo`, YOLO mode) → the relay rule arriving → `READY-X5` → `RELAY 2: [MAC->LINUX …]` landing from macOS → Codex's shell command:
 
-![Linux pane — Codex CLI receiving RELAY messages from macOS and injecting Claude on Windows via telepty](docs/demo-relay-linux.gif)
+```
+Ran telepty inject --submit --from orchestrator demo-claude2@100.100.189.32 \
+    "RELAY 3: [LINUX->WIN codex @ Linux] Linux catches cleanly; Windows, keep the loop flying!"
+  ✅ Context injected successfully into 'demo-claude2'.
+  ✅ Submitted via pty_cr — consumed as a new turn.
+```
+
+That is an LLM on Linux delivering a prompt **into another LLM's live session on a Windows machine** with one command:
+
+![Linux — Codex CLI: receiving RELAY from macOS and injecting Claude on Windows via telepty inject](docs/demo-relay-linux.gif)
 
 ### 3️⃣ Windows — Claude CLI (`100.100.189.32`)
 
-Claude receives the `[LINUX->WIN]` baton and closes the loop — you can see the actual `telepty inject … relay-grok3@100.72.155.21` command it runs to send the message back to macOS:
+Claude receives the `[LINUX->WIN]` baton in its composer, acknowledges, and closes the loop by injecting Grok back on macOS (`relay-grok3@100.72.155.21`) — completing macOS → Linux → Windows → macOS:
 
-![Windows pane — Claude CLI receiving RELAY messages from Linux and injecting Grok on macOS via telepty](docs/demo-relay-windows.gif)
+![Windows — Claude CLI: receiving RELAY from Linux and injecting Grok on macOS via telepty inject](docs/demo-relay-windows.gif)
 
-All IPs are Tailscale CGNAT addresses (`100.64.0.0/10`) — private to the tailnet, unreachable from the public internet.
+> **Notes** · The IPs are Tailscale CGNAT addresses (`100.64.0.0/10`) — private to the tailnet and unreachable from the public internet. · Message frames are held ~2.5s for readability; spinners run at natural speed. · The agents' quips are their own — nobody scripted "baton airborne".
 
 ## Install
 
