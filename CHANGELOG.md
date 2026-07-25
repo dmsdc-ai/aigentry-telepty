@@ -2,6 +2,14 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.6.16 — 2026-07-25
+
+### Fixed
+- **#721** `TASK_IDLE_UNCONFIRMED` false-negatives (cry-wolf) on genuinely-completed worker turns, two root causes. **(b, primary)** worker-launcher (`telepty allow --auto-restart …`) sessions never produce a clean `idle→working` edge — their continuously-active child stays `working`, so the CR yields only `starting→working` / `working↔thinking` flips, all excluded by the #619 recorder's fromState guard. The durable consumption fact was therefore never recorded (0 `consumed_recorded` suppressions in production) and every long launcher completion decayed to the weak-idle signal and cried wolf. A new idle-gate path (`maybeRecordLauncherConsumption`) re-derives the verdict from decay-proof signals — **scoped to wrapped sessions** so non-wrapped keep strict #619/#545 semantics — gated on submit-accepted + real post-CR output + an elapsed floor (`TELEPTY_LAUNCHER_CONSUMPTION_MIN_SECONDS`, default 30s) an order of magnitude above the ~4.5s claude startup-settle, preserving the #537/BUG-B never-false-complete invariant. **(c, secondary / #579)** the clear-on-REPORT reverse-match only fired for `REPORT_PREFIX_RE`-shaped payloads, so a `--ref`/enveloped REPORT (file body with a leading markdown title) left the pending report stale and the honest post-report idle cried wolf. The reverse-match now treats any outbound inject a worker routes back to its pending-report source as completion evidence (`resolveOutboundReportStatus` fallback; `REPORT_PREFIX_RE` itself unchanged). Cosmetic consequence: any such outbound — including a mid-task clarifying question — now clears the entry and reports `TASK_COMPLETE_WITH_REPORT`; since the source already has the worker's message in hand, the cleared enforcement is intended and the completion label on a question is an accepted mislabel.
+
+### Rollout
+- Daemon-side (daemon restart). FIX 1 is inert for non-wrapped sessions; `TELEPTY_LAUNCHER_CONSUMPTION_MIN_SECONDS` tunes the launcher-completion elapsed floor (default 30).
+
 ## 0.6.15 — 2026-07-12
 
 ### Fixed
@@ -31,13 +39,6 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 ### Rollout
 - #715/#716 are daemon-side (daemon restart only). #713's bridge-side detection improvement additionally applies to newly started `telepty allow` bridges.
 
-## [Unreleased]
-
-### Fixed
-- **#721** `TASK_IDLE_UNCONFIRMED` false-negatives (cry-wolf) on genuinely-completed worker turns, two root causes. **(b, primary)** worker-launcher (`telepty allow --auto-restart …`) sessions never produce a clean `idle→working` edge — their continuously-active child stays `working`, so the CR yields only `starting→working` / `working↔thinking` flips, all excluded by the #619 recorder's fromState guard. The durable consumption fact was therefore never recorded (0 `consumed_recorded` suppressions in production) and every long launcher completion decayed to the weak-idle signal and cried wolf. A new idle-gate path (`maybeRecordLauncherConsumption`) re-derives the verdict from decay-proof signals — **scoped to wrapped sessions** so non-wrapped keep strict #619/#545 semantics — gated on submit-accepted + real post-CR output + an elapsed floor (`TELEPTY_LAUNCHER_CONSUMPTION_MIN_SECONDS`, default 30s) an order of magnitude above the ~4.5s claude startup-settle, preserving the #537/BUG-B never-false-complete invariant. **(c, secondary / #579)** the clear-on-REPORT reverse-match only fired for `REPORT_PREFIX_RE`-shaped payloads, so a `--ref`/enveloped REPORT (file body with a leading markdown title) left the pending report stale and the honest post-report idle cried wolf. The reverse-match now treats any outbound inject a worker routes back to its pending-report source as completion evidence (`resolveOutboundReportStatus` fallback; `REPORT_PREFIX_RE` itself unchanged). Cosmetic consequence: any such outbound — including a mid-task clarifying question — now clears the entry and reports `TASK_COMPLETE_WITH_REPORT`; since the source already has the worker's message in hand, the cleared enforcement is intended and the completion label on a question is an accepted mislabel.
-
-### Rollout
-- Daemon-side (daemon restart). FIX 1 is inert for non-wrapped sessions; `TELEPTY_LAUNCHER_CONSUMPTION_MIN_SECONDS` tunes the launcher-completion elapsed floor (default 30).
 
 ## [0.6.11] - 2026-07-05
 
