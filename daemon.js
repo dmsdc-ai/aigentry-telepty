@@ -410,6 +410,12 @@ const IDLE_UNCONFIRMED_SETTLE_MAX_REARMS = Math.max(0, Number(process.env.TELEPT
 // no-output stretch is survivable while a pathological always-busy child still signals.
 const IDLE_UNCONFIRMED_CPU_DELTA_SECONDS = Number(process.env.TELEPTY_IDLE_UNCONFIRMED_CPU_DELTA_SECONDS) || 0.1;
 const IDLE_UNCONFIRMED_CPU_MAX_REARMS = Math.max(0, Number(process.env.TELEPTY_IDLE_UNCONFIRMED_CPU_MAX_REARMS) || 24);
+// #721 FIX 1: elapsed floor (seconds since inject) below which a worker-launcher (wrapped)
+// real-idle is NOT credited as a genuine turn completion. Sits an order of magnitude above the
+// ~4.5s claude startup-settle (the #537 never-started flip) and well below the real 800-1400s
+// misfires — the load-bearing guard that lets ambiguous/force launcher confirms count as
+// consumption without re-opening BUG-B. See maybeRecordLauncherConsumption.
+const LAUNCHER_CONSUMPTION_MIN_SECONDS = Number(process.env.TELEPTY_LAUNCHER_CONSUMPTION_MIN_SECONDS) || 30;
 
 function pendingReportHasSubmitEvidence(pendingReport) {
   return !!(pendingReport && (
@@ -445,6 +451,61 @@ function maybeRecordInjectConsumption(pendingReport, fromState, toState, transit
   if (!Number.isFinite(transitionSinceMs) || transitionSinceMs < submitStartedMs) return false;
   pendingReport.injectConsumedAt = new Date(transitionSinceMs).toISOString();
   pendingReport.injectConsumedSinceMs = transitionSinceMs;
+  return true;
+}
+
+// #721 FIX 2 (#579): the reverse-match's completion verdict for an inject a session routed back
+// to its own pending-report SOURCE (the worker replying to whoever tasked it). A prefix-shaped
+// REPORT keeps its precise status (classifyReportPrompt); any OTHER payload — a `--ref`/enveloped
+// REPORT whose file body is not REPORT_PREFIX_RE-shaped (e.g. a leading markdown title) — is
+// still completion EVIDENCE and clears the stale pending report so a later honest idle does not
+// cry wolf. REPORT_PREFIX_RE is unchanged: this is a strict fallback that only ADDS a completion
+// verdict, and only in the already-routed (sender→pending-source) reverse-match branch.
+function resolveOutboundReportStatus(prompt) {
+  return classifyReportPrompt(prompt) || 'report_complete';
+}
+
+// #721 FIX 1 (root cause b): a worker-launcher (wrapped) session never rides a clean idle→working
+// edge — its continuously-active child stays `working`, so the inject's CR produces only
+// starting→working / working↔thinking mid-turn flips, all excluded by maybeRecordInjectConsumption's
+// fromState guard. #619's durable fact is therefore NEVER recorded for launchers (0 `consumed_recorded`
+// suppressions in production), so every long launcher completion decays to the weak-idle signal and
+// cries wolf. This re-derives the consumption verdict at idle-gate time from DECAY-PROOF signals
+// (durable submit flags + the monotonic outputRing byte counter + elapsed — none of which age out like
+// echo/OSC133), SCOPED to wrapped sessions so non-wrapped sessions keep strict #619/#545 semantics.
+//
+// never-false-complete (BUG-B / #537) is held by four conjuncts:
+//   (a) submitStartedAt set — at/after the CR (never records before the CR);
+//   (b) submitConfirm.accepted === true — the CR was accepted. Excludes the classic #537
+//       (accepted:false) AND the undefined-confirm never-started shape (enforce-submit-gate /
+//       submit-via-pty). For a launcher this is the ambiguous/force/no_observable accept, which is
+//       intentionally allowed HERE (unlike observeConsumptionEvidence) because (c)+(d) below add the
+//       real-work + long-elapsed evidence a bare force-confirm lacks;
+//   (c) the outputRing advanced past the inject watermark — real post-CR output, not a no-op flip;
+//   (d) elapsed ≥ LAUNCHER_CONSUMPTION_MIN_SECONDS — an order of magnitude above the ~4.5s
+//       startup-settle, the load-bearing guard vs a #544-era never-started startup flip.
+// Recording here (rather than a decay-proof early fact) is required because (d) can only be judged
+// at idle-time — a #537 startup flip and a genuine turn are identical at the working transition.
+//
+// KNOWN BOUNDED RISK (accepted, #721 FIX-phase decision): a never-started wrapped worker whose stale
+// pending report RE-FIRES real-idle > floor later (no fresh inject cycle) can satisfy (a–d) and
+// false-complete. Rare (requires a spurious late idle with no new task); the elapsed floor makes the
+// common ~4.5s settle safe. Documented rather than plumbed away (a submit-baselined watermark was
+// weighed and dropped as higher blast-radius for marginal gain).
+function maybeRecordLauncherConsumption(session, pendingReport, elapsedSinceInjectSec, nowMs) {
+  if (!pendingReport || pendingReport.injectConsumedAt) return false;
+  if (!session || session.type !== 'wrapped') return false;
+  if (!pendingReport.submitExpected || !pendingReport.submitStartedAt) return false;
+  const confirm = pendingReport.submitConfirm;
+  if (!(confirm && confirm.accepted === true)) return false;
+  const ringNow = Number.isFinite(session.outputRingTotalBytes) ? session.outputRingTotalBytes : 0;
+  const ringAtInject = Number.isFinite(pendingReport.ringBytesAtInject) ? pendingReport.ringBytesAtInject : 0;
+  if (ringNow <= ringAtInject) return false;
+  if (!(elapsedSinceInjectSec >= LAUNCHER_CONSUMPTION_MIN_SECONDS)) return false;
+  const submitStartedMs = new Date(pendingReport.submitStartedAt).getTime();
+  pendingReport.injectConsumedAt = new Date(Number.isFinite(nowMs) ? nowMs : Date.now()).toISOString();
+  pendingReport.injectConsumedSinceMs = Number.isFinite(submitStartedMs) ? submitStartedMs : null;
+  pendingReport.injectConsumedVia = 'launcher_watermark';
   return true;
 }
 
@@ -580,6 +641,16 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
       console.log(`[AUTO-REPORT] ${targetId} ready-signal deferred; awaiting submit confirmation`);
       return;
     }
+  }
+
+  // #721 FIX 1: rescue a genuine worker-launcher (wrapped) completion the edge-gated #619 recorder
+  // never credited. On a real-idle flip, re-derive the durable consumption fact from decay-proof
+  // launcher-safe signals (maybeRecordLauncherConsumption) so a recorded fact then flows through
+  // strongSubmitConfirmed / negates idleEvidenceUnreliable below exactly like a #619 fact — the
+  // decayed weak idle no longer cries wolf. Scoped to wrapped sessions, so #537/#545 never-false-
+  // complete for every non-wrapped session is untouched.
+  if (trigger === 'real-idle') {
+    maybeRecordLauncherConsumption(_sessions[targetId] || targetSession, pendingReport, elapsedNum, _now());
   }
 
   // #537 / Bug B: a never-started worker (transient submit failure → claude startup
@@ -3414,7 +3485,11 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       if (senderPending) {
         const pendingSourceAlias = resolveSessionAlias(senderPending.source) || senderPending.source;
         if (pendingSourceAlias === recipientAlias) {
-          const classification = classifyReportPrompt(prompt);
+          // #721 FIX 2 (#579): a prefix-shaped REPORT keeps its precise status; any other payload
+          // the worker routes back to its pending source is still completion evidence (fallback
+          // to 'report_complete') — so a --ref/enveloped REPORT clears the entry instead of the
+          // stale pending report crying wolf at the next honest idle.
+          const classification = resolveOutboundReportStatus(prompt);
           if (classification) {
             delete pendingReports[senderAlias];
             const elapsedSecs = Number(((Date.now() - new Date(senderPending.injectedAt).getTime()) / 1000).toFixed(1));
@@ -4601,6 +4676,7 @@ if (require.main === module) {
 module.exports = {
   fireAutoReport,                 // #32: provenance-tagged auto-report (deps DI: now/deliver/...)
   maybeRecordInjectConsumption,   // #619: durable early-consumption fact capture (idle-gate decay-proofing)
+  resolveOutboundReportStatus,    // #721 FIX 2 (#579): reverse-match completion verdict + non-prefix fallback
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
   isTerminalGateFailure,          // #678: submit-gate disposition — no_state is best-effort dispatch, not hard-fail
   terminalLevelSubmit,            // #544: PTY-only submit path (pty_cr | null)
