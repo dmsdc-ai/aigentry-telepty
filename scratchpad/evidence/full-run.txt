@@ -1,0 +1,45 @@
+######## 1. RED test — the product invariants #730 breaks ########
+not ok 1 - \#730 RED: a codex session that missed the one-shot ESC[?2004h still needs the paste envelope
+not ok 2 - \#730 RED: bracketed-paste capability survives a daemon restart
+not ok 3 - \#730 RED: a restored codex session still gets the paste envelope
+ok 4 - \#730 characterization: un-enveloped multi-line body + 0ms CR accumulates, never submits
+ok 5 - \#730 characterization: the paste envelope makes the CR land regardless of gap
+ok 6 - \#730 characterization: holding the CR past the burst window also lands it
+
+######## 2. E2E byte capture — REAL telepty force-submit path ########
+# harness daemon on PORT=0 with an isolated HOME; production 3848 untouched.
+## e2e-730 — harness daemon on port 60132 (production 3848 untouched), HOME=/var/folders/vn/4kv7j91x0f70bwmfn9n_369r0000gn/T/c730-home-guR7qX
+## body: 4 lines, 109 chars
+
+--- variant: bridge RELAYED codex's ESC[?2004h  (session c730-e2e-sees2004h) ---
+  frame0 +0ms  BRACKETED-PASTE body len=121
+    head=1b5b3230307e5245  tail=6f621b5b3230317e
+  frame1 +0ms  BARE CR (0x0d)
+    head=0d  tail=0d
+  => bodyWrapped=true crSeparate=true text->CR=0ms
+## e2e-730 — harness daemon on port 60143 (production 3848 untouched), HOME=/var/folders/vn/4kv7j91x0f70bwmfn9n_369r0000gn/T/c730-home-tOt6gM
+## body: 4 lines, 109 chars
+
+--- variant: bridge MISSED codex's ESC[?2004h  (session c730-e2e-misses2004h) ---
+  frame0 +0ms  RAW body (no envelope) len=109
+    head=5245504f52543a20  tail=6f727420626c6f62
+  frame1 +0ms  BARE CR (0x0d)
+    head=0d  tail=0d
+  => bodyWrapped=false crSeparate=true text->CR=0ms
+
+######## 3. Real codex 0.144.1 matrix — tmux capture-pane as the VT ########
+# codex: codex-cli 0.144.1
+-- un-enveloped multi-line body, sweeping the text->CR gap --
+## VERDICT {"tag":"m-nowrap-ml-g10","wrap":false,"gapMs":10,"busy":false,"stubDelayMs":0,"parked":0,"total":2,"manualEnterFlushed":true
+## VERDICT {"tag":"m-nowrap-ml-g50","wrap":false,"gapMs":50,"busy":false,"stubDelayMs":0,"parked":1,"total":2,"manualEnterFlushed":true
+## VERDICT {"tag":"m-nowrap-ml-g80","wrap":false,"gapMs":80,"busy":false,"stubDelayMs":0,"parked":1,"total":2,"manualEnterFlushed":true
+## VERDICT {"tag":"m-nowrap-ml-g100","wrap":false,"gapMs":100,"busy":false,"stubDelayMs":0,"parked":0,"total":2,"manualEnterFlushed":true
+## VERDICT {"tag":"m-nowrap-ml-g120","wrap":false,"gapMs":120,"busy":false,"stubDelayMs":0,"parked":1,"total":2,"manualEnterFlushed":true
+## VERDICT {"tag":"m-nowrap-ml-g150","wrap":false,"gapMs":150,"busy":false,"stubDelayMs":0,"parked":0,"total":2,"manualEnterFlushed":true
+## VERDICT {"tag":"m-nowrap-ml-g300","wrap":false,"gapMs":300,"busy":false,"stubDelayMs":0,"parked":0,"total":2,"manualEnterFlushed":true
+## VERDICT {"tag":"m-nowrap-ml-g600","wrap":false,"gapMs":600,"busy":false,"stubDelayMs":0,"parked":0,"total":2,"manualEnterFlushed":true
+-- controls --
+## VERDICT {"tag":"m-nowrap-1line-g10","wrap":false,"gapMs":10,"busy":false,"stubDelayMs":0,"parked":0,"total":2,"manualEnterFlushed":true
+## VERDICT {"tag":"m-wrap-ml-g10","wrap":true,"gapMs":10,"busy":false,"stubDelayMs":0,"parked":0,"total":2,"manualEnterFlushed":true
+
+Evidence written to /tmp/c730-work (*.verdict.json, *.screens.txt, *.log).

@@ -1899,12 +1899,46 @@ function isTerminalGateFailure(gateResult) {
 // this envelope, so it is an unambiguous keystroke regardless of inter-write timing.
 // Non-paste-capable sessions (legacy claude/gemini/agy that never advertised ?2004h)
 // are byte-identical. An empty body is never wrapped.
+//
+// #730: capability is now decided by CLI IDENTITY first, with the observed mode-set as
+// an override in BOTH directions. Observation alone was not enough: codex 0.144.1 emits
+// ESC[?2004h exactly once in its first ~1.4KB, so a wrapped session whose owner bridge
+// attached after that chunk — or any session restored across a daemon restart — never
+// learned it and silently fell back to a raw body, which real codex swallows the CR of.
+//   true      → observed ?2004h  → wrap (unchanged)
+//   false     → observed ?2004l  → do NOT wrap, even for a known CLI (disable override)
+//   undefined → not observed     → wrap iff the CLI is known paste-capable (codex/claude)
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
 function maybeBracketedPaste(text, session) {
   if (!text) return text;
-  if (!session || !session.bracketedPasteCapable) return text;
+  if (!session) return text;
+  const capable = session.bracketedPasteCapable === undefined
+    ? readyRegistry.isPasteCapableCli(session.command)
+    : session.bracketedPasteCapable;
+  if (!capable) return text;
   return BRACKETED_PASTE_START + text + BRACKETED_PASTE_END;
+}
+
+// #730 — defense-in-depth floor on the FORCE submit path only. `force` skips the render
+// gate and fires the CR immediately (measured ~3ms text→CR end-to-end), which lands inside
+// codex 0.144.1's paste-burst window: an un-enveloped MULTI-LINE body swallows the CR
+// (10/11 runs at a 16ms gap; still 1/7 at 127ms — it is a probability, not a threshold).
+//
+// Deliberately SCOPED, not global: an enveloped body is already immune (0/9 swallowed), and
+// a single-line body is immune too (0/5), so the common path pays no latency tax. Only the
+// exact failing shape — no envelope AND embedded newlines — waits.
+// Pure + exported so the policy is unit-testable without booting the daemon.
+const FORCE_CR_GAP_DEFAULT_MS = 250;
+function forceSubmitCrGapMs(injectedBody, session, env = process.env) {
+  if (!injectedBody || !injectedBody.includes('\n')) return 0;
+  if (maybeBracketedPaste(injectedBody, session) !== injectedBody) return 0; // enveloped → immune
+  // An UNSET or blank var must fall back to the default, never to 0 — `Number('')` is 0,
+  // so a bare `TELEPTY_FORCE_CR_GAP_MS=` in an env file would silently disable the floor.
+  const raw = String(env.TELEPTY_FORCE_CR_GAP_MS ?? '').trim();
+  if (!raw) return FORCE_CR_GAP_DEFAULT_MS;
+  const configured = Number(raw);
+  return Number.isFinite(configured) && configured >= 0 ? configured : FORCE_CR_GAP_DEFAULT_MS;
 }
 
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
@@ -3047,6 +3081,13 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
       markPendingReportSubmitStarted(id, injectedBody);
     }
     const forceRingBytesAtSubmit = session.outputRingTotalBytes || 0;
+    // #730: hold the CR clear of the composer's paste-burst window for the one shape that
+    // needs it (un-enveloped + multi-line). 0ms — byte-identical to before — otherwise.
+    const forceCrGapMs = forceSubmitCrGapMs(injectedBody, session);
+    if (forceCrGapMs > 0) {
+      console.log(`[SUBMIT] force CR gap ${forceCrGapMs}ms for ${id} (un-enveloped multi-line body)`);
+      await new Promise((resolve) => setTimeout(resolve, forceCrGapMs));
+    }
     const strategy = terminalLevelSubmit(id, session);
     const forceSubmittedAtMs = Date.now();
     if (strategy) {
@@ -4695,7 +4736,8 @@ module.exports = {
   startNodeBrokerClient,          // node-mode: start createBrokerClient (default-OFF; in-process deliver)
   deliverInjectionToSession,      // §4.3: the in-process delivery wired into the broker-client
   appendToOutputRing,             // #716: seam that tracks bracketed-paste capability (?2004h)
-  maybeBracketedPaste,            // #716: capability-gated bracketed-paste wrap of injected text
+  maybeBracketedPaste,            // #716/#730: identity+observation-gated bracketed-paste wrap
+  forceSubmitCrGapMs,             // #730: scoped force-path text→CR floor (un-enveloped multi-line only)
   resolveBindHost,                // telepty#50 + #672: pure bind-address policy (loopback default, env opt-in, tailnet auto)
   formatBindHint,                 // telepty#50 + #672: startup bind/exposure banner line
   isTailnetAuto,                  // #672: pure predicate — is the zero-config tailnet path active

@@ -151,6 +151,21 @@ function isKnownAiCli(command) {
   return !!lookup(command);
 }
 
+// #730 — CLIs whose composer is known to run bracketed-paste + paste-burst detection,
+// so an injected body must be wrapped in ESC[200~/ESC[201~ for the separately-written
+// submit CR to survive (#716). Kept deliberately CONSERVATIVE: only CLIs we have
+// verified on a real binary. gemini is NOT listed — it never advertised ?2004h.
+//
+// This exists because the observed signal is one-shot and easy to miss: codex 0.144.1
+// emits ESC[?2004h exactly once, inside its first ~1.4KB, and never again — so a
+// session whose output capture attached late (or came back from a daemon restart)
+// could never learn it. Identity does not expire; the observation does.
+const PASTE_CAPABLE_CLIS = new Set(['codex', 'claude']);
+
+function isPasteCapableCli(command) {
+  return PASTE_CAPABLE_CLIS.has(commandKey(command));
+}
+
 // CSI branch = ECMA-48 CSI (see #715): params 0x30-0x3f (incl. < > = : used by
 // kitty-keyboard/modifyOtherKeys), intermediates 0x20-0x2f, final 0x40-0x7e. The
 // prior [0-9;?] param class leaked claude v2.1.198's ESC[<u/ESC[>1u/ESC[>4;2m (#713).
@@ -180,6 +195,7 @@ module.exports = {
   lookup,
   commandKey,
   isKnownAiCli,
+  isPasteCapableCli,   // #730: identity-based bracketed-paste capability (codex/claude)
   detectOutput,
   normalizeOutputForDetection,
   ENTRIES,

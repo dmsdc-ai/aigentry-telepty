@@ -1,0 +1,187 @@
+===== after C730MSG1
+line0 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line1 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line2 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line3 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line4 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line5 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line6 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line7 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx =====
+╭─────────────────────────────────────────────────╮
+│ ✨ Update available! 0.144.1 -> 0.145.0         │
+│ Run brew upgrade --cask codex to update.        │
+│                                                 │
+│ See full release notes:                         │
+│ https://github.com/openai/codex/releases/latest │
+╰─────────────────────────────────────────────────╯
+
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.1)            │
+│                                       │
+│ model:     gpt-5.5   /model to change │
+│ directory: ~/.aigentry/worktrees/c730 │
+╰───────────────────────────────────────╯
+
+  Tip: New Build faster with the Codex App. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true
+
+
+› C730MSG1
+  line0 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line1 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line2 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line3 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line4 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line5 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line6 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line7 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+
+  gpt-5.5 default · ~/.aigentry/worktrees/c730
+
+
+
+
+
+
+
+
+
+
+
+
+===== after C730MSG2
+line0 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line1 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line2 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line3 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line4 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line5 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line6 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+line7 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx =====
+╰─────────────────────────────────────────────────╯
+
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.1)            │
+│                                       │
+│ model:     gpt-5.5   /model to change │
+│ directory: ~/.aigentry/worktrees/c730 │
+╰───────────────────────────────────────╯
+
+  Tip: New Build faster with the Codex App. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true
+
+
+› C730MSG1
+  line0 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line1 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line2 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line3 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line4 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line5 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line6 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line7 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  C730MSG2
+  line0 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line1 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line2 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line3 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line4 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line5 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line6 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line7 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+
+■ {"error":{"message":"c730 stub","type":"invalid_request_error"}}
+
+
+› Find and fix a bug in @filename
+
+  gpt-5.5 default · ~/.aigentry/worktrees/c730
+
+
+
+
+===== before manual Enter =====
+╰─────────────────────────────────────────────────╯
+
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.1)            │
+│                                       │
+│ model:     gpt-5.5   /model to change │
+│ directory: ~/.aigentry/worktrees/c730 │
+╰───────────────────────────────────────╯
+
+  Tip: New Build faster with the Codex App. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true
+
+
+› C730MSG1
+  line0 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line1 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line2 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line3 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line4 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line5 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line6 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line7 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  C730MSG2
+  line0 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line1 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line2 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line3 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line4 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line5 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line6 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line7 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+
+■ {"error":{"message":"c730 stub","type":"invalid_request_error"}}
+
+
+› Find and fix a bug in @filename
+
+  gpt-5.5 default · ~/.aigentry/worktrees/c730
+
+
+
+
+===== after manual Enter =====
+╰─────────────────────────────────────────────────╯
+
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.1)            │
+│                                       │
+│ model:     gpt-5.5   /model to change │
+│ directory: ~/.aigentry/worktrees/c730 │
+╰───────────────────────────────────────╯
+
+  Tip: New Build faster with the Codex App. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true
+
+
+› C730MSG1
+  line0 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line1 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line2 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line3 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line4 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line5 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line6 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line7 of msg1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  C730MSG2
+  line0 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line1 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line2 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line3 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line4 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line5 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line6 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  line7 of msg2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+
+■ {"error":{"message":"c730 stub","type":"invalid_request_error"}}
+
+
+› Find and fix a bug in @filename
+
+  gpt-5.5 default · ~/.aigentry/worktrees/c730
+
+
+
