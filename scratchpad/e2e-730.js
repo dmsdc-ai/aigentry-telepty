@@ -16,12 +16,15 @@
 // usage: node e2e-730.js
 
 const { spawn, execFileSync } = require('child_process');
+const execFileAsync = require('util').promisify(require('child_process').execFile);
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
 
-const ROOT = '/Users/duckyoungkim/projects/aigentry-telepty';
+// Repo root = the checkout this script lives in. Must NOT be hardcoded to the main
+// worktree: a fix branch would otherwise be validated against unfixed daemon.js.
+const ROOT = path.resolve(__dirname, '..');
 const OUT = '/tmp/c730-work/e2e';
 const lines = [];
 const log = (m) => { lines.push(m); process.stdout.write(m + '\n'); };
@@ -104,7 +107,10 @@ async function runVariant(port, emit2004h, ctx) {
   const { ws, frames } = await attachBridge(port, sessionId, { emit2004h, token: ctx.token });
   log(`[variant] bridge attached, running CLI inject`);
 
-  execFileSync(process.execPath, [
+  // MUST be async: execFileSync blocks this process's event loop, so queued WS frames
+  // are only dispatched after the CLI exits and every frame gets stamped with the same
+  // millisecond — which reports a fake 0ms text->CR gap no matter what the daemon did.
+  await execFileAsync(process.execPath, [
     path.join(ROOT, 'cli.js'), 'inject', '--submit', '--submit-force', sessionId, BODY,
   ], { cwd: ROOT, env: cliEnv(ctx, port), encoding: 'utf8' });
 

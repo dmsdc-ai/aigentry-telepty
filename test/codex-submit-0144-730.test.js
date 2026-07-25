@@ -1,6 +1,6 @@
 'use strict';
 
-// #730 — RED. codex CLI 0.144.1: `telepty inject --submit --submit-force` reports
+// #730 — codex CLI 0.144.1: `telepty inject --submit --submit-force` reports
 // `✅ Submitted via pty_cr [forced]` but the text parks in the composer and the CR
 // never registers; injects accumulate until a manual `send-key enter` flushes the
 // whole blob as ONE message.
@@ -26,19 +26,24 @@
 // So the swallow needs ALL THREE: no bracketed-paste envelope, embedded newlines,
 // and a short text->CR gap. It is a PROBABILITY that decays with the gap, not a
 // clean threshold — 127ms still failed 1/7. The force path (daemon.js:3045-3050)
-// writes the CR with NO gate and NO delay — measured 0ms on the real path
-// (scratchpad/e2e-730.js) — while the ordinary deferred path waits 300/500ms
+// writes the CR with NO gate and NO delay — measured ~3ms on the real path
+// (scratchpad/e2e-730.js; an earlier 0ms figure was a harness event-loop artifact) — while the ordinary deferred path waits 300/500ms
 // (daemon.js:1987) and is safe. That is why `--submit-force` is the flag that fails.
 //
-// These tests are RED on purpose: they assert the invariants that make #716's
-// envelope actually reach a real session. Not registered in package.json — repro
-// phase only, no product fix in this branch.
+// Fix (this branch), approved as A+B+C(scoped):
+//   A  capability decided by CLI IDENTITY (src/prompt-symbol-registry.js
+//      isPasteCapableCli — codex/claude only), with the observed ?2004h/?2004l as an
+//      override in both directions.
+//   B  the OBSERVED capability persists across a daemon restart.
+//   C  the force path floors the text->CR gap (TELEPTY_FORCE_CR_GAP_MS, default 250ms)
+//      ONLY for the failing shape — un-enveloped AND multi-line. Everything else
+//      stays byte- and timing-identical.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const daemon = require('../daemon');
-const { maybeBracketedPaste, appendToOutputRing } = daemon;
+const { maybeBracketedPaste, appendToOutputRing, forceSubmitCrGapMs } = daemon;
 const {
   serializePersistedSessions,
   buildRestoredWrappedSession,
@@ -62,7 +67,7 @@ const isWrapped = (s) => s.startsWith(BP_START) && s.endsWith(BP_END);
 // the only place the flag is ever set, so any session whose output capture was not
 // live for that single chunk stays un-wrapped forever.
 
-test('#730 RED: a codex session that missed the one-shot ESC[?2004h still needs the paste envelope', () => {
+test('#730 A: a codex session that missed the one-shot ESC[?2004h still gets the paste envelope', () => {
   // A wrapped session registered/attached AFTER codex printed its banner: every
   // frame the owner bridge relays from here on is steady-state UI, no mode-set.
   const lateAttach = { outputRing: [], command: 'codex' };
@@ -84,7 +89,7 @@ test('#730 RED: a codex session that missed the one-shot ESC[?2004h still needs 
 // flag — and codex already burned its only ESC[?2004h long ago, so it can never
 // be re-learned. #716 is permanently inert for that session.
 
-test('#730 RED: bracketed-paste capability survives a daemon restart', () => {
+test('#730 B: an OBSERVED bracketed-paste capability survives a daemon restart', () => {
   const live = {
     id: 'c730-codex',
     type: 'wrapped',
@@ -104,7 +109,7 @@ test('#730 RED: bracketed-paste capability survives a daemon restart', () => {
     'so it can never be re-learned and every later inject goes out un-enveloped');
 });
 
-test('#730 RED: a restored codex session still gets the paste envelope', () => {
+test('#730 B: a restored codex session still gets the paste envelope', () => {
   const persisted = serializePersistedSessions({
     s: { id: 's', type: 'wrapped', command: 'codex', cwd: '/tmp/demo', createdAt: new Date().toISOString(), bracketedPasteCapable: true },
   }).s;
@@ -147,11 +152,13 @@ class Codex0144Composer {
   }
 }
 
-test('#730 characterization: un-enveloped multi-line body + 0ms CR accumulates, never submits', () => {
+test('#730 characterization: un-enveloped multi-line body + immediate CR accumulates, never submits', () => {
   const c = new Codex0144Composer();
-  const bare = { command: 'codex' }; // no bracketedPasteCapable — the field condition
+  // A CLI with no identity rule and no observed ?2004h — still delivered raw post-fix,
+  // which is exactly the residual shape fix C's timing floor exists to cover.
+  const bare = { command: 'some-unknown-cli' };
 
-  // Two injects, force-path shaped: body then CR at +0ms (measured, e2e-730.js).
+  // Two injects, force-path shaped: body then CR ~immediately (measured ~3ms, e2e-730.js).
   c.write(maybeBracketedPaste('REPORT one\nline A', bare), 1000);
   c.write('\r', 1000);
   c.write(maybeBracketedPaste('REPORT two\nline B', bare), 2000);
@@ -181,12 +188,58 @@ test('#730 characterization: the paste envelope makes the CR land regardless of 
 
 test('#730 characterization: holding the CR past the burst window also lands it', () => {
   const c = new Codex0144Composer();
-  const bare = { command: 'codex' };
+  const bare = { command: 'some-unknown-cli' };
 
   c.write(maybeBracketedPaste('REPORT one\nline A', bare), 1000);
   c.write('\r', 1000 + CODEX_0144_PASTE_BURST_MODEL_MS);
 
   assert.equal(c.submits, 1,
-    'the deferred inject path (300/500ms, daemon.js:1987) clears this window — ' +
-    'only the force path (daemon.js:3045-3050, 0ms) does not');
+    'the deferred inject path (300/500ms) clears this window, and fix C now floors ' +
+    'the force path to 250ms for exactly this shape');
+});
+
+// ── A: identity is the base, observation overrides in BOTH directions ─────────
+
+test('#730 A: an observed ESC[?2004l disables the envelope even for a known CLI', () => {
+  const session = { outputRing: [], command: 'codex' };
+  appendToOutputRing(session, 'shutting down UI\x1b[?2004l');
+  assert.equal(session.bracketedPasteCapable, false);
+  assert.equal(maybeBracketedPaste('a\nb', session), 'a\nb',
+    'an explicit disable must beat identity — the CLI just told us it stopped accepting pastes');
+});
+
+test('#730 A: identity stays conservative — unknown CLIs are byte-identical', () => {
+  for (const command of ['gemini', 'agy', 'bash', 'some-unknown-cli', undefined]) {
+    assert.equal(maybeBracketedPaste('a\nb', { command }), 'a\nb',
+      `${command} must not be wrapped on identity alone`);
+  }
+  // …but an observed ?2004h still enables it, exactly as before #730.
+  assert.ok(isWrapped(maybeBracketedPaste('a\nb', { command: 'gemini', bracketedPasteCapable: true })));
+});
+
+test('#730 A: claude is paste-capable by identity too', () => {
+  assert.ok(isWrapped(maybeBracketedPaste('a\nb', { command: '/usr/local/bin/claude --resume' })));
+});
+
+// ── C: the force-path CR floor is SCOPED to the one failing shape ─────────────
+
+test('#730 C: force CR gap applies only to an un-enveloped multi-line body', () => {
+  const unknown = { command: 'some-unknown-cli' };   // not enveloped
+  const codex = { command: 'codex' };                // enveloped by identity (fix A)
+
+  assert.equal(forceSubmitCrGapMs('a\nb', unknown), 250, 'the failing shape waits');
+  assert.equal(forceSubmitCrGapMs('single line', unknown), 0, 'single-line is immune (0/5 measured)');
+  assert.equal(forceSubmitCrGapMs('a\nb', codex), 0, 'enveloped is immune (0/9 measured)');
+  assert.equal(forceSubmitCrGapMs('', unknown), 0, 'no body, nothing to protect');
+  assert.equal(forceSubmitCrGapMs(null, unknown), 0);
+});
+
+test('#730 C: the floor is tunable via TELEPTY_FORCE_CR_GAP_MS', () => {
+  const unknown = { command: 'some-unknown-cli' };
+  assert.equal(forceSubmitCrGapMs('a\nb', unknown, { TELEPTY_FORCE_CR_GAP_MS: '400' }), 400);
+  assert.equal(forceSubmitCrGapMs('a\nb', unknown, { TELEPTY_FORCE_CR_GAP_MS: '0' }), 0, 'opt out entirely');
+  // Garbage never silently disables the protection — it falls back to the default.
+  for (const bad of ['abc', '-1', '', undefined]) {
+    assert.equal(forceSubmitCrGapMs('a\nb', unknown, { TELEPTY_FORCE_CR_GAP_MS: bad }), 250, `bad value ${bad}`);
+  }
 });

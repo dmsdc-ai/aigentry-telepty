@@ -32,7 +32,14 @@ function serializePersistedSessions(sessions) {
       idleTtl: s.idleTtl || null,
       idleTtlMs: s.idleTtlMs == null ? null : s.idleTtlMs,
       ownerPid: s.ownerPid || null,
-      ptyPid: s.ptyPid || null
+      ptyPid: s.ptyPid || null,
+      // #730: the OBSERVED bracketed-paste capability (ESC[?2004h/l). Identity-based
+      // capability is re-derived from `command` on restore, but an observation about a
+      // CLI we have no identity rule for can never be re-learned — codex-style CLIs
+      // advertise it once at startup and never again. Emitted ONLY when actually
+      // observed, so a session that never saw the mode-set serializes byte-identically
+      // to the pre-#730 format.
+      ...(s.bracketedPasteCapable === undefined ? {} : { bracketedPasteCapable: s.bracketedPasteCapable })
     };
   }
   return data;
@@ -76,6 +83,12 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
     idleTtlMs: meta.idleTtlMs == null ? null : meta.idleTtlMs,
     ownerPid: meta.ownerPid || null,
     ptyPid: meta.ptyPid || null,
+    // #730: restore an OBSERVED capability. Absent (or a null from a hand-edited file)
+    // must stay `undefined` so the session falls back to identity-based capability
+    // rather than being pinned to a hard "not capable".
+    ...(meta.bracketedPasteCapable === true || meta.bracketedPasteCapable === false
+      ? { bracketedPasteCapable: meta.bracketedPasteCapable }
+      : {}),
     clients: new Set(), isClosing: false, outputRing: [], ready: true,     };
 }
 

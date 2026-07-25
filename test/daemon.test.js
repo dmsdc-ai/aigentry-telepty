@@ -6,6 +6,13 @@ const http = require('http');
 const WebSocket = require('ws');
 const { createSessionId, delay, startTestDaemon, waitFor } = require('../test-support/daemon-harness');
 
+// #730: codex is paste-capable BY IDENTITY now, so an injected body reaches a codex
+// session wrapped in bracketed paste even when the fixture never relayed an ESC[?2004h.
+// (Pre-#730 these fixtures asserted the raw body — that was the shape real codex 0.144.1
+// swallows the submit CR of. The CR itself is still written separately, outside the
+// envelope, exactly as #716 requires.)
+const asPasted = (body) => `\x1b[200~${body}\x1b[201~`;
+
 let harness;
 
 function collectJsonMessages(ws) {
@@ -665,7 +672,7 @@ test('codex submit confirmation resends CR when context-ref remains visible and 
   });
   assert.equal(inject.status, 200);
 
-  await waitFor(() => ownerMessages.find((message) => message.type === 'inject' && message.data === body), {
+  await waitFor(() => ownerMessages.find((message) => message.type === 'inject' && message.data === asPasted(body)), {
     timeoutMs: 5000,
     description: 'codex context-ref delivered'
   });
@@ -740,7 +747,7 @@ test('codex submit confirmation returns 504 when context-ref remains unsubmitted
     body: { prompt: body, no_enter: true }
   });
   assert.equal(inject.status, 200);
-  await waitFor(() => ownerMessages.find((message) => message.type === 'inject' && message.data === body), {
+  await waitFor(() => ownerMessages.find((message) => message.type === 'inject' && message.data === asPasted(body)), {
     timeoutMs: 5000,
     description: 'stuck context-ref delivered'
   });
