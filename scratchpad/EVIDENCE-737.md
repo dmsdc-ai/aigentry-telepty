@@ -40,7 +40,8 @@ The `codex_modal_ui` detection the brief credits with protecting the non-force p
 
 `scratchpad/repro-737-tmux.js` — real codex under an isolated `CODEX_HOME`, tmux
 `capture-pane` as the VT (regex ANSI-stripping was proven untrustworthy for codex
-composers in #730), loopback stub provider answering any turn with an immediate 400.
+composers in #730), model provider pointed at a dead loopback port with retries disabled
+so any turn that starts dies instantly on connection-refused (zero API cost).
 
 ```
 node scratchpad/repro-737-tmux.js <tag>       # env: MODAL=1|0 PATHSHAPE=force|plain|gated WRAP=1|0
@@ -288,7 +289,13 @@ first (small, safe, immediately stops the brew-exec-and-die), then add the hold/
 - Never touched: production daemon (3848 / launchd), the `orchestrator` session, the real
   `~/.codex` (read-only copy of `auth.json` into the isolated home), the default tmux
   server (own socket `-L c737`). Every codex/daemon/tmux process spawned here was killed.
-- Snyk: N/A this phase (no first-party product code generated). Both harness scripts bind
-  loopback-only HTTP by design, carrying the same accepted CWE-319 note as #730's harness.
+- Snyk: `snyk_code_scan` over `scratchpad/` and the new test — **0 findings in the files
+  this branch adds**. No product code was generated; neither harness opens a listening
+  socket (#730's stub provider is not needed here, since #737 fires before a turn can
+  begin), and `repro-737-tmux.js` reuses #730's hardened `safeOutPath` tag sanitiser.
+  The scan does report 8 **pre-existing** issues inherited from `main`, all in #730's
+  harness — 1× Medium CWE-319 (`scratchpad/repro-730-tmux.js:71`, the accepted loopback
+  stub-provider note) and 7× Low CWE-23 (`scratchpad/probe-codex.js`, unsanitised argv
+  into `fs.write*`). Reported, not touched — Rule 29, separate cleanup task.
 - Known sandbox quirk honoured: `require('../daemon')` arms persisted-session poll timers,
   so every node run here is timeout-wrapped.

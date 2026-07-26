@@ -107,10 +107,10 @@ function seedBrewStub() {
 
 const codexArgs = [
   '--sandbox', 'read-only', '--ask-for-approval', 'never',
-  // Loopback stub provider: any turn that does start ends immediately with a 400, so the
-  // repro costs nothing and never reaches a real model. Plain HTTP on 127.0.0.1 is
-  // deliberate (it is codex's base_url; a throwaway listener serving one static 400 and
-  // carrying no credentials). Snyk CWE-319 accepted — test-only, never bound off-loopback.
+  // Point the model provider at a dead loopback port with retries disabled: nothing
+  // listens there, so any turn that does start fails instantly with connection-refused.
+  // The repro never reaches a real model and costs nothing. #730's harness ran an actual
+  // 400-serving stub; not needed here — #737 fires before a turn can ever begin.
   '-c', `model_providers.stub={name="stub",base_url="http://127.0.0.1:${STUB_PORT}/v1",wire_api="responses",request_max_retries=0,stream_max_retries=0}`,
   '-c', 'model_provider="stub"',
 ];
