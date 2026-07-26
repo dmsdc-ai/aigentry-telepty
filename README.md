@@ -6,6 +6,52 @@ telepty is a PTY orchestration daemon and session bridge for AI CLI workflows. I
 
 Built for AI CLI workflows (Claude Code, Codex, Gemini CLI), but works with any interactive terminal program.
 
+Here is the one thing it exists for: a real Claude Code worker session (Opus 5), spawned by an orchestrator through telepty and viewed live via `telepty attach`. The orchestrator's prompts land in Claude's composer with no human at the keyboard — and Claude answers on camera:
+
+![Live worker session — orchestrator prompts landing inside a real Claude Code session via telepty inject, viewed through telepty attach](demo/telepty-claude-inject.gif)
+
+## Install
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/install.sh | bash
+
+# Windows (PowerShell as Admin) — BETA
+iwr -useb https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/install.ps1 | iex
+
+# Or via npm
+npm install -g @dmsdc-ai/aigentry-telepty
+```
+
+The installer sets up telepty as a background service (`launchd` on macOS, `systemd` on Linux, detached process on Windows).
+
+**Windows is BETA.** It installs and the cross-machine demo below is a real Windows box, but
+`windows-latest` CI is quarantined as non-blocking (Windows-specific failures tracked in #577),
+the UDS delivery path is POSIX-only, and the inbound tailnet firewall rule only auto-installs
+when the daemon runs elevated — otherwise you run one `netsh` command it prints for you.
+
+## Quick Start
+
+The installer already started the daemon, so `telepty list` answers immediately. (If it does
+not, start one detached with `telepty daemon start`.)
+
+```bash
+# 1. Wrap an existing CLI session for remote control
+telepty allow --id my-session claude
+
+# 2. List active sessions (this daemon + registered peers)
+telepty list
+
+# 3. Inject a prompt into a session
+telepty inject my-session "explain this codebase"
+
+# 4. Attach to a session interactively
+telepty attach my-session
+
+# 5. Broadcast to all sessions
+telepty broadcast "status report"
+```
+
 ## Demo — three machines, three AI CLIs, one relay
 
 Three LLM agents pass a baton around a Tailscale mesh **by running `telepty inject` themselves** — no SSH sessions, no copy-paste, no human typing after the kickoff:
@@ -59,48 +105,7 @@ What to watch: `LOCAL 2: [grok -> claude, same box]` lands in Claude's composer 
 
 ![Same-machine relay — Grok, Claude and Codex sessions on one Mac injecting each other locally via telepty](docs/demo-relay-local.gif)
 
-This is the day-to-day shape of telepty: an orchestrator session driving worker sessions — dispatching prompts, reading screens, collecting reports — whether the workers live on the same machine or across a tailnet.
-
-And here is that shape from **inside the worker's own UI, captured live**: a real Claude Code worker session (Opus 5), spawned by an aigentry orchestrator through telepty, viewed via `telepty attach`. Watch the orchestrator's prompts land in Claude's composer with no human at the keyboard — and Claude answer on camera:
-
-![Live worker session — orchestrator prompts landing inside a real Claude Code session via telepty inject, viewed through telepty attach](demo/telepty-claude-inject.gif)
-
-## Install
-
-```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/install.sh | bash
-
-# Windows (PowerShell as Admin)
-iwr -useb https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/install.ps1 | iex
-
-# Or via npm
-npm install -g @dmsdc-ai/aigentry-telepty
-```
-
-The installer sets up telepty as a background service (`launchd` on macOS, `systemd` on Linux, detached process on Windows).
-
-## Quick Start
-
-```bash
-# 1. Start the daemon
-telepty daemon
-
-# 2. Wrap an existing CLI session for remote control
-telepty allow --id my-session claude
-
-# 3. List active sessions (local + Tailnet)
-telepty list
-
-# 4. Inject a prompt into a session
-telepty inject my-session "explain this codebase"
-
-# 5. Attach to a session interactively
-telepty attach my-session
-
-# 6. Broadcast to all sessions
-telepty broadcast "status report"
-```
+This is the day-to-day shape of telepty: an orchestrator session driving worker sessions — dispatching prompts, reading screens, collecting reports — whether the workers live on the same machine or across a tailnet. The clip at the top of this README is that same shape seen from **inside the worker's own UI**.
 
 ## What telepty is — and what it is not
 
@@ -133,23 +138,43 @@ readiness-aware inject/submit, event streams, cross-machine session control.
   human terminal work — telepty does none of this and doesn't try to.
 - **Use telepty** when software needs to spawn, inspect, inject into, and
   track many AI-CLI sessions over an API — across machines.
+- **vs agent frameworks** (LangGraph, CrewAI, …): they orchestrate model **API calls**;
+  telepty orchestrates real **CLI processes** — the actual `claude`/`codex`/`gemini` binary
+  with its own auth, tools, config, and TUI.
+- **vs MCP**: MCP gives one agent tools; telepty gives one agent other agents' terminals.
+  Complementary, and telepty ships its own MCP server (`telepty-mcp`, exposing
+  `telepty_list_sessions` / `telepty_inject_session` / `telepty_session_status`) so an
+  MCP-speaking agent can drive sessions without shelling out.
+- **vs mosh / ssh**: those carry *your* keystrokes to *one* remote shell. telepty exposes
+  *many* sessions to *software* over an API, and needs no sshd on either side.
 
 ## Limitations (honest)
 - No terminal emulation: no cell grid, cursor model, or copy-mode. Screen
   reads are buffered bytes + heuristic state, not a ground-truth screen.
+- `read-screen` therefore returns the **tail of the raw output stream with ANSI escapes
+  stripped by regex**, not a rendered screen. A repainting TUI (spinners, redrawn boxes,
+  progress lines) reads as several overlapping frames stacked on top of each other. Good
+  for "what did it say", not for "what does the screen look like right now".
+- **Session durability depends on who owns the PTY.** `allow`-wrapped sessions survive a
+  daemon restart: the bridge process owns the PTY and re-registers on reconnect, and only
+  `wrapped` sessions are rebuilt from the persisted session file. `spawn`ed sessions do
+  **not** survive: their PTY is a child of the daemon process and dies with it — including
+  the automatic daemon restart that `npm install -g` performs on upgrade. If a session must
+  outlive the daemon, wrap it with `allow`.
 - Requires a background daemon and a network port (:3848, auth-gated).
 
 ## Core Commands
 
 | Command | Description |
 |---------|-------------|
-| `telepty daemon` | Start the background daemon (port 3848) |
-| `telepty allow --id <name> <cmd>` | Wrap a CLI for inject control |
-| `telepty spawn --id <name> <cmd>` | Spawn a new background session |
-| `telepty list [--json]` | List sessions across all discovered hosts |
+| `telepty daemon start\|stop\|restart` | Manage the background daemon (port 3848); `start` is detached and returns immediately |
+| `telepty daemon` | Run the daemon in the **foreground** — this is what launchd/systemd invoke; it blocks your shell |
+| `telepty allow --id <name> <cmd>` | Wrap a CLI for inject control (survives a daemon restart) |
+| `telepty spawn --id <name> <cmd>` | Spawn a new background session (dies with the daemon) |
+| `telepty list [--json]` | List sessions on this daemon + registered peers |
 | `telepty attach [id[@host]]` | Attach to a session (interactive picker if no ID) |
-| `telepty inject <id[@host]> "text"` | Inject text into a session |
-| `telepty inject --submit <id> "text"` | Inject text and press Enter (render-gated, retries once on safe gate-timeout) |
+| `telepty inject <id[@host]> "text"` | Inject text and submit it. The Enter rides along as a deferred PTY write and is **not** gated — there is no no-submit mode |
+| `telepty inject --submit <id> "text"` | Same delivery, but the Enter becomes a separate **render-gated** submit: it waits until the target has actually rendered the text (retries once on safe gate-timeout) |
 | `telepty inject --submit --submit-force <id> "text"` | As above, but bypass the gate (skip Layer 1/3 detection — opt-in escape hatch) |
 | `telepty inject --submit --submit-retry N <id> "text"` | Override retry count [0–3] on safe 504 (default 1) |
 | `telepty enter <id[@host]>` | Send Enter/Return to a session |
@@ -157,6 +182,10 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | `telepty broadcast "text"` | Inject into ALL sessions |
 | `telepty rename <old> <new>` | Rename a session |
 | `telepty read-screen <id> [--lines N]` | Read session screen buffer |
+| `telepty connect-http <host>[:port]` | Register a remote daemon as a peer over HTTP (no SSH needed) |
+| `telepty connect <user@host>` | Register a remote peer over SSH |
+| `telepty peers` | List registered peers |
+| `telepty disconnect <name>\|--all` | Remove a registered peer |
 | `telepty reply "text"` | Reply to the last injector |
 | `telepty monitor` | Real-time event billboard |
 | `telepty listen` | Stream event bus as JSON |
@@ -170,6 +199,7 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | `TELEPTY_MODAL_REMEDY` | `park`, `hold`, `reject`, `off` | `park` for claude, `hold` for codex | What to do when the target CLI is showing a blocking modal, where an Enter activates the modal's highlighted item instead of submitting. `park` acks immediately and queues the inject, delivering it in order once the surface clears; `hold` keeps the request open until the surface clears, then delivers; `reject` refuses immediately with an actionable error; `off` restores pre-0.6.18 behavior (writes into the modal). Setting it overrides the per-CLI default for every session. |
 | `TELEPTY_MODAL_HOLD_MS` | milliseconds | `30000` | How long `TELEPTY_MODAL_REMEDY=hold` waits for the modal to clear before falling back to `reject`. |
 | `TELEPTY_MODAL_PARK_TTL_MS` | milliseconds | `600000` | How long `TELEPTY_MODAL_REMEDY=park` holds queued injects for a modal that never clears, before flushing them with an actionable `modal_park_timeout` event. Matches `TELEPTY_BRIDGE_INJECT_TTL_SECS`. |
+| `TELEPTY_SHARED_REF_TTL_DAYS` | days (`0` disables the sweep) | `7` | Age at which `~/.telepty/shared/*.md` payloads from `inject --ref` are deleted. The sweep runs at the start of each `--ref` write, not on a timer. |
 
 `TELEPTY_SUBMIT_FORCE_DEFAULT=1` is for orchestrators and automation that
 already know their targets are real, initialized REPLs. It avoids the transient
@@ -202,11 +232,28 @@ delivered in order once the surface clears. A parked inject reports
 
 ## Cross-Machine Sessions
 
-telepty auto-discovers sessions across your Tailnet. All commands (`list`, `attach`, `inject`, `rename`, `multicast`, `broadcast`) work seamlessly across machines.
+Two different things are at play here, and only one of them is zero-config:
+
+- **Reachability is zero-config on a tailnet.** The daemon binds and trusts tailnet peers by
+  itself (below), and `<id>@<host>` targeting works right away against any reachable daemon —
+  no registration step. `inject`, `attach`, `read-screen`, `enter`, `multicast` and `rename`
+  all accept `@<host>`.
+- **Discovery is not.** `telepty list` enumerates this daemon's sessions plus the peers
+  recorded in `~/.telepty/peers.json` — it does **not** scan the tailnet. Two fresh tailnet
+  machines each see only their own sessions until you register one with the other:
+
+  ```bash
+  telepty connect-http <host>        # HTTP only — no sshd on either side
+  telepty connect <user@host>        # over SSH (ControlMaster)
+  telepty peers                      # what is registered
+  telepty disconnect <name>           # unregister
+  ```
+
+  After that, `list` / `broadcast` / `multicast` see the peer's sessions too.
 
 ### Zero-config on Tailscale (auto bind + auto trust)
 
-On a host that is on a **Tailscale tailnet**, a fresh install is cross-machine-ready with
+On a host that is on a **Tailscale tailnet**, a fresh install is cross-machine-*reachable* with
 **no manual env**. At startup the daemon detects its tailnet interface (a `100.64.0.0/10`
 address) and:
 
@@ -234,9 +281,10 @@ never need to type a `100.x.y.z` address.
 
 ### `<id>@<host>` syntax
 
-To target a specific host (when the same session ID exists on multiple hosts,
-or when there is no Tailnet auto-discovery), append `@<host>` to the session
-ID. `<host>` can be a hostname, LAN IP, or Tailnet name.
+To target a specific host — the same session ID existing on several hosts, or a host you
+have not registered as a peer — append `@<host>` to the session ID. `<host>` can be a
+hostname, LAN IP, or Tailnet name. This needs no `connect`/`connect-http` first: the target
+is resolved directly, which is why the relay demo above works between fresh machines.
 
 ```bash
 # Hostname / Tailnet name
@@ -267,7 +315,7 @@ CLI (telepty) ──> HTTP/WS ──> Daemon (:3848)
 ```
 
 - **`allow`** wraps a CLI process in a PTY bridge, enabling remote inject
-- **`inject`** delivers text via the fastest available path: kitty terminal API, WebSocket, or UDS (Unix Domain Socket for embedded integrations)
+- **`inject`** delivers text over the transport that session type owns: owner WebSocket, a direct PTY write, or UDS (Unix Domain Socket for embedded integrations)
 - **`submit`** is handled separately from text injection for reliability across all AI CLIs
 
 ## `[context-ref]` Protocol — long payloads via shared file
@@ -296,8 +344,10 @@ The receiving AI session is expected to:
 
 - File path: `~/.telepty/shared/<sha256>.md` (sha256 of payload body)
 - Created with mode `0600`; readable only by the local user
-- Persists across sessions; not garbage-collected automatically (run
-  `telepty clean --shared` to prune)
+- Swept on write, not on a timer: every `--ref` inject first deletes shared files older than
+  `TELEPTY_SHARED_REF_TTL_DAYS` (default `7`). Nothing runs while you are idle, so a directory
+  you stop using keeps its last files until the next `--ref` — `rm ~/.telepty/shared/*.md` to
+  clear it now. There is no `telepty clean --shared` subcommand.
 
 ### When to use `--ref`
 
@@ -320,11 +370,18 @@ install-hooks {claude|codex|gemini}` after installing
 
 ## Inject Delivery Paths
 
-| Priority | Method | When |
-|----------|--------|------|
-| 1 | `kitty @ send-text` | Terminal supports kitty protocol |
-| 2 | UDS (Unix Domain Socket) | Embedded IPC sessions (e.g. aterm) |
-| 3 | WebSocket PTY write | Wrapped sessions via allow-bridge |
+Delivery is picked by **session type**, not by a priority ladder — there is no fallback chain
+between these rows.
+
+| Session type | Created by | Delivery |
+|---|---|---|
+| `aterm` | embedded IPC integration | UDS (Unix Domain Socket); an HTTP delivery endpoint for back-compat |
+| `wrapped` | `telepty allow` | owner WebSocket → the bridge writes the PTY it owns |
+| `spawned` | `telepty spawn` | direct write into the daemon-owned PTY |
+
+The submit (Enter) is separate from all of this and is always a bare `0x0D` into the innermost
+PTY. The old `kitty @ send-text` and `cmux send-key` submit paths were removed (#544/#546) —
+they were a flaky side channel next to a reliable PTY write.
 
 ## AI CLI Integration
 
