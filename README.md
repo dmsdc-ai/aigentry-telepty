@@ -61,6 +61,10 @@ What to watch: `LOCAL 2: [grok -> claude, same box]` lands in Claude's composer 
 
 This is the day-to-day shape of telepty: an orchestrator session driving worker sessions — dispatching prompts, reading screens, collecting reports — whether the workers live on the same machine or across a tailnet.
 
+And here is that shape **captured live, not staged**: an aigentry orchestrator running six concurrent Claude Opus 5 worker sessions on one Mac — bug-reproduction coders, architects, reviewers — all wrapped by one telepty daemon. `telepty list` shows the real fleet mid-flight, a worker's finished REPORT arrives as a `telepty inject` payload, and the same inject → read-screen round-trip is demonstrated end-to-end on a scratch session (the live workers are never touched):
+
+![Live orchestration fleet — a real orchestrator driving six concurrent AI worker sessions through one telepty daemon: list the fleet, receive a worker REPORT, inject/read-screen round-trip](demo/telepty-live-fleet.gif)
+
 ## Install
 
 ```bash
