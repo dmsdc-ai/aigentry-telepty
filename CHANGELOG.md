@@ -5,6 +5,22 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 ## Unreleased
 
 ### Fixed
+- **#801** a wrapped AI-CLI session that dies on an API/transport error is no longer reported to
+  its dispatcher as a completion. The dead session goes quiet, so the idle detector fires and the
+  auto-report used to emit `TASK_COMPLETE: <sid> is now idle after processing inject` — observed
+  6× on 2026-07-26 (claude `API Error: 529 Overloaded` ×5 at 204–330s, codex
+  `invalid_request_error` ×1 at 10.8s), indistinguishable from a real completion without reading
+  the screen. `src/prompt-symbol-registry.js` gains a per-CLI terminal-turn-failure marker table
+  (`detectSurfaceError`) alongside #737/#760's modal table, measured against real PTY bytes from
+  claude 2.1.220 and codex 0.145.0 (`scratchpad/capture-801-api-error.js`); the auto-report path
+  consults it over the ring slice appended past the inject watermark and emits a distinct
+  `TASK_ERROR: <sid> went idle after an API/transport error (<detail>)` instead. Unlike the modal
+  predicate there is no composer counter-signal — both CLIs repaint the composer *after* the
+  error banner, which is the symptom, not recovery — so the turn watermark is what scopes the
+  verdict. Fail-open throughout: an unmeasured CLI (gemini, shells), a missing watermark, or an
+  unrecognised screen keeps today's emission byte-for-byte, and `TASK_IDLE_UNCONFIRMED` /
+  `TASK_IDLE_NO_REPORT` semantics are untouched — the check only runs where the daemon was about
+  to assert the inject had been processed. No new daemon, no new state file, no new config knob.
 - **#757** supervised version-change restarts no longer create a first-pass orphan outside launchd/systemd/schtasks. Reproduced with a scratch launchd label and port: a detached `telepty-daemon` owning the port made `launchctl kickstart -k` exit the managed job with code 0 while the detached pid kept serving; killing that pid and kicking again recovered. Fix: supervised `restartDaemonGraceful` now restarts through the detected OS supervisor and never falls back to `detached + unref` for supervisor-managed installs, while unsupervised hosts keep the existing detached restart path. Global `postinstall` uses the same supervisor-owned restart rule, so upgrades no longer preempt launchd with a detached replacement.
 
 ## 0.7.0 — 2026-07-26

@@ -98,6 +98,47 @@ const SURFACE_MODAL_RULES = {
   claude: { modal: CLAUDE_MODAL_PATTERNS, composer: CLAUDE_COMPOSER_MARKERS, reason: 'claude_modal_ui' },
 };
 
+// #801 — per-CLI TERMINAL-TURN-FAILURE markers: the banner a CLI prints when the turn dies on
+// an API/transport error instead of producing an answer. Same table shape as
+// SURFACE_MODAL_RULES, measured the same way (scratchpad/capture-801-api-error.js — real
+// binaries, real VT, raw `pipe-pane -O` bytes, NOT a rendered snapshot; #760).
+//
+// Why there is no composer counter-signal here, unlike detectSurfaceModal: BOTH CLIs repaint
+// the composer and its status footer AFTER the error banner. That repaint is not a recovery,
+// it IS the symptom — the worker is back at its prompt having produced nothing — so a
+// composer counter-signal would veto every real error. What keeps this honest is scoping at
+// the call site instead: only ring bytes appended past the inject watermark are scanned
+// (daemon.js detectIdleAfterError), so an error can only ever be attributed to the turn it
+// happened in.
+//
+// Whitespace tolerance is load-bearing, exactly as in the modal lists: the captured claude
+// bytes read `⏺API Error:` with the rendered space GONE (Ink paints space runs as ESC[<n>C
+// cursor jumps) while `API Error`'s interior space survives. `\s*` matches both forms.
+const CLAUDE_ERROR_PATTERNS = [
+  // Retries do NOT produce this line. claude repaints "✻ 529 Overloaded · Retrying in 8s ·
+  // attempt 5/10" for as long as it still has hope and prints the ⏺ bullet only once the turn
+  // is dead — measured across all 10 retries in /tmp/c801-work/claude-529.raw.bin. So this
+  // marker means "turn over", not "a request failed".
+  /⏺\s*API\s*Error:?\s*\d*/,
+];
+const CODEX_ERROR_PATTERNS = [
+  // codex surfaces the raw API envelope on one line behind its ■ error glyph. Anchor on the
+  // glyph: a bare `"type":"error"` can legitimately appear in a tool result the worker itself
+  // printed, and inside the turn slice that would be a false TASK_ERROR.
+  /■\s*\{[^\n]*"type"\s*:\s*"[a-z_]*error"/,
+  /■\s*\{[^\n]*"status"\s*:\s*[45]\d\d/,
+];
+// gemini has no row: its error surface is not measured yet, so it keeps `not_applicable` and
+// byte-identical behaviour, the same fail-open default SURFACE_MODAL_RULES gives it.
+const SURFACE_ERROR_RULES = {
+  claude: { error: CLAUDE_ERROR_PATTERNS, reason: 'claude_api_error' },
+  codex: { error: CODEX_ERROR_PATTERNS, reason: 'codex_api_error' },
+};
+
+// The excerpt is injected verbatim into the TASK_ERROR text the orchestrator reads, so it is
+// capped and single-lined rather than passed through whole.
+const ERROR_DETAIL_MAX_CHARS = 120;
+
 const ENTRIES = {
   // claude renders an empty input row as "❯" + spaces, sandwiched between
   // two horizontal-rule lines made of U+2500 ('─').
@@ -334,6 +375,26 @@ function detectSurfaceModal(command, output) {
     : { blocked: false, reason: 'composer_after_modal', modal_at: modalAt, ready_at: readyAt };
 }
 
+// #801 — did this stretch of PTY bytes end the turn in an API/transport error?
+//
+// Positional in the same last-one-wins sense as detectSurfaceModal (the newest marker is the
+// one described), but with no counter-signal — see SURFACE_ERROR_RULES for why the composer
+// cannot serve as one here. FAIL-OPEN: unknown CLI or no marker => `errored: false` => the
+// caller keeps today's behaviour.
+function detectSurfaceError(command, output) {
+  const rule = SURFACE_ERROR_RULES[commandKey(command)];
+  if (!rule) return { errored: false, reason: 'not_applicable' };
+  const text = normalizeOutputForDetection(output);
+  const errorAt = rule.error.reduce((max, p) => Math.max(max, lastMatchIndex(text, p)), -1);
+  if (errorAt === -1) return { errored: false, reason: 'no_error_seen' };
+  const detail = text.slice(errorAt, errorAt + ERROR_DETAIL_MAX_CHARS + 40)
+    .split('\n')[0]
+    .replace(/^[⏺■•\s]+/, '')
+    .trim()
+    .slice(0, ERROR_DETAIL_MAX_CHARS);
+  return { errored: true, reason: rule.reason, error_at: errorAt, detail };
+}
+
 function detectOutput(command, output) {
   const entry = lookup(command);
   if (!entry) {
@@ -349,6 +410,7 @@ module.exports = {
   isKnownAiCli,
   isPasteCapableCli,   // #730: identity-based bracketed-paste capability (codex/claude)
   detectSurfaceModal,  // #737: positional modal check for the byte-stream delivery path
+  detectSurfaceError,  // #801: per-CLI terminal-turn-failure markers (error-death vs completion)
   detectOutput,
   normalizeOutputForDetection,
   ENTRIES,

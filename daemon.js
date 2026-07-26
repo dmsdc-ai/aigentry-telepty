@@ -525,6 +525,32 @@ function observeConsumptionEvidence(pendingReport, session) {
   return { observed: echo.observed === true, reason: echo.reason };
 }
 
+// #801 — TASK_COMPLETE vs error-death. A wrapped session whose CLI dies on an API/transport
+// error goes quiet, so the idle detector fires and the auto-report asserts the worker "is now
+// idle after processing inject". It processed nothing: it printed an error banner and returned
+// to its prompt. Observed 6× on 2026-07-26 (claude `API Error: 529 Overloaded` ×5 at
+// 204-330s; codex `invalid_request_error` ×1 at 10.8s), and indistinguishable from a genuine
+// completion without reading the screen — which is the one thing the signal exists to avoid.
+//
+// Scoped to the TURN, not the session: only ring bytes appended past the inject watermark are
+// scanned, using the same split observeInjectEcho does. An error from an earlier turn was
+// already reported when it happened and must not poison this turn's verdict.
+//
+// FAIL-OPEN by construction — no watermark, no ring, no per-CLI rule, or no marker => null =>
+// the caller emits exactly what it emits today. Only positive error evidence may relabel, so a
+// genuine TASK_COMPLETE can never be suppressed by an unrecognised screen.
+function detectIdleAfterError(session, pendingReport) {
+  if (!session || !pendingReport) return null;
+  if (!Array.isArray(session.outputRing) || session.outputRing.length === 0) return null;
+  if (!Number.isFinite(session.outputRingTotalBytes)) return null;
+  if (!Number.isFinite(pendingReport.ringBytesAtInject)) return null;
+  const appended = Math.max(0, session.outputRingTotalBytes - pendingReport.ringBytesAtInject);
+  if (appended === 0) return null;
+  const all = session.outputRing.join('');
+  const verdict = readyRegistry.detectSurfaceError(session.command, all.slice(Math.max(0, all.length - appended)));
+  return verdict.errored === true ? verdict : null;
+}
+
 function getPendingReport(sessionId, registry = pendingReports) {
   if (typeof sessionId !== 'string') return null;
   if (sessionId === '__proto__' || sessionId === 'prototype' || sessionId === 'constructor') return null;
@@ -752,6 +778,13 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
     }
   }
 
+  // #801: we are about to assert "processed inject". Only ask when the answer could change
+  // the claim — an already-UNCONFIRMED report is honest as-is, and its semantics stay intact.
+  const _detectIdleAfterError = deps.detectIdleAfterError || detectIdleAfterError;
+  const errorVerdict = confirmed
+    ? _detectIdleAfterError(_sessions[targetId] || targetSession, pendingReport)
+    : null;
+
   pendingReport.idleNotified = true;
   pendingReport.idleAt = new Date(_now()).toISOString();
 
@@ -762,7 +795,8 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
       inject_id: pendingReport.injectId,
       elapsed_secs: Number(elapsed),
       injected_at: pendingReport.injectedAt,
-      trigger
+      trigger,
+      ...(errorVerdict ? { error_marker: errorVerdict.reason, error_detail: errorVerdict.detail } : {})
     }
   });
   console.log(`[ENFORCE-REPORT] ${targetId} idle after ${elapsed}s (trigger=${trigger}) — awaiting REPORT from ${pendingReport.source}`);
@@ -772,11 +806,15 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
   if (!srcSession) return;
 
   const injTag = pendingReport.injectId ? ` inject=${pendingReport.injectId}` : '';
-  const reportMsg = confirmed
-    ? `TASK_COMPLETE: ${targetId} is now idle after processing inject (${elapsed}s, via ${trigger}${injTag})`
-    : `TASK_IDLE_UNCONFIRMED: ${targetId} signaled idle ${elapsed}s after inject (via ${trigger}${injTag}) — inject may NOT have been processed; verify before treating as done`;
+  const label = errorVerdict ? 'TASK_ERROR' : confirmed ? 'TASK_COMPLETE' : 'TASK_IDLE_UNCONFIRMED';
+  const reportMsg = errorVerdict
+    ? `TASK_ERROR: ${targetId} went idle after an API/transport error (${errorVerdict.detail}) `
+      + `— ${elapsed}s, via ${trigger}${injTag}; the inject was NOT processed`
+    : confirmed
+      ? `TASK_COMPLETE: ${targetId} is now idle after processing inject (${elapsed}s, via ${trigger}${injTag})`
+      : `TASK_IDLE_UNCONFIRMED: ${targetId} signaled idle ${elapsed}s after inject (via ${trigger}${injTag}) — inject may NOT have been processed; verify before treating as done`;
   _deliver(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
-  console.log(`[AUTO-REPORT] ${targetId} → ${srcId}: ${confirmed ? 'TASK_COMPLETE' : 'TASK_IDLE_UNCONFIRMED'} after ${elapsed}s (trigger=${trigger})`);
+  console.log(`[AUTO-REPORT] ${targetId} → ${srcId}: ${label} after ${elapsed}s (trigger=${trigger})`);
 }
 
 const sessions = {};
@@ -5051,6 +5089,7 @@ if (require.main === module) {
 // production call sites is unchanged. NOT a public API — internal/test use only.
 module.exports = {
   fireAutoReport,                 // #32: provenance-tagged auto-report (deps DI: now/deliver/...)
+  detectIdleAfterError,           // #801: turn-scoped error-death verdict (TASK_ERROR vs TASK_COMPLETE)
   maybeRecordInjectConsumption,   // #619: durable early-consumption fact capture (idle-gate decay-proofing)
   resolveOutboundReportStatus,    // #721 FIX 2 (#579): reverse-match completion verdict + non-prefix fallback
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
