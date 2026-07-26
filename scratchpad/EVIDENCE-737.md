@@ -1,6 +1,7 @@
 # #737 — codex update modal swallows the first inject
 
-**Phase: REPRODUCE + DIAGNOSE. No product code changed. HOLD for fix approval.**
+**Phase: FIXED (A+C approved, C shipped first). §§1–5 are the repro/diagnosis as
+written at HOLD time and are left unedited; §7 is the fix and its verification.**
 
 Branch `fix/737-update-modal-repro`. Measured 2026-07-26 against real codex-cli 0.144.1
 on darwin 25.4.0, and against the real telepty daemon at `1425eee` (0.6.17).
@@ -299,3 +300,132 @@ first (small, safe, immediately stops the brew-exec-and-die), then add the hold/
   into `fs.write*`). Reported, not touched — Rule 29, separate cleanup task.
 - Known sandbox quirk honoured: `require('../daemon')` arms persisted-session poll timers,
   so every node run here is timeout-wrapped.
+
+---
+
+## 7. The fix (2026-07-26, A+C approved — C shipped first)
+
+Two commits, in the approved order: `71a1fc6` (C: predicate + refusal) then `6e8e208`
+(A: hold, with C as its timeout branch).
+
+### 7.1 Why the existing detector could not simply be reused
+
+`detect()` answers *"is this screen ready?"* about a cmux `read-screen` **snapshot**, where
+step 1's modal anti-pattern is exactly right — a dismissed modal is no longer on the screen.
+The delivery path has no screen primitive, only the PTY `outputRing`: an **append-only byte
+stream** in which the boot modal stays present for the whole session.
+
+Measured on a real codex ring (`scratchpad/probe-737-ring.js`), `detectOutput()` over the
+ring after the modal was dismissed and a message submitted:
+
+| tail window | 2k | 8k | 32k | full |
+|---|---|---|---|---|
+| stage 1 — modal up | `codex_modal_ui` | `codex_modal_ui` | `codex_modal_ui` | `codex_modal_ui` |
+| stage 2 — dismissed, composer live | not-found | **`codex_modal_ui`** | **`codex_modal_ui`** | **`codex_modal_ui`** |
+| stage 3 — after a real submit | not-found | READY | **`codex_modal_ui`** | **`codex_modal_ui`** |
+
+A presence-based predicate would therefore have parked **every** dispatch, forever, on any
+codex session that ever showed the modal — the exact blast-radius failure flagged at HOLD.
+
+**A per-chunk latch was tried and rejected** (`scratchpad/probe-737-latch.js`), mirroring the
+`ESC[?2004h`/`?2004l` shape `appendToOutputRing` already uses: it arms correctly but never
+clears, because only **1 of 74** chunks carries any signal — codex paints the composer banner
+incrementally, so no single chunk holds both step-2 markers.
+
+**Chosen: positional last-signal-wins.** Normalize the tail, take the last modal marker and
+the last live-composer footer, later wins. Same session, same probe:
+
+```
+  [1 boot]          latch(A)=true   positional(B)=true    (modalAt=125 readyAt=-1)
+  [2 dismissed]     latch(A)=true   positional(B)=false   (modalAt=125 readyAt=1633)
+  [3 after submit]  latch(A)=true   positional(B)=false   (modalAt=125 readyAt=2067)
+  tail windows 2k / 8k / 32k / 200k → blocked=false, all four
+```
+
+Window-insensitive, so the daemon's bounded ring read cannot flip the verdict. This is also
+what this file's own header already claims its detectors do ("returns the LAST occurrence …
+so transcript echoes earlier in the viewport do not produce false positives"); step 1 simply
+never honoured it.
+
+### 7.2 What changed
+
+| file | change |
+|---|---|
+| `src/prompt-symbol-registry.js` | hoisted codex's step-1 patterns to `CODEX_MODAL_PATTERNS` (same regexes, same per-pattern flags — `detect()` behavior unchanged) so the new predicate cannot drift from it; added `CODEX_COMPOSER_FOOTER` and the exported `detectSurfaceModal()` |
+| `daemon.js` | `readOutputRingTail` (bounded, newest-first); `isSurfaceBlockedByModal` (**fail-open**); `modalRemedy` / `modalHoldMs` env selectors; `modalDeliveryDecision`; `awaitSurfaceModalClear`; `resolveModalGate` — the one awaited gate consulted by `deliverInjectionToSession`, the force block, and the gated/gateOff path |
+| `package.json` | `test/codex-modal-first-inject-737.test.js` registered in `test`, `test:watch`, `test:ci` |
+| `README.md` / `README.tmpl.md` / `CHANGELOG.md` | `TELEPTY_MODAL_REMEDY`, `TELEPTY_MODAL_HOLD_MS` |
+
+**Fail-open by construction** — the force path is production orchestrator dispatch, so only
+*positive* modal evidence may block. No ring, no codex, no modal marker, or a composer footer
+after the modal ⇒ `deliver`, byte-identical to before. Scoped to codex; claude/gemini always
+get `not_applicable`. Pinned by a 7-case test.
+
+### 7.3 RED → GREEN
+
+`test/codex-modal-first-inject-737.test.js`: **15/15 pass** (3 anchors, 5 originally-RED,
+7 added for blast radius, the positional rule, the hold, and the env levers).
+
+| # | test | before | after |
+|---|---|---|---|
+| 1–3 | anchors: modal/composer classification, modal detectable from raw PTY bytes | pass | pass |
+| 4 | `isSurfaceBlockedByModal` exists and is true for a wrapped non-cmux modal session | **RED** | pass |
+| 5–7 | force / gated / plain must not resolve to `deliver` | **RED** | pass |
+| 8 | a composer surface still resolves to `deliver` on every path | **RED** | pass |
+| 9 | fails open on 7 non-modal surface shapes | — | pass |
+| 10 | a dismissed modal still in the ring does **not** block | — | pass |
+| 11–14 | hold releases on repaint; never-clearing hold degrades to reject; clear surface costs 0 polls; `TELEPTY_MODAL_HOLD_MS` bound + blank-value guard | — | pass |
+| 15 | `TELEPTY_MODAL_REMEDY` selector, `off` restores pre-fix behavior | — | pass |
+
+### 7.4 End-to-end on the real daemon (`scratchpad/e2e-737.js`)
+
+| variant | before | after |
+|---|---|---|
+| force | body + CR (+4ms) | **nothing written**, refused |
+| gated | body + CR (+7ms) | **nothing written**, refused |
+| plain | body + CR (+525ms) | **nothing written**, refused |
+| control (composer) | body + CR (+10ms) | body + CR (+3ms), elapsed 77ms — unchanged |
+| holdRelease (dismissed at 1200ms) | n/a | **body + CR delivered at 1210ms** — delayed, not dropped |
+
+Operator-facing:
+`❌ [SURFACE_MODAL] codex_modal_ui — delivery refused: Target codex is showing a blocking
+modal …; an Enter there would activate its default item, not submit your message. Dismiss it
+on the surface, or clear it by setting dismissed_version to latest_version in
+$CODEX_HOME/version.json and respawning.`
+
+### 7.5 Live proof against real codex (`scratchpad/e2e-737-live.js`)
+
+Real codex 0.144.1 under node-pty, behind the real daemon, driven by the real CLI. Both arms
+run on the same build — the "before" arm is `TELEPTY_MODAL_REMEDY=off`, which *is* the
+pre-#737 delivery path, so this is a same-harness RED→GREEN rather than a cross-build
+comparison.
+
+| arm | inject #1 (modal up) | brew execs | codex alive | inject #2 (after dismissal) |
+|---|---|---|---|---|
+| before — `REMEDY=off` | `✅ injected` (a lie) | **1** | **NO — exited** | n/a, session dead |
+| after — default `hold` | `❌ SURFACE_MODAL`, actionable | **0** | **yes** | `✅` delivered, body on surface |
+
+### 7.6 Suites, Snyk, scope
+
+- **Full suite: 79 files, 859 assertions, 0 failures.** Run per-file and timeout-wrapped —
+  10 files (all of which `require` daemon.js) complete their assertions but never exit, the
+  known persisted-session poll-timer quirk; they contribute 114 of those assertions and are
+  counted from their TAP `ok` lines. A plain `npm run test:ci` cannot finish for the same
+  reason (SIGKILL at ~10min, no failures up to that point) — that is pre-existing, not new.
+- **Snyk: 0 new.** `src/prompt-symbol-registry.js` 0 findings; `daemon.js` reports 15, and
+  `main`'s `daemon.js` reports the **same 15 with identical fingerprints** — none in the
+  changed regions. Pre-existing scratchpad findings from #730's harness remain untouched
+  (Rule 29).
+- **No merge, no publish.** Branch only.
+
+### 7.7 Out of scope, found on the way (reported, not fixed — Rule 29)
+
+1. **`cli.js` exits 0 on a refused inject.** Failures are `console.error` + `return`, with no
+   non-zero exit code — true for `SURFACE_MODAL` and equally for the pre-existing `STALE` /
+   `DISCONNECTED` paths. A shell doing `telepty inject … && next` treats a refusal as success.
+   Pre-existing CLI contract; changing it affects every failure mode, not just #737.
+2. **WS auto-register stamps `command: 'wrapped'`** (`src/transport/websocket.js`), not the
+   real CLI. Any session that comes up through that reconnect path is unidentifiable as
+   codex, so **every** CLI-identity feature silently degrades — #730's paste capability and
+   #737's modal predicate alike. Sessions restored from the persisted store keep their real
+   command, so this is scoped to the auto-register fallback. Worth its own issue.
