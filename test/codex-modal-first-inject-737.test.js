@@ -5,8 +5,7 @@
 // classifies that screen correctly (`codex_modal_ui`), but NO delivery path consults it,
 // so telepty writes the body and then a bare CR straight into the modal.
 //
-// UNREGISTERED (not in package.json `test`): this is the RED spec for the #737 fix.
-// Run explicitly:  node --test test/codex-modal-first-inject-737.test.js
+// Written RED against the shipped 0.6.17 daemon, now GREEN and registered in package.json.
 //
 // ── Measured against real codex 0.144.1 (scratchpad/repro-737-tmux.js — tmux
 //    capture-pane as the VT, isolated CODEX_HOME with version.json
@@ -82,12 +81,14 @@ function modalSession(screen = MODAL_SCREEN) {
   };
 }
 
-// The remedy is a HOLD-time decision. The RED below asserts only "not lost"; set this
-// to narrow the assertion once the remedy is approved.
-//   hold      — park the body until the surface leaves the modal, then deliver
-//   dismiss   — dismiss the modal first, then (re)deliver body + CR
-//   reject    — refuse the inject with an actionable error (caller re-injects)
+// Approved remedy: A (hold-and-retry) with C (reject) as its timeout branch, C shipped
+// first. The tests below assert only "not lost" against this set, so neither stage of the
+// rollout rewrites them; SHIPPED_REMEDY pins which one is the current default.
+//   hold      — park the body until the surface leaves the modal, then deliver   (A)
+//   reject    — refuse the inject with an actionable error (caller re-injects)   (C)
+//   dismiss   — considered and rejected: a bare Enter IS the destructive key here
 const ACCEPTED_REMEDIES = new Set(['hold', 'dismiss', 'reject']);
+const SHIPPED_REMEDY = 'reject';
 const REMEDY = process.env.TELEPTY_MODAL_REMEDY || null;
 
 // ── GREEN anchors: the detection itself already works. These must never regress. ──
@@ -159,4 +160,51 @@ test('#737 RED: a composer surface still resolves to plain delivery on every pat
   for (const opts of [{ force: true }, { force: false }]) {
     assert.equal(daemon.modalDeliveryDecision(modalSession(COMPOSER_SCREEN), opts).action, 'deliver');
   }
+});
+
+// ── Blast radius. The force path is production orchestrator dispatch, so the predicate
+// must be FAIL-OPEN: only positive modal evidence may ever block a write. ──
+
+test('#737: the predicate fails open on every surface that is not provably modal', () => {
+  const daemon = require('../daemon');
+  const cases = [
+    ['no session', null],
+    ['no ring', { command: 'codex', outputRing: undefined }],
+    ['empty ring', { command: 'codex', outputRing: [] }],
+    ['composer only', { command: 'codex', outputRing: [COMPOSER_SCREEN] }],
+    ['unknown cli', { command: 'bash', outputRing: [MODAL_SCREEN] }],
+    ['claude session', { command: 'claude', outputRing: [MODAL_SCREEN] }],
+    ['gemini session', { command: 'gemini', outputRing: [MODAL_SCREEN] }],
+  ];
+  for (const [label, session] of cases) {
+    assert.equal(daemon.isSurfaceBlockedByModal(session), false, `blocked a non-modal surface: ${label}`);
+  }
+});
+
+// The byte stream is append-only: the boot modal stays in the ring for the whole session.
+// Deciding by presence (what detectOutput does — correct for a cmux screen SNAPSHOT) would
+// park every dispatch on a healthy composer forever. Measured on a real codex ring:
+// scratchpad/probe-737-ring.js. Position is what makes the predicate usable here.
+test('#737: a dismissed modal still in the ring does NOT block — position decides', () => {
+  const daemon = require('../daemon');
+  const registry2 = require('../src/prompt-symbol-registry');
+  const ring = `${MODAL_SCREEN}\n${COMPOSER_SCREEN}\n`;
+  // The old presence-based read says "modal" — that is exactly the false positive.
+  assert.equal(registry2.detectOutput('codex', ring).reason, 'codex_modal_ui');
+  // The positional read sees the composer footer after the modal, and lets the write through.
+  assert.equal(daemon.isSurfaceBlockedByModal({ command: 'codex', outputRing: [ring] }), false);
+  assert.equal(registry2.detectSurfaceModal('codex', ring).reason, 'composer_after_modal');
+});
+
+// Rollback lever, mirroring TELEPTY_SUBMIT_BUSY_DISPATCH=off.
+test('#737: TELEPTY_MODAL_REMEDY selects the remedy and `off` restores pre-fix behavior', () => {
+  const daemon = require('../daemon');
+  assert.equal(daemon.modalRemedy({}), SHIPPED_REMEDY, 'shipped default changed without updating the test');
+  assert.equal(daemon.modalRemedy({ TELEPTY_MODAL_REMEDY: 'hold' }), 'hold');
+  assert.equal(daemon.modalRemedy({ TELEPTY_MODAL_REMEDY: 'reject' }), 'reject');
+  assert.equal(daemon.modalRemedy({ TELEPTY_MODAL_REMEDY: 'off' }), 'off');
+  assert.equal(daemon.modalRemedy({ TELEPTY_MODAL_REMEDY: 'nonsense' }), SHIPPED_REMEDY);
+  assert.equal(
+    daemon.modalDeliveryDecision(modalSession(), { force: true }, { TELEPTY_MODAL_REMEDY: 'off' }).action,
+    'deliver');
 });

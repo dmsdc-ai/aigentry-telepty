@@ -2,6 +2,14 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## Unreleased
+
+### Fixed
+- **#737** codex update modal swallowed the first inject — and ran an unattended upgrade. A codex whose `$CODEX_HOME/version.json` has `dismissed_version` < `latest_version` boots into a blocking modal whose PRE-SELECTED item is `1. Update now (runs \`brew upgrade --cask codex\`)`. telepty's inject shape — bracketed-paste body (#716/#730) + a separately-written CR — moves no selection, so the CR ACTIVATED that default: codex shell-exec'd brew and exited. The message was lost AND the session died. Deterministic on real codex 0.144.1 at 19/515/1523ms text→CR, i.e. a surface STATE, not #730's paste-burst race. The registry already classified the screen as `codex_modal_ui`, but nothing on the delivery path consulted it: its only consumer (`submit-gate.awaitPromptSymbol`) is cmux-only AND advisory, the force path returns before Layer 3 runs, and `deliverInjectionToSession` never asked at all. Fix: (A) `detectSurfaceModal` in the CLI registry decides by POSITION — last modal marker vs last live-composer marker — because the PTY output ring is an append-only byte stream where a presence check reports `codex_modal_ui` forever after a dismissal; (B) a fail-open `isSurfaceBlockedByModal` predicate over that ring, consulted by all three write paths (plain inject, gated submit, forced submit) through one shared `resolveModalGate`; (C) the default remedy holds the body until the surface clears (`TELEPTY_MODAL_REMEDY=hold`, bounded by `TELEPTY_MODAL_HOLD_MS`, default 30s) and falls back to an actionable `SURFACE_MODAL` refusal instead of ever writing into a modal. `TELEPTY_MODAL_REMEDY=off` restores the previous behavior.
+
+### Rollout
+- Daemon-side (daemon restart). No bridge changes. Non-codex CLIs and non-modal codex surfaces are byte- and timing-identical.
+
 ## 0.6.17 — 2026-07-26
 
 ### Fixed

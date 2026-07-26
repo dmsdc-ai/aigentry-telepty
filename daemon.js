@@ -1941,6 +1941,84 @@ function forceSubmitCrGapMs(injectedBody, session, env = process.env) {
   return Number.isFinite(configured) && configured >= 0 ? configured : FORCE_CR_GAP_DEFAULT_MS;
 }
 
+// #737 — a codex booted with `dismissed_version` < `latest_version` opens a BLOCKING
+// "Update available … Press enter to continue" modal whose PRE-SELECTED item is
+// "1. Update now (runs `brew upgrade --cask codex`)". Our inject shape — bracketed-paste
+// body (#716/#730) + a separately-written CR — moves no selection, so the CR ACTIVATES that
+// default: codex shell-execs brew and exits. The message is lost AND the session dies.
+// Measured deterministic on real codex 0.144.1 at 19/515/1523ms text->CR (a STATE, not
+// #730's paste-burst race). See scratchpad/EVIDENCE-737.md.
+//
+// The registry already classified that screen as `codex_modal_ui`, but nothing on the
+// delivery path consulted it: its only consumer (submit-gate.awaitPromptSymbol) is cmux-only
+// AND advisory, force returns before Layer 3 runs, and this function never asked at all.
+// These two seams are what every write path now asks first.
+const MODAL_RING_TAIL_BYTES = 65536;
+
+// Bounded, newest-first read of the PTY ring — same shape as submit-gate's readTail. The
+// positional rule in detectSurfaceModal is window-insensitive, so this budget is about cost,
+// not correctness.
+function readOutputRingTail(session, maxBytes = MODAL_RING_TAIL_BYTES) {
+  if (!session || !Array.isArray(session.outputRing) || session.outputRing.length === 0) return '';
+  let total = 0;
+  const parts = [];
+  for (let i = session.outputRing.length - 1; i >= 0 && total < maxBytes; i--) {
+    parts.unshift(session.outputRing[i]);
+    total += session.outputRing[i].length;
+  }
+  return parts.join('');
+}
+
+// FAIL-OPEN by construction: no ring, no codex, or no modal evidence => false => deliver,
+// byte-identical to pre-#737. The force path is production orchestrator dispatch, so a false
+// positive here would stall every dispatch; only positive modal evidence may block.
+function isSurfaceBlockedByModal(session) {
+  if (!session) return false;
+  const tail = readOutputRingTail(session);
+  if (!tail) return false;
+  return readyRegistry.detectSurfaceModal(session.command, tail).blocked === true;
+}
+
+// Remedy selector. `reject` (C) is this commit's default: refuse with an actionable error
+// so the caller learns immediately, instead of killing the session. `hold` (A) lands in the
+// next commit and becomes the default there — it parks the body until the surface clears
+// and falls back to `reject` on timeout. `off` is the rollback lever — same shape as
+// TELEPTY_SUBMIT_BUSY_DISPATCH=off.
+const MODAL_REMEDY_DEFAULT = 'reject';
+const MODAL_REMEDIES = new Set(['hold', 'reject', 'off']);
+function modalRemedy(env = process.env) {
+  const raw = String(env.TELEPTY_MODAL_REMEDY ?? '').trim().toLowerCase();
+  return MODAL_REMEDIES.has(raw) ? raw : MODAL_REMEDY_DEFAULT;
+}
+
+// The single decision every write path consults. `options` is accepted and deliberately NOT
+// branched on: force, gated and plain all lose the message identically (measured — all three
+// wrote body+CR into the modal), so they must all get the same answer. It stays in the
+// signature as the attribution seam for logging and for any future per-path divergence.
+function modalDeliveryDecision(session, options = {}, env = process.env) {
+  const remedy = modalRemedy(env);
+  if (remedy === 'off') return { action: 'deliver', reason: 'modal_gate_off' };
+  if (!isSurfaceBlockedByModal(session)) return { action: 'deliver', reason: 'surface_clear' };
+  return {
+    action: remedy,
+    reason: 'codex_modal_ui',
+    path: options.force === true ? 'force' : 'gated',
+    hint: 'Target codex is showing a blocking modal (e.g. "Update available … Press enter to '
+      + 'continue"); an Enter there would activate its default item, not submit your message. '
+      + 'Dismiss it on the surface, or clear it by setting dismissed_version to latest_version '
+      + 'in $CODEX_HOME/version.json and respawning.',
+  };
+}
+
+function modalRejectionResponse(decision) {
+  return {
+    error: `codex_modal_ui — delivery refused: ${decision.hint}`,
+    reason: 'codex_modal_ui',
+    code: 'SURFACE_MODAL',
+    hint: decision.hint,
+  };
+}
+
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
   const now = Date.now();
   if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
@@ -1968,6 +2046,16 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   const injectFailure = getInjectFailure(session, { nowMs: now });
   if (injectFailure) {
     return { success: false, ...injectFailure };
+  }
+
+  // #737: never write into a surface whose Enter key is wired to something other than
+  // "submit my message". This is the TEXT path — bypass #4 in the evidence: it consulted
+  // only the bootstrapReady boolean, which a blind timer flips without ever looking at the
+  // screen (shouldApplyOwnerAliveFloor).
+  const modalDecision = modalDeliveryDecision(session, options);
+  if (modalDecision.action !== 'deliver') {
+    console.log(`[INJECT] ${id} refused — ${modalDecision.reason} (remedy=${modalDecision.action})`);
+    return { success: false, httpStatus: 409, ...modalRejectionResponse(modalDecision) };
   }
 
   // Mailbox payload is TEXT ONLY — CR is sent separately after a delay.
@@ -3077,6 +3165,24 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   // escape-hatch but at request scope.
   // See: docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md §3.1
   if (force) {
+    // #737: the force path is the one that kills sessions — it skips the bootstrap gate
+    // (above) and returns before Layer 3 (below), so this is the ONLY place it can be asked.
+    // A bare CR into the update modal activates "1. Update now" and codex exits.
+    const forceModalDecision = modalDeliveryDecision(session, { force: true });
+    if (forceModalDecision.action !== 'deliver') {
+      console.log(`[SUBMIT] force refused for ${id} — ${forceModalDecision.reason} (remedy=${forceModalDecision.action})`);
+      if (injectedBody) {
+        markPendingReportSubmitUnconfirmed(id, { reason: 'codex_modal_ui', attempts: 0, retryable: true });
+      }
+      emitSubmitBus({ strategy: 'none', attempts: 0, gated: false, forced: true, submit_confirmed: false, reason: 'codex_modal_ui' });
+      return res.status(409).json({
+        ...modalRejectionResponse(forceModalDecision),
+        strategy: 'none',
+        attempts: 0,
+        gated: false,
+        forced: true,
+      });
+    }
     if (injectedBody) {
       markPendingReportSubmitStarted(id, injectedBody);
     }
@@ -3125,6 +3231,26 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
       attempts: 0,
       gated: false,
       forced: true,
+    });
+  }
+
+  // #737: every remaining submit path (gateOff escape hatch + the gated path) converges
+  // here. Layer 3 already knows about `codex_modal_ui` but is cmux-only AND advisory
+  // (`no_prompt_symbol_seen` falls through and submits anyway), so it protects nothing on a
+  // wrapped session — measured: the gated path fired its CR into the modal at +3ms.
+  const submitModalDecision = modalDeliveryDecision(session, { force: false });
+  if (submitModalDecision.action !== 'deliver') {
+    console.log(`[SUBMIT] refused for ${id} — ${submitModalDecision.reason} (remedy=${submitModalDecision.action})`);
+    if (injectedBody) {
+      markPendingReportSubmitUnconfirmed(id, { reason: 'codex_modal_ui', attempts: 0, retryable: true });
+    }
+    emitSubmitBus({ strategy: 'none', attempts: 0, gated: true, forced: false, submit_confirmed: false, reason: 'codex_modal_ui' });
+    return res.status(409).json({
+      ...modalRejectionResponse(submitModalDecision),
+      strategy: 'none',
+      attempts: 0,
+      gated: true,
+      forced: false,
     });
   }
 
@@ -4738,6 +4864,10 @@ module.exports = {
   appendToOutputRing,             // #716: seam that tracks bracketed-paste capability (?2004h)
   maybeBracketedPaste,            // #716/#730: identity+observation-gated bracketed-paste wrap
   forceSubmitCrGapMs,             // #730: scoped force-path text→CR floor (un-enveloped multi-line only)
+  isSurfaceBlockedByModal,        // #737: fail-open modal predicate over the PTY output ring
+  modalDeliveryDecision,          // #737: the one decision every write path consults
+  modalRemedy,                    // #737: TELEPTY_MODAL_REMEDY selector (hold|reject|off)
+  readOutputRingTail,             // #737: bounded newest-first ring read (predicate input)
   resolveBindHost,                // telepty#50 + #672: pure bind-address policy (loopback default, env opt-in, tailnet auto)
   formatBindHint,                 // telepty#50 + #672: startup bind/exposure banner line
   isTailnetAuto,                  // #672: pure predicate — is the zero-config tailnet path active

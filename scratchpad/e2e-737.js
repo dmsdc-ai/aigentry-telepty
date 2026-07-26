@@ -118,9 +118,21 @@ async function runVariant(port, name, ctx) {
   const sessionId = `c737-e2e-${name}`;
   const { ws, frames } = await attachBridge(port, sessionId, { boot, token: ctx.token });
 
+  // The WS auto-register path stamps `command: 'wrapped'` (src/transport/websocket.js), not
+  // the real CLI — so a bridge-only session is not identifiable as codex and every
+  // CLI-identity feature (#730 paste capability, #737 modal predicate) reads as
+  // not-applicable. A real `telepty allow` registers over HTTP first; do the same here, or
+  // this harness measures a session shape production does not have.
+  await fetch(`http://127.0.0.1:${port}/api/sessions/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ctx.token}` },
+    body: JSON.stringify({ session_id: sessionId, command: 'codex', cwd: '/tmp/c737-work' }),
+  }).catch(() => {});
+
   // What the shipped matcher thinks of the screen the bridge just relayed.
   const detected = registry.detectOutput('codex', boot);
 
+  const startedAt = Date.now();
   try {
     await execFileAsync(process.execPath, [
       path.join(ROOT, 'cli.js'), 'inject', ...args, sessionId, BODY,
@@ -152,8 +164,11 @@ async function runVariant(port, name, ctx) {
     bodyWrapped: !!bodyFrame && bodyFrame.data.startsWith('\x1b[200~'),
     crDelivered: !!crFrame,
     textToCrMs: bodyFrame && crFrame ? crFrame.at - bodyFrame.at : null,
+    // How long the CLI call took — for holdRelease this is the parked time, and for a
+    // never-clearing modal it is the TELEPTY_MODAL_HOLD_MS bound before the reject.
+    cliElapsedMs: bodyFrame ? bodyFrame.at - startedAt : Date.now() - startedAt,
   };
-  log(`  => registry says ready=${result.registryFound} (${result.registryReason}) BUT bodyDelivered=${result.bodyDelivered} crDelivered=${result.crDelivered} text->CR=${result.textToCrMs}ms`);
+  log(`  => registry says ready=${result.registryFound} (${result.registryReason}); bodyDelivered=${result.bodyDelivered} crDelivered=${result.crDelivered} text->CR=${result.textToCrMs}ms elapsed=${result.cliElapsedMs}ms`);
 
   try {
     execFileSync(process.execPath, [path.join(ROOT, 'cli.js'), 'kill', sessionId],
