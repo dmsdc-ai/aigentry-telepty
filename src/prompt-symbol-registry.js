@@ -63,20 +63,31 @@ const CLAUDE_MODAL_PATTERNS = [
 ];
 
 // Live-composer watermarks. Any one of them painting AFTER the last modal marker is
-// evidence the composer came back. Deliberately a UNION of four independent signals:
-// every extra counter-signal makes the predicate MORE fail-open, which is the safe
-// direction for a gate that sits in front of all production dispatch.
-const CLAUDE_COMPOSER_MARKERS = [
+// evidence the composer came back. Deliberately a UNION of four independent signals
+// (three footer shapes below plus the composer box): every extra counter-signal makes the
+// predicate MORE fail-open, which is the safe direction for a gate that sits in front of
+// all production dispatch.
+const CLAUDE_FOOTER_MARKERS = [
   // Status footer context meter: "trusted | Haiku 4.5 | [██░░░░░] 18% 36.9K/200.0K".
   /\|\s*\[[█░\s]*\]\s*\d+%/,
   /\d+(\.\d+)?K\s*\/\s*\d+(\.\d+)?K/,
   // Permission-mode line: "⏸ plan mode on (shift+tab to cycle)" / glued "⏸manualmodeon".
   /(⏸|▶)\s*\S[^\n]*mode\s*on/,
-  // The composer box itself: the caret row sandwiched between two horizontal rules. Any
-  // caret content counts (empty, placeholder, or half-typed text) — a composer with text in
-  // it is still a composer. Modal option rows never sit between two rules.
-  /─{10,}\n[❯>][^\n]*\n─{10,}/,
 ];
+// The composer box itself: the caret row sandwiched between two horizontal rules. Any
+// caret content counts (empty, placeholder, or half-typed text) — a composer with text in
+// it is still a composer. Modal option rows never sit between two rules.
+const CLAUDE_COMPOSER_BOX = /─{10,}\n[❯>][^\n]*\n─{10,}/;
+const CLAUDE_COMPOSER_MARKERS = [...CLAUDE_FOOTER_MARKERS, CLAUDE_COMPOSER_BOX];
+
+// #752 — the same watermarks, with the box tightened for the one job the loose form cannot
+// do. As a counter-signal to a modal, ANY caret glyph is the right call (fail-open). As
+// positive evidence that a composer is up — what ENTRIES.claude.detect now needs — the
+// ASCII-'>' arm also accepts a markdown blockquote quoted between two rules in a transcript
+// (the #679 fixture). The ❯-only form keeps the placeholder composer this bug is about
+// (`❯ Try"…"`) and drops the blockquote; a Windows ASCII-caret composer still lands via the
+// footer signals, which claude paints on every frame.
+const CLAUDE_READY_MARKERS = [...CLAUDE_FOOTER_MARKERS, /─{10,}\n❯[^\n]*\n─{10,}/];
 
 // #760 — per-CLI rule table for the delivery-path predicate. codex's entry is #737's two
 // lists verbatim; adding a CLI means adding a row plus a captured-bytes test, and cannot
@@ -90,16 +101,39 @@ const SURFACE_MODAL_RULES = {
 const ENTRIES = {
   // claude renders an empty input row as "❯" + spaces, sandwiched between
   // two horizontal-rule lines made of U+2500 ('─').
-  // #679: on Windows/ConPTY the caret glyph falls back to ASCII '>' (0x3E) —
-  // `❯` renders 0×, `>` renders instead — so the ❯-only matcher never fired,
-  // bootstrap_ready never flipped, and gated injects parked in the mailbox
-  // forever. Accept both carets; the full-line `\s*$` anchor + `─`-rule
-  // adjacency guard still reject a stray '> markdown blockquote' in transcript.
+  // #752: the empty-caret scan below is a real claude's SECOND composer onwards. On a fresh
+  // session claude paints a placeholder hint INSIDE the empty composer —
+  // `❯ Try"refactordaemon.test.js"` (captured verbatim) — so `^❯\s*$` never matched, and
+  // `telepty allow` (cli.js observePromptReady) therefore never marked a real claude ready:
+  // every inject parked in the bridge mailbox for the life of the session, with the daemon
+  // reporting success. Decide POSITIONALLY first, on the same marker lists and the same
+  // last-one-wins rule detectSurfaceModal uses (#737/#760) — those were measured against
+  // real 2.1.220 PTY bytes, so they survive both Ink's differential paint (the bridge's
+  // byte stream) and a rendered cmux snapshot. The legacy scan stays as the fallback.
   claude: {
     symbol: '❯',
     byteSeq: Buffer.from([0xE2, 0x9D, 0xAF]),
     detect(screen) {
-      const lines = String(screen == null ? '' : screen).split('\n');
+      const text = String(screen == null ? '' : screen);
+      const composerAt = CLAUDE_READY_MARKERS.reduce((max, p) => Math.max(max, lastMatchIndex(text, p)), -1);
+      const modalAt = CLAUDE_MODAL_PATTERNS.reduce((max, p) => Math.max(max, lastMatchIndex(text, p)), -1);
+
+      // Step 1: modal veto, decided POSITIONALLY (last marker wins — the #737 rule). A
+      // pre-prompt UI owning the surface is NOT ready: Enter there picks an option, it does
+      // not submit. Position, not presence, because an append-only byte stream keeps every
+      // screen it ever painted — including the composer from before the modal opened.
+      if (modalAt > composerAt) {
+        return { found: false, reason: 'claude_modal_ui' };
+      }
+
+      // Step 2: legacy empty-caret scan. Runs before the marker fallback because it is the
+      // strict one AND the only one that can report geometry (line_index/col).
+      // #679: on Windows/ConPTY the caret glyph falls back to ASCII '>' (0x3E) —
+      // `❯` renders 0×, `>` renders instead — so the ❯-only matcher never fired,
+      // bootstrap_ready never flipped, and gated injects parked in the mailbox
+      // forever. Accept both carets; the full-line `\s*$` anchor + `─`-rule
+      // adjacency guard still reject a stray '> markdown blockquote' in transcript.
+      const lines = text.split('\n');
       for (let i = lines.length - 1; i >= 1; i--) {
         const line = lines[i];
         const m = /^([❯>])\s*$/.exec(line);
@@ -107,8 +141,14 @@ const ENTRIES = {
         const above = lines[i - 1] || '';
         const below = lines[i + 1] || '';
         if (above.includes('─') || below.includes('─')) {
-          return { found: true, line_index: i, col: line.indexOf(m[1]) + 1 };
+          return { found: true, line_index: i, col: line.indexOf(m[1]) + 1, reason: 'claude_empty_caret' };
         }
+      }
+
+      // Step 3: a live composer that is not an EMPTY one. This is the #752 case — a fresh
+      // claude paints a placeholder hint on the caret row, so step 2 can never match it.
+      if (composerAt >= 0) {
+        return { found: true, reason: 'claude_composer_marker' };
       }
       return { found: false };
     },
