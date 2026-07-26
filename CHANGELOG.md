@@ -2,6 +2,11 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## Unreleased
+
+### Fixed
+- **#757** supervised version-change restarts no longer create a first-pass orphan outside launchd/systemd/schtasks. Reproduced with a scratch launchd label and port: a detached `telepty-daemon` owning the port made `launchctl kickstart -k` exit the managed job with code 0 while the detached pid kept serving; killing that pid and kicking again recovered. Fix: supervised `restartDaemonGraceful` now restarts through the detected OS supervisor and never falls back to `detached + unref` for supervisor-managed installs, while unsupervised hosts keep the existing detached restart path. Global `postinstall` uses the same supervisor-owned restart rule, so upgrades no longer preempt launchd with a detached replacement.
+
 ## 0.7.0 — 2026-07-26
 
 ### Removed — BREAKING (over-engineering cuts, ecosystem cleanup audit 2026-07-26)

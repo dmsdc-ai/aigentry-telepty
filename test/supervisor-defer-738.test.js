@@ -9,6 +9,7 @@ const path = require('path');
 const {
   LAUNCHD_PLIST_NAME,
   SYSTEMD_UNIT_PATH,
+  SYSTEMD_USER_UNIT_NAME,
   WINDOWS_TASK_NAME,
   DEFER_MARKER_TTL_MS,
   detectSupervisor,
@@ -49,9 +50,15 @@ test('detect: linux with the root-installed unit → systemd', () => {
   assert.deepEqual(result, { present: true, kind: 'systemd', detail: SYSTEMD_UNIT_PATH });
 });
 
+test('detect: linux with the user-installed unit → systemd-user', () => {
+  const userUnit = path.join(HOME, '.config', 'systemd', 'user', SYSTEMD_USER_UNIT_NAME);
+  const result = detectSupervisor({
+    platform: 'linux', env: {}, homedir, existsSync: existsOnly(userUnit)
+  });
+  assert.deepEqual(result, { present: true, kind: 'systemd-user', detail: userUnit });
+});
+
 test('detect: linux non-root install (no unit file) → absent', () => {
-  // install.js only writes the unit when running as root; a user-level Linux install has
-  // no supervisor at all and must keep the unchanged spawn path.
   const result = detectSupervisor({
     platform: 'linux', env: {}, homedir, existsSync: existsOnly()
   });

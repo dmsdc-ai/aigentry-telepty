@@ -9,13 +9,14 @@
 //
 // Design (constitution §2 — same behavior on every OS):
 //   DETECTION is per-OS, because the install surfaces differ (install.js:340-410).
-//   POLICY is uniform and lives in cli.js ensureDaemonRunning: supervisor present ⇒ wait
-//   for it, bounded; supervisor absent ⇒ byte-identical to the pre-#738 spawn path.
+//   POLICY is uniform and lives in cli.js ensureDaemonRunning / restartDaemonGraceful:
+//   supervisor present ⇒ let the supervisor own daemon start/restart; supervisor absent ⇒
+//   byte-identical to the pre-#738 spawn path.
 //
-// Detection is LAZY — cli.js only calls it when it is about to spawn a daemon (i.e. when
-// nothing answered on the port), never on the healthy fast path. So the one shell-out this
-// needs on Windows costs nothing in normal operation. It is additionally memoized per
-// process.
+// Detection is LAZY — cli.js only calls it when it is about to start or restart a daemon,
+// never on the healthy fast path. postinstall calls it only during a stale global upgrade.
+// So the one shell-out this needs on Windows costs nothing in normal operation. It is
+// additionally memoized per process.
 //
 // §17 무의존: no new dependencies — fs/os/path/child_process only.
 
@@ -24,11 +25,14 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync, execSync } = require('child_process');
 
 // The daemon profile's install surfaces, verbatim from install.js:256-263 + 340-410.
+const LAUNCHD_LABEL = 'com.aigentry.telepty';
 const LAUNCHD_PLIST_NAME = 'com.aigentry.telepty.plist';   // ~/Library/LaunchAgents/
+const SYSTEMD_SERVICE_NAME = 'telepty';
 const SYSTEMD_UNIT_PATH = '/etc/systemd/system/telepty.service';
+const SYSTEMD_USER_UNIT_NAME = 'telepty.service';
 const WINDOWS_TASK_NAME = 'telepty-daemon';
 
 const ABSENT = Object.freeze({ present: false, kind: null, detail: null });
@@ -72,11 +76,14 @@ function detectSupervisorUncached(deps = {}) {
     }
   }
 
-  // Linux and everything else. install.js only writes the systemd unit when running as
-  // root (install.js:388-402); a non-root Linux install has no supervisor at all, and
-  // correctly detects as absent → unchanged behavior.
-  return existsSync(SYSTEMD_UNIT_PATH)
-    ? { present: true, kind: 'systemd', detail: SYSTEMD_UNIT_PATH }
+  // Linux and everything else. install.js writes either a root unit or a user unit.
+  if (existsSync(SYSTEMD_UNIT_PATH)) {
+    return { present: true, kind: 'systemd', detail: SYSTEMD_UNIT_PATH };
+  }
+
+  const userUnitPath = path.join(homedir(), '.config', 'systemd', 'user', SYSTEMD_USER_UNIT_NAME);
+  return existsSync(userUnitPath)
+    ? { present: true, kind: 'systemd-user', detail: userUnitPath }
     : ABSENT;
 }
 
@@ -127,15 +134,66 @@ function clearSupervisorDeferMarker(opts) {
   }
 }
 
+function restartSupervisorDaemon(supervisor, deps = {}) {
+  if (!supervisor || !supervisor.present) {
+    return { success: false, error: 'no supervisor detected' };
+  }
+
+  const execFile = deps.execFileSync || execFileSync;
+  const getuid = deps.getuid || (() => (typeof process.getuid === 'function' ? process.getuid() : null));
+
+  try {
+    if (supervisor.kind === 'launchd') {
+      const uid = getuid();
+      if (!Number.isInteger(uid) || uid < 0) {
+        return { success: false, error: 'cannot resolve uid for launchd kickstart' };
+      }
+      execFile('launchctl', ['kickstart', '-k', `gui/${uid}/${LAUNCHD_LABEL}`], {
+        stdio: ['ignore', 'ignore', 'ignore']
+      });
+      return { success: true, kind: supervisor.kind };
+    }
+
+    if (supervisor.kind === 'systemd') {
+      execFile('systemctl', ['restart', SYSTEMD_SERVICE_NAME], {
+        stdio: ['ignore', 'ignore', 'ignore']
+      });
+      return { success: true, kind: supervisor.kind };
+    }
+
+    if (supervisor.kind === 'systemd-user') {
+      execFile('systemctl', ['--user', 'restart', SYSTEMD_SERVICE_NAME], {
+        stdio: ['ignore', 'ignore', 'ignore']
+      });
+      return { success: true, kind: supervisor.kind };
+    }
+
+    if (supervisor.kind === 'schtasks') {
+      execFile('schtasks', ['/run', '/tn', WINDOWS_TASK_NAME], {
+        stdio: ['ignore', 'ignore', 'ignore']
+      });
+      return { success: true, kind: supervisor.kind };
+    }
+
+    return { success: false, error: `unsupported supervisor kind: ${supervisor.kind}` };
+  } catch (err) {
+    return { success: false, kind: supervisor.kind, error: err.message };
+  }
+}
+
 module.exports = {
   DEFER_MARKER_FILE,
   DEFER_MARKER_TTL_MS,
+  LAUNCHD_LABEL,
   LAUNCHD_PLIST_NAME,
+  SYSTEMD_SERVICE_NAME,
   SYSTEMD_UNIT_PATH,
+  SYSTEMD_USER_UNIT_NAME,
   WINDOWS_TASK_NAME,
   clearSupervisorDeferMarker,
   detectSupervisor,
   isDeferMarkerFresh,
   readSupervisorDeferMarker,
+  restartSupervisorDaemon,
   writeSupervisorDeferMarker
 };
