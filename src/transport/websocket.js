@@ -2,6 +2,7 @@
 
 const crypto = require('node:crypto');
 const { WebSocketServer } = require('ws');
+const { createOriginGuard } = require('../protocol/http-auth');
 
 function isOpenWebSocket(ws) {
   return Boolean(ws && ws.readyState === 1);
@@ -34,6 +35,11 @@ function installWebSocketTransport(deps) {
     applySessionStateReport,
     busAutoRoute
   } = deps;
+
+  // Same browser-drive-by guard as the HTTP middleware, and needed MORE here: a WS handshake
+  // is not CORS-gated at all, so before this a visited page could open a socket to loopback and
+  // read/write somebody's terminal. Default-deny when no allowlist is supplied.
+  const isForbiddenOrigin = deps.isForbiddenOrigin || createOriginGuard(deps.allowedOrigins);
 
   const wss = new WebSocketServer({ noServer: true });
 
@@ -336,6 +342,12 @@ function installWebSocketTransport(deps) {
   function handleUpgrade(req, socket, head) {
     const url = new URL(req.url, 'http://' + req.headers.host);
     const token = url.searchParams.get('token');
+
+    if (isForbiddenOrigin(req.headers['origin'])) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
 
     const wsAuthHeader = req.headers['authorization'] || '';
     const wsJwtValid = wsAuthHeader.startsWith('Bearer ') && verifyJwt(wsAuthHeader.slice(7));

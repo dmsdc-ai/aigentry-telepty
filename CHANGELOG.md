@@ -4,6 +4,27 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## Unreleased
 
+### Security
+- **Any website the user visited could drive their AI CLI sessions.** The daemon listens on
+  loopback and `isAllowedPeer` trusted `127.0.0.1`/`::1` unconditionally and *first*, before any
+  token check, so a page in the user's browser could `fetch('http://127.0.0.1:3848/api/sessions/
+  <sid>/inject', {method:'POST', …})` and type into a live session with no token and no
+  interaction — the response is CORS-gated, but the request executes, which is the whole attack.
+  A WebSocket handshake is not CORS-gated at all, so `new WebSocket('ws://127.0.0.1:3848/api/
+  sessions/<sid>')` was unauthenticated read/write on somebody's terminal. Loopback trust is not
+  authentication against a browser. Fix: browsers always attach `Origin` to a cross-origin fetch
+  and to every WS handshake, while curl, the telepty CLI, and SSH-tunnelled peers never do — so a
+  request that *carries* `Origin` must now name an explicitly allowlisted origin
+  (`TELEPTY_ALLOWED_ORIGINS`, comma-separated, **empty by default** = no web page may call the
+  API) or it is refused 403 before the loopback/token branches. The guard is checked first, so a
+  leaked token cannot buy a disallowed origin past it, and `Origin: null` (sandboxed iframe,
+  `file://`) is a value rather than an absence and stays blocked. Reads are guarded as well as
+  writes: `GET /api/sessions` discloses session ids and cwd paths, `/screen` discloses the
+  terminal itself, and the daemon answers `Access-Control-Allow-Origin: *`, so a page really
+  could read those bodies back. Origin-less callers take exactly the path they took before, so
+  every existing CLI, tunnel, and peer flow is byte-identical. No new auth scheme, token file, or
+  config format.
+
 ### Fixed
 - **#801** a wrapped AI-CLI session that dies on an API/transport error is no longer reported to
   its dispatcher as a completion. The dead session goes quiet, so the idle detector fires and the
