@@ -2,6 +2,14 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.6.17 — 2026-07-26
+
+### Fixed
+- **#730** codex 0.144.1 forced-submit swallow — not a codex regression: the #716 bracketed-paste envelope was healthy but not APPLIED, because `bracketedPasteCapable` was learned only from a one-shot `ESC[?2004h` (emitted once in codex's first ~1.4KB) that wrapped sessions miss on late owner-WS attach and that never survived a daemon restart. Un-enveloped multi-line bodies with a near-0ms text→CR gap were then swallowed probabilistically. Fix: (A) paste capability is now identity-based via the CLI registry (`isPasteCapableCli`: codex, claude), with observed `?2004h`/`?2004l` as positive/negative overrides; (B) observed capability persists across daemon restarts (serialized only when actually observed — legacy session bytes unchanged); (C) defense-in-depth: the force path floors the text→CR gap (`TELEPTY_FORCE_CR_GAP_MS`, default 250ms) only for un-enveloped multi-line bodies — enveloped bodies keep ~0ms.
+
+### Rollout
+- Daemon-side (daemon restart). No bridge changes.
+
 ## 0.6.16 — 2026-07-25
 
 ### Fixed
