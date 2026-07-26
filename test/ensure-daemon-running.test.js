@@ -144,6 +144,7 @@ test('ensureDaemonRunning: no daemon at all (meta null + sessions unreachable) â
   await ensureDaemonRunning({
     requiredCapabilities: [CAP],
     _getDaemonMeta: async () => null,
+    _detectSupervisor: () => ({ present: false, kind: null, detail: null }),
     _fetchWithAuth: timeoutFetch(),
     _restartDaemonGraceful: restart,
     _probe: { attempts: 2, backoffMs: 0 }

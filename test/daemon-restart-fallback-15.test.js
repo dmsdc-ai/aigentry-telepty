@@ -106,6 +106,7 @@ test('restartDaemonGraceful: surviving port owner → ONE attempt, no daemon sta
   try {
     const result = await restartDaemonGraceful({
       _cleanupDaemonProcesses: () => { cleanups += 1; return { stopped: [], failed: [{ pid: 777, source: 'state-file' }] }; },
+      _detectSupervisor: () => ({ present: false, kind: null, detail: null }),
       _startDetachedDaemon: () => { starts += 1; },
       _waitForDaemonHealth: async () => null,
       _findPortOwnerPid: () => 777,
@@ -127,6 +128,7 @@ test('restartDaemonGraceful: port freed by cleanup → starts the new daemon and
   let starts = 0;
   const result = await restartDaemonGraceful({
     _cleanupDaemonProcesses: () => ({ stopped: [], failed: [] }),
+    _detectSupervisor: () => ({ present: false, kind: null, detail: null }),
     _startDetachedDaemon: () => { starts += 1; },
     _waitForDaemonHealth: async () => ({ version: pkg.version, capabilities: [] }),
     _findPortOwnerPid: () => null,

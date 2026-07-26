@@ -39,6 +39,7 @@ const {
   detectSupervisor,
   isDeferMarkerFresh,
   readSupervisorDeferMarker,
+  restartSupervisorDaemon,
   writeSupervisorDeferMarker
 } = require('./src/supervisor');
 const crossMachine = require('./cross-machine');
@@ -372,9 +373,17 @@ async function restartDaemonGraceful(options = {}) {
   // same pattern as ensureDaemonRunning #567).
   const cleanup = options._cleanupDaemonProcesses || cleanupDaemonProcesses;
   const startDaemon = options._startDetachedDaemon || startDetachedDaemon;
+  const detect = options._detectSupervisor || detectSupervisor;
+  const restartSupervisor = options._restartSupervisorDaemon || restartSupervisorDaemon;
   const waitHealth = options._waitForDaemonHealth || waitForDaemonHealth;
   const portOwner = options._findPortOwnerPid || findPortOwnerPid;
   const parentInfo = options._findParentProcessInfo || findParentProcessInfo;
+  const supervisor = detect();
+  const supervisorPresent = Boolean(supervisor && supervisor.present);
+  const acceptsMeta = (meta) => {
+    if (!meta || meta.version !== pkg.version) return false;
+    return requiredCapabilities.every(c => (meta.capabilities || []).includes(c));
+  };
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     // (a) Kill existing daemon processes
@@ -391,6 +400,16 @@ async function restartDaemonGraceful(options = {}) {
       }
     }
 
+    // A supervisor may have already restored the daemon while cleanup was waiting.
+    // Accept that process if it is the requested version/capability set; otherwise
+    // keep the normal blocked-port protection below.
+    if (supervisorPresent) {
+      const restored = await waitHealth(1000);
+      if (acceptsMeta(restored)) {
+        return { success: true, meta: restored, attempt, supervisor: supervisor.kind };
+      }
+    }
+
     // telepty#15 fail-fast: when the port is still owned by a process cleanup did
     // not stop (state file absent and unkillable, EPERM, foreign parent), starting
     // a new daemon can never bind — the old "3 attempts with backoff" was pure
@@ -402,16 +421,23 @@ async function restartDaemonGraceful(options = {}) {
       return { success: false, meta: null, attempt, blockedPid: survivingOwner, diagnostic };
     }
 
-    // (c) Start new daemon
-    startDaemon();
+    // (c) Start the replacement. On supervised installs, the replacement must be
+    // launched by that supervisor; a detached child would recreate #757's orphan.
+    if (supervisorPresent) {
+      const kicked = restartSupervisor(supervisor);
+      if (!kicked || kicked.success !== true) {
+        const diagnostic = `${supervisor.kind} restart failed: ${(kicked && kicked.error) || 'unknown error'}`;
+        console.error(`\x1b[31m❌ Daemon restart blocked: ${diagnostic}\x1b[0m`);
+        return { success: false, meta: null, attempt, supervisor: supervisor.kind, diagnostic };
+      }
+    } else {
+      startDaemon();
+    }
 
     // (d) Wait for new daemon to respond with correct version
     const meta = await waitHealth(5000);
-    if (meta && meta.version === pkg.version) {
-      const hasCapabilities = requiredCapabilities.every(c => (meta.capabilities || []).includes(c));
-      if (hasCapabilities || requiredCapabilities.length === 0) {
-        return { success: true, meta, attempt };
-      }
+    if (acceptsMeta(meta)) {
+      return { success: true, meta, attempt, supervisor: supervisorPresent ? supervisor.kind : null };
     }
 
     // Retry with backoff
@@ -421,6 +447,14 @@ async function restartDaemonGraceful(options = {}) {
       process.stderr.write(`\x1b[33m⚠️ Daemon restart attempt ${attempt}/${maxAttempts} failed. Retrying in ${backoff / 1000}s...\x1b[0m\n`);
       await new Promise(r => setTimeout(r, backoff));
     }
+  }
+
+  if (supervisorPresent) {
+    console.error(
+      `\x1b[31m❌ Daemon restart failed after ${maxAttempts} supervisor attempt(s). ` +
+      `${supervisor.kind} did not start telepty daemon on port ${PORT}; not spawning a detached daemon for a supervisor-managed install.\x1b[0m`
+    );
+    return { success: false, meta: null, attempt: maxAttempts, supervisor: supervisor.kind };
   }
 
   // telepty#44: name the surviving daemon (state-file pid and/or current port owner) so
