@@ -36,3 +36,13 @@ jobs:
         run: npm run typecheck
       - name: Run regression suite
         run: npm run test:ci
+      # #768: this one file drives a real daemon + a real `telepty allow` bridge + a real PTY
+      # with a deliberately delayed WS handshake. Inside the parallel list it lands on a worker
+      # alongside whatever else node --test schedules there, and on the 3-core macOS runner that
+      # pairing pushed test/enforce-report.test.js:359 from 1.2s to its 10s ceiling — a test that
+      # only waits for a bus event and loses nothing, so the honest fix is to stop contending
+      # rather than to raise its budget. Measured: dropping this file from the parallel list
+      # restores macOS to green (run 30204629841). `npm test` still includes it; a dev machine
+      # has the cores. Give it its own step so it runs alone and gates just the same.
+      - name: Run PTY-serialized regression tests
+        run: npm run test:ci:pty
