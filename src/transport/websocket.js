@@ -188,6 +188,16 @@ function installWebSocketTransport(deps) {
                   client.send(JSON.stringify({ type: 'output', data }));
                 }
               });
+            } else if (type === 'heartbeat') {
+              // #732: bridge-side liveness. It rides the exact same gate as an 'output'
+              // frame (cli.js: wsReady && readyState === 1), so its arrival proves the
+              // bridge→daemon leg works and any silence is the SESSION's, not the PIPE's.
+              // Deliberately does NOT touch lastActivityAt: that field is already stamped
+              // by the daemon's own delivery path (daemon.js:1119/2033/2061/4415), and
+              // stamping it here too would re-hide what the heartbeat exists to reveal.
+              activeSession.bridgeHeartbeatAt = new Date().toISOString();
+              if (Number.isFinite(msg.pty_bytes)) activeSession.bridgePtyBytes = msg.pty_bytes;
+              if (typeof msg.read_side === 'string') activeSession.bridgeReadSide = msg.read_side;
             } else if (type === 'ready') {
               if (isBootstrapGatedSession(activeSession)) {
                 markBootstrapReady(sessionId, activeSession, 'bridge_ready');
