@@ -9,140 +9,139 @@
 // returning pre-death content. Nothing on either side noticed; only a bridge
 // respawn cured it.
 //
-// This file has two jobs:
-//   1. REPRO (passes today) — pin the observable signature, so the fix has a
-//      before/after reference.
-//   2. RED (fails today)    — pin the contract the product does not hold:
-//      upstream must recover, and while it has not, the session must not be
-//      advertised as healthy.
-//
-// NOT registered in package.json `test`/`test:ci` — REPRO phase artifact (#732).
-// Run directly:
-//   node --require ./test-support/setup-env.js --test test/bridge-output-pipe-732.test.js
+// Two shapes of the fault, two contracts:
+//   * UNRECOVERABLE (fault mode `mute`) — bytes stop reaching the consumer and no
+//     amount of re-arming brings them back. The daemon cannot repair this, so the
+//     contract is that it must NOTICE: health degrades to UPSTREAM_STALLED and
+//     inject stops reporting plain success.
+//   * RECOVERABLE (fault mode `pause`) — the PTY read side merely stopped flowing.
+//     The bridge's own watchdog must re-arm it and upstream must resume.
 //
 // #524 guard: isolated HOME + ephemeral port; the production daemon on 3848 and
 // any session this file did not create are never touched.
 
-const { test, before, after } = require('node:test');
+const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
+// NOTE: daemon.js is deliberately NOT required here — a bare require binds a listener,
+// which would contend with the operator's daemon. The pure decision logic lives in
+// test/upstream-stall-predicate-732.test.js, which pins PORT/HOME before requiring it.
 const H = require('../test-support/bridge-pipe-harness');
 
 const SKIP = process.platform === 'win32' ? 'POSIX-only (node-pty master fd semantics)' : false;
 
-// How long the product may take to notice a dead upstream and restore it. Generous
-// on purpose: the daemon's own owner-WS heartbeat runs on a 30s interval
-// (src/transport/websocket.js:51-59), so anything shorter than that could be
-// called an unfair bar. Today upstream never comes back at all.
-const UPSTREAM_RECOVERY_MS = 45000;
+// Compressed detection windows so the e2e runs in seconds. Production defaults
+// (30s stall / 10s heartbeat) are pinned in test/upstream-stall-predicate-732.test.js.
+const FAST = {
+  daemon: { TELEPTY_UPSTREAM_STALL_SECONDS: '5', TELEPTY_HEALTH_POLL_MS: '500' },
+  bridge: { TELEPTY_BRIDGE_HEARTBEAT_MS: '1000' }
+};
 
-let home;
-let daemon;
-let bridge;
-let A;
-let sid;
-let proofFile;
-let ringBeforeFault = '';
-let sessionBeforeFault = null;
-let downstreamProven = false;
+// Stand up a real daemon + real `telepty allow` bridge with both legs verified.
+async function bothLegsUp(t, { faultMode }) {
+  const home = H.makeHome();
+  const sid = `c732-${faultMode}-${process.pid}`;
+  const daemon = H.startDaemon({ home, env: FAST.daemon });
+  let bridge = null;
+  t.after(async () => {
+    H.killBridge(bridge);
+    await H.stopDaemon(daemon);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
 
-before(async () => {
-  if (SKIP) return;
-  home = H.makeHome();
-  sid = `c732-${process.pid}`;
-  proofFile = path.join(home, 'c732-downstream-proof.txt');
-
-  daemon = H.startDaemon({ home });
   const port = await H.daemonReady(daemon);
-  A = H.api(port);
+  const A = H.api(port);
+  bridge = H.startBridge({
+    home, port, sid,
+    faultInjector: true,
+    env: { ...FAST.bridge, TELEPTY_FAULT_MODE: faultMode }
+  });
 
-  bridge = H.startBridge({ home, port, sid, faultInjector: true });
   await H.waitFor(async () => (await A.session(sid)).id === sid, { description: 'session register' });
   await H.waitFor(async () => (await A.screen(sid)).screen.length > 0, { description: 'first PTY output in ring' });
-
-  // Both legs healthy before the fault — otherwise the repro proves nothing.
   await A.inject(sid, 'echo C732_PRE\n');
   await H.waitFor(() => bridge.out.includes('C732_PRE'), { description: 'pre-fault inject reached the PTY' });
   await H.waitFor(async () => (await A.screen(sid)).screen.includes('C732_PRE'),
     { description: 'pre-fault PTY output reached the daemon ring' });
 
-  ringBeforeFault = (await A.screen(sid)).screen;
-  sessionBeforeFault = await A.session(sid);
+  return { home, sid, daemon, bridge, A };
+}
 
-  // Sever ONLY the upstream leg (see test-support/pty-read-fault.js).
+test('#732 REPRO + DETECT: an unrecoverable upstream death is caught, not silently served', { skip: SKIP }, async (t) => {
+  const { home, sid, daemon, bridge, A } = await bothLegsUp(t, { faultMode: 'mute' });
+  const ringBeforeFault = (await A.screen(sid)).screen;
+  const proofFile = path.join(home, 'c732-downstream-proof.txt');
+
   bridge.severUpstream();
   await H.delay(1000);
 
-  // Downstream proof must not depend on either the ring or the bridge's stdout —
-  // both ride the severed leg. A file written by the shell is independent evidence
-  // that the injected bytes reached the PTY and the CLI executed them.
+  // Downstream proof must not depend on the ring or on the bridge's stdout — both
+  // ride the severed leg. A file written by the shell is independent evidence that
+  // the injected bytes reached the PTY and the CLI executed them.
   await A.inject(sid, `echo PROVEN > ${proofFile}\n`);
-  try {
-    await H.waitFor(() => fs.existsSync(proofFile) && fs.readFileSync(proofFile, 'utf8').includes('PROVEN'),
-      { timeoutMs: 20000, description: 'post-fault inject executed by the PTY' });
-    downstreamProven = true;
-  } catch { downstreamProven = false; }
-});
+  await H.waitFor(() => fs.existsSync(proofFile) && fs.readFileSync(proofFile, 'utf8').includes('PROVEN'),
+    { timeoutMs: 20000, description: 'post-fault inject executed by the PTY' });
 
-after(async () => {
-  H.killBridge(bridge);
-  await H.stopDaemon(daemon);
-  if (home) fs.rmSync(home, { recursive: true, force: true });
-});
-
-test('#732 REPRO: downstream survives while upstream is dead (the live signature)', { skip: SKIP }, async () => {
+  // --- the live signature is still reproduced (the daemon cannot un-lose the bytes) ---
   assert.equal(bridge.alive(), true,
     'bridge process must still be running — a dead bridge is a different (already handled) failure');
-  assert.equal(downstreamProven, true,
-    'inject must still reach the PTY and be executed (the live evidence: codex kept processing turns)');
-
   const screen = (await A.screen(sid)).screen;
-  assert.ok(!screen.includes('PROVEN'),
-    'repro precondition: the post-fault command must NOT have reached the ring');
+  assert.ok(!screen.includes('PROVEN'), 'the post-fault command must NOT have reached the ring');
   assert.equal(screen, ringBeforeFault,
     'read-screen returns pre-death content, byte-identical (live: "read-screen returned old content")');
+
+  // --- was RED: health must stop calling an unobservable session healthy ---
+  await H.waitFor(async () => (await A.session(sid)).healthStatus === 'UPSTREAM_STALLED', {
+    timeoutMs: 30000, intervalMs: 250,
+    description: 'health to degrade once the owner is connected but has returned no bytes'
+  });
+  const s = await A.session(sid);
+  assert.equal(s.healthStatus, 'UPSTREAM_STALLED');
+  assert.equal(s.healthReason, 'OWNER_CONNECTED_UPSTREAM_STALLED');
+
+  // --- was RED: inject must not look like an ordinary success ---
+  const blind = await A.inject(sid, 'echo C732_BLIND\n');
+  assert.equal(blind.status, 503, 'inject into an unobservable session must hard-fail');
+  assert.equal(blind.body.code, 'UPSTREAM_STALLED',
+    'and must say WHICH failure it is, so a caller can tell it apart from a disconnected owner');
+
+  // --- the diagnosis the operator needs: which leg broke? ---
+  const tr = s.transport;
+  assert.ok(tr.upstream_silent_seconds >= 0, 'upstream silence is measured, not guessed');
+  assert.ok(tr.bridge_heartbeat_at,
+    'the bridge heartbeat still arrives — so the bridge→daemon leg is fine and the break is above it');
+  const beforeBytes = tr.bridge_pty_bytes;
+  await H.delay(3000);
+  const after = await A.session(sid);
+  assert.equal(after.transport.bridge_pty_bytes, beforeBytes,
+    'bridge_pty_bytes frozen while heartbeats keep arriving == the PTY read side died inside the bridge');
+  assert.notEqual(after.transport.bridge_heartbeat_at, tr.bridge_heartbeat_at,
+    'heartbeats are still flowing (silent PIPE, not silent SESSION)');
+
+  assert.match(daemon.log(), /\[UPSTREAM\] Session .* output pipe is dead/,
+    'the daemon must announce the stall instead of waiting for a human to read the screen');
 });
 
-test('#732 RED: PTY output must reach the daemon ring after an upstream stall', { skip: SKIP }, async () => {
-  const marker = `C732_RECOVERY_${Date.now()}`;
+test('#732 SELF-HEAL: a recoverable PTY read-side stall re-arms and upstream resumes', { skip: SKIP }, async (t) => {
+  const { sid, bridge, A } = await bothLegsUp(t, { faultMode: 'pause' });
+
+  bridge.severUpstream();          // read side stops flowing; nothing is destroyed
+  await H.delay(500);
+
+  const marker = `C732_HEAL_${Date.now()}`;
   await A.inject(sid, `echo ${marker}\n`);
 
+  // The bridge's own watchdog (cli.js checkPtyReadSide) must notice a read stream
+  // that stopped flowing and resume it — without it, the PTY buffer fills, the child
+  // blocks, and the session is dead in both directions.
   await H.waitFor(async () => (await A.screen(sid)).screen.includes(marker), {
-    timeoutMs: UPSTREAM_RECOVERY_MS,
-    intervalMs: 500,
-    description: `PTY output to reach the daemon ring within ${UPSTREAM_RECOVERY_MS}ms of an upstream stall`
+    timeoutMs: 30000, intervalMs: 250,
+    description: 'PTY output to reach the daemon ring again after a recoverable read-side stall'
   });
+
+  assert.equal((await A.session(sid)).healthStatus, 'CONNECTED',
+    'once bytes flow again the session is healthy — the stall verdict must clear itself');
 });
 
-test('#732 RED: a session with a dead upstream must not be advertised as healthy', { skip: SKIP }, async () => {
-  const s = await A.session(sid);
-
-  // Today: CONNECTED / OWNER_CONNECTED, because health is derived purely from
-  // isOpenWebSocket(session.ownerWs) (daemon.js:902-915). The owner socket is
-  // open and answering pings; it just never sends anything. Liveness of the
-  // socket is not liveness of the pipe.
-  assert.notEqual(s.healthStatus, 'CONNECTED',
-    'health must degrade when the owner WS is open but has delivered no upstream bytes');
-});
-
-test('#732 RED: inject must not report plain success into a session whose upstream is dead', { skip: SKIP }, async () => {
-  const r = await A.inject(sid, 'echo C732_BLIND\n');
-
-  // Today: 200 {success:true}. The caller cannot distinguish "delivered and
-  // observable" from "delivered into a session whose output nobody can see" —
-  // which is what made the live incident invisible for ~9h.
-  assert.notEqual(r.status, 200,
-    'inject into a session with an unobservable upstream must not look like an ordinary success');
-});
-
-test('#732 CONTROL: lastActivityAt is not an upstream signal (it is bumped by the daemon itself)', { skip: SKIP }, async () => {
-  // Not a contract — a diagnostic fact worth pinning: daemon.js:2033/2061/4415/1119
-  // stamp lastActivityAt on the daemon's OWN delivery path, so an operator polling
-  // activity sees a "live" session even though no byte has come back since the
-  // fault. This is why the break stayed invisible.
-  const after1 = await A.session(sid);
-  assert.notEqual(sessionBeforeFault.lastActivityAt, after1.lastActivityAt,
-    'lastActivityAt advanced purely from injects, with zero upstream bytes');
-});
