@@ -4,7 +4,7 @@
     {
       "name": "telepty",
       "package": "@dmsdc-ai/aigentry-telepty",
-      "version": "0.7.0",
+      "version": "0.7.1",
       "role": "Cross-terminal / cross-machine prompt transport (PTY daemon)",
       "maturity": "Shipping",
       "license": "MIT"
