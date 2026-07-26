@@ -53,7 +53,12 @@ async function bootDaemon() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'c737-home-'));
   const child = spawn(process.execPath, [path.join(ROOT, 'daemon.js')], {
     cwd: ROOT,
-    env: { ...process.env, PORT: '0', HOME: home, TELEPTY_HOME: home, TELEPTY_AUTH_TOKEN: '' },
+    // The #737 hold bound is 30s in production; shorten it here so a "nobody ever dismisses
+    // it" variant reaches its reject branch without stalling the harness for half a minute.
+    env: {
+      ...process.env, PORT: '0', HOME: home, TELEPTY_HOME: home, TELEPTY_AUTH_TOKEN: '',
+      TELEPTY_MODAL_HOLD_MS: process.env.TELEPTY_MODAL_HOLD_MS || '4000',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let buf = '';
@@ -106,15 +111,18 @@ function cliEnv(ctx, port) {
 }
 
 const VARIANTS = {
-  // name        boot         cli args after `inject`
-  force:  { boot: MODAL_BOOT,    args: ['--submit', '--submit-force'] },
-  gated:  { boot: MODAL_BOOT,    args: ['--submit'] },
-  plain:  { boot: MODAL_BOOT,    args: [] },
-  control:{ boot: COMPOSER_BOOT, args: ['--submit', '--submit-force'] },
+  // name          boot          cli args after `inject`              surface clears mid-hold?
+  force:      { boot: MODAL_BOOT,    args: ['--submit', '--submit-force'] },
+  gated:      { boot: MODAL_BOOT,    args: ['--submit'] },
+  plain:      { boot: MODAL_BOOT,    args: [] },
+  control:    { boot: COMPOSER_BOOT, args: ['--submit', '--submit-force'] },
+  // #737 A: somebody dismisses the modal while the inject is parked. The body must then be
+  // delivered normally — the hold is a delay, not a drop.
+  holdRelease: { boot: MODAL_BOOT,   args: ['--submit', '--submit-force'], clearAfterMs: 1200 },
 };
 
 async function runVariant(port, name, ctx) {
-  const { boot, args } = VARIANTS[name];
+  const { boot, args, clearAfterMs } = VARIANTS[name];
   const sessionId = `c737-e2e-${name}`;
   const { ws, frames } = await attachBridge(port, sessionId, { boot, token: ctx.token });
 
@@ -131,6 +139,10 @@ async function runVariant(port, name, ctx) {
 
   // What the shipped matcher thinks of the screen the bridge just relayed.
   const detected = registry.detectOutput('codex', boot);
+
+  // Simulate the surface owner dismissing the modal mid-hold: codex repaints its composer,
+  // which is the watermark the positional predicate keys on.
+  if (clearAfterMs) setTimeout(() => { try { ws.send(JSON.stringify({ type: 'output', data: COMPOSER_BOOT })); } catch {} }, clearAfterMs);
 
   const startedAt = Date.now();
   try {

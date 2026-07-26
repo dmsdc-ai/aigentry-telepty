@@ -88,7 +88,7 @@ function modalSession(screen = MODAL_SCREEN) {
 //   reject    — refuse the inject with an actionable error (caller re-injects)   (C)
 //   dismiss   — considered and rejected: a bare Enter IS the destructive key here
 const ACCEPTED_REMEDIES = new Set(['hold', 'dismiss', 'reject']);
-const SHIPPED_REMEDY = 'reject';
+const SHIPPED_REMEDY = 'hold';
 const REMEDY = process.env.TELEPTY_MODAL_REMEDY || null;
 
 // ── GREEN anchors: the detection itself already works. These must never regress. ──
@@ -194,6 +194,47 @@ test('#737: a dismissed modal still in the ring does NOT block — position deci
   // The positional read sees the composer footer after the modal, and lets the write through.
   assert.equal(daemon.isSurfaceBlockedByModal({ command: 'codex', outputRing: [ring] }), false);
   assert.equal(registry2.detectSurfaceModal('codex', ring).reason, 'composer_after_modal');
+});
+
+// ── A: hold-and-retry, with C as its timeout branch. ──
+
+test('#737 A: the hold releases as soon as the surface leaves the modal', async () => {
+  const daemon = require('../daemon');
+  const session = modalSession();
+  // Whoever owns the surface dismisses the modal while we are parked; codex then repaints
+  // its composer footer, which is what the positional predicate keys on.
+  setTimeout(() => { session.outputRing.push(`\n${COMPOSER_SCREEN}\n`); }, 60);
+  const held = await daemon.awaitSurfaceModalClear(session, { timeoutMs: 4000, pollIntervalMs: 20 });
+  assert.equal(held.cleared, true);
+  assert.ok(held.waited_ms < 4000, `waited ${held.waited_ms}ms — should release on the repaint`);
+  assert.equal(await daemon.resolveModalGate('s', session, { force: true }, { timeoutMs: 4000, pollIntervalMs: 20 }), null,
+    'gate must let the write through once the surface is clear');
+});
+
+test('#737 A: a hold that never clears degrades to reject, not to a write', async () => {
+  const daemon = require('../daemon');
+  const session = modalSession();                       // nobody ever dismisses it
+  const decision = await daemon.resolveModalGate('s', session, { force: true }, { timeoutMs: 120, pollIntervalMs: 20 });
+  assert.ok(decision, 'gate must not resolve to "proceed" while the modal is still up');
+  assert.equal(decision.action, 'reject');
+  assert.equal(decision.reason, 'codex_modal_ui');
+  assert.ok(decision.held_ms >= 120, `held only ${decision.held_ms}ms — the bound was not honoured`);
+  assert.match(decision.hint, /version\.json/);
+});
+
+test('#737 A: a clear surface costs the hold nothing', async () => {
+  const daemon = require('../daemon');
+  const held = await daemon.awaitSurfaceModalClear(modalSession(COMPOSER_SCREEN), { timeoutMs: 5000, pollIntervalMs: 50 });
+  assert.equal(held.cleared, true);
+  assert.equal(held.waited_ms, 0, 'a non-modal surface must not pay a single poll');
+});
+
+test('#737 A: TELEPTY_MODAL_HOLD_MS bounds the hold, and a blank value keeps the default', () => {
+  const daemon = require('../daemon');
+  assert.equal(daemon.modalHoldMs({}), 30000);
+  assert.equal(daemon.modalHoldMs({ TELEPTY_MODAL_HOLD_MS: '' }), 30000, 'blank must not read as 0');
+  assert.equal(daemon.modalHoldMs({ TELEPTY_MODAL_HOLD_MS: '1500' }), 1500);
+  assert.equal(daemon.modalHoldMs({ TELEPTY_MODAL_HOLD_MS: 'nope' }), 30000);
 });
 
 // Rollback lever, mirroring TELEPTY_SUBMIT_BUSY_DISPATCH=off.

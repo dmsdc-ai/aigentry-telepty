@@ -1979,12 +1979,13 @@ function isSurfaceBlockedByModal(session) {
   return readyRegistry.detectSurfaceModal(session.command, tail).blocked === true;
 }
 
-// Remedy selector. `reject` (C) is this commit's default: refuse with an actionable error
-// so the caller learns immediately, instead of killing the session. `hold` (A) lands in the
-// next commit and becomes the default there — it parks the body until the surface clears
-// and falls back to `reject` on timeout. `off` is the rollback lever — same shape as
-// TELEPTY_SUBMIT_BUSY_DISPATCH=off.
-const MODAL_REMEDY_DEFAULT = 'reject';
+// Remedy selector. `hold` (A) is the default: park the body until the surface leaves the
+// modal, then deliver — and fall back to `reject` if it never does (C is A's timeout
+// branch, resolveModalGate below). `reject` alone refuses immediately, which is the
+// smaller, C-only behavior. `off` is the rollback lever — same shape as
+// TELEPTY_SUBMIT_BUSY_DISPATCH=off. Nothing is ever written into a modal in any mode but
+// `off`.
+const MODAL_REMEDY_DEFAULT = 'hold';
 const MODAL_REMEDIES = new Set(['hold', 'reject', 'off']);
 function modalRemedy(env = process.env) {
   const raw = String(env.TELEPTY_MODAL_REMEDY ?? '').trim().toLowerCase();
@@ -2008,6 +2009,52 @@ function modalDeliveryDecision(session, options = {}, env = process.env) {
       + 'Dismiss it on the surface, or clear it by setting dismissed_version to latest_version '
       + 'in $CODEX_HOME/version.json and respawning.',
   };
+}
+
+// A's bound. The modal does NOT clear by itself — it needs a keystroke from whoever owns
+// the surface — so the hold must expire into C rather than wait forever. 30s mirrors
+// BOOTSTRAP_READY_TIMEOUT_MS, the existing "how long we wait for a surface to become
+// injectable" budget. Only ever paid when a modal is genuinely up.
+const MODAL_HOLD_DEFAULT_MS = 30000;
+function modalHoldMs(env = process.env) {
+  // An UNSET or blank var must fall back to the default, never to 0 — `Number('')` is 0,
+  // so a bare `TELEPTY_MODAL_HOLD_MS=` in an env file would silently disable the hold.
+  const raw = String(env.TELEPTY_MODAL_HOLD_MS ?? '').trim();
+  if (!raw) return MODAL_HOLD_DEFAULT_MS;
+  const configured = Number(raw);
+  return Number.isFinite(configured) && configured >= 0 ? configured : MODAL_HOLD_DEFAULT_MS;
+}
+
+// Park until the surface leaves the modal. Polls the same fail-open predicate, so a
+// surface that was never modal returns immediately with waited_ms 0.
+async function awaitSurfaceModalClear(session, opts = {}) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : modalHoldMs();
+  const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) ? opts.pollIntervalMs : 150;
+  const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
+  const sleepFn = typeof opts.sleep === 'function' ? opts.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+  const start = now();
+  while (isSurfaceBlockedByModal(session)) {
+    if (now() - start >= timeoutMs) return { cleared: false, waited_ms: now() - start };
+    await sleepFn(pollIntervalMs);
+  }
+  return { cleared: true, waited_ms: now() - start };
+}
+
+// The single gate every write path awaits. Resolves to null when the write may proceed, or
+// to a rejection decision when it must not. `hold` degrades to `reject` on timeout — that
+// is the approved A-with-C-as-its-timeout-branch shape, in one place so force, gated and
+// plain cannot drift apart.
+async function resolveModalGate(id, session, options = {}, holdOpts = {}) {
+  const decision = modalDeliveryDecision(session, options);
+  if (decision.action === 'deliver') return null;
+  if (decision.action !== 'hold') return decision;
+  const held = await awaitSurfaceModalClear(session, holdOpts);
+  if (held.cleared) {
+    console.log(`[MODAL] ${id} surface cleared after ${held.waited_ms}ms — delivering`);
+    return null;
+  }
+  console.log(`[MODAL] ${id} still modal after ${held.waited_ms}ms — refusing (hold timed out)`);
+  return { ...decision, action: 'reject', held_ms: held.waited_ms };
 }
 
 function modalRejectionResponse(decision) {
@@ -2052,9 +2099,9 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   // "submit my message". This is the TEXT path — bypass #4 in the evidence: it consulted
   // only the bootstrapReady boolean, which a blind timer flips without ever looking at the
   // screen (shouldApplyOwnerAliveFloor).
-  const modalDecision = modalDeliveryDecision(session, options);
-  if (modalDecision.action !== 'deliver') {
-    console.log(`[INJECT] ${id} refused — ${modalDecision.reason} (remedy=${modalDecision.action})`);
+  const modalDecision = await resolveModalGate(id, session, options);
+  if (modalDecision) {
+    console.log(`[INJECT] ${id} refused — ${modalDecision.reason}`);
     return { success: false, httpStatus: 409, ...modalRejectionResponse(modalDecision) };
   }
 
@@ -3168,9 +3215,9 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     // #737: the force path is the one that kills sessions — it skips the bootstrap gate
     // (above) and returns before Layer 3 (below), so this is the ONLY place it can be asked.
     // A bare CR into the update modal activates "1. Update now" and codex exits.
-    const forceModalDecision = modalDeliveryDecision(session, { force: true });
-    if (forceModalDecision.action !== 'deliver') {
-      console.log(`[SUBMIT] force refused for ${id} — ${forceModalDecision.reason} (remedy=${forceModalDecision.action})`);
+    const forceModalDecision = await resolveModalGate(id, session, { force: true });
+    if (forceModalDecision) {
+      console.log(`[SUBMIT] force refused for ${id} — ${forceModalDecision.reason}`);
       if (injectedBody) {
         markPendingReportSubmitUnconfirmed(id, { reason: 'codex_modal_ui', attempts: 0, retryable: true });
       }
@@ -3238,9 +3285,9 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   // here. Layer 3 already knows about `codex_modal_ui` but is cmux-only AND advisory
   // (`no_prompt_symbol_seen` falls through and submits anyway), so it protects nothing on a
   // wrapped session — measured: the gated path fired its CR into the modal at +3ms.
-  const submitModalDecision = modalDeliveryDecision(session, { force: false });
-  if (submitModalDecision.action !== 'deliver') {
-    console.log(`[SUBMIT] refused for ${id} — ${submitModalDecision.reason} (remedy=${submitModalDecision.action})`);
+  const submitModalDecision = await resolveModalGate(id, session, { force: false });
+  if (submitModalDecision) {
+    console.log(`[SUBMIT] refused for ${id} — ${submitModalDecision.reason}`);
     if (injectedBody) {
       markPendingReportSubmitUnconfirmed(id, { reason: 'codex_modal_ui', attempts: 0, retryable: true });
     }
@@ -4867,6 +4914,9 @@ module.exports = {
   isSurfaceBlockedByModal,        // #737: fail-open modal predicate over the PTY output ring
   modalDeliveryDecision,          // #737: the one decision every write path consults
   modalRemedy,                    // #737: TELEPTY_MODAL_REMEDY selector (hold|reject|off)
+  modalHoldMs,                    // #737: TELEPTY_MODAL_HOLD_MS bound on the hold remedy
+  awaitSurfaceModalClear,         // #737: A — park until the surface leaves the modal
+  resolveModalGate,               // #737: the awaited gate every write path shares
   readOutputRingTail,             // #737: bounded newest-first ring read (predicate input)
   resolveBindHost,                // telepty#50 + #672: pure bind-address policy (loopback default, env opt-in, tailnet auto)
   formatBindHint,                 // telepty#50 + #672: startup bind/exposure banner line
