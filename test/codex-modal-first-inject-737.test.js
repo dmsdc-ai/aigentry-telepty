@@ -1,0 +1,162 @@
+'use strict';
+
+// #737 — a codex session showing the blocking "Update available … Press enter to
+// continue" modal swallows the FIRST inject. The shipped prompt-symbol matcher already
+// classifies that screen correctly (`codex_modal_ui`), but NO delivery path consults it,
+// so telepty writes the body and then a bare CR straight into the modal.
+//
+// UNREGISTERED (not in package.json `test`): this is the RED spec for the #737 fix.
+// Run explicitly:  node --test test/codex-modal-first-inject-737.test.js
+//
+// ── Measured against real codex 0.144.1 (scratchpad/repro-737-tmux.js — tmux
+//    capture-pane as the VT, isolated CODEX_HOME with version.json
+//    dismissed_version < latest_version, stub `brew` on PATH) ────────────────────────
+//
+//   modal  body envelope  text->CR   body reached composer   CR consumed as        codex
+//                                                             modal activation      survives
+//   ─────  ─────────────  ────────   ─────────────────────   ───────────────────   ────────
+//   yes    bracketed      19ms       NO (absorbed)            YES -> option 1       NO (exits)
+//   yes    bracketed      515ms      NO (absorbed)            YES -> option 1       NO (exits)
+//   yes    bracketed      1523ms     NO (absorbed)            YES -> option 1       NO (exits)
+//   yes    raw            18ms       NO (absorbed as keys)    YES -> a Skip option  yes
+//   no     bracketed      17ms       yes, submitted           n/a                   yes
+//
+// The modal's PRE-SELECTED item is "1. Update now (runs `brew upgrade --cask codex`)".
+// A bracketed-paste body — which is exactly what telepty writes for codex since #730's
+// identity-based capability (src/prompt-symbol-registry.js PASTE_CAPABLE_CLIS) — moves
+// no selection, so the following CR ACTIVATES that default: codex shell-executes brew
+// and then exits with "Update ran successfully! Please restart Codex." The injected
+// message is gone AND the session is dead. 3/3 wrapped runs, deterministic.
+//
+// ── The bypass, measured on the real daemon (scratchpad/e2e-737.js) ─────────────────
+//   variant   cli                                registry verdict   body written   CR written
+//   force     inject --submit --submit-force      codex_modal_ui     yes            yes (+4ms)
+//   gated     inject --submit                     codex_modal_ui     yes            yes (+7ms)
+//   plain     inject                              codex_modal_ui     yes            yes (+525ms)
+//   control   inject --submit --submit-force      codex_multi_signal yes            yes (+10ms)
+//
+// All three paths deliver identically. `codex_modal_ui` is currently decorative on the
+// delivery path — see scratchpad/EVIDENCE-737.md for the file:line map.
+
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+
+const registry = require('../src/prompt-symbol-registry');
+
+// Captured verbatim from a real codex 0.144.1 boot with dismissed_version < latest_version
+// (scratchpad/repro-737-tmux.js, `modal-force.screens.txt`, "===== boot =====").
+const MODAL_SCREEN = [
+  '',
+  '  ✨ Update available! 0.144.1 -> 0.145.0',
+  '',
+  '  Release notes: https://github.com/openai/codex/releases/latest',
+  '',
+  '› 1. Update now (runs `brew upgrade --cask codex`)',
+  '  2. Skip',
+  '  3. Skip until next version',
+  '',
+  '  Press enter to continue',
+].join('\n');
+
+// Same codex, one version.json field different — boots straight to the composer.
+const COMPOSER_SCREEN = [
+  '>_ OpenAI Codex (v0.144.1)',
+  '› ',
+  'gpt-5.5 xhigh fast · /tmp/c737-work',
+].join('\n');
+
+// A wrapped codex session as the daemon models one: the rendered surface lives in the
+// PTY-fed outputRing, there is no cmux workspace, and bootstrap has long since flipped
+// ready (the owner-alive optimistic floor, daemon.js shouldApplyOwnerAliveFloor).
+function modalSession(screen = MODAL_SCREEN) {
+  return {
+    type: 'wrapped',
+    command: 'codex',
+    backend: 'pty',
+    cmuxWorkspaceId: null,
+    bootstrapReady: true,
+    bootstrapReadyReason: 'owner_alive',
+    outputRing: [screen],
+    outputRingTotalBytes: screen.length,
+    bracketedPasteCapable: true,
+  };
+}
+
+// The remedy is a HOLD-time decision. The RED below asserts only "not lost"; set this
+// to narrow the assertion once the remedy is approved.
+//   hold      — park the body until the surface leaves the modal, then deliver
+//   dismiss   — dismiss the modal first, then (re)deliver body + CR
+//   reject    — refuse the inject with an actionable error (caller re-injects)
+const ACCEPTED_REMEDIES = new Set(['hold', 'dismiss', 'reject']);
+const REMEDY = process.env.TELEPTY_MODAL_REMEDY || null;
+
+// ── GREEN anchors: the detection itself already works. These must never regress. ──
+
+test('#737 anchor: the real update-modal screen classifies as codex_modal_ui', () => {
+  const r = registry.detectOutput('codex', MODAL_SCREEN);
+  assert.equal(r.found, false);
+  assert.equal(r.reason, 'codex_modal_ui');
+});
+
+test('#737 anchor: the composer control classifies as ready', () => {
+  const r = registry.detectOutput('codex', COMPOSER_SCREEN);
+  assert.equal(r.found, true);
+  assert.equal(r.reason, 'codex_multi_signal');
+});
+
+// The modal is detectable from the PTY byte stream alone — no cmux read-screen needed.
+// This is what makes a backend-agnostic fix possible: today the only production consumer
+// of detect() is submit-gate.awaitPromptSymbol, which hard-skips every non-cmux session.
+test('#737 anchor: the modal is detectable from raw PTY bytes (no screen primitive needed)', () => {
+  const ptyBytes = '\x1b[?2004h\x1b[?25l\r\n  ✨ Update available! 0.144.1 -> 0.145.0\r\n\r\n'
+    + '› 1. Update now (runs `brew upgrade --cask codex`)\r\n  2. Skip\r\n  3. Skip until next version\r\n\r\n'
+    + '  Press enter to continue\r\n';
+  const r = registry.detectOutput('codex', ptyBytes);
+  assert.equal(r.reason, 'codex_modal_ui');
+});
+
+// ── RED: the delivery paths must be able to ask, and must act on the answer. ──
+
+// Seam 1 — a session-level predicate the delivery paths can consult. Named to mirror the
+// existing isBootstrapGatedSession/isBootstrapReady pair in daemon.js; the fix may rename
+// it, in which case rename here too. What is NOT negotiable is that some seam answers
+// "would my bytes be lost right now?" from state a wrapped (non-cmux) session actually has.
+test('#737 RED: the daemon exposes a modal-block predicate over a session surface', () => {
+  const daemon = require('../daemon');
+  assert.equal(typeof daemon.isSurfaceBlockedByModal, 'function',
+    'no seam exists for "is this surface swallowing input?" — detection stops at the registry');
+  assert.equal(daemon.isSurfaceBlockedByModal(modalSession()), true);
+  assert.equal(daemon.isSurfaceBlockedByModal(modalSession(COMPOSER_SCREEN)), false);
+});
+
+// Seam 2 — the load-bearing one. Every path that writes to the surface must resolve to a
+// non-losing action while the modal is up. The remedy is parameterized; "deliver" is the
+// one answer that is always wrong, because it is what ships today and it loses the message
+// AND (bracketed body + CR) kills the session.
+for (const variant of [
+  { name: 'force', opts: { force: true } },
+  { name: 'gated', opts: { force: false } },
+  { name: 'plain', opts: { force: false, noEnter: false } },
+]) {
+  test(`#737 RED: ${variant.name} delivery into a modal surface must not resolve to "deliver"`, () => {
+    const daemon = require('../daemon');
+    assert.equal(typeof daemon.modalDeliveryDecision, 'function',
+      'no policy seam — the force path (daemon.js:3079) returns before Layer 3 (daemon.js:3180) ever runs');
+    const decision = daemon.modalDeliveryDecision(modalSession(), variant.opts);
+    assert.notEqual(decision.action, 'deliver',
+      `${variant.name} still writes body+CR into the modal — message lost`);
+    assert.ok(ACCEPTED_REMEDIES.has(decision.action),
+      `unknown remedy '${decision.action}' — expected one of ${[...ACCEPTED_REMEDIES].join('|')}`);
+    if (REMEDY) assert.equal(decision.action, REMEDY);
+  });
+}
+
+// A non-modal surface must be byte-identical to today on every path — the fix cannot tax
+// the common dispatch. Pairs with the control row in the evidence table above.
+test('#737 RED: a composer surface still resolves to plain delivery on every path', () => {
+  const daemon = require('../daemon');
+  assert.equal(typeof daemon.modalDeliveryDecision, 'function');
+  for (const opts of [{ force: true }, { force: false }]) {
+    assert.equal(daemon.modalDeliveryDecision(modalSession(COMPOSER_SCREEN), opts).action, 'deliver');
+  }
+});
