@@ -61,12 +61,22 @@ function installWebSocketTransport(deps) {
     if (!session) {
       const connectedAt = new Date().toISOString();
       // Auto-register wrapped session on WS connect (supports reconnect after daemon restart)
+      // #754: take the CLI identity from the claim URL when the bridge states one. This path
+      // used to hard-code `wrapped`, and a reconnect that reached the WS before its
+      // re-register POST landed (cli.js connectDaemonWs swallows that failure) silently
+      // replaced a known CLI name with a generic string — which turns OFF every
+      // identity-gated feature at once: the bootstrap gate (isBootstrapGatedSession), the
+      // #737/#760 modal gates (detectSurfaceModal/modalRemedy), the #730/#716 bracketed-paste
+      // envelope, and the submit render-gate's registry lookup. No error is logged for any of
+      // them; `isKnownAiCli('wrapped')` is just false. Absent param → the old fallback, so a
+      // pre-#754 bridge is byte-identical.
+      const claimedCommand = url.searchParams.get('command');
       const autoSession = {
         id: sessionId,
         type: 'wrapped',
         ptyProcess: null,
         ownerWs: ws,
-        command: 'wrapped',
+        command: claimedCommand || 'wrapped',
         cwd: process.cwd(),
         createdAt: connectedAt,
         lastActivityAt: connectedAt,
@@ -79,7 +89,7 @@ function installWebSocketTransport(deps) {
             };
       initializeBootstrapState(autoSession);
       sessions[sessionId] = autoSession;
-      console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect`);
+      console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect (command: ${autoSession.command})`);
       // Set tab title via kitty (no \x0c redraw — it causes flickering on multi-session reconnect)
       setTimeout(() => {
         const sock = findKittySocket();

@@ -1925,7 +1925,11 @@ async function main() {
     // Daemon uses this to reclaim ownership even if a stale ownerWs is still registered.
     // telepty#56: owner_pid lets the daemon record this bridge's PID at claim time so
     // `kill --force` can SIGKILL the owning process (kill-stick), independent of register timing.
-    const wsUrl = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}&owner=1&owner_pid=${process.pid}`;
+    // #754: state the wrapped CLI's identity on the claim URL. When the daemon has no record
+    // of this session (a reconnect whose re-register POST below lost the race — that failure
+    // is swallowed), its auto-register used to invent `command: 'wrapped'` and silently kill
+    // every identity-gated feature. The bridge is the one process that always knows.
+    const wsUrl = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}&owner=1&owner_pid=${process.pid}&command=${encodeURIComponent(command)}`;
     let daemonWs = null;
     let wsReady = false;
     let reconnectAttempts = 0;
