@@ -1,39 +1,32 @@
 'use strict';
 // #738 — ensure-daemon-running vs supervisor (launchd) kickstart race.
 //
-// REPRO PHASE ONLY. Unregistered (not in package.json `test`): run explicitly with
-//   node --test test/kickstart-race-738.test.js
+// ── The bug (reproduced here before the fix) ──────────────────────────────────────
+// Production launches the daemon through the CLI: the launchd plist ProgramArguments are
+// `<telepty bin> daemon`, and `telepty` is a symlink to cli.js. cli.js:1296-1303 then does
+// `require('./daemon.js')`, so inside daemon.js `require.main` is cli.js, NOT daemon.js.
+// Every `require.main === module` block is therefore dead in production — including the
+// claimDaemonState singleton lock at daemon.js:382. (Only the listen block, daemon.js:4306,
+// got the AIGENTRY_TELEPTY_DAEMON_MAIN escape hatch. Repairing the rest is orchestrator
+// task #742; this fix deliberately does NOT depend on it.)
 //
-// ── Mechanism under test ──────────────────────────────────────────────────────────
-// Production launches the daemon through the CLI: the launchd plist ProgramArguments
-// are `<telepty bin> daemon`, and `telepty` is a symlink to cli.js. cli.js:1296-1303
-// then does `require('./daemon.js')` — so inside daemon.js `require.main` is cli.js,
-// NOT daemon.js. Consequences:
+// So the only arbitration between two daemons is first-come-first-served on the TCP port:
+// the loser hits EADDRINUSE, probes /api/health, and `process.exit(0)` (daemon.js:4643-4651)
+// — silently, as a success. `launchctl kickstart -k` leaves a gap with no listener; a CLI
+// running in that gap concluded "no daemon" within its ~600ms probe budget (cli.js:768-782)
+// and spawned a detached daemon that won the port. The survivor was an orphan outside
+// launchd: logs unwired, and fresh fuel for the #733 self-update wars.
 //
-//   daemon.js:382  `if (require.main === module) claimDaemonState(...)`  → NEVER RUNS
-//                  in production. The singleton lock that would arbitrate two daemons
-//                  is dead on the only launch path that matters.
-//   daemon.js:4306 the listen block DOES run (it also honors
-//                  AIGENTRY_TELEPTY_DAEMON_MAIN, set by cli.js:1302).
-//
-// So the ONLY arbitration left is first-come-first-served on the TCP port, resolved by
-// daemon.js:4640-4655: on EADDRINUSE the loser probes /api/health and, seeing a healthy
-// telepty, `process.exit(0)` — silently, as a success.
-//
-// `launchctl kickstart -k` kills the running daemon and relaunches it, leaving a gap
-// with no listener. cli.js ensureDaemonRunning (cli.js:754) probes /api/meta 3× with
-// 200ms backoff (~600ms budget), then /api/sessions; all fail inside the gap, so
-// decideDaemonAction returns `start` (cli.js:751) and restartDaemonGraceful spawns a
-// DETACHED daemon (cli.js:426-434) that binds the port before the supervisor instance
-// finishes booting. The supervisor instance then exits 0 → launchd considers the job
-// done, and the daemon that survives is the CLI's orphan: outside launchd, logs unwired
-// (StandardOutPath never applies to it), and a fresh peer in the #733 self-update wars.
+// ── The fix under test ───────────────────────────────────────────────────────────
+// cli.js deferToSupervisor: on the `start` path only, if an OS service supervisor owns this
+// daemon (src/supervisor.js — launchd plist / systemd unit / schtasks task), wait for it
+// rather than racing it. No supervisor installed ⇒ the pre-#738 spawn path, unchanged.
 //
 // ── Isolation ─────────────────────────────────────────────────────────────────────
-// Everything runs on an OS-assigned ephemeral port under a temp HOME. `launchctl` is
-// never invoked; the "supervisor" is a plain scripted relaunch of the same command line
-// launchd uses. The production daemon (port 3848) and the real ~/Library/LaunchAgents
-// are never touched.
+// Everything runs on an OS-assigned ephemeral port under a temp HOME. `launchctl` is never
+// invoked; the "supervisor" is a plain scripted relaunch of the same command line launchd
+// uses. The production daemon (port 3848) and the real ~/Library/LaunchAgents are never
+// touched.
 
 const { afterEach, test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -48,13 +41,13 @@ const HOST = '127.0.0.1';
 const PRODUCTION_PORT = 3848; // never touched — asserted in runKickstartRace
 
 // Stand-in for the launchd relaunch latency (SIGKILL → exec → node boot → express init).
-// The racer's own probe budget is ~600ms (cli.js:768-782), so a 1200ms gap puts the
-// CLI-spawned daemon on the port first — deterministically, and without being
-// unrealistic: booting this daemon.js costs ~1s of wall clock on its own.
+// The CLI's own probe budget is ~600ms (cli.js:768-782), so a 1200ms gap is exactly the
+// window that used to produce the orphan — and it is realistic: booting this daemon.js
+// costs ~1s of wall clock on its own.
 const KICKSTART_GAP_MS = 1200;
-// How long the supervisor instance gets to either exit (broken: it lost the port) or own
-// the port (the contract the RED test pins).
-const SUPERVISOR_VERDICT_MS = 10000;
+// How long the supervisor instance gets to either exit (the old broken outcome) or own the
+// port (the contract). Must exceed the CLI's own defer ceiling.
+const SUPERVISOR_VERDICT_MS = 15000;
 
 const spawnedChildren = [];
 const tempDirs = [];
@@ -64,7 +57,7 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Timeline breadcrumbs — a race repro that goes wrong is unreadable without them.
+// Timeline breadcrumbs — a race test that goes wrong is unreadable without them.
 const t0 = Date.now();
 function mark(message) {
   process.stderr.write(`[738 +${String(Date.now() - t0).padStart(6)}ms] ${message}\n`);
@@ -91,9 +84,9 @@ async function getFreePort() {
   return port;
 }
 
-// The plist the CLI *could* consult to learn a supervisor owns this daemon. Written into
-// the temp HOME so the real ~/Library/LaunchAgents is untouched. Mirrors the shape
-// install.js:89-128 generates (and the installed com.aigentry.telepty.plist).
+// The supervisor's detection surface — the same path install.js:363 writes and
+// src/supervisor.js reads. Written into the temp HOME, so the real ~/Library/LaunchAgents
+// is never touched.
 function writeSupervisorPlist(homeDir) {
   const agentsDir = path.join(homeDir, 'Library', 'LaunchAgents');
   fs.mkdirSync(agentsDir, { recursive: true });
@@ -118,18 +111,18 @@ function writeSupervisorPlist(homeDir) {
   return plistPath;
 }
 
-function createTempHome() {
+function createTempHome({ supervisor = true } = {}) {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-738-'));
   tempDirs.push(homeDir);
 
   // PATH shim: resolveTeleptyEntryPoint (cli.js:413) runs `which telepty` and spawns
-  // whatever it finds. Without this the racer would spawn the GLOBALLY INSTALLED telepty
+  // whatever it finds. Without this the CLI would spawn the GLOBALLY INSTALLED telepty
   // instead of this worktree's cli.js.
   const binDir = path.join(homeDir, 'bin');
   fs.mkdirSync(binDir, { recursive: true });
   fs.symlinkSync(path.join(projectRoot, 'cli.js'), path.join(binDir, 'telepty'));
 
-  writeSupervisorPlist(homeDir);
+  if (supervisor) writeSupervisorPlist(homeDir);
   return { homeDir, binDir };
 }
 
@@ -144,9 +137,10 @@ function childEnv({ homeDir, binDir, port }) {
     TELEPTY_PORT: String(port),  // cli.js:146
     NO_UPDATE_NOTIFIER: '1',
     TELEPTY_DISABLE_UPDATE_NOTIFIER: '1',
-    TELEPTY_NO_TAILNET_AUTO: '1' // unregistered file → setup-env.js may not be loaded
+    TELEPTY_NO_TAILNET_AUTO: '1'
   };
   delete env.TELEPTY_SESSION_ID; // #555 hygiene (see test-support/setup-env.js)
+  delete env.TELEPTY_NO_SUPERVISOR_DEFER; // never inherit the operator kill-switch
   return env;
 }
 
@@ -158,8 +152,8 @@ function spawnNode(args, env, label) {
   });
   child.label = label;
   child.logs = { stdout: '', stderr: '' };
-  // NOTE: child.exitCode is null BOTH for "still running" and for "killed by a signal",
-  // so it cannot be used to test liveness — track the exit explicitly instead.
+  // NOTE: child.exitCode is null BOTH for "still running" and for "killed by a signal", so
+  // it cannot be used to test liveness — track the exit explicitly instead.
   child.exitResult = null;
   child.once('exit', (code, signal) => { child.exitResult = { code, signal }; });
   child.stdout.on('data', (c) => { child.logs.stdout += c.toString(); });
@@ -174,8 +168,8 @@ function describe(child) {
     `stdout:\n${child.logs.stdout}\nstderr:\n${child.logs.stderr}`;
 }
 
-// Resolves { code, signal } once the child is gone, or null if it outlives timeoutMs.
-// The timer is cleared on exit so no dangling handle keeps the runner alive.
+// Resolves { code, signal } once the child is gone, or null if it outlives timeoutMs. The
+// timer is cleared on exit so no dangling handle keeps the runner alive.
 function waitExit(child, timeoutMs) {
   if (child.exitResult) return Promise.resolve(child.exitResult);
   return new Promise((resolve) => {
@@ -204,8 +198,8 @@ async function stopChild(child) {
   }
 }
 
-// #524 guard: the daemon the racer spawns is detached+unref'd, so it is nobody's tracked
-// child. Reap it by asking the port who it is (/api/meta reports pid — daemon.js:2624).
+// #524 guard: a daemon the CLI spawns is detached+unref'd, so it is nobody's tracked child.
+// Reap it by asking the port who it is (/api/meta reports pid — daemon.js:2624).
 async function reapPort(port) {
   if (port === PRODUCTION_PORT) return; // belt-and-braces; runKickstartRace already asserts
   for (let i = 0; i < 5; i++) {
@@ -222,20 +216,24 @@ afterEach(async () => {
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
+async function claimTestPort() {
+  const port = await getFreePort();
+  assert.notEqual(port, PRODUCTION_PORT, 'refusing to run against the production daemon port');
+  testPorts.push(port);
+  return port;
+}
+
 // ── The scenario ──────────────────────────────────────────────────────────────────
 // 1. a supervisor-managed daemon is running and owns the port
 // 2. `launchctl kickstart -k` stand-in: kill it, relaunch the SAME command line after a gap
 // 3. an ambient CLI invocation lands in that gap and runs ensureDaemonRunning
-async function runKickstartRace() {
-  const port = await getFreePort();
-  assert.notEqual(port, PRODUCTION_PORT, 'refusing to run the repro against the production daemon port');
-  testPorts.push(port);
-
-  const { homeDir, binDir } = createTempHome();
+async function runKickstartRace({ supervisor = true } = {}) {
+  const port = await claimTestPort();
+  const { homeDir, binDir } = createTempHome({ supervisor });
   const env = childEnv({ homeDir, binDir, port });
 
   // (1) The supervisor's daemon — launched EXACTLY the way the launchd plist does it.
-  mark(`scenario start on :${port}`);
+  mark(`scenario start on :${port} (supervisor=${supervisor})`);
   const original = spawnNode(['cli.js', 'daemon'], env, 'daemon#supervisor-original');
   const originalMeta = await waitFor(() => fetchMeta(port), {
     description: `original daemon on :${port}\n${describe(original)}`
@@ -247,11 +245,11 @@ async function runKickstartRace() {
   await waitExit(original, 5000);
   mark('kickstart gap open (old daemon dead)');
 
-  let supervisor = null;
-  const supervisorLaunched = delay(KICKSTART_GAP_MS).then(() => {
-    supervisor = spawnNode(['cli.js', 'daemon'], env, 'daemon#supervisor-relaunch');
-    mark(`supervisor relaunch spawned (pid ${supervisor.pid})`);
-    return supervisor;
+  let relaunch = null;
+  const relaunchLaunched = delay(KICKSTART_GAP_MS).then(() => {
+    relaunch = spawnNode(['cli.js', 'daemon'], env, 'daemon#supervisor-relaunch');
+    mark(`supervisor relaunch spawned (pid ${relaunch.pid})`);
+    return relaunch;
   });
 
   // (3) The ambient CLI that hits the gap (reconcile tick, status poll, anything).
@@ -259,79 +257,111 @@ async function runKickstartRace() {
   const racerExit = await waitExit(racer, 30000);
   mark(`racer exit=${JSON.stringify(racerExit)}`);
 
-  await supervisorLaunched;
+  await relaunchLaunched;
 
   // Let the supervisor instance reach its verdict: exit (it lost the port) or serve.
-  const supervisorExit = await waitExit(supervisor, SUPERVISOR_VERDICT_MS); // null ⇒ still serving
-  mark(`supervisor exit=${JSON.stringify(supervisorExit)}`);
+  const relaunchExit = await waitExit(relaunch, SUPERVISOR_VERDICT_MS); // null ⇒ still serving
+  mark(`supervisor relaunch exit=${JSON.stringify(relaunchExit)}`);
 
-  return { port, homeDir, originalMeta, supervisor, supervisorExit, racer, racerExit };
+  return { port, homeDir, originalMeta, relaunch, relaunchExit, racer, racerExit };
 }
 
-// ── REPRO: passes today; this IS the bug ──────────────────────────────────────────
-test('#738 REPRO: a CLI racing the kickstart gap leaves an orphan daemon and the supervisor instance exits 0', async () => {
-  const r = await runKickstartRace();
+// ── 1. Characterization of the primitive the whole bug rests on ───────────────────
+// Not the #738 fix — this pins the arbitration that made an orphan possible in the first
+// place, and it stays true until #742 repairs the require.main guards. If this test ever
+// starts failing, #742 landed and the fix below can be revisited.
+test('#738 characterization: two daemons racing one port — loser exits 0, singleton lock never engages (#742)', async () => {
+  const port = await claimTestPort();
+  const { homeDir, binDir } = createTempHome();
+  const env = childEnv({ homeDir, binDir, port });
+
+  const first = spawnNode(['cli.js', 'daemon'], env, 'daemon#first');
+  const firstMeta = await waitFor(() => fetchMeta(port), {
+    description: `first daemon on :${port}\n${describe(first)}`
+  });
+
+  const second = spawnNode(['cli.js', 'daemon'], env, 'daemon#second');
+  const secondExit = await waitExit(second, 15000);
+
+  // The loser exits *successfully* — indistinguishable from a clean shutdown, which is why
+  // a supervisor sees no failure and nothing self-heals (daemon.js:4643-4651).
+  assert.deepEqual(secondExit, { code: 0, signal: null },
+    `expected the second daemon to exit 0\n${describe(second)}`);
+  assert.match(`${second.logs.stdout}\n${second.logs.stderr}`, /already running/i,
+    `expected the "already running" EADDRINUSE bail-out\n${describe(second)}`);
+
+  // The first daemon is untouched — the port is decided purely by who bound first.
+  const stillServing = await fetchMeta(port);
+  assert.equal(stillServing && stillServing.pid, firstMeta.pid);
+
+  // And the singleton lock never engaged: under the production launch path
+  // (`telepty daemon` → cli.js → require('./daemon.js')) the claimDaemonState guard at
+  // daemon.js:382 is `require.main === module` only. This is #742's territory.
+  assert.equal(
+    fs.existsSync(path.join(homeDir, '.telepty', 'daemon-state.json')),
+    false,
+    'daemon-state.json exists — claimDaemonState now runs on the CLI launch path (#742 landed?)'
+  );
+});
+
+// ── 2. The #738 contract (was RED, now GREEN) ─────────────────────────────────────
+test('#738: with a supervisor installed, a CLI racing the kickstart gap defers — no orphan', async () => {
+  const r = await runKickstartRace({ supervisor: true });
 
   assert.deepEqual(r.racerExit, { code: 0, signal: null }, `racer failed\n${describe(r.racer)}`);
 
-  const meta = await fetchMeta(r.port);
-  assert.ok(meta, `nobody is serving :${r.port} after the race\n${describe(r.supervisor)}`);
-
-  // A NEW daemon owns the port ...
-  assert.notEqual(meta.pid, r.originalMeta.pid, 'expected the killed daemon to be gone');
-  // ... and it is NOT the supervisor's instance → it is an orphan outside launchd.
-  assert.notEqual(meta.pid, r.supervisor.pid,
-    `expected the CLI-spawned orphan to own :${r.port}, but the supervisor did\n${describe(r.supervisor)}`);
-
-  // The supervisor instance lost the port and exited *successfully* — indistinguishable
-  // from a clean shutdown, which is why nothing self-heals (daemon.js:4643-4651).
-  assert.deepEqual(r.supervisorExit, { code: 0, signal: null },
-    `expected the supervisor instance to exit 0\n${describe(r.supervisor)}`);
-  assert.match(`${r.supervisor.logs.stdout}\n${r.supervisor.logs.stderr}`, /already running/i,
-    `expected the "already running" EADDRINUSE bail-out\n${describe(r.supervisor)}`);
-
-  // The singleton lock that should have arbitrated this never even engaged: under the
-  // production launch path (`telepty daemon` → cli.js → require('./daemon.js')) the
-  // claimDaemonState guard at daemon.js:382 is `require.main === module` only.
-  assert.equal(
-    fs.existsSync(path.join(r.homeDir, '.telepty', 'daemon-state.json')),
-    false,
-    'daemon-state.json exists — claimDaemonState unexpectedly ran on the CLI launch path'
-  );
-
-  // No self-heal: the orphan is still there, and stays there.
-  await delay(3000);
-  const later = await fetchMeta(r.port);
-  assert.ok(later, 'orphan vanished on its own — not the observed production behavior');
-  assert.equal(later.pid, meta.pid, 'orphan was replaced on its own — no self-heal expected');
-  mark(`orphan pid ${later.pid} still owns :${r.port} — repro confirmed`);
-});
-
-// ── RED: the contract. Fails today. ───────────────────────────────────────────────
-test('#738 RED: with a supervisor plist present, a CLI racing the gap must not own the port', async () => {
-  const r = await runKickstartRace();
-
-  const plist = path.join(r.homeDir, 'Library', 'LaunchAgents', 'com.aigentry.telepty.plist');
-  assert.ok(fs.existsSync(plist), 'scenario precondition: a supervisor plist is installed');
-
   // The contract, satisfiable EITHER way:
   //   (a) the CLI sees the supervisor and defers instead of spawning, or
-  //   (b) the supervisor instance wins the port within SUPERVISOR_VERDICT_MS.
+  //   (b) the supervisor instance wins the port.
   // Both collapse to: the process serving the port is the supervisor's.
   const owner = await waitFor(async () => {
     const meta = await fetchMeta(r.port);
-    return meta && meta.pid === r.supervisor.pid ? meta : null;
+    return meta && meta.pid === r.relaunch.pid ? meta : null;
   }, {
     timeoutMs: SUPERVISOR_VERDICT_MS,
-    description: `supervisor instance (pid ${r.supervisor.pid}) to own :${r.port}`
+    description: `supervisor instance (pid ${r.relaunch.pid}) to own :${r.port}`
   }).catch(async () => {
     const meta = await fetchMeta(r.port);
     assert.fail(
       `orphan daemon (pid ${meta && meta.pid}) owns :${r.port}; the supervisor instance ` +
-      `(pid ${r.supervisor.pid}) exited instead of taking it over.\n${describe(r.supervisor)}`
+      `(pid ${r.relaunch.pid}) did not.\n${describe(r.relaunch)}`
     );
   });
 
-  assert.equal(owner.pid, r.supervisor.pid);
-  assert.equal(r.supervisorExit, null, 'supervisor instance must still be serving');
+  assert.equal(owner.pid, r.relaunch.pid);
+  assert.equal(r.relaunchExit, null, 'supervisor instance must still be serving');
+
+  // The CLI must have said so, and must NOT have taken the auto-start path.
+  assert.match(r.racer.logs.stderr, /managed by launchd/i,
+    `expected the defer banner\n${describe(r.racer)}`);
+  assert.doesNotMatch(r.racer.logs.stderr, /Auto-starting local telepty daemon/i,
+    `CLI spawned a daemon despite the supervisor\n${describe(r.racer)}`);
+
+  // And the ownership is stable — no late orphan sneaks in behind the supervisor.
+  await delay(2000);
+  const later = await fetchMeta(r.port);
+  assert.equal(later && later.pid, r.relaunch.pid, 'port changed hands after the race settled');
+  mark(`supervisor pid ${r.relaunch.pid} owns :${r.port} — contract satisfied`);
+});
+
+// ── 3. No supervisor ⇒ byte-identical pre-#738 behavior ───────────────────────────
+// The regression guard for the other half of the policy. NOTE for Linux hosts: detection
+// also looks at /etc/systemd/system/telepty.service, which a root-installed telepty would
+// have; such a host would (correctly) see a supervisor and skip the spawn. CI and dev boxes
+// do not root-install telepty, so this asserts the absent branch there.
+test('#738: with no supervisor installed, the CLI still auto-starts the daemon (unchanged)', async () => {
+  const r = await runKickstartRace({ supervisor: false });
+
+  assert.deepEqual(r.racerExit, { code: 0, signal: null }, `racer failed\n${describe(r.racer)}`);
+  assert.doesNotMatch(r.racer.logs.stderr, /managed by/i,
+    `deferred despite no supervisor being installed\n${describe(r.racer)}`);
+  assert.match(r.racer.logs.stderr, /Auto-starting local telepty daemon/i,
+    `expected the pre-#738 auto-start path\n${describe(r.racer)}`);
+
+  // A daemon is serving, and it is the one the CLI spawned (not the scripted relaunch,
+  // which loses the port exactly as it always did when no supervisor policy applies).
+  const meta = await fetchMeta(r.port);
+  assert.ok(meta, `nobody is serving :${r.port}\n${describe(r.racer)}`);
+  assert.notEqual(meta.pid, r.originalMeta.pid, 'expected the killed daemon to be gone');
+  assert.notEqual(meta.pid, r.relaunch.pid, 'expected the CLI-spawned daemon to own the port');
 });

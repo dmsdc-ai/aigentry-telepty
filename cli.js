@@ -35,6 +35,13 @@ const {
 } = require('./src/cli/session-view');
 const { resolveWindowsExecutable } = require('./src/win-resolve-executable');
 const { decideVersionAction } = require('./src/version-handshake');
+const {
+  clearSupervisorDeferMarker,
+  detectSupervisor,
+  isDeferMarkerFresh,
+  readSupervisorDeferMarker,
+  writeSupervisorDeferMarker
+} = require('./src/supervisor');
 const crossMachine = require('./cross-machine');
 const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec');
 const { FileMailbox } = require('./src/mailbox/index');
@@ -751,6 +758,61 @@ function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessi
   return { action: 'start', reason: 'daemon-unreachable' };
 }
 
+// #738: how long to wait for a supervisor-owned daemon to come back before falling back to
+// spawning one ourselves. Sized for a real `launchctl kickstart -k` (kill → exec → node
+// boot → express init ≈ 1s+ for daemon.js) with generous headroom; the wait ends the
+// instant the daemon answers, so the ceiling only costs anything when the supervisor is
+// genuinely not delivering — and that verdict is then cached (see deferToSupervisor).
+const SUPERVISOR_DEFER_MS = Number(process.env.TELEPTY_SUPERVISOR_WAIT_MS) > 0
+  ? Number(process.env.TELEPTY_SUPERVISOR_WAIT_MS)
+  : 10000;
+
+// #738: when an OS service supervisor (launchd / systemd / schtasks) owns this daemon, a
+// CLI that finds the port empty is far more likely to be standing in a restart gap than
+// looking at a genuinely dead daemon. Spawning there produces an ORPHAN: it wins the port,
+// the supervisor's own instance then hits EADDRINUSE and exits 0 (daemon.js:4643-4651), and
+// the daemon that survives is outside the supervisor — logs unwired, #733 self-update fuel.
+//
+// So: wait for the supervisor instead of racing it. Returns the daemon's /api/meta when the
+// supervisor delivered one (the caller must NOT spawn). Returns null to fall
+// through to the pre-#738 spawn path — which is what happens on every host with no
+// supervisor installed, making this a no-op there (constitution §2: the POLICY is identical
+// on every OS; only the detection surface differs).
+async function deferToSupervisor(options = {}) {
+  const detect = options._detectSupervisor || detectSupervisor;
+  const getMeta = options._getDaemonMeta || getDaemonMeta;
+  const readMarker = options._readSupervisorDeferMarker || readSupervisorDeferMarker;
+  const writeMarker = options._writeSupervisorDeferMarker || writeSupervisorDeferMarker;
+  const clearMarker = options._clearSupervisorDeferMarker || clearSupervisorDeferMarker;
+  const waitMs = options.supervisorWaitMs == null ? SUPERVISOR_DEFER_MS : options.supervisorWaitMs;
+  const pollMs = options.supervisorPollMs == null ? 300 : options.supervisorPollMs;
+
+  const supervisor = detect();
+  if (!supervisor.present) return null; // no supervisor → unchanged behavior
+
+  // telepty#15-style once-per-state memory: a supervisor that is installed but broken
+  // (disabled, unloaded, crash-looping) must not cost EVERY command the full wait.
+  const signature = `${supervisor.kind}:${PORT}`;
+  if (isDeferMarkerFresh(readMarker(), signature)) return null;
+
+  // stderr (not stdout): banner must not contaminate `telepty list --json` (task #400).
+  process.stderr.write(`\x1b[33m⏳ Daemon is managed by ${supervisor.kind}; waiting up to ${Math.max(1, Math.round(waitMs / 1000))}s for it to come back...\x1b[0m\n`);
+
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    const meta = await getMeta('127.0.0.1');
+    if (meta && meta.version) {
+      clearMarker();
+      return meta; // the supervisor delivered — no orphan; caller re-decides on this meta
+    }
+  }
+
+  writeMarker({ signature, recordedAt: new Date().toISOString() });
+  process.stderr.write(`\x1b[33m⚠️ ${supervisor.kind} did not restore the daemon in time — starting one directly.\x1b[0m\n`);
+  return null;
+}
+
 async function ensureDaemonRunning(options = {}) {
   if (REMOTE_HOST !== '127.0.0.1') return; // Only auto-start local daemon
 
@@ -796,10 +858,26 @@ async function ensureDaemonRunning(options = {}) {
     }
   }
 
-  const decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable });
+  let decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable });
 
   if (decision.action === 'noop') {
     return; // healthy + correct version + all capabilities → leave the daemon alone (#567)
+  }
+
+  // #738: ONLY the 'start' path (nothing answered on the port) can be a supervisor restart
+  // gap. 'restart' means a daemon IS answering and we have decided to replace it — a
+  // different problem (#733), deliberately left untouched here.
+  if (decision.action === 'start') {
+    const supervised = await deferToSupervisor(options);
+    if (supervised) {
+      // The supervisor's daemon is up, so we must not spawn — but it is a daemon we have
+      // not vetted yet (an upgrade window can leave the supervisor on an older install).
+      // Re-run the same policy against it: healthy ⇒ done; wrong version/capabilities ⇒
+      // fall through to the normal restart path with this daemon in hand.
+      meta = supervised;
+      decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable: true });
+      if (decision.action === 'noop') return;
+    }
   }
 
   // telepty#15: a restart blocked by a daemon the CLI cannot stop (foreign parent
@@ -4134,6 +4212,7 @@ module.exports = {
   isOwnerReplacedClose,   // #56: 4001 'Owner replaced' → exit-not-reconnect (durable Replace)
   sanitizePathArg,        // #26: path-arg validation/normalization
   decideDaemonAction,     // #567: pure restart-decision policy (meta-primary; no I/O)
+  deferToSupervisor,      // #738: supervisor-aware defer (injectable detect/probe/marker seams)
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
   helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
