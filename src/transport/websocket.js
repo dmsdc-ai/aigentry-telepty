@@ -150,7 +150,31 @@ function installWebSocketTransport(deps) {
 
     ws.on('message', (message) => {
       try {
-        const { type, data, cols, rows } = JSON.parse(message);
+        const msg = JSON.parse(message);
+        const { type, data, cols, rows } = msg;
+
+        // #732 (H5 guard): `activeSession` above is a snapshot taken once, at connect time.
+        // If sessions[id] is ever replaced under a live owner — a delete+recreate through
+        // DELETE /:id (daemon.js:3819) or the disconnect GC (daemon.js:4632) followed by the
+        // bridge's re-register — the snapshot goes orphan: `ws === activeSession.ownerWs`
+        // still holds, so every 'output' frame is appended to a record nobody reads, while
+        // injects keep routing to the live record's ownerWs. That is a silent upstream death
+        // with a working downstream, i.e. #732 again by a different route. Re-resolve the
+        // live record on every frame so the snapshot can never become the routing authority.
+        const activeSession = sessions[sessionId];
+        if (!activeSession) return;   // record is gone — nothing to feed
+
+        // An owner whose record was swapped re-adopts a FREE owner slot rather than silently
+        // degrading into a viewer (the viewer branch drops 'output' entirely). Same
+        // last-writer-wins rule as the connect-time claim: only an explicit ?owner=1 bridge,
+        // and only when no other owner socket is open, so a live owner is never displaced.
+        if (activeSession.type === 'wrapped' && isOwnerConnect
+            && activeSession.ownerWs !== ws && !isOpenWebSocket(activeSession.ownerWs)) {
+          activeSession.ownerWs = ws;
+          activeSession.clients.add(ws);
+          markSessionConnected(activeSession);
+          console.log(`[WS] Re-adopted owner for session ${sessionId} (session record was replaced under a live owner)`);
+        }
 
         if (activeSession.type === 'wrapped') {
           if (ws === activeSession.ownerWs) {
@@ -213,6 +237,12 @@ function installWebSocketTransport(deps) {
 
     ws.on('close', () => {
       clearInterval(pingInterval);
+      // #732 (H5 guard): clean up the LIVE record for the same reason the message handler
+      // re-resolves it — cleaning only the connect-time snapshot would leave a replaced
+      // record holding a closed ownerWs forever. The `ws === ownerWs` check below still
+      // guarantees a stale socket can never tear down an owner it does not own.
+      const activeSession = sessions[sessionId];
+      if (!activeSession) return;
       activeSession.clients.delete(ws);
       if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
         activeSession.ownerWs = null;
