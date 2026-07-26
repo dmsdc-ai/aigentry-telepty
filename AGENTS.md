@@ -18,7 +18,6 @@ CLI (cli.js) ──→ HTTP/WS ──→ Daemon (daemon.js:3848)
 |------|------|
 | `cli.js` | CLI 명령 + allow-bridge (PTY 래핑) |
 | `daemon.js` | HTTP/WS 서버, 세션 상태, inject 전달 |
-| `tui.js` | blessed 기반 TUI 대시보드 |
 | `session-routing.js` | 세션 ID 해석, alias 매칭, 호스트 그룹핑 |
 | `daemon-control.js` | 싱글톤 daemon PID 관리 |
 | `auth.js` | UUID 토큰 기반 인증 |
@@ -28,8 +27,7 @@ CLI (cli.js) ──→ HTTP/WS ──→ Daemon (daemon.js:3848)
 | `cross-machine.js` | SSH/HTTP 피어 연결, 원격 inject |
 | `terminal-backend.js` | 터미널(kitty/cmux 등) 백엔드 어댑터 |
 | `src/mailbox/` | 파일 기반 메시지 큐 (retry/ack/DLQ — BOUNDARY.md KNOWN DIVERGENCE 참조) |
-| `src/transport/` | broker 모드 (server/client/protocol, #42 opt-in default-OFF) + peer-relay |
-| `src/bridge/` | Node↔Rust supervisor IPC (launcher/ipc/j3-shim) |
+| `src/transport/` | WebSocket 전송 계층 |
 | `src/audit/` | inject 감사 로그 + provenance (#43/#47, opt-in) |
 | `src/submit-gate.js` | submit 게이팅 (REPL-ready/echo/settle 감지) |
 | `src/session-store/` | 세션 디스크 영속 (BOUNDARY.md KNOWN DIVERGENCE 참조) |
@@ -54,11 +52,9 @@ npm test                    # full suite (file list in package.json)
 npm run test:watch          # watch mode
 telepty daemon              # daemon 시작 (포트 3848)
 telepty allow --id <name> claude  # 세션 래핑
-telepty tui                 # TUI 대시보드
 telepty list                # 세션 목록
 telepty inject <id> "msg"   # 메시지 주입
 telepty broadcast "msg"     # 전체 브로드캐스트
-telepty session start --launch  # kitty 탭으로 다중 세션 시작
 ```
 
 ## Key Rules
