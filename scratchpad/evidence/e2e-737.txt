@@ -1,0 +1,24 @@
+
+--- variant force: telepty inject --submit --submit-force into a session showing the UPDATE MODAL ---
+  registry.detectOutput('codex', screen) => {"found":false,"reason":"codex_modal_ui"}
+  frame0 +0ms  BRACKETED-PASTE body len=99
+  frame1 +3ms  BARE CR (0x0d)
+  => registry says ready=false (codex_modal_ui) BUT bodyDelivered=true crDelivered=true text->CR=3ms
+
+--- variant gated: telepty inject --submit into a session showing the UPDATE MODAL ---
+  registry.detectOutput('codex', screen) => {"found":false,"reason":"codex_modal_ui"}
+  frame0 +0ms  BRACKETED-PASTE body len=99
+  frame1 +3ms  BARE CR (0x0d)
+  => registry says ready=false (codex_modal_ui) BUT bodyDelivered=true crDelivered=true text->CR=3ms
+
+--- variant plain: telepty inject  into a session showing the UPDATE MODAL ---
+  registry.detectOutput('codex', screen) => {"found":false,"reason":"codex_modal_ui"}
+  frame0 +0ms  BRACKETED-PASTE body len=99
+  frame1 +502ms  BARE CR (0x0d)
+  => registry says ready=false (codex_modal_ui) BUT bodyDelivered=true crDelivered=true text->CR=502ms
+
+--- variant control: telepty inject --submit --submit-force into a session showing the composer ---
+  registry.detectOutput('codex', screen) => {"found":true,"reason":"codex_multi_signal"}
+  frame0 +0ms  BRACKETED-PASTE body len=99
+  frame1 +2ms  BARE CR (0x0d)
+  => registry says ready=true (codex_multi_signal) BUT bodyDelivered=true crDelivered=true text->CR=2ms

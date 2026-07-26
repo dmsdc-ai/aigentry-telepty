@@ -13,6 +13,23 @@
 
 'use strict';
 
+// #737: the pre-prompt UIs codex's detect() step 1 rejects, hoisted so the delivery-path
+// modal predicate (detectSurfaceModal, below) scans for EXACTLY the same shapes and the two
+// cannot drift apart. Flags are per-pattern and deliberate — the first two are
+// case-SENSITIVE; do not "normalize" them.
+const CODEX_MODAL_PATTERNS = [
+  /Resume a previous session/,
+  /^Filter:/m,
+  /Do you trust the contents/i,
+  /Press enter to continue/i,
+];
+
+// #737: live-composer watermark — the model/status footer that detect() step 2 keys on
+// ("gpt-5.5 xhigh fast" / "gpt-5.5 default · /path"). It repaints on every composer frame
+// and is absent while a modal owns the screen, so its LAST position is reliable evidence
+// that the composer was alive after that point in the stream.
+const CODEX_COMPOSER_FOOTER = /gpt-\S+\s+\S+(\s+fast|\s*·)/;
+
 const ENTRIES = {
   // claude renders an empty input row as "❯" + spaces, sandwiched between
   // two horizontal-rule lines made of U+2500 ('─').
@@ -56,12 +73,7 @@ const ENTRIES = {
       // trust prompt, and generic "Press enter to continue" modals are all
       // pre-prompt UIs where Enter would not submit a user message. Treat
       // any of them as NOT ready.
-      if (
-        /Resume a previous session/.test(text) ||
-        /^Filter:/m.test(text) ||
-        /Do you trust the contents/i.test(text) ||
-        /Press enter to continue/i.test(text)
-      ) {
+      if (CODEX_MODAL_PATTERNS.some((re) => re.test(text))) {
         return { found: false, reason: 'codex_modal_ui' };
       }
 
@@ -182,6 +194,46 @@ function normalizeOutputForDetection(output) {
     .replace(/\n{2,}/g, '\n');
 }
 
+// #737 — surface-modal detection for the DELIVERY path.
+//
+// detect() answers "is this screen ready?" about a cmux `read-screen` SNAPSHOT, and there
+// step 1 is exactly right: a dismissed modal is simply not on the screen any more. The
+// delivery path has no screen primitive — only the PTY outputRing, an append-only BYTE
+// STREAM in which the boot modal stays present for the rest of the session. Running
+// detect() over that stream therefore reports `codex_modal_ui` forever after a dismissal
+// (measured: scratchpad/probe-737-ring.js — 8k/32k/full tails all say modal, on a live
+// composer), which would park every dispatch on a healthy session.
+//
+// So this decides by POSITION — which is what the header of this file already claims the
+// detectors do ("returns the LAST occurrence (closest to the bottom) so transcript echoes
+// earlier in the viewport do not produce false positives"): last modal marker vs last
+// live-composer marker, later wins. Verified window-insensitive at 2k/8k/32k/200k tails
+// (scratchpad/probe-737-latch.js), so a bounded ring read cannot flip the verdict.
+//
+// Scoped to codex: it is the only CLI with modal patterns, so claude/gemini always get
+// `not_applicable` and their delivery is byte-identical.
+function lastMatchIndex(text, pattern) {
+  const re = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g');
+  let last = -1;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    last = m.index;
+    if (m.index === re.lastIndex) re.lastIndex++; // zero-width match guard
+  }
+  return last;
+}
+
+function detectSurfaceModal(command, output) {
+  if (commandKey(command) !== 'codex') return { blocked: false, reason: 'not_applicable' };
+  const text = normalizeOutputForDetection(output);
+  const modalAt = CODEX_MODAL_PATTERNS.reduce((max, p) => Math.max(max, lastMatchIndex(text, p)), -1);
+  if (modalAt === -1) return { blocked: false, reason: 'no_modal_seen' };
+  const readyAt = lastMatchIndex(text, CODEX_COMPOSER_FOOTER);
+  return modalAt > readyAt
+    ? { blocked: true, reason: 'codex_modal_ui', modal_at: modalAt, ready_at: readyAt }
+    : { blocked: false, reason: 'composer_after_modal', modal_at: modalAt, ready_at: readyAt };
+}
+
 function detectOutput(command, output) {
   const entry = lookup(command);
   if (!entry) {
@@ -196,6 +248,7 @@ module.exports = {
   commandKey,
   isKnownAiCli,
   isPasteCapableCli,   // #730: identity-based bracketed-paste capability (codex/claude)
+  detectSurfaceModal,  // #737: positional modal check for the byte-stream delivery path
   detectOutput,
   normalizeOutputForDetection,
   ENTRIES,

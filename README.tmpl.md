@@ -169,6 +169,8 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
 | `TELEPTY_SUBMIT_FORCE_DEFAULT` | `1`, `true`, `yes`, `on` to enable; unset, `0`, or `off` to disable | unset | Makes `telepty inject --submit <id> "text"` behave as if `--submit-force` was passed. |
+| `TELEPTY_MODAL_REMEDY` | `hold` (default), `reject`, `off` | `hold` | What to do when the target CLI is showing a blocking modal (e.g. codex's "Update available … Press enter to continue"), where an Enter activates the modal's default item instead of submitting. `hold` parks the inject until the surface clears, then delivers; `reject` refuses immediately with an actionable error; `off` restores pre-0.6.18 behavior (writes into the modal). |
+| `TELEPTY_MODAL_HOLD_MS` | milliseconds | `30000` | How long `TELEPTY_MODAL_REMEDY=hold` waits for the modal to clear before falling back to `reject`. |
 
 `TELEPTY_SUBMIT_FORCE_DEFAULT=1` is for orchestrators and automation that
 already know their targets are real, initialized REPLs. It avoids the transient
@@ -180,6 +182,13 @@ This bypasses the safety gate that protects sessions still booting. Set it only
 when you understand that trade-off. Use `--no-submit-force` on a specific
 `telepty inject --submit` call to restore the gated behavior even when the
 environment default is enabled.
+
+`TELEPTY_MODAL_REMEDY` exists because a modal is not just "not ready" — it can be
+destructive. A fresh codex whose `version.json` has `dismissed_version` <
+`latest_version` opens an update modal whose PRE-SELECTED item is
+`1. Update now (runs \`brew upgrade --cask codex\`)`; telepty's bracketed-paste body
+moves no selection, so the submit CR activates that default and codex runs the
+upgrade and exits. Nothing is written into a modal unless you set `off`.
 
 ## Cross-Machine Sessions
 
