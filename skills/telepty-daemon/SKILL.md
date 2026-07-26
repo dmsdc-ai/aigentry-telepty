@@ -1,6 +1,6 @@
 ---
 name: telepty-daemon
-description: 'Manage the telepty daemon — start (detached), stop, restart, repair, update, and TUI dashboard. Use when daemon is broken or needs maintenance. 키워드: 데몬 시작, 데몬 재시작, 데몬 종료, 백그라운드, TUI, 대시보드, 데몬 상태, daemon'
+description: 'Manage the telepty daemon — start (detached), stop, restart, repair, update, and the live monitor dashboard. Use when daemon is broken or needs maintenance. 키워드: 데몬 시작, 데몬 재시작, 데몬 종료, 백그라운드, 모니터, 대시보드, 데몬 상태, daemon'
 ---
 
 # telepty-daemon — Daemon Management
@@ -54,19 +54,16 @@ telepty cleanup-daemons
 telepty daemon
 ```
 
-## tui — Interactive dashboard
+## monitor — Live event dashboard
 
 ```bash
-telepty tui
+telepty monitor
 ```
 
-Natural-language: "대시보드 열어줘", "show the TUI", "open dashboard"
+Natural-language: "대시보드 열어줘", "show the dashboard", "watch the sessions"
 
-Opens a blessed-based TUI with session list, health status, and quick actions:
-- `s` — start a new session
-- `k` — kill selected session
-- `p` — purge stale sessions
-- `Enter` — attach to selected session
+Streams a real-time billboard of session lifecycle and inject events. For a one-shot snapshot
+instead, use `telepty list`; to attach to one of the sessions, `telepty attach` (picker if no ID).
 
 ## update — Self-update telepty
 

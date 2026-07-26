@@ -100,13 +100,45 @@ function createIsAllowedPeer(PEER_ALLOWLIST) {
   return isAllowedPeer;
 }
 
+// Loopback trust is not authentication against a browser. The daemon listens on loopback and
+// isAllowedPeer trusts 127.0.0.1/::1 unconditionally and first, so a page the user merely
+// visits could `fetch('http://127.0.0.1:3848/api/…/inject', {method:'POST'})` and type into a
+// live AI CLI session — the response is CORS-gated but the REQUEST EXECUTES, and a WebSocket
+// handshake is not CORS-gated at all.
+//
+// Browsers ALWAYS attach `Origin` to a cross-origin fetch and to every WS handshake; curl, the
+// telepty CLI, and SSH-tunnelled peers never do. So: a request that CARRIES Origin must name an
+// explicitly allowlisted origin (TELEPTY_ALLOWED_ORIGINS, default empty = no browser may call
+// the API) — checked before the loopback/token branches, so a stolen credential cannot buy a
+// disallowed origin past it. An origin-less caller takes exactly the path it took before, which
+// is every CLI/tunnel/peer flow that exists today.
+//
+// `Origin: null` (sandboxed iframe, file://) is a value, not an absence — it stays blocked.
+function createOriginGuard(allowedOrigins) {
+  const allowed = new Set((allowedOrigins || []).map((o) => String(o).trim()).filter(Boolean));
+  return function isForbiddenOrigin(origin) {
+    if (!origin) return false; // not a browser — pre-existing behavior, byte-identical
+    return !allowed.has(origin);
+  };
+}
+
+const ORIGIN_DENIED = { error: 'Forbidden: browser origin not allowed.', code: 'ORIGIN_NOT_ALLOWED' };
+
 function createAuthMiddleware(options) {
   const EXPECTED_TOKEN = options.expectedToken;
   const isAllowedPeer = options.isAllowedPeer;
   const verifyJwt = options.verifyJwt;
+  // Default-deny when the caller passes no allowlist: a construction site that forgets this
+  // option must fail closed on the browser vector, never fall back to the old open behavior.
+  const isForbiddenOrigin = options.isForbiddenOrigin || createOriginGuard(options.allowedOrigins);
 
   return (req, res, next) => {
     const clientIp = req.ip;
+
+    if (isForbiddenOrigin(req.headers && req.headers['origin'])) {
+      console.warn(`[AUTH] Rejected browser-originated request from ${clientIp} (origin: ${req.headers['origin']})`);
+      return res.status(403).json(ORIGIN_DENIED);
+    }
 
     if (isAllowedPeer(clientIp)) {
       return next(); // Trust local and allowlisted peers (SSH tunnels arrive as localhost)
@@ -132,6 +164,7 @@ module.exports = {
   createAuthMiddleware,
   createBrokerAcl,
   createIsAllowedPeer,
+  createOriginGuard,
   createVerifyJwt,
   isRevokedNode,
   signNodeJwt

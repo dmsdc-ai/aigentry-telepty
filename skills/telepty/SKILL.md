@@ -26,8 +26,8 @@ telepty list
 # Attach to a session interactively
 telepty attach my-session
 
-# Open TUI dashboard
-telepty tui
+# Watch sessions and events in real time
+telepty monitor
 ```
 
 ## Core Concepts
@@ -44,7 +44,7 @@ telepty tui
 
 ## Default Approach
 
-- For humans: prefer natural-language examples and TUI, then raw CLI commands
+- For humans: prefer natural-language examples and `telepty monitor`, then raw CLI commands
 - For AI agents: use raw `telepty` commands directly for execution
 - When daemon is broken: repair first with `telepty cleanup-daemons && telepty daemon start` (or `telepty daemon restart`)
 
@@ -59,4 +59,3 @@ Each telepty feature has its own detailed skill:
 - `telepty-daemon` — daemon management, repair, update
 - `telepty-rename` — rename, delete, clean sessions
 - `telepty-listen` — monitor events and read screen
-- `telepty-session` — multi-session start and layout

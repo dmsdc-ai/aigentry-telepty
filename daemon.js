@@ -10,7 +10,7 @@ const { claimDaemonState, clearDaemonState, isProcessRunning } = require('./daem
 const { checkEntitlement } = require('./entitlement');
 const terminalBackend = require('./terminal-backend');
 const { installWebSocketTransport, isOpenWebSocket } = require('./src/transport/websocket');
-const { createAuthMiddleware, createIsAllowedPeer, createVerifyJwt } = require('./src/protocol/http-auth');
+const { createAuthMiddleware, createIsAllowedPeer, createOriginGuard, createVerifyJwt } = require('./src/protocol/http-auth');
 const { detectTailnet, TAILNET_CIDR } = require('./src/net/tailnet');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
@@ -176,6 +176,11 @@ app.use(express.json());
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
 const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
 
+// Browser origin allowlist: comma-separated origins in TELEPTY_ALLOWED_ORIGINS. Empty by
+// default — no web page may call this API, because loopback trust alone let any site the user
+// visited drive their AI CLI sessions. See createOriginGuard in src/protocol/http-auth.js.
+const ALLOWED_ORIGINS = (process.env.TELEPTY_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+
 // #672 tailnet auto (seamless cross-machine): detect the tailnet interface once at boot
 // via a PURE live scan of os.networkInterfaces(). D1: the IP is discovered, never
 // configured — used only in-memory for this run, never persisted, and re-detected every
@@ -275,6 +280,9 @@ const JWT_SECRET = process.env.TELEPTY_JWT_SECRET || null;
 
 const verifyJwt = createVerifyJwt(JWT_SECRET);
 const isAllowedPeer = createIsAllowedPeer(effectivePeerAllowlist);
+// One guard instance shared by the HTTP middleware and the WS upgrade handler — the two
+// entrances a browser can reach.
+const isForbiddenOrigin = createOriginGuard(ALLOWED_ORIGINS);
 
 // Health check – no auth required
 app.get('/api/health', (req, res) => {
@@ -282,7 +290,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // Authentication Middleware
-app.use(createAuthMiddleware({ isAllowedPeer, expectedToken: EXPECTED_TOKEN, verifyJwt }));
+app.use(createAuthMiddleware({ isAllowedPeer, expectedToken: EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin }));
 
 const PORT = process.env.PORT || 3848;
 // Actual bound port. Equals PORT for a fixed port; when PORT=0 the OS assigns an
@@ -5048,6 +5056,7 @@ installWebSocketTransport({
   expectedToken: EXPECTED_TOKEN,
   verifyJwt,
   isAllowedPeer,
+  isForbiddenOrigin,
   initializeBootstrapState,
   findKittySocket,
   findKittyWindowId,

@@ -31,9 +31,8 @@ telepty attach my-claude
 # Attach to a remote session
 telepty attach analyst-claude@remote-host
 
-# Interactive selection (from TUI)
-telepty tui
-# Then select a session and press Enter
+# Interactive selection — omit the ID to get a session picker
+telepty attach
 ```
 
 ### Cross-host attach
