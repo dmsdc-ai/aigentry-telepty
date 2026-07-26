@@ -1,7 +1,11 @@
 # #732 — bridge→daemon output pipe silent death: REPRODUCE + DIAGNOSE
 
-Phase: REPRO ONLY (Rule 24 SPEC FIRST). No product code changed.
 Branch: `fix/732-output-pipe-repro`. Date: 2026-07-26.
+
+> **Status: FIXED.** This document is the repro/diagnosis record, written before the
+> fix and kept as the historical account — §5 lists what was then still open. The
+> approved fix landed in four commits on this branch; see §8 for what shipped and
+> which of the hypotheses below it acts on.
 
 ---
 
@@ -208,7 +212,53 @@ Hooks that already exist and would close the gap cheaply:
   reproduces the signature without needing it.
 
 ## 7. Artifacts
-- `test/bridge-output-pipe-732.test.js` — repro + 3 RED (unregistered)
-- `test/bridge-output-pipe-732-levers.test.js` — lever (a)/(b)/(c) negatives (unregistered)
+- `test/bridge-output-pipe-732.test.js` — repro + contract tests
+- `test/bridge-output-pipe-732-levers.test.js` — lever (a)/(b)/(c) negatives
+- `test/upstream-stall-predicate-732.test.js` — pure stall-decision logic at production defaults
+- `test/ws-owner-record-swap-732.test.js` — H5 record-swap guard
 - `test-support/bridge-pipe-harness.js` — daemon+bridge+proxy harness
 - `test-support/pty-read-fault.js` — test-only upstream-sever preload
+
+All four are registered in `package.json` `test` / `test:watch` / `test:ci`.
+
+---
+
+## 8. What shipped (fix phase, approved after the HOLD)
+
+| # | commit | acts on |
+|---|---|---|
+| 1 | `fix(#732): detect a dead output pipe behind a live owner socket` | the detection gap — the reason H1 was invisible |
+| 2 | `fix(#732): route owner frames through the live session record…` | H5, the latent record-swap hazard |
+| 3 | `fix(#732): bridge-side liveness frame + PTY read-side self-defense` | H1's mechanism, plus the leg-attribution gap |
+| 4 | `test(#732): flip the repro RED tests to contract tests…` | RED → GREEN + suite registration |
+
+**Detection (§5 hook 1).** `outputRingTotalBytes` — the upstream-only counter that
+already existed and nothing read — is now a probe: each wrapped delivery records
+"I wrote at T, the counter stood at N", and if it has not passed N after
+`TELEPTY_UPSTREAM_STALL_SECONDS` (default 30) the pipe is declared dead. The probe
+re-arms only once answered, so a chatty caller cannot reset the clock and hide the
+break. Health becomes `UPSTREAM_STALLED` / `OWNER_CONNECTED_UPSTREAM_STALLED`,
+inject returns `503 UPSTREAM_STALLED` instead of `200`, and the daemon emits
+`session_upstream_stalled` / `session_upstream_recovered` plus a `[UPSTREAM]` log
+line. Entirely daemon-side, so it protects sessions whose long-lived bridges predate
+the fix.
+
+**Attribution (§5 hook 2).** The bridge now heartbeats the daemon on the same gate an
+`output` frame rides, carrying the bytes it has read from the PTY and its read-side
+state. Heartbeat arriving + `bridge_pty_bytes` frozen ⇒ the PTY read side died inside
+the bridge; heartbeat stopped ⇒ the bridge→daemon leg is gone; both moving ⇒ the
+session is simply quiet. Surfaced in the session transport block.
+
+**Self-defense (§5 hook 3 — the scope call).** The bridge polls its own node-pty read
+side. A stream that merely stopped flowing is resumed; a destroyed one is reported
+rather than vanishing. A destroyed master fd is unrecoverable by construction, so the
+honest contract splits: recoverable stalls must self-heal (SELF-HEAL test),
+unrecoverable ones must be *noticed* (REPRO + DETECT test).
+
+**Not fixed, by nature.** Bytes that never leave the bridge are gone; the daemon can
+report the loss but not replay it. `read-screen` still returns pre-death content
+while stalled — now with `health_status: UPSTREAM_STALLED` beside it.
+
+**§6 unknowns unchanged.** The 2026-07-13 trigger remains unrecoverable (no
+bridge-side logging existed), and the `lastActivity: None` observation still matches
+no daemon code path — the local repro never needed it.
