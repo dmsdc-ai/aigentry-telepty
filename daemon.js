@@ -39,6 +39,13 @@ const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STA
 const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
 const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
 const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS || 10000));
+// #732: how long a wrapped session may return ZERO upstream bytes after the daemon has
+// written to it before the output pipe is declared dead. An open owner socket proves the
+// SOCKET is alive, not that the PIPE is — the #732 incident had a bridge that answered
+// every 30s ping and wrote every inject into its PTY while its PTY→WS leg was silently
+// gone for ~9h. A live CLI renders something (composer echo, prompt redraw) within
+// seconds of a delivery, so this is ~10x the expected echo latency.
+const UPSTREAM_STALL_SECONDS = Math.max(1, Number(process.env.TELEPTY_UPSTREAM_STALL_SECONDS || 30));
 const IDLE_REAPER_POLL_MS = Math.max(100, Number(process.env.TELEPTY_IDLE_REAPER_POLL_MS || 60000));
 const BOOTSTRAP_READY_TIMEOUT_MS = Math.max(500, Number(process.env.TELEPTY_BOOTSTRAP_READY_TIMEOUT_MS || 30000));
 // Surface FOCUS is owned by the orchestrator's Workspace Host adapter (`wh_focus`), per the
@@ -899,6 +906,34 @@ function getSessionDisconnectedMs(session, nowMs = Date.now()) {
   return Math.max(0, nowMs - new Date(session.lastDisconnectedAt).getTime());
 }
 
+// #732 — upstream-liveness probe. The daemon already keeps a monotonic upstream-only byte
+// counter (`outputRingTotalBytes`, stamped in appendToOutputRing and nothing else). Arming a
+// probe records "at this instant I wrote downstream, and the counter stood here"; if the
+// counter has not moved since, not one byte has come back from the PTY.
+//
+// The probe is armed only when no UNANSWERED probe is already aging — otherwise a stream of
+// injects would keep resetting the clock and a dead pipe would never trip the threshold.
+// It self-clears: any upstream byte pushes the counter past the watermark.
+function armUpstreamProbe(session, nowMs = Date.now()) {
+  if (!session || session.type !== 'wrapped') return;
+  const watermark = session.outputRingTotalBytes || 0;
+  // `!= null`, not falsiness: a probe armed at epoch 0 is a real probe.
+  if (session.upstreamProbeAt != null && watermark <= (session.upstreamProbeWatermark || 0)) {
+    return;
+  }
+  session.upstreamProbeAt = nowMs;
+  session.upstreamProbeWatermark = watermark;
+}
+
+// Pure predicate — exported for unit testing. "Socket alive but pipe dead."
+function isUpstreamStalled(session, nowMs = Date.now(), options = {}) {
+  if (!session || session.type !== 'wrapped') return false;
+  if (session.upstreamProbeAt == null) return false;
+  if ((session.outputRingTotalBytes || 0) > (session.upstreamProbeWatermark || 0)) return false;
+  const stallMs = (options.stallSeconds ?? UPSTREAM_STALL_SECONDS) * 1000;
+  return nowMs - session.upstreamProbeAt >= stallMs;
+}
+
 function getSessionHealthStatus(session, options = {}) {
   const nowMs = options.nowMs ?? Date.now();
   const staleMs = (options.staleSeconds ?? SESSION_STALE_SECONDS) * 1000;
@@ -906,7 +941,9 @@ function getSessionHealthStatus(session, options = {}) {
 
   if (session.type === 'wrapped') {
     if (isOpenWebSocket(session.ownerWs)) {
-      return 'CONNECTED';
+      // #732: an open owner socket is necessary, not sufficient. A session that has
+      // returned nothing since we last wrote to it is unobservable, not healthy.
+      return isUpstreamStalled(session, nowMs, options) ? 'UPSTREAM_STALLED' : 'CONNECTED';
     }
     if (disconnectedMs !== null && disconnectedMs >= staleMs) {
       return 'STALE';
@@ -940,6 +977,8 @@ function getSessionHealthStatus(session, options = {}) {
 function getSessionHealthReason(session, healthStatus) {
   if (session.type === 'wrapped') {
     if (healthStatus === 'CONNECTED') return 'OWNER_CONNECTED';
+    // #732: the owner socket is open and answering pings; the output pipe behind it is not.
+    if (healthStatus === 'UPSTREAM_STALLED') return 'OWNER_CONNECTED_UPSTREAM_STALLED';
     if (healthStatus === 'STALE') return 'OWNER_DISCONNECTED_STALE';
     return 'OWNER_DISCONNECTED';
   }
@@ -1589,6 +1628,18 @@ function buildSessionTransportBlock(session, options = {}) {
     last_inject_from: session.lastInjectFrom || null,
     last_reply_to: session.lastInjectReplyTo || null,
     last_thread_id: session.lastThreadId || null,
+    // #732 upstream diagnosis. `upstream_silent_seconds` counts from the oldest delivery
+    // that has not produced a single byte back. The bridge_* fields come from the bridge's
+    // own heartbeat and split the two failure shapes apart: a heartbeat that keeps arriving
+    // while `bridge_pty_bytes` is frozen means the PTY read side died inside the bridge; a
+    // heartbeat that stopped means the bridge→daemon leg itself is gone.
+    upstream_silent_seconds: session.upstreamProbeAt != null && (session.outputRingTotalBytes || 0) <= (session.upstreamProbeWatermark || 0)
+      ? Math.floor((nowMs - session.upstreamProbeAt) / 1000)
+      : null,
+    upstream_bytes: session.outputRingTotalBytes || 0,
+    bridge_heartbeat_at: session.bridgeHeartbeatAt || null,
+    bridge_pty_bytes: session.bridgePtyBytes ?? null,
+    bridge_read_side: session.bridgeReadSide || null,
     bootstrap: buildBootstrapBlock(session)
   };
 }
@@ -1702,6 +1753,16 @@ function getInjectFailure(session, options = {}) {
   }
   if (healthStatus === 'DISCONNECTED') {
     return { httpStatus: 503, code: 'DISCONNECTED', error: 'Session owner is disconnected.' };
+  }
+  // #732: bytes would physically reach the PTY, but nothing the session produces can be
+  // read back — every reply, echo and REPORT would be invisible. Reporting that as a plain
+  // success is what kept the live incident undetected for ~9h, so fail it loudly instead.
+  if (healthStatus === 'UPSTREAM_STALLED') {
+    return {
+      httpStatus: 503,
+      code: 'UPSTREAM_STALLED',
+      error: 'Session output pipe is dead: the owner is connected but has returned no output since the last delivery.'
+    };
   }
   return null;
 }
@@ -1825,6 +1886,9 @@ async function writeDataToSession(id, session, data) {
       return buildErrorBody('DISCONNECTED', 'Session owner is disconnected.', { httpStatus: 503 });
     }
     session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
+    // #732: every wrapped delivery doubles as an upstream probe — a live PTY answers with
+    // at least an echo. See armUpstreamProbe (no-op while an earlier probe is unanswered).
+    armUpstreamProbe(session);
     return { success: true };
   }
 
@@ -2895,6 +2959,7 @@ function submitViaPty(session) {
   if (session.type === 'wrapped') {
     if (session.ownerWs && session.ownerWs.readyState === 1) {
       session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+      armUpstreamProbe(session);   // #732: a submit is a delivery too — probe with it
       return true;
     }
     return false;
@@ -4618,6 +4683,23 @@ if (require.main === module) setInterval(() => {
       });
     }
 
+    // #732: surface the socket-alive/pipe-dead transition exactly once per stall, and
+    // re-arm when upstream bytes resume. Without this the break is only visible to
+    // whoever next reads the screen — which in the live incident was ~9h later.
+    if (healthStatus === 'UPSTREAM_STALLED' && !session._upstreamStallEmitted) {
+      session._upstreamStallEmitted = true;
+      console.warn(`[UPSTREAM] Session ${id} output pipe is dead — owner connected, 0 bytes back since ${new Date(session.upstreamProbeAt).toISOString()}`);
+      emitSessionLifecycleEvent('session_upstream_stalled', id, session, {
+        silentSeconds: Math.floor((now - session.upstreamProbeAt) / 1000),
+        bridgeHeartbeatAt: session.bridgeHeartbeatAt || null,
+        bridgeReadSide: session.bridgeReadSide || null
+      });
+    } else if (healthStatus !== 'UPSTREAM_STALLED' && session._upstreamStallEmitted) {
+      session._upstreamStallEmitted = false;
+      console.log(`[UPSTREAM] Session ${id} output pipe recovered`);
+      emitSessionLifecycleEvent('session_upstream_recovered', id, session);
+    }
+
     const shouldCleanupDisconnected = (session.type === 'wrapped' || session.type === 'aterm')
       && !isOpenWebSocket(session.ownerWs)
       && (!session.clients || session.clients.size === 0)
@@ -4726,6 +4808,8 @@ module.exports = {
   failBootstrapQueueOnTimeout,    // #31: actionable bootstrap-timeout queue flush
   shouldApplyOwnerAliveFloor,     // #29: owner-alive optimistic-floor decision (deps DI: isProcessRunning/...)
   scheduleBootstrapPromptPoll,    // #29: arms the floor timer (deps DI: setTimeout/...)
+  isUpstreamStalled,              // #732: pure "socket alive, pipe dead" predicate
+  armUpstreamProbe,               // #732: arms the upstream watermark probe on a delivery
   decideSurfaceGc,                // #17: surface-liveness verdict→action (incl. INV-17 unknown→skip)
   applySurfaceMismatchProbe,      // surface_mismatched debounce + payload helper (deps DI: emit/clock)
   classifyPeerLaneInject,         // #533 Phase 2: pure peer-lane inject policy verdict
