@@ -12,7 +12,7 @@
     {
       "name": "brain",
       "package": "@dmsdc-ai/aigentry-brain",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "role": "Persistent cross-session memory (MCP server)",
       "maturity": "Early",
       "license": "MIT"
