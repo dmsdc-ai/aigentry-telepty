@@ -2,7 +2,7 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## Unreleased
+## 0.7.0 — 2026-07-26
 
 ### Removed — BREAKING (over-engineering cuts, ecosystem cleanup audit 2026-07-26)
 
