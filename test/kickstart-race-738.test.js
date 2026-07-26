@@ -84,10 +84,51 @@ async function getFreePort() {
   return port;
 }
 
-// The supervisor's detection surface — the same path install.js:363 writes and
+// The supervisor's detection surface — the same paths install.js:363 writes and
 // src/supervisor.js reads. Written into the temp HOME, so the real ~/Library/LaunchAgents
-// is never touched.
-function writeSupervisorPlist(homeDir) {
+// and ~/.config/systemd are never touched.
+//
+// #768: detection is per-OS (src/supervisor.js:58-90) but this used to write only the
+// launchd plist, which Linux detection does not look at. On CI's ubuntu runner the
+// `supervisor: true` scenario therefore ran with NO supervisor detectable, the racer took
+// the pre-#738 auto-start path, and its orphan won the port — a permanent red that looked
+// like the #738 fix regressing. Write the surface this platform actually reads.
+function writeSupervisorSurface(homeDir) {
+  return process.platform === 'darwin'
+    ? writeLaunchdPlist(homeDir)
+    : writeSystemdUserUnit(homeDir);
+}
+
+// The kind src/supervisor.js reports for the surface written above (it names the defer banner).
+const SUPERVISOR_KIND = process.platform === 'darwin' ? 'launchd' : 'systemd-user';
+
+// win32 detection is a `schtasks /query` probe against the registry (src/supervisor.js:69-79),
+// not a file under HOME — there is no way to present a supervisor to the child without
+// registering a real scheduled task on the runner, which the isolation contract above forbids.
+const SUPERVISOR_UNFAKEABLE = process.platform === 'win32'
+  ? 'win32: supervisor detection is a schtasks registry probe, unfakeable inside a temp HOME'
+  : false;
+
+// Linux: the user unit, not /etc/systemd/system — the root unit is outside the temp HOME
+// and writing it would violate the isolation contract above.
+function writeSystemdUserUnit(homeDir) {
+  const unitDir = path.join(homeDir, '.config', 'systemd', 'user');
+  fs.mkdirSync(unitDir, { recursive: true });
+  const unitPath = path.join(unitDir, 'telepty.service');
+  fs.writeFileSync(unitPath, `[Unit]
+Description=aigentry-telepty daemon
+
+[Service]
+ExecStart=${path.join(homeDir, 'bin', 'telepty')} daemon
+Restart=always
+
+[Install]
+WantedBy=default.target
+`);
+  return unitPath;
+}
+
+function writeLaunchdPlist(homeDir) {
   const agentsDir = path.join(homeDir, 'Library', 'LaunchAgents');
   fs.mkdirSync(agentsDir, { recursive: true });
   const plistPath = path.join(agentsDir, 'com.aigentry.telepty.plist');
@@ -122,7 +163,7 @@ function createTempHome({ supervisor = true } = {}) {
   fs.mkdirSync(binDir, { recursive: true });
   fs.symlinkSync(path.join(projectRoot, 'cli.js'), path.join(binDir, 'telepty'));
 
-  if (supervisor) writeSupervisorPlist(homeDir);
+  if (supervisor) writeSupervisorSurface(homeDir);
   return { homeDir, binDir };
 }
 
@@ -305,7 +346,7 @@ test('#738 characterization: two daemons racing one port — loser exits 0, sing
 });
 
 // ── 2. The #738 contract (was RED, now GREEN) ─────────────────────────────────────
-test('#738: with a supervisor installed, a CLI racing the kickstart gap defers — no orphan', async () => {
+test('#738: with a supervisor installed, a CLI racing the kickstart gap defers — no orphan', { skip: SUPERVISOR_UNFAKEABLE }, async () => {
   const r = await runKickstartRace({ supervisor: true });
 
   assert.deepEqual(r.racerExit, { code: 0, signal: null }, `racer failed\n${describe(r.racer)}`);
@@ -331,8 +372,9 @@ test('#738: with a supervisor installed, a CLI racing the kickstart gap defers �
   assert.equal(owner.pid, r.relaunch.pid);
   assert.equal(r.relaunchExit, null, 'supervisor instance must still be serving');
 
-  // The CLI must have said so, and must NOT have taken the auto-start path.
-  assert.match(r.racer.logs.stderr, /managed by launchd/i,
+  // The CLI must have said so, and must NOT have taken the auto-start path. The banner names
+  // the detected kind (cli.js:735), which is per-OS — assert the one this platform installs.
+  assert.match(r.racer.logs.stderr, new RegExp(`managed by ${SUPERVISOR_KIND}`, 'i'),
     `expected the defer banner\n${describe(r.racer)}`);
   assert.doesNotMatch(r.racer.logs.stderr, /Auto-starting local telepty daemon/i,
     `CLI spawned a daemon despite the supervisor\n${describe(r.racer)}`);

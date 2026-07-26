@@ -24,13 +24,17 @@ const LISTENING_BANNER = /listening on https?:\/\/[^\s]+:(\d+)/;
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function waitFor(check, { timeoutMs = 10000, intervalMs = 50, description = 'condition' } = {}) {
+async function waitFor(check, { timeoutMs = 10000, intervalMs = 50, description = 'condition', context = null } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try { const r = await check(); if (r) return r; } catch { /* keep polling */ }
     await delay(intervalMs);
   }
-  throw new Error(`Timed out waiting for ${description}`);
+  // A two-process PTY race that times out is unreadable without the state of both
+  // processes — `context` is how the caller attaches it (see #768).
+  let extra = '';
+  if (context) { try { extra = `\n${await context()}`; } catch (e) { extra = `\n[context failed: ${e.message}]`; } }
+  throw new Error(`Timed out waiting for ${description}${extra}`);
 }
 
 function makeHome() {

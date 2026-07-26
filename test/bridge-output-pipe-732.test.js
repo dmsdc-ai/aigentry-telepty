@@ -59,12 +59,42 @@ async function bothLegsUp(t, { faultMode }) {
     env: { ...FAST.bridge, TELEPTY_FAULT_MODE: faultMode }
   });
 
-  await H.waitFor(async () => (await A.session(sid)).id === sid, { description: 'session register' });
-  await H.waitFor(async () => (await A.screen(sid)).screen.length > 0, { description: 'first PTY output in ring' });
+  // Two-process race, so a timeout here is unreadable without both sides' state (#768).
+  const diag = async () => {
+    const s = await A.session(sid).catch((e) => ({ error: e.message }));
+    return [
+      `[diag] transport=${JSON.stringify(s.transport)}`,
+      `[diag] bridge.alive=${bridge.alive()} bridge.out=${JSON.stringify(bridge.out)}`,
+      `[diag] bridge.err=${JSON.stringify(bridge.err)}`,
+      `[diag] daemon.log=${JSON.stringify(daemon.log().slice(-2000))}`
+    ].join('\n');
+  };
+
+  await H.waitFor(async () => (await A.session(sid)).id === sid,
+    { description: 'session register', context: diag });
+
+  // #768: this used to wait for the shell's BOOT prompt to show up in the ring, and that is
+  // not a signal the bridge can deliver. relayPtyOutput (cli.js:2025) forwards PTY bytes only
+  // while the owner WS is open and keeps NO pre-connect buffer, so everything the PTY emitted
+  // before the WS handshake completed is dropped — permanently, since an idle shell never
+  // reprints its prompt. On a Linux CI runner bash wins that race essentially always
+  // (evidence: bridge_pty_bytes=23 with upstream_bytes=0 and bridge_read_side=ok), which is
+  // why this file was red on every ubuntu run while passing on this developer's Mac. No
+  // timeout budget can fix a byte that was thrown away, so do not "fix" this by waiting
+  // longer. Product-side buffering of pre-connect output is a separate change.
+  //
+  // What the precondition actually needs is proof that BOTH legs carry traffic now, and the
+  // pre-fault inject below already proves exactly that, end to end and with bytes minted
+  // after the owner is connected: inject → owner-WS → child.write → PTY (bridge.out), then
+  // PTY → owner-WS 'output' → daemon ring (A.screen). Strictly stronger than the boot-prompt
+  // check it replaces — nothing that was proven here has been dropped.
+  await H.waitFor(async () => (await A.session(sid)).healthStatus === 'CONNECTED',
+    { description: 'owner WS connected (the cli.js:2025 relay gate is open)', context: diag });
   await A.inject(sid, 'echo C732_PRE\n');
-  await H.waitFor(() => bridge.out.includes('C732_PRE'), { description: 'pre-fault inject reached the PTY' });
+  await H.waitFor(() => bridge.out.includes('C732_PRE'),
+    { description: 'pre-fault inject reached the PTY', context: diag });
   await H.waitFor(async () => (await A.screen(sid)).screen.includes('C732_PRE'),
-    { description: 'pre-fault PTY output reached the daemon ring' });
+    { description: 'pre-fault PTY output reached the daemon ring', context: diag });
 
   return { home, sid, daemon, bridge, A };
 }
