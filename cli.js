@@ -1858,6 +1858,11 @@ async function main() {
     let currentOwnerToken = null;
     let lastInjectTextTime = 0;
     const MAX_RECONNECT_DELAY = 30000;
+    // #732: bridge→daemon liveness interval. Must stay well under the daemon's
+    // TELEPTY_UPSTREAM_STALL_SECONDS (default 30s) so a stall verdict is always backed by at
+    // least one heartbeat's worth of evidence about which leg actually broke.
+    const BRIDGE_HEARTBEAT_MS = Math.max(1000, Number(process.env.TELEPTY_BRIDGE_HEARTBEAT_MS || 10000));
+    let heartbeatTimer = null;
 
     async function connectDaemonWs() {
       // Re-register session BEFORE WebSocket connect (daemon rejects WS if session unknown)
@@ -2034,6 +2039,7 @@ async function main() {
         : `${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`;
       fetchWithAuth(deleteUrl, { method: 'DELETE' }).catch(() => {});
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);   // #732
       try {
         daemonWs.close();
       } catch {}
@@ -2061,7 +2067,14 @@ async function main() {
 
     // Relay PTY output to current terminal + send to daemon for attach clients
     let readyNotified = false;
-    child.onData((data) => {
+    // #732: monotonic count of bytes this bridge has actually READ from the PTY. Reported on
+    // the heartbeat below; it is what lets the daemon tell "the CLI is quiet" (counter also
+    // quiet) from "the PTY read side died inside the bridge" (counter frozen while the
+    // heartbeat keeps arriving). Single definition of the relay so the auto-restart path
+    // below cannot drift from it.
+    let ptyBytesRead = 0;
+    function relayPtyOutput(data) {
+      ptyBytesRead += data.length;
       const rewritten = rewriteTitleSequences(data);
       process.stdout.write(rewritten);
       if (wsReady && daemonWs.readyState === 1) {
@@ -2078,7 +2091,53 @@ async function main() {
           daemonWs.send(JSON.stringify({ type: 'ready' }));
         }
       }
-    });
+    }
+    child.onData(relayPtyOutput);
+
+    // #732: PTY read-side self-defense. node-pty gives us two independent halves over one
+    // master fd — the read side (`_socket`, a tty.ReadStream) feeding onData, and a separate
+    // write side (`_writeStream`) carrying child.write. A read-side error therefore kills
+    // upstream while injects keep working, and node-pty swallows the most likely one:
+    // unixTerminal.js:99-105 returns on EAGAIN WITHOUT _close(), so no 'close' and no 'exit'
+    // ever reaches us and onData is silently dead forever. Poll the read side directly:
+    // resume it if it merely stopped flowing (recoverable), and report the state on the
+    // heartbeat so a destroyed one is visible instead of silent.
+    let ptyReadSide = 'ok';
+    function checkPtyReadSide() {
+      const sock = child && child._socket;
+      if (!sock) return;
+      if (sock.destroyed) {
+        // The master fd is gone; there is nothing left to re-arm. Say so — loudly enough to
+        // be diagnosable, quietly enough not to corrupt TUI rendering (stderr, once).
+        if (ptyReadSide !== 'destroyed') {
+          ptyReadSide = 'destroyed';
+          process.stderr.write(`\n[telepty] PTY read stream is destroyed for session '${sessionId}' — output can no longer be relayed; respawn this session.\n`);
+        }
+        return;
+      }
+      if (typeof sock.isPaused === 'function' && sock.isPaused()) {
+        ptyReadSide = 'resumed';
+        sock.resume();
+        return;
+      }
+      ptyReadSide = 'ok';
+    }
+
+    // #732: bridge→daemon liveness. The daemon has pinged US every 30s since forever
+    // (src/transport/websocket.js), which only ever proved the SOCKET was alive; nothing
+    // proved the output pipe was. This frame rides the same `wsReady && readyState === 1`
+    // gate as an 'output' frame, so its arrival is positive evidence that leg still works.
+    heartbeatTimer = setInterval(() => {
+      checkPtyReadSide();
+      if (wsReady && daemonWs && daemonWs.readyState === 1) {
+        daemonWs.send(JSON.stringify({
+          type: 'heartbeat',
+          pty_bytes: ptyBytesRead,
+          read_side: ptyReadSide
+        }));
+      }
+    }, BRIDGE_HEARTBEAT_MS);
+    heartbeatTimer.unref();
 
     // Handle child exit with death tracking + auto-restart
     function attachChildExitHandler() {
@@ -2104,21 +2163,7 @@ async function main() {
               readyNotified = false;
               outputTail = '';
               // Re-attach output relay, prompt detection, and exit handler
-              child.onData((data) => {
-                const rewritten = rewriteTitleSequences(data);
-                process.stdout.write(rewritten);
-                if (wsReady && daemonWs.readyState === 1) {
-                  daemonWs.send(JSON.stringify({ type: 'output', data }));
-                }
-                if (observePromptReady(data)) {
-                  promptReady = true;
-                  firstReadyObserved = true;
-                  flushBridgeMailbox();
-                  if (wsReady && daemonWs.readyState === 1) {
-                    daemonWs.send(JSON.stringify({ type: 'ready' }));
-                  }
-                }
-              });
+              child.onData(relayPtyOutput);
               attachChildExitHandler();
               emitRestartEvent(crashCount);
               console.log(`\x1b[32m✅ Session '${sessionId}' restarted (attempt ${crashCount}).\x1b[0m\n`);
