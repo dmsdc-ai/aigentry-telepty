@@ -1146,7 +1146,13 @@ function bootstrapQueuedResponse(op, extra = {}) {
 
 async function executeBootstrapInject(sessionId, session, op) {
   const prompt = typeof op.prompt === 'string' ? op.prompt : '';
-  const textResult = await writeDataToSession(sessionId, session, prompt);
+  // #760: this is the ONLY inject path that wrote the body un-enveloped — the mailbox path
+  // has wrapped it since #716/#730, and #730 measured that the un-enveloped MULTI-LINE shape
+  // is exactly what swallows the following CR (still 1/7 at a 127ms gap; the envelope was
+  // 0/9). Harmless while this queue only carried boot-time injects; load-bearing now that a
+  // modal park routes worker REPORTs — multi-line by definition — through it. Fixed here
+  // rather than in the park branch so the boot caller stops rolling the same dice.
+  const textResult = await writeDataToSession(sessionId, session, maybeBracketedPaste(prompt, session));
   if (!textResult.success) return textResult;
 
   if (!op.noEnter) {
@@ -1403,6 +1409,19 @@ async function drainBootstrapQueue(sessionId, session) {
   session.bootstrapDraining = true;
   session.bootstrapDrainPromise = (async () => {
     while (hasBootstrapBacklog(session)) {
+      // #760: the drain writes straight to the surface (executeBootstrapInject /
+      // executeBootstrapSubmit), so it has to ask the modal gate itself — markBootstrapReady
+      // reaches it without ever consulting one. Checked BEFORE the shift so the op stays
+      // parked rather than being consumed into a modal, and re-armed so the park poll picks
+      // it up again. Also covers a modal that appears part-way through a drain.
+      //
+      // Asked through modalDeliveryDecision, not the raw predicate, so that
+      // TELEPTY_MODAL_REMEDY=off stays a COMPLETE rollback: with the gate off the drain
+      // writes into the modal exactly as it did before this change.
+      if (modalDeliveryDecision(session).action !== 'deliver') {
+        scheduleModalParkDrain(sessionId, session);
+        break;
+      }
       const op = session.bootstrapQueue.shift();
       try {
         if (op.cancelled) {
@@ -2049,29 +2068,56 @@ function isSurfaceBlockedByModal(session) {
 // smaller, C-only behavior. `off` is the rollback lever — same shape as
 // TELEPTY_SUBMIT_BUSY_DISPATCH=off. Nothing is ever written into a modal in any mode but
 // `off`.
+//
+// #760 adds `park` and makes the DEFAULT per-CLI, because the two CLIs' modals have
+// different lifetimes and only the lifetime matters here:
+//   codex  — the update/resume modal is transient and machine-owned. 30s of hold clears it
+//            or nothing will. Unchanged.
+//   claude — an AskUserQuestion list or an ExitPlanMode approval waits on a HUMAN and
+//            routinely stays up for minutes (#743: 3 REPORTs lost across one plan window).
+//            `hold` cannot work there: `telepty inject` is a plain undici fetch (cli.js
+//            fetchWithAuth) with a 300s headers timeout, so a long hold hands the caller a
+//            network error while the daemon delivers anyway — a lost ack AND a duplicate.
+//            `park` acks immediately and lets the queue do the waiting.
+// The env var still overrides both, in either direction.
 const MODAL_REMEDY_DEFAULT = 'hold';
-const MODAL_REMEDIES = new Set(['hold', 'reject', 'off']);
-function modalRemedy(env = process.env) {
+const MODAL_REMEDIES = new Set(['hold', 'park', 'reject', 'off']);
+const MODAL_REMEDY_BY_CLI = { claude: 'park' };
+function modalRemedy(env = process.env, session = null) {
   const raw = String(env.TELEPTY_MODAL_REMEDY ?? '').trim().toLowerCase();
-  return MODAL_REMEDIES.has(raw) ? raw : MODAL_REMEDY_DEFAULT;
+  if (MODAL_REMEDIES.has(raw)) return raw;
+  const cli = session ? readyRegistry.commandKey(session.command) : null;
+  return MODAL_REMEDY_BY_CLI[cli] || MODAL_REMEDY_DEFAULT;
 }
+
+// Per-CLI remediation copy. The gate is generic; what the operator has to DO to clear the
+// surface is not, so the hint names the actual modal and the actual key.
+const MODAL_HINT_BY_CLI = {
+  codex: 'Target codex is showing a blocking modal (e.g. "Update available … Press enter to '
+    + 'continue"); an Enter there would activate its default item, not submit your message. '
+    + 'Dismiss it on the surface, or clear it by setting dismissed_version to latest_version '
+    + 'in $CODEX_HOME/version.json and respawning.',
+  claude: 'Target claude is showing a blocking modal (AskUserQuestion option list, '
+    + 'ExitPlanMode plan approval, tool-permission or trust dialog); an Enter there would '
+    + 'select the highlighted option — on a plan approval that is "Yes, auto-accept edits" — '
+    + 'not submit your message. Answer or Esc the prompt on the surface; parked injects are '
+    + 'delivered in order as soon as it clears.',
+};
 
 // The single decision every write path consults. `options` is accepted and deliberately NOT
 // branched on: force, gated and plain all lose the message identically (measured — all three
 // wrote body+CR into the modal), so they must all get the same answer. It stays in the
 // signature as the attribution seam for logging and for any future per-path divergence.
 function modalDeliveryDecision(session, options = {}, env = process.env) {
-  const remedy = modalRemedy(env);
+  const remedy = modalRemedy(env, session);
   if (remedy === 'off') return { action: 'deliver', reason: 'modal_gate_off' };
   if (!isSurfaceBlockedByModal(session)) return { action: 'deliver', reason: 'surface_clear' };
+  const cli = readyRegistry.commandKey(session && session.command) || 'codex';
   return {
     action: remedy,
-    reason: 'codex_modal_ui',
+    reason: `${cli}_modal_ui`,
     path: options.force === true ? 'force' : 'gated',
-    hint: 'Target codex is showing a blocking modal (e.g. "Update available … Press enter to '
-      + 'continue"); an Enter there would activate its default item, not submit your message. '
-      + 'Dismiss it on the surface, or clear it by setting dismissed_version to latest_version '
-      + 'in $CODEX_HOME/version.json and respawning.',
+    hint: MODAL_HINT_BY_CLI[cli] || MODAL_HINT_BY_CLI.codex,
   };
 }
 
@@ -2123,11 +2169,148 @@ async function resolveModalGate(id, session, options = {}, holdOpts = {}) {
 
 function modalRejectionResponse(decision) {
   return {
-    error: `codex_modal_ui — delivery refused: ${decision.hint}`,
-    reason: 'codex_modal_ui',
+    error: `${decision.reason} — delivery refused: ${decision.hint}`,
+    reason: decision.reason,
     code: 'SURFACE_MODAL',
     hint: decision.hint,
   };
+}
+
+// ── #760: the `park` remedy ────────────────────────────────────────────────────────────
+//
+// Contract: not lost, delivered after the modal clears, order preserved. `hold` gives the
+// first two only for a modal short enough to fit inside one HTTP request, and gives the
+// third to nobody — two concurrent holds poll independently and race. A queue gives all
+// three, and this daemon already has exactly the right one: session.bootstrapQueue is a
+// per-session FIFO of "ops that may not touch the surface yet", with a drain that replays
+// them in order (drainBootstrapQueue) and bus events for depth/failure. Boot uses it while
+// the CLI is still starting; a modal is the same predicate with a different cause, so the
+// park reuses the queue outright rather than growing a second one beside it.
+//
+// The re-entry point differs: a parked op is drained by executeBootstrapInject /
+// executeBootstrapSubmit, exactly as a boot-parked op is — so it does NOT re-enter the
+// mailbox path, and does not carry the #47 provenance banner a non-parked inject gets.
+// (Pre-existing property of this queue, called out rather than widened here.) It DOES now
+// carry the #716/#730 bracketed-paste envelope: that one was not cosmetic, and the fix went
+// into executeBootstrapInject so the boot caller stops rolling the same dice.
+//
+// TTL rather than "forever": a modal nobody ever answers must not accumulate injects for the
+// life of the session. 600s matches the bridge mailbox's park budget
+// (TELEPTY_BRIDGE_INJECT_TTL_SECS, #720) so the two places that hold a message have one
+// number. Only ever paid when a modal is genuinely up.
+const MODAL_PARK_TTL_DEFAULT_MS = 600000;
+const MODAL_PARK_POLL_MS = 500;
+function modalParkTtlMs(env = process.env) {
+  // An UNSET or blank var must fall back to the default, never to 0 — `Number('')` is 0, so
+  // a bare `TELEPTY_MODAL_PARK_TTL_MS=` in an env file would silently disable the park.
+  const raw = String(env.TELEPTY_MODAL_PARK_TTL_MS ?? '').trim();
+  if (!raw) return MODAL_PARK_TTL_DEFAULT_MS;
+  const configured = Number(raw);
+  return Number.isFinite(configured) && configured > 0 ? configured : MODAL_PARK_TTL_DEFAULT_MS;
+}
+
+// Mirrors failBootstrapQueueOnTimeout: a park that outlives its TTL must surface an
+// ACTIONABLE event and flush, never accumulate silently. Silence is the #760 bug itself.
+function flushModalParkQueue(sessionId, session, waitedMs) {
+  const queued = Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0;
+  if (queued === 0) return 0;
+  const drained = session.bootstrapQueue.splice(0, queued);
+  for (const op of drained) {
+    if (op.type === 'submit') {
+      resolveBootstrapSubmit(op, {
+        status: 504,
+        body: {
+          error: 'Submit parked behind a surface modal that never cleared',
+          reason: 'surface_modal_park_timeout',
+          strategy: 'none', attempts: 0, gated: true, bootstrap_queued: true, bootstrap_op_id: op.op_id,
+        },
+      });
+    }
+  }
+  emitBootstrapEvent('modal_park_timeout', sessionId, session, {
+    actionable: true,
+    queued_dropped: queued,
+    waited_ms: waitedMs,
+    hint: `Session '${sessionId}' has been showing a blocking modal for ${Math.round(waitedMs / 1000)}s — `
+      + `${queued} parked inject(s) were flushed. Answer or dismiss the prompt on the surface, then re-inject.`,
+  });
+  console.log(`[MODAL] ${sessionId} park TTL expired after ${waitedMs}ms — flushed ${queued} op(s)`);
+  return queued;
+}
+
+// Awaitable form: poll until the surface clears (then drain in order) or the TTL expires
+// (then flush). Same fail-open predicate as the hold, so a surface that was never modal
+// returns immediately having paid nothing.
+async function awaitModalParkDrain(sessionId, session, opts = {}) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : modalParkTtlMs();
+  const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) ? opts.pollIntervalMs : MODAL_PARK_POLL_MS;
+  const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
+  const sleepFn = typeof opts.sleep === 'function' ? opts.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
+  cancelModalParkPoll(session);   // this call supersedes any background poll
+  const start = now();
+  while (isSurfaceBlockedByModal(session)) {
+    if (now() - start >= timeoutMs) {
+      const waited = now() - start;
+      return { cleared: false, waited_ms: waited, flushed: flushModalParkQueue(sessionId, session, waited) };
+    }
+    await sleepFn(pollIntervalMs);
+  }
+  const waited = now() - start;
+  await drainBootstrapQueue(sessionId, session);
+  return { cleared: true, waited_ms: waited, flushed: 0 };
+}
+
+function cancelModalParkPoll(session) {
+  if (session && session.modalParkPoll) {
+    clearTimeout(session.modalParkPoll);
+    session.modalParkPoll = null;
+  }
+}
+
+// Fire-and-forget form, used by the request paths: single-flight per session, and unref'd so
+// a parked session can never hold the process open. Measured on real claude 2.1.220: a
+// surface sitting on a modal emits ZERO bytes for as long as it is up (+0B over 45s on both
+// the AskUserQuestion and ExitPlanMode captures), so there is no output event to re-arm on —
+// polling is the only way to notice the clear.
+function scheduleModalParkDrain(sessionId, session) {
+  if (!session || session.modalParkPoll) return;
+  const deadline = Date.now() + modalParkTtlMs();
+  const tick = () => {
+    session.modalParkPoll = null;
+    if (!isSurfaceBlockedByModal(session)) {
+      const depth = Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0;
+      console.log(`[MODAL] ${sessionId} surface cleared — draining ${depth} parked op(s)`);
+      drainBootstrapQueue(sessionId, session);
+      return;
+    }
+    if (Date.now() >= deadline) {
+      flushModalParkQueue(sessionId, session, modalParkTtlMs());
+      return;
+    }
+    session.modalParkPoll = setTimeout(tick, MODAL_PARK_POLL_MS);
+    if (session.modalParkPoll.unref) session.modalParkPoll.unref();
+  };
+  session.modalParkPoll = setTimeout(tick, MODAL_PARK_POLL_MS);
+  if (session.modalParkPoll.unref) session.modalParkPoll.unref();
+}
+
+// Push one op onto the park and start (or keep) the poll. Returns the queued op so each
+// caller can shape its own ack — inject and submit answer on different response schemas.
+function parkOperationOnModal(sessionId, session, operation, decision) {
+  const op = enqueueBootstrapOperation(sessionId, session, operation);
+  scheduleModalParkDrain(sessionId, session);
+  console.log(`[MODAL] ${sessionId} ${operation.type} parked — ${decision.reason} `
+    + `(depth ${session.bootstrapQueue.length})`);
+  return op;
+}
+
+function modalParkResponse(op, decision, extra = {}) {
+  return bootstrapQueuedResponse(op, {
+    parked: 'surface_modal',
+    reason: decision.reason,
+    hint: decision.hint,
+    ...extra,
+  });
 }
 
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
@@ -2164,9 +2347,39 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   // only the bootstrapReady boolean, which a blind timer flips without ever looking at the
   // screen (shouldApplyOwnerAliveFloor).
   const modalDecision = await resolveModalGate(id, session, options);
-  if (modalDecision) {
-    console.log(`[INJECT] ${id} refused — ${modalDecision.reason}`);
-    return { success: false, httpStatus: 409, ...modalRejectionResponse(modalDecision) };
+
+  // #760: ORDER. Once anything is parked for this session, everything behind it parks too —
+  // including after the modal clears, until the drain has actually caught up. Without this
+  // the second dispatch sees a clear surface, goes straight down the mailbox path, and
+  // overtakes the first one that is still sitting in the queue mid-drain. Same guard the
+  // gated /submit path already uses for the bootstrap queue.
+  const parkBehindBacklog = !modalDecision
+    && modalRemedy(process.env, session) === 'park'
+    && (hasBootstrapBacklog(session) || session.bootstrapDraining === true);
+  const injectParkDecision = modalDecision || (parkBehindBacklog
+    ? { action: 'park', reason: 'modal_park_backlog', hint: 'Queued behind an inject parked by a surface modal.' }
+    : null);
+
+  if (injectParkDecision) {
+    // `park` acks the queue position instead of refusing. A refusal is what makes the caller
+    // re-inject, and re-injecting into a modal that is still up is how #743 turned one
+    // blocked REPORT into three lost ones.
+    if (injectParkDecision.action === 'park') {
+      const op = parkOperationOnModal(id, session, {
+        type: 'inject',
+        prompt,
+        noEnter: !!options.noEnter,
+        options: { source: options.source || 'inject', from: options.from || 'daemon' },
+      }, injectParkDecision);
+      session.lastActivityAt = new Date(now).toISOString();
+      return modalParkResponse(op, injectParkDecision, {
+        msg_id: op.op_id,
+        pending: session.bootstrapQueue.length,
+        submit: options.noEnter ? 'skipped' : 'queued',
+      });
+    }
+    console.log(`[INJECT] ${id} refused — ${injectParkDecision.reason}`);
+    return { success: false, httpStatus: 409, ...modalRejectionResponse(injectParkDecision) };
   }
 
   // Mailbox payload is TEXT ONLY — CR is sent separately after a delay.
@@ -2398,6 +2611,8 @@ async function teardownSessionById(id, options = {}) {
   // verdict — this call is a NO-OP on the managed path. It actuates only for a standalone
   // telepty that opted in via AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
   try { terminalBackend.closeSurface(session); } catch {}
+
+  cancelModalParkPoll(session);   // #760: a destroyed session must not keep polling its surface
 
   delete sessions[id];
   sessionStateManager.unregister(id);
@@ -3245,6 +3460,20 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
       type: 'submit',
       body: { ...(req.body || {}) }
     });
+    // #760: this branch is also how the CR half of `telepty inject --submit` reaches the
+    // queue after its body was modal-parked (hasBootstrapBacklog above). Awaiting it would
+    // 504 at gateTimeoutMs and CANCEL the op, dropping the CR while the body sits parked —
+    // half a message, which is worse than none. Ack the queue position; the park drain runs
+    // both ops in order once the surface clears.
+    if (isSurfaceBlockedByModal(session)) {
+      scheduleModalParkDrain(id, session);
+      console.log(`[SUBMIT] ${id} parked behind a surface modal (depth ${session.bootstrapQueue.length})`);
+      return res.json(bootstrapQueuedResponse(op, {
+        parked: 'surface_modal',
+        reason: modalDeliveryDecision(session, { force: false }).reason,
+        pending: session.bootstrapQueue.length,
+      }));
+    }
     if (isBootstrapReady(session)) {
       drainBootstrapQueue(id, session);
     }
@@ -3282,6 +3511,26 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
     // A bare CR into the update modal activates "1. Update now" and codex exits.
     const forceModalDecision = await resolveModalGate(id, session, { force: true });
     if (forceModalDecision) {
+      // #760: `--submit-force` IS the worker REPORT path, and its body was parked by the
+      // /inject request a moment earlier. Park the CR behind it so the pair replays in
+      // order; refusing here would strand the body on the queue with no Enter behind it.
+      if (forceModalDecision.action === 'park') {
+        const op = parkOperationOnModal(id, session, {
+          type: 'submit',
+          body: { ...(req.body || {}) },
+        }, forceModalDecision);
+        emitSubmitBus({
+          strategy: 'none', attempts: 0, gated: false, forced: true,
+          submit_confirmed: false, reason: forceModalDecision.reason, parked: 'surface_modal',
+        });
+        return res.json(bootstrapQueuedResponse(op, {
+          parked: 'surface_modal',
+          reason: forceModalDecision.reason,
+          hint: forceModalDecision.hint,
+          pending: session.bootstrapQueue.length,
+          forced: true,
+        }));
+      }
       console.log(`[SUBMIT] force refused for ${id} — ${forceModalDecision.reason}`);
       if (injectedBody) {
         markPendingReportSubmitUnconfirmed(id, { reason: 'codex_modal_ui', attempts: 0, retryable: true });
@@ -3352,6 +3601,24 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   // wrapped session — measured: the gated path fired its CR into the modal at +3ms.
   const submitModalDecision = await resolveModalGate(id, session, { force: false });
   if (submitModalDecision) {
+    // #760: same park as the force path. Reached when the modal came up between the /inject
+    // and the /submit, so the queue was still empty at the bootstrap branch above.
+    if (submitModalDecision.action === 'park') {
+      const op = parkOperationOnModal(id, session, {
+        type: 'submit',
+        body: { ...(req.body || {}) },
+      }, submitModalDecision);
+      emitSubmitBus({
+        strategy: 'none', attempts: 0, gated: true, forced: false,
+        submit_confirmed: false, reason: submitModalDecision.reason, parked: 'surface_modal',
+      });
+      return res.json(bootstrapQueuedResponse(op, {
+        parked: 'surface_modal',
+        reason: submitModalDecision.reason,
+        hint: submitModalDecision.hint,
+        pending: session.bootstrapQueue.length,
+      }));
+    }
     console.log(`[SUBMIT] refused for ${id} — ${submitModalDecision.reason}`);
     if (injectedBody) {
       markPendingReportSubmitUnconfirmed(id, { reason: 'codex_modal_ui', attempts: 0, retryable: true });
@@ -4997,11 +5264,15 @@ module.exports = {
   forceSubmitCrGapMs,             // #730: scoped force-path text→CR floor (un-enveloped multi-line only)
   isSurfaceBlockedByModal,        // #737: fail-open modal predicate over the PTY output ring
   modalDeliveryDecision,          // #737: the one decision every write path consults
-  modalRemedy,                    // #737: TELEPTY_MODAL_REMEDY selector (hold|reject|off)
+  modalRemedy,                    // #737/#760: TELEPTY_MODAL_REMEDY selector, per-CLI default
   modalHoldMs,                    // #737: TELEPTY_MODAL_HOLD_MS bound on the hold remedy
   awaitSurfaceModalClear,         // #737: A — park until the surface leaves the modal
   resolveModalGate,               // #737: the awaited gate every write path shares
   readOutputRingTail,             // #737: bounded newest-first ring read (predicate input)
+  modalParkTtlMs,                 // #760: TELEPTY_MODAL_PARK_TTL_MS bound on the park remedy
+  awaitModalParkDrain,            // #760: poll → drain in order, or flush on TTL
+  drainBootstrapQueue,            // #760: modal-guarded FIFO drain (also the boot drain)
+  deliverInjectionToSession,      // #760: park-vs-deliver decision at the text path
   resolveBindHost,                // telepty#50 + #672: pure bind-address policy (loopback default, env opt-in, tailnet auto)
   formatBindHint,                 // telepty#50 + #672: startup bind/exposure banner line
   isTailnetAuto,                  // #672: pure predicate — is the zero-config tailnet path active

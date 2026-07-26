@@ -563,7 +563,10 @@ test('known wrapped AI CLI queues inject until bootstrap ready', async () => {
   });
 
   const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
-  assert.equal(injectMessages[0], 'bootstrap-task');
+  // #760: a drained bootstrap body is bracketed-paste enveloped, like every other inject
+  // path since #716/#730 — the un-enveloped multi-line shape is what swallows the CR that
+  // follows it. claude is paste-capable by identity, so the envelope applies here.
+  assert.equal(injectMessages[0], '\x1b[200~bootstrap-task\x1b[201~');
   assert.equal(injectMessages[1], '\r');
 
   const detail = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
@@ -600,7 +603,11 @@ test('known wrapped AI CLI drains multiple bootstrap injects in FIFO order', asy
   });
 
   const injectMessages = ownerMessages.filter((message) => message.type === 'inject').map((message) => message.data);
-  assert.deepEqual(injectMessages.slice(0, 3), ['first', 'second', 'third']);
+  // #760: codex is paste-capable by identity too — order is what this test pins, the
+  // envelope is asserted alongside it rather than stripped away.
+  assert.deepEqual(injectMessages.slice(0, 3), [
+    '\x1b[200~first\x1b[201~', '\x1b[200~second\x1b[201~', '\x1b[200~third\x1b[201~',
+  ]);
 
   ownerWs.close();
 });
