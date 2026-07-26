@@ -1809,6 +1809,47 @@ async function main() {
     const BRIDGE_HEARTBEAT_MS = Math.max(1000, Number(process.env.TELEPTY_BRIDGE_HEARTBEAT_MS || 10000));
     let heartbeatTimer = null;
 
+    // #768: PTY bytes minted while the owner WS is down have nowhere to go, and dropping them
+    // is not recoverable — an idle CLI never reprints, so the daemon's ring (and therefore
+    // every `read-screen` and every predicate that reads the ring) stays EMPTY until the CLI's
+    // next write. At bootstrap that is the common case rather than an edge one: bash prints its
+    // prompt in ~200ms while the owner-WS handshake takes longer, so on Linux a wrapped CLI's
+    // whole startup banner was lost almost always (CI evidence: bridge_pty_bytes=23 with
+    // upstream_bytes=0 and bridge_read_side=ok). Hold those bytes and flush them, in order,
+    // once the owner WS opens. Declared here, with the rest of the WS lifecycle state, so it
+    // is initialized before the first connectDaemonWs() call below.
+    //
+    // Bounded, because a WS that never opens must cost a fixed amount of memory instead of
+    // growing with the session's lifetime. 256K chars is ~25x a full 200x50 screen repaint
+    // with colour, which comfortably covers a startup banner — the thing that was being lost
+    // — without pretending to be a scrollback buffer. On overflow drop the OLDEST: the newest
+    // output is what still describes the screen. The unit is string length, the same measure
+    // ptyBytesRead reports, so it equals bytes for ASCII and over-allocates by up to 3x for
+    // CJK-heavy output — still a fixed ceiling, which is the property that matters here.
+    // ponytail: flat array + running counter; a ring buffer buys nothing at this size.
+    const PRECONNECT_MAX_CHARS = 256 * 1024;
+    let preConnectHeld = [];
+    let preConnectChars = 0;
+    function holdPreConnectOutput(data) {
+      preConnectHeld.push(data);
+      preConnectChars += data.length;
+      while (preConnectChars > PRECONNECT_MAX_CHARS && preConnectHeld.length > 1) {
+        preConnectChars -= preConnectHeld.shift().length;
+      }
+    }
+    // Flushed as ONE 'output' frame: the daemon appends it to the ring and feeds the session
+    // state machine exactly as it would the same bytes arriving in pieces.
+    function flushPreConnectOutput() {
+      if (!preConnectHeld.length) return;
+      try {
+        daemonWs.send(JSON.stringify({ type: 'output', data: preConnectHeld.join('') }));
+        preConnectHeld = [];
+        preConnectChars = 0;
+      } catch {
+        // Socket died mid-flush — keep the bytes for the next open rather than lose them.
+      }
+    }
+
     async function connectDaemonWs() {
       // Re-register session BEFORE WebSocket connect (daemon rejects WS if session unknown)
       if (reconnectAttempts > 0) {
@@ -1839,6 +1880,10 @@ async function main() {
 
       daemonWs.on('open', () => {
         wsReady = true;
+        // #768: before anything else this owner says, hand over what the PTY printed while the
+        // socket was still coming up — so the ring's first content is the CLI's actual screen
+        // and not whatever it happened to write next.
+        flushPreConnectOutput();
         // No resize trick on reconnect — it causes visible flickering across all
         // terminals when the daemon restarts and multiple sessions reconnect at once.
         reconnectAttempts = 0;
@@ -2024,6 +2069,8 @@ async function main() {
       process.stdout.write(rewritten);
       if (wsReady && daemonWs.readyState === 1) {
         daemonWs.send(JSON.stringify({ type: 'output', data }));
+      } else {
+        holdPreConnectOutput(data);
       }
       // Detect prompt in output to enable inject delivery
       if (observePromptReady(data)) {

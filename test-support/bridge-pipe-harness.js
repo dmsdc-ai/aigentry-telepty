@@ -24,13 +24,17 @@ const LISTENING_BANNER = /listening on https?:\/\/[^\s]+:(\d+)/;
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function waitFor(check, { timeoutMs = 10000, intervalMs = 50, description = 'condition' } = {}) {
+async function waitFor(check, { timeoutMs = 10000, intervalMs = 50, description = 'condition', context = null } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try { const r = await check(); if (r) return r; } catch { /* keep polling */ }
     await delay(intervalMs);
   }
-  throw new Error(`Timed out waiting for ${description}`);
+  // A two-process PTY race that times out is unreadable without the state of both
+  // processes — `context` is how the caller attaches it (see #768).
+  let extra = '';
+  if (context) { try { extra = `\n${await context()}`; } catch (e) { extra = `\n[context failed: ${e.message}]`; } }
+  throw new Error(`Timed out waiting for ${description}${extra}`);
 }
 
 function makeHome() {
@@ -131,15 +135,45 @@ function api(port) {
 }
 
 // Controllable TCP proxy for socket-level levers (blackhole a direction without
-// FIN/RST, or drop connections while staying bound).
-function startProxy({ targetPort, targetHost = '127.0.0.1' }) {
+// FIN/RST, drop connections while staying bound, or delay one direction).
+//
+// holdWsUpgradeMs (#768): postpone ONLY the WebSocket upgrade by that long — plain HTTP is
+// forwarded untouched. Nothing is dropped; the upgrade bytes are queued in order and then
+// delivered, so this delays the owner-WS handshake without breaking it, and the bridge's PTY
+// has provably booted and printed before its owner WS can open. That race is what decides
+// whether pre-connect PTY output survives, and it is otherwise timing-dependent (Linux loses
+// it almost always, macOS usually wins it).
+//
+// It has to be upgrade-only: holding the whole bridge->daemon direction also starves the
+// CLI's own HTTP health/version probes, and the CLI then concludes the daemon is broken and
+// goes off to restart it — which tests daemon management, not this pipe.
+function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0 }) {
   const pairs = new Set();
   const state = { up: true, down: true }; // up = bridge->daemon, down = daemon->bridge
   const server = net.createServer((client) => {
     const upstream = net.connect(targetPort, targetHost);
     const pair = { client, upstream };
     pairs.add(pair);
-    client.on('data', (c) => { if (state.up) upstream.write(c); });
+    // Per-connection: `held` is an array while this connection's bytes are being queued,
+    // and null once it is a straight pass-through (either plain HTTP or the hold expired).
+    let held = null;
+    let sniffed = holdWsUpgradeMs <= 0;
+    client.on('data', (c) => {
+      if (!state.up) return;
+      if (!sniffed) {
+        // Request line + headers arrive in one loopback segment, so the first chunk decides.
+        sniffed = true;
+        if (/upgrade:\s*websocket/i.test(c.toString('latin1'))) {
+          held = [];
+          setTimeout(() => {
+            const queued = held;
+            held = null;
+            for (const b of queued) { if (state.up) upstream.write(b); }
+          }, holdWsUpgradeMs).unref();
+        }
+      }
+      if (held) held.push(c); else upstream.write(c);
+    });
     upstream.on('data', (c) => { if (state.down) client.write(c); });
     const bye = () => {
       pairs.delete(pair);
