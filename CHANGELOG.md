@@ -2,7 +2,7 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## Unreleased
+## 0.7.1 — 2026-07-26
 
 ### Security
 - **Any website the user visited could drive their AI CLI sessions.** The daemon listens on
