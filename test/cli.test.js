@@ -675,7 +675,11 @@ test('telepty allow queues first fake-claude inject until welcome bootstrap read
     const inject = await harness.runCli(['inject', sessionId, 'dispatch-token'], { timeoutMs: 10000 });
     assert.equal(inject.code, 0, inject.stderr);
 
-    await waitFor(() => stripAnsi(output).includes('SUBMIT:dispatch-token'), {
+    // #760: the drained bootstrap body now carries the #716/#730 bracketed-paste envelope,
+    // like every other inject path. The stub echoes whatever bytes it receives (a real
+    // claude interprets the markers instead), and the harness stripAnsi only removes SGR —
+    // so the markers are still in `output` and the assertion names them.
+    await waitFor(() => stripAnsi(output).includes(`SUBMIT:\u001b[200~dispatch-token\u001b[201~`), {
       timeoutMs: 10000,
       description: 'fake claude post-bootstrap submit'
     });

@@ -30,6 +30,63 @@ const CODEX_MODAL_PATTERNS = [
 // that the composer was alive after that point in the stream.
 const CODEX_COMPOSER_FOOTER = /gpt-\S+\s+\S+(\s+fast|\s*·)/;
 
+// #760 — the same two lists for Claude Code, measured against real 2.1.220 surfaces
+// (scratchpad/capture-760-claude-modals.js, scratchpad/EVIDENCE-760.md).
+//
+// EVERY pattern here is whitespace-TOLERANT (`\s*` between tokens, never a literal space),
+// and that is load-bearing, not stylistic. claude renders through Ink, which paints
+// DIFFERENTIALLY: runs of spaces are emitted as ESC[<n>C cursor jumps, so once stripAnsi
+// removes those the words abut. Measured on the captured ring:
+// `grep -aF "Enter to select" ask.raw.bin` => 0 hits, while the rendered screen shows the
+// line plainly. A literal-space pattern matches a `cmux read-screen` snapshot and MISSES
+// the PTY byte stream this predicate actually runs on. codex needed none of this — its TUI
+// repaints whole lines.
+const CLAUDE_MODAL_PATTERNS = [
+  // AskUserQuestion / any select-list modal (model picker, /agents, …): the list footer.
+  // Enter here picks the highlighted option; it does not submit a message.
+  /Enter\s*to\s*select/,
+  // ExitPlanMode approval. The pre-selected item is "1. Yes, auto-accept edits", so a bare
+  // CR does not lose the message quietly — it drops a real claude into auto-accept-edits and
+  // starts executing the plan. Same destructive-default family as #737's "1. Update now".
+  /Ready\s*to\s*code\?/,
+  /Would\s*you\s*like\s*to\s*proceed\?/,
+  /Yes,\s*auto-accept\s*edits/,
+  // Tool-permission prompt ("Do you want to proceed? / Yes, and don't ask again / No").
+  /Do\s*you\s*want\s*to\s*proceed\?/,
+  /Yes,\s*and\s*don't\s*ask\s*again/,
+  // Folder-trust dialog. Binary-verified confirmLabel in 2.1.220; not reproducible on a
+  // host that has already accepted it, so this one is not screen-captured — see EVIDENCE.
+  /Yes,\s*I\s*trust\s*this\s*folder/,
+  // First-run onboarding, before any composer exists.
+  /Choose\s*the\s*text\s*style/,
+  /Select\s*login\s*method/,
+];
+
+// Live-composer watermarks. Any one of them painting AFTER the last modal marker is
+// evidence the composer came back. Deliberately a UNION of four independent signals:
+// every extra counter-signal makes the predicate MORE fail-open, which is the safe
+// direction for a gate that sits in front of all production dispatch.
+const CLAUDE_COMPOSER_MARKERS = [
+  // Status footer context meter: "trusted | Haiku 4.5 | [██░░░░░] 18% 36.9K/200.0K".
+  /\|\s*\[[█░\s]*\]\s*\d+%/,
+  /\d+(\.\d+)?K\s*\/\s*\d+(\.\d+)?K/,
+  // Permission-mode line: "⏸ plan mode on (shift+tab to cycle)" / glued "⏸manualmodeon".
+  /(⏸|▶)\s*\S[^\n]*mode\s*on/,
+  // The composer box itself: the caret row sandwiched between two horizontal rules. Any
+  // caret content counts (empty, placeholder, or half-typed text) — a composer with text in
+  // it is still a composer. Modal option rows never sit between two rules.
+  /─{10,}\n[❯>][^\n]*\n─{10,}/,
+];
+
+// #760 — per-CLI rule table for the delivery-path predicate. codex's entry is #737's two
+// lists verbatim; adding a CLI means adding a row plus a captured-bytes test, and cannot
+// change any other CLI's verdict. A CLI with no row keeps `not_applicable` (byte-identical
+// delivery), which is what claude got before this change.
+const SURFACE_MODAL_RULES = {
+  codex: { modal: CODEX_MODAL_PATTERNS, composer: [CODEX_COMPOSER_FOOTER], reason: 'codex_modal_ui' },
+  claude: { modal: CLAUDE_MODAL_PATTERNS, composer: CLAUDE_COMPOSER_MARKERS, reason: 'claude_modal_ui' },
+};
+
 const ENTRIES = {
   // claude renders an empty input row as "❯" + spaces, sandwiched between
   // two horizontal-rule lines made of U+2500 ('─').
@@ -210,8 +267,10 @@ function normalizeOutputForDetection(output) {
 // live-composer marker, later wins. Verified window-insensitive at 2k/8k/32k/200k tails
 // (scratchpad/probe-737-latch.js), so a bounded ring read cannot flip the verdict.
 //
-// Scoped to codex: it is the only CLI with modal patterns, so claude/gemini always get
-// `not_applicable` and their delivery is byte-identical.
+// #760 generalized the CLI scoping into SURFACE_MODAL_RULES (above): codex and claude each
+// bring their own modal/composer marker lists and their own reason string, and the
+// positional rule below is shared. gemini has no row, so it still gets `not_applicable` and
+// byte-identical delivery.
 function lastMatchIndex(text, pattern) {
   const re = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g');
   let last = -1;
@@ -224,13 +283,14 @@ function lastMatchIndex(text, pattern) {
 }
 
 function detectSurfaceModal(command, output) {
-  if (commandKey(command) !== 'codex') return { blocked: false, reason: 'not_applicable' };
+  const rule = SURFACE_MODAL_RULES[commandKey(command)];
+  if (!rule) return { blocked: false, reason: 'not_applicable' };
   const text = normalizeOutputForDetection(output);
-  const modalAt = CODEX_MODAL_PATTERNS.reduce((max, p) => Math.max(max, lastMatchIndex(text, p)), -1);
+  const modalAt = rule.modal.reduce((max, p) => Math.max(max, lastMatchIndex(text, p)), -1);
   if (modalAt === -1) return { blocked: false, reason: 'no_modal_seen' };
-  const readyAt = lastMatchIndex(text, CODEX_COMPOSER_FOOTER);
+  const readyAt = rule.composer.reduce((max, p) => Math.max(max, lastMatchIndex(text, p)), -1);
   return modalAt > readyAt
-    ? { blocked: true, reason: 'codex_modal_ui', modal_at: modalAt, ready_at: readyAt }
+    ? { blocked: true, reason: rule.reason, modal_at: modalAt, ready_at: readyAt }
     : { blocked: false, reason: 'composer_after_modal', modal_at: modalAt, ready_at: readyAt };
 }
 
