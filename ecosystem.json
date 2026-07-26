@@ -1,10 +1,10 @@
 {
-  "_comment": "Canonical aigentry ecosystem manifest. Source of truth for the shared README ecosystem table. Versions re-verified live via `npm view` on 2026-07-05 (telepty 0.6.9 -> 0.6.11; all others unchanged). Vendored byte-identical into each repo; refresh via aigentry-devkit/scripts/sync-readme-tooling.mjs on any version change. A repo's own row is overridden with its live package.json version at regen time.",
+  "_comment": "Canonical aigentry ecosystem manifest. Source of truth for the shared README ecosystem table. Versions re-verified live via `npm view` on 2026-07-26 (telepty 0.6.11 -> 0.6.19, devkit 0.0.22 -> 0.1.14; brain/deliberation/aterm unchanged). Vendored byte-identical into each repo; refresh via aigentry-devkit/scripts/sync-readme-tooling.mjs on any version change. A repo's own row is overridden with its live package.json version at regen time.",
   "modules": [
     {
       "name": "telepty",
       "package": "@dmsdc-ai/aigentry-telepty",
-      "version": "0.6.11",
+      "version": "0.6.19",
       "role": "Cross-terminal / cross-machine prompt transport (PTY daemon)",
       "maturity": "Shipping",
       "license": "MIT"
@@ -28,7 +28,7 @@
     {
       "name": "devkit",
       "package": "@dmsdc-ai/aigentry-devkit",
-      "version": "0.0.22",
+      "version": "0.1.14",
       "role": "Installer/scaffold for the AI dev environment",
       "maturity": "Early",
       "license": "MIT"
