@@ -2,6 +2,51 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## Unreleased
+
+### Removed — BREAKING (over-engineering cuts, ecosystem cleanup audit 2026-07-26)
+
+Dormant surfaces with zero observed adopters across the ecosystem are gone. Every
+removal below was verified by repo + cross-repo grep (`aigentry-*`, excluding
+`node_modules`/`dist`) before being applied.
+
+- **Broker relay (#42)** — `telepty broker`, `telepty connect-broker`, and
+  `telepty install --broker` are removed, along with `src/transport/broker-{server,client,protocol}.js`,
+  the daemon's `TELEPTY_BROKER_*` wiring (broker-mode HTTPS listener, node-mode
+  broker-client), and the broker-host service variant in `install.js`. Activation
+  always required operator-provisioned `TELEPTY_JWT_SECRET` + `TELEPTY_ENROLL_SECRET`
+  + TLS cert/key and was never switched on. Cross-machine traffic continues on the
+  wired SSH/HTTP peer path (`cross-machine.js` + `src/transport/websocket.js`).
+  `BUS_EVENT_SCHEMA.md` §Broker Relay Events is removed with it.
+- **TUI dashboard** — `telepty tui` / `telepty dashboard` and `tui.js` are removed;
+  this also drops the `blessed` dependency (unmaintained since 2015). `telepty list`
+  + `telepty listen` cover observation, and the terminal multiplexer is the dashboard.
+- **Kitty surface orchestration** — `telepty session start` and `telepty layout` are
+  removed. Terminal-surface lifecycle belongs to the Workspace Host adapter per
+  `BOUNDARY.md`; the daemon stopped foregrounding surfaces on 2026-05-30.
+- **Rust supervisor sidecar (Phase 1 spike)** — `crates/` (telepty-supervisor-core,
+  telepty-supervisor-bin, telepty-cross-machine), the cargo workspace
+  (`Cargo.toml`/`Cargo.lock`/`rust-toolchain.toml`), `src/bridge/`
+  (j3-shim, supervisor-ipc, supervisor-launcher), the two lazy bridge call sites in
+  `cli.js`, the `scripts/{bridge-phase1.js,m2-smoke.sh,m3-smoke.sh,measure-rss.sh}`
+  harness, and `.github/workflows/phase1-spike-ci.yml` are removed. `daemon.js` PTY
+  ownership is the live implementation; the crates never shipped in the npm package.
+  Resurrect from git history if the L2 supervisor migration ever resumes.
+- **Bus-event peer relay** — `src/transport/peer-relay.js` and the
+  `TELEPTY_RELAY_PEERS` env knob are removed (the knob was set nowhere).
+
+### Changed
+
+- `auth.js` token generation uses Node's stdlib `crypto.randomUUID()`; the `uuid`
+  dependency is dropped.
+- The `update-notifier` dependency (~80 transitive packages) is dropped along with its
+  `NO_UPDATE_NOTIFIER` / `TELEPTY_DISABLE_UPDATE_NOTIFIER` opt-outs. Version-drift
+  detection already runs in `src/version-handshake.js` on every daemon contact, and
+  `telepty update` owns the upgrade path.
+- Repo-root hygiene: the committed `aigentry-telepty-0.0.4.tgz` release tarball,
+  `.deliberation_request{2,3}.json`, `test-pty.js`, and `URGENT_ISSUES.resolved.md`
+  are untracked.
+
 ## 0.6.19 — 2026-07-26
 
 ### Fixed

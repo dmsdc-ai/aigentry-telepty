@@ -180,80 +180,8 @@ function buildWindowsQueryTaskCommand(options = {}) {
   return `schtasks /query /tn ${quoteWindowsArg(taskName)} /fo LIST`;
 }
 
-// --- Broker-host service variant (telepty #42 broker MVP — spec §6 + §2 H; reuses #41 hardening) ---
-// The broker runs the SAME hardened service definition as the daemon, but executes
-// `<node> <cli.js> broker` (spec §5/§6) and carries the broker host env (TLS + JWT/enroll
-// secrets, spec §6). Selected via `telepty install --broker` or env TELEPTY_BROKER_MODE.
-const BROKER_LAUNCHD_LABEL = 'com.aigentry.telepty-broker';
-const BROKER_SYSTEMD_SERVICE = 'telepty-broker';
-const BROKER_WINDOWS_TASK = 'telepty-broker';
-
-// Pass-through env keys for the broker host service (spec §5/§6). Secrets are NEVER
-// hardcoded — they are read from the install-time environment and forwarded into the
-// generated service definition so the always-on broker host loads them on start.
-const BROKER_ENV_KEYS = [
-  'TELEPTY_JWT_SECRET',
-  'TELEPTY_ENROLL_SECRET',
-  'TELEPTY_TLS_CERT',
-  'TELEPTY_TLS_KEY',
-  'TELEPTY_BROKER_ACL',
-  'TELEPTY_ENROLL_MAX_NODES',
-  'PORT',
-];
-
-function collectBrokerServiceEnv(env = process.env) {
-  const result = { TELEPTY_BROKER_MODE: '1' };
-  for (const key of BROKER_ENV_KEYS) {
-    const value = env[key];
-    if (value !== undefined && value !== '') {
-      result[key] = String(value);
-    }
-  }
-  return result;
-}
-
-function buildBrokerLaunchdPlist(options = {}) {
-  return buildLaunchdPlist({
-    ...options,
-    label: options.label || BROKER_LAUNCHD_LABEL,
-    command: 'broker',
-    extraEnv: { ...collectBrokerServiceEnv(options.env), ...(options.extraEnv || {}) },
-  });
-}
-
-function buildBrokerSystemdService(options = {}) {
-  return buildSystemdService({
-    ...options,
-    command: 'broker',
-    description: options.description || 'Telepty Broker',
-    extraEnv: { ...collectBrokerServiceEnv(options.env), ...(options.extraEnv || {}) },
-  });
-}
-
-function buildBrokerWindowsAutostartCommand(options = {}) {
-  return buildWindowsAutostartCommand({
-    ...options,
-    taskName: options.taskName || BROKER_WINDOWS_TASK,
-    command: 'broker',
-  });
-}
-
-// Resolve the active service profile (daemon vs broker) so main() can install either
-// variant from one code path. The daemon profile reproduces the exact pre-#42 values
-// (no behavior change for existing installs); the broker profile selects distinct
-// label/service/task names, the `broker` command, and the broker host env.
-function resolveServiceProfile(options = {}) {
-  if (options.broker) {
-    return {
-      command: 'broker',
-      launchdLabel: BROKER_LAUNCHD_LABEL,
-      launchdPlistName: `${BROKER_LAUNCHD_LABEL}.plist`,
-      systemdService: BROKER_SYSTEMD_SERVICE,
-      windowsTask: BROKER_WINDOWS_TASK,
-      description: 'Telepty Broker',
-      extraEnv: collectBrokerServiceEnv(options.env),
-    };
-  }
+// Resolve the service profile main() installs (the exact pre-#42 daemon values).
+function resolveServiceProfile() {
   return {
     command: 'daemon',
     launchdLabel: 'com.aigentry.telepty',
@@ -324,15 +252,7 @@ async function installSkills() {
 async function main() {
   console.log("🚀 Installing @dmsdc-ai/aigentry-telepty...");
 
-  // Broker-host variant (telepty #42): `telepty install --broker` or env TELEPTY_BROKER_MODE
-  // installs the SAME hardened service running `telepty broker` instead of `telepty daemon`.
-  // Default-OFF — existing daemon installs are entirely unaffected (additive).
-  const wantsBroker = process.argv.slice(2).includes('--broker')
-    || process.env.TELEPTY_BROKER_MODE === '1';
-  const profile = resolveServiceProfile({ broker: wantsBroker });
-  if (wantsBroker) {
-    console.log(`🛰️  Broker-host mode: installing service '${profile.launchdLabel}' (runs 'telepty broker').`);
-  }
+  const profile = resolveServiceProfile();
 
   // 1. Install globally via npm
   console.log("📦 Installing package globally...");
@@ -455,12 +375,5 @@ module.exports = {
   buildSystemdService,
   buildWindowsAutostartCommand,
   resolveDaemonLaunchOptions,
-  buildBrokerLaunchdPlist,
-  buildBrokerSystemdService,
-  buildBrokerWindowsAutostartCommand,
-  collectBrokerServiceEnv,
   resolveServiceProfile,
-  BROKER_LAUNCHD_LABEL,
-  BROKER_SYSTEMD_SERVICE,
-  BROKER_WINDOWS_TASK,
 };

@@ -63,7 +63,6 @@ function buildDeps(server, sessions) {
     markSessionDisconnected: () => {},
     resolveSessionAlias: (id) => id,
     applySessionStateReport: () => ({ success: false }),
-    relayToPeers: () => {},
     busAutoRoute: () => {},
   };
 }

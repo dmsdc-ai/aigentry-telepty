@@ -32,7 +32,6 @@ function installWebSocketTransport(deps) {
     markSessionDisconnected,
     resolveSessionAlias,
     applySessionStateReport,
-    relayToPeers,
     busAutoRoute
   } = deps;
 
@@ -305,7 +304,6 @@ function installWebSocketTransport(deps) {
             return;
           }
 
-          if (!msg._relayed_from) relayToPeers(applied.event);
           persistSessions();
           return;
         }
@@ -319,8 +317,6 @@ function installWebSocketTransport(deps) {
 
         // Auto-route turn_request events (shared logic with HTTP publish)
         busAutoRoute(msg);
-        // Relay to peer daemons (dedup prevents loops)
-        if (!msg._relayed_from) relayToPeers(msg);
       } catch (e) {
         console.error('[BUS] Invalid message format', e);
       }

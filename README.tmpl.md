@@ -160,8 +160,6 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | `telepty reply "text"` | Reply to the last injector |
 | `telepty monitor` | Real-time event billboard |
 | `telepty listen` | Stream event bus as JSON |
-| `telepty tui` | Full TUI dashboard |
-| `telepty layout [grid\|tall\|stack]` | Arrange kitty windows |
 | `telepty update` | Update to latest version |
 
 ## Environment variables

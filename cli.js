@@ -8,7 +8,6 @@ const WebSocket = require('ws');
 const { execSync, execFileSync, spawn } = require('child_process');
 const readline = require('readline');
 const prompts = require('prompts');
-const updateNotifier = require('update-notifier');
 const pkg = require('./package.json');
 const { getConfig } = require('./auth');
 const {
@@ -142,11 +141,6 @@ process.on('exit', () => {
   resetInteractiveInput(process.stdin);
 });
 
-// Check for updates unless explicitly disabled for tests/CI.
-if (!process.env.NO_UPDATE_NOTIFIER && !process.env.TELEPTY_DISABLE_UPDATE_NOTIFIER) {
-  updateNotifier({pkg}).notify({ isGlobal: true });
-}
-
 // Support remote host via environment variable or default to localhost.
 // TELEPTY_HOST accepts: `host`, `host:port`, or `http://host:port`. Embedded
 // port from TELEPTY_HOST is used unless TELEPTY_PORT is set explicitly.
@@ -185,98 +179,6 @@ const fetchWithAuth = (url, options = {}) => {
   if (sessionToken) headers['x-telepty-session-token'] = sessionToken;
   return fetch(url, { ...options, headers });
 };
-
-function normalizeBrokerUrl(url) {
-  const value = String(url || '').trim();
-  if (!value) return '';
-  try {
-    return new URL(value).toString().replace(/\/+$/, '');
-  } catch {
-    return '';
-  }
-}
-
-function readBrokerEnrollSecret(value) {
-  const spec = String(value || '');
-  if (!spec) throw new Error('--enroll-secret is required');
-  if (spec.startsWith('env:')) {
-    const name = spec.slice(4);
-    const secret = process.env[name];
-    if (!secret) throw new Error(`Environment variable ${name} is empty or unset`);
-    return secret;
-  }
-  if (spec.startsWith('@')) {
-    return fs.readFileSync(spec.slice(1), 'utf8').trim();
-  }
-  return spec;
-}
-
-function readJsonFile(filePath, fallback) {
-  try {
-    if (!fs.existsSync(filePath)) return fallback;
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJsonFile(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 });
-  try { fs.chmodSync(filePath, 0o600); } catch {}
-}
-
-function brokerAclPath() {
-  return process.env.TELEPTY_BROKER_ACL || path.join(os.homedir(), '.telepty', 'broker-acl.json');
-}
-
-function brokerRevokedPath() {
-  return process.env.TELEPTY_BROKER_REVOKED || path.join(os.homedir(), '.telepty', 'broker-revoked.json');
-}
-
-function brokerAllow(fromNode, toNodes) {
-  const acl = readJsonFile(brokerAclPath(), {});
-  const existing = Array.isArray(acl[fromNode]) ? acl[fromNode] : [];
-  acl[fromNode] = Array.from(new Set([...existing, ...toNodes]));
-  writeJsonFile(brokerAclPath(), acl);
-  return acl[fromNode];
-}
-
-function brokerDeny(node) {
-  const acl = readJsonFile(brokerAclPath(), {});
-  delete acl[node];
-  writeJsonFile(brokerAclPath(), acl);
-}
-
-function brokerRevoke(node) {
-  const revoked = readJsonFile(brokerRevokedPath(), []);
-  const list = Array.isArray(revoked) ? revoked : [];
-  if (!list.includes(node)) list.push(node);
-  writeJsonFile(brokerRevokedPath(), list);
-  return list;
-}
-
-async function enrollBrokerNode(url, node, enrollSecret, pin) {
-  const brokerUrl = normalizeBrokerUrl(url);
-  if (!brokerUrl) throw new Error('connect-broker requires a valid broker URL');
-  const res = await fetch(`${brokerUrl}/broker/enroll`, {
-    method: 'POST',
-    signal: AbortSignal.timeout(10000),
-    headers: {
-      'Content-Type': 'application/json',
-      'x-telepty-enroll': enrollSecret
-    },
-    body: JSON.stringify({ node, pin_ack: pin || null })
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data.error || data.code || `Broker enroll failed with HTTP ${res.status}`);
-  }
-  if (!data || typeof data.jwt !== 'string' || !data.jwt) {
-    throw new Error('Broker enroll response did not include a node JWT');
-  }
-  return { ...data, url: brokerUrl };
-}
 
 function isSubmitForceDefaultEnabled(env = process.env) {
   const value = (env.TELEPTY_SUBMIT_FORCE_DEFAULT || '').trim().toLowerCase();
@@ -1382,82 +1284,9 @@ async function main() {
     return;
   }
 
-  if (cmd === 'broker') {
-    const subcmd = args[1];
-    if (subcmd === 'allow') {
-      const fromNode = args[2];
-      const toFlag = args.indexOf('--to');
-      const toNodes = toFlag !== -1 && args[toFlag + 1]
-        ? args[toFlag + 1].split(',').map((item) => item.trim()).filter(Boolean)
-        : [];
-      if (!fromNode || toNodes.length === 0) {
-        console.error('❌ Usage: telepty broker allow <fromNode> --to <nodeA,nodeB>');
-        process.exit(1);
-      }
-      const allowed = brokerAllow(fromNode, toNodes);
-      console.log(`\x1b[32m✅ Broker ACL: ${fromNode} may inject ${allowed.join(', ')}\x1b[0m`);
-      return;
-    }
-
-    if (subcmd === 'deny') {
-      const node = args[2];
-      if (!node) {
-        console.error('❌ Usage: telepty broker deny <node>');
-        process.exit(1);
-      }
-      brokerDeny(node);
-      console.log(`\x1b[32m✅ Broker ACL: ${node} denied\x1b[0m`);
-      return;
-    }
-
-    if (subcmd === 'revoke') {
-      const node = args[2];
-      if (!node) {
-        console.error('❌ Usage: telepty broker revoke <node>');
-        process.exit(1);
-      }
-      brokerRevoke(node);
-      console.log(`\x1b[32m✅ Broker revocation: ${node} revoked\x1b[0m`);
-      return;
-    }
-
-    if (subcmd) {
-      console.error('❌ Usage: telepty broker [allow <fromNode> --to <nodeA,nodeB> | deny <node> | revoke <node>]');
-      process.exit(1);
-    }
-
-    console.log('Starting telepty broker...');
-    process.env.TELEPTY_BROKER_MODE = '1';
-    process.env.AIGENTRY_TELEPTY_DAEMON_MAIN = '1';
-    require('./daemon.js');
-    return;
-  }
-
-  if (cmd === 'tui' || cmd === 'dashboard') {
-    const { TuiDashboard } = require('./tui');
-    new TuiDashboard();
-    return;
-  }
-
   if (cmd === 'list') {
     try {
       let sessions = await discoverSessions({ silent: true });
-      // Bridge merge: surface supervisor-managed sessions discovered via
-      // filesystem manifest scan. De-dup with daemon entries by session id.
-      // Daemon path remains source-of-truth when both surfaces report the
-      // same session; bridge fills the gap when daemon is down (P2 #430).
-      try {
-        const bridgeSessions = require('./src/bridge/j3-shim').list();
-        const seenIds = new Set(sessions.map((s) => s.id));
-        for (const bs of bridgeSessions) {
-          if (!seenIds.has(bs.id)) {
-            sessions.push(bs);
-            seenIds.add(bs.id);
-          }
-        }
-      } catch {
-        // Best-effort: daemon list still surfaced above.
-      }
       const nowMs = Date.now();
       sessions = sessions.map((session) => enrichSessionIdle(session, nowMs));
       if (args.includes('--json')) {
@@ -2565,23 +2394,6 @@ async function main() {
         referencePath = reference.referencePath;
       }
 
-      // Bridge-first attempt for local supervisor-managed sessions (P2 #430).
-      // Gated submit semantics (render-gate, retry, submit-force) stay on
-      // daemon.js — P2 wire does not carry those yet — so we only bridge the
-      // basic inject path. Bridge failure (no manifest, supervisor crashed
-      // mid-call, etc.) falls through to the daemon HTTP path below.
-      if (!useSubmit) {
-        const bridgeShim = require('./src/bridge/j3-shim');
-        if (bridgeShim.findSupervisorManifest(target.id)) {
-          const bridgeRes = await bridgeShim.inject(target.id, `${injectPrompt}\r`, {});
-          if (bridgeRes.success) {
-            const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
-            console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m' (bridge).${refSuffix}`);
-            return;
-          }
-        }
-      }
-
       const body = buildInjectRequestBody(injectPrompt, {
         fromId,
         replyTo,
@@ -3266,244 +3078,6 @@ async function main() {
     return;
   }
 
-  if (cmd === 'session' && args[1] === 'start') {
-    // Generate kitty session file and launch
-    const configArg = args.find(a => a.startsWith('--config='));
-    const configPath = configArg ? configArg.split('=').slice(1).join('=') : null;
-    const cliArg = args.find(a => a.startsWith('--cli='));
-    const cli = cliArg ? cliArg.split('=')[1] : 'claude --dangerously-skip-permissions --continue';
-    const projectsDir = args.find(a => a.startsWith('--dir=')) ? args.find(a => a.startsWith('--dir=')).split('=')[1] : process.cwd();
-
-    // Discover project folders (subdirectories with .git)
-    let projects;
-    if (configPath) {
-      projects = JSON.parse(fs.readFileSync(sanitizePathArg(configPath, 'config'), 'utf8')).projects;
-    } else {
-      const resolvedDir = sanitizePathArg(projectsDir, 'dir');
-      projects = fs.readdirSync(sanitizePathArg(projectsDir, 'dir'), { withFileTypes: true })
-        .filter(d => d.isDirectory() && fs.existsSync(path.join(resolvedDir, d.name, '.git')))
-        .map(d => ({ name: d.name, cwd: path.join(resolvedDir, d.name) }));
-    }
-
-    if (projects.length === 0) {
-      console.error('❌ No git projects found in', projectsDir);
-      process.exit(1);
-    }
-
-    // Resolve full paths (kitty @ launch has no shell PATH)
-    const cliParts = cli.split(' ');
-    let teleptyFullPath, cliFullPath;
-    try {
-      teleptyFullPath = execSync('which telepty', { encoding: 'utf8' }).trim();
-    } catch {
-      teleptyFullPath = process.argv[1];
-    }
-    try {
-      cliFullPath = execSync(`which ${cliParts[0]}`, { encoding: 'utf8' }).trim();
-    } catch {
-      cliFullPath = cliParts[0];
-    }
-    const cliFullArgs = cliParts.slice(1).join(' ');
-    const nodeFullPath = process.execPath; // Bypass #!/usr/bin/env node shebang (nvm not in PATH for non-interactive shells)
-
-    // Generate kitty session file
-    const sessionFile = path.join(os.tmpdir(), `telepty-session-${Date.now()}.conf`);
-    let conf = '# Auto-generated telepty session\n';
-    projects.forEach((p, i) => {
-      const name = p.name;
-      const cwd = p.cwd || path.join(projectsDir, name);
-      const sessionId = `${name}-${cli.split(' ')[0]}`;
-      if (i === 0) {
-        conf += `new_tab ${name}\n`;
-      } else {
-        conf += `\nnew_tab ${name}\n`;
-      }
-      conf += `layout tall\n`;
-      conf += `cd ${cwd}\n`;
-      conf += `title ${name}\n`;
-      conf += `env TELEPTY_SESSION_ID=\n`;
-      conf += `env PATH=${process.env.PATH}\n`;
-      conf += `launch --type=window /bin/zsh -c 'unset TELEPTY_SESSION_ID; ${nodeFullPath} ${teleptyFullPath} allow --id ${sessionId} ${cliFullPath}${cliFullArgs ? ' ' + cliFullArgs : ''}'\n`;
-    });
-
-    fs.writeFileSync(sessionFile, conf);
-    console.log(`✅ Kitty session file: ${sessionFile}`);
-    console.log(`   ${projects.length} projects, CLI: ${cli}`);
-
-    // Auto-launch if --launch flag
-    if (args.includes('--launch')) {
-      const { spawn, execFileSync } = require('child_process');
-
-      // Detect existing kitty instance via remote control socket
-      let kittySocket = null;
-      try {
-        const sockFiles = fs.readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
-        if (sockFiles.length > 0) {
-          const candidate = '/tmp/' + sockFiles[0];
-          // Verify socket is alive
-          execFileSync('kitty', ['@', '--to', `unix:${candidate}`, 'ls'], {
-            timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-          });
-          kittySocket = candidate;
-        }
-      } catch { kittySocket = null; }
-
-      if (kittySocket) {
-        // Launch tabs in existing kitty instance (single Dock icon, kitty @ controllable)
-        let launched = 0;
-        for (const p of projects) {
-          const name = p.name;
-          const cwd = p.cwd || path.join(projectsDir, name);
-          const sessionIdForProject = `${name}-${cli.split(' ')[0]}`;
-          const shellCmd = `unset TELEPTY_SESSION_ID; ${nodeFullPath} ${teleptyFullPath} allow --id ${sessionIdForProject} ${cliFullPath}${cliFullArgs ? ' ' + cliFullArgs : ''}`;
-          const launchArgs = ['@', '--to', `unix:${kittySocket}`,
-            'launch', '--type=os-window', '--cwd', cwd,
-            '--env', 'TELEPTY_SESSION_ID=',
-            '--env', `PATH=${process.env.PATH}`,
-            '/bin/zsh', '-c', shellCmd];
-          try {
-            execFileSync('kitty', launchArgs, { timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] });
-            launched++;
-          } catch (e) {
-            console.error(`⚠️  Failed to launch tab for ${name}: ${e.message}`);
-          }
-        }
-        console.log(`🚀 ${launched}/${projects.length} tabs launched in existing kitty instance.`);
-      } else {
-        // No existing kitty — start a new instance with session file
-        console.log(`\n   Launch: kitty --session ${sessionFile}\n`);
-        spawn('kitty', ['--session', sessionFile], { detached: true, stdio: 'ignore' }).unref();
-        console.log('🚀 Kitty launched (new instance).');
-      }
-    } else {
-      console.log(`\n   Launch: kitty --session ${sessionFile}\n`);
-    }
-    return;
-  }
-
-  if (cmd === 'layout') {
-    const layoutType = args[1] || 'grid';
-    const validLayouts = ['grid', 'tall', 'stack'];
-    if (!validLayouts.includes(layoutType)) {
-      console.error(`❌ Invalid layout: ${layoutType}. Valid: ${validLayouts.join(', ')}`);
-      process.exit(1);
-    }
-
-    await ensureDaemonRunning();
-    const { execSync } = require('child_process');
-
-    // Get active session count for grid calculation
-    try {
-      const sessionsRes = await fetchWithAuth(`${DAEMON_URL}/api/sessions`);
-      const sessionsList = await sessionsRes.json();
-      const activeIds = Object.keys(sessionsList);
-      if (activeIds.length === 0) {
-        console.log('No active sessions to arrange.');
-        return;
-      }
-    } catch (e) {
-      console.error('❌ Could not fetch sessions:', e.message);
-      process.exit(1);
-    }
-
-    // Detect kitty process name
-    let processName = 'kitty';
-    try {
-      execSync(`osascript -e 'tell application "System Events" to get name of first process whose name is "kitty"'`, {
-        timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
-      });
-    } catch {
-      processName = 'stable';
-    }
-
-    // Get screen dimensions
-    let screenW = 2560, screenH = 1440;
-    try {
-      const bounds = execSync(`osascript -e 'tell application "Finder" to get bounds of window of desktop'`, {
-        encoding: 'utf8', timeout: 3000
-      }).trim();
-      const parts = bounds.split(', ');
-      screenW = parseInt(parts[2]);
-      screenH = parseInt(parts[3]);
-    } catch {}
-
-    const menuBarH = 25;
-    const dockH = 70;
-    const usableH = screenH - menuBarH - dockH;
-
-    // Build AppleScript — collect windows from ALL kitty process instances
-    // (kitty --session spawns separate processes, each with its own window)
-    const collectWindows = `
-          set wList to {}
-          set kittyProcs to every process whose name is "${processName}"
-          repeat with p in kittyProcs
-            repeat with w in (every window of p)
-              set end of wList to w
-            end repeat
-          end repeat
-          set n to count of wList
-          if n = 0 then return "0"`;
-
-    let layoutBody;
-    if (layoutType === 'grid') {
-      layoutBody = `
-            set numCols to (n ^ 0.5) as integer
-            if numCols * numCols < n then set numCols to numCols + 1
-            set numRows to ((n - 1) div numCols) + 1
-            set cellW to ${screenW} div numCols
-            set cellH to ${usableH} div numRows
-            repeat with i from 1 to n
-              set c to ((i - 1) mod numCols)
-              set r to ((i - 1) div numCols)
-              set position of (item i of wList) to {c * cellW, ${menuBarH} + r * cellH}
-              set size of (item i of wList) to {cellW, cellH}
-            end repeat`;
-    } else if (layoutType === 'tall') {
-      layoutBody = `
-            set halfW to ${screenW} div 2
-            if n = 1 then
-              set position of (item 1 of wList) to {0, ${menuBarH}}
-              set size of (item 1 of wList) to {${screenW}, ${usableH}}
-            else
-              set position of (item 1 of wList) to {0, ${menuBarH}}
-              set size of (item 1 of wList) to {halfW, ${usableH}}
-              set rightH to ${usableH} div (n - 1)
-              repeat with i from 2 to n
-                set y to ${menuBarH} + ((i - 2) * rightH)
-                set position of (item i of wList) to {halfW, y}
-                set size of (item i of wList) to {halfW, rightH}
-              end repeat
-            end if`;
-    } else if (layoutType === 'stack') {
-      layoutBody = `
-            set cellH to ${usableH} div n
-            repeat with i from 1 to n
-              set y to ${menuBarH} + ((i - 1) * cellH)
-              set position of (item i of wList) to {0, y}
-              set size of (item i of wList) to {${screenW}, cellH}
-            end repeat`;
-    }
-
-    const script = `
-        tell application "System Events"
-          ${collectWindows}
-          ${layoutBody}
-          return n
-        end tell`;
-
-    try {
-      const result = execSync(`osascript -e '${script}'`, { encoding: 'utf8', timeout: 10000 }).trim();
-      if (result === '0') {
-        console.log('⚠️  No kitty windows found. Sessions may be in tabs — use kitty @ launch --type=os-window for separate windows.');
-      } else {
-        console.log(`✅ Layout '${layoutType}' applied to ${result} kitty windows.`);
-      }
-    } catch (e) {
-      console.error(`❌ Layout failed: ${e.message}`);
-    }
-    return;
-  }
-
   if (cmd === 'deliberate') {
     await ensureDaemonRunning();
     const subCmd = args[1];
@@ -4004,47 +3578,6 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
-  // telepty connect-broker <url> --node <name> --enroll-secret <secret|@file|env:VAR> [--pin <sha256>]
-  // One-click broker enrollment: POST /broker/enroll with the fleet enroll
-  // secret, then persist the minted node JWT in ~/.telepty/broker.json (0600)
-  // and a non-secret transport='broker' peer in peers.json.
-  if (cmd === 'connect-broker') {
-    const target = args[1];
-    const nodeFlag = args.indexOf('--node');
-    const secretFlag = args.indexOf('--enroll-secret');
-    const pinFlag = args.indexOf('--pin');
-    const node = nodeFlag !== -1 ? args[nodeFlag + 1] : null;
-    const secretSpec = secretFlag !== -1 ? args[secretFlag + 1] : null;
-    const pin = pinFlag !== -1 ? args[pinFlag + 1] : null;
-    if (!target || !node || !secretSpec) {
-      console.error('❌ Usage: telepty connect-broker <url> --node <name> --enroll-secret <secret|@file|env:VAR> [--pin <sha256>]');
-      process.exit(1);
-    }
-
-    process.stdout.write(`\x1b[36m🔗 Enrolling ${node} with broker ${target}...\x1b[0m\n`);
-    try {
-      const enrollSecret = readBrokerEnrollSecret(secretSpec);
-      const enroll = await enrollBrokerNode(target, node, enrollSecret, pin);
-      const result = await crossMachine.connectBroker(enroll.url, {
-        node,
-        jwt: enroll.jwt,
-        pin
-      });
-      if (result.success) {
-        console.log(`\x1b[32m✅ Connected ${result.node} to broker\x1b[0m`);
-        console.log(`   Broker: ${result.url}`);
-        console.log(`\nBroker sessions are now discoverable via \x1b[36mtelepty list\x1b[0m`);
-      } else {
-        console.error(`\x1b[31m❌ ${result.error}\x1b[0m`);
-        process.exit(1);
-      }
-    } catch (err) {
-      console.error(`\x1b[31m❌ ${err.message}\x1b[0m`);
-      process.exit(1);
-    }
-    return;
-  }
-
   // telepty disconnect [<name> | --all]
   if (cmd === 'disconnect') {
     if (args[1] === '--all') {
@@ -4203,13 +3736,10 @@ Discuss the following topic from your project's perspective. Engage with other s
 \x1b[1mCross-Machine:\x1b[0m
   telepty connect <user@host> [--name N] [--port P]      SSH tunnel to remote host
   telepty connect-http <host>[:port] [--name N] [--token T]  Register remote daemon via HTTP (no SSH)
-  telepty connect-broker <url> --node N --enroll-secret S [--pin P]  Enroll with broker relay
-  telepty broker [allow <from> --to a,b | deny <node> | revoke <node>]  Start/admin broker
   telepty disconnect <name> | --all              Disconnect remote host
   telepty peers [--remove <name>]                List connected peers
 
 \x1b[1mMonitoring:\x1b[0m
-  telepty tui                                    Full TUI dashboard
   telepty monitor                                Real-time event billboard
   telepty listen                                 Stream event bus as JSON
 
@@ -4227,7 +3757,6 @@ Discuss the following topic from your project's perspective. Engage with other s
 \x1b[1mOther:\x1b[0m
   telepty update                                 Update to latest version
   telepty uninstall [--purge] [--dry-run]        Stop daemon + unload service; keep user data unless --purge
-  telepty layout [grid|tall|stack]               Arrange terminal windows
   telepty status-report --phase <p> [options]    Emit structured status event
 
 \x1b[1mExamples:\x1b[0m

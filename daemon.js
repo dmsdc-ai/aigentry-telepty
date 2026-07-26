@@ -10,7 +10,6 @@ const { claimDaemonState, clearDaemonState, isProcessRunning } = require('./daem
 const { checkEntitlement } = require('./entitlement');
 const terminalBackend = require('./terminal-backend');
 const { installWebSocketTransport, isOpenWebSocket } = require('./src/transport/websocket');
-const { createPeerRelay, relayPeersFromEnv } = require('./src/transport/peer-relay');
 const { createAuthMiddleware, createIsAllowedPeer, createVerifyJwt } = require('./src/protocol/http-auth');
 const { detectTailnet, TAILNET_CIDR } = require('./src/net/tailnet');
 const { FileMailbox } = require('./src/mailbox/index');
@@ -172,17 +171,6 @@ function loadPersistedSessions() {
 const app = express();
 app.use(cors());
 
-// #42 broker MVP (W3/T5) — broker-mode HTTP surface (spec §2F, §5). DEFAULT-OFF:
-// only when TELEPTY_BROKER_MODE is set does the daemon mount the broker-server at
-// /broker/*. Mounted BEFORE express.json so the broker reads the raw request stream
-// itself (it has its own per-node JWT gate); the existing /api/* auth path is untouched.
-// Fail-fast (loud throw) if a required broker env is missing. The HTTPS listener that
-// serves this handler is created in the boot block below (TLS mandatory, §4.4).
-let brokerServer = null;
-if (brokerEnv().mode) {
-  brokerServer = mountBrokerMode(app);
-}
-
 app.use(express.json());
 
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
@@ -191,9 +179,8 @@ const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map
 // #672 tailnet auto (seamless cross-machine): detect the tailnet interface once at boot
 // via a PURE live scan of os.networkInterfaces(). D1: the IP is discovered, never
 // configured — used only in-memory for this run, never persisted, and re-detected every
-// start so a Tailscale-reassigned IP is followed automatically. Broker mode has its own
-// network posture (HTTPS + per-node JWT) and is excluded from auto-bind/auto-trust.
-const TAILNET = brokerServer ? null : detectTailnet();
+// start so a Tailscale-reassigned IP is followed automatically.
+const TAILNET = detectTailnet();
 const TAILNET_IP = TAILNET ? TAILNET.ip : null;
 const AUTO_TAILNET = isTailnetAuto(process.env, TAILNET_IP);
 // Auto-trust the tailnet CIDR on the auto path — safe because the socket is bound to the
@@ -282,15 +269,6 @@ function resolveVerifiedSender(token) {
 function verifiedSenderFromReq(req) {
   return resolveVerifiedSender(req.headers && req.headers['x-telepty-session-token']);
 }
-
-// Cross-machine bus relay: forward bus events to peer daemons
-const relayToPeers = createPeerRelay({
-  relayPeers: relayPeersFromEnv(process.env),
-  relaySeen: new Set(), // dedup by message_id
-  machineId: MACHINE_ID,
-  expectedToken: EXPECTED_TOKEN,
-  getPort: () => PORT
-});
 
 // JWT auth: set TELEPTY_JWT_SECRET to enable. Tokens in Authorization: Bearer <token>
 const JWT_SECRET = process.env.TELEPTY_JWT_SECRET || null;
@@ -4416,7 +4394,6 @@ app.post('/api/bus/publish', (req, res) => {
       return respondWithError(res, applied.httpStatus || 400, applied.code || 'INVALID_REQUEST', applied.error);
     }
 
-    if (!payload._relayed_from) relayToPeers(applied.event);
     persistSessions();
     return res.json({ success: true, delivered: busClients.size, event: applied.event });
   }
@@ -4432,8 +4409,6 @@ app.post('/api/bus/publish', (req, res) => {
 
   // Auto-route if this is a turn_request
   busAutoRoute(payload);
-  // Relay to peer daemons (dedup prevents loops)
-  if (!payload._relayed_from) relayToPeers(payload);
 
   res.json({ success: true, delivered: deliveredCount });
 });
@@ -4664,142 +4639,6 @@ app.patch('/api/threads/:id', (req, res) => {
   res.json({ success: true, thread_id: thread.id, status: thread.status });
 });
 
-// === #42 broker MVP (W3/T5) — broker wiring helpers (spec §2F, §4.3, §5) =========
-// Additive + default-OFF. Factored as DI-seamed helpers (deps override factories /
-// env / readFile) so the wiring is unit-testable without booting the daemon or
-// touching the network. The broker-server / broker-client factories are REUSED
-// verbatim — no reimplementation here.
-
-// Resolve broker config from the environment (all knobs default-OFF when absent).
-function brokerEnv(env = process.env) {
-  const home = os.homedir();
-  return {
-    mode: env.TELEPTY_BROKER_MODE === '1' || env.TELEPTY_BROKER_MODE === 'true',
-    jwtSecret: env.TELEPTY_JWT_SECRET || null,
-    enrollSecret: env.TELEPTY_ENROLL_SECRET || null,
-    tlsCert: env.TELEPTY_TLS_CERT || null,
-    tlsKey: env.TELEPTY_TLS_KEY || null,
-    aclPath: env.TELEPTY_BROKER_ACL || path.join(home, '.telepty', 'broker-acl.json'),
-    revokedPath: env.TELEPTY_BROKER_REVOKED || path.join(home, '.telepty', 'broker-revoked.json'),
-    configPath: env.TELEPTY_BROKER_CONFIG || path.join(home, '.telepty', 'broker.json'),
-    maxNodes: Number(env.TELEPTY_ENROLL_MAX_NODES) || 256,
-    url: env.TELEPTY_BROKER_URL || null,
-    jwt: env.TELEPTY_BROKER_JWT || null,
-    node: env.TELEPTY_BROKER_NODE || null,
-    pin: env.TELEPTY_BROKER_PIN || null,
-  };
-}
-
-function readJsonFileSafe(filePath, readFile = fs.readFileSync) {
-  try {
-    return JSON.parse(readFile(filePath, 'utf8'));
-  } catch {
-    return null; // missing/invalid file ⇒ default (caller decides)
-  }
-}
-
-// Broker host: mount createBrokerServer at /broker/* (spec §2F-i). Loads the ACL +
-// revocation tables from disk (the broker-server is pure — the daemon owns the file
-// I/O and the TLS listener, per the module contract). Fail-fast loud if a required
-// broker env is missing (§5). Returns the broker instance (handler/close).
-function mountBrokerMode(app, deps = {}) {
-  const env = deps.env || brokerEnv();
-  const createServer = deps.createBrokerServer
-    || require('./src/transport/broker-server').createBrokerServer;
-  const readFile = deps.readFile || fs.readFileSync;
-  const bus = deps.broadcastBusEvent || broadcastBusEvent;
-  const requireTls = deps.requireTls !== undefined ? deps.requireTls : true;
-
-  const missing = [];
-  if (!env.jwtSecret) missing.push('TELEPTY_JWT_SECRET');
-  if (!env.enrollSecret) missing.push('TELEPTY_ENROLL_SECRET');
-  if (!env.tlsCert) missing.push('TELEPTY_TLS_CERT');
-  if (!env.tlsKey) missing.push('TELEPTY_TLS_KEY');
-  if (missing.length) {
-    throw new Error(`[BROKER] broker mode requires env: ${missing.join(', ')}`);
-  }
-
-  const aclTable = readJsonFileSafe(env.aclPath, readFile) || {};
-  const revokedRaw = readJsonFileSafe(env.revokedPath, readFile);
-  const revokedNodes = new Set(
-    Array.isArray(revokedRaw) ? revokedRaw : (revokedRaw && revokedRaw.revoked) || []
-  );
-
-  const broker = createServer({
-    jwtSecret: env.jwtSecret,
-    enrollSecret: env.enrollSecret,
-    aclTable,
-    revokedNodes,
-    maxNodes: env.maxNodes,
-    requireTls,
-    broadcastBusEvent: bus,
-    // #47 P5 — funnel cross-machine deliveries through the SAME inject audit writer as local
-    // ones (one schema, one file, three producers: local deliver, #45 block, broker). The
-    // broker owns no fs (pure); the daemon owns the writer.
-    onInjectAudit: deps.auditAppend || auditAppend,
-  });
-
-  // Mount the raw handler at /broker/* (full path preserved so the broker router
-  // matches, spec §3.0). Placed before express.json/auth by the call site above.
-  app.use((req, res, next) => {
-    if ((req.url || '').split('?')[0].startsWith('/broker/')) return broker.handler(req, res);
-    return next();
-  });
-  return broker;
-}
-
-// Node side: resolve broker connection config. Env (TELEPTY_BROKER_URL +
-// TELEPTY_BROKER_JWT) wins; else ~/.telepty/broker.json; else null (default-OFF).
-function loadNodeBrokerConfig(deps = {}) {
-  const env = deps.env || brokerEnv();
-  const readFile = deps.readFile || fs.readFileSync;
-  if (env.url && env.jwt) {
-    return { url: env.url, jwt: env.jwt, node: env.node || MACHINE_ID, pin: env.pin || null, accept_from: null };
-  }
-  const cfg = readJsonFileSafe(env.configPath, readFile);
-  if (cfg && cfg.url && cfg.jwt) {
-    return {
-      url: cfg.url,
-      jwt: cfg.jwt,
-      node: cfg.node || MACHINE_ID,
-      pin: cfg.pin || null,
-      accept_from: cfg.accept_from === undefined ? null : cfg.accept_from,
-    };
-  }
-  return null;
-}
-
-// Node side: start the broker-client when broker config is present (spec §2F-ii).
-// No config ⇒ returns null and starts nothing (§5 default-OFF, zero new behavior).
-// CREDENTIAL BOUNDARY (§4.3): delivery is in-process via deliverInjectionToSession —
-// the local daemon token (EXPECTED_TOKEN) is NEVER passed to the client / on the wire.
-function startNodeBrokerClient(deps = {}) {
-  const cfg = deps.config || loadNodeBrokerConfig(deps);
-  if (!cfg) return null;
-  const createClient = deps.createBrokerClient
-    || require('./src/transport/broker-client').createBrokerClient;
-  const deliver = deps.deliver || deliverInjectionToSession;
-  const sessionMap = deps.sessions || sessions;
-
-  const client = createClient({
-    url: cfg.url,
-    node: cfg.node || MACHINE_ID,
-    nodeJwt: cfg.jwt,
-    pin: cfg.pin || null,
-    acceptFrom: cfg.accept_from,
-    deliver, // in-process delivery — §4.3 (no daemon token on the wire)
-    getSession: (id) => sessionMap[id] || null,
-    getSessions: () => Object.keys(sessionMap).map((id) => ({ id, peerName: MACHINE_ID, host: MACHINE_ID })),
-  });
-
-  if (deps.autostart !== false && typeof client.start === 'function') {
-    Promise.resolve(client.start()).catch((err) => {
-      console.error(`[BROKER] node-mode client start failed: ${err && err.message ? err.message : err}`);
-    });
-  }
-  return client;
-}
-
 // Bind the port when launched as the daemon. A test can `require('./daemon.js')` to reach the
 // exported decision functions WITHOUT starting the daemon — it just must not set the env below.
 // The production CLI reaches daemon.js via require() (cli.js `cmd==='daemon'`), so require.main is
@@ -4807,22 +4646,8 @@ function startNodeBrokerClient(deps = {}) {
 // require.main ALONE (0.5.0 regression) meant app.listen never ran in production → daemon exited 0.
 let server;
 let tailnetServer; // additive tailnet listener (AUTO_TAILNET path); needs the WS upgrade handler too
-let nodeBrokerClient = null;
 if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
-  if (brokerServer) {
-    // Broker mode (§4.4): TLS mandatory — serve the express app (with /broker/*
-    // mounted) over HTTPS using the configured self-signed cert/key.
-    const https = require('https');
-    const benv = brokerEnv();
-    const tlsOptions = { cert: fs.readFileSync(benv.tlsCert), key: fs.readFileSync(benv.tlsKey) };
-    server = https.createServer(tlsOptions, app).listen(PORT, HOST, () => {
-      const address = server.address();
-      boundPort = (address && address.port) || Number(PORT);
-      console.log(`🔐 aigentry-telepty broker listening on https://${HOST}:${boundPort} (/broker/*)`);
-      console.log(formatBindHint(HOST)); // telepty#50
-      runStartupBootstrapRestore();
-    });
-  } else if (AUTO_TAILNET) {
+  if (AUTO_TAILNET) {
     // #672 tailnet auto path: bind loopback as the PRIMARY (drives bootstrap/boundPort
     // and effectively never fails), then add an additive best-effort listener on the
     // live tailnet IP so tailnet peers reach :3848 — LAN/public sockets stay closed. An
@@ -4836,10 +4661,9 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
       console.log(formatBindHint(HOST, TAILNET));
       maybeGuideWindowsFirewall(boundPort); // G1: Windows inbound-rule guide/auto-add
       runStartupBootstrapRestore();
-      nodeBrokerClient = startNodeBrokerClient();
     });
     // Additive tailnet listener — same HTTP posture as the loopback primary (the daemon
-    // is HTTP by design; TLS is broker-mode only, and tailnet transport is already
+    // is HTTP by design, and tailnet transport is already
     // WireGuard-encrypted). app.listen() returns a fresh server, so this is a second
     // socket on the same app. ponytail: fixed-PORT production shares one port on both
     // listeners; a PORT=0 ephemeral run would split ports, but the auto path is never
@@ -4855,9 +4679,6 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
       console.log(`🚀 aigentry-telepty daemon listening on http://${HOST}:${boundPort}`);
       console.log(formatBindHint(HOST)); // telepty#50
       runStartupBootstrapRestore();
-      // #42 node-mode (§2F-ii): start the broker-client if broker config is present.
-      // Absent ⇒ no-op (default-OFF). Started after listen so sessions/delivery are live.
-      nodeBrokerClient = startNodeBrokerClient();
     });
   }
 }
@@ -5205,20 +5026,12 @@ installWebSocketTransport({
   markSessionDisconnected,
   resolveSessionAlias,
   applySessionStateReport,
-  relayToPeers,
   busAutoRoute
 });
 
 function shutdown(code) {
   mailboxDelivery.stop();
   mailboxNotifier.cancelAll();
-  // #42: stop the node-mode broker-client (closes the held SSE) + the broker-server.
-  if (nodeBrokerClient && typeof nodeBrokerClient.stop === 'function') {
-    try { nodeBrokerClient.stop(); } catch { /* best-effort */ }
-  }
-  if (brokerServer && typeof brokerServer.close === 'function') {
-    try { brokerServer.close(); } catch { /* best-effort */ }
-  }
   clearDaemonState(process.pid);
   process.exit(code);
 }
@@ -5253,12 +5066,6 @@ module.exports = {
   decideSurfaceGc,                // #17: surface-liveness verdict→action (incl. INV-17 unknown→skip)
   applySurfaceMismatchProbe,      // surface_mismatched debounce + payload helper (deps DI: emit/clock)
   classifyPeerLaneInject,         // #533 Phase 2: pure peer-lane inject policy verdict
-  // #42 broker MVP (W3/T5): DI-seamed broker wiring (deps override factories/env/readFile).
-  brokerEnv,                      // env→broker config resolver (default-OFF when absent)
-  mountBrokerMode,                // broker-mode: mount createBrokerServer at /broker/* + fail-fast
-  loadNodeBrokerConfig,           // node-mode: resolve broker.json / env config (or null)
-  startNodeBrokerClient,          // node-mode: start createBrokerClient (default-OFF; in-process deliver)
-  deliverInjectionToSession,      // §4.3: the in-process delivery wired into the broker-client
   appendToOutputRing,             // #716: seam that tracks bracketed-paste capability (?2004h)
   maybeBracketedPaste,            // #716/#730: identity+observation-gated bracketed-paste wrap
   forceSubmitCrGapMs,             // #730: scoped force-path text→CR floor (un-enveloped multi-line only)

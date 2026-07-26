@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 
 const CONFIG_DIR = path.join(os.homedir(), '.telepty');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -22,7 +22,7 @@ function getConfig() {
 
   // Generate new config
   const newConfig = {
-    authToken: uuidv4(),
+    authToken: randomUUID(),
     createdAt: new Date().toISOString()
   };
 
