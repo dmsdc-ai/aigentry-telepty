@@ -2,7 +2,7 @@
 
 **Connect any terminal to any terminal, any machine.**
 
-telepty is a **PTY control plane** for AI CLI workflows: the CLIs keep doing the work (data plane), telepty addresses their sessions by name and guarantees delivery. Concretely, a background daemon plus a session bridge — it lets you spawn, attach to, and inject commands into terminal sessions, locally or across machines via Tailscale.
+telepty is an **agent session control plane**: the CLIs keep doing the work (data plane), telepty addresses their sessions by name and guarantees delivery. Concretely, a background daemon plus a session bridge — it lets you spawn, attach to, and inject commands into terminal sessions, locally or across machines via Tailscale.
 
 Built for AI CLI workflows (Claude Code, Codex, Gemini CLI), but works with any interactive terminal program.
 
@@ -109,7 +109,7 @@ This is the day-to-day shape of telepty: an orchestrator session driving worker 
 
 ## What telepty is — and what it is not
 
-telepty is a **PTY control plane for AI CLI workflows** (a daemon plus a session bridge).
+telepty is an **agent session control plane for AI CLI workflows** (a PTY daemon plus a session bridge).
 It is **not** a terminal multiplexer and does not replace tmux.
 
 > **tmux is better at being a terminal. telepty is better at letting
