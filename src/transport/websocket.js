@@ -33,7 +33,10 @@ function installWebSocketTransport(deps) {
     markSessionDisconnected,
     resolveSessionAlias,
     applySessionStateReport,
-    busAutoRoute
+    busAutoRoute,
+    // #815 credential store — owner-claim gate below. Optional so a construction site that omits
+    // it degrades to the pre-#815 open claim rather than throwing; the daemon always passes it.
+    credentials
   } = deps;
 
   // Same browser-drive-by guard as the HTTP middleware, and needed MORE here: a WS handshake
@@ -113,11 +116,41 @@ function installWebSocketTransport(deps) {
 
     const activeSession = sessions[sessionId];
 
+    // #815: gate the owner claim. Before this, ANY local process could open ?owner=1 on ANY
+    // session and take the PTY byte stream — last-writer-wins displaced the incumbent bridge with
+    // close 4001. Hijacking a live terminal is at least as bad as the token disclosure #815 fixes,
+    // and it is the same root cause: authority granted for naming an id.
+    //
+    // A session that HOLDS a credential now requires the matching bearer on the handshake. A
+    // session that holds none is untouched — the WS auto-register path (a reconnect that beats its
+    // own re-register POST) and any pre-#815 restored record still claim freely, so this closes
+    // the hijack without breaking reconnect. Refusal is LOUD (4003, its own code) rather than a
+    // silent downgrade to viewer, because a bridge that silently becomes a viewer drops every
+    // 'output' frame and looks alive while being dead — the #732/#754 failure shape.
+    if (activeSession.type === 'wrapped' && isOwnerConnect
+        && credentials && credentials.hasCredential(sessionId)
+        && !credentials.matches(sessionId, req.headers['x-telepty-session-token'])) {
+      console.warn(`[WS] Refused unauthenticated owner claim for session ${sessionId}`);
+      activeSession.clients.delete(ws);
+      clearInterval(pingInterval);
+      try { ws.close(4003, 'Owner claim unauthenticated'); } catch {}
+      return;
+    }
+
     // For wrapped sessions, first connector OR explicit ?owner=1 claim becomes the owner.
     // ?owner=1 reclaim handles the stale-ownerWs bug: allow bridge reconnects but stale TCP
     // half-open connection still holds ownerWs slot → reconnect wrongly becomes a viewer.
     if (activeSession.type === 'wrapped' && (!activeSession.ownerWs || isOwnerConnect)) {
       const hadDisconnectedOwner = !isOpenWebSocket(activeSession.ownerWs) && activeSession.lastDisconnectedAt;
+      // #815: was the incumbent owner ALIVE when it got displaced? That is the case that ends a
+      // running agent — the displaced bridge reads close 4001 and exits the session (cli.js:534,
+      // 1969-1971) — and it was emitting NOTHING. `hadDisconnectedOwner` is false here, so no
+      // session_reconnect fires either; the record simply survives under the new socket while the
+      // assignee is gone. Silence reads as continuity, which is the lie.
+      const displacedLiveOwner = isOwnerConnect
+        && isOpenWebSocket(activeSession.ownerWs)
+        && activeSession.ownerWs !== ws;
+      const displacedOwnerPid = displacedLiveOwner ? (activeSession.ownerPid || null) : null;
       if (isOwnerConnect && activeSession.ownerWs && activeSession.ownerWs !== ws) {
         // telepty#56 (durable last-writer-wins Replace): close the displaced owner with the
         // dedicated terminal code 4001 'Owner replaced' instead of a bare terminate(). A
@@ -155,6 +188,21 @@ function installWebSocketTransport(deps) {
       initializeBootstrapState(activeSession);
       console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
       scheduleBootstrapPromptPoll(sessionId, activeSession);
+      // #815: emit the honest lifecycle fact BEFORE any continuity claim. A live owner was
+      // replaced — the daemon knows that for certain. It does NOT know whether the displaced
+      // process then died, so this asserts only what was observed and never dresses a takeover up
+      // as a reconnect. A consumer must treat this as "the assignee of this session may no longer
+      // exist"; it is not interchangeable with session_reconnect.
+      if (displacedLiveOwner) {
+        emitSessionLifecycleEvent('session_owner_replaced', sessionId, activeSession, {
+          reason: 'owner_claim_displaced_live_owner',
+          displaced_owner_pid: displacedOwnerPid,
+          claimant_owner_pid: activeSession.ownerPid || null,
+          // Was the claimant required to prove it holds this instance's credential? False means
+          // the session had no credential to check against — the residual, stated per event.
+          claim_was_credentialed: Boolean(credentials && credentials.hasCredential(sessionId))
+        });
+      }
       if (hadDisconnectedOwner) {
         emitSessionLifecycleEvent('session_reconnect', sessionId, activeSession);
       }

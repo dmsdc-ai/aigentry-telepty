@@ -45,6 +45,12 @@ function buildAuditLine(record = {}) {
     source: record.source || record.kind || 'inject',
     claimed_from: claimed,
     verified_sender_sid: verified,
+    // #815: the principal is (sid, epoch, generation) — a bare sid is not an identity, because a
+    // textual sid is destroyed and recreated routinely. The epoch is what tells a consumer that
+    // two lines naming the same sid came from the same INSTANCE. Null whenever the sender is
+    // unverified, so an absent epoch never reads as "verified, epoch unknown".
+    verified_sender_epoch: verified && record.verified_sender_epoch != null ? record.verified_sender_epoch : null,
+    verified_sender_generation: verified && record.verified_sender_generation != null ? record.verified_sender_generation : null,
     spoof_suspected: !!(claimed && verified && claimed !== verified),
     to: record.to != null ? record.to : null,
     to_alias: record.to_alias != null ? record.to_alias : null,

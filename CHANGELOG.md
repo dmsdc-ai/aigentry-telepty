@@ -2,6 +2,71 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## Unreleased
+
+### Security
+- **Session sender identity is now bound to a session instance rather than to a session name
+  (#815).** The daemon's per-session token — the thing that makes `verified_sender_sid` mean
+  anything — was issued against a session *id*, re-issued on demand to any local caller that named
+  an already-registered id, and never revoked. The identity a caller could obtain therefore did not
+  depend on being that session, and an id that was cleaned up and respawned inherited its
+  predecessor's authority for the lifetime of the daemon. The same held for the per-session
+  provenance nonce (#47 P4), which is what an agent checks before trusting a delivery's origin
+  banner.
+
+  The principal is now `(canonical_sid, session_epoch, credential_generation)`. A credential is
+  minted exactly once, at the first registration of an id the daemon does not already hold; a
+  re-registration returns no credential material to anyone, including the legitimate holder; and
+  every destroy path — `DELETE`, kill, forced cleanup, TTL/GC — revokes the epoch before the id can
+  be reused, so a recreated id can never resolve to its predecessor. Verification fails closed: an
+  unparseable, unknown, stale or revoked credential yields no verified sender, never a fallback to
+  the name the caller claimed.
+
+  The daemon stores only `sha256(bearer)` and persists **that verifier**, never the bearer. This is
+  what lets a session survive a daemon restart without reissuing anything — the wrapped child holds
+  its credential in a spawn-time environment that cannot be updated from outside, so a reissued
+  credential could never reach it. `sessions.json` consequently became owner-only (`0600`), and is
+  chmod'ed on read as well as on write so a file left world-readable by an older daemon is
+  tightened in place rather than at the next write.
+
+- **Taking ownership of a live session now requires proving you own it (#815).** A `?owner=1`
+  WebSocket claim was authenticated by nothing but knowledge of the session id, and the daemon
+  trusts loopback before any credential check, so the claim was open to any local process. Because
+  ownership is last-writer-wins, a claim also displaced the incumbent bridge with close 4001 — and
+  a displaced bridge exits its session. A session that holds a credential now requires the matching
+  bearer on the handshake or the claim is refused with close `4003`, loudly, rather than downgraded
+  to a viewer. Sessions with no credential (the WS auto-register reconnect path, records restored
+  from an older daemon) claim as before, so reconnect is unaffected.
+
+- **`inject_written` no longer rebroadcasts the prompt (#815).** Any local process may subscribe to
+  `/api/bus` with no token and no `Origin`, so the event published the full text of every delivery
+  to every local subscriber. It now carries `content_sha256` + `content_length` instead of
+  `content` — enough to correlate a delivery and verify integrity against a payload you already
+  hold, and nothing to read if you do not. **Breaking for any bus subscriber reading
+  `inject_written.content`.**
+
+- **A re-registration can no longer redirect where a session's injects are delivered (#815).**
+  `delivery` / `delivery_endpoint` are mutable only by a caller holding the session's current
+  credential. Sessions with no credential are unaffected.
+
+### Added
+- `session_owner_replaced` bus event (#815): a `?owner=1` claim that displaced a **live** owner
+  previously emitted no event at all, leaving the session record looking healthy under the new
+  socket while its assignee had exited. The daemon now states the fact it actually observed. It is
+  not interchangeable with `session_reconnect` and implies no process-exit observation. See
+  `BUS_EVENT_SCHEMA.md`.
+- `verified_sender_epoch` / `verified_sender_generation` on inject audit lines and on
+  `inject_written`, completing the principal so a consumer can tell which *instance* of a session
+  id sent something.
+
+### Notes
+- Sessions that are live across the upgrade lose sender attribution once, at the restart that
+  installs it: they have no persisted verifier, and their in-memory credentials did not survive a
+  restart before this change either. Not a regression, but visible outside a maintenance window.
+- What sender authentication does and does not prove — including a measured platform split on
+  whether a same-uid process can read a bearer out of another process's environment, and the
+  first-claim residual — is documented in `BOUNDARY.md`.
+
 ## 0.7.1 — 2026-07-26
 
 ### Security

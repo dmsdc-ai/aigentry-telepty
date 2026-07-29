@@ -43,17 +43,21 @@ test('P4: register mints a per-session nonce; capability is OFF by default', asy
   assert.equal(reg.body.provenance_capable, false, 'default-OFF: no banner until opted in');
 });
 
-test('P4: provenance_capable:true opts the session in; nonce is stable across re-register', async () => {
+test('P4: provenance_capable:true opts the session in; re-register never re-discloses the nonce', async () => {
   const sid = createSessionId('prov-on');
   const reg1 = await daemon.request('/api/sessions/register', { method: 'POST', body: { session_id: sid, command: 'x', provenance_capable: true } });
   assert.equal(reg1.body.provenance_capable, true);
-  const nonce1 = reg1.body.session_nonce;
+  assert.equal(typeof reg1.body.session_nonce, 'string', 'issued once, at first registration');
 
-  // A metadata re-register (no capability flag) must NOT drop capability nor rotate the nonce —
-  // the carried env copy would otherwise go stale and every banner would read as untrusted.
   const reg2 = await daemon.request('/api/sessions/register', { method: 'POST', body: { session_id: sid, command: 'x' } });
   assert.equal(reg2.body.provenance_capable, true, 'capability is sticky once on');
-  assert.equal(reg2.body.session_nonce, nonce1, 'nonce is idempotent per sid');
+  // #815: this assertion USED to read "nonce is idempotent per sid" and compared reg2's nonce to
+  // reg1's. That was the vulnerability, not a feature: the nonce is the secret an agent checks
+  // before trusting a delivery's origin banner, and returning it to whoever names an
+  // already-registered sid handed the provenance fence to any local caller. The nonce is still
+  // stable for the session (never rotated out from under the carried env copy) — it is simply
+  // never disclosed a second time, so stability is no longer observable from a response body.
+  assert.equal(reg2.body.session_nonce, undefined, 'a re-register discloses no nonce');
 });
 
 // --- P5 #45 blocked-inject audit line ---------------------------------------

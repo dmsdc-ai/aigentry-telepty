@@ -110,9 +110,11 @@ async function bootDaemon(homeDir) {
 // status line into the body echo, mirroring how a real TUI redraws its status line at frame end. An
 // IDLE bridge echoes bare text (transient `working`) and, on a CR, simulates the composer clearing +
 // a fresh turn starting (idle→working with output past the submit watermark).
-function attachOwnerBridge(port, sessionId) {
+function attachOwnerBridge(port, sessionId, bearer) {
   const url = `ws://127.0.0.1:${port}/api/sessions/${sessionId}?owner=1&owner_pid=${process.pid}&token=${TOKEN}`;
-  const ws = new WebSocket(url);
+  // #815: a session that holds a credential requires the matching bearer on the owner claim, or
+  // the daemon refuses it (4003) — a tokenless claim is indistinguishable from a takeover attempt.
+  const ws = new WebSocket(url, bearer ? { headers: { 'x-telepty-session-token': bearer } } : undefined);
   let spinnerTimer = null;
   let spinnerFrame = 0;
   let mode = 'idle';
@@ -165,9 +167,9 @@ test('#694(a) idle target: clean ready path (gate_wait_ms=0, consumed, no gated_
   try {
     d = await bootDaemon(home);
     const id = 'idle694';
-    await d.req('/api/sessions/register', { method: 'POST',
+    const reg = await d.req('/api/sessions/register', { method: 'POST',
       body: { session_id: id, command: 'claude', delivery_type: 'wrapped', cwd: '/tmp' } });
-    const bridge = attachOwnerBridge(d.port, id);
+    const bridge = attachOwnerBridge(d.port, id, reg.body && reg.body.session_token);
     await bridge.ready;
     bridge.goIdle();
     await delay(300);
@@ -201,9 +203,9 @@ test('#694(b) busy target: fast-path dispatches without the full-timeout burn', 
   try {
     d = await bootDaemon(home);
     const id = 'busy694';
-    await d.req('/api/sessions/register', { method: 'POST',
+    const reg = await d.req('/api/sessions/register', { method: 'POST',
       body: { session_id: id, command: 'claude', delivery_type: 'wrapped', cwd: '/tmp' } });
-    const bridge = attachOwnerBridge(d.port, id);
+    const bridge = attachOwnerBridge(d.port, id, reg.body && reg.body.session_token);
     await bridge.ready;
     bridge.startBusy(300);
     await delay(700); // let `thinking` accrue duration_ms ≫ grace (a genuine ongoing turn)

@@ -139,6 +139,25 @@ Emitted by telepty after successful auto-route delivery.
 { "type": "session.replaced", "sender": "daemon", "old_id": "string", "new_id": "string", "alias": "string", "timestamp": "ISO 8601" }
 ```
 
+### `session_owner_replaced` (0.8.0, #815)
+```json
+{ "type": "session_owner_replaced", "sender": "daemon", "session_id": "string", "reason": "owner_claim_displaced_live_owner", "displaced_owner_pid": "number|null", "claimant_owner_pid": "number|null", "claim_was_credentialed": "boolean", "timestamp": "ISO 8601" }
+```
+A `?owner=1` claim displaced an owner whose socket was **still open**. The displaced bridge reads
+close 4001 and exits its session, so **the agent assigned to this session may no longer exist.**
+
+Emitted because this case previously produced *no event at all*: `session_reconnect` fires only
+when the prior owner was already disconnected, so a live takeover left the record looking healthy
+under a new socket while its assignee was gone. Silence read as continuity.
+
+- This is **not** interchangeable with `session_reconnect`, which asserts a continuity that did
+  not happen here. A consumer must not treat a replaced owner as a recovered one.
+- The daemon asserts only what it observed: that a live owner was replaced. It does **not** know
+  whether the displaced process then died — no process-exit observation is implied.
+- `claim_was_credentialed: false` means the session held no credential to check the claim against
+  (the WS auto-register path, or a record restored from a pre-#815 daemon). That is the residual
+  case in which displacement remains possible at all.
+
 ### `session.idle`
 ```json
 { "type": "session.idle", "session_id": "string", "idleSeconds": "number", "lastActivityAt": "ISO 8601", "timestamp": "ISO 8601" }
@@ -153,8 +172,19 @@ Emitted by telepty after successful auto-route delivery.
 
 ### `inject_written`
 ```json
-{ "type": "inject_written", "inject_id": "UUID", "sender": "daemon", "target_agent": "string", "content": "string", "from": "string|null", "verified_sender_sid": "string|null", "spoof_suspected": "boolean", "origin": "trusted-local|untrusted-remote", "reply_to": "string|null", "thread_id": "string|null", "reply_expected": "boolean", "timestamp": "ISO 8601" }
+{ "type": "inject_written", "inject_id": "UUID", "sender": "daemon", "target_agent": "string", "content_sha256": "string", "content_length": "number", "from": "string|null", "verified_sender_sid": "string|null", "verified_sender_epoch": "string|null", "verified_sender_generation": "number|null", "spoof_suspected": "boolean", "origin": "trusted-local|untrusted-remote", "reply_to": "string|null", "thread_id": "string|null", "reply_expected": "boolean", "timestamp": "ISO 8601" }
 ```
+- **BREAKING (0.8.0, #815): `content` is gone.** The prompt is no longer rebroadcast verbatim.
+  Any local process may subscribe to `/api/bus` with no token and no `Origin`, so publishing the
+  full text of every dispatch there was a disclosure in its own right — and the harvest that hands
+  an adversary the correlation identifiers carried inside dispatches. `content_sha256` +
+  `content_length` replace it: enough to correlate a delivery and to verify integrity against a
+  payload you already hold, and nothing to read if you do not. A subscriber that needs the text
+  must be a party to the inject; the bus is not an authorization boundary.
+- `verified_sender_epoch` / `verified_sender_generation` complete the principal
+  `(canonical_sid, session_epoch, credential_generation)` — see `verified_sender_sid` below. Both
+  are `null` whenever the sender is unverified, so an absent epoch never reads as
+  "verified, epoch unknown".
 - `from` is the **claimed** sender (`body.from`, spoofable). `verified_sender_sid` is the
   **daemon-verified** identity (mapped from the per-session token presented as
   `x-telepty-session-token`), or `null` when unverifiable (operator/human shell). `spoof_suspected`

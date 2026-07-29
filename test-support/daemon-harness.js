@@ -105,7 +105,18 @@ async function startTestDaemon(options = {}) {
   // Resolved to the real OS-assigned port after read-back when requestedPort === 0.
   let port = requestedPort;
   let portResolved = requestedPort !== 0;
-  const { homeDir, env: homeEnv } = createTempHome();
+  // A caller may supply its own HOME so two successive daemons can share one — the shape a
+  // daemon-RESTART test needs (#815: a persisted credential verifier must survive it). When the
+  // caller owns the directory, stop() must not delete it out from under the next daemon.
+  const ownsHome = !options.homeDir;
+  const { homeDir, env: homeEnv } = ownsHome
+    ? createTempHome()
+    : {
+      homeDir: options.homeDir,
+      env: process.platform === 'win32'
+        ? { HOME: options.homeDir, USERPROFILE: options.homeDir }
+        : { HOME: options.homeDir }
+    };
   const sharedEnv = {
     ...process.env,
     ...homeEnv,
@@ -190,6 +201,23 @@ async function startTestDaemon(options = {}) {
     }, { description: 'session cleanup' });
   }
 
+  // Kill the daemon process WITHOUT the cleanupSessions() pass stop() does. A restart test needs
+  // this: cleanupSessions DELETEs every session, and DELETE revokes credentials (#815), so
+  // stopping politely would destroy the very state the restart is supposed to carry across.
+  async function kill() {
+    if (child.exitCode === null) {
+      child.kill();
+      const exited = await Promise.race([
+        once(child, 'exit').then(() => true),
+        delay(2000).then(() => false)
+      ]);
+      if (!exited && child.exitCode === null) {
+        child.kill('SIGKILL');
+        await once(child, 'exit').catch(() => {});
+      }
+    }
+  }
+
   async function stop() {
     try {
       await cleanupSessions();
@@ -211,7 +239,9 @@ async function startTestDaemon(options = {}) {
       }
     }
 
-    fs.rmSync(homeDir, { recursive: true, force: true });
+    if (ownsHome) {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
   }
 
   async function spawnSession(sessionId, overrides = {}) {
@@ -228,6 +258,12 @@ async function startTestDaemon(options = {}) {
     return request('/api/sessions/spawn', { method: 'POST', body });
   }
 
+  // #815: a session's bearer is issued exactly once, in the response to its FIRST registration.
+  // Remember it per sid so a test that later claims ownership can prove it owns the session, which
+  // is what the real bridge now does (cli.js sends it on the WS handshake). Without this a test
+  // bridge is indistinguishable from an attacker and the daemon refuses its claim with 4003.
+  const sessionBearers = new Map();
+
   async function registerSession(sessionId, overrides = {}) {
     const body = {
       session_id: sessionId,
@@ -236,11 +272,23 @@ async function startTestDaemon(options = {}) {
       ...overrides
     };
 
-    return request('/api/sessions/register', { method: 'POST', body });
+    const result = await request('/api/sessions/register', { method: 'POST', body });
+    if (result.body && result.body.session_token) {
+      sessionBearers.set(sessionId, result.body.session_token);
+    }
+    return result;
   }
 
-  async function connectWebSocket(pathname) {
-    const ws = new WebSocket(`ws://${host}:${port}${pathname}`);
+  // WebSocket options that authenticate an ?owner=1 claim for `sessionId`. Returns undefined when
+  // no bearer is known, which is the correct shape for the auto-register path (no credential to
+  // prove) and for a test deliberately claiming as an unauthenticated caller.
+  function ownerAuth(sessionId) {
+    const bearer = sessionBearers.get(sessionId);
+    return bearer ? { headers: { 'x-telepty-session-token': bearer } } : undefined;
+  }
+
+  async function connectWebSocket(pathname, wsOptions) {
+    const ws = new WebSocket(`ws://${host}:${port}${pathname}`, wsOptions);
     await new Promise((resolve, reject) => {
       ws.once('open', resolve);
       ws.once('error', reject);
@@ -311,11 +359,13 @@ async function startTestDaemon(options = {}) {
     request,
     spawnSession,
     registerSession,
+    ownerAuth,
     cleanupSessions,
     connectBus: () => connectWebSocket('/api/bus'),
     connectSession: (sessionId) => connectWebSocket(`/api/sessions/${encodeURIComponent(sessionId)}`),
     runCli,
     stop,
+    kill,
     waitFor,
     isAlive: () => child.exitCode === null,
     getLogs: () => ({ stdout, stderr })

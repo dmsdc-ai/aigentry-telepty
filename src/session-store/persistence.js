@@ -33,6 +33,17 @@ function serializePersistedSessions(sessions) {
       idleTtlMs: s.idleTtlMs == null ? null : s.idleTtlMs,
       ownerPid: s.ownerPid || null,
       ptyPid: s.ptyPid || null,
+      // #815: the VERIFIER for the active credential epoch — never the bearer itself. This is
+      // what keeps the already-running child's spawn-time bearer verifiable across a daemon
+      // restart without reissuing anything (its environment cannot be updated from outside).
+      // Omitted entirely for a session with no credential, so those serialize as before.
+      ...(s.sessionEpoch && s.credentialVerifier
+        ? {
+          sessionEpoch: s.sessionEpoch,
+          credentialVerifier: s.credentialVerifier,
+          credentialGeneration: s.credentialGeneration || 1
+        }
+        : {}),
       // #730: the OBSERVED bracketed-paste capability (ESC[?2004h/l). Identity-based
       // capability is re-derived from `command` on restore, but an observation about a
       // CLI we have no identity rule for can never be re-learned — codex-style CLIs
@@ -45,17 +56,27 @@ function serializePersistedSessions(sessions) {
   return data;
 }
 
+// #815: this file now carries credential verifiers, so it is owner-only (0600). The mode is
+// passed to writeFileSync for the create case AND chmod'ed explicitly, because writeFileSync's
+// mode applies only when it creates the file — an existing 0644 sessions.json written by an
+// older daemon would otherwise keep its permissions forever.
+const SESSION_FILE_MODE = 0o600;
+
 function savePersistedSessions(sessions, persistPath = defaultSessionPersistPath()) {
   try {
     const data = serializePersistedSessions(sessions);
     fs.mkdirSync(path.dirname(persistPath), { recursive: true });
-    fs.writeFileSync(persistPath, JSON.stringify(data, null, 2));
+    fs.writeFileSync(persistPath, JSON.stringify(data, null, 2), { mode: SESSION_FILE_MODE });
+    try { fs.chmodSync(persistPath, SESSION_FILE_MODE); } catch {}
   } catch {}
 }
 
 function loadPersistedSessions(persistPath = defaultSessionPersistPath()) {
   try {
     if (!fs.existsSync(persistPath)) return {};
+    // Tighten on the way in too: a file left world-readable by a pre-#815 daemon must not stay
+    // that way until the next write happens to land.
+    try { fs.chmodSync(persistPath, SESSION_FILE_MODE); } catch {}
     return JSON.parse(fs.readFileSync(persistPath, 'utf8'));
   } catch { return {}; }
 }
@@ -83,6 +104,16 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
     idleTtlMs: meta.idleTtlMs == null ? null : meta.idleTtlMs,
     ownerPid: meta.ownerPid || null,
     ptyPid: meta.ptyPid || null,
+    // #815: carry the credential epoch + verifier back onto the live record so the restored
+    // instance keeps its identity. Both must be present or neither is restored — a half-record
+    // would leave a session that looks credentialed but can never verify.
+    ...(meta.sessionEpoch && meta.credentialVerifier
+      ? {
+        sessionEpoch: meta.sessionEpoch,
+        credentialVerifier: meta.credentialVerifier,
+        credentialGeneration: Number(meta.credentialGeneration) || 1
+      }
+      : {}),
     // #730: restore an OBSERVED capability. Absent (or a null from a hand-edited file)
     // must stay `undefined` so the session falls back to identity-based capability
     // rather than being pinned to a hard "not capable".

@@ -1288,7 +1288,8 @@ test('auto-report: inject with from triggers TASK_COMPLETE when target goes idle
 // Connect a wrapped owner bridge (?owner=1), wait for open, and return the ws plus a live record
 // of every JSON frame and close event it sees. No auth token needed — the daemon allows loopback.
 async function connectOwner(sessionId) {
-  const ws = new WebSocket(`ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}?owner=1`);
+  // #815: prove ownership on the claim, exactly as the real bridge does.
+  const ws = new WebSocket(`ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}?owner=1`, harness.ownerAuth(sessionId));
   const frames = [];
   const closes = [];
   ws.on('message', (chunk) => {

@@ -25,6 +25,7 @@ const lifecycle = require('./src/lifecycle');
 const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, applySurfaceMismatchProbe } = lifecycle;
 const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
+const { createCredentialStore } = require('./src/session-store/session-credentials');
 const { createAuditWriter, readInjectLog } = require('./src/audit/inject-log');
 const { mintSessionNonce, applyProvenance } = require('./src/audit/provenance');
 
@@ -235,44 +236,66 @@ function auditAppend(record) {
   try { auditWriter.append(record); } catch { /* audit must never throw into a handler */ }
 }
 
-// #43 P2 — per-session verified-sender tokens (spec §4, ADR D1). The daemon mints a random
-// token at /api/sessions/register and maps token→sid; the `allow` wrapper carries it in the
-// parent-hijack-protected env beside TELEPTY_SESSION_ID; `inject` presents x-telepty-session-token.
-// `verified_sender_sid` = the mapped sid (the daemon's own truth) or null when unverifiable.
-// Issuance is idempotent per sid so the periodic metadata re-register (cli.js
-// updateDaemonProcessMetadata) does NOT rotate the token out from under the carried env.
-const sessionTokens = new Map(); // token → sid
-const sidTokens = new Map();     // sid → token
-function mintSessionToken(sid) {
-  const existing = sidTokens.get(sid);
-  if (existing) return existing;
-  const token = crypto.randomBytes(32).toString('base64url');
-  sessionTokens.set(token, sid);
-  sidTokens.set(sid, token);
-  return token;
-}
+// #43 P2 / #815 — per-session verified-sender credentials. The principal is
+// (sid, epoch, generation), NOT a bare sid: an id is routinely destroyed and recreated here
+// (worker cleanup, track reuse), and the successor must not inherit its predecessor's authority.
+//
+// #815 closed three composing defects. Issuance used to be keyed to a NAME and was idempotent per
+// sid, so re-registering an already-registered id handed its live token to whoever asked; loopback
+// callers pass the auth middleware before any token check; and tokens were never revoked. Together
+// that let any local process obtain any session's token and speak as it — including as the
+// orchestrator. Now: issuance happens exactly once, at first registration of an id the daemon does
+// not hold; a re-register discloses nothing; and every destroy path revokes.
+//
+// The daemon keeps only sha256(bearer) and PERSISTS that verifier (never the bearer), so the same
+// bearer stays verifiable across a daemon restart with no reissuance — which matters because the
+// wrapped child carries it in its spawn-time env and that env cannot be updated from outside.
+const sessionCredentials = createCredentialStore();
 
-// #47 P4 — per-session provenance nonce (spec §6, ADR §3 D3). The daemon mints one nonce per
-// sid at register and delivers it to the agent ONCE over the trusted bootstrap/onboarding channel
-// (the protected env, not any deliverable payload). The receiving agent trusts a delivery's origin
-// banner ONLY if it carries this nonce. Issuance is idempotent per sid so the periodic metadata
-// re-register does not rotate the nonce out from under the carried env (matches the token above).
+// #47 P4 — per-session provenance nonce (spec §6, ADR §3 D3). The receiving agent trusts a
+// delivery's origin banner ONLY if it carries this nonce, so the nonce is bearer material and had
+// the IDENTICAL #815 defect: idempotent per sid, returned on every re-register to any caller, and
+// never revoked. It now shares the credential's lifecycle exactly — minted once per instance,
+// disclosed only at that first registration, revoked with the epoch.
 const sidNonces = new Map(); // sid → nonce
-function ensureSessionNonce(sid) {
-  const existing = sidNonces.get(sid);
-  if (existing) return existing;
+
+// Mint the credential + nonce for a NEW instance of `sid`. The bearer and nonce it returns are
+// handed to exactly one caller, exactly once, and are never recoverable afterwards.
+function issueSessionCredential(sid) {
+  const credential = sessionCredentials.issue(sid);
   const nonce = mintSessionNonce();
   sidNonces.set(sid, nonce);
-  return nonce;
+  return { ...credential, nonce };
 }
-function resolveVerifiedSender(token) {
-  if (!token) return null;
-  return sessionTokens.get(token) || null;
+
+// Called from EVERY destroy path before the id can be reused.
+function revokeSessionCredential(sid) {
+  sessionCredentials.revoke(sid);
+  sidNonces.delete(sid);
 }
-// Extract the presented session token from an inject request (header only — never the body,
-// which is attacker-controlled). Returns the daemon-verified sid or null.
+
+// Resolve the presented bearer to the full principal (header only — never the body, which is
+// attacker-controlled). Fail closed: unparseable, unknown, stale or revoked yields null, never a
+// fallback to the name the caller claimed.
+function verifiedPrincipalFromReq(req) {
+  const bearer = req.headers && req.headers['x-telepty-session-token'];
+  if (!bearer) return null;
+  return sessionCredentials.verify(bearer);
+}
+// Back-compat shorthand for the call sites that only need the sid half of the principal.
 function verifiedSenderFromReq(req) {
-  return resolveVerifiedSender(req.headers && req.headers['x-telepty-session-token']);
+  const principal = verifiedPrincipalFromReq(req);
+  return principal ? principal.sid : null;
+}
+// The three audit/bus fields for a principal, emitted TOGETHER so a consumer never sees a
+// verified sid beside a null epoch — that combination would read as "verified, instance unknown",
+// which is not a state this daemon can be in. All three are null, or all three are set.
+function verifiedSenderFields(principal) {
+  return {
+    verified_sender_sid: principal ? principal.sid : null,
+    verified_sender_epoch: principal ? principal.epoch : null,
+    verified_sender_generation: principal ? principal.generation : null
+  };
 }
 
 // JWT auth: set TELEPTY_JWT_SECRET to enable. Tokens in Authorization: Bearer <token>
@@ -2639,6 +2662,7 @@ async function teardownSessionById(id, options = {}) {
   cancelModalParkPoll(session);   // #760: a destroyed session must not keep polling its surface
 
   delete sessions[id];
+  revokeSessionCredential(id);    // #815: kill path — the epoch dies with the instance
   sessionStateManager.unregister(id);
   try { mailbox.purge(id); } catch {}
   lifecycle.cleanupSessionArtifacts(id);
@@ -2665,6 +2689,11 @@ for (const [id, meta] of Object.entries(_persisted)) {
   const restored = sessionPersistence.buildRestoredWrappedSession(id, meta, { cwd: process.cwd() });
   if (!restored) continue;
   sessions[id] = restored;
+  // #815: re-index the persisted VERIFIER so the bearer the wrapped child already carries in its
+  // spawn-time environment keeps verifying across this restart, with nothing reissued. Without
+  // this, every restored session silently becomes an unauthenticated sender — the child's env
+  // cannot be updated from outside, so a fresh credential would never reach it.
+  sessionCredentials.adopt(id, meta);
   initializeBootstrapState(sessions[id]);
   // #678: a session restored across a daemon restart must get a render-state machine,
   // else the submit gate reads getState()=null → no_state and never fires the CR. The
@@ -2838,6 +2867,7 @@ app.post('/api/sessions/spawn', (req, res) => {
       sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
       if (sessions[currentId] === sessionRecord) {
         delete sessions[currentId];
+        revokeSessionCredential(currentId);   // #815: PTY exit — the instance is gone
         sessionStateManager.unregister(currentId);
       }
     });
@@ -2860,6 +2890,13 @@ app.post('/api/sessions/register', (req, res) => {
   // Idempotent: allow re-registration (update command/cwd, keep clients)
   if (sessions[session_id]) {
     const existing = sessions[session_id];
+    // #815: does this caller hold the session's CURRENT credential? A re-register never mints,
+    // recovers or discloses credential material either way — this only decides whether the
+    // caller may redirect where the session's injects are delivered (below).
+    // Keyed off the RESOLVED record's own id (daemon-owned state), never the raw body string —
+    // identical here since we are inside `if (sessions[session_id])`, but it keeps
+    // attacker-controlled text out of the credential path entirely.
+    const credentialed = sessionCredentials.matches(existing.id, req.headers['x-telepty-session-token']);
     if (command) existing.command = command;
     if (cwd) existing.cwd = cwd;
     if (backend) existing.backend = backend;
@@ -2868,12 +2905,22 @@ app.post('/api/sessions/register', (req, res) => {
     if (Object.prototype.hasOwnProperty.call(req.body, 'term_program')) existing.termProgram = term_program || null;
     if (Object.prototype.hasOwnProperty.call(req.body, 'term')) existing.term = term || null;
     if (req.body.delivery_type) existing.type = req.body.delivery_type;
-    if (req.body.delivery_endpoint) existing.deliveryEndpoint = req.body.delivery_endpoint;
-    if (req.body.delivery) {
-      existing.delivery = req.body.delivery;
-      if (!existing.deliveryEndpoint && req.body.delivery.address) {
-        existing.deliveryEndpoint = req.body.delivery.address;
+    // #815: the delivery endpoint is where this session's injects are WRITTEN. An uncredentialed
+    // re-register that could rewrite it would redirect a live session's traffic to an attacker —
+    // the same "keyed to a name" flaw as the token disclosure, on the same endpoint. A session
+    // that has no credential at all (aterm/external registrants) is unchanged: nothing to prove
+    // against, so those registrations keep working exactly as before.
+    const mayRedirectDelivery = credentialed || !sessionCredentials.hasCredential(existing.id);
+    if (mayRedirectDelivery) {
+      if (req.body.delivery_endpoint) existing.deliveryEndpoint = req.body.delivery_endpoint;
+      if (req.body.delivery) {
+        existing.delivery = req.body.delivery;
+        if (!existing.deliveryEndpoint && req.body.delivery.address) {
+          existing.deliveryEndpoint = req.body.delivery.address;
+        }
       }
+    } else if (req.body.delivery_endpoint || req.body.delivery) {
+      console.warn(`[REGISTER] Ignored uncredentialed delivery-endpoint change for session ${session_id}`);
     }
     if (req.body.delivery_type === 'aterm') {
       existing.ready = true;
@@ -2886,7 +2933,6 @@ app.post('/api/sessions/register', (req, res) => {
     // #47 P4 — provenance capability is opt-in (default-OFF). Only flip it ON; never silently OFF
     // on a metadata re-register, or a session's delivered bytes would change mid-flight.
     if (req.body.provenance_capable === true) existing.provenanceCapable = true;
-    existing.provenanceNonce = ensureSessionNonce(session_id);
     // #678: a bridge reconnecting to an already-known session (e.g. one restored across a
     // daemon restart, or a re-`allow` of the same id) must still end up with a render-state
     // machine. register() is idempotent (returns the existing machine untouched), so this is
@@ -2894,11 +2940,21 @@ app.post('/api/sessions/register', (req, res) => {
     // machine for a same-id reconnect, since a daemon restart is not required to reach here.
     sessionStateManager.register(session_id);
     console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
-    return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_token: mintSessionToken(session_id), session_nonce: existing.provenanceNonce, provenance_capable: !!existing.provenanceCapable });
+    // #815: NO credential material in a re-register response — not the bearer, not the nonce, not
+    // even to a caller that proved it holds the current one. This was the disclosure: the branch
+    // used to return `mintSessionToken(session_id)` to whoever named an already-registered id.
+    // The legitimate holder does not need a copy back: the bridge carries the bearer in its env
+    // (cli.js) and the child got its copy at spawn. `session_epoch` is a non-secret instance
+    // discriminator — it identifies WHICH instance answered, and proves nothing on its own.
+    return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_epoch: existing.sessionEpoch || null, provenance_capable: !!existing.provenanceCapable });
   }
 
   const { delivery_type, delivery_endpoint, delivery } = req.body;
   const resolvedEndpoint = delivery_endpoint || (delivery && delivery.address) || null;
+  // #815 — THE issuance point, and the only one. This branch runs exactly when the daemon does
+  // not currently hold `session_id`, so every credential belongs to a fresh instance: a recreated
+  // textual sid gets a new epoch and its predecessor's bearer can never resolve to it.
+  const issued = issueSessionCredential(session_id);
   const sessionRecord = {
     id: session_id,
     type: delivery_type || 'wrapped',
@@ -2930,7 +2986,11 @@ app.post('/api/sessions/register', (req, res) => {
     // #47 P4 — provenance banner is opt-in per session (default-OFF, spec §6 rollout). A nonce is
     // always minted (cheap) but the capability-gated banner only wraps deliveries when capable.
     provenanceCapable: req.body.provenance_capable === true,
-    provenanceNonce: ensureSessionNonce(session_id),
+    provenanceNonce: issued.nonce,
+    // #815: the VERIFIER is what lives on the record and goes to disk — the bearer never does.
+    sessionEpoch: issued.epoch,
+    credentialVerifier: issued.verifier,
+    credentialGeneration: issued.generation,
   };
   initializeBootstrapState(sessionRecord);
   applyTimestampMetadata(sessionRecord, req.body);
@@ -2969,9 +3029,13 @@ app.post('/api/sessions/register', (req, res) => {
     if (client.readyState === 1) client.send(busMsg);
   });
 
-  console.log(`[REGISTER] Registered wrapped session ${session_id}`);
+  console.log(`[REGISTER] Registered wrapped session ${session_id} (epoch: ${issued.epoch})`);
+  // #815: persist the verifier BEFORE acknowledging. persistSessions() is synchronous, so once
+  // this response is on the wire the credential is already durable — a daemon that dies between
+  // the two can never leave a bearer in a child's env with no verifier on disk to match it.
   persistSessions();
-  res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd, session_token: mintSessionToken(session_id), session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
+  // The bearer and nonce cross the wire HERE and only here, once, to this one caller.
+  res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd, session_token: issued.bearer, session_epoch: issued.epoch, credential_generation: issued.generation, session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
 });
 
 app.get('/api/sessions', (req, res) => {
@@ -3152,7 +3216,7 @@ function isPeerLaneFanout(from, prompt) {
 // intended target (mirrors the single-inject block event for reporting parity) and return
 // the same 403 PEER_INJECT_BLOCKED shape, reaching ZERO sessions. `targetIds` is the full
 // intended target set (broadcast = all sessions, multicast = requested session_ids).
-function rejectPeerLaneFanout(res, { from, reason, targetIds, source, verifiedSenderSid = null, prompt = '' }) {
+function rejectPeerLaneFanout(res, { from, reason, targetIds, source, verifiedSender = null, prompt = '' }) {
   const inject_id = crypto.randomUUID();
   const failed = [];
   for (const id of targetIds) {
@@ -3169,7 +3233,7 @@ function rejectPeerLaneFanout(res, { from, reason, targetIds, source, verifiedSe
     // fan-out audit), so a blocked fan-out's blast-radius is queryable just like a delivered one.
     auditAppend({
       ts: new Date().toISOString(), inject_id, kind: source, source,
-      claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+      claimed_from: from || null, ...verifiedSender,
       to: id, to_alias: null, origin: 'trusted-local', origin_host: MACHINE_ID,
       payload: prompt, delivery_result: `blocked:${reason}`
     });
@@ -3189,7 +3253,7 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
   // #45 — operator-only fan-out gate (peer lane blocked outright, before any delivery).
   const verdict = isPeerLaneFanout(from, prompt);
   if (verdict.lane === 'peer') {
-    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds: session_ids, source: 'multicast', verifiedSenderSid: verifiedSenderFromReq(req), prompt });
+    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds: session_ids, source: 'multicast', verifiedSender: verifiedSenderFields(verifiedPrincipalFromReq(req)), prompt });
   }
   // #45 — defense-in-depth blast-radius cap (operator lane too).
   if (session_ids.length > FANOUT_MAX_TARGETS) {
@@ -3201,7 +3265,9 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
   const results = { successful: [], failed: [] };
   // #43 — one inject_id for the whole fan-out; one audit line per target (group by inject_id).
   const inject_id = crypto.randomUUID();
-  const verifiedSenderSid = verifiedSenderFromReq(req);
+  const verifiedPrincipal = verifiedPrincipalFromReq(req);
+  const verifiedSenderSid = verifiedPrincipal ? verifiedPrincipal.sid : null;
+  const verifiedSender = verifiedSenderFields(verifiedPrincipal);   // #815 audit fields
 
   for (const id of session_ids) {
     const session = sessions[id];
@@ -3214,12 +3280,12 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
         });
         if (!delivery.success) {
           results.failed.push({ id, code: delivery.code, error: delivery.error });
-          auditMulticastTarget(inject_id, 'multicast', from, verifiedSenderSid, id, prompt, `failed:${delivery.code || 'DELIVERY_FAILED'}`);
+          auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, `failed:${delivery.code || 'DELIVERY_FAILED'}`);
           continue;
         }
 
         results.successful.push({ id, strategy: delivery.strategy });
-        auditMulticastTarget(inject_id, 'multicast', from, verifiedSenderSid, id, prompt, 'success');
+        auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, 'success');
 
         // Broadcast injection to bus
         broadcastBusEvent({
@@ -3231,11 +3297,11 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
         });
       } catch (err) {
         results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
-        auditMulticastTarget(inject_id, 'multicast', from, verifiedSenderSid, id, prompt, 'failed:DELIVERY_FAILED');
+        auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, 'failed:DELIVERY_FAILED');
       }
     } else {
       results.failed.push({ id, code: 'SESSION_NOT_FOUND', error: 'Session not found' });
-      auditMulticastTarget(inject_id, 'multicast', from, verifiedSenderSid, id, prompt, 'failed:SESSION_NOT_FOUND');
+      auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, 'failed:SESSION_NOT_FOUND');
     }
   }
 
@@ -3244,10 +3310,12 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
 
 // #43 — shared per-target audit helper for the fan-out handlers (multicast/broadcast). One
 // JSONL line per target so blast-radius is queryable per session; all share `inject_id`.
-function auditMulticastTarget(inject_id, kind, from, verifiedSenderSid, id, prompt, delivery_result) {
+// #815: takes the full principal fields (verifiedSenderFields) rather than a bare sid, so a
+// fan-out line carries the same instance identity a single inject does.
+function auditMulticastTarget(inject_id, kind, from, verifiedSender, id, prompt, delivery_result) {
   auditAppend({
     ts: new Date().toISOString(), inject_id, kind, source: kind,
-    claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+    claimed_from: from || null, ...verifiedSender,
     to: id, to_alias: null, origin: 'trusted-local', origin_host: MACHINE_ID,
     payload: prompt, delivery_result
   });
@@ -3262,7 +3330,7 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
   const targetIds = Object.keys(sessions);
   const verdict = isPeerLaneFanout(from, prompt);
   if (verdict.lane === 'peer') {
-    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds, source: 'broadcast', verifiedSenderSid: verifiedSenderFromReq(req), prompt });
+    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds, source: 'broadcast', verifiedSender: verifiedSenderFields(verifiedPrincipalFromReq(req)), prompt });
   }
   // #45 — defense-in-depth blast-radius cap (operator lane too).
   if (targetIds.length > FANOUT_MAX_TARGETS) {
@@ -3274,7 +3342,9 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
   const results = { successful: [], failed: [] };
   // #43 — one inject_id for the whole broadcast; one audit line per target.
   const inject_id = crypto.randomUUID();
-  const verifiedSenderSid = verifiedSenderFromReq(req);
+  const verifiedPrincipal = verifiedPrincipalFromReq(req);
+  const verifiedSenderSid = verifiedPrincipal ? verifiedPrincipal.sid : null;
+  const verifiedSender = verifiedSenderFields(verifiedPrincipal);   // #815 audit fields
 
   for (const id of targetIds) {
     const session = sessions[id];
@@ -3286,15 +3356,15 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
       });
       if (!delivery.success) {
         results.failed.push({ id, code: delivery.code, error: delivery.error });
-        auditMulticastTarget(inject_id, 'broadcast', from, verifiedSenderSid, id, prompt, `failed:${delivery.code || 'DELIVERY_FAILED'}`);
+        auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, `failed:${delivery.code || 'DELIVERY_FAILED'}`);
         continue;
       }
 
       results.successful.push({ id, strategy: delivery.strategy });
-      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSenderSid, id, prompt, 'success');
+      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, 'success');
     } catch (err) {
       results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
-      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSenderSid, id, prompt, 'failed:DELIVERY_FAILED');
+      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, 'failed:DELIVERY_FAILED');
     }
   }
 
@@ -3950,8 +4020,12 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
   // Routing metadata stays in session/bus state, not in the visible prompt text.
   const finalPrompt = prompt;
   const inject_id = crypto.randomUUID();
-  // #43 P2 — daemon-verified sender identity (from the presented token, never body.from).
-  const verifiedSenderSid = verifiedSenderFromReq(req);
+  // #43 P2 / #815 — daemon-verified sender identity (from the presented bearer, never body.from).
+  // The full principal (sid, epoch, generation) so a consumer can tell WHICH INSTANCE of a sid
+  // sent this; `verifiedSender` spreads the epoch/generation onto every audit line below.
+  const verifiedPrincipal = verifiedPrincipalFromReq(req);
+  const verifiedSenderSid = verifiedPrincipal ? verifiedPrincipal.sid : null;
+  const verifiedSender = verifiedSenderFields(verifiedPrincipal);
 
   // #533 Phase 2 — peer-lane inject guardrail (in-band hard block, before delivery).
   // Out-of-policy peer→peer injects (no sanctioned ask-request/ask-reply envelope)
@@ -3975,7 +4049,7 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
     // itself is unchanged; this only records the attempt.
     auditAppend({
       ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
-      claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+      claimed_from: from || null, ...verifiedSender,
       to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
       origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
       payload: finalPrompt, delivery_result: `blocked:${peerVerdict.reason}`
@@ -4004,7 +4078,7 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       }, session);
       auditAppend({
         ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
-        claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+        claimed_from: from || null, ...verifiedSender,
         to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
         origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
         payload: finalPrompt, delivery_result: `failed:${delivery.code || 'DELIVERY_FAILED'}`
@@ -4022,7 +4096,7 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
     // #43 P1/P2 — one audit line per delivery (claimed + daemon-verified sender, hash-only).
     auditAppend({
       ts: injectTimestamp, inject_id, kind: 'inject', source: 'inject',
-      claimed_from: from || null, verified_sender_sid: verifiedSenderSid,
+      claimed_from: from || null, ...verifiedSender,
       to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
       origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
       payload: finalPrompt, delivery_result: 'success'
@@ -4032,10 +4106,17 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       extra: {
         inject_id,
         target_agent: id,
-        content: prompt,
+        // #815: the prompt is NO LONGER rebroadcast verbatim. Any local socket may subscribe to
+        // the bus with no token and no Origin, so `content: prompt` published the full text of
+        // every dispatch to any local process — a disclosure in its own right, and the harvest
+        // that hands an adversary the correlation identifiers carried inside dispatches. Only
+        // non-secret transport metadata now: enough to correlate and to verify integrity against
+        // a payload you already hold, and nothing to read if you do not.
+        content_sha256: crypto.createHash('sha256').update(prompt).digest('hex'),
+        content_length: Buffer.byteLength(prompt),
         from: from || null,
         // #43 — live bus event enriched with daemon-verified provenance (spec §7).
-        verified_sender_sid: verifiedSenderSid,
+        ...verifiedSender,
         spoof_suspected: !!(from && verifiedSenderSid && from !== verifiedSenderSid),
         origin: 'trusted-local',
         reply_to: reply_to || null,
@@ -4263,6 +4344,16 @@ app.patch('/api/sessions/:id', (req, res) => {
   // Move session to new key (including state machine)
   sessions[new_id] = session;
   delete sessions[id];
+  // #815: a rename moves ONE LIVE INSTANCE to a new name — same PTY, same owner, same epoch. The
+  // credential follows the instance rather than being revoked, or the running child (which holds
+  // the bearer in an environment nobody can update) would silently lose its identity. Only
+  // canonical_sid changes in the principal; the epoch still says "same instance".
+  sessionCredentials.rename(id, new_id);
+  const renamedNonce = sidNonces.get(id);
+  if (renamedNonce !== undefined) {
+    sidNonces.delete(id);
+    sidNonces.set(new_id, renamedNonce);
+  }
   sessionStateManager.unregister(id);
   sessionStateManager.register(new_id);
   session.id = new_id;
@@ -4346,6 +4437,7 @@ app.delete('/api/sessions/:id', (req, res) => {
     // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
     try { terminalBackend.closeSurface(session); } catch {}
     delete sessions[id];
+    revokeSessionCredential(id);    // #815: DELETE — revoke before the id can be reused
     sessionStateManager.unregister(id);
     try { mailbox.purge(id); } catch {}
     lifecycle.cleanupSessionArtifacts(id);
@@ -4355,6 +4447,7 @@ app.delete('/api/sessions/:id', (req, res) => {
   } catch (err) {
     // Even if kill fails, remove from registry
     delete sessions[id];
+    revokeSessionCredential(id);    // #815: same on the error path — never leave a live epoch
     sessionStateManager.unregister(id);
     try { mailbox.purge(id); } catch {}
     lifecycle.cleanupSessionArtifacts(id);
@@ -5019,6 +5112,7 @@ if (require.main === module) setInterval(() => {
         disconnectedSeconds
       });
       delete sessions[id];
+      revokeSessionCredential(id);  // #815: TTL/GC is the routine reuse path — revoke here too
       sessionStateManager.unregister(id);
       console.log(`[CLEANUP] Removed stale session ${id} after ${disconnectedSeconds}s disconnected`);
       persistSessions();
@@ -5053,6 +5147,7 @@ installWebSocketTransport({
   tailnetServer,
   sessions,
   busClients,
+  credentials: sessionCredentials,   // #815 — owner-claim gate
   expectedToken: EXPECTED_TOKEN,
   verifyJwt,
   isAllowedPeer,

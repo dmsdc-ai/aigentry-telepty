@@ -535,6 +535,14 @@ function isOwnerReplacedClose(code) {
   return code === 4001;
 }
 
+// #815: the daemon refused this owner claim because the session holds a credential we cannot
+// match (close 4003). Reconnecting cannot fix that — the bearer we hold is for a dead instance,
+// or another owner legitimately holds this id. Exit rather than spin: a reconnect loop against a
+// permanent refusal is the oscillation #56 already had to fix once.
+function isOwnerClaimRefusedClose(code) {
+  return code === 4003;
+}
+
 function runUpdateInstall() {
   if (process.env.TELEPTY_SKIP_PACKAGE_UPDATE === '1') {
     return;
@@ -1854,7 +1862,7 @@ async function main() {
       // Re-register session BEFORE WebSocket connect (daemon rejects WS if session unknown)
       if (reconnectAttempts > 0) {
         try {
-          await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
+          const rereg = await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1871,12 +1879,30 @@ async function main() {
               ...(idleTtl !== null ? { idle_ttl: idleTtl } : {})
             })
           });
+          // #815: normally a re-register returns NO credential material and this is a no-op. The
+          // exception that matters: if the daemon GC'd this session while we were disconnected,
+          // the POST above was a FIRST registration of a fresh instance — a new epoch, a new
+          // bearer, and our env copy is now stale. Without adopting it here the owner claim below
+          // would be refused (4003) and the session could never reconnect. The child keeps the
+          // old bearer either way: its environment cannot be updated from outside, so it becomes
+          // an unauthenticated sender against the new instance — which is correct, it IS a
+          // different instance now.
+          const reregData = await rereg.json().catch(() => null);
+          if (reregData && reregData.session_token) {
+            process.env.TELEPTY_SESSION_TOKEN = reregData.session_token;
+          }
         } catch (e) {
           // Registration may fail if session already exists or daemon not ready
         }
       }
 
-      daemonWs = new WebSocket(wsUrl);
+      // #815: prove ownership on the claim. The daemon refuses a ?owner=1 claim on a session that
+      // already holds a credential unless the matching bearer arrives here — that is what stops
+      // any local process from taking over a live PTY byte stream. Sent as a HANDSHAKE HEADER,
+      // never on the URL: a query string lands in logs and error reports, a header does not.
+      daemonWs = new WebSocket(wsUrl, process.env.TELEPTY_SESSION_TOKEN
+        ? { headers: { 'x-telepty-session-token': process.env.TELEPTY_SESSION_TOKEN } }
+        : undefined);
 
       daemonWs.on('open', () => {
         wsReady = true;
@@ -1969,6 +1995,16 @@ async function main() {
         if (isOwnerReplacedClose(code)) {
           if (closeAllowSession()) {
             exitAllowSession(0);
+          }
+          return;
+        }
+        // #815: owner claim refused — permanent, so exit instead of reconnecting. Reported on
+        // stderr because unlike 4001 this is not a normal lifecycle event: it means this bridge
+        // is not the credentialed owner of this id.
+        if (isOwnerClaimRefusedClose(code)) {
+          console.error(`\x1b[31m❌ [allow] Owner claim refused for session '${sessionId}' — this bridge does not hold its current credential.\x1b[0m`);
+          if (closeAllowSession()) {
+            exitAllowSession(1);
           }
           return;
         }
@@ -3761,6 +3797,12 @@ Discuss the following topic from your project's perspective. Engage with other s
           const hostLabel = formatHostLabel(host);
 
           let preview = msg.content || msg.message || msg.payload || msg.data;
+          // #815: inject_written no longer carries the prompt — the bus is readable by any local
+          // process with no token, so rebroadcasting dispatch text there was a disclosure. Show
+          // the transport metadata that replaced it instead of an empty line.
+          if (!preview && msg.content_sha256) {
+            preview = `<${msg.content_length} bytes, sha256:${String(msg.content_sha256).slice(0, 12)}…>`;
+          }
           if (msg.type === 'session_spawn') {
             console.log(`\x1b[90m[${time}]\x1b[0m 🚀 \x1b[32m\x1b[1mNew Session\x1b[0m: \x1b[36m${msg.session_id}\x1b[0m (${msg.command}) @ ${hostLabel}`);
             return;
@@ -3869,6 +3911,7 @@ module.exports = {
   classifyBackend,        // #29: TERM_PROGRAM/CMUX/kitty → backend string
   isDaemonDestroyClose,   // #17 OQ-2: 1000 'Session destroyed' → terminate-not-reconnect
   isOwnerReplacedClose,   // #56: 4001 'Owner replaced' → exit-not-reconnect (durable Replace)
+  isOwnerClaimRefusedClose, // #815: 4003 'Owner claim unauthenticated' → exit-not-reconnect
   sanitizePathArg,        // #26: path-arg validation/normalization
   decideDaemonAction,     // #567: pure restart-decision policy (meta-primary; no I/O)
   deferToSupervisor,      // #738: supervisor-aware defer (injectable detect/probe/marker seams)

@@ -31,7 +31,7 @@ function ownerUrl(id, query = '') {
 }
 
 function ownerConnect(id, query = '') {
-  const ws = new WebSocket(ownerUrl(id, query));
+  const ws = new WebSocket(ownerUrl(id, query), harness.ownerAuth(id));   // #815: credentialed claim
   return new Promise((resolve, reject) => {
     ws.once('open', () => resolve(ws));
     ws.once('error', reject);
@@ -72,7 +72,7 @@ test('telepty#56: two reconnecting owners on one id do not oscillate (Replace is
   // Terminal codes (1000 'Session destroyed', 4001 'Owner replaced') must NOT reconnect.
   function bridge() {
     if (stop) return;
-    const ws = new WebSocket(ownerUrl(id));
+    const ws = new WebSocket(ownerUrl(id), harness.ownerAuth(id));   // #815: credentialed claim
     sockets.push(ws);
     ws.on('close', (code) => {
       if (!stop && code !== 1000 && code !== 4001) setTimeout(bridge, 20);

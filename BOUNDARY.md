@@ -25,6 +25,47 @@
 - The OS buffers stdin asynchronously; a process blocked, sleeping, or not reading stdin will silently queue the bytes
 - There is no read-back or echo confirmation; callers must observe stdout via the WebSocket stream to infer processing
 
+## Sender authentication — what `verified_sender_sid` proves (0.8.0, #815)
+
+The daemon issues a per-session bearer once, at the first registration of a session id it does not
+already hold, and keeps only `sha256(bearer)` as a **verifier**. The verifier is persisted; the
+bearer never is. The principal is `(canonical_sid, session_epoch, credential_generation)`.
+
+**What it proves.** `verified_sender_sid == X` with `verified_sender_epoch == E` means: the caller
+presented a bearer that this daemon issued exactly once to the instance `(X, E)`, that has not been
+revoked, and whose verifier is on disk. It survives a daemon restart, and a later session that
+reuses the textual id `X` gets a different epoch and can never inherit it.
+
+**What it does NOT prove.** It is authentication against *confused-deputy*, *remote-over-tunnel*,
+and *stale-instance* senders — **not** against a local process that can read the owner's bearer out
+of its memory or environment. Consumers building on this (notably completion signalling, where
+"did session X really send this report?" is load-bearing) must not over-read it.
+
+Platform detail, measured rather than assumed:
+
+- **macOS** (verified on Darwin 25.4.0): a same-uid, non-self process does **not** get the
+  environment block. `ps eww -p <other-pid>` returns the command line with no environ; the same
+  command against the caller's own pid does return it. `ps` reads `sysctl KERN_PROCARGS2`, and XNU
+  withholds the environment for a process other than the caller. So `TELEPTY_SESSION_TOKEN` is not
+  trivially readable from a sibling process here.
+- **Linux**: `/proc/<pid>/environ` is mode 0400 owned by the process uid, so a same-uid process is
+  expected to be able to read it. **UNVERIFIED — no Linux host was available to measure.** Treat
+  the bearer as same-uid-readable on Linux until someone runs the check.
+
+### Residual: the first-claim race
+
+Issuance binds to the *first registrant* of an id. Between the daemon learning an id and the real
+wrapper claiming its PTY, a local process that wins the race becomes the credentialed instance. The
+window is milliseconds, and the real wrapper then fails **loudly** — its owner claim is refused with
+close 4003 because a verifier now exists that it cannot match — rather than silently proceeding.
+Fail-closed and detectable, but not prevented.
+
+Closing it fully requires a secret the wrapper holds *before* it first talks to the daemon: the
+launcher that spawns `telepty allow` generates a one-time value, passes it in the spawn environment
+and to the daemon in an authenticated pre-registration, and the daemon issues only against it. That
+is a consumer-side spawn change, deliberately not built here. **Documented so the next person does
+not have to rediscover it.**
+
 ## Design principle
 
 > **telepty = stateless dumb pipe**
