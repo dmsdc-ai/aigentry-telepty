@@ -4,6 +4,84 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## Unreleased
 
+### Changed — BREAKING: telepty no longer asserts task completion (#60 Stage A)
+
+**The daemon used to state that a task was finished, from signals that cannot measure it.** Silence,
+elapsed time, a prompt glyph, a submit flag and an unqualified bridge `ready` frame were each
+sufficient to emit `TASK_COMPLETE`. This happened four times in one day on this project's own
+workers, every one verified false; in one case the classifier read the line
+`⏵⏵ bypass permissions on · 3 shells`, called the session idle at confidence 0.6, and the daemon
+turned that into a 100%-confidence sentence saying the work was done.
+
+Transport, activity and inject-consumption are measurable. **Task outcome is not**, and nothing in
+this release can produce one. `0.8.0` emits honest absence instead, and completion stays explicitly
+unknown until an authenticated, correlated report exists — that is Stage B / `0.9.0`, blocked on
+#816 (a private capability/report channel) and #817 (cross-machine sender identity).
+
+- **Removed every terminal producer.** `TASK_COMPLETE`, `TASK_COMPLETE_WITH_REPORT`,
+  `TASK_IDLE_UNCONFIRMED`, `TASK_ERROR`, `TASK_IDLE_NO_REPORT` and `TASK_DEAD_NO_REPORT` are gone.
+  One `task_completion_unknown` observation replaces them, carrying `completion_fact: null`,
+  `terminal: false`, the measured observation, a consumption verdict and an explicit capability
+  block.
+- **Removed the reverse-text report path.** Every payload a session routed back to whoever tasked
+  it was mapped to `report_complete` — a clarifying question was recorded as that worker reporting
+  its task complete, and `CHANGELOG.md` (0.2.x) recorded the mislabel as accepted. **`0.8.0` no
+  longer classifies report-shaped text at all**: `classifyReportPrompt`, `REPORT_PREFIX_RE`,
+  `REPORT_STATUS_*_RE` and `resolveOutboundReportStatus` are deleted. No text can authenticate its
+  sender or correlate itself to a dispatch, so no text may settle one. A reverse-routed inject is
+  an ordinary message.
+- **Absence is now durable, and committed before delivery.** A tracked inject writes a versioned
+  `tracked_injections` ledger record (temp → `fsync` → atomic rename → directory `fsync`) *before*
+  bytes reach the target, and a failed commit **aborts the delivery** (`TRACKING_PERSISTENCE_FAILED`)
+  rather than delivering and forgetting. The ledger survives restart, gains
+  `daemon_restart_observed`, and contains no outcome field at all.
+- **Added `GET /api/inject-observations/:inject_id`.** Always HTTP 200 with a discriminated
+  schema-v2 body; an absent, pre-v2 or corrupt record is `tracking_state: "unavailable"` with a
+  named top-level `reason`. **Schema v2 never uses 404 as a task-state signal** — "no record" and
+  "finished" are different statements and a status code cannot tell them apart. An unauthenticated
+  caller gets 401 from the auth middleware, which means "prove who you are", not "absent".
+- **`telepty inject` now prints the transport `inject_id`** (own line, `inject_id: ` prefix). It
+  previously existed only inside the daemon, so no consumer could correlate a dispatch to anything.
+- **Every observation entry point is total.** The transition handler, ready frame, ready dwell,
+  settle and CPU re-arms, the consumption branch, session death, supersession, cancellation and
+  restore each return a *named* result (`observation_emitted`, `observation_duplicate`,
+  `unmapped_transition_cause`, `tracking_superseded`, `tracking_unavailable`,
+  `observation_deferred`, `tracking_persistence_failed`). The `#52` consumption gate — a bare
+  `return` that emitted nothing and set nothing — is deleted: consumption is a *field* on the
+  observation, never a gate in front of one.
+- **Retired the `idleNotified` latch.** A one-way "already spoke" bit was burned by a wrong-label
+  emission and then dropped the later genuine observation. Duplicate suppression is now keyed on
+  observation identity in the ledger, where it cannot become an authority gate; a *different*
+  measurement on the same inject is still emitted. `idle_notified` is gone from
+  `GET /api/pendingReports/:id`.
+- **External activity vocabulary is measurement-cause-based (§2.3).** Names are selected from
+  `(destination, normalized cause, required evidence)` and fail closed to
+  `unmapped_transition_cause` — never to a state-name fallback. Producer triggers that used to
+  collapse several measurements into one name are split: `osc_133_prompt` into
+  `osc_133_a_or_b_received` / `quiet_after_recent_osc_133_a_or_b`, `lifecycle` into
+  `lifecycle_starting` / `lifecycle_restarting` / `process_exit`, and the shared `pattern` into
+  `input_request_pattern` / `busy_indicator_pattern`. `markIdle` can no longer let caller detail
+  overwrite the normalized cause. The internal 8-state FSM is unchanged — submit and readiness
+  code branches on it.
+- **Consumption admission is strict, with rejection precedence.** `consumption.status: "observed"`
+  requires a fresh post-submit `idle|waiting → working|thinking` edge **and** an accepted,
+  non-ambiguous, *screen-derived* submit confirmation (`body_consumed`, `state_working`,
+  `state_thinking`). A positive submit rejection is evaluated **before** any durable field, so a
+  stale `injectConsumedAt` cannot override it. `force`, `gate_off`, `redelivered` and `empty_body`
+  accepts measure no screen and no longer count. The `#721` launcher watermark keeps its whole
+  calculation but is now `submit_accepted_and_output_advanced` telemetry with consumption
+  `not_established` — it never measured consumption, and a never-started worker can satisfy it.
+- **Breaking for consumers:** `autoState.state` is replaced by `activityObservation` (named by
+  cause, neutrally styled — quiet is never green/done) plus a separate `completion` block;
+  `/api/sessions/:id/state` renames `auto` to `activity_observation`; the bus event
+  `session_auto_state` becomes `session_activity_observation`.
+
+Stage A deliberately adds **no new fact detector**. OSC 9;4 is real but in-band and unattributed —
+a child's progress clear closes the parent's bracket — so it stays telemetry and is never promoted.
+The `#32/#48/#52/#537/#545/#619/#721` compensation stack is retained (Stage D removes it
+separately); the settle window now only debounces *follow-up* observations, which is not silence
+because the durable `tracking_started` record already exists and is pollable.
+
 ### Security
 - **Session sender identity is now bound to a session instance rather than to a session name
   (#815).** The daemon's per-session token — the thing that makes `verified_sender_sid` mean

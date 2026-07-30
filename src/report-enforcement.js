@@ -1,19 +1,19 @@
-// src/report-enforcement.js — REPORT enforcement helpers (0.2.0)
-// See specs/enforce-report-spec.md
+// src/report-enforcement.js — output-summary helper.
+//
+// telepty#60 Stage A (0.8.0) REMOVED the report classifier that used to live here.
+// `classifyReportPrompt` + REPORT_PREFIX_RE + REPORT_STATUS_*_RE are gone: 0.8.0 does not
+// classify report-shaped text at all, because no text can authenticate its sender or correlate
+// itself to a dispatch, and its only consumer mapped every non-matching payload to
+// `report_complete` anyway (daemon.js resolveOutboundReportStatus, also deleted). An
+// authenticated, correlated report validator returns in Stage B / 0.9.0, gated on #816 (private
+// capability + report channel) and #817 (cross-machine sender identity). A classifier left
+// exported with no consumer is the thing someone rewires by mistake, so it is not left.
 //
 // Exports pure, testable helpers:
-//   - classifyReportPrompt(prompt): categorize an inject prompt
 //   - buildAutoSummary(session, opts): scrape last lines of output with redaction
 //   - ANSI_STRIPPER_RE, SECRET_DENYLIST_RE: regex constants (exported for tests)
-//   - REPORT_PREFIX_RE, REPORT_STATUS_*_RE: classification regexes
 
 'use strict';
-
-// Prefix patterns that identify a content REPORT inject (reverse-match required)
-const REPORT_PREFIX_RE = /^\s*(REPORT|STATUS|SPEC|OWNER-DIAGNOSIS|ENFORCE-SPEC|LOG-FIX-SPEC|LOG-FIX-IMPLEMENTED|FIX-SPEC|FIX-IMPLEMENTED|SPEC-SYNC|DIAGNOSIS|ENFORCE-IMPLEMENTED)[:\s]/;
-const REPORT_STATUS_BLOCKED_RE = /^\s*STATUS:\s*blocked\b/i;
-const REPORT_STATUS_DISMISSED_RE = /^\s*STATUS:\s*dismissed\b/i;
-const REPORT_STATUS_ERROR_RE = /^\s*STATUS:\s*error\b/i;
 
 // ANSI stripper (matches session-state.js)
 const ANSI_STRIPPER_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b\[[\?]?[0-9;]*[hlm]/g;
@@ -24,22 +24,6 @@ const SECRET_DENYLIST_RE = /(api[_-]?key\s*[:=]\s*\S+|password\s*[:=]\s*\S+|toke
 // Default config (overridable via options)
 const DEFAULT_AUTO_SUMMARY_LINES = 40;
 const DEFAULT_AUTO_SUMMARY_MAX_BYTES = 4096;
-
-/**
- * Classify incoming inject prompt for REPORT enforcement.
- * Returns one of: 'report_dismissed', 'report_blocked', 'report_error',
- * 'report_complete', or null (not a report).
- *
- * Order matters: STATUS variants checked before generic prefix.
- */
-function classifyReportPrompt(prompt) {
-  if (typeof prompt !== 'string') return null;
-  if (REPORT_STATUS_DISMISSED_RE.test(prompt)) return 'report_dismissed';
-  if (REPORT_STATUS_BLOCKED_RE.test(prompt)) return 'report_blocked';
-  if (REPORT_STATUS_ERROR_RE.test(prompt)) return 'report_error';
-  if (REPORT_PREFIX_RE.test(prompt)) return 'report_complete';
-  return null;
-}
 
 /**
  * Build an auto_summary from a session's output ring.
@@ -73,12 +57,7 @@ function buildAutoSummary(session, options = {}) {
 }
 
 module.exports = {
-  classifyReportPrompt,
   buildAutoSummary,
-  REPORT_PREFIX_RE,
-  REPORT_STATUS_BLOCKED_RE,
-  REPORT_STATUS_DISMISSED_RE,
-  REPORT_STATUS_ERROR_RE,
   ANSI_STRIPPER_RE,
   SECRET_DENYLIST_RE,
   DEFAULT_AUTO_SUMMARY_LINES,

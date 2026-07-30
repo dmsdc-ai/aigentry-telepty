@@ -2499,6 +2499,10 @@ async function main() {
         if (result.success) {
           const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
           console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m' @ ${target.peerName}.${refSuffix}`);
+          // #60: same contract on the remote arm, when the SSH hop returns an id. Note that a
+          // remote inject_id is a TRANSPORT id only — cross-machine sender identity is #817 and
+          // remains unavailable, so correlating one still proves nothing about who sent it.
+          if (result.inject_id) console.log(`   inject_id: ${result.inject_id}`);
         } else {
           console.error(`❌ ${result.error}`);
         }
@@ -2525,6 +2529,14 @@ async function main() {
       if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
       const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
       console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'.${refSuffix}`);
+      // #60 Stage A: SURFACE THE TRANSPORT inject_id.
+      //
+      // The daemon has always returned it and this command has always thrown it away, so the
+      // orchestrator had nothing to correlate a dispatch against and its per-inject observation
+      // poll resolved to `no_transport_inject_id` every time. Own line, stable `inject_id: `
+      // prefix, plain text before any decoration, so a caller can scrape it without parsing the
+      // decorated success line above.
+      if (data && data.inject_id) console.log(`   inject_id: ${data.inject_id}`);
 
       // Terminal-level submit: POST /submit after text injection.
       // Daemon-side render-gate handles timing (waits for REPL readiness),

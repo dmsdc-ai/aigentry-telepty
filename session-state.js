@@ -206,7 +206,10 @@ class SessionStateMachine {
     if (OSC_133_RE.test(data)) {
       this._lastOsc133At = now;
       this._transition(STATES.IDLE, 0.95, {
-        trigger: 'osc_133_prompt',
+        // #60 §2.3: the RAW marker arrival. Distinct from the _tick "quiet after a recent
+        // marker" cause below — those two used to share `osc_133_prompt`, which let a quiet
+        // timeout borrow the authority of a marker it never saw.
+        trigger: 'osc_133_a_or_b_received',
         timestamp: new Date(now).toISOString(),
       });
       return;
@@ -267,20 +270,22 @@ class SessionStateMachine {
 
   // --- Lifecycle methods (called by daemon) ---
 
+  // #60 §2.3: start / restart / death used to share the single trigger `lifecycle`, so three
+  // measurements with nothing in common serialized identically. Each now names its own cause.
   markStarting() {
-    this._transition(STATES.STARTING, 1.0, { trigger: 'lifecycle' });
+    this._transition(STATES.STARTING, 1.0, { trigger: 'lifecycle_starting' });
   }
 
   markDead(exitCode, signal) {
     this._transition(STATES.DEAD, 1.0, {
-      trigger: 'lifecycle',
+      trigger: 'process_exit',
       exit_code: exitCode ?? null,
       signal: signal ?? null,
     });
   }
 
   markRestarting() {
-    this._transition(STATES.RESTARTING, 1.0, { trigger: 'lifecycle' });
+    this._transition(STATES.RESTARTING, 1.0, { trigger: 'lifecycle_restarting' });
   }
 
   markIdle(confidence = 1.0, detail = {}) {
@@ -288,8 +293,11 @@ class SessionStateMachine {
       return;
     }
     this._transition(STATES.IDLE, confidence, {
-      trigger: 'manual_idle',
+      // #60 §2.3: caller detail is spread FIRST so a caller can never overwrite the normalized
+      // cause. It used to be spread last, which let any caller passing `trigger` dress a bare
+      // caller mark up as a screen-derived measurement.
       ...detail,
+      trigger: 'manual_state_mark',
     });
   }
 
@@ -338,7 +346,8 @@ class SessionStateMachine {
     // --- Priority 1: waiting (most specific, must act on immediately) ---
     if (this._matchesAny(lastLine, WAITING_PATTERNS)) {
       this._transition(STATES.WAITING, 0.9, {
-        trigger: 'pattern',
+        // #60 §2.3: was the shared `pattern`, indistinguishable from a thinking-spinner match.
+        trigger: 'input_request_pattern',
         matched_line: lastLine.slice(0, 100),
       });
       return;
@@ -355,7 +364,8 @@ class SessionStateMachine {
     // --- Priority 3: thinking (AI spinner/progress) ---
     if (this._matchesAny(lastLine, THINKING_PATTERNS)) {
       this._transition(STATES.THINKING, 0.8, {
-        trigger: 'pattern',
+        // #60 §2.3: was the shared `pattern` (see the waiting entrance above).
+        trigger: 'busy_indicator_pattern',
         matched_line: lastLine.slice(0, 100),
       });
       return;
@@ -413,7 +423,12 @@ class SessionStateMachine {
       const confidence = hasOsc133 ? 0.95 : (hasPrompt ? 0.9 : 0.6);
 
       this._transition(STATES.IDLE, confidence, {
-        trigger: hasOsc133 ? 'osc_133_prompt' : (hasPrompt ? 'prompt_detected' : 'silence_timeout'),
+        // #60 §2.3: three distinct measurements that used to collapse into two names. Quiet
+        // AFTER a recent marker is not the marker itself, and a prompt-shaped suffix is a
+        // detector match on untrusted current-frame bytes, not a turn boundary.
+        trigger: hasOsc133
+          ? 'quiet_after_recent_osc_133_a_or_b'
+          : (hasPrompt ? 'prompt_suffix_after_quiet' : 'silence_timeout'),
         silence_ms: silenceMs,
         last_line: lastLine.slice(0, 100),
       });
@@ -463,7 +478,10 @@ class SessionStateMachine {
       return {
         confidence: Math.min(0.95, 0.7 + (maxCount - this.config.error_repeat_count) * 0.05),
         detail: {
-          trigger: 'repeated_error',
+          // #60 §2.3 / §7 item 5: the repeated-error entrance and the thinking-timeout
+          // entrance both land in STATES.ERROR but measure different things. Naming the cause
+          // is what stops a timeout from serializing as observed error text.
+          trigger: 'repeated_error_pattern',
           error_fingerprint: maxFp,
           repeat_count: maxCount,
           window_ms: this.config.error_window_ms,
@@ -626,9 +644,113 @@ class SessionStateManager {
   }
 }
 
+// ---------------------------------------------------------------------------
+// #60 §2.3 — external observation vocabulary (pure)
+// ---------------------------------------------------------------------------
+//
+// The external name is selected from the normalized measurement CAUSE, never from the
+// destination state. That is the whole point: five different routes reach internal `idle`, and
+// serializing the state name let a 0.6-confidence silence timeout present itself exactly like an
+// OSC-133 REPL-done mark. Each row below names only what its entrance actually measured.
+//
+// `requires` lists the evidence fields the row cannot be stated without. A row whose evidence is
+// missing fails closed to `unmapped_transition_cause` rather than emitting the stronger name with
+// a hole in it.
+const OBSERVATION_CAUSES = Object.freeze({
+  lifecycle_starting:                { kind: 'session_start_phase_observed',            destinations: ['starting'],            requires: [] },
+  osc_133_a_or_b_received:           { kind: 'osc_133_a_or_b_observed',                 destinations: ['idle'],                requires: ['timestamp'] },
+  quiet_after_recent_osc_133_a_or_b: { kind: 'pty_quiet_after_osc_133_a_or_b_observed', destinations: ['idle'],                requires: ['silence_ms'] },
+  prompt_suffix_after_quiet:         { kind: 'prompt_suffix_after_quiet_observed',      destinations: ['idle'],                requires: ['silence_ms'] },
+  silence_timeout:                   { kind: 'pty_quiet',                               destinations: ['idle'],                requires: ['silence_ms'] },
+  manual_state_mark:                 { kind: 'manual_state_mark_observed',              destinations: ['idle'],                requires: [] },
+  output_received:                   { kind: 'output_observed',                         destinations: ['working'],             requires: [] },
+  busy_indicator_pattern:            { kind: 'busy_indicator_pattern_observed',         destinations: ['thinking'],            requires: ['matched_line'] },
+  input_request_pattern:             { kind: 'input_request_pattern_observed',          destinations: ['waiting'],             requires: ['matched_line'] },
+  repeated_error_pattern:            { kind: 'repeated_error_pattern_observed',         destinations: ['error'],               requires: ['error_fingerprint', 'repeat_count', 'window_ms'] },
+  thinking_timeout:                  { kind: 'thinking_classification_timeout_observed', destinations: ['error'],             requires: ['thinking_duration_ms'] },
+  lifecycle_restarting:              { kind: 'session_restart_mark_observed',           destinations: ['restarting'],          requires: [] },
+  process_exit:                      { kind: 'session_process_exited',                  destinations: ['dead'],                requires: [] },
+  // #815 owner lifecycle, consumed by Stage A as lifecycle facts only (§3 "Stage A consumption
+  // of #815 owner lifecycle"). Neither is a task outcome.
+  owner_epoch_replaced:              { kind: 'owner_replaced_observed',                 destinations: ['*'],                   requires: ['displaced_session_epoch'] },
+  owner_process_exited:              { kind: 'session_process_exited',                  destinations: ['*'],                   requires: [] },
+  // §3.7 — qualified bridge readiness. DELIVERY-readiness hints only: they say a surface looks
+  // ready to receive an inject, never that a turn ended. The unqualified legacy frame keeps its
+  // own name so a 0.7.1 bridge's `{type:"ready"}` cannot borrow the qualified ones' meaning.
+  ready_frame_composer_surface:      { kind: 'composer_surface_observed',               destinations: ['*'],                   requires: ['detector'] },
+  ready_frame_prompt_suffix:         { kind: 'prompt_suffix_observed',                  destinations: ['*'],                   requires: ['detector'] },
+  ready_frame_legacy_unqualified:    { kind: 'legacy_ready_observed',                   destinations: ['*'],                   requires: [] },
+});
+
+// Presentation, keyed by OBSERVATION KIND — not by internal state. STATE_DISPLAY maps internal
+// `idle` to a GREEN sleeping pill, and that green is a done-semantics claim the sidebar reads as
+// task success (§8.5.5). Quiet, prompt-shaped, marker and caller-mark observations are therefore
+// NEUTRAL here. Nothing in this table is green.
+const OBSERVATION_DISPLAY = Object.freeze({
+  session_start_phase_observed:            { emoji: '🔄', color: '\x1b[33m', tone: 'pending' },
+  osc_133_a_or_b_observed:                 { emoji: '•',  color: '\x1b[90m', tone: 'neutral' },
+  pty_quiet_after_osc_133_a_or_b_observed: { emoji: '•',  color: '\x1b[90m', tone: 'neutral' },
+  prompt_suffix_after_quiet_observed:      { emoji: '•',  color: '\x1b[90m', tone: 'neutral' },
+  pty_quiet:                               { emoji: '·',  color: '\x1b[90m', tone: 'neutral' },
+  manual_state_mark_observed:              { emoji: '✎',  color: '\x1b[90m', tone: 'neutral' },
+  output_observed:                         { emoji: '🔨', color: '\x1b[36m', tone: 'active' },
+  busy_indicator_pattern_observed:         { emoji: '🧠', color: '\x1b[35m', tone: 'active' },
+  input_request_pattern_observed:          { emoji: '⏳', color: '\x1b[33m', tone: 'attention' },
+  repeated_error_pattern_observed:         { emoji: '🔴', color: '\x1b[31m', tone: 'error' },
+  thinking_classification_timeout_observed:{ emoji: '⏱',  color: '\x1b[33m', tone: 'attention' },
+  session_restart_mark_observed:           { emoji: '🔄', color: '\x1b[33m', tone: 'pending' },
+  session_process_exited:                  { emoji: '☠️', color: '\x1b[90m', tone: 'error' },
+  owner_replaced_observed:                 { emoji: '⇄',  color: '\x1b[33m', tone: 'attention' },
+  unmapped_transition_cause:               { emoji: '?',  color: '\x1b[37m', tone: 'neutral' },
+});
+
+/**
+ * Map a measured transition to its external observation. PURE.
+ *
+ * Fails closed: an unknown cause, a cause that did not come from a destination it is defined
+ * for, or a cause missing a required evidence field all return `unmapped_transition_cause`
+ * carrying the raw destination and trigger. It NEVER falls back to a state-name mapping — that
+ * fallback is the defect, because it is precisely how a weak cause inherits a strong name.
+ *
+ * @param {{destination?: string, cause?: string, evidence?: object}} input
+ * @returns {{kind: string, cause: string|null, fields: object}}
+ */
+function mapObservationCause({ destination, cause, evidence } = {}) {
+  const ev = evidence && typeof evidence === 'object' ? evidence : {};
+  const row = Object.prototype.hasOwnProperty.call(OBSERVATION_CAUSES, String(cause))
+    ? OBSERVATION_CAUSES[String(cause)]
+    : null;
+  const unmapped = (reason) => ({
+    kind: 'unmapped_transition_cause',
+    cause: cause == null ? null : String(cause),
+    fields: { destination: destination == null ? null : String(destination), trigger: cause == null ? null : String(cause), reason },
+  });
+
+  if (!row) return unmapped('unknown_cause');
+  if (!row.destinations.includes('*') && !row.destinations.includes(String(destination))) {
+    return unmapped('cause_destination_mismatch');
+  }
+  const missing = row.requires.filter(f => ev[f] === undefined || ev[f] === null);
+  if (missing.length > 0) return unmapped(`missing_evidence:${missing.join(',')}`);
+
+  const fields = {};
+  for (const f of row.requires) fields[f] = ev[f];
+  // Always-useful qualifiers, included only when actually measured. `confidence` qualifies the
+  // classifier; it never manufactures missing evidence and never qualifies completion.
+  if (ev.last_output_at !== undefined) fields.last_output_at = ev.last_output_at;
+  if (ev.confidence !== undefined) fields.confidence = ev.confidence;
+  // Elapsed since the inject. A field, never a threshold: elapsed time is an observation and was
+  // never a completion floor (§7 item 8).
+  if (ev.elapsed_ms !== undefined) fields.elapsed_ms = ev.elapsed_ms;
+  return { kind: row.kind, cause: String(cause), fields };
+}
+
 module.exports = {
   STATES,
   STATE_DISPLAY,
+  OBSERVATION_CAUSES,
+  OBSERVATION_DISPLAY,
+  mapObservationCause,
   DEFAULT_CONFIG,
   SessionStateMachine,
   SessionStateManager,
