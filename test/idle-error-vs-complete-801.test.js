@@ -255,58 +255,95 @@ function makeGate({ preFrames = [], postFrames = [], pendingReportOverrides = {}
   ctx.timers = [];
   ctx.fire = (trigger = 'real-idle') =>
     fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps);
+  // #60 Stage A: every quiet observation now goes through the #48/#52 settle debounce — the old
+  // code let a `confirmed` completion bypass it, and there are no confirmed completions left.
+  // So the emission happens on the settle recheck, not on the first fire.
+  ctx.flushTimers = () => {
+    let n = 0;
+    while (ctx.timers.length && n < 50) { ctx.timers.shift().fn(); n++; }
+    return n;
+  };
   return ctx;
 }
 
-test('#801 THE BUG: an error-death is reported TASK_ERROR, not TASK_COMPLETE', () => {
+// The literal absence statement this path now emits, for a 204.5s quiet after the c757s inject.
+const UNKNOWN_204 =
+  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-801 — no completion fact observed; pty_quiet=204\.5s; consumption=(observed|not_established); outcome protocol unavailable$/;
+
+test('#801 THE BUG: an error-death is no longer reported as a completion', () => {
   const g = makeGate({ preFrames: ['boot\n'], postFrames: [BODY + '\n', CLAUDE_ERROR_RING] });
   g.fire();
+  g.flushTimers();
   assert.equal(g.delivered.length, 1);
   const msg = g.delivered[0].msg;
-  assert.match(msg, /^TASK_ERROR: worker-1 went idle after an API\/transport error \(API Error: 529 Overloaded\./);
-  assert.match(msg, /the inject was NOT processed/);
+  // The bug was the daemon calling this a COMPLETION. That is fixed at the root rather than by
+  // relabelling: there is no completion claim for any input, so an error-death cannot be dressed
+  // as one. The `TASK_ERROR` counter-label goes with it — "the inject was NOT processed" was an
+  // assertion about the worker's turn that the daemon could not measure either.
+  assert.match(msg, UNKNOWN_204);
   assert.doesNotMatch(msg, /TASK_COMPLETE/);
-  // provenance survives the relabel
-  assert.match(msg, /via real-idle inject=inj-801/);
+  assert.doesNotMatch(msg, /TASK_ERROR/);
+  // provenance survives
+  assert.match(msg, /inject=inj-801/);
 });
 
+// !!! HELD — NOT MIGRATED, EXPECTED RED. Injected to the orchestrator as a suspected source
+// regression rather than a vocabulary change; see below. Do not "fix" this by asserting the
+// marker is absent — that would pin the defect as intended behaviour.
+//
+// daemon.js:949-952 still computes the turn-scoped error verdict and writes
+// `evidence.error_marker` / `evidence.error_detail`, and the comment at :944-946 says it "rides
+// along as a marker". It does not: mapObservationCause (session-state.js:736-737) copies only
+// the matched cause row's `requires` fields plus last_output_at/confidence/elapsed_ms, and
+// `silence_timeout` requires just ['silence_ms'], so both fields are dropped before the envelope
+// is built. Measured consequence: this error-death and the gemini CONTROL below now emit
+// byte-identical output. A grep confirms error_marker/error_detail have zero production readers.
 test('#801 the bus event carries the marker for the observability lane', () => {
   const g = makeGate({ preFrames: ['boot\n'], postFrames: [CLAUDE_ERROR_RING] });
   g.fire();
-  const ev = g.broadcasts.find((b) => b.type === 'TASK_IDLE_NO_REPORT');
-  assert.equal(ev.opts.extra.error_marker, 'claude_api_error');
-  assert.match(ev.opts.extra.error_detail, /529 Overloaded/);
+  g.flushTimers();
+  const ev = g.broadcasts.find((b) => b.type === 'task_completion_unknown');
+  assert.equal(ev.opts.extra.observation.error_marker, 'claude_api_error');
+  assert.match(ev.opts.extra.observation.error_detail, /529 Overloaded/);
 });
 
-test('#801 codex error-death is reported TASK_ERROR', () => {
+test('#801 codex error-death is not reported as a completion either', () => {
   const g = makeGate({ command: 'codex', preFrames: ['boot\n'], postFrames: [CODEX_ERROR_RING] });
   g.fire();
-  assert.match(g.delivered[0].msg, /^TASK_ERROR: worker-1 went idle after an API\/transport error \(/);
-  assert.match(g.delivered[0].msg, /invalid_request_error/);
+  g.flushTimers();
+  assert.match(g.delivered[0].msg, UNKNOWN_204);
+  assert.doesNotMatch(g.delivered[0].msg, /TASK_COMPLETE|TASK_ERROR/);
 });
 
-test('#801 CONTROL: a genuine completion is untouched', () => {
+test('#801 CONTROL: a genuine completion is also only ever an observation', () => {
+  // These two fixtures are real answered turns — the strongest "this really did finish" input
+  // the daemon ever had. They still produce no completion claim, which is the whole cutover:
+  // the daemon never had a fact for the control case either, it just had fewer doubts.
   for (const [command, ring] of [['claude', CLAUDE_OK_RING], ['codex', CODEX_OK_RING]]) {
     const g = makeGate({ command, preFrames: ['boot\n'], postFrames: [BODY + '\n', ring] });
     g.fire();
-    assert.match(g.delivered[0].msg,
-      /^TASK_COMPLETE: worker-1 is now idle after processing inject \(204\.5s, via real-idle inject=inj-801\)$/,
-      `${command} control must be byte-identical to pre-#801`);
-    const ev = g.broadcasts.find((b) => b.type === 'TASK_IDLE_NO_REPORT');
-    assert.equal(ev.opts.extra.error_marker, undefined);
+    g.flushTimers();
+    assert.match(g.delivered[0].msg, UNKNOWN_204, `${command} control`);
+    assert.doesNotMatch(g.delivered[0].msg, /TASK_COMPLETE/, `${command} control`);
   }
 });
 
-test('#801 CONTROL: an unmeasured CLI showing the same banner still completes', () => {
+test('#801 CONTROL: an unmeasured CLI showing the same banner is treated identically', () => {
+  // Fail-open is preserved trivially now — an unrecognised screen cannot suppress a completion
+  // claim that no longer exists. (This case is also the measurement behind the HOLD above: it
+  // is currently indistinguishable from the claude error-death, which is the regression.)
   const g = makeGate({ command: 'gemini', preFrames: ['boot\n'], postFrames: [CLAUDE_ERROR_RING] });
   g.fire();
-  assert.match(g.delivered[0].msg, /^TASK_COMPLETE:/);
+  g.flushTimers();
+  assert.match(g.delivered[0].msg, UNKNOWN_204);
+  assert.doesNotMatch(g.delivered[0].msg, /TASK_COMPLETE|TASK_ERROR/);
 });
 
-test('#801 TASK_IDLE_UNCONFIRMED semantics stay intact — the check never relabels a warning', () => {
-  // An unconfirmed idle is already honest ("may NOT have been processed"); #801 only ever
-  // intercepts a claim of COMPLETION. Drop the consumption evidence and force the #545
-  // downgrade, then settle so the notification actually emits.
+test('#801 an unconfirmed idle is stated the same way — no relabelling remains possible', () => {
+  // The original point was that #801's check only ever intercepted a claim of COMPLETION and
+  // never touched the honest warning. With one statement for every path there is no label left
+  // to relabel; what is asserted instead is that dropping the consumption evidence changes the
+  // consumption FIELD and nothing else about the sentence.
   const g = makeGate({
     preFrames: ['boot\n'],
     postFrames: [CLAUDE_ERROR_RING],
@@ -319,7 +356,11 @@ test('#801 TASK_IDLE_UNCONFIRMED semantics stay intact — the check never relab
   });
   g.deps.idleEvidenceReliable = false;
   g.fire();
+  g.flushTimers();
   assert.equal(g.delivered.length, 1);
-  assert.match(g.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED: worker-1 signaled idle/);
-  assert.doesNotMatch(g.delivered[0].msg, /TASK_ERROR/);
+  assert.match(g.delivered[0].msg, UNKNOWN_204);
+  assert.doesNotMatch(g.delivered[0].msg, /TASK_ERROR|TASK_IDLE_UNCONFIRMED/);
+  const ev = g.broadcasts.find((b) => b.type === 'task_completion_unknown');
+  assert.equal(ev.opts.extra.consumption.basis, 'submit_rejection_observed',
+    'the rejected submit is named as the basis, where the old code encoded it in the label');
 });
