@@ -980,9 +980,21 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
       evidence.detector = (sess && sess.readyDetector) || 'unqualified';
       evidence.cli_key = (sess && sess.readyCliKey) || null;
     }
-    // #545 reliability is now EVIDENCE, not a promotion input. #801's turn-scoped surface-error
-    // verdict likewise rides along as a marker; neither may change the observation's name, because
-    // the name is fixed by the measured cause.
+    // #545 reliability is no longer a promotion input — nothing here promotes. It is computed and
+    // then DELIBERATELY NOT CARRIED on the emitted observation: §2.3 fixes each row's payload to
+    // the fields that row requires, plus last_output_at and confidence, and mapObservationCause
+    // drops everything else. Do not read the assignment below as "it becomes a field" — an earlier
+    // version of this comment claimed exactly that, and the claim was false, which is the same
+    // defect this release exists to remove.
+    //
+    // It stays computed because it is a real input to the local decisions above and is useful in
+    // the log line, and because OSC 133 has never fired on real traffic (zero hits across 9 live
+    // PTY captures and 15 fixtures) — so as an emitted field it would be permanently false, which
+    // is noise rather than information.
+    //
+    // #801's surface-error verdict is the deliberate exception and IS carried; see recordObservation,
+    // where it is attached explicitly rather than by widening the §2.3 whitelist. Neither signal may
+    // change the observation's NAME — that is fixed by the measured cause.
     if (deps.idleEvidenceReliable !== undefined) evidence.idle_evidence_reliable = deps.idleEvidenceReliable;
     const _detectIdleAfterError = deps.detectIdleAfterError || detectIdleAfterError;
     const errorVerdict = _detectIdleAfterError(sess, pendingReport);
