@@ -188,6 +188,19 @@ class SessionStateMachine {
 
     // Periodic state check
     this._pollTimer = setInterval(() => this._tick(), this.config.poll_interval_ms);
+
+    // #60 §2.3 row 1 — stamp the start phase through markStarting() rather than leaving `_detail`
+    // null. The constructor used to assign the STARTING state directly, so a session that had only
+    // been registered carried no measured cause and mapObservationCause failed closed to
+    // `unmapped_transition_cause`. That is not a transient window: `_tick` early-returns while the
+    // state is STARTING, so a session which never emits output stays there permanently, and an
+    // observation that can never fire is an absence this release promised to emit.
+    //
+    // Routed through markStarting() deliberately, not by assigning the detail here: that keeps ONE
+    // definition of the initial cause. Two definitions, with this one silently skipped, IS the
+    // defect. `_transition` short-circuits on same-state (it updates confidence/detail and fires no
+    // listeners), so this records the cause without inventing a transition or disturbing `_since`.
+    this.markStarting();
   }
 
   // --- Public API ---

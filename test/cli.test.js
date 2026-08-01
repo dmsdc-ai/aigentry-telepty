@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const pty = require('node-pty');
+const WebSocket = require('ws');
 const { buildSharedContextPrompt, createSharedContextDescriptor, getSharedContextDir } = require('../shared-context');
 const { createSessionId, startTestDaemon, stripAnsi, waitFor } = require('../test-support/daemon-harness');
 
@@ -98,6 +99,13 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // #60: an owner socket opened by an observation arm must be closed even when the assertion
+  // under test throws first — a leaked socket keeps the daemon's client set non-empty and the
+  // NEXT test then fails on "Timed out waiting for daemon start", turning one real red into a
+  // cascade of infrastructure reds that hide it.
+  for (const ws of openOwnerSockets.splice(0)) {
+    try { ws.close(); } catch { /* already gone */ }
+  }
   await harness.stop();
 });
 
@@ -168,6 +176,168 @@ test('telepty list --json includes computed idle_seconds', async () => {
   const session = parsed.find((item) => item.id === sessionId);
   assert.equal(session.lastActivityAt, lastActivityAt);
   assert.ok(session.idle_seconds >= 590, `idle_seconds=${session.idle_seconds}`);
+});
+
+// --- #60 Stage A §8.5 consumer contract: the CLI must claim no more than it measured --------
+//
+// These pin the surfaces a removed claim most easily survives on — as WORDING. The daemon half
+// landed already (`serializeSession.activityObservation`, `/state`'s `activity_observation`), and
+// this file went on passing 24/24 because it never asserted the renamed field: cli.js still read
+// `s.autoState`, which is now `undefined`, so the activity column silently rendered EMPTY. A test
+// that passes by not looking is worth less than no test, so the column is pinned here.
+//
+// Every arm drives a REAL measured observation through the owner socket rather than asserting
+// against a session that never left `starting`. That matters twice over: a never-fed session maps
+// to `unmapped_transition_cause` (see the HOLD on the SessionStateMachine constructor), and an
+// assertion that renders nothing at all would pass vacuously — the exact "the branch under test
+// was never reached" shape this design round keeps producing.
+
+// An OWNER socket, because only `ws === session.ownerWs` frames reach sessionStateManager.feed.
+// The bearer is what makes it the owner rather than an attacker (#815). Tracked so afterEach can
+// close it on the throwing path too.
+const openOwnerSockets = [];
+async function connectOwnerSocket(sessionId) {
+  const ws = new WebSocket(
+    `ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}?owner=1&owner_pid=${process.pid}`,
+    harness.ownerAuth(sessionId)
+  );
+  openOwnerSockets.push(ws);
+  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  return ws;
+}
+
+// Drive the state machine to a NAMED observation and wait until the daemon actually serves it,
+// so the CLI assertions below cannot race the transition.
+async function observeSession(sessionId, ptyOutput, expectedKind, timeoutMs = 12000) {
+  const ws = await connectOwnerSocket(sessionId);
+  ws.send(JSON.stringify({ type: 'output', data: ptyOutput }));
+  await waitFor(async () => {
+    const res = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/state`);
+    return res.body && res.body.activity_observation && res.body.activity_observation.kind === expectedKind;
+  }, { timeoutMs, description: `activity observation ${expectedKind}` });
+  return ws;
+}
+
+test('telepty status heading is the activity observation, never a State: line (§8.5.2)', async () => {
+  const sessionId = createSessionId('cli-status-observation');
+  await harness.registerSession(sessionId);
+  // `Enter value:` matches WAITING_PATTERNS → an immediate, timer-free transition whose cause
+  // (`input_request_pattern`) carries the `matched_line` its mapping row requires.
+  const ws = await observeSession(sessionId, 'Enter value: ', 'input_request_pattern_observed');
+
+  const result = await harness.runCli(['status', sessionId]);
+  ws.close();
+  assert.equal(result.code, 0, result.stderr);
+  const output = stripAnsi(`${result.stdout}\n${result.stderr}`);
+
+  assert.match(output, /Activity observation:/,
+    `expected /Activity observation:/; got: ${JSON.stringify(output)}`);
+  assert.match(output, /input_request_pattern_observed/,
+    'the measured observation KIND is what ships, not an internal FSM state name');
+  assert.doesNotMatch(output, /^\s*State:/m,
+    '"State:" labelled an internal 8-state FSM value as if it were the session\'s condition');
+  assert.match(output, /Cause: input_request_pattern/, 'the measured cause is named beside the observation');
+});
+
+test('telepty status states the outcome protocol is unavailable (§A4)', async () => {
+  const sessionId = createSessionId('cli-status-outcome');
+  await harness.registerSession(sessionId);
+  const ws = await observeSession(sessionId, 'Enter value: ', 'input_request_pattern_observed');
+
+  const result = await harness.runCli(['status', sessionId]);
+  ws.close();
+  assert.equal(result.code, 0, result.stderr);
+  const output = stripAnsi(`${result.stdout}\n${result.stderr}`);
+
+  // §A4: capability gaps are EXPLICIT, never implied by absence. A reader who is not told the
+  // outcome protocol is unavailable will assume the activity line answers "is it done".
+  assert.match(output, /Outcome protocol: unavailable/,
+    `expected the outcome-protocol line; got: ${JSON.stringify(output)}`);
+  assert.match(output, /Completion fact: none observed/,
+    'the absence is stated, never left to inference');
+});
+
+test('telepty status renders quiet as neutral, never as task success (§8.5.2/§8.5.5)', async () => {
+  const sessionId = createSessionId('cli-status-quiet');
+  await harness.registerSession(sessionId);
+  // The observation Stage A exists for. Non-prompt, non-OSC output then silence past
+  // idle_timeout_ms (5s) → `silence_timeout` → `pty_quiet` at confidence 0.6. This is the exact
+  // measurement the daemon used to announce as TASK_COMPLETE.
+  const ws = await observeSession(sessionId, 'working on it\n', 'pty_quiet');
+
+  const result = await harness.runCli(['status', sessionId]);
+  ws.close();
+  assert.equal(result.code, 0, result.stderr);
+  const raw = `${result.stdout}\n${result.stderr}`;
+  const output = stripAnsi(raw);
+
+  // Non-vacuous: prove the quiet observation IS rendered before asserting how it is styled.
+  assert.match(output, /Activity observation:.*pty_quiet/,
+    `expected the quiet observation to render; got: ${JSON.stringify(output)}`);
+  // Green is the claim. STATE_DISPLAY maps internal `idle` to a GREEN sleeping pill and the
+  // sidebar reads that green as task success, so no observation may ever be painted green —
+  // least of all this one, on the surface a human reads before believing a worker is done.
+  assert.doesNotMatch(raw, /\x1b\[32m/, 'quiet must not render green: green is read as "done"');
+  assert.doesNotMatch(raw, /\x1b\[92m/, 'bright green is the same claim');
+  // §2.3: the internal FSM value must not reach the external surface at all.
+  assert.doesNotMatch(output, /\bidle\b/,
+    'external `idle` is gone — consumers read it as "the turn is over"');
+});
+
+test('telepty list renders the activity observation and never leaves it blank (§8.5.1)', async () => {
+  const sessionId = createSessionId('cli-list-observation');
+  await harness.registerSession(sessionId);
+  const ws = await observeSession(sessionId, 'Enter value: ', 'input_request_pattern_observed');
+
+  const result = await harness.runCli(['list']);
+  ws.close();
+  assert.equal(result.code, 0, result.stderr);
+  const output = stripAnsi(`${result.stdout}\n${result.stderr}`);
+
+  assert.match(output, /input_request_pattern_observed/,
+    `the activity column must carry the measured observation, not render empty; got: ${JSON.stringify(output)}`);
+});
+
+test('telepty list --json exports activityObservation + completion, never autoState (§8.5.1)', async () => {
+  // The machine-readable contract every other consumer (cmux sidebar, tracker) reads.
+  const sessionId = createSessionId('cli-list-json-observation');
+  await harness.registerSession(sessionId);
+  const ws = await observeSession(sessionId, 'Enter value: ', 'input_request_pattern_observed');
+
+  const result = await harness.runCli(['list', '--json']);
+  ws.close();
+  assert.equal(result.code, 0, result.stderr);
+
+  const session = JSON.parse(result.stdout).find((item) => item.id === sessionId);
+  assert.equal(session.autoState, undefined, 'the task-like `autoState.state:"idle"` export is gone');
+  assert.equal(session.activityObservation.kind, 'input_request_pattern_observed');
+  assert.equal(session.activityObservation.cause, 'input_request_pattern');
+  assert.notEqual(session.activityObservation.tone, 'success', 'no tone may mean done');
+  assert.equal(session.completion.completion_fact, null, 'completion is a SEPARATE, permanently null block');
+  assert.equal(session.completion.terminal, false);
+  assert.equal(session.completion.capability.outcome_protocol, 'unavailable');
+});
+
+test('observationTone maps every tone to a non-success color (§8.5.12)', () => {
+  // A pure exhaustive check on the rule the rendering rests on: "nothing in this table is
+  // green". Table-driven rather than sampled, and it includes the unknown-name arm, because a
+  // missing mapping must fall back to NEUTRAL — never to success styling, and never to the
+  // internal `idle` pill.
+  const { observationTone, OBSERVATION_TONE_COLOR } = require('../src/cli/session-view');
+  const { OBSERVATION_DISPLAY } = require('../session-state');
+
+  for (const [tone, color] of Object.entries(OBSERVATION_TONE_COLOR)) {
+    assert.doesNotMatch(color, /\x1b\[9?32m/, `tone "${tone}" must not be green`);
+  }
+  // Every kind the producer can emit has an explicit presentation.
+  for (const kind of Object.keys(OBSERVATION_DISPLAY)) {
+    const rendered = observationTone(OBSERVATION_DISPLAY[kind].tone);
+    assert.ok(rendered, `kind "${kind}" has no tone presentation`);
+    assert.doesNotMatch(rendered, /\x1b\[9?32m/, `kind "${kind}" renders green`);
+  }
+  // Deleted/unknown mapping → neutral, never success.
+  assert.equal(observationTone('some_tone_that_does_not_exist'), OBSERVATION_TONE_COLOR.neutral);
+  assert.equal(observationTone(undefined), OBSERVATION_TONE_COLOR.neutral);
 });
 
 test('telepty session info prints terminal metadata', async () => {

@@ -108,6 +108,98 @@ test('#732 H5: output frames follow the LIVE session record after it is replaced
     'and nothing keeps writing into the orphaned record');
 });
 
+// --- #60 Stage A §3.7: ready-frame qualification -----------------------------------------
+//
+// A `ready` frame says a surface looks able to RECEIVE an inject. It has never said a turn ended,
+// but it used to arrive as an anonymous `{type:"ready"}` and the daemon fired the "auto-report"
+// path off it — telling the source the target "completed inject task". Two different detectors
+// produce that frame and they are not equally strong: a registry-tail match sees a known CLI's
+// composer surface, while the generic path is a regex on the current frame that `cat` of a shell
+// script satisfies. Stage A qualifies them and keeps the legacy bare frame DISTINCT, so a 0.7.1
+// bridge can never borrow a qualified name.
+
+async function readyFrameLands(frame) {
+  const app = express();
+  const server = http.createServer(app);
+  const port = await new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
+  const sessions = { [SID]: newRecord() };
+  installWebSocketTransport(buildDeps(server, sessions));
+
+  const ws = await connectOwner(port);
+  ws.send(JSON.stringify({ type: 'ready', ...frame }));
+  await delay(150);
+  try { ws.terminate(); } catch { /* already gone */ }
+  server.close();
+  return sessions[SID];
+}
+
+test('#60 §3.7: a registry-tail match is recorded as a qualified composer surface', async () => {
+  const session = await readyFrameLands({
+    ready_kind: 'composer_surface_observed', detector: 'claude_composer_marker', cli_key: 'claude',
+  });
+  assert.equal(session.readyKind, 'composer_surface_observed');
+  assert.equal(session.readyDetector, 'claude_composer_marker',
+    'the detector is REQUIRED evidence for this observation row — without it the cause maps unmapped');
+  assert.equal(session.readyCliKey, 'claude');
+});
+
+test('#60 §3.7: a generic current-frame match stays the weaker prompt-suffix observation', async () => {
+  const session = await readyFrameLands({
+    ready_kind: 'prompt_suffix_observed', detector: 'generic_prompt_suffix', cli_key: null,
+  });
+  assert.equal(session.readyKind, 'prompt_suffix_observed');
+  assert.equal(session.readyDetector, 'generic_prompt_suffix');
+  assert.equal(session.readyCliKey, null, 'no known CLI was identified, so no key is claimed');
+});
+
+test('#60 §3.7: a legacy bare ready frame cannot borrow a qualified name', async () => {
+  // Exactly what a 0.7.1 bridge sends, including after a daemon restart replays it (§ deployment
+  // step 5). It measured something, so it is not discarded — it is just not allowed to present
+  // itself as the stronger observation.
+  const session = await readyFrameLands({});
+  assert.equal(session.readyKind, 'legacy_unqualified_ready');
+  assert.equal(session.readyDetector, 'unqualified');
+  assert.equal(session.readyCliKey, null);
+});
+
+test('#60 §3.7: an unrecognised ready_kind is refused, not passed through', async () => {
+  // The frame is bridge-supplied input. A kind this daemon does not know — a future name, a typo,
+  // or a crafted one — must fail CLOSED to legacy rather than being written onto the session and
+  // handed to the cause mapper as if the bridge had authority to name observations.
+  const session = await readyFrameLands({
+    ready_kind: 'task_completed_observed', detector: 'made_up', cli_key: 'claude',
+  });
+  assert.equal(session.readyKind, 'legacy_unqualified_ready',
+    'an unknown kind must not be stored — the bridge does not get to name observations');
+  assert.equal(session.readyDetector, 'unqualified');
+  assert.equal(session.readyCliKey, null);
+});
+
+test('#60 §3.7: a later bare frame clears an earlier qualification instead of keeping it stale', async () => {
+  const app = express();
+  const server = http.createServer(app);
+  const port = await new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
+  const sessions = { [SID]: newRecord() };
+  installWebSocketTransport(buildDeps(server, sessions));
+
+  const ws = await connectOwner(port);
+  ws.send(JSON.stringify({
+    type: 'ready', ready_kind: 'composer_surface_observed', detector: 'claude_composer_marker', cli_key: 'claude',
+  }));
+  await delay(120);
+  assert.equal(sessions[SID].readyKind, 'composer_surface_observed', 'baseline: the qualified frame landed');
+
+  // A reconnecting or downgraded bridge now sends the bare frame. Keeping the earlier, stronger
+  // name would let a session keep wearing a measurement nobody is making any more.
+  ws.send(JSON.stringify({ type: 'ready' }));
+  await delay(120);
+  after(() => { try { ws.terminate(); } catch { /* already gone */ } server.close(); });
+
+  assert.equal(sessions[SID].readyKind, 'legacy_unqualified_ready',
+    'the qualification must not survive a frame that no longer carries it');
+  assert.equal(sessions[SID].readyCliKey, null);
+});
+
 test('#732 H5: re-adoption never displaces a live owner', async () => {
   const app = express();
   const server = http.createServer(app);

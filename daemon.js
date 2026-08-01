@@ -518,6 +518,23 @@ function getTrackedInjection(injectId) {
 }
 
 /**
+ * Every tracked inject assigned to a session. #60 Stage A §3 "consumption of #815 owner
+ * lifecycle" needs it: an owner-replacement fact must be appended to EVERY inject assigned to the
+ * displaced epoch, not just the session's active one — supersession deliberately retains the
+ * older records, and an inject nobody can answer for is the silence this release removes.
+ *
+ * Superseded records are included: they remain queryable by `inject_id` and an owner replacement
+ * is exactly the kind of fact their reader still needs. Ordered by creation so the caller emits
+ * oldest-first.
+ */
+function listTrackedInjectionsForSession(sessionId) {
+  if (typeof sessionId !== 'string' || !sessionId) return [];
+  return Object.values(trackedInjections.injections)
+    .filter((record) => record && record.session_id === sessionId)
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+/**
  * Create the durable transport-observation record for a tracked inject. MUST complete before the
  * bytes are handed to the target (§3 Stage A item 1): a delivered task that no record answers for
  * is the silence this release exists to remove.
@@ -4745,19 +4762,38 @@ app.delete('/api/sessions/:id', (req, res) => {
     // surface on this normal CLI-exit (CLEANUP_REQUEST→wh_close). Actuates only for a standalone
     // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
     try { terminalBackend.closeSurface(session); } catch {}
+    // #60 Stage A §A2 (F1) — OBSERVE THE DEATH BEFORE THE RECORD DISAPPEARS.
+    //
+    // This used to `delete sessions[id]` first and never call markDead at all. The PTY kill's
+    // onExit fires asynchronously, by which point the record is gone, so the transition listener's
+    // `if (!session) return` guard bailed and the death was emitted on NO channel. Silence is the
+    // one output Stage A forbids, and this is the entrance operator tooling uses
+    // (bin/session-cleanup.sh calls exactly this DELETE), so every cleaned-up session was saying
+    // nothing about its own end while the natural-exit path said it correctly.
+    //
+    // markDead runs the transition synchronously, so the observation is emitted while `sessions[id]`
+    // is still live; unregister then destroys the machine, which also makes the later onExit
+    // markDead a no-op (its `if (sm)` guard) rather than a duplicate emission. Exit code and signal
+    // are left null deliberately: an operator asked for this kill, and no exit status was observed
+    // at this instant — inventing one would be a measurement we did not make.
+    sessionStateManager.markDead(id);
+    sessionStateManager.unregister(id);
     delete sessions[id];
     revokeSessionCredential(id);    // #815: DELETE — revoke before the id can be reused
-    sessionStateManager.unregister(id);
     try { mailbox.purge(id); } catch {}
     lifecycle.cleanupSessionArtifacts(id);
     console.log(`[KILL] Session ${id} removed`);
     persistSessions();
     res.json({ success: true, status: 'closing' });
   } catch (err) {
-    // Even if kill fails, remove from registry
+    // Even if kill fails, remove from registry — and still observe the death first, for the same
+    // reason as the success path above. A kill that errored is MORE in need of a statement, not
+    // less: the record is being removed either way, so a reader who hears nothing here cannot
+    // distinguish a failed teardown from a session that is still running.
+    sessionStateManager.markDead(id);
+    sessionStateManager.unregister(id);
     delete sessions[id];
     revokeSessionCredential(id);    // #815: same on the error path — never leave a live epoch
-    sessionStateManager.unregister(id);
     try { mailbox.purge(id); } catch {}
     lifecycle.cleanupSessionArtifacts(id);
     persistSessions();
@@ -5480,7 +5516,14 @@ installWebSocketTransport({
   markSessionDisconnected,
   resolveSessionAlias,
   applySessionStateReport,
-  busAutoRoute
+  busAutoRoute,
+  // #60 Stage A §3 — the total observation emitter and the per-session ledger query, so the
+  // transport can persist #815's owner-replaced / owner-death facts against every tracked inject
+  // instead of only announcing them on the bus. fireAutoReport is NOT usable for these: it falls
+  // into the #48/#52 settle window and drops the emission when the session is busy, and an owner
+  // replacement is a hard fact the daemon knows with certainty.
+  recordObservation,
+  listTrackedInjectionsForSession
 });
 
 function shutdown(code) {
@@ -5511,6 +5554,7 @@ module.exports = {
   recordObservation,              // #60 Stage A: the TOTAL observation emitter (named result on every path)
   beginTrackedInjection,          // #60 Stage A: durable write-before-delivery tracking record
   getTrackedInjection,            // #60 Stage A: ledger read by inject_id
+  listTrackedInjectionsForSession, // #60 Stage A: ledger read by session (owner-lifecycle fan-out)
   restoreTrackedInjections,       // #60 Stage A: restore + daemon_restart_observed, before readiness
   observeInjectEchoEvidence,      // #60 Stage A: ring-scoped echo evidence (a field, no longer a gate)
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)

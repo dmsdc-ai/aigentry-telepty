@@ -36,8 +36,52 @@ function installWebSocketTransport(deps) {
     busAutoRoute,
     // #815 credential store — owner-claim gate below. Optional so a construction site that omits
     // it degrades to the pre-#815 open claim rather than throwing; the daemon always passes it.
-    credentials
+    credentials,
+    // #60 Stage A §3 — durable observation seam. Optional for the same reason: a test harness that
+    // omits them gets the bus-only behaviour instead of a throw.
+    recordObservation,
+    listTrackedInjectionsForSession
   } = deps;
+
+  /**
+   * #60 Stage A §3 "consumption of #815 owner lifecycle" — append an owner-lifecycle fact to
+   * EVERY tracked inject assigned to this session, durably, then let recordObservation put it on
+   * the bus. Owner replacement and owner death are transport facts the daemon knows with
+   * certainty; neither is a task outcome, and both carry `completion_fact: null`.
+   *
+   * Returns the named results, one per record — never undefined, never a bare return.
+   */
+  function recordOwnerLifecycle(sessionId, session, cause, evidence) {
+    if (typeof recordObservation !== 'function' || typeof listTrackedInjectionsForSession !== 'function') {
+      // Named, not silent: a construction site without the ledger seam still emitted the bus
+      // lifecycle event above, and this says exactly what did not happen.
+      return ['observation_ledger_unavailable'];
+    }
+    const records = listTrackedInjectionsForSession(sessionId);
+    if (records.length === 0) return ['no_tracked_inject'];
+    const active = pendingReports[sessionId] || null;
+    return records.map((record) => {
+      // Reuse the LIVE pending report when this is the session's active inject, so its consumption
+      // provenance survives; a superseded record gets a minimal stub, which classifies as
+      // `no_consumption_evidence` — accurate, because nothing about consumption was measured here.
+      const pendingReport = active && active.injectId === record.inject_id
+        ? active
+        : { injectId: record.inject_id, source: record.transport_source };
+      return recordObservation({
+        sessionId,
+        session,
+        pendingReport,
+        // `destination: '*'` rows accept any destination; the internal FSM is NOT driven from
+        // here, because the daemon has not measured what state the session is in — only that its
+        // owner changed. Passing the last known state would be inventing a measurement.
+        destination: null,
+        cause,
+        evidence,
+        deliverToSource: true,
+        trigger: 'owner_lifecycle',
+      });
+    });
+  }
 
   // Same browser-drive-by guard as the HTTP middleware, and needed MORE here: a WS handshake
   // is not CORS-gated at all, so before this a visited page could open a socket to loopback and
@@ -137,6 +181,24 @@ function installWebSocketTransport(deps) {
       return;
     }
 
+    // #60 Stage A §3 item 4 — the claim that got PAST the gate above proved it holds this
+    // instance's credential, so `verify` names the exact epoch it proved. Record it: nothing else
+    // in this transport ever set `session.sessionEpoch`, so every WS-owned session was filed in the
+    // ledger as `session_epoch: null / no_815_epoch_fact` even when the claimant had just presented
+    // a bearer that resolves to a precise instance (daemon.js beginTrackedInjection). This is the
+    // ONLY thing that may set it: an open socket, a fresh owner_token, loopback origin or a
+    // matching SID must never stand in for the credential — that substitution is the defect #815
+    // removed. No credential presented, or none held, leaves it untouched and unavailable.
+    // RESOLVED here, ASSIGNED below inside the ownership transfer — assigning it here would
+    // overwrite the incumbent's epoch before the displacement block can capture it, and the
+    // displaced epoch is precisely what the owner-replaced fact has to name.
+    const claimedBearer = req.headers['x-telepty-session-token'];
+    const verifiedClaimEpoch = (() => {
+      if (!credentials || !claimedBearer || typeof credentials.verify !== 'function') return null;
+      const principal = credentials.verify(claimedBearer);
+      return principal && principal.sid === sessionId ? principal.epoch : null;
+    })();
+
     // For wrapped sessions, first connector OR explicit ?owner=1 claim becomes the owner.
     // ?owner=1 reclaim handles the stale-ownerWs bug: allow bridge reconnects but stale TCP
     // half-open connection still holds ownerWs slot → reconnect wrongly becomes a viewer.
@@ -151,6 +213,10 @@ function installWebSocketTransport(deps) {
         && isOpenWebSocket(activeSession.ownerWs)
         && activeSession.ownerWs !== ws;
       const displacedOwnerPid = displacedLiveOwner ? (activeSession.ownerPid || null) : null;
+      // Captured BEFORE the claimant's epoch overwrites it — this is the epoch the tracked
+      // injects were assigned to, and it is the evidence `owner_epoch_replaced` requires.
+      const displacedSessionEpoch = activeSession.sessionEpoch || null;
+      const displacedLiveOwnerSocket = displacedLiveOwner ? activeSession.ownerWs : null;
       if (isOwnerConnect && activeSession.ownerWs && activeSession.ownerWs !== ws) {
         // telepty#56 (durable last-writer-wins Replace): close the displaced owner with the
         // dedicated terminal code 4001 'Owner replaced' instead of a bare terminate(). A
@@ -169,6 +235,12 @@ function installWebSocketTransport(deps) {
         }, 1000);
       }
       activeSession.ownerWs = ws;
+      // #60 Stage A §3 item 4/5 — the new owner's authenticated epoch, or NULL when it proved
+      // none. Null is written deliberately rather than leaving the predecessor's value in place:
+      // keeping a stale epoch would file the incoming owner's work under the displaced instance's
+      // identity, which is the exact "verified, instance unknown" combination #815 forbids. A
+      // legacy or unproven claim is authentication-unavailable, and that is recorded as absence.
+      activeSession.sessionEpoch = verifiedClaimEpoch;
       // telepty#56 (kill-stick): capture the owner PID at claim time. The reconnect-register POST
       // only carries owner_pid on reconnect, so a first-connect owner would otherwise have a null
       // ownerPid and `kill --force` could not SIGKILL the owning process. The bridge passes its pid
@@ -198,10 +270,33 @@ function installWebSocketTransport(deps) {
           reason: 'owner_claim_displaced_live_owner',
           displaced_owner_pid: displacedOwnerPid,
           claimant_owner_pid: activeSession.ownerPid || null,
+          displaced_session_epoch: displacedSessionEpoch,
           // Was the claimant required to prove it holds this instance's credential? False means
           // the session had no credential to check against — the residual, stated per event.
           claim_was_credentialed: Boolean(credentials && credentials.hasCredential(sessionId))
         });
+        // #60 Stage A §3 item 1 — and DURABLY, against every tracked inject assigned to the
+        // displaced epoch. The bus event above is push-only: a subscriber that was not listening
+        // at this instant, or a daemon restart, would leave those injects with no record that
+        // their assignee was displaced. That gap is the whole reason the ledger exists.
+        //
+        // When the displaced owner never proved an epoch, `displaced_session_epoch` is null and
+        // the mapper fails CLOSED to `unmapped_transition_cause` (missing required evidence). That
+        // is the correct outcome and it is left to happen: the honest statement is "an owner was
+        // replaced and we cannot bind it to an instance", never a synthesized epoch.
+        const results = recordOwnerLifecycle(sessionId, activeSession, 'owner_epoch_replaced', {
+          displaced_session_epoch: displacedSessionEpoch,
+          displaced_owner_pid: displacedOwnerPid,
+        });
+        console.log(`[OBSERVE] ${sessionId} owner replaced — ${results.length} tracked inject(s): ${results.join(', ')}`);
+        // #60 Stage A §3 item 3 — mark the displaced socket so its own close handler can report
+        // the death. Once `ownerWs` moved, that handler takes the "client detached" branch and the
+        // displaced bridge's exit becomes invisible; the bridge reads close 4001 as terminal and
+        // exits WITHOUT necessarily driving markDead, so nothing else would ever say it died.
+        if (displacedLiveOwnerSocket) {
+          displacedLiveOwnerSocket.__teleptyDisplacedEpoch = displacedSessionEpoch;
+          displacedLiveOwnerSocket.__teleptyDisplaced = true;
+        }
       }
       if (hadDisconnectedOwner) {
         emitSessionLifecycleEvent('session_reconnect', sessionId, activeSession);
@@ -268,22 +363,49 @@ function installWebSocketTransport(deps) {
                 activeSession.ready = true;
               }
               activeSession.lastActivityAt = new Date().toISOString();
-              console.log(`[READY] Session ${sessionId} CLI is ready for inject`);
-              // Broadcast readiness to bus (cmux/kitty paths now enabled for this session)
+
+              // #60 Stage A §3.7 — QUALIFY the frame. A `ready` frame is a transport fact about a
+              // surface that looks able to RECEIVE an inject; it is not an outcome, and the two
+              // detectors behind it are not equally strong. Only the two names the bridge is
+              // allowed to assert are accepted; anything else — a 0.7.1 bridge's bare
+              // `{type:"ready"}`, a garbled value, an unknown future kind — stays LEGACY and
+              // unqualified, so it can never borrow a qualified observation's meaning.
+              //
+              // Assigned on EVERY frame, never left stale: a session that once matched a composer
+              // surface and later sends a bare frame must fall back to legacy, not keep wearing
+              // the stronger name from a measurement that is no longer being made.
+              const QUALIFIED_READY_KINDS = ['composer_surface_observed', 'prompt_suffix_observed'];
+              const qualified = QUALIFIED_READY_KINDS.includes(msg.ready_kind);
+              activeSession.readyKind = qualified ? msg.ready_kind : 'legacy_unqualified_ready';
+              activeSession.readyDetector = qualified && typeof msg.detector === 'string'
+                ? msg.detector
+                : 'unqualified';
+              activeSession.readyCliKey = qualified && typeof msg.cli_key === 'string' ? msg.cli_key : null;
+
+              console.log(`[READY] Session ${sessionId} surface is ready for inject (${activeSession.readyKind}, detector=${activeSession.readyDetector})`);
+              // Broadcast readiness to bus (cmux/kitty paths now enabled for this session).
+              // Carries the qualification so a subscriber can tell a known CLI's composer surface
+              // from a regex hit on the current frame.
               const readyMsg = JSON.stringify({
                 type: 'session_ready',
                 session_id: sessionId,
+                ready_kind: activeSession.readyKind,
+                detector: activeSession.readyDetector,
+                cli_key: activeSession.readyCliKey,
                 timestamp: new Date().toISOString()
               });
               busClients.forEach(client => {
                 if (client.readyState === 1) client.send(readyMsg);
               });
-              // Auto-report: notify source that target completed inject task
-              // Legacy ready-signal auto-report path. Skip if onTransition already
-              // fired (pendingReports[sessionId].idleNotified === true).
+
+              // #60 Stage A: this used to be the "auto-report" path — it told the SOURCE that the
+              // target "completed inject task" on the strength of a ready frame. A ready frame
+              // measures a surface, not a turn, and the `!idleNotified` guard it rode on is gone
+              // (that one-way bit was burned by a wrong-label emission and then dropped the later
+              // genuine one). What remains emits ONE completion-absence observation: the frame is
+              // reported as what it is, and no path in this file can produce a terminal claim.
               const pendingReport = pendingReports[sessionId];
-              if (pendingReport && !pendingReport.idleNotified) {
-                // ready-signal: cli.js bridge emitted a 'ready' WS frame.
+              if (pendingReport) {
                 fireAutoReport(sessionId, activeSession, pendingReport, 'ready-signal');
               }
             }
@@ -317,6 +439,20 @@ function installWebSocketTransport(deps) {
       const activeSession = sessions[sessionId];
       if (!activeSession) return;
       activeSession.clients.delete(ws);
+
+      // #60 Stage A §3 item 3 — a DISPLACED owner closing is the assignee going away. It cannot
+      // take the branch below (its `ownerWs` slot was reassigned at displacement), so without this
+      // the exit is reported as an ordinary viewer detaching and the tracked injects hear nothing.
+      // The bridge treats close 4001 as terminal and exits, frequently without the PTY child ever
+      // driving `sessionStateManager.markDead`, so this is emitted on the transport fact alone —
+      // which is exactly what §8.3 item 10 requires.
+      if (ws.__teleptyDisplaced) {
+        const results = recordOwnerLifecycle(sessionId, activeSession, 'owner_process_exited', {
+          displaced_session_epoch: ws.__teleptyDisplacedEpoch || null,
+        });
+        console.log(`[OBSERVE] ${sessionId} displaced owner exited — ${results.length} tracked inject(s): ${results.join(', ')}`);
+      }
+
       if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
         activeSession.ownerWs = null;
         // #29: cancel any pending owner-alive optimistic timer — the owner is gone, so the

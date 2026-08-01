@@ -30,7 +30,9 @@ const {
   formatSessionTerminal,
   enrichSessionIdle,
   formatSessionStatusWithIdle,
-  printSessionInfo
+  printSessionInfo,
+  formatActivityObservation,
+  formatOutcomeProtocol
 } = require('./src/cli/session-view');
 const { resolveWindowsExecutable } = require('./src/win-resolve-executable');
 const { decideVersionAction } = require('./src/version-handshake');
@@ -994,9 +996,9 @@ async function manageInteractive() {
         console.log('\x1b[1mAvailable Sessions:\x1b[0m');
         sessions.forEach(s => {
           const hostLabel = formatHostLabel(s.host);
-          const stEmoji = s.autoState ? s.autoState.emoji : '';
-          const stLabel = s.autoState ? s.autoState.state : '';
-          console.log(`  - \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) [${s.command}] - ${s.healthStatus || 'UNKNOWN'}${stLabel ? ` ${stEmoji} ${stLabel}` : ''} - Clients: ${s.active_clients}`);
+          // #60 Stage A: the measured observation, not the removed `autoState.state`. Health is
+          // TRANSPORT; the observation is ACTIVITY; neither is an outcome.
+          console.log(`  - \x1b[36m${s.id}\x1b[0m (\x1b[33m${hostLabel}\x1b[0m) [${s.command}] - ${s.healthStatus || 'UNKNOWN'} ${formatActivityObservation(s.activityObservation)} - Clients: ${s.active_clients}`);
         });
       }
       console.log('\n');
@@ -1341,9 +1343,11 @@ async function main() {
         console.log(`  - ID: \x1b[36m${s.id}\x1b[0m`);
         console.log(`    Host: ${formatHostLabel(s.host)}`);
         console.log(`    Command: ${s.command}`);
-        const autoEmoji = s.autoState ? s.autoState.emoji : '';
-      const autoLabel = s.autoState ? s.autoState.state : '';
-      console.log(`    Status: ${formatSessionStatusWithIdle(s)}${autoLabel ? ` ${autoEmoji} ${autoLabel}` : ''}`);
+        console.log(`    Status: ${formatSessionStatusWithIdle(s)}`);
+        // #60 Stage A: separate lines, because they are separate domains. Status is transport
+        // connectivity; the activity observation is what the PTY was measured doing. Collapsing
+        // them onto one line is how "connected + quiet" came to be read as "finished".
+        console.log(`    Activity observation: ${formatActivityObservation(s.activityObservation)}`);
         console.log(`    Terminal: ${formatSessionTerminal(s)}`);
         console.log(`    CWD: ${s.cwd}`);
         console.log(`    Clients: ${s.active_clients}`);
@@ -1723,12 +1727,33 @@ async function main() {
       return promptReady && (Date.now() - lastUserInputTime > IDLE_THRESHOLD);
     }
 
+    // #60 Stage A §3.7 — a ready frame is a DELIVERY-readiness hint, and the two ways we detect it
+    // are not equally strong. A registry-tail match sees a known CLI's actual composer surface; a
+    // bare `[❯>$#%]\s*$` match is a regex on whatever bytes are in the current frame, which `cat`
+    // of a shell script satisfies just as well as a prompt does. They used to arrive as the same
+    // anonymous `{type:"ready"}`, so the daemon could not tell them apart — and neither says the
+    // turn ended. Qualify at the detection site and remember it, so the reconnect re-send below
+    // cannot silently downgrade a qualified session to the legacy unqualified frame.
+    let readyQualification = null;
     function observePromptReady(data) {
       if (knownAiCli) {
         outputTail = (outputTail + data).slice(-20000);
-        return !!readyRegistry.detectOutput(command, outputTail).found;
+        const hit = readyRegistry.detectOutput(command, outputTail);
+        if (!hit.found) return false;
+        readyQualification = {
+          ready_kind: 'composer_surface_observed',
+          detector: hit.reason || 'registry_match',
+          cli_key: readyRegistry.commandKey(command),
+        };
+        return true;
       }
-      return promptPattern.test(data);
+      if (!promptPattern.test(data)) return false;
+      readyQualification = {
+        ready_kind: 'prompt_suffix_observed',
+        detector: 'generic_prompt_suffix',
+        cli_key: null,
+      };
+      return true;
     }
 
     let queueFlushTimer = null;
@@ -1913,9 +1938,11 @@ async function main() {
         // No resize trick on reconnect — it causes visible flickering across all
         // terminals when the daemon restarts and multiple sessions reconnect at once.
         reconnectAttempts = 0;
-        // Re-send ready on reconnect so new daemon knows CLI is ready
+        // Re-send ready on reconnect so new daemon knows CLI is ready. Carries the SAME
+        // qualification the original detection produced — a reconnect measures nothing new, so it
+        // must not present itself as a stronger (or weaker) observation than what was seen.
         if (readyNotified && promptReady) {
-          daemonWs.send(JSON.stringify({ type: 'ready' }));
+          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}) }));
         }
       });
 
@@ -2116,7 +2143,7 @@ async function main() {
         // Notify daemon that CLI is ready for inject
         if (!readyNotified && wsReady && daemonWs.readyState === 1) {
           readyNotified = true;
-          daemonWs.send(JSON.stringify({ type: 'ready' }));
+          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}) }));
         }
       }
     }
@@ -2741,43 +2768,49 @@ async function main() {
         process.exit(1);
       }
 
-      const auto = data.auto || {};
+      // #60 Stage A §8.5.2 — `auto.state` is gone from the daemon; what ships is the measured
+      // observation plus a SEPARATE completion block that is permanently null in 0.8.0. The old
+      // rendering called this field "State" and painted `idle` GREEN, which is a done-semantics
+      // claim from a measurement that cannot support one. Both are removed here: nothing on this
+      // screen asserts an outcome, and the one thing a reader most wants to know — whether telepty
+      // can tell them the task finished — is answered explicitly instead of by omission.
+      const observation = data.activity_observation || null;
+      const completion = data.completion || null;
       const selfReport = data.self_report || {};
-
-      // Color-coded state display
-      const stateColors = {
-        starting: '\x1b[33m',      // yellow
-        idle: '\x1b[32m',          // green
-        working: '\x1b[36m',       // cyan
-        thinking: '\x1b[35m',      // magenta
-        waiting: '\x1b[33m',       // yellow
-        error: '\x1b[31m',         // red
-        restarting: '\x1b[33m',    // yellow
-        dead: '\x1b[90m',          // gray
-      };
-      const stateColor = stateColors[auto.state] || '\x1b[37m';
       const reset = '\x1b[0m';
+      const fields = (observation && observation.fields) || {};
 
       console.log(`\n  Session: \x1b[36m${data.session_id}${reset}`);
-      const stateEmoji = auto.emoji || '';
-      console.log(`  State: ${stateColor}${stateEmoji} ${auto.state || 'unknown'}${reset} (confidence: ${auto.confidence != null ? (auto.confidence * 100).toFixed(0) + '%' : '?'})`);
-      if (auto.since) {
-        const durationMs = auto.duration_ms || 0;
+      console.log(`  Activity observation: ${formatActivityObservation(observation)}`);
+      if (observation && observation.cause) {
+        console.log(`  Cause: ${observation.cause}`);
+      }
+      if (observation && observation.confidence != null) {
+        // Confidence qualifies the CLASSIFIER, never the completion (§2.3).
+        console.log(`  Classifier confidence: ${(observation.confidence * 100).toFixed(0)}%`);
+      }
+      if (observation && observation.since) {
+        const durationMs = observation.duration_ms || 0;
         const durationStr = durationMs < 60000
           ? `${(durationMs / 1000).toFixed(0)}s`
           : `${(durationMs / 60000).toFixed(1)}m`;
-        console.log(`  Since: ${auto.since} (${durationStr} ago)`);
+        console.log(`  Since: ${observation.since} (${durationStr} ago)`);
       }
-      if (auto.detail) {
-        console.log(`  Trigger: ${auto.detail.trigger || '-'}`);
-        if (auto.detail.matched_line) console.log(`  Matched: "${auto.detail.matched_line}"`);
-        if (auto.detail.silence_ms) console.log(`  Silence: ${(auto.detail.silence_ms / 1000).toFixed(1)}s`);
-        if (auto.detail.repeat_count) console.log(`  Error repeats: ${auto.detail.repeat_count}`);
-      }
-      if (auto.last_output_preview) {
-        const preview = auto.last_output_preview.replace(/\n/g, '\\n').slice(-80);
+      // Only the evidence the observation's own mapping row required — printed under literal
+      // names so a reader can see what was measured rather than inferring it from a verdict.
+      if (fields.matched_line) console.log(`  Matched: "${fields.matched_line}"`);
+      if (fields.silence_ms) console.log(`  Silence: ${(fields.silence_ms / 1000).toFixed(1)}s`);
+      if (fields.repeat_count) console.log(`  Error repeats: ${fields.repeat_count}`);
+      if (observation && observation.last_output_preview) {
+        const preview = observation.last_output_preview.replace(/\n/g, '\\n').slice(-80);
         console.log(`  Last output: "${preview}"`);
       }
+
+      // §A4: the capability gap is EXPLICIT. `completion_fact` is null by construction in 0.8.0 —
+      // there is no measurement that can produce one — so say that, rather than leaving a reader
+      // to read the quiet line above as an answer.
+      console.log(`  Completion fact: none observed`);
+      console.log(`  Outcome protocol: ${formatOutcomeProtocol(completion)}`);
 
       if (selfReport.phase) {
         console.log(`\n  Self-report:`);
