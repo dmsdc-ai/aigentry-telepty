@@ -210,9 +210,14 @@ test('#694(b) busy target: fast-path dispatches without the full-timeout burn', 
     bridge.startBusy(300);
     await delay(700); // let `thinking` accrue duration_ms ≫ grace (a genuine ongoing turn)
 
+    // #60 §3.8: `auto` (the internal FSM name) became `activity_observation`, keyed by the
+    // measured cause. The busy precondition is unchanged in substance — it just names the two
+    // observations a busy session produces instead of the two internal states they map from:
+    // `working` → output_observed, `thinking` → busy_indicator_pattern_observed.
     const st = await d.req(`/api/sessions/${id}/state`);
-    assert.ok(['thinking', 'working'].includes(st.body.auto.state),
-      `precondition: target is busy, got ${JSON.stringify(st.body.auto)}`);
+    const busyKinds = ['output_observed', 'busy_indicator_pattern_observed'];
+    assert.ok(st.body.activity_observation && busyKinds.includes(st.body.activity_observation.kind),
+      `precondition: target is busy, got ${JSON.stringify(st.body.activity_observation)}`);
 
     await d.req(`/api/sessions/${id}/inject`, { method: 'POST', body: { prompt: BODY, no_enter: true } });
     await delay(150);

@@ -85,6 +85,20 @@ async function bootDaemon(homeDir) {
 
 // (a) + (b) end-to-end: register a wrapped session, restart the daemon (session persists), and
 // verify the restored session has a live render-state machine — then a bridge re-register keeps it.
+// #60 §3.8 renamed the /state read model: `auto` (the INTERNAL FSM name, served straight to
+// consumers) became `activity_observation`, keyed by the measured cause. This test never cared
+// about the state NAME — it only ever asked "is a state machine attached at all?", which the old
+// shape spelled `auto.state === 'unknown'` / `auto.detail === 'no state machine registered'`.
+// That question survives verbatim: a session with no machine now reports the explicit
+// `tracking_unavailable` kind carrying `reason: no_state_machine_registered`, which is a NAMED
+// absence rather than the string 'unknown' the old code emitted.
+function assertMachinePresent(res, message) {
+  const obs = res.body.activity_observation;
+  assert.ok(obs, `${message}: no activity_observation in ${JSON.stringify(res.body)}`);
+  assert.notEqual(obs.kind, 'tracking_unavailable', `${message}, got ${JSON.stringify(obs)}`);
+  assert.notEqual(obs.fields && obs.fields.reason, 'no_state_machine_registered', message);
+}
+
 test('#678(a,b) restart-restored wrapped session has a state machine (not no_state), survives re-register', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tp678-'));
   let d;
@@ -95,25 +109,22 @@ test('#678(a,b) restart-restored wrapped session has a state machine (not no_sta
       body: { session_id: 'alpha', command: 'claude', delivery_type: 'wrapped', cwd: '/tmp' } });
     assert.equal(reg.status, 201);
     const before = await d.req('/api/sessions/alpha/state');
-    assert.notEqual(before.body.auto.state, 'unknown', 'machine present before restart');
+    assertMachinePresent(before, 'machine present before restart');
     await d.stop();
 
     // Daemon #2 (same HOME): restores 'alpha'. Pre-fix this yielded getState()=null →
-    // /state auto = { state:'unknown', detail:'no state machine registered' }.
+    // /state reported the absent machine instead of an activity observation.
     d = await bootDaemon(home);
     const restored = await d.req('/api/sessions/alpha/state');
     assert.equal(restored.status, 200);
-    assert.notEqual(restored.body.auto.state, 'unknown',
-      `restored session must have a state machine, got ${JSON.stringify(restored.body.auto)}`);
-    assert.notEqual(restored.body.auto.detail, 'no state machine registered');
+    assertMachinePresent(restored, 'restored session must have a state machine');
 
     // (b) A bridge reconnecting re-registers the same id (early-return branch) — machine stays live.
     const rereg = await d.req('/api/sessions/register', { method: 'POST',
       body: { session_id: 'alpha', command: 'claude', delivery_type: 'wrapped', cwd: '/tmp' } });
     assert.equal(rereg.body.reregistered, true);
     const after = await d.req('/api/sessions/alpha/state');
-    assert.notEqual(after.body.auto.state, 'unknown', 'machine present after bridge re-register');
-    assert.notEqual(after.body.auto.detail, 'no state machine registered');
+    assertMachinePresent(after, 'machine present after bridge re-register');
   } finally {
     if (d) await d.stop();
     fs.rmSync(home, { recursive: true, force: true });
