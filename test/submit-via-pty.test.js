@@ -179,9 +179,15 @@ test('confirmSubmitAccepted still honors an explicit opts.readScreen seam (futur
 
 const NOW = 1_700_000_000_000;
 
+// #60 Stage A: the broadcast is captured too, because the verdict this section was written to
+// discriminate now lives in `consumption.basis` on the emitted observation rather than in a
+// choice between two message labels.
+const broadcasts = [];
+
 function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4.5, idleEvidenceReliable } = {}) {
   const captured = [];
-  const timers = []; // #48: settle-and-recheck defers UNCONFIRMED — capture and flush below
+  const timers = []; // #48: settle-and-recheck defers the follow-up — capture and flush below
+  broadcasts.length = 0;
   const pendingReport = {
     source: 'orch',
     injectId: 'inj-1',
@@ -191,48 +197,71 @@ function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4
   const deps = {
     now: () => NOW,
     setTimeout: (fn) => { timers.push(fn); return 0; },
-    broadcastSessionEvent: () => {},
+    broadcastSessionEvent: (type, sid, _s, opts) => broadcasts.push({ type, opts }),
     resolveSessionAlias: (s) => s,
     sessions: { orch: { id: 'orch' } },
     pendingReports: { 'worker-1': pendingReport },
     deliverInjectionToSession: (srcId, _s, msg) => captured.push({ srcId, msg }),
-    idleEvidenceReliable, // #545: real-idle reliability gate (undefined = ungated, prior behavior)
-    getAutoState: () => 'idle', // #48: still idle at recheck → the honest label fires
+    idleEvidenceReliable, // #545: now recorded as EVIDENCE, no longer a promotion input
+    getAutoState: () => 'idle', // #48: still idle at recheck → the observation fires
   };
   fireAutoReport('worker-1', { id: 'worker-1' }, pendingReport, trigger, deps);
   while (timers.length) timers.shift()(); // #48: run the settle recheck
   return captured.length ? captured[0].msg : null;
 }
 
-test('BUG B: never-started worker (submit failed, only a startup spinner) → TASK_IDLE_UNCONFIRMED, never TASK_COMPLETE [real-idle]', () => {
+const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1 — no completion fact observed; pty_quiet=\d+\.\ds; consumption=(observed|not_established); outcome protocol unavailable$/;
+
+// The whole of section 4/4b used to turn on a two-way verdict: UNCONFIRMED for a never-started
+// worker, TASK_COMPLETE for a real one. Both are deleted, so every case below states the same
+// sentence. That is the point rather than a loss — note that the three "positive" cases all rest
+// on a `force` accept, which measured no screen at all, and #545 exists precisely because a
+// confirmed submit plus a weak idle flip was already known not to establish anything.
+function statedAbsence(msg) {
+  assert.ok(msg, 'an observation is delivered — never silence');
+  assert.match(msg, UNKNOWN_RE);
+  assert.doesNotMatch(msg, /TASK_COMPLETE:/);
+  assert.doesNotMatch(msg, /TASK_IDLE_UNCONFIRMED:/);
+  const ev = broadcasts.find((b) => b.type === 'task_completion_unknown');
+  assert.ok(ev, 'the bus hears it too');
+  assert.equal(ev.opts.extra.completion_fact, null);
+  assert.equal(ev.opts.extra.terminal, false);
+  return ev.opts.extra.consumption;
+}
+
+test('BUG B: never-started worker (submit failed, only a startup spinner) is never a completion [real-idle]', () => {
   // Submit was expected but never strong-confirmed (no submitConfirmedAt, accepted:false).
-  // The ONLY positive signal is sawWorkingAfterInject — a startup-spinner-polluted transition.
-  // The accept gate must stay pinned to RELIABLE evidence, so this remains UNCONFIRMED.
-  const msg = runGate({
+  // The ONLY positive signal is sawWorkingAfterInject — a startup-spinner-polluted transition,
+  // which Stage A does not admit as an input to consumption at all.
+  const consumption = statedAbsence(runGate({
     submitExpected: true,
     sawWorkingAfterInject: true,
     submitConfirm: { accepted: false, reason: 'strategy_failed' },
-  });
-  assert.ok(msg);
-  assert.match(msg, /^TASK_IDLE_UNCONFIRMED:/);
-  assert.doesNotMatch(msg, /^TASK_COMPLETE:/);
+  }));
+  assert.equal(consumption.basis, 'submit_rejection_observed');
+  assert.equal(consumption.submit_confirm_reason, 'strategy_failed');
 });
 
-test('BUG B: never-started worker stays UNCONFIRMED on the silence-timeout trigger too', () => {
-  const msg = runGate({ submitExpected: true, sawWorkingAfterInject: true }, { trigger: 'silence-timeout', elapsedSec: 12 });
-  assert.ok(msg);
-  assert.match(msg, /^TASK_IDLE_UNCONFIRMED:/);
+test('BUG B: never-started worker is not a completion on the silence-timeout trigger either', () => {
+  const consumption = statedAbsence(
+    runGate({ submitExpected: true, sawWorkingAfterInject: true }, { trigger: 'silence-timeout', elapsedSec: 12 })
+  );
+  assert.equal(consumption.basis, 'no_consumption_evidence',
+    'sawWorkingAfterInject on its own is not evidence of anything');
 });
 
-test('positive: a strong-confirmed pty_cr submit (post-#544) → TASK_COMPLETE', () => {
-  // Change 2a: a delivered pty_cr now sets submitConfirmedAt at submit time, so the
-  // existing reliable-evidence gate correctly reports completion — no false UNCONFIRMED.
-  const msg = runGate({
+test('a force-accepted pty_cr submit (post-#544) is delivery, not completion', () => {
+  // Change 2a: a delivered pty_cr sets submitConfirmedAt at submit time. That is a TRANSPORT
+  // fact — the CR reached the PTY — and the old gate promoted it to a completion claim. The two
+  // are different domains, which is the separation Stage A exists to draw.
+  const consumption = statedAbsence(runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
-  }, { elapsedSec: 30 });
-  assert.match(msg, /^TASK_COMPLETE:/);
+  }, { elapsedSec: 30 }));
+  assert.equal(consumption.basis, 'no_consumption_evidence');
+  assert.equal(consumption.submit_confirm_reason, 'force',
+    'the accept was seen and rejected as evidence — force is outside the screen-derived whitelist');
 });
 
 // ---------------------------------------------------------------------------
@@ -243,34 +272,40 @@ test('positive: a strong-confirmed pty_cr submit (post-#544) → TASK_COMPLETE',
 // but whose idle was NOT a reliable OSC133-marked / body-consumed transition must report the
 // honest TASK_IDLE_UNCONFIRMED, never a false TASK_COMPLETE.
 
-test('#545: real-idle with unreliable idle evidence → TASK_IDLE_UNCONFIRMED even when submit confirmed', () => {
-  const msg = runGate({
+// #545's `idleEvidenceReliable` is no longer a gate that downgrades a completion — there is no
+// completion to downgrade. It is computed and recorded as evidence about the idle flip. So the
+// three cases below assert the property that replaces the old gate: the reliability of the idle
+// evidence CANNOT change what is claimed, in either direction, on any trigger.
+
+test('#545: unreliable idle evidence with a confirmed submit claims nothing', () => {
+  const consumption = statedAbsence(runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
-  }, { elapsedSec: 30, idleEvidenceReliable: false });
-  assert.ok(msg);
-  assert.match(msg, /^TASK_IDLE_UNCONFIRMED:/);
-  assert.doesNotMatch(msg, /^TASK_COMPLETE:/);
+  }, { elapsedSec: 30, idleEvidenceReliable: false }));
+  assert.equal(consumption.basis, 'no_consumption_evidence');
 });
 
-test('#545: real-idle with reliable idle evidence (OSC133 + body consumed) → TASK_COMPLETE', () => {
-  const msg = runGate({
+test('#545: RELIABLE idle evidence (OSC133 + body consumed) still claims nothing', () => {
+  // The load-bearing half. This is the strongest idle evidence the daemon can have, and it was
+  // the exact input that produced TASK_COMPLETE. It now produces the same sentence as the
+  // unreliable case above — a reliable idle flip measures the SCREEN settling, never a turn
+  // ending, so it never had the standing to conclude the task was done.
+  const consumption = statedAbsence(runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
-  }, { elapsedSec: 30, idleEvidenceReliable: true });
-  assert.match(msg, /^TASK_COMPLETE:/);
+  }, { elapsedSec: 30, idleEvidenceReliable: true }));
+  assert.equal(consumption.basis, 'no_consumption_evidence');
 });
 
-test('#545: the gate is real-idle-scoped — silence-timeout reports are unaffected by the flag', () => {
-  // A non-real-idle trigger must not be downgraded by idleEvidenceReliable.
-  const msg = runGate({
+test('#545: the reliability flag changes nothing on a silence-timeout trigger either', () => {
+  const consumption = statedAbsence(runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
-  }, { trigger: 'silence-timeout', elapsedSec: 30, idleEvidenceReliable: false });
-  assert.match(msg, /^TASK_COMPLETE:/);
+  }, { trigger: 'silence-timeout', elapsedSec: 30, idleEvidenceReliable: false }));
+  assert.equal(consumption.basis, 'no_consumption_evidence');
 });
 
 // ---------------------------------------------------------------------------

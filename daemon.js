@@ -622,6 +622,28 @@ function recordObservation({
   const observation = { kind: mapped.kind, trigger: mapped.cause, ...mapped.fields };
   if (trigger) observation.emitted_via = trigger;
 
+  // #801 output marker, attached HERE rather than by widening mapObservationCause's evidence
+  // whitelist. The whitelist is a contract — a name may not travel with evidence its cause row
+  // did not require — and widening it would let every unrelated field leak into every row. This
+  // is the one sanctioned exception, so it is made at the call site where it is visible.
+  //
+  // What these two fields say: a known error banner was MATCHED IN THE OUTPUT BYTES of this
+  // turn, by detectIdleAfterError, scoped past the inject watermark. That is a measured fact
+  // about output — the text was there. What they do NOT say, and must never be read as: that
+  // the session failed, that the task failed, or that the inject went unprocessed. Those are
+  // outcome claims and remain unmeasurable; this envelope still carries completion_fact:null
+  // and terminal:false alongside them, and the observation's KIND is unchanged — a marker
+  // cannot rename the measurement it rode in on.
+  //
+  // Without this, a CLI dying on a 529 and an unmeasured CLI printing the same banner emit
+  // byte-identical observations: the daemon measured the difference and then discarded it,
+  // which is the inverse of this release's thesis rather than an instance of it (§A4 —
+  // capability gaps are reported, not erased).
+  if (evidence && evidence.error_marker) {
+    observation.error_marker = evidence.error_marker;
+    if (evidence.error_detail) observation.error_detail = evidence.error_detail;
+  }
+
   const injectId = pendingReport ? pendingReport.injectId : null;
   const record = injectId ? getTrackedInjection(injectId) : null;
 
