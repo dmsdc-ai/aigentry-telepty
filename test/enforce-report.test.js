@@ -202,11 +202,19 @@ test('control-only redraws do not re-mark a quiet session working', async () => 
   await harness.registerSession(senderId);
   const senderOwner = await harness.connectSession(senderId);
 
-  senderOwner.send(JSON.stringify({ type: 'output', data: 'working on task\n' }));
-  await waitFor(async () => {
+  // §3.8: the read model is renamed too. `auto.state` served the INTERNAL FSM name straight to
+  // consumers, which is how `idle` reached a sidebar as a green done-pill. It is now
+  // `activity_observation`, keyed by the measured CAUSE, with completion split into its own
+  // permanently-unknown block.
+  const observationOf = async () => {
     const state = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/state`);
-    return state.body.auto.state === 'working';
-  }, { timeoutMs: 2000, description: 'sender working state' });
+    assert.equal(state.status, 200);
+    return state.body;
+  };
+
+  senderOwner.send(JSON.stringify({ type: 'output', data: 'working on task\n' }));
+  await waitFor(async () => (await observationOf()).activity_observation.kind === 'output_observed',
+    { timeoutMs: 2000, description: 'sender output_observed' });
 
   // This test used to reach idle by injecting REPORT text at the sender's report source and
   // asserted `detail.trigger === 'report_inject'`. Text can no longer mark a session idle, and
@@ -214,24 +222,28 @@ test('control-only redraws do not re-mark a quiet session working', async () => 
   // redraw must not read as new work — is independent of the report path and still live, so it
   // is driven from a real measurement instead: the raw OSC 133 prompt marker.
   senderOwner.send(JSON.stringify({ type: 'output', data: '\x1b]133;B\x07' }));
-  await waitFor(async () => {
-    const state = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/state`);
-    return state.body.auto.state === 'idle';
-  }, { timeoutMs: 2000, description: 'sender idle after prompt marker' });
+  await waitFor(async () => (await observationOf()).activity_observation.kind === 'osc_133_a_or_b_observed',
+    { timeoutMs: 2000, description: 'sender quiet at a prompt marker' });
 
   senderOwner.send(JSON.stringify({ type: 'output', data: '\x1b[?25l\r\x1b[2K\x1b[?25h' }));
   await delay(100);
 
-  const afterControl = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/state`);
-  assert.equal(afterControl.body.auto.state, 'idle');
-  // Unchanged: control-only bytes carry no measurement, so they may not restate the cause either.
-  assert.equal(afterControl.body.auto.detail.trigger, 'osc_133_a_or_b_received');
+  const afterControl = await observationOf();
+  // Unchanged: control-only bytes carry no measurement, so they may neither re-mark the session
+  // as working nor restate the cause.
+  assert.equal(afterControl.activity_observation.kind, 'osc_133_a_or_b_observed');
+  assert.equal(afterControl.activity_observation.cause, 'osc_133_a_or_b_received');
+  // §8.5.5: a quiet session must never present as task success. Nothing in the observation
+  // display table is green, and this is the entrance the sidebar pill reads.
+  assert.equal(afterControl.activity_observation.tone, 'neutral');
+  // The read model states an activity measurement and, separately, that it knows no outcome.
+  assert.equal(afterControl.completion.completion_fact, null);
+  assert.equal(afterControl.completion.terminal, false);
+  assert.equal(afterControl.completion.capability.outcome_protocol, 'unavailable');
 
   senderOwner.send(JSON.stringify({ type: 'output', data: 'new task output\n' }));
-  await waitFor(async () => {
-    const state = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/state`);
-    return state.body.auto.state === 'working';
-  }, { timeoutMs: 2000, description: 'sender working after meaningful output' });
+  await waitFor(async () => (await observationOf()).activity_observation.kind === 'output_observed',
+    { timeoutMs: 2000, description: 'sender output_observed after meaningful output' });
 
   senderOwner.close();
 });

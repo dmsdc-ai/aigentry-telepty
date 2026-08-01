@@ -110,50 +110,91 @@ function decayedLongCompletion(extra = {}) {
 // reproduce — the live false-negative: a genuine long completion is cried-wolf.
 // ---------------------------------------------------------------------------
 
-test('#619 reproduce: long completion with decayed at-idle evidence → TASK_IDLE_UNCONFIRMED (the bug)', () => {
+// The consumption block on the single observation this path now emits. #60 Stage A deleted the
+// suppress/notify gate, so what used to be a choice between two message LABELS is now one
+// message plus a named `consumption` field. The cry-wolf this file exists to prevent is
+// therefore gone by construction on the message side — the text accuses nobody of anything —
+// and what remains testable, and worth testing, is whether the evidence is classified correctly.
+function consumptionOf(ctx) {
+  assert.equal(ctx.delivered.length, 1, 'exactly one observation is stated — never silence');
+  assert.match(ctx.delivered[0].msg, /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-619 /);
+  assert.doesNotMatch(ctx.delivered[0].msg, /TASK_COMPLETE:|TASK_IDLE_UNCONFIRMED:/);
+  const ev = ctx.broadcasts.find((b) => b.type === 'task_completion_unknown');
+  assert.ok(ev);
+  assert.equal(ev.opts.extra.completion_fact, null, 'no consumption evidence is ever a completion');
+  return ev.opts.extra.consumption;
+}
+
+test('#619 reproduce: long completion with decayed at-idle evidence no longer cries wolf', () => {
   const ctx = makeGate(decayedLongCompletion());
   ctx.fire('real-idle');
-  ctx.flushTimers(); // settle elapses: still idle, output stalled, no CPU → notify
-  assert.equal(ctx.delivered.length, 1, 'pre-fix: the genuine completion is cried-wolf');
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED: worker-1 signaled idle/);
+  ctx.flushTimers(); // settle elapses: still idle, output stalled, no CPU → state it
+  // The bug was the ACCUSATION: `TASK_IDLE_UNCONFIRMED: ... inject may NOT have been processed;
+  // verify before treating as done` on a worker that had in fact finished. That sentence is
+  // deleted, because "may not have been processed" was never a measurement either. The honest
+  // statement that replaces it reports what was actually seen: quiet, and no consumption
+  // evidence still derivable from a screen that decayed 800 seconds ago.
+  const consumption = consumptionOf(ctx);
+  assert.equal(consumption.basis, 'no_consumption_evidence');
+  assert.match(ctx.delivered[0].msg, /pty_quiet=8\d\d\.\ds/);
 });
 
 // ---------------------------------------------------------------------------
-// fix — a durable early-consumption fact makes the decayed at-idle evidence moot.
+// fix — a durable early-consumption candidate makes the decayed at-idle evidence moot.
 // ---------------------------------------------------------------------------
 
-test('#619 fix: a recorded early consumption → TASK_COMPLETE, no false UNCONFIRMED', () => {
+test('#619 fix: an early-recorded fresh-turn candidate survives 800s of decay', () => {
   const ctx = makeGate(decayedLongCompletion({
-    // recorded at turn-start (~T+1s), long before idle — decay-proof.
-    injectConsumedAt: new Date(T0 - 805_000).toISOString(),
-    injectConsumedSinceMs: T0 - 805_000,
+    // Captured at turn-start (~T-805s), long before idle — this is the decay-proof half.
+    injectConsumptionCandidate: {
+      from: 'idle', to: 'working',
+      sinceMs: T0 - 805_000, at: new Date(T0 - 805_000).toISOString(),
+    },
+    // ...and the screen-derived confirmation from that same early moment. Stage A requires BOTH
+    // conjuncts: the edge alone is not consumption (see the invariant below). `state_working` is
+    // produced by the very transition being judged, which is why the predicate is evaluated here
+    // at classification time rather than at the edge.
+    submitConfirm: { accepted: true, reason: 'state_working', ambiguous: false },
   }));
   ctx.fire('real-idle');
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1);
-  assert.match(
-    ctx.delivered[0].msg,
-    /^TASK_COMPLETE: worker-1 is now idle after processing inject/,
-    'stored consumption fact promotes the decayed idle to a genuine completion'
-  );
-  assert.ok(
-    !ctx.delivered.some((d) => /^TASK_IDLE_UNCONFIRMED:/.test(d.msg)),
-    'no cry-wolf once consumption is a recorded fact'
-  );
+  // The #619 win, restated: consumption is established at idle-time from a fact recorded ~800s
+  // earlier, with no dependence on a ring or an OSC mark that has since scrolled away.
+  const consumption = consumptionOf(ctx);
+  assert.equal(consumption.status, 'observed');
+  assert.equal(consumption.basis, 'fresh_busy_transition');
+  assert.equal(consumption.transition_from, 'idle');
+  assert.equal(consumption.transition_to, 'working');
+  assert.equal(consumption.submit_confirm_reason, 'state_working');
+  assert.equal(consumption.evaluated_at, 'consumption_classification');
+  assert.match(ctx.delivered[0].msg, /consumption=observed/);
+  // Consumption established is still NOT a completion — the old test asserted this promoted to
+  // TASK_COMPLETE, and that promotion is exactly what Stage A removes.
+  assert.doesNotMatch(ctx.delivered[0].msg, /TASK_COMPLETE/);
 });
 
 // ---------------------------------------------------------------------------
-// invariant — never-false-complete: a genuinely UNCONSUMED long inject (no recorded
-// fact, decayed screen, no echo) must STILL be UNCONFIRMED. The fix only flips
-// genuinely-consumed-but-decayed cases.
+// invariant — never-false-complete: consumption may not be established without BOTH
+// conjuncts. Under the old code the durable fact alone flipped the verdict; the
+// migrated invariant pins the stronger rule.
 // ---------------------------------------------------------------------------
 
-test('#619 invariant: never-consumed inject (no recorded fact) stays UNCONFIRMED', () => {
-  const ctx = makeGate(decayedLongCompletion()); // NO injectConsumedAt
+test('#619 invariant: a recorded candidate alone, with an ambiguous confirm, is not consumption', () => {
+  const ctx = makeGate(decayedLongCompletion({
+    // The fresh-turn edge IS recorded — the old code's sole condition for promoting.
+    injectConsumptionCandidate: {
+      from: 'idle', to: 'working',
+      sinceMs: T0 - 805_000, at: new Date(T0 - 805_000).toISOString(),
+    },
+    // But the long turn's confirm is `no_observable`/ambiguous, which measured no screen. The
+    // whitelist is narrower than `accepted === true` on purpose.
+  }));
   ctx.fire('real-idle');
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1);
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED:/, 'never-false-complete preserved');
+  const consumption = consumptionOf(ctx);
+  assert.equal(consumption.status, 'not_established', 'never-false-complete preserved');
+  assert.equal(consumption.basis, 'no_consumption_evidence');
+  assert.equal(consumption.submit_confirm_reason, 'no_observable');
 });
 
 // ---------------------------------------------------------------------------
@@ -165,12 +206,18 @@ function freshReport(over = {}) {
   return { submitExpected: true, submitStartedAt: new Date(T0).toISOString(), ...over };
 }
 
-test('#619 capture: idle→working at/after the CR records the consumption fact', () => {
+test('#619 capture: idle→working at/after the CR records the consumption candidate', () => {
   const pr = freshReport();
   const recorded = maybeRecordInjectConsumption(pr, 'idle', 'working', T0 + 1500);
   assert.equal(recorded, true);
-  assert.equal(pr.injectConsumedSinceMs, T0 + 1500);
-  assert.ok(pr.injectConsumedAt);
+  // Renamed presence. The capture seam and its rules are unchanged; what it writes is now a
+  // CANDIDATE edge rather than a settled `injectConsumedAt`, because the confirmation conjunct
+  // does not exist yet at this instant — `state_working` is produced BY this transition.
+  assert.equal(pr.injectConsumedAt, undefined, 'the edge no longer settles consumption by itself');
+  assert.equal(pr.injectConsumptionCandidate.sinceMs, T0 + 1500);
+  assert.equal(pr.injectConsumptionCandidate.from, 'idle');
+  assert.equal(pr.injectConsumptionCandidate.to, 'working');
+  assert.ok(pr.injectConsumptionCandidate.at);
 });
 
 test('#619 capture: waiting→thinking after the CR also records (interactive-prompt resume)', () => {
@@ -200,11 +247,11 @@ test('#619 capture: no submitStartedAt (non-submit inject) records nothing', () 
   assert.equal(maybeRecordInjectConsumption(pr, 'idle', 'working', T0 + 1000), false);
 });
 
-test('#619 capture: idempotent — an already-recorded fact is not overwritten', () => {
-  const pr = freshReport({ injectConsumedAt: 'first', injectConsumedSinceMs: 111 });
+test('#619 capture: idempotent — an already-recorded candidate is not overwritten', () => {
+  const first = { from: 'idle', to: 'working', sinceMs: 111, at: 'first' };
+  const pr = freshReport({ injectConsumptionCandidate: first });
   assert.equal(maybeRecordInjectConsumption(pr, 'idle', 'working', T0 + 9999), false);
-  assert.equal(pr.injectConsumedAt, 'first');
-  assert.equal(pr.injectConsumedSinceMs, 111);
+  assert.deepEqual(pr.injectConsumptionCandidate, first, 'the FIRST fresh edge is the one that counts');
 });
 
 test('#619 capture: a non-turn transition (idle→waiting) records nothing', () => {

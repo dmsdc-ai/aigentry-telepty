@@ -1238,7 +1238,7 @@ test('GET /api/health returns status ok and version', async () => {
   assert.ok(result.body.version.length > 0);
 });
 
-test('auto-report: inject with from triggers TASK_COMPLETE when target goes idle', async () => {
+test('auto-report: inject with from delivers a completion-unknown observation when target goes quiet', async () => {
   const sourceId = 'orch'; // orchestrator dispatching work (orch-lane, registered in beforeEach)
   const targetId = `auto-rpt-target-${Date.now()}`;
 
@@ -1269,16 +1269,25 @@ test('auto-report: inject with from triggers TASK_COMPLETE when target goes idle
   });
   assert.equal(injectResult.status, 200);
 
-  // Wait for auto-report to arrive at source (idle threshold based for spawned sessions)
+  // Wait for the observation to arrive at source (idle threshold based for spawned sessions)
   // Default AUTO_REPORT_IDLE_SECONDS is 10, health poll is ~10s. Wait up to 25s.
-  await waitFor(() => sourceOutputs.some(o => o.includes('TASK_COMPLETE')), {
+  //
+  // #60 Stage A: this used to wait for `TASK_COMPLETE` — the daemon telling the dispatching
+  // side that the target had finished the work, inferred from the target going quiet. That
+  // inference is deleted. The DELIVERY to the source survives unchanged (same path, same
+  // trigger, same recipient), so this is a renamed presence; only the sentence changed.
+  await waitFor(() => sourceOutputs.some(o => o.includes('TASK_COMPLETION_UNKNOWN')), {
     timeoutMs: 25000,
-    description: 'auto-report TASK_COMPLETE at source'
+    description: 'completion-unknown observation at source'
   });
 
   const allOutput = sourceOutputs.join('');
-  assert.ok(allOutput.includes('TASK_COMPLETE'));
+  assert.ok(allOutput.includes('TASK_COMPLETION_UNKNOWN'));
   assert.ok(allOutput.includes(targetId));
+  assert.ok(allOutput.includes('no completion fact observed'));
+  assert.ok(allOutput.includes('outcome protocol unavailable'));
+  // The withdrawn claim must not survive as a substring of the new one either.
+  assert.ok(!/TASK_COMPLETE\b/.test(allOutput), 'no terminal completion claim reaches the source');
 
   sourceWs.close();
 });
