@@ -238,10 +238,13 @@ test('osc_containment: 0.8.0 contains no terminal outcome validator or producer'
     });
   }
 
-  // The two named validators the design deleted must not have come back under their old names.
-  const daemon = require('../daemon');
-  assert.equal(typeof daemon.resolveOutboundReportStatus, 'undefined',
-    'the reverse-route completion verdict must not exist in 0.8.0');
+  // The text classifier the design deleted must not have come back under its old name.
+  //
+  // report-enforcement is a pure module and safe to require. daemon.js is NOT: requiring it reads
+  // the real $HOME at load, restores every live persisted session into this process and arms their
+  // timers. This file has no reason to pay that cost — the absence of `resolveOutboundReportStatus`
+  // is already asserted in completion-unknown-observation-60.test.js:339, which does the hermetic
+  // HOME redirect first.
   assert.equal(typeof require('../src/report-enforcement').classifyReportPrompt, 'undefined',
     '0.8.0 classifies no report-shaped text');
 });

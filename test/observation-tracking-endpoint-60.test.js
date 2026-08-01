@@ -226,7 +226,12 @@ test('dead_reports_absence_to_source: a process exit is reported as absence, and
     // A real SOURCE session, so the source-facing half of the row is exercised and not just the
     // bus. Without it `deliverToSource` finds no session and silently does nothing — which would
     // leave the "reports absence TO SOURCE" half of this row untested while the test still passed.
-    const source = createSessionId('orch-src');
+    //
+    // The id must be the literal `orchestrator`: the #533 peer-lane guardrail rejects a tracked
+    // inject whose `from` is outside AIGENTRY_ORCHESTRATOR_SIDS with 403 PEER_INJECT_BLOCKED, so a
+    // uniquely-named source session cannot dispatch at all. (This is a test-daemon on PORT=0 with
+    // a temp HOME; the name collides with nothing outside it.)
+    const source = 'orchestrator';
     await daemon.spawnSession(source);
 
     // A child that exits on its own is the entrance §8.1's row names: `ptyProcess.onExit` calls
