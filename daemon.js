@@ -466,7 +466,26 @@ function maybeGuideWindowsFirewall(port) {
 }
 
 const HOST = resolveBindHost(process.env, TAILNET_IP);
-process.title = 'telepty-daemon';
+
+// #896: the title is an IDENTITY CLAIM, so only the process that is actually the daemon may make
+// it. On macOS/Linux `process.title` REPLACES what `ps -axo command=` reports, and that string is
+// the primary way the stop path finds a daemon (telepty#44 — isLikelyTeleptyDaemon,
+// daemon-control.js:109). Set unconditionally at module load, it was claimed by every process that
+// merely `require`d this file for its exported pure seams — 22 test files do exactly that. Those
+// processes then read as `telepty-daemon` in the process table, so any concurrent
+// cleanupDaemonProcesses() sweep SIGTERMed them mid-run. Measured during #850: one baseline run
+// lost two whole test FILES to `signal: 'SIGTERM'` plus two daemons mid-test, and the same sweep
+// reaches the OPERATOR'S production daemon, which is why test-support/kickstart-race-738-racer.js
+// has to stub the sweep out by hand.
+//
+// The guard is the one this file already uses for the other real-daemon-only side effect, the
+// app.listen block at the bottom — NOT `require.main === module` alone, which is false in
+// production (the launchd plist runs `telepty daemon` → cli.js → require('./daemon.js'), so
+// require.main is cli.js). cli.js sets AIGENTRY_TELEPTY_DAEMON_MAIN before that require, so a real
+// daemon still gets its title and the stop path still finds it: no production behaviour changes.
+if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
+  process.title = 'telepty-daemon';
+}
 
 // Singleton claim — guarded so a test require neither exits (when a daemon is running) nor
 // overwrites a live daemon's on-disk state claim (when one is). Only the real daemon claims.
