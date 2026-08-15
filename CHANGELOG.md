@@ -152,6 +152,15 @@ because the durable `tracking_started` record already exists and is pollable.
   CLI and the MCP server (env-then-file at all three); it is a fleet-wide token and must be set for
   the daemon too, or the client sends one the daemon has never heard of.
 
+- **`TELEPTY_AUTH_TOKEN` is now honoured by the daemon before the token file is read (#843).** The
+  daemon evaluated the override *after* a `getConfig()` whose failure exits 1, so with a corrupt
+  `~/.telepty/config.json` and a valid env token the CLI and the MCP server worked and the daemon
+  died at startup — the recovery configuration the override exists for. With the variable set the
+  secret is not read from that file at all; the daemon's other read of it (`idle_ttl_default` via
+  `loadTeleptyConfig`) is still attempted, but a failure there no longer exits — the settings that
+  could not be read are reported on stderr as unavailable rather than silently defaulted. With no
+  env token, #835's fail-closed refusal is unchanged at either read.
+
 - **Rotating the shared daemon token requires a daemon restart, by design.** The daemon reads
   `~/.telepty/config.json` once, at boot, and never looks at it again. An operator who edits the
   config under a running daemon gets 401s from every caller until it is restarted — that is correct
@@ -179,27 +188,44 @@ because the durable `tracking_started` record already exists and is pollable.
   See `BOUNDARY.md`, which also records the cross-host credential-distribution gap and the
   deliberate `/api/health` exposure.
 
-- **The WebSocket viewer write path is now audited and policy-checked (#826).** A viewer's
-  `{type:'input'}` frame is forwarded to the session owner as an inject — a write into somebody's
-  terminal with exactly the authority of `POST /api/sessions/:id/inject`, and until now with none of
-  its accountability: no audit line, no #533 peer-lane check, no provenance labelling. It is
-  included in this release rather than deferred precisely *because* of the fixes above: while
+- **Inject audit coverage (#826, #843).** A viewer's `{type:'input'}` frame is a write into
+  somebody's terminal with exactly the authority of `POST /api/sessions/:id/inject`, and until now
+  with none of its accountability: no audit line, no #533 peer-lane check, no provenance labelling.
+  It is included in this release rather than deferred precisely *because* of the fixes above: while
   anything on the box could write uncredentialed the audit log was obviously incomplete, but the
   moment a credential is required of writers an operator will reasonably read that log as the record
-  of who typed. That door now produces a schema-v1 line with `source: "ws-viewer"` and
-  `delivery_result: "forwarded"` — deliberately not `"success"`, because all that path measures is
-  that the frame was written to the owner socket. `classifyPeerLaneInject` (#533) runs on it too,
-  keyed on a *claimed* sender, so it remains a policy guardrail and not an authentication boundary.
+  of who typed.
 
-  **What is written to a PTY and still is not logged**, because a count is not an enumeration and
-  the log is about to be trusted: a viewer's `{type:'input'}` frame on the **spawned** branch (it
-  writes straight to `ptyProcess`, so `ws-viewer` lines do not mean every viewer write is recorded),
-  `busAutoRoute` → `deliverInjectionToSession` (the `source: "inject"` audit lines live in the HTTP
-  route handler, not in the delivery function the bus path calls), and `POST
-  /api/sessions/:id/submit`, which writes a bare `\r`. `BOUNDARY.md` carries the full table of
-  recorded doors (`inject`, `multicast`, `broadcast`, `ws-viewer`) beside that list, and states that
-  it is a measurement rather than a proven ceiling. An interactive `telepty attach` produces one
-  audit line per keystroke.
+  Viewer WebSocket writes are now authorized and recorded at the session types a viewer can write
+  into — a wrapped session's non-owner client, whose frame is forwarded to the owner socket, and a
+  spawned session's client, whose frame goes straight to `ptyProcess` — under `source: "ws-viewer"`,
+  with `delivery_result: "forwarded"` rather than `"success"`, because all that path measures is
+  that the frame was handed over. A frame with no writable target (a wrapped session whose owner
+  socket is closed, a session record with no `ptyProcess`) is dropped ahead of the authorization
+  check and writes nothing, so it leaves no line. `classifyPeerLaneInject` (#533) runs on this door
+  too, keyed on a *claimed* sender, so it stays a policy guardrail and not an authentication
+  boundary.
+
+  Bus auto-routed turns (`turn_request`, `deliberation_route_turn`) are recorded under
+  `source: "bus"` and take the same `classifyPeerLaneInject` verdict as
+  `POST /api/sessions/:id/inject`; a payload the HTTP route refuses with 403 can no longer be
+  re-addressed to `POST /api/bus/publish` and reach the PTY. An event that names no sender is still
+  delivered — that is the same answer the HTTP route gives a body with no `from`.
+
+  Writes into a PTY that are **not** in the inject log, named so their absence is not read as
+  coverage: `POST /api/sessions/:id/submit` and `POST /api/sessions/submit-all` (a bare `\r`, no
+  payload; `submit-all` fans that CR out across the session registry, and a session on the
+  `osascript_cmd_enter` strategy gets a GUI keystroke rather than a PTY write at all); viewer
+  `resize` frames (geometry, no bytes into the input stream); and the daemon's own
+  `task_completion_unknown` text delivered to a dispatch's source session.
+
+  `source: "mailbox"` was documented but never produced by any code path; it is removed from the
+  schema. The mailbox is the transport beneath the other sources, not an entrance — its one
+  `enqueue` call site sits inside `deliverInjectionToSession`, downstream of the doors above.
+
+  `BOUNDARY.md` carries the door table by name beside that list, and states that it is a measurement
+  rather than a proven ceiling. An interactive `telepty attach` produces one audit line per
+  keystroke.
 
 ### Security
 - **Session sender identity is now bound to a session instance rather than to a session name
