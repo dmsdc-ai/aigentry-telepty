@@ -330,10 +330,33 @@ Read it with three limits in mind:
   thing, but nothing there states the right thing either, and the event name is what a subscriber
   reads first. **A subscriber must read the fields, not the event name.** This predates 0.8.0;
   0.8.0 is only the release that made it legible, by giving the audit log a word (`queued`) for the
-  case that had none. Accepted for 0.8.0 and fixed in 0.9.0. Renaming breaks every subscriber at a
-  tag for a defect that was always there, and suppressing the event for a park would be worse — a
-  subscriber counting `inject_written` would then silently miss parks, which is absence-as-silence,
-  the defect this release exists to remove.
+  case that had none. Accepted for 0.8.0; the fix is tracked for a later release. Renaming breaks
+  every subscriber at a tag for a defect that was always there, and suppressing the event for a
+  park would be worse — a subscriber counting `inject_written` would then silently miss parks,
+  which is absence-as-silence, the defect this release exists to remove.
+
+  **Residual (#873): the ledger's `trigger` names the queue, not the cause.**
+  `parkTrackedInjection` writes its `strategy` argument into the `inject_parked` observation's
+  `trigger`, and the call sites that reach it pass the same value: the bootstrap gate
+  (`daemon.js:2897`, `reason: "bootstrap_not_ready"`) writes `trigger: "bootstrap_queue"`, and so
+  does the surface-modal park (`daemon.js:2941`, `reason: "<cli>_modal_ui"` or
+  `"modal_park_backlog"`). That is true to the code — it is one FIFO, as this list says above, and
+  the queue really is where the two parks named there land. But `trigger` is the field a consumer
+  groups by, so grouping on it merges a session that never finished bootstrapping with a surface
+  holding a modal up, which are different things to answer for. The cause survives only in
+  `reason`. Same caveat as #865, one surface over: **read the fields, not the name.** Accepted for
+  0.8.0; the fix is tracked for a later release.
+
+  **Residual (#873): a parked fan-out target is filed under `results.successful`.** The multicast
+  (`daemon.js:3858`) and broadcast (`daemon.js:3936`) handlers push `{id, strategy}` onto
+  `results.successful` on any `delivery.success`, and a park is `success: true` — so the HTTP
+  response files a target that wrote zero bytes under the word *successful*. The audit line for
+  that same target now says `queued` (#860), which means the log and the response state different
+  things about one delivery, and the response's only disclosure is `strategy: "bootstrap_queue"` on
+  the entry itself. Read an entry in `results.successful` as *accepted*, and read its `strategy`
+  before counting the array: `results.successful.length` is not a count of deliveries. Same caveat
+  as #865, one surface over: read the fields, not the name. Accepted for 0.8.0; splitting the array
+  is a wire change for the fan-out callers, so the fix is tracked for a later release.
 - **`claimed_from` is a claim; `verified_sender_sid` is the measurement.** Wherever a line carries a
   verified half it comes from the `x-telepty-session-token` bearer (#815) — the request header on
   the HTTP doors, the handshake header on the `ws-viewer` door — and never from the message body or

@@ -12,13 +12,29 @@
 // #31 focus GATE, #31.4 queue-flush and #32 provenance are covered by their own
 // focused seams. The pure surface-GC verdict mapping lives in src/lifecycle.js.
 
-const { test, before, after, beforeEach } = require('node:test');
+const { test: nodeTest, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
 const backend = require('../terminal-backend.js');
+
+// POSIX-only by construction. The harness below writes a `#!/usr/bin/env node` script under a file
+// literally named `cmux`, chmod 0755s it, and prepends its directory to PATH so that
+// execFileSync('cmux', …) inside terminal-backend resolves to it. Windows resolves neither a
+// shebang nor an extensionless name — there is no `.cmd`/`.exe` for it to find — so the probes
+// that shell out would measure PATH resolution instead of the surface primitives they check. The
+// ones that never reach cmux (a non-cmux backend, a malformed ref, `focusSurface` being gone)
+// would still hold there; they are skipped with the rest rather than split off, because a file
+// that half-runs on a platform its harness does not support is the harder thing to read.
+// Skipped with a stated reason rather than returned out of, so a Windows run reports a skip
+// instead of a pass it did not earn. Applied once at the seam because the whole file shares the
+// one harness; the per-test form is in test/daemon-restart-title-44.test.js.
+const SKIP = process.platform === 'win32'
+  ? 'POSIX-only (fake `cmux` is a shebang script resolved by name from PATH)'
+  : false;
+const test = (name, fn) => nodeTest(name, { skip: SKIP }, fn);
 
 // ── Fake cmux harness ────────────────────────────────────────────────────────
 // A node script named `cmux` reads control.json to decide ping/list/close/focus
