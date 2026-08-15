@@ -122,13 +122,27 @@ GUI, and if it ever does need closing the answer is binding health to loopback o
 
 Each node mints its own random token, so a cross-host caller must present the **target's** token.
 It is resolved by address: `TELEPTY_AUTH_TOKEN` → a `peers.json` entry matching that `host:port`
-(written by `telepty connect-http <host> --token <that host's authToken>`) → the local token. The
-last step is deliberate: a *wrong* credential yields a diagnosable 401, while sending none yields an
-ambiguity indistinguishable from an absent endpoint.
+(written by `telepty connect-http <host> --token <that host's authToken>`) → the local token, and
+that third step is reachable **only for this machine** (`isLocalHostname`). A non-local address with
+neither of the first two is REFUSED before the socket opens, with a message naming
+`telepty connect-http <host> --token` and `TELEPTY_AUTH_TOKEN` as the ways through.
+
+The refusal replaced an unconditional local-token fallback (#844). The old reasoning was that a
+*wrong* credential yields a diagnosable 401 while sending none yields an ambiguity — true, and
+irrelevant to the actual choice, because the local token is not merely wrong at a peer: it is this
+machine's master credential, and post-#820 it is the whole boundary here. Handing it to an arbitrary
+address is a disclosure, not a diagnostic, and on a tailnet the auto-populated allowlist lets the
+recipient use it against the daemon that sent it. A refusal that names `connect-http --token` costs
+the operator one command; the send cost them the daemon, silently.
 
 What does **not** exist: any discovery, rotation, revocation, or per-peer scoping of those tokens.
 Step 2 only helps an operator who has already run `connect-http --token`, and addressing forms with
-no `peers.json` entry (`<sid>@<tailnet-ip>`, `TELEPTY_HOST`) fall back to the env variable or fail.
+no `peers.json` entry (`<sid>@<tailnet-ip>`, `TELEPTY_HOST`) must use the env variable or are
+refused. Note the consequence worth stating: addressing **your own** daemon by a non-loopback name —
+its tailnet IP, its hostname — is refused as well, because `isLocalHostname` recognises loopback
+literals and nothing else. That is a deliberate false positive. The predicate is a syntactic check on
+the address, and widening it to "any address this host happens to answer on" would make the boundary
+depend on interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the escape hatch.
 This is a named limitation, not a solved problem.
 
 ### `TELEPTY_AUTH_TOKEN` must be set for BOTH ends or neither
@@ -169,24 +183,66 @@ because it never looks again. The failure surfaces on the caller side, named, no
 
 ## The inject audit log — what it records, and what it does not prove (0.8.0, #826)
 
-`~/.telepty/logs/injects.jsonl` records **both** write paths into a PTY: `POST
-/api/sessions/:id/inject` (`source: "inject"`) and a WebSocket viewer's `{type:'input'}` frame
-forwarded to the session owner (`source: "ws-viewer"`). Until 0.8.0 the second wrote nothing at all,
-so the log was silently incomplete — and it stops being merely untidy the moment every writer is
-authenticated, because that is when the log starts being read as *the* record of who typed.
+`~/.telepty/logs/injects.jsonl` records these write paths into a PTY, and no others. The list is an
+enumeration, not a count: an earlier draft of this section said "both write paths", which was true
+of how many had been looked at rather than of how many exist.
+
+**Recorded** (measured on 0.8.0 by the `auditAppend` call sites in `daemon.js` and
+`src/transport/websocket.js`):
+
+| door | `source` |
+|---|---|
+| `POST /api/sessions/:id/inject` | `inject` |
+| `POST /api/sessions/multicast/inject` | `multicast` |
+| `POST /api/sessions/broadcast/inject` | `broadcast` |
+| a WebSocket viewer's `{type:'input'}` frame forwarded to the owner of a **wrapped** session | `ws-viewer` |
+
+**Not recorded**, and therefore absent from a log an operator may reasonably read as the record of
+who typed:
+
+- a WebSocket viewer's `{type:'input'}` frame on the **spawned** branch, which writes straight to
+  `ptyProcess` (`src/transport/websocket.js`) — the wrapped branch next to it is audited, so the
+  presence of `ws-viewer` lines does **not** mean every viewer write is logged
+- `busAutoRoute` → `deliverInjectionToSession` (`daemon.js`) — the audit lines for `source: "inject"`
+  live in the HTTP route handler, not in the delivery function the bus path calls
+- `POST /api/sessions/:id/submit`, which writes a bare `\r` into the PTY
+
+The `ws-viewer` door wrote nothing at all before 0.8.0, and that gap stops being merely untidy the
+moment a credential is required of writers, because that is when the log starts being read as
+authoritative. Closing one gap is also what makes the remaining three worth naming here rather than
+leaving them to be discovered.
+
+**Why doors keep going missing — the mechanism, so the next one is not a surprise.** Auditing is
+attached to *route handlers*, not to the function that performs the write. All three
+`source: "inject"` `auditAppend` calls live inside `app.post('/api/sessions/:id/inject')`;
+`deliverInjectionToSession`, the function that actually reaches the PTY, contains none. So the audit
+line is a property of *how you were called*, not of *what you did*, and *every* caller of the
+delivery function other than that one route is silent by construction — `busAutoRoute` is simply the
+one that exists today. The same shape produced the `ws-viewer` gap (`src/transport/websocket.js`
+audits the wrapped branch and writes straight to `ptyProcess` on the spawned one) and the `/submit`
+gap (a different route, so a different handler, so no audit).
+
+If you are adding a caller of `deliverInjectionToSession`, or any new path that writes into a PTY:
+it will not be logged unless you log it, and nothing in the code will tell you that. Add the door to
+the table above in the same change, or state here that it is not covered.
+
+**This list is a measurement, not a proven ceiling.** It was produced by enumerating write paths,
+which is a thing that can be done incompletely; re-measure it rather than trusting the count.
 
 Read it with three limits in mind:
 
 - **`delivery_result` says what was measured.** `success` (HTTP path) means the daemon's delivery
   machinery reported success. `forwarded` (WS path) means only that the frame was written to the
   owner socket. They are different measurements and deliberately do not share a word.
-- **`claimed_from` is a claim; `verified_sender_sid` is the measurement.** On both paths the
-  verified half comes from the `x-telepty-session-token` bearer (#815) — the request header on the
-  HTTP path, the handshake header on the WS path — and never from the message body or frame.
-- **`classifyPeerLaneInject` (#533) is a policy guardrail, not an authentication boundary.** It now
-  applies to both write paths, but on both it is keyed on the *claimed* sender, so a caller that
-  states no `from` is on the operator lane by construction. Do not read a clean peer-lane log as
-  proof that no peer-to-peer delegation happened.
+- **`claimed_from` is a claim; `verified_sender_sid` is the measurement.** Wherever a line carries a
+  verified half it comes from the `x-telepty-session-token` bearer (#815) — the request header on
+  the HTTP doors, the handshake header on the `ws-viewer` door — and never from the message body or
+  frame.
+- **`classifyPeerLaneInject` (#533) is a policy guardrail, not an authentication boundary.** It runs
+  on the doors listed as recorded above; on each of them it is keyed on the *claimed* sender, so a
+  caller that states no `from` is on the operator lane by construction. It does not run on the
+  unrecorded doors. Do not read a clean peer-lane log as proof that no peer-to-peer delegation
+  happened.
 
 Volume note: the WS path records one line per `input` frame, and an interactive `telepty attach`
 sends one frame per keystroke. The writer is bounded (drop-oldest with an `audit_overflow` bus
