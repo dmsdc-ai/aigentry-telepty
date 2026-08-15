@@ -2,7 +2,7 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## 0.8.0 — unreleased
+## 0.8.0 — 2026-08-15
 
 ### Changed — BREAKING: telepty no longer asserts task completion (#60 Stage A)
 
