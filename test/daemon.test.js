@@ -1295,10 +1295,15 @@ test('auto-report: inject with from delivers a completion-unknown observation wh
 // --- BUG-C: duplicate --id shared-fate (a stale owner's DELETE must not kill the live owner) ---
 
 // Connect a wrapped owner bridge (?owner=1), wait for open, and return the ws plus a live record
-// of every JSON frame and close event it sees. No auth token needed — the daemon allows loopback.
+// of every JSON frame and close event it sees.
 async function connectOwner(sessionId) {
-  // #815: prove ownership on the claim, exactly as the real bridge does.
-  const ws = new WebSocket(`ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}?owner=1`, harness.ownerAuth(sessionId));
+  // Two credentials, two questions, exactly as the real bridge presents them: the DAEMON token
+  // gets the socket upgraded at all (#820 — loopback stopped being one), and the per-session
+  // bearer proves this claimant owns THIS session (#815).
+  const ws = new WebSocket(
+    `ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}?owner=1&token=${encodeURIComponent(harness.authToken())}`,
+    harness.ownerAuth(sessionId)
+  );
   const frames = [];
   const closes = [];
   ws.on('message', (chunk) => {

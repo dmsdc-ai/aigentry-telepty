@@ -82,6 +82,83 @@ The `#32/#48/#52/#537/#545/#619/#721` compensation stack is retained (Stage D re
 separately); the settle window now only debounces *follow-up* observations, which is not silence
 because the durable `tracking_started` record already exists and is pollable.
 
+### Security — BREAKING: reachability is no longer authentication (#820, #823)
+
+- **Every caller must now present the daemon token — including callers on loopback (#820).** The
+  daemon has always minted a token in `~/.telepty/config.json`, and the `telepty` CLI has always
+  sent it. But the auth middleware answered the network's question instead of the caller's: if the
+  peer-address policy said "allowed", it returned early and the credential was never consulted. On
+  a default install that meant any process on the machine could list sessions (with their `command`
+  and `cwd`), read and write any PTY, `DELETE` sessions, and `POST /api/sessions/spawn` with a
+  `command` and `cwd` of its choosing. The WebSocket upgrade — the attach viewer and `/api/bus`
+  alike — had the identical shape.
+
+  The two questions are now separated and asked in order: **origin guard → peer reachability →
+  credential → route.** #806's property is unchanged (a valid credential still cannot buy a
+  disallowed browser origin).
+
+- **The peer allowlist narrows reachability and no longer grants authentication (#823).** An
+  address outside `TELEPTY_PEER_ALLOWLIST` gets `403 PEER_NOT_ALLOWED`; an address inside it still
+  has to present the token. This branch was the one that read as safe and was not: a *matching*
+  allowlist entry returned "allowed" exactly as completely as an empty list did, and #672's tailnet
+  auto-bind puts the tailnet CIDR into that list **on the default configuration** — so every device
+  on an operator's tailnet reached every route uncredentialed. An empty allowlist still means *no
+  IP restriction* (turning it into deny-all would break tailnet reachability for no gain), and
+  loopback is never narrowed away, so a local CLI cannot be locked out by an allowlist.
+
+  Operators who worked around this with `TELEPTY_NO_TAILNET_AUTO=1` no longer need it: the tailnet
+  listener can be left on, because it now requires a credential like every other address.
+
+- **A refused WebSocket upgrade is now distinguishable from a daemon that is not there.** The
+  refusal used to be a bare `HTTP/1.1 401` immediately followed by `destroy()`, which raced the
+  write — clients frequently saw ECONNRESET, i.e. an `error` event and close **1006**, byte-identical
+  to a dead daemon, so a bridge reconnected forever in silence against a daemon that was answering
+  and declining. Refusals are now complete HTTP responses (`Connection: close`, JSON body with the
+  same `code` the HTTP middleware uses, `X-Telepty-Refusal` header) flushed before the FIN, so `ws`
+  clients get `unexpected-response` with a readable status. `telepty attach` no longer crashes with
+  an unhandled `error` event on a refused handshake; it prints which fault it was.
+
+- **Cross-host callers must present the TARGET's token, resolved by address.** Each node mints its
+  own token, so the local one is not valid at a peer. Resolution order is `TELEPTY_AUTH_TOKEN` → a
+  `peers.json` entry matching that `host:port` → the local token; a *wrong* token yields a
+  diagnosable 401 and no path sends none. `telepty connect-http <host> --token <that host's
+  authToken>` has always stored `entry.token` and nothing ever read it, because the lookup was
+  keyed on a peer name the dial sites had already dropped — that stored credential is now reachable.
+
+  **Migration, and it is the only user-visible one:** run `telepty connect-http <host> --token
+  <that host's authToken>` once per HTTP peer. `TELEPTY_AUTH_TOKEN` is honoured by the daemon, the
+  CLI and the MCP server (env-then-file at all three); it is a fleet-wide token and must be set for
+  the daemon too, or the client sends one the daemon has never heard of.
+
+- **Who must act:** anyone with a hand-rolled `curl 127.0.0.1:3848/api/...`. Add
+  `-H "x-telepty-token: $(jq -r .authToken ~/.telepty/config.json)"`. `telepty` CLI users are
+  unaffected. `/api/health` stays unauthenticated, so liveness probes, `connect-http` discovery and
+  GUI version detection are unaffected. Mixed fleets are safe in both directions: an old client
+  against a new daemon fails closed with 401; a new client against an old daemon works (the extra
+  header is ignored). No credential is minted, rotated or migrated.
+
+- **What this does NOT fix, stated plainly:** the boundary moves from *"anyone who can open a socket
+  to the port"* to *"anyone who can read `~/.telepty/config.json"`* — roughly the uid boundary. It
+  does **not** stop a same-uid process, which is the adversary most worth naming here: an agent's
+  shell tool, a build script, an `npm postinstall`. What it does buy is that the network surface is
+  no longer weaker than the filesystem surface, and that OS sandboxing now has something to bite on.
+  See `BOUNDARY.md`, which also records the cross-host credential-distribution gap and the
+  deliberate `/api/health` exposure.
+
+- **The WebSocket viewer write path is now audited and policy-checked (#826).** A viewer's
+  `{type:'input'}` frame is forwarded to the session owner as an inject — a write into somebody's
+  terminal with exactly the authority of `POST /api/sessions/:id/inject`, and until now with none of
+  its accountability: no audit line, no #533 peer-lane check, no provenance labelling. It is
+  included in this release rather than deferred precisely *because* of the fixes above: while
+  anything on the box could write uncredentialed the audit log was obviously incomplete, but the
+  moment every writer is authenticated an operator will reasonably read that log as the record of
+  who typed. Both write paths now produce a schema-v1 line, the WS one with `source: "ws-viewer"`
+  and `delivery_result: "forwarded"` — deliberately not `"success"`, because all that path measures
+  is that the frame was written to the owner socket. `classifyPeerLaneInject` (#533) now applies to
+  both doors; on both it is keyed on a *claimed* sender, so it remains a policy guardrail and not an
+  authentication boundary — `BOUNDARY.md` says so explicitly, so the log is not read for more than
+  it proves. An interactive `telepty attach` produces one audit line per keystroke.
+
 ### Security
 - **Session sender identity is now bound to a session instance rather than to a session name
   (#815).** The daemon's per-session token — the thing that makes `verified_sender_sid` mean
@@ -109,16 +186,17 @@ because the durable `tracking_started` record already exists and is pollable.
 
 - **Taking ownership of a live session now requires proving you own it (#815).** A `?owner=1`
   WebSocket claim was authenticated by nothing but knowledge of the session id, and the daemon
-  trusts loopback before any credential check, so the claim was open to any local process. Because
+  trusted loopback before any credential check (closed by #820 above), so the claim was open to any
+  local process. Because
   ownership is last-writer-wins, a claim also displaced the incumbent bridge with close 4001 — and
   a displaced bridge exits its session. A session that holds a credential now requires the matching
   bearer on the handshake or the claim is refused with close `4003`, loudly, rather than downgraded
   to a viewer. Sessions with no credential (the WS auto-register reconnect path, records restored
   from an older daemon) claim as before, so reconnect is unaffected.
 
-- **`inject_written` no longer rebroadcasts the prompt (#815).** Any local process may subscribe to
-  `/api/bus` with no token and no `Origin`, so the event published the full text of every delivery
-  to every local subscriber. It now carries `content_sha256` + `content_length` instead of
+- **`inject_written` no longer rebroadcasts the prompt (#815).** Any local process could subscribe
+  to `/api/bus` with no token and no `Origin` (the token half is closed by #820 above), so the event
+  published the full text of every delivery to every local subscriber. It now carries `content_sha256` + `content_length` instead of
   `content` — enough to correlate a delivery and verify integrity against a payload you already
   hold, and nothing to read if you do not. **Breaking for any bus subscriber reading
   `inject_written.content`.**

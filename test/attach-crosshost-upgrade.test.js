@@ -45,9 +45,14 @@ function buildApp() {
   return app;
 }
 
-// Minimal deps: only the viewer-attach path runs after upgrade. isAllowedPeer=false forces
-// token-based auth so we can exercise BOTH the accept (correct token) and reject (no token) paths.
-function buildDeps(primary, secondary) {
+// Minimal deps: only the viewer-attach path runs after upgrade.
+//
+// #823: `isAllowedPeer` used to be stubbed `() => false` here to "force token-based auth", which
+// worked only because the gate was `isAllowedPeer(addr) || token || jwt` — the peer answer was an
+// alternative to the credential. It is now a PRECONDITION that can only narrow, so `false` means
+// "this address may not connect at all" and no token can buy past it. Reachable is the right stub
+// for the attach paths under test; the narrowing itself is asserted separately below.
+function buildDeps(primary, secondary, { reachable = true } = {}) {
   const sessions = {
     [SID]: { id: SID, type: 'wrapped', ownerWs: { readyState: 1 }, clients: new Set(), outputRing: [] }
   };
@@ -58,7 +63,7 @@ function buildDeps(primary, secondary) {
     busClients: new Set(),
     expectedToken: TOKEN,
     verifyJwt: () => false,
-    isAllowedPeer: () => false,
+    isAllowedPeer: () => reachable,
     initializeBootstrapState: () => {},
     findKittySocket: () => null,
     findKittyWindowId: () => null,
@@ -101,8 +106,25 @@ test('both loopback and tailnet listeners upgrade attach to WS (101), auth prese
   // Security invariant: an UNAUTHORIZED cross-host upgrade still rejects (no widening vs inject).
   const unauth = await attempt(secondaryPort, { token: 'wrong' });
   assert.notEqual(unauth.kind, 'open', `unauthorized cross-host attach must NOT upgrade, got ${JSON.stringify(unauth)}`);
-  assert.ok(
-    unauth.kind === 'http' && unauth.status === 401 || unauth.kind === 'error',
-    `unauthorized cross-host attach should be rejected (401/close), got ${JSON.stringify(unauth)}`
-  );
+  // #820 tightened "401 or some error" to "401, specifically": the refusal is a complete HTTP
+  // response now, so a client always reads the status instead of an ECONNRESET.
+  assert.equal(unauth.kind, 'http', `refusal must be readable, got ${JSON.stringify(unauth)}`);
+  assert.equal(unauth.status, 401);
+
+  // ...and one with NO token at all, which used to upgrade on every default install.
+  const tokenless = await attempt(secondaryPort);
+  assert.equal(tokenless.kind, 'http', `an uncredentialed attach must be refused, got ${JSON.stringify(tokenless)}`);
+  assert.equal(tokenless.status, 401);
+});
+
+test('#823: an address outside the allowlist is 403 — reachability narrows, a token cannot widen', async () => {
+  const app = buildApp();
+  const primary = http.createServer(app);
+  const primaryPort = await listen(primary);
+  installWebSocketTransport(buildDeps(primary, undefined, { reachable: false }));
+  after(() => primary.close());
+
+  const withToken = await attempt(primaryPort, { token: TOKEN });
+  assert.equal(withToken.kind, 'http', `expected a readable refusal, got ${JSON.stringify(withToken)}`);
+  assert.equal(withToken.status, 403, 'the policy answer comes first and no credential buys past it');
 });

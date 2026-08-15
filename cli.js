@@ -166,15 +166,78 @@ function daemonWsUrl(host) {
 
 let cachedAuthToken = null;
 
+// #823 — env-then-file, the SAME resolution order daemon.js and mcp-server/index.mjs use. Setting
+// TELEPTY_AUTH_TOKEN for a client but not for the daemon produces a 401 that looks like a
+// credential bug; the variable is therefore documented (BOUNDARY.md) as something you set for
+// BOTH ends or neither, and never silently preferred at one end only.
 function getAuthToken() {
   if (cachedAuthToken == null) {
-    cachedAuthToken = getConfig().authToken;
+    cachedAuthToken = process.env.TELEPTY_AUTH_TOKEN || getConfig().authToken;
   }
   return cachedAuthToken;
 }
 
+// #823 — which token belongs to THIS target?
+//
+// Every node mints its own random token, so the local one is simply wrong for a peer. Until #820
+// that did not matter: the remote daemon trusted the address and never looked at the credential.
+// Now it does, so the target's token has to be resolved rather than assumed.
+//
+// Keyed on the ADDRESS, not on a peer name. `connect-http --token` has always written
+// `entry.token` into peers.json and nothing ever read it, because the lookup was name-keyed while
+// both dial sites had already dropped `peerName` (cli.js:2278/:2287, session-routing.js:47/:52) —
+// and the ecosystem's real addressing (`<sid>@<tailnet-ip>`, TELEPTY_HOST) has no peers.json
+// entry at all. Address-keying is what makes that stored credential reachable.
+let cachedPeerTokens = null;
+function peerTokenFor(host, port) {
+  if (cachedPeerTokens == null) {
+    cachedPeerTokens = new Map();
+    try {
+      for (const entry of Object.values(crossMachine.loadPeers().peers || {})) {
+        if (entry && entry.token && entry.host) {
+          cachedPeerTokens.set(`${entry.host}:${entry.port}`, entry.token);
+        }
+      }
+    } catch { /* no peers.json, or unreadable — nothing to resolve, fall through to the local token */ }
+  }
+  return cachedPeerTokens.get(`${host}:${port}`) || null;
+}
+
+function isLocalHostname(host) {
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+}
+
+// Resolution order: explicit env → the peer's stored token → the local token. NEVER "no token":
+// a wrong credential yields a loud, diagnosable 401, while an absent one yields the ambiguity
+// this release exists to delete.
+function resolveTargetToken(url) {
+  if (process.env.TELEPTY_AUTH_TOKEN) return process.env.TELEPTY_AUTH_TOKEN;
+  try {
+    const parsed = new URL(url);
+    // Keyed on host AND port, so two daemons on one host are two targets. Not skipped for
+    // loopback: nobody runs `connect-http` against their own daemon, so the local address has no
+    // entry and this falls through — but if an entry for that exact address DOES exist, it is a
+    // deliberate act and honouring it is correct.
+    const peerToken = peerTokenFor(parsed.hostname, Number(parsed.port) || PORT);
+    if (peerToken) return peerToken;
+  } catch { /* not a URL we can read — the local token is the only honest guess */ }
+  return getAuthToken();
+}
+
+// #823 — ONE refusal message for every surface, naming the fix. A refusal that tells you how to
+// stop being refused is worth more than five call sites each inventing their own wording.
+function credentialRefusalHint(host) {
+  if (!host || isLocalHostname(host)) {
+    return 'The local daemon is running and REFUSED this token. It freezes the token at start, by design, '
+      + 'so a rotated ~/.telepty/config.json needs a daemon restart to take effect.';
+  }
+  return `Each node mints its own token, so the local one is not valid at ${host}. Store that host's token:\n`
+    + `    telepty connect-http ${host} --token <that host's authToken>\n`
+    + '  or export TELEPTY_AUTH_TOKEN with a token both ends share (the daemon must see it too).';
+}
+
 const fetchWithAuth = (url, options = {}) => {
-  const headers = { ...options.headers, 'x-telepty-token': getAuthToken() };
+  const headers = { ...options.headers, 'x-telepty-token': resolveTargetToken(url) };
   // #43 P2 — present the per-session verified-sender token (minted at register, carried in the
   // parent-hijack-protected env beside TELEPTY_SESSION_ID) so the daemon can map token→sid and
   // record verified_sender_sid. Header only, never the body. Absent for operator/human shells.
@@ -228,8 +291,8 @@ function daemonAnswerError(answer, host = '127.0.0.1') {
     message = `${where} returned a response this CLI could not read. Treating it as a failure, not as an empty result.`;
   } else if (answer.refused) {
     message = `${where} REFUSED this CLI's credentials on ${answer.endpoint} (HTTP ${answer.status}). ` +
-      'The daemon is running — this is a credential mismatch, not an absence. Compare the token in ' +
-      '~/.telepty/config.json with the one the daemon loaded, then retry.';
+      'The daemon is running — this is a credential mismatch, not an absence.\n  ' +
+      credentialRefusalHint(host);
   } else {
     message = `${where} answered ${answer.endpoint} with HTTP ${answer.status} — running, but not serving. This is not an empty result.`;
   }
@@ -406,14 +469,24 @@ function startDetachedDaemon() {
 
 async function waitForDaemonHealth(maxMs = 5000) {
   const deadline = Date.now() + maxMs;
+  let lastAnswer = null;
   while (Date.now() < deadline) {
     try {
       const meta = await getDaemonMeta('127.0.0.1');
       if (meta && meta.version) return meta;
+      // #820/#835 — a REFUSAL is not "not healthy yet". `getDaemonMeta` returns a classification
+      // object for 401/403, which has no `version`, so this loop used to poll it to timeout and
+      // return bare `null` — indistinguishable from "nothing ever answered on the port". The
+      // caller (restartDaemonGraceful) then killed and respawned, three times, against a daemon
+      // that was alive and answering. Backoff does not fix a credential mismatch: stop, and carry
+      // the answer out so the failure can name it. Callers gate on `meta.version`, so returning
+      // the classification changes no accept/reject decision — only what gets SAID.
+      if (meta && meta.refused) return meta;
+      if (meta && meta.answered) lastAnswer = meta;
     } catch {}
     await new Promise(r => setTimeout(r, 300));
   }
-  return null;
+  return lastAnswer;
 }
 
 // telepty#15: actionable diagnostic for a daemon the CLI cannot stop (foreign
@@ -499,6 +572,15 @@ async function restartDaemonGraceful(options = {}) {
     const meta = await waitHealth(5000);
     if (acceptsMeta(meta)) {
       return { success: true, meta, attempt, supervisor: supervisorPresent ? supervisor.kind : null };
+    }
+
+    // #820: the daemon came up and REFUSED us. Retrying kills and respawns a healthy process
+    // three more times for a fault that backoff cannot touch. Stop, and say which fault it is.
+    if (meta && meta.refused) {
+      const diagnostic = `Daemon on port ${PORT} started and REFUSED this CLI's credentials (HTTP ${meta.status} on ${meta.endpoint}). `
+        + credentialRefusalHint('127.0.0.1');
+      console.error(`\x1b[31m❌ ${diagnostic}\x1b[0m`);
+      return { success: false, meta, attempt, refused: true, diagnostic };
     }
 
     // Retry with backoff
@@ -969,10 +1051,31 @@ async function ensureDaemonRunning(options = {}) {
 }
 
 async function manageInteractiveAttach(sessionId, targetHost) {
-  const wsUrl = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}`;
+  const wsBase = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}`;
+  const wsUrl = `${wsBase}?token=${encodeURIComponent(resolveTargetToken(wsBase))}`;
   const ws = new WebSocket(wsUrl);
   let cleanupTerminal = null;
   return new Promise((resolve) => {
+    // This socket had NO error listener, so a refused upgrade — the normal outcome for a
+    // cross-host attach with the wrong token — reached the process as an unhandled 'error' event
+    // and crashed the CLI with a stack trace. A refusal is an answer; report it as one.
+    ws.on('unexpected-response', (_req, res) => {
+      res.resume();
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        console.error(`\n❌ The daemon at ${targetHost} REFUSED this attach (HTTP ${res.statusCode}). It is running — this is a credential mismatch, not an absence.\n  ${credentialRefusalHint(targetHost)}`);
+      } else {
+        console.error(`\n❌ The daemon at ${targetHost} answered the attach handshake with HTTP ${res.statusCode} — running, but not serving.`);
+      }
+      markCommandFailed();
+      resolve();
+    });
+    ws.on('error', (err) => {
+      // Reached only when nothing answered: connect refused, timeout, DNS. Distinct from the
+      // branch above precisely so the two stop being the same event to a caller.
+      console.error(`\n❌ Could not reach the daemon at ${targetHost}: ${err.message}`);
+      markCommandFailed();
+      resolve();
+    });
     ws.on('open', () => {
       // Set Ghostty tab title to show session ID
       process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
@@ -1931,7 +2034,8 @@ async function main() {
     // of this session (a reconnect whose re-register POST below lost the race — that failure
     // is swallowed), its auto-register used to invent `command: 'wrapped'` and silently kill
     // every identity-gated feature. The bridge is the one process that always knows.
-    const wsUrl = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}&owner=1&owner_pid=${process.pid}&command=${encodeURIComponent(command)}`;
+    const wsOwnerBase = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}`;
+    const wsUrl = `${wsOwnerBase}?token=${encodeURIComponent(resolveTargetToken(wsOwnerBase))}&owner=1&owner_pid=${process.pid}&command=${encodeURIComponent(command)}`;
     let daemonWs = null;
     let wsReady = false;
     let reconnectAttempts = 0;
@@ -2442,7 +2546,8 @@ async function main() {
       }
     }
 
-    const wsUrl = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(getAuthToken())}`;
+    const wsAttachBase = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}`;
+    const wsUrl = `${wsAttachBase}?token=${encodeURIComponent(resolveTargetToken(wsAttachBase))}`;
     const ws = new WebSocket(wsUrl);
     let cleanupTerminal = null;
 
@@ -2493,6 +2598,18 @@ async function main() {
         }
       } catch(e) {}
       process.exit(0);
+    });
+
+    // #835/#823 — a refused handshake is an ANSWER. Without this it arrived as a bare
+    // "WebSocket Error" indistinguishable from an unreachable port.
+    ws.on('unexpected-response', (_req, res) => {
+      res.resume();
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        console.error(`❌ The daemon at ${targetHost} REFUSED this attach (HTTP ${res.statusCode}). It is running — this is a credential mismatch, not an absence.\n  ${credentialRefusalHint(targetHost)}`);
+      } else {
+        console.error(`❌ The daemon at ${targetHost} answered the attach handshake with HTTP ${res.statusCode} — running, but not serving.`);
+      }
+      process.exit(1);
     });
 
     ws.on('error', (err) => {
@@ -3962,7 +4079,8 @@ Discuss the following topic from your project's perspective. Engage with other s
     let connectedHosts = 0;
 
     hosts.forEach((host) => {
-      const wsUrl = `${daemonWsUrl(host)}/api/bus?token=${encodeURIComponent(getAuthToken())}`;
+      const wsBusBase = `${daemonWsUrl(host)}/api/bus`;
+      const wsUrl = `${wsBusBase}?token=${encodeURIComponent(resolveTargetToken(wsBusBase))}`;
       const ws = new WebSocket(wsUrl);
 
       ws.on('open', () => {

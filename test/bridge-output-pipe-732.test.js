@@ -52,7 +52,7 @@ async function bothLegsUp(t, { faultMode }) {
   });
 
   const port = await H.daemonReady(daemon);
-  const A = H.api(port);
+  const A = H.api(port, home);
   bridge = H.startBridge({
     home, port, sid,
     faultInjector: true,

@@ -167,7 +167,12 @@ function createTempHome({ supervisor = true } = {}) {
   return { homeDir, binDir };
 }
 
+// #820: the /api/meta probe needs the token of the daemon on that port, and only the spawn env
+// knows which temp HOME holds it. Recorded here because this is the one place both are in hand.
+const portHomes = new Map();
+
 function childEnv({ homeDir, binDir, port }) {
+  portHomes.set(port, homeDir);
   const env = {
     ...process.env,
     HOME: homeDir,
@@ -220,14 +225,30 @@ function waitExit(child, timeoutMs) {
   });
 }
 
-async function fetchMeta(port) {
-  try {
-    const res = await fetch(`http://${HOST}:${port}/api/meta`, { signal: AbortSignal.timeout(1000) });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
+// #820: /api/meta is behind the auth middleware and loopback is no longer a credential, so the
+// probe must present the token the daemon under `homeDir` minted. Read per call rather than
+// cached: these daemons are being raced into existence, so the file may not exist yet on the
+// first poll. Absent homeDir (reapPort's best-effort sweep) still probes — it just gets a 401 and
+// treats it as "nobody to reap", which is the pre-existing best-effort contract there.
+function fetchMeta(port, homeDir) {
+  let token = null;
+  if (homeDir) {
+    try {
+      token = JSON.parse(fs.readFileSync(path.join(homeDir, '.telepty', 'config.json'), 'utf8')).authToken;
+    } catch { /* not minted yet */ }
   }
+  return (async () => {
+    try {
+      const res = await fetch(`http://${HOST}:${port}/api/meta`, {
+        signal: AbortSignal.timeout(1000),
+        headers: token ? { 'x-telepty-token': token } : {}
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  })();
 }
 
 async function stopChild(child) {
@@ -244,7 +265,7 @@ async function stopChild(child) {
 async function reapPort(port) {
   if (port === PRODUCTION_PORT) return; // belt-and-braces; runKickstartRace already asserts
   for (let i = 0; i < 5; i++) {
-    const meta = await fetchMeta(port);
+    const meta = await fetchMeta(port, portHomes.get(port));
     if (!meta || !meta.pid) return;
     try { process.kill(meta.pid, 'SIGKILL'); } catch { /* already gone */ }
     await delay(200);
@@ -254,6 +275,7 @@ async function reapPort(port) {
 afterEach(async () => {
   await Promise.all(spawnedChildren.splice(0).map((child) => stopChild(child)));
   await Promise.all(testPorts.splice(0).map((port) => reapPort(port)));
+  portHomes.clear();
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -276,7 +298,7 @@ async function runKickstartRace({ supervisor = true } = {}) {
   // (1) The supervisor's daemon — launched EXACTLY the way the launchd plist does it.
   mark(`scenario start on :${port} (supervisor=${supervisor})`);
   const original = spawnNode(['cli.js', 'daemon'], env, 'daemon#supervisor-original');
-  const originalMeta = await waitFor(() => fetchMeta(port), {
+  const originalMeta = await waitFor(() => fetchMeta(port, homeDir), {
     description: `original daemon on :${port}\n${describe(original)}`
   });
   mark(`original daemon serving (pid ${originalMeta.pid})`);
@@ -317,7 +339,7 @@ test('#738 characterization: two daemons racing one port — loser exits 0, sing
   const env = childEnv({ homeDir, binDir, port });
 
   const first = spawnNode(['cli.js', 'daemon'], env, 'daemon#first');
-  const firstMeta = await waitFor(() => fetchMeta(port), {
+  const firstMeta = await waitFor(() => fetchMeta(port, homeDir), {
     description: `first daemon on :${port}\n${describe(first)}`
   });
 
@@ -332,7 +354,7 @@ test('#738 characterization: two daemons racing one port — loser exits 0, sing
     `expected the "already running" EADDRINUSE bail-out\n${describe(second)}`);
 
   // The first daemon is untouched — the port is decided purely by who bound first.
-  const stillServing = await fetchMeta(port);
+  const stillServing = await fetchMeta(port, homeDir);
   assert.equal(stillServing && stillServing.pid, firstMeta.pid);
 
   // And the singleton lock never engaged: under the production launch path
@@ -356,13 +378,13 @@ test('#738: with a supervisor installed, a CLI racing the kickstart gap defers �
   //   (b) the supervisor instance wins the port.
   // Both collapse to: the process serving the port is the supervisor's.
   const owner = await waitFor(async () => {
-    const meta = await fetchMeta(r.port);
+    const meta = await fetchMeta(r.port, r.homeDir);
     return meta && meta.pid === r.relaunch.pid ? meta : null;
   }, {
     timeoutMs: SUPERVISOR_VERDICT_MS,
     description: `supervisor instance (pid ${r.relaunch.pid}) to own :${r.port}`
   }).catch(async () => {
-    const meta = await fetchMeta(r.port);
+    const meta = await fetchMeta(r.port, r.homeDir);
     assert.fail(
       `orphan daemon (pid ${meta && meta.pid}) owns :${r.port}; the supervisor instance ` +
       `(pid ${r.relaunch.pid}) did not.\n${describe(r.relaunch)}`
@@ -381,7 +403,7 @@ test('#738: with a supervisor installed, a CLI racing the kickstart gap defers �
 
   // And the ownership is stable — no late orphan sneaks in behind the supervisor.
   await delay(2000);
-  const later = await fetchMeta(r.port);
+  const later = await fetchMeta(r.port, r.homeDir);
   assert.equal(later && later.pid, r.relaunch.pid, 'port changed hands after the race settled');
   mark(`supervisor pid ${r.relaunch.pid} owns :${r.port} — contract satisfied`);
 });
@@ -402,7 +424,7 @@ test('#738: with no supervisor installed, the CLI still auto-starts the daemon (
 
   // A daemon is serving, and it is the one the CLI spawned (not the scripted relaunch,
   // which loses the port exactly as it always did when no supervisor policy applies).
-  const meta = await fetchMeta(r.port);
+  const meta = await fetchMeta(r.port, r.homeDir);
   assert.ok(meta, `nobody is serving :${r.port}\n${describe(r.racer)}`);
   assert.notEqual(meta.pid, r.originalMeta.pid, 'expected the killed daemon to be gone');
   assert.notEqual(meta.pid, r.relaunch.pid, 'expected the CLI-spawned daemon to own the port');

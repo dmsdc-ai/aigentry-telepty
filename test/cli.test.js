@@ -198,7 +198,8 @@ test('telepty list --json includes computed idle_seconds', async () => {
 const openOwnerSockets = [];
 async function connectOwnerSocket(sessionId) {
   const ws = new WebSocket(
-    `ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}?owner=1&owner_pid=${process.pid}`,
+    `ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}`
+    + `?owner=1&owner_pid=${process.pid}&token=${encodeURIComponent(harness.authToken())}`,
     harness.ownerAuth(sessionId)
   );
   openOwnerSockets.push(ws);

@@ -55,7 +55,7 @@ function runAuthMiddleware(middleware, reqOverrides = {}) {
 
 test('auth middleware rejects unauthorized request with 401', () => {
   const middleware = createAuthMiddleware({
-    isAllowedPeer: createIsAllowedPeer(['203.0.113.11']),
+    isAllowedPeer: createIsAllowedPeer([]),
     expectedToken: 'expected-token',
     verifyJwt: createVerifyJwt('jwt-secret')
   });
@@ -73,7 +73,7 @@ test('auth middleware rejects unauthorized request with 401', () => {
 test('auth middleware accepts valid bearer JWT', () => {
   const secret = 'jwt-secret';
   const middleware = createAuthMiddleware({
-    isAllowedPeer: createIsAllowedPeer(['203.0.113.11']),
+    isAllowedPeer: createIsAllowedPeer([]),
     expectedToken: 'expected-token',
     verifyJwt: createVerifyJwt(secret)
   });
@@ -88,7 +88,7 @@ test('auth middleware accepts valid bearer JWT', () => {
   assert.equal(result.res.body, null);
 });
 
-test('peer outside allowlist is rejected without a valid credential', () => {
+test('peer outside allowlist is rejected — 403, the policy answer, before any credential', () => {
   const middleware = createAuthMiddleware({
     isAllowedPeer: createIsAllowedPeer(['203.0.113.11']),
     expectedToken: 'expected-token',
@@ -100,26 +100,51 @@ test('peer outside allowlist is rejected without a valid credential', () => {
   });
 
   assert.equal(result.nextCalled, false);
-  assert.equal(result.res.statusCode, 401);
-  assert.deepEqual(result.res.body, {
-    error: 'Unauthorized: Invalid or missing token.',
-    code: 'PERMISSION_DENIED'
-  });
+  // #823: was 401. Reachability and authentication are different questions and now get different
+  // answers — 403 "you may not connect from there" vs 401 "you did not prove who you are".
+  assert.equal(result.res.statusCode, 403);
+  assert.equal(result.res.body.code, 'PEER_NOT_ALLOWED');
 });
 
-test('allowlisted peer bypasses token checks', () => {
+test('allowlisted peer still needs the token — the allowlist narrows, it does not authenticate', () => {
+  // #823: this test used to be named "allowlisted peer bypasses token checks" and asserted
+  // exactly that. The bypass was the vulnerability: on the default config #672 auto-trust puts the
+  // tailnet CIDR in this list, so every tailnet device MATCHED and reached every route with no
+  // credential. Measured on the host that found it: HTTP 200, no token.
   const middleware = createAuthMiddleware({
     isAllowedPeer: createIsAllowedPeer(['203.0.113.12']),
     expectedToken: 'expected-token',
     verifyJwt: createVerifyJwt('jwt-secret')
   });
 
-  const result = runAuthMiddleware(middleware, {
-    ip: '::ffff:203.0.113.12'
+  const refused = runAuthMiddleware(middleware, { ip: '::ffff:203.0.113.12' });
+  assert.equal(refused.nextCalled, false, 'reachable is not authenticated');
+  assert.equal(refused.res.statusCode, 401);
+
+  const allowed = runAuthMiddleware(middleware, {
+    ip: '::ffff:203.0.113.12',
+    headers: { 'x-telepty-token': 'expected-token' }
+  });
+  assert.equal(allowed.nextCalled, true, 'reachable AND authenticated still passes');
+  assert.equal(allowed.res.statusCode, null);
+});
+
+test('loopback needs the token too — the whole of #820, at the middleware', () => {
+  const middleware = createAuthMiddleware({
+    isAllowedPeer: createIsAllowedPeer([]),
+    expectedToken: 'expected-token',
+    verifyJwt: createVerifyJwt('jwt-secret')
   });
 
-  assert.equal(result.nextCalled, true);
-  assert.equal(result.res.statusCode, null);
+  const refused = runAuthMiddleware(middleware, { ip: '127.0.0.1' });
+  assert.equal(refused.nextCalled, false);
+  assert.equal(refused.res.statusCode, 401);
+
+  const allowed = runAuthMiddleware(middleware, {
+    ip: '127.0.0.1',
+    headers: { 'x-telepty-token': 'expected-token' }
+  });
+  assert.equal(allowed.nextCalled, true, 'the local CLI has always sent this token');
 });
 
 // ── #672: CIDR-aware isAllowedPeer (net.BlockList) ──────────────────────────────
@@ -138,7 +163,10 @@ test('isAllowedPeer: loopback always allowed regardless of allowlist (not tighte
   assert.equal(allowed('::1'), true);
 });
 
-test('isAllowedPeer: empty allowlist preserves "allow all authenticated" branch', () => {
+test('isAllowedPeer: empty allowlist means NO IP RESTRICTION (reachability only)', () => {
+  // #823: the branch is unchanged, its meaning is not. This function answers "may this address
+  // connect", never "is this caller authenticated" — turning empty into deny-all would break
+  // tailnet reachability for no security gain, since the credential check now runs regardless.
   const allowed = createIsAllowedPeer([]);
   assert.equal(allowed('203.0.113.5'), true);
   assert.equal(allowed('100.72.0.1'), true);

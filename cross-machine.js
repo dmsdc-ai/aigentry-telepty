@@ -449,7 +449,12 @@ async function connectHttp(target, options = {}) {
   const name = options.name || spec.host.split('.')[0] || spec.host;
 
   const headers = {};
-  if (options.token) headers['x-telepty-token'] = options.token;
+  // #823 — /api/meta is auth-gated, so discovery needs whichever token this operator has for the
+  // target. /api/health below deliberately sends none: it is registered BEFORE the auth
+  // middleware (daemon.js), and hardening it would break daemon-control's port-ownership probe
+  // and aterm's version detection in one stroke.
+  const metaToken = options.token || process.env.TELEPTY_AUTH_TOKEN;
+  if (metaToken) headers['x-telepty-token'] = metaToken;
 
   let machineId = name;
   let healthOk = false;
@@ -523,7 +528,9 @@ async function listHttpRemoteSessions(name, options = {}) {
   if (!entry || getPeerTransport(entry) !== 'http') return [];
 
   const headers = {};
-  const token = options.token || entry.token;
+  // #823 — same address-keyed order as cli.js resolveTargetToken: explicit → env → the peer's
+  // stored token (written by `connect-http --token`, and read for the first time here).
+  const token = options.token || process.env.TELEPTY_AUTH_TOKEN || entry.token;
   if (token) headers['x-telepty-token'] = token;
 
   const target = `${entry.host}:${entry.port}`;

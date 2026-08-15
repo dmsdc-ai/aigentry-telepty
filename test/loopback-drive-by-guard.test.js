@@ -1,8 +1,9 @@
 'use strict';
 // P0 SECURITY — any website the user merely visits can drive their AI CLI sessions.
 //
-// The daemon listens on loopback and `isAllowedPeer` trusts 127.0.0.1/::1 unconditionally,
-// FIRST, before any token check. So a page in the user's browser could
+// The daemon listens on loopback and `isAllowedPeer` USED TO short-circuit the middleware for
+// 127.0.0.1/::1, before any token check (#820 closed that; the credential is now required for
+// every address). So a page in the user's browser could
 // `fetch('http://127.0.0.1:3848/api/sessions/<sid>/inject', {method:'POST', ...})` and type
 // into a live AI CLI session with no token and no interaction. The response is CORS-gated
 // (and this daemon answers `Access-Control-Allow-Origin: *`, so not even that) — but the
@@ -71,9 +72,12 @@ test('CLI path unchanged: the same loopback POST without Origin still succeeds',
   const { app, injects } = buildHttpApp([]);
   const base = await serve(app);
 
+  // #820: the token is what makes this the CLI path now. Before, an origin-less loopback POST
+  // succeeded with NO credential — this assertion encoded that as intended behaviour. The Origin
+  // half of the contract (#806) is untouched: an origin-less caller still takes the old path.
   const res = await fetch(`${base}/api/sessions/${SID}/inject`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'x-telepty-token': 'sekret' },
     body: JSON.stringify({ prompt: 'hello' })
   });
 
@@ -90,8 +94,8 @@ test('drive-by: reads are guarded too — GET /api/sessions with Origin is refus
   const blocked = await fetch(`${base}/api/sessions`, { headers: { origin: EVIL } });
   assert.equal(blocked.status, 403);
 
-  const cli = await fetch(`${base}/api/sessions`);
-  assert.equal(cli.status, 200, 'origin-less read stays open');
+  const cli = await fetch(`${base}/api/sessions`, { headers: { 'x-telepty-token': 'sekret' } });
+  assert.equal(cli.status, 200, 'origin-less CREDENTIALED read stays open');
 });
 
 test('drive-by: a stolen token does not buy a disallowed origin past the guard', async () => {
@@ -116,7 +120,7 @@ test('an explicitly allowlisted origin is let through (opt-in escape hatch)', as
 
   const ok = await fetch(`${base}/api/sessions/${SID}/inject`, {
     method: 'POST',
-    headers: { origin: 'https://ui.example', 'content-type': 'application/json' },
+    headers: { origin: 'https://ui.example', 'content-type': 'application/json', 'x-telepty-token': 'sekret' },
     body: JSON.stringify({ prompt: 'hi' })
   });
   assert.equal(ok.status, 200);
@@ -128,9 +132,9 @@ test('an explicitly allowlisted origin is let through (opt-in escape hatch)', as
 
 // ── WebSocket: the worse half of the same vector (no CORS at all) ────────────────
 
-function attachWs(port, opts = {}) {
+function attachWs(port, opts = {}, query = '') {
   return new Promise((resolve) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/sessions/${SID}`, opts);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/sessions/${SID}${query}`, opts);
     const done = (r) => { try { ws.terminate(); } catch {} resolve(r); };
     ws.on('open', () => done({ kind: 'open' }));
     ws.on('unexpected-response', (_req, res) => { res.resume(); done({ kind: 'http', status: res.statusCode }); });
@@ -178,11 +182,18 @@ test('drive-by: a browser WebSocket handshake carrying Origin is refused, an Ori
 
   const evil = await attachWs(port, { origin: EVIL });
   assert.notEqual(evil.kind, 'open', `a page must not attach to a terminal, got ${JSON.stringify(evil)}`);
-  assert.ok(
-    (evil.kind === 'http' && evil.status === 403) || evil.kind === 'error',
-    `browser WS handshake should be refused, got ${JSON.stringify(evil)}`
-  );
+  // #820 tightened this from "403 or some error" to "403, specifically": the refusal is now a
+  // complete HTTP response written with end() rather than a raced write+destroy, so the client
+  // reliably reads the status instead of an ECONNRESET that looks like a dead daemon.
+  assert.equal(evil.kind, 'http', `browser WS handshake should be refused with a readable status, got ${JSON.stringify(evil)}`);
+  assert.equal(evil.status, 403);
 
-  const cli = await attachWs(port);
-  assert.equal(cli.kind, 'open', `telepty attach (no Origin) must still upgrade, got ${JSON.stringify(cli)}`);
+  // #820: an origin-less upgrade must now carry the token as well. Before, this asserted that an
+  // uncredentialed loopback handshake OPENS — the defect, recorded as the contract.
+  const cli = await attachWs(port, { headers: { authorization: '' } }, '?token=sekret');
+  assert.equal(cli.kind, 'open', `telepty attach (no Origin, with the token) must still upgrade, got ${JSON.stringify(cli)}`);
+
+  const tokenless = await attachWs(port);
+  assert.equal(tokenless.kind, 'http', `an origin-less UNCREDENTIALED handshake must be refused, got ${JSON.stringify(tokenless)}`);
+  assert.equal(tokenless.status, 401);
 });

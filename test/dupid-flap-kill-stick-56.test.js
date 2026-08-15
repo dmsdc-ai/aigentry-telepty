@@ -27,7 +27,9 @@ afterEach(async () => {
 });
 
 function ownerUrl(id, query = '') {
-  return `ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(id)}?owner=1${query}`;
+  // #820: the daemon token upgrades the socket; harness.ownerAuth() adds the #815 session bearer.
+  return `ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(id)}`
+    + `?owner=1&token=${encodeURIComponent(harness.authToken())}${query}`;
 }
 
 function ownerConnect(id, query = '') {

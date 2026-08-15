@@ -62,7 +62,10 @@ function buildDeps(server, sessions, credentials) {
     busClients: new Set(),
     expectedToken: TOKEN,
     verifyJwt: () => false,
-    isAllowedPeer: () => false,
+    // #823: `isAllowedPeer` is now a reachability PRECONDITION that can only narrow, not an
+    // alternative to the credential. `false` here would mean "this address may not connect at
+    // all" (403) and no token would buy past it; the token in the URL is what authenticates.
+    isAllowedPeer: () => true,
     initializeBootstrapState: () => {},
     findKittySocket: () => null,
     findKittyWindowId: () => null,
