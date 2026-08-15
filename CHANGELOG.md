@@ -2,7 +2,7 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## Unreleased
+## 0.8.0 — unreleased
 
 ### Changed — BREAKING: telepty no longer asserts task completion (#60 Stage A)
 
@@ -118,24 +118,51 @@ because the durable `tracking_started` record already exists and is pollable.
   clients get `unexpected-response` with a readable status. `telepty attach` no longer crashes with
   an unhandled `error` event on a refused handshake; it prints which fault it was.
 
-- **Cross-host callers must present the TARGET's token, resolved by address.** Each node mints its
-  own token, so the local one is not valid at a peer. Resolution order is `TELEPTY_AUTH_TOKEN` → a
-  `peers.json` entry matching that `host:port` → the local token; a *wrong* token yields a
-  diagnosable 401 and no path sends none. `telepty connect-http <host> --token <that host's
-  authToken>` has always stored `entry.token` and nothing ever read it, because the lookup was
-  keyed on a peer name the dial sites had already dropped — that stored credential is now reachable.
+- **Cross-host callers must present the TARGET's token, resolved by address — and a target with no
+  credential of its own is REFUSED, never handed the local one (#844).** Each node mints its own
+  token, so the local one is not valid at a peer. Resolution order is `TELEPTY_AUTH_TOKEN` → a
+  `peers.json` entry matching that `host:port` → the local token **for this machine only**; a
+  *wrong* token still yields a diagnosable 401, and no path we do dial sends none. A non-local
+  address with neither of the first two is refused before the socket opens, with a message naming
+  `connect-http --token` and `TELEPTY_AUTH_TOKEN`.
+
+  The refusal replaces a silent send that this release is precisely what made dangerous. The
+  resolver ended in an unconditional `getAuthToken()`, so any command aimed at an address with no
+  stored entry put **this machine's daemon master token** on the wire in cleartext, to whoever
+  answered. That was inert in 0.7.1 because the target trusted every caller and never read the
+  credential. Now that token is the whole boundary on the *sending* side, and on a tailnet #672's
+  auto-populated allowlist lets the recipient turn it straight back on the daemon that sent it —
+  one mistyped host, `telepty inject sess@10.0.0.5`, was enough, with no output at all.
+
+  `telepty connect-http <host> --token <that host's authToken>` has always stored `entry.token` and
+  nothing ever read it, because the lookup was keyed on a peer name the dial sites had already
+  dropped — that stored credential is now reachable, and it is what a non-local target must have.
 
   **Migration, and it is the only user-visible one:** run `telepty connect-http <host> --token
-  <that host's authToken>` once per HTTP peer. `TELEPTY_AUTH_TOKEN` is honoured by the daemon, the
+  <that host's authToken>` once per HTTP peer. This is now required rather than advisable: without
+  it, a cross-host command is refused instead of quietly failing a 401. `TELEPTY_AUTH_TOKEN` is
+  honoured by the daemon, the
   CLI and the MCP server (env-then-file at all three); it is a fleet-wide token and must be set for
   the daemon too, or the client sends one the daemon has never heard of.
+
+- **Rotating the shared daemon token requires a daemon restart, by design.** The daemon reads
+  `~/.telepty/config.json` once, at boot, and never looks at it again. An operator who edits the
+  config under a running daemon gets 401s from every caller until it is restarted — that is correct
+  behaviour, not a bug, and it is the first thing this release's refusal message says. Re-reading
+  per request would widen the boundary from *"whoever can **read** this file can drive the daemon"*
+  to *"whoever can **write** it owns the running daemon"*, turning a file write into a silent
+  credential takeover of the process that parents every live session, with nothing in any log. The
+  freeze is what keeps rotation an explicit, observable act. Recorded in `BOUNDARY.md`; stated here
+  because the 401s are what an operator actually hits.
 
 - **Who must act:** anyone with a hand-rolled `curl 127.0.0.1:3848/api/...`. Add
   `-H "x-telepty-token: $(jq -r .authToken ~/.telepty/config.json)"`. `telepty` CLI users are
   unaffected. `/api/health` stays unauthenticated, so liveness probes, `connect-http` discovery and
   GUI version detection are unaffected. Mixed fleets are safe in both directions: an old client
   against a new daemon fails closed with 401; a new client against an old daemon works (the extra
-  header is ignored). No credential is minted, rotated or migrated.
+  header is ignored, and #844 below is what makes the *CLI* side of that true — the version probe
+  used to declare an old daemon broken before the header ever mattered). No credential is minted,
+  rotated or migrated.
 
 - **What this does NOT fix, stated plainly:** the boundary moves from *"anyone who can open a socket
   to the port"* to *"anyone who can read `~/.telepty/config.json"`* — roughly the uid boundary. It
@@ -204,6 +231,71 @@ because the durable `tracking_started` record already exists and is pollable.
 - **A re-registration can no longer redirect where a session's injects are delivered (#815).**
   `delivery` / `delivery_endpoint` are mutable only by a caller holding the session's current
   credential. Sessions with no credential are unaffected.
+
+### Fixed — a refusal is not a licence to destroy, and absence of evidence is not evidence of absence (#844)
+
+#835 established that a daemon which ANSWERS and declines is not a daemon that is absent, because
+the "absent" verdict is what authorises SIGTERM/SIGKILL against the process that parents every live
+PTY session. Two independent reviews of this release found the rule broken in five more places —
+including, twice, by code this release itself added. They are grouped here because they are one
+rule: **a destructive action requires positive evidence of the condition it destroys on.**
+
+- **A REFUSED owner claim no longer tears down the incumbent it was refused against.** `telepty
+  allow --id X` against an id the daemon already holds is a re-registration, so #815 correctly
+  issues it no credential and the daemon refuses its `?owner=1` claim with close `4003`. The
+  bridge's 4003 handler then ran the ordinary exit path — which issues `DELETE /api/sessions/X`,
+  carrying an `owner_token` only if it has one. It never had one. So the DELETE went out bare, the
+  #536 owner-token guard had nothing to compare, and the healthy incumbent was destroyed by the one
+  process the daemon had just told it does not own that id. The dup-id/respawn race that produces
+  this is routine. The refused bridge now exits without the teardown and without purging the
+  bridge mailbox, both of which belong to the owner.
+
+- **A `404` on `/api/meta` is an old daemon, not a broken one.** The version probe classified every
+  non-2xx as "the daemon answered", and aborted with *"running, but not serving"* — a cause it had
+  not determined. `/api/meta` was added 2026-03-12, so a daemon predating it answers 404 for exactly
+  the reason it answers 200 on `/api/sessions`. `telepty list` against such a daemon died on that
+  message, which killed the legacy-upgrade path and falsified this release's own claim above that a
+  new client against an old daemon works. Scoped to that route: 401/403/5xx from it still abort, and
+  a 404 from anywhere else is not the same statement.
+
+- **A daemon the supervisor brought back REFUSING is no longer reported as never having come back.**
+  `getDaemonMeta` has three consumers; #835 taught two of them that a non-200 is an answer and left
+  `deferToSupervisor` accepting only a version. A live daemon returning 401 was therefore reported
+  as *"the supervisor did not restore it in time"*, and that verdict routes into
+  `cleanupDaemonProcesses()`. It now hands the answer back to the policy, and the policy's `abort`
+  is honoured on that path too — it was previously checked only *before* the supervisor wait, so a
+  refusal discovered during the wait fell straight through to the restart.
+
+- **The cmux surface GC signals instead of killing, and can no longer read a non-listing as an
+  absence.** `isSurfaceAlive` decided `gone` from a substring scan of `cmux list-workspaces` output,
+  so a truncated, localised, half-succeeded or reformatted listing produced `gone` with exactly the
+  confidence of a real answer — and a session whose workspace id is a short-ref rather than a uuid
+  could never match the uuid-formatted listing at all. Only a listing that parses as an enumeration
+  and demonstrably omits the id is now `gone`; everything else is `unknown`, which GCs nothing.
+  Beyond that, the GC block runs **only** for sessions whose owner socket is open, so it was using a
+  uuid's absence from another tool's stdout to override this daemon's own present-tense measurement
+  that the session is alive. That ordering is reversed: the open socket blocks the reclaim, and what
+  remains is the `surface_orphaned` signal — emitted once, carrying `ownerSocketOpen` and
+  `reclaimed: false` — for the orchestrator's reconciler to act on. Same "telepty signals; the
+  orchestrator actuates" split already used for the surface itself. The `INV-17` comment there
+  claimed a guarantee broader than the measurement provided and has been rewritten to what the code
+  establishes.
+
+- **The daemon state-file pid is confirmed before it is signalled.** `cleanupDaemonProcesses` builds
+  its kill set from three sources. Two confirmed identity first — the port-owner source via
+  `pidMatchesTeleptyCmdline` ("so we never SIGTERM an arbitrary process that happens to own the
+  port"), the process-scan source via `isLikelyTeleptyDaemon` — and the state-file source added its
+  pid with no check at all, even though that is a pid telepty *wrote* rather than one it measured. A
+  stale state file surviving a pid rollover named a stranger, and `stopDaemon` documented a surgical
+  guarantee it never verified. All three sources now carry their own evidence.
+
+- **The release artifact no longer lies about which release it is.** `package.json` and both version
+  fields of `package-lock.json` still said `0.7.1` — the version already published on npm — while
+  the notes above describe 0.8.0. `/api/meta` reports that string, and a version-equal daemon is
+  treated as healthy, so a 0.8.0 CLI meeting a running 0.7.1 daemon would have accepted it and kept
+  talking across wire semantics this release changed. The suite checked only that the version was
+  semver-shaped, which `0.7.1` satisfies perfectly. A release invariant now ties the manifest, the
+  lockfile and the newest `CHANGELOG.md` section to one number.
 
 ### Added
 - `session_owner_replaced` bus event (#815): a `?owner=1` claim that displaced a **live** owner

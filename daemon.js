@@ -28,7 +28,7 @@ const { stripAnsiForScreen } = require('./src/screen-ansi'); // #715: read-scree
 const { sampleChildCpuSeconds } = require('./src/child-cpu'); // #52: quiet-thinking CPU recheck
 const readyRegistry = require('./src/prompt-symbol-registry');
 const lifecycle = require('./src/lifecycle');
-const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, applySurfaceMismatchProbe } = lifecycle;
+const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, decideSurfaceGcAction, applySurfaceMismatchProbe } = lifecycle;
 const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
 const { createCredentialStore } = require('./src/session-store/session-credentials');
@@ -5485,12 +5485,21 @@ if (require.main === module) setInterval(() => {
       }
     }
 
-    // #17: CONNECTED-zombie GC via cmux surface-liveness. Post-08cd796 a wrapped cmux bridge
-    // SURVIVES its terminal app's death, so ownerWs stays OPEN and the 300s disconnect-GC
-    // (below) never fires. If the workspace was EXPLICITLY closed while cmux itself is alive,
-    // the session is a headless zombie → reclaim it after a grace window. INV-17: isSurfaceAlive
-    // returns 'unknown' when cmux is unreachable (app-quit/restart vanishes ALL surfaces at
-    // once), so this GCs NOTHING in that case — preserving the #486/#488 survival guarantee.
+    // #17: CONNECTED-zombie detection via cmux surface-liveness. Post-08cd796 a wrapped cmux
+    // bridge SURVIVES its terminal app's death, so ownerWs stays OPEN and the 300s disconnect-GC
+    // (below) never fires. If the workspace was EXPLICITLY closed while cmux itself is alive, the
+    // session is a headless-zombie CANDIDATE.
+    //
+    // #844: it is a candidate, and this block no longer reclaims one. What INV-17 actually
+    // establishes is narrower than it read: `isSurfaceAlive` returns 'unknown' when cmux is
+    // unreachable or answers with something that is not a parseable listing, so those cases GC
+    // nothing — but "the uuid was missing from a listing we could parse" is still a statement
+    // about ANOTHER TOOL'S STDOUT, and this block only ever runs for sessions whose owner socket
+    // is OPEN. That socket is this daemon's own, first-hand, present-tense measurement that the
+    // session is alive, and it outranks the parsed absence rather than merely gating the look at
+    // it. So the outcome here is the `surface_orphaned` SIGNAL, once, and the orchestrator's
+    // reconciler — which owns the surface — decides. The #486/#488 survival guarantee is
+    // preserved by construction now, not only in the unreachable-cmux case.
     if (session.type === 'wrapped' && session.backend === 'cmux' && session.cmuxWorkspaceId
         && isOpenWebSocket(session.ownerWs)) {
       const mismatchProbe = terminalBackend.detectSurfaceMismatch(session, { sessionId: id });
@@ -5507,36 +5516,43 @@ if (require.main === module) setInterval(() => {
       }
 
       const liveness = terminalBackend.isSurfaceAlive(session);
-      const gcAction = decideSurfaceGc(liveness, session, now);
+      // #844: the verdict, then what it is allowed to actuate. This block is entered ONLY when the
+      // owner socket is open, so the pre-#844 code used "a uuid did not appear in cmux's stdout"
+      // to override "this session is connected right now" — the weaker measurement overriding the
+      // stronger, first-hand one. The open socket blocks the kill; the `surface_orphaned` signal
+      // still goes out, once, and the orchestrator's reconciler actuates.
+      const gcAction = decideSurfaceGcAction(decideSurfaceGc(liveness, session, now), {
+        ownerConnected: true,
+        alreadySignalled: Boolean(session.surfaceOrphanSignalledAt)
+      });
       if (gcAction === 'mark') {
         session.surfaceGoneAt = new Date().toISOString();
         console.log(`[SURFACE-GC] cmux workspace gone for ${id} (${session.cmuxWorkspaceId}) — ${SURFACE_ORPHAN_SECONDS}s grace started`);
-      } else if (gcAction === 'reclaim') {
+      } else if (gcAction === 'signal') {
         const goneSeconds = Math.floor((now - new Date(session.surfaceGoneAt).getTime()) / 1000);
-        console.log(`[SURFACE-GC] Reclaiming headless cmux zombie ${id} after ${goneSeconds}s surface-gone`);
-        emitSessionLifecycleEvent('session_cleanup', id, session, {
-          reason: 'SURFACE_GONE',
-          surfaceGoneSeconds: goneSeconds
-        });
-        // Surface-ownership verdict (2026-05-30): telepty reclaims the zombie SESSION but does
-        // NOT close the surface. Emit the orphan SIGNAL so the orchestrator's reconciler closes
-        // the surface (wh_close). telepty signals; the orchestrator actuates.
+        console.log(`[SURFACE-GC] cmux workspace still absent for ${id} after ${goneSeconds}s — signalling surface_orphaned; the owner socket is OPEN so this session is NOT reclaimed here`);
+        // Surface-ownership verdict (2026-05-30): telepty does NOT close the surface — it emits
+        // the orphan SIGNAL so the orchestrator's reconciler closes it (wh_close). #844 extends
+        // the same split to the SESSION: a workspace uuid missing from another tool's stdout does
+        // not outrank this daemon's own open socket to the session, so the signal is the whole
+        // action. The orchestrator holds the surface-side evidence and actuates on both.
         broadcastSessionEvent('surface_orphaned', id, session, {
           extra: {
             sid: id,
             backend: session.backend || null,
             cmuxWorkspaceId: session.cmuxWorkspaceId || null,
             surfaceGoneSeconds: goneSeconds,
-            livenessVerdict: liveness
+            livenessVerdict: liveness,
+            ownerSocketOpen: true,
+            reclaimed: false
           }
         });
-        teardownSessionById(id, { force: true, timeoutMs: 5000, reason: 'SURFACE_GONE', source: 'surface_gc' })
-          .catch(err => console.error(`[SURFACE-GC] teardown failed for ${id}: ${err.message}`));
-        continue; // being destroyed — skip remaining checks for this session this tick
+        session.surfaceOrphanSignalledAt = new Date().toISOString(); // once, not once per tick
       } else if (gcAction === 'recover') {
         // Recovery within the grace window (mirrors the aterm socket-recover above).
         console.log(`[SURFACE-GC] cmux workspace recovered for ${id} — clearing grace window`);
         session.surfaceGoneAt = null;
+        session.surfaceOrphanSignalledAt = null; // #844: a later genuine absence signals again
       }
       // 'skip' (incl. 'unknown' — INV-17 gate) → leave surfaceGoneAt unchanged, GC nothing.
     }

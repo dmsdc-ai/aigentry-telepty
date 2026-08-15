@@ -207,21 +207,53 @@ function isLocalHostname(host) {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
 }
 
-// Resolution order: explicit env → the peer's stored token → the local token. NEVER "no token":
-// a wrong credential yields a loud, diagnosable 401, while an absent one yields the ambiguity
-// this release exists to delete.
+// Resolution order: explicit env → the peer's stored token → the local token, and the last step
+// is reachable ONLY for this machine. NEVER "no token" for a target we do dial: a wrong
+// credential yields a loud, diagnosable 401, while an absent one yields the ambiguity this
+// release exists to delete.
+//
+// #844 F1 — the local token used to be the unconditional fallback, so any command aimed at an
+// address with no stored credential put THIS MACHINE'S DAEMON MASTER TOKEN on the wire in
+// cleartext. That was harmless in 0.7.1 only because the target trusted every caller and never
+// read the credential; #820 is precisely what turns it into the whole boundary on the sending
+// side, and on a tailnet #672's auto-populated allowlist lets the recipient point it straight
+// back at the daemon that sent it. One mistyped host — `telepty inject sess@10.0.0.5` — handed
+// over the key, silently.
+//
+// So `isLocalHostname()` decides RESOLUTION now, not just error wording: a non-local address with
+// no credential of its own is REFUSED before the socket opens, naming the fix. A refusal an
+// operator can act on beats a send they never saw.
 function resolveTargetToken(url) {
   if (process.env.TELEPTY_AUTH_TOKEN) return process.env.TELEPTY_AUTH_TOKEN;
+  let host = null;
   try {
     const parsed = new URL(url);
+    host = parsed.hostname;
     // Keyed on host AND port, so two daemons on one host are two targets. Not skipped for
     // loopback: nobody runs `connect-http` against their own daemon, so the local address has no
     // entry and this falls through — but if an entry for that exact address DOES exist, it is a
     // deliberate act and honouring it is correct.
-    const peerToken = peerTokenFor(parsed.hostname, Number(parsed.port) || PORT);
+    const peerToken = peerTokenFor(host, Number(parsed.port) || PORT);
     if (peerToken) return peerToken;
-  } catch { /* not a URL we can read — the local token is the only honest guess */ }
+  } catch { /* not a URL we can read — see below: no host, so nothing is dialled from here */ }
+  if (host && !isLocalHostname(host)) throw credentialRefusalError(host);
   return getAuthToken();
+}
+
+// #844 F1 — the refusal itself. `markCommandFailed()` so a caller that prints the message but
+// swallows the throw still cannot exit 0 on it (#835: a zero is what scripts read as "nothing to
+// do"), and the operator-facing half is `credentialRefusalHint` — the same one refusal message
+// every other surface prints, naming `connect-http --token` and `TELEPTY_AUTH_TOKEN`.
+function credentialRefusalError(host) {
+  const error = new Error(
+    `Refusing to send this machine's daemon token to ${host} — no stored credential for that address, `
+    + 'and the local token is not valid there.\n  '
+    + credentialRefusalHint(host)
+  );
+  error.name = 'CredentialRefusalError';
+  error.code = 'NO_TARGET_CREDENTIAL';
+  markCommandFailed();
+  return error;
 }
 
 // #823 — ONE refusal message for every surface, naming the fix. A refusal that tells you how to
@@ -849,7 +881,15 @@ async function resolveSessionTarget(sessionRef, options = {}) {
 // refuses us is RUNNING and owns every live PTY session, so the verdict is `abort` — the
 // caller must fail loudly instead of remediating.
 function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessionsReachable = false } = {}) {
-  if (meta && meta.answered) {
+  // #844: a 404 on `/api/meta` is the one answer that names its own cause — the ROUTE is not
+  // there. It was added 2026-03-12, so a daemon predating it answers 404 for exactly the reason
+  // it answers 200 on `/api/sessions`: it is an OLD daemon, which is the case the sessionsReachable
+  // probe below exists to identify and upgrade. Aborting on it stated a cause this function did
+  // not determine ("running, but not serving"), killed the legacy-upgrade path, and falsified the
+  // release note that a new client against an old daemon works. Scoped to that endpoint on
+  // purpose: 401/403/5xx from it still abort, and a 404 from anywhere else is not this statement.
+  const isMissingMetaRoute = meta && meta.answered && meta.status === 404 && meta.endpoint === '/api/meta';
+  if (meta && meta.answered && !isMissingMetaRoute) {
     return {
       action: 'abort',
       reason: meta.refused ? `daemon-refused:${meta.status}` : `daemon-answered-error:${meta.status}`
@@ -924,7 +964,14 @@ async function deferToSupervisor(options = {}) {
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, pollMs));
     const meta = await getMeta('127.0.0.1');
-    if (meta && meta.version) {
+    // #844: an ANSWER is the supervisor having delivered, whatever the answer says. `getDaemonMeta`
+    // has three consumers; #835 taught waitForDaemonHealth and the legacy probe that a non-200 is
+    // an answer and left this one accepting `meta.version` only. So a daemon that came back and
+    // REFUSED our credentials (401), or an older one with no /api/meta route at all (404), was
+    // reported as "the supervisor did not restore it in time" — and that verdict routes into
+    // cleanupDaemonProcesses() → SIGTERM/SIGKILL against a daemon that is demonstrably alive.
+    // Hand it to the caller and let the policy decide; abort/restart/noop are its call, not ours.
+    if (meta && (meta.version || meta.answered)) {
       clearMarker();
       return meta; // the supervisor delivered — no orphan; caller re-decides on this meta
     }
@@ -1010,6 +1057,10 @@ async function ensureDaemonRunning(options = {}) {
       meta = supervised;
       decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable: true });
       if (decision.action === 'noop') return;
+      // #844: re-deciding can now produce `abort` — the supervisor's daemon answered and declined.
+      // The abort check above ran before this block, so without this line the refusal fell straight
+      // through to the restart banner and doRestart(), i.e. the kill it exists to prevent.
+      if (decision.action === 'abort') throw daemonAnswerError(meta, '127.0.0.1');
     }
   }
 
@@ -2239,9 +2290,18 @@ async function main() {
         // #815: owner claim refused — permanent, so exit instead of reconnecting. Reported on
         // stderr because unlike 4001 this is not a normal lifecycle event: it means this bridge
         // is not the credentialed owner of this id.
+        //
+        // #844: and therefore it must NOT tear the session down on the way out. Unlike the 4001
+        // path above — where this bridge WAS the owner and its stale ownerToken makes the DELETE
+        // self-suppressing under the daemon's #536 guard — a refused claim never received a token
+        // at all (#815 issues one only at first registration), so the DELETE would go out BARE:
+        // nothing for the guard to compare, and the live incumbent destroyed by the one process
+        // the daemon had just told it does not own this id. That is #835's invariant — a refusal
+        // must never authorise a destructive remediation — broken by the refusal's own handler.
+        // The mailbox purge is withheld for the same reason: those deliveries belong to the owner.
         if (isOwnerClaimRefusedClose(code)) {
-          console.error(`\x1b[31m❌ [allow] Owner claim refused for session '${sessionId}' — this bridge does not hold its current credential.\x1b[0m`);
-          if (closeAllowSession()) {
+          console.error(`\x1b[31m❌ [allow] Owner claim refused for session '${sessionId}' — this bridge does not hold its current credential. Leaving the session to its owner.\x1b[0m`);
+          if (closeAllowSession({ destroySession: false })) {
             exitAllowSession(1);
           }
           return;
@@ -2303,7 +2363,11 @@ async function main() {
     let allowSessionClosed = false;
     const allowSignalHandlers = new Map();
 
-    function closeAllowSession() {
+    // #844: `destroySession: false` closes THIS bridge's own resources and nothing else — no
+    // teardown DELETE, no mailbox purge. It is for the one caller that has been told, by the
+    // daemon, that it does not own this id (close 4003): the session and its queued deliveries
+    // belong to somebody else, so neither is ours to discard.
+    function closeAllowSession({ destroySession = true } = {}) {
       if (allowSessionClosed) {
         return false;
       }
@@ -2311,14 +2375,18 @@ async function main() {
       allowSessionClosed = true;
       cleanupTerminal();
       // Purge bridge mailbox on clean exit (undelivered messages are stale)
-      try { bridgeMailbox.purge(bridgeTarget); } catch {}
+      if (destroySession) {
+        try { bridgeMailbox.purge(bridgeTarget); } catch {}
+      }
       process.stdout.write(`\x1b]0;\x07`);
       // BUG-C: carry our owner token so the daemon destroys only on the CURRENT owner's exit;
       // a stale/displaced owner's DELETE (mismatched token) must not tear down the live owner.
-      const deleteUrl = currentOwnerToken
-        ? `${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}?owner_token=${encodeURIComponent(currentOwnerToken)}`
-        : `${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`;
-      fetchWithAuth(deleteUrl, { method: 'DELETE' }).catch(() => {});
+      if (destroySession) {
+        const deleteUrl = currentOwnerToken
+          ? `${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}?owner_token=${encodeURIComponent(currentOwnerToken)}`
+          : `${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`;
+        fetchWithAuth(deleteUrl, { method: 'DELETE' }).catch(() => {});
+      }
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (heartbeatTimer) clearInterval(heartbeatTimer);   // #732
       try {
@@ -4237,4 +4305,6 @@ module.exports = {
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
   formatDaemonStopDiagnostic, // telepty#15: actionable can't-stop-daemon diagnostic (pure)
   restartDaemonGraceful,  // telepty#15: injectable seams for the blocked-restart fail-fast path
+  resolveTargetToken,     // #844 F1: which credential belongs to THIS address — refuses, never assumes
+  fetchWithAuth,          // #844 F1: the wire itself, so a test can assert what would have been sent
 };

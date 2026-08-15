@@ -298,7 +298,9 @@ test('stopDaemon: targets state-file pid + configured-port owner, and NEVER scan
     port: 49999,
     readDaemonState: () => ({ pid: 111 }),
     findPortOwnerPid: (p) => (p === 49999 ? 222 : null),
-    pidMatchesTeleptyCmdline: (pid) => pid === 222, // port owner confirmed as telepty
+    // #844: BOTH sources confirm identity now — the state-file pid is a pid we WROTE, not one we
+    // measured, so `stopDaemon`'s surgical promise has to be checked rather than asserted.
+    pidMatchesTeleptyCmdline: (pid) => pid === 111 || pid === 222,
     isProcessRunning: () => false,
     stopDaemonProcess: (pid) => { killed.push(pid); return true; },
     // If stop ever sweeps the table it MUST go through this seam — assert it does not.

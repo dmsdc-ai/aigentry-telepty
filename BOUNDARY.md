@@ -122,13 +122,26 @@ GUI, and if it ever does need closing the answer is binding health to loopback o
 
 Each node mints its own random token, so a cross-host caller must present the **target's** token.
 It is resolved by address: `TELEPTY_AUTH_TOKEN` → a `peers.json` entry matching that `host:port`
-(written by `telepty connect-http <host> --token <that host's authToken>`) → the local token. The
-last step is deliberate: a *wrong* credential yields a diagnosable 401, while sending none yields an
-ambiguity indistinguishable from an absent endpoint.
+(written by `telepty connect-http <host> --token <that host's authToken>`) → the local token, and
+that third step is reachable **only for this machine** (`isLocalHostname`). A non-local address with
+neither of the first two is REFUSED before the socket opens, with a message naming both fixes.
+
+The refusal replaced an unconditional local-token fallback (#844). The old reasoning was that a
+*wrong* credential yields a diagnosable 401 while sending none yields an ambiguity — true, and
+irrelevant to the actual choice, because the local token is not merely wrong at a peer: it is this
+machine's master credential, and post-#820 it is the whole boundary here. Handing it to an arbitrary
+address is a disclosure, not a diagnostic, and on a tailnet the auto-populated allowlist lets the
+recipient use it against the daemon that sent it. A refusal that names `connect-http --token` costs
+the operator one command; the send cost them the daemon, silently.
 
 What does **not** exist: any discovery, rotation, revocation, or per-peer scoping of those tokens.
 Step 2 only helps an operator who has already run `connect-http --token`, and addressing forms with
-no `peers.json` entry (`<sid>@<tailnet-ip>`, `TELEPTY_HOST`) fall back to the env variable or fail.
+no `peers.json` entry (`<sid>@<tailnet-ip>`, `TELEPTY_HOST`) must use the env variable or are
+refused. Note the consequence worth stating: addressing **your own** daemon by a non-loopback name —
+its tailnet IP, its hostname — is refused as well, because `isLocalHostname` recognises loopback
+literals and nothing else. That is a deliberate false positive. The predicate is a syntactic check on
+the address, and widening it to "any address this host happens to answer on" would make the boundary
+depend on interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the escape hatch.
 This is a named limitation, not a solved problem.
 
 ### `TELEPTY_AUTH_TOKEN` must be set for BOTH ends or neither

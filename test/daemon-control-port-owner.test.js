@@ -22,7 +22,10 @@ test('cleanup: only state-file source → stopped attributed to state-file', () 
     readDaemonState: () => ({ pid: 4242, host: '127.0.0.1', port: 3848, version: '0.3.5' }),
     listDaemonProcesses: () => [],
     findPortOwnerPid: () => null,
-    pidMatchesTeleptyCmdline: () => false,
+    // #844: the state-file source now confirms identity like the other two, so this stub has to
+    // answer for the pid it is asked about. This test is about ATTRIBUTION, not about whether an
+    // unconfirmed pid is killed — that property is asserted in positive-evidence-844.test.js.
+    pidMatchesTeleptyCmdline: (pid) => pid === 4242,
     stopDaemonProcess: killerOk(killed)
   });
 
@@ -130,7 +133,7 @@ test('cleanup: kill failure → entry in failed not stopped', () => {
     readDaemonState: () => ({ pid: 1111 }),
     listDaemonProcesses: () => [],
     findPortOwnerPid: () => null,
-    pidMatchesTeleptyCmdline: () => false,
+    pidMatchesTeleptyCmdline: (pid) => pid === 1111, // #844: the state-file source confirms too
     stopDaemonProcess: () => false
   });
   assert.equal(result.stopped.length, 0);
