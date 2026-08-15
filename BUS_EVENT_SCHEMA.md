@@ -274,8 +274,8 @@ Recorded:
 | door | source | code |
 |------|--------|------|
 | `POST /api/sessions/:id/inject` | `inject` | `daemon.js` inject route |
-| `POST /api/sessions/multicast` | `multicast` | `auditMulticastTarget` |
-| `POST /api/sessions/broadcast` | `broadcast` | `auditMulticastTarget` |
+| `POST /api/sessions/multicast/inject` | `multicast` | `auditMulticastTarget` |
+| `POST /api/sessions/broadcast/inject` | `broadcast` | `auditMulticastTarget` |
 | viewer WS `{type:"input"}` into a **wrapped** session | `ws-viewer` | `authorizeViewerInject` |
 | viewer WS `{type:"input"}` into a **spawned** session | `ws-viewer` | `authorizeViewerInject` (#843; unrecorded before) |
 | bus `turn_request` / `deliberation_route_turn` auto-route | `bus` | `busAutoRoute` (#843; unrecorded before) |
