@@ -427,7 +427,17 @@ test('telepty inject --submit does NOT retry on 500 error', async () => {
       ['inject', '--submit', '--submit-retry', '3', sessionId, 'server-error'],
       { homeDir, port: mock.port }
     );
-    assert.equal(result.code, 0, result.stderr);
+    // #840 CHANGED EXPECTATION (was `code === 0`). This test's subject is the retry budget, and
+    // that is unchanged — one call, no retry. The exit code was the file's boilerplate
+    // `assert.equal(result.code, 0, result.stderr)` reflecting then-current behaviour, not a
+    // stated contract like the 504 arms above (cli.js says in so many words that orchestrator
+    // scripts depend on exit 0 there, and those tests still assert 0).
+    //
+    // A 500 on /submit means the Enter never dispatched: the text is parked in the composer and
+    // no turn fired, with nothing left to fire it. `bin/dispatch.sh` sends every dispatch with
+    // `--submit` and gates on this exit code, so a zero here books an undelivered dispatch as
+    // `write_observed`. Printing "Submit failed" while exiting success is the defect #840 names.
+    assert.notEqual(result.code, 0, result.stderr);
     assert.equal(mock.submitCalls.length, 1);
     assert.match(result.stderr, /Submit failed/);
   } finally {

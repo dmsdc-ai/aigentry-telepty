@@ -22,7 +22,7 @@ const {
 } = require('./daemon-control');
 const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
 const { getRuntimeInfo } = require('./runtime-info');
-const { formatHostLabel, groupSessionsByHost, pickSessionTarget } = require('./session-routing');
+const { formatHostLabel, groupSessionsByHost, parseSessionReference, pickSessionTarget } = require('./session-routing');
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const {
@@ -268,6 +268,27 @@ function credentialRefusalHint(host) {
     + '  or export TELEPTY_AUTH_TOKEN with a token both ends share (the daemon must see it too).';
 }
 
+// #837 — `fetch failed` names nothing. undici's message for every connect-level failure is that
+// one string with no host in it, and this CLI talks to at least three kinds of origin (the local
+// daemon, an HTTP peer, a TELEPTY_HOST target). An operator who reads it on a local write cannot
+// tell the local daemon being down from a socket that died for some other reason — which is
+// exactly how a poisoned local socket got diagnosed as daemon-down and a working peer got parked
+// for a day. Say which origin, and carry the cause code that says why.
+function namedTransportError(url, cause) {
+  let origin = String(url);
+  try { origin = new URL(url).origin; } catch { /* not parseable — naming the raw target still beats naming nothing */ }
+  const code = (cause && (cause.code || (cause.cause && cause.cause.code))) || null;
+  const detail = cause && cause.name === 'TimeoutError'
+    ? 'timed out'
+    : `${(cause && cause.message) || 'unknown error'}${code ? ` (${code})` : ''}`;
+  const error = new Error(`Could not reach ${origin} — ${detail}`);
+  error.name = 'TransportError';
+  error.origin = origin;
+  error.code = code;
+  error.cause = cause;
+  return error;
+}
+
 const fetchWithAuth = (url, options = {}) => {
   const headers = { ...options.headers, 'x-telepty-token': resolveTargetToken(url) };
   // #43 P2 — present the per-session verified-sender token (minted at register, carried in the
@@ -275,7 +296,10 @@ const fetchWithAuth = (url, options = {}) => {
   // record verified_sender_sid. Header only, never the body. Absent for operator/human shells.
   const sessionToken = process.env.TELEPTY_SESSION_TOKEN;
   if (sessionToken) headers['x-telepty-session-token'] = sessionToken;
-  return fetch(url, { ...options, headers });
+  // Wrapped here rather than at the 45 call sites: every one of them either prints `e.message`
+  // or swallows the throw, so this is the single place the origin can be attached without
+  // changing what any caller does with the error.
+  return fetch(url, { ...options, headers }).catch((error) => { throw namedTransportError(url, error); });
 };
 
 function isSubmitForceDefaultEnabled(env = process.env) {
@@ -837,7 +861,57 @@ function isRemoteSession(session) {
   return session.remote === true || (session.host && session.host !== '127.0.0.1' && session.host.includes('@'));
 }
 
+// #837 — resolve against the LOCAL daemon alone, or return null and let the caller fan out.
+//
+// The property this exists to hold: an operation addressed to the LOCAL daemon must never depend
+// on any peer's reachability. `discoverSessions()` fans out to every peer before it answers, and
+// its SSH arm is a SYNCHRONOUS `spawnSync('ssh', …, {timeout: 10000})` — so one unreachable peer
+// blocks the event loop for 10s between the session read and the write that follows it. undici's
+// keep-alive socket to the local daemon is closed by the daemon's idle timeout during that block
+// and undici cannot notice (its timers cannot run either), so the local write reused a dead
+// socket and reported `fetch failed`. That is the whole reported defect: a local write made
+// undiagnosable by a peer it never needed to ask.
+//
+// Hardening the socket would not have been the fix. The 10s wait is itself the dependency, and a
+// local session's address does not become more or less true because some other machine is down.
+//
+// Deliberately conservative — this only SHORT-CIRCUITS, it never decides a failure:
+//   • TELEPTY_HOST pointed elsewhere means the operation is not addressed here at all.
+//   • `<id>@<host>` naming a non-local host is the operator addressing a peer explicitly.
+//   • anything other than a hit (unreachable, refused, non-list, no match) returns null, so
+//     `discoverSessions()` remains the single authority on classifying those — including #835's
+//     rule that a refusing daemon must fail the command rather than shrink the list.
+// The cost is one extra local round-trip (~2ms, measured) on the miss path, where the fan-out
+// that follows dwarfs it.
+async function resolveLocalSessionTarget(sessionRef) {
+  if (REMOTE_HOST !== '127.0.0.1') return null;
+  const parsed = parseSessionReference(sessionRef);
+  if (!parsed.id) return null;
+  if (parsed.host && !isLocalHostname(parsed.host)) return null;
+
+  let sessions;
+  try {
+    const res = await fetchWithAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
+      signal: AbortSignal.timeout(1500)
+    });
+    if (!res.ok) return null;
+    sessions = await res.json();
+  } catch { return null; }
+  if (!Array.isArray(sessions)) return null;
+
+  // The same matcher discovery uses, over the local list only — so exact ids AND the project
+  // prefix fallback both resolve here, and a local session never reaches the fan-out by having
+  // been spelled shorter. The list is one daemon's, so the multi-host arm cannot fire.
+  return pickSessionTarget(parsed.id, sessions.map((s) => ({ host: '127.0.0.1', ...s })), '127.0.0.1');
+}
+
 async function resolveSessionTarget(sessionRef, options = {}) {
+  if (!options.sessions) {
+    // #837: a hit here means no peer was consulted. A caller that already did its own discovery
+    // (and paid for the fan-out) passes `sessions` and keeps its list as the authority.
+    const local = await resolveLocalSessionTarget(sessionRef);
+    if (local) return local;
+  }
   const sessions = options.sessions || await discoverSessions({ silent: true });
   const target = pickSessionTarget(sessionRef, sessions, REMOTE_HOST);
   // When <id>@<peerName> uses an SSH peer alias (e.g. `winserver`) and the
@@ -2841,6 +2915,7 @@ async function main() {
           if (result.inject_id) console.log(`   inject_id: ${result.inject_id}`);
         } else {
           console.error(`❌ ${result.error}`);
+          markCommandFailed(); // #840: the SSH hop reported the delivery did not happen
         }
         return;
       }
@@ -2862,7 +2937,12 @@ async function main() {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
+      // #840: the route answers non-2xx only on `success: false` — 403 blocked, 409 modal
+      // rejection, 410 stale, 500/502/503/504 delivery. Every one of them is a delivery that did
+      // not happen, and until now every one of them exited 0. A PARKED delivery is not among
+      // them: `queued` answers 200 (#860), so it keeps the success path and exit 0 — it was
+      // accepted, and a caller that retried it would double-deliver.
+      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); markCommandFailed(); return; }
       const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
       console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'.${refSuffix}`);
       // #60 Stage A: SURFACE THE TRANSPORT inject_id.
@@ -2914,6 +2994,10 @@ async function main() {
         }
         if (lastError) {
           console.error(`⚠️  Submit failed: ${lastError.message}`);
+          // #840: the text landed but no turn fired, and nothing else will fire it. The caller
+          // cannot claim this dispatch was delivered — dispatch.sh's non-zero arm records the
+          // transport result as `unknown`, which is exactly the honest word for it.
+          markCommandFailed();
         } else if (submitRes && submitRes.ok) {
           const gateNote = submitData.gated && submitData.gate_wait_ms > 0
             ? ` [gate ${submitData.gate_wait_ms}ms]`
@@ -2942,6 +3026,13 @@ async function main() {
           // Soft failure: REPL never readied. Orchestrator scripts depend on
           // exit 0 here — surface a clear remediation hint but do not exit
           // non-zero.
+          //
+          // #840 re-affirms this as a DELIBERATE zero rather than an oversight, and it is the
+          // one 5xx on this path that keeps its zero. Two measured reasons: the gate timing out
+          // is not the delivery failing (the daemon may still dispatch afterwards, which is what
+          // `gated_dispatch_after_timeout` reports), and `bin/dispatch.sh` sends every dispatch
+          // with `--submit --submit-retry 2` and gates on this exit code — making it non-zero
+          // would fail every gated dispatch in the ecosystem for a delivery that landed.
           const reason = (submitData && submitData.reason) || 'gate_timeout';
           const lastState = (submitData && submitData.last_state) || 'unknown';
           const daemonAttempts = submitData && Number.isFinite(Number(submitData.attempts)) ? Number(submitData.attempts) : attemptsMade;
@@ -2952,9 +3043,13 @@ async function main() {
           console.log(`⚠️  Submit gated-timeout (${reason}, last_state=${lastState})${retriesNote}.${hint}`);
         } else {
           console.error(`⚠️  Submit failed: ${formatApiError(submitData)}`);
+          markCommandFailed(); // #840: not the 504 above — this arm has no dispatch-after-timeout
         }
       }
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+      // #840: a transport failure here is the arm the operator actually hit — `fetch failed`
+      // printed, exit 0, so `$?` said the dispatch landed. The origin is named by
+      // namedTransportError (#837); the exit code is what a script can read.
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); markCommandFailed(); }
     return;
   }
 
