@@ -273,10 +273,35 @@ four; the next named six; a third confirmed those six and corrected two of the r
 
 Read it with three limits in mind:
 
-- **`delivery_result` says what was measured.** `success` (HTTP and bus paths) means the daemon's
-  delivery machinery reported success. `forwarded` (`ws-viewer`) means only that the frame was handed
-  to the delivery adapter — the owner socket for a wrapped session, `ptyProcess` for a spawned one.
-  They are different measurements and deliberately do not share a word.
+- **`delivery_result` says what was measured.** `success` (the `inject`, `multicast`, `broadcast`
+  and `bus` doors) means the daemon's delivery machinery reported success. `forwarded` (`ws-viewer`)
+  means only that the frame was handed to the delivery adapter — the owner socket for a wrapped
+  session, `ptyProcess` for a spawned one. `queued` (#860; the same four doors as `success`) means
+  the delivery was **accepted and parked** on the session's `bootstrapQueue` — one FIFO serving both
+  the bootstrap gate and the surface-modal park — with zero bytes written. Two further shapes carry
+  a reason after a colon: `blocked:<reason>`, written when the #533 peer-lane guard refused the
+  payload before any write (`inject`, `multicast`, `broadcast`, `ws-viewer`), and `failed:<code>`,
+  written when a delivery was attempted and did not land.
+
+  Five shapes, then, not two — and they are different measurements that deliberately do not share a
+  word. `queued` in particular is not `success` under a softer name: before #860 a parked op *was*
+  written as `success`, which is how a delivery of zero bytes came to be recorded as a delivery.
+  Keyed on the strategy as well as the flag, because the mailbox path also reports `queued` for a
+  body it has already written synchronously, and that one is a write.
+
+- **A `queued` line is closed out for one door, and for three it is the last word.** On the
+  single-target `POST /api/sessions/:id/inject` — and only when the request carried a `from` —
+  `beginTrackedInjection` opens a record in `~/.config/aigentry-telepty/tracked-injections.json`,
+  and the park and its outcome land there: `inject_parked` when it parks, then
+  `inject_delivery_refused` or `inject_delivery_dropped` if the queue never delivers it. So for that
+  door, whether the bytes were ever written is answered by the observation ledger rather than here.
+
+  **The `multicast`, `broadcast` and `bus` doors open no such record.** `beginTrackedInjection` has
+  exactly one caller; those three routes deliver without an inject id, so `parkTrackedInjection`
+  no-ops and nothing is ever appended for them. Their `queued` line is the last thing written about
+  that delivery, and the question this log defers is, for them, deferred to nothing. Read `queued`
+  on a fan-out or bus line as *accepted, zero bytes, outcome unrecorded* — not as a pointer to an
+  answer kept elsewhere.
 - **`claimed_from` is a claim; `verified_sender_sid` is the measurement.** Wherever a line carries a
   verified half it comes from the `x-telepty-session-token` bearer (#815) — the request header on
   the HTTP doors, the handshake header on the `ws-viewer` door — and never from the message body or
