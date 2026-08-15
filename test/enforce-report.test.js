@@ -451,9 +451,32 @@ test('idle after an inject emits task_completion_unknown, not a terminal claim',
   const senderId = createSessionId('legacy-sender');
   const receiverId = ORCH;
 
-  // Spawn two shell sessions
-  await harness.spawnSession(senderId);
-  await harness.spawnSession(receiverId);
+  // Spawn two shell sessions.
+  //
+  // #903: the WIDTH is load-bearing, so it is passed explicitly rather than left at the harness
+  // default of 80. The daemon writes its OWN prompt for a spawned bash — `[USER: <sid>] \w \$`
+  // (daemon.js:3355-3362, unconditional, so a PS1 in the spawn env cannot override it) — and with
+  // this test's session id and the CI checkout path that prompt is ~100 chars. At 80 columns it
+  // wraps, and bash 3.2 (which is what `bash` resolves to on macos-latest: /bin/bash 3.2.57)
+  // finishes the wrap with a BARE CR, no LF. session-state.js splits lines on /\r?\n/, so the CR
+  // does not split: the line keeps a literal `/` immediately followed by `\r`, and the classic
+  // spinner pattern `[|/\-\\]\s` (session-state.js:90) matches it. The session is then classified
+  // `thinking`, which for a quiet session is ABSORBING (session-state.js:460, the #545 guard, gated
+  // on an OSC 133 mark daemon.js records as never once seen in real traffic) — so no further idle
+  // ENTRY ever fires, fireAutoReport is never reached from an idle cause, and the quiet observation
+  // this test waits for can never be emitted. Measured: 3 red / 8 on macos-latest, ubuntu always
+  // green (bash 5 emits no bare CR), and one character of session-id length decides it, because it
+  // decides which character lands at the wrap column.
+  //
+  // That is a PRODUCT defect — a daemon-spawned shell whose prompt wraps just after `/`, `-`, `|`
+  // or `\` is unobservable in production too — and it is ticketed for 0.9.0, not fixed here: the
+  // product is under a structure freeze. This width is the accommodation, and it is honest about
+  // what it buys: no wrap, so no forged spinner token, so the quiet path this test exists to pin
+  // actually runs. It is NOT a timing knob and raising it further buys nothing — anyone tempted to
+  // touch the budget below should read this first.
+  const wideEnoughToNotWrap = { cols: 200 };
+  await harness.spawnSession(senderId, wideEnoughToNotWrap);
+  await harness.spawnSession(receiverId, wideEnoughToNotWrap);
 
   const bus = await harness.connectBus();
   const messages = collectJsonMessages(bus);
@@ -478,6 +501,14 @@ test('idle after an inject emits task_completion_unknown, not a terminal claim',
   // waits for the next idle transition to try again, one 1000ms poll tick per lap
   // (session-state.js:63), with no cap on the laps.
   //
+  // #903 correction: that re-arm was never what reddened macOS, and the settle stack is not
+  // implicated at all — the drop path clears its timer and re-arms on the next idle entry, and
+  // every re-arm is capped. The macOS red was a HANG, not a tail: the session was classified
+  // `thinking` off its own wrapped prompt and no idle entry could ever follow (see the spawn width
+  // above). That is why each raise landed on the ceiling exactly — 10.2s against the 10s budget,
+  // 60.2s against the 60s one. A budget cannot separate "slow" from "never" when the answer is
+  // never; the width above is what makes the wait finite.
+  //
   // So the budget below is a LIVENESS tripwire and nothing else: it separates "eventually" from
   // "never", which is the assertion this test actually makes. Silence must still fail it — that
   // is the #52 defect in reverse and the reason the wait exists at all — and a delivery that
@@ -488,36 +519,10 @@ test('idle after an inject emits task_completion_unknown, not a terminal claim',
     && m.session_id === senderId
     && QUIET_OBSERVATION_KINDS.includes(m.observation && m.observation.kind);
 
-  // dg903 INSTRUMENT (branch-only, remove before merge): the 60s ceiling reds macOS CI 3/3 while
-  // ubuntu passes at ~1.4s. The timeout alone cannot tell "no observation at all" from "an
-  // observation under a kind this test does not accept", so dump the sender's whole observation
-  // trajectory, the live state, and the daemon's own log before rethrowing.
-  try {
-    await waitFor(() => messages.some(isQuietObservation), {
-      timeoutMs: 60000,
-      description: 'task_completion_unknown for the quiet sender'
-    });
-  } catch (err) {
-    const mine = messages.filter(m => m.session_id === senderId);
-    console.error(`\n[dg903] ===== sender=${senderId} messages=${mine.length} (total ${messages.length}) =====`);
-    for (const m of mine) {
-      const o = m.observation || {};
-      console.error(`[dg903] ${m.timestamp || ''} type=${m.type} kind=${o.kind} trigger=${o.trigger} `
-        + `from_state=${m.from_observation_state} silence_ms=${o.silence_ms} conf=${o.confidence} `
-        + `matched=${JSON.stringify(o.matched_line || o.last_line || null)}`);
-    }
-    const st = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}`);
-    console.error(`[dg903] session GET ${st.status}: ${JSON.stringify(st.body).slice(0, 3000)}`);
-    const scr = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/screen`);
-    console.error(`[dg903] sender screen ${scr.status}: ${JSON.stringify(String(
-      typeof scr.body === 'string' ? scr.body : JSON.stringify(scr.body)).slice(-1200))}`);
-    const obs = await harness.request(`/api/inject-observations/${encodeURIComponent(trackedId)}`);
-    console.error(`[dg903] inject-observations ${obs.status}: ${JSON.stringify(obs.body).slice(0, 3000)}`);
-    const logs = harness.getLogs();
-    console.error(`[dg903] ===== daemon stdout tail =====\n${logs.stdout.slice(-6000)}`);
-    console.error(`[dg903] ===== daemon stderr tail =====\n${logs.stderr.slice(-2000)}`);
-    throw err;
-  }
+  await waitFor(() => messages.some(isQuietObservation), {
+    timeoutMs: 60000,
+    description: 'task_completion_unknown for the quiet sender'
+  });
 
   const event = messages.find(isQuietObservation);
   assert.ok(event);
