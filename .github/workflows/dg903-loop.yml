@@ -15,6 +15,7 @@ on:
 
 jobs:
   single-file:
+    if: ${{ false }} # answered: 3/3 green on macos-latest — the red needs the parallel suite
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +43,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest]
-        rep: [1, 2]
+        rep: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:

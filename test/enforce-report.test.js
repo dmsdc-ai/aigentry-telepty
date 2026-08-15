@@ -508,6 +508,9 @@ test('idle after an inject emits task_completion_unknown, not a terminal claim',
     }
     const st = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}`);
     console.error(`[dg903] session GET ${st.status}: ${JSON.stringify(st.body).slice(0, 3000)}`);
+    const scr = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}/screen`);
+    console.error(`[dg903] sender screen ${scr.status}: ${JSON.stringify(String(
+      typeof scr.body === 'string' ? scr.body : JSON.stringify(scr.body)).slice(-1200))}`);
     const obs = await harness.request(`/api/inject-observations/${encodeURIComponent(trackedId)}`);
     console.error(`[dg903] inject-observations ${obs.status}: ${JSON.stringify(obs.body).slice(0, 3000)}`);
     const logs = harness.getLogs();
