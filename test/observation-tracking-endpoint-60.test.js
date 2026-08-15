@@ -268,10 +268,39 @@ test('dead_reports_absence_to_source: a process exit is reported as absence, and
 
     // …and the SOURCE is told, in the literal absence text. The old dead branch only broadcast on
     // the bus, so an orchestrator that was not subscribed learned nothing at all.
-    const screen = await daemon.request(`/api/sessions/${encodeURIComponent(source)}/screen`);
-    const text = typeof screen.body === 'string' ? screen.body : JSON.stringify(screen.body);
-    assert.ok(text.includes('TASK_COMPLETION_UNKNOWN'),
-      'expected the source to receive a completion-absence notification for the dead worker');
+    //
+    // #878: WAIT for the text — the ledger append and the source delivery are not one event.
+    // recordObservation commits the observation synchronously and only THEN calls
+    // deliverInjectionToSession, without awaiting it (daemon.js:922-929); the bytes still have a
+    // mailbox tick, a PTY write and bash's echo ahead of them. The poll above therefore returns
+    // while the delivery is in flight, and a single read here asserts on whichever side of that
+    // gap the runner lands on — green on a fast box, red on a loaded 3-core macOS runner.
+    const readSourceScreen = async () => {
+      const screen = await daemon.request(`/api/sessions/${encodeURIComponent(source)}/screen`);
+      return typeof screen.body === 'string' ? screen.body : JSON.stringify(screen.body);
+    };
+    // --- #878 TEMPORARY INSTRUMENT — removed once the macOS measurement is in hand ------------
+    const tObserved = Date.now();
+    const firstReadHasNotice = (await readSourceScreen()).includes('TASK_COMPLETION_UNKNOWN');
+    let text;
+    try {
+      text = await daemon.waitFor(async () => {
+        const t = await readSourceScreen();
+        return t.includes('TASK_COMPLETION_UNKNOWN') ? t : null;
+      }, {
+        timeoutMs: 10000,
+        intervalMs: 25,
+        description: 'the source to receive a completion-absence notification for the dead worker',
+      });
+    } catch (err) {
+      const log = daemon.getLogs().stdout.split('\n').filter((l) => /OBSERVE|MAILBOX|INJECT|EXIT/.test(l));
+      console.log(`[PROBE878] NEVER ARRIVED platform=${process.platform} daemon_log=${JSON.stringify(log.slice(-15))}`);
+      console.log(`[PROBE878] screen_tail=${JSON.stringify((await readSourceScreen()).slice(-400))}`);
+      throw err;
+    }
+    console.log(`[PROBE878] platform=${process.platform} first_read_has_notice=${firstReadHasNotice}`
+      + ` arrived_after_ms=${Date.now() - tObserved}`);
+    // --- end instrument -----------------------------------------------------------------------
     assert.ok(!/\bTASK_COMPLETE\b|\bTASK_ERROR\b/.test(text),
       'the source must never be told the task completed or failed — neither was measured');
   })();
