@@ -37,7 +37,7 @@ const T0 = 1_700_000_000_000; // fixed clock origin
 // have been processed — also unmeasurable) are both gone, along with the elapsed-time floor that
 // used to pick between them.
 const COMPLETION_UNKNOWN_RE =
-  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-48 — no completion fact observed; (\S+)=(\d+\.\d)s; consumption=(observed|not_established); outcome protocol unavailable$/;
+  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-48 — no completion fact observed; (\S+?)(?:=(\d+\.\d)s)?(?:; elapsed_since_inject=(\d+\.\d)s)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
 const REMOVED_LABELS = [/TASK_COMPLETE:/, /TASK_IDLE_UNCONFIRMED:/, /TASK_COMPLETE_WITH_REPORT/];
 
@@ -52,7 +52,10 @@ function assertStatesAbsence(msg) {
   const m = COMPLETION_UNKNOWN_RE.exec(msg);
   assert.ok(m, `not the literal absence statement: ${msg}`);
   for (const re of REMOVED_LABELS) assert.doesNotMatch(msg, re);
-  return { kind: m[1], seconds: Number(m[2]), consumption: m[3] };
+  // #843: the kind's OWN measurement and the elapsed-since-inject qualifier are separate
+  // segments now. They were one — whichever was present filled `<kind>=<n>s` — so a 3s quiet
+  // 900s into a dispatch printed as `pty_quiet=900.0s`.
+  return { kind: m[1], seconds: Number(m[2]), elapsedSeconds: Number(m[3]), consumption: m[4] };
 }
 
 function completionUnknownEvent(ctx) {
@@ -171,7 +174,8 @@ test('#48 never-false-complete: elapsed crossing the floor during settle cannot 
   const extra = completionUnknownEvent(ctx);
   // Non-vacuous: elapsed really did cross the old floor — that is the exact input that used to
   // flip the verdict — and it is carried as evidence while claiming nothing.
-  assert.ok(stated.seconds >= 5, `expected elapsed past the old floor, got ${stated.seconds}s`);
+  assert.ok(stated.elapsedSeconds >= 5,
+    `expected elapsed past the old floor, got ${stated.elapsedSeconds}s`);
   assert.ok(extra.observation.elapsed_ms >= 5000);
 });
 
@@ -263,7 +267,7 @@ after(async () => {
 // Register a wrapped codex-like session, connect its owner bridge, and pass bootstrap.
 async function bootWrappedSession(sessionId) {
   await harness.registerSession(sessionId, { command: 'codex', backend: 'pty' });
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   ownerWs.send(JSON.stringify({ type: 'ready' }));
   await waitFor(async () => {
     const detail = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);

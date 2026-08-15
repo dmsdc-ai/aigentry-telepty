@@ -15,7 +15,8 @@
 //   const sm = new SessionStateMachine(sessionId, config);
 //   sm.feed(data);              // call on every PTY output chunk
 //   sm.markStarting();          // daemon: PTY spawn initiated
-//   sm.markDead(exitCode);      // daemon: PTY exited
+//   sm.markDead(exitCode);      // daemon: PTY exit OBSERVED (onExit fired)
+//   sm.markTerminationRequested(reason[, killError]);  // daemon: teardown asked for, no exit seen
 //   sm.markRestarting();        // daemon: auto-restart triggered
 //   sm.getState();              // → { state, since, confidence, last_output_preview, detail }
 //   sm.onTransition(callback);  // (from, to, detail) => {}
@@ -289,11 +290,39 @@ class SessionStateMachine {
     this._transition(STATES.STARTING, 1.0, { trigger: 'lifecycle_starting' });
   }
 
+  // #843 A — markDead is for an OBSERVED exit and nothing else. Its caller is the PTY's `onExit`
+  // (daemon.js), so the exit event is in hand at this instant; `exit_observed_at` records that,
+  // and the external row REQUIRES it. Exit code and signal are still allowed to be null — a
+  // signal-killed child has no code and a code-exited child has no signal — so the evidence the
+  // name rests on has to be the observation itself, not either of its two optional halves.
   markDead(exitCode, signal) {
     this._transition(STATES.DEAD, 1.0, {
       trigger: 'process_exit',
+      exit_observed_at: new Date().toISOString(),
       exit_code: exitCode ?? null,
       signal: signal ?? null,
+    });
+  }
+
+  // #843 A — an operator asked for a teardown and NO exit status was observed.
+  //
+  // This entrance used to route through markDead(), which hardcodes `trigger: 'process_exit'` and
+  // maps to the external kind `session_process_exited`. The DELETE path was careful to leave exit
+  // code and signal null precisely because it had not measured them — and then wore a name
+  // asserting the exact thing it knew it had not seen. The fields were honest; the name was the
+  // overclaim. The state is still DEAD: the record is going away and the machine is unregistered
+  // straight after, so what the session is doing genuinely stops being observable here. It is the
+  // CAUSE that had to stop lying, not the state.
+  //
+  // `killError` present = the kill call itself threw. That is a materially different and more
+  // dangerous fact than "we asked": the process may still be running and it is now untracked, so
+  // it gets its own name rather than a field on the calmer one.
+  markTerminationRequested(reason, killError) {
+    this._transition(STATES.DEAD, 1.0, {
+      trigger: killError ? 'termination_kill_failed' : 'termination_requested',
+      reason: reason || 'unspecified',
+      requested_at: new Date().toISOString(),
+      ...(killError ? { kill_error: String(killError) } : {}),
     });
   }
 
@@ -595,6 +624,14 @@ class SessionStateManager {
   }
 
   /**
+   * Mark a session as ended because a teardown was REQUESTED — no exit status observed (#843).
+   */
+  markTerminationRequested(sessionId, reason, killError) {
+    const sm = this._machines.get(sessionId);
+    if (sm) sm.markTerminationRequested(reason, killError);
+  }
+
+  /**
    * Mark a session as restarting (auto-restart triggered).
    */
   markRestarting(sessionId) {
@@ -682,11 +719,27 @@ const OBSERVATION_CAUSES = Object.freeze({
   repeated_error_pattern:            { kind: 'repeated_error_pattern_observed',         destinations: ['error'],               requires: ['error_fingerprint', 'repeat_count', 'window_ms'] },
   thinking_timeout:                  { kind: 'thinking_classification_timeout_observed', destinations: ['error'],             requires: ['thinking_duration_ms'] },
   lifecycle_restarting:              { kind: 'session_restart_mark_observed',           destinations: ['restarting'],          requires: [] },
-  process_exit:                      { kind: 'session_process_exited',                  destinations: ['dead'],                requires: [] },
+  // #843 A — `session_process_exited` is reserved for an OBSERVED child/bridge exit, and the row
+  // now REQUIRES the evidence that says so. It used to sit at `requires: []`, which is what let
+  // two entrances that observed no exit at all wear it: an operator DELETE and the close of a
+  // socket the daemon itself sent. An empty `requires` on the strongest name in the table is not a
+  // relaxation, it is a hole — the whole mechanism of this file is that a name cannot be stated
+  // without the measurement it is made of.
+  process_exit:                      { kind: 'session_process_exited',                  destinations: ['dead'],                requires: ['exit_observed_at'] },
+  // The two DELETE outcomes. Distinct facts, distinct names: one says the daemon was asked to end
+  // a session and did not watch it die, the other says the kill call failed and the process may
+  // still be alive with nothing tracking it.
+  termination_requested:             { kind: 'session_termination_requested',           destinations: ['dead'],                requires: ['reason', 'requested_at'] },
+  termination_kill_failed:           { kind: 'session_termination_kill_failed',         destinations: ['dead'],                requires: ['reason', 'kill_error'] },
   // #815 owner lifecycle, consumed by Stage A as lifecycle facts only (§3 "Stage A consumption
   // of #815 owner lifecycle"). Neither is a task outcome.
   owner_epoch_replaced:              { kind: 'owner_replaced_observed',                 destinations: ['*'],                   requires: ['displaced_session_epoch'] },
-  owner_process_exited:              { kind: 'session_process_exited',                  destinations: ['*'],                   requires: [] },
+  // #843 A — a displaced owner's SOCKET closed. The daemon initiated that close itself (close
+  // 4001, src/transport/websocket.js), so reporting it as a process exit asserted a child death
+  // nobody observed; the displaced bridge usually does exit, but "usually" is not a measurement.
+  // BUS_EVENT_SCHEMA.md already said this correctly for `session_owner_replaced` — the code was
+  // contradicting the repo's own documentation.
+  owner_transport_detached:          { kind: 'owner_transport_detached',                destinations: ['*'],                   requires: ['detached_at'] },
   // §3.7 — qualified bridge readiness. DELIVERY-readiness hints only: they say a surface looks
   // ready to receive an inject, never that a turn ended. The unqualified legacy frame keeps its
   // own name so a 0.7.1 bridge's `{type:"ready"}` cannot borrow the qualified ones' meaning.
@@ -713,6 +766,11 @@ const OBSERVATION_DISPLAY = Object.freeze({
   thinking_classification_timeout_observed:{ emoji: '⏱',  color: '\x1b[33m', tone: 'attention' },
   session_restart_mark_observed:           { emoji: '🔄', color: '\x1b[33m', tone: 'pending' },
   session_process_exited:                  { emoji: '☠️', color: '\x1b[90m', tone: 'error' },
+  // #843 — a requested teardown is not a witnessed death, and a kill that threw is worse than
+  // either. Three measurements, three presentations; none of them green, same as every row here.
+  session_termination_requested:           { emoji: '⏹',  color: '\x1b[90m', tone: 'attention' },
+  session_termination_kill_failed:         { emoji: '⚠',  color: '\x1b[31m', tone: 'error' },
+  owner_transport_detached:                { emoji: '⇹',  color: '\x1b[33m', tone: 'attention' },
   owner_replaced_observed:                 { emoji: '⇄',  color: '\x1b[33m', tone: 'attention' },
   unmapped_transition_cause:               { emoji: '?',  color: '\x1b[37m', tone: 'neutral' },
 });

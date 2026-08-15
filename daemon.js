@@ -41,13 +41,6 @@ const { mintSessionNonce, applyProvenance } = require('./src/audit/provenance');
 // of 401s with no cause anywhere. `console.warn` in whichever process read the file does not
 // reach that operator; refusing to serve, with the reason on stderr where the service log keeps
 // it, does. Same shape as the loadTeleptyConfig() guard further down.
-let config;
-try {
-  config = getConfig();
-} catch (err) {
-  console.error(`[AUTH] Failed to load telepty auth config: ${err.message}`);
-  process.exit(1);
-}
 // #823 — env-then-file, and the CLI (`cli.js getAuthToken`) plus the MCP server resolve it in the
 // SAME order, so an operator cannot end up with one end reading the env and the other the file.
 // Deliberately resolved HERE rather than inside `auth.js getConfig()`: getConfig() is also the
@@ -58,7 +51,29 @@ try {
 // PATH, so an operator who exports this in a shell but not for the daemon gets 401s. That is the
 // documented hazard (BOUNDARY.md), not an accident to paper over. The value is still FROZEN at
 // module load — see the note above; rotation is an explicit restart, by design.
-const EXPECTED_TOKEN = process.env.TELEPTY_AUTH_TOKEN || config.authToken;
+//
+// #843 C — resolved BEFORE `getConfig()`, and short-circuiting it. It used to be read eleven
+// lines below a getConfig() whose failure is `process.exit(1)`, so "env then file" was true of
+// the CLI and the MCP server and false of the daemon: with a corrupt config and a valid env
+// token, the clients worked and the daemon died before reaching the check. That is exactly the
+// state an operator is in while recovering from the corruption #835's fail-closed refusal
+// reports — the documented escape hatch was unusable at the one end that most needed it. Two
+// individually-correct changes (fail closed on an unreadable secret; honour the override)
+// composing into a wrong whole.
+//
+// With the secret supplied out-of-band the token file is not read AT ALL, so it cannot refuse.
+// Without it, nothing changes: the refusal below still stands, exactly as #835 wrote it.
+const ENV_AUTH_TOKEN = process.env.TELEPTY_AUTH_TOKEN || null;
+let config = null;
+if (!ENV_AUTH_TOKEN) {
+  try {
+    config = getConfig();
+  } catch (err) {
+    console.error(`[AUTH] Failed to load telepty auth config: ${err.message}`);
+    process.exit(1);
+  }
+}
+const EXPECTED_TOKEN = ENV_AUTH_TOKEN || config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
 const net = require('net');
 const fs = require('fs');
@@ -208,7 +223,11 @@ sessionStateManager.onTransition((sessionId, from, to, detail) => {
     // after the process is gone still gets a named observation instead of a 404.
     delete pendingReports[sessionId];
     return recordObservation({
-      sessionId, session, pendingReport, destination: 'dead', cause: cause || 'process_exit',
+      // #843 — no `|| 'process_exit'` fallback. A transition that arrived at `dead` without a
+      // measured cause is not evidence of a process exit; substituting the strongest name in the
+      // table for a missing measurement is the defect this release removes, in one line. With no
+      // cause the mapper fails closed to `unmapped_transition_cause`, which is the honest answer.
+      sessionId, session, pendingReport, destination: 'dead', cause,
       evidence: { ...evidence, auto_summary: buildAutoSummaryWithDefaults(session) },
       deliverToSource: true, trigger: 'transition',
     });
@@ -591,7 +610,19 @@ function beginTrackedInjection({ injectId, sessionId, source, session }) {
     observation_seq: 0,
     observations: [],
     last_observation: null,
-    capability: { ...CAPABILITY_STAGE_A },
+    // #843 — the capability block must not contradict the record it is stamped on.
+    // `CAPABILITY_STAGE_A` is frozen with `session_authentication_reason: 'no_815_epoch_fact'` and
+    // was spread onto EVERY record, including records whose own `session_epoch` two lines up holds
+    // the epoch the session PROVED on its #815 handshake. One response body then carried both the
+    // epoch and a reason denying any epoch fact was measured, leaving a reader to pick which half
+    // of one object to believe. §A4 requires gaps to be explicit; it does not license reporting a
+    // gap that was measured shut.
+    capability: {
+      ...CAPABILITY_STAGE_A,
+      ...(session && session.sessionEpoch
+        ? { session_authentication: 'observed', session_authentication_reason: null }
+        : {}),
+    },
     tracking_state: 'tracked',
   };
   trackedInjections.injections[injectId] = record;
@@ -606,6 +637,43 @@ function beginTrackedInjection({ injectId, sessionId, source, session }) {
   trackedLedgerHealthy = true;
   trackedLedgerUnavailableReason = null;
   return { ok: true, record };
+}
+
+/**
+ * #843 — the write-ahead record's ABORT. The record is opened before the bytes are handed over
+ * (§3 item 1) because a delivered task no record answers for is silence. It had no way back: when
+ * the delivery was then REFUSED, the ledger kept `tracking_state:"tracked"` with `inject_accepted`
+ * forever and an orchestrator polling it saw a dispatch that looks in flight and will never move.
+ *
+ * The daemon measured that zero bytes were written — it returned that measurement to the HTTP
+ * caller as a 503 — and then discarded it everywhere else. Recording it is the same rule the rest
+ * of this release follows: state what was measured, including when the measurement is a negative.
+ *
+ * Returns a named result, never undefined.
+ */
+function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError) {
+  const record = getTrackedInjection(injectId);
+  if (!record) return 'tracking_unavailable';
+  record.tracking_state = 'aborted';
+  sessionPersistence.appendLedgerObservation(record, {
+    kind: 'inject_delivery_refused',
+    trigger: 'delivery_refused',
+    delivery_code: deliveryCode || 'DELIVERY_FAILED',
+    delivery_error: deliveryError || null,
+    bytes_written: 0,
+  }, new Date().toISOString());
+  // The pending entry goes too. It is what makes the session look like it is awaiting a turn, and
+  // it belongs to an inject whose bytes were never delivered — every later observation on this
+  // session would otherwise be filed against it.
+  if (sessionId && pendingReports[sessionId] && pendingReports[sessionId].injectId === injectId) {
+    delete pendingReports[sessionId];
+  }
+  const committed = commitTrackedInjections();
+  if (!committed.ok) {
+    console.error(`[OBSERVE] abort commit FAILED for ${injectId} (${committed.reason})`);
+    return 'tracking_persistence_failed';
+  }
+  return 'tracking_aborted';
 }
 
 // Observation identity. Dedup is keyed on WHAT WAS MEASURED, not on a one-way "already notified"
@@ -685,11 +753,35 @@ function recordObservation({
     if (record.last_observation && observationIdentity(record.last_observation.kind, record.last_observation.trigger) === identity) {
       result = 'observation_duplicate';
     } else {
+      // #843 — snapshot BEFORE the in-memory append, because the append is speculative until the
+      // commit lands. Two defects rode on its absence, and they compounded:
+      //   1. the failed-commit branch below used to `return` HERE, ahead of the broadcast, so a
+      //      store that could not be written emitted NOTHING — no bus event, no source delivery.
+      //      That is §A2 ("absence is emitted, never silence") violated inside the emitter written
+      //      to enforce §A2, on the one condition an operator most needs to hear about;
+      //   2. `appendLedgerObservation` had already moved `last_observation`, so the identity dedup
+      //      then suppressed every RETRY of that same measurement as a duplicate of an append that
+      //      never reached disk. The first attempt was silent and it silenced all the rest.
+      // The rollback is what makes the retry meaningful; falling through to the broadcast is what
+      // makes the failure audible. Neither alone is enough.
+      const priorSeq = record.observation_seq;
+      const priorLast = record.last_observation;
+      const priorObservations = Array.isArray(record.observations) ? record.observations.slice() : [];
+      const priorCapability = record.capability;
       sessionPersistence.appendLedgerObservation(record, { ...observation, consumption_status: consumption.status }, nowIso);
       record.capability = { ...CAPABILITY_STAGE_A, ...(record.capability || {}) };
       const committed = commitTrackedInjections();
-      if (!committed.ok) return 'tracking_persistence_failed';
-      if (record.tracking_state === 'superseded') result = 'tracking_superseded';
+      if (!committed.ok) {
+        record.observation_seq = priorSeq;
+        record.last_observation = priorLast;
+        record.observations = priorObservations;
+        record.capability = priorCapability;
+        result = 'tracking_persistence_failed';
+        console.error(`[OBSERVE] ledger commit FAILED for ${injectId} (${committed.reason}) — `
+          + `${observation.kind} was emitted on the bus but is NOT durable`);
+      } else if (record.tracking_state === 'superseded') {
+        result = 'tracking_superseded';
+      }
     }
   } else if (injectId) {
     // A tracked inject whose record we cannot find (pre-v2, another daemon epoch, corrupt store).
@@ -1119,8 +1211,23 @@ let teleptyConfig;
 try {
   teleptyConfig = loadTeleptyConfig();
 } catch (err) {
-  console.error(`[CONFIG] Failed to load telepty config: ${err.message}`);
-  process.exit(1);
+  // #843 C — the SECOND read of `~/.telepty/config.json`. Skipping the token read above without
+  // this one is the same defect one layer out: the daemon would clear the auth gate on the env
+  // token and then die here, on the same unparseable bytes, having been told the secret already.
+  //
+  // What this file supplies at this point is optional settings (`idle_ttl_default`) whose absence
+  // has a defined default, so with the secret in hand the honest answer is to come up and say what
+  // could not be read — §A4, a capability gap reported as a gap — rather than to refuse. The
+  // refusal is unchanged when no env token was supplied: there, an unreadable config is still a
+  // condition the daemon must not boot through.
+  if (!ENV_AUTH_TOKEN) {
+    console.error(`[CONFIG] Failed to load telepty config: ${err.message}`);
+    process.exit(1);
+  }
+  console.error(`[CONFIG] ${err.message}`);
+  console.error('[CONFIG] TELEPTY_AUTH_TOKEN supplied the secret, so the daemon is starting without '
+    + 'this file. Settings in it are UNAVAILABLE, not absent — idle_ttl_default falls back to "off".');
+  teleptyConfig = loadTeleptyConfig({ paths: [] });
 }
 
 function broadcastBusEvent(event) {
@@ -4434,7 +4541,16 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
         origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
         payload: finalPrompt, delivery_result: `failed:${delivery.code || 'DELIVERY_FAILED'}`
       });
-      return respondWithError(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error);
+      // #843 — close the write-ahead record. Without this the refusal is recorded in the AUDIT log
+      // (above) and contradicted in the OBSERVATION ledger, which keeps saying `tracked` /
+      // `inject_accepted` for a dispatch that delivered nothing. `inject_id` rides on the error
+      // body for the same reason: a caller told its dispatch was refused must be able to poll the
+      // record that says so.
+      const aborted = trackedRecord
+        ? abortTrackedInjection(inject_id, id, delivery.code, delivery.error)
+        : 'no_tracked_inject';
+      return respondWithError(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error,
+        { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable' });
     }
 
     if (from) session.lastInjectFrom = from;
@@ -4654,10 +4770,27 @@ app.get('/api/inject-observations/:inject_id', (req, res) => {
     return unavailable('not_observed_by_daemon_epoch');
   }
 
-  const pendingReport = getPendingReport(record.session_id);
+  // #843 — the consumption block must be measured FOR THE INJECT BEING POLLED. This read
+  // `getPendingReport(record.session_id)` — whichever inject currently owns that session's pending
+  // slot — with no check that it is the same one. `GET /api/inject-observations/A` therefore
+  // changed its answer when an unrelated inject B arrived and became byte-identical to `GET B`
+  // while A was marked superseded: one inject's evidence served under another inject's id. That is
+  // the same substitution this release removes everywhere else, at the endpoint an orchestrator
+  // polls to decide what happened to a specific dispatch.
+  //
+  // When the slot belongs to someone else, the honest answer is that this inject has no
+  // consumption evidence of its own — named, not borrowed.
+  const activePendingReport = getPendingReport(record.session_id);
+  const pendingReport = activePendingReport && activePendingReport.injectId === record.inject_id
+    ? activePendingReport
+    : null;
   const consumption = pendingReport
     ? classifyConsumption(pendingReport)
-    : { status: 'not_established', basis: 'no_active_pending_report' };
+    : {
+      status: 'not_established',
+      basis: activePendingReport ? 'pending_report_belongs_to_other_inject' : 'no_active_pending_report',
+      ...(activePendingReport ? { active_inject_id: activePendingReport.injectId || null } : {}),
+    };
   const last = record.last_observation || { kind: 'tracking_started', trigger: 'inject_accepted' };
 
   return res.status(200).json({
@@ -4667,7 +4800,9 @@ app.get('/api/inject-observations/:inject_id', (req, res) => {
     inject_id: record.inject_id,
     completion_fact: null,
     terminal: false,
-    tracking_state: record.tracking_state === 'superseded' ? 'superseded' : 'tracked',
+    // #843 — `aborted` travels too. Collapsing it into `tracked` would put a dispatch that
+    // delivered zero bytes back into the in-flight bucket the abort exists to take it out of.
+    tracking_state: ['superseded', 'aborted'].includes(record.tracking_state) ? record.tracking_state : 'tracked',
     observation: last,
     observation_seq: record.observation_seq,
     observations: record.observations || [],
@@ -4847,6 +4982,35 @@ app.post('/api/sessions/:id/kill', async (req, res) => {
   }
 });
 
+/**
+ * #843 A — the DELETE teardown response, as a value. PURE.
+ *
+ * Two different things happened and they must not answer with the same word. `killError === null`
+ * means the teardown call returned; a non-null one means it threw, the registry record was removed
+ * anyway (leaving a half-torn record would be worse), and therefore the daemon can no longer
+ * observe or signal a process that may still be running. That is a condition to report, not a
+ * `status` string tacked onto a success.
+ *
+ * Pure and exported because the branch is otherwise unreachable from a test: node-pty's `kill()`
+ * swallows ESRCH on a reaped child, so nothing an integration test can arrange makes the real call
+ * throw — and an unreachable branch that returns success is precisely what shipped.
+ */
+function describeSessionTeardown(killError) {
+  if (!killError) return { httpStatus: 200, body: { success: true, status: 'closing' } };
+  return {
+    httpStatus: 500,
+    body: {
+      success: false,
+      code: 'KILL_FAILED',
+      status: 'registry-removed-kill-unconfirmed',
+      error: `Session teardown failed: ${killError.message || String(killError)}. `
+        + 'The registry record was removed, so this process is no longer tracked by the daemon '
+        + 'and may still be running.',
+      registry_removed: true,
+    },
+  };
+}
+
 app.delete('/api/sessions/:id', (req, res) => {
   const requestedId = req.params.id;
   // #548: destructive op — must not cascade across alias-sharing siblings.
@@ -4867,6 +5031,14 @@ app.delete('/api/sessions/:id', (req, res) => {
       && isOpenWebSocket(session.ownerWs)) {
     return res.json({ success: true, status: 'stale-detached' });
   }
+  // #843 A — the kill outcome is MEASURED, not inferred from which block ran. The two arms used
+  // to be a `try` returning `{success:true, status:'closing'}` and a `catch` returning
+  // `{success:true, status:'force-removed'}`: a kill that THREW answered success. The process may
+  // still be running, the registry record is gone, so nothing tracks it any more — and
+  // `bin/session-cleanup.sh`, the operator entrance here, read that success as "the worker is
+  // gone". Capturing the error as a value collapses the duplicated teardown into one path and
+  // makes "a failed kill does not report success" structural rather than a thing to remember.
+  let killError = null;
   try {
     session.isClosing = true;
     if (session.type === 'wrapped') {
@@ -4874,49 +5046,41 @@ app.delete('/api/sessions/:id', (req, res) => {
     } else if (session.ptyProcess) {
       session.ptyProcess.kill();
     }
-    // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
-    // verdict — NO-OP on the managed path. The orchestrator's session-cleanup.sh closes the
-    // surface on this normal CLI-exit (CLEANUP_REQUEST→wh_close). Actuates only for a standalone
-    // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
-    try { terminalBackend.closeSurface(session); } catch {}
-    // #60 Stage A §A2 (F1) — OBSERVE THE DEATH BEFORE THE RECORD DISAPPEARS.
-    //
-    // This used to `delete sessions[id]` first and never call markDead at all. The PTY kill's
-    // onExit fires asynchronously, by which point the record is gone, so the transition listener's
-    // `if (!session) return` guard bailed and the death was emitted on NO channel. Silence is the
-    // one output Stage A forbids, and this is the entrance operator tooling uses
-    // (bin/session-cleanup.sh calls exactly this DELETE), so every cleaned-up session was saying
-    // nothing about its own end while the natural-exit path said it correctly.
-    //
-    // markDead runs the transition synchronously, so the observation is emitted while `sessions[id]`
-    // is still live; unregister then destroys the machine, which also makes the later onExit
-    // markDead a no-op (its `if (sm)` guard) rather than a duplicate emission. Exit code and signal
-    // are left null deliberately: an operator asked for this kill, and no exit status was observed
-    // at this instant — inventing one would be a measurement we did not make.
-    sessionStateManager.markDead(id);
-    sessionStateManager.unregister(id);
-    delete sessions[id];
-    revokeSessionCredential(id);    // #815: DELETE — revoke before the id can be reused
-    try { mailbox.purge(id); } catch {}
-    lifecycle.cleanupSessionArtifacts(id);
-    console.log(`[KILL] Session ${id} removed`);
-    persistSessions();
-    res.json({ success: true, status: 'closing' });
   } catch (err) {
-    // Even if kill fails, remove from registry — and still observe the death first, for the same
-    // reason as the success path above. A kill that errored is MORE in need of a statement, not
-    // less: the record is being removed either way, so a reader who hears nothing here cannot
-    // distinguish a failed teardown from a session that is still running.
-    sessionStateManager.markDead(id);
-    sessionStateManager.unregister(id);
-    delete sessions[id];
-    revokeSessionCredential(id);    // #815: same on the error path — never leave a live epoch
-    try { mailbox.purge(id); } catch {}
-    lifecycle.cleanupSessionArtifacts(id);
-    persistSessions();
-    console.log(`[KILL] Session ${id} force-removed (process cleanup error: ${err.message})`);
-    res.json({ success: true, status: 'force-removed' });
+    killError = err;
   }
+  // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
+  // verdict — NO-OP on the managed path. The orchestrator's session-cleanup.sh closes the
+  // surface on this normal CLI-exit (CLEANUP_REQUEST→wh_close). Actuates only for a standalone
+  // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
+  try { terminalBackend.closeSurface(session); } catch {}
+  // #60 Stage A §A2 (F1) — OBSERVE THE END BEFORE THE RECORD DISAPPEARS.
+  //
+  // This used to `delete sessions[id]` first and mark nothing at all. The PTY kill's onExit fires
+  // asynchronously, by which point the record is gone, so the transition listener's
+  // `if (!session) return` guard bailed and the end was emitted on NO channel. Silence is the one
+  // output Stage A forbids, and this is the entrance operator tooling uses, so every cleaned-up
+  // session was saying nothing about its own end while the natural-exit path said it correctly.
+  //
+  // #843 A — and it is `markTerminationRequested`, not `markDead`. The A2 repair above was right
+  // to leave exit code and signal null (no exit status was observed at this instant, and
+  // inventing one would be a measurement we did not make) and then routed through the one method
+  // whose external name is `session_process_exited`. Honest fields under a name that contradicted
+  // them. The mark runs synchronously, so the observation is emitted while `sessions[id]` is still
+  // live; unregister then destroys the machine, which also makes the later onExit markDead a no-op
+  // (its `if (sm)` guard) rather than a second, differently-named statement about one ending.
+  sessionStateManager.markTerminationRequested(id, 'operator_delete', killError && killError.message);
+  sessionStateManager.unregister(id);
+  delete sessions[id];
+  revokeSessionCredential(id);    // #815: DELETE — revoke before the id can be reused
+  try { mailbox.purge(id); } catch {}
+  lifecycle.cleanupSessionArtifacts(id);
+  persistSessions();
+  const teardown = describeSessionTeardown(killError);
+  console.log(killError
+    ? `[KILL] Session ${id} registry-removed but the kill was NOT confirmed: ${killError.message}`
+    : `[KILL] Session ${id} removed`);
+  res.status(teardown.httpStatus).json(teardown.body);
 });
 
 // Shared auto-router: handles turn_request events from any source (WS or HTTP)
@@ -4948,10 +5112,63 @@ async function busAutoRoute(msg) {
 
   const prompt = (msg.payload && msg.payload.prompt) || msg.content || msg.prompt || JSON.stringify(msg);
   const inject_id = crypto.randomUUID();
+
+  // #843 B — the THIRD write door, and until now the only one with no accountability at all.
+  //
+  // This writes into any session's PTY with exactly the authority of
+  // `POST /api/sessions/:id/inject`, and it applied neither of that route's two rules: no
+  // `classifyPeerLaneInject` verdict and no `auditAppend` line. Reproduced against one daemon:
+  // the HTTP door refuses `from:'aigentry-coder-a' → victim` with 403 PEER_INJECT_BLOCKED and
+  // records the attempt; the identical payload re-addressed to `POST /api/bus/publish` returned
+  // 200, landed in the PTY, and left the audit log unchanged. A guardrail enforced at two doors
+  // of three is not a guardrail — it is the false confidence this release exists to remove, and
+  // #826 shipped believing there were two doors.
+  //
+  // The claimed sender is read ONLY from fields that name a session id. `msg.from` is the direct
+  // analogue of `body.from`. `msg.source` is accepted only when it carries no `:` — the bus
+  // envelope defines `source` as `project:session_id` (BUS_EVENT_SCHEMA.md), which is a different
+  // namespace, and mapping it into the sid namespace would invent an identity and false-block
+  // legitimate deliberation routing. An event that names no sender resolves to `null`, which
+  // classifies as `no-sender` and is ALLOWED — deliberately the same answer the HTTP door gives a
+  // body with no `from`. This is accountability parity, not a new restriction: the unattributed
+  // bus route keeps working, and now it leaves a record.
+  const busSource = typeof msg.source === 'string' && !msg.source.includes(':') ? msg.source : null;
+  const claimedFrom = (typeof msg.from === 'string' && msg.from) || busSource || null;
+  const peerVerdict = classifyPeerLaneInject({
+    from: claimedFrom, to: targetId, prompt, orchestratorSids: ORCHESTRATOR_SIDS
+  });
+  const auditBusWrite = (deliveryResult) => auditAppend({
+    ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'bus',
+    claimed_from: claimedFrom,
+    // The bus is not an authorization boundary — any local socket may publish to it with no
+    // credential — so nothing arriving here is a verified identity. Absence, stated as absence.
+    ...verifiedSenderFields(null),
+    to: targetId, to_alias: rawTarget !== targetId ? rawTarget : null,
+    origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: null,
+    payload: prompt, delivery_result: deliveryResult
+  });
+
+  if (peerVerdict.decision === 'block') {
+    broadcastSessionEvent('peer_inject_blocked', targetId, targetSession, {
+      extra: {
+        target_agent: targetId, from: claimedFrom, reason: peerVerdict.reason,
+        attempted_kind: peerVerdict.kind, envelope_present: peerVerdict.envelopePresent,
+        inject_id, source: 'bus_auto_route', turn_id: turnId
+      }
+    });
+    auditBusWrite(`blocked:${peerVerdict.reason}`);
+    console.warn(`[PEER-GUARD] blocked bus-route inject ${claimedFrom} → ${targetId} (${peerVerdict.reason})`);
+    emitInjectFailureEvent(targetId, 'PEER_INJECT_BLOCKED', `Peer-lane inject blocked: ${peerVerdict.reason}`, {
+      source: 'bus_auto_route', turn_id: turnId, original_message_id: msg.message_id || null
+    }, targetSession);
+    return;
+  }
+
   const delivery = await deliverInjectionToSession(targetId, targetSession, prompt, {
     source: 'bus_auto_route'
   });
   const delivered = delivery.success === true;
+  auditBusWrite(delivered ? 'success' : `failed:${delivery.code || 'DELIVERY_FAILED'}`);
   if (!delivered) {
     emitInjectFailureEvent(targetId, delivery.code, delivery.error, {
       source: 'bus_auto_route',
@@ -5672,6 +5889,7 @@ module.exports = {
   maybeRecordInjectConsumption,   // #60 Stage A: records the fresh-busy-edge CANDIDATE (see the fn comment)
   maybeRecordLauncherConsumption, // #60 Stage A: launcher watermark telemetry — never consumption
   recordObservation,              // #60 Stage A: the TOTAL observation emitter (named result on every path)
+  describeSessionTeardown,        // #843: DELETE teardown response — a failed kill never reports success
   beginTrackedInjection,          // #60 Stage A: durable write-before-delivery tracking record
   getTrackedInjection,            // #60 Stage A: ledger read by inject_id
   listTrackedInjectionsForSession, // #60 Stage A: ledger read by session (owner-lifecycle fan-out)

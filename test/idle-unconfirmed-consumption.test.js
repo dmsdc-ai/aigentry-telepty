@@ -224,7 +224,7 @@ test('#52 (b): no echo + no CPU advance → no_consumption_evidence (format inta
   const consumption = stateOnce(ctx);
   assert.equal(consumption.basis, 'no_consumption_evidence');
   assert.match(ctx.delivered[0].msg,
-    /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-52 — no completion fact observed; legacy_ready_observed=\d+\.\ds; consumption=not_established; outcome protocol unavailable$/);
+    /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-52 — no completion fact observed; legacy_ready_observed(?:; elapsed_since_inject=\d+\.\ds)?; consumption=not_established; outcome protocol unavailable$/);
 });
 
 test('#52 (b): body below the conservative length floor never claims echo', () => {

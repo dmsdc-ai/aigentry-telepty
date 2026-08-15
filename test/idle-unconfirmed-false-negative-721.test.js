@@ -49,7 +49,7 @@ const BODY =
 // #60 Stage A: both verdicts are deleted. Every path below emits the same literal statement, and
 // the four FIX 1 conjuncts that used to select between the verdicts are each still observable —
 // as `consumption.basis` on that statement. See the per-guard assertions.
-const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-721 — no completion fact observed; pty_quiet=\d+\.\ds; consumption=(observed|not_established); outcome protocol unavailable$/;
+const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-721 — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
 function consumptionOf(ctx) {
   assert.equal(ctx.delivered.length, 1, 'a statement is emitted (not suppressed)');

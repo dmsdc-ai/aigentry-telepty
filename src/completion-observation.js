@@ -197,12 +197,22 @@ function formatCompletionUnknownText(envelope) {
   const e = envelope || {};
   const obs = e.observation || {};
   const parts = [];
-  if (Number.isFinite(obs.elapsed_ms)) {
-    parts.push(`${obs.kind}=${(obs.elapsed_ms / 1000).toFixed(1)}s`);
-  } else if (Number.isFinite(obs.silence_ms)) {
+  // #843 — `<kind>=<n>s` is a claim that the kind measured n seconds, so only the kind's OWN
+  // measurement may fill it. This tested `elapsed_ms` first and fell back to `silence_ms`, which
+  // are different things: `silence_ms` is how long the PTY has been quiet — what `pty_quiet` is
+  // named after, and the only evidence its row requires — while `elapsed_ms` is time since the
+  // inject, a qualifier attached to every row. A 3-second silence 900 seconds into a dispatch came
+  // out as `pty_quiet=900.0s`, overstating the measurement by two orders of magnitude, and rows
+  // that measure no duration at all (`output_observed`) wore elapsed as if it were theirs. This is
+  // the one line the orchestrator reads, in the release that renamed everything to be honest about
+  // exactly this. Elapsed is a real measurement and is still stated — under its own name.
+  if (Number.isFinite(obs.silence_ms)) {
     parts.push(`${obs.kind}=${(obs.silence_ms / 1000).toFixed(1)}s`);
   } else {
     parts.push(String(obs.kind));
+  }
+  if (Number.isFinite(obs.elapsed_ms)) {
+    parts.push(`elapsed_since_inject=${(obs.elapsed_ms / 1000).toFixed(1)}s`);
   }
   const consumption = (e.consumption && e.consumption.status) || 'not_established';
   parts.push(`consumption=${consumption}`);

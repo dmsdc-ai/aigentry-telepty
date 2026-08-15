@@ -67,7 +67,7 @@ function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4
 // exactly which rule fired, so the A/B vs C/D/D2 difference is still visible where it is real.
 
 const COMPLETION_UNKNOWN_RE =
-  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1 — no completion fact observed; pty_quiet=\d+\.\ds; consumption=(observed|not_established); outcome protocol unavailable$/;
+  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1 — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
 function assertNoVerdict(msg) {
   assert.ok(msg, 'an observation should be delivered — never silence');

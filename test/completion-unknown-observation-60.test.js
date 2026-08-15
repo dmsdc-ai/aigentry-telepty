@@ -37,7 +37,7 @@ process.env.USERPROFILE = TMP_HOME;
 process.env.PORT = '0';
 
 const daemon = require('../daemon');
-const { fireAutoReport, recordObservation } = daemon;
+const { fireAutoReport, recordObservation, describeSessionTeardown } = daemon;
 
 const NOW = 1_700_000_000_000; // fixed clock
 
@@ -329,6 +329,112 @@ test('duplicate_idle_transition_is_total: a repeat of the same observation is na
   }
 });
 
+// --- #843 failed_commit_is_not_silence --------------------------------------------------
+
+test('failed_commit_is_not_silence: a ledger write failure is still emitted, and does not poison the retry', () => {
+  // §A2 inside the emitter written to enforce §A2. `recordObservation` returned
+  // `tracking_persistence_failed` BEFORE the broadcast, so a store that could not be written
+  // produced no bus event and no source delivery at all — total silence, which is the one output
+  // Stage A forbids. And because `appendLedgerObservation` had already mutated
+  // `record.last_observation`, the identity dedup then suppressed every RETRY of that same
+  // measurement as a duplicate: the first attempt was silent and the first silenced the rest.
+  //
+  // Drive the real failure, not a stub: make the ledger directory unwritable, which is exactly
+  // how this reproduces in the field (a HOME whose .config is read-only).
+  const ledgerDir = path.join(TMP_HOME, '.config', 'aigentry-telepty');
+  fs.mkdirSync(ledgerDir, { recursive: true });
+
+  const session = { id: 'ledger-1', type: 'spawned' };
+  const pendingReport = { source: 'orch', injectId: 'inj-ledger', unconfirmedSettleDone: true };
+  const busEvents = [];
+  const delivered = [];
+  const deps = {
+    broadcastSessionEvent: (type, sid, _s, payload) => busEvents.push({ type, sid, payload }),
+    resolveSessionAlias: (s) => s,
+    sessions: { orch: { id: 'orch' }, 'ledger-1': session },
+    deliverInjectionToSession: (srcId, _s, msg) => delivered.push({ srcId, msg }),
+  };
+  const measurement = () => ({
+    sessionId: 'ledger-1', session, pendingReport,
+    destination: 'idle', cause: 'silence_timeout', evidence: { silence_ms: 6000 },
+    deliverToSource: true, trigger: 'transition', deps,
+  });
+
+  const begun = daemon.beginTrackedInjection({
+    injectId: pendingReport.injectId, sessionId: 'ledger-1', source: 'orch', session,
+  });
+  assert.equal(begun.ok, true, 'the write-ahead record must commit while the store is still writable');
+  const seqBefore = daemon.getTrackedInjection(pendingReport.injectId).observation_seq;
+
+  fs.chmodSync(ledgerDir, 0o500);
+  let first;
+  try {
+    first = recordObservation(measurement());
+  } finally {
+    fs.chmodSync(ledgerDir, 0o700);
+  }
+
+  assert.equal(first, 'tracking_persistence_failed',
+    'the named result is right — it is the silence around it that is the defect');
+  assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 1,
+    'a store that cannot be written is a condition to REPORT: the bus must still hear the absence');
+  assert.equal(delivered.length, 1,
+    'and the source waiting on this inject must still be told, not left inferring from silence');
+  const body = busEvents[0].payload.extra;
+  assert.equal(body.tracking_result, 'tracking_persistence_failed',
+    'the envelope must NAME the durability gap rather than presenting a normal observation');
+  assert.equal(body.completion_fact, null);
+  assert.equal(body.terminal, false);
+
+  // The in-memory record must be rolled back to exactly what is on disk. A `last_observation`
+  // describing an append that never reached the ledger is a claim about durable state that was
+  // not measured — and it is what turns the retry into a phantom duplicate.
+  const rolledBack = daemon.getTrackedInjection(pendingReport.injectId);
+  assert.equal(rolledBack.observation_seq, seqBefore,
+    'a failed commit must not advance the durable sequence it failed to write');
+  assert.notEqual(rolledBack.last_observation && rolledBack.last_observation.kind, 'pty_quiet',
+    'the un-persisted observation must not be left standing as the record\'s last one');
+
+  // The retry, once the store is writable again, is the FIRST successful statement of this
+  // measurement — never a duplicate of one that only ever existed in memory.
+  const second = recordObservation(measurement());
+  assert.equal(second, 'observation_emitted',
+    `the retry of an observation that never landed must be emitted, got ${JSON.stringify(second)}`);
+  assert.equal(daemon.getTrackedInjection(pendingReport.injectId).last_observation.kind, 'pty_quiet');
+  assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 2);
+  for (const d of delivered) {
+    assert.ok(!TERMINAL_TEXT_RE.test(d.msg), `terminal outcome emitted: ${d.msg}`);
+  }
+});
+
+// --- #843 a failed kill must not report success -----------------------------------------
+
+test('failed_kill_is_not_success: DELETE reports the kill it could not confirm', () => {
+  // `DELETE /api/sessions/:id` removed the registry record and answered
+  // `{success:true, status:'force-removed'}` even when `ptyProcess.kill()` threw. The process may
+  // still be running, and it is now untracked — the daemon has lost the ability to observe or kill
+  // it — and the caller was told the teardown worked. `bin/session-cleanup.sh` is the operator
+  // entrance here, so that success reads as "the worker is gone".
+  //
+  // The removal itself stays: leaving a half-torn record behind would be worse, and the record is
+  // being dropped either way. What changes is that the response states which of the two happened.
+  // Unit-tested through the pure decision because a real `ptyProcess.kill()` does not throw on a
+  // reaped child (node-pty swallows ESRCH), so the branch is unreachable from an integration test —
+  // and an unreachable branch that returns success is exactly what shipped.
+  const ok = describeSessionTeardown(null);
+  assert.equal(ok.httpStatus, 200);
+  assert.equal(ok.body.success, true);
+  assert.equal(ok.body.status, 'closing');
+
+  const failed = describeSessionTeardown(new Error('kill EPERM'));
+  assert.notEqual(failed.httpStatus, 200, 'a teardown that could not be confirmed is not a 200');
+  assert.equal(failed.body.success, false);
+  assert.equal(failed.body.code, 'KILL_FAILED');
+  assert.match(String(failed.body.error), /kill EPERM/, 'the cause must survive into the response');
+  assert.equal(failed.body.registry_removed, true,
+    'the record IS gone — the caller has to know that too, or it will assume the session is still tracked');
+});
+
 // --- §8.1 arbitrary_reverse_message_is_not_report ---------------------------------------
 
 test('arbitrary_reverse_message_is_not_report: no text is parsed as a terminal report', () => {
@@ -342,4 +448,39 @@ test('arbitrary_reverse_message_is_not_report: no text is parsed as a terminal r
   const reportEnforcement = require('../src/report-enforcement');
   assert.equal(typeof reportEnforcement.classifyReportPrompt, 'undefined',
     '0.8.0 classifies no report-shaped text: the validator returns in Stage B (#816/#817)');
+});
+
+// --- #843 a frozen reason contradicted by its own record --------------------------------
+
+test('capability_reason_matches_the_record: a proven epoch is not reported as "no epoch fact"', () => {
+  // `CAPABILITY_STAGE_A` is frozen with `session_authentication_reason: 'no_815_epoch_fact'` and
+  // spread onto every ledger record — including records whose own `session_epoch` field holds the
+  // epoch the session PROVED on its #815 handshake. One response body then carries both
+  // `session_epoch: "<id>"` and a reason saying there is no epoch fact.
+  //
+  // §A4 requires capability gaps to be explicit; it does not license reporting a gap that was
+  // measured shut. A reader reconciling those two fields has to decide which half of one object to
+  // believe, which is worse than either answer alone.
+  const proven = daemon.beginTrackedInjection({
+    injectId: 'inj-epoch', sessionId: 'epoch-1', source: 'orch',
+    session: { id: 'epoch-1', sessionEpoch: '1IWURA54wVOSjXlZmNVhsA' },
+  });
+  assert.equal(proven.ok, true);
+  const record = daemon.getTrackedInjection('inj-epoch');
+  assert.equal(record.session_epoch, '1IWURA54wVOSjXlZmNVhsA');
+  assert.equal(record.session_epoch_reason, null);
+  assert.notEqual(record.capability.session_authentication_reason, 'no_815_epoch_fact',
+    'the record proves the epoch fact was measured — its capability block may not deny it');
+  assert.equal(record.capability.session_authentication, 'observed');
+  assert.equal(record.capability.session_authentication_reason, null);
+
+  // The unproven case is untouched: an absence is still reported as an absence, with its reason.
+  const unproven = daemon.beginTrackedInjection({
+    injectId: 'inj-noepoch', sessionId: 'epoch-2', source: 'orch', session: { id: 'epoch-2' },
+  });
+  assert.equal(unproven.ok, true);
+  const bare = daemon.getTrackedInjection('inj-noepoch');
+  assert.equal(bare.session_epoch, null);
+  assert.equal(bare.capability.session_authentication, 'unavailable');
+  assert.equal(bare.capability.session_authentication_reason, 'no_815_epoch_fact');
 });

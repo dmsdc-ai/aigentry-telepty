@@ -26,10 +26,11 @@ function listen(server) {
 }
 
 // Attempt a WS upgrade; resolve to a compact outcome regardless of success/failure.
-function attempt(port, { token } = {}) {
+function attempt(port, { token, headerToken } = {}) {
   return new Promise((resolve) => {
     const q = token != null ? `?token=${encodeURIComponent(token)}` : '';
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/sessions/${SID}${q}`);
+    const options = headerToken != null ? { headers: { 'x-telepty-token': headerToken } } : undefined;
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/sessions/${SID}${q}`, options);
     const done = (r) => { try { ws.terminate(); } catch {} resolve(r); };
     ws.on('open', () => done({ kind: 'open' }));
     ws.on('unexpected-response', (_req, res) => { res.resume(); done({ kind: 'http', status: res.statusCode }); });
@@ -127,4 +128,42 @@ test('#823: an address outside the allowlist is 403 — reachability narrows, a 
   const withToken = await attempt(primaryPort, { token: TOKEN });
   assert.equal(withToken.kind, 'http', `expected a readable refusal, got ${JSON.stringify(withToken)}`);
   assert.equal(withToken.status, 403, 'the policy answer comes first and no credential buys past it');
+});
+
+// #843 — the upgrade must accept the SAME carriers the HTTP door does.
+//
+// `src/protocol/http-auth.js:190` reads `req.headers['x-telepty-token'] || req.query.token`.
+// `handleUpgrade` read only the query parameter, so the two entrances took different credentials
+// while #820's design asserted they were symmetric. The wrong spec reached another repo:
+// aigentry-aterm (`6f2603c`) puts the token on its `/api/bus` upgrade as an `x-telepty-token`
+// header, explicitly because that URL is logged — which is the better choice, not the worse one.
+// Shipping without this answers that GUI's live event stream with a 401 that reads as a credential
+// fault when the fault is which carrier the transport reads.
+test('#843: the upgrade accepts the token in either named carrier — header or query', async () => {
+  const app = buildApp();
+  const primary = http.createServer(app);
+  const port = await listen(primary);
+  installWebSocketTransport(buildDeps(primary, null));
+  after(() => primary.close());
+
+  const viaQuery = await attempt(port, { token: TOKEN });
+  assert.equal(viaQuery.kind, 'open', `?token= must keep working — the CLI and existing viewers use it: ${JSON.stringify(viaQuery)}`);
+
+  const viaHeader = await attempt(port, { headerToken: TOKEN });
+  assert.equal(viaHeader.kind, 'open',
+    `x-telepty-token must upgrade, exactly as it authenticates at the HTTP door: ${JSON.stringify(viaHeader)}`);
+
+  // The negative that is easy to lose: a new CARRIER is not a new way to skip the credential.
+  const wrongHeader = await attempt(port, { headerToken: 'wrong' });
+  assert.equal(wrongHeader.kind, 'http', `a wrong header token must be refused readably, got ${JSON.stringify(wrongHeader)}`);
+  assert.equal(wrongHeader.status, 401);
+
+  // And a wrong header does not become acceptable by also sending a good query parameter or the
+  // reverse — the header is read FIRST, so whichever is presented is the one that is checked.
+  const wrongHeaderGoodQuery = await attempt(port, { headerToken: 'wrong', token: TOKEN });
+  assert.equal(wrongHeaderGoodQuery.status, 401,
+    'the presented header is the credential under test; a query parameter must not rescue it');
+
+  const tokenless = await attempt(port);
+  assert.equal(tokenless.status, 401, 'and presenting neither carrier is still refused');
 });

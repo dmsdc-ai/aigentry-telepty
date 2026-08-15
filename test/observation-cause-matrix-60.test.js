@@ -103,6 +103,40 @@ test('every_state_entrance_has_literal_observation: start, restart and death no 
   assert.equal(dead.to, 'dead');
   assert.equal(dead.detail.trigger, 'process_exit');
   assert.equal(dead.detail.exit_code, 1);
+  // #843 — and it stamps WHEN the exit was observed. That field is what makes the name sayable;
+  // see the termination-request test below for the entrance that cannot produce it.
+  assert.equal(typeof dead.detail.exit_observed_at, 'string');
+});
+
+test('#843 an exit that was never observed does not get the exit name', () => {
+  // The A2 fix for `DELETE /api/sessions/:id` was careful about its FIELDS — exit code and signal
+  // are left null on purpose, because no exit status was observed at that instant — and then
+  // routed through `markDead`, whose hardcoded `trigger: 'process_exit'` maps to the external kind
+  // `session_process_exited`. The fields were honest and the NAME asserted the exact thing the
+  // code knew it had not seen. An A2 repair that shipped an A3 violation.
+  const requested = withMachine((sm, seen) => {
+    sm.markTerminationRequested('operator_delete');
+    return last(seen);
+  });
+  assert.equal(requested.to, 'dead', 'the session IS over — it is the cause, not the state, that was wrong');
+  assert.equal(requested.detail.trigger, 'termination_requested');
+  assert.equal(requested.detail.reason, 'operator_delete');
+  assert.equal(requested.detail.exit_observed_at, undefined,
+    'nothing here observed an exit, so nothing here may carry the evidence of one');
+
+  const killFailed = withMachine((sm, seen) => {
+    sm.markTerminationRequested('operator_delete', 'kill EPERM');
+    return last(seen);
+  });
+  assert.equal(killFailed.detail.trigger, 'termination_kill_failed');
+  assert.equal(killFailed.detail.kill_error, 'kill EPERM');
+
+  // And the mapper refuses the strong name to anything that cannot show the evidence. This is the
+  // part that makes the rename load-bearing rather than cosmetic: a future caller that reaches for
+  // `process_exit` without an observed exit fails CLOSED instead of inheriting the name.
+  const unevidenced = mapObservationCause({ destination: 'dead', cause: 'process_exit', evidence: {} });
+  assert.equal(unevidenced.kind, 'unmapped_transition_cause');
+  assert.equal(unevidenced.fields.reason, 'missing_evidence:exit_observed_at');
 });
 
 test('every_state_entrance_has_literal_observation: the raw OSC 133 marker and quiet-after-a-marker are different measurements', () => {
@@ -259,9 +293,14 @@ const VOCABULARY_MATRIX = [
   ['repeated_error_pattern',            'error',    { error_fingerprint: 'deploy failed', repeat_count: 3, window_ms: 180000 }, 'repeated_error_pattern_observed'],
   ['thinking_timeout',                  'error',    { thinking_duration_ms: 301000 },                              'thinking_classification_timeout_observed'],
   ['lifecycle_restarting',              'restarting', {},                                                          'session_restart_mark_observed'],
-  ['process_exit',                      'dead',     {},                                                            'session_process_exited'],
+  ['process_exit',                      'dead',     { exit_observed_at: '2026-07-29T00:00:00.000Z' },              'session_process_exited'],
+  // #843 — three facts the release used to serialize as one. An observed child exit, an operator
+  // asking for teardown with no exit status in hand, and a kill call that threw are different
+  // measurements and now carry different names.
+  ['termination_requested',             'dead',     { reason: 'operator_delete', requested_at: '2026-07-29T00:00:00.000Z' }, 'session_termination_requested'],
+  ['termination_kill_failed',           'dead',     { reason: 'operator_delete', kill_error: 'kill EPERM' },       'session_termination_kill_failed'],
   ['owner_epoch_replaced',              'idle',     { displaced_session_epoch: 'epoch-1' },                        'owner_replaced_observed'],
-  ['owner_process_exited',              'idle',     {},                                                            'session_process_exited'],
+  ['owner_transport_detached',          'idle',     { detached_at: '2026-07-29T00:00:00.000Z' },                   'owner_transport_detached'],
 ];
 
 test('every_state_entrance_has_literal_observation: every §2.3 producer row maps to its own name and fields', () => {

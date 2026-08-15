@@ -305,3 +305,107 @@ test('the daemon refuses to boot on an unreadable config, loudly, without rewrit
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// #843 C — the recovery configuration the env override exists for was impossible at the daemon.
+//
+// `TELEPTY_AUTH_TOKEN` is documented (BOUNDARY.md, CHANGELOG.md, and daemon.js's own comment) as
+// env-then-file at BOTH ends. The CLI (`cli.js getAuthToken`) and the MCP server genuinely
+// short-circuit: with the variable set, `getConfig()` is never called. The daemon evaluated the
+// override at line 61 — eleven lines AFTER a `getConfig()` whose failure is `process.exit(1)`.
+//
+// So with a corrupt config plus a valid env token, the CLI and MCP worked and the daemon exited
+// before reaching the check. That combination is not exotic: it is precisely the state an operator
+// is in while recovering from the corruption the #835 fail-closed refusal reports. Two
+// individually-correct changes — fail closed on an unreadable secret, and honour the env override —
+// composing into a whole where the documented escape hatch cannot be used.
+//
+// `~/.telepty/config.json` is read TWICE at boot: once by `getConfig()` for the secret, once by
+// `loadTeleptyConfig()` for optional settings (`idle_ttl_default`). Both had to stop being fatal
+// when the secret came from the environment, or the daemon still dies on the second read having
+// skipped the first — which is the same defect one layer out.
+test('the daemon boots on a corrupt config when TELEPTY_AUTH_TOKEN supplies the secret', { timeout: 30000 }, async () => {
+  const { home, cfg } = withHome();
+  const ENV_TOKEN = `env-supplied-${randomUUID()}`;
+  let d = null;
+  try {
+    seed(cfg, '{"authToken":"REAL-SECR');
+    const before = fs.readFileSync(cfg);
+
+    d = spawn(process.execPath, [path.join(ROOT, 'daemon.js')], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        HOME: home, USERPROFILE: home, PORT: '0',
+        TELEPTY_NO_TAILNET_AUTO: '1',
+        TELEPTY_AUTH_TOKEN: ENV_TOKEN
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    d.stdout.on('data', (c) => { stdout += c; });
+    d.stderr.on('data', (c) => { stderr += c; });
+
+    const listening = await new Promise((resolve) => {
+      const deadline = setTimeout(() => resolve(false), 20000);
+      const poll = setInterval(() => {
+        if (!/listening on/.test(stdout)) return;
+        clearInterval(poll); clearTimeout(deadline); resolve(true);
+      }, 50);
+      d.on('exit', () => { clearInterval(poll); clearTimeout(deadline); resolve(false); });
+    });
+
+    assert.equal(listening, true,
+      `the documented recovery path must work at the daemon too. stderr: ${stderr}`);
+    // The bytes are still untouched — this is a read that did not happen, not a repair.
+    assert.deepEqual(fs.readFileSync(cfg), before, 'it must not have rewritten the unreadable file');
+    // §A4: the settings it could not read are reported AS unavailable, not silently defaulted.
+    assert.match(stderr, /\[CONFIG\]/,
+      'the file it declined to trust must still be named on stderr, where a service log keeps it');
+
+    // And the token in force is the env one: a request bearing it is not 401.
+    const port = Number((stdout.match(/listening on http:\/\/[^:]+:(\d+)/) || [])[1]);
+    assert.ok(Number.isInteger(port) && port > 0, `could not read the bound port from: ${stdout}`);
+    const ok = await fetch(`http://127.0.0.1:${port}/api/sessions`, { headers: { 'x-telepty-token': ENV_TOKEN } });
+    assert.equal(ok.status, 200, 'the env-supplied token must be the one the daemon actually enforces');
+    const denied = await fetch(`http://127.0.0.1:${port}/api/sessions`, { headers: { 'x-telepty-token': 'REAL-SECR' } });
+    assert.notEqual(denied.status, 200, 'and the unreadable file must not have supplied a working one');
+  } finally {
+    if (d) { try { d.kill('SIGKILL'); } catch { /* already gone */ } }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('without the env token nothing changes: a corrupt config is still a refusal', { timeout: 30000 }, async () => {
+  // The pairing that makes the change above a PRECEDENCE fix rather than a weakening of #835. The
+  // file-only refusal is asserted in full by the test above this block; this one pins that the new
+  // env branch cannot be reached by accident — an empty variable is not a supplied secret.
+  const { home, cfg } = withHome();
+  try {
+    seed(cfg, '{"authToken":"REAL-SECR');
+    const d = spawn(process.execPath, [path.join(ROOT, 'daemon.js')], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        HOME: home, USERPROFILE: home, PORT: '0',
+        TELEPTY_NO_TAILNET_AUTO: '1',
+        TELEPTY_AUTH_TOKEN: ''
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stderr = '';
+    let stdout = '';
+    d.stderr.on('data', (c) => { stderr += c; });
+    d.stdout.on('data', (c) => { stdout += c; });
+    const code = await new Promise((resolve, reject) => {
+      const t = setTimeout(() => { d.kill('SIGKILL'); reject(new Error('daemon did not exit')); }, 20000);
+      d.on('exit', (c) => { clearTimeout(t); resolve(c); });
+    });
+
+    assert.notEqual(code, 0, 'an empty TELEPTY_AUTH_TOKEN supplies no secret and must not open the recovery path');
+    assert.match(stderr, /\[AUTH\]/);
+    assert.doesNotMatch(stdout, /listening on/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -362,3 +362,57 @@ test('launcher_watermark_is_not_consumption: the watermark recorder itself keeps
   assert.equal(maybeRecordLauncherConsumption(wrapped, base(), 30, NOW), true,
     'all four conjuncts hold at the floor');
 });
+
+// =============================================================================================
+// #843 — the one sentence the orchestrator actually reads
+// =============================================================================================
+
+const {
+  formatCompletionUnknownText,
+  buildCompletionUnknown,
+} = require('../src/completion-observation');
+
+test('#843: the absence text states the measurement its NAME is made of, not a bigger number', () => {
+  // `formatCompletionUnknownText` tested `elapsed_ms` FIRST and only fell back to `silence_ms`.
+  // Those are different measurements: `silence_ms` is how long the PTY has been quiet — the thing
+  // `pty_quiet` is named after and the only evidence its row requires — while `elapsed_ms` is time
+  // since the inject, a qualifier that rides along on every row. A 3-second silence 900 seconds
+  // into a dispatch was therefore delivered as `pty_quiet=900.0s`: the observation's own name
+  // attached to a number two orders of magnitude larger than what it measured, in the release
+  // that renamed everything to stop exactly this. It is also the single line the orchestrator
+  // reads, so it is the overclaim with the widest blast radius in the file.
+  const envelope = buildCompletionUnknown({
+    sessionId: 'worker-1',
+    injectId: 'inj-1',
+    observation: { kind: 'pty_quiet', trigger: 'silence_timeout', silence_ms: 3000, elapsed_ms: 900_000 },
+    consumption: { status: 'not_established', basis: 'no_consumption_evidence' },
+  });
+  const text = formatCompletionUnknownText(envelope);
+
+  assert.match(text, /pty_quiet=3\.0s/, 'the named measurement must carry its own value');
+  assert.doesNotMatch(text, /pty_quiet=900\.0s/,
+    'the quiet name must never be attached to the elapsed-since-inject number');
+  // Elapsed is real and worth stating — as itself, under its own label.
+  assert.match(text, /elapsed_since_inject=900\.0s/,
+    'elapsed time is a measurement too; the fix is to name it, not to drop it');
+  assert.match(text, /consumption=not_established/);
+  assert.doesNotMatch(text, /\b(TASK_COMPLETE|TASK_ERROR)\b/);
+});
+
+test('#843: a row with no silence measurement states its name bare, and elapsed separately', () => {
+  const noSilence = formatCompletionUnknownText(buildCompletionUnknown({
+    sessionId: 'worker-1',
+    observation: { kind: 'output_observed', trigger: 'output_received', elapsed_ms: 4200 },
+  }));
+  assert.match(noSilence, /output_observed;/, 'a row that measured no silence claims none');
+  assert.doesNotMatch(noSilence, /output_observed=/,
+    'and must not borrow elapsed as though it were the thing the name measures');
+  assert.match(noSilence, /elapsed_since_inject=4\.2s/);
+
+  const neither = formatCompletionUnknownText(buildCompletionUnknown({
+    sessionId: 'worker-1',
+    observation: { kind: 'owner_transport_detached', trigger: 'owner_transport_detached' },
+  }));
+  assert.match(neither, /owner_transport_detached; consumption=/);
+  assert.doesNotMatch(neither, /elapsed_since_inject/, 'no elapsed measured, none stated');
+});

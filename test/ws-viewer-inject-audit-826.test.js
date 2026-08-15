@@ -216,6 +216,151 @@ test('the orchestrator lane is untouched — the guardrail did not become a tigh
   viewer.close();
 });
 
+// =============================================================================================
+// #843 B — the SPAWNED viewer door, and the BUS door. #826 fixed one write path of three.
+// =============================================================================================
+
+// A spawned session: the daemon owns the PTY directly, so there is no owner bridge and EVERY
+// attached socket is a viewer. `websocket.js` handled it in the `else` arm below the wrapped
+// branch — `activeSession.ptyProcess.write(data)`, no policy verdict, no audit line. The #826
+// comment one branch up calls the wrapped path "the one write path with no accountability"; the
+// spawned path still was exactly that, and the six #826 cases all build wrapped fixtures, so
+// nothing ever went through this door.
+async function spawned(prefix) {
+  const sid = createSessionId(prefix);
+  const res = await daemon.spawnSession(sid);
+  assert.ok([200, 201].includes(res.status), `spawn: ${res.status} ${JSON.stringify(res.body)}`);
+  const viewer = await open(`/api/sessions/${encodeURIComponent(sid)}?token=${encodeURIComponent(TOKEN)}`);
+  return { sid, viewer };
+}
+
+// Everything the PTY has echoed back to this socket. For a spawned session the shell echoes what
+// is typed into it, so the marker appearing here is proof the bytes reached the PTY — and its
+// absence, over a window, is proof they did not.
+function collectOutput(ws) {
+  const chunks = [];
+  ws.on('message', (buf) => {
+    let msg = null;
+    try { msg = JSON.parse(buf.toString()); } catch { return; }
+    if (msg.type === 'output' && typeof msg.data === 'string') chunks.push(msg.data);
+  });
+  return () => chunks.join('');
+}
+
+test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly like a wrapped one', async () => {
+  const { sid, viewer } = await spawned('spawnaudit');
+  const output = collectOutput(viewer);
+
+  viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_OK\r', from: 'orchestrator' }));
+  await daemon.waitFor(() => (output().includes('SPAWNMARKER_OK') ? true : null),
+    { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' });
+
+  const lines = await waitForAudit((l) => l.to === sid && l.source === 'ws-viewer');
+  assert.equal(lines.length, 1, 'one line per viewer write, same as the wrapped door');
+  assert.equal(lines[0].kind, 'inject');
+  assert.equal(lines[0].delivery_result, 'forwarded');
+  assert.equal(lines[0].claimed_from, 'orchestrator');
+  assert.equal(lines[0].payload_bytes, Buffer.byteLength('echo SPAWNMARKER_OK\r'));
+
+  viewer.close();
+});
+
+test('#843: #533 applies at the spawned door too — the block is not one `else` away', async () => {
+  const { sid, viewer } = await spawned('spawnpeer');
+  const output = collectOutput(viewer);
+
+  viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_LEAK\r', from: 'peer-alpha' }));
+  // A shell echoes what is typed into it, so if these bytes reached the PTY the marker comes back
+  // within milliseconds. Give it a full second before concluding it did not.
+  await new Promise((r) => setTimeout(r, 1000));
+  assert.equal(output().includes('SPAWNMARKER_LEAK'), false,
+    'an out-of-policy peer-lane write must not reach a spawned PTY either');
+
+  const lines = await waitForAudit((l) => l.to === sid && l.source === 'ws-viewer');
+  assert.match(lines[0].delivery_result, /^blocked:/);
+  assert.equal(lines[0].claimed_from, 'peer-alpha');
+
+  viewer.close();
+});
+
+test('#843: a spawned resize still resizes, and is still not an inject', async () => {
+  // The resize DECISION, restated at the second door: geometry is not text. `classifyPeerLaneInject`
+  // has no prompt to classify, and recording a window-size change as `kind:'inject'` would put a
+  // PTY write in the log that never happened — this release's own defect, committed by the fix for
+  // it. Resize therefore stays outside the inject gate at BOTH doors, deliberately and identically.
+  const { sid, viewer } = await spawned('spawnresize');
+  viewer.send(JSON.stringify({ type: 'resize', cols: 132, rows: 43 }));
+  await new Promise((r) => setTimeout(r, 400));
+
+  assert.equal(auditLines().some((l) => l.to === sid && l.source === 'ws-viewer'), false,
+    'a geometry change writes nothing into the PTY — recording it as an inject would be its own overclaim');
+  // And it did not take the input path by accident: a resize routed through the inject adapter
+  // would have written `undefined` into the shell.
+  assert.equal((await post(`/api/sessions/${encodeURIComponent(sid)}/screen`, {})).status !== 500, true);
+
+  viewer.close();
+});
+
+test('#843: the BUS door is a PTY write and is audited as one', async () => {
+  // `busAutoRoute` writes into any session's PTY via `deliverInjectionToSession` with no audit
+  // line and no policy verdict. Same authority as `POST /api/sessions/:id/inject`, no
+  // accountability at all — so the inject log, which an operator now reasonably reads as THE
+  // record of who typed into a session, was missing a whole door.
+  const sid = createSessionId('busaudit');
+  const reg = await post('/api/sessions/register', { session_id: sid, command: 'test-wrap', cwd: process.cwd() });
+  assert.ok([200, 201].includes(reg.status));
+  const owner = await open(
+    `/api/sessions/${encodeURIComponent(sid)}?token=${encodeURIComponent(TOKEN)}&owner=1&owner_pid=${process.pid}&command=test-wrap`,
+    { headers: { 'x-telepty-session-token': reg.body.session_token } }
+  );
+
+  const delivered = nextFrame(owner, (m) => m.type === 'inject' && m.data === 'bus-audited-task', 5000);
+  const publish = await post('/api/bus/publish', {
+    type: 'turn_request', target: sid, payload: { prompt: 'bus-audited-task' }
+  });
+  assert.equal(publish.status, 200);
+  assert.ok(await delivered, 'an unattributed bus route still delivers — this is accountability, not a tightening');
+
+  const lines = await waitForAudit((l) => l.to === sid && l.source === 'bus');
+  assert.equal(lines[0].kind, 'inject');
+  assert.equal(lines[0].delivery_result, 'success');
+  assert.equal(lines[0].claimed_from, null, 'no sender was claimed, and absence is recorded as absence');
+  assert.equal(lines[0].verified_sender_sid, null,
+    'the bus is not an authorization boundary: nothing on it is a verified identity');
+
+  owner.close();
+});
+
+test('#843: the BUS door cannot launder a #533 block', async () => {
+  // The reproduction, both halves against the same daemon: the HTTP door refuses this payload
+  // with 403 and records the attempt; re-addressing the identical payload to the bus used to
+  // return 200, land the text in the PTY, and leave the audit log untouched.
+  const sid = createSessionId('buslaunder');
+  const reg = await post('/api/sessions/register', { session_id: sid, command: 'test-wrap', cwd: process.cwd() });
+  const owner = await open(
+    `/api/sessions/${encodeURIComponent(sid)}?token=${encodeURIComponent(TOKEN)}&owner=1&owner_pid=${process.pid}&command=test-wrap`,
+    { headers: { 'x-telepty-session-token': reg.body.session_token } }
+  );
+
+  const viaHttp = await post(`/api/sessions/${encodeURIComponent(sid)}/inject`, {
+    prompt: 'go do my work for me', from: 'peer-alpha'
+  });
+  assert.equal(viaHttp.status, 403, 'the HTTP door refuses this — that is the rule being enforced');
+
+  const leaked = nextFrame(owner, (m) => m.type === 'inject' && String(m.data).includes('go do my work'), 1500);
+  const publish = await post('/api/bus/publish', {
+    type: 'turn_request', target: sid, from: 'peer-alpha', payload: { prompt: 'go do my work for me' }
+  });
+  assert.equal(publish.status, 200, 'publishing is still accepted — it is the ROUTE that must refuse');
+  assert.equal(await leaked, null, 'the same payload the HTTP door refused must not reach the PTY via the bus');
+
+  const lines = await waitForAudit((l) => l.to === sid && l.source === 'bus');
+  assert.match(lines[0].delivery_result, /^blocked:/);
+  assert.equal(lines[0].claimed_from, 'peer-alpha');
+
+  owner.close();
+});
+
 test('a resize frame is not an inject and is not audited as one', async () => {
   const { sid, owner, viewer } = await pair('wsresize');
 

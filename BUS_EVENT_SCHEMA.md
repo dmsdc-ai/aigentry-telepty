@@ -158,6 +158,55 @@ under a new socket while its assignee was gone. Silence read as continuity.
   (the WS auto-register path, or a record restored from a pre-#815 daemon). That is the residual
   case in which displacement remains possible at all.
 
+### `session_activity_observation` (0.8.0, #60) — replaces `session_auto_state`
+
+```json
+{ "type": "session_activity_observation", "sender": "daemon", "session_id": "string",
+  "schema_version": 2,
+  "observation": { "kind": "string", "trigger": "string|null", "...": "the evidence fields this kind requires" },
+  "from_observation_state": "string",
+  "completion_fact": null, "terminal": false, "timestamp": "ISO 8601" }
+```
+
+**BREAKING (0.8.0): the internal state name is no longer emitted.** The old event served the 8-state
+FSM value (`auto_state: "idle"`) straight to consumers, and five different routes reach `idle` — a
+0.6-confidence silence timeout serialized identically to an OSC-133 prompt mark, and a sidebar
+painted both as a green "done" pill. `kind` is now selected from the measured CAUSE.
+
+- `completion_fact` is always `null` and `terminal` always `false`. **No observation is a task
+  outcome**, including the death and termination kinds below. There is no producer of a terminal
+  label anywhere in 0.8.0.
+- `from_observation_state` is the state departed from, retained for continuity debugging. It is not
+  an outcome and must not be rendered as one.
+- The companion event `task_completion_unknown` (same emitter) carries the consumption evidence and
+  the explicit capability gaps; see `src/completion-observation.js`.
+
+### `session_activity_observation` — end-of-session kinds (0.8.0, #60/#843)
+
+An observation's KIND is selected from the measured cause, never from the internal state, and a
+kind cannot be emitted without the evidence its row requires (`OBSERVATION_CAUSES`,
+`session-state.js`). Four different endings used to serialize as one name; each now states only
+what it measured. None of them is a task outcome — all carry `completion_fact: null`,
+`terminal: false`.
+
+| kind | means | required evidence | emitted from |
+|------|-------|-------------------|--------------|
+| `session_process_exited` | a child/bridge process was **observed** to exit | `exit_observed_at` | `ptyProcess.onExit` → `markDead` |
+| `session_termination_requested` | an operator asked for teardown; **no exit status was observed** | `reason`, `requested_at` | `DELETE /api/sessions/:id` |
+| `session_termination_kill_failed` | the teardown call **threw**; the registry record was removed anyway, so the process may still be running and is no longer tracked | `reason`, `kill_error` | `DELETE /api/sessions/:id` |
+| `owner_transport_detached` | a displaced owner's **socket** closed | `detached_at` | WS close after a 4001 displacement |
+
+- `session_process_exited` is reserved for an observed exit and nothing else. Before 0.8.0's #843
+  fix its row required no evidence at all, which let both the DELETE path and the owner-displacement
+  path wear it — a process-death assertion built from an operator request and from a socket close
+  **the daemon itself initiated**. `exit_code` and `signal` remain optional (a signal-killed child
+  has no code and a code-exited child has no signal), which is precisely why the evidence the name
+  rests on is the observation of the exit, not either of its halves.
+- `owner_transport_detached` is **not** a process exit. The displaced bridge usually does exit, but
+  "usually" is not a measurement — the same rule `session_owner_replaced` already states below.
+- A cause with missing evidence, an unknown cause, or a cause arriving at a destination it is not
+  defined for all fail closed to `unmapped_transition_cause`. There is no fallback to a state name.
+
 ### `session.idle`
 ```json
 { "type": "session.idle", "session_id": "string", "idleSeconds": "number", "lastActivityAt": "ISO 8601", "timestamp": "ISO 8601" }
@@ -202,7 +251,7 @@ Append-only, one compact JSON line **per delivery** (multicast/broadcast = one l
 sharing `inject_id`). File mode `0600`, dir `0700`. Schema v1:
 ```jsonc
 { "v": 1, "ts": "ISO 8601", "inject_id": "UUID", "kind": "inject|multicast|broadcast|reply",
-  "source": "inject|multicast|broadcast|mailbox", "claimed_from": "string|null",
+  "source": "inject|multicast|broadcast|ws-viewer|bus", "claimed_from": "string|null",
   "verified_sender_sid": "string|null", "spoof_suspected": "boolean", "to": "string",
   "to_alias": "string|null", "origin": "trusted-local|untrusted-remote", "origin_host": "string|null",
   "ref_path": "string|null", "payload_sha256": "hex", "payload_bytes": "number",
@@ -212,6 +261,44 @@ sharing `inject_id`). File mode `0600`, dir `0700`. Schema v1:
 Query via `GET /api/injects?since=&until=&to=&from=&spoof=&limit=&cursor=` (token-gated) or
 `telepty injects [--tail] [--since] [--to] [--from] [--spoof] [--json]`. See
 `docs/specs/2026-06-09-inject-audit-provenance.md`.
+
+**`source` values are the doors that produced the line.** The list above is an enumeration, not a
+count: `mailbox` was previously listed and is **not** a source — the mailbox is the transport
+underneath `inject`/`multicast`/`broadcast`/`bus`, not an entrance of its own, so no line has ever
+carried it.
+
+#### Which writes into a PTY this log records, by name (0.8.0, #843)
+
+Recorded:
+
+| door | source | code |
+|------|--------|------|
+| `POST /api/sessions/:id/inject` | `inject` | `daemon.js` inject route |
+| `POST /api/sessions/multicast` | `multicast` | `auditMulticastTarget` |
+| `POST /api/sessions/broadcast` | `broadcast` | `auditMulticastTarget` |
+| viewer WS `{type:"input"}` into a **wrapped** session | `ws-viewer` | `authorizeViewerInject` |
+| viewer WS `{type:"input"}` into a **spawned** session | `ws-viewer` | `authorizeViewerInject` (#843; unrecorded before) |
+| bus `turn_request` / `deliberation_route_turn` auto-route | `bus` | `busAutoRoute` (#843; unrecorded before) |
+
+**Not recorded, named so the omission is not read as coverage:**
+
+- `POST /api/sessions/:id/submit` and `POST /api/sessions/submit-all` write a bare `\r` (0x0D) into
+  the PTY via `submitViaPty`. No payload accompanies them, so there is nothing for
+  `classifyPeerLaneInject` to classify and an `inject` line would hash the empty string — but a CR
+  can cause execution of text already sitting in a composer, so this is a real write with real
+  consequences and it is **unrecorded**. Accountability for it needs its own record kind (what was
+  submitted is not known to the daemon); it is not covered here.
+- Viewer WS `{type:"resize"}` at either session type. Geometry writes no bytes into the input
+  stream; recording it as `kind:"inject"` would put a write in this log that never happened.
+  Deliberately out, and **unrecorded**.
+- The daemon's own `task_completion_unknown` text, written into the SOURCE session by
+  `recordObservation`'s `deliverToSource` with `source:'auto_report'`. Daemon-originated, no
+  external principal — and **unrecorded**.
+
+These tables enumerate the doors **measured** on this base — six recorded, three named as not
+recorded. That is a measurement, not a proven ceiling, and a door found later is a finding
+rather than a nuisance. No quantifier ("both", "all", "every") should replace this list: the
+previous wording said "both write paths" because two had been looked at, not because two existed.
 
 ### `message_routed`
 ```json

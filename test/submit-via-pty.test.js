@@ -210,7 +210,7 @@ function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4
   return captured.length ? captured[0].msg : null;
 }
 
-const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1 — no completion fact observed; pty_quiet=\d+\.\ds; consumption=(observed|not_established); outcome protocol unavailable$/;
+const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1 — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
 // The whole of section 4/4b used to turn on a two-way verdict: UNCONFIRMED for a never-started
 // worker, TASK_COMPLETE for a real one. Both are deleted, so every case below states the same

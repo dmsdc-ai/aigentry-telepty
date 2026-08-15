@@ -492,7 +492,7 @@ test('inject on wrapped session forwards to owner WebSocket', async () => {
   await harness.registerSession(sessionId);
 
   // First WebSocket connector becomes owner
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
@@ -513,7 +513,7 @@ test('inject keeps routing metadata out of wrapped prompt text and submits separ
   const sessionId = createSessionId('owner-routing');
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
@@ -541,7 +541,7 @@ test('known wrapped AI CLI queues inject until bootstrap ready', async () => {
   const sessionId = createSessionId('bootstrap-claude');
   await harness.registerSession(sessionId, { command: 'claude' });
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
@@ -580,7 +580,7 @@ test('known wrapped AI CLI drains multiple bootstrap injects in FIFO order', asy
   const sessionId = createSessionId('bootstrap-order');
   await harness.registerSession(sessionId, { command: 'codex' });
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   for (const prompt of ['first', 'second', 'third']) {
@@ -616,7 +616,7 @@ test('bootstrap queued submit waits behind queued text and preserves order', asy
   const sessionId = createSessionId('bootstrap-submit');
   await harness.registerSession(sessionId, { command: 'gemini' });
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
@@ -661,7 +661,7 @@ test('codex submit confirmation resends CR when context-ref remains visible and 
   const body = '[context-ref] Read ~/.telepty/shared/6516f10fb6850f9c9c18f3aa238c0060cc3f5d6b781ba1dca79dd2a12e77d81d.md';
 
   await harness.registerSession(sessionId, { command: 'codex', backend: 'pty' });
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const bus = await harness.connectBus();
@@ -740,7 +740,7 @@ test('codex submit confirmation returns 504 when context-ref remains unsubmitted
   const body = '[context-ref] Read ~/.telepty/shared/stuck.md';
 
   await harness.registerSession(sessionId, { command: 'codex', backend: 'pty' });
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   ownerWs.send(JSON.stringify({ type: 'ready' }));
@@ -793,7 +793,7 @@ test('bus auto-route uses wrapped WS split delivery instead of cmux direct injec
     cmux_workspace_id: 'workspace:test'
   });
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const publish = await harness.request('/api/bus/publish', {
@@ -823,7 +823,7 @@ test('wrapped session owner output broadcasts to attached clients', async () => 
   const sessionId = createSessionId('owner-broadcast');
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const viewerWs = await harness.connectSession(sessionId);
   const viewerMessages = collectJsonMessages(viewerWs);
 
@@ -842,7 +842,7 @@ test('session WebSocket roundtrip relays an owner output frame', async () => {
   const sessionId = createSessionId('ws-roundtrip');
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const viewerWs = await harness.connectSession(sessionId);
   const viewerMessages = collectJsonMessages(viewerWs);
   const token = createSessionId('ws-roundtrip-token');
@@ -862,7 +862,7 @@ test('wrapped session non-owner input forwards to owner as inject', async () => 
   const sessionId = createSessionId('viewer-input');
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
   const viewerWs = await harness.connectSession(sessionId);
 
@@ -908,7 +908,7 @@ test('wrapped sessions emit disconnect/reconnect/stale lifecycle and clean up af
   const messages = collectJsonMessages(bus);
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   await waitFor(async () => {
     const list = await harness.request('/api/sessions');
     const session = list.body.find((item) => item.id === sessionId);

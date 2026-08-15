@@ -238,13 +238,12 @@ test('dead_reports_absence_to_source: a process exit is reported as absence, and
     // `sessionStateManager.markDead` while the session record is still live (daemon.js:3079-3082),
     // so the transition listener sees it.
     //
-    // NOT the DELETE path, deliberately. `DELETE /api/sessions/:id` removes `sessions[id]` BEFORE
-    // `sessionStateManager.unregister(id)` (daemon.js:4748-4750) and never calls markDead at all,
-    // so the listener's `if (!session) return` guard at daemon.js:118 bails and an operator-killed
-    // session's death produces NO observation. That is a real §A2 silence; it is a source defect
-    // this track may not fix (daemon.js is outside the file boundary) and it is REPORTED rather
-    // than pinned here — a test asserting the current DELETE behaviour would bank the silence as
-    // intended behaviour, which is the opposite of what this release is for.
+    // NOT the DELETE path, deliberately — and the two are no longer interchangeable. That path
+    // observes its ending too (the §A2 silence it once produced is fixed), but under
+    // `session_termination_requested`: an operator asked for the teardown and no exit status was
+    // observed at that instant. `session_process_exited` is now reserved for an exit that was
+    // actually seen, and requires `exit_observed_at` to be stated at all (#843). This arm is the
+    // entrance that genuinely observes one. See test/delete-death-observation-60.test.js.
     const sid = createSessionId('dying');
     await daemon.spawnSession(sid, { command: 'bash', args: ['-c', 'sleep 3'] });
     const res = await dispatch(sid, 'work this process will not survive', source);
@@ -327,4 +326,80 @@ test('all_observation_entrypoints_return_decisions: the retired pendingReports v
     assert.equal(res.body.terminal, false);
     assert.equal(res.body.tracking_state, 'tracked');
   })();
+});
+
+// =============================================================================================
+// #843 — the write-ahead record must be able to say the delivery did not happen
+// =============================================================================================
+
+test('#843 refused_delivery_aborts_the_write_ahead_record: zero bytes written is a measurement, not a gap', async () => {
+  // The record is created BEFORE delivery on purpose (§3 item 1): a delivered task that no record
+  // answers for is the silence this release removes. But the write-ahead has no ABORT. When the
+  // delivery is then refused — a wrapped session with no owner socket, an aterm whose endpoint is
+  // gone — the ledger keeps `tracking_state:"tracked"` with `inject_accepted` forever, and the
+  // pendingReport entry leaks alongside it.
+  //
+  // That inverts the release's thesis. The daemon MEASURED that zero bytes were written, returned
+  // that measurement to the HTTP caller as a 503, and then discarded it everywhere else — so an
+  // orchestrator polling the ledger sees a dispatch that looks in-flight and will never move,
+  // which is the "waiting forever on something that never started" failure the tracking exists to
+  // prevent.
+  const sid = createSessionId('undelivered');
+  const reg = await daemon.request('/api/sessions/register', {
+    method: 'POST', body: { session_id: sid, command: 'test-wrap', cwd: process.cwd() },
+  });
+  assert.ok([200, 201].includes(reg.status), `register: ${reg.status}`);
+
+  // Registered but never connected: there is no owner socket, so nothing can receive the bytes.
+  const res = await dispatch(sid, 'this dispatch has nowhere to land');
+  assert.notEqual(res.status, 200, `expected a refusal, got ${res.status} ${JSON.stringify(res.body)}`);
+  const injectId = res.body.inject_id;
+  assert.ok(injectId, `the refusal must still name the inject it refused: ${JSON.stringify(res.body)}`);
+
+  const poll = await observations(injectId);
+  const body = assertDiscriminatedUnknown(poll, 'after a refused delivery');
+  assert.equal(body.tracking_state, 'aborted',
+    'a dispatch whose bytes were refused is not "tracked" — nothing is in flight to track');
+  const kinds = (body.observations || []).map((o) => o.kind);
+  assert.ok(kinds.includes('inject_delivery_refused'),
+    `the refusal must be recorded as its own observation, got ${JSON.stringify(kinds)}`);
+  const refused = body.observations.find((o) => o.kind === 'inject_delivery_refused');
+  assert.ok(refused.delivery_code, 'and it must name WHY the delivery was refused');
+  // Still not an outcome: a task that never started did not fail, it never started.
+  assert.equal(body.completion_fact, null);
+  assert.equal(body.terminal, false);
+
+  // The pendingReport must not leak either — it is what makes the session look busy to every
+  // later observation, and it belongs to an inject that was never delivered.
+  const pending = await daemon.request(`/api/pendingReports/${encodeURIComponent(sid)}`);
+  assert.equal(pending.status, 404,
+    'a refused dispatch must not leave a pending report behind claiming the session is awaiting a turn');
+});
+
+test('#843 consumption_is_measured_for_the_inject_being_polled, never for whichever one is active', async () => {
+  // The poll built its consumption block from `getPendingReport(record.session_id)` — whatever
+  // inject currently owns that session's pending slot — with no check that it is the inject being
+  // asked about. So `GET /api/inject-observations/A` silently changes its answer when an unrelated
+  // inject B arrives, and becomes byte-identical to `GET B` while A is marked superseded. One
+  // inject's evidence served under another inject's id is the same substitution this release
+  // removes everywhere else, at the endpoint an orchestrator polls to decide what happened.
+  const sid = createSessionId('crossinject');
+  await daemon.spawnSession(sid);
+
+  const first = await dispatch(sid, 'inject A');
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  const second = await dispatch(sid, 'inject B');
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+
+  const a = await observations(first.body.inject_id);
+  const b = await observations(second.body.inject_id);
+  assertDiscriminatedUnknown(a, 'superseded inject A');
+  assertDiscriminatedUnknown(b, 'active inject B');
+
+  assert.equal(a.body.tracking_state, 'superseded');
+  assert.equal(b.body.tracking_state, 'tracked');
+  assert.equal(a.body.consumption.basis, 'pending_report_belongs_to_other_inject',
+    'A has no pending report of its own — that absence is the honest answer, not B\'s evidence');
+  assert.notDeepEqual(a.body.consumption, b.body.consumption,
+    'two different injects must not receive the same consumption block measured once, on one of them');
 });

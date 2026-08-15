@@ -156,8 +156,15 @@ test('owner_displaced_without_markdead_reports_absence: both facts reach every t
   await delay(300);
 
   for (const injectId of ['inj-old', 'inj-new']) {
-    assert.ok(kindsOf(injectId).includes('session_process_exited'),
-      `expected session_process_exited for ${injectId} without markDead, got ${JSON.stringify(kindsOf(injectId))}`);
+    // #843 — the fact is still reported (that is §8.3 item 10 and it stands), but under the name
+    // of what was actually measured: a SOCKET closed. The daemon initiated that close itself, 35
+    // lines up, with code 4001. Calling a close the daemon sent `session_process_exited` asserted
+    // a child exit nobody observed — and BUS_EVENT_SCHEMA.md:153-156 already said, correctly, that
+    // this path implies no process-exit observation. The code contradicted the repo's own doc.
+    assert.ok(kindsOf(injectId).includes('owner_transport_detached'),
+      `expected owner_transport_detached for ${injectId} without markDead, got ${JSON.stringify(kindsOf(injectId))}`);
+    assert.equal(kindsOf(injectId).includes('session_process_exited'), false,
+      'transport detachment is not process death: the displaced bridge may still be running');
   }
 
   // Neither fact is an outcome. Owner replacement is not task failure and death is not task
@@ -219,4 +226,90 @@ test('a credential-holding session still refuses an unauthenticated owner claim 
   assert.equal(closeCode, 4003, 'a session holding a credential requires the matching bearer to be owned');
   assert.equal(session.ownerWs, null, 'and the refused claimant never became the owner');
   assert.equal(session.sessionEpoch, undefined, 'nor acquired an epoch on the way out');
+});
+
+// #843 — ownership without the bearer.
+//
+// The #815 owner-claim gate fires only when the handshake carries `?owner=1`. The ASSIGNMENT 35
+// lines below it fires on `!activeSession.ownerWs || isOwnerConnect` — so on a credentialed
+// session with no current owner, dropping the query parameter takes ownership without presenting
+// the bearer at all. The taker then receives the full body of every subsequent inject to that
+// session, which is exactly the disclosure #815 exists to prevent, reached by not asking for it.
+//
+// Not introduced by this release (the gate is byte-identical at the base commit), but #815's
+// residual is documented as the first-claim race, and this is a second, larger one.
+//
+// The refusal is deliberately NOT the 4003 the explicit path uses: this socket never claimed to be
+// an owner, so refusing the connection would break ordinary viewers attaching to a session whose
+// bridge has dropped. It is refused OWNERSHIP and attached as a viewer — which is what it asked
+// for. The #815 comment's warning against a silent downgrade is about an explicit `?owner=1`
+// bridge, whose whole purpose is to own; it does not apply to a socket that made no claim.
+test('an implicit first-claim on a credentialed session does not confer ownership (#843)', async () => {
+  const app = express();
+  const server = http.createServer(app);
+  const port = await new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
+  after(() => server.close());
+
+  const credentials = createCredentialStore();
+  const issued = credentials.issue(SID);
+  const session = newRecord();
+  installWebSocketTransport(buildDeps(server, { [SID]: session }, credentials));
+
+  // No `?owner=1`, no bearer — and the session currently has no owner.
+  const sneak = new WebSocket(`ws://127.0.0.1:${port}/api/sessions/${SID}?token=${TOKEN}`);
+  let sawOwnerToken = false;
+  sneak.on('message', (buf) => {
+    try { if (JSON.parse(buf.toString()).type === 'owner_token') sawOwnerToken = true; } catch { /* not JSON */ }
+  });
+  await new Promise((resolve, reject) => { sneak.once('open', resolve); sneak.once('error', reject); });
+  await delay(200);
+  after(() => { try { sneak.terminate(); } catch { /* already gone */ } });
+
+  // Server-authoritative: `ownerWs` is the daemon's own record of who owns the PTY stream, and it
+  // starts null. (It holds the SERVER-side socket, which is never the client object this test
+  // holds — so identity against `sneak` would be vacuously true and prove nothing.)
+  assert.equal(session.ownerWs, null,
+    'a socket that presented no bearer must not become the owner of a credentialed session');
+  assert.equal(session.sessionEpoch, undefined,
+    'and must not acquire the epoch it never proved — not even as a null assignment');
+  assert.equal(sawOwnerToken, false,
+    'nor be handed the owner token, which is the discriminator the DELETE guard trusts');
+  // It is still a viewer: the connection is not refused, only the authority is.
+  assert.equal(session.clients.size, 1,
+    'an ordinary attach must keep working — this refuses ownership, not connectivity');
+  assert.equal(sneak.readyState, 1, 'the socket stays open');
+
+  // And the real bridge, presenting the bearer, still takes ownership normally.
+  const owner = await connect(port, issued.bearer);
+  await delay(200);
+  after(() => { try { owner.terminate(); } catch { /* already gone */ } });
+  assert.notEqual(session.ownerWs, null, 'the credentialed bridge still owns its session');
+  assert.equal(session.sessionEpoch, issued.epoch);
+});
+
+test('a session holding NO credential still accepts an implicit first claim (#843 keeps reconnect working)', async () => {
+  // The residual #815 deliberately leaves open: a record with no credential (the WS auto-register
+  // path, or one restored from a pre-#815 daemon) has nothing to check a claim against. Narrowing
+  // that here would break reconnect, which is the thing #815 was careful not to do.
+  const app = express();
+  const server = http.createServer(app);
+  const port = await new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
+  after(() => server.close());
+
+  const credentials = createCredentialStore();
+  const session = newRecord();
+  installWebSocketTransport(buildDeps(server, { [SID]: session }, credentials));
+
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/api/sessions/${SID}?token=${TOKEN}`);
+  let sawOwnerToken = false;
+  ws.on('message', (buf) => {
+    try { if (JSON.parse(buf.toString()).type === 'owner_token') sawOwnerToken = true; } catch { /* not JSON */ }
+  });
+  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  await delay(200);
+  after(() => { try { ws.terminate(); } catch { /* already gone */ } });
+
+  assert.notEqual(session.ownerWs, null, 'no credential to check against: the pre-#815 claim path is unchanged');
+  assert.equal(sawOwnerToken, true, 'and the claimant is handed the owner token, as before');
+  assert.equal(session.sessionEpoch, null, 'but it proved nothing, and that absence is recorded');
 });

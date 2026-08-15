@@ -49,13 +49,23 @@ function collectBus(ws) {
   return events;
 }
 
-const deathObservations = (events, sessionId) => events.filter((e) => (
+const observationsOfKind = (events, sessionId, kind) => events.filter((e) => (
   e.session_id === sessionId
   && e.type === 'session_activity_observation'
-  && e.observation && e.observation.kind === 'session_process_exited'
+  && e.observation && e.observation.kind === kind
 ));
+const deathObservations = (events, sessionId) => observationsOfKind(events, sessionId, 'session_process_exited');
 
-test('F1: a DELETE-killed session emits its death observation (§A2)', async () => {
+test('F1: a DELETE-killed session emits its end observation (§A2) — under a name that matches what was measured (#843)', async () => {
+  // The §A2 half of this is unchanged and still asserted: this entrance used to emit NOTHING, and
+  // silence is the one output Stage A forbids.
+  //
+  // What #843 changes is the NAME. The A2 fix routed the DELETE through `markDead`, whose external
+  // kind is `session_process_exited` — an assertion that a child process was seen to exit. Nothing
+  // on this path saw that. The daemon asked for a teardown; the exit status is genuinely unknown at
+  // this instant, which is exactly why the fix deliberately left exit_code and signal null. The
+  // fields were honest and the name was not, so the honest fields were filed under a claim that
+  // contradicted them.
   const sessionId = createSessionId('delete-death');
   const events = collectBus(bus);
   await harness.spawnSession(sessionId);
@@ -65,13 +75,20 @@ test('F1: a DELETE-killed session emits its death observation (§A2)', async () 
   const res = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
   assert.equal(res.status, 200, JSON.stringify(res.body));
 
-  await waitFor(() => deathObservations(events, sessionId).length > 0, {
+  await waitFor(() => observationsOfKind(events, sessionId, 'session_termination_requested').length > 0, {
     timeoutMs: 10000,
-    description: 'a death observation for the operator-killed session',
+    description: 'a termination-requested observation for the operator-killed session',
   });
 
-  const observed = deathObservations(events, sessionId)[0];
-  assert.equal(observed.observation.kind, 'session_process_exited');
+  const observed = observationsOfKind(events, sessionId, 'session_termination_requested')[0];
+  assert.equal(observed.observation.kind, 'session_termination_requested');
+  assert.equal(observed.observation.reason, 'operator_delete',
+    'the observation must say WHY the session ended, since it cannot say how the process did');
+  // The overclaim, asserted negatively: no observed-exit name may appear on this entrance at all.
+  // A DELETE does kill the PTY, and its onExit may well fire later — but the state machine is
+  // unregistered synchronously here, so nothing downstream may report an exit this path never saw.
+  assert.equal(deathObservations(events, sessionId).length, 0,
+    'no process exit was observed on this path, so session_process_exited must not be emitted');
   // A death is not a task outcome. The session is gone; what it was doing is still unknown.
   assert.equal(observed.completion_fact, null);
   assert.equal(observed.terminal, false);

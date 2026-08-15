@@ -200,7 +200,7 @@ test('control-only redraws do not re-mark a quiet session working', async () => 
   const senderId = createSessionId('wrapped-sender');
 
   await harness.registerSession(senderId);
-  const senderOwner = await harness.connectSession(senderId);
+  const senderOwner = await harness.connectSession(senderId, harness.ownerAuth(senderId));
 
   // §3.8: the read model is renamed too. `auto.state` served the INTERNAL FSM name straight to
   // consumers, which is how `idle` reached a sidebar as a green done-pill. It is now

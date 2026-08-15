@@ -66,7 +66,12 @@ const CONSUMER_MATRIX = [
   ['repeated_error_pattern_observed',         'repeated_error_pattern',            'error',    { error_fingerprint: 'boom', repeat_count: 3, window_ms: 180000 }, ['error', 'attention', 'neutral']],
   ['thinking_classification_timeout_observed','thinking_timeout',                  'error',    { thinking_duration_ms: 301000 },                     ['attention', 'error', 'neutral']],
   ['session_restart_mark_observed',           'lifecycle_restarting',              'restarting', {},                                                 ['pending', 'neutral', 'active']],
-  ['session_process_exited',                  'process_exit',                      'dead',     {},                                                   ['error', 'attention', 'neutral']],
+  ['session_process_exited',                  'process_exit',                      'dead',     { exit_observed_at: '2026-07-29T00:00:00.000Z' },     ['error', 'attention', 'neutral']],
+  // #843 — the two entrances that used to borrow `session_process_exited`. Each now presents as
+  // what it measured; neither may reach the death styling, and neither may go quiet.
+  ['session_termination_requested',           'termination_requested',             'dead',     { reason: 'operator_delete', requested_at: '2026-07-29T00:00:00.000Z' }, ['attention', 'neutral', 'pending']],
+  ['session_termination_kill_failed',         'termination_kill_failed',           'dead',     { reason: 'operator_delete', kill_error: 'kill EPERM' }, ['error', 'attention']],
+  ['owner_transport_detached',                'owner_transport_detached',          'idle',     { detached_at: '2026-07-29T00:00:00.000Z' },          ['attention', 'error', 'neutral']],
   ['owner_replaced_observed',                 'owner_epoch_replaced',              'idle',     { displaced_session_epoch: 'epoch-1' },               ['attention', 'error', 'neutral']],
 ];
 
@@ -134,14 +139,18 @@ test('consumer_vocabulary_matrix_is_total: the matrix covers the whole vocabular
   const covered = new Set(CONSUMER_MATRIX.map(([, cause]) => cause));
   const ready = Object.keys(OBSERVATION_CAUSES).filter(c => c.startsWith('ready_frame_'));
   const missing = Object.keys(OBSERVATION_CAUSES).filter(c => !covered.has(c) && !ready.includes(c));
-  // `owner_process_exited` maps onto `session_process_exited`, already asserted above via
-  // `process_exit`; assert the aliasing explicitly rather than adding a duplicate row.
-  assert.deepEqual(missing, ['owner_process_exited'],
+  // #843 — nothing is aliased any more. This assertion used to allow exactly one uncovered cause,
+  // `owner_process_exited`, on the grounds that it emitted the SAME name as an ordinary child
+  // exit: "one death, one name". That was the bug stated as a property. There were never two
+  // deaths here — there was one death and one socket close, and folding them together is what
+  // made a daemon-initiated disconnect indistinguishable from an observed process exit. Every
+  // cause now has its own row.
+  assert.deepEqual(missing, [],
     `§2.3 causes with no consumer assertion: ${missing.join(', ')}`);
-  assert.equal(
-    mapObservationCause({ destination: 'idle', cause: 'owner_process_exited', evidence: {} }).kind,
+  assert.notEqual(
+    mapObservationCause({ destination: 'idle', cause: 'owner_transport_detached', evidence: { detached_at: '2026-07-29T00:00:00.000Z' } }).kind,
     'session_process_exited',
-    'the #815 owner-death fact emits the same name as an ordinary child exit — one death, one name');
+    'a transport detachment must not present as a process exit');
 
   // Whole-table sweep: nothing in the presentation layer may be green or done, including rows a
   // future change adds without touching this file.

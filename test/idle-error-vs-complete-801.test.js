@@ -268,7 +268,7 @@ function makeGate({ preFrames = [], postFrames = [], pendingReportOverrides = {}
 
 // The literal absence statement this path now emits, for a 204.5s quiet after the c757s inject.
 const UNKNOWN_204 =
-  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-801 — no completion fact observed; pty_quiet=204\.5s; consumption=(observed|not_established); outcome protocol unavailable$/;
+  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-801 — no completion fact observed; pty_quiet=(\d+\.\d)s(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
 test('#801 THE BUG: an error-death is no longer reported as a completion', () => {
   const g = makeGate({ preFrames: ['boot\n'], postFrames: [BODY + '\n', CLAUDE_ERROR_RING] });
