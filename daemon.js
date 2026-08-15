@@ -35,7 +35,19 @@ const { createCredentialStore } = require('./src/session-store/session-credentia
 const { createAuditWriter, readInjectLog } = require('./src/audit/inject-log');
 const { mintSessionNonce, applyProvenance } = require('./src/audit/provenance');
 
-const config = getConfig();
+// #835: the daemon is the process that must not be fooled. It freezes EXPECTED_TOKEN below and
+// never re-reads it, while every CLI process re-reads the file — so a daemon that came up on a
+// token nobody else has 401s every call for the rest of its life, and the operator sees a fleet
+// of 401s with no cause anywhere. `console.warn` in whichever process read the file does not
+// reach that operator; refusing to serve, with the reason on stderr where the service log keeps
+// it, does. Same shape as the loadTeleptyConfig() guard further down.
+let config;
+try {
+  config = getConfig();
+} catch (err) {
+  console.error(`[AUTH] Failed to load telepty auth config: ${err.message}`);
+  process.exit(1);
+}
 const EXPECTED_TOKEN = config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
 const net = require('net');

@@ -66,6 +66,30 @@ and to the daemon in an authenticated pre-registration, and the daemon issues on
 is a consumer-side spawn change, deliberately not built here. **Documented so the next person does
 not have to rediscover it.**
 
+## The shared daemon secret — read boundary, and why rotation needs a restart
+
+`~/.telepty/config.json` holds the token every caller presents to the daemon. Two properties are
+deliberate, and both are load-bearing:
+
+**The daemon freezes the token at boot and never re-reads it.** So rotating it requires a deliberate
+daemon restart. An operator who edits the config under a running daemon will get 401s until the
+daemon is restarted — that is correct behaviour, not a bug. The boundary the token buys is *"whoever
+can **read** this file can drive the daemon"* — real against a different uid, a sandbox with a
+different `HOME`, or a container neighbour. Re-reading per request would quietly widen it to
+*"whoever can **write** this file owns the running daemon"*, making a file write a silent credential
+takeover of the process that parents every live session, with no restart and nothing in any log. The
+freeze is what keeps rotation an explicit, observable act.
+
+**A config that cannot be read is never replaced.** `getConfig()` mints a token only when there is no
+config at all; a file that will not parse, or that carries no usable `authToken`, is a refusal
+(`err.code === 'TELEPTY_CONFIG_UNREADABLE'`) with the bytes on disk left exactly as found. The daemon
+refuses to boot on one rather than serving on a secret nobody else has. Minting over an unreadable
+config would destroy a secret that is still recoverable, and — given the freeze above — desync a
+long-lived daemon from every subsequent call, permanently.
+
+Consequence worth stating once: a running daemon is *immune* to the config changing underneath it,
+because it never looks again. The failure surfaces on the caller side, named, not as a silent re-key.
+
 ## Design principle
 
 > **telepty = stateless dumb pipe**
