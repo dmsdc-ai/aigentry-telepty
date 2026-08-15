@@ -488,10 +488,33 @@ test('idle after an inject emits task_completion_unknown, not a terminal claim',
     && m.session_id === senderId
     && QUIET_OBSERVATION_KINDS.includes(m.observation && m.observation.kind);
 
-  await waitFor(() => messages.some(isQuietObservation), {
-    timeoutMs: 60000,
-    description: 'task_completion_unknown for the quiet sender'
-  });
+  // dg903 INSTRUMENT (branch-only, remove before merge): the 60s ceiling reds macOS CI 3/3 while
+  // ubuntu passes at ~1.4s. The timeout alone cannot tell "no observation at all" from "an
+  // observation under a kind this test does not accept", so dump the sender's whole observation
+  // trajectory, the live state, and the daemon's own log before rethrowing.
+  try {
+    await waitFor(() => messages.some(isQuietObservation), {
+      timeoutMs: 60000,
+      description: 'task_completion_unknown for the quiet sender'
+    });
+  } catch (err) {
+    const mine = messages.filter(m => m.session_id === senderId);
+    console.error(`\n[dg903] ===== sender=${senderId} messages=${mine.length} (total ${messages.length}) =====`);
+    for (const m of mine) {
+      const o = m.observation || {};
+      console.error(`[dg903] ${m.timestamp || ''} type=${m.type} kind=${o.kind} trigger=${o.trigger} `
+        + `from_state=${m.from_observation_state} silence_ms=${o.silence_ms} conf=${o.confidence} `
+        + `matched=${JSON.stringify(o.matched_line || o.last_line || null)}`);
+    }
+    const st = await harness.request(`/api/sessions/${encodeURIComponent(senderId)}`);
+    console.error(`[dg903] session GET ${st.status}: ${JSON.stringify(st.body).slice(0, 3000)}`);
+    const obs = await harness.request(`/api/inject-observations/${encodeURIComponent(trackedId)}`);
+    console.error(`[dg903] inject-observations ${obs.status}: ${JSON.stringify(obs.body).slice(0, 3000)}`);
+    const logs = harness.getLogs();
+    console.error(`[dg903] ===== daemon stdout tail =====\n${logs.stdout.slice(-6000)}`);
+    console.error(`[dg903] ===== daemon stderr tail =====\n${logs.stderr.slice(-2000)}`);
+    throw err;
+  }
 
   const event = messages.find(isQuietObservation);
   assert.ok(event);
