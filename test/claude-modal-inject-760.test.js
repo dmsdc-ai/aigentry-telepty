@@ -370,10 +370,22 @@ test('#760: a clear claude surface resolves to plain delivery on every path', ()
   assert.equal(daemon.modalDeliveryDecision(claudeSession(COMPOSER_RING), {}).reason, 'surface_clear');
 });
 
+// #850: this asserted `waited_ms === 0`, which is not the claim in its own name. `waited_ms` is
+// `now() - start` around a loop that a clear surface never enters (daemon.js:2811-2821), so with
+// zero polls it still measures whatever wall clock elapsed across one synchronous
+// `isSurfaceBlockedByModal` call — and any >=1ms preemption between those two `Date.now()` reads
+// makes it 1. Observed red exactly that way during the #850 baseline: `1 !== 0`. Count the polls
+// instead; that IS the claim, the `sleep` seam already exposes it, and it is load-proof. The seam
+// keeps the real timer so a regression that polls is still bounded by timeoutMs rather than spinning.
 test('#760: the park costs a clear surface nothing — no queue, no poll', async () => {
   const daemon = require('../daemon');
   const session = claudeSession(COMPOSER_RING);
-  const outcome = await daemon.awaitModalParkDrain('c760-noop', session, { timeoutMs: 5000, pollIntervalMs: 50 });
+  let polls = 0;
+  const outcome = await daemon.awaitModalParkDrain('c760-noop', session, {
+    timeoutMs: 5000,
+    pollIntervalMs: 50,
+    sleep: (ms) => { polls += 1; return new Promise((r) => setTimeout(r, ms)); }
+  });
   assert.equal(outcome.cleared, true);
-  assert.equal(outcome.waited_ms, 0, 'a non-modal surface must not pay a single poll');
+  assert.equal(polls, 0, 'a non-modal surface must not pay a single poll');
 });
