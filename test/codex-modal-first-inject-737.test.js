@@ -222,11 +222,21 @@ test('#737 A: a hold that never clears degrades to reject, not to a write', asyn
   assert.match(decision.hint, /version\.json/);
 });
 
+// #850: same defect as test/claude-modal-inject-760.test.js — `waited_ms` is `now() - start`
+// around a loop a clear surface never enters (daemon.js:2700-2705), so asserting it is exactly 0
+// asserts that no wall clock ticked across one synchronous predicate call. Observed red on an
+// otherwise idle box during the #850 work: `3 !== 0`. The poll count is the claim in the test's
+// own name, and the `sleep` seam measures it directly.
 test('#737 A: a clear surface costs the hold nothing', async () => {
   const daemon = require('../daemon');
-  const held = await daemon.awaitSurfaceModalClear(modalSession(COMPOSER_SCREEN), { timeoutMs: 5000, pollIntervalMs: 50 });
+  let polls = 0;
+  const held = await daemon.awaitSurfaceModalClear(modalSession(COMPOSER_SCREEN), {
+    timeoutMs: 5000,
+    pollIntervalMs: 50,
+    sleep: (ms) => { polls += 1; return new Promise((r) => setTimeout(r, ms)); }
+  });
   assert.equal(held.cleared, true);
-  assert.equal(held.waited_ms, 0, 'a non-modal surface must not pay a single poll');
+  assert.equal(polls, 0, 'a non-modal surface must not pay a single poll');
 });
 
 test('#737 A: TELEPTY_MODAL_HOLD_MS bounds the hold, and a blank value keeps the default', () => {
