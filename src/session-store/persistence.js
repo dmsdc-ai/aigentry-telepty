@@ -37,6 +37,12 @@ function serializePersistedSessions(sessions) {
       // what keeps the already-running child's spawn-time bearer verifiable across a daemon
       // restart without reissuing anything (its environment cannot be updated from outside).
       // Omitted entirely for a session with no credential, so those serialize as before.
+      //
+      // #860 F1: `sessionEpochProved` is deliberately NOT in this list and must not be added. It
+      // records that a bearer was presented to THIS daemon and verified; a process that read the
+      // fact out of a file has verified nothing, and restoring it would let a daemon restart
+      // manufacture an authentication nobody performed. A restored session is epoch-carrying and
+      // proof-less until its bridge re-claims, which is the honest state and the one it gets.
       ...(s.sessionEpoch && s.credentialVerifier
         ? {
           sessionEpoch: s.sessionEpoch,

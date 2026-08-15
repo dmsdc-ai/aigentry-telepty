@@ -309,6 +309,14 @@ function installWebSocketTransport(deps) {
       // identity, which is the exact "verified, instance unknown" combination #815 forbids. A
       // legacy or unproven claim is authentication-unavailable, and that is recorded as absence.
       activeSession.sessionEpoch = verifiedClaimEpoch;
+      // #860 F1 — and SEPARATELY, the fact that it was PROVED here. `sessionEpoch` alone cannot
+      // carry that: the register route mints one before anyone has presented anything, and the
+      // restore path reads one off disk, so a consumer keying "authenticated" on the epoch reports
+      // both of those as measurements that were never made (daemon.js
+      // sessionAuthenticationCapability). This assignment is the ONLY writer, it sits on the line
+      // after the epoch it belongs to, and it is written on BOTH arms deliberately: an unproven
+      // claim must CLEAR any predecessor's proof, exactly as the null epoch above does.
+      activeSession.sessionEpochProved = verifiedClaimEpoch;
       // telepty#56 (kill-stick): capture the owner PID at claim time. The reconnect-register POST
       // only carries owner_pid on reconnect, so a first-connect owner would otherwise have a null
       // ownerPid and `kill --force` could not SIGKILL the owning process. The bridge passes its pid

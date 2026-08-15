@@ -576,6 +576,47 @@ function listTrackedInjectionsForSession(sessionId) {
 }
 
 /**
+ * #860 F1 — what `capability.session_authentication: "observed"` is allowed to mean.
+ *
+ * `observed` is the word this release reserves for a MEASUREMENT, and #843 keyed it on
+ * `session.sessionEpoch` alone. Three writers set that field and only ONE of them measured
+ * anything:
+ *
+ *   src/transport/websocket.js  — an owner claim whose bearer `credentials.verify()` resolved to
+ *                                 THIS sid. A proof was presented and checked.       PROOF
+ *   POST /api/sessions/register — issuance. The epoch is minted here, before any caller has
+ *                                 presented anything at all.                         no proof
+ *   session-store/persistence   — restored off disk on daemon start. This daemon has verified
+ *                                 nothing; it read a file.                           no proof
+ *
+ * So the predicate answered "did this daemon mint or restore an epoch for this id", and the field
+ * reported that as an authentication. An orchestrator reading it concluded the target session
+ * instance had authenticated itself — for an aterm session, which never opens a WebSocket, nothing
+ * ever can. That is the substitution #815 removed, re-committed by the release that removed it.
+ *
+ * The proof is therefore carried by its own field, `session.sessionEpochProved`, written ONLY at
+ * the verified claim. It holds the epoch VALUE rather than a flag: a later writer that moves
+ * `sessionEpoch` without proving it (register on a recreated sid, a displaced-owner claim that
+ * proved nothing) must not inherit the old proof, and comparing the two is what makes that
+ * impossible to get wrong by omission.
+ *
+ * Three cases, three honest answers:
+ *   no epoch at all  → unavailable / no_815_epoch_fact       (the frozen default, unchanged)
+ *   epoch, no proof  → unavailable / no_815_bearer_presented (minted or restored — see above)
+ *   epoch + proof    → observed / null
+ *
+ * Returns the OVERLAY onto CAPABILITY_STAGE_A, so the no-epoch case returns {} and leaves the
+ * frozen default exactly as it was.
+ */
+function sessionAuthenticationCapability(session) {
+  if (!session || !session.sessionEpoch) return {};
+  if (session.sessionEpochProved && session.sessionEpochProved === session.sessionEpoch) {
+    return { session_authentication: 'observed', session_authentication_reason: null };
+  }
+  return { session_authentication: 'unavailable', session_authentication_reason: 'no_815_bearer_presented' };
+}
+
+/**
  * Create the durable transport-observation record for a tracked inject. MUST complete before the
  * bytes are handed to the target (§3 Stage A item 1): a delivered task that no record answers for
  * is the silence this release exists to remove.
@@ -616,12 +657,11 @@ function beginTrackedInjection({ injectId, sessionId, source, session }) {
     // the epoch the session PROVED on its #815 handshake. One response body then carried both the
     // epoch and a reason denying any epoch fact was measured, leaving a reader to pick which half
     // of one object to believe. §A4 requires gaps to be explicit; it does not license reporting a
-    // gap that was measured shut.
+    // gap that was measured shut. #860 F1: nor does it license the opposite — see
+    // sessionAuthenticationCapability, which is what decides the three cases.
     capability: {
       ...CAPABILITY_STAGE_A,
-      ...(session && session.sessionEpoch
-        ? { session_authentication: 'observed', session_authentication_reason: null }
-        : {}),
+      ...sessionAuthenticationCapability(session),
     },
     tracking_state: 'tracked',
   };
@@ -649,18 +689,40 @@ function beginTrackedInjection({ injectId, sessionId, source, session }) {
  * caller as a 503 — and then discarded it everywhere else. Recording it is the same rule the rest
  * of this release follows: state what was measured, including when the measurement is a negative.
  *
+ * #860 F2 — it had exactly ONE call site: the synchronous `!delivery.success` arm of the inject
+ * route. `deliverInjectionToSession` has a THIRD outcome that is neither success nor refusal — the
+ * op is pushed onto the bootstrap / modal-park queue and the route is handed
+ * `{success: true, strategy: 'bootstrap_queue', queued: true}` with zero bytes written. Every
+ * terminal outcome of that queue (drain failure, bootstrap-ready timeout, modal-park TTL) emitted
+ * a bus event and nothing durable, so the ledger kept saying `tracked` / `inject_accepted` forever
+ * for a dispatch that delivered nothing — the same push-only gap websocket.js:346-349 argues
+ * against in this release. Those three paths now end here.
+ *
+ * `cause` names WHICH terminal outcome, because they are not the same measurement:
+ *   inject_delivery_refused — the write was ATTEMPTED and the transport refused it. `bytes_written`
+ *                             is what actually landed first, which is not always zero: the queue
+ *                             drain writes the body and the submit CR separately, and a CR that
+ *                             fails after the body landed must not be recorded as a delivery of
+ *                             nothing.
+ *   inject_delivery_dropped — the write was NEVER attempted. The op was accepted, parked, and
+ *                             discarded by a queue timeout or TTL. `bytes_written` is 0, measured.
+ *
  * Returns a named result, never undefined.
  */
-function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError) {
+function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError, cause = {}) {
   const record = getTrackedInjection(injectId);
   if (!record) return 'tracking_unavailable';
   record.tracking_state = 'aborted';
   sessionPersistence.appendLedgerObservation(record, {
-    kind: 'inject_delivery_refused',
-    trigger: 'delivery_refused',
+    kind: cause.kind || 'inject_delivery_refused',
+    trigger: cause.trigger || 'delivery_refused',
     delivery_code: deliveryCode || 'DELIVERY_FAILED',
     delivery_error: deliveryError || null,
-    bytes_written: 0,
+    // Omitting `bytesWritten` means the caller MEASURED zero (the synchronous refusal arm: the
+    // route never handed a byte over). An explicit `null` means it could not measure — a throw
+    // mid-drain can land on either side of the body write — and null is recorded rather than a
+    // guessed zero.
+    bytes_written: cause.bytesWritten === undefined ? 0 : cause.bytesWritten,
   }, new Date().toISOString());
   // The pending entry goes too. It is what makes the session look like it is awaiting a turn, and
   // it belongs to an inject whose bytes were never delivered — every later observation on this
@@ -674,6 +736,58 @@ function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError)
     return 'tracking_persistence_failed';
   }
   return 'tracking_aborted';
+}
+
+/**
+ * #860 F2 — record the PARK itself, at the moment it happens.
+ *
+ * The abort above closes the queue's terminal outcomes, but the reproduced arrangement has no
+ * terminal outcome to close: `scheduleBootstrapPromptPoll` returns early when there is no open
+ * owner socket, so no timer is ever armed and the record cannot move at any later time. Left at
+ * `tracking_started` / `inject_accepted`, the one thing `bin/dispatch-tracker.sh` polls is
+ * indistinguishable from a dispatch whose bytes are on the wire.
+ *
+ * The record therefore states what was measured when it was measured: accepted, parked, zero bytes
+ * written. `tracking_state` stays `tracked` — a park is not terminal, and claiming it were would be
+ * the same defect pointed the other way.
+ *
+ * No-ops for an untracked inject (multicast / broadcast / bus route open no record).
+ */
+function parkTrackedInjection(injectId, strategy, reason) {
+  if (!injectId) return 'no_tracked_inject';
+  const record = getTrackedInjection(injectId);
+  if (!record) return 'tracking_unavailable';
+  sessionPersistence.appendLedgerObservation(record, {
+    kind: 'inject_parked',
+    trigger: strategy,
+    reason: reason || null,
+    bytes_written: 0,
+  }, new Date().toISOString());
+  const committed = commitTrackedInjections();
+  if (!committed.ok) {
+    console.error(`[OBSERVE] park commit FAILED for ${injectId} (${committed.reason})`);
+    return 'tracking_persistence_failed';
+  }
+  return 'tracking_parked';
+}
+
+/**
+ * #860 F2 — the audit log's `delivery_result` for a delivery that has not been written.
+ *
+ * `deliverInjectionToSession` returns `success: true` for the queue push as well as for a real
+ * write, so all four audited inject doors (HTTP route, multicast, broadcast, bus auto-route) wrote
+ * `delivery_result: "success"` for an operation whose measured byte count is zero. BOUNDARY.md
+ * enumerates that field as two values with two meanings and says they "deliberately do not share a
+ * word"; a third state wearing the strongest of the two is the defect this release exists to
+ * remove. `queued` is that third state: accepted and parked, nothing written, terminal outcome in
+ * the observation ledger rather than here.
+ *
+ * Keyed on the STRATEGY as well as the flag, because `queued` alone does not mean what it looks
+ * like: the mailbox path returns `{strategy: 'mailbox', queued: ack.queued}` for a delivery it has
+ * already written synchronously (`mailboxDelivery.tick()`), and that one is a write.
+ */
+function deliveryAuditResult(delivery) {
+  return delivery && delivery.queued === true && delivery.strategy === 'bootstrap_queue' ? 'queued' : 'success';
 }
 
 // Observation identity. Dedup is keyed on WHAT WAS MEASURED, not on a one-way "already notified"
@@ -1570,13 +1684,18 @@ async function executeBootstrapInject(sessionId, session, op) {
   // 0/9). Harmless while this queue only carried boot-time injects; load-bearing now that a
   // modal park routes worker REPORTs — multi-line by definition — through it. Fixed here
   // rather than in the park branch so the boot caller stops rolling the same dice.
-  const textResult = await writeDataToSession(sessionId, session, maybeBracketedPaste(prompt, session));
-  if (!textResult.success) return textResult;
+  const body = maybeBracketedPaste(prompt, session);
+  const textResult = await writeDataToSession(sessionId, session, body);
+  // #860 F2 — a failure here is reported back with the byte count that actually landed, because
+  // the caller records it in the ledger. The two arms differ: nothing was written when the BODY
+  // was refused, but the body is on the surface by the time the submit CR can fail, and an abort
+  // that stamped `bytes_written: 0` on that one would be the same defect it exists to close.
+  if (!textResult.success) return { ...textResult, bytes_written: 0 };
 
   if (!op.noEnter) {
     await sleep(WRAPPED_SUBMIT_DELAY_MS);
     const submitResult = await writeDataToSession(sessionId, session, '\r');
-    if (!submitResult.success) return submitResult;
+    if (!submitResult.success) return { ...submitResult, bytes_written: Buffer.byteLength(body) };
   }
 
   session.lastActivityAt = new Date().toISOString();
@@ -1854,6 +1973,12 @@ async function drainBootstrapQueue(sessionId, session) {
               code: result.code || 'DELIVERY_FAILED',
               error: result.error || 'bootstrap delivery failed'
             });
+            // #860 F2 — and durably. The event above is push-only; this is a TERMINAL outcome for
+            // a dispatch whose record has said `tracked` since the route accepted it.
+            abortTrackedInjection(op.injectId, sessionId, result.code || 'DELIVERY_FAILED', result.error, {
+              trigger: 'bootstrap_queue_failed',
+              bytesWritten: result.bytes_written,
+            });
           }
         } else if (op.type === 'submit') {
           const result = await executeBootstrapSubmit(sessionId, session, op);
@@ -1885,6 +2010,13 @@ async function drainBootstrapQueue(sessionId, session) {
           operation: op.type,
           code: 'BOOTSTRAP_DRAIN_FAILED',
           error: error.message || 'bootstrap drain failed'
+        });
+        // #860 F2 — the same terminal outcome as the arm above, reached by a throw. `bytesWritten:
+        // null` because a throw can land on either side of the body write, and this is the one
+        // path that cannot say which.
+        abortTrackedInjection(op.injectId, sessionId, 'BOOTSTRAP_DRAIN_FAILED', error.message || 'bootstrap drain failed', {
+          trigger: 'bootstrap_drain_failed',
+          bytesWritten: null,
         });
       }
     }
@@ -1952,6 +2084,11 @@ function failBootstrapQueueOnTimeout(sessionId, session, detail = {}) {
       code: 'BOOTSTRAP_READY_TIMEOUT',
       error: `target '${sessionId}' not ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms`
     });
+    // #860 F2 — DROPPED, not refused: this op was accepted, parked, and discarded without the
+    // daemon ever attempting a write. Zero bytes is a measurement here, not an assumption.
+    abortTrackedInjection(op.injectId, sessionId, 'BOOTSTRAP_READY_TIMEOUT',
+      `target '${sessionId}' not ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms`,
+      { kind: 'inject_delivery_dropped', trigger: 'bootstrap_ready_timeout' });
   }
 }
 
@@ -2644,6 +2781,12 @@ function flushModalParkQueue(sessionId, session, waitedMs) {
         },
       });
     }
+    // #860 F2 — the third terminal path. A submit op answers its caller on the open HTTP request
+    // above; an inject op's caller left long ago, and the ledger is the only thing that can still
+    // tell it the body never reached the surface.
+    abortTrackedInjection(op.injectId, sessionId, 'SURFACE_MODAL_PARK_TIMEOUT',
+      `parked behind a surface modal that did not clear within ${waitedMs}ms`,
+      { kind: 'inject_delivery_dropped', trigger: 'surface_modal_park_timeout' });
   }
   emitBootstrapEvent('modal_park_timeout', sessionId, session, {
     actionable: true,
@@ -2742,11 +2885,16 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       type: 'inject',
       prompt,
       noEnter: !!options.noEnter,
+      // #860 F2: the tracked record's id rides ON THE OP, because the queue is where the dispatch
+      // and the ledger part company — the route returns, and whatever this queue eventually does
+      // with the op is the only thing left that can answer for it.
+      injectId: options.injectId || null,
       options: {
         source: options.source || 'inject',
         from: options.from || 'daemon'
       }
     });
+    parkTrackedInjection(options.injectId, 'bootstrap_queue', 'bootstrap_not_ready');
     session.lastActivityAt = new Date(now).toISOString();
     return bootstrapQueuedResponse(op, {
       msg_id: op.op_id,
@@ -2787,8 +2935,10 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
         type: 'inject',
         prompt,
         noEnter: !!options.noEnter,
+        injectId: options.injectId || null,     // #860 F2 — see the bootstrap-queue push above
         options: { source: options.source || 'inject', from: options.from || 'daemon' },
       }, injectParkDecision);
+      parkTrackedInjection(options.injectId, 'bootstrap_queue', injectParkDecision.reason);
       session.lastActivityAt = new Date(now).toISOString();
       return modalParkResponse(op, injectParkDecision, {
         msg_id: op.op_id,
@@ -3706,7 +3856,9 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
         }
 
         results.successful.push({ id, strategy: delivery.strategy });
-        auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, 'success');
+        // #860 F2 — a fan-out target that parked the op wrote nothing; same three-value rule as
+        // the single-target route.
+        auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, deliveryAuditResult(delivery));
 
         // Broadcast injection to bus
         broadcastBusEvent({
@@ -3782,7 +3934,7 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
       }
 
       results.successful.push({ id, strategy: delivery.strategy });
-      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, 'success');
+      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, deliveryAuditResult(delivery));  // #860 F2
     } catch (err) {
       results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
       auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, 'failed:DELIVERY_FAILED');
@@ -4525,6 +4677,9 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       noEnter: !!no_enter,
       source: 'inject',
       from: from || 'inject',
+      // #860 F2 — carried so that a park keeps its link to the write-ahead record. Null for an
+      // untracked operator inject (no `from`), and every consumer of it no-ops on null.
+      injectId: trackedRecord ? inject_id : null,
       // #47 P4 — the daemon-verified sender (never body.from) labels the provenance banner.
       verifiedSenderSid
     });
@@ -4557,7 +4712,10 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
     if (reply_to) session.lastInjectReplyTo = reply_to;
     if (thread_id) session.lastThreadId = thread_id;
 
-    console.log(`[INJECT] Wrote to session ${id} (inject_id: ${inject_id})`);
+    // #860 F2 — the service log gets the same distinction the audit line does. "Wrote" was printed
+    // for a queue push too, so an operator grepping the log for a delivery found one that had not
+    // happened.
+    console.log(`[INJECT] ${deliveryAuditResult(delivery) === 'queued' ? 'Queued for' : 'Wrote to'} session ${id} (inject_id: ${inject_id})`);
 
     const injectTimestamp = new Date().toISOString();
     // #43 P1/P2 — one audit line per delivery (claimed + daemon-verified sender, hash-only).
@@ -4566,7 +4724,9 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       claimed_from: from || null, ...verifiedSender,
       to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
       origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
-      payload: finalPrompt, delivery_result: 'success'
+      // #860 F2 — `queued` when the delivery was parked on the bootstrap / modal queue with zero
+      // bytes written, `success` only for a delivery the machinery reported as written.
+      payload: finalPrompt, delivery_result: deliveryAuditResult(delivery)
     });
     broadcastSessionEvent('inject_written', id, session, {
       timestamp: injectTimestamp,
@@ -5168,7 +5328,10 @@ async function busAutoRoute(msg) {
     source: 'bus_auto_route'
   });
   const delivered = delivery.success === true;
-  auditBusWrite(delivered ? 'success' : `failed:${delivery.code || 'DELIVERY_FAILED'}`);
+  // #860 F2 — `queued` for an op parked on the bootstrap / modal queue: this route audits the bus
+  // door, and a door that recorded a write which never happened is the gap #826 opened this log to
+  // close.
+  auditBusWrite(delivered ? deliveryAuditResult(delivery) : `failed:${delivery.code || 'DELIVERY_FAILED'}`);
   if (!delivered) {
     emitInjectFailureEvent(targetId, delivery.code, delivery.error, {
       source: 'bus_auto_route',
@@ -5916,6 +6079,8 @@ module.exports = {
   recordObservation,              // #60 Stage A: the TOTAL observation emitter (named result on every path)
   describeSessionTeardown,        // #843: DELETE teardown response — a failed kill never reports success
   beginTrackedInjection,          // #60 Stage A: durable write-before-delivery tracking record
+  sessionAuthenticationCapability, // #860 F1: "observed" requires a bearer that was PRESENTED and verified
+  deliveryAuditResult,            // #860 F2: audit `delivery_result` — `queued` is not `success`
   getTrackedInjection,            // #60 Stage A: ledger read by inject_id
   listTrackedInjectionsForSession, // #60 Stage A: ledger read by session (owner-lifecycle fan-out)
   restoreTrackedInjections,       // #60 Stage A: restore + daemon_restart_observed, before readiness

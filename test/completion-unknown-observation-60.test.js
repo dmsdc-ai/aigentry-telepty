@@ -37,6 +37,7 @@ process.env.USERPROFILE = TMP_HOME;
 process.env.PORT = '0';
 
 const daemon = require('../daemon');
+const sessionPersistence = require('../src/session-store/persistence');
 const { fireAutoReport, recordObservation, describeSessionTeardown } = daemon;
 
 const NOW = 1_700_000_000_000; // fixed clock
@@ -452,29 +453,44 @@ test('arbitrary_reverse_message_is_not_report: no text is parsed as a terminal r
 
 // --- #843 a frozen reason contradicted by its own record --------------------------------
 
-test('capability_reason_matches_the_record: a proven epoch is not reported as "no epoch fact"', () => {
+test('capability_reason_matches_the_record: an epoch fact is not reported as "no epoch fact"', () => {
   // `CAPABILITY_STAGE_A` is frozen with `session_authentication_reason: 'no_815_epoch_fact'` and
-  // spread onto every ledger record — including records whose own `session_epoch` field holds the
-  // epoch the session PROVED on its #815 handshake. One response body then carries both
-  // `session_epoch: "<id>"` and a reason saying there is no epoch fact.
+  // spread onto every ledger record — including records whose own `session_epoch` field holds an
+  // epoch. One response body then carries both `session_epoch: "<id>"` and a reason saying there is
+  // no epoch fact.
   //
   // §A4 requires capability gaps to be explicit; it does not license reporting a gap that was
   // measured shut. A reader reconciling those two fields has to decide which half of one object to
   // believe, which is worse than either answer alone.
-  const proven = daemon.beginTrackedInjection({
-    injectId: 'inj-epoch', sessionId: 'epoch-1', source: 'orch',
-    session: { id: 'epoch-1', sessionEpoch: '1IWURA54wVOSjXlZmNVhsA' },
+  //
+  // #860 F1 — this test used to hand-build `{id, sessionEpoch}` and call it "a proven epoch", which
+  // asserted the premise instead of measuring it: three writers set `sessionEpoch` and only the
+  // #815 owner claim proves anything. The session below is built by the production RESTORE path, is
+  // therefore honestly proof-less, and the reason it gets names the absence that is actually true.
+  // The proven case is end-to-end in test/session-authentication-proof-860.test.js, where a real
+  // bridge presents a real bearer on a real handshake.
+  const persisted = sessionPersistence.serializePersistedSessions({
+    'epoch-1': {
+      id: 'epoch-1', type: 'wrapped', command: 'claude', cwd: '/tmp',
+      createdAt: new Date().toISOString(),
+      sessionEpoch: '1IWURA54wVOSjXlZmNVhsA', credentialVerifier: 'v1:verifier', credentialGeneration: 1,
+    },
   });
-  assert.equal(proven.ok, true);
+  const restored = sessionPersistence.buildRestoredWrappedSession('epoch-1', persisted['epoch-1']);
+  const withEpoch = daemon.beginTrackedInjection({
+    injectId: 'inj-epoch', sessionId: 'epoch-1', source: 'orch', session: restored,
+  });
+  assert.equal(withEpoch.ok, true);
   const record = daemon.getTrackedInjection('inj-epoch');
   assert.equal(record.session_epoch, '1IWURA54wVOSjXlZmNVhsA');
   assert.equal(record.session_epoch_reason, null);
   assert.notEqual(record.capability.session_authentication_reason, 'no_815_epoch_fact',
-    'the record proves the epoch fact was measured — its capability block may not deny it');
-  assert.equal(record.capability.session_authentication, 'observed');
-  assert.equal(record.capability.session_authentication_reason, null);
+    'the record carries the epoch fact — its capability block may not deny one was measured');
+  assert.equal(record.capability.session_authentication, 'unavailable',
+    'restoring an epoch off disk verifies nothing — it may not read as an authentication');
+  assert.equal(record.capability.session_authentication_reason, 'no_815_bearer_presented');
 
-  // The unproven case is untouched: an absence is still reported as an absence, with its reason.
+  // The no-epoch case is untouched: an absence is still reported as an absence, with its reason.
   const unproven = daemon.beginTrackedInjection({
     injectId: 'inj-noepoch', sessionId: 'epoch-2', source: 'orch', session: { id: 'epoch-2' },
   });
