@@ -20,8 +20,11 @@
 //     is not fresh echo);
 //   - a definitively failed submit (accepted:false — body stuck in the composer) can
 //     never be overridden by echo;
-//   - suppression emits nothing (no TASK_COMPLETE) and does not consume the once-only
-//     idleNotified guard.
+//   - no branch can produce a completion claim.
+//
+// #60 Stage A changed HOW that evidence is expressed, not what counts as evidence: the
+// suppression is deleted and every branch emits one observation carrying `consumption.basis`.
+// See the stateOnce() helper below for why.
 //
 // Unit tests drive fireAutoReport() via its deps DI seam (same pattern as
 // test/idle-unconfirmed-settle.test.js).
@@ -105,27 +108,66 @@ function cpuScript(values) {
 }
 
 // ---------------------------------------------------------------------------
+// #60 Stage A — the #52 consumption GATE is deleted; consumption is a FIELD
+// ---------------------------------------------------------------------------
+//
+// #52 expressed its evidence as a SUPPRESSION: when the inject looked consumed, fireAutoReport
+// took a bare `return` and emitted nothing at all. That was tolerable only while a separate
+// `confirmed` path still spoke; with the terminal claims removed it would have become pure
+// silence, and silence is the defect this release exists to remove — a consumer cannot tell
+// "consumed, so nothing to warn about" from "the daemon died".
+//
+// So every branch below now emits exactly ONE observation, and the evidence discrimination this
+// file was written to protect moves intact onto `consumption.basis`. That is strictly more
+// information than before: seven distinguishable bases where there used to be a silent/loud bit.
+//
+// Note `status` stays 'not_established' throughout. 'observed' additionally requires a qualified
+// fresh non-busy→busy edge recorded at transition time, which none of these fixtures produce —
+// echo and a body-removal confirm are screen facts, not proof a turn started.
+function stateOnce(ctx) {
+  assert.equal(ctx.delivered.length, 1, 'exactly one observation is stated — never silence');
+  assert.match(ctx.delivered[0].msg, /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-52 /);
+  assert.doesNotMatch(ctx.delivered[0].msg, /TASK_COMPLETE:|TASK_IDLE_UNCONFIRMED:/);
+  assert.equal(ctx.delivered[0].srcId, 'orch');
+  const ev = ctx.broadcasts.find((b) => b.type === 'task_completion_unknown');
+  assert.ok(ev, 'the bus hears the absence too');
+  assert.equal(ev.opts.extra.completion_fact, null);
+  assert.equal(ev.opts.extra.terminal, false);
+  // The retired once-only flag must not come back; dedup is ledger identity now.
+  assert.equal('idleNotified' in ctx.pendingReport, false, 'the retired once-only flag is not resurrected');
+  return ev.opts.extra.consumption;
+}
+
+// ---------------------------------------------------------------------------
 // (a) quiet-thinking: no output, no spinner — but the inject echo IS in the ring
 // ---------------------------------------------------------------------------
 
-test('#52 (a): quiet-thinking — body echoed in post-inject frames → UNCONFIRMED suppressed', () => {
+test('#52 (a): quiet-thinking — body echoed in post-inject frames → recorded as inject_echo_observed', () => {
   const ctx = makeGate({
     preFrames: ['codex 0.99 — workspace ready\n› \n'],
     postFrames: [`│ › ${BODY} │\n`], // composer redraw with the injected text
   });
   ctx.fire();
   ctx.flushTimers(); // settle elapses: still idle-classified, output stalled (quiet thinking)
-  assert.equal(ctx.delivered.length, 0, 'consumed inject must not raise an unconfirmed-delivery warning');
-  assert.equal(ctx.broadcasts.length, 0, 'no TASK_IDLE_NO_REPORT bus event either');
-  assert.equal(ctx.pendingReport.idleNotified, undefined, 'once-only guard not consumed — a later evidence-backed idle may still report');
+  // OLD: asserted SILENCE — the gate returned without emitting. The echo detection itself is
+  // unchanged and still fires; what changed is that it now NAMES itself instead of muting the
+  // statement, so a consumer reading this observation learns strictly more than it used to.
+  const consumption = stateOnce(ctx);
+  assert.equal(consumption.basis, 'inject_echo_observed');
+  assert.equal(consumption.status, 'not_established',
+    'echo proves bytes reached the screen, never that a turn started — it was never consumption');
 });
 
-test('#52 (a): suppression never emits TASK_COMPLETE (never-false-complete)', () => {
+test('#52 (a): an echoed inject still never yields a completion claim (never-false-complete)', () => {
   const ctx = makeGate({ postFrames: [`› ${BODY}\n`] });
   ctx.fire();
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 0);
-  assert.ok(!ctx.delivered.some((d) => /^TASK_COMPLETE:/.test(d.msg)));
+  const consumption = stateOnce(ctx);
+  assert.equal(consumption.basis, 'inject_echo_observed');
+  // The original point of this test — the strongest available evidence must not manufacture a
+  // completion — survives verbatim, and is now checked against a statement rather than silence.
+  const ev = ctx.broadcasts.find((b) => b.type === 'task_completion_unknown');
+  assert.equal(ev.opts.extra.capability.outcome_protocol, 'unavailable');
 });
 
 test('#52 (a): echo survives composer line-wrapping and box borders', () => {
@@ -136,13 +178,13 @@ test('#52 (a): echo survives composer line-wrapping and box borders', () => {
   const ctx = makeGate({ postFrames: [wrapped] });
   ctx.fire();
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 0, 'wrapped echo still counts as consumption evidence');
+  assert.equal(stateOnce(ctx).basis, 'inject_echo_observed', 'wrapped echo is still observed');
 });
 
-test('#52 (a): screen-verified submit confirm (body_consumed) suppresses the #545-shape UNCONFIRMED', () => {
+test('#52 (a): screen-verified submit confirm (body_consumed) is named, and names its shortfall', () => {
   // Live #52 shape: submit screen-verified as consumed, codex quiet-thinks, the
   // classifier flips real-idle with unreliable evidence. Pre-fix this notified
-  // UNCONFIRMED; consumed + idle-looking is at most a TASK_IDLE fact — suppress.
+  // UNCONFIRMED; #52 then suppressed it entirely.
   const ctx = makeGate({
     elapsedSec: 20,
     pendingReportOverrides: {
@@ -155,15 +197,21 @@ test('#52 (a): screen-verified submit confirm (body_consumed) suppresses the #54
   });
   ctx.fire('real-idle');
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 0, 'screen-verified consumption gates the warning');
-  assert.equal(ctx.pendingReport.idleNotified, undefined);
+  const consumption = stateOnce(ctx);
+  assert.equal(consumption.basis, 'submit_body_removed_observed');
+  assert.equal(consumption.submit_confirm_reason, 'body_consumed');
+  // This is the sharpest gain over the old binary. `body_consumed` is a genuine screen-derived
+  // confirmation, but on its own it still falls short of consumption, and the gap is now stated
+  // rather than hidden behind a suppression that looked identical to real evidence.
+  assert.equal(consumption.status, 'not_established');
+  assert.equal(consumption.shortfall, 'no_qualifying_fresh_busy_edge');
 });
 
 // ---------------------------------------------------------------------------
 // (b) genuinely unconsumed: no echo + no CPU advance → the signal is preserved
 // ---------------------------------------------------------------------------
 
-test('#52 (b): no echo + no CPU advance → TASK_IDLE_UNCONFIRMED still fires (format intact)', () => {
+test('#52 (b): no echo + no CPU advance → no_consumption_evidence (format intact)', () => {
   const ctx = makeGate({
     preFrames: ['some unrelated screen content\n'],
     postFrames: [], // the inject never echoed — nothing reached the TUI
@@ -171,27 +219,26 @@ test('#52 (b): no echo + no CPU advance → TASK_IDLE_UNCONFIRMED still fires (f
   });
   ctx.fire();
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1, 'genuinely-unconsumed inject must notify');
-  assert.match(
-    ctx.delivered[0].msg,
-    /^TASK_IDLE_UNCONFIRMED: worker-1 signaled idle \d+\.\ds after inject \(via ready-signal inject=inj-52\)/,
-    'consumer-visible message format preserved'
-  );
-  assert.equal(ctx.pendingReport.idleNotified, true);
+  // The signal is preserved, and it is now the literal absence statement rather than a claim
+  // that "the inject may NOT have been processed" — which was never measured either.
+  const consumption = stateOnce(ctx);
+  assert.equal(consumption.basis, 'no_consumption_evidence');
+  assert.match(ctx.delivered[0].msg,
+    /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-52 — no completion fact observed; legacy_ready_observed(?:; elapsed_since_inject=\d+\.\ds)?; consumption=not_established; outcome protocol unavailable$/);
 });
 
-test('#52 (b): body below the conservative length floor never claims echo → still notifies', () => {
+test('#52 (b): body below the conservative length floor never claims echo', () => {
   const ctx = makeGate({
     pendingReportOverrides: { injectedBodyPreview: 'ACK status please' }, // < 24 normalized chars
     postFrames: ['› ACK status please\n'],
   });
   ctx.fire();
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1, 'short bodies are too weak for echo evidence — signal preserved');
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED:/);
+  assert.equal(stateOnce(ctx).basis, 'no_consumption_evidence',
+    'short bodies are too weak for echo evidence — the conservative floor still holds');
 });
 
-test('#52 (b): identical re-inject — body already in PRE-inject frames, only redrawn after → still notifies', () => {
+test('#52 (b): identical re-inject — body already in PRE-inject frames, only redrawn after', () => {
   // An alt-screen redraw of an EARLIER identical message lands in the post-inject
   // suffix; windows that pre-exist before the watermark are not fresh echo.
   const oldEcho = `│ › ${BODY} │\n`;
@@ -201,8 +248,8 @@ test('#52 (b): identical re-inject — body already in PRE-inject frames, only r
   });
   ctx.fire();
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1, 'a redraw of pre-existing identical text is not consumption evidence');
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED:/);
+  assert.equal(stateOnce(ctx).basis, 'no_consumption_evidence',
+    'a redraw of pre-existing identical text is not fresh echo');
 });
 
 test('#52 (b): definitively failed submit (body stuck in composer) can never be echo-overridden', () => {
@@ -215,11 +262,16 @@ test('#52 (b): definitively failed submit (body stuck in composer) can never be 
   });
   ctx.fire('real-idle');
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1, 'stuck-composer inject was NOT consumed — signal preserved');
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED:/);
+  const consumption = stateOnce(ctx);
+  // Rejection PRECEDENCE, which is the load-bearing half of this test: the body IS echoed, so
+  // the echo branch would have matched, but a positive submit rejection is evaluated first and
+  // wins outright. Under the old binary both outcomes were just "notified" and the ordering was
+  // untestable from here; now the basis names which rule fired.
+  assert.equal(consumption.basis, 'submit_rejection_observed');
+  assert.equal(consumption.submit_confirm_reason, 'body_still_visible');
 });
 
-test("#52 (b): a 'force' submit confirm is not screen-verified consumption — without echo it still notifies", () => {
+test("#52 (b): a 'force' submit confirm is not screen-verified consumption", () => {
   const ctx = makeGate({
     elapsedSec: 20,
     pendingReportOverrides: {
@@ -232,8 +284,12 @@ test("#52 (b): a 'force' submit confirm is not screen-verified consumption — w
   });
   ctx.fire('real-idle');
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1, 'force-confirm bypassed verification — not consumption evidence');
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED:/);
+  const consumption = stateOnce(ctx);
+  // `accepted: true` is NOT sufficient — the whitelist is narrower than acceptance, and `force`
+  // measured no screen at all. The recorded reason proves the confirm was seen and rejected as
+  // evidence, rather than simply not being present.
+  assert.equal(consumption.basis, 'no_consumption_evidence');
+  assert.equal(consumption.submit_confirm_reason, 'force');
 });
 
 // ---------------------------------------------------------------------------
@@ -247,11 +303,10 @@ test('#52 (c): screen idle + child CPU advancing at recheck → re-settles inste
   });
   ctx.fire();
   ctx.flushTimers(); // recheck 1: CPU advanced → quiet thinking, re-settle
-  assert.equal(ctx.delivered.length, 0, 'CPU-active session is working — no notification');
+  assert.equal(ctx.delivered.length, 0, 'CPU-active session is working — the follow-up debounces');
   assert.equal(ctx.timers.length, 1, 'a fresh settle window is open');
-  ctx.flushTimers(); // recheck 2: CPU flat → genuinely stalled → notify
-  assert.equal(ctx.delivered.length, 1);
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED:/);
+  ctx.flushTimers(); // recheck 2: CPU flat → genuinely stalled → state it
+  assert.equal(stateOnce(ctx).basis, 'no_consumption_evidence');
 });
 
 test('#52 (c): CPU re-settles are bounded — a perpetually-busy child cannot starve the signal forever', () => {
@@ -267,8 +322,8 @@ test('#52 (c): CPU re-settles are bounded — a perpetually-busy child cannot st
     ctx.flushTimers();
     flushes++;
   }
-  assert.equal(ctx.delivered.length, 1, 'bounded: eventually notifies even with CPU always advancing');
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED:/);
+  assert.equal(ctx.delivered.length, 1, 'bounded: eventually states it even with CPU always advancing');
+  assert.equal(stateOnce(ctx).basis, 'no_consumption_evidence');
   assert.ok(flushes >= 5, 'the CPU bound is meaningfully larger than a single settle');
 });
 

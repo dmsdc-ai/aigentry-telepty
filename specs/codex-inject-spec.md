@@ -1,8 +1,20 @@
 # SPEC: Codex inject reliability — 4 issues
 
+> **⛔ SUPERSEDED — DO NOT IMPLEMENT.** Both fixes below were reversed after this was written.
+> **Fix 3** wires an auto-report that emits `TASK_COMPLETE: <sid> is now idle after processing
+> inject (Ns)` off an idle transition; **#60 Stage A** deleted that contract deliberately — the
+> daemon cannot measure task outcome from silence, elapsed time or a prompt glyph, and no longer
+> claims it. `TASK_COMPLETE` and every sibling label are gone, replaced by one
+> `task_completion_unknown` observation (`src/completion-observation.js`,
+> `GET /api/inject-observations/:inject_id`); see `CHANGELOG.md` → *0.8.0* → "BREAKING:
+> telepty no longer asserts task completion (#60 Stage A)". **Fix 1**'s kitty → cmux → PTY submit
+> chain was replaced by a single PTY path in `docs/adr/2026-06-07-submit-via-pty-context-layer.md`
+> (`terminalLevelSubmit` is `submitViaPty` only). Kept verbatim as a record of the 2026-04 analysis.
+
 **Bug source:** orchestrator inject e9f41301...
 **Session:** aigentry-telepty
-**Status:** SPEC — awaiting orchestrator approval
+**Status:** SUPERSEDED by #60 Stage A — was "SPEC — awaiting orchestrator approval"; that approval
+will never come, because the behaviour specified here was removed on purpose.
 
 ---
 

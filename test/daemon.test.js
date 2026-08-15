@@ -492,7 +492,7 @@ test('inject on wrapped session forwards to owner WebSocket', async () => {
   await harness.registerSession(sessionId);
 
   // First WebSocket connector becomes owner
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
@@ -513,7 +513,7 @@ test('inject keeps routing metadata out of wrapped prompt text and submits separ
   const sessionId = createSessionId('owner-routing');
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
@@ -541,7 +541,7 @@ test('known wrapped AI CLI queues inject until bootstrap ready', async () => {
   const sessionId = createSessionId('bootstrap-claude');
   await harness.registerSession(sessionId, { command: 'claude' });
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
@@ -580,7 +580,7 @@ test('known wrapped AI CLI drains multiple bootstrap injects in FIFO order', asy
   const sessionId = createSessionId('bootstrap-order');
   await harness.registerSession(sessionId, { command: 'codex' });
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   for (const prompt of ['first', 'second', 'third']) {
@@ -616,7 +616,7 @@ test('bootstrap queued submit waits behind queued text and preserves order', asy
   const sessionId = createSessionId('bootstrap-submit');
   await harness.registerSession(sessionId, { command: 'gemini' });
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
@@ -661,7 +661,7 @@ test('codex submit confirmation resends CR when context-ref remains visible and 
   const body = '[context-ref] Read ~/.telepty/shared/6516f10fb6850f9c9c18f3aa238c0060cc3f5d6b781ba1dca79dd2a12e77d81d.md';
 
   await harness.registerSession(sessionId, { command: 'codex', backend: 'pty' });
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const bus = await harness.connectBus();
@@ -740,7 +740,7 @@ test('codex submit confirmation returns 504 when context-ref remains unsubmitted
   const body = '[context-ref] Read ~/.telepty/shared/stuck.md';
 
   await harness.registerSession(sessionId, { command: 'codex', backend: 'pty' });
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   ownerWs.send(JSON.stringify({ type: 'ready' }));
@@ -793,7 +793,7 @@ test('bus auto-route uses wrapped WS split delivery instead of cmux direct injec
     cmux_workspace_id: 'workspace:test'
   });
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
 
   const publish = await harness.request('/api/bus/publish', {
@@ -823,7 +823,7 @@ test('wrapped session owner output broadcasts to attached clients', async () => 
   const sessionId = createSessionId('owner-broadcast');
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const viewerWs = await harness.connectSession(sessionId);
   const viewerMessages = collectJsonMessages(viewerWs);
 
@@ -842,7 +842,7 @@ test('session WebSocket roundtrip relays an owner output frame', async () => {
   const sessionId = createSessionId('ws-roundtrip');
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const viewerWs = await harness.connectSession(sessionId);
   const viewerMessages = collectJsonMessages(viewerWs);
   const token = createSessionId('ws-roundtrip-token');
@@ -862,7 +862,7 @@ test('wrapped session non-owner input forwards to owner as inject', async () => 
   const sessionId = createSessionId('viewer-input');
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   const ownerMessages = collectJsonMessages(ownerWs);
   const viewerWs = await harness.connectSession(sessionId);
 
@@ -908,7 +908,7 @@ test('wrapped sessions emit disconnect/reconnect/stale lifecycle and clean up af
   const messages = collectJsonMessages(bus);
   await harness.registerSession(sessionId);
 
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   await waitFor(async () => {
     const list = await harness.request('/api/sessions');
     const session = list.body.find((item) => item.id === sessionId);
@@ -1238,7 +1238,7 @@ test('GET /api/health returns status ok and version', async () => {
   assert.ok(result.body.version.length > 0);
 });
 
-test('auto-report: inject with from triggers TASK_COMPLETE when target goes idle', async () => {
+test('auto-report: inject with from delivers a completion-unknown observation when target goes quiet', async () => {
   const sourceId = 'orch'; // orchestrator dispatching work (orch-lane, registered in beforeEach)
   const targetId = `auto-rpt-target-${Date.now()}`;
 
@@ -1269,16 +1269,25 @@ test('auto-report: inject with from triggers TASK_COMPLETE when target goes idle
   });
   assert.equal(injectResult.status, 200);
 
-  // Wait for auto-report to arrive at source (idle threshold based for spawned sessions)
+  // Wait for the observation to arrive at source (idle threshold based for spawned sessions)
   // Default AUTO_REPORT_IDLE_SECONDS is 10, health poll is ~10s. Wait up to 25s.
-  await waitFor(() => sourceOutputs.some(o => o.includes('TASK_COMPLETE')), {
+  //
+  // #60 Stage A: this used to wait for `TASK_COMPLETE` — the daemon telling the dispatching
+  // side that the target had finished the work, inferred from the target going quiet. That
+  // inference is deleted. The DELIVERY to the source survives unchanged (same path, same
+  // trigger, same recipient), so this is a renamed presence; only the sentence changed.
+  await waitFor(() => sourceOutputs.some(o => o.includes('TASK_COMPLETION_UNKNOWN')), {
     timeoutMs: 25000,
-    description: 'auto-report TASK_COMPLETE at source'
+    description: 'completion-unknown observation at source'
   });
 
   const allOutput = sourceOutputs.join('');
-  assert.ok(allOutput.includes('TASK_COMPLETE'));
+  assert.ok(allOutput.includes('TASK_COMPLETION_UNKNOWN'));
   assert.ok(allOutput.includes(targetId));
+  assert.ok(allOutput.includes('no completion fact observed'));
+  assert.ok(allOutput.includes('outcome protocol unavailable'));
+  // The withdrawn claim must not survive as a substring of the new one either.
+  assert.ok(!/TASK_COMPLETE\b/.test(allOutput), 'no terminal completion claim reaches the source');
 
   sourceWs.close();
 });
@@ -1286,10 +1295,15 @@ test('auto-report: inject with from triggers TASK_COMPLETE when target goes idle
 // --- BUG-C: duplicate --id shared-fate (a stale owner's DELETE must not kill the live owner) ---
 
 // Connect a wrapped owner bridge (?owner=1), wait for open, and return the ws plus a live record
-// of every JSON frame and close event it sees. No auth token needed — the daemon allows loopback.
+// of every JSON frame and close event it sees.
 async function connectOwner(sessionId) {
-  // #815: prove ownership on the claim, exactly as the real bridge does.
-  const ws = new WebSocket(`ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}?owner=1`, harness.ownerAuth(sessionId));
+  // Two credentials, two questions, exactly as the real bridge presents them: the DAEMON token
+  // gets the socket upgraded at all (#820 — loopback stopped being one), and the per-session
+  // bearer proves this claimant owns THIS session (#815).
+  const ws = new WebSocket(
+    `ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}?owner=1&token=${encodeURIComponent(harness.authToken())}`,
+    harness.ownerAuth(sessionId)
+  );
   const frames = [];
   const closes = [];
   ws.on('message', (chunk) => {

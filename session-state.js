@@ -15,7 +15,8 @@
 //   const sm = new SessionStateMachine(sessionId, config);
 //   sm.feed(data);              // call on every PTY output chunk
 //   sm.markStarting();          // daemon: PTY spawn initiated
-//   sm.markDead(exitCode);      // daemon: PTY exited
+//   sm.markDead(exitCode);      // daemon: PTY exit OBSERVED (onExit fired)
+//   sm.markTerminationRequested(reason[, killError]);  // daemon: teardown asked for, no exit seen
 //   sm.markRestarting();        // daemon: auto-restart triggered
 //   sm.getState();              // → { state, since, confidence, last_output_preview, detail }
 //   sm.onTransition(callback);  // (from, to, detail) => {}
@@ -188,6 +189,19 @@ class SessionStateMachine {
 
     // Periodic state check
     this._pollTimer = setInterval(() => this._tick(), this.config.poll_interval_ms);
+
+    // #60 §2.3 row 1 — stamp the start phase through markStarting() rather than leaving `_detail`
+    // null. The constructor used to assign the STARTING state directly, so a session that had only
+    // been registered carried no measured cause and mapObservationCause failed closed to
+    // `unmapped_transition_cause`. That is not a transient window: `_tick` early-returns while the
+    // state is STARTING, so a session which never emits output stays there permanently, and an
+    // observation that can never fire is an absence this release promised to emit.
+    //
+    // Routed through markStarting() deliberately, not by assigning the detail here: that keeps ONE
+    // definition of the initial cause. Two definitions, with this one silently skipped, IS the
+    // defect. `_transition` short-circuits on same-state (it updates confidence/detail and fires no
+    // listeners), so this records the cause without inventing a transition or disturbing `_since`.
+    this.markStarting();
   }
 
   // --- Public API ---
@@ -206,7 +220,10 @@ class SessionStateMachine {
     if (OSC_133_RE.test(data)) {
       this._lastOsc133At = now;
       this._transition(STATES.IDLE, 0.95, {
-        trigger: 'osc_133_prompt',
+        // #60 §2.3: the RAW marker arrival. Distinct from the _tick "quiet after a recent
+        // marker" cause below — those two used to share `osc_133_prompt`, which let a quiet
+        // timeout borrow the authority of a marker it never saw.
+        trigger: 'osc_133_a_or_b_received',
         timestamp: new Date(now).toISOString(),
       });
       return;
@@ -267,20 +284,50 @@ class SessionStateMachine {
 
   // --- Lifecycle methods (called by daemon) ---
 
+  // #60 §2.3: start / restart / death used to share the single trigger `lifecycle`, so three
+  // measurements with nothing in common serialized identically. Each now names its own cause.
   markStarting() {
-    this._transition(STATES.STARTING, 1.0, { trigger: 'lifecycle' });
+    this._transition(STATES.STARTING, 1.0, { trigger: 'lifecycle_starting' });
   }
 
+  // #843 A — markDead is for an OBSERVED exit and nothing else. Its caller is the PTY's `onExit`
+  // (daemon.js), so the exit event is in hand at this instant; `exit_observed_at` records that,
+  // and the external row REQUIRES it. Exit code and signal are still allowed to be null — a
+  // signal-killed child has no code and a code-exited child has no signal — so the evidence the
+  // name rests on has to be the observation itself, not either of its two optional halves.
   markDead(exitCode, signal) {
     this._transition(STATES.DEAD, 1.0, {
-      trigger: 'lifecycle',
+      trigger: 'process_exit',
+      exit_observed_at: new Date().toISOString(),
       exit_code: exitCode ?? null,
       signal: signal ?? null,
     });
   }
 
+  // #843 A — an operator asked for a teardown and NO exit status was observed.
+  //
+  // This entrance used to route through markDead(), which hardcodes `trigger: 'process_exit'` and
+  // maps to the external kind `session_process_exited`. The DELETE path was careful to leave exit
+  // code and signal null precisely because it had not measured them — and then wore a name
+  // asserting the exact thing it knew it had not seen. The fields were honest; the name was the
+  // overclaim. The state is still DEAD: the record is going away and the machine is unregistered
+  // straight after, so what the session is doing genuinely stops being observable here. It is the
+  // CAUSE that had to stop lying, not the state.
+  //
+  // `killError` present = the kill call itself threw. That is a materially different and more
+  // dangerous fact than "we asked": the process may still be running and it is now untracked, so
+  // it gets its own name rather than a field on the calmer one.
+  markTerminationRequested(reason, killError) {
+    this._transition(STATES.DEAD, 1.0, {
+      trigger: killError ? 'termination_kill_failed' : 'termination_requested',
+      reason: reason || 'unspecified',
+      requested_at: new Date().toISOString(),
+      ...(killError ? { kill_error: String(killError) } : {}),
+    });
+  }
+
   markRestarting() {
-    this._transition(STATES.RESTARTING, 1.0, { trigger: 'lifecycle' });
+    this._transition(STATES.RESTARTING, 1.0, { trigger: 'lifecycle_restarting' });
   }
 
   markIdle(confidence = 1.0, detail = {}) {
@@ -288,8 +335,11 @@ class SessionStateMachine {
       return;
     }
     this._transition(STATES.IDLE, confidence, {
-      trigger: 'manual_idle',
+      // #60 §2.3: caller detail is spread FIRST so a caller can never overwrite the normalized
+      // cause. It used to be spread last, which let any caller passing `trigger` dress a bare
+      // caller mark up as a screen-derived measurement.
       ...detail,
+      trigger: 'manual_state_mark',
     });
   }
 
@@ -338,7 +388,8 @@ class SessionStateMachine {
     // --- Priority 1: waiting (most specific, must act on immediately) ---
     if (this._matchesAny(lastLine, WAITING_PATTERNS)) {
       this._transition(STATES.WAITING, 0.9, {
-        trigger: 'pattern',
+        // #60 §2.3: was the shared `pattern`, indistinguishable from a thinking-spinner match.
+        trigger: 'input_request_pattern',
         matched_line: lastLine.slice(0, 100),
       });
       return;
@@ -355,7 +406,8 @@ class SessionStateMachine {
     // --- Priority 3: thinking (AI spinner/progress) ---
     if (this._matchesAny(lastLine, THINKING_PATTERNS)) {
       this._transition(STATES.THINKING, 0.8, {
-        trigger: 'pattern',
+        // #60 §2.3: was the shared `pattern` (see the waiting entrance above).
+        trigger: 'busy_indicator_pattern',
         matched_line: lastLine.slice(0, 100),
       });
       return;
@@ -413,7 +465,12 @@ class SessionStateMachine {
       const confidence = hasOsc133 ? 0.95 : (hasPrompt ? 0.9 : 0.6);
 
       this._transition(STATES.IDLE, confidence, {
-        trigger: hasOsc133 ? 'osc_133_prompt' : (hasPrompt ? 'prompt_detected' : 'silence_timeout'),
+        // #60 §2.3: three distinct measurements that used to collapse into two names. Quiet
+        // AFTER a recent marker is not the marker itself, and a prompt-shaped suffix is a
+        // detector match on untrusted current-frame bytes, not a turn boundary.
+        trigger: hasOsc133
+          ? 'quiet_after_recent_osc_133_a_or_b'
+          : (hasPrompt ? 'prompt_suffix_after_quiet' : 'silence_timeout'),
         silence_ms: silenceMs,
         last_line: lastLine.slice(0, 100),
       });
@@ -463,7 +520,10 @@ class SessionStateMachine {
       return {
         confidence: Math.min(0.95, 0.7 + (maxCount - this.config.error_repeat_count) * 0.05),
         detail: {
-          trigger: 'repeated_error',
+          // #60 §2.3 / §7 item 5: the repeated-error entrance and the thinking-timeout
+          // entrance both land in STATES.ERROR but measure different things. Naming the cause
+          // is what stops a timeout from serializing as observed error text.
+          trigger: 'repeated_error_pattern',
           error_fingerprint: maxFp,
           repeat_count: maxCount,
           window_ms: this.config.error_window_ms,
@@ -564,6 +624,14 @@ class SessionStateManager {
   }
 
   /**
+   * Mark a session as ended because a teardown was REQUESTED — no exit status observed (#843).
+   */
+  markTerminationRequested(sessionId, reason, killError) {
+    const sm = this._machines.get(sessionId);
+    if (sm) sm.markTerminationRequested(reason, killError);
+  }
+
+  /**
    * Mark a session as restarting (auto-restart triggered).
    */
   markRestarting(sessionId) {
@@ -626,9 +694,134 @@ class SessionStateManager {
   }
 }
 
+// ---------------------------------------------------------------------------
+// #60 §2.3 — external observation vocabulary (pure)
+// ---------------------------------------------------------------------------
+//
+// The external name is selected from the normalized measurement CAUSE, never from the
+// destination state. That is the whole point: five different routes reach internal `idle`, and
+// serializing the state name let a 0.6-confidence silence timeout present itself exactly like an
+// OSC-133 REPL-done mark. Each row below names only what its entrance actually measured.
+//
+// `requires` lists the evidence fields the row cannot be stated without. A row whose evidence is
+// missing fails closed to `unmapped_transition_cause` rather than emitting the stronger name with
+// a hole in it.
+const OBSERVATION_CAUSES = Object.freeze({
+  lifecycle_starting:                { kind: 'session_start_phase_observed',            destinations: ['starting'],            requires: [] },
+  osc_133_a_or_b_received:           { kind: 'osc_133_a_or_b_observed',                 destinations: ['idle'],                requires: ['timestamp'] },
+  quiet_after_recent_osc_133_a_or_b: { kind: 'pty_quiet_after_osc_133_a_or_b_observed', destinations: ['idle'],                requires: ['silence_ms'] },
+  prompt_suffix_after_quiet:         { kind: 'prompt_suffix_after_quiet_observed',      destinations: ['idle'],                requires: ['silence_ms'] },
+  silence_timeout:                   { kind: 'pty_quiet',                               destinations: ['idle'],                requires: ['silence_ms'] },
+  manual_state_mark:                 { kind: 'manual_state_mark_observed',              destinations: ['idle'],                requires: [] },
+  output_received:                   { kind: 'output_observed',                         destinations: ['working'],             requires: [] },
+  busy_indicator_pattern:            { kind: 'busy_indicator_pattern_observed',         destinations: ['thinking'],            requires: ['matched_line'] },
+  input_request_pattern:             { kind: 'input_request_pattern_observed',          destinations: ['waiting'],             requires: ['matched_line'] },
+  repeated_error_pattern:            { kind: 'repeated_error_pattern_observed',         destinations: ['error'],               requires: ['error_fingerprint', 'repeat_count', 'window_ms'] },
+  thinking_timeout:                  { kind: 'thinking_classification_timeout_observed', destinations: ['error'],             requires: ['thinking_duration_ms'] },
+  lifecycle_restarting:              { kind: 'session_restart_mark_observed',           destinations: ['restarting'],          requires: [] },
+  // #843 A — `session_process_exited` is reserved for an OBSERVED child/bridge exit, and the row
+  // now REQUIRES the evidence that says so. It used to sit at `requires: []`, which is what let
+  // two entrances that observed no exit at all wear it: an operator DELETE and the close of a
+  // socket the daemon itself sent. An empty `requires` on the strongest name in the table is not a
+  // relaxation, it is a hole — the whole mechanism of this file is that a name cannot be stated
+  // without the measurement it is made of.
+  process_exit:                      { kind: 'session_process_exited',                  destinations: ['dead'],                requires: ['exit_observed_at'] },
+  // The two DELETE outcomes. Distinct facts, distinct names: one says the daemon was asked to end
+  // a session and did not watch it die, the other says the kill call failed and the process may
+  // still be alive with nothing tracking it.
+  termination_requested:             { kind: 'session_termination_requested',           destinations: ['dead'],                requires: ['reason', 'requested_at'] },
+  termination_kill_failed:           { kind: 'session_termination_kill_failed',         destinations: ['dead'],                requires: ['reason', 'kill_error'] },
+  // #815 owner lifecycle, consumed by Stage A as lifecycle facts only (§3 "Stage A consumption
+  // of #815 owner lifecycle"). Neither is a task outcome.
+  owner_epoch_replaced:              { kind: 'owner_replaced_observed',                 destinations: ['*'],                   requires: ['displaced_session_epoch'] },
+  // #843 A — a displaced owner's SOCKET closed. The daemon initiated that close itself (close
+  // 4001, src/transport/websocket.js), so reporting it as a process exit asserted a child death
+  // nobody observed; the displaced bridge usually does exit, but "usually" is not a measurement.
+  // BUS_EVENT_SCHEMA.md already said this correctly for `session_owner_replaced` — the code was
+  // contradicting the repo's own documentation.
+  owner_transport_detached:          { kind: 'owner_transport_detached',                destinations: ['*'],                   requires: ['detached_at'] },
+  // §3.7 — qualified bridge readiness. DELIVERY-readiness hints only: they say a surface looks
+  // ready to receive an inject, never that a turn ended. The unqualified legacy frame keeps its
+  // own name so a 0.7.1 bridge's `{type:"ready"}` cannot borrow the qualified ones' meaning.
+  ready_frame_composer_surface:      { kind: 'composer_surface_observed',               destinations: ['*'],                   requires: ['detector'] },
+  ready_frame_prompt_suffix:         { kind: 'prompt_suffix_observed',                  destinations: ['*'],                   requires: ['detector'] },
+  ready_frame_legacy_unqualified:    { kind: 'legacy_ready_observed',                   destinations: ['*'],                   requires: [] },
+});
+
+// Presentation, keyed by OBSERVATION KIND — not by internal state. STATE_DISPLAY maps internal
+// `idle` to a GREEN sleeping pill, and that green is a done-semantics claim the sidebar reads as
+// task success (§8.5.5). Quiet, prompt-shaped, marker and caller-mark observations are therefore
+// NEUTRAL here. Nothing in this table is green.
+const OBSERVATION_DISPLAY = Object.freeze({
+  session_start_phase_observed:            { emoji: '🔄', color: '\x1b[33m', tone: 'pending' },
+  osc_133_a_or_b_observed:                 { emoji: '•',  color: '\x1b[90m', tone: 'neutral' },
+  pty_quiet_after_osc_133_a_or_b_observed: { emoji: '•',  color: '\x1b[90m', tone: 'neutral' },
+  prompt_suffix_after_quiet_observed:      { emoji: '•',  color: '\x1b[90m', tone: 'neutral' },
+  pty_quiet:                               { emoji: '·',  color: '\x1b[90m', tone: 'neutral' },
+  manual_state_mark_observed:              { emoji: '✎',  color: '\x1b[90m', tone: 'neutral' },
+  output_observed:                         { emoji: '🔨', color: '\x1b[36m', tone: 'active' },
+  busy_indicator_pattern_observed:         { emoji: '🧠', color: '\x1b[35m', tone: 'active' },
+  input_request_pattern_observed:          { emoji: '⏳', color: '\x1b[33m', tone: 'attention' },
+  repeated_error_pattern_observed:         { emoji: '🔴', color: '\x1b[31m', tone: 'error' },
+  thinking_classification_timeout_observed:{ emoji: '⏱',  color: '\x1b[33m', tone: 'attention' },
+  session_restart_mark_observed:           { emoji: '🔄', color: '\x1b[33m', tone: 'pending' },
+  session_process_exited:                  { emoji: '☠️', color: '\x1b[90m', tone: 'error' },
+  // #843 — a requested teardown is not a witnessed death, and a kill that threw is worse than
+  // either. Three measurements, three presentations; none of them green, same as every row here.
+  session_termination_requested:           { emoji: '⏹',  color: '\x1b[90m', tone: 'attention' },
+  session_termination_kill_failed:         { emoji: '⚠',  color: '\x1b[31m', tone: 'error' },
+  owner_transport_detached:                { emoji: '⇹',  color: '\x1b[33m', tone: 'attention' },
+  owner_replaced_observed:                 { emoji: '⇄',  color: '\x1b[33m', tone: 'attention' },
+  unmapped_transition_cause:               { emoji: '?',  color: '\x1b[37m', tone: 'neutral' },
+});
+
+/**
+ * Map a measured transition to its external observation. PURE.
+ *
+ * Fails closed: an unknown cause, a cause that did not come from a destination it is defined
+ * for, or a cause missing a required evidence field all return `unmapped_transition_cause`
+ * carrying the raw destination and trigger. It NEVER falls back to a state-name mapping — that
+ * fallback is the defect, because it is precisely how a weak cause inherits a strong name.
+ *
+ * @param {{destination?: string, cause?: string, evidence?: object}} input
+ * @returns {{kind: string, cause: string|null, fields: object}}
+ */
+function mapObservationCause({ destination, cause, evidence } = {}) {
+  const ev = evidence && typeof evidence === 'object' ? evidence : {};
+  const row = Object.prototype.hasOwnProperty.call(OBSERVATION_CAUSES, String(cause))
+    ? OBSERVATION_CAUSES[String(cause)]
+    : null;
+  const unmapped = (reason) => ({
+    kind: 'unmapped_transition_cause',
+    cause: cause == null ? null : String(cause),
+    fields: { destination: destination == null ? null : String(destination), trigger: cause == null ? null : String(cause), reason },
+  });
+
+  if (!row) return unmapped('unknown_cause');
+  if (!row.destinations.includes('*') && !row.destinations.includes(String(destination))) {
+    return unmapped('cause_destination_mismatch');
+  }
+  const missing = row.requires.filter(f => ev[f] === undefined || ev[f] === null);
+  if (missing.length > 0) return unmapped(`missing_evidence:${missing.join(',')}`);
+
+  const fields = {};
+  for (const f of row.requires) fields[f] = ev[f];
+  // Always-useful qualifiers, included only when actually measured. `confidence` qualifies the
+  // classifier; it never manufactures missing evidence and never qualifies completion.
+  if (ev.last_output_at !== undefined) fields.last_output_at = ev.last_output_at;
+  if (ev.confidence !== undefined) fields.confidence = ev.confidence;
+  // Elapsed since the inject. A field, never a threshold: elapsed time is an observation and was
+  // never a completion floor (§7 item 8).
+  if (ev.elapsed_ms !== undefined) fields.elapsed_ms = ev.elapsed_ms;
+  return { kind: row.kind, cause: String(cause), fields };
+}
+
 module.exports = {
   STATES,
   STATE_DISPLAY,
+  OBSERVATION_CAUSES,
+  OBSERVATION_DISPLAY,
+  mapObservationCause,
   DEFAULT_CONFIG,
   SessionStateMachine,
   SessionStateManager,

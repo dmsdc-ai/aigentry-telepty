@@ -11,6 +11,12 @@ function isCmuxRef(id) {
   return typeof id === 'string' && CMUX_REF_RE.test(id);
 }
 
+// #844: the uuid half of the allowlist above, used by isSurfaceAlive to decide whether cmux's
+// `--id-format uuids` output can be PARSED as an enumeration at all. `CMUX_UUID_SCAN_RE` is the
+// same shape unanchored + global, for pulling every id out of a listing.
+const CMUX_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CMUX_UUID_SCAN_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
+
 // Detect terminal environment at daemon level
 function detectTerminal() {
   // 1. cmux: check env var or cmux ping
@@ -122,9 +128,16 @@ function clearCache() {
 //               case is the INV-17 gate: a cmux app-quit/restart makes ALL surfaces vanish at
 //               once, so an unreachable cmux means INDETERMINATE → caller must PRESERVE (GC
 //               nothing), preserving the #486/#488 survival guarantee.
-//   'gone'    — cmux reachable but this session's workspace UUID is absent from the live list
-//               (an explicit single-workspace close while the bridge survived).
+//   'gone'    — cmux reachable AND it returned a listing we could parse as a uuid enumeration
+//               that demonstrably omits this session's workspace UUID (an explicit
+//               single-workspace close while the bridge survived).
 //   'alive'   — cmux reachable and the workspace is present.
+//
+// #844: 'gone' is the verdict that authorises a teardown, so it requires POSITIVE evidence of
+// absence. The INV-17 gate covers cmux FAILING; it does nothing for cmux ANSWERING with something
+// that is not a listing — truncated output, a localised message, a changed format, a
+// half-succeeded command that still exited 0. A raw substring scan called every one of those
+// 'gone' with exactly the confidence it gave a real answer.
 function isSurfaceAlive(session) {
   if (!session || session.backend !== 'cmux') return 'unknown';
   const wid = session.cmuxWorkspaceId;
@@ -145,9 +158,15 @@ function isSurfaceAlive(session) {
   } catch {
     return 'unknown';
   }
+  // The listing was requested with `--id-format uuids`, so a uuid is the only thing that can be
+  // compared against it: a short-ref (`workspace:2`) or an index misses every line and would read
+  // as absence manufactured by the question rather than observed in the answer.
   const needle = String(wid).toLowerCase();
-  const present = listing.split('\n').some(line => line.toLowerCase().includes(needle));
-  return present ? 'alive' : 'gone';
+  if (!CMUX_UUID_RE.test(needle)) return 'unknown';
+  const enumerated = String(listing).toLowerCase().match(CMUX_UUID_SCAN_RE) || [];
+  // Zero uuids recovered ⇒ whatever cmux printed, it was not an enumeration. Indeterminate.
+  if (enumerated.length === 0) return 'unknown';
+  return enumerated.includes(needle) ? 'alive' : 'gone';
 }
 
 function getExpectedPtyPid(session) {

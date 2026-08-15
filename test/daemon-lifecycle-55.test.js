@@ -46,8 +46,8 @@ const CLI = path.join(REPO_ROOT, 'cli.js');
 const tempDirs = [];
 const daemonPorts = [];
 after(async () => {
-  for (const port of daemonPorts) {
-    const m = await meta(port);
+  for (const { port, home } of daemonPorts) {
+    const m = await meta(port, home);
     const pid = m && m.pid;
     if (Number.isInteger(pid) && pid > 0) {
       try { process.kill(pid, 'SIGKILL'); } catch {}
@@ -77,9 +77,10 @@ function makeTempHome() {
   return homeDir;
 }
 
-// Track a port whose daemon must be reaped in `after`.
-function trackDaemonPort(port) {
-  daemonPorts.push(port);
+// Track a port whose daemon must be reaped in `after`. The HOME comes with it because since
+// #820 the /api/meta pid lookup needs that daemon's token, and each temp HOME holds its own.
+function trackDaemonPort(port, home) {
+  daemonPorts.push({ port, home });
   return port;
 }
 
@@ -144,9 +145,22 @@ async function health(port) {
   }
 }
 
-async function meta(port) {
+// #820: /api/meta is behind the auth middleware, and loopback is no longer a credential — so the
+// probe has to present the token the daemon under `home` actually loaded. (/api/health above needs
+// none: it is registered before the middleware, deliberately.)
+function tokenFor(home) {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/meta`, { signal: AbortSignal.timeout(1000) });
+    return JSON.parse(fs.readFileSync(path.join(home, '.telepty', 'config.json'), 'utf8')).authToken;
+  } catch { return null; }
+}
+
+async function meta(port, home) {
+  try {
+    const token = home ? tokenFor(home) : null;
+    const res = await fetch(`http://127.0.0.1:${port}/api/meta`, {
+      signal: AbortSignal.timeout(1000),
+      headers: token ? { 'x-telepty-token': token } : {}
+    });
     if (!res.ok) return null;
     return await res.json();
   } catch {
@@ -168,7 +182,7 @@ async function waitFor(fn, { timeoutMs = 7000, intervalMs = 100, desc = 'conditi
 
 test('daemon start: returns control to the shell immediately AND brings up a reachable detached daemon', async () => {
   const home = makeTempHome();
-  const port = trackDaemonPort(await pickFreePort());
+  const port = trackDaemonPort(await pickFreePort(), home);
 
   // If `start` blocked (the old foreground bug), runCli would time out → reject.
   const res = await runCli(['daemon', 'start'], home, port);
@@ -183,13 +197,13 @@ test('daemon start: returns control to the shell immediately AND brings up a rea
 
 test('daemon stop: terminates the running daemon process and frees the port', async () => {
   const home = makeTempHome();
-  const port = trackDaemonPort(await pickFreePort());
+  const port = trackDaemonPort(await pickFreePort(), home);
 
   await runCli(['daemon', 'start'], home, port);
   await waitFor(() => health(port), { desc: 'daemon up before stop' });
   // The `telepty daemon` path launches daemon.js via require() so it does not
   // write daemon-state.json; the live pid comes from /api/meta (port-owner path).
-  const m = await meta(port);
+  const m = await meta(port, home);
   const pid = m && m.pid;
   assert.ok(Number.isInteger(pid) && pid > 0, 'daemon should report a pid via /api/meta');
 
@@ -219,17 +233,17 @@ test('daemon stop: with NO daemon running does NOT start one (the #55 ignore-arg
 
 test('daemon restart: cycles the daemon (stop + start) and leaves it reachable', async () => {
   const home = makeTempHome();
-  const port = trackDaemonPort(await pickFreePort());
+  const port = trackDaemonPort(await pickFreePort(), home);
 
   await runCli(['daemon', 'start'], home, port);
-  const before = await waitFor(() => meta(port), { desc: 'daemon up before restart' });
+  const before = await waitFor(() => meta(port, home), { desc: 'daemon up before restart' });
 
   const res = await runCli(['daemon', 'restart'], home, port);
   assert.equal(res.code, 0, `daemon restart should exit 0\nstderr:\n${res.stderr}`);
   assert.match(res.stdout, /restarted/i);
 
   const afterMeta = await waitFor(async () => {
-    const m = await meta(port);
+    const m = await meta(port, home);
     // Reachable again; the restarted daemon is a fresh process (new pid).
     return m && m.pid && m.pid !== before.pid ? m : null;
   }, { desc: 'restarted daemon reachable with a new pid' });
@@ -238,7 +252,7 @@ test('daemon restart: cycles the daemon (stop + start) and leaves it reachable',
 
 test('bare `telepty daemon` keeps FOREGROUND behavior (back-compat for install/launchd flows)', async () => {
   const home = makeTempHome();
-  const port = trackDaemonPort(await pickFreePort());
+  const port = trackDaemonPort(await pickFreePort(), home);
 
   // Spawn directly (NOT runCli) — foreground means the process must NOT exit.
   const child = spawn(process.execPath, [CLI, 'daemon'], {
@@ -284,7 +298,9 @@ test('stopDaemon: targets state-file pid + configured-port owner, and NEVER scan
     port: 49999,
     readDaemonState: () => ({ pid: 111 }),
     findPortOwnerPid: (p) => (p === 49999 ? 222 : null),
-    pidMatchesTeleptyCmdline: (pid) => pid === 222, // port owner confirmed as telepty
+    // #844: BOTH sources confirm identity now — the state-file pid is a pid we WROTE, not one we
+    // measured, so `stopDaemon`'s surgical promise has to be checked rather than asserted.
+    pidMatchesTeleptyCmdline: (pid) => pid === 111 || pid === 222,
     isProcessRunning: () => false,
     stopDaemonProcess: (pid) => { killed.push(pid); return true; },
     // If stop ever sweeps the table it MUST go through this seam — assert it does not.

@@ -1,66 +1,66 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const reportEnforcement = require('../src/report-enforcement');
 const {
-  classifyReportPrompt,
   buildAutoSummary,
-  REPORT_PREFIX_RE,
-  REPORT_STATUS_BLOCKED_RE,
-  REPORT_STATUS_DISMISSED_RE,
   SECRET_DENYLIST_RE,
-} = require('../src/report-enforcement');
+} = reportEnforcement;
 
-// ---------------- classifyReportPrompt ----------------
+// ---------------- the deleted report classifier (#60 Stage A) ----------------
+//
+// This suite used to assert that report-shaped TEXT could be classified into an outcome:
+// `REPORT:` → report_complete, `STATUS: blocked` → report_blocked, and so on. That claim is
+// WITHDRAWN, not renamed. No text can authenticate its sender or correlate itself to a dispatch,
+// so no text may name an outcome; `classifyReportPrompt`, REPORT_PREFIX_RE and the
+// REPORT_STATUS_*_RE family are deleted, and their sole production caller
+// (`resolveOutboundReportStatus`) is deleted with them. An authenticated, correlated validator
+// returns in Stage B / 0.9.0 behind #816 + #817.
+//
+// So the migration pins the ABSENCE rather than a new spelling. That is the stronger assertion:
+// the old tests only proved the classifier worked, while these fail the moment anyone re-exports
+// it or wires a production caller back up — which is the actual way this regresses.
 
-describe('classifyReportPrompt', () => {
-  it('classifies REPORT: prefix as report_complete', () => {
-    assert.equal(classifyReportPrompt('REPORT: files=x | result=ok'), 'report_complete');
+describe('report classifier removal (#60 Stage A)', () => {
+  it('exports no report-text classifier', () => {
+    assert.equal(reportEnforcement.classifyReportPrompt, undefined,
+      'classifyReportPrompt must stay deleted — 0.8.0 classifies no report-shaped text');
   });
 
-  it('classifies STATUS: blocked as report_blocked', () => {
-    assert.equal(classifyReportPrompt('STATUS: blocked waiting on review'), 'report_blocked');
+  it('exports no report-prefix or report-status matchers', () => {
+    for (const name of ['REPORT_PREFIX_RE', 'REPORT_STATUS_BLOCKED_RE',
+      'REPORT_STATUS_DISMISSED_RE', 'REPORT_STATUS_ERROR_RE']) {
+      assert.equal(reportEnforcement[name], undefined, `${name} must stay deleted`);
+    }
   });
 
-  it('classifies STATUS: dismissed as report_dismissed', () => {
-    assert.equal(classifyReportPrompt('STATUS: dismissed by orchestrator'), 'report_dismissed');
+  it('exports no outcome vocabulary at all', () => {
+    // The four values the deleted classifier could return. None may reappear as an export,
+    // under any name — a renamed classifier is the same claim in a different costume.
+    const serialized = JSON.stringify(Object.entries(reportEnforcement)
+      .map(([k, v]) => [k, typeof v === 'function' ? 'fn' : String(v)]));
+    for (const outcome of ['report_complete', 'report_blocked', 'report_dismissed', 'report_error']) {
+      assert.ok(!serialized.includes(outcome), `${outcome} must not appear in the export surface`);
+    }
   });
 
-  it('classifies STATUS: error as report_error', () => {
-    assert.equal(classifyReportPrompt('STATUS: error build failed'), 'report_error');
-  });
-
-  it('classifies SPEC: prefix as report_complete', () => {
-    assert.equal(classifyReportPrompt('SPEC: some architectural spec'), 'report_complete');
-  });
-
-  it('classifies ENFORCE-SPEC: as report_complete', () => {
-    assert.equal(classifyReportPrompt('ENFORCE-SPEC: approach C'), 'report_complete');
-  });
-
-  it('classifies ENFORCE-IMPLEMENTED: as report_complete', () => {
-    assert.equal(classifyReportPrompt('ENFORCE-IMPLEMENTED: files=daemon.js'), 'report_complete');
-  });
-
-  it('classifies OWNER-DIAGNOSIS: as report_complete', () => {
-    assert.equal(classifyReportPrompt('OWNER-DIAGNOSIS: root cause'), 'report_complete');
-  });
-
-  it('returns null for plain text prompt', () => {
-    assert.equal(classifyReportPrompt('please fix the bug'), null);
-  });
-
-  it('returns null for non-string input', () => {
-    assert.equal(classifyReportPrompt(null), null);
-    assert.equal(classifyReportPrompt(undefined), null);
-    assert.equal(classifyReportPrompt(42), null);
-  });
-
-  it('allows leading whitespace', () => {
-    assert.equal(classifyReportPrompt('   REPORT: trimmed'), 'report_complete');
-  });
-
-  it('STATUS variants beat generic REPORT prefix (ordering)', () => {
-    // STATUS: blocked should win, not generic report_complete
-    assert.equal(classifyReportPrompt('STATUS: blocked'), 'report_blocked');
+  it('has no production consumer (source invariant)', () => {
+    const root = path.join(__dirname, '..');
+    const srcFiles = fs.readdirSync(path.join(root, 'src'), { recursive: true })
+      .filter(f => typeof f === 'string' && /\.(js|mjs)$/.test(f))
+      .map(f => path.join('src', f));
+    const files = ['daemon.js', 'cli.js', 'session-state.js', 'mcp-server/index.mjs', ...srcFiles];
+    for (const rel of files) {
+      // Strip line comments: both surviving mentions of these names are prose explaining the
+      // deletion, and prose is not a consumer.
+      const code = fs.readFileSync(path.join(root, rel), 'utf8')
+        .split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+      assert.ok(!/classifyReportPrompt/.test(code),
+        `${rel} must not reference the deleted classifier`);
+      assert.ok(!/REPORT_(PREFIX|STATUS)_/.test(code),
+        `${rel} must not reference the deleted report matchers`);
+    }
   });
 });
 
@@ -152,26 +152,9 @@ describe('buildAutoSummary', () => {
 // ---------------- regex exports ----------------
 
 describe('regex exports', () => {
-  it('REPORT_PREFIX_RE matches expected prefixes', () => {
-    const prefixes = ['REPORT:', 'STATUS:', 'SPEC:', 'OWNER-DIAGNOSIS:', 'ENFORCE-SPEC:',
-      'LOG-FIX-SPEC:', 'LOG-FIX-IMPLEMENTED:', 'FIX-SPEC:', 'FIX-IMPLEMENTED:',
-      'SPEC-SYNC:', 'DIAGNOSIS:', 'ENFORCE-IMPLEMENTED:'];
-    for (const p of prefixes) {
-      assert.ok(REPORT_PREFIX_RE.test(`${p} body`), `should match ${p}`);
-    }
-  });
-
-  it('REPORT_STATUS_BLOCKED_RE matches case-insensitively', () => {
-    assert.ok(REPORT_STATUS_BLOCKED_RE.test('STATUS: blocked'));
-    assert.ok(REPORT_STATUS_BLOCKED_RE.test('status: blocked'));
-    assert.ok(REPORT_STATUS_BLOCKED_RE.test('STATUS: BLOCKED'));
-  });
-
-  it('REPORT_STATUS_DISMISSED_RE matches dismissed state', () => {
-    assert.ok(REPORT_STATUS_DISMISSED_RE.test('STATUS: dismissed'));
-    assert.ok(!REPORT_STATUS_DISMISSED_RE.test('STATUS: blocked'));
-  });
-
+  // The REPORT_PREFIX_RE / REPORT_STATUS_*_RE cases that lived here are deleted with the
+  // classifier; their absence is pinned above. SECRET_DENYLIST_RE is untouched by #60 — it
+  // serves buildAutoSummary redaction, which measures nothing about task outcome.
   it('SECRET_DENYLIST_RE matches common secret patterns', () => {
     const samples = ['api_key=abc', 'api-key=xyz', 'password=pw', 'token=tk', 'secret=sc'];
     for (const s of samples) {

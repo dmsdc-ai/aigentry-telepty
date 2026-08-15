@@ -16,6 +16,42 @@ function getPeerTransport(entry) {
   return entry.transport || 'ssh';
 }
 
+// #835: a peer that ANSWERS and declines is not a peer with no sessions. Only a connect error
+// (peer offline, ssh unreachable) may honestly degrade to []; a 401/403 means the peer is up
+// and refusing our credential, and a 5xx means it is up and broken. Both must reach the
+// operator by name — a list that silently drops a refusing peer still looks authoritative.
+const PEER_REFUSAL_STATUSES = new Set([401, 403]);
+
+function peerAnswerError(name, target, status, detail) {
+  const what = PEER_REFUSAL_STATUSES.has(status)
+    ? `REFUSED this node's credential (HTTP ${status})`
+    : status
+      ? `answered with HTTP ${status}`
+      : 'could not answer';
+  const because = detail ? ` (${detail})` : '';
+  const error = new Error(`Peer '${name}' (${target}) ${what}${because} — its sessions are UNKNOWN, not absent.`);
+  error.name = 'PeerResponseError';
+  error.peer = name;
+  error.status = status || null;
+  error.refused = PEER_REFUSAL_STATUSES.has(status);
+  return error;
+}
+
+function isPeerAnswerError(error) {
+  return Boolean(error) && error.name === 'PeerResponseError';
+}
+
+// Split a per-peer settlement into the sessions we know about and the peers we could not ask.
+function collectPeerResults(settled) {
+  const sessions = [];
+  const failures = [];
+  for (const result of settled) {
+    if (result.status === 'fulfilled') sessions.push(...result.value);
+    else failures.push(result.reason);
+  }
+  return { sessions, failures };
+}
+
 // SSH ControlMaster socket path pattern
 function controlPath(target) {
   return path.join(CONTROL_DIR, `ctrl-${target.replace(/[^a-zA-Z0-9@.-]/g, '_')}`);
@@ -110,13 +146,21 @@ function runRemoteCommand(peer, remoteCommand, options = {}) {
   });
 
   if (result.error) {
-    throw result.error;
+    // #835: ssh never ran or never answered (spawn failure, timeout) — a transport-level
+    // absence, not the remote declining. Tagged so callers can keep the two apart.
+    throw Object.assign(result.error, { transportFailure: true });
   }
 
   if (result.status !== 0) {
     const stderr = String(result.stderr || '').trim();
     const stdout = String(result.stdout || '').trim();
-    throw new Error(stderr || stdout || `Remote command failed with exit code ${result.status}`);
+    // #835: carry the exit status. ssh reserves 255 for its OWN failure (host unreachable, auth
+    // to the host failed); any other non-zero is the REMOTE command answering that it could not
+    // do the job — a distinction the caller needs to tell "peer is offline" from "peer refused".
+    throw Object.assign(
+      new Error(stderr || stdout || `Remote command failed with exit code ${result.status}`),
+      { status: result.status }
+    );
   }
 
   return String(result.stdout || '');
@@ -237,9 +281,16 @@ function listRemoteSessions(name) {
   try {
     const output = runRemoteCommand(peer, 'telepty list --json', { timeout: 10000 });
     const sessions = JSON.parse(output);
+    if (!Array.isArray(sessions)) throw new Error('remote returned a non-list');
     return sessions.map(s => ({ ...s, host: peer.target, peerName: name, remote: true }));
-  } catch {
-    return [];
+  } catch (error) {
+    // #835: ssh's OWN failure — exit 255 (host down, host auth failed) or a spawn-level error
+    // (blackholed host, timeout, no ssh binary) — is a genuinely unreachable peer, the one case
+    // where "no sessions" is honest. Anything else is the remote telepty answering that it could
+    // not tell us (after this fix it exits non-zero on a refusal instead of printing `[]`), and
+    // that must never read here as "that machine is empty".
+    if (error && (error.status === 255 || error.transportFailure)) return [];
+    throw peerAnswerError(name, peer.target, null, error && error.message);
   }
 }
 
@@ -247,20 +298,29 @@ function listRemoteSessions(name) {
  * Discover sessions across all connected peers, including SSH peers that are
  * persisted in peers.json but not in this process's activePeers Map. Fresh
  * CLI subprocesses depend on the file-backed path — #411.
- * @returns {Array} all remote sessions
+ * @returns {{sessions: Array, failures: Error[]}} sessions we know about, and the peers we
+ *          could not ask (#835 — a peer we could not ask is not a peer with nothing to report)
  */
 function discoverAllRemoteSessions() {
-  const allSessions = [];
+  const sessions = [];
+  const failures = [];
   const seen = new Set();
+  const collect = (name) => {
+    try {
+      sessions.push(...listRemoteSessions(name));
+    } catch (error) {
+      failures.push(error);
+    }
+  };
   for (const [name] of activePeers) {
-    allSessions.push(...listRemoteSessions(name));
+    collect(name);
     seen.add(name);
   }
   for (const peer of listSshPeers()) {
     if (seen.has(peer.name)) continue;
-    allSessions.push(...listRemoteSessions(peer.name));
+    collect(peer.name);
   }
-  return allSessions;
+  return { sessions, failures };
 }
 
 /**
@@ -389,7 +449,12 @@ async function connectHttp(target, options = {}) {
   const name = options.name || spec.host.split('.')[0] || spec.host;
 
   const headers = {};
-  if (options.token) headers['x-telepty-token'] = options.token;
+  // #823 — /api/meta is auth-gated, so discovery needs whichever token this operator has for the
+  // target. /api/health below deliberately sends none: it is registered BEFORE the auth
+  // middleware (daemon.js), and hardening it would break daemon-control's port-ownership probe
+  // and aterm's version detection in one stroke.
+  const metaToken = options.token || process.env.TELEPTY_AUTH_TOKEN;
+  if (metaToken) headers['x-telepty-token'] = metaToken;
 
   let machineId = name;
   let healthOk = false;
@@ -463,35 +528,40 @@ async function listHttpRemoteSessions(name, options = {}) {
   if (!entry || getPeerTransport(entry) !== 'http') return [];
 
   const headers = {};
-  const token = options.token || entry.token;
+  // #823 — same address-keyed order as cli.js resolveTargetToken: explicit → env → the peer's
+  // stored token (written by `connect-http --token`, and read for the first time here).
+  const token = options.token || process.env.TELEPTY_AUTH_TOKEN || entry.token;
   if (token) headers['x-telepty-token'] = token;
 
+  const target = `${entry.host}:${entry.port}`;
   try {
     const url = `http://${entry.host}:${entry.port}/api/sessions`;
     const res = await fetch(url, {
       signal: AbortSignal.timeout(options.timeoutMs || 3000),
       headers
     });
-    if (!res.ok) return [];
+    // #835: a refused or failing peer used to contribute zero sessions to a list that still
+    // looked authoritative. It answered — say so.
+    if (!res.ok) throw peerAnswerError(name, target, res.status);
     const sessions = await res.json();
-    if (!Array.isArray(sessions)) return [];
+    if (!Array.isArray(sessions)) throw peerAnswerError(name, target, res.status, 'non-list response body');
     return sessions.map((s) => ({
       ...s,
-      host: `${entry.host}:${entry.port}`,
+      host: target,
       peerName: name,
       peerPort: entry.port
     }));
-  } catch {
-    return [];
+  } catch (error) {
+    if (isPeerAnswerError(error)) throw error;
+    return []; // connect error / timeout: the peer is unreachable, so no sessions is honest
   }
 }
 
 async function discoverHttpRemoteSessions(options = {}) {
   const peers = listHttpPeers();
-  const results = await Promise.all(
+  return collectPeerResults(await Promise.allSettled(
     peers.map((peer) => listHttpRemoteSessions(peer.name, options))
-  );
-  return results.flat();
+  ));
 }
 
 // ── Broker peer support (opt-in relay discovery) ────────────────────────────
@@ -562,10 +632,12 @@ async function listBrokerRemoteSessions(options = {}) {
       signal: AbortSignal.timeout(options.timeoutMs || 3000),
       headers: { Authorization: `Bearer ${jwt}` }
     });
-    if (!res.ok) return [];
+    // #835: same shape as the HTTP peer — a broker that rejects our JWT is not a broker
+    // relaying zero sessions.
+    if (!res.ok) throw peerAnswerError(config && config.node ? config.node : 'broker', brokerUrl, res.status);
     const body = await res.json();
     const sessions = Array.isArray(body) ? body : body && body.sessions;
-    if (!Array.isArray(sessions)) return [];
+    if (!Array.isArray(sessions)) throw peerAnswerError(config && config.node ? config.node : 'broker', brokerUrl, res.status, 'non-list response body');
     return sessions.map((session) => {
       const base = (session && typeof session === 'object') ? session : { id: session };
       const node = base.peerName || base.host || base.node || base.machineId || base.machine_id;
@@ -575,14 +647,15 @@ async function listBrokerRemoteSessions(options = {}) {
         peerName: node
       };
     });
-  } catch {
-    return [];
+  } catch (error) {
+    if (isPeerAnswerError(error)) throw error;
+    return []; // broker unreachable
   }
 }
 
 async function discoverBrokerRemoteSessions(options = {}) {
-  if (listBrokerPeers().length === 0) return [];
-  return listBrokerRemoteSessions(options);
+  if (listBrokerPeers().length === 0) return { sessions: [], failures: [] };
+  return collectPeerResults(await Promise.allSettled([listBrokerRemoteSessions(options)]));
 }
 
 module.exports = {

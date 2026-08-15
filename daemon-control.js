@@ -371,8 +371,18 @@ function cleanupDaemonProcesses(opts) {
   const o = opts || {};
   const targets = new Map();
   const state = (o.readDaemonState || readDaemonState)();
+  const confirmCmdline = (o.pidMatchesTeleptyCmdline || pidMatchesTeleptyCmdline);
 
-  if (state && Number.isInteger(state.pid) && state.pid > 0 && state.pid !== process.pid) {
+  // #844: the state file records a pid we WROTE, not a pid we just measured. A stale file that
+  // outlived its daemon across a pid rollover names an unrelated process, and this source used to
+  // add it with no probe at all — while the other two sources both confirm identity first (the
+  // port-owner source via this same `pidMatchesTeleptyCmdline`, explicitly "so we never SIGTERM an
+  // arbitrary process that happens to own the port"; the process-scan source via
+  // `isLikelyTeleptyDaemon`). Two of three already required positive evidence; the exception was
+  // also the one `stopDaemon` promises is surgical. A pid that no longer exists, or exists as
+  // somebody else, simply is not a target — the stale state file is cleared below either way.
+  if (state && Number.isInteger(state.pid) && state.pid > 0 && state.pid !== process.pid
+      && confirmCmdline(state.pid)) {
     targets.set(state.pid, { pid: state.pid, source: 'state-file' });
   }
 
@@ -390,7 +400,6 @@ function cleanupDaemonProcesses(opts) {
   if (o.includePortOwner !== false) {
     const portOwnerPid = (o.findPortOwnerPid || findPortOwnerPid)(o.port || 3848);
     if (portOwnerPid && portOwnerPid !== process.pid && !targets.has(portOwnerPid)) {
-      const confirmCmdline = (o.pidMatchesTeleptyCmdline || pidMatchesTeleptyCmdline);
       if (confirmCmdline(portOwnerPid)) {
         targets.set(portOwnerPid, { pid: portOwnerPid, source: 'port-owner' });
       }

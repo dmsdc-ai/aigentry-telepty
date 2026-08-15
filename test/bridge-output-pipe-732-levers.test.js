@@ -55,7 +55,7 @@ test('#732 lever (a): a hard daemon restart restores BOTH legs, not just downstr
   });
 
   const port = await H.daemonReady(d);
-  const A = H.api(port);
+  const A = H.api(port, home);
   bridge = H.startBridge({ home, port, sid });
   await H.waitFor(async () => (await A.session(sid)).id === sid, { description: 'register' });
   await H.waitFor(async () => (await A.screen(sid)).screen.length > 0, { description: 'first output' });
@@ -105,7 +105,7 @@ test('#732 levers (b)(c): an upstream TCP stall is reaped by the daemon heartbea
   const port = await H.daemonReady(d);
   px = H.startProxy({ targetPort: port });
   const pxPort = await px.listen();
-  const A = H.api(port);                       // control plane goes direct
+  const A = H.api(port, home);                       // control plane goes direct
   bridge = H.startBridge({ home, port: pxPort, sid });   // only the bridge is proxied
 
   await H.waitFor(async () => (await A.session(sid)).id === sid, { description: 'register' });

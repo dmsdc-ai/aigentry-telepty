@@ -71,9 +71,19 @@ async function daemonReady(d) {
       if (!m) return false;
       d.port = Number(m[1]);
     }
-    return (await fetch(`http://127.0.0.1:${d.port}/api/sessions`)).ok;
+    // #820: /api/health is registered before the auth middleware, so readiness does not depend on
+    // a credential the daemon may not have written to disk yet.
+    return (await fetch(`http://127.0.0.1:${d.port}/api/health`)).ok;
   }, { timeoutMs: 15000, description: 'daemon start' });
   return d.port;
+}
+
+// #820 — the token this daemon is serving, read from its own isolated HOME the way any real
+// consumer reads it.
+function daemonToken(home) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(home, '.telepty', 'config.json'), 'utf8')).authToken;
+  } catch { return null; }
 }
 
 async function stopDaemon(d, signal = 'SIGKILL') {
@@ -114,19 +124,26 @@ function killBridge(b) {
   if (b && b.child) { try { b.child.kill('SIGKILL'); } catch { /* already gone */ } }
 }
 
-function api(port) {
+// #820: every call carries the daemon token — loopback is no longer a credential. `home` is the
+// isolated HOME the daemon was started with; the token is read from it per call so a harness
+// created before the daemon finished writing config.json still authenticates.
+function api(port, home) {
   const base = `http://127.0.0.1:${port}`;
+  const auth = (extra = {}) => {
+    const token = home ? daemonToken(home) : null;
+    return token ? { 'x-telepty-token': token, ...extra } : { ...extra };
+  };
   const json = async (r) => (r.ok ? r.json() : { status: r.status });
   return {
     screen: async (sid) => {
-      const r = await fetch(`${base}/api/sessions/${encodeURIComponent(sid)}/screen?lines=200`);
+      const r = await fetch(`${base}/api/sessions/${encodeURIComponent(sid)}/screen?lines=200`, { headers: auth() });
       return r.ok ? r.json() : { screen: '', status: r.status };
     },
-    session: (sid) => fetch(`${base}/api/sessions/${encodeURIComponent(sid)}`).then(json),
+    session: (sid) => fetch(`${base}/api/sessions/${encodeURIComponent(sid)}`, { headers: auth() }).then(json),
     inject: async (sid, prompt, extra = {}) => {
       const r = await fetch(`${base}/api/sessions/${encodeURIComponent(sid)}/inject`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: auth({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ prompt, ...extra })
       });
       return { status: r.status, body: await r.json().catch(() => null) };
@@ -201,6 +218,6 @@ function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0 
 
 module.exports = {
   delay, waitFor, makeHome,
-  startDaemon, daemonReady, stopDaemon,
+  startDaemon, daemonReady, daemonToken, stopDaemon,
   startBridge, killBridge, api, startProxy
 };

@@ -2,7 +2,246 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## Unreleased
+## 0.8.0 — unreleased
+
+### Changed — BREAKING: telepty no longer asserts task completion (#60 Stage A)
+
+**The daemon used to state that a task was finished, from signals that cannot measure it.** Silence,
+elapsed time, a prompt glyph, a submit flag and an unqualified bridge `ready` frame were each
+sufficient to emit `TASK_COMPLETE`. This happened four times in one day on this project's own
+workers, every one verified false; in one case the classifier read the line
+`⏵⏵ bypass permissions on · 3 shells`, called the session idle at confidence 0.6, and the daemon
+turned that into a 100%-confidence sentence saying the work was done.
+
+Transport, activity and inject-consumption are measurable. **Task outcome is not**, and nothing in
+this release can produce one. `0.8.0` emits honest absence instead, and completion stays explicitly
+unknown until an authenticated, correlated report exists — that is Stage B / `0.9.0`, blocked on
+#816 (a private capability/report channel) and #817 (cross-machine sender identity).
+
+- **Removed every terminal producer.** `TASK_COMPLETE`, `TASK_COMPLETE_WITH_REPORT`,
+  `TASK_IDLE_UNCONFIRMED`, `TASK_ERROR`, `TASK_IDLE_NO_REPORT` and `TASK_DEAD_NO_REPORT` are gone.
+  One `task_completion_unknown` observation replaces them, carrying `completion_fact: null`,
+  `terminal: false`, the measured observation, a consumption verdict and an explicit capability
+  block.
+- **Removed the reverse-text report path.** Every payload a session routed back to whoever tasked
+  it was mapped to `report_complete` — a clarifying question was recorded as that worker reporting
+  its task complete, and `CHANGELOG.md` (0.2.x) recorded the mislabel as accepted. **`0.8.0` no
+  longer classifies report-shaped text at all**: `classifyReportPrompt`, `REPORT_PREFIX_RE`,
+  `REPORT_STATUS_*_RE` and `resolveOutboundReportStatus` are deleted. No text can authenticate its
+  sender or correlate itself to a dispatch, so no text may settle one. A reverse-routed inject is
+  an ordinary message.
+- **Absence is now durable, and committed before delivery.** A tracked inject writes a versioned
+  `tracked_injections` ledger record (temp → `fsync` → atomic rename → directory `fsync`) *before*
+  bytes reach the target, and a failed commit **aborts the delivery** (`TRACKING_PERSISTENCE_FAILED`)
+  rather than delivering and forgetting. The ledger survives restart, gains
+  `daemon_restart_observed`, and contains no outcome field at all.
+- **Added `GET /api/inject-observations/:inject_id`.** Always HTTP 200 with a discriminated
+  schema-v2 body; an absent, pre-v2 or corrupt record is `tracking_state: "unavailable"` with a
+  named top-level `reason`. **Schema v2 never uses 404 as a task-state signal** — "no record" and
+  "finished" are different statements and a status code cannot tell them apart. An unauthenticated
+  caller gets 401 from the auth middleware, which means "prove who you are", not "absent".
+- **`telepty inject` now prints the transport `inject_id`** (own line, `inject_id: ` prefix). It
+  previously existed only inside the daemon, so no consumer could correlate a dispatch to anything.
+- **Every observation entry point is total.** The transition handler, ready frame, ready dwell,
+  settle and CPU re-arms, the consumption branch, session death, supersession, cancellation and
+  restore each return a *named* result (`observation_emitted`, `observation_duplicate`,
+  `unmapped_transition_cause`, `tracking_superseded`, `tracking_unavailable`,
+  `observation_deferred`, `tracking_persistence_failed`). The `#52` consumption gate — a bare
+  `return` that emitted nothing and set nothing — is deleted: consumption is a *field* on the
+  observation, never a gate in front of one.
+- **Retired the `idleNotified` latch.** A one-way "already spoke" bit was burned by a wrong-label
+  emission and then dropped the later genuine observation. Duplicate suppression is now keyed on
+  observation identity in the ledger, where it cannot become an authority gate; a *different*
+  measurement on the same inject is still emitted. `idle_notified` is gone from
+  `GET /api/pendingReports/:id`.
+- **External activity vocabulary is measurement-cause-based (§2.3).** Names are selected from
+  `(destination, normalized cause, required evidence)` and fail closed to
+  `unmapped_transition_cause` — never to a state-name fallback. Producer triggers that used to
+  collapse several measurements into one name are split: `osc_133_prompt` into
+  `osc_133_a_or_b_received` / `quiet_after_recent_osc_133_a_or_b`, `lifecycle` into
+  `lifecycle_starting` / `lifecycle_restarting` / `process_exit`, and the shared `pattern` into
+  `input_request_pattern` / `busy_indicator_pattern`. `markIdle` can no longer let caller detail
+  overwrite the normalized cause. The internal 8-state FSM is unchanged — submit and readiness
+  code branches on it.
+- **Consumption admission is strict, with rejection precedence.** `consumption.status: "observed"`
+  requires a fresh post-submit `idle|waiting → working|thinking` edge **and** an accepted,
+  non-ambiguous, *screen-derived* submit confirmation (`body_consumed`, `state_working`,
+  `state_thinking`). A positive submit rejection is evaluated **before** any durable field, so a
+  stale `injectConsumedAt` cannot override it. `force`, `gate_off`, `redelivered` and `empty_body`
+  accepts measure no screen and no longer count. The `#721` launcher watermark keeps its whole
+  calculation but is now `submit_accepted_and_output_advanced` telemetry with consumption
+  `not_established` — it never measured consumption, and a never-started worker can satisfy it.
+- **Breaking for consumers:** `autoState.state` is replaced by `activityObservation` (named by
+  cause, neutrally styled — quiet is never green/done) plus a separate `completion` block;
+  `/api/sessions/:id/state` renames `auto` to `activity_observation`; the bus event
+  `session_auto_state` becomes `session_activity_observation`.
+
+Stage A deliberately adds **no new fact detector**. OSC 9;4 is real but in-band and unattributed —
+a child's progress clear closes the parent's bracket — so it stays telemetry and is never promoted.
+The `#32/#48/#52/#537/#545/#619/#721` compensation stack is retained (Stage D removes it
+separately); the settle window now only debounces *follow-up* observations, which is not silence
+because the durable `tracking_started` record already exists and is pollable.
+
+### Security — BREAKING: reachability is no longer authentication (#820, #823)
+
+- **Every caller must now present the daemon token — including callers on loopback (#820).** The
+  daemon has always minted a token in `~/.telepty/config.json`, and the `telepty` CLI has always
+  sent it. But the auth middleware answered the network's question instead of the caller's: if the
+  peer-address policy said "allowed", it returned early and the credential was never consulted. On
+  a default install that meant any process on the machine could list sessions (with their `command`
+  and `cwd`), read and write any PTY, `DELETE` sessions, and `POST /api/sessions/spawn` with a
+  `command` and `cwd` of its choosing. The WebSocket upgrade — the attach viewer and `/api/bus`
+  alike — had the identical shape.
+
+  The two questions are now separated and asked in order: **origin guard → peer reachability →
+  credential → route.** #806's property is unchanged (a valid credential still cannot buy a
+  disallowed browser origin).
+
+- **The peer allowlist narrows reachability and no longer grants authentication (#823).** An
+  address outside `TELEPTY_PEER_ALLOWLIST` gets `403 PEER_NOT_ALLOWED`; an address inside it still
+  has to present the token. This branch was the one that read as safe and was not: a *matching*
+  allowlist entry returned "allowed" exactly as completely as an empty list did, and #672's tailnet
+  auto-bind puts the tailnet CIDR into that list **on the default configuration** — so every device
+  on an operator's tailnet reached every route uncredentialed. An empty allowlist still means *no
+  IP restriction* (turning it into deny-all would break tailnet reachability for no gain), and
+  loopback is never narrowed away, so a local CLI cannot be locked out by an allowlist.
+
+  Operators who worked around this with `TELEPTY_NO_TAILNET_AUTO=1` no longer need it: the tailnet
+  listener can be left on, because it now requires a credential like every other address.
+
+- **A refused WebSocket upgrade is now distinguishable from a daemon that is not there.** The
+  refusal used to be a bare `HTTP/1.1 401` immediately followed by `destroy()`, which raced the
+  write — clients frequently saw ECONNRESET, i.e. an `error` event and close **1006**, byte-identical
+  to a dead daemon, so a bridge reconnected forever in silence against a daemon that was answering
+  and declining. Refusals are now complete HTTP responses (`Connection: close`, JSON body with the
+  same `code` the HTTP middleware uses, `X-Telepty-Refusal` header) flushed before the FIN, so `ws`
+  clients get `unexpected-response` with a readable status. `telepty attach` no longer crashes with
+  an unhandled `error` event on a refused handshake; it prints which fault it was.
+
+- **Cross-host callers must present the TARGET's token, resolved by address — and a target with no
+  credential of its own is REFUSED, never handed the local one (#844).** Each node mints its own
+  token, so the local one is not valid at a peer. Resolution order is `TELEPTY_AUTH_TOKEN` → a
+  `peers.json` entry matching that `host:port` → the local token **for this machine only**; a
+  *wrong* token still yields a diagnosable 401, and no path we do dial sends none. A non-local
+  address with neither of the first two is refused before the socket opens, with a message naming
+  `connect-http --token` and `TELEPTY_AUTH_TOKEN`.
+
+  The refusal replaces a silent send that this release is precisely what made dangerous. The
+  resolver ended in an unconditional `getAuthToken()`, so any command aimed at an address with no
+  stored entry put **this machine's daemon master token** on the wire in cleartext, to whoever
+  answered. That was inert in 0.7.1 because the target trusted every caller and never read the
+  credential. Now that token is the whole boundary on the *sending* side, and on a tailnet #672's
+  auto-populated allowlist lets the recipient turn it straight back on the daemon that sent it —
+  one mistyped host, `telepty inject sess@10.0.0.5`, was enough, with no output at all.
+
+  `telepty connect-http <host> --token <that host's authToken>` has always stored `entry.token` and
+  nothing ever read it, because the lookup was keyed on a peer name the dial sites had already
+  dropped — that stored credential is now reachable, and it is what a non-local target must have.
+
+  What the refusal measures: whether the hostname in the URL is a loopback literal (`127.0.0.1`,
+  `localhost`, `::1`, `[::1]`). What it does **not** measure: whether a non-loopback address is in
+  fact this same host. Addressing your own daemon by its tailnet IP or its hostname is refused too —
+  a deliberate false positive, because the alternative is a credential boundary that depends on
+  interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the way through. It also
+  distributes no credentials and revokes none; `BOUNDARY.md` still records that gap as open.
+
+  **Migration, and it is the only user-visible one:** run `telepty connect-http <host> --token
+  <that host's authToken>` once per HTTP peer. This is now required rather than advisable: without
+  it, a cross-host command is refused instead of quietly failing a 401. `TELEPTY_AUTH_TOKEN` is
+  honoured by the daemon, the
+  CLI and the MCP server (env-then-file at all three); it is a fleet-wide token and must be set for
+  the daemon too, or the client sends one the daemon has never heard of.
+
+- **`TELEPTY_AUTH_TOKEN` is now honoured by the daemon before the token file is read (#843).** The
+  daemon evaluated the override *after* a `getConfig()` whose failure exits 1, so with a corrupt
+  `~/.telepty/config.json` and a valid env token the CLI and the MCP server worked and the daemon
+  died at startup — the recovery configuration the override exists for. With the variable set the
+  secret is not read from that file at all; the daemon's other read of it (`idle_ttl_default` via
+  `loadTeleptyConfig`) is still attempted, but a failure there no longer exits — the settings that
+  could not be read are reported on stderr as unavailable rather than silently defaulted. With no
+  env token, #835's fail-closed refusal is unchanged at either read.
+
+- **Rotating the shared daemon token requires a daemon restart, by design.** The daemon reads
+  `~/.telepty/config.json` once, at boot, and never looks at it again. An operator who edits the
+  config under a running daemon gets 401s from every caller until it is restarted — that is correct
+  behaviour, not a bug, and it is the first thing this release's refusal message says. Re-reading
+  per request would widen the boundary from *"whoever can **read** this file can drive the daemon"*
+  to *"whoever can **write** it owns the running daemon"*, turning a file write into a silent
+  credential takeover of the process that parents every live session, with nothing in any log. The
+  freeze is what keeps rotation an explicit, observable act. Recorded in `BOUNDARY.md`; stated here
+  because the 401s are what an operator actually hits.
+
+- **Who must act:** anyone with a hand-rolled `curl 127.0.0.1:3848/api/...`. Add
+  `-H "x-telepty-token: $(jq -r .authToken ~/.telepty/config.json)"`. `telepty` CLI users are
+  unaffected. `/api/health` stays unauthenticated, so liveness probes, `connect-http` discovery and
+  GUI version detection are unaffected. Mixed fleets are safe in both directions: an old client
+  against a new daemon fails closed with 401; a new client against an old daemon works (the extra
+  header is ignored, and #844 below is what makes the *CLI* side of that true — the version probe
+  used to declare an old daemon broken before the header ever mattered). No credential is minted,
+  rotated or migrated.
+
+- **What this does NOT fix, stated plainly:** the boundary moves from *"anyone who can open a socket
+  to the port"* to *"anyone who can read `~/.telepty/config.json"`* — roughly the uid boundary. It
+  does **not** stop a same-uid process, which is the adversary most worth naming here: an agent's
+  shell tool, a build script, an `npm postinstall`. What it does buy is that the network surface is
+  no longer weaker than the filesystem surface, and that OS sandboxing now has something to bite on.
+  See `BOUNDARY.md`, which also records the cross-host credential-distribution gap and the
+  deliberate `/api/health` exposure.
+
+- **Inject audit coverage (#826, #843).** A viewer's `{type:'input'}` frame is a write into
+  somebody's terminal with exactly the authority of `POST /api/sessions/:id/inject`, and until now
+  with none of its accountability: no audit line, no #533 peer-lane check, no provenance labelling.
+  It is included in this release rather than deferred precisely *because* of the fixes above: while
+  anything on the box could write uncredentialed the audit log was obviously incomplete, but the
+  moment a credential is required of writers an operator will reasonably read that log as the record
+  of who typed.
+
+  Viewer WebSocket writes are now authorized and recorded at the session types a viewer can write
+  into — a wrapped session's non-owner client, whose frame is forwarded to the owner socket, and a
+  spawned session's client, whose frame goes straight to `ptyProcess` — under `source: "ws-viewer"`,
+  with `delivery_result: "forwarded"` rather than `"success"`, because all that path measures is
+  that the frame was handed over. A frame with no writable target (a wrapped session whose owner
+  socket is closed, a session record with no `ptyProcess`) is dropped ahead of the authorization
+  check and writes nothing, so it leaves no line. `classifyPeerLaneInject` (#533) runs on this door
+  too, keyed on a *claimed* sender, so it stays a policy guardrail and not an authentication
+  boundary.
+
+  Bus auto-routed turns (`turn_request`, `deliberation_route_turn`) are recorded under
+  `source: "bus"` and take the same `classifyPeerLaneInject` verdict as
+  `POST /api/sessions/:id/inject`; a payload the HTTP route refuses with 403 can no longer be
+  re-addressed to `POST /api/bus/publish` and reach the PTY. An event that names no sender is still
+  delivered — that is the same answer the HTTP route gives a body with no `from`.
+
+  Writes into a PTY that are **not** in the inject log, named so their absence is not read as
+  coverage: `POST /api/sessions/:id/submit` and `POST /api/sessions/submit-all` (a bare `\r`, no
+  payload; `submit-all` fans that CR out across every session in the registry holding a live
+  `ownerWs` or `ptyProcess`, with no exception — `getSubmitStrategy` answers `pty_cr` for every
+  command including its fallback, so `runSubmitAll`'s `osascript_cmd_enter` branch and
+  `submitViaOsascript` are unreachable dead code and not a live exemption); viewer
+  `resize` frames (geometry, no bytes into the input stream); and the daemon's own
+  `task_completion_unknown` text delivered to a dispatch's source session.
+
+  `source: "mailbox"` was documented but never produced by any code path; it is removed from the
+  schema. The mailbox is the transport beneath the other sources, not an entrance — its one
+  `enqueue` call site sits inside `deliverInjectionToSession`, downstream of the doors above.
+
+  **Residual, accepted for 0.8.0 (#865): the `inject_written` event's name still asserts a write on
+  one route.** A parked delivery reaches the single-target `POST /api/sessions/:id/inject`
+  emission — its only early return is on `!delivery.success`, and a park is `success: true` — so
+  an event *named* `inject_written` is broadcast for a delivery that wrote zero bytes. Which surface
+  got which, because "fixed" would overclaim: the **bus auto-route** emission's fields are now
+  honest (`delivered: false`, `delivery_result: "queued"`, `code`/`error` null); the
+  **single-target** emission carries no `delivered` field at all, so it states nothing false and
+  nothing true, and the name is what a subscriber reads first. **Read the fields, not the event
+  name.** It predates 0.8.0 — this is simply the release that made it legible, by giving the audit
+  log a word for the case. Renaming would break every subscriber at a tag for a defect that was
+  always there, and suppressing the event for a park would be worse: a subscriber counting
+  `inject_written` would silently miss parks, which is absence-as-silence, the defect this release
+  exists to remove. Fixed in 0.9.0.
+
+  `BOUNDARY.md` carries the door table by name beside that list, and states that it is a measurement
+  rather than a proven ceiling. An interactive `telepty attach` produces one audit line per
+  keystroke.
 
 ### Security
 - **Session sender identity is now bound to a session instance rather than to a session name
@@ -31,16 +270,17 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 - **Taking ownership of a live session now requires proving you own it (#815).** A `?owner=1`
   WebSocket claim was authenticated by nothing but knowledge of the session id, and the daemon
-  trusts loopback before any credential check, so the claim was open to any local process. Because
+  trusted loopback before any credential check (closed by #820 above), so the claim was open to any
+  local process. Because
   ownership is last-writer-wins, a claim also displaced the incumbent bridge with close 4001 — and
   a displaced bridge exits its session. A session that holds a credential now requires the matching
   bearer on the handshake or the claim is refused with close `4003`, loudly, rather than downgraded
   to a viewer. Sessions with no credential (the WS auto-register reconnect path, records restored
   from an older daemon) claim as before, so reconnect is unaffected.
 
-- **`inject_written` no longer rebroadcasts the prompt (#815).** Any local process may subscribe to
-  `/api/bus` with no token and no `Origin`, so the event published the full text of every delivery
-  to every local subscriber. It now carries `content_sha256` + `content_length` instead of
+- **`inject_written` no longer rebroadcasts the prompt (#815).** Any local process could subscribe
+  to `/api/bus` with no token and no `Origin` (the token half is closed by #820 above), so the event
+  published the full text of every delivery to every local subscriber. It now carries `content_sha256` + `content_length` instead of
   `content` — enough to correlate a delivery and verify integrity against a payload you already
   hold, and nothing to read if you do not. **Breaking for any bus subscriber reading
   `inject_written.content`.**
@@ -48,6 +288,115 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 - **A re-registration can no longer redirect where a session's injects are delivered (#815).**
   `delivery` / `delivery_endpoint` are mutable only by a caller holding the session's current
   credential. Sessions with no credential are unaffected.
+
+- **`capability.session_authentication` narrowed: holding a session epoch is no longer evidence
+  that a bearer was presented (#860).** Any session carrying a `sessionEpoch` reported `observed` —
+  including one minted at `POST /api/sessions/register` and one restored from disk, neither of which
+  involved a presented credential. That is the substitution #815 removed, re-committed by the
+  release that removed it. `observed` now requires a bearer presented **and** verified on the
+  WebSocket handshake, recorded in a field of its own (`sessionEpochProved`, holding the epoch VALUE
+  rather than a flag, so a writer that moves `sessionEpoch` without proving it cannot inherit its
+  predecessor's proof).
+
+  **Consumer-visible on `GET /api/inject-observations/:inject_id`.** Three cases, three answers: no
+  epoch → `unavailable` / `no_815_epoch_fact`, unchanged; an epoch with no proof → `unavailable` /
+  **`no_815_bearer_presented`**, a reason value that did not exist before 0.8.0; epoch plus proof →
+  `observed` / `null`. A session that reported `observed` before this release reports
+  `no_815_bearer_presented` after it unless it proved a bearer. The reason vocabulary is open and
+  the daemon validates nothing against a list, so a consumer that only stores the string is not
+  broken by the new value — but one that BRANCHES on the reason, or that has read `observed` as a
+  property of any epoch-bearing session, is reading a different fact after 0.8.0 than before it.
+  **Breaking for any consumer keying on `capability.session_authentication`.**
+
+### Fixed — a refusal is not a licence to destroy, and absence of evidence is not evidence of absence (#844)
+
+#835 established that a daemon which ANSWERS and declines is not a daemon that is absent, because
+the "absent" verdict is what authorises SIGTERM/SIGKILL against the process that parents live PTY
+sessions. Two independent reviews of this release found the rule broken in five further places,
+listed below — including, twice, in code this release itself added. Five is what those reviews
+found, not a proven ceiling; the rule is what to check against, not the count. They are grouped here
+because they are one rule: **a destructive action requires positive evidence of the condition it
+destroys on.**
+
+- **A REFUSED owner claim no longer tears down the incumbent it was refused against.** `telepty
+  allow --id X` against an id the daemon already holds is a re-registration, so #815 correctly
+  issues it no credential and the daemon refuses its `?owner=1` claim with close `4003`. The
+  bridge's 4003 handler then ran the ordinary exit path — which issues `DELETE /api/sessions/X`,
+  carrying an `owner_token` only if it has one. It never had one. So the DELETE went out bare, the
+  #536 owner-token guard had nothing to compare, and the healthy incumbent was destroyed by the one
+  process the daemon had just told it does not own that id. The dup-id/respawn race that produces
+  this is routine. The refused bridge now exits without the teardown DELETE and without purging the
+  bridge mailbox; the session and its queued deliveries belong to the owner, not to it.
+
+- **A `404` on `/api/meta` is an old daemon, not a broken one.** The version probe classified every
+  non-2xx as "the daemon answered", and aborted with *"running, but not serving"* — a cause it had
+  not determined. `/api/meta` was added 2026-03-12, so a daemon predating it answers 404 for exactly
+  the reason it answers 200 on `/api/sessions`. `telepty list` against such a daemon died on that
+  message, which killed the legacy-upgrade path and falsified this release's own claim above that a
+  new client against an old daemon works. Scoped to that route: 401/403/5xx from it still abort, and
+  a 404 from anywhere else is not the same statement.
+
+- **A daemon the supervisor brought back REFUSING is no longer reported as never having come back.**
+  `getDaemonMeta` has three consumers; #835 taught two of them that a non-200 is an answer and left
+  `deferToSupervisor` accepting only a version. A live daemon returning 401 was therefore reported
+  as *"the supervisor did not restore it in time"*, and that verdict routes into
+  `cleanupDaemonProcesses()`. It now hands the answer back to the policy, and the policy's `abort`
+  is honoured on that path too — it was previously checked only *before* the supervisor wait, so a
+  refusal discovered during the wait fell straight through to the restart.
+
+- **The cmux surface GC signals instead of killing, and can no longer read a non-listing as an
+  absence.** `isSurfaceAlive` decided `gone` from a substring scan of `cmux list-workspaces` output,
+  so a truncated, localised, half-succeeded or reformatted listing produced `gone` with exactly the
+  confidence of a real answer — and a session whose workspace id is a short-ref rather than a uuid
+  could never match the uuid-formatted listing at all. Only a listing that parses as an enumeration
+  and demonstrably omits the id is now `gone`; everything else is `unknown`, which GCs nothing.
+  Beyond that, the GC block runs **only** for sessions whose owner socket is open, so it was using a
+  uuid's absence from another tool's stdout to override this daemon's own present-tense measurement
+  that the session is alive. That ordering is reversed: the open socket blocks the reclaim, and what
+  remains is the `surface_orphaned` signal — emitted once, carrying `ownerSocketOpen: true` and
+  `reclaimed: false`. The `INV-17` comment there claimed a guarantee broader than the measurement
+  provided and has been rewritten to what the code establishes.
+
+  **Nothing downstream reclaims the session today, and you should not read this note as saying it
+  does.** telepty emits `surface_orphaned` on the WebSocket bus. What the orchestrator runs
+  always-on is a different path — its `wh_alive` sweep — and that closes the **surface**, not the
+  session. Its event-driven consumer for this signal reads a `state/surface-orphaned.jsonl` file
+  that nothing currently writes: there is no bus→file bridge, so the consumer is dormant (tracked as
+  orchestrator task #847). **Net effect for an operator: a wrapped cmux session whose workspace is
+  gone while its owner socket stays open now persists until the disconnect-GC or an explicit
+  cleanup, instead of being reclaimed here.** That is still the better trade — the previous
+  behaviour destroyed such a session on a measurement weaker than the open socket it was overriding
+  — but it is a real gap and it is stated rather than left to be discovered.
+
+- **The daemon state-file pid is confirmed before it is signalled.** `cleanupDaemonProcesses` builds
+  its kill set from three sources. Two confirmed identity first — the port-owner source via
+  `pidMatchesTeleptyCmdline` ("so we never SIGTERM an arbitrary process that happens to own the
+  port"), the process-scan source via `isLikelyTeleptyDaemon` — and the state-file source added its
+  pid with no check at all, even though that is a pid telepty *wrote* rather than one it measured. A
+  stale state file surviving a pid rollover named a stranger, and `stopDaemon` documented a surgical
+  guarantee it never verified. The state-file source, the process-scan source and the port-owner
+  source now each confirm identity before contributing a pid.
+
+- **The release artifact no longer lies about which release it is.** `package.json` `version`, and
+  `package-lock.json`'s `version` and `packages[""].version`, still said `0.7.1` — the version
+  already published on npm — while the notes above describe 0.8.0. `/api/meta` reports that string,
+  and a version-equal daemon is treated as healthy, so a 0.8.0 CLI meeting a running 0.7.1 daemon
+  would have accepted it and kept talking across wire semantics this release changed. The suite
+  checked only that the version was semver-shaped, which `0.7.1` satisfies perfectly. A **fourth**
+  tracked place said `0.7.1` too and was missed on the first pass: `README.md`'s ecosystem row for
+  this package. That row is generated — `scripts/gen-readme.mjs` self-overrides the repo's own row
+  with the local `package.json` version — so it was stale only because the generator had not been
+  re-run since the bump. `prepublishOnly` regenerates it into the npm tarball and
+  `.github/workflows/readme-regen.yml` fixes `main` after the GitHub Release, so the **published**
+  artifact would have been right; what was wrong is the **tagged repo** — what a reader gets from a
+  clone at the tag. It is regenerated here, and the invariant now measures it.
+
+  What the new release invariant measures: those three manifest fields agree with each other;
+  `README.md`'s ecosystem row for this package names that same version; the newest `## ` section in
+  this file names exactly that version and is a version heading rather than a placeholder; no
+  version has two sections; and no section below it names a higher version. What it does **not**
+  measure: whether the version is free on npm, whether a git tag exists, and whether the prose under
+  the heading describes the code — it compares declarations to declarations.
 
 ### Added
 - `session_owner_replaced` bus event (#815): a `?owner=1` claim that displaced a **live** owner
@@ -66,6 +415,40 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 - What sender authentication does and does not prove — including a measured platform split on
   whether a same-uid process can read a bearer out of another process's environment, and the
   first-claim residual — is documented in `BOUNDARY.md`.
+- `test:watch` had drifted **19 files** behind `test` and `test:ci`, across three commits of this
+  release cycle — so a developer in watch mode got a green that silently omitted every guard 0.8.0
+  added, including the release invariant above. `test` and `test:watch` now name the same **109
+  files**. `test:ci` names **108**: it omits `test/bridge-preconnect-output-768.test.js`, which runs
+  as its own CI step under `test:ci:pty` (`.github/workflows/test-install.yml`) — an exclusion that
+  predates this release cycle and is deliberate, not drift. So two lists agree and the third differs
+  by one named file; there is no state here in which all three carry the same names. They are a
+  fourth hand-maintained list that nothing checks, and the mechanism that let them drift is the
+  same one behind the version and audit-door defects in these notes: an enumeration written by
+  hand, read as coverage, and compared against nothing.
+- **The suite could silently shorten itself, and the number this release rests on was a lower
+  bound rather than a measurement.** Four test files ended with
+  `test.after(() => setImmediate(() => process.exit(0)))` — the early exit this repo retired
+  `--test-force-exit` for, hand-rolled per file. `process.exit()` tears the process down before the
+  TAP stream has flushed, so the runner counted fewer tests than actually ran and still printed
+  `fail 0`, `exit 0`. Measured under suite-like load: **83 of 400 runs truncated (20.8%)**, the worst
+  reporting **3 of 9** tests as a clean pass.
+
+  The premise those files stated — that requiring `daemon.js` "left background handles open" — is
+  false for three of them. Measured with `process.getActiveResourcesInfo()` after the last test,
+  the only live handles are the process's own stdout and stderr, and each exits on its own in
+  ~0.2s. `idle-unconfirmed-settle` really was held open, but by the test harness rather than by
+  module load: `Promise.race` in `startTestDaemon`'s `stop()`/`kill()` abandoned its losing
+  `delay(2000)` without cancelling it, and a pending timer keeps an event loop alive. It now
+  clears its loser (`waitForChildExit`), and the file exits on its own in ~2.0s — the same wall
+  time the force-exit was buying, now earned rather than forced. After: **0 of 784 runs
+  truncated**, `declared === reported` on every run.
+
+  `test/no-force-exit-in-test-hooks-861.test.js` keeps the class closed rather than the four
+  instances: it refuses any teardown hook that reaches `process.exit`, and carries its own
+  detector self-check, because a lint that cannot fail is the defect it is guarding against. It
+  names what it does not detect — an exit reached through a helper, one on `process.on('exit')`,
+  one in a `before` hook, and the legitimate case of a stub CLI written to disk as a string and
+  spawned as a child.
 
 ## 0.7.1 — 2026-07-26
 
@@ -562,6 +945,23 @@ removal below was verified by repo + cross-repo grep (`aigentry-*`, excluding
   `decideSurfaceGc`, and session-side zombie reclaim are retained; telepty now
   emits a `surface_orphaned` bus event for the orchestrator reconciler to
   actuate the close. INV-17 / #486 preserved (probe unknown → skip gate intact).
+
+  **Annotation appended 2026-08-15 (#844). The bullet above is left exactly as it shipped —
+  this is a forward-reference, not a correction of the record.** The *outcome* that sentence
+  promises held. The *mechanism* it names never ran. The surface close was, and still is,
+  actuated by the orchestrator's always-on `wh_alive` sweep, so the behaviour operators observed
+  on 0.5.0 was correct. But the event-driven consumer the sentence credits —
+  `consume_surface_orphaned` in the orchestrator's `bin/session-reconciler.sh` — has been dormant
+  since the commit that introduced it (`e92f445`, 2026-05-30, the orchestrator half of this same
+  ADR): it returns immediately unless `state/surface-orphaned.jsonl` exists, and no bus→file
+  bridge has ever written that file. `git log -S 'SURFACE_ORPHANED_SRC'` in that repo returns
+  exactly one commit. It shipped inert on day one, while this note announced the handoff as
+  operational — the two repos were written together and only one of them said so.
+
+  Why this is worth a pointer rather than a shrug: 0.8.0 routes a *second* thing through the same
+  dormant consumer, and that one has no always-on equivalent behind it. See the 0.8.0
+  **Fixed — a refusal is not a licence to destroy** section, which states the session-reclaim gap
+  in operator terms, and orchestrator task #847 for the bridge.
 
 ### Fixed — Lifecycle / bootstrap / skill-loading (tasks #35 #20 #32 #17 #29 #31 #19)
 

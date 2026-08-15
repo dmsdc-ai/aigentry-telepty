@@ -2,6 +2,10 @@
 
 // #537 / Bug B: ENFORCE-REPORT must NOT emit TASK_COMPLETE for a never-started worker.
 //
+// #60 Stage A resolves this by removing the claim rather than guarding it: no input produces
+// TASK_COMPLETE for any worker now, started or not. See the block above the first test for why
+// the two-way verdict this file was written around could never be measured.
+//
 // A transient submit failure (cmux `send-key` → "Failed to write to socket") means the
 // injected prompt's Enter never reaches the live CLI, so claude sits idle. The daemon then
 // observes claude's startup busy→idle settle (~4.5s) and, prior to this fix, fired a bogus
@@ -46,45 +50,80 @@ function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4
   return captured.length ? captured[0].msg : null;
 }
 
-// ---------------- the gate: never-started worker → NOT TASK_COMPLETE ----------------
+// ---------------- the gate is gone, because the discrimination was never measurable ----------
+//
+// This file was built around a two-way verdict: A/B (never-started worker) had to say
+// TASK_IDLE_UNCONFIRMED, and C/D/D2 (legitimate work) had to say TASK_COMPLETE. #60 Stage A
+// deletes BOTH labels, so the five cases below now produce the same literal sentence.
+//
+// That is not the migration losing a distinction — it is the release admitting the distinction
+// was never backed by a measurement. C's "STRONG-confirmed" is a `force` accept, which measured
+// no screen at all; D and D2 rest on `sawWorkingAfterInject` and an elapsed floor, and the very
+// next test down (B) exists because startup pollution makes that flag untrustworthy. The daemon
+// was choosing between "done" and "maybe not delivered" from inputs that could not tell them
+// apart, which is Bug B's actual root cause rather than a special case of it.
+//
+// What survives, and is asserted per case, is the evidence itself: `consumption.basis` names
+// exactly which rule fired, so the A/B vs C/D/D2 difference is still visible where it is real.
 
-test('A: real-idle with submit expected + submit explicitly FAILED → TASK_IDLE_UNCONFIRMED', () => {
+const COMPLETION_UNKNOWN_RE =
+  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1 — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
+
+function assertNoVerdict(msg) {
+  assert.ok(msg, 'an observation should be delivered — never silence');
+  assert.match(msg, COMPLETION_UNKNOWN_RE);
+  assert.doesNotMatch(msg, /TASK_COMPLETE:/);
+  assert.doesNotMatch(msg, /TASK_IDLE_UNCONFIRMED:/);
+}
+
+test('A: real-idle with submit expected + submit explicitly FAILED → no verdict, absence stated', () => {
   const msg = runGate({
     submitExpected: true,
     submitConfirm: { accepted: false, reason: 'cmux_send_failed' },
   });
-  assert.ok(msg, 'an auto-report should be delivered');
-  assert.match(msg, /^TASK_IDLE_UNCONFIRMED:/);
-  assert.doesNotMatch(msg, /^TASK_COMPLETE:/);
+  // A failed submit is still the strongest signal here, and it is still recorded — as a
+  // consumption basis rather than as a label. What it can no longer do is imply the inject was
+  // not processed, which the old text asserted outright.
+  assertNoVerdict(msg);
+  assert.match(msg, /consumption=not_established/);
 });
 
-test('B: real-idle with submit expected + only startup sawWorkingAfterInject (no confirm) → TASK_IDLE_UNCONFIRMED', () => {
+test('B: real-idle with submit expected + only startup sawWorkingAfterInject (no confirm)', () => {
   // sawWorkingAfterInject is startup-polluted and must NOT be trusted when a submit was expected.
+  // Stage A makes that structural: the flag is not an input to any consumption admission, so it
+  // cannot dress a never-started worker up as a started one under any label.
   const msg = runGate({ submitExpected: true, sawWorkingAfterInject: true });
-  assert.match(msg, /^TASK_IDLE_UNCONFIRMED:/);
-  assert.doesNotMatch(msg, /^TASK_COMPLETE:/);
+  assertNoVerdict(msg);
+  assert.match(msg, /consumption=not_established/);
 });
 
-// ---------------- legit completions: TASK_COMPLETE still fires ----------------
+// ---------------- the three cases that used to be promoted to TASK_COMPLETE ----------------
 
-test('C: real-idle with submit STRONG-confirmed + real work (82s) → TASK_COMPLETE', () => {
+test('C: real-idle with a force accept + real work (82s) is NOT a completion', () => {
   const msg = runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 82_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
     sawWorkingAfterInject: true,
   }, { elapsedSec: 82.7 });
-  assert.match(msg, /^TASK_COMPLETE:/);
+  // The old name for this fixture was "STRONG-confirmed". `force` skips the synchronous
+  // consumption classify entirely — daemon.js's own comment says a busy-parked body would
+  // silently drop — so it is not screen-derived evidence and never was.
+  assertNoVerdict(msg);
+  assert.match(msg, /consumption=not_established/);
 });
 
-test('D: real-idle, no submit expected (auto-enter inject) + saw working → TASK_COMPLETE (back-compat)', () => {
+test('D: real-idle, no submit expected (auto-enter inject) + saw working is NOT a completion', () => {
   const msg = runGate({ submitExpected: false, sawWorkingAfterInject: true }, { elapsedSec: 5 });
-  assert.match(msg, /^TASK_COMPLETE:/);
+  assertNoVerdict(msg);
 });
 
-test('D2: real-idle, no submit expected, above elapsed floor → TASK_COMPLETE (legacy floor preserved)', () => {
+test('D2: real-idle, no submit expected, above the old elapsed floor is NOT a completion', () => {
+  // The legacy floor is deleted as a decision input. Elapsed is carried as a measurement — the
+  // text still reports it — but crossing a threshold is not evidence that work finished.
   const msg = runGate({ submitExpected: false }, { elapsedSec: 5 });
-  assert.match(msg, /^TASK_COMPLETE:/);
+  assertNoVerdict(msg);
+  assert.match(msg, /pty_quiet=5\.0s/);
 });
 
 // ---------------- honest force-confirm: delivery to rendered surface ----------------
@@ -113,6 +152,12 @@ test('force with no strategy is never delivered', () => {
   assert.equal(forceSubmitDeliveredToSurface({ backend: 'cmux', cmuxWorkspaceId: 'w1' }, null), false);
 });
 
-// Requiring daemon.js loads persisted sessions for read-only inspection; ensure the test
-// process exits even if module-load left background handles open.
-test.after(() => { setImmediate(() => process.exit(0)); });
+// No force-exit here, and do not add one back (#861).
+//
+// A `test.after(() => setImmediate(() => process.exit(0)))` used to sit here, on the premise
+// that requiring daemon.js "left background handles open". Measured with
+// process.getActiveResourcesInfo() after the last test, that premise is false: the only live
+// handles are this process's own stdout and stderr, and the file exits on its own in ~0.2s.
+// The hook was the harm — process.exit() tears down before the TAP stream has flushed, so the
+// runner counted fewer tests than ran and still printed "fail 0". Measured under suite-like
+// load, the worst run reported 5 of this file's 10 tests and called it a pass.

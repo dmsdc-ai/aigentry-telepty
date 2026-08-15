@@ -37,17 +37,29 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const daemon = require('../daemon');
-const { fireAutoReport, maybeRecordInjectConsumption, resolveOutboundReportStatus } = daemon;
+const { fireAutoReport, maybeRecordInjectConsumption } = daemon;
 const { SessionStateMachine } = require('../session-state');
-const { classifyReportPrompt } = require('../src/report-enforcement');
+const reportEnforcement = require('../src/report-enforcement');
 
 const T0 = 1_700_000_000_000;
 
 const BODY =
   'TASK: implement the hold-and-redeliver fix, run the full suite, commit on top of the base, then REPORT back';
 
-const TASK_COMPLETE_RE = /^TASK_COMPLETE: worker-1 is now idle after processing inject/;
-const UNCONFIRMED_RE = /^TASK_IDLE_UNCONFIRMED: worker-1 signaled idle/;
+// #60 Stage A: both verdicts are deleted. Every path below emits the same literal statement, and
+// the four FIX 1 conjuncts that used to select between the verdicts are each still observable —
+// as `consumption.basis` on that statement. See the per-guard assertions.
+const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-721 — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
+
+function consumptionOf(ctx) {
+  assert.equal(ctx.delivered.length, 1, 'a statement is emitted (not suppressed)');
+  assert.match(ctx.delivered[0].msg, UNKNOWN_RE);
+  assert.doesNotMatch(ctx.delivered[0].msg, /TASK_COMPLETE:|TASK_IDLE_UNCONFIRMED:/);
+  const ev = ctx.broadcasts.find((b) => b.type === 'task_completion_unknown');
+  assert.ok(ev);
+  assert.equal(ev.opts.extra.completion_fact, null);
+  return ev.opts.extra.consumption;
+}
 
 // DI context around fireAutoReport — mirrors test/idle-unconfirmed-decayed-619.test.js, with an
 // added `pendingReport` input so a report DRIVEN through the real transition wiring (Repro 1) or
@@ -222,13 +234,18 @@ test('#721 Repro 1 (root cause b): a wrapped-launcher completion is cried-wolf b
   assert.equal(idleTrigger, 'silence_timeout',
     `launcher idle flip is evidence-unreliable (no OSC133); observed edges: ${edges}`);
   assert.equal(pendingReport.sawWorkingAfterInject, true, 'the launcher child provably worked after the inject');
-  assert.equal(pendingReport.injectConsumedAt, undefined,
+  assert.equal(pendingReport.injectConsumptionCandidate, undefined,
     `the edge-gated #619 recorder correctly never fires across the launcher wiring (that IS the gap); observed edges: ${edges}`);
 
-  // RED→GREEN (FIX 1): the completed launcher turn flips real-idle with weak evidence and no #619
-  // fact. Pre-fix that is cried-wolf (TASK_IDLE_UNCONFIRMED). FIX 1 re-derives the consumption
-  // verdict at the idle gate from decay-proof launcher-safe signals — wrapped + accepted:true +
-  // post-CR output advanced + elapsed ≥ 30s — records it, and the verdict is TASK_COMPLETE.
+  // FIX 1's WATERMARK CALCULATION is preserved verbatim — wrapped + accepted:true + post-CR
+  // output advanced + elapsed ≥ 30s. What Stage A removes is the conclusion it was allowed to
+  // draw. The old code recorded the result as consumption and promoted the idle to TASK_COMPLETE;
+  // daemon.js:483-503 already conceded that a never-started wrapped worker can satisfy exactly
+  // these conjuncts, so the watermark is now labelled for what it measures —
+  // `submit_accepted_and_output_advanced` — and carries status `not_established`.
+  //
+  // The cry-wolf this file was opened to fix is gone at the root instead of by promotion: the
+  // statement no longer accuses the worker of not having processed the inject.
   const ctx = makeGate({
     pendingReport,
     sessionOverrides: { type: 'wrapped' },
@@ -239,11 +256,15 @@ test('#721 Repro 1 (root cause b): a wrapped-launcher completion is cried-wolf b
   });
   ctx.fire('real-idle');
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1, 'a verdict is emitted (not suppressed)');
-  assert.match(ctx.delivered[0].msg, TASK_COMPLETE_RE,
-    'FIX 1 promotes the decayed wrapped-launcher idle to TASK_COMPLETE; main cries wolf with TASK_IDLE_UNCONFIRMED');
-  assert.ok(pendingReport.injectConsumedAt, 'FIX 1 records the launcher consumption fact at the idle gate');
-  assert.equal(pendingReport.injectConsumedVia, 'launcher_watermark', 'recorded via the FIX 1 launcher path, not the edge recorder');
+  const consumption = consumptionOf(ctx);
+  assert.equal(consumption.basis, 'submit_accepted_and_output_advanced');
+  assert.equal(consumption.status, 'not_established',
+    'the launcher watermark is telemetry — a never-started wrapped worker can satisfy it');
+  // The measurement itself is retained in full, which is what makes this a rename and not a loss.
+  assert.ok(pendingReport.launcherWatermarkAt, 'FIX 1 still records the launcher watermark at the idle gate');
+  assert.ok(Number.isFinite(consumption.ring_bytes_delta) && consumption.ring_bytes_delta > 0,
+    'the post-CR output advance is reported as the byte delta it actually is');
+  assert.equal(consumption.elapsed_ms, 806_900);
 });
 
 // ---------------------------------------------------------------------------
@@ -274,30 +295,39 @@ function launcherGate({ sessionType = 'wrapped', elapsedSec = 806.9, submitConfi
   });
 }
 
-test('#721 FIX 1 guard (d): a wrapped completion UNDER the elapsed floor (#537 ~4.5s startup-settle) stays TASK_IDLE_UNCONFIRMED', () => {
+// Each guard still flips exactly ONE of FIX 1's four conditions off. The assertion moves from
+// "the verdict stays UNCONFIRMED" to "the watermark is not claimed, and the basis names why" —
+// which is a finer instrument than the old binary, because it distinguishes the three reasons a
+// guard can trip rather than collapsing them into one label.
+
+test('#721 FIX 1 guard (d): a wrapped session UNDER the elapsed floor (#537 ~4.5s startup-settle) is not credited', () => {
   const ctx = launcherGate({ elapsedSec: 4.5 }); // startup-settle, below the 30s floor
   ctx.fire('real-idle');
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1);
-  assert.match(ctx.delivered[0].msg, UNCONFIRMED_RE, 'below the floor a wrapped session is NOT credited — never-false-complete (BUG-B) preserved');
-  assert.equal(ctx.pendingReport.injectConsumedAt, undefined, 'no launcher fact recorded below the floor');
+  assert.equal(consumptionOf(ctx).basis, 'no_consumption_evidence',
+    'below the floor the watermark is not taken — never-false-complete (BUG-B) preserved');
+  assert.equal(ctx.pendingReport.launcherWatermarkAt, undefined, 'no launcher watermark below the floor');
 });
 
-test('#721 FIX 1 guard (b): a wrapped completion whose submit definitively FAILED (accepted:false) stays TASK_IDLE_UNCONFIRMED', () => {
+test('#721 FIX 1 guard (b): a wrapped session whose submit definitively FAILED (accepted:false)', () => {
   const ctx = launcherGate({ submitConfirm: { accepted: false, reason: 'cmux_send_failed' } });
   ctx.fire('real-idle');
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1);
-  assert.match(ctx.delivered[0].msg, UNCONFIRMED_RE, 'a failed submit is positive non-consumption — the classic #537 never-started case stays UNCONFIRMED');
+  const consumption = consumptionOf(ctx);
+  // Sharper than the old label: a failed submit is POSITIVE non-consumption, and rejection
+  // precedence means it is evaluated before the watermark rather than merely outranking it.
+  assert.equal(consumption.basis, 'submit_rejection_observed');
+  assert.equal(consumption.submit_confirm_reason, 'cmux_send_failed');
+  assert.equal(ctx.pendingReport.launcherWatermarkAt, undefined);
 });
 
-test('#721 FIX 1 guard (scope): a NON-wrapped session with the identical shape keeps strict #545 semantics (TASK_IDLE_UNCONFIRMED)', () => {
+test('#721 FIX 1 guard (scope): a NON-wrapped session with the identical shape is not credited', () => {
   const ctx = launcherGate({ sessionType: 'spawned' }); // not a launcher → FIX 1 must not apply
   ctx.fire('real-idle');
   ctx.flushTimers();
-  assert.equal(ctx.delivered.length, 1);
-  assert.match(ctx.delivered[0].msg, UNCONFIRMED_RE, 'FIX 1 is scoped to wrapped sessions; non-wrapped keep the strict weak-idle downgrade');
-  assert.equal(ctx.pendingReport.injectConsumedAt, undefined, 'no launcher fact for a non-wrapped session');
+  assert.equal(consumptionOf(ctx).basis, 'no_consumption_evidence',
+    'the watermark stays scoped to wrapped sessions');
+  assert.equal(ctx.pendingReport.launcherWatermarkAt, undefined, 'no launcher watermark for a non-wrapped session');
 });
 
 // ===========================================================================
@@ -306,63 +336,42 @@ test('#721 FIX 1 guard (scope): a NON-wrapped session with the identical shape k
 // wolf. Seam: daemon.js:3406-3448 reverse-match + classifyReportPrompt (src/report-enforcement.js:35).
 // ===========================================================================
 
-// Faithful transcription of the reverse-match clear decision (daemon.js:3410-3419), with
-// resolveSessionAlias as identity (in-test aliases are literal). Mutates `pendingReports`.
-// Calls the REAL daemon `resolveOutboundReportStatus` (FIX 2) so this tracks the actual
-// completion verdict — pre-FIX-2 that gate was classifyReportPrompt alone (the #579 hole).
-function reverseMatchClear(pendingReports, fromSid, recipientSid, prompt) {
-  const senderPending = pendingReports[fromSid];
-  if (!senderPending) return false;
-  if (senderPending.source !== recipientSid) return false;    // routing guard (unchanged by FIX 2)
-  const classification = resolveOutboundReportStatus(prompt); // daemon.js:3417 (FIX 2 fallback)
-  if (!classification) return false;
-  delete pendingReports[fromSid]; // daemon.js:3419
-  return true;
-}
+// Both Repro 2 tests are migrated to ABSENCE, because the mechanism they exercised is deleted
+// rather than renamed. FIX 2 was `resolveOutboundReportStatus`: for any inject a worker routed
+// back to its pending source, it returned a completion status — falling back to
+// `report_complete` for ANY payload that was not a recognised prefix. That fallback is exactly
+// what made "Can you clarify the requirement?" register as the worker reporting its task done.
+//
+// §3.6 removes the whole reverse-text path with both functions. The consequence is deliberate
+// and worth stating plainly: a worker's REPORT no longer clears its own pending entry, because
+// no text can authenticate its sender or correlate itself to a dispatch. The cry-wolf that made
+// clearing urgent is separately gone — the honest idle statement no longer accuses anyone — so
+// the stale entry is now just an uncleared entry, not a false accusation waiting to fire.
+//
+// The integration-level half of this (reverse-routed REPORT text settles nothing, and the
+// pending entry survives it) is pinned against the real daemon in test/enforce-report.test.js.
 
-test('#721 Repro 2 (cause c/#579): a non-prefix (--ref/markdown) REPORT payload clears the pending report so a later honest idle does not cry wolf', () => {
-  const pendingReports = {
-    'worker-1': {
-      source: 'orch',
-      submitExpected: true,
-      submitStartedAt: new Date(T0 - 305_000).toISOString(),
-      injectId: 'inj-721',
-      injectedAt: new Date(T0 - 306_900).toISOString(),
-      injectConsumedAt: undefined,
-      idleNotified: false,
-    },
-  };
-
-  // The worker pushes its REPORT to its pending source (orch) via `telepty inject --ref FILE`;
-  // the delivered payload is the file contents, whose first line is a markdown title — NOT a
-  // REPORT:-prefixed line (analyst §3, Repro 2).
-  const refReportPayload = '# worker-1 report\n\nDONE | files: daemon.js | build: pass | remaining: none\n';
-
-  // The #579 hole + FIX 2. The raw classifier is deliberately NOT broadened (REPORT_PREFIX_RE
-  // unchanged), so it still returns null for a non-prefix payload; the fix lives in
-  // resolveOutboundReportStatus, which falls back to completion evidence for any inject the
-  // worker routed back to its pending source. Pre-FIX-2 this returned null and the reverse-match
-  // never cleared the entry (the cry-wolf precondition).
-  assert.equal(classifyReportPrompt(refReportPayload), null,
-    'REPORT_PREFIX_RE is NOT broadened — the raw classifier still returns null for a non-prefix payload');
-  assert.ok(resolveOutboundReportStatus(refReportPayload),
-    'FIX 2: an outbound-to-pending-source REPORT is completion evidence even without a REPORT prefix (#579)');
-
-  const cleared = reverseMatchClear(pendingReports, 'worker-1', 'orch', refReportPayload);
-  assert.ok(cleared, 'an outbound REPORT to the pending source must clear the sender pending report');
-  assert.ok(!pendingReports['worker-1'],
-    'the pending report must be cleared once the worker delivered its REPORT; on main it survives and the next honest idle cries wolf (see Repro 1 gate)');
+test('#721 Repro 2 (cause c/#579): the reverse-text report path that FIX 2 lived in is deleted', () => {
+  assert.equal(daemon.resolveOutboundReportStatus, undefined,
+    'resolveOutboundReportStatus must stay deleted — it mapped every unrecognised payload to report_complete');
+  assert.equal(reportEnforcement.classifyReportPrompt, undefined,
+    'the raw prefix classifier is deleted with it');
 });
 
-test('#721 Repro 2 boundary (keep green): a prefixed `REPORT:` payload DOES clear the pending report', () => {
-  const pendingReports = {
-    'worker-1': { source: 'orch', submitExpected: true, injectId: 'inj-721', injectedAt: new Date(T0 - 100_000).toISOString() },
-  };
+test('#721 Repro 2 boundary: not even a prefix-shaped REPORT can settle a record from text', () => {
+  // The old boundary case proved a `REPORT:`-prefixed payload still cleared the entry. That is
+  // the one shape most likely to be quietly reintroduced as "obviously safe", so the boundary is
+  // kept and inverted: a prefix is not authentication, and 0.8.0 has no function that will read
+  // one. An authenticated, correlated report protocol returns in Stage B behind #816 and #817.
   const prefixed = 'REPORT: [idle721] DONE | files: daemon.js | build: pass | remaining: none';
-  assert.equal(classifyReportPrompt(prefixed), 'report_complete', 'the existing prefix path must keep classifying');
-  assert.equal(resolveOutboundReportStatus(prefixed), 'report_complete',
-    'FIX 2 preserves the precise prefixed status (no downgrade to the fallback)');
-  const cleared = reverseMatchClear(pendingReports, 'worker-1', 'orch', prefixed);
-  assert.ok(cleared, 'a prefix-shaped REPORT clears (guards against a fix that regresses the existing path)');
-  assert.ok(!pendingReports['worker-1']);
+  for (const [name, fn] of [
+    ['daemon.resolveOutboundReportStatus', daemon.resolveOutboundReportStatus],
+    ['reportEnforcement.classifyReportPrompt', reportEnforcement.classifyReportPrompt],
+  ]) {
+    assert.equal(typeof fn, 'undefined', `${name} must not exist to classify ${prefixed.slice(0, 8)}…`);
+  }
+  assert.equal(daemon.CAPABILITY_STAGE_A
+    ? daemon.CAPABILITY_STAGE_A.outcome_protocol
+    : require('../src/completion-observation').CAPABILITY_STAGE_A.outcome_protocol,
+  'unavailable', 'and the capability block says so, rather than leaving it to be inferred');
 });

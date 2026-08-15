@@ -36,9 +36,29 @@ function collectMessages(ws, predicate, options = {}) {
   });
 }
 
+// #820/#823 — this file simulates cross-host over LOOPBACK: two harness daemons, two temp HOMEs,
+// two DIFFERENT tokens, both on 127.0.0.1 (see the comment inside the first test). So the moment
+// loopback stops being a credential, a CLI running out of daemonA's HOME presents daemonA's token
+// to daemonB and is refused — in production AND here.
+//
+// The fix is to resolve the TARGET's token, keyed by ADDRESS. `connect-http --token` is how an
+// operator supplies it, and it is the one user-visible migration this release asks for; running it
+// once here is what lets every dial site below authenticate against daemonB.
+//
+// Note what does NOT work and why, because it is the trap: setting TELEPTY_AUTH_TOKEN to daemonB's
+// token would make the CLI present it to daemonA too — the local /api/meta probe in
+// ensureDaemonRunning — and that 401s. The env override is a FLEET-WIDE token for both ends, not a
+// per-target one; a process talking to two daemons needs the per-address path.
 before(async () => {
   daemonA = await startTestDaemon();
   daemonB = await startTestDaemon();
+
+  const peer = await daemonA.runCli([
+    'connect-http', `${daemonB.host}:${daemonB.port}`,
+    '--name', 'crosshost-peer',
+    '--token', daemonB.authToken()
+  ], { timeoutMs: 8000 });
+  assert.equal(peer.code, 0, `connect-http --token failed:\nstderr: ${peer.stderr}\nstdout: ${peer.stdout}`);
 });
 
 after(async () => {
@@ -51,7 +71,9 @@ test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async 
   const spawn = await daemonB.spawnSession(sessionId);
   assert.ok([200, 201].includes(spawn.status), `spawnSession status=${spawn.status}: ${JSON.stringify(spawn.body)}`);
 
-  const targetWs = new WebSocket(`ws://${daemonB.host}:${daemonB.port}/api/sessions/${encodeURIComponent(sessionId)}`);
+  const targetWs = new WebSocket(
+    `ws://${daemonB.host}:${daemonB.port}/api/sessions/${encodeURIComponent(sessionId)}`
+    + `?token=${encodeURIComponent(daemonB.authToken())}`);
   await new Promise((resolve, reject) => {
     targetWs.once('open', resolve);
     targetWs.once('error', reject);
@@ -64,7 +86,9 @@ test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async 
     { description: 'cross-host inject delivery', timeoutMs: 8000 }
   );
 
-  // Run the CLI from daemonA's HOME but target daemonB explicitly via @host:port.
+  // Run the CLI from daemonA's HOME but target daemonB explicitly via @host:port. The token for
+  // daemonB is resolved from its peers.json entry BY ADDRESS — the dial site here has only a host
+  // string, never a peer name, which is why name-keyed resolution never fired for this path.
   const result = await daemonA.runCli([
     'inject',
     `${sessionId}@${daemonB.host}:${daemonB.port}`,
@@ -88,6 +112,7 @@ test('cross-host: TELEPTY_HOST=host:port produces a clean http URL (no double-po
       TELEPTY_HOST: `${daemonB.host}:${daemonB.port}`,
       // Intentionally clear TELEPTY_PORT so the embedded port governs.
       TELEPTY_PORT: ''
+      // #820: no TELEPTY_AUTH_TOKEN — the address resolves daemonB's stored peer token.
     }
   });
 
@@ -109,11 +134,16 @@ test('connect-http: registers HTTP peer in peers.json and exposes its sessions t
     fs.rmSync(peersPath);
   }
 
+  // #820/#823 — `--token <that host's authToken>` is the migration this release asks cross-host
+  // HTTP-peer users to perform, and this is the path that proves it works end to end: the token
+  // is stored in peers.json by connect-http and then RESOLVED BY ADDRESS at discovery time.
+  // Before this release connect-http wrote `entry.token` and nothing ever read it.
   const peerName = createSessionId('peer-http');
   const connect = await daemonA.runCli([
     'connect-http',
     `${daemonB.host}:${daemonB.port}`,
-    '--name', peerName
+    '--name', peerName,
+    '--token', daemonB.authToken()
   ], { timeoutMs: 8000 });
 
   assert.equal(connect.code, 0, `connect-http failed:\nstderr: ${connect.stderr}\nstdout: ${connect.stdout}`);
@@ -126,6 +156,7 @@ test('connect-http: registers HTTP peer in peers.json and exposes its sessions t
   assert.equal(entry.transport, 'http');
   assert.equal(entry.host, daemonB.host);
   assert.equal(entry.port, daemonB.port);
+  assert.equal(entry.token, daemonB.authToken(), 'the peer token is stored so discovery can present it');
 
   // Spawn a fresh session on daemon B and verify it shows up in `list` from A
   const remoteSession = createSessionId('cross-host-discovered');

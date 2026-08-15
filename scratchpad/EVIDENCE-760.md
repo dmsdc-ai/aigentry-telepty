@@ -246,8 +246,14 @@ GREEN (fix):     # tests 23  # pass 22  # fail 0
 — the daemon-require quirk: requiring `daemon.js` starts a server, the process
 never exits, and the runner reports the FILE as timed out while every assertion in
 it passed. The shipped `test/codex-modal-first-inject-737.test.js` behaves
-identically. Node 20's `--test-force-exit` removes it entirely — see §9b — and
-under that flag this file is `# pass 23 # fail 0 # cancelled 0`, exit 0.)
+identically.
+
+RETIRED 2026-08-01 (#829): this used to recommend `--test-force-exit`. Do not use it.
+The flag truncates runs non-deterministically — it drops tests without failing them,
+so a run still prints `fail 0` — and the underlying quirk is now FIXED at its cause:
+`test-support/setup-env.js` gives every test process an isolated `HOME`, so requiring
+`daemon.js` no longer restores and supervises the real `~/.telepty` sessions, and the
+process exits on its own. This file runs clean flagless.)
 
 | # | assertion | before | after |
 |---|---|---|---|
@@ -282,11 +288,16 @@ assertions, with `broker-client.test.js` passing cleanly in isolation on both
 traced to a zombie suite process from a previous run racing the live one for
 ports; killed by explicit PID, and the file passes on both branches in isolation.)
 
-Node 20's `--test-force-exit` removes the quirk — the runner exits once the tests
-finish instead of waiting on the daemon's open handles. Run:
+RETIRED 2026-08-01 (#829). This section used to instruct running with
+`--test-force-exit`. **Do not.** The flag drops tests without failing them, so a
+truncated run still prints `fail 0` — the counts below were measured under it and
+should be read with that in mind. The quirk it worked around is fixed at its cause:
+`test-support/setup-env.js` now isolates `HOME`, so requiring `daemon.js` no longer
+restores and supervises the real `~/.telepty` sessions and the process exits by
+itself. Run flagless:
 
 ```
-node --test-force-exit --require ./test-support/setup-env.js --test --test-timeout=120000 <the package.json file list>
+node --require ./test-support/setup-env.js --test --test-timeout=120000 <the package.json file list>
 ```
 
 | build | tests | pass | fail | skipped | exit |

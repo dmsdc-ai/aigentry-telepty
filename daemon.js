@@ -15,22 +15,65 @@ const { detectTailnet, TAILNET_CIDR } = require('./src/net/tailnet');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
-const { SessionStateManager, STATE_DISPLAY, stripAnsi: stripAnsiState } = require('./session-state');
-const { classifyReportPrompt, buildAutoSummary } = require('./src/report-enforcement');
+const { SessionStateManager, STATE_DISPLAY, OBSERVATION_DISPLAY, mapObservationCause, stripAnsi: stripAnsiState } = require('./session-state');
+// #60 Stage A: `classifyReportPrompt` is GONE. 0.8.0 parses no text as a terminal report — the
+// only consumer was resolveOutboundReportStatus, which mapped every reverse-routed payload
+// (including a clarifying question) to `report_complete`. The validator returns in Stage B, once
+// #816 supplies a private report channel and #817 supplies cross-machine sender identity.
+const { buildAutoSummary } = require('./src/report-enforcement');
+const completionObservation = require('./src/completion-observation');
+const { CAPABILITY_STAGE_A, classifyConsumption, buildCompletionUnknown, formatCompletionUnknownText } = completionObservation;
 const submitGate = require('./src/submit-gate');
 const { stripAnsiForScreen } = require('./src/screen-ansi'); // #715: read-screen ANSI/VT stripper
 const { sampleChildCpuSeconds } = require('./src/child-cpu'); // #52: quiet-thinking CPU recheck
 const readyRegistry = require('./src/prompt-symbol-registry');
 const lifecycle = require('./src/lifecycle');
-const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, applySurfaceMismatchProbe } = lifecycle;
+const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, decideSurfaceGcAction, applySurfaceMismatchProbe } = lifecycle;
 const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
 const { createCredentialStore } = require('./src/session-store/session-credentials');
 const { createAuditWriter, readInjectLog } = require('./src/audit/inject-log');
 const { mintSessionNonce, applyProvenance } = require('./src/audit/provenance');
 
-const config = getConfig();
-const EXPECTED_TOKEN = config.authToken;
+// #835: the daemon is the process that must not be fooled. It freezes EXPECTED_TOKEN below and
+// never re-reads it, while every CLI process re-reads the file — so a daemon that came up on a
+// token nobody else has 401s every call for the rest of its life, and the operator sees a fleet
+// of 401s with no cause anywhere. `console.warn` in whichever process read the file does not
+// reach that operator; refusing to serve, with the reason on stderr where the service log keeps
+// it, does. Same shape as the loadTeleptyConfig() guard further down.
+// #823 — env-then-file, and the CLI (`cli.js getAuthToken`) plus the MCP server resolve it in the
+// SAME order, so an operator cannot end up with one end reading the env and the other the file.
+// Deliberately resolved HERE rather than inside `auth.js getConfig()`: getConfig() is also the
+// first-run minting path and has two return points, so folding the override in there silently
+// ignores the variable on a fresh machine.
+//
+// It requires a deliberate act to use: the daemon runs under launchd, whose plist supplies only
+// PATH, so an operator who exports this in a shell but not for the daemon gets 401s. That is the
+// documented hazard (BOUNDARY.md), not an accident to paper over. The value is still FROZEN at
+// module load — see the note above; rotation is an explicit restart, by design.
+//
+// #843 C — resolved BEFORE `getConfig()`, and short-circuiting it. It used to be read eleven
+// lines below a getConfig() whose failure is `process.exit(1)`, so "env then file" was true of
+// the CLI and the MCP server and false of the daemon: with a corrupt config and a valid env
+// token, the clients worked and the daemon died before reaching the check. That is exactly the
+// state an operator is in while recovering from the corruption #835's fail-closed refusal
+// reports — the documented escape hatch was unusable at the one end that most needed it. Two
+// individually-correct changes (fail closed on an unreadable secret; honour the override)
+// composing into a wrong whole.
+//
+// With the secret supplied out-of-band the token file is not read AT ALL, so it cannot refuse.
+// Without it, nothing changes: the refusal below still stands, exactly as #835 wrote it.
+const ENV_AUTH_TOKEN = process.env.TELEPTY_AUTH_TOKEN || null;
+let config = null;
+if (!ENV_AUTH_TOKEN) {
+  try {
+    config = getConfig();
+  } catch (err) {
+    console.error(`[AUTH] Failed to load telepty auth config: ${err.message}`);
+    process.exit(1);
+  }
+}
+const EXPECTED_TOKEN = ENV_AUTH_TOKEN || config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
 const net = require('net');
 const fs = require('fs');
@@ -95,70 +138,102 @@ function buildAutoSummaryWithDefaults(session) {
   });
 }
 
-// Broadcast state transitions to the bus + fire enforcement events on idle/dead
+// #60 Stage A — every state transition is an OBSERVATION, and every eligible transition on a
+// tracked inject routes through the total emitter. There is no branch here that can produce a
+// terminal task outcome, because there is no terminal producer left in the daemon.
+//
+// The three things this listener used to do wrong:
+//   1. it emitted the internal state name externally (`session_auto_state`/`auto_state:"idle"`),
+//      which invited exactly the "the turn is over" reading the states cannot support;
+//   2. it returned early on `pendingReport.idleNotified`, a one-way bit that a WRONG-label
+//      emission burned and which then dropped the later genuine observation;
+//   3. it handled only working/thinking, idle and dead — a waiting-pattern or repeated-error
+//      entrance produced NOTHING at all, and both of those states are absorbing, so a dispatch
+//      could park in one forever with no statement ever made about it.
 sessionStateManager.onTransition((sessionId, from, to, detail) => {
   const session = sessions[sessionId];
   if (!session) return;
-  broadcastSessionEvent('session_auto_state', sessionId, session, {
-    extra: { auto_state: to, auto_state_from: from, auto_detail: detail }
+  const cause = detail && detail.detail ? detail.detail.trigger : null;
+  const evidence = { ...(detail && detail.detail ? detail.detail : {}), confidence: detail ? detail.confidence : undefined };
+
+  // External activity vocabulary (§2.3/§3.8). The internal 8-state FSM is unchanged — submit and
+  // readiness code branches on it (src/submit-gate.js:21-46, :498-508) — but what leaves this
+  // process is the measured cause, never the state name.
+  const mapped = mapObservationCause({ destination: to, cause, evidence });
+  broadcastSessionEvent('session_activity_observation', sessionId, session, {
+    extra: {
+      schema_version: 2,
+      observation: { kind: mapped.kind, trigger: mapped.cause, ...mapped.fields },
+      from_observation_state: from,
+      completion_fact: null,
+      terminal: false,
+    }
   });
 
-  const transitionPendingReport = getPendingReport(sessionId);
-  if ((to === 'working' || to === 'thinking') && transitionPendingReport) {
-    const pendingReport = transitionPendingReport;
+  const pendingReport = getPendingReport(sessionId);
+  if (!pendingReport) return;
+
+  if (to === 'working' || to === 'thinking') {
     if (!pendingReport.submitExpected || pendingReport.submitStartedAt) {
       pendingReport.sawWorkingAfterInject = true;
       pendingReport.workingAfterInjectAt = new Date().toISOString();
     }
-    // #619: capture the durable early-consumption fact the instant a genuine fresh turn
-    // fires, so the idle-gate (evaluated minutes later on a scrolled-off ring) reads the
-    // stored fact instead of failing to re-derive it. since_ms is set at this transition.
-    const consumedSinceMs = sessionStateManager.getState(sessionId)?.since_ms;
-    maybeRecordInjectConsumption(pendingReport, from, to, consumedSinceMs);
+    // #619 lineage: capture the fresh-turn edge the instant it fires, because the outputRing it
+    // would otherwise be re-derived from has scrolled off by the time a long turn goes quiet.
+    // Stage A records it as a CANDIDATE only — see maybeRecordInjectConsumption for why the
+    // submit-confirmation conjuncts cannot be evaluated at this point.
+    maybeRecordInjectConsumption(pendingReport, from, to, sessionStateManager.getState(sessionId)?.since_ms);
+    recordObservation({ sessionId, session, pendingReport, destination: to, cause, evidence, trigger: 'transition' });
+    return;
   }
 
-  // Fire TASK_IDLE_NO_REPORT on idle transition (for sessions with pendingReports).
-  // Session still needs to self-inject a content REPORT — this event only observes.
-  // Legacy TASK_COMPLETE text-inject is also fired for back-compat (0.2.x grandfather).
-  if (to === 'idle' && pendingReports[sessionId]) {
-    const pendingReport = pendingReports[sessionId];
-    // Mark as idle-notified (but keep the entry — REPORT is still pending).
-    // Entry is cleared when REPORT arrives (via inject endpoint) OR session dies.
-    if (pendingReport.idleNotified) return; // only fire once
-    // #545: only an OSC133-marked idle with the injected body consumed from the PTY outputRing
-    // is trustworthy enough to report TASK_COMPLETE. A weak prompt-glyph / silence flip (the
-    // residual WORKING case the THINKING-only state guard doesn't cover) stays
-    // TASK_IDLE_UNCONFIRMED — never a false complete.
-    const idleTrigger = detail && detail.detail ? detail.detail.trigger : null;
+  if (to === 'idle') {
+    // #545: reliability of the idle evidence is still computed, and is still worth recording —
+    // it is now a FIELD on the observation rather than an input to a promotion decision. Note
+    // both OSC-133 causes count: the raw marker and quiet-after-a-recent-marker are different
+    // measurements, and the old code compared against the single overloaded `osc_133_prompt`.
     const bodyText = pendingReport.injectedBodyPreview;
     const bodyVisible = bodyText
       ? submitGate.observeBodyVisibility(session, bodyText).visible === true
       : false;
-    const idleEvidenceReliable = idleTrigger === 'osc_133_prompt' && !bodyVisible;
-    // real-idle: the state manager observed a genuine busy→idle transition.
-    fireAutoReport(sessionId, session, pendingReport, 'real-idle', { idleEvidenceReliable });
-  }
-
-  // Fire TASK_DEAD_NO_REPORT when session dies with a pending report
-  if (to === 'dead' && pendingReports[sessionId]) {
-    const pendingReport = pendingReports[sessionId];
-    delete pendingReports[sessionId];
-
-    const autoSummary = buildAutoSummaryWithDefaults(session);
-    const elapsed = ((Date.now() - new Date(pendingReport.injectedAt).getTime()) / 1000).toFixed(1);
-
-    broadcastSessionEvent('TASK_DEAD_NO_REPORT', sessionId, session, {
-      extra: {
-        source: pendingReport.source,
-        inject_id: pendingReport.injectId,
-        elapsed_secs: Number(elapsed),
-        injected_at: pendingReport.injectedAt,
-        auto_summary: autoSummary,
-        exit_detail: detail
-      }
+    const idleEvidenceReliable = (cause === 'osc_133_a_or_b_received' || cause === 'quiet_after_recent_osc_133_a_or_b')
+      && !bodyVisible;
+    return fireAutoReport(sessionId, session, pendingReport, 'real-idle', {
+      idleEvidenceReliable,
+      observationCause: cause,
+      observationEvidence: evidence,
+      silenceMs: evidence.silence_ms,
     });
-    console.log(`[ENFORCE-REPORT] ${sessionId} died before REPORT after ${elapsed}s — auto_summary attached`);
   }
+
+  // §3.4 / §7 items 4 and 5: the entrances that used to produce nothing. Each emits IMMEDIATELY
+  // (no settle debounce) because there is no ambiguity to settle — a waiting pattern matched, or
+  // an error fingerprint repeated, or a thinking classification timed out. Each keeps its own
+  // name and its own fields, and each carries completion_fact:null. A repeated-error entrance is
+  // NOT the same measurement as a thinking timeout, and neither is a task failure.
+  if (to === 'waiting' || to === 'error' || to === 'restarting' || to === 'starting') {
+    return recordObservation({
+      sessionId, session, pendingReport, destination: to, cause, evidence,
+      deliverToSource: to === 'waiting' || to === 'error', trigger: 'transition',
+    });
+  }
+
+  if (to === 'dead') {
+    // The pending entry is released, but the ledger record is NOT: it stays queryable so a poll
+    // after the process is gone still gets a named observation instead of a 404.
+    delete pendingReports[sessionId];
+    return recordObservation({
+      // #843 — no `|| 'process_exit'` fallback. A transition that arrived at `dead` without a
+      // measured cause is not evidence of a process exit; substituting the strongest name in the
+      // table for a missing measurement is the defect this release removes, in one line. With no
+      // cause the mapper fails closed to `unmapped_transition_cause`, which is the honest answer.
+      sessionId, session, pendingReport, destination: 'dead', cause,
+      evidence: { ...evidence, auto_summary: buildAutoSummaryWithDefaults(session) },
+      deliverToSource: true, trigger: 'transition',
+    });
+  }
+
+  return recordObservation({ sessionId, session, pendingReport, destination: to, cause, evidence, trigger: 'transition' });
 });
 
 function persistSessions() {
@@ -433,6 +508,430 @@ const IDLE_UNCONFIRMED_CPU_MAX_REARMS = Math.max(0, Number(process.env.TELEPTY_I
 // consumption without re-opening BUG-B. See maybeRecordLauncherConsumption.
 const LAUNCHER_CONSUMPTION_MIN_SECONDS = Number(process.env.TELEPTY_LAUNCHER_CONSUMPTION_MIN_SECONDS) || 30;
 
+// ---------------------------------------------------------------------------
+// #60 Stage A — the tracked-injection observation ledger + the TOTAL emitter
+// ---------------------------------------------------------------------------
+
+const TRACKED_INJECTIONS_PATH = process.env.TELEPTY_TRACKED_INJECTIONS_PATH
+  || sessionPersistence.defaultTrackedInjectionsPath();
+
+// In-memory mirror of the durable ledger. `trackedLedgerHealthy` is false when the store could
+// not be read: the endpoint then answers `tracking_state:"unavailable"` with a named reason
+// instead of pretending nothing was ever tracked.
+let trackedInjections = sessionPersistence.emptyTrackedInjections();
+let trackedLedgerHealthy = true;
+let trackedLedgerUnavailableReason = null;
+
+function commitTrackedInjections() {
+  return sessionPersistence.saveTrackedInjections(trackedInjections, TRACKED_INJECTIONS_PATH);
+}
+
+// Restore BEFORE HTTP/WS readiness. A restored record gets `daemon_restart_observed` appended: a
+// dispatch that was in flight across a restart is still explicitly unknown, and a missing record
+// can never settle, delete or suspend it.
+function restoreTrackedInjections() {
+  const loaded = sessionPersistence.loadTrackedInjections(TRACKED_INJECTIONS_PATH);
+  if (!loaded.ok) {
+    trackedLedgerHealthy = false;
+    trackedLedgerUnavailableReason = loaded.reason;
+    console.warn(`[OBSERVE] tracked-injection store unavailable (${loaded.reason}${loaded.detail ? `: ${loaded.detail}` : ''}) — every poll answers tracking_state=unavailable`);
+    return;
+  }
+  trackedInjections = loaded.ledger;
+  const nowIso = new Date().toISOString();
+  let restored = 0;
+  for (const record of Object.values(trackedInjections.injections)) {
+    sessionPersistence.appendLedgerObservation(record, { kind: 'daemon_restart_observed', trigger: 'daemon_restart' }, nowIso);
+    restored++;
+  }
+  if (restored > 0) {
+    commitTrackedInjections();
+    console.log(`[OBSERVE] restored ${restored} tracked injection(s) — all still completion-unknown`);
+  }
+}
+
+function getTrackedInjection(injectId) {
+  if (typeof injectId !== 'string' || !injectId) return null;
+  if (injectId === '__proto__' || injectId === 'prototype' || injectId === 'constructor') return null;
+  const store = trackedInjections.injections;
+  if (!Object.prototype.hasOwnProperty.call(store, injectId)) return null;
+  return store[injectId];
+}
+
+/**
+ * Every tracked inject assigned to a session. #60 Stage A §3 "consumption of #815 owner
+ * lifecycle" needs it: an owner-replacement fact must be appended to EVERY inject assigned to the
+ * displaced epoch, not just the session's active one — supersession deliberately retains the
+ * older records, and an inject nobody can answer for is the silence this release removes.
+ *
+ * Superseded records are included: they remain queryable by `inject_id` and an owner replacement
+ * is exactly the kind of fact their reader still needs. Ordered by creation so the caller emits
+ * oldest-first.
+ */
+function listTrackedInjectionsForSession(sessionId) {
+  if (typeof sessionId !== 'string' || !sessionId) return [];
+  return Object.values(trackedInjections.injections)
+    .filter((record) => record && record.session_id === sessionId)
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+/**
+ * #860 F1 — what `capability.session_authentication: "observed"` is allowed to mean.
+ *
+ * `observed` is the word this release reserves for a MEASUREMENT, and #843 keyed it on
+ * `session.sessionEpoch` alone. Three writers set that field and only ONE of them measured
+ * anything:
+ *
+ *   src/transport/websocket.js  — an owner claim whose bearer `credentials.verify()` resolved to
+ *                                 THIS sid. A proof was presented and checked.       PROOF
+ *   POST /api/sessions/register — issuance. The epoch is minted here, before any caller has
+ *                                 presented anything at all.                         no proof
+ *   session-store/persistence   — restored off disk on daemon start. This daemon has verified
+ *                                 nothing; it read a file.                           no proof
+ *
+ * So the predicate answered "did this daemon mint or restore an epoch for this id", and the field
+ * reported that as an authentication. An orchestrator reading it concluded the target session
+ * instance had authenticated itself — for an aterm session, which never opens a WebSocket, nothing
+ * ever can. That is the substitution #815 removed, re-committed by the release that removed it.
+ *
+ * The proof is therefore carried by its own field, `session.sessionEpochProved`, written ONLY at
+ * the verified claim. It holds the epoch VALUE rather than a flag: a later writer that moves
+ * `sessionEpoch` without proving it (register on a recreated sid, a displaced-owner claim that
+ * proved nothing) must not inherit the old proof, and comparing the two is what makes that
+ * impossible to get wrong by omission.
+ *
+ * Three cases, three honest answers:
+ *   no epoch at all  → unavailable / no_815_epoch_fact       (the frozen default, unchanged)
+ *   epoch, no proof  → unavailable / no_815_bearer_presented (minted or restored — see above)
+ *   epoch + proof    → observed / null
+ *
+ * Returns the OVERLAY onto CAPABILITY_STAGE_A, so the no-epoch case returns {} and leaves the
+ * frozen default exactly as it was.
+ */
+function sessionAuthenticationCapability(session) {
+  if (!session || !session.sessionEpoch) return {};
+  if (session.sessionEpochProved && session.sessionEpochProved === session.sessionEpoch) {
+    return { session_authentication: 'observed', session_authentication_reason: null };
+  }
+  return { session_authentication: 'unavailable', session_authentication_reason: 'no_815_bearer_presented' };
+}
+
+/**
+ * Create the durable transport-observation record for a tracked inject. MUST complete before the
+ * bytes are handed to the target (§3 Stage A item 1): a delivered task that no record answers for
+ * is the silence this release exists to remove.
+ *
+ * Returns {ok:true, record} or {ok:false, reason} — on failure the caller must NOT deliver.
+ */
+function beginTrackedInjection({ injectId, sessionId, source, session }) {
+  const nowIso = new Date().toISOString();
+  // Supersession: a second tracked dispatch for the same session retains the OLD record and
+  // appends `tracking_superseded` before the active pointer moves. The previous code only logged
+  // a warning and destructively overwrote a SID-keyed entry, so the old inject_id became
+  // unqueryable — and an inject_id nobody can query is indistinguishable from one that never
+  // existed.
+  for (const record of Object.values(trackedInjections.injections)) {
+    if (record.session_id === sessionId && record.tracking_state === 'tracked') {
+      record.tracking_state = 'superseded';
+      sessionPersistence.appendLedgerObservation(record, {
+        kind: 'tracking_superseded', trigger: 'superseded_by_new_tracked_inject', superseded_by: injectId,
+      }, nowIso);
+    }
+  }
+
+  const record = {
+    inject_id: injectId,
+    session_id: sessionId,
+    // #815 gives an epoch only where a session actually proved one. Stage A records the absence
+    // with a reason rather than inventing availability from a bare SID or an open socket.
+    session_epoch: (session && session.sessionEpoch) || null,
+    session_epoch_reason: (session && session.sessionEpoch) ? null : 'no_815_epoch_fact',
+    transport_source: source || null,
+    created_at: nowIso,
+    observation_seq: 0,
+    observations: [],
+    last_observation: null,
+    // #843 — the capability block must not contradict the record it is stamped on.
+    // `CAPABILITY_STAGE_A` is frozen with `session_authentication_reason: 'no_815_epoch_fact'` and
+    // was spread onto EVERY record, including records whose own `session_epoch` two lines up holds
+    // the epoch the session PROVED on its #815 handshake. One response body then carried both the
+    // epoch and a reason denying any epoch fact was measured, leaving a reader to pick which half
+    // of one object to believe. §A4 requires gaps to be explicit; it does not license reporting a
+    // gap that was measured shut. #860 F1: nor does it license the opposite — see
+    // sessionAuthenticationCapability, which is what decides the three cases.
+    capability: {
+      ...CAPABILITY_STAGE_A,
+      ...sessionAuthenticationCapability(session),
+    },
+    tracking_state: 'tracked',
+  };
+  trackedInjections.injections[injectId] = record;
+  sessionPersistence.appendLedgerObservation(record, { kind: 'tracking_started', trigger: 'inject_accepted' }, nowIso);
+
+  const committed = commitTrackedInjections();
+  if (!committed.ok) {
+    delete trackedInjections.injections[injectId];
+    console.error(`[OBSERVE] tracking persistence FAILED for ${injectId} — refusing delivery (${committed.reason})`);
+    return { ok: false, reason: 'tracking_persistence_failed' };
+  }
+  trackedLedgerHealthy = true;
+  trackedLedgerUnavailableReason = null;
+  return { ok: true, record };
+}
+
+/**
+ * #843 — the write-ahead record's ABORT. The record is opened before the bytes are handed over
+ * (§3 item 1) because a delivered task no record answers for is silence. It had no way back: when
+ * the delivery was then REFUSED, the ledger kept `tracking_state:"tracked"` with `inject_accepted`
+ * forever and an orchestrator polling it saw a dispatch that looks in flight and will never move.
+ *
+ * The daemon measured that zero bytes were written — it returned that measurement to the HTTP
+ * caller as a 503 — and then discarded it everywhere else. Recording it is the same rule the rest
+ * of this release follows: state what was measured, including when the measurement is a negative.
+ *
+ * #860 F2 — it had exactly ONE call site: the synchronous `!delivery.success` arm of the inject
+ * route. `deliverInjectionToSession` has a THIRD outcome that is neither success nor refusal — the
+ * op is pushed onto the bootstrap / modal-park queue and the route is handed
+ * `{success: true, strategy: 'bootstrap_queue', queued: true}` with zero bytes written. Every
+ * terminal outcome of that queue (drain failure, bootstrap-ready timeout, modal-park TTL) emitted
+ * a bus event and nothing durable, so the ledger kept saying `tracked` / `inject_accepted` forever
+ * for a dispatch that delivered nothing — the same push-only gap websocket.js:346-349 argues
+ * against in this release. Those three paths now end here.
+ *
+ * `cause` names WHICH terminal outcome, because they are not the same measurement:
+ *   inject_delivery_refused — the write was ATTEMPTED and the transport refused it. `bytes_written`
+ *                             is what actually landed first, which is not always zero: the queue
+ *                             drain writes the body and the submit CR separately, and a CR that
+ *                             fails after the body landed must not be recorded as a delivery of
+ *                             nothing.
+ *   inject_delivery_dropped — the write was NEVER attempted. The op was accepted, parked, and
+ *                             discarded by a queue timeout or TTL. `bytes_written` is 0, measured.
+ *
+ * Returns a named result, never undefined.
+ */
+function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError, cause = {}) {
+  const record = getTrackedInjection(injectId);
+  if (!record) return 'tracking_unavailable';
+  record.tracking_state = 'aborted';
+  sessionPersistence.appendLedgerObservation(record, {
+    kind: cause.kind || 'inject_delivery_refused',
+    trigger: cause.trigger || 'delivery_refused',
+    delivery_code: deliveryCode || 'DELIVERY_FAILED',
+    delivery_error: deliveryError || null,
+    // Omitting `bytesWritten` means the caller MEASURED zero (the synchronous refusal arm: the
+    // route never handed a byte over). An explicit `null` means it could not measure — a throw
+    // mid-drain can land on either side of the body write — and null is recorded rather than a
+    // guessed zero.
+    bytes_written: cause.bytesWritten === undefined ? 0 : cause.bytesWritten,
+  }, new Date().toISOString());
+  // The pending entry goes too. It is what makes the session look like it is awaiting a turn, and
+  // it belongs to an inject whose bytes were never delivered — every later observation on this
+  // session would otherwise be filed against it.
+  if (sessionId && pendingReports[sessionId] && pendingReports[sessionId].injectId === injectId) {
+    delete pendingReports[sessionId];
+  }
+  const committed = commitTrackedInjections();
+  if (!committed.ok) {
+    console.error(`[OBSERVE] abort commit FAILED for ${injectId} (${committed.reason})`);
+    return 'tracking_persistence_failed';
+  }
+  return 'tracking_aborted';
+}
+
+/**
+ * #860 F2 — record the PARK itself, at the moment it happens.
+ *
+ * The abort above closes the queue's terminal outcomes, but the reproduced arrangement has no
+ * terminal outcome to close: `scheduleBootstrapPromptPoll` returns early when there is no open
+ * owner socket, so no timer is ever armed and the record cannot move at any later time. Left at
+ * `tracking_started` / `inject_accepted`, the one thing `bin/dispatch-tracker.sh` polls is
+ * indistinguishable from a dispatch whose bytes are on the wire.
+ *
+ * The record therefore states what was measured when it was measured: accepted, parked, zero bytes
+ * written. `tracking_state` stays `tracked` — a park is not terminal, and claiming it were would be
+ * the same defect pointed the other way.
+ *
+ * No-ops for an untracked inject (multicast / broadcast / bus route open no record).
+ */
+function parkTrackedInjection(injectId, strategy, reason) {
+  if (!injectId) return 'no_tracked_inject';
+  const record = getTrackedInjection(injectId);
+  if (!record) return 'tracking_unavailable';
+  sessionPersistence.appendLedgerObservation(record, {
+    kind: 'inject_parked',
+    trigger: strategy,
+    reason: reason || null,
+    bytes_written: 0,
+  }, new Date().toISOString());
+  const committed = commitTrackedInjections();
+  if (!committed.ok) {
+    console.error(`[OBSERVE] park commit FAILED for ${injectId} (${committed.reason})`);
+    return 'tracking_persistence_failed';
+  }
+  return 'tracking_parked';
+}
+
+/**
+ * #860 F2 — the audit log's `delivery_result` for a delivery that has not been written.
+ *
+ * `deliverInjectionToSession` returns `success: true` for the queue push as well as for a real
+ * write, so all four audited inject doors (HTTP route, multicast, broadcast, bus auto-route) wrote
+ * `delivery_result: "success"` for an operation whose measured byte count is zero. BOUNDARY.md
+ * enumerates that field as two values with two meanings and says they "deliberately do not share a
+ * word"; a third state wearing the strongest of the two is the defect this release exists to
+ * remove. `queued` is that third state: accepted and parked, nothing written, terminal outcome in
+ * the observation ledger rather than here.
+ *
+ * Keyed on the STRATEGY as well as the flag, because `queued` alone does not mean what it looks
+ * like: the mailbox path returns `{strategy: 'mailbox', queued: ack.queued}` for a delivery it has
+ * already written synchronously (`mailboxDelivery.tick()`), and that one is a write.
+ */
+function deliveryAuditResult(delivery) {
+  return delivery && delivery.queued === true && delivery.strategy === 'bootstrap_queue' ? 'queued' : 'success';
+}
+
+// Observation identity. Dedup is keyed on WHAT WAS MEASURED, not on a one-way "already notified"
+// bit. That distinction is the whole repair: `idleNotified` was burned by a wrong-label emission
+// and then dropped the later genuine one, and because it was a single bit it could never
+// distinguish "we already said this" from "we are no longer allowed to speak".
+function observationIdentity(kind, cause) {
+  return `${kind}|${cause == null ? '' : cause}`;
+}
+
+/**
+ * THE TOTAL EMITTER. Every observation entry point routes through here, and every eligible
+ * invocation RETURNS a named result — never `undefined`, never a bare `return`.
+ *
+ * Named results: observation_emitted · observation_duplicate · unmapped_transition_cause ·
+ * tracking_superseded · tracking_unavailable · observation_deferred · tracking_persistence_failed
+ */
+function recordObservation({
+  sessionId,
+  session,
+  pendingReport,
+  destination,
+  cause,
+  evidence,
+  deliverToSource = false,
+  trigger,
+  deps = {},
+}) {
+  const _broadcast = deps.broadcastSessionEvent || broadcastSessionEvent;
+  const _sessions = deps.sessions || sessions;
+  const _resolveAlias = deps.resolveSessionAlias || resolveSessionAlias;
+  const _deliver = deps.deliverInjectionToSession || deliverInjectionToSession;
+  const nowIso = new Date().toISOString();
+
+  const mapped = mapObservationCause({ destination, cause, evidence });
+  const observation = { kind: mapped.kind, trigger: mapped.cause, ...mapped.fields };
+  if (trigger) observation.emitted_via = trigger;
+
+  // #801 output marker, attached HERE rather than by widening mapObservationCause's evidence
+  // whitelist. The whitelist is a contract — a name may not travel with evidence its cause row
+  // did not require — and widening it would let every unrelated field leak into every row. This
+  // is the one sanctioned exception, so it is made at the call site where it is visible.
+  //
+  // What these two fields say: a known error banner was MATCHED IN THE OUTPUT BYTES of this
+  // turn, by detectIdleAfterError, scoped past the inject watermark. That is a measured fact
+  // about output — the text was there. What they do NOT say, and must never be read as: that
+  // the session failed, that the task failed, or that the inject went unprocessed. Those are
+  // outcome claims and remain unmeasurable; this envelope still carries completion_fact:null
+  // and terminal:false alongside them, and the observation's KIND is unchanged — a marker
+  // cannot rename the measurement it rode in on.
+  //
+  // Without this, a CLI dying on a 529 and an unmeasured CLI printing the same banner emit
+  // byte-identical observations: the daemon measured the difference and then discarded it,
+  // which is the inverse of this release's thesis rather than an instance of it (§A4 —
+  // capability gaps are reported, not erased).
+  if (evidence && evidence.error_marker) {
+    observation.error_marker = evidence.error_marker;
+    if (evidence.error_detail) observation.error_detail = evidence.error_detail;
+  }
+
+  const injectId = pendingReport ? pendingReport.injectId : null;
+  const record = injectId ? getTrackedInjection(injectId) : null;
+
+  const consumption = pendingReport
+    ? classifyConsumption(pendingReport, {
+      echoObserved: deps.echoObserved === true,
+      echoReason: deps.echoReason || null,
+    })
+    : { status: 'not_established', basis: 'no_tracked_inject' };
+
+  // Duplicate suppression by observation identity. It suppresses the repeat NOTIFICATION; it is
+  // not an authority gate, and it can never prevent a future genuine observation of a different
+  // kind from being recorded.
+  let result = 'observation_emitted';
+  if (record) {
+    const identity = observationIdentity(mapped.kind, mapped.cause);
+    if (record.last_observation && observationIdentity(record.last_observation.kind, record.last_observation.trigger) === identity) {
+      result = 'observation_duplicate';
+    } else {
+      // #843 — snapshot BEFORE the in-memory append, because the append is speculative until the
+      // commit lands. Two defects rode on its absence, and they compounded:
+      //   1. the failed-commit branch below used to `return` HERE, ahead of the broadcast, so a
+      //      store that could not be written emitted NOTHING — no bus event, no source delivery.
+      //      That is §A2 ("absence is emitted, never silence") violated inside the emitter written
+      //      to enforce §A2, on the one condition an operator most needs to hear about;
+      //   2. `appendLedgerObservation` had already moved `last_observation`, so the identity dedup
+      //      then suppressed every RETRY of that same measurement as a duplicate of an append that
+      //      never reached disk. The first attempt was silent and it silenced all the rest.
+      // The rollback is what makes the retry meaningful; falling through to the broadcast is what
+      // makes the failure audible. Neither alone is enough.
+      const priorSeq = record.observation_seq;
+      const priorLast = record.last_observation;
+      const priorObservations = Array.isArray(record.observations) ? record.observations.slice() : [];
+      const priorCapability = record.capability;
+      sessionPersistence.appendLedgerObservation(record, { ...observation, consumption_status: consumption.status }, nowIso);
+      record.capability = { ...CAPABILITY_STAGE_A, ...(record.capability || {}) };
+      const committed = commitTrackedInjections();
+      if (!committed.ok) {
+        record.observation_seq = priorSeq;
+        record.last_observation = priorLast;
+        record.observations = priorObservations;
+        record.capability = priorCapability;
+        result = 'tracking_persistence_failed';
+        console.error(`[OBSERVE] ledger commit FAILED for ${injectId} (${committed.reason}) — `
+          + `${observation.kind} was emitted on the bus but is NOT durable`);
+      } else if (record.tracking_state === 'superseded') {
+        result = 'tracking_superseded';
+      }
+    }
+  } else if (injectId) {
+    // A tracked inject whose record we cannot find (pre-v2, another daemon epoch, corrupt store).
+    // Explicit, named, never silence.
+    result = 'tracking_unavailable';
+  }
+
+  if (mapped.kind === 'unmapped_transition_cause') result = 'unmapped_transition_cause';
+
+  const envelope = buildCompletionUnknown({
+    sessionId,
+    injectId,
+    observation,
+    consumption,
+    capability: record ? record.capability : CAPABILITY_STAGE_A,
+    observationSeq: record ? record.observation_seq : undefined,
+  });
+
+  // The bus always hears the absence, even when the ledger deduped or is unavailable — a
+  // subscriber must never have to infer from silence.
+  _broadcast('task_completion_unknown', sessionId, session, {
+    timestamp: nowIso,
+    extra: { ...envelope, tracking_result: result, source: pendingReport ? pendingReport.source : null },
+  });
+
+  if (deliverToSource && pendingReport && result !== 'observation_duplicate') {
+    const srcId = _resolveAlias(pendingReport.source) || pendingReport.source;
+    const srcSession = _sessions[srcId];
+    if (srcSession) {
+      _deliver(srcId, srcSession, formatCompletionUnknownText(envelope), { noEnter: false, source: 'auto_report' });
+      console.log(`[OBSERVE] ${sessionId} → ${srcId}: ${observation.kind} (${result}, via ${trigger || mapped.cause})`);
+    }
+  }
+  return result;
+}
+
 function pendingReportHasSubmitEvidence(pendingReport) {
   return !!(pendingReport && (
     pendingReport.submitConfirmedAt ||
@@ -457,29 +956,42 @@ function pendingReportHasSubmitEvidence(pendingReport) {
 //   - a submit must have been attempted (submitStartedAt) — a non-submit text-inject records nothing.
 // A never-consumed inject therefore never gets a fact and still signals UNCONFIRMED. Pure +
 // idempotent (first genuine turn wins); mutates the passed pendingReport, returns whether it recorded.
+// #60 Stage A: this now records a CANDIDATE edge, not a consumption verdict.
+//
+// §3.10 requires `consumption.status:"observed"` to also carry `submitConfirm.accepted === true`,
+// `ambiguous === false` and a screen-derived reason. That predicate CANNOT be evaluated here:
+// `submitConfirm` is written when confirmSubmitAccepted resolves, and its strongest accept reason
+// — `state_working` — is produced BY this very transition (src/submit-gate.js:218-227 polls the
+// state machine). Applying the conjuncts at this call site would make `observed` unreachable in
+// production while every test that seeds the field stayed green: an assertion that cannot be
+// true, shipping green, which is the exact defect class this release removes.
+//
+// So the edge gate stays here (it is the only place the edge is visible) and the confirmation
+// conjuncts move to classifyConsumption, which runs when the confirmation actually exists. Same
+// conjuncts, correct evaluation point. Provenance for both halves is recorded so a reader can see
+// why a verdict was reached and where.
 function maybeRecordInjectConsumption(pendingReport, fromState, toState, transitionSinceMs) {
-  if (!pendingReport || pendingReport.injectConsumedAt) return false;
-  if (toState !== 'working' && toState !== 'thinking') return false;
-  if (fromState !== 'idle' && fromState !== 'waiting') return false;
-  if (!pendingReport.submitStartedAt) return false;
-  const submitStartedMs = new Date(pendingReport.submitStartedAt).getTime();
-  if (!Number.isFinite(submitStartedMs)) return false;
-  if (!Number.isFinite(transitionSinceMs) || transitionSinceMs < submitStartedMs) return false;
-  pendingReport.injectConsumedAt = new Date(transitionSinceMs).toISOString();
-  pendingReport.injectConsumedSinceMs = transitionSinceMs;
+  if (!pendingReport || pendingReport.injectConsumptionCandidate) return false;
+  const candidate = {
+    from: fromState,
+    to: toState,
+    sinceMs: transitionSinceMs,
+    at: Number.isFinite(transitionSinceMs) ? new Date(transitionSinceMs).toISOString() : null,
+  };
+  if (!completionObservation.isFreshBusyEdge(candidate, pendingReport.submitStartedAt)) return false;
+  pendingReport.injectConsumptionCandidate = candidate;
   return true;
 }
 
-// #721 FIX 2 (#579): the reverse-match's completion verdict for an inject a session routed back
-// to its own pending-report SOURCE (the worker replying to whoever tasked it). A prefix-shaped
-// REPORT keeps its precise status (classifyReportPrompt); any OTHER payload — a `--ref`/enveloped
-// REPORT whose file body is not REPORT_PREFIX_RE-shaped (e.g. a leading markdown title) — is
-// still completion EVIDENCE and clears the stale pending report so a later honest idle does not
-// cry wolf. REPORT_PREFIX_RE is unchanged: this is a strict fallback that only ADDS a completion
-// verdict, and only in the already-routed (sender→pending-source) reverse-match branch.
-function resolveOutboundReportStatus(prompt) {
-  return classifyReportPrompt(prompt) || 'report_complete';
-}
+// #60 Stage A / §7 item 10: `resolveOutboundReportStatus` is GONE, and with it the entire
+// reverse-text report path. It mapped EVERY reverse-routed payload to `report_complete` — a
+// clarifying question from a worker was recorded as that worker reporting its task complete, and
+// CHANGELOG.md:122-125 recorded the mislabel as accepted behaviour.
+//
+// In 0.8.0 an ordinary reverse-routed inject is an ordinary message. There is no text a session
+// can emit that telepty will treat as a terminal report, because no text can authenticate its
+// sender or correlate to a dispatch. That capability is Stage B and is blocked on #816 (a private
+// capability/report channel) and #817 (cross-machine sender identity).
 
 // #721 FIX 1 (root cause b): a worker-launcher (wrapped) session never rides a clean idle→working
 // edge — its continuously-active child stays `working`, so the inject's CR produces only
@@ -508,8 +1020,17 @@ function resolveOutboundReportStatus(prompt) {
 // false-complete. Rare (requires a spurious late idle with no new task); the elapsed floor makes the
 // common ~4.5s settle safe. Documented rather than plumbed away (a submit-baselined watermark was
 // weighed and dropped as higher blast-radius for marginal gain).
+// #60 Stage A / §3.10: the CALCULATION is preserved verbatim; only its false NAME is removed.
+//
+// This heuristic never measured consumption. The comment block above says so itself — a
+// never-started wrapped worker whose stale pending report re-fires real-idle past the floor
+// satisfies (a-d) and would false-complete — and daemon.js's own note at the launcher watermark
+// admits a never-started worker can satisfy it. So it no longer writes `injectConsumedAt` and no
+// longer flows through `consumed_recorded`. It records `submit_accepted_and_output_advanced`
+// telemetry (acceptance basis, ring-byte delta, elapsed) and consumption stays
+// `not_established`. Stage D may delete the calculation; Stage A only stops it lying.
 function maybeRecordLauncherConsumption(session, pendingReport, elapsedSinceInjectSec, nowMs) {
-  if (!pendingReport || pendingReport.injectConsumedAt) return false;
+  if (!pendingReport || pendingReport.launcherWatermarkAt) return false;
   if (!session || session.type !== 'wrapped') return false;
   if (!pendingReport.submitExpected || !pendingReport.submitStartedAt) return false;
   const confirm = pendingReport.submitConfirm;
@@ -518,10 +1039,9 @@ function maybeRecordLauncherConsumption(session, pendingReport, elapsedSinceInje
   const ringAtInject = Number.isFinite(pendingReport.ringBytesAtInject) ? pendingReport.ringBytesAtInject : 0;
   if (ringNow <= ringAtInject) return false;
   if (!(elapsedSinceInjectSec >= LAUNCHER_CONSUMPTION_MIN_SECONDS)) return false;
-  const submitStartedMs = new Date(pendingReport.submitStartedAt).getTime();
-  pendingReport.injectConsumedAt = new Date(Number.isFinite(nowMs) ? nowMs : Date.now()).toISOString();
-  pendingReport.injectConsumedSinceMs = Number.isFinite(submitStartedMs) ? submitStartedMs : null;
-  pendingReport.injectConsumedVia = 'launcher_watermark';
+  pendingReport.launcherWatermarkAt = new Date(Number.isFinite(nowMs) ? nowMs : Date.now()).toISOString();
+  pendingReport.launcherRingBytesDelta = ringNow - ringAtInject;
+  pendingReport.launcherElapsedMs = Math.round(elapsedSinceInjectSec * 1000);
   return true;
 }
 
@@ -534,21 +1054,12 @@ function maybeRecordLauncherConsumption(session, pendingReport, elapsedSinceInje
 // A definitively failed submit (accepted:false — body observed stuck in the composer /
 // no-land) is positive NON-consumption and can never be overridden by echo, so the
 // never-false-complete invariant of #48 holds: a genuinely unconsumed inject still signals.
-function observeConsumptionEvidence(pendingReport, session) {
-  // #619: a durable early-consumption fact (recorded at turn-start) is decay-proof — prefer it
-  // over re-deriving from the possibly scrolled-off outputRing at idle-time. This also covers the
-  // #48 settle re-entry path (where `confirmed` is force-false) as a suppression backstop.
-  if (pendingReport.injectConsumedAt) {
-    return { observed: true, reason: 'consumed_recorded' };
-  }
-  const confirm = pendingReport.submitConfirm;
-  if (confirm && confirm.accepted === false) {
-    return { observed: false, reason: 'submit_failed' };
-  }
-  if (confirm && confirm.accepted === true && !confirm.ambiguous
-      && (confirm.reason === 'body_consumed' || /^state_(working|thinking)$/.test(String(confirm.reason)))) {
-    return { observed: true, reason: `submit_${confirm.reason}` };
-  }
+// #60 Stage A: `observeConsumptionEvidence` is GONE. It was a GATE — its caller used it to decide
+// whether to stay silent (daemon.js:803-810, a bare `return` that emitted nothing and set
+// nothing). Consumption is now a FIELD on the observation, computed by
+// src/completion-observation.js#classifyConsumption, which is total and has rejection precedence.
+// This helper only gathers the one piece of evidence that needs the session's output ring.
+function observeInjectEchoEvidence(pendingReport, session) {
   const echo = submitGate.observeInjectEcho(session, pendingReport.injectedBodyPreview, {
     sinceBytes: Number.isFinite(pendingReport.ringBytesAtInject) ? pendingReport.ringBytesAtInject : null,
     stripAnsi: stripAnsiState,
@@ -630,21 +1141,32 @@ function markPendingReportSubmitUnconfirmed(sessionId, confirm) {
   };
 }
 
-// #32: single provenance-tagged auto-report path (was 3 byte-identical builders at the
-// onTransition-idle / silence-timeout / ready-signal sites). `trigger` distinguishes the
-// originating path; sub-floor elapsed is relabeled TASK_IDLE_UNCONFIRMED instead of TASK_COMPLETE.
-// Caller is responsible for the `!pendingReport.idleNotified` once-only guard.
-// `deps` is a thin DI seam (defaults = module globals) so the elapsed→label decision is
-// unit-testable with an injected clock and a captured deliver fn — behavior is byte-identical
-// for the production callers, which pass no deps.
+// #32 lineage: this was the single provenance-tagged AUTO-REPORT path, and its job was to decide
+// TASK_COMPLETE vs TASK_IDLE_UNCONFIRMED from elapsed time, submit flags and a prompt glyph.
+//
+// #60 Stage A removed that decision entirely. There is no `confirmed` any more, no label, and no
+// terminal message: this path now emits ONE `task_completion_unknown` observation through the
+// total emitter and delivers the literal absence text to the source. The name is kept because it
+// is the seam every caller and the design's §8.1 refer to; it no longer auto-reports anything.
+//
+// What survives from the compensation stack (#32/#48/#52/#537/#545/#619/#721), deliberately, per
+// the Stage-A/Stage-D split:
+//   - the ready-signal dwell still waits for submit confirmation before speaking;
+//   - the #48 settle window and the #52 CPU re-arm still DEBOUNCE follow-up observations;
+//   - #545's idle-evidence reliability and #721's launcher watermark are still computed.
+// None of them can gate a completion claim, because there is none. Critically, the debounce is
+// not silence: the durable `tracking_started` observation was already committed before the bytes
+// were handed over, so the absence exists and is pollable the whole time this function is
+// deferring. Debouncing a follow-up is not the same thing as withholding a first statement, and
+// getting those two confused is what killed three design rounds.
+//
+// `deps` remains the DI seam (clock, setTimeout, bus, deliver, live state, CPU sampler).
+// Returns a NAMED result on every path — never undefined, never a bare return.
 function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = {}) {
   const _now = deps.now || Date.now;
   const _setTimeout = deps.setTimeout || setTimeout;
-  const _broadcast = deps.broadcastSessionEvent || broadcastSessionEvent;
-  const _resolveAlias = deps.resolveSessionAlias || resolveSessionAlias;
   const _sessions = deps.sessions || sessions;
   const _pendingReports = deps.pendingReports || pendingReports;
-  const _deliver = deps.deliverInjectionToSession || deliverInjectionToSession;
   // #48: live auto-state lookup for the settle recheck (DI for unit tests).
   const _getAutoState = deps.getAutoState || ((sid) => {
     const st = sessionStateManager.getState(sid);
@@ -656,14 +1178,78 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
 
   const elapsedNum = (_now() - new Date(pendingReport.injectedAt).getTime()) / 1000;
   const elapsed = elapsedNum.toFixed(1);
-  const hasSubmitEvidence = pendingReportHasSubmitEvidence(pendingReport);
+  const liveSession = () => _sessions[targetId] || targetSession;
 
-  if (trigger === 'ready-signal' && pendingReport.submitExpected) {
-    if (hasSubmitEvidence) {
-      console.log(`[AUTO-REPORT] ${targetId} ready-signal suppressed; submit already confirmed`);
-      return;
+  // Resolve the measured cause for this entrance. The caller passes the state machine's own
+  // normalized cause where it has one (deps.observationCause); otherwise the trigger names it.
+  // Nothing here infers a cause from the destination state.
+  const resolveCause = () => {
+    if (deps.observationCause) return deps.observationCause;
+    if (trigger === 'ready-signal') {
+      const sess = liveSession();
+      const kind = sess && sess.readyKind ? sess.readyKind : 'legacy_unqualified_ready';
+      if (kind === 'composer_surface_observed') return 'ready_frame_composer_surface';
+      if (kind === 'prompt_suffix_observed') return 'ready_frame_prompt_suffix';
+      return 'ready_frame_legacy_unqualified';
     }
+    return 'silence_timeout';
+  };
 
+  const emit = (extraEvidence = {}, extraDeps = {}) => {
+    const sess = liveSession();
+    const cause = resolveCause();
+    const evidence = {
+      elapsed_ms: Math.round(elapsedNum * 1000),
+      silence_ms: Number.isFinite(deps.silenceMs) ? deps.silenceMs : Math.round(elapsedNum * 1000),
+      ...(deps.observationEvidence || {}),
+      ...extraEvidence,
+    };
+    if (cause.startsWith('ready_frame_')) {
+      evidence.detector = (sess && sess.readyDetector) || 'unqualified';
+      evidence.cli_key = (sess && sess.readyCliKey) || null;
+    }
+    // #545 reliability is no longer a promotion input — nothing here promotes. It is computed and
+    // then DELIBERATELY NOT CARRIED on the emitted observation: §2.3 fixes each row's payload to
+    // the fields that row requires, plus last_output_at and confidence, and mapObservationCause
+    // drops everything else. Do not read the assignment below as "it becomes a field" — an earlier
+    // version of this comment claimed exactly that, and the claim was false, which is the same
+    // defect this release exists to remove.
+    //
+    // It stays computed because it is a real input to the local decisions above and is useful in
+    // the log line, and because OSC 133 has never fired on real traffic (zero hits across 9 live
+    // PTY captures and 15 fixtures) — so as an emitted field it would be permanently false, which
+    // is noise rather than information.
+    //
+    // #801's surface-error verdict is the deliberate exception and IS carried; see recordObservation,
+    // where it is attached explicitly rather than by widening the §2.3 whitelist. Neither signal may
+    // change the observation's NAME — that is fixed by the measured cause.
+    if (deps.idleEvidenceReliable !== undefined) evidence.idle_evidence_reliable = deps.idleEvidenceReliable;
+    const _detectIdleAfterError = deps.detectIdleAfterError || detectIdleAfterError;
+    const errorVerdict = _detectIdleAfterError(sess, pendingReport);
+    if (errorVerdict) {
+      evidence.error_marker = errorVerdict.reason;
+      evidence.error_detail = errorVerdict.detail;
+    }
+    const echo = sess ? observeInjectEchoEvidence(pendingReport, sess) : { observed: false, reason: null };
+    return recordObservation({
+      sessionId: targetId,
+      session: sess,
+      pendingReport,
+      destination: 'idle',
+      cause,
+      evidence,
+      deliverToSource: true,
+      trigger,
+      deps: { ...deps, echoObserved: echo.observed, echoReason: echo.reason, ...extraDeps },
+    });
+  };
+
+  // --- ready-signal dwell (#32): wait for the submit verdict before speaking ---------------
+  if (trigger === 'ready-signal' && pendingReport.submitExpected) {
+    if (pendingReportHasSubmitEvidence(pendingReport)) {
+      // Submit already answered — the ready frame adds no new measurement. Named, not silent.
+      return 'observation_duplicate';
+    }
     const shouldWaitForSubmit = pendingReport.submitInProgress === true || elapsedNum < AUTO_REPORT_MIN_REAL_SECONDS;
     if (shouldWaitForSubmit) {
       if (!pendingReport.readySignalTimer) {
@@ -672,180 +1258,64 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
         pendingReport.readySignalTimer = _setTimeout(() => {
           pendingReport.readySignalTimer = null;
           const currentPending = getPendingReport(targetId, _pendingReports);
-          if (!currentPending || currentPending.idleNotified) return;
-          if (pendingReportHasSubmitEvidence(currentPending)) {
-            console.log(`[AUTO-REPORT] ${targetId} ready-signal dwell suppressed; submit confirmed`);
-            return;
-          }
-          fireAutoReport(targetId, _sessions[targetId] || targetSession, currentPending, 'ready-signal', deps);
+          if (!currentPending) return;
+          fireAutoReport(targetId, liveSession(), currentPending, 'ready-signal', deps);
         }, delayMs);
       }
-      console.log(`[AUTO-REPORT] ${targetId} ready-signal deferred; awaiting submit confirmation`);
-      return;
+      console.log(`[OBSERVE] ${targetId} ready-frame observation deferred; awaiting submit verdict`);
+      return 'observation_deferred';
     }
   }
 
-  // #721 FIX 1: rescue a genuine worker-launcher (wrapped) completion the edge-gated #619 recorder
-  // never credited. On a real-idle flip, re-derive the durable consumption fact from decay-proof
-  // launcher-safe signals (maybeRecordLauncherConsumption) so a recorded fact then flows through
-  // strongSubmitConfirmed / negates idleEvidenceUnreliable below exactly like a #619 fact — the
-  // decayed weak idle no longer cries wolf. Scoped to wrapped sessions, so #537/#545 never-false-
-  // complete for every non-wrapped session is untouched.
+  // --- #721 launcher watermark: telemetry only, never consumption --------------------------
   if (trigger === 'real-idle') {
-    maybeRecordLauncherConsumption(_sessions[targetId] || targetSession, pendingReport, elapsedNum, _now());
+    maybeRecordLauncherConsumption(liveSession(), pendingReport, elapsedNum, _now());
   }
 
-  // #537 / Bug B: a never-started worker (transient submit failure → claude startup
-  // busy→idle settle at ~4.5s) must NOT be reported TASK_COMPLETE. When a submit was
-  // expected, the elapsed floor and startup-polluted sawWorkingAfterInject are NOT trusted
-  // as proof of processing — require positive submit confirmation (screen-poll verify /
-  // honest force / gate-off). Paths with no submit expected keep the legacy floor/work rule.
-  const strongSubmitConfirmed = !!(
-    // #619: a durable early-consumption fact (a genuine fresh turn fired by the inject) is
-    // the strongest completion proof there is — stronger than a screen-derived submit confirm
-    // and decay-proof at idle-time. Recorded conservatively (maybeRecordInjectConsumption), so
-    // this never promotes a never-consumed inject.
-    pendingReport.injectConsumedAt ||
-    pendingReport.submitConfirmedAt ||
-    (pendingReport.submitConfirm && pendingReport.submitConfirm.accepted === true)
-  );
-  // #545: a `real-idle` flip with weak evidence (no OSC133 REPL-done mark / injected body still
-  // visible in the PTY outputRing) must NOT be reported TASK_COMPLETE — a still-busy worker that
-  // merely paused output gets the honest TASK_IDLE_UNCONFIRMED. The caller (onTransition) sets
-  // deps.idleEvidenceReliable; === false forces the downgrade. Scoped to submitExpected (the #545
-  // symptom — a submit-confirmed worker still thinking), consistent with the BUG-B confirm gate;
-  // plain non-submit injects keep their existing floor-based completion. Absent flag / other
-  // triggers preserve prior behavior.
-  // #619: a recorded early-consumption fact overrides the decayed at-idle evidence. The
-  // `idleEvidenceReliable === false` downgrade exists because the screen-derived evidence is
-  // weak; a stored consumption fact IS the (decay-proof) evidence, so the downgrade no longer
-  // applies. Without a recorded fact, behavior is unchanged (#545/#52 conservative UNCONFIRMED).
-  const idleEvidenceUnreliable = trigger === 'real-idle'
-    && pendingReport.submitExpected
-    && deps.idleEvidenceReliable === false
-    && !pendingReport.injectConsumedAt;
-  // #48: a settled recheck re-enters ONLY to emit the UNCONFIRMED label — pinned at arm time,
-  // so elapsed growing past the floor during the settle window can never promote a stale idle
-  // snapshot to TASK_COMPLETE (never a false complete).
-  const confirmed = pendingReport.unconfirmedSettleDone
-    ? false
-    : trigger === 'ready-signal' && pendingReport.submitExpected
-      ? false
-      : idleEvidenceUnreliable
-        ? false
-        : pendingReport.submitExpected
-          ? strongSubmitConfirmed
-          : (elapsedNum >= AUTO_REPORT_MIN_REAL_SECONDS || hasSubmitEvidence);
-
-  // #48: settle-and-recheck before any UNCONFIRMED notification. The first weak idle/ready
-  // snapshot right after an inject is almost always a transition gap — the bridge re-sends
-  // 'ready' on a TUI prompt-glyph redraw (with no state transition, no evidence flag is ever
-  // set even though the session IS working), and codex's silence+glyph heuristic flips
-  // real-idle mid-work. Hold the notification for a settle window and recheck the LIVE
-  // session: notify only when it is still not working AND its output has not advanced.
-  // Suppression does NOT consume the once-only idleNotified guard, so a later genuine
-  // busy→idle transition re-enters this path (and an evidence-backed one reports COMPLETE).
-  if (!confirmed && !pendingReport.unconfirmedSettleDone) {
-    if (pendingReport.unconfirmedSettleTimer) return; // settle window already open
+  // --- #48/#52 settle debounce (follow-ups only; the initial unknown is already durable) ---
+  if (!pendingReport.unconfirmedSettleDone) {
+    if (pendingReport.unconfirmedSettleTimer) return 'observation_deferred'; // window already open
     const settleMs = Math.max(50, Math.round(IDLE_UNCONFIRMED_SETTLE_SECONDS * 1000));
     const armSettle = () => {
-      const liveAtArm = _sessions[targetId] || targetSession;
+      const liveAtArm = liveSession();
       const activityAtArm = liveAtArm ? liveAtArm.lastActivityAt : null;
       const cpuAtArm = _sampleChildCpu(liveAtArm); // #52: null when unobservable
       pendingReport.unconfirmedSettleTimer = _setTimeout(() => {
         pendingReport.unconfirmedSettleTimer = null;
         const currentPending = getPendingReport(targetId, _pendingReports);
-        // REPORT arrived / entry replaced / another path already notified — stand down.
-        if (currentPending !== pendingReport || currentPending.idleNotified) return;
-        const liveSession = _sessions[targetId] || targetSession;
+        if (currentPending !== pendingReport) return;
         const autoState = _getAutoState(targetId);
         if (autoState === 'working' || autoState === 'thinking') {
-          console.log(`[AUTO-REPORT] ${targetId} idle-unconfirmed suppressed after settle — session is ${autoState} (trigger=${trigger})`);
+          // Still busy: the quiet we were about to describe is gone. Nothing to state.
+          console.log(`[OBSERVE] ${targetId} quiet observation dropped after settle — session is ${autoState}`);
           return;
         }
-        const activityNow = liveSession ? liveSession.lastActivityAt : null;
+        const activityNow = liveSession() ? liveSession().lastActivityAt : null;
         if (activityNow !== activityAtArm
             && (pendingReport.unconfirmedSettleRearms || 0) < IDLE_UNCONFIRMED_SETTLE_MAX_REARMS) {
           pendingReport.unconfirmedSettleRearms = (pendingReport.unconfirmedSettleRearms || 0) + 1;
-          console.log(`[AUTO-REPORT] ${targetId} output advanced during settle — re-settling (${pendingReport.unconfirmedSettleRearms}/${IDLE_UNCONFIRMED_SETTLE_MAX_REARMS})`);
           armSettle();
           return;
         }
-        // #52: screen idle + output stalled, but the wrapped child's CPU time advanced
-        // across the settle window → quiet thinking (codex no-spinner blind spot). Treat
-        // as working: re-settle on its own bound instead of notifying.
-        const cpuNow = _sampleChildCpu(liveSession);
+        const cpuNow = _sampleChildCpu(liveSession());
         if (cpuAtArm != null && cpuNow != null
             && (cpuNow - cpuAtArm) >= IDLE_UNCONFIRMED_CPU_DELTA_SECONDS
             && (pendingReport.unconfirmedCpuRearms || 0) < IDLE_UNCONFIRMED_CPU_MAX_REARMS) {
           pendingReport.unconfirmedCpuRearms = (pendingReport.unconfirmedCpuRearms || 0) + 1;
-          console.log(`[AUTO-REPORT] ${targetId} child CPU advanced ${(cpuNow - cpuAtArm).toFixed(2)}s during settle — quiet-thinking; re-settling (${pendingReport.unconfirmedCpuRearms}/${IDLE_UNCONFIRMED_CPU_MAX_REARMS})`);
           armSettle();
           return;
         }
         pendingReport.unconfirmedSettleDone = true;
-        fireAutoReport(targetId, liveSession || targetSession, currentPending, trigger, deps);
+        fireAutoReport(targetId, liveSession() || targetSession, currentPending, trigger, deps);
       }, settleMs);
     };
     armSettle();
-    console.log(`[AUTO-REPORT] ${targetId} idle unconfirmed at ${elapsed}s (trigger=${trigger}) — settling ${IDLE_UNCONFIRMED_SETTLE_SECONDS}s before notify`);
-    return;
+    console.log(`[OBSERVE] ${targetId} quiet at ${elapsed}s (trigger=${trigger}) — settling ${IDLE_UNCONFIRMED_SETTLE_SECONDS}s before the follow-up observation`);
+    return 'observation_deferred';
   }
 
-  // #52: before emitting the unconfirmed-DELIVERY warning, check for inject-consumption
-  // evidence (screen-verified submit / post-inject echo). Idle-looking + consumed is at
-  // most a TASK_IDLE fact — not "inject may NOT have been processed". Suppression does not
-  // consume the once-only idleNotified guard, so a later evidence-backed genuine busy→idle
-  // transition can still report TASK_COMPLETE, and the pending entry stays armed until the
-  // worker's content REPORT arrives. Confirmed completions (confirmed === true) are
-  // untouched — this gate only ever silences a would-be false warning, never a signal that
-  // a genuinely unconsumed inject produced (no echo + no verified submit ⇒ falls through).
-  if (!confirmed) {
-    const _observeConsumption = deps.observeConsumptionEvidence || observeConsumptionEvidence;
-    const consumption = _observeConsumption(pendingReport, _sessions[targetId] || targetSession);
-    if (consumption.observed) {
-      console.log(`[AUTO-REPORT] ${targetId} idle-unconfirmed suppressed — inject consumption observed (${consumption.reason}, trigger=${trigger})`);
-      return;
-    }
-  }
-
-  // #801: we are about to assert "processed inject". Only ask when the answer could change
-  // the claim — an already-UNCONFIRMED report is honest as-is, and its semantics stay intact.
-  const _detectIdleAfterError = deps.detectIdleAfterError || detectIdleAfterError;
-  const errorVerdict = confirmed
-    ? _detectIdleAfterError(_sessions[targetId] || targetSession, pendingReport)
-    : null;
-
-  pendingReport.idleNotified = true;
-  pendingReport.idleAt = new Date(_now()).toISOString();
-
-  // Richer bus event (observability) — now also carries the trigger provenance.
-  _broadcast('TASK_IDLE_NO_REPORT', targetId, targetSession, {
-    extra: {
-      source: pendingReport.source,
-      inject_id: pendingReport.injectId,
-      elapsed_secs: Number(elapsed),
-      injected_at: pendingReport.injectedAt,
-      trigger,
-      ...(errorVerdict ? { error_marker: errorVerdict.reason, error_detail: errorVerdict.detail } : {})
-    }
-  });
-  console.log(`[ENFORCE-REPORT] ${targetId} idle after ${elapsed}s (trigger=${trigger}) — awaiting REPORT from ${pendingReport.source}`);
-
-  const srcId = _resolveAlias(pendingReport.source) || pendingReport.source;
-  const srcSession = _sessions[srcId];
-  if (!srcSession) return;
-
-  const injTag = pendingReport.injectId ? ` inject=${pendingReport.injectId}` : '';
-  const label = errorVerdict ? 'TASK_ERROR' : confirmed ? 'TASK_COMPLETE' : 'TASK_IDLE_UNCONFIRMED';
-  const reportMsg = errorVerdict
-    ? `TASK_ERROR: ${targetId} went idle after an API/transport error (${errorVerdict.detail}) `
-      + `— ${elapsed}s, via ${trigger}${injTag}; the inject was NOT processed`
-    : confirmed
-      ? `TASK_COMPLETE: ${targetId} is now idle after processing inject (${elapsed}s, via ${trigger}${injTag})`
-      : `TASK_IDLE_UNCONFIRMED: ${targetId} signaled idle ${elapsed}s after inject (via ${trigger}${injTag}) — inject may NOT have been processed; verify before treating as done`;
-  _deliver(srcId, srcSession, reportMsg, { noEnter: false, source: 'auto_report' });
-  console.log(`[AUTO-REPORT] ${targetId} → ${srcId}: ${label} after ${elapsed}s (trigger=${trigger})`);
+  // --- emit. Consumption is a FIELD here, never a gate. -----------------------------------
+  return emit();
 }
 
 const sessions = {};
@@ -855,8 +1325,23 @@ let teleptyConfig;
 try {
   teleptyConfig = loadTeleptyConfig();
 } catch (err) {
-  console.error(`[CONFIG] Failed to load telepty config: ${err.message}`);
-  process.exit(1);
+  // #843 C — the SECOND read of `~/.telepty/config.json`. Skipping the token read above without
+  // this one is the same defect one layer out: the daemon would clear the auth gate on the env
+  // token and then die here, on the same unparseable bytes, having been told the secret already.
+  //
+  // What this file supplies at this point is optional settings (`idle_ttl_default`) whose absence
+  // has a defined default, so with the secret in hand the honest answer is to come up and say what
+  // could not be read — §A4, a capability gap reported as a gap — rather than to refuse. The
+  // refusal is unchanged when no env token was supplied: there, an unreadable config is still a
+  // condition the daemon must not boot through.
+  if (!ENV_AUTH_TOKEN) {
+    console.error(`[CONFIG] Failed to load telepty config: ${err.message}`);
+    process.exit(1);
+  }
+  console.error(`[CONFIG] ${err.message}`);
+  console.error('[CONFIG] TELEPTY_AUTH_TOKEN supplied the secret, so the daemon is starting without '
+    + 'this file. Settings in it are UNAVAILABLE, not absent — idle_ttl_default falls back to "off".');
+  teleptyConfig = loadTeleptyConfig({ paths: [] });
 }
 
 function broadcastBusEvent(event) {
@@ -1199,13 +1684,18 @@ async function executeBootstrapInject(sessionId, session, op) {
   // 0/9). Harmless while this queue only carried boot-time injects; load-bearing now that a
   // modal park routes worker REPORTs — multi-line by definition — through it. Fixed here
   // rather than in the park branch so the boot caller stops rolling the same dice.
-  const textResult = await writeDataToSession(sessionId, session, maybeBracketedPaste(prompt, session));
-  if (!textResult.success) return textResult;
+  const body = maybeBracketedPaste(prompt, session);
+  const textResult = await writeDataToSession(sessionId, session, body);
+  // #860 F2 — a failure here is reported back with the byte count that actually landed, because
+  // the caller records it in the ledger. The two arms differ: nothing was written when the BODY
+  // was refused, but the body is on the surface by the time the submit CR can fail, and an abort
+  // that stamped `bytes_written: 0` on that one would be the same defect it exists to close.
+  if (!textResult.success) return { ...textResult, bytes_written: 0 };
 
   if (!op.noEnter) {
     await sleep(WRAPPED_SUBMIT_DELAY_MS);
     const submitResult = await writeDataToSession(sessionId, session, '\r');
-    if (!submitResult.success) return submitResult;
+    if (!submitResult.success) return { ...submitResult, bytes_written: Buffer.byteLength(body) };
   }
 
   session.lastActivityAt = new Date().toISOString();
@@ -1483,6 +1973,12 @@ async function drainBootstrapQueue(sessionId, session) {
               code: result.code || 'DELIVERY_FAILED',
               error: result.error || 'bootstrap delivery failed'
             });
+            // #860 F2 — and durably. The event above is push-only; this is a TERMINAL outcome for
+            // a dispatch whose record has said `tracked` since the route accepted it.
+            abortTrackedInjection(op.injectId, sessionId, result.code || 'DELIVERY_FAILED', result.error, {
+              trigger: 'bootstrap_queue_failed',
+              bytesWritten: result.bytes_written,
+            });
           }
         } else if (op.type === 'submit') {
           const result = await executeBootstrapSubmit(sessionId, session, op);
@@ -1514,6 +2010,13 @@ async function drainBootstrapQueue(sessionId, session) {
           operation: op.type,
           code: 'BOOTSTRAP_DRAIN_FAILED',
           error: error.message || 'bootstrap drain failed'
+        });
+        // #860 F2 — the same terminal outcome as the arm above, reached by a throw. `bytesWritten:
+        // null` because a throw can land on either side of the body write, and this is the one
+        // path that cannot say which.
+        abortTrackedInjection(op.injectId, sessionId, 'BOOTSTRAP_DRAIN_FAILED', error.message || 'bootstrap drain failed', {
+          trigger: 'bootstrap_drain_failed',
+          bytesWritten: null,
         });
       }
     }
@@ -1581,6 +2084,11 @@ function failBootstrapQueueOnTimeout(sessionId, session, detail = {}) {
       code: 'BOOTSTRAP_READY_TIMEOUT',
       error: `target '${sessionId}' not ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms`
     });
+    // #860 F2 — DROPPED, not refused: this op was accepted, parked, and discarded without the
+    // daemon ever attempting a write. Zero bytes is a measurement here, not an assumption.
+    abortTrackedInjection(op.injectId, sessionId, 'BOOTSTRAP_READY_TIMEOUT',
+      `target '${sessionId}' not ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms`,
+      { kind: 'inject_delivery_dropped', trigger: 'bootstrap_ready_timeout' });
   }
 }
 
@@ -2273,6 +2781,12 @@ function flushModalParkQueue(sessionId, session, waitedMs) {
         },
       });
     }
+    // #860 F2 — the third terminal path. A submit op answers its caller on the open HTTP request
+    // above; an inject op's caller left long ago, and the ledger is the only thing that can still
+    // tell it the body never reached the surface.
+    abortTrackedInjection(op.injectId, sessionId, 'SURFACE_MODAL_PARK_TIMEOUT',
+      `parked behind a surface modal that did not clear within ${waitedMs}ms`,
+      { kind: 'inject_delivery_dropped', trigger: 'surface_modal_park_timeout' });
   }
   emitBootstrapEvent('modal_park_timeout', sessionId, session, {
     actionable: true,
@@ -2371,11 +2885,16 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       type: 'inject',
       prompt,
       noEnter: !!options.noEnter,
+      // #860 F2: the tracked record's id rides ON THE OP, because the queue is where the dispatch
+      // and the ledger part company — the route returns, and whatever this queue eventually does
+      // with the op is the only thing left that can answer for it.
+      injectId: options.injectId || null,
       options: {
         source: options.source || 'inject',
         from: options.from || 'daemon'
       }
     });
+    parkTrackedInjection(options.injectId, 'bootstrap_queue', 'bootstrap_not_ready');
     session.lastActivityAt = new Date(now).toISOString();
     return bootstrapQueuedResponse(op, {
       msg_id: op.op_id,
@@ -2416,8 +2935,10 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
         type: 'inject',
         prompt,
         noEnter: !!options.noEnter,
+        injectId: options.injectId || null,     // #860 F2 — see the bootstrap-queue push above
         options: { source: options.source || 'inject', from: options.from || 'daemon' },
       }, injectParkDecision);
+      parkTrackedInjection(options.injectId, 'bootstrap_queue', injectParkDecision.reason);
       session.lastActivityAt = new Date(now).toISOString();
       return modalParkResponse(op, injectParkDecision, {
         msg_id: op.op_id,
@@ -2607,13 +3128,34 @@ function serializeSession(id, session, options = {}) {
     ptyPid: session.ptyPid || (session.ptyProcess && session.ptyProcess.pid) || null,
     transport,
     semantic,
-    autoState: autoState ? {
-      state: autoState.state,
-      emoji: (STATE_DISPLAY[autoState.state] || {}).emoji || '?',
-      since: autoState.since,
-      confidence: autoState.confidence,
-      detail: autoState.detail,
-    } : null,
+    // #60 Stage A / §3.8 — BREAKING: `autoState.state:"idle"` is gone from the external surface.
+    // It exported an internal FSM value that consumers read as "the turn is over", and the
+    // sidebar rendered it as a GREEN sleeping pill, i.e. task success. What ships now is the
+    // measured observation (named by cause, neutrally styled) and a SEPARATE completion block
+    // whose fields are permanently null/false in 0.8.0. Consumers must read the two apart.
+    activityObservation: autoState ? (() => {
+      const cause = autoState.detail ? autoState.detail.trigger : null;
+      const mapped = mapObservationCause({
+        destination: autoState.state,
+        cause,
+        evidence: { ...(autoState.detail || {}), confidence: autoState.confidence },
+      });
+      const display = OBSERVATION_DISPLAY[mapped.kind] || OBSERVATION_DISPLAY.unmapped_transition_cause;
+      return {
+        kind: mapped.kind,
+        cause: mapped.cause,
+        emoji: display.emoji,
+        tone: display.tone,
+        since: autoState.since,
+        confidence: autoState.confidence,
+        fields: mapped.fields,
+      };
+    })() : null,
+    completion: {
+      completion_fact: null,
+      terminal: false,
+      capability: { ...CAPABILITY_STAGE_A },
+    },
     mailbox: (() => {
       try {
         const pending = mailbox.peek(id).filter(m => m.state === 'pending' || m.state === 'in_flight');
@@ -2682,6 +3224,11 @@ async function teardownSessionById(id, options = {}) {
 // Detect terminal environment at daemon startup
 const DETECTED_TERMINAL = terminalBackend.detectTerminal();
 console.log(`[DAEMON] Terminal backend: ${DETECTED_TERMINAL}`);
+
+// #60 Stage A: restore the observation ledger BEFORE HTTP/WS readiness, so the first poll after
+// a restart is answered from durable state rather than from an empty map. A restored record
+// gains `daemon_restart_observed` and stays completion-unknown; it can never settle a dispatch.
+restoreTrackedInjections();
 
 // Restore persisted session metadata (wrapped sessions await reconnect)
 const _persisted = loadPersistedSessions();
@@ -3049,8 +3596,10 @@ app.get('/api/sessions', (req, res) => {
 });
 
 // #43 P3 — token-gated historical inject audit query (spec §7). Behind the SAME shared auth
-// middleware as every /api/* route (app.use(createAuthMiddleware) above), so it is 401 for an
-// unauthorized non-local request and open to localhost/allowlisted peers. Filters: since/until,
+// middleware as every /api/* route (app.use(createAuthMiddleware) above), so it is 401 for ANY
+// caller without the token — #820: loopback and an allowlist match are no longer credentials, so
+// "open to localhost/allowlisted peers" is no longer true of this or any other route. Filters:
+// since/until,
 // to (alias-resolved), from (claimed OR verified), spoof; pagination via limit/cursor (newest
 // first). Reads the live injects.jsonl (one write path, file-backed) — separate lifecycle from
 // the ephemeral /api/events live bus, so the two are not conflated.
@@ -3093,11 +3642,33 @@ app.get('/api/sessions/:id/state', (req, res) => {
   const session = sessions[resolvedId];
   const semantic = buildSessionSemanticBlock(session);
 
+  // #60 §3.8: `auto` is renamed to `activity_observation` and names the measured cause, not the
+  // internal state. The completion block is separate and permanently unknown in 0.8.0.
+  const mapped = autoState
+    ? mapObservationCause({
+      destination: autoState.state,
+      cause: autoState.detail ? autoState.detail.trigger : null,
+      evidence: { ...(autoState.detail || {}), confidence: autoState.confidence },
+    })
+    : null;
   res.json({
     session_id: resolvedId,
-    auto: autoState
-      ? { ...autoState, emoji: (STATE_DISPLAY[autoState.state] || {}).emoji || '?' }
-      : { state: 'unknown', emoji: '?', detail: 'no state machine registered' },
+    activity_observation: mapped
+      ? {
+        kind: mapped.kind,
+        cause: mapped.cause,
+        emoji: (OBSERVATION_DISPLAY[mapped.kind] || OBSERVATION_DISPLAY.unmapped_transition_cause).emoji,
+        tone: (OBSERVATION_DISPLAY[mapped.kind] || OBSERVATION_DISPLAY.unmapped_transition_cause).tone,
+        since: autoState.since,
+        since_ms: autoState.since_ms,
+        duration_ms: autoState.duration_ms,
+        confidence: autoState.confidence,
+        last_output_at: autoState.last_output_at,
+        last_output_preview: autoState.last_output_preview,
+        fields: mapped.fields,
+      }
+      : { kind: 'tracking_unavailable', cause: null, emoji: '?', tone: 'neutral', fields: { reason: 'no_state_machine_registered' } },
+    completion: { completion_fact: null, terminal: false, capability: { ...CAPABILITY_STAGE_A } },
     self_report: semantic,
     last_state_report_at: session.lastStateReportAt || null,
   });
@@ -3285,7 +3856,9 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
         }
 
         results.successful.push({ id, strategy: delivery.strategy });
-        auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, 'success');
+        // #860 F2 — a fan-out target that parked the op wrote nothing; same three-value rule as
+        // the single-target route.
+        auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, deliveryAuditResult(delivery));
 
         // Broadcast injection to bus
         broadcastBusEvent({
@@ -3361,7 +3934,7 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
       }
 
       results.successful.push({ id, strategy: delivery.strategy });
-      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, 'success');
+      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, deliveryAuditResult(delivery));  // #860 F2
     } catch (err) {
       results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
       auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, 'failed:DELIVERY_FAILED');
@@ -4062,11 +4635,51 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
     console.warn('[PEER-GUARD] orchestrator sid unconfigured (AIGENTRY_ORCHESTRATOR_SIDS empty) — peer guardrail disabled (fail-open)');
   }
 
+  // #60 Stage A / §3 item 1 — DURABLY RECORD ABSENCE BEFORE DELIVERY.
+  //
+  // This used to run after the delivery call, as a best-effort in-memory assignment. That
+  // ordering is what made silence possible: bytes reached a worker, the daemon restarted, and
+  // nothing anywhere could answer for the dispatch — the orchestrator's poll then got a 404 and
+  // read it as a task-state signal. The commit is transactional (temp → fsync → rename → dir
+  // fsync) and its failure ABORTS the delivery: refusing to deliver is honest, delivering and
+  // then forgetting is not.
+  //
+  // Scoped to tracked injects (`from` present) — an untracked operator inject is unaffected.
+  let trackedRecord = null;
+  if (from) {
+    const begun = beginTrackedInjection({ injectId: inject_id, sessionId: id, source: from, session });
+    if (!begun.ok) {
+      emitInjectFailureEvent(id, 'TRACKING_PERSISTENCE_FAILED',
+        'Observation tracking could not be persisted; no task bytes were delivered.',
+        { inject_id, from: from || null }, session);
+      return respondWithError(res, 500, 'TRACKING_PERSISTENCE_FAILED',
+        'Observation tracking could not be persisted; no task bytes were delivered.',
+        { inject_id, tracking_state: 'unavailable', reason: 'tracking_persistence_failed' });
+    }
+    trackedRecord = begun.record;
+    pendingReports[id] = {
+      source: from,
+      injectedAt: new Date().toISOString(),
+      injectId: inject_id,
+      submitExpected: !!no_enter,
+      noEnter: !!no_enter,
+      injectedBodyPreview: prompt.slice(0, 500),
+      // #52: echo-evidence watermark — only frames appended after this inject count.
+      ringBytesAtInject: session.outputRingTotalBytes || 0,
+      awaitingReport: true
+      // NOTE: no `idleNotified`. The one-way "already spoke" bit is gone; duplicate suppression
+      // is keyed on observation identity in the ledger, where it cannot become an authority gate.
+    };
+  }
+
   try {
     const delivery = await deliverInjectionToSession(id, session, finalPrompt, {
       noEnter: !!no_enter,
       source: 'inject',
       from: from || 'inject',
+      // #860 F2 — carried so that a park keeps its link to the write-ahead record. Null for an
+      // untracked operator inject (no `from`), and every consumer of it no-ops on null.
+      injectId: trackedRecord ? inject_id : null,
       // #47 P4 — the daemon-verified sender (never body.from) labels the provenance banner.
       verifiedSenderSid
     });
@@ -4083,14 +4696,26 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
         origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
         payload: finalPrompt, delivery_result: `failed:${delivery.code || 'DELIVERY_FAILED'}`
       });
-      return respondWithError(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error);
+      // #843 — close the write-ahead record. Without this the refusal is recorded in the AUDIT log
+      // (above) and contradicted in the OBSERVATION ledger, which keeps saying `tracked` /
+      // `inject_accepted` for a dispatch that delivered nothing. `inject_id` rides on the error
+      // body for the same reason: a caller told its dispatch was refused must be able to poll the
+      // record that says so.
+      const aborted = trackedRecord
+        ? abortTrackedInjection(inject_id, id, delivery.code, delivery.error)
+        : 'no_tracked_inject';
+      return respondWithError(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error,
+        { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable' });
     }
 
     if (from) session.lastInjectFrom = from;
     if (reply_to) session.lastInjectReplyTo = reply_to;
     if (thread_id) session.lastThreadId = thread_id;
 
-    console.log(`[INJECT] Wrote to session ${id} (inject_id: ${inject_id})`);
+    // #860 F2 — the service log gets the same distinction the audit line does. "Wrote" was printed
+    // for a queue push too, so an operator grepping the log for a delivery found one that had not
+    // happened.
+    console.log(`[INJECT] ${deliveryAuditResult(delivery) === 'queued' ? 'Queued for' : 'Wrote to'} session ${id} (inject_id: ${inject_id})`);
 
     const injectTimestamp = new Date().toISOString();
     // #43 P1/P2 — one audit line per delivery (claimed + daemon-verified sender, hash-only).
@@ -4099,7 +4724,9 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       claimed_from: from || null, ...verifiedSender,
       to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
       origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
-      payload: finalPrompt, delivery_result: 'success'
+      // #860 F2 — `queued` when the delivery was parked on the bootstrap / modal queue with zero
+      // bytes written, `success` only for a delivery the machinery reported as written.
+      payload: finalPrompt, delivery_result: deliveryAuditResult(delivery)
     });
     broadcastSessionEvent('inject_written', id, session, {
       timestamp: injectTimestamp,
@@ -4125,73 +4752,24 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       }
     });
 
-    // Reverse-match for REPORT detection:
-    // If this inject is FROM a session with a pending report whose source is
-    // the current recipient, and the prompt matches a REPORT prefix, then
-    // this is a content REPORT satisfying enforcement for the sender.
-    if (from) {
-      const senderAlias = resolveSessionAlias(from) || from;
-      const senderPending = pendingReports[senderAlias];
-      const recipientAlias = resolveSessionAlias(id) || id;
-      if (senderPending) {
-        const pendingSourceAlias = resolveSessionAlias(senderPending.source) || senderPending.source;
-        if (pendingSourceAlias === recipientAlias) {
-          // #721 FIX 2 (#579): a prefix-shaped REPORT keeps its precise status; any other payload
-          // the worker routes back to its pending source is still completion evidence (fallback
-          // to 'report_complete') — so a --ref/enveloped REPORT clears the entry instead of the
-          // stale pending report crying wolf at the next honest idle.
-          const classification = resolveOutboundReportStatus(prompt);
-          if (classification) {
-            delete pendingReports[senderAlias];
-            const elapsedSecs = Number(((Date.now() - new Date(senderPending.injectedAt).getTime()) / 1000).toFixed(1));
-            const senderSession = sessions[senderAlias];
-            sessionStateManager.markIdle(senderAlias, 1.0, {
-              trigger: 'report_inject',
-              report_inject_id: inject_id,
-              report_status: classification,
-              source: senderPending.source
-            });
-            const eventType =
-              classification === 'report_blocked' ? 'TASK_BLOCKED_WITH_REASON' :
-              classification === 'report_dismissed' ? 'TASK_DISMISSED' :
-              classification === 'report_error' ? 'TASK_COMPLETE_WITH_REPORT' :
-              'TASK_COMPLETE_WITH_REPORT';
-            broadcastSessionEvent(eventType, senderAlias, senderSession, {
-              extra: {
-                source: senderPending.source,
-                inject_id: senderPending.injectId,
-                report_inject_id: inject_id,
-                elapsed_secs: elapsedSecs,
-                injected_at: senderPending.injectedAt,
-                report_status: classification,
-                report_summary: prompt.slice(0, 500)
-              }
-            });
-            console.log(`[ENFORCE-REPORT] ${eventType} from ${senderAlias} → ${recipientAlias} (${classification}, ${elapsedSecs}s)`);
-          }
-        }
-      }
-    }
+    // #60 Stage A / §3.6: the reverse-text REPORT path is DELETED, not adapted.
+    //
+    // It used to look at any inject a session routed back to its own pending-report source and
+    // call it a completion — `resolveOutboundReportStatus` mapped every payload that was not a
+    // recognised prefix to `report_complete`, so "Can you clarify the requirement?" was recorded
+    // as that worker reporting its task done. It also marked the sender idle from that text and
+    // broadcast TASK_COMPLETE_WITH_REPORT.
+    //
+    // No text can authenticate its sender or correlate itself to a dispatch, so no text may
+    // settle one. In 0.8.0 a reverse-routed inject is an ordinary message and the sender's
+    // tracked record stays completion-unknown. The authenticated, correlated report protocol is
+    // Stage B, and it will not consult pendingReports, the observation ledger, PTY state, or
+    // reverse-route matching (§V2/§7 item 10).
 
-    // Auto-report: track pending inject for idle notification back to source.
-    // Overwrite warning: if an entry already exists, log for observability.
-    if (from) {
-      if (pendingReports[id]) {
-        console.warn(`[AUTO-REPORT] overwritten pending report for ${id} (previous source: ${pendingReports[id].source}, new source: ${from})`);
-      }
-      pendingReports[id] = {
-        source: from,
-        injectedAt: injectTimestamp,
-        injectId: inject_id,
-        submitExpected: !!no_enter,
-        noEnter: !!no_enter,
-        injectedBodyPreview: prompt.slice(0, 500),
-        // #52: echo-evidence watermark — only frames appended after this inject count.
-        ringBytesAtInject: session.outputRingTotalBytes || 0,
-        awaitingReport: true,
-        idleNotified: false
-      };
-    }
+    // The tracked record and the pending entry were both created BEFORE this delivery (see the
+    // begin-tracking block above), so there is nothing to register here. Supersession of a prior
+    // record for the same session is handled there too: the old inject_id keeps its history and
+    // gains `tracking_superseded`, instead of being destructively overwritten.
 
     // Notify all attached viewers (telepty attach clients) about the inject
     // This enables aterm and other viewers to show inject events in real-time
@@ -4249,6 +4827,154 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
   }
 });
 
+// #826 — the OTHER write path, kept next to the route above because they are twins and were
+// diverging silently.
+//
+// `src/transport/websocket.js` forwards an attached viewer's `{type:'input'}` to the PTY owner as
+// `{type:'inject'}`. That is a write into somebody's terminal with exactly the authority of the
+// route above, and until now it applied none of the route's accountability: no `auditAppend`
+// (#47 P5), no `classifyPeerLaneInject` (#533's hard block), no provenance labelling.
+//
+// That gap only became DANGEROUS with #820/#823. Before them the audit log was obviously
+// incomplete — anything on the box could write with no credential, so nobody could read the log
+// as a record of anything. Once every writer is authenticated an operator will reasonably read
+// the inject log as THE record of who typed into a session, and #533 as THE enforcement point.
+// Both would then claim more than they measure. The security fix is what creates the false
+// confidence, which is why this ships in the same release.
+//
+// Held to the SAME rule as the HTTP path, deliberately no stricter: the policy verdict is keyed
+// on a CLAIMED sender at both doors (so #533 remains a policy guardrail, not an authentication
+// boundary), while `verified_sender_*` comes from the #815 bearer presented on the handshake and
+// never from the frame — the same split as `body.from` vs `x-telepty-session-token`.
+//
+// Returns whether the frame may be forwarded. Records the attempt either way.
+function authorizeViewerInject({ sessionId, session, data, claimedFrom, principal }) {
+  const inject_id = crypto.randomUUID();
+  const payload = typeof data === 'string' ? data : '';
+  const verdict = classifyPeerLaneInject({
+    from: claimedFrom, to: sessionId, prompt: payload, orchestratorSids: ORCHESTRATOR_SIDS
+  });
+  const blocked = verdict.decision === 'block';
+
+  if (blocked) {
+    broadcastSessionEvent('peer_inject_blocked', sessionId, session, {
+      extra: {
+        target_agent: sessionId,
+        from: claimedFrom || null,
+        reason: verdict.reason,
+        attempted_kind: verdict.kind,
+        envelope_present: verdict.envelopePresent,
+        inject_id
+      }
+    });
+    console.warn(`[PEER-GUARD] blocked ws-viewer inject ${claimedFrom} → ${sessionId} (${verdict.reason})`);
+  }
+
+  auditAppend({
+    ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'ws-viewer',
+    claimed_from: claimedFrom || null, ...verifiedSenderFields(principal),
+    to: sessionId, to_alias: null,
+    origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: null,
+    payload,
+    // `forwarded`, not `success`. The HTTP route's `success` means its delivery machinery
+    // reported success; all this path can measure is that the frame was written to the owner
+    // socket. Two different measurements must not wear the same word — that substitution is the
+    // defect class this release exists to remove.
+    delivery_result: blocked ? `blocked:${verdict.reason}` : 'forwarded'
+  });
+
+  return !blocked;
+}
+
+// GET /api/inject-observations/:inject_id — #60 Stage A, the orchestrator's poll target.
+//
+// ALWAYS 200 with a discriminated schema-v2 body. Schema v2 never uses 404 as a task-state
+// signal: "the daemon has no record of this inject" and "the task is finished" are different
+// statements, and a status code cannot tell them apart. An absent, pre-v2 or corrupt record is
+// `tracking_state:"unavailable"` with a NAMED reason.
+//
+// Contract notes for consumers:
+//   - `reason` is TOP-LEVEL on the unavailable arm (bin/dispatch-tracker.sh reads it there).
+//   - `observation` is always an object and `observation.kind` always a string.
+//   - `completion_fact` is always null and `terminal` always false in 0.8.0. There is no code
+//     path in this release that can set either to anything else.
+//   - An UNAUTHENTICATED caller never reaches this handler: the HTTP auth middleware answers
+//     401/403 first, with no body of this schema. A 401 therefore means "prove who you are",
+//     NOT "this endpoint is absent" and NOT "nothing is tracked" — a consumer that folds it into
+//     an absence reason is making exactly the overclaim this release removes. Send the daemon
+//     token (`x-telepty-token`).
+app.get('/api/inject-observations/:inject_id', (req, res) => {
+  const injectId = req.params.inject_id;
+
+  const unavailable = (reason, extra = {}) => res.status(200).json({
+    type: 'task_completion_unknown',
+    schema_version: 2,
+    inject_id: injectId,
+    completion_fact: null,
+    terminal: false,
+    tracking_state: 'unavailable',
+    reason,
+    observation: { kind: 'tracking_unavailable', trigger: reason },
+    consumption: { status: 'not_established', basis: 'no_tracked_inject' },
+    capability: { ...CAPABILITY_STAGE_A },
+    ...extra,
+  });
+
+  if (!trackedLedgerHealthy) {
+    return unavailable(trackedLedgerUnavailableReason || 'observation_store_unavailable');
+  }
+  const record = getTrackedInjection(injectId);
+  if (!record) {
+    // Either it was never tracked here, or it predates this daemon's schema-v2 store. Both are
+    // "this daemon epoch did not observe it" — explicitly, not by omission.
+    return unavailable('not_observed_by_daemon_epoch');
+  }
+
+  // #843 — the consumption block must be measured FOR THE INJECT BEING POLLED. This read
+  // `getPendingReport(record.session_id)` — whichever inject currently owns that session's pending
+  // slot — with no check that it is the same one. `GET /api/inject-observations/A` therefore
+  // changed its answer when an unrelated inject B arrived and became byte-identical to `GET B`
+  // while A was marked superseded: one inject's evidence served under another inject's id. That is
+  // the same substitution this release removes everywhere else, at the endpoint an orchestrator
+  // polls to decide what happened to a specific dispatch.
+  //
+  // When the slot belongs to someone else, the honest answer is that this inject has no
+  // consumption evidence of its own — named, not borrowed.
+  const activePendingReport = getPendingReport(record.session_id);
+  const pendingReport = activePendingReport && activePendingReport.injectId === record.inject_id
+    ? activePendingReport
+    : null;
+  const consumption = pendingReport
+    ? classifyConsumption(pendingReport)
+    : {
+      status: 'not_established',
+      basis: activePendingReport ? 'pending_report_belongs_to_other_inject' : 'no_active_pending_report',
+      ...(activePendingReport ? { active_inject_id: activePendingReport.injectId || null } : {}),
+    };
+  const last = record.last_observation || { kind: 'tracking_started', trigger: 'inject_accepted' };
+
+  return res.status(200).json({
+    type: 'task_completion_unknown',
+    schema_version: 2,
+    session_id: record.session_id,
+    inject_id: record.inject_id,
+    completion_fact: null,
+    terminal: false,
+    // #843 — `aborted` travels too. Collapsing it into `tracked` would put a dispatch that
+    // delivered zero bytes back into the in-flight bucket the abort exists to take it out of.
+    tracking_state: ['superseded', 'aborted'].includes(record.tracking_state) ? record.tracking_state : 'tracked',
+    observation: last,
+    observation_seq: record.observation_seq,
+    observations: record.observations || [],
+    consumption,
+    session_epoch: record.session_epoch,
+    session_epoch_reason: record.session_epoch_reason,
+    transport_source: record.transport_source,
+    created_at: record.created_at,
+    capability: record.capability || { ...CAPABILITY_STAGE_A },
+  });
+});
+
 // GET /api/pendingReports/:id — inspect pending report entry + optional auto_summary
 app.get('/api/pendingReports/:id', (req, res) => {
   const requestedId = req.params.id;
@@ -4264,7 +4990,19 @@ app.get('/api/pendingReports/:id', (req, res) => {
     source: entry.source,
     inject_id: entry.injectId,
     injected_at: entry.injectedAt,
-    idle_notified: !!entry.idleNotified,
+    // #60 Stage A: `idle_notified` is GONE from this response. It was the PTY-derived false
+    // authority — a consumer that read it as "the worker finished" was reading a debounce bit.
+    // The honest replacement is the observation itself, from the ledger.
+    tracking_state: (() => {
+      const rec = getTrackedInjection(entry.injectId);
+      return rec ? rec.tracking_state : 'unavailable';
+    })(),
+    last_observation: (() => {
+      const rec = getTrackedInjection(entry.injectId);
+      return rec ? rec.last_observation : null;
+    })(),
+    completion_fact: null,
+    terminal: false,
     idle_at: entry.idleAt || null,
     awaiting_report: !!entry.awaitingReport,
     submit_expected: !!entry.submitExpected,
@@ -4404,6 +5142,35 @@ app.post('/api/sessions/:id/kill', async (req, res) => {
   }
 });
 
+/**
+ * #843 A — the DELETE teardown response, as a value. PURE.
+ *
+ * Two different things happened and they must not answer with the same word. `killError === null`
+ * means the teardown call returned; a non-null one means it threw, the registry record was removed
+ * anyway (leaving a half-torn record would be worse), and therefore the daemon can no longer
+ * observe or signal a process that may still be running. That is a condition to report, not a
+ * `status` string tacked onto a success.
+ *
+ * Pure and exported because the branch is otherwise unreachable from a test: node-pty's `kill()`
+ * swallows ESRCH on a reaped child, so nothing an integration test can arrange makes the real call
+ * throw — and an unreachable branch that returns success is precisely what shipped.
+ */
+function describeSessionTeardown(killError) {
+  if (!killError) return { httpStatus: 200, body: { success: true, status: 'closing' } };
+  return {
+    httpStatus: 500,
+    body: {
+      success: false,
+      code: 'KILL_FAILED',
+      status: 'registry-removed-kill-unconfirmed',
+      error: `Session teardown failed: ${killError.message || String(killError)}. `
+        + 'The registry record was removed, so this process is no longer tracked by the daemon '
+        + 'and may still be running.',
+      registry_removed: true,
+    },
+  };
+}
+
 app.delete('/api/sessions/:id', (req, res) => {
   const requestedId = req.params.id;
   // #548: destructive op — must not cascade across alias-sharing siblings.
@@ -4424,6 +5191,14 @@ app.delete('/api/sessions/:id', (req, res) => {
       && isOpenWebSocket(session.ownerWs)) {
     return res.json({ success: true, status: 'stale-detached' });
   }
+  // #843 A — the kill outcome is MEASURED, not inferred from which block ran. The two arms used
+  // to be a `try` returning `{success:true, status:'closing'}` and a `catch` returning
+  // `{success:true, status:'force-removed'}`: a kill that THREW answered success. The process may
+  // still be running, the registry record is gone, so nothing tracks it any more — and
+  // `bin/session-cleanup.sh`, the operator entrance here, read that success as "the worker is
+  // gone". Capturing the error as a value collapses the duplicated teardown into one path and
+  // makes "a failed kill does not report success" structural rather than a thing to remember.
+  let killError = null;
   try {
     session.isClosing = true;
     if (session.type === 'wrapped') {
@@ -4431,30 +5206,41 @@ app.delete('/api/sessions/:id', (req, res) => {
     } else if (session.ptyProcess) {
       session.ptyProcess.kill();
     }
-    // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
-    // verdict — NO-OP on the managed path. The orchestrator's session-cleanup.sh closes the
-    // surface on this normal CLI-exit (CLEANUP_REQUEST→wh_close). Actuates only for a standalone
-    // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
-    try { terminalBackend.closeSurface(session); } catch {}
-    delete sessions[id];
-    revokeSessionCredential(id);    // #815: DELETE — revoke before the id can be reused
-    sessionStateManager.unregister(id);
-    try { mailbox.purge(id); } catch {}
-    lifecycle.cleanupSessionArtifacts(id);
-    console.log(`[KILL] Session ${id} removed`);
-    persistSessions();
-    res.json({ success: true, status: 'closing' });
   } catch (err) {
-    // Even if kill fails, remove from registry
-    delete sessions[id];
-    revokeSessionCredential(id);    // #815: same on the error path — never leave a live epoch
-    sessionStateManager.unregister(id);
-    try { mailbox.purge(id); } catch {}
-    lifecycle.cleanupSessionArtifacts(id);
-    persistSessions();
-    console.log(`[KILL] Session ${id} force-removed (process cleanup error: ${err.message})`);
-    res.json({ success: true, status: 'force-removed' });
+    killError = err;
   }
+  // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
+  // verdict — NO-OP on the managed path. The orchestrator's session-cleanup.sh closes the
+  // surface on this normal CLI-exit (CLEANUP_REQUEST→wh_close). Actuates only for a standalone
+  // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
+  try { terminalBackend.closeSurface(session); } catch {}
+  // #60 Stage A §A2 (F1) — OBSERVE THE END BEFORE THE RECORD DISAPPEARS.
+  //
+  // This used to `delete sessions[id]` first and mark nothing at all. The PTY kill's onExit fires
+  // asynchronously, by which point the record is gone, so the transition listener's
+  // `if (!session) return` guard bailed and the end was emitted on NO channel. Silence is the one
+  // output Stage A forbids, and this is the entrance operator tooling uses, so every cleaned-up
+  // session was saying nothing about its own end while the natural-exit path said it correctly.
+  //
+  // #843 A — and it is `markTerminationRequested`, not `markDead`. The A2 repair above was right
+  // to leave exit code and signal null (no exit status was observed at this instant, and
+  // inventing one would be a measurement we did not make) and then routed through the one method
+  // whose external name is `session_process_exited`. Honest fields under a name that contradicted
+  // them. The mark runs synchronously, so the observation is emitted while `sessions[id]` is still
+  // live; unregister then destroys the machine, which also makes the later onExit markDead a no-op
+  // (its `if (sm)` guard) rather than a second, differently-named statement about one ending.
+  sessionStateManager.markTerminationRequested(id, 'operator_delete', killError && killError.message);
+  sessionStateManager.unregister(id);
+  delete sessions[id];
+  revokeSessionCredential(id);    // #815: DELETE — revoke before the id can be reused
+  try { mailbox.purge(id); } catch {}
+  lifecycle.cleanupSessionArtifacts(id);
+  persistSessions();
+  const teardown = describeSessionTeardown(killError);
+  console.log(killError
+    ? `[KILL] Session ${id} registry-removed but the kill was NOT confirmed: ${killError.message}`
+    : `[KILL] Session ${id} removed`);
+  res.status(teardown.httpStatus).json(teardown.body);
 });
 
 // Shared auto-router: handles turn_request events from any source (WS or HTTP)
@@ -4486,10 +5272,66 @@ async function busAutoRoute(msg) {
 
   const prompt = (msg.payload && msg.payload.prompt) || msg.content || msg.prompt || JSON.stringify(msg);
   const inject_id = crypto.randomUUID();
+
+  // #843 B — the THIRD write door, and until now the only one with no accountability at all.
+  //
+  // This writes into any session's PTY with exactly the authority of
+  // `POST /api/sessions/:id/inject`, and it applied neither of that route's two rules: no
+  // `classifyPeerLaneInject` verdict and no `auditAppend` line. Reproduced against one daemon:
+  // the HTTP door refuses `from:'aigentry-coder-a' → victim` with 403 PEER_INJECT_BLOCKED and
+  // records the attempt; the identical payload re-addressed to `POST /api/bus/publish` returned
+  // 200, landed in the PTY, and left the audit log unchanged. A guardrail enforced at two doors
+  // of three is not a guardrail — it is the false confidence this release exists to remove, and
+  // #826 shipped believing there were two doors.
+  //
+  // The claimed sender is read ONLY from fields that name a session id. `msg.from` is the direct
+  // analogue of `body.from`. `msg.source` is accepted only when it carries no `:` — the bus
+  // envelope defines `source` as `project:session_id` (BUS_EVENT_SCHEMA.md), which is a different
+  // namespace, and mapping it into the sid namespace would invent an identity and false-block
+  // legitimate deliberation routing. An event that names no sender resolves to `null`, which
+  // classifies as `no-sender` and is ALLOWED — deliberately the same answer the HTTP door gives a
+  // body with no `from`. This is accountability parity, not a new restriction: the unattributed
+  // bus route keeps working, and now it leaves a record.
+  const busSource = typeof msg.source === 'string' && !msg.source.includes(':') ? msg.source : null;
+  const claimedFrom = (typeof msg.from === 'string' && msg.from) || busSource || null;
+  const peerVerdict = classifyPeerLaneInject({
+    from: claimedFrom, to: targetId, prompt, orchestratorSids: ORCHESTRATOR_SIDS
+  });
+  const auditBusWrite = (deliveryResult) => auditAppend({
+    ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'bus',
+    claimed_from: claimedFrom,
+    // The bus is not an authorization boundary — any local socket may publish to it with no
+    // credential — so nothing arriving here is a verified identity. Absence, stated as absence.
+    ...verifiedSenderFields(null),
+    to: targetId, to_alias: rawTarget !== targetId ? rawTarget : null,
+    origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: null,
+    payload: prompt, delivery_result: deliveryResult
+  });
+
+  if (peerVerdict.decision === 'block') {
+    broadcastSessionEvent('peer_inject_blocked', targetId, targetSession, {
+      extra: {
+        target_agent: targetId, from: claimedFrom, reason: peerVerdict.reason,
+        attempted_kind: peerVerdict.kind, envelope_present: peerVerdict.envelopePresent,
+        inject_id, source: 'bus_auto_route', turn_id: turnId
+      }
+    });
+    auditBusWrite(`blocked:${peerVerdict.reason}`);
+    console.warn(`[PEER-GUARD] blocked bus-route inject ${claimedFrom} → ${targetId} (${peerVerdict.reason})`);
+    emitInjectFailureEvent(targetId, 'PEER_INJECT_BLOCKED', `Peer-lane inject blocked: ${peerVerdict.reason}`, {
+      source: 'bus_auto_route', turn_id: turnId, original_message_id: msg.message_id || null
+    }, targetSession);
+    return;
+  }
+
   const delivery = await deliverInjectionToSession(targetId, targetSession, prompt, {
     source: 'bus_auto_route'
   });
   const delivered = delivery.success === true;
+  // #860 F2 — `queued` for an op parked on the bootstrap / modal queue: this route audits the bus
+  // door, and a door that recorded a write which never happened is the gap #826 opened this log to
+  // close.
+  auditBusWrite(delivered ? deliveryAuditResult(delivery) : `failed:${delivery.code || 'DELIVERY_FAILED'}`);
   if (!delivered) {
     emitInjectFailureEvent(targetId, delivery.code, delivery.error, {
       source: 'bus_auto_route',
@@ -4497,6 +5339,22 @@ async function busAutoRoute(msg) {
       original_message_id: msg.message_id || null
     }, targetSession);
   }
+
+  // #861 — `delivered` means BYTES WERE WRITTEN, and a park writes none.
+  //
+  // `bootstrapQueuedResponse` returns `success: true` for an op parked on the bootstrap /
+  // surface-modal queue, so `delivery.success` cannot carry this field on its own. #860 made the
+  // audit log say `queued` for exactly that case and this event went on saying `delivered: true`
+  // about the same inject — and the asymmetry ran the wrong way: `injects.jsonl` is token-gated
+  // while any local process may subscribe to the bus with no credential, so the honest record sat
+  // behind the credential and the false one was in the open.
+  //
+  // Asked THROUGH `deliveryAuditResult` rather than re-expressed here. It is the same question the
+  // audit line two lines up asks, and two writers of one predicate — with nothing binding them — is
+  // the shape every drift defect in this release has: the answers agree until someone edits one.
+  // The keying (strategy as well as flag) and its reason live there, at the single writer.
+  const parked = deliveryAuditResult(delivery) === 'queued';
+  const wrote = delivered && !parked;
 
   // Emit inject_written ack
   broadcastSessionEvent('inject_written', targetId, targetSession, {
@@ -4507,12 +5365,16 @@ async function busAutoRoute(msg) {
       source_type: 'bus_auto_route',
       turn_id: (msg.payload && msg.payload.turn_id) || null,
       original_message_id: msg.message_id || null,
-      delivered,
+      delivered: wrote,
+      // The audit log's own vocabulary, carried on the UNGUARDED surface too, so a subscriber can
+      // tell "accepted and parked" from "refused" without opening a log it may hold no token for.
+      // A park is not a failure: `code`/`error` stay null below, because nothing went wrong.
+      delivery_result: wrote ? 'success' : parked ? 'queued' : `failed:${delivery.code || 'DELIVERY_FAILED'}`,
       code: delivered ? null : delivery.code,
       error: delivered ? null : delivery.error
     }
   });
-  console.log(`[BUS-ROUTE] ${eventType} → ${targetId}: ${delivered ? 'delivered' : 'failed'}`);
+  console.log(`[BUS-ROUTE] ${eventType} → ${targetId}: ${wrote ? 'delivered' : parked ? 'queued (parked, 0 bytes)' : 'failed'}`);
 }
 
 app.post('/api/bus/publish', (req, res) => {
@@ -4988,7 +5850,10 @@ if (require.main === module) setInterval(() => {
     // Auto-report fallback for non-wrapped sessions (legacy threshold path).
     // Skip if onTransition already fired the idle notification.
     const pendingRpt = pendingReports[id];
-    if (pendingRpt && !pendingRpt.idleNotified && session.type !== 'wrapped' && idleSeconds !== null && idleSeconds >= AUTO_REPORT_IDLE_SECONDS) {
+    // #60 Stage A: the `!idleNotified` once-only guard is gone — repeat observations are deduped
+    // by identity inside the emitter, which returns `observation_duplicate` instead of silently
+    // dropping a later genuine measurement.
+    if (pendingRpt && session.type !== 'wrapped' && idleSeconds !== null && idleSeconds >= AUTO_REPORT_IDLE_SECONDS) {
       // silence-timeout: session has been quiet past the threshold without a REPORT.
       fireAutoReport(id, session, pendingRpt, 'silence-timeout');
     }
@@ -5020,12 +5885,28 @@ if (require.main === module) setInterval(() => {
       }
     }
 
-    // #17: CONNECTED-zombie GC via cmux surface-liveness. Post-08cd796 a wrapped cmux bridge
-    // SURVIVES its terminal app's death, so ownerWs stays OPEN and the 300s disconnect-GC
-    // (below) never fires. If the workspace was EXPLICITLY closed while cmux itself is alive,
-    // the session is a headless zombie → reclaim it after a grace window. INV-17: isSurfaceAlive
-    // returns 'unknown' when cmux is unreachable (app-quit/restart vanishes ALL surfaces at
-    // once), so this GCs NOTHING in that case — preserving the #486/#488 survival guarantee.
+    // #17: CONNECTED-zombie detection via cmux surface-liveness. Post-08cd796 a wrapped cmux
+    // bridge SURVIVES its terminal app's death, so ownerWs stays OPEN and the 300s disconnect-GC
+    // (below) never fires. If the workspace was EXPLICITLY closed while cmux itself is alive, the
+    // session is a headless-zombie CANDIDATE.
+    //
+    // #844: it is a candidate, and this block no longer reclaims one. What INV-17 actually
+    // establishes is narrower than it read: `isSurfaceAlive` returns 'unknown' when cmux is
+    // unreachable or answers with something that is not a parseable listing, so those cases GC
+    // nothing — but "the uuid was missing from a listing we could parse" is still a statement
+    // about ANOTHER TOOL'S STDOUT, and this block only ever runs for sessions whose owner socket
+    // is OPEN. That socket is this daemon's own, first-hand, present-tense measurement that the
+    // session is alive, and it outranks the parsed absence rather than merely gating the look at
+    // it. So the outcome here is the `surface_orphaned` SIGNAL, once, and nothing else. The
+    // #486/#488 survival guarantee is preserved by construction now, not only in the
+    // unreachable-cmux case.
+    //
+    // Stated so nobody has to assume it: NO consumer reclaims the session on that signal today.
+    // The orchestrator's always-on `wh_alive` sweep closes the SURFACE; its event-driven consumer
+    // for this event reads a state file no bus→file bridge writes, so it is dormant (orchestrator
+    // task #847). A session whose workspace is gone while its owner socket stays open therefore
+    // persists here until the disconnect-GC or an explicit cleanup. That is the intended trade —
+    // the alternative was destroying it on evidence weaker than the socket being overridden.
     if (session.type === 'wrapped' && session.backend === 'cmux' && session.cmuxWorkspaceId
         && isOpenWebSocket(session.ownerWs)) {
       const mismatchProbe = terminalBackend.detectSurfaceMismatch(session, { sessionId: id });
@@ -5042,36 +5923,45 @@ if (require.main === module) setInterval(() => {
       }
 
       const liveness = terminalBackend.isSurfaceAlive(session);
-      const gcAction = decideSurfaceGc(liveness, session, now);
+      // #844: the verdict, then what it is allowed to actuate. This block is entered ONLY when the
+      // owner socket is open, so the pre-#844 code used "a uuid did not appear in cmux's stdout"
+      // to override "this session is connected right now" — the weaker measurement overriding the
+      // stronger, first-hand one. The open socket blocks the kill; the `surface_orphaned` signal
+      // still goes out, once. See the block comment above for what does and does not consume it.
+      const gcAction = decideSurfaceGcAction(decideSurfaceGc(liveness, session, now), {
+        ownerConnected: true,
+        alreadySignalled: Boolean(session.surfaceOrphanSignalledAt)
+      });
       if (gcAction === 'mark') {
         session.surfaceGoneAt = new Date().toISOString();
         console.log(`[SURFACE-GC] cmux workspace gone for ${id} (${session.cmuxWorkspaceId}) — ${SURFACE_ORPHAN_SECONDS}s grace started`);
-      } else if (gcAction === 'reclaim') {
+      } else if (gcAction === 'signal') {
         const goneSeconds = Math.floor((now - new Date(session.surfaceGoneAt).getTime()) / 1000);
-        console.log(`[SURFACE-GC] Reclaiming headless cmux zombie ${id} after ${goneSeconds}s surface-gone`);
-        emitSessionLifecycleEvent('session_cleanup', id, session, {
-          reason: 'SURFACE_GONE',
-          surfaceGoneSeconds: goneSeconds
-        });
-        // Surface-ownership verdict (2026-05-30): telepty reclaims the zombie SESSION but does
-        // NOT close the surface. Emit the orphan SIGNAL so the orchestrator's reconciler closes
-        // the surface (wh_close). telepty signals; the orchestrator actuates.
+        console.log(`[SURFACE-GC] cmux workspace still absent for ${id} after ${goneSeconds}s — signalling surface_orphaned; the owner socket is OPEN so this session is NOT reclaimed here`);
+        // Surface-ownership verdict (2026-05-30): telepty does NOT close the surface — it emits
+        // the orphan SIGNAL and the orchestrator's sweep closes it. #844 extends the same split to
+        // the SESSION: a workspace uuid missing from another tool's stdout does not outrank this
+        // daemon's own open socket to the session, so the signal is the whole action here. Note
+        // the asymmetry, because it is load-bearing: the surface half HAS an always-on consumer,
+        // the session half does not yet (orchestrator #847), so this session stays until the
+        // disconnect-GC or an explicit cleanup.
         broadcastSessionEvent('surface_orphaned', id, session, {
           extra: {
             sid: id,
             backend: session.backend || null,
             cmuxWorkspaceId: session.cmuxWorkspaceId || null,
             surfaceGoneSeconds: goneSeconds,
-            livenessVerdict: liveness
+            livenessVerdict: liveness,
+            ownerSocketOpen: true,
+            reclaimed: false
           }
         });
-        teardownSessionById(id, { force: true, timeoutMs: 5000, reason: 'SURFACE_GONE', source: 'surface_gc' })
-          .catch(err => console.error(`[SURFACE-GC] teardown failed for ${id}: ${err.message}`));
-        continue; // being destroyed — skip remaining checks for this session this tick
+        session.surfaceOrphanSignalledAt = new Date().toISOString(); // once, not once per tick
       } else if (gcAction === 'recover') {
         // Recovery within the grace window (mirrors the aterm socket-recover above).
         console.log(`[SURFACE-GC] cmux workspace recovered for ${id} — clearing grace window`);
         session.surfaceGoneAt = null;
+        session.surfaceOrphanSignalledAt = null; // #844: a later genuine absence signals again
       }
       // 'skip' (incl. 'unknown' — INV-17 gate) → leave surfaceGoneAt unchanged, GC nothing.
     }
@@ -5168,7 +6058,17 @@ installWebSocketTransport({
   markSessionDisconnected,
   resolveSessionAlias,
   applySessionStateReport,
-  busAutoRoute
+  busAutoRoute,
+  // #60 Stage A §3 — the total observation emitter and the per-session ledger query, so the
+  // transport can persist #815's owner-replaced / owner-death facts against every tracked inject
+  // instead of only announcing them on the bus. fireAutoReport is NOT usable for these: it falls
+  // into the #48/#52 settle window and drops the emission when the session is busy, and an owner
+  // replacement is a hard fact the daemon knows with certainty.
+  recordObservation,
+  listTrackedInjectionsForSession,
+  // #826 — the viewer write path gets the same policy verdict and the same audit line as
+  // POST /api/sessions/:id/inject. See authorizeViewerInject.
+  authorizeViewerInject
 });
 
 function shutdown(code) {
@@ -5194,8 +6094,17 @@ if (require.main === module) {
 module.exports = {
   fireAutoReport,                 // #32: provenance-tagged auto-report (deps DI: now/deliver/...)
   detectIdleAfterError,           // #801: turn-scoped error-death verdict (TASK_ERROR vs TASK_COMPLETE)
-  maybeRecordInjectConsumption,   // #619: durable early-consumption fact capture (idle-gate decay-proofing)
-  resolveOutboundReportStatus,    // #721 FIX 2 (#579): reverse-match completion verdict + non-prefix fallback
+  maybeRecordInjectConsumption,   // #60 Stage A: records the fresh-busy-edge CANDIDATE (see the fn comment)
+  maybeRecordLauncherConsumption, // #60 Stage A: launcher watermark telemetry — never consumption
+  recordObservation,              // #60 Stage A: the TOTAL observation emitter (named result on every path)
+  describeSessionTeardown,        // #843: DELETE teardown response — a failed kill never reports success
+  beginTrackedInjection,          // #60 Stage A: durable write-before-delivery tracking record
+  sessionAuthenticationCapability, // #860 F1: "observed" requires a bearer that was PRESENTED and verified
+  deliveryAuditResult,            // #860 F2: audit `delivery_result` — `queued` is not `success`
+  getTrackedInjection,            // #60 Stage A: ledger read by inject_id
+  listTrackedInjectionsForSession, // #60 Stage A: ledger read by session (owner-lifecycle fan-out)
+  restoreTrackedInjections,       // #60 Stage A: restore + daemon_restart_observed, before readiness
+  observeInjectEchoEvidence,      // #60 Stage A: ring-scoped echo evidence (a field, no longer a gate)
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
   isTerminalGateFailure,          // #678: submit-gate disposition — no_state is best-effort dispatch, not hard-fail
   terminalLevelSubmit,            // #544: PTY-only submit path (pty_cr | null)

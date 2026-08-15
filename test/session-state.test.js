@@ -99,7 +99,12 @@ describe('OSC 133 prompt → idle', () => {
     const state = sm.getState();
     assert.equal(state.state, 'idle');
     assert.equal(state.confidence, 0.95);
-    assert.equal(state.detail.trigger, 'osc_133_prompt');
+    // #60 §2.3: `osc_133_prompt` split. The RAW marker arrival keeps its measurement under
+    // `osc_133_a_or_b_received`; the _tick "quiet after a recent marker" cause is a separate
+    // name now, so a silence timeout can no longer borrow a marker it never saw.
+    assert.equal(state.detail.trigger, 'osc_133_a_or_b_received');
+    // The cause row cannot be stated without it, so its absence would fail closed.
+    assert.ok(state.detail.timestamp, 'raw marker arrival carries its timestamp evidence');
     sm.destroy();
   });
 });
@@ -125,7 +130,7 @@ describe('working state', () => {
 
     const state = sm.getState();
     assert.equal(state.state, 'idle');
-    assert.equal(state.detail.trigger, 'osc_133_prompt');
+    assert.equal(state.detail.trigger, 'osc_133_a_or_b_received');
     sm.destroy();
   });
 });
@@ -248,7 +253,16 @@ describe('error state', () => {
     assert.notEqual(sm.getState().state, 'error'); // 2 errors not enough
     sm.feed('Error: connection refused\n');
     assert.equal(sm.getState().state, 'error'); // 3 errors → error
-    assert.equal(sm.getState().detail.trigger, 'repeated_error');
+    // #60 §2.3: renamed `repeated_error` → `repeated_error_pattern`. Both error entrances land
+    // in `error`, but they measure different things (a repeated pattern vs a thinking timeout);
+    // the destination alone can no longer name either one.
+    const detail = sm.getState().detail;
+    assert.equal(detail.trigger, 'repeated_error_pattern');
+    // The evidence the cause row cannot be stated without — absence fails closed to
+    // `unmapped_transition_cause` rather than emitting the strong name with a hole in it.
+    assert.ok(detail.error_fingerprint, 'carries the error fingerprint');
+    assert.equal(detail.repeat_count, 3);
+    assert.ok(Number.isFinite(detail.window_ms), 'carries the dedup window');
     sm.destroy();
   });
 });
@@ -413,16 +427,19 @@ describe('SessionStateManager', () => {
     mgr.destroyAll();
   });
 
-  it('markIdle forces a working session to idle with semantic detail', () => {
+  it('markIdle forces a working session to idle and normalizes the caller trigger', () => {
     const mgr = new SessionStateManager();
     mgr.register('s1');
     mgr.feed('s1', 'task output\n');
     assert.equal(mgr.getState('s1').state, 'working');
 
+    // This used to assert `detail.trigger === 'report_inject'` — that a CALLER could name the
+    // cause of an idle mark. #60 §2.3 withdraws that: a caller mark measures nothing about the
+    // screen, so caller detail is now spread BEFORE the cause and the cause is always
+    // `manual_state_mark`. `report_status` is gone with the report classifier and is not passed.
     const marked = mgr.markIdle('s1', 1.0, {
       trigger: 'report_inject',
       report_inject_id: 'report-1',
-      report_status: 'report_complete',
       source: 'orchestrator',
     });
 
@@ -430,8 +447,23 @@ describe('SessionStateManager', () => {
     assert.equal(marked, true);
     assert.equal(state.state, 'idle');
     assert.equal(state.confidence, 1.0);
-    assert.equal(state.detail.trigger, 'report_inject');
+    assert.equal(state.detail.trigger, 'manual_state_mark');
+    // Caller CONTEXT still passes through — it just cannot rename the measurement.
     assert.equal(state.detail.report_inject_id, 'report-1');
+    assert.equal(state.detail.source, 'orchestrator');
+    mgr.destroyAll();
+  });
+
+  it('markIdle caller cannot borrow a screen-derived cause', () => {
+    const mgr = new SessionStateManager();
+    mgr.register('s1');
+    mgr.feed('s1', 'task output\n');
+
+    // The strong form of the above: the exact string a real marker arrival produces, supplied by
+    // a caller who saw no marker, must not survive. Overwriting here is how a bare caller mark
+    // used to present itself as a 0.95-confidence OSC-133 measurement.
+    mgr.markIdle('s1', 1.0, { trigger: 'osc_133_a_or_b_received' });
+    assert.equal(mgr.getState('s1').detail.trigger, 'manual_state_mark');
     mgr.destroyAll();
   });
 

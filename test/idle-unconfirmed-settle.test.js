@@ -31,6 +31,41 @@ const { fireAutoReport } = daemon;
 
 const T0 = 1_700_000_000_000; // fixed clock origin
 
+// #60 Stage A: fireAutoReport no longer CHOOSES a label. It emits one literal statement that
+// names the measured cause and says, in words, that no completion fact exists. `TASK_COMPLETE`
+// (a claim it could not measure) and `TASK_IDLE_UNCONFIRMED` (which asserted the inject may not
+// have been processed — also unmeasurable) are both gone, along with the elapsed-time floor that
+// used to pick between them.
+const COMPLETION_UNKNOWN_RE =
+  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-48 — no completion fact observed; (\S+?)(?:=(\d+\.\d)s)?(?:; elapsed_since_inject=(\d+\.\d)s)?; consumption=(observed|not_established); outcome protocol unavailable$/;
+
+const REMOVED_LABELS = [/TASK_COMPLETE:/, /TASK_IDLE_UNCONFIRMED:/, /TASK_COMPLETE_WITH_REPORT/];
+
+// The observation kinds that describe a session having gone QUIET or a bridge claiming ready.
+// Announcing one of these while the session is in fact working IS the #48 false positive.
+const QUIET_OR_READY_KINDS = [
+  'pty_quiet', 'prompt_suffix_after_quiet_observed', 'pty_quiet_after_osc_133_a_or_b_observed',
+  'legacy_ready_observed', 'composer_surface_observed', 'prompt_suffix_observed',
+];
+
+function assertStatesAbsence(msg) {
+  const m = COMPLETION_UNKNOWN_RE.exec(msg);
+  assert.ok(m, `not the literal absence statement: ${msg}`);
+  for (const re of REMOVED_LABELS) assert.doesNotMatch(msg, re);
+  // #843: the kind's OWN measurement and the elapsed-since-inject qualifier are separate
+  // segments now. They were one — whichever was present filled `<kind>=<n>s` — so a 3s quiet
+  // 900s into a dispatch printed as `pty_quiet=900.0s`.
+  return { kind: m[1], seconds: Number(m[2]), elapsedSeconds: Number(m[3]), consumption: m[4] };
+}
+
+function completionUnknownEvent(ctx) {
+  const ev = ctx.broadcasts.find((b) => b.type === 'task_completion_unknown');
+  assert.ok(ev, 'the bus always hears the absence');
+  assert.equal(ev.opts.extra.completion_fact, null);
+  assert.equal(ev.opts.extra.terminal, false);
+  return ev.opts.extra;
+}
+
 // Build a DI context around fireAutoReport: captured timers (flushed manually, advancing
 // the injected clock), captured deliveries/broadcasts, and a mutable auto-state.
 function makeGate({ elapsedSec = 0.2, pendingReportOverrides = {}, autoState = 'idle' } = {}) {
@@ -71,9 +106,14 @@ function makeGate({ elapsedSec = 0.2, pendingReportOverrides = {}, autoState = '
 test('#48 FP: ready-signal 0.2s after a plain inject does NOT notify immediately — settle armed', () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
   ctx.fire();
-  assert.equal(ctx.delivered.length, 0, 'no immediate UNCONFIRMED delivery');
-  assert.equal(ctx.broadcasts.length, 0, 'no immediate TASK_IDLE_NO_REPORT broadcast');
-  assert.equal(ctx.pendingReport.idleNotified, undefined, 'once-only guard not consumed');
+  assert.equal(ctx.delivered.length, 0, 'no immediate follow-up delivery');
+  assert.equal(ctx.broadcasts.length, 0, 'no immediate broadcast');
+  // `idleNotified` is RETIRED — the once-only guard is now ledger identity dedup inside the
+  // emitter. Asserting the old flag is undefined would be vacuous (nothing sets it), so the
+  // live marker is asserted instead: the settle window is open and has not been marked done.
+  assert.equal('idleNotified' in ctx.pendingReport, false, 'the retired once-only flag is not resurrected');
+  assert.equal(ctx.pendingReport.unconfirmedSettleDone, undefined, 'settle not yet concluded');
+  assert.ok(ctx.pendingReport.unconfirmedSettleTimer, 'settle window is open');
   assert.equal(ctx.timers.length, 1, 'settle recheck timer armed');
 });
 
@@ -84,7 +124,8 @@ test('#48 FP: session working at recheck → suppressed entirely, once-only guar
   ctx.flushTimers();
   assert.equal(ctx.delivered.length, 0, 'suppressed — inject IS being processed');
   assert.equal(ctx.broadcasts.length, 0);
-  assert.equal(ctx.pendingReport.idleNotified, undefined, 'a later busy→idle transition may still notify');
+  assert.equal(ctx.pendingReport.unconfirmedSettleDone, undefined,
+    'suppression consumed nothing — a later busy→idle observation may still be stated');
 });
 
 test('#48 FP: real-idle mid-work flip (codex ~4.8s) with unconfirmed submit → suppressed when working at recheck', () => {
@@ -99,34 +140,43 @@ test('#48 FP: real-idle mid-work flip (codex ~4.8s) with unconfirmed submit → 
   ctx.autoState = 'working';
   ctx.flushTimers();
   assert.equal(ctx.delivered.length, 0);
-  assert.equal(ctx.pendingReport.idleNotified, undefined);
+  assert.equal(ctx.pendingReport.unconfirmedSettleDone, undefined);
 });
 
-test('#48 signal preserved: still idle + output stalled after settle → TASK_IDLE_UNCONFIRMED fires (format intact)', () => {
+test('#48 signal preserved: still idle + output stalled after settle → the absence is stated (format intact)', () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
   ctx.fire();
   ctx.flushTimers(); // state stays idle, lastActivityAt unchanged
   assert.equal(ctx.delivered.length, 1, 'genuinely-unconsumed inject still notifies');
   assert.equal(ctx.delivered[0].srcId, 'orch');
-  assert.match(
-    ctx.delivered[0].msg,
-    /^TASK_IDLE_UNCONFIRMED: worker-1 signaled idle \d+\.\ds after inject \(via ready-signal inject=inj-48\)/,
-    'consumer-visible message format preserved'
-  );
-  assert.equal(ctx.pendingReport.idleNotified, true);
-  assert.ok(ctx.broadcasts.some((b) => b.type === 'TASK_IDLE_NO_REPORT'), 'bus event fires with the notification');
+  // RENAMED PRESENCE. The notification still fires, on the same path, after the same settle, to
+  // the same source — #48's purpose is intact. What changed is what it is allowed to SAY: the old
+  // text asserted "inject may NOT have been processed", which is not a measurement either.
+  const stated = assertStatesAbsence(ctx.delivered[0].msg);
+  assert.equal(stated.kind, 'legacy_ready_observed',
+    'an unqualified bridge ready frame keeps its own name and cannot borrow a stronger one');
+  assert.equal(stated.consumption, 'not_established');
+  assert.equal(ctx.pendingReport.unconfirmedSettleDone, true, 'the settle concluded');
+  const extra = completionUnknownEvent(ctx);
+  assert.equal(extra.observation.kind, 'legacy_ready_observed');
 });
 
-test('#48 never-false-complete: elapsed crossing the floor during settle must NOT promote to TASK_COMPLETE', () => {
+test('#48 never-false-complete: elapsed crossing the floor during settle cannot promote to an outcome', () => {
   // Armed at 0.2s (sub-floor); the settle window pushes fire-time elapsed past
-  // AUTO_REPORT_MIN_REAL_SECONDS. The label is pinned at arm time — a genuinely
-  // unconsumed inject must never be reported DONE because time passed.
+  // AUTO_REPORT_MIN_REAL_SECONDS. The old code CHOSE its label from elapsed time, so this test
+  // pinned that the label was fixed at arm time. Stage A removes the choice outright: elapsed is
+  // a FIELD on the observation and never a threshold, so there is no label for time to promote.
   const ctx = makeGate({ elapsedSec: 0.2 });
   ctx.fire();
   ctx.flushTimers();
   assert.equal(ctx.delivered.length, 1);
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED:/);
-  assert.doesNotMatch(ctx.delivered[0].msg, /^TASK_COMPLETE:/);
+  const stated = assertStatesAbsence(ctx.delivered[0].msg);
+  const extra = completionUnknownEvent(ctx);
+  // Non-vacuous: elapsed really did cross the old floor — that is the exact input that used to
+  // flip the verdict — and it is carried as evidence while claiming nothing.
+  assert.ok(stated.elapsedSeconds >= 5,
+    `expected elapsed past the old floor, got ${stated.elapsedSeconds}s`);
+  assert.ok(extra.observation.elapsed_ms >= 5000);
 });
 
 test('#48: output advance while still idle-classified re-settles (bounded) before notifying', () => {
@@ -140,23 +190,34 @@ test('#48: output advance while still idle-classified re-settles (bounded) befor
   // Output now stalls → the next recheck fires.
   ctx.flushTimers();
   assert.equal(ctx.delivered.length, 1);
-  assert.match(ctx.delivered[0].msg, /^TASK_IDLE_UNCONFIRMED:/);
+  assertStatesAbsence(ctx.delivered[0].msg);
 });
 
-test('#48: suppression keeps the door open — a later evidence-backed real-idle still reports TASK_COMPLETE', () => {
+test('#48: suppression keeps the door open — a later real-idle still states the absence', () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
   ctx.fire();
   ctx.autoState = 'working';
-  ctx.flushTimers(); // suppressed, idleNotified not consumed
+  ctx.flushTimers(); // suppressed; the settle is NOT marked done, so the path stays open
   assert.equal(ctx.delivered.length, 0);
+  assert.equal(ctx.pendingReport.unconfirmedSettleDone, undefined, 'suppression consumed nothing');
 
   // The worker finishes: a genuine busy→idle transition with processing evidence.
   ctx.pendingReport.sawWorkingAfterInject = true;
   ctx.nowMs = T0 + 30_000;
   ctx.autoState = 'idle';
   ctx.fire('real-idle');
-  assert.equal(ctx.delivered.length, 1);
-  assert.match(ctx.delivered[0].msg, /^TASK_COMPLETE:/, 'confirmed completions are never deferred');
+
+  // The old assertion was that THIS fire promoted straight to TASK_COMPLETE — "confirmed
+  // completions are never deferred". There are no confirmed completions left to fast-path, so
+  // the later quiet goes through the same settle debounce as any other. That is not silence: the
+  // durable tracking_started record was committed before the bytes were ever handed over, so the
+  // absence has been pollable since delivery. What this test still guards is the door-open
+  // property — suppression must not have consumed the session's right to be described later.
+  assert.equal(ctx.delivered.length, 0, 'the later observation debounces like any other');
+  ctx.flushTimers();
+  assert.equal(ctx.delivered.length, 1, 'the door stayed open — the later quiet is still stated');
+  const stated = assertStatesAbsence(ctx.delivered[0].msg);
+  assert.equal(stated.kind, 'pty_quiet', 'a real-idle entrance with no cause supplied is silence, named as such');
 });
 
 test('#48: a second trigger while a settle window is open does not double-arm or notify', () => {
@@ -206,7 +267,7 @@ after(async () => {
 // Register a wrapped codex-like session, connect its owner bridge, and pass bootstrap.
 async function bootWrappedSession(sessionId) {
   await harness.registerSession(sessionId, { command: 'codex', backend: 'pty' });
-  const ownerWs = await harness.connectSession(sessionId);
+  const ownerWs = await harness.connectSession(sessionId, harness.ownerAuth(sessionId));
   ownerWs.send(JSON.stringify({ type: 'ready' }));
   await waitFor(async () => {
     const detail = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
@@ -239,25 +300,29 @@ test('#48 integration FP: ready-signal right after inject into an already-workin
   ownerWs.send(JSON.stringify({ type: 'output', data: 'still compiling, more output\n' }));
   ownerWs.send(JSON.stringify({ type: 'ready' }));
 
+  // The #48 false positive, restated in Stage A vocabulary. Asserting that TASK_IDLE_NO_REPORT is
+  // absent would now be vacuous — nothing produces that name any more. The FP that must stay
+  // fixed is announcing a QUIET or READY observation for a session that is in fact working, so
+  // that is what is pinned. Note this cannot be "no task_completion_unknown at all": the working
+  // transitions legitimately emit `output_observed` ones, and demanding silence there would be
+  // asking for exactly the absence-by-omission this release removes.
+  const quietClaim = () => busMessages.find((m) => m.type === 'task_completion_unknown'
+    && m.session_id === sessionId
+    && QUIET_OR_READY_KINDS.includes(m.observation && m.observation.kind));
+
   await delay(150); // pre-fix the false positive fired right here
-  assert.equal(
-    busMessages.some((m) => m.type === 'TASK_IDLE_NO_REPORT' && m.session_id === sessionId),
-    false,
-    'no immediate idle notification — settle window open'
-  );
+  assert.equal(quietClaim(), undefined, 'no immediate quiet observation — settle window open');
 
   // Still working through the settle recheck (0.4s) — the snapshot must be discarded.
   ownerWs.send(JSON.stringify({ type: 'output', data: 'work continues, esc to interrupt\n' }));
   await delay(900);
+  assert.equal(quietClaim(), undefined,
+    'suppressed after recheck — the session was processing the inject');
   assert.equal(
-    busMessages.some((m) => m.type === 'TASK_IDLE_NO_REPORT' && m.session_id === sessionId),
+    orchMessages.some((m) => m.type === 'inject'
+      && /TASK_IDLE_UNCONFIRMED|TASK_COMPLETION_UNKNOWN/.test(String(m.data))),
     false,
-    'suppressed after recheck — the session was processing the inject'
-  );
-  assert.equal(
-    orchMessages.some((m) => m.type === 'inject' && /TASK_IDLE_UNCONFIRMED/.test(String(m.data))),
-    false,
-    'no false TASK_IDLE_UNCONFIRMED text reaches the injecting side'
+    'no false quiet text reaches the injecting side, under either the old or the new spelling'
   );
 
   bus.close();
@@ -284,18 +349,34 @@ test('#48 integration signal preserved: genuinely unconsumed inject still notifi
   // the inject genuinely was not consumed. After the settle window the warning MUST fire.
   ownerWs.send(JSON.stringify({ type: 'ready' }));
 
-  await waitFor(
-    () => busMessages.some((m) => m.type === 'TASK_IDLE_NO_REPORT' && m.session_id === sessionId),
-    { timeoutMs: 4000, description: 'TASK_IDLE_NO_REPORT after settle for an unconsumed inject' }
+  // Renamed presence: the post-settle notification still fires for a genuinely unconsumed
+  // inject, carrying the same `source`. Only its claim changed.
+  const quietClaim = () => busMessages.find((m) => m.type === 'task_completion_unknown'
+    && m.session_id === sessionId
+    && QUIET_OR_READY_KINDS.includes(m.observation && m.observation.kind));
+
+  await waitFor(quietClaim,
+    { timeoutMs: 4000, description: 'task_completion_unknown after settle for an unconsumed inject' }
   );
-  const event = busMessages.find((m) => m.type === 'TASK_IDLE_NO_REPORT' && m.session_id === sessionId);
+  const event = quietClaim();
   assert.equal(event.source, 'orch');
+  assert.equal(event.completion_fact, null);
+  assert.equal(event.terminal, false);
+  assert.equal(event.consumption.status, 'not_established',
+    'nothing was consumed, and the observation says so as a FIELD rather than as a gate');
+  assert.equal(event.capability.outcome_protocol, 'unavailable');
 
   bus.close();
   ownerWs.close();
   orchWs.close();
 });
 
-// Requiring daemon.js loads persisted sessions for read-only inspection; ensure the test
-// process exits even if module-load left background handles open.
-test.after(() => { setImmediate(() => process.exit(0)); });
+// No force-exit here, and do not add one back (#861).
+//
+// A `test.after(() => setImmediate(() => process.exit(0)))` used to sit here. Unlike the other
+// three files that carried it, this one really did keep the loop alive — but not for the reason
+// the old comment gave. It was not module load: it was the un-cancelled `delay(2000)` in the
+// harness stop() race, which Promise.race abandons without clearing. That timer now clears its
+// own loser (test-support/daemon-harness.js waitForChildExit), and this file exits on its own
+// ~2.1s after its last test. process.exit() tears down before the TAP stream has flushed, so
+// the runner counts fewer tests than ran and still prints "fail 0".

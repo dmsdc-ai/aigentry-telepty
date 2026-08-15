@@ -147,8 +147,43 @@ async function startTestDaemon(options = {}) {
     stderr += chunk.toString();
   });
 
+  // #820 — the daemon's own secret, resolved the same way every real consumer resolves it:
+  // TELEPTY_AUTH_TOKEN if the caller pinned one in the spawn env, else the config.json this
+  // daemon minted under its temp HOME. Read lazily and cached, because on the readiness path the
+  // file does not exist until the daemon has booted far enough to write it.
+  //
+  // Deliberately NOT injected into the daemon's env by default: several suites seed their own
+  // config.json with a known token before starting a daemon here, and an env token would silently
+  // override the one they seeded.
+  let cachedAuthToken = null;
+  function authToken() {
+    if (cachedAuthToken == null) {
+      if (daemonEnv.TELEPTY_AUTH_TOKEN) {
+        cachedAuthToken = daemonEnv.TELEPTY_AUTH_TOKEN;
+      } else {
+        try {
+          // The daemon's EFFECTIVE home, not this harness's `homeDir`: a caller may override HOME
+          // through `options.env` (test/release-0.4.5-bugfixes.test.js does), in which case the
+          // config.json that matters is the one under the env's HOME.
+          const effectiveHome = daemonEnv.HOME || daemonEnv.USERPROFILE || homeDir;
+          cachedAuthToken = JSON.parse(
+            fs.readFileSync(path.join(effectiveHome, '.telepty', 'config.json'), 'utf8')
+          ).authToken;
+        } catch { return null; } // not written yet — do not cache the miss
+      }
+    }
+    return cachedAuthToken;
+  }
+
+  // Every request carries the daemon token, because since #820 loopback is no longer a
+  // credential. A test that wants to BE an uncredentialed caller passes `noAuth: true` — an
+  // explicit act, so the absence of a credential is always something a reader can see.
   async function request(pathname, options = {}) {
     const headers = { ...(options.headers || {}) };
+    if (!options.noAuth && headers['x-telepty-token'] === undefined) {
+      const token = authToken();
+      if (token) headers['x-telepty-token'] = token;
+    }
     const init = {
       method: options.method || 'GET',
       headers
@@ -178,7 +213,10 @@ async function startTestDaemon(options = {}) {
     }
 
     try {
-      const response = await fetch(`http://${host}:${port}/api/sessions`);
+      // #820: /api/health, not /api/sessions. Health is registered BEFORE the auth middleware
+      // (daemon.js), so readiness no longer depends on holding a credential — which matters
+      // because the credential is a file this daemon has not necessarily written yet.
+      const response = await fetch(`http://${host}:${port}/api/health`);
       return response.ok;
     } catch {
       return false;
@@ -201,16 +239,30 @@ async function startTestDaemon(options = {}) {
     }, { description: 'session cleanup' });
   }
 
+  // Bounded wait for the daemon child to exit, with the losing timer CANCELLED (#861).
+  //
+  // `Promise.race` abandons the loser; it does not cancel it. A plain `delay(2000)` here stays
+  // pending for the full 2s after the child has already exited, and a pending timer keeps the
+  // TEST process's event loop alive long after its last assertion. That is what four test files
+  // were papering over with `process.exit(0)` in an after-hook — which exits before the TAP
+  // stream has flushed and silently drops test results from the reported count.
+  async function waitForChildExit(timeoutMs = 2000) {
+    let timer;
+    const expired = new Promise((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); });
+    try {
+      return await Promise.race([once(child, 'exit').then(() => true), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // Kill the daemon process WITHOUT the cleanupSessions() pass stop() does. A restart test needs
   // this: cleanupSessions DELETEs every session, and DELETE revokes credentials (#815), so
   // stopping politely would destroy the very state the restart is supposed to carry across.
   async function kill() {
     if (child.exitCode === null) {
       child.kill();
-      const exited = await Promise.race([
-        once(child, 'exit').then(() => true),
-        delay(2000).then(() => false)
-      ]);
+      const exited = await waitForChildExit();
       if (!exited && child.exitCode === null) {
         child.kill('SIGKILL');
         await once(child, 'exit').catch(() => {});
@@ -228,10 +280,7 @@ async function startTestDaemon(options = {}) {
     if (child.exitCode === null) {
       child.kill();
 
-      const exited = await Promise.race([
-        once(child, 'exit').then(() => true),
-        delay(2000).then(() => false)
-      ]);
+      const exited = await waitForChildExit();
 
       if (!exited && child.exitCode === null) {
         child.kill('SIGKILL');
@@ -287,11 +336,24 @@ async function startTestDaemon(options = {}) {
     return bearer ? { headers: { 'x-telepty-session-token': bearer } } : undefined;
   }
 
-  async function connectWebSocket(pathname, wsOptions) {
-    const ws = new WebSocket(`ws://${host}:${port}${pathname}`, wsOptions);
+  // #820: the upgrade needs the daemon token too. Appended unless the caller already put a
+  // `token=` in the path (a test asserting the refusal) or passes `noAuth`.
+  async function connectWebSocket(pathname, wsOptions, { noAuth = false } = {}) {
+    let url = `ws://${host}:${port}${pathname}`;
+    const token = authToken();
+    if (!noAuth && token && !pathname.includes('token=')) {
+      url += `${pathname.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
+    }
+    const ws = new WebSocket(url, wsOptions);
     await new Promise((resolve, reject) => {
       ws.once('open', resolve);
       ws.once('error', reject);
+      // A refusal is an answer, and a harness that reported it as a connect error would hide the
+      // one thing these tests exist to tell apart.
+      ws.once('unexpected-response', (_req, res) => {
+        res.resume();
+        reject(new Error(`WS upgrade refused: HTTP ${res.statusCode}`));
+      });
     });
     return ws;
   }
@@ -356,13 +418,17 @@ async function startTestDaemon(options = {}) {
     port,
     host,
     homeDir,
+    // #820 — exposed so a cross-host test can hand the CLI the TARGET daemon's token, which is
+    // the production fix (resolve the target's token, not the local one) expressed in-harness.
+    authToken,
     request,
     spawnSession,
     registerSession,
     ownerAuth,
     cleanupSessions,
-    connectBus: () => connectWebSocket('/api/bus'),
-    connectSession: (sessionId) => connectWebSocket(`/api/sessions/${encodeURIComponent(sessionId)}`),
+    connectBus: (options) => connectWebSocket('/api/bus', undefined, options),
+    connectSession: (sessionId, wsOptions, options) =>
+      connectWebSocket(`/api/sessions/${encodeURIComponent(sessionId)}`, wsOptions, options),
     runCli,
     stop,
     kill,

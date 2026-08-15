@@ -243,6 +243,27 @@ function decideSurfaceGc(liveness, session, nowMs, graceSeconds = SURFACE_ORPHAN
   return 'skip';
 }
 
+// #844: what a 'reclaim' verdict is allowed to ACTUATE, given the evidence telepty holds
+// directly. A destructive action requires positive evidence of the condition it destroys on, and
+// an OPEN OWNER SOCKET is positive, first-hand evidence that the session is alive right now —
+// stronger and more direct than a uuid's absence from another tool's stdout. The surface GC is
+// entered only for connected sessions, so it was using the weaker measurement to override the
+// stronger one. It no longer can: the socket blocks the kill, and what remains is the
+// `surface_orphaned` SIGNAL, emitted once. No consumer reclaims the session on it today — the
+// orchestrator's always-on sweep closes the SURFACE, and its event-driven consumer for this signal
+// is dormant (orchestrator #847) — so 'signal' means the session persists until the disconnect-GC
+// or an explicit cleanup. Deliberate: the alternative was killing it on the weaker measurement.
+//
+//   'signal'  — say it, do not kill it (and `alreadySignalled` keeps it to once, not per tick)
+//   'reclaim' — passthrough for a caller with no live owner socket; nothing reaches this today
+//
+// Pure, no side effects; the caller performs the action.
+function decideSurfaceGcAction(gcVerdict, { ownerConnected = false, alreadySignalled = false } = {}) {
+  if (gcVerdict !== 'reclaim') return gcVerdict;
+  if (!ownerConnected) return 'reclaim';
+  return alreadySignalled ? 'skip' : 'signal';
+}
+
 function clearSurfaceMismatchState(session) {
   if (!session) return;
   session.surfaceMismatchAt = null;
@@ -344,6 +365,7 @@ module.exports = {
   selectIdleTtlVictims,
   selectCleanOlderThanTargets,
   decideSurfaceGc,
+  decideSurfaceGcAction,
   clearSurfaceMismatchState,
   buildSurfaceMismatchExtra,
   applySurfaceMismatchProbe

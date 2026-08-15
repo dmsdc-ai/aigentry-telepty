@@ -81,6 +81,13 @@ Full package list with `--test-force-exit`:
 828 tests: 825 pass, 2 fail, 1 skipped
 ```
 
+> **Caveat added 2026-08-01 (#829).** The record above is left as measured, but that
+> flag is now known to truncate runs non-deterministically — it drops tests without
+> failing them, so `828 tests` may undercount and the `825 pass` cannot be read as
+> full coverage. The flag is retired: its cause (a test process supervising the real
+> `~/.telepty` sessions, so it could never exit) is fixed in
+> `test-support/setup-env.js`. Do not reuse this invocation; run flagless.
+
 Failures are the known pre-existing #732 bridge-output-pipe timeouts:
 
 - `test/bridge-output-pipe-732-levers.test.js`
