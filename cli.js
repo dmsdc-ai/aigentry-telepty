@@ -188,17 +188,76 @@ function isSubmitForceDefaultEnabled(env = process.env) {
   return value === '1' || value === 'true' || value === 'yes' || value === 'on';
 }
 
+// #835: a response that ARRIVES and DECLINES is not an absence. Every probe below has to keep
+// three outcomes apart, because only ONE of them may honestly degrade to an empty result:
+//
+//   connect error / timeout   the daemon is unreachable      → [] / null is honest
+//   401 / 403                 the daemon answered and REFUSED → name it, never []
+//   5xx / unparseable         the daemon answered and is BROKEN → name it, never []
+//
+// Collapsing the second and third into the first is what let one token mismatch blank the
+// session list on every command and hand `decideDaemonAction` a verdict that SIGKILLs a live,
+// healthy daemon (the parent of every PTY session) while every surface printed success.
+const REFUSAL_STATUSES = new Set([401, 403]);
+
+// The classification of a daemon answer that is not a result. Deliberately carries no
+// `version` field: every existing `meta && meta.version` reader sees exactly what it saw
+// before, so the classification is additive rather than a behavior change at those sites.
+// Returns null when there is no numeric status to classify — a response that cannot tell us
+// what it was is not an answer, and inventing a condition from it would be the same mistake in
+// the other direction.
+function daemonAnswer(status, endpoint) {
+  if (!Number.isInteger(status)) return null;
+  return { answered: true, status, refused: REFUSAL_STATUSES.has(status), endpoint };
+}
+
+// #835: no command may exit 0 after swallowing a refusal — that zero is exactly what
+// `session-cleanup.sh` and friends read as "nothing to do". Set centrally because every
+// discovery caller is a catch-and-print, and guarded on `require.main` so a cli.js required as
+// a library (tests, mcp-server) never has its host process's exit code rewritten under it.
+function markCommandFailed() {
+  if (require.main === module) process.exitCode = 1;
+}
+
+// The error for a daemon answer that is not a result. Tolerates a null answer (see
+// daemonAnswer) so an unclassifiable response still fails loudly instead of throwing here.
+function daemonAnswerError(answer, host = '127.0.0.1') {
+  const where = host === '127.0.0.1' ? `Local telepty daemon (port ${PORT})` : `Daemon at ${host}`;
+  let message;
+  if (!answer) {
+    message = `${where} returned a response this CLI could not read. Treating it as a failure, not as an empty result.`;
+  } else if (answer.refused) {
+    message = `${where} REFUSED this CLI's credentials on ${answer.endpoint} (HTTP ${answer.status}). ` +
+      'The daemon is running — this is a credential mismatch, not an absence. Compare the token in ' +
+      '~/.telepty/config.json with the one the daemon loaded, then retry.';
+  } else {
+    message = `${where} answered ${answer.endpoint} with HTTP ${answer.status} — running, but not serving. This is not an empty result.`;
+  }
+  const error = new Error(message);
+  error.name = 'DaemonResponseError';
+  error.status = answer ? answer.status : null;
+  error.refused = Boolean(answer && answer.refused);
+  markCommandFailed();
+  return error;
+}
+
+function isDaemonAnswerError(error) {
+  return Boolean(error) && error.name === 'DaemonResponseError';
+}
+
 async function getDaemonMeta(host = REMOTE_HOST) {
   try {
     const res = await fetchWithAuth(`${daemonUrl(host)}/api/meta`, {
       signal: AbortSignal.timeout(1500)
     });
     if (!res.ok) {
-      return null;
+      // #835: an ANSWER, not silence — the daemon is up. Returning null here is what made a
+      // refusal indistinguishable from an empty port to the restart policy.
+      return daemonAnswer(res.status, '/api/meta');
     }
     return await res.json();
   } catch {
-    return null;
+    return null; // connect error / timeout: genuinely nothing answered
   }
 }
 
@@ -597,6 +656,7 @@ function getDiscoveryHosts() {
 async function discoverSessions(options = {}) {
   await ensureDaemonRunning();
   const allSessions = [];
+  const peerFailures = [];
 
   if (!options.silent) {
     process.stdout.write('\x1b[36m🔍 Discovering active sessions across connected machines...\x1b[0m\n');
@@ -607,33 +667,53 @@ async function discoverSessions(options = {}) {
     const res = await fetchWithAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
       signal: AbortSignal.timeout(1500)
     });
-    if (res.ok) {
-      const sessions = await res.json();
-      sessions.forEach((session) => {
-        allSessions.push({ host: '127.0.0.1', ...session });
-      });
-    }
-  } catch {}
+    // #835: the local daemon is the authority for local sessions. A refusal or a 5xx from it
+    // means we do not KNOW what is running — which is not the same as knowing nothing is. Every
+    // command is built on this list, so an unknown must fail the command, not shrink the list.
+    if (!res.ok) throw daemonAnswerError(daemonAnswer(res.status, '/api/sessions'));
+    const sessions = await res.json();
+    sessions.forEach((session) => {
+      allSessions.push({ host: '127.0.0.1', ...session });
+    });
+  } catch (error) {
+    if (isDaemonAnswerError(error)) throw error;
+    // connect error / timeout only: the daemon is genuinely unreachable, so "no local
+    // sessions" is an honest answer.
+  }
 
   // Remote peer sessions via SSH direct
   const remoteSessions = crossMachine.discoverAllRemoteSessions();
-  allSessions.push(...remoteSessions);
+  allSessions.push(...remoteSessions.sessions);
+  peerFailures.push(...remoteSessions.failures);
 
   // Remote peer sessions via HTTP (no SSH)
   try {
     const httpSessions = await crossMachine.discoverHttpRemoteSessions();
-    allSessions.push(...httpSessions);
-  } catch {
-    // HTTP peer discovery is best-effort.
+    allSessions.push(...httpSessions.sessions);
+    peerFailures.push(...httpSessions.failures);
+  } catch (error) {
+    peerFailures.push(error); // best-effort transport, but never a silent one
   }
 
   // Remote peer sessions via broker relay. Default-OFF: without a
   // transport='broker' peer in peers.json, this performs no broker call.
   try {
     const brokerSessions = await crossMachine.discoverBrokerRemoteSessions();
-    allSessions.push(...brokerSessions);
-  } catch {
-    // Broker peer discovery is best-effort.
+    allSessions.push(...brokerSessions.sessions);
+    peerFailures.push(...brokerSessions.failures);
+  } catch (error) {
+    peerFailures.push(error);
+  }
+
+  // #835: a peer that answered and declined is not a peer with no sessions. Unlike the local
+  // daemon it must not fail the whole command — the sessions we DID discover are real — but the
+  // list is incomplete, so say which peer is missing and never let it exit 0. stderr, not
+  // stdout: the banner must not contaminate `telepty list --json` (task #400).
+  if (peerFailures.length > 0) {
+    markCommandFailed();
+    for (const failure of peerFailures) {
+      process.stderr.write(`\x1b[31m⚠️ ${failure.message} The session list is INCOMPLETE.\x1b[0m\n`);
+    }
   }
 
   return allSessions;
@@ -679,7 +759,21 @@ async function resolveSessionTarget(sessionRef, options = {}) {
 //   sessionsReachable    - whether /api/sessions answered; ONLY consulted when meta
 //                          is null, to tell an older daemon that lacks /api/meta apart
 //                          from no daemon at all
+//
+// #835: `meta` may also be a daemonAnswer() — the daemon answered but declined or failed. That
+// is the one input for which there is no safe remediation here: `start` and `restart` both lead
+// to cleanupDaemonProcesses → SIGTERM/SIGKILL against the state-file pid, every process the
+// global `ps` scan thinks is a telepty daemon, and the confirmed port owner. A daemon that
+// refuses us is RUNNING and owns every live PTY session, so the verdict is `abort` — the
+// caller must fail loudly instead of remediating.
 function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessionsReachable = false } = {}) {
+  if (meta && meta.answered) {
+    return {
+      action: 'abort',
+      reason: meta.refused ? `daemon-refused:${meta.status}` : `daemon-answered-error:${meta.status}`
+    };
+  }
+
   if (meta && meta.version) {
     // PRIMARY, definitive signal. A daemon reporting a matching version AND all
     // required capabilities is healthy+correct → never restart, even if a follow-up
@@ -799,6 +893,11 @@ async function ensureDaemonRunning(options = {}) {
         signal: AbortSignal.timeout(5000)
       });
       sessionsReachable = !!(sessionsRes && sessionsRes.ok);
+      // #835: a non-200 here is an ANSWER too. Folding it into "nothing answered" is what
+      // turned a refused legacy probe into the verdict that authorizes the kill.
+      if (sessionsRes && !sessionsRes.ok && !meta) {
+        meta = daemonAnswer(sessionsRes.status, '/api/sessions');
+      }
     } catch {
       sessionsReachable = false; // timeout/refused while probing the legacy fallback
     }
@@ -808,6 +907,12 @@ async function ensureDaemonRunning(options = {}) {
 
   if (decision.action === 'noop') {
     return; // healthy + correct version + all capabilities → leave the daemon alone (#567)
+  }
+
+  // #835: the daemon answered and declined (or is failing). It is alive — killing it is the
+  // one thing we must not do. Fail the command loudly instead of remediating.
+  if (decision.action === 'abort') {
+    throw daemonAnswerError(meta, '127.0.0.1');
   }
 
   // #738: ONLY the 'start' path (nothing answered on the port) can be a supervisor restart
@@ -1409,20 +1514,21 @@ async function main() {
         console.log('\x1b[1mTailing inject audit log (Ctrl-C to stop)...\x1b[0m');
         for (;;) {
           const res = await fetchWithAuth(buildQuery());
-          if (res.ok) {
-            const data = await res.json();
-            const fresh = (data.injects || []).slice().reverse(); // oldest→newest for display
-            for (const l of fresh) {
-              const key = `${l.inject_id}|${l.to}`;
-              if (seen.has(key)) continue;
-              seen.add(key);
-              if (!firstPass) console.log(asJson ? JSON.stringify(l) : formatRow(l));
-            }
-            if (firstPass) {
-              // Print the initial window once, then stream only newer lines.
-              for (const l of fresh) console.log(asJson ? JSON.stringify(l) : formatRow(l));
-              firstPass = false;
-            }
+          // #835: without this, a refusal makes the tail poll forever printing nothing — an
+          // audit log that looks quiet is exactly what an audit log must never fake.
+          if (!res.ok) throw daemonAnswerError(daemonAnswer(res.status, '/api/injects'));
+          const data = await res.json();
+          const fresh = (data.injects || []).slice().reverse(); // oldest→newest for display
+          for (const l of fresh) {
+            const key = `${l.inject_id}|${l.to}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            if (!firstPass) console.log(asJson ? JSON.stringify(l) : formatRow(l));
+          }
+          if (firstPass) {
+            // Print the initial window once, then stream only newer lines.
+            for (const l of fresh) console.log(asJson ? JSON.stringify(l) : formatRow(l));
+            firstPass = false;
           }
           await new Promise((r) => setTimeout(r, 1000));
         }
@@ -1830,6 +1936,7 @@ async function main() {
     let wsReady = false;
     let reconnectAttempts = 0;
     let reconnectTimer = null;
+    let wsRefusalReported = false; // #835: name an upgrade refusal once, not once per retry
     // BUG-C: the daemon mints a per-owner token on each owner claim/reclaim and pushes it here.
     // We echo it on the teardown DELETE so the daemon can tell our (current-owner) exit apart
     // from a stale/displaced owner's exit and avoid the shared-fate teardown.
@@ -2040,6 +2147,23 @@ async function main() {
 
       daemonWs.on('error', () => {
         // Error will be followed by close event
+      });
+
+      // #835: the daemon writes a raw `HTTP/1.1 401` on the upgrade (src/transport/websocket.js),
+      // which arrives at this client as error + close 1006 — byte-identical to "the daemon is
+      // down", so the bridge reconnects forever in silence while the session is unreachable.
+      // Keep reconnecting (this process owns a live PTY; exiting would kill the user's CLI), but
+      // say it once: a credential mismatch does not fix itself with backoff.
+      daemonWs.on('unexpected-response', (_req, res) => {
+        if (!wsRefusalReported && (res.statusCode === 401 || res.statusCode === 403)) {
+          wsRefusalReported = true;
+          process.stderr.write(
+            `\x1b[31m❌ [allow] The daemon REFUSED this bridge's credentials (HTTP ${res.statusCode}) for session '${sessionId}'. ` +
+            'It is running and this session is alive, but unreachable until the token matches — ' +
+            'reconnecting will not fix it.\x1b[0m\n'
+          );
+        }
+        res.resume();
       });
     }
 
@@ -3027,7 +3151,14 @@ async function main() {
       }
 
       const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
-      console.log(`✅ Context broadcasted successfully to ${aggregate.successful.length} active session(s).${refSuffix}`);
+      // #835: "✅ … successfully to 0 active session(s)" was the sentence a refused discovery
+      // printed — a success banner for a broadcast that reached nobody. Reaching nobody is
+      // never a success worth a checkmark, whatever emptied the list.
+      if (aggregate.successful.length === 0) {
+        console.warn(`⚠️ No session received this broadcast — nothing was sent.${refSuffix}`);
+      } else {
+        console.log(`✅ Context broadcasted successfully to ${aggregate.successful.length} active session(s).${refSuffix}`);
+      }
       if (aggregate.failed.length > 0) {
         console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host} [${item.code || 'UNKNOWN'}] ${item.error || ''}`.trim()).join(', '));
       }
@@ -3136,6 +3267,7 @@ async function main() {
         }
 
         let cleaned = 0;
+        let declined = 0;
         for (const target of targets) {
           try {
             const host = target.session.host || '127.0.0.1';
@@ -3147,24 +3279,39 @@ async function main() {
             if (res.ok) {
               console.log(`  🗑  Removed session: \x1b[36m${target.id}\x1b[0m (${target.reference})`);
               cleaned++;
+            } else {
+              // #835: a removal the daemon REFUSED is not a session that needed no removing.
+              console.error(`❌ ${daemonAnswerError(daemonAnswer(res.status, `kill ${target.id}`), host).message}`);
+              declined++;
             }
           } catch (_) {}
         }
-        console.log(cleaned > 0 ? `✅ Cleaned ${cleaned} session(s).` : '✅ No sessions cleaned.');
+        console.log(cleaned > 0
+          ? `✅ Cleaned ${cleaned} session(s).`
+          : declined > 0
+            ? `⚠️ Cleaned 0 — the daemon refused ${declined} removal(s).`
+            : '✅ No sessions cleaned.');
         return;
       }
 
       let cleaned = 0;
+      let declined = 0;
       for (const s of sessions) {
         if (s.healthStatus === 'STALE' || s.healthStatus === 'DISCONNECTED') {
           try {
             const host = s.host || '127.0.0.1';
             const res = await fetchWithAuth(`${daemonUrl(host)}/api/sessions/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
             if (res.ok) { console.log(`  🗑  Removed ghost: \x1b[36m${s.id}\x1b[0m (${s.healthStatus})`); cleaned++; }
+            // #835: same shape — "no ghost sessions found" must not be how a refusal reads.
+            else { console.error(`❌ ${daemonAnswerError(daemonAnswer(res.status, `delete ${s.id}`), host).message}`); declined++; }
           } catch (_) {}
         }
       }
-      console.log(cleaned > 0 ? `✅ Cleaned ${cleaned} ghost session(s).` : '✅ No ghost sessions found.');
+      console.log(cleaned > 0
+        ? `✅ Cleaned ${cleaned} ghost session(s).`
+        : declined > 0
+          ? `⚠️ Cleaned 0 — the daemon refused ${declined} ghost removal(s).`
+          : '✅ No ghost sessions found.');
     } catch (e) { console.error(`❌ ${e.message || 'Failed to clean sessions.'}`); }
     return;
   }
@@ -3948,7 +4095,14 @@ Discuss the following topic from your project's perspective. Engage with other s
 // Guard the entry point so a test can `require('./cli.js')` to reach the exported pure helpers
 // without dispatching the argv command. Behavior when run as the CLI is unchanged.
 if (require.main === module) {
-  main();
+  // #835: a refusal thrown from the daemon-probe path can surface on commands that do not wrap
+  // their own call (`spawn`, `allow`). It must read as one clear line and exit non-zero — not as
+  // an unhandled-rejection stack. Anything else keeps its previous crash behavior exactly.
+  main().catch((error) => {
+    if (!isDaemonAnswerError(error)) throw error;
+    console.error(`❌ ${error.message}`);
+    process.exit(1);
+  });
 }
 
 // Minimal test surface (no logic change) — pure decisions exposed for unit-testing.
