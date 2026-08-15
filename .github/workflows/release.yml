@@ -45,6 +45,11 @@ jobs:
       # test/release-version-invariant-844.test.js ties package.json <-> package-lock.json <->
       # CHANGELOG <-> README together. The tag is the fourth party and no test in the tree can
       # see it, because the tag is not in the tree. This step is that missing assertion.
+      #
+      # `VERSION` comes from the manifest and the tag only has to AGREE with it. Deriving the
+      # version from the tag instead — `git describe`, `git tag --sort=-version:refname | head -1`
+      # — is deliberately absent and must stay absent: `v1.0.1` is tagged on this repo (2026-03-10)
+      # for a version npm has never published, so tag ranking picks 1.0.1 over the real 0.8.0.
       - name: Tag and package.json must name the same version
         id: identity
         env:
@@ -172,6 +177,16 @@ jobs:
             exit 1
           fi
 
+      # DATED DEBT — #876. This authenticates with a granular access token by choice, for one
+      # release: `release.yml` has never executed, and an unrehearsed OIDC exchange in the same
+      # first run would leave a failure with two candidate causes and no way to separate them.
+      # One unverified variable at a time.
+      #
+      # It is not a steady state. npm's Phase 2 (targeted January 2027) removes direct publishing
+      # from the bypass-2FA token variant CI needs; Phase 1 is already enforced — `npm profile get`
+      # returns 403 on this account today. The migration is trusted publishing (OIDC), which needs
+      # npm >= 11.5.1 and therefore `node-version: 24`. Do NOT reach for node 22 on the strength of
+      # npm's "Node 22.14.0 or higher" line: node 22 ships npm 10.9.8, has no OIDC, and says nothing.
       - name: Publish to npm
         if: steps.registry.outputs.exists != 'true'
         env:
