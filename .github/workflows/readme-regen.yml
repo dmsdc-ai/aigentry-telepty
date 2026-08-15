@@ -1,9 +1,11 @@
 name: readme-regen
 
-# telepty publishes manually (no CI publish). This workflow keeps README.md on main
-# synced to ecosystem.json + package.json. It runs when a GitHub Release is published
-# (around a manual publish) or on demand. Tarball freshness at publish time is handled
-# separately by the package.json `prepublishOnly` regen on the maintainer's machine.
+# Since #874, release.yml publishes on a tag push and creates the GitHub Release; before
+# that it was done by hand. This workflow keeps README.md on main synced to ecosystem.json
+# + package.json. It runs when a GitHub Release is published — so, after a publish that
+# release.yml verified against the registry — or on demand. Tarball freshness at publish
+# time is handled separately by the package.json `prepublishOnly` regen, which release.yml
+# runs itself before it packs.
 on:
   release:
     types: [published]
