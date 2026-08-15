@@ -371,6 +371,12 @@ test('#48 integration signal preserved: genuinely unconsumed inject still notifi
   orchWs.close();
 });
 
-// Requiring daemon.js loads persisted sessions for read-only inspection; ensure the test
-// process exits even if module-load left background handles open.
-test.after(() => { setImmediate(() => process.exit(0)); });
+// No force-exit here, and do not add one back (#861).
+//
+// A `test.after(() => setImmediate(() => process.exit(0)))` used to sit here. Unlike the other
+// three files that carried it, this one really did keep the loop alive — but not for the reason
+// the old comment gave. It was not module load: it was the un-cancelled `delay(2000)` in the
+// harness stop() race, which Promise.race abandons without clearing. That timer now clears its
+// own loser (test-support/daemon-harness.js waitForChildExit), and this file exits on its own
+// ~2.1s after its last test. process.exit() tears down before the TAP stream has flushed, so
+// the runner counts fewer tests than ran and still prints "fail 0".

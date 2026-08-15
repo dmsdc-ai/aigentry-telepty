@@ -239,16 +239,30 @@ async function startTestDaemon(options = {}) {
     }, { description: 'session cleanup' });
   }
 
+  // Bounded wait for the daemon child to exit, with the losing timer CANCELLED (#861).
+  //
+  // `Promise.race` abandons the loser; it does not cancel it. A plain `delay(2000)` here stays
+  // pending for the full 2s after the child has already exited, and a pending timer keeps the
+  // TEST process's event loop alive long after its last assertion. That is what four test files
+  // were papering over with `process.exit(0)` in an after-hook — which exits before the TAP
+  // stream has flushed and silently drops test results from the reported count.
+  async function waitForChildExit(timeoutMs = 2000) {
+    let timer;
+    const expired = new Promise((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); });
+    try {
+      return await Promise.race([once(child, 'exit').then(() => true), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // Kill the daemon process WITHOUT the cleanupSessions() pass stop() does. A restart test needs
   // this: cleanupSessions DELETEs every session, and DELETE revokes credentials (#815), so
   // stopping politely would destroy the very state the restart is supposed to carry across.
   async function kill() {
     if (child.exitCode === null) {
       child.kill();
-      const exited = await Promise.race([
-        once(child, 'exit').then(() => true),
-        delay(2000).then(() => false)
-      ]);
+      const exited = await waitForChildExit();
       if (!exited && child.exitCode === null) {
         child.kill('SIGKILL');
         await once(child, 'exit').catch(() => {});
@@ -266,10 +280,7 @@ async function startTestDaemon(options = {}) {
     if (child.exitCode === null) {
       child.kill();
 
-      const exited = await Promise.race([
-        once(child, 'exit').then(() => true),
-        delay(2000).then(() => false)
-      ]);
+      const exited = await waitForChildExit();
 
       if (!exited && child.exitCode === null) {
         child.kill('SIGKILL');

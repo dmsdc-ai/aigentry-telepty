@@ -19,6 +19,10 @@
 //   1. the two manifests agree with each other (three fields, one number)
 //   2. the release notes are filed under exactly the version the package claims
 //   3. that version is not one this project has already shipped
+//   4. README.md's ecosystem row for this package names that version too
+//
+// (4) was added in r3: the first cut of this file enumerated only the manifests, and a FOURTH
+// tracked place still said `0.7.1` while this suite was green — README.md's own ecosystem row.
 //
 // (2) is the load-bearing one. Notes accumulated under a `## Unreleased` heading are what let
 // the package version and the release it describes drift apart in the first place: the notes
@@ -35,6 +39,7 @@ const projectRoot = path.resolve(__dirname, '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
 const lock = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package-lock.json'), 'utf8'));
 const changelog = fs.readFileSync(path.join(projectRoot, 'CHANGELOG.md'), 'utf8');
+const readme = fs.readFileSync(path.join(projectRoot, 'README.md'), 'utf8');
 
 // `## 0.8.0 — 2026-08-15`, `## 0.6.11] - ...` (the older bracketed style), or a bare `## 0.8.0`.
 // Anything after the version is free text: the date is filled in at publish time.
@@ -60,6 +65,28 @@ test('package-lock.json carries the same version as package.json, in both of its
     'package-lock.json:3 disagrees with package.json — run `npm install` after a version bump');
   assert.equal(lock.packages[''].version, pkg.version,
     'package-lock.json packages[""].version disagrees with package.json');
+});
+
+test("README.md's ecosystem row for this package names the version package.json claims", () => {
+  // The fourth tracked place. That row is GENERATED — scripts/gen-readme.mjs self-overrides the
+  // repo's own row with the local package.json version "so a repo never displays a stale version
+  // of itself" — so it says the wrong number only when the generator has not been re-run since a
+  // bump, which is exactly what happened at 0.7.1 -> 0.8.0.
+  //
+  // Bounded, so this is not read as more than it is: `prepublishOnly` regenerates the README into
+  // the npm tarball and .github/workflows/readme-regen.yml fixes `main` after the GitHub Release,
+  // so the PUBLISHED artifact was already right. What was wrong, and what this catches, is the
+  // TAGGED REPO — what a reader gets from a clone or from GitHub at the tag.
+  //
+  // Keyed on the package name, not the display name, because the name is the identity.
+  const escaped = pkg.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const row = new RegExp(`^\\|[^|]*\\|\\s*\`${escaped}\`\\s*\\|\\s*([^|]*?)\\s*\\|`, 'm').exec(readme);
+  assert.ok(row,
+    `README.md has no ecosystem row for \`${pkg.name}\` — if the table moved, move this assertion `
+    + 'with it rather than deleting it');
+  assert.equal(row[1], pkg.version,
+    `README.md's ecosystem row says ${row[1]} but package.json says ${pkg.version} — the row is `
+    + 'generated, so fix it with `node scripts/gen-readme.mjs`, not by hand');
 });
 
 test('CHANGELOG.md files its newest section under exactly the version package.json claims', () => {

@@ -250,13 +250,14 @@ what it measured. None of them is a task outcome — all carry `completion_fact:
 Append-only, one compact JSON line **per delivery** (multicast/broadcast = one line **per target**,
 sharing `inject_id`). File mode `0600`, dir `0700`. Schema v1:
 ```jsonc
-{ "v": 1, "ts": "ISO 8601", "inject_id": "UUID", "kind": "inject|multicast|broadcast|reply",
+{ "v": 1, "ts": "ISO 8601", "inject_id": "UUID", "kind": "inject|multicast|broadcast",
   "source": "inject|multicast|broadcast|ws-viewer|bus", "claimed_from": "string|null",
-  "verified_sender_sid": "string|null", "spoof_suspected": "boolean", "to": "string",
+  "verified_sender_sid": "string|null", "verified_sender_epoch": "string|null",
+  "verified_sender_generation": "number|null", "spoof_suspected": "boolean", "to": "string",
   "to_alias": "string|null", "origin": "trusted-local|untrusted-remote", "origin_host": "string|null",
   "ref_path": "string|null", "payload_sha256": "hex", "payload_bytes": "number",
   "payload_preview": "null (hash-only default) | string (truncated, opt-in TELEPTY_AUDIT_PREVIEW=1)",
-  "delivery_result": "success | failed:<CODE> | blocked:<reason>" }
+  "delivery_result": "success | queued | forwarded | failed:<CODE> | blocked:<reason>" }
 ```
 Query via `GET /api/injects?since=&until=&to=&from=&spoof=&limit=&cursor=` (token-gated) or
 `telepty injects [--tail] [--since] [--to] [--from] [--spoof] [--json]`. See
@@ -266,6 +267,27 @@ Query via `GET /api/injects?since=&until=&to=&from=&spoof=&limit=&cursor=` (toke
 count: `mailbox` was previously listed and is **not** a source — the mailbox is the transport
 underneath `inject`/`multicast`/`broadcast`/`bus`, not an entrance of its own, so no line has ever
 carried it.
+
+**`kind` values, measured the same way.** `reply` was previously listed and is **not** a kind. It is
+a CLI verb: `telepty reply` posts to `POST /api/sessions/:id/inject` with `reply_to` set, so its
+delivery is audited `kind:"inject"` like anything else through that door. Every `auditAppend` call
+site writes `inject`, `multicast` or `broadcast`, and `buildAuditLine` defaults to `inject` — no
+line has ever carried `reply`. Same defect as `mailbox`, one field over: a value that reads as
+documented capability and was only ever an intention.
+
+**`delivery_result` has five shapes, and this block listed three.** `forwarded` arrived with the
+`ws-viewer` door (0.8.0, #843) and `queued` with the park audit (#860); both were missing while
+`success | failed:<CODE> | blocked:<reason>` was presented as the whole set. `BOUNDARY.md` carries
+the long form — what each shape measures, which doors can write `queued`, and the one door of those
+four whose `queued` line is ever closed out by a record elsewhere.
+
+**`verified_sender_epoch` / `verified_sender_generation` (0.8.0, #815) were emitted but undocumented
+here.** They complete the principal `(sid, epoch, generation)`: a bare sid is not an identity,
+because a textual sid is destroyed and recreated routinely, and the epoch is what tells a consumer
+that two lines naming the same sid came from the same *instance*. Both are `null` whenever the
+sender is unverified, so an absent epoch never reads as "verified, epoch unknown". They are derived
+in `src/audit/inject-log.js`, which is the authoritative shape of a line — as are `payload_sha256`,
+`payload_bytes` and `spoof_suspected`, none of which any caller passes.
 
 #### Which writes into a PTY this log records, by name (0.8.0, #843)
 
