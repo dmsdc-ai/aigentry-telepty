@@ -308,8 +308,31 @@ async function runKickstartRace({ supervisor = true } = {}) {
   await waitExit(original, 5000);
   mark('kickstart gap open (old daemon dead)');
 
+  // #850: WHAT schedules the relaunch has to differ by scenario, because the two scenarios
+  // need different things from it.
+  //   supervisor=true  — the relaunch IS the kickstart gap the CLI must not race, so it stays
+  //                      on KICKSTART_GAP_MS. The contract there is satisfied either way
+  //                      (defer, or the supervisor wins the port), so no ordering is assumed.
+  //   supervisor=false — nothing is supervising this daemon, so nothing relaunches it on a wall
+  //                      clock; the relaunch is only here to be the competitor that loses. The
+  //                      fixed gap made that an unbounded coin flip: a `setTimeout` does not
+  //                      stretch under load, but the CLI's path to its own spawn is WORK —
+  //                      node boot + require(cli.js) + 3 getDaemonMeta probes with 200/400ms
+  //                      backoff + the /api/sessions fallback + one execSync lsof. Measured on
+  //                      a 14-core box: gap+650ms to that spawn idle, gap+1573ms under 24 CPU
+  //                      spinners, against a relaunch pinned at gap+1205ms either way. So the
+  //                      order inverted under load and the port changed hands — 0/10 red alone,
+  //                      10/10 red loaded. Wait for the condition the scenario actually needs
+  //                      instead of predicting it; the ceiling below is a liveness tripwire.
   let relaunch = null;
-  const relaunchLaunched = delay(KICKSTART_GAP_MS).then(() => {
+  let cliDaemon = null;
+  const relaunchGate = supervisor
+    ? delay(KICKSTART_GAP_MS)
+    : waitFor(() => fetchMeta(port, homeDir), {
+      timeoutMs: 20000,
+      description: `the CLI-spawned daemon to own :${port}`
+    }).then((meta) => { cliDaemon = meta; }, () => { /* stays null — the test asserts on it */ });
+  const relaunchLaunched = relaunchGate.then(() => {
     relaunch = spawnNode(['cli.js', 'daemon'], env, 'daemon#supervisor-relaunch');
     mark(`supervisor relaunch spawned (pid ${relaunch.pid})`);
     return relaunch;
@@ -326,7 +349,7 @@ async function runKickstartRace({ supervisor = true } = {}) {
   const relaunchExit = await waitExit(relaunch, SUPERVISOR_VERDICT_MS); // null ⇒ still serving
   mark(`supervisor relaunch exit=${JSON.stringify(relaunchExit)}`);
 
-  return { port, homeDir, originalMeta, relaunch, relaunchExit, racer, racerExit };
+  return { port, homeDir, originalMeta, cliDaemon, relaunch, relaunchExit, racer, racerExit };
 }
 
 // ── 1. Characterization of the primitive the whole bug rests on ───────────────────
@@ -422,10 +445,14 @@ test('#738: with no supervisor installed, the CLI still auto-starts the daemon (
   assert.match(r.racer.logs.stderr, /Auto-starting local telepty daemon/i,
     `expected the pre-#738 auto-start path\n${describe(r.racer)}`);
 
-  // A daemon is serving, and it is the one the CLI spawned (not the scripted relaunch,
-  // which loses the port exactly as it always did when no supervisor policy applies).
+  // A daemon is serving, and it is the one the CLI spawned. `cliDaemon` was observed owning the
+  // port while the original was already dead and the scripted relaunch did not exist yet, so
+  // nothing else could have put it there — this is an identity, not a race outcome (#850). It is
+  // also the stronger claim: the old `notEqual(relaunch.pid)` passed whenever ANY third daemon
+  // held the port, and could never show that the CLI had spawned one at all.
   const meta = await fetchMeta(r.port, r.homeDir);
+  assert.ok(r.cliDaemon, `the CLI never got a daemon onto :${r.port}\n${describe(r.racer)}`);
   assert.ok(meta, `nobody is serving :${r.port}\n${describe(r.racer)}`);
   assert.notEqual(meta.pid, r.originalMeta.pid, 'expected the killed daemon to be gone');
-  assert.notEqual(meta.pid, r.relaunch.pid, 'expected the CLI-spawned daemon to own the port');
+  assert.equal(meta.pid, r.cliDaemon.pid, 'expected the CLI-spawned daemon to own the port');
 });
