@@ -66,6 +66,83 @@ and to the daemon in an authenticated pre-registration, and the daemon issues on
 is a consumer-side spawn change, deliberately not built here. **Documented so the next person does
 not have to rediscover it.**
 
+## Reachability is not authentication (0.8.0, #820 / #823)
+
+Until 0.8.0 the daemon's auth middleware answered the network's question instead of the caller's:
+`if (isAllowedPeer(ip)) return next()`. `isAllowedPeer` returns true for loopback, for every address
+when the allowlist is empty, **and for any address that matches a non-empty allowlist** — so three
+populations reached every route with no credential at all: any process on the machine, every address
+on a network-bound daemon, and (because #672's tailnet auto-bind populates that allowlist on the
+default configuration) every device on the operator's tailnet. Session enumeration, PTY read, PTY
+write, `DELETE`, and `POST /api/sessions/spawn` with a caller-chosen `command` and `cwd` were all
+open on that path.
+
+In 0.8.0 the two questions are separated and asked in order:
+
+1. **Origin** (#806) — a request carrying a browser `Origin` must name an allowlisted one. Absolute:
+   a valid credential cannot buy past it.
+2. **Reachability** — `isAllowedPeer` can only NARROW. Outside the allowlist is `403 PEER_NOT_ALLOWED`.
+   An empty allowlist still means *no IP restriction*, never *no authentication*; loopback is never
+   narrowed away, so a local CLI cannot be locked out by an allowlist.
+3. **Credential** — the daemon token, for **every** address including loopback. Otherwise `401`.
+
+### What the boundary now is, precisely
+
+The line moves from *"anyone who can open a socket to the port"* to *"anyone who can read
+`~/.telepty/config.json`"* (mode `0600` inside a `0700` directory) — roughly the uid boundary, plus
+root.
+
+**It does not stop a same-uid process.** An agent's shell tool, a build script, an `npm postinstall`
+runs as the user and can read that file. What the change does buy:
+
+- The network surface is no longer *weaker* than the filesystem surface. Before, reaching the port
+  beat owning the file: a process denied `$HOME` still had full PTY read/write. That inversion is
+  what was closed.
+- A real boundary against different-uid local processes, sandboxes with a different `HOME`,
+  container/VM neighbours sharing host loopback, and any port-forward endpoint that is not this user.
+- Against same-uid it raises the cost from *zero* (open a socket) to *a filesystem read that is
+  auditable and blockable by OS sandboxing* (macOS TCC/sandbox profiles, Linux LSM) — a lever that
+  did not exist before.
+
+> Same-uid is not a boundary telepty can create; only the OS can, and this fix is the precondition
+> for ever using it.
+
+### `/api/health` is deliberately unauthenticated, and discloses the version
+
+It is registered *before* the auth middleware, and it must stay that way: `daemon-control.js`'s
+port-ownership probe, `cross-machine.js`'s `connect-http` discovery, and the aterm GUI's version
+detection all depend on it. Note what that means beyond "unauthenticated": it is registered after
+`cors()` (whose default is `Access-Control-Allow-Origin: *`) and *before* the browser origin guard,
+so it is the one route that answers **200 with a readable body to a disallowed `Origin`**. On the
+tailnet listener it therefore offers unauthenticated version fingerprinting to any device on the
+tailnet. Accepted and written down rather than closed: dropping the `version` field would break the
+GUI, and if it ever does need closing the answer is binding health to loopback only.
+
+### Cross-host HTTP peers: a credential-distribution gap with no design yet
+
+Each node mints its own random token, so a cross-host caller must present the **target's** token.
+It is resolved by address: `TELEPTY_AUTH_TOKEN` → a `peers.json` entry matching that `host:port`
+(written by `telepty connect-http <host> --token <that host's authToken>`) → the local token. The
+last step is deliberate: a *wrong* credential yields a diagnosable 401, while sending none yields an
+ambiguity indistinguishable from an absent endpoint.
+
+What does **not** exist: any discovery, rotation, revocation, or per-peer scoping of those tokens.
+Step 2 only helps an operator who has already run `connect-http --token`, and addressing forms with
+no `peers.json` entry (`<sid>@<tailnet-ip>`, `TELEPTY_HOST`) fall back to the env variable or fail.
+This is a named limitation, not a solved problem.
+
+### `TELEPTY_AUTH_TOKEN` must be set for BOTH ends or neither
+
+The daemon (`daemon.js`), the CLI (`cli.js`) and the MCP server (`mcp-server/index.mjs`) all resolve
+env-then-file, in that order. It is a **fleet-wide** token, applied to every daemon the process
+talks to — not a per-target one; a CLI invocation that talks to two daemons (e.g. a cross-host
+`inject`, which also probes the local daemon) needs the per-address `peers.json` path instead.
+
+The hazard to know about: the production daemon runs under launchd, whose plist supplies only
+`PATH`. An operator who exports this in a shell but not for the daemon gets a client sending a token
+the daemon has never heard of — a 401 that reads like a credential bug. Set it for both, or for
+neither.
+
 ## The shared daemon secret — read boundary, and why rotation needs a restart
 
 `~/.telepty/config.json` holds the token every caller presents to the daemon. Two properties are
@@ -89,6 +166,32 @@ long-lived daemon from every subsequent call, permanently.
 
 Consequence worth stating once: a running daemon is *immune* to the config changing underneath it,
 because it never looks again. The failure surfaces on the caller side, named, not as a silent re-key.
+
+## The inject audit log — what it records, and what it does not prove (0.8.0, #826)
+
+`~/.telepty/logs/injects.jsonl` records **both** write paths into a PTY: `POST
+/api/sessions/:id/inject` (`source: "inject"`) and a WebSocket viewer's `{type:'input'}` frame
+forwarded to the session owner (`source: "ws-viewer"`). Until 0.8.0 the second wrote nothing at all,
+so the log was silently incomplete — and it stops being merely untidy the moment every writer is
+authenticated, because that is when the log starts being read as *the* record of who typed.
+
+Read it with three limits in mind:
+
+- **`delivery_result` says what was measured.** `success` (HTTP path) means the daemon's delivery
+  machinery reported success. `forwarded` (WS path) means only that the frame was written to the
+  owner socket. They are different measurements and deliberately do not share a word.
+- **`claimed_from` is a claim; `verified_sender_sid` is the measurement.** On both paths the
+  verified half comes from the `x-telepty-session-token` bearer (#815) — the request header on the
+  HTTP path, the handshake header on the WS path — and never from the message body or frame.
+- **`classifyPeerLaneInject` (#533) is a policy guardrail, not an authentication boundary.** It now
+  applies to both write paths, but on both it is keyed on the *claimed* sender, so a caller that
+  states no `from` is on the operator lane by construction. Do not read a clean peer-lane log as
+  proof that no peer-to-peer delegation happened.
+
+Volume note: the WS path records one line per `input` frame, and an interactive `telepty attach`
+sends one frame per keystroke. The writer is bounded (drop-oldest with an `audit_overflow` bus
+event, rotation at 50 MB × 5 files), but an operator sizing this log should expect interactive
+attach sessions to dominate it.
 
 ## Design principle
 

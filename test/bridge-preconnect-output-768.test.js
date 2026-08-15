@@ -59,7 +59,7 @@ test('#768 RED: PTY output printed before the owner WS opens still reaches the d
     const port = await H.daemonReady(daemon);
     // The test talks to the daemon directly; only the BRIDGE goes through the held proxy, so
     // these assertions are never themselves delayed by the lever.
-    const A = H.api(port);
+    const A = H.api(port, home);
     proxy = H.startProxy({ targetPort: port, holdWsUpgradeMs: WS_UPGRADE_HOLD_MS });
     const proxyPort = await proxy.listen();
 

@@ -138,14 +138,16 @@ test('P3: GET /api/injects returns lines filtered by to + from with pagination s
 });
 
 test('P3: /api/injects is token-gated by the shared auth middleware (401 unauthorized)', async () => {
-  // The live daemon trusts localhost, so a true 401 can only be exercised by mounting the
-  // SAME createAuthMiddleware (the exact gate /api/injects sits behind) with a non-local peer.
+  // #820: this used to need `isAllowedPeer: () => false` to "simulate a remote caller", because
+  // the live daemon TRUSTED localhost and a 401 was otherwise unreachable from a test. That was
+  // the vulnerability. The peer stub is now `true` (reachable, the ordinary case) and the 401 is
+  // produced by the thing that should produce it: no credential.
   const express = require('express');
   const { createAuthMiddleware } = require('../src/protocol/http-auth');
   const { readInjectLog } = require('../src/audit/inject-log');
   const app = express();
   app.use(createAuthMiddleware({
-    isAllowedPeer: () => false,        // simulate a remote (non-localhost) caller
+    isAllowedPeer: () => true,
     expectedToken: 'sekret',
     verifyJwt: () => false
   }));

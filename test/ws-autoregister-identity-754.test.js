@@ -40,9 +40,12 @@ after(async () => { if (harness) await harness.stop(); });
 // The exact shape of the failed-re-register reconnect: an owner WS for a session the daemon
 // has no record of.
 async function ownerConnect(sessionId, query = '') {
+  // #820: the daemon token is what upgrades the socket. This session is deliberately UNREGISTERED
+  // (that is the case under test), so it holds no #815 bearer — the two credentials answer
+  // different questions and only the first one is required here.
   const ws = new WebSocket(
     `ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sessionId)}`
-    + `?owner=1&owner_pid=${process.pid}${query}`);
+    + `?owner=1&owner_pid=${process.pid}&token=${encodeURIComponent(harness.authToken())}${query}`);
   await new Promise((resolve, reject) => {
     ws.once('open', resolve);
     ws.once('error', reject);

@@ -25,7 +25,11 @@ const PKG_VERSION = (() => {
 
 // ── Config ──
 
+// #823 — env-then-file, the SAME order daemon.js (EXPECTED_TOKEN) and cli.js (getAuthToken) use.
+// This file reads config.json directly rather than through auth.js, so it has to agree explicitly
+// or an operator who sets TELEPTY_AUTH_TOKEN gets a working CLI and a 401-ing MCP server.
 function getAuthToken() {
+  if (process.env.TELEPTY_AUTH_TOKEN) return process.env.TELEPTY_AUTH_TOKEN;
   try {
     const configPath = path.join(os.homedir(), ".telepty", "config.json");
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));

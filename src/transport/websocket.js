@@ -40,7 +40,11 @@ function installWebSocketTransport(deps) {
     // #60 Stage A §3 — durable observation seam. Optional for the same reason: a test harness that
     // omits them gets the bus-only behaviour instead of a throw.
     recordObservation,
-    listTrackedInjectionsForSession
+    listTrackedInjectionsForSession,
+    // #826 — policy + audit for the viewer write path, so it matches POST /inject. Returns
+    // whether the frame may be forwarded, and records the attempt either way. Optional, same
+    // convention as above; the daemon always passes it.
+    authorizeViewerInject
   } = deps;
 
   /**
@@ -193,11 +197,15 @@ function installWebSocketTransport(deps) {
     // overwrite the incumbent's epoch before the displacement block can capture it, and the
     // displaced epoch is precisely what the owner-replaced fact has to name.
     const claimedBearer = req.headers['x-telepty-session-token'];
-    const verifiedClaimEpoch = (() => {
-      if (!credentials || !claimedBearer || typeof credentials.verify !== 'function') return null;
-      const principal = credentials.verify(claimedBearer);
-      return principal && principal.sid === sessionId ? principal.epoch : null;
-    })();
+    // Resolved ONCE per socket. #826 also needs it — for a VIEWER the principal is a different
+    // session (whoever is typing), which is why the full principal is kept rather than only the
+    // epoch of a self-claim.
+    const presentedPrincipal = (credentials && claimedBearer && typeof credentials.verify === 'function')
+      ? credentials.verify(claimedBearer)
+      : null;
+    const verifiedClaimEpoch = presentedPrincipal && presentedPrincipal.sid === sessionId
+      ? presentedPrincipal.epoch
+      : null;
 
     // For wrapped sessions, first connector OR explicit ?owner=1 claim becomes the owner.
     // ?owner=1 reclaim handles the stale-ownerWs bug: allow bridge reconnects but stale TCP
@@ -412,7 +420,31 @@ function installWebSocketTransport(deps) {
           } else {
             // Non-owner client input -> forward to owner as inject
             if (type === 'input' && activeSession.ownerWs && activeSession.ownerWs.readyState === 1) {
-              activeSession.ownerWs.send(JSON.stringify({ type: 'inject', data }));
+              // #826 — this is a WRITE into somebody's terminal, and until now it was the one
+              // write path with no accountability: it skipped `auditAppend` (#47 P5),
+              // `classifyPeerLaneInject` (#533's hard block) and provenance labelling, all of
+              // which `POST /api/sessions/:id/inject` applies. Equal authority, unequal
+              // accountability — so #533 read as enforced while being one WS frame away from
+              // optional, and the inject log read as a record of who typed while missing a whole
+              // door.
+              //
+              // Now it takes the same rule as the HTTP path: same policy verdict, same audit
+              // schema, `source: 'ws-viewer'` so the two doors stay tellable apart, and the
+              // verified sender taken from the #815 bearer on the HANDSHAKE — never from the
+              // frame, which is attacker-controlled exactly like `body.from`.
+              //
+              // Optional dep, per this file's convention: a construction site without it forwards
+              // as before rather than throwing. The daemon always passes it.
+              const allowed = typeof authorizeViewerInject === 'function'
+                ? authorizeViewerInject({
+                  sessionId,
+                  session: activeSession,
+                  data,
+                  claimedFrom: typeof msg.from === 'string' ? msg.from : null,
+                  principal: presentedPrincipal
+                })
+                : true;
+              if (allowed) activeSession.ownerWs.send(JSON.stringify({ type: 'inject', data }));
             } else if (type === 'resize' && activeSession.ownerWs && activeSession.ownerWs.readyState === 1) {
               activeSession.ownerWs.send(JSON.stringify({ type: 'resize', cols, rows }));
             }
@@ -518,26 +550,66 @@ function installWebSocketTransport(deps) {
     });
   });
 
+  // #835/#820 — a refusal must be readable AS a refusal.
+  //
+  // This used to be `socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy()`. The
+  // destroy() races the write, so the client frequently saw ECONNRESET instead of the response:
+  // in `ws` that surfaces as an `error` event plus close **1006**, which is byte-identical to what
+  // a client sees when the daemon is not running at all. A bridge then reconnects forever, in
+  // silence, against a daemon that is answering and declining. "Nothing is there" and "you were
+  // refused" are different facts and a client has to be able to act on the difference.
+  //
+  // So: a COMPLETE response — status line, `Connection: close`, a JSON body with the same `code`
+  // the HTTP middleware returns, and `Content-Length` so the client knows the body ended — then
+  // `end()`, which flushes before the FIN. `ws` delivers that to `unexpected-response` with a
+  // readable `res.statusCode`, and 1006 is left to mean only what it should: nothing answered.
+  function refuseUpgrade(socket, status, reason, code, message) {
+    const body = JSON.stringify({ error: message, code });
+    // A socket that already went away must not throw out of an upgrade handler.
+    socket.on('error', () => {});
+    try {
+      socket.end(
+        `HTTP/1.1 ${status} ${reason}\r\n`
+        + 'Connection: close\r\n'
+        + 'Content-Type: application/json\r\n'
+        + `Content-Length: ${Buffer.byteLength(body)}\r\n`
+        + `X-Telepty-Refusal: ${code}\r\n`
+        + '\r\n'
+        + body
+      );
+    } catch { /* already destroyed — nothing to tell */ }
+  }
+
   // Shared upgrade handler. Attached to every provided listener so a cross-host attach reaching
-  // the additive tailnet socket (daemon.js:4225) upgrades exactly like loopback — the auth check
-  // (isAllowedPeer || token || jwt) is identical to the inject/read-screen HTTP path, so attach
-  // gains no reach those already lack. Was bound to loopback only → tailnet WS fell through to
-  // Express GET /api/sessions/:id → HTTP 200 ("Unexpected server response: 200").
+  // the additive tailnet socket (daemon.js:4225) upgrades exactly like loopback.
+  //
+  // #820/#823: the gate is now IDENTICAL to the HTTP middleware's, in the same order —
+  // origin → peer reachability → credential. It used to be `isAllowedPeer(addr) || token || jwt`,
+  // where a `true` from the peer policy ALONE opened the socket. On a default install that is
+  // true for every address (empty allowlist) and for every tailnet device (#672 auto-trust
+  // populates the list, and a MATCH returns true just as completely as an empty list does), so
+  // an uncredentialed handshake — viewer socket and `/api/bus` alike — upgraded with 101.
   function handleUpgrade(req, socket, head) {
     const url = new URL(req.url, 'http://' + req.headers.host);
     const token = url.searchParams.get('token');
 
     if (isForbiddenOrigin(req.headers['origin'])) {
-      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-      socket.destroy();
+      refuseUpgrade(socket, 403, 'Forbidden', 'ORIGIN_NOT_ALLOWED', 'Forbidden: browser origin not allowed.');
+      return;
+    }
+
+    // Reachability only, and it can only narrow — never a credential.
+    if (!isAllowedPeer(req.socket.remoteAddress)) {
+      refuseUpgrade(socket, 403, 'Forbidden', 'PEER_NOT_ALLOWED',
+        'Forbidden: this address is not in TELEPTY_PEER_ALLOWLIST.');
       return;
     }
 
     const wsAuthHeader = req.headers['authorization'] || '';
     const wsJwtValid = wsAuthHeader.startsWith('Bearer ') && verifyJwt(wsAuthHeader.slice(7));
-    if (!isAllowedPeer(req.socket.remoteAddress) && token !== expectedToken && !wsJwtValid) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
+    if (token !== expectedToken && !wsJwtValid) {
+      refuseUpgrade(socket, 401, 'Unauthorized', 'PERMISSION_DENIED',
+        'Unauthorized: Invalid or missing token.');
       return;
     }
 

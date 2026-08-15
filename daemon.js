@@ -48,7 +48,17 @@ try {
   console.error(`[AUTH] Failed to load telepty auth config: ${err.message}`);
   process.exit(1);
 }
-const EXPECTED_TOKEN = config.authToken;
+// #823 — env-then-file, and the CLI (`cli.js getAuthToken`) plus the MCP server resolve it in the
+// SAME order, so an operator cannot end up with one end reading the env and the other the file.
+// Deliberately resolved HERE rather than inside `auth.js getConfig()`: getConfig() is also the
+// first-run minting path and has two return points, so folding the override in there silently
+// ignores the variable on a fresh machine.
+//
+// It requires a deliberate act to use: the daemon runs under launchd, whose plist supplies only
+// PATH, so an operator who exports this in a shell but not for the daemon gets 401s. That is the
+// documented hazard (BOUNDARY.md), not an accident to paper over. The value is still FROZEN at
+// module load — see the note above; rotation is an explicit restart, by design.
+const EXPECTED_TOKEN = process.env.TELEPTY_AUTH_TOKEN || config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
 const net = require('net');
 const fs = require('fs');
@@ -3329,8 +3339,10 @@ app.get('/api/sessions', (req, res) => {
 });
 
 // #43 P3 — token-gated historical inject audit query (spec §7). Behind the SAME shared auth
-// middleware as every /api/* route (app.use(createAuthMiddleware) above), so it is 401 for an
-// unauthorized non-local request and open to localhost/allowlisted peers. Filters: since/until,
+// middleware as every /api/* route (app.use(createAuthMiddleware) above), so it is 401 for ANY
+// caller without the token — #820: loopback and an allowlist match are no longer credentials, so
+// "open to localhost/allowlisted peers" is no longer true of this or any other route. Filters:
+// since/until,
 // to (alias-resolved), from (claimed OR verified), spoof; pagination via limit/cursor (newest
 // first). Reads the live injects.jsonl (one write path, file-backed) — separate lifecycle from
 // the ephemeral /api/events live bus, so the two are not conflated.
@@ -4539,6 +4551,65 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
   }
 });
 
+// #826 — the OTHER write path, kept next to the route above because they are twins and were
+// diverging silently.
+//
+// `src/transport/websocket.js` forwards an attached viewer's `{type:'input'}` to the PTY owner as
+// `{type:'inject'}`. That is a write into somebody's terminal with exactly the authority of the
+// route above, and until now it applied none of the route's accountability: no `auditAppend`
+// (#47 P5), no `classifyPeerLaneInject` (#533's hard block), no provenance labelling.
+//
+// That gap only became DANGEROUS with #820/#823. Before them the audit log was obviously
+// incomplete — anything on the box could write with no credential, so nobody could read the log
+// as a record of anything. Once every writer is authenticated an operator will reasonably read
+// the inject log as THE record of who typed into a session, and #533 as THE enforcement point.
+// Both would then claim more than they measure. The security fix is what creates the false
+// confidence, which is why this ships in the same release.
+//
+// Held to the SAME rule as the HTTP path, deliberately no stricter: the policy verdict is keyed
+// on a CLAIMED sender at both doors (so #533 remains a policy guardrail, not an authentication
+// boundary), while `verified_sender_*` comes from the #815 bearer presented on the handshake and
+// never from the frame — the same split as `body.from` vs `x-telepty-session-token`.
+//
+// Returns whether the frame may be forwarded. Records the attempt either way.
+function authorizeViewerInject({ sessionId, session, data, claimedFrom, principal }) {
+  const inject_id = crypto.randomUUID();
+  const payload = typeof data === 'string' ? data : '';
+  const verdict = classifyPeerLaneInject({
+    from: claimedFrom, to: sessionId, prompt: payload, orchestratorSids: ORCHESTRATOR_SIDS
+  });
+  const blocked = verdict.decision === 'block';
+
+  if (blocked) {
+    broadcastSessionEvent('peer_inject_blocked', sessionId, session, {
+      extra: {
+        target_agent: sessionId,
+        from: claimedFrom || null,
+        reason: verdict.reason,
+        attempted_kind: verdict.kind,
+        envelope_present: verdict.envelopePresent,
+        inject_id
+      }
+    });
+    console.warn(`[PEER-GUARD] blocked ws-viewer inject ${claimedFrom} → ${sessionId} (${verdict.reason})`);
+  }
+
+  auditAppend({
+    ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'ws-viewer',
+    claimed_from: claimedFrom || null, ...verifiedSenderFields(principal),
+    to: sessionId, to_alias: null,
+    origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: null,
+    payload,
+    // `forwarded`, not `success`. The HTTP route's `success` means its delivery machinery
+    // reported success; all this path can measure is that the frame was written to the owner
+    // socket. Two different measurements must not wear the same word — that substitution is the
+    // defect class this release exists to remove.
+    delivery_result: blocked ? `blocked:${verdict.reason}` : 'forwarded'
+  });
+
+  return !blocked;
+}
+
 // GET /api/inject-observations/:inject_id — #60 Stage A, the orchestrator's poll target.
 //
 // ALWAYS 200 with a discriminated schema-v2 body. Schema v2 never uses 404 as a task-state
@@ -5569,7 +5640,10 @@ installWebSocketTransport({
   // into the #48/#52 settle window and drops the emission when the session is busy, and an owner
   // replacement is a hard fact the daemon knows with certainty.
   recordObservation,
-  listTrackedInjectionsForSession
+  listTrackedInjectionsForSession,
+  // #826 — the viewer write path gets the same policy verdict and the same audit line as
+  // POST /api/sessions/:id/inject. See authorizeViewerInject.
+  authorizeViewerInject
 });
 
 function shutdown(code) {

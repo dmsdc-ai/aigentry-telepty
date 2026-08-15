@@ -306,10 +306,13 @@ test('#815 finding-b: an uncredentialed ?owner=1 claim is refused (4003), a cred
   const sid = createSessionId('claim815');
   const reg = await register(sid);
   const bearer = reg.body.session_token;
-  const url = `ws://${daemon.host}:${daemon.port}/api/sessions/${encodeURIComponent(sid)}?owner=1`;
+  const url = `ws://${daemon.host}:${daemon.port}/api/sessions/${encodeURIComponent(sid)}?owner=1&token=${encodeURIComponent(daemon.authToken())}`;
 
   const refused = await new Promise((resolve, reject) => {
-    const ws = new WebSocket(url); // no credential — the attacker's shape
+    // #820: the DAEMON token (in `url`) upgrades the socket; what this attacker lacks is the
+    // per-session bearer, which is the credential under test here. Two credentials, two
+    // questions — conflating them would make this assert the transport gate by accident.
+    const ws = new WebSocket(url); // no SESSION bearer — the attacker's shape
     ws.once('close', (code) => resolve(code));
     ws.once('error', reject);
     setTimeout(() => reject(new Error('claim was neither refused nor closed')), 4000);
@@ -338,7 +341,7 @@ test('#815 finding-b: an uncredentialed ?owner=1 claim is refused (4003), a cred
 // Breaking it would break reconnect, which is exactly what the dispatch forbade.
 test('#815 finding-b: a session with no credential still claims ownership freely', async () => {
   const sid = createSessionId('nocred815');
-  const url = `ws://${daemon.host}:${daemon.port}/api/sessions/${encodeURIComponent(sid)}?owner=1&command=bash`;
+  const url = `ws://${daemon.host}:${daemon.port}/api/sessions/${encodeURIComponent(sid)}?owner=1&command=bash&token=${encodeURIComponent(daemon.authToken())}`;
   const ws = new WebSocket(url); // never registered → daemon auto-registers on WS connect
   try {
     const claimed = await new Promise((resolve, reject) => {
@@ -362,7 +365,7 @@ test('#815 finding-b: a session with no credential still claims ownership freely
 // reads as continuity. This asserts the honest fact is on the bus, and that it is NOT a reconnect.
 test('#815 addendum: displacing a live owner emits session_owner_replaced, not session_reconnect', async () => {
   const sid = createSessionId('displace815');
-  const url = `ws://${daemon.host}:${daemon.port}/api/sessions/${encodeURIComponent(sid)}?owner=1&command=bash`;
+  const url = `ws://${daemon.host}:${daemon.port}/api/sessions/${encodeURIComponent(sid)}?owner=1&command=bash&token=${encodeURIComponent(daemon.authToken())}`;
   const bus = await daemon.connectBus();
   const events = [];
   bus.on('message', (m) => { try { events.push(JSON.parse(m)); } catch {} });
