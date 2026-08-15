@@ -5340,6 +5340,22 @@ async function busAutoRoute(msg) {
     }, targetSession);
   }
 
+  // #861 — `delivered` means BYTES WERE WRITTEN, and a park writes none.
+  //
+  // `bootstrapQueuedResponse` returns `success: true` for an op parked on the bootstrap /
+  // surface-modal queue, so `delivery.success` cannot carry this field on its own. #860 made the
+  // audit log say `queued` for exactly that case and this event went on saying `delivered: true`
+  // about the same inject — and the asymmetry ran the wrong way: `injects.jsonl` is token-gated
+  // while any local process may subscribe to the bus with no credential, so the honest record sat
+  // behind the credential and the false one was in the open.
+  //
+  // Keyed on the strategy as well as the flag, for the same reason `deliveryAuditResult` is: the
+  // mailbox path reports `queued` for a body it has already written synchronously, and that one is
+  // a write. This predicate must give the same answer as `deliveryAuditResult` — same question,
+  // deliberately the same expression.
+  const parked = delivery.queued === true && delivery.strategy === 'bootstrap_queue';
+  const wrote = delivered && !parked;
+
   // Emit inject_written ack
   broadcastSessionEvent('inject_written', targetId, targetSession, {
     extra: {
@@ -5349,12 +5365,16 @@ async function busAutoRoute(msg) {
       source_type: 'bus_auto_route',
       turn_id: (msg.payload && msg.payload.turn_id) || null,
       original_message_id: msg.message_id || null,
-      delivered,
+      delivered: wrote,
+      // The audit log's own vocabulary, carried on the UNGUARDED surface too, so a subscriber can
+      // tell "accepted and parked" from "refused" without opening a log it may hold no token for.
+      // A park is not a failure: `code`/`error` stay null below, because nothing went wrong.
+      delivery_result: wrote ? 'success' : parked ? 'queued' : `failed:${delivery.code || 'DELIVERY_FAILED'}`,
       code: delivered ? null : delivery.code,
       error: delivered ? null : delivery.error
     }
   });
-  console.log(`[BUS-ROUTE] ${eventType} → ${targetId}: ${delivered ? 'delivered' : 'failed'}`);
+  console.log(`[BUS-ROUTE] ${eventType} → ${targetId}: ${wrote ? 'delivered' : parked ? 'queued (parked, 0 bytes)' : 'failed'}`);
 }
 
 app.post('/api/bus/publish', (req, res) => {

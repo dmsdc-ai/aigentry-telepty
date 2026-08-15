@@ -113,7 +113,7 @@ Published by deliberation to request a turn from a session. Telepty daemon auto-
 
 ### `inject_written` (ACK)
 
-Emitted by telepty after successful auto-route delivery.
+Emitted by telepty after an auto-route delivery attempt — including one that wrote nothing.
 
 ```json
 {
@@ -122,10 +122,25 @@ Emitted by telepty after successful auto-route delivery.
   "sender": "daemon",
   "target_agent": "<session_id>",
   "source_type": "bus_auto_route",
-  "delivered": true,
+  "delivered": "boolean",
+  "delivery_result": "success | queued | failed:<CODE>",
+  "code": "string|null",
+  "error": "string|null",
   "timestamp": "ISO 8601"
 }
 ```
+
+- **`delivered` means bytes were written** (0.8.0, #861). It is `false` for a delivery **parked** on
+  the session's bootstrap / surface-modal queue, which writes nothing. It previously read `true`
+  there, because the delivery call returns `success: true` for a park — so this event asserted a
+  write that had not happened, while the audit log said `queued` about the same `inject_id`. That
+  asymmetry ran the wrong way: `injects.jsonl` is token-gated and the bus is not.
+- **A park is not a failure.** `code` and `error` stay `null` for it; `delivery_result` is what
+  separates `queued` from `failed:<CODE>`. It carries the audit log's vocabulary deliberately, so a
+  subscriber can tell the two apart without opening a log it may hold no token for.
+- Whether parked bytes are ever written is not answered here. For the single-target
+  `POST /api/sessions/:id/inject` door the observation ledger closes it out; for this bus door
+  nothing does — see `BOUNDARY.md`.
 
 ## Session Lifecycle Events
 
@@ -345,14 +360,6 @@ previous wording said "both write paths" because two had been looked at, not bec
 ```json
 { "type": "thread.closed", "thread_id": "UUID", "topic": "string", "message_count": "number", "timestamp": "ISO 8601" }
 ```
-
-## Termination Signal Detection
-
-Messages containing these strings suppress auto-reply guide footer:
-- `no further reply needed`
-- `thread closed` / `closed on X side`
-- `ack received` / `ack-only`
-- `회신 불필요` / `스레드 종료`
 
 ## Inject API Reference
 
