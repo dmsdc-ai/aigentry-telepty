@@ -302,6 +302,21 @@ Read it with three limits in mind:
   that delivery, and the question this log defers is, for them, deferred to nothing. Read `queued`
   on a fan-out or bus line as *accepted, zero bytes, outcome unrecorded* — not as a pointer to an
   answer kept elsewhere.
+
+  **Residual (#865): the `inject_written` bus event's NAME still asserts a write on one route.** A
+  park reaches the single-target `POST /api/sessions/:id/inject` emission — the only early return
+  there is on `!delivery.success`, and a park is `success: true` — so an event *named*
+  `inject_written` is broadcast for a delivery that wrote nothing. Say which surface got which,
+  because "fixed" would be the overclaim: the **bus auto-route** emission's fields are now honest
+  (`delivered: false`, `delivery_result: "queued"`, `code`/`error` null, #861), while the
+  **single-target** emission carries no `delivered` field at all — nothing there states the wrong
+  thing, but nothing there states the right thing either, and the event name is what a subscriber
+  reads first. **A subscriber must read the fields, not the event name.** This predates 0.8.0;
+  0.8.0 is only the release that made it legible, by giving the audit log a word (`queued`) for the
+  case that had none. Accepted for 0.8.0 and fixed in 0.9.0. Renaming breaks every subscriber at a
+  tag for a defect that was always there, and suppressing the event for a park would be worse — a
+  subscriber counting `inject_written` would then silently miss parks, which is absence-as-silence,
+  the defect this release exists to remove.
 - **`claimed_from` is a claim; `verified_sender_sid` is the measurement.** Wherever a line carries a
   verified half it comes from the `x-telepty-session-token` bearer (#815) — the request header on
   the HTTP doors, the handshake header on the `ws-viewer` door — and never from the message body or

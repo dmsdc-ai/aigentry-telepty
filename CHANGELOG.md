@@ -225,6 +225,20 @@ because the durable `tracking_started` record already exists and is pollable.
   schema. The mailbox is the transport beneath the other sources, not an entrance — its one
   `enqueue` call site sits inside `deliverInjectionToSession`, downstream of the doors above.
 
+  **Residual, accepted for 0.8.0 (#865): the `inject_written` event's name still asserts a write on
+  one route.** A parked delivery reaches the single-target `POST /api/sessions/:id/inject`
+  emission — its only early return is on `!delivery.success`, and a park is `success: true` — so
+  an event *named* `inject_written` is broadcast for a delivery that wrote zero bytes. Which surface
+  got which, because "fixed" would overclaim: the **bus auto-route** emission's fields are now
+  honest (`delivered: false`, `delivery_result: "queued"`, `code`/`error` null); the
+  **single-target** emission carries no `delivered` field at all, so it states nothing false and
+  nothing true, and the name is what a subscriber reads first. **Read the fields, not the event
+  name.** It predates 0.8.0 — this is simply the release that made it legible, by giving the audit
+  log a word for the case. Renaming would break every subscriber at a tag for a defect that was
+  always there, and suppressing the event for a park would be worse: a subscriber counting
+  `inject_written` would silently miss parks, which is absence-as-silence, the defect this release
+  exists to remove. Fixed in 0.9.0.
+
   `BOUNDARY.md` carries the door table by name beside that list, and states that it is a measurement
   rather than a proven ceiling. An interactive `telepty attach` produces one audit line per
   keystroke.
