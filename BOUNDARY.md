@@ -280,8 +280,8 @@ Read it with three limits in mind:
   the delivery was **accepted and parked** on the session's `bootstrapQueue` — one FIFO serving both
   the bootstrap gate and the surface-modal park — with zero bytes written. Two further shapes carry
   a reason after a colon: `blocked:<reason>`, written when the #533 peer-lane guard refused the
-  payload before any write (`inject`, `multicast`, `broadcast`, `ws-viewer`), and `failed:<code>`,
-  written when a delivery was attempted and did not land.
+  payload before any write (`inject`, `multicast`, `broadcast`, `ws-viewer`, `bus`), and
+  `failed:<code>`, written when a delivery was attempted and did not land.
 
   Five shapes, then, not two — and they are different measurements that deliberately do not share a
   word. `queued` in particular is not `success` under a softer name: before #860 a parked op *was*
@@ -289,12 +289,29 @@ Read it with three limits in mind:
   Keyed on the strategy as well as the flag, because the mailbox path also reports `queued` for a
   body it has already written synchronously, and that one is a write.
 
-- **A `queued` line is closed out for one door, and for three it is the last word.** On the
+- **A `queued` line is followed up for one door, and only on the outcomes that failed.** On the
   single-target `POST /api/sessions/:id/inject` — and only when the request carried a `from` —
   `beginTrackedInjection` opens a record in `~/.config/aigentry-telepty/tracked-injections.json`,
-  and the park and its outcome land there: `inject_parked` when it parks, then
-  `inject_delivery_refused` or `inject_delivery_dropped` if the queue never delivers it. So for that
-  door, whether the bytes were ever written is answered by the observation ledger rather than here.
+  and the park lands there as `inject_parked`, followed by `inject_delivery_refused` or
+  `inject_delivery_dropped` if the queue never delivers it.
+
+  **The fourth outcome — the drain succeeding — appends nothing.** `drainBootstrapQueue` calls
+  `abortTrackedInjection` only on `!result.success`; its success arm stamps `lastActivityAt` and
+  returns. So the last observation on a dispatch that WAS delivered stays `inject_parked` /
+  `bytes_written: 0`, indefinitely, and it is byte-identical to the record of one still sitting in
+  the queue. Name what this ledger answers for the door: **whether the delivery failed, and how.**
+  It does not answer whether the bytes were written, and a reader holding only the ledger cannot
+  tell *still parked* from *delivered* — only that neither a refusal nor a drop has been recorded.
+  Do not read `inject_parked` as a live state; read it as *parked, and not since refused or
+  dropped*. Consumers that copy the last observation kind into their own records (the orchestrator's
+  dispatch tracker does) will carry `inject_parked` on delivered dispatches for that reason.
+
+  **Residual (#864): an affirmative answer exists nowhere.** The drain's success arm has the
+  measurement — `executeBootstrapInject` already computes the byte count for the CR-failure case —
+  but appending an `inject_delivered` observation needs sender context threaded through four doors,
+  so it is deferred rather than done. Until it lands, "did the parked bytes land?" has no
+  affirmative answer on any surface: the audit log's last word is `queued` and the ledger's is
+  `inject_parked`.
 
   **The `multicast`, `broadcast` and `bus` doors open no such record.** `beginTrackedInjection` has
   exactly one caller; those three routes deliver without an inject id, so `parkTrackedInjection`

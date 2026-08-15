@@ -289,6 +289,25 @@ because the durable `tracking_started` record already exists and is pollable.
   `delivery` / `delivery_endpoint` are mutable only by a caller holding the session's current
   credential. Sessions with no credential are unaffected.
 
+- **`capability.session_authentication` narrowed: holding a session epoch is no longer evidence
+  that a bearer was presented (#860).** Any session carrying a `sessionEpoch` reported `observed` —
+  including one minted at `POST /api/sessions/register` and one restored from disk, neither of which
+  involved a presented credential. That is the substitution #815 removed, re-committed by the
+  release that removed it. `observed` now requires a bearer presented **and** verified on the
+  WebSocket handshake, recorded in a field of its own (`sessionEpochProved`, holding the epoch VALUE
+  rather than a flag, so a writer that moves `sessionEpoch` without proving it cannot inherit its
+  predecessor's proof).
+
+  **Consumer-visible on `GET /api/inject-observations/:inject_id`.** Three cases, three answers: no
+  epoch → `unavailable` / `no_815_epoch_fact`, unchanged; an epoch with no proof → `unavailable` /
+  **`no_815_bearer_presented`**, a reason value that did not exist before 0.8.0; epoch plus proof →
+  `observed` / `null`. A session that reported `observed` before this release reports
+  `no_815_bearer_presented` after it unless it proved a bearer. The reason vocabulary is open and
+  the daemon validates nothing against a list, so a consumer that only stores the string is not
+  broken by the new value — but one that BRANCHES on the reason, or that has read `observed` as a
+  property of any epoch-bearing session, is reading a different fact after 0.8.0 than before it.
+  **Breaking for any consumer keying on `capability.session_authentication`.**
+
 ### Fixed — a refusal is not a licence to destroy, and absence of evidence is not evidence of absence (#844)
 
 #835 established that a daemon which ANSWERS and declines is not a daemon that is absent, because
@@ -398,7 +417,11 @@ destroys on.**
   first-claim residual — is documented in `BOUNDARY.md`.
 - `test:watch` had drifted **19 files** behind `test` and `test:ci`, across three commits of this
   release cycle — so a developer in watch mode got a green that silently omitted every guard 0.8.0
-  added, including the release invariant above. All three lists are back in agreement. They are a
+  added, including the release invariant above. `test` and `test:watch` now name the same **109
+  files**. `test:ci` names **108**: it omits `test/bridge-preconnect-output-768.test.js`, which runs
+  as its own CI step under `test:ci:pty` (`.github/workflows/test-install.yml`) — an exclusion that
+  predates this release cycle and is deliberate, not drift. So two lists agree and the third differs
+  by one named file; there is no state here in which all three carry the same names. They are a
   fourth hand-maintained list that nothing checks, and the mechanism that let them drift is the
   same one behind the version and audit-door defects in these notes: an enumeration written by
   hand, read as coverage, and compared against nothing.

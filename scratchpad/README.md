@@ -25,7 +25,7 @@ never the whole test for keeping a file here — it is just the test the other f
 
 **Read all of it as history.** The daemon no longer asserts task outcome at all — it emits one
 `task_completion_unknown` observation (`src/completion-observation.js`,
-`GET /api/inject-observations/:inject_id`; `CHANGELOG.md` → *0.8.0 — unreleased* → "BREAKING:
+`GET /api/inject-observations/:inject_id`; `CHANGELOG.md` → *0.8.0* → "BREAKING:
 telepty no longer asserts task completion"). Do not treat any expectation in this directory as the
 current contract, and do not port one into `test/`.
 

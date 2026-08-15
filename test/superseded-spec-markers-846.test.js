@@ -53,6 +53,82 @@ const DATED_RECORDS = [
 const MARKER = /SUPERSEDED|HISTORICAL/;
 const MARKER_WINDOW = 25; // lines — "a reader who reads only the top" must be enough
 
+// A marker is only useful if the reader can follow it. These pointers have broken twice:
+// they named `*Unreleased*` and a sibling renamed the heading; they were repointed at
+// `*0.8.0 — unreleased*`, which is the half of the heading the PUBLISH STEP REWRITES — that
+// one would have broken at the tag, with nothing in the suite to notice. Hence a check that
+// runs the publish step at the pointers rather than a third round of fixing strings.
+const CHANGELOG_POINTER = /`CHANGELOG\.md`\s*→\s*\*([^*]+)\*/g;
+
+// Resolves = a reader searching CHANGELOG.md for the pointed-at text finds a section. Prefix
+// PLUS the heading's free-text separator, not a bare prefix, so `0.6.1` cannot resolve against
+// `## 0.6.11`. Bracketed headings (`## [0.6.11] - ...`, the older style) are unwrapped first.
+function resolvesInChangelog(pointer, changelog) {
+  return changelog.split('\n')
+    .filter((line) => /^##\s+\S/.test(line))
+    .map((line) => line.replace(/^##\s+/, '').replace(/^\[(.+?)\]/, '$1').trim())
+    .some((h) => h === pointer
+      || (h.startsWith(pointer) && /^[—-]/.test(h.slice(pointer.length).trim())));
+}
+
+// The publish step fills the date into the newest heading by hand — 0.8.0 is the only undated
+// section; every one below it reads `## X.Y.Z — YYYY-MM-DD`. First match only: `m` without `g`.
+const NEWEST_VERSION_HEADING = /^(##\s+\[?\d+\.\d+\.\d+\]?).*$/m;
+
+function withPublishedDate(changelog) {
+  return changelog.replace(NEWEST_VERSION_HEADING, '$1 — 2026-08-15');
+}
+
+test('#846: every CHANGELOG cross-reference resolves, and still resolves once publishing dates the heading', () => {
+  // Self-check on a fixture, so this cannot pass by matching nothing or by accepting anything.
+  const FIXTURE = '## 0.9.0 — unreleased\n\ntext\n\n## 0.8.0 — 2026-08-15\n';
+  assert.equal(resolvesInChangelog('0.9.0', FIXTURE), true,
+    'the resolver must match a heading by the stable half of its text');
+  assert.equal(resolvesInChangelog('0.9.0 — unreleased', withPublishedDate(FIXTURE)), false,
+    'the resolver must refuse a pointer that embeds the free text the publish step rewrites — '
+    + 'if it does not, the scan below cannot fail and this whole test is decoration');
+  assert.equal(resolvesInChangelog('0.9', FIXTURE), false,
+    'a bare prefix must not resolve — 0.6.1 is not 0.6.11');
+
+  const changelog = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8');
+  const published = withPublishedDate(changelog);
+  // The substitution must have had a target. Asserted on the heading rather than on
+  // `published !== changelog`, because once the release IS dated the rewrite is a no-op that
+  // proves the same thing — this check has to survive the tag it is guarding.
+  assert.ok(NEWEST_VERSION_HEADING.test(changelog),
+    'CHANGELOG.md has no version-shaped `## ` heading, so the simulated publish step rewrites '
+    + 'nothing and this test no longer exercises the edit that broke these pointers twice');
+
+  const tracked = execFileSync('git', ['ls-files', '*.md'], { cwd: ROOT, encoding: 'utf8' })
+    .split('\n').filter(Boolean);
+
+  const broken = [];
+  let pointers = 0;
+  for (const rel of tracked) {
+    const body = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    for (const m of body.matchAll(CHANGELOG_POINTER)) {
+      pointers += 1;
+      const pointer = m[1].trim();
+      if (!resolvesInChangelog(pointer, changelog)) {
+        broken.push(`${rel}: → *${pointer}* matches no CHANGELOG.md section today`);
+      } else if (!resolvesInChangelog(pointer, published)) {
+        broken.push(`${rel}: → *${pointer}* resolves today and STOPS resolving the moment the `
+          + 'release is dated — point at the version, which publishing keeps, not at the free text '
+          + 'after it, which publishing rewrites');
+      }
+    }
+  }
+
+  // Guards the vacuous case only — that the matcher found no pointers at all, e.g. because the
+  // arrow form changed. It does NOT guard against a pointer being deleted; deleting one is a
+  // legitimate edit and this count is deliberately not a hand-maintained expected total.
+  assert.ok(pointers > 0,
+    'no `CHANGELOG.md` → *section* pointer matched in any tracked *.md — if the pointer form '
+    + 'changed, teach CHANGELOG_POINTER the new form rather than leaving it matching nothing');
+
+  assert.deepEqual(broken, [], `CHANGELOG.md cross-references that a reader cannot follow:\n  ${broken.join('\n  ')}\n`);
+});
+
 test('#846: no tracked doc prescribes a removed terminal label without saying it is superseded', () => {
   const tracked = execFileSync('git', ['ls-files', '*.md'], { cwd: ROOT, encoding: 'utf8' })
     .split('\n').filter(Boolean);

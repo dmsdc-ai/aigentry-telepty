@@ -7,7 +7,7 @@
 > no text can authenticate its sender or correlate itself to a dispatch, so no text may settle
 > one. `TASK_COMPLETE_WITH_REPORT` no longer exists; one `task_completion_unknown` observation
 > replaces every terminal label (`src/completion-observation.js`,
-> `GET /api/inject-observations/:inject_id`). See `CHANGELOG.md` → *0.8.0 — unreleased* → "BREAKING:
+> `GET /api/inject-observations/:inject_id`). See `CHANGELOG.md` → *0.8.0* → "BREAKING:
 > telepty no longer asserts task completion (#60 Stage A)". The other half did land and is
 > current: `SessionStateMachine.markIdle` / `SessionStateManager.markIdle` exist in
 > `session-state.js` (Stage A changed only how caller detail merges with the normalized cause).

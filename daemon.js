@@ -5349,11 +5349,11 @@ async function busAutoRoute(msg) {
   // while any local process may subscribe to the bus with no credential, so the honest record sat
   // behind the credential and the false one was in the open.
   //
-  // Keyed on the strategy as well as the flag, for the same reason `deliveryAuditResult` is: the
-  // mailbox path reports `queued` for a body it has already written synchronously, and that one is
-  // a write. This predicate must give the same answer as `deliveryAuditResult` — same question,
-  // deliberately the same expression.
-  const parked = delivery.queued === true && delivery.strategy === 'bootstrap_queue';
+  // Asked THROUGH `deliveryAuditResult` rather than re-expressed here. It is the same question the
+  // audit line two lines up asks, and two writers of one predicate — with nothing binding them — is
+  // the shape every drift defect in this release has: the answers agree until someone edits one.
+  // The keying (strategy as well as flag) and its reason live there, at the single writer.
+  const parked = deliveryAuditResult(delivery) === 'queued';
   const wrote = delivered && !parked;
 
   // Emit inject_written ack

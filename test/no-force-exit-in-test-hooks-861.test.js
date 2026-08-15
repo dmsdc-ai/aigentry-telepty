@@ -79,9 +79,15 @@ test('#861: the detector fires on the shape it is meant to catch, and not on fix
   assert.equal(
     hooksReachingExit('after(async () => { await harness.stop(); });').length, 0,
     'an ordinary teardown hook must not be flagged');
+  // INSIDE the hook, and in all three quote forms `stripCommentsAndStrings` handles. It used to
+  // sit before the `after(`, where the paren-balanced body never reached it — so the assertion
+  // passed with the string branch removed entirely and proved nothing about the thing it names.
+  // Disabling any one of the three now turns this red. The shape is real: test/cli.test.js and
+  // test/lifecycle-surface-acceptance.test.js build stub CLIs that exit, from template literals.
   assert.equal(
-    hooksReachingExit('const stub = "if (x) process.exit(0);";\nafter(() => server.close());').length, 0,
-    'a stub-CLI fixture written as a string literal is legitimate and must not be flagged');
+    hooksReachingExit('after(() => { fs.writeFileSync(p, `process.exit(0)`); '
+      + 'const a = "process.exit(1)"; const b = \'process.exit(2)\'; server.close(); });').length, 0,
+    'a stub-CLI fixture written as a string literal inside the hook is legitimate and must not be flagged');
   assert.equal(
     hooksReachingExit('// after(() => process.exit(0)) used to live here\nafter(() => s.close());').length, 0,
     'a mention inside a comment must not be flagged');

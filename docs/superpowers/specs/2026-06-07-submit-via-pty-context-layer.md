@@ -7,7 +7,7 @@
 > terminal label along with `fireAutoReport`'s ability to emit one. `fireAutoReport` now emits a
 > single `task_completion_unknown` observation and nothing else; the daemon cannot measure task
 > outcome and no longer claims it (`src/completion-observation.js`,
-> `GET /api/inject-observations/:inject_id`; `CHANGELOG.md` → *0.8.0 — unreleased* → "BREAKING: telepty no
+> `GET /api/inject-observations/:inject_id`; `CHANGELOG.md` → *0.8.0* → "BREAKING: telepty no
 > longer asserts task completion (#60 Stage A)"). Do not resurrect a "never-started worker locks
 > to `TASK_IDLE_UNCONFIRMED`" regression test — that label is gone by design.
 
