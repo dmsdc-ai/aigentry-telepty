@@ -357,6 +357,12 @@ test('#546: submit-all delivers a single 0x0D via the PTY path to ≥2 wrapped s
   }
 });
 
-// Requiring daemon.js loads persisted sessions for read-only inspection; ensure the test
-// process exits even if module-load left background handles open.
-test.after(() => { setImmediate(() => process.exit(0)); });
+// No force-exit here, and do not add one back (#861).
+//
+// A `test.after(() => setImmediate(() => process.exit(0)))` used to sit here, on the premise
+// that requiring daemon.js "left background handles open". Measured with
+// process.getActiveResourcesInfo() after the last test, that premise is false: the only live
+// handles are this process's own stdout and stderr, and the file exits on its own in ~0.2s.
+// The hook was the harm — process.exit() tears down before the TAP stream has flushed, so the
+// runner counted fewer tests than ran and still printed "fail 0". Measured under suite-like
+// load, the worst run reported 14 of this file's 19 tests and called it a pass.

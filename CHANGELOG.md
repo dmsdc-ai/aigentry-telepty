@@ -388,6 +388,30 @@ destroys on.**
   fourth hand-maintained list that nothing checks, and the mechanism that let them drift is the
   same one behind the version and audit-door defects in these notes: an enumeration written by
   hand, read as coverage, and compared against nothing.
+- **The suite could silently shorten itself, and the number this release rests on was a lower
+  bound rather than a measurement.** Four test files ended with
+  `test.after(() => setImmediate(() => process.exit(0)))` — the early exit this repo retired
+  `--test-force-exit` for, hand-rolled per file. `process.exit()` tears the process down before the
+  TAP stream has flushed, so the runner counted fewer tests than actually ran and still printed
+  `fail 0`, `exit 0`. Measured under suite-like load: **83 of 400 runs truncated (20.8%)**, the worst
+  reporting **3 of 9** tests as a clean pass.
+
+  The premise those files stated — that requiring `daemon.js` "left background handles open" — is
+  false for three of them. Measured with `process.getActiveResourcesInfo()` after the last test,
+  the only live handles are the process's own stdout and stderr, and each exits on its own in
+  ~0.2s. `idle-unconfirmed-settle` really was held open, but by the test harness rather than by
+  module load: `Promise.race` in `startTestDaemon`'s `stop()`/`kill()` abandoned its losing
+  `delay(2000)` without cancelling it, and a pending timer keeps an event loop alive. It now
+  clears its loser (`waitForChildExit`), and the file exits on its own in ~2.0s — the same wall
+  time the force-exit was buying, now earned rather than forced. After: **0 of 784 runs
+  truncated**, `declared === reported` on every run.
+
+  `test/no-force-exit-in-test-hooks-861.test.js` keeps the class closed rather than the four
+  instances: it refuses any teardown hook that reaches `process.exit`, and carries its own
+  detector self-check, because a lint that cannot fail is the defect it is guarding against. It
+  names what it does not detect — an exit reached through a helper, one on `process.on('exit')`,
+  one in a `before` hook, and the legitimate case of a stub CLI written to disk as a string and
+  spawned as a child.
 
 ## 0.7.1 — 2026-07-26
 

@@ -428,7 +428,7 @@ telepty
 ## Testing
 
 ```bash
-npm test              # 70 tests (node:test)
+npm test              # the whole suite (node:test); the run prints its own test count
 npm run test:watch    # Watch mode
 ```
 
