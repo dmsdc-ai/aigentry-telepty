@@ -469,8 +469,8 @@ test('idle after an inject emits task_completion_unknown, not a terminal claim',
   // decides which character lands at the wrap column.
   //
   // That is a PRODUCT defect — a daemon-spawned shell whose prompt wraps just after `/`, `-`, `|`
-  // or `\` is unobservable in production too — and it is ticketed for 0.9.0, not fixed here: the
-  // product is under a structure freeze. This width is the accommodation, and it is honest about
+  // or `\` is unobservable in production too — and it is ticketed as #67 for 0.9.0, not fixed here:
+  // the product is under a structure freeze. This width is the accommodation, and it is honest about
   // what it buys: no wrap, so no forged spinner token, so the quiet path this test exists to pin
   // actually runs. It is NOT a timing knob and raising it further buys nothing — anyone tempted to
   // touch the budget below should read this first.
