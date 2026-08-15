@@ -28,11 +28,22 @@ const REMOVED_LABELS = [
 ];
 
 // A dated record states what was true on a date; marking it superseded would falsify a
-// true record. `EVIDENCE-*.md` matches under either directory — #846 proposes moving
-// them to docs/reports/, which the second pattern already covers.
+// true record.
+//
+// THIS LIST IS HAND-MAINTAINED, AND THAT IS THE DESIGN — not an oversight to automate away.
+// Whether a document *prescribes* a contract or *records* an observation is a judgment no
+// regex makes: the same `TASK_COMPLETE` string is an instruction in a spec and a measurement
+// in an incident write-up. So the list is the mechanism, and it fails CLOSED — a new dated
+// record that names a removed label turns this test red until someone adds it here. That red
+// is the test working. If you hit it: confirm the file really is a record (a statement about
+// a date, not something a reader should implement), then add its pattern and say why in a
+// comment, as the entries below do. If it is not a record, mark the document instead.
 const DATED_RECORDS = [
   /^CHANGELOG\.md$/,
   /^docs\/reports\//,
+  // Stays in scratchpad/: #846 considered moving these to docs/reports/ and rejected it —
+  // the move would have needed path edits in two files that ship to npm, for a cosmetic
+  // gain, and scratchpad/README.md already says the directory is not disposable.
   /^scratchpad\/EVIDENCE-\d+\.md$/,
   // Not a carrier: its label hits are example screen-history text for a prompt-glyph
   // disambiguation fixture, and the render gate itself survives Stage A.
