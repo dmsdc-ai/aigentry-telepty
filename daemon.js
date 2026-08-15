@@ -5497,9 +5497,16 @@ if (require.main === module) setInterval(() => {
     // about ANOTHER TOOL'S STDOUT, and this block only ever runs for sessions whose owner socket
     // is OPEN. That socket is this daemon's own, first-hand, present-tense measurement that the
     // session is alive, and it outranks the parsed absence rather than merely gating the look at
-    // it. So the outcome here is the `surface_orphaned` SIGNAL, once, and the orchestrator's
-    // reconciler — which owns the surface — decides. The #486/#488 survival guarantee is
-    // preserved by construction now, not only in the unreachable-cmux case.
+    // it. So the outcome here is the `surface_orphaned` SIGNAL, once, and nothing else. The
+    // #486/#488 survival guarantee is preserved by construction now, not only in the
+    // unreachable-cmux case.
+    //
+    // Stated so nobody has to assume it: NO consumer reclaims the session on that signal today.
+    // The orchestrator's always-on `wh_alive` sweep closes the SURFACE; its event-driven consumer
+    // for this event reads a state file no bus→file bridge writes, so it is dormant (orchestrator
+    // task #847). A session whose workspace is gone while its owner socket stays open therefore
+    // persists here until the disconnect-GC or an explicit cleanup. That is the intended trade —
+    // the alternative was destroying it on evidence weaker than the socket being overridden.
     if (session.type === 'wrapped' && session.backend === 'cmux' && session.cmuxWorkspaceId
         && isOpenWebSocket(session.ownerWs)) {
       const mismatchProbe = terminalBackend.detectSurfaceMismatch(session, { sessionId: id });
@@ -5520,7 +5527,7 @@ if (require.main === module) setInterval(() => {
       // owner socket is open, so the pre-#844 code used "a uuid did not appear in cmux's stdout"
       // to override "this session is connected right now" — the weaker measurement overriding the
       // stronger, first-hand one. The open socket blocks the kill; the `surface_orphaned` signal
-      // still goes out, once, and the orchestrator's reconciler actuates.
+      // still goes out, once. See the block comment above for what does and does not consume it.
       const gcAction = decideSurfaceGcAction(decideSurfaceGc(liveness, session, now), {
         ownerConnected: true,
         alreadySignalled: Boolean(session.surfaceOrphanSignalledAt)
@@ -5532,10 +5539,12 @@ if (require.main === module) setInterval(() => {
         const goneSeconds = Math.floor((now - new Date(session.surfaceGoneAt).getTime()) / 1000);
         console.log(`[SURFACE-GC] cmux workspace still absent for ${id} after ${goneSeconds}s — signalling surface_orphaned; the owner socket is OPEN so this session is NOT reclaimed here`);
         // Surface-ownership verdict (2026-05-30): telepty does NOT close the surface — it emits
-        // the orphan SIGNAL so the orchestrator's reconciler closes it (wh_close). #844 extends
-        // the same split to the SESSION: a workspace uuid missing from another tool's stdout does
-        // not outrank this daemon's own open socket to the session, so the signal is the whole
-        // action. The orchestrator holds the surface-side evidence and actuates on both.
+        // the orphan SIGNAL and the orchestrator's sweep closes it. #844 extends the same split to
+        // the SESSION: a workspace uuid missing from another tool's stdout does not outrank this
+        // daemon's own open socket to the session, so the signal is the whole action here. Note
+        // the asymmetry, because it is load-bearing: the surface half HAS an always-on consumer,
+        // the session half does not yet (orchestrator #847), so this session stays until the
+        // disconnect-GC or an explicit cleanup.
         broadcastSessionEvent('surface_orphaned', id, session, {
           extra: {
             sid: id,

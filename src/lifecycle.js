@@ -249,8 +249,10 @@ function decideSurfaceGc(liveness, session, nowMs, graceSeconds = SURFACE_ORPHAN
 // stronger and more direct than a uuid's absence from another tool's stdout. The surface GC is
 // entered only for connected sessions, so it was using the weaker measurement to override the
 // stronger one. It no longer can: the socket blocks the kill, and what remains is the
-// `surface_orphaned` SIGNAL, emitted once, for the orchestrator's reconciler to act on. That is
-// the same "telepty signals; the orchestrator actuates" split already applied to the surface.
+// `surface_orphaned` SIGNAL, emitted once. No consumer reclaims the session on it today — the
+// orchestrator's always-on sweep closes the SURFACE, and its event-driven consumer for this signal
+// is dormant (orchestrator #847) — so 'signal' means the session persists until the disconnect-GC
+// or an explicit cleanup. Deliberate: the alternative was killing it on the weaker measurement.
 //
 //   'signal'  — say it, do not kill it (and `alreadySignalled` keeps it to once, not per tick)
 //   'reclaim' — passthrough for a caller with no live owner socket; nothing reaches this today

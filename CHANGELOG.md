@@ -138,6 +138,13 @@ because the durable `tracking_started` record already exists and is pollable.
   nothing ever read it, because the lookup was keyed on a peer name the dial sites had already
   dropped — that stored credential is now reachable, and it is what a non-local target must have.
 
+  What the refusal measures: whether the hostname in the URL is a loopback literal (`127.0.0.1`,
+  `localhost`, `::1`, `[::1]`). What it does **not** measure: whether a non-loopback address is in
+  fact this same host. Addressing your own daemon by its tailnet IP or its hostname is refused too —
+  a deliberate false positive, because the alternative is a credential boundary that depends on
+  interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the way through. It also
+  distributes no credentials and revokes none; `BOUNDARY.md` still records that gap as open.
+
   **Migration, and it is the only user-visible one:** run `telepty connect-http <host> --token
   <that host's authToken>` once per HTTP peer. This is now required rather than advisable: without
   it, a cross-host command is refused instead of quietly failing a 401. `TELEPTY_AUTH_TOKEN` is
@@ -178,13 +185,21 @@ because the durable `tracking_started` record already exists and is pollable.
   its accountability: no audit line, no #533 peer-lane check, no provenance labelling. It is
   included in this release rather than deferred precisely *because* of the fixes above: while
   anything on the box could write uncredentialed the audit log was obviously incomplete, but the
-  moment every writer is authenticated an operator will reasonably read that log as the record of
-  who typed. Both write paths now produce a schema-v1 line, the WS one with `source: "ws-viewer"`
-  and `delivery_result: "forwarded"` — deliberately not `"success"`, because all that path measures
-  is that the frame was written to the owner socket. `classifyPeerLaneInject` (#533) now applies to
-  both doors; on both it is keyed on a *claimed* sender, so it remains a policy guardrail and not an
-  authentication boundary — `BOUNDARY.md` says so explicitly, so the log is not read for more than
-  it proves. An interactive `telepty attach` produces one audit line per keystroke.
+  moment a credential is required of writers an operator will reasonably read that log as the record
+  of who typed. That door now produces a schema-v1 line with `source: "ws-viewer"` and
+  `delivery_result: "forwarded"` — deliberately not `"success"`, because all that path measures is
+  that the frame was written to the owner socket. `classifyPeerLaneInject` (#533) runs on it too,
+  keyed on a *claimed* sender, so it remains a policy guardrail and not an authentication boundary.
+
+  **What is written to a PTY and still is not logged**, because a count is not an enumeration and
+  the log is about to be trusted: a viewer's `{type:'input'}` frame on the **spawned** branch (it
+  writes straight to `ptyProcess`, so `ws-viewer` lines do not mean every viewer write is recorded),
+  `busAutoRoute` → `deliverInjectionToSession` (the `source: "inject"` audit lines live in the HTTP
+  route handler, not in the delivery function the bus path calls), and `POST
+  /api/sessions/:id/submit`, which writes a bare `\r`. `BOUNDARY.md` carries the full table of
+  recorded doors (`inject`, `multicast`, `broadcast`, `ws-viewer`) beside that list, and states that
+  it is a measurement rather than a proven ceiling. An interactive `telepty attach` produces one
+  audit line per keystroke.
 
 ### Security
 - **Session sender identity is now bound to a session instance rather than to a session name
@@ -235,10 +250,12 @@ because the durable `tracking_started` record already exists and is pollable.
 ### Fixed — a refusal is not a licence to destroy, and absence of evidence is not evidence of absence (#844)
 
 #835 established that a daemon which ANSWERS and declines is not a daemon that is absent, because
-the "absent" verdict is what authorises SIGTERM/SIGKILL against the process that parents every live
-PTY session. Two independent reviews of this release found the rule broken in five more places —
-including, twice, by code this release itself added. They are grouped here because they are one
-rule: **a destructive action requires positive evidence of the condition it destroys on.**
+the "absent" verdict is what authorises SIGTERM/SIGKILL against the process that parents live PTY
+sessions. Two independent reviews of this release found the rule broken in five further places,
+listed below — including, twice, in code this release itself added. Five is what those reviews
+found, not a proven ceiling; the rule is what to check against, not the count. They are grouped here
+because they are one rule: **a destructive action requires positive evidence of the condition it
+destroys on.**
 
 - **A REFUSED owner claim no longer tears down the incumbent it was refused against.** `telepty
   allow --id X` against an id the daemon already holds is a re-registration, so #815 correctly
@@ -247,8 +264,8 @@ rule: **a destructive action requires positive evidence of the condition it dest
   carrying an `owner_token` only if it has one. It never had one. So the DELETE went out bare, the
   #536 owner-token guard had nothing to compare, and the healthy incumbent was destroyed by the one
   process the daemon had just told it does not own that id. The dup-id/respawn race that produces
-  this is routine. The refused bridge now exits without the teardown and without purging the
-  bridge mailbox, both of which belong to the owner.
+  this is routine. The refused bridge now exits without the teardown DELETE and without purging the
+  bridge mailbox; the session and its queued deliveries belong to the owner, not to it.
 
 - **A `404` on `/api/meta` is an old daemon, not a broken one.** The version probe classified every
   non-2xx as "the daemon answered", and aborted with *"running, but not serving"* — a cause it had
@@ -275,11 +292,20 @@ rule: **a destructive action requires positive evidence of the condition it dest
   Beyond that, the GC block runs **only** for sessions whose owner socket is open, so it was using a
   uuid's absence from another tool's stdout to override this daemon's own present-tense measurement
   that the session is alive. That ordering is reversed: the open socket blocks the reclaim, and what
-  remains is the `surface_orphaned` signal — emitted once, carrying `ownerSocketOpen` and
-  `reclaimed: false` — for the orchestrator's reconciler to act on. Same "telepty signals; the
-  orchestrator actuates" split already used for the surface itself. The `INV-17` comment there
-  claimed a guarantee broader than the measurement provided and has been rewritten to what the code
-  establishes.
+  remains is the `surface_orphaned` signal — emitted once, carrying `ownerSocketOpen: true` and
+  `reclaimed: false`. The `INV-17` comment there claimed a guarantee broader than the measurement
+  provided and has been rewritten to what the code establishes.
+
+  **Nothing downstream reclaims the session today, and you should not read this note as saying it
+  does.** telepty emits `surface_orphaned` on the WebSocket bus. What the orchestrator runs
+  always-on is a different path — its `wh_alive` sweep — and that closes the **surface**, not the
+  session. Its event-driven consumer for this signal reads a `state/surface-orphaned.jsonl` file
+  that nothing currently writes: there is no bus→file bridge, so the consumer is dormant (tracked as
+  orchestrator task #847). **Net effect for an operator: a wrapped cmux session whose workspace is
+  gone while its owner socket stays open now persists until the disconnect-GC or an explicit
+  cleanup, instead of being reclaimed here.** That is still the better trade — the previous
+  behaviour destroyed such a session on a measurement weaker than the open socket it was overriding
+  — but it is a real gap and it is stated rather than left to be discovered.
 
 - **The daemon state-file pid is confirmed before it is signalled.** `cleanupDaemonProcesses` builds
   its kill set from three sources. Two confirmed identity first — the port-owner source via
@@ -287,15 +313,21 @@ rule: **a destructive action requires positive evidence of the condition it dest
   port"), the process-scan source via `isLikelyTeleptyDaemon` — and the state-file source added its
   pid with no check at all, even though that is a pid telepty *wrote* rather than one it measured. A
   stale state file surviving a pid rollover named a stranger, and `stopDaemon` documented a surgical
-  guarantee it never verified. All three sources now carry their own evidence.
+  guarantee it never verified. The state-file source, the process-scan source and the port-owner
+  source now each confirm identity before contributing a pid.
 
-- **The release artifact no longer lies about which release it is.** `package.json` and both version
-  fields of `package-lock.json` still said `0.7.1` — the version already published on npm — while
-  the notes above describe 0.8.0. `/api/meta` reports that string, and a version-equal daemon is
-  treated as healthy, so a 0.8.0 CLI meeting a running 0.7.1 daemon would have accepted it and kept
-  talking across wire semantics this release changed. The suite checked only that the version was
-  semver-shaped, which `0.7.1` satisfies perfectly. A release invariant now ties the manifest, the
-  lockfile and the newest `CHANGELOG.md` section to one number.
+- **The release artifact no longer lies about which release it is.** `package.json` `version`, and
+  `package-lock.json`'s `version` and `packages[""].version`, still said `0.7.1` — the version
+  already published on npm — while the notes above describe 0.8.0. `/api/meta` reports that string,
+  and a version-equal daemon is treated as healthy, so a 0.8.0 CLI meeting a running 0.7.1 daemon
+  would have accepted it and kept talking across wire semantics this release changed. The suite
+  checked only that the version was semver-shaped, which `0.7.1` satisfies perfectly.
+
+  What the new release invariant measures: those three manifest fields agree with each other; the
+  newest `## ` section in this file names exactly that version and is a version heading rather than
+  a placeholder; no version has two sections; and no section below it names a higher version. What
+  it does **not** measure: whether the version is free on npm, whether a git tag exists, and whether
+  the prose under the heading describes the code — it compares declarations to declarations.
 
 ### Added
 - `session_owner_replaced` bus event (#815): a `?owner=1` claim that displaced a **live** owner
