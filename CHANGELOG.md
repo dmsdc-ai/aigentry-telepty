@@ -15,7 +15,7 @@ turned that into a 100%-confidence sentence saying the work was done.
 
 Transport, activity and inject-consumption are measurable. **Task outcome is not**, and nothing in
 this release can produce one. `0.8.0` emits honest absence instead, and completion stays explicitly
-unknown until an authenticated, correlated report exists — that is Stage B / `0.9.0`, blocked on
+unknown until an authenticated, correlated report exists — that is Stage B, blocked on
 #816 (a private capability/report channel) and #817 (cross-machine sender identity).
 
 - **Removed every terminal producer.** `TASK_COMPLETE`, `TASK_COMPLETE_WITH_REPORT`,
@@ -237,7 +237,18 @@ because the durable `tracking_started` record already exists and is pollable.
   log a word for the case. Renaming would break every subscriber at a tag for a defect that was
   always there, and suppressing the event for a park would be worse: a subscriber counting
   `inject_written` would silently miss parks, which is absence-as-silence, the defect this release
-  exists to remove. Fixed in 0.9.0.
+  exists to remove. The fix is tracked for a later release.
+
+  **Residual, accepted for 0.8.0 (#873): two more surfaces where the name is wider than the
+  measurement.** The ledger's `inject_parked` observation carries `trigger: "bootstrap_queue"` for
+  a park the bootstrap gate made and for one a surface modal made, so a consumer grouping by
+  `trigger` — the field a consumer does group by — merges two causes; only `reason` separates them
+  (`bootstrap_not_ready` against `<cli>_modal_ui` / `modal_park_backlog`). And on
+  `POST /api/sessions/multicast` and `/broadcast`, a target that parked is pushed into the
+  response's `results.successful` with `strategy: "bootstrap_queue"` as the only disclosure, while
+  the audit line for that same target says `queued` — so `results.successful.length` is a count of
+  targets accepted, not of deliveries. The #865 caveat covers the ledger field and the fan-out
+  response alike: **read the fields, not the name.** `BOUNDARY.md` carries them in full.
 
   `BOUNDARY.md` carries the door table by name beside that list, and states that it is a measurement
   rather than a proven ceiling. An interactive `telepty attach` produces one audit line per
