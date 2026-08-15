@@ -1,7 +1,13 @@
 # ADR 2026-06-07 — Telepty submit via the PTY/context layer (drop `cmux send-key` from the submit path)
 
 - **Status:** Accepted (orchestrator-approved 2026-06-07, user-approved, with the
-  reliable-evidence condition on Decision 3 folded in)
+  reliable-evidence condition on Decision 3 folded in) — **Decisions 1/2/4/5 still hold;
+  Decision 3 is SUPERSEDED by #60 Stage A**, which deleted `TASK_IDLE_UNCONFIRMED`,
+  `TASK_COMPLETE` and every other terminal label rather than gating them. The daemon now emits
+  one `task_completion_unknown` observation and asserts no task outcome
+  (`src/completion-observation.js`; `CHANGELOG.md` → *Unreleased* → "BREAKING: telepty no longer
+  asserts task completion (#60 Stage A)"). Decision 3's premise — that a *reliable* signal could
+  license the label — is the premise Stage A rejects. The record below is unchanged.
 - **Date:** 2026-06-07
 - **Repo:** `aigentry-telepty` (branch `main`)
 - **Tasks:** #544 (submit-race), #537 / "BUG B" (bogus `TASK_IDLE_UNCONFIRMED` reports)

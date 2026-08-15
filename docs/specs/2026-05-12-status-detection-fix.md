@@ -1,8 +1,21 @@
 # SPEC: Telepty status detection fix for REPORT-completed idle sessions
 
+> **⛔ SUPERSEDED — DO NOT IMPLEMENT §3/§4's REPORT-driven half.** The chosen direction (d) — a
+> reverse-matched `REPORT:` inject forcing the sender's state to `idle` and broadcasting
+> `TASK_COMPLETE_WITH_REPORT` — was deleted by **#60 Stage A**. `0.8.0` classifies no
+> report-shaped text: `classifyReportPrompt` and `resolveOutboundReportStatus` are gone, because
+> no text can authenticate its sender or correlate itself to a dispatch, so no text may settle
+> one. `TASK_COMPLETE_WITH_REPORT` no longer exists; one `task_completion_unknown` observation
+> replaces every terminal label (`src/completion-observation.js`,
+> `GET /api/inject-observations/:inject_id`). See `CHANGELOG.md` → *Unreleased* → "BREAKING:
+> telepty no longer asserts task completion (#60 Stage A)". The other half did land and is
+> current: `SessionStateMachine.markIdle` / `SessionStateManager.markIdle` exist in
+> `session-state.js` (Stage A changed only how caller detail merges with the normalized cause).
+> Kept verbatim as a record of the #16 analysis; §8's approval gate is void.
+
 **Issue:** dmsdc-ai/aigentry-telepty#16  
 **Date:** 2026-05-12  
-**Status:** draft, awaiting orchestrator approval  
+**Status:** SUPERSEDED by #60 Stage A — was "draft, awaiting orchestrator approval"  
 **Chosen direction:** (d) REPORT-event-based status transition, plus one minimal control-only PTY guard
 
 ## 1. Problem

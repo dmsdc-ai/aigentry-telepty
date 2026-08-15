@@ -1,8 +1,22 @@
 # SPEC: Enforce result-summary REPORT when sessions go idle
 
+> **⛔ SUPERSEDED — DO NOT IMPLEMENT.** This spec's whole premise — that an idle transition
+> settles a task, and that REPORT-shaped text can confirm it — was deleted by **#60 Stage A**.
+> `TASK_COMPLETE`, `TASK_COMPLETE_WITH_REPORT`, `TASK_IDLE_NO_REPORT`, `TASK_TIMEOUT_NO_REPORT`,
+> `TASK_BLOCKED_WITH_REASON` and `TASK_DEAD_NO_REPORT` (§3, §4, §7) no longer exist, and `0.8.0`
+> classifies no report-shaped text at all: `classifyReportPrompt`, the `REPORT_*` regexes and
+> `resolveOutboundReportStatus` are gone, because no text can authenticate its sender or correlate
+> itself to a dispatch. §2's prefix-detection schema is exactly what was removed. One
+> `task_completion_unknown` observation replaces the lot (`src/completion-observation.js`,
+> `GET /api/inject-observations/:inject_id`); see `CHANGELOG.md` → *Unreleased* → "BREAKING:
+> telepty no longer asserts task completion (#60 Stage A)". An authenticated, correlated report
+> is Stage B / `0.9.0`, blocked on #816 and #817 — it will not look like this. Kept verbatim as a
+> record of the 2026-04 analysis.
+
 **Source:** orchestrator inject d94c9990...
 **Session:** aigentry-telepty
-**Status:** SPEC — awaiting orchestrator approval
+**Status:** SUPERSEDED by #60 Stage A — was "SPEC — awaiting orchestrator approval"; that approval
+will never come, because the behaviour specified here was removed on purpose.
 **Topic:** REPORT enforcement after inject-driven idle transitions
 
 ---
