@@ -1,6 +1,7 @@
 node_modules/
 state/
 target/
+undefined/
 *.log
 .env
 .env.local

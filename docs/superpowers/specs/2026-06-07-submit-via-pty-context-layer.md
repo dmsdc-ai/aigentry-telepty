@@ -1,7 +1,19 @@
 # Implementation spec — Submit via PTY/context layer (pty-only + PTY-native confirm)
 
+> **⚠️ HISTORICAL — DO NOT IMPLEMENT. The code is not held; it shipped, and part of it has since
+> been removed.** Changes 1/2/4 landed: `terminalLevelSubmit` is `submitViaPty` only (daemon.js),
+> which is current. **Change 3 and test-plan items 5/6 are superseded by #60 Stage A** — they
+> gate, assert and preserve `TASK_IDLE_UNCONFIRMED` and `TASK_COMPLETE`, and Stage A deleted every
+> terminal label along with `fireAutoReport`'s ability to emit one. `fireAutoReport` now emits a
+> single `task_completion_unknown` observation and nothing else; the daemon cannot measure task
+> outcome and no longer claims it (`src/completion-observation.js`,
+> `GET /api/inject-observations/:inject_id`; `CHANGELOG.md` → *Unreleased* → "BREAKING: telepty no
+> longer asserts task completion (#60 Stage A)"). Do not resurrect a "never-started worker locks
+> to `TASK_IDLE_UNCONFIRMED`" regression test — that label is gone by design.
+
 - **ADR:** `docs/adr/2026-06-07-submit-via-pty-context-layer.md`
-- **Status:** SPEC FIRST — code HELD until orchestrator injects `APPROVED`
+- **Status:** HISTORICAL — was "SPEC FIRST — code HELD until orchestrator injects `APPROVED`";
+  the submit-path changes shipped, and Change 3 was later superseded by #60 Stage A
 - **Tasks:** #544, #537 / BUG B
 - **Files touched:** `daemon.js`, `src/submit-gate.js`, `test/` (new regression file)
 - **Out of scope (Rule 29):** removing `submitViaCmux` / `sendViaKitty`
