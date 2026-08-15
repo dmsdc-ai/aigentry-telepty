@@ -268,10 +268,27 @@ test('dead_reports_absence_to_source: a process exit is reported as absence, and
 
     // …and the SOURCE is told, in the literal absence text. The old dead branch only broadcast on
     // the bus, so an orchestrator that was not subscribed learned nothing at all.
-    const screen = await daemon.request(`/api/sessions/${encodeURIComponent(source)}/screen`);
-    const text = typeof screen.body === 'string' ? screen.body : JSON.stringify(screen.body);
-    assert.ok(text.includes('TASK_COMPLETION_UNKNOWN'),
-      'expected the source to receive a completion-absence notification for the dead worker');
+    //
+    // #878: WAIT for the text — the ledger append and the source delivery are not one event.
+    // recordObservation commits the observation synchronously and only THEN calls
+    // deliverInjectionToSession, without awaiting it (daemon.js:922-929); the bytes still have a
+    // mailbox tick, a PTY write and bash's echo ahead of them. The poll above therefore returns
+    // while the delivery is in flight, and a single read here asserted on whichever side of that
+    // gap the runner landed on. Measured on the macos-latest runner that failed twice on `main`:
+    // the notification was absent at the instant the old read took its sample and arrived 324ms
+    // later — the product delivers, the assertion was simply looking too early.
+    //
+    // The wait is on the condition, not on a longer constant: the timeout is a failsafe, and a
+    // delivery that genuinely never happens still fails this test at 10s.
+    const text = await daemon.waitFor(async () => {
+      const screen = await daemon.request(`/api/sessions/${encodeURIComponent(source)}/screen`);
+      const t = typeof screen.body === 'string' ? screen.body : JSON.stringify(screen.body);
+      return t.includes('TASK_COMPLETION_UNKNOWN') ? t : null;
+    }, {
+      timeoutMs: 10000,
+      intervalMs: 25,
+      description: 'the source to receive a completion-absence notification for the dead worker',
+    });
     assert.ok(!/\bTASK_COMPLETE\b|\bTASK_ERROR\b/.test(text),
       'the source must never be told the task completed or failed — neither was measured');
   })();

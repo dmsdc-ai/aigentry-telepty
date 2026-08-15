@@ -75,6 +75,11 @@ beforeEach(async () => {
       // at 300ms — which is what timed out macOS at 8.1s), keeping total emit well under the
       // budget below. Can't zero the rearm caps from env (daemon uses `Number(x) || 24`, so
       // '0' → 24); shrinking the window is the clean lever. Idle path still genuinely exercised.
+      //
+      // #880 correction: "the worst-case emit is ~= 24 × settleMs" bounds the RE-ARMS only. The
+      // same settle recheck can instead DROP the pending observation outright and wait for the
+      // next idle transition (daemon.js:1288-1292), and that lap has no cap — which is why the
+      // budget at the wait site below could not be a latency prediction. See the note there.
       TELEPTY_IDLE_UNCONFIRMED_SETTLE_SECONDS: '0.1',
       // Register the fixture orchestrator sids so orchestrator→worker injects
       // classify as orch-lane (allowed), not peer-lane-blocked (#533 Phase 2).
@@ -380,8 +385,23 @@ test('Idle WITHOUT pendingReports (no inject source) fires no enforcement event'
   const bus = await harness.connectBus();
   const messages = collectJsonMessages(bus);
 
-  // Do NOT inject — just wait for idle state
-  await delay(1000);
+  // Do NOT inject — wait for the session's own activity observations to start flowing.
+  //
+  // #880: this was `await delay(1000)`, and the positive assertion below (`activity.length > 0`)
+  // was racing it against the daemon's 1000ms state poll tick (session-state.js:63 — hardcoded,
+  // not one of the three fields daemon.js:118-123 passes through, so no env lever shrinks it).
+  // A quiet, never-injected session produces its FIRST transition on that tick, so the constant
+  // and the event it was waiting for were the same duration: a tick a millisecond late reds the
+  // test. Wait for the observation instead. The absence assertions that follow are then anchored
+  // to a real emission rather than to a constant — and anchored tighter than before, because the
+  // activity broadcast and the pendingReport lookup that would have produced a completion-unknown
+  // happen in the SAME synchronous transition listener (daemon.js:163-174).
+  const activityFor = () => messages.filter(m => m.type === 'session_activity_observation'
+    && m.session_id === sessionId);
+  await waitFor(() => activityFor().length > 0, {
+    timeoutMs: 10000,
+    description: 'activity observations for the untracked session'
+  });
 
   const enforcementEvent = messages.find(m =>
     m.type === 'TASK_IDLE_NO_REPORT' ||
@@ -395,8 +415,7 @@ test('Idle WITHOUT pendingReports (no inject source) fires no enforcement event'
   // release separated: ACTIVITY is measurable and is emitted for any session, whereas
   // task_completion_unknown is scoped to a tracked dispatch and must NOT appear for user-driven
   // work, because nothing was dispatched for its completion to be unknown about.
-  const activity = messages.filter(m => m.type === 'session_activity_observation'
-    && m.session_id === sessionId);
+  const activity = activityFor();
   assert.ok(activity.length > 0, 'activity observations still flow for an untracked session');
   for (const m of activity) {
     assert.equal(m.completion_fact, null);
@@ -442,16 +461,35 @@ test('idle after an inject emits task_completion_unknown, not a terminal claim',
   // Receiver → sender inject
   const trackedId = await trackedInject(senderId, { prompt: 'echo hello', from: receiverId });
 
-  // Wait for idle (TELEPTY_STATE_IDLE_TIMEOUT_MS=300ms set in beforeEach)
-  // #577: 10000ms budget. With the shrunk settle above the daemon's bounded worst-case emit is
-  // ~detect(1-2s) + settle-rearms(3×0.1) + cpu-rearms(24×0.1) ≈ 4.5s; 10s covers that plus
-  // headroom for 1000ms state poll-tick scheduling jitter on a loaded CI runner (was 4000/8000).
+  // Wait for the quiet observation (TELEPTY_STATE_IDLE_TIMEOUT_MS=300ms set in beforeEach).
+  //
+  // #880: the wait was already on the condition — what was wrong is what the NUMBER meant. It was
+  // sized as a prediction of the daemon's worst-case emit latency, and three raises (4000 → 8000
+  // → 10000) were each overtaken in turn: run 31876684780 timed out here at 10259ms on
+  // macos-latest, against 1382ms and 1333ms for the same test in the two neighbouring runs — 1
+  // red in 3, and the #768 note in .github/workflows/test-install.yml:36-46 records this same
+  // file making the same 1.2s → 10s jump under runner contention.
+  //
+  // A fourth guess would be overtaken too, because no constant can bound that latency. Measured
+  // on a 14-core box: 1.13s to emit, 1.39s for the test — and still only 1.37-1.58s with twelve
+  // concurrent copies of this file plus 24 CPU spinners, so the macOS tail is not a slowdown that
+  // scales with load. It is a re-arm: the #48/#52 settle recheck DROPS the pending observation
+  // whenever the session reads working/thinking when the window closes (daemon.js:1288-1292) and
+  // waits for the next idle transition to try again, one 1000ms poll tick per lap
+  // (session-state.js:63), with no cap on the laps.
+  //
+  // So the budget below is a LIVENESS tripwire and nothing else: it separates "eventually" from
+  // "never", which is the assertion this test actually makes. Silence must still fail it — that
+  // is the #52 defect in reverse and the reason the wait exists at all — and a delivery that
+  // never happens still fails, one minute later instead of ten seconds later. The belt against a
+  // genuine hang is not this number: the CI job caps at 20 minutes
+  // (.github/workflows/test-install.yml:21).
   const isQuietObservation = (m) => m.type === 'task_completion_unknown'
     && m.session_id === senderId
     && QUIET_OBSERVATION_KINDS.includes(m.observation && m.observation.kind);
 
   await waitFor(() => messages.some(isQuietObservation), {
-    timeoutMs: 10000,
+    timeoutMs: 60000,
     description: 'task_completion_unknown for the quiet sender'
   });
 
