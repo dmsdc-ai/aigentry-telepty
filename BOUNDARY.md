@@ -212,6 +212,20 @@ moment a credential is required of writers, because that is when the log starts 
 authoritative. Closing one gap is also what makes the remaining three worth naming here rather than
 leaving them to be discovered.
 
+**Why doors keep going missing — the mechanism, so the next one is not a surprise.** Auditing is
+attached to *route handlers*, not to the function that performs the write. All three
+`source: "inject"` `auditAppend` calls live inside `app.post('/api/sessions/:id/inject')`;
+`deliverInjectionToSession`, the function that actually reaches the PTY, contains none. So the audit
+line is a property of *how you were called*, not of *what you did*, and *every* caller of the
+delivery function other than that one route is silent by construction — `busAutoRoute` is simply the
+one that exists today. The same shape produced the `ws-viewer` gap (`src/transport/websocket.js`
+audits the wrapped branch and writes straight to `ptyProcess` on the spawned one) and the `/submit`
+gap (a different route, so a different handler, so no audit).
+
+If you are adding a caller of `deliverInjectionToSession`, or any new path that writes into a PTY:
+it will not be logged unless you log it, and nothing in the code will tell you that. Add the door to
+the table above in the same change, or state here that it is not covered.
+
 **This list is a measurement, not a proven ceiling.** It was produced by enumerating write paths,
 which is a thing that can be done incompletely; re-measure it rather than trusting the count.
 

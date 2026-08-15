@@ -843,6 +843,23 @@ removal below was verified by repo + cross-repo grep (`aigentry-*`, excluding
   emits a `surface_orphaned` bus event for the orchestrator reconciler to
   actuate the close. INV-17 / #486 preserved (probe unknown → skip gate intact).
 
+  **Annotation appended 2026-08-15 (#844). The bullet above is left exactly as it shipped —
+  this is a forward-reference, not a correction of the record.** The *outcome* that sentence
+  promises held. The *mechanism* it names never ran. The surface close was, and still is,
+  actuated by the orchestrator's always-on `wh_alive` sweep, so the behaviour operators observed
+  on 0.5.0 was correct. But the event-driven consumer the sentence credits —
+  `consume_surface_orphaned` in the orchestrator's `bin/session-reconciler.sh` — has been dormant
+  since the commit that introduced it (`e92f445`, 2026-05-30, the orchestrator half of this same
+  ADR): it returns immediately unless `state/surface-orphaned.jsonl` exists, and no bus→file
+  bridge has ever written that file. `git log -S 'SURFACE_ORPHANED_SRC'` in that repo returns
+  exactly one commit. It shipped inert on day one, while this note announced the handoff as
+  operational — the two repos were written together and only one of them said so.
+
+  Why this is worth a pointer rather than a shrug: 0.8.0 routes a *second* thing through the same
+  dormant consumer, and that one has no always-on equivalent behind it. See the 0.8.0
+  **Fixed — a refusal is not a licence to destroy** section, which states the session-reclaim gap
+  in operator terms, and orchestrator task #847 for the bridge.
+
 ### Fixed — Lifecycle / bootstrap / skill-loading (tasks #35 #20 #32 #17 #29 #31 #19)
 
 - **#35 / #20 — Codex skill loading.** Single-quote the `description` YAML
