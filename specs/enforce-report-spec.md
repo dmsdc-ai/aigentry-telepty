@@ -8,7 +8,7 @@
 > `resolveOutboundReportStatus` are gone, because no text can authenticate its sender or correlate
 > itself to a dispatch. §2's prefix-detection schema is exactly what was removed. One
 > `task_completion_unknown` observation replaces the lot (`src/completion-observation.js`,
-> `GET /api/inject-observations/:inject_id`); see `CHANGELOG.md` → *Unreleased* → "BREAKING:
+> `GET /api/inject-observations/:inject_id`); see `CHANGELOG.md` → *0.8.0 — unreleased* → "BREAKING:
 > telepty no longer asserts task completion (#60 Stage A)". An authenticated, correlated report
 > is Stage B / `0.9.0`, blocked on #816 and #817 — it will not look like this. Kept verbatim as a
 > record of the 2026-04 analysis.

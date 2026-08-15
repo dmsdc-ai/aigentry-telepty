@@ -5,7 +5,7 @@
   Decision 3 is SUPERSEDED by #60 Stage A**, which deleted `TASK_IDLE_UNCONFIRMED`,
   `TASK_COMPLETE` and every other terminal label rather than gating them. The daemon now emits
   one `task_completion_unknown` observation and asserts no task outcome
-  (`src/completion-observation.js`; `CHANGELOG.md` → *Unreleased* → "BREAKING: telepty no longer
+  (`src/completion-observation.js`; `CHANGELOG.md` → *0.8.0 — unreleased* → "BREAKING: telepty no longer
   asserts task completion (#60 Stage A)"). Decision 3's premise — that a *reliable* signal could
   license the label — is the premise Stage A rejects. The record below is unchanged.
 - **Date:** 2026-06-07

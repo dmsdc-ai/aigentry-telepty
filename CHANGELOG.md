@@ -214,8 +214,10 @@ because the durable `tracking_started` record already exists and is pollable.
 
   Writes into a PTY that are **not** in the inject log, named so their absence is not read as
   coverage: `POST /api/sessions/:id/submit` and `POST /api/sessions/submit-all` (a bare `\r`, no
-  payload; `submit-all` fans that CR out across the session registry, and a session on the
-  `osascript_cmd_enter` strategy gets a GUI keystroke rather than a PTY write at all); viewer
+  payload; `submit-all` fans that CR out across every session in the registry holding a live
+  `ownerWs` or `ptyProcess`, with no exception — `getSubmitStrategy` answers `pty_cr` for every
+  command including its fallback, so `runSubmitAll`'s `osascript_cmd_enter` branch and
+  `submitViaOsascript` are unreachable dead code and not a live exemption); viewer
   `resize` frames (geometry, no bytes into the input stream); and the daemon's own
   `task_completion_unknown` text delivered to a dispatch's source session.
 
@@ -347,13 +349,21 @@ destroys on.**
   already published on npm — while the notes above describe 0.8.0. `/api/meta` reports that string,
   and a version-equal daemon is treated as healthy, so a 0.8.0 CLI meeting a running 0.7.1 daemon
   would have accepted it and kept talking across wire semantics this release changed. The suite
-  checked only that the version was semver-shaped, which `0.7.1` satisfies perfectly.
+  checked only that the version was semver-shaped, which `0.7.1` satisfies perfectly. A **fourth**
+  tracked place said `0.7.1` too and was missed on the first pass: `README.md`'s ecosystem row for
+  this package. That row is generated — `scripts/gen-readme.mjs` self-overrides the repo's own row
+  with the local `package.json` version — so it was stale only because the generator had not been
+  re-run since the bump. `prepublishOnly` regenerates it into the npm tarball and
+  `.github/workflows/readme-regen.yml` fixes `main` after the GitHub Release, so the **published**
+  artifact would have been right; what was wrong is the **tagged repo** — what a reader gets from a
+  clone at the tag. It is regenerated here, and the invariant now measures it.
 
-  What the new release invariant measures: those three manifest fields agree with each other; the
-  newest `## ` section in this file names exactly that version and is a version heading rather than
-  a placeholder; no version has two sections; and no section below it names a higher version. What
-  it does **not** measure: whether the version is free on npm, whether a git tag exists, and whether
-  the prose under the heading describes the code — it compares declarations to declarations.
+  What the new release invariant measures: those three manifest fields agree with each other;
+  `README.md`'s ecosystem row for this package names that same version; the newest `## ` section in
+  this file names exactly that version and is a version heading rather than a placeholder; no
+  version has two sections; and no section below it names a higher version. What it does **not**
+  measure: whether the version is free on npm, whether a git tag exists, and whether the prose under
+  the heading describes the code — it compares declarations to declarations.
 
 ### Added
 - `session_owner_replaced` bus event (#815): a `?owner=1` claim that displaced a **live** owner
@@ -372,6 +382,12 @@ destroys on.**
 - What sender authentication does and does not prove — including a measured platform split on
   whether a same-uid process can read a bearer out of another process's environment, and the
   first-claim residual — is documented in `BOUNDARY.md`.
+- `test:watch` had drifted **19 files** behind `test` and `test:ci`, across three commits of this
+  release cycle — so a developer in watch mode got a green that silently omitted every guard 0.8.0
+  added, including the release invariant above. All three lists are back in agreement. They are a
+  fourth hand-maintained list that nothing checks, and the mechanism that let them drift is the
+  same one behind the version and audit-door defects in these notes: an enumeration written by
+  hand, read as coverage, and compared against nothing.
 
 ## 0.7.1 — 2026-07-26
 

@@ -6,7 +6,7 @@
 > daemon cannot measure task outcome from silence, elapsed time or a prompt glyph, and no longer
 > claims it. `TASK_COMPLETE` and every sibling label are gone, replaced by one
 > `task_completion_unknown` observation (`src/completion-observation.js`,
-> `GET /api/inject-observations/:inject_id`); see `CHANGELOG.md` → *Unreleased* → "BREAKING:
+> `GET /api/inject-observations/:inject_id`); see `CHANGELOG.md` → *0.8.0 — unreleased* → "BREAKING:
 > telepty no longer asserts task completion (#60 Stage A)". **Fix 1**'s kitty → cmux → PTY submit
 > chain was replaced by a single PTY path in `docs/adr/2026-06-07-submit-via-pty-context-layer.md`
 > (`terminalLevelSubmit` is `submitViaPty` only). Kept verbatim as a record of the 2026-04 analysis.

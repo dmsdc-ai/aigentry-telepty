@@ -228,10 +228,14 @@ coverage:
   the PTY via `submitViaPty`. No payload accompanies them, so there is nothing for
   `classifyPeerLaneInject` to classify and an `inject` line would hash the empty string — but a CR
   causes execution of whatever is already sitting in a composer, so this is a real write with real
-  consequences and it is **unrecorded**. `submit-all` runs that CR across the session registry.
-  A session whose submit strategy is `osascript_cmd_enter` gets a GUI keystroke instead and touches
-  no PTY at all. Accountability here needs its own record kind — what was submitted is not known to
-  the daemon — and is not covered by this log.
+  consequences and it is **unrecorded**. `submit-all` runs that CR across the session registry,
+  and **no session is exempt from it**: `getSubmitStrategy` (`daemon.js`) maps `claude`, `gemini`
+  and `codex` to `pty_cr` and falls back to `pty_cr` for everything else, so it is a constant
+  function. `runSubmitAll`'s `osascript_cmd_enter` branch and the `submitViaOsascript` helper it
+  calls are therefore unreachable on this release — they are dead code, named here so the branch is
+  not mistaken for a live exception. Read the blast radius as every session in the registry holding
+  a live `ownerWs` or `ptyProcess`. Accountability here needs its own record kind — what was
+  submitted is not known to the daemon — and is not covered by this log.
 - viewer WebSocket `{type:'resize'}` frames. Geometry writes no bytes into the input stream;
   recording it as `kind:"inject"` would put a write in this log that never happened. Deliberately
   out, and **unrecorded**.
