@@ -1,20 +1,29 @@
-# scratchpad — dated evidence, not current code
+# scratchpad — dated evidence and the harnesses that produced it
 
-Nothing in this directory is a contract, a test, or a supported entry point. It is not in
-`package.json` `files`, so it never ships to npm, and no CI job runs it.
+Nothing here is a contract, a test, or a supported entry point. It is not in `package.json`
+`files`, so it never ships to npm, and no CI job runs any of it.
 
-Two kinds of file live here:
+What remains is deliberate. Every file below is **cited by name** from something that stays —
+an `EVIDENCE-*.md` write-up, a `test/*.test.js` provenance comment, `daemon.js`,
+`src/prompt-symbol-registry.js`, or `CHANGELOG.md`:
 
-- **`EVIDENCE-*.md`** — dated write-ups of what was measured for a specific issue (#730, #737,
-  #760, #801), including verbatim production output. They are *records*: accurate as of their
-  date, and deliberately kept, because they are the evidence behind fixes that shipped. They are
-  not descriptions of how the daemon behaves today.
-- **`e2e-*.js`, `repro-*`, `probe-*`, `peek-*`, `capture-*`** — one-off drivers written to
-  reproduce one bug against a harness daemon. They bit-rot silently, since nothing runs them.
+- **`EVIDENCE-*.md`** (#730, #737, #760, #801) — dated write-ups of what was measured for one
+  issue, including verbatim production output. They are *records*: accurate as of their date,
+  and the evidence behind fixes that shipped. They do not describe how the daemon behaves today.
+- **`e2e-*.js`, `repro-*`, `probe-*`, `capture-*`, `evidence/modal-force.screens.txt`** — the
+  one-off harnesses and raw captures those write-ups point at. They are kept because a test that
+  says "measured against real codex 0.144.1 (`scratchpad/repro-737-tmux.js`)" is only checkable
+  while the cited artifact exists. Nothing keeps them running, so assume they have rotted:
+  `e2e-801.js` still expects terminal task-outcome labels on five of its seven arms, and those
+  labels were removed by #60 Stage A.
 
-**Known rot:** `e2e-801.js` asserts `want: 'TASK_COMPLETE'` on five of its seven arms, and
-`EVIDENCE-801.md` records `TASK_COMPLETE` / `TASK_ERROR` frames. Those labels no longer exist —
-#60 Stage A removed every terminal task-outcome claim from the daemon and replaced them with one
-`task_completion_unknown` observation (`src/completion-observation.js`; `CHANGELOG.md` →
-*Unreleased* → "BREAKING: telepty no longer asserts task completion"). Read those two files as
-history. Do not treat their expectations as the contract, and do not port them into `test/`.
+**Read all of it as history.** The daemon no longer asserts task outcome at all — it emits one
+`task_completion_unknown` observation (`src/completion-observation.js`,
+`GET /api/inject-observations/:inject_id`; `CHANGELOG.md` → *Unreleased* → "BREAKING: telepty no
+longer asserts task completion"). Do not treat any expectation in this directory as the current
+contract, and do not port one into `test/`.
+
+Ten orphaned files — eight raw `evidence/*.txt` captures that no write-up indexed, plus
+`peek-752.js` and `repro-737.sh` — were removed in #846: an uncited capture has lost the
+provenance that made it evidence. Do not add new files here without citing them from the
+write-up that uses them.
