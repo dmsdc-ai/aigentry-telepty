@@ -1,0 +1,257 @@
+name: Release
+
+# telepty #874. A tag push is the only thing that publishes this package.
+#
+# WHY THIS FILE READS THE WAY IT DOES. The runbook this replaces said "git tag && git push,
+# CI publishes". Measured on 2026-08-15: no tag-triggered workflow existed, no `npm publish`
+# step existed, and no NPM_TOKEN secret existed. 0.6.19, 0.7.0 and 0.7.1 reached npm by hand
+# with no tag at all. Had the tag push been trusted as the publish, npm would have sat on
+# 0.7.1 while the release was reported shipped — an output claiming more than it measured,
+# which is the exact defect 0.8.0 removed from the daemon.
+#
+# So the rule here: a green run must mean the version is on npm AND the registry serves the
+# bytes this tag builds. Every gate fails loudly; none of them skip into green. A missing
+# secret is a failure, not a no-op. A local build agreeing with itself is not evidence — the
+# proof steps read back from the registry.
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: read
+
+# Two runs for the same tag (a re-run, or a tag force-pushed) must not race each other at
+# the registry. Queue instead of cancel: cancelling mid-publish is how you get a half-release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Gate 1 + 2, before a single test runner is spun up: the tag must agree with the tree, and
+  # the credential must exist. Both are cheap and both are unrecoverable later.
+  guard:
+    name: Gate
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.identity.outputs.package }}
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # test/release-version-invariant-844.test.js ties package.json <-> package-lock.json <->
+      # CHANGELOG <-> README together. The tag is the fourth party and no test in the tree can
+      # see it, because the tag is not in the tree. This step is that missing assertion.
+      #
+      # `VERSION` comes from the manifest and the tag only has to AGREE with it. Deriving the
+      # version from the tag instead — `git describe`, `git tag --sort=-version:refname | head -1`
+      # — is deliberately absent and must stay absent: `v1.0.1` is tagged on this repo (2026-03-10)
+      # for a version npm has never published, so tag ranking picks 1.0.1 over the real 0.8.0.
+      - name: Tag and package.json must name the same version
+        id: identity
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          PACKAGE="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${TAG#v}"
+          if [ "$TAG_VERSION" != "$VERSION" ]; then
+            echo "::error::tag ${TAG} asks to publish ${TAG_VERSION}, but package.json in this tree says ${VERSION}. Refusing: publishing here would ship bytes that do not match the tag. Fix package.json (and package-lock.json, CHANGELOG.md, README.md — see test/release-version-invariant-844.test.js), then retag."
+            exit 1
+          fi
+          echo "package=${PACKAGE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag ${TAG} agrees with package.json: ${PACKAGE}@${VERSION}"
+
+      # A workflow that silently no-ops when the secret is absent is green-without-publishing,
+      # i.e. the bug this file exists to prevent. The token's value is never printed, only its
+      # emptiness is tested.
+      - name: NPM_TOKEN must be present
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "::error::repository secret NPM_TOKEN is not set. This run cannot publish, so it fails instead of passing. Create an npm automation token with publish rights for ${{ steps.identity.outputs.package }} and add it at Settings > Secrets and variables > Actions > New repository secret, named NPM_TOKEN."
+            exit 1
+          fi
+          echo "NPM_TOKEN is present"
+
+  # Gate 3: the whole suite, not a subset. Job shape is deliberately the same as
+  # .github/workflows/test-install.yml (matrix, 20min cap, windows quarantine, the four steps)
+  # so the release gate and the PR gate cannot drift into measuring different things. Kept as a
+  # copy rather than a workflow_call refactor because test-install.yml is out of scope for #874.
+  test:
+    name: Full suite
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    # telepty #577, same quarantine as test-install.yml: windows-latest has windows-specific
+    # reds tracked separately, so ubuntu+macOS are the blocking gate. Remove when #577 lands.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run typecheck
+        run: npm run typecheck
+      - name: Run regression suite
+        run: npm run test:ci
+      # #768: this file is deliberately excluded from the parallel list and runs alone. Both
+      # steps are required — `test:ci` alone is a subset, and a subset must not gate a publish.
+      - name: Run PTY-serialized regression tests
+        run: npm run test:ci:pty
+
+  publish:
+    name: Publish and verify from the registry
+    needs: [guard, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh release create
+    env:
+      PACKAGE: ${{ needs.guard.outputs.package }}
+      VERSION: ${{ needs.guard.outputs.version }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm pack` does NOT run prepublishOnly (only prepack/prepare), but `npm publish` does —
+      # so packing first and publishing from the directory would shasum one tarball and ship
+      # another whenever gen-readme.mjs changes README.md. Run the hook explicitly, pack, then
+      # publish THAT tarball. gen-readme is idempotent, so a second run inside npm publish
+      # cannot change the bytes we measured.
+      - name: Build the exact tarball this run will publish
+        id: pack
+        run: |
+          set -euo pipefail
+          npm run prepublishOnly
+          npm pack --json > "${RUNNER_TEMP}/pack.json"
+          TARBALL="$(node -p "require(process.env.RUNNER_TEMP + '/pack.json')[0].filename")"
+          SHASUM="$(node -p "require(process.env.RUNNER_TEMP + '/pack.json')[0].shasum")"
+          echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
+          echo "shasum=${SHASUM}" >> "$GITHUB_OUTPUT"
+          echo "packed ${TARBALL} sha1=${SHASUM}"
+
+      # Idempotence. npm versions are immutable, so a re-run or a twice-pushed tag must not try
+      # to publish again. It must also not shrug and go green: "already there" is only
+      # acceptable if what is already there is what this tag builds — the shasum step below
+      # proves that either way. A 404 means not published; anything else (network, auth, outage)
+      # is an unknown answer and an unknown answer fails rather than guessing "not published".
+      - name: Ask the registry whether this version already exists
+        id: registry
+        run: |
+          set -euo pipefail
+          set +e
+          REMOTE="$(npm view --prefer-online "${PACKAGE}@${VERSION}" dist.shasum 2>"${RUNNER_TEMP}/view.err")"
+          RC=$?
+          set -e
+          if [ "$RC" -eq 0 ] && [ -n "$REMOTE" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${PACKAGE}@${VERSION} is already on npm (sha1=${REMOTE}); this run will verify it rather than republish"
+          elif grep -q 'E404' "${RUNNER_TEMP}/view.err"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "${PACKAGE}@${VERSION} is not on npm yet"
+          else
+            cat "${RUNNER_TEMP}/view.err"
+            echo "::error::could not determine whether ${PACKAGE}@${VERSION} is on the registry. Refusing to publish on an unknown answer."
+            exit 1
+          fi
+
+      # DATED DEBT — #876. This authenticates with a granular access token by choice, for one
+      # release: `release.yml` has never executed, and an unrehearsed OIDC exchange in the same
+      # first run would leave a failure with two candidate causes and no way to separate them.
+      # One unverified variable at a time.
+      #
+      # It is not a steady state. npm's Phase 2 (targeted January 2027) removes direct publishing
+      # from the bypass-2FA token variant CI needs; Phase 1 is already enforced — `npm profile get`
+      # returns 403 on this account today. The migration is trusted publishing (OIDC), which needs
+      # npm >= 11.5.1 and therefore `node-version: 24`. Do NOT reach for node 22 on the strength of
+      # npm's "Node 22.14.0 or higher" line: node 22 ships npm 10.9.8, has no OIDC, and says nothing.
+      - name: Publish to npm
+        if: steps.registry.outputs.exists != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public
+
+      # The verification that matters. A local build agreeing with itself proves nothing about
+      # what users download. This reads the shasum back from the registry and compares it to the
+      # tarball we packed. It runs on the fresh-publish path AND the already-published path, so
+      # a green run always states the same true thing: npm serves these bytes.
+      - name: The registry must serve the bytes we packed
+        run: |
+          set -euo pipefail
+          LOCAL="${{ steps.pack.outputs.shasum }}"
+          REMOTE=""
+          for attempt in 1 2 3 4 5 6; do
+            REMOTE="$(npm view --prefer-online "${PACKAGE}@${VERSION}" dist.shasum 2>/dev/null || true)"
+            [ -n "$REMOTE" ] && break
+            echo "registry has not surfaced ${VERSION} yet (attempt ${attempt}/6); waiting 10s"
+            sleep 10
+          done
+          if [ -z "$REMOTE" ]; then
+            echo "::error::${PACKAGE}@${VERSION} is still not readable from the registry after publishing. The publish is NOT confirmed."
+            exit 1
+          fi
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "::error::npm serves ${PACKAGE}@${VERSION} with sha1 ${REMOTE}, but this tag packs to ${LOCAL}. The registry's bytes are not this tag's bytes. npm versions are immutable — republish under a new version rather than assuming this is cosmetic."
+            exit 1
+          fi
+          echo "registry sha1 ${REMOTE} matches the packed tarball"
+
+      # Second, independent proof: not the metadata npm reports, but the artifact a user
+      # actually gets. Clean temp dir, private npm cache so nothing can be served from an
+      # earlier install, and the binary has to say the tag's version out loud.
+      - name: A clean install from npm must report the tag's version
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          export npm_config_cache="${WORK}/npm-cache"
+          REPORTED="$(npx -y -p "${PACKAGE}@${VERSION}" telepty --version)"
+          if [ "$REPORTED" != "$VERSION" ]; then
+            echo "::error::installed ${PACKAGE}@${VERSION} from npm and it reports version '${REPORTED}', expected '${VERSION}'."
+            exit 1
+          fi
+          echo "installed from npm in a clean dir; telepty --version reports ${REPORTED}"
+
+      # Only now, with the publish proven, is there something to announce. readme-regen.yml
+      # triggers on `release: published` and syncs README.md on main — do not duplicate that
+      # here. Notes come from the CHANGELOG section that release-version-invariant-844 already
+      # guarantees exists for exactly this version.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "GitHub Release ${TAG} already exists; leaving it alone"
+            exit 0
+          fi
+          awk -v v="$VERSION" '$1 == "##" && ($2 == v || $2 == "[" v "]") { p = 1; next } p && /^## / { exit } p' \
+            CHANGELOG.md > "${RUNNER_TEMP}/notes.md"
+          if [ ! -s "${RUNNER_TEMP}/notes.md" ]; then
+            echo "::error::CHANGELOG.md has no section for ${VERSION}, so there are no release notes to publish. The package IS on npm — fix the CHANGELOG on main and re-run this job."
+            exit 1
+          fi
+          gh release create "$TAG" --title "$TAG" --notes-file "${RUNNER_TEMP}/notes.md"
+          echo "created GitHub Release ${TAG}"
