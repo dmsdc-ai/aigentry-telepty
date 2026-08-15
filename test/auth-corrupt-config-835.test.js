@@ -150,6 +150,128 @@ test('concurrent first-run mints converge on one token — no process loses its 
   }
 });
 
+// #839 — the first-run write must be ATOMIC, not merely exclusive.
+//
+// The `flag: 'wx'` above makes the CREATE exclusive, but the bytes then land in the file everyone
+// can already see: create, then write. A process that opens config.json inside that window reads
+// TRUNCATED JSON — and the fail-closed reader this file pins then (correctly) throws, so it exits
+// 1. Where the old code mis-recovered by minting over the file, the fixed code crashes. The
+// concurrency test above cannot see it: it is a CLOBBER detector, and it only ever reddened under
+// full-suite load, where contention widened the window on its own.
+//
+// So widen the window on purpose. The child installs a shim that sleeps between the exclusive
+// CREATE of a file and the write of its content, and announces the create on stderr so the readers
+// are admitted at the widest point of the window rather than at a guessed delay. The shim is fair
+// to both versions — it delays whatever file the code creates exclusively. Pre-fix that file is
+// config.json itself, so every reader admitted at the marker finds it empty; post-fix it is the
+// temp file, and config.json does not exist at all until the atomic link puts it there complete.
+function slowMintScript(delayMs) {
+  return `
+    const fs = require('fs');
+    const sleep = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+    const realOpen = fs.openSync;
+    const realWriteFile = fs.writeFileSync;
+    const announceAndStall = () => { fs.writeSync(2, 'CREATED\\n'); sleep(${delayMs}); };
+
+    fs.openSync = (p, flags, mode) => {
+      const fd = realOpen(p, flags, mode);
+      if (String(flags).includes('x')) announceAndStall();
+      return fd;
+    };
+    // node's writeFileSync(path, ...) opens through its own internals, so widening it needs its
+    // own arm: same create → stall → write, just spelled out.
+    fs.writeFileSync = (file, data, opts) => {
+      const flag = opts && opts.flag;
+      if (typeof file === 'string' && typeof flag === 'string' && flag.includes('x')) {
+        const fd = realOpen(file, flag, (opts && opts.mode) || 0o666);
+        announceAndStall();
+        fs.writeSync(fd, data);
+        fs.closeSync(fd);
+        return;
+      }
+      return realWriteFile(file, data, opts);
+    };
+
+    const { getConfig } = require(${JSON.stringify(AUTH)});
+    process.stdout.write(getConfig().authToken);
+  `;
+}
+
+// getConfig() in a child, no shim, no try/catch: a throw is an exit 1 here, which is exactly the
+// failure the fail-closed reader produces when it is handed a half-written file.
+function spawnReader(home) {
+  const script = `
+    const { getConfig } = require(${JSON.stringify(AUTH)});
+    process.stdout.write(getConfig().authToken);
+  `;
+  return new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, ['-e', script], {
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let out = '';
+    let err = '';
+    p.stdout.on('data', (c) => { out += c; });
+    p.stderr.on('data', (c) => { err += c; });
+    p.on('error', reject);
+    p.on('exit', (code) => resolve({ code, out: out.trim(), err: err.trim() }));
+  });
+}
+
+test('a reader that arrives mid-mint never sees a partial config — the write is atomic', { timeout: 30000 }, async () => {
+  const { home, cfg } = withHome();
+  const WINDOW_MS = 1500; // wide enough that four child-process startups fit inside it under load
+  try {
+    const writer = spawn(process.execPath, ['-e', slowMintScript(WINDOW_MS)], {
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let wOut = '';
+    let wErr = '';
+    writer.stdout.on('data', (c) => { wOut += c; });
+    writer.stderr.on('data', (c) => { wErr += c; });
+    const writerExit = new Promise((resolve, reject) => {
+      writer.on('error', reject);
+      writer.on('exit', (code) => resolve(code));
+    });
+
+    await new Promise((resolve, reject) => {
+      const deadline = setTimeout(() => {
+        clearInterval(poll);
+        reject(new Error(`the writer never announced its exclusive create: ${wErr}`));
+      }, 15000);
+      const poll = setInterval(() => {
+        if (!wErr.includes('CREATED')) return;
+        clearInterval(poll);
+        clearTimeout(deadline);
+        resolve();
+      }, 10);
+    });
+
+    const readers = await Promise.all(Array.from({ length: 4 }, () => spawnReader(home)));
+    const writerCode = await writerExit;
+
+    assert.deepEqual(
+      readers.filter((r) => r.code !== 0).map((r) => r.err),
+      [],
+      'a reader admitted while a mint is in flight must never see a file it cannot read'
+    );
+    assert.equal(writerCode, 0, `the minting process itself must exit 0: ${wErr}`);
+
+    const tokens = [wOut.trim(), ...readers.map((r) => r.out)];
+    assert.equal(new Set(tokens).size, 1, `all 5 must agree, got ${JSON.stringify(tokens)}`);
+    assert.equal(JSON.parse(fs.readFileSync(cfg, 'utf8')).authToken, tokens[0]);
+    assert.equal((fs.statSync(cfg).mode & 0o777), 0o600, 'the atomically placed config stays 0600');
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(cfg)),
+      ['config.json'],
+      'and no temp file is left behind in ~/.telepty'
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // The loudness requirement: a `console.warn` from whichever process happened to read the file is
 // not enough. The process that must not be fooled is the DAEMON — it freezes the token at module
 // load, so a daemon that boots on a replacement secret 401s every call for the rest of its life
