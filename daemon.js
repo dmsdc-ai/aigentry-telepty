@@ -5824,7 +5824,22 @@ const mailboxDelivery = new DeliveryEngine(mailbox, {
 });
 // Startup sweep: break stale lock files before starting delivery. Guarded so a test require
 // of this module neither breaks on-disk locks nor starts the delivery loop.
-if (require.main === module) {
+//
+// #916 block 3: the guard is the one #896 (title), #910 (singleton claim) and #916.1 (shutdown)
+// already use. `require.main === module` alone is false in production, so this loop has NEVER
+// run on a real daemon — `DeliveryEngine.start()` logs unconditionally and `[MAILBOX]
+// DeliveryEngine started` appears 0 times in 47,771 lines of the operator's daemon log.
+//
+// First-attempt delivery was never lost: `mailboxDelivery.tick()` is called synchronously on the
+// inject path. What was missing is the BACKGROUND leg — in-flight recovery, stale expiry, and
+// retry of a first attempt that failed (the daemon log's "Delivery failed … (attempt 0/1/2)"
+// lines had no loop to carry them further).
+//
+// Enabling is safe by measurement, not assumption (2026-08-16, before this change):
+// `sessionResolver` is `() => Object.keys(sessions)`, so the loop only ever touches LIVE sessions
+// — the 777 stale mailbox directories on that host are unreachable to it — and every message for
+// every live session was already `acked` (PENDING = 0). There is no backlog to flush.
+if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
   const staleBroken = mailbox.breakStaleLocks();
   if (staleBroken > 0) {
     console.log(`[MAILBOX] Startup sweep: broke ${staleBroken} stale lock(s)`);
