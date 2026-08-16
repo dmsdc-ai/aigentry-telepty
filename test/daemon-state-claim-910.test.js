@@ -109,9 +109,9 @@ test('#910: a bare test require still claims nothing (#896 contract)', async () 
 // this is what #910 unblocks in production. Unit-level — no real install, every seam injected.
 test('#910: postinstall reaches its upgrade path once a state file exists', async () => {
   const postinstall = require('../scripts/postinstall.js');
-  const pkg = require('../package.json');
   const logs = [];
   let cleanupCalled = 0;
+  let respawned = null;
 
   await postinstall.main({
     env: { npm_config_global: 'true' }, // postinstall only acts on a GLOBAL install
@@ -119,11 +119,17 @@ test('#910: postinstall reaches its upgrade path once a state file exists', asyn
     readDaemonState: () => ({ pid: 4242, port: 3848, version: '0.0.1-stale' }),
     detectSupervisor: () => ({ present: false, kind: null, detail: null }),
     cleanupDaemonProcesses: () => { cleanupCalled += 1; return { stopped: [], failed: [] }; },
-    startDetachedDaemon: () => {},
-    waitForDaemonVersion: async () => ({ version: pkg.version }),
+    // EVERY side effect of the unsupervised branch is injected. Without these two the real
+    // `resolveTeleptyBin()` + `spawnDetachedDaemon()` run: postinstall.main() returns while a
+    // REAL detached daemon it spawned is still starting — which is both a process this test has
+    // no business creating (it would target :3848, the operator's port) and the leaked async
+    // activity node:test reports after the test ends.
+    resolveTeleptyBin: () => '/nonexistent/telepty',
+    spawnDetachedDaemon: (bin) => { respawned = bin; },
   });
 
   assert.equal(cleanupCalled, 1, 'a stale running daemon is what postinstall exists to replace');
+  assert.equal(respawned, '/nonexistent/telepty', 'the upgrade path ran to its respawn — through seams, spawning nothing');
   assert.equal(
     logs.some((m) => /No running daemon detected/.test(m)),
     false,
