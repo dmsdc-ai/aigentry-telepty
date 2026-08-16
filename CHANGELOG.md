@@ -2,6 +2,67 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.8.1 — 2026-08-16
+
+Patch release: fixes only, no protocol change. **Not protocol-affecting — upgrading does not
+require restarting orchestrator bridges or re-registering sessions** (the restart rule applies to
+protocol releases). `npm i -g @dmsdc-ai/aigentry-telepty@0.8.1`; the CLI adopts the fix on its next
+invocation, and the daemon needs no restart for #902 (the sweep runs in the CLI, never in the
+resident daemon).
+
+### Fixed
+
+- **A telepty CLI could stop a daemon it was not talking to (#902).** Any command that reaches
+  daemon repair — `inject`, `list`, `attach`, `enter`, `status`, `allow`, `listen`, `update` and
+  ~15 more — ran a system-wide `ps` sweep that SIGTERMed *every* process whose title looked like a
+  telepty daemon, plus the owner of a hardcoded port 3848. **What a 0.8.0 user sees**: on a host
+  running more than one daemon (a second node, a test daemon, a bundled one), an ordinary
+  `telepty inject` aimed at one daemon could terminate another — measured here as a CLI configured
+  for port 52209 killing the daemon on 3848, twice in one day, once from a plain report command.
+  Repair is now scoped to the daemon the CLI is actually addressing (its resolved port), by way of
+  the surgical stop `telepty daemon stop` already used. `telepty cleanup-daemons` is unchanged and
+  remains the deliberate machine-wide sweep — it is now named in the restart-failure message as the
+  escape hatch.
+- **A supervised daemon could be restarted by a CLI addressing a different port (#902).**
+  `launchctl kickstart -k` / `systemctl restart` act on a service *label*, not a port, so the
+  supervisor path could bounce the managed daemon regardless of which one the CLI meant. The
+  supervised port is now read from the job's own descriptor (the launchd plist's / systemd unit's
+  `PORT`), falling back to 3848 only when the descriptor names none — which is what the shipped
+  install writes, so supervised installs behave exactly as before.
+- **Test and tooling processes no longer masquerade as the daemon (#896).** `process.title =
+  'telepty-daemon'` was set at module load, so any process that merely `require`d `daemon.js` for a
+  pure helper — 22 test files do — appeared as a daemon in `ps` and could be swept up by a
+  concurrent stop. Only a real daemon claims the title now.
+- **A local inject no longer depends on any peer being reachable (#837), and a failed inject no
+  longer exits 0 (#840).** Resolving a local session used to fan out to every configured peer
+  first, and the SSH arm is a synchronous 10s-timeout call — so one unreachable peer blocked a
+  purely local write long enough for its keep-alive socket to die, and the write then failed with
+  an undiagnosable `fetch failed`. **What a 0.8.0 user sees**: local sessions work while a peer is
+  down, and scripts can trust `telepty inject`'s exit code.
+- **An idle worker no longer re-notifies its source forever (#914).** The daemon deduped absence
+  notifications against only the immediately-previous observation, but an idle session cycles
+  causes (`silence_timeout` → `prompt_suffix_after_quiet` → `thinking_timeout` → …), so no two
+  consecutive observations ever matched and the source was re-told every settle tick — measured at
+  ~70 notifications in one night for a single idle worker. **What a 0.8.0 user sees**: each
+  *distinct* absence is delivered once per inject instead of every ~30s. Unchanged on purpose: the
+  event bus still receives every observation (a subscriber must never infer from silence), the
+  ledger still records every one, the first absence for an inject is always delivered, and a
+  genuinely new observation kind — a process exit, say — still gets through.
+
+### Changed (release engineering)
+
+- **Publishing is now tag-driven and verified against the registry (#874, #876).** Pushing a
+  `v*` tag publishes and then re-reads the published tarball's shasum to prove what landed, rather
+  than trusting the publish step's exit code.
+
+### Internal (no user-visible behavior change)
+
+Test-reliability work only, listed so the 25 commits since 0.8.0 are accounted for: macOS absence
+notification waits on the condition instead of sampling once (#63); the quiet-observation budget
+became a tripwire rather than a latency guess (#878, #880); the baseline flake counts polls instead
+of milliseconds and the no-supervisor race stopped being a coin flip (#850); the macOS observation
+red was a wrapped spinner line, fixed by spawning wide enough (#903).
+
 ## 0.8.0 — 2026-08-15
 
 ### Changed — BREAKING: telepty no longer asserts task completion (#60 Stage A)

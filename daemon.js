@@ -817,6 +817,37 @@ function observationIdentity(kind, cause) {
   return `${kind}|${cause == null ? '' : cause}`;
 }
 
+// #914: source-delivery dedup — the SET of absence identities this inject has already told its
+// source about.
+//
+// The ledger's rule compares one entry (`record.last_observation`). That is the right rule for
+// "did the measurement change?" and the wrong one for "have we already said this?". An idle
+// session cycles causes (silence_timeout → prompt_suffix_after_quiet → thinking_timeout → …), so
+// no observation ever equals the one immediately before it, the duplicate branch never fires, and
+// the source was re-notified every settle tick — measured at ~70 orchestrator turns in one night
+// for a single idle worker. The debounce this file claims for follow-up observations was real for
+// the ledger and absent on the delivery leg.
+//
+// Keyed on the record OBJECT, so this costs the ledger nothing: no new persisted field, no shape
+// change, no commit, and the set is collected with the record it belongs to. A daemon restart
+// rebuilds records and therefore starts a fresh set — deliberate: a new epoch has not told anyone
+// anything yet.
+const deliveredAbsenceIdentities = new WeakMap();
+
+// Returns true when `identity` has already been delivered to the source for this record; records
+// it as delivered otherwise. Deliberately NOT a pure predicate — the claim and the check must be
+// one step, or two observations in the same tick both see "not yet delivered".
+function markAbsenceDeliveredToSource(record, identity) {
+  let delivered = deliveredAbsenceIdentities.get(record);
+  if (!delivered) {
+    delivered = new Set();
+    deliveredAbsenceIdentities.set(record, delivered);
+  }
+  if (delivered.has(identity)) return true;
+  delivered.add(identity);
+  return false;
+}
+
 /**
  * THE TOTAL EMITTER. Every observation entry point routes through here, and every eligible
  * invocation RETURNS a named result — never `undefined`, never a bare `return`.
@@ -941,6 +972,13 @@ function recordObservation({
   });
 
   if (deliverToSource && pendingReport && result !== 'observation_duplicate') {
+    // #914: the source hears each DISTINCT absence once per inject. The bus above is
+    // unconditional and the ledger below already recorded this observation — only the
+    // notification is suppressed, and only for an identity this inject already sent.
+    if (record && markAbsenceDeliveredToSource(record, observationIdentity(mapped.kind, mapped.cause))) {
+      console.log(`[OBSERVE] ${sessionId}: ${observation.kind} already delivered for ${injectId} — not re-notifying source`);
+      return result;
+    }
     const srcId = _resolveAlias(pendingReport.source) || pendingReport.source;
     const srcSession = _sessions[srcId];
     if (srcSession) {
