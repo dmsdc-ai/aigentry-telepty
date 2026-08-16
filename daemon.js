@@ -5848,13 +5848,49 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
 }
 
 const IDLE_THRESHOLD_SECONDS = 60;
-async function runIdleTtlSweep(nowMs = Date.now()) {
-  const victims = lifecycle.selectIdleTtlVictims(sessions, teleptyConfig, { nowMs });
+// #916 block 4: the idle-TTL reaper's mode. `enforce` is the pre-#916 behaviour (auto-kill);
+// `warn` computes exactly the same victim list and LOGS what it would reap without touching it;
+// `off` does not arm the sweep at all.
+//
+// Default is `warn`, deliberately. This sweep has NEVER run on a real daemon — it was guarded on
+// `require.main === module`, false in production — so `idle_ttl` is a feature no operator's config
+// has ever actually exercised. Arming it and enforcing in the same change would turn a silently
+// inert setting into a session-killer at one restart, with no chance to read what it was about to
+// do. Warn first; the operator flips `enforce` after reading the log.
+const IDLE_TTL_MODE = (() => {
+  const raw = String(process.env.TELEPTY_IDLE_TTL_MODE || 'warn').trim().toLowerCase();
+  return ['off', 'warn', 'enforce'].includes(raw) ? raw : 'warn';
+})();
+
+// `deps` follows this file's existing DI idiom (fireAutoReport, recordObservation,
+// ensureDaemonRunning) so warn-vs-enforce is unit-testable without live sessions.
+async function runIdleTtlSweep(nowMs = Date.now(), deps = {}) {
+  const _sessions = deps.sessions || sessions;
+  const _config = deps.config || teleptyConfig;
+  const _teardown = deps.teardownSessionById || teardownSessionById;
+  const _broadcast = deps.broadcastSessionEvent || broadcastSessionEvent;
+  const _log = deps.log || console.log;
+  const mode = deps.mode || IDLE_TTL_MODE;
+
+  const victims = lifecycle.selectIdleTtlVictims(_sessions, _config, { nowMs });
+
+  // WARN-ONLY: say precisely what enforce would have destroyed, and destroy nothing. No
+  // `tracing`/`idle_ttl_auto_kill` broadcast here — that event asserts a kill happened, and
+  // emitting it for a session still running would be a false statement on the bus.
+  if (mode !== 'enforce') {
+    for (const victim of victims) {
+      _log(`[REAPER] WARN-ONLY: would auto-kill ${victim.id} after ${victim.idleSeconds}s idle `
+        + `(ttl=${victim.ttlMs}ms). Nothing was killed — set TELEPTY_IDLE_TTL_MODE=enforce to act on this.`);
+    }
+    return { mode, victims: victims.map((v) => v.id), killed: [] };
+  }
+
+  const killed = [];
   for (const victim of victims) {
-    const session = sessions[victim.id];
+    const session = _sessions[victim.id];
     if (!session || session._idleTtlKilling) continue;
     session._idleTtlKilling = true;
-    broadcastSessionEvent('tracing', victim.id, session, {
+    _broadcast('tracing', victim.id, session, {
       nowMs,
       extra: {
         action: 'idle_ttl_auto_kill',
@@ -5865,26 +5901,36 @@ async function runIdleTtlSweep(nowMs = Date.now()) {
       }
     });
     try {
-      await teardownSessionById(victim.id, {
+      await _teardown(victim.id, {
         force: false,
         timeoutMs: 5000,
         reason: 'IDLE_TTL',
         source: 'idle_reaper'
       });
-      console.log(`[REAPER] Auto-killed ${victim.id} after ${victim.idleSeconds}s idle (ttl=${victim.ttlMs}ms)`);
+      killed.push(victim.id);
+      _log(`[REAPER] Auto-killed ${victim.id} after ${victim.idleSeconds}s idle (ttl=${victim.ttlMs}ms)`);
     } catch (err) {
       session._idleTtlKilling = false;
       console.error(`[REAPER] Failed to auto-kill ${victim.id}: ${err.message}`);
     }
   }
+  return { mode, victims: victims.map((v) => v.id), killed };
 }
 
 // Guarded: timers must not run (and keep the event loop alive) on a test require.
-if (require.main === module) setInterval(() => {
-  runIdleTtlSweep().catch((err) => {
-    console.error(`[REAPER] Idle TTL sweep failed: ${err.message}`);
-  });
-}, IDLE_REAPER_POLL_MS);
+//
+// #916 block 4: the guard is the one #896/#910/#916.1/#916.3 use — `require.main === module` alone
+// is false in production, so this sweep has never run on a real daemon. It arms in `warn` and
+// `enforce`; `off` does not arm it at all. The startup line states the mode out loud, because an
+// operator reading a log needs to know whether this daemon would kill or only report.
+if (IDLE_TTL_MODE !== 'off' && (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')) {
+  console.log(`[REAPER] idle-TTL sweep armed (mode=${IDLE_TTL_MODE}, poll=${IDLE_REAPER_POLL_MS}ms)`);
+  setInterval(() => {
+    runIdleTtlSweep().catch((err) => {
+      console.error(`[REAPER] Idle TTL sweep failed: ${err.message}`);
+    });
+  }, IDLE_REAPER_POLL_MS);
+}
 
 if (require.main === module) setInterval(() => {
   const now = Date.now();
@@ -6187,6 +6233,8 @@ module.exports = {
   maybeRecordInjectConsumption,   // #60 Stage A: records the fresh-busy-edge CANDIDATE (see the fn comment)
   maybeRecordLauncherConsumption, // #60 Stage A: launcher watermark telemetry — never consumption
   recordObservation,              // #60 Stage A: the TOTAL observation emitter (named result on every path)
+  runIdleTtlSweep,                // #916.4: idle-TTL sweep (deps DI: sessions/config/teardown/mode)
+  IDLE_TTL_MODE,                  // #916.4: 'off' | 'warn' (default) | 'enforce'
   describeSessionTeardown,        // #843: DELETE teardown response — a failed kill never reports success
   beginTrackedInjection,          // #60 Stage A: durable write-before-delivery tracking record
   sessionAuthenticationCapability, // #860 F1: "observed" requires a bearer that was PRESENTED and verified
