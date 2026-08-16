@@ -6145,7 +6145,17 @@ function shutdown(code) {
 
 // Daemon-lifecycle signal/exit handlers — only when run as the daemon, so a test require does
 // not register them (and does not clear on-disk daemon-state at the test process's exit).
-if (require.main === module) {
+//
+// #916 block 1: the guard is the one #896 (title) and #910 (singleton claim) already use.
+// `require.main === module` alone is false in production — launchd runs `telepty daemon` →
+// cli.js → `require('./daemon.js')` — so NO real daemon has ever had a shutdown path: every one
+// died on the default SIGTERM disposition, with no mailboxDelivery.stop(), no
+// mailboxNotifier.cancelAll(), and no clearDaemonState(). #902's incident recorded the
+// signature: `launchctl … last exit -15`, where a handled signal would have exited 0.
+//
+// This is the other half of #910. #910 makes the daemon WRITE daemon-state.json; without this
+// nothing ever clears it, so a state file outlives the daemon that wrote it.
+if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
   process.on('SIGINT', () => shutdown(0));
   process.on('SIGTERM', () => shutdown(0));
   process.on('exit', () => {
