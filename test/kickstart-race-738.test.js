@@ -93,10 +93,15 @@ async function getFreePort() {
 // `supervisor: true` scenario therefore ran with NO supervisor detectable, the racer took
 // the pre-#738 auto-start path, and its orphan won the port — a permanent red that looked
 // like the #738 fix regressing. Write the surface this platform actually reads.
-function writeSupervisorSurface(homeDir) {
+// #902: the surface must also DECLARE the port the supervised job serves. The CLI's supervisor
+// gate compares the addressed port against the descriptor's PORT (falling back to 3848 when it
+// names none), so a fixture on an OS-assigned ephemeral port has to say so — otherwise the CLI
+// correctly concludes the supervised daemon is some other daemon and refuses to defer to it.
+// Pinning 3848 here instead is not an option: that is the operator's production daemon.
+function writeSupervisorSurface(homeDir, port) {
   return process.platform === 'darwin'
-    ? writeLaunchdPlist(homeDir)
-    : writeSystemdUserUnit(homeDir);
+    ? writeLaunchdPlist(homeDir, port)
+    : writeSystemdUserUnit(homeDir, port);
 }
 
 // The kind src/supervisor.js reports for the surface written above (it names the defer banner).
@@ -111,7 +116,7 @@ const SUPERVISOR_UNFAKEABLE = process.platform === 'win32'
 
 // Linux: the user unit, not /etc/systemd/system — the root unit is outside the temp HOME
 // and writing it would violate the isolation contract above.
-function writeSystemdUserUnit(homeDir) {
+function writeSystemdUserUnit(homeDir, port) {
   const unitDir = path.join(homeDir, '.config', 'systemd', 'user');
   fs.mkdirSync(unitDir, { recursive: true });
   const unitPath = path.join(unitDir, 'telepty.service');
@@ -119,6 +124,7 @@ function writeSystemdUserUnit(homeDir) {
 Description=aigentry-telepty daemon
 
 [Service]
+Environment="PORT=${port}"
 ExecStart=${path.join(homeDir, 'bin', 'telepty')} daemon
 Restart=always
 
@@ -128,7 +134,7 @@ WantedBy=default.target
   return unitPath;
 }
 
-function writeLaunchdPlist(homeDir) {
+function writeLaunchdPlist(homeDir, port) {
   const agentsDir = path.join(homeDir, 'Library', 'LaunchAgents');
   fs.mkdirSync(agentsDir, { recursive: true });
   const plistPath = path.join(agentsDir, 'com.aigentry.telepty.plist');
@@ -143,6 +149,11 @@ function writeLaunchdPlist(homeDir) {
         <string>${path.join(homeDir, 'bin', 'telepty')}</string>
         <string>daemon</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PORT</key>
+        <string>${port}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -152,7 +163,7 @@ function writeLaunchdPlist(homeDir) {
   return plistPath;
 }
 
-function createTempHome({ supervisor = true } = {}) {
+function createTempHome({ supervisor = true, port } = {}) {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-738-'));
   tempDirs.push(homeDir);
 
@@ -163,7 +174,7 @@ function createTempHome({ supervisor = true } = {}) {
   fs.mkdirSync(binDir, { recursive: true });
   fs.symlinkSync(path.join(projectRoot, 'cli.js'), path.join(binDir, 'telepty'));
 
-  if (supervisor) writeSupervisorSurface(homeDir);
+  if (supervisor) writeSupervisorSurface(homeDir, port);
   return { homeDir, binDir };
 }
 
@@ -292,7 +303,7 @@ async function claimTestPort() {
 // 3. an ambient CLI invocation lands in that gap and runs ensureDaemonRunning
 async function runKickstartRace({ supervisor = true } = {}) {
   const port = await claimTestPort();
-  const { homeDir, binDir } = createTempHome({ supervisor });
+  const { homeDir, binDir } = createTempHome({ supervisor, port });
   const env = childEnv({ homeDir, binDir, port });
 
   // (1) The supervisor's daemon — launched EXACTLY the way the launchd plist does it.

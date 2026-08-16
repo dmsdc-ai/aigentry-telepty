@@ -6,6 +6,7 @@ const { spawn } = require('node:child_process');
 
 const dc = require('../daemon-control');
 const cli = require('../cli');
+const supervisor = require('../src/supervisor');
 const pkg = require('../package.json');
 
 // #902 — the daemon sweep must only ever act on the daemon the CLI is ADDRESSING.
@@ -228,6 +229,84 @@ test('R5: no supervisor kickstart when the CLI addresses a non-default port', as
 
   assert.equal(kicked, 0, 'a label-scoped restart must not fire for a port the supervisor does not serve');
   assert.equal(started, 1, 'the unsupervised spawn path takes over instead');
+});
+
+// ── R5c — the supervised port is READ, not presumed ─────────────────────────────────────
+// The gate compares the addressed port against the port the supervised job actually serves.
+// DEFAULT_PORT is the fallback for "the descriptor names none" — never a presumption about
+// which daemon is supervised. (The shipped plist names none, so that fallback IS production.)
+test('R5c: supervisedPort reads PORT out of a launchd plist', () => {
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.aigentry.telepty</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>/usr/bin</string>
+        <key>PORT</key><string>51999</string>
+    </dict>
+</dict>
+</plist>`;
+  assert.equal(
+    supervisor.supervisedPort({ present: true, kind: 'launchd', detail: '/fake.plist' }, { readFileSync: () => plist }),
+    51999
+  );
+});
+
+test('R5c2: supervisedPort reads PORT out of a systemd unit', () => {
+  const unit = '[Service]\nEnvironment="PORT=51998"\nExecStart=/usr/bin/telepty daemon\n';
+  assert.equal(
+    supervisor.supervisedPort({ present: true, kind: 'systemd-user', detail: '/fake.service' }, { readFileSync: () => unit }),
+    51998
+  );
+});
+
+test('R5c3: a descriptor that names no PORT is undetermined, not "the default"', () => {
+  // The SHIPPED plist is exactly this shape — EnvironmentVariables with PATH but no PORT
+  // (measured on the operator host). Returning null keeps the fallback a caller policy.
+  const plist = '<plist><dict><key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin</string></dict></dict></plist>';
+  assert.equal(
+    supervisor.supervisedPort({ present: true, kind: 'launchd', detail: '/fake.plist' }, { readFileSync: () => plist }),
+    null
+  );
+});
+
+test('R5c4: an unreadable or absent descriptor is undetermined', () => {
+  assert.equal(
+    supervisor.supervisedPort({ present: true, kind: 'launchd', detail: '/nope.plist' }, {
+      readFileSync: () => { throw new Error('ENOENT'); }
+    }),
+    null
+  );
+  // schtasks `detail` is a task NAME, not a readable file.
+  assert.equal(supervisor.supervisedPort({ present: true, kind: 'schtasks', detail: 'telepty-daemon' }), null);
+  assert.equal(supervisor.supervisedPort({ present: false, kind: null, detail: null }), null);
+});
+
+test('R5d: descriptor names no port ⇒ the gate falls back to DEFAULT_PORT', async () => {
+  // The production path: shipped plist, no PORT key, CLI on the default port ⇒ supervised.
+  let kicked = 0;
+  await cli.restartDaemonGraceful(inertRestartSeams({
+    port: 3848,
+    _detectSupervisor: () => ({ present: true, kind: 'launchd', detail: '/fake.plist' }),
+    _supervisedPort: () => null, // descriptor names none
+    _restartSupervisorDaemon: () => { kicked += 1; return { success: true, kind: 'launchd' }; },
+    _startDetachedDaemon: () => { throw new Error('must not spawn on a supervised install'); }
+  }));
+  assert.equal(kicked, 1, 'fallback to DEFAULT_PORT keeps the shipped install supervised');
+});
+
+test('R5e: a supervised job on a NON-default port is honored on that port', async () => {
+  // The case D1.4-as-written could not express, and the reason the #738 fixture needs it.
+  let kicked = 0;
+  await cli.restartDaemonGraceful(inertRestartSeams({
+    port: 51999,
+    _detectSupervisor: () => ({ present: true, kind: 'launchd', detail: '/fake.plist' }),
+    _supervisedPort: () => 51999,
+    _restartSupervisorDaemon: () => { kicked += 1; return { success: true, kind: 'launchd' }; },
+    _startDetachedDaemon: () => { throw new Error('must not spawn on a supervised install'); }
+  }));
+  assert.equal(kicked, 1, 'the supervisor serves 51999 and the CLI addresses 51999 — that IS its daemon');
 });
 
 test('R5b: the supervisor is still used when the CLI addresses the default port', async () => {

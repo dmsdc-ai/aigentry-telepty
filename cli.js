@@ -43,6 +43,7 @@ const {
   isDeferMarkerFresh,
   readSupervisorDeferMarker,
   restartSupervisorDaemon,
+  supervisedPort,
   writeSupervisorDeferMarker
 } = require('./src/supervisor');
 const crossMachine = require('./cross-machine');
@@ -556,6 +557,19 @@ function formatDaemonStopDiagnostic({ pid, parent }) {
   return `Daemon (PID ${pid}) could not be stopped — run: kill ${pid} && telepty daemon`;
 }
 
+// #902: the port-scoping gate shared by restartDaemonGraceful and deferToSupervisor. A detected
+// supervisor only counts as OURS when the job it manages serves the port this CLI is addressing;
+// otherwise a label-scoped restart would reach a daemon we are not talking to. `supervisedPort`
+// returns null when the descriptor names no port — that is when, and only when, the default
+// applies (the shipped plist carries no PORT key, so this is the normal production path).
+function supervisorFor(detected, addressedPort, options = {}) {
+  if (!detected || !detected.present) return detected || { present: false };
+  const readPort = options._supervisedPort || supervisedPort;
+  const servedPort = readPort(detected);
+  const effective = Number.isInteger(servedPort) && servedPort > 0 ? servedPort : DEFAULT_PORT;
+  return addressedPort === effective ? detected : { present: false };
+}
+
 async function restartDaemonGraceful(options = {}) {
   const maxAttempts = options.maxAttempts || 3;
   const requiredCapabilities = options.requiredCapabilities || [];
@@ -580,10 +594,11 @@ async function restartDaemonGraceful(options = {}) {
   const portOwner = options._findPortOwnerPid || findPortOwnerPid;
   const parentInfo = options._findParentProcessInfo || findParentProcessInfo;
   // #902: a supervisor restart is LABEL-scoped (`launchctl kickstart -k gui/<uid>/<label>`,
-  // src/supervisor.js:151) — it kills the supervised daemon whatever port we are addressing.
-  // The plist/unit runs `telepty daemon` with no PORT override, so the job serves the default
-  // port; addressing any other port means the supervised daemon is not ours to restart.
-  const supervisor = addressedPort === DEFAULT_PORT ? detect() : { present: false };
+  // src/supervisor.js) — it kills the supervised daemon whatever port we are addressing. So it
+  // may only run when the supervised job serves the port we are addressing. The port is READ
+  // from the job's own descriptor; DEFAULT_PORT is the fallback only when the descriptor names
+  // none (the shipped plist does not), never a presumption about which daemon is supervised.
+  const supervisor = supervisorFor(detect(), addressedPort, options);
   const supervisorPresent = Boolean(supervisor && supervisor.present);
   const acceptsMeta = (meta) => {
     if (!meta || meta.version !== pkg.version) return false;
@@ -1046,7 +1061,7 @@ async function deferToSupervisor(options = {}) {
   const addressedPort = Number.isInteger(options.port) && options.port > 0
     ? options.port
     : Number(PORT);
-  const supervisor = addressedPort === DEFAULT_PORT ? detect() : { present: false };
+  const supervisor = supervisorFor(detect(), addressedPort, options);
   if (!supervisor.present) return null; // no supervisor → unchanged behavior
 
   // telepty#15-style once-per-state memory: a supervisor that is installed but broken

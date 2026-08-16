@@ -87,6 +87,43 @@ function detectSupervisorUncached(deps = {}) {
     : ABSENT;
 }
 
+// #902: which port does the supervised job actually serve?
+//
+// A supervisor restart is LABEL-scoped (`launchctl kickstart -k gui/<uid>/<label>`), so it kills
+// the supervised daemon whatever port the CLI is addressing — that is one of the two ways a CLI
+// configured for :52209 destroyed the daemon on :3848. The gate in cli.js needs to compare the
+// addressed port against the supervised one, and the descriptor this module already returns
+// (`detail` = plist / unit path) is where that port is written: install.js templates the daemon's
+// PORT into the service's environment block.
+//
+// Returns the port when the descriptor NAMES one, else null — "I could not determine it" is not
+// the same statement as "it is the default", so the fallback is the caller's policy decision
+// (cli.js), consistent with this module's split: detection here, policy there.
+function supervisedPort(supervisor, deps = {}) {
+  const readFileSync = deps.readFileSync || fs.readFileSync;
+  if (!supervisor || !supervisor.present || !supervisor.detail) return null;
+
+  // schtasks is registry-side: `detail` is a task NAME, not a readable descriptor.
+  if (supervisor.kind === 'schtasks') return null;
+
+  let text;
+  try {
+    text = String(readFileSync(supervisor.detail, 'utf8'));
+  } catch {
+    return null; // unreadable/absent descriptor ⇒ undetermined, never a guess
+  }
+
+  const match = supervisor.kind === 'launchd'
+    // <key>PORT</key><string>4000</string> inside EnvironmentVariables (install.js:115).
+    ? text.match(/<key>\s*PORT\s*<\/key>\s*<string>\s*(\d+)\s*<\/string>/)
+    // systemd: Environment=PORT=4000, optionally quoted.
+    : text.match(/^\s*Environment\s*=\s*"?PORT=(\d+)"?/m);
+  if (!match) return null;
+
+  const port = Number(match[1]);
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : null;
+}
+
 let cachedDetection = null;
 
 // Memoized per process. Passing `deps` bypasses the cache entirely (unit tests inject
@@ -195,5 +232,6 @@ module.exports = {
   isDeferMarkerFresh,
   readSupervisorDeferMarker,
   restartSupervisorDaemon,
+  supervisedPort,
   writeSupervisorDeferMarker
 };
