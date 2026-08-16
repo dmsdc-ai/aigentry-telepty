@@ -13,18 +13,42 @@ name: Release
 # bytes this tag builds. Every gate fails loudly; none of them skip into green. A missing
 # secret is a failure, not a no-op. A local build agreeing with itself is not evidence — the
 # proof steps read back from the registry.
+#
+# And the corollary #917 had to pay for: A QUARANTINED LEG MUST NEVER BE IN THE PUBLISH `needs`
+# GRAPH. `continue-on-error` excuses a job that FAILS; it does not excuse one that is CANCELLED,
+# and a job killed by `timeout-minutes` is cancelled, so its dependents skip. Measured on run
+# 31921029756 (v0.8.1): every gate that could speak said green, windows was cancelled at the
+# 20-minute cap, `publish` was skipped, and npm kept serving 0.8.0 while the tag said otherwise.
+# CANCELLED IS NOT GREEN AND IT IS NOT FAILED — it is a third outcome, and only the needs graph
+# decides whether it can hold a release hostage. Measure a quarantined platform in its own job.
 
 on:
   push:
     tags: [ 'v*' ]
+  # #917: re-run an EXISTING tag without retagging. v0.8.1 published nothing because the
+  # windows leg timed out (see the `test-windows` job), and a tag-triggered re-run would have
+  # re-executed the release.yml AT THAT TAG — the broken one — because a push-tag run resolves
+  # its workflow file from the tag's tree. Dispatching from the default branch runs the FIXED
+  # file while every checkout below pins the tag's tree, so the bytes published are still the
+  # tag's bytes. The tag must already exist and must agree with package.json at that tag; the
+  # Gate below is what enforces that, unchanged.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v0.8.1). Must already exist and agree with package.json at that tag.'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 # Two runs for the same tag (a re-run, or a tag force-pushed) must not race each other at
 # the registry. Queue instead of cancel: cancelling mid-publish is how you get a half-release.
+# Keyed on the RESOLVED tag, not github.ref: a dispatch runs on the default branch, so keying
+# on the ref would put a dispatched re-run of v0.8.1 in a different group from the tag push it
+# is re-running — the exact race this group exists to prevent.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -36,8 +60,13 @@ jobs:
     outputs:
       package: ${{ steps.identity.outputs.package }}
       version: ${{ steps.identity.outputs.version }}
+      # #917: the resolved tag, so every downstream job checks out the same tree this Gate
+      # validated — whether the run came from a tag push or a dispatch.
+      tag: ${{ steps.identity.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -53,7 +82,7 @@ jobs:
       - name: Tag and package.json must name the same version
         id: identity
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           PACKAGE="$(node -p "require('./package.json').name")"
@@ -65,6 +94,7 @@ jobs:
           fi
           echo "package=${PACKAGE}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "tag ${TAG} agrees with package.json: ${PACKAGE}@${VERSION}"
 
       # A workflow that silently no-ops when the secret is absent is green-without-publishing,
@@ -85,21 +115,32 @@ jobs:
   # .github/workflows/test-install.yml (matrix, 20min cap, windows quarantine, the four steps)
   # so the release gate and the PR gate cannot drift into measuring different things. Kept as a
   # copy rather than a workflow_call refactor because test-install.yml is out of scope for #874.
+  # #917: THE BLOCKING GATE — ubuntu + macOS only.
+  #
+  # windows-latest used to be a third leg of this matrix under
+  # `continue-on-error: ${{ matrix.os == 'windows-latest' }}`, with a comment saying
+  # "ubuntu+macOS are the blocking gate". The YAML did not implement that sentence.
+  # `continue-on-error` excuses a job that FAILS; it does not excuse one that is CANCELLED, and
+  # a job killed by `timeout-minutes` is cancelled. Measured on run 31921029756 (v0.8.1): Gate
+  # green, ubuntu green 1m56, macOS green 2m44, windows cancelled at 20m06 — and `publish` was
+  # SKIPPED. The tag was pushed, the run went through, and npm still served 0.8.0.
+  #
+  # A quarantined leg must never be in the publish `needs` graph. Windows is measured in its own
+  # job below, where its outcome cannot reach this one.
   test:
     name: Full suite
     needs: guard
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
         node: [20]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    # telepty #577, same quarantine as test-install.yml: windows-latest has windows-specific
-    # reds tracked separately, so ubuntu+macOS are the blocking gate. Remove when #577 lands.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -115,6 +156,34 @@ jobs:
       - name: Run PTY-serialized regression tests
         run: npm run test:ci:pty
 
+  # #879: MEASURED, NOT GATING. Same steps as the gate above, deliberately outside it and
+  # outside `publish`'s needs graph — windows-latest has never completed this suite inside the
+  # 20-minute cap, so anything downstream of it is hostage to that. Its result is still recorded
+  # (that is the point of running it at all); it simply cannot decide whether a release ships.
+  # Fold it back into `test` when #879 lands and windows completes.
+  test-windows:
+    name: Full suite (windows — measured, not gating, #879)
+    needs: guard
+    runs-on: windows-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run typecheck
+        run: npm run typecheck
+      - name: Run regression suite
+        run: npm run test:ci
+      - name: Run PTY-serialized regression tests
+        run: npm run test:ci:pty
+
   publish:
     name: Publish and verify from the registry
     needs: [guard, test]
@@ -124,9 +193,13 @@ jobs:
     env:
       PACKAGE: ${{ needs.guard.outputs.package }}
       VERSION: ${{ needs.guard.outputs.version }}
-      TAG: ${{ github.ref_name }}
+      # #917: the tag the Gate resolved and validated, not github.ref_name — on a dispatched
+      # re-run the ref is the default branch and the tag is the input.
+      TAG: ${{ needs.guard.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
