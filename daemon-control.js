@@ -10,6 +10,10 @@ const { killWindowsProcess } = require('./src/win-kill-process');
 const TELEPTY_DIR = path.join(os.homedir(), '.telepty');
 const DAEMON_STATE_FILE = path.join(TELEPTY_DIR, 'daemon-state.json');
 const DEFAULT_KILL_GRACE_MS = 5000;
+// #902: the port a telepty daemon serves when nothing overrides it. Named because it is now a
+// value callers must CHOOSE — an implicit default inside the sweep is what let a CLI addressing
+// one port signal a daemon on another.
+const DEFAULT_PORT = 3848;
 
 function killGraceMs() {
   const raw = Number(process.env.TELEPTY_DAEMON_KILL_GRACE_MS);
@@ -381,8 +385,16 @@ function cleanupDaemonProcesses(opts) {
   // `isLikelyTeleptyDaemon`). Two of three already required positive evidence; the exception was
   // also the one `stopDaemon` promises is surgical. A pid that no longer exists, or exists as
   // somebody else, simply is not a target — the stale state file is cleared below either way.
+  //
+  // #902: the file records {pid, host, port} (claimDaemonState above) and only the pid was ever
+  // read. A state file describing the daemon on 3848 therefore authorized a kill from a CLI
+  // addressing a different port — the pid is only this caller's business when the daemon it
+  // names is the daemon this caller addresses. `port == null` keeps pre-0.4 state files (written
+  // before the field existed) stoppable, the same tolerance telepty#15 needed for daemons that
+  // predate the file entirely.
+  const portMatchesAddress = !state || state.port == null || state.port === o.port;
   if (state && Number.isInteger(state.pid) && state.pid > 0 && state.pid !== process.pid
-      && confirmCmdline(state.pid)) {
+      && portMatchesAddress && confirmCmdline(state.pid)) {
     targets.set(state.pid, { pid: state.pid, source: 'state-file' });
   }
 
@@ -397,8 +409,11 @@ function cleanupDaemonProcesses(opts) {
   // SIGTERM an arbitrary process that happens to own the port.
   // Confirmation order: HTTP /api/health probe → ps cmdline match.
   // Sync-friendly: HTTP probe is opt-in (port-owner kept disabled in tests).
+  // #902: the port comes from the CALLER — no `|| 3848` fallback. A caller that names no port has
+  // named no daemon, and `findPortOwnerPid` returns null for a non-integer port, so this source
+  // simply contributes nothing rather than silently addressing the default.
   if (o.includePortOwner !== false) {
-    const portOwnerPid = (o.findPortOwnerPid || findPortOwnerPid)(o.port || 3848);
+    const portOwnerPid = (o.findPortOwnerPid || findPortOwnerPid)(o.port);
     if (portOwnerPid && portOwnerPid !== process.pid && !targets.has(portOwnerPid)) {
       if (confirmCmdline(portOwnerPid)) {
         targets.set(portOwnerPid, { pid: portOwnerPid, source: 'port-owner' });
@@ -439,7 +454,7 @@ function stopDaemon(opts) {
   const o = opts || {};
   return cleanupDaemonProcesses({
     ...o,
-    port: Number.isInteger(o.port) && o.port > 0 ? o.port : 3848,
+    port: Number.isInteger(o.port) && o.port > 0 ? o.port : DEFAULT_PORT,
     // Force-disable the system-wide process scan unconditionally (never honor a
     // caller-provided one) — this is the surgical guarantee: stop reaps only the
     // state-file pid and the configured port's owner, never a table sweep.
@@ -449,6 +464,7 @@ function stopDaemon(opts) {
 
 module.exports = {
   DAEMON_STATE_FILE,
+  DEFAULT_PORT,
   claimDaemonState,
   cleanupDaemonProcesses,
   stopDaemon,

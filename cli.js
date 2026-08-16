@@ -11,6 +11,7 @@ const prompts = require('prompts');
 const pkg = require('./package.json');
 const { getConfig } = require('./auth');
 const {
+  DEFAULT_PORT,
   cleanupDaemonProcesses,
   clearRestartFailureMarker,
   findParentProcessInfo,
@@ -42,6 +43,7 @@ const {
   isDeferMarkerFresh,
   readSupervisorDeferMarker,
   restartSupervisorDaemon,
+  supervisedPort,
   writeSupervisorDeferMarker
 } = require('./src/supervisor');
 const crossMachine = require('./cross-machine');
@@ -555,20 +557,48 @@ function formatDaemonStopDiagnostic({ pid, parent }) {
   return `Daemon (PID ${pid}) could not be stopped — run: kill ${pid} && telepty daemon`;
 }
 
+// #902: the port-scoping gate shared by restartDaemonGraceful and deferToSupervisor. A detected
+// supervisor only counts as OURS when the job it manages serves the port this CLI is addressing;
+// otherwise a label-scoped restart would reach a daemon we are not talking to. `supervisedPort`
+// returns null when the descriptor names no port — that is when, and only when, the default
+// applies (the shipped plist carries no PORT key, so this is the normal production path).
+function supervisorFor(detected, addressedPort, options = {}) {
+  if (!detected || !detected.present) return detected || { present: false };
+  const readPort = options._supervisedPort || supervisedPort;
+  const servedPort = readPort(detected);
+  const effective = Number.isInteger(servedPort) && servedPort > 0 ? servedPort : DEFAULT_PORT;
+  return addressedPort === effective ? detected : { present: false };
+}
+
 async function restartDaemonGraceful(options = {}) {
   const maxAttempts = options.maxAttempts || 3;
   const requiredCapabilities = options.requiredCapabilities || [];
   // Injectable seams (default to the real implementations) so the blocked-restart
   // path is unit-testable without touching a real daemon or process table (#15;
   // same pattern as ensureDaemonRunning #567).
-  const cleanup = options._cleanupDaemonProcesses || cleanupDaemonProcesses;
+  // #902: the daemon this CLI is ADDRESSING. Every remediation below is scoped to it — the
+  // sweep used to be told nothing and fall back to a hardcoded 3848, so a CLI configured for
+  // another port SIGTERMed the operator's production daemon. `options.port` is an injectable
+  // seam like the rest; production callers never pass one and get the CLI's own port.
+  const addressedPort = Number.isInteger(options.port) && options.port > 0
+    ? options.port
+    : Number(PORT);
+  // #902: SURGICAL by default — stopDaemon targets only the state-file pid and the addressed
+  // port's owner, never a system-wide `ps` scan (daemon-control.js:438, telepty#55 wrote it for
+  // exactly this property; the repair path just never adopted it).
+  const cleanup = options._cleanupDaemonProcesses || stopDaemon;
   const startDaemon = options._startDetachedDaemon || startDetachedDaemon;
   const detect = options._detectSupervisor || detectSupervisor;
   const restartSupervisor = options._restartSupervisorDaemon || restartSupervisorDaemon;
   const waitHealth = options._waitForDaemonHealth || waitForDaemonHealth;
   const portOwner = options._findPortOwnerPid || findPortOwnerPid;
   const parentInfo = options._findParentProcessInfo || findParentProcessInfo;
-  const supervisor = detect();
+  // #902: a supervisor restart is LABEL-scoped (`launchctl kickstart -k gui/<uid>/<label>`,
+  // src/supervisor.js) — it kills the supervised daemon whatever port we are addressing. So it
+  // may only run when the supervised job serves the port we are addressing. The port is READ
+  // from the job's own descriptor; DEFAULT_PORT is the fallback only when the descriptor names
+  // none (the shipped plist does not), never a presumption about which daemon is supervised.
+  const supervisor = supervisorFor(detect(), addressedPort, options);
   const supervisorPresent = Boolean(supervisor && supervisor.present);
   const acceptsMeta = (meta) => {
     if (!meta || meta.version !== pkg.version) return false;
@@ -576,8 +606,8 @@ async function restartDaemonGraceful(options = {}) {
   };
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    // (a) Kill existing daemon processes
-    const results = cleanup();
+    // (a) Stop the daemon we are addressing (#902: the sweep is told which one)
+    const results = cleanup({ port: addressedPort });
 
     // (b) Wait up to 3s for old processes to fully exit
     if (results.stopped.length > 0) {
@@ -604,7 +634,7 @@ async function restartDaemonGraceful(options = {}) {
     // not stop (state file absent and unkillable, EPERM, foreign parent), starting
     // a new daemon can never bind — the old "3 attempts with backoff" was pure
     // noise. Stop retrying and emit one actionable diagnostic instead.
-    const survivingOwner = portOwner(Number(PORT));
+    const survivingOwner = portOwner(addressedPort);
     if (Number.isInteger(survivingOwner) && survivingOwner > 0 && survivingOwner !== process.pid) {
       const diagnostic = formatDaemonStopDiagnostic({ pid: survivingOwner, parent: parentInfo(survivingOwner) });
       console.error(`\x1b[31m❌ Daemon restart blocked: ${diagnostic}\x1b[0m`);
@@ -667,7 +697,9 @@ async function restartDaemonGraceful(options = {}) {
     if (Number.isInteger(portOwner) && portOwner > 0 && portOwner !== statePid) parts.push(`port 3848 owner pid ${portOwner}`);
     if (parts.length) survivor = ` Old daemon still alive (${parts.join(', ')}) — run "kill ${portOwner || statePid}" then "telepty daemon".`;
   } catch {}
-  console.error(`\x1b[31m❌ Daemon restart failed after ${maxAttempts} attempts. Run "telepty daemon" manually to start.${survivor}\x1b[0m`);
+  // #902: name the machine-wide escape hatch here — the repair path is now scoped to the
+  // addressed daemon, so a daemon on an unexpected port is deliberately out of its reach.
+  console.error(`\x1b[31m❌ Daemon restart failed after ${maxAttempts} attempts. Run "telepty daemon" manually to start, or "telepty cleanup-daemons" to stop every telepty daemon on this machine.${survivor}\x1b[0m`);
   return { success: false, meta: null, attempt: maxAttempts };
 }
 
@@ -766,7 +798,8 @@ async function repairLocalDaemon(options = {}) {
   }
 
   const restart = options.restart !== false;
-  const results = cleanupDaemonProcesses();
+  // #902: "repair MY daemon" — the one this CLI addresses, not every daemon on the machine.
+  const results = stopDaemon({ port: Number(PORT) });
 
   if (!restart) {
     return { stopped: results.stopped.length, failed: results.failed.length, meta: null };
@@ -1023,7 +1056,12 @@ async function deferToSupervisor(options = {}) {
   const waitMs = options.supervisorWaitMs == null ? SUPERVISOR_DEFER_MS : options.supervisorWaitMs;
   const pollMs = options.supervisorPollMs == null ? 300 : options.supervisorPollMs;
 
-  const supervisor = detect();
+  // #902: same label-vs-port scoping as restartDaemonGraceful. Waiting on (and then kickstarting)
+  // a supervised job only makes sense when that job serves the port we are addressing.
+  const addressedPort = Number.isInteger(options.port) && options.port > 0
+    ? options.port
+    : Number(PORT);
+  const supervisor = supervisorFor(detect(), addressedPort, options);
   if (!supervisor.present) return null; // no supervisor → unchanged behavior
 
   // telepty#15-style once-per-state memory: a supervisor that is installed but broken
@@ -1590,7 +1628,9 @@ async function main() {
   }
 
   if (cmd === 'cleanup-daemons') {
-    const results = cleanupDaemonProcesses();
+    // #902: the one command whose contract IS machine-wide — it names the default port
+    // explicitly now that the sweep no longer assumes one.
+    const results = cleanupDaemonProcesses({ port: DEFAULT_PORT });
     console.log(`Stopped ${results.stopped.length} telepty daemon(s).`);
     if (results.failed.length > 0) {
       console.log(`Failed to stop ${results.failed.length} daemon(s).`);

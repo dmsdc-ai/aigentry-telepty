@@ -97,8 +97,11 @@ async function main(options = {}) {
   try {
     // Lazy require so a malformed install of daemon-control.js doesn't abort
     // postinstall before the skip-check runs.
-    const cleanupDaemonProcesses = options.cleanupDaemonProcesses || require('../daemon-control').cleanupDaemonProcesses;
-    const result = cleanupDaemonProcesses();
+    const daemonControl = require('../daemon-control');
+    const cleanupDaemonProcesses = options.cleanupDaemonProcesses || daemonControl.cleanupDaemonProcesses;
+    // #902: postinstall replaces the installed daemon machine-wide; the default port is now
+    // named, not assumed by the sweep.
+    const result = cleanupDaemonProcesses({ port: daemonControl.DEFAULT_PORT });
     stopped = result.stopped.length;
     if (result.failed.length > 0) {
       logger.warn(`[telepty postinstall] Could not stop ${result.failed.length} daemon process(es).`);
