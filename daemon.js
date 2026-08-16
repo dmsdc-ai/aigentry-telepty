@@ -489,7 +489,15 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
 
 // Singleton claim — guarded so a test require neither exits (when a daemon is running) nor
 // overwrites a live daemon's on-disk state claim (when one is). Only the real daemon claims.
-if (require.main === module) {
+//
+// #910: the guard is the one #896 established three lines above, NOT `require.main === module`
+// alone — that is false in production, where the launchd plist runs `telepty daemon` → cli.js →
+// `require('./daemon.js')` (cli.js sets AIGENTRY_TELEPTY_DAEMON_MAIN immediately before it). So
+// the claim never ran on any real daemon: measured on the operator host as a live daemon with no
+// ~/.telepty/daemon-state.json at all. Three things were silently dead as a result — the
+// singleton guard, postinstall's daemon upgrade (it gates on the state file), and #902's
+// state-file port gate, which had nothing to read.
+if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
   const daemonClaim = claimDaemonState({ host: HOST, port: Number(PORT), version: pkg.version });
   if (!daemonClaim.claimed) {
     const current = daemonClaim.current;
