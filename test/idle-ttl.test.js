@@ -61,7 +61,11 @@ test('daemon idle reaper removes a session whose per-session TTL is exceeded and
   const harness = await startTestDaemon({
     env: {
       TELEPTY_IDLE_REAPER_POLL_MS: '100',
-      TELEPTY_HEALTH_POLL_MS: '1000'
+      TELEPTY_HEALTH_POLL_MS: '1000',
+      // #916.4: the reaper now defaults to WARN-ONLY — it names its victims and kills nothing.
+      // This test asserts the KILL semantics, so it must ask for them explicitly. That the
+      // default no longer reaps is the point of the block-4 change, not a regression here.
+      TELEPTY_IDLE_TTL_MODE: 'enforce'
     }
   });
 
