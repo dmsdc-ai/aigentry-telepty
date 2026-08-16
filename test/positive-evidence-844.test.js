@@ -191,6 +191,7 @@ test('an unconfirmed state-file pid is NOT killed — a stale file after a pid r
 test('a CONFIRMED state-file pid is still killed, still attributed to state-file', () => {
   const killed = [];
   const result = cleanupDaemonProcesses({
+    port: 3848, // #902: name the addressed daemon — this fixture is about confirmation, not scoping
     readDaemonState: () => ({ pid: 4242, host: '127.0.0.1', port: 3848, version: '0.3.5' }),
     listDaemonProcesses: () => [],
     findPortOwnerPid: () => null,

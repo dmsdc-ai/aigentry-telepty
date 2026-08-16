@@ -4,7 +4,7 @@ const { execSync, spawn } = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
-const { cleanupDaemonProcesses } = require('./daemon-control');
+const { DEFAULT_PORT, cleanupDaemonProcesses } = require('./daemon-control');
 
 function run(cmd) {
   try {
@@ -39,7 +39,8 @@ function resolveDaemonLaunchOptions(options = {}) {
 
 function cleanupLocalDaemons() {
   console.log('🧹 Cleaning up existing telepty daemons...');
-  const results = cleanupDaemonProcesses();
+  // #902: service install is machine-wide by contract; the default port is now named, not assumed.
+  const results = cleanupDaemonProcesses({ port: DEFAULT_PORT });
   console.log(`   Stopped ${results.stopped.length} daemon(s).`);
   if (results.failed.length > 0) {
     console.warn(`   Could not stop ${results.failed.length} daemon(s).`);

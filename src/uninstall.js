@@ -54,7 +54,8 @@ function runUninstall(opts = {}) {
   const execFile = opts.execFileSync || execFileSync;
   const fsx = opts.fs || fs;
   // Late-require keeps module load free of side effects and the seam injectable.
-  const cleanup = opts.cleanupDaemonProcesses || require('../daemon-control').cleanupDaemonProcesses;
+  const daemonControl = require('../daemon-control');
+  const cleanup = opts.cleanupDaemonProcesses || daemonControl.cleanupDaemonProcesses;
   const plan = planUninstall(opts);
 
   const result = {
@@ -71,7 +72,9 @@ function runUninstall(opts = {}) {
   // process-title scan → port owner; daemon-control, telepty#15/#44).
   if (!dryRun) {
     try {
-      const stopResult = cleanup();
+      // #902: uninstall is machine-wide by contract; it names the default port explicitly now
+      // that the sweep no longer assumes one.
+      const stopResult = cleanup({ port: daemonControl.DEFAULT_PORT });
       result.stopped = stopResult.stopped || [];
       result.failed = stopResult.failed || [];
     } catch {

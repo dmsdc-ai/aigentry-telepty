@@ -15,20 +15,16 @@
 //                       worktree's cli.js, so resolveTeleptyEntryPoint() (cli.js:413)
 //                       spawns the worktree daemon and never the globally installed one.
 
-const { ensureDaemonRunning, restartDaemonGraceful } = require('../cli');
+const { ensureDaemonRunning } = require('../cli');
 
-ensureDaemonRunning({
-  _restartDaemonGraceful: (options) => restartDaemonGraceful({
-    ...options,
-    // SAFETY (the only stubbed seam): the real cleanupDaemonProcesses does a system-wide
-    // `ps -axo pid=,command=` sweep and SIGTERMs every process whose title looks like a
-    // telepty daemon (daemon-control.js:160-197) — which includes the operator's
-    // production daemon on port 3848. In the gap being reproduced the old daemon has
-    // ALREADY been killed by the supervisor, so the real sweep stops nothing and this
-    // no-op is behaviorally identical for this scenario.
-    _cleanupDaemonProcesses: () => ({ stopped: [], failed: [] })
-  })
-})
+// #902: the hand-written `_cleanupDaemonProcesses` no-op that used to live here is GONE, and
+// its absence is the point. It existed because the repair path ran a system-wide `ps` sweep
+// that SIGTERMed every `telepty-daemon`-titled process on the machine — including the
+// operator's production daemon on :3848 — so this racer had to stub the seam out by hand to be
+// safe to run. The repair path is now scoped to the daemon the CLI addresses (this racer's
+// TELEPTY_PORT, an OS-assigned ephemeral port under a temp HOME), so the REAL stop path cannot
+// reach any daemon but this fixture's own. Running it unstubbed is the honest regression.
+ensureDaemonRunning()
   .then(() => process.exit(0))
   .catch((error) => {
     console.error(`[RACER] ${error && error.message}`);

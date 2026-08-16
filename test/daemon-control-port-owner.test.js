@@ -19,6 +19,7 @@ function killerOk(captured) {
 test('cleanup: only state-file source → stopped attributed to state-file', () => {
   const killed = [];
   const result = cleanupDaemonProcesses({
+    port: 3848, // #902: name the addressed daemon — this fixture is about attribution, not scoping
     readDaemonState: () => ({ pid: 4242, host: '127.0.0.1', port: 3848, version: '0.3.5' }),
     listDaemonProcesses: () => [],
     findPortOwnerPid: () => null,
