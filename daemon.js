@@ -5932,7 +5932,29 @@ if (IDLE_TTL_MODE !== 'off' && (require.main === module || process.env.AIGENTRY_
   }, IDLE_REAPER_POLL_MS);
 }
 
-if (require.main === module) setInterval(() => {
+// #916 block 2, the last of the four. Same guard as #896 (title), #910 (singleton claim),
+// #916.1 (shutdown) and #916.4 (idle reaper): `require.main === module` alone is false in
+// production, so this sweep has never run on a real daemon.
+//
+// It is NOT only telemetry, which is why it was held for an explicit owner decision. Every
+// HEALTH_POLL_MS this loop:
+//   • broadcasts `session_health` per session, and `session.idle` past IDLE_THRESHOLD_SECONDS
+//   • fires the legacy `silence-timeout` auto-report for NON-wrapped sessions with a pending
+//     report (no-op for an all-wrapped host)
+//   • re-checks aterm socket liveness and cmux surface liveness
+//   • and DELETES sessions: a wrapped/aterm session with no owner socket, no clients, and
+//     `disconnectedSeconds >= SESSION_CLEANUP_SECONDS` is removed and its credential revoked
+//
+// That last one is the reason for the deployment gate. At a restart, persisted sessions are
+// restored with `ownerWs` null and `clients` 0, so a bridge that never reconnects becomes
+// eligible — which is #905's failure mode. The threshold is operator-set:
+// `SESSION_CLEANUP_SECONDS` (line 82) reads TELEPTY_SESSION_CLEANUP_SECONDS at boot, and this
+// host's launchd plist carries 86400, so the GC needs a full day of absence rather than 5
+// minutes. The startup line below states the effective value out loud, because "is the knob
+// actually in effect?" must be answerable from the log rather than inferred.
+if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
+  console.log(`[HEALTH] session sweep armed (poll=${HEALTH_POLL_MS}ms, stale-disconnect cleanup after ${SESSION_CLEANUP_SECONDS}s)`);
+  setInterval(() => {
   const now = Date.now();
   for (const [id, session] of Object.entries(sessions)) {
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
@@ -6134,7 +6156,8 @@ if (require.main === module) setInterval(() => {
       persistSessions();
     }
   }
-}, HEALTH_POLL_MS);
+  }, HEALTH_POLL_MS);
+}
 
 if (server) server.on('error', async (error) => {
   clearDaemonState(process.pid);
@@ -6233,6 +6256,7 @@ module.exports = {
   maybeRecordInjectConsumption,   // #60 Stage A: records the fresh-busy-edge CANDIDATE (see the fn comment)
   maybeRecordLauncherConsumption, // #60 Stage A: launcher watermark telemetry — never consumption
   recordObservation,              // #60 Stage A: the TOTAL observation emitter (named result on every path)
+  SESSION_CLEANUP_SECONDS,        // #916.2: stale-disconnect GC threshold (TELEPTY_SESSION_CLEANUP_SECONDS)
   runIdleTtlSweep,                // #916.4: idle-TTL sweep (deps DI: sessions/config/teardown/mode)
   IDLE_TTL_MODE,                  // #916.4: 'off' | 'warn' (default) | 'enforce'
   describeSessionTeardown,        // #843: DELETE teardown response — a failed kill never reports success
