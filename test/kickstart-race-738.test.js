@@ -367,7 +367,7 @@ async function runKickstartRace({ supervisor = true } = {}) {
 // Not the #738 fix — this pins the arbitration that made an orphan possible in the first
 // place, and it stays true until #742 repairs the require.main guards. If this test ever
 // starts failing, #742 landed and the fix below can be revisited.
-test('#738 characterization: two daemons racing one port — loser exits 0, singleton lock never engages (#742)', async () => {
+test('#738 characterization: two daemons racing one port — loser exits 0, and (since #910) the singleton lock engages', async () => {
   const port = await claimTestPort();
   const { homeDir, binDir } = createTempHome();
   const env = childEnv({ homeDir, binDir, port });
@@ -391,14 +391,14 @@ test('#738 characterization: two daemons racing one port — loser exits 0, sing
   const stillServing = await fetchMeta(port, homeDir);
   assert.equal(stillServing && stillServing.pid, firstMeta.pid);
 
-  // And the singleton lock never engaged: under the production launch path
-  // (`telepty daemon` → cli.js → require('./daemon.js')) the claimDaemonState guard at
-  // daemon.js:382 is `require.main === module` only. This is #742's territory.
-  assert.equal(
-    fs.existsSync(path.join(homeDir, '.telepty', 'daemon-state.json')),
-    false,
-    'daemon-state.json exists — claimDaemonState now runs on the CLI launch path (#742 landed?)'
-  );
+  // #910 landed, which is what this assertion was written to detect. Under the production launch
+  // path (`telepty daemon` → cli.js → require('./daemon.js')) claimDaemonState now runs, so the
+  // first daemon HAS claimed the state file and the loser above bailed on that claim rather than
+  // on EADDRINUSE — the "already running" match is satisfied by either message, deliberately.
+  // The claim still names the WINNER, which is the property that matters: a second daemon must
+  // never overwrite a live daemon's claim.
+  const claim = JSON.parse(fs.readFileSync(path.join(homeDir, '.telepty', 'daemon-state.json'), 'utf8'));
+  assert.equal(claim.pid, firstMeta.pid, 'the state file must name the daemon that actually owns the port');
 });
 
 // ── 2. The #738 contract (was RED, now GREEN) ─────────────────────────────────────
