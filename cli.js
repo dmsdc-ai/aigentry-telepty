@@ -792,6 +792,22 @@ function runUpdateInstall() {
   execFileSync('npm', ['install', '-g', '@dmsdc-ai/aigentry-telepty@latest'], { stdio: 'inherit' });
 }
 
+// gh#61 defect 1 — did the update leave a daemon actually running?
+//
+// `repairLocalDaemon` REPORTS a failed restart in its return value; it does not throw. The update
+// branch ignored that value, so `🎉 You are now using the latest version.` printed directly under
+// `❌ Daemon restart blocked: …` and the process exited 0. The reporter read that banner while six
+// live sessions were already unreachable, and only learned otherwise from a later `telepty list`.
+//
+// `skipped` is NOT a failure: TELEPTY_SKIP_DAEMON_REPAIR=1 means the operator turned the repair
+// off, so there is no verdict and nothing was claimed. Anything else unrecognized fails closed —
+// this gate exists to stop a success being asserted, so silence must not read as success.
+function updateRestartSucceeded(repair) {
+  if (!repair) return false;
+  if (repair.skipped === true) return true;
+  return repair.versionMatch === true;
+}
+
 async function repairLocalDaemon(options = {}) {
   if (process.env.TELEPTY_SKIP_DAEMON_REPAIR === '1') {
     return { stopped: 0, failed: 0, meta: null, skipped: true };
@@ -1603,7 +1619,18 @@ async function main() {
     try {
       runUpdateInstall();
       console.log('\n\x1b[32m✅ Update complete! Restarting daemon...\x1b[0m');
-      await repairLocalDaemon({ restart: true });
+      const repair = await repairLocalDaemon({ restart: true });
+      // gh#61 defect 1: the restart verdict arrives as a RETURN VALUE, so a hard failure never
+      // reached the catch below and the celebration printed anyway, exit 0. The failure is the
+      // last thing said, and the consequence users actually care about is named: the sessions
+      // are gone until a daemon is back. restartDaemonGraceful has already printed WHY.
+      if (!updateRestartSucceeded(repair)) {
+        console.error('\n\x1b[31m❌ Update installed, but the daemon did NOT come back up.\x1b[0m');
+        console.error('\x1b[31m   Existing sessions are disconnected until a daemon is running again.\x1b[0m');
+        console.error('   Retry with: telepty daemon restart    then check: telepty list');
+        process.exitCode = 1;
+        return;
+      }
       console.log('🎉 You are now using the latest version.');
     } catch (e) {
       console.error('\n❌ Update failed. Please try running: npm install -g @dmsdc-ai/aigentry-telepty@latest');
@@ -4490,6 +4517,7 @@ module.exports = {
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
   helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
+  updateRestartSucceeded, // gh#61: did `update` leave a running daemon — skip is not a failure
   formatDaemonStopDiagnostic, // telepty#15: actionable can't-stop-daemon diagnostic (pure)
   restartDaemonGraceful,  // telepty#15: injectable seams for the blocked-restart fail-fast path
   resolveTargetToken,     // #844 F1: which credential belongs to THIS address — refuses, never assumes
