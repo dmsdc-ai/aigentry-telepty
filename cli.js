@@ -1546,6 +1546,33 @@ function isHelpLikePayload(payload) {
   return text === '--help' || text === '-h';
 }
 
+// Commands that render their own, better usage text and reach it without side effects. The guard
+// below steps aside for these; forgetting to list one costs a less specific help screen, never an
+// executed command — the inverse of the failure mode TRAILING_PAYLOAD_HELP had.
+const SELF_HELP_COMMANDS = new Set(['init']);
+
+// tp941 (gh#79, gh#61) — help is a QUESTION; answering it is never an ACTION.
+//
+// telepty#51 gated interception on membership in TRAILING_PAYLOAD_HELP and called it from INSIDE
+// each command branch, so every command off that three-entry list ran first and answered second:
+// `telepty update --help` performed the update (gh#61), and `telepty clean --help` DELETEd every
+// STALE/DISCONNECTED session (gh#79). The allow-list WAS the defect — a list you must remember to
+// extend is a list that gets forgotten — so this runs before any branch and defaults to help for
+// every subcommand, including ones nobody has written yet.
+//
+// Two deliberate deferrals, both toward MORE specific help rather than toward execution:
+// interceptSubcommandHelp still owns the trailing-payload family's tailored usage (and stays the
+// third layer of the telepty#51 defence, not a replacement for it), and SELF_HELP_COMMANDS own
+// theirs. `--` keeps meaning "literal payload follows" via helpRequested, so
+// `telepty broadcast -- --help` still delivers the six characters.
+function interceptHelp(cmd, argv) {
+  if (!helpRequested(argv)) return false;
+  if (interceptSubcommandHelp(cmd, argv)) return true;
+  if (SELF_HELP_COMMANDS.has(cmd)) return false;
+  printGlobalHelp();
+  return true;
+}
+
 async function main() {
   const cmd = args[0];
 
@@ -1557,6 +1584,10 @@ async function main() {
     console.log(pkg.version);
     return;
   }
+
+  // tp941 Guard A: before ANY command branch, so no subcommand can execute on its way to
+  // printing its own usage. Deliberately below the version check, which takes no argv.
+  if (interceptHelp(cmd, args.slice(1))) return;
 
   if (cmd === 'init') {
     const { main: runInit } = require('./src/init/print-snippet');
@@ -3614,6 +3645,21 @@ async function main() {
         return;
       }
 
+      // tp941 Guard B (gh#79): this branch read `dryRun` nowhere — it was parsed above but only
+      // ever consulted inside the `--older-than` path — so `telepty clean --idle --dry-run`,
+      // handed out as a READ-ONLY diagnostic, DELETEd a live registry entry. Report, remove
+      // nothing. Same shape as the --older-than dry run so both paths read alike.
+      const ghosts = sessions.filter((s) => s.healthStatus === 'STALE' || s.healthStatus === 'DISCONNECTED');
+      if (dryRun) {
+        ghosts.forEach((s) => {
+          console.log(`  Would remove ghost: \x1b[36m${s.id}\x1b[0m (${s.healthStatus})`);
+        });
+        console.log(ghosts.length > 0
+          ? `✅ Dry run: ${ghosts.length} ghost session(s) would be removed.`
+          : '✅ Dry run: no ghost sessions found.');
+        return;
+      }
+
       let cleaned = 0;
       let declined = 0;
       for (const s of sessions) {
@@ -4346,6 +4392,12 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
+  printGlobalHelp();
+}
+
+// tp941: the global usage block, lifted verbatim out of main()'s tail so `interceptHelp` can
+// print it BEFORE dispatch instead of only after every command branch has declined the argv.
+function printGlobalHelp() {
   console.log(`
 \x1b[1mtelepty\x1b[0m — Connect any terminal to any terminal, any machine.
 
