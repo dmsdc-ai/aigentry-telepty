@@ -2,6 +2,115 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.8.2 — 2026-09-07
+
+Patch release: fixes only, **not a protocol release** — the wire semantics are unchanged and no
+session has to be re-registered for the protocol's sake. But the three fixes live in three
+different processes, so what upgrading gets you depends on what you restart:
+
+- the **CLI** guards (A/B/C/E) apply on the next `telepty` invocation — nothing to restart;
+- the **`telepty allow` wrapper** fix (D) ships in the wrapper process, so a wrapper that is
+  already running keeps 0.8.1 behaviour until it is respawned;
+- the **daemon** gate (F) takes effect only after the daemon restarts
+  (`launchctl kickstart -k gui/$UID/com.aigentry.telepty`, or `systemctl restart` for the unit).
+
+`npm i -g @dmsdc-ai/aigentry-telepty@0.8.2`. Everything here answers
+[gh#82](https://github.com/dmsdc-ai/aigentry-telepty/issues/82), reported against 0.8.1.
+
+### Fixed
+
+- **A "nothing answered" verdict no longer begins by killing the port owner (gh#82 A/B, #1121).**
+  `ensureDaemonRunning` probed `/api/meta` and `/api/sessions` with a 1500 ms deadline; both slow
+  meant `{action:'start', reason:'daemon-unreachable'}`, and the first act of the restart it calls
+  was SIGTERM/SIGKILL of the state-file pid and the port's owner. A verdict meaning *nothing is
+  there* began by killing whatever was there — a no-op only while the verdict is right.
+  **What a 0.8.1 user sees**: a plain `telepty list` against a daemon that is merely slow no longer
+  kills it. `/api/health` (unauthenticated, so #835's credential case cannot confound it) is now
+  part of the absence verdict, and `restartDaemonGraceful` re-confirms liveness on `/api/health`
+  before *any* stop, at three times the deadline that produced the verdict — the daemon too slow
+  for 1500 ms is exactly the one this protects. Meta timed out but health answered now prints
+  `alive, only slow. Not restarting it.` and returns. The re-confirmation is opt-in per verdict
+  (`absenceVerdict`), so `telepty update` and the version-mismatch restart — which stop a daemon
+  they *know* is alive, on purpose — are unchanged. #567 (meta answered → never restart) and #835
+  (an answered 401 → abort, never kill) are re-asserted, not replaced.
+  Pinned by `test/start-path-liveness-82.test.js`, whose T7 is the reproduction the report said it
+  did not have: a stub that answers `/api/health` and stalls the other two. Measured red against
+  0.8.1 — it prints `⚙️ Auto-starting local telepty daemon...` while the stub is answering health
+  200 — and green after.
+- **The probe deadline is now one knob, and `start` requires failing at two patience levels
+  (gh#82 C, #1121).** The three hardcoded 1500 ms deadlines became `probeTimeoutMs()`,
+  overridable with `TELEPTY_PROBE_TIMEOUT_MS`; the default is unchanged, and the `/api/meta` retry
+  escalates to 3000 ms from the second attempt. **What a 0.8.1 user sees**: a loaded daemon (the
+  report suspected five sessions polling at once) gets a second, more patient look instead of the
+  same impatient one three times, and a host that is simply slow can raise the deadline without
+  patching.
+- **A failed restart now says what it tried and why it failed (gh#82 E, #1121).** Every attempt
+  appends one line to `~/.telepty/logs/daemon-restart.log`, in the `session-deaths.log` idiom, and
+  the `⚠️ Daemon restart attempt n/3 failed` lines name the reason. **What a 0.8.1 user sees**:
+  the reporter's log directory was *empty* after three failed attempts, which is why the cause
+  needed a multi-round remote diagnosis; there is now a file to read.
+- **A refused upgrade no longer freezes the wrapper's reconnect loop (gh#82 D, #1122).** `ws`
+  aborts a handshake — the `error` + close 1006 the reconnect path is built on — only when nothing
+  listens for `unexpected-response`. #835 added that listener so a credential refusal could be
+  *named* instead of read as absence, and thereby silenced the abort: a daemon that ANSWERED the
+  upgrade with 401/403 produced no `error` and no `close` at all, so `scheduleReconnect()` was
+  never reached again and one refusal froze the bridge for the life of the process. The re-register
+  POST was never the missing piece — it already ran on every attempt; the missing piece was the
+  second attempt. The CLI now `terminate()`s a refused handshake, which emits the close the
+  existing 1s→30s backoff already handles, and the claim URL and daemon token are re-resolved per
+  attempt so a daemon that came back holding a different secret is reachable again.
+  **What a 0.8.1 user sees**: the reporter's wrapper sat `STALE (OWNER_DISCONNECTED_STALE)` for
+  10 h 36 min with `ownerPid` and `ptyPid` both alive and the PTY still serving a human, while
+  every inject was rejected `[STALE]` and five worker REPORTs were lost; recovery required killing
+  and relaunching the wrapper. Now the loop survives the refusal and re-registers on its own.
+  #17 is untouched: a daemon-issued 1000, a 4001 owner replacement and a 4003 refused claim still
+  return before `scheduleReconnect()`. Pinned by `test/wrapper-reregister-82.test.js`, which drives
+  a real bridge against real daemons — its row B (a refusal no credential re-read can fix) and row
+  A (a rotated token) both time out on 0.8.1, and row C is the #17 negative control.
+- **`telepty list` now says when a STALE session's processes are still alive (gh#82 D, #1122).**
+  A local STALE row carries `— owner pid 15916 ALIVE: not a leftover`, and `--json` carries
+  `owner_alive` / `pty_alive`. **What a 0.8.1 user sees**: the row the reporter read as "leftover,
+  safe to clean up" was the live session, and `telepty kill` on it would have terminated the
+  wrapped CLI and its work; the pids were already in the payload, only the probe and the words were
+  missing. Local sessions only — a pid probe against a peer's pid number reads a *local* process,
+  so remote rows report `null` rather than a plausible lie.
+- **Screen-derived `TASK_COMPLETION_UNKNOWN` is no longer pushed while there is no outcome
+  protocol (gh#82 F, #1122).** `src/completion-observation.js` hardcodes
+  `outcome_protocol: 'unavailable'` (Stage B deferred to 0.9.0), so the screen heuristics carry the
+  whole judgement — and against a TUI they mis-read routinely. **What a 0.8.1 user sees**: the
+  reporter sent ~12 injects to five `telepty allow … claude` workers in one day and got an alarm
+  for nearly all of them, every one contradicted by the worker's own REPORT — four with `pty_quiet`
+  of 5.1–5.9 s (a model thinking) and one `repeated_error_pattern_observed` against a screen
+  holding nothing but spinner frames. While `outcome_protocol === 'unavailable'`, only absences
+  made of a daemon-measured process or transport fact are pushed to the source
+  (`session_process_exited`, `session_termination_kill_failed`, `owner_replaced_observed`,
+  `owner_transport_detached`); every screen-derived kind is withheld, and so is
+  `session_termination_requested` — it tells the requester what the requester just did.
+  This gates the **notification only**: the bus event and the ledger append stay unconditional, so
+  the observation is still recorded and queryable by `inject_id`, and the suppression is logged
+  rather than silent. The gate is a predicate on the capability, so Stage B re-enables every kind
+  with no change here; `TELEPTY_COMPLETION_UNKNOWN_PUSH=1` restores 0.8.1 behaviour today.
+  Pinned by `test/completion-unknown-gate-82.test.js`.
+
+### Known — reported in gh#82, not fixed here
+
+- **The daemon binds `$PORT` while the CLI dials `$TELEPTY_PORT` (#1124).** Two different
+  environment variables, so a `PORT=5000` shell leaves a daemon the CLI cannot find. It is a
+  connection error and not a kill: since 0.8.1, `cleanupDaemonProcesses` refuses a state-file pid
+  whose recorded port disagrees with the addressed one (#902's `portMatchesAddress`, pinned by
+  `sweep-scoping-902` R2/R2b/R2c). Aligning the variables is filed rather than done.
+- **The survivor advice still hardcodes port 3848 (#1125).** When a restart fails, the message that
+  names the surviving daemon (`Old daemon still alive (…) — run "kill <pid>"`) looks up the port
+  owner on 3848 regardless of which port the CLI is addressing, so on any other port it can name
+  the wrong pid or none. The repair path itself is port-scoped; only this advice text is not.
+
+### Not answered
+
+The report's open questions stay open: why `/api/meta` and `/api/sessions` exceeded 1500 ms in
+environment A, why the daemon was invisible to `ps` while answering `/api/health`, and why the
+environment B daemon restarted twice. Nothing here explains them — the fixes make a wrong verdict
+non-destructive and a refused reconnect survivable, which is a different claim.
+
 ## 0.8.1 — 2026-08-16
 
 Patch release: fixes only, no protocol change. **Not protocol-affecting — upgrading does not
