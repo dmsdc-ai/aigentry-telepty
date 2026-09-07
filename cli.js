@@ -366,10 +366,38 @@ function isDaemonAnswerError(error) {
   return Boolean(error) && error.name === 'DaemonResponseError';
 }
 
-async function getDaemonMeta(host = REMOTE_HOST) {
+// gh#82 (C): the probe deadline was three separate `1500` literals, so the one number that
+// decides "nothing answered on this port" — the verdict that authorizes a kill — could not be
+// raised on a host where it is simply too short. The reporter's daemon exceeded it while
+// `/api/health` still answered instantly. Read at CALL time, not module load, so a test can
+// exercise the knob without a subprocess and so a long-lived CLI honours a mid-run change.
+// Default deliberately unchanged (1500): this widens the escape hatch, it does not retune.
+function probeTimeoutMs() {
+  const override = Number(process.env.TELEPTY_PROBE_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : 1500;
+}
+
+// gh#82 (A)/(B): the cheapest liveness signal telepty has, and the only one that cannot be
+// confounded by the #835 credential case — `/api/health` (daemon.js:386) is registered BEFORE
+// createAuthMiddleware, so a daemon that refuses this CLI's token still answers it. Used as the
+// re-confirmation gate immediately before any stop on the `start` path, and as the third probe
+// in the absence verdict itself. A 200 here means ALIVE; anything else (refused connection,
+// timeout, non-200) means we learned nothing new and the caller's existing policy stands.
+async function probeDaemonHealth(port, timeoutMs, host = '127.0.0.1') {
+  try {
+    const res = await fetch(`${buildDaemonUrl(host, port)}/api/health`, {
+      signal: AbortSignal.timeout(timeoutMs > 0 ? timeoutMs : probeTimeoutMs() * 3)
+    });
+    return Boolean(res && res.ok);
+  } catch {
+    return false; // connect error / timeout: no evidence of life
+  }
+}
+
+async function getDaemonMeta(host = REMOTE_HOST, timeoutMs = 0) {
   try {
     const res = await fetchWithAuth(`${daemonUrl(host)}/api/meta`, {
-      signal: AbortSignal.timeout(1500)
+      signal: AbortSignal.timeout(timeoutMs > 0 ? timeoutMs : probeTimeoutMs())
     });
     if (!res.ok) {
       // #835: an ANSWER, not silence — the daemon is up. Returning null here is what made a
@@ -570,6 +598,29 @@ function supervisorFor(detected, addressedPort, options = {}) {
   return addressedPort === effective ? detected : { present: false };
 }
 
+// gh#82 (E): environment A's `~/.telepty/logs` was EMPTY after three failed restart attempts, so
+// the only record of the incident was three stderr lines that named no cause — which is why the
+// diagnosis needed multiple remote rounds. One appended line per attempt, same idiom as the
+// session-death log below (mkdir -p + appendFileSync, best-effort, never throws into the caller).
+const DAEMON_RESTART_LOG_PATH = () => path.join(os.homedir(), '.telepty', 'logs', 'daemon-restart.log');
+
+function logDaemonRestartEvent(fields) {
+  try {
+    const logPath = DAEMON_RESTART_LOG_PATH();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    const body = Object.entries(fields).map(([k, v]) => `${k}=${v == null ? 'none' : v}`).join(' ');
+    fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${body}\n`);
+  } catch { /* best effort — a missing log must never break a restart */ }
+}
+
+// gh#82 (A): why the restart could not be completed, in terms of what we actually observed.
+function describeRestartFailure(meta, supervisorPresent, supervisorKind) {
+  if (meta && meta.refused) return `daemon-answered-refused:${meta.status}`;
+  if (meta && meta.answered) return `daemon-answered-error:${meta.status}`;
+  if (meta && meta.version) return `version-mismatch-or-capability:${meta.version}`;
+  return supervisorPresent ? `no-daemon-after-${supervisorKind}-restart` : 'no-daemon-after-spawn';
+}
+
 async function restartDaemonGraceful(options = {}) {
   const maxAttempts = options.maxAttempts || 3;
   const requiredCapabilities = options.requiredCapabilities || [];
@@ -593,6 +644,43 @@ async function restartDaemonGraceful(options = {}) {
   const waitHealth = options._waitForDaemonHealth || waitForDaemonHealth;
   const portOwner = options._findPortOwnerPid || findPortOwnerPid;
   const parentInfo = options._findParentProcessInfo || findParentProcessInfo;
+  const probeHealth = options._probeDaemonHealth || probeDaemonHealth;
+  const writeLog = options._logDaemonRestartEvent || logDaemonRestartEvent;
+  // gh#82 (A) — THE GUARD. `absenceVerdict` means the caller reached us by concluding that
+  // NOTHING answered on this port (decideDaemonAction → 'start'). Step (a) below then SIGTERMs
+  // the state-file pid and the port's owner: a verdict of "nothing is there" beginning by
+  // killing whatever is there. It is a no-op only while the verdict is right, and the reporter's
+  // machine is the case where it was wrong — `/api/health` answered 200 immediately before the
+  // command and connection-refused immediately after.
+  //
+  // So re-confirm liveness on the cheapest, unauthenticated endpoint before any stop, with a
+  // deadline 3× the probe that produced the verdict: a daemon too slow for 1500 ms is exactly
+  // the daemon this exists to protect, so the re-check must not inherit the same impatience.
+  // A 200 here is #835's rule applying to the OTHER half of the path: it is alive — killing it
+  // is the one thing we must not do. We return without stopping and let the caller retry its
+  // real request.
+  //
+  // Opt-in, deliberately. The other two callers stop a daemon they KNOW is alive, on purpose:
+  // `repairLocalDaemon` (a user-invoked repair) and the version-mismatch/capability `restart`
+  // verdict, where a healthy 200 from the OLD daemon is precisely what we are replacing. An
+  // unconditional guard here would turn `telepty update` into a no-op.
+  if (options.absenceVerdict === true) {
+    const alive = await probeHealth(addressedPort, probeTimeoutMs() * 3);
+    if (alive) {
+      writeLog({
+        event: 'stop-refused',
+        port: addressedPort,
+        verdict: 'alive-but-slow',
+        reason: 'health-200-after-absence-verdict'
+      });
+      process.stderr.write(
+        `\x1b[33m⚠️ Daemon on port ${addressedPort} did not answer /api/meta in time, but /api/health returned 200 — `
+        + `it is ALIVE, only slow. Not restarting it. Retry the command; if it keeps timing out, raise `
+        + `TELEPTY_PROBE_TIMEOUT_MS (currently ${probeTimeoutMs()}ms).\x1b[0m\n`
+      );
+      return { success: false, meta: null, attempt: 0, aliveButSlow: true, reason: 'alive-but-slow' };
+    }
+  }
   // #902: a supervisor restart is LABEL-scoped (`launchctl kickstart -k gui/<uid>/<label>`,
   // src/supervisor.js) — it kills the supervised daemon whatever port we are addressing. So it
   // may only run when the supervised job serves the port we are addressing. The port is READ
@@ -638,6 +726,14 @@ async function restartDaemonGraceful(options = {}) {
     if (Number.isInteger(survivingOwner) && survivingOwner > 0 && survivingOwner !== process.pid) {
       const diagnostic = formatDaemonStopDiagnostic({ pid: survivingOwner, parent: parentInfo(survivingOwner) });
       console.error(`\x1b[31m❌ Daemon restart blocked: ${diagnostic}\x1b[0m`);
+      writeLog({
+        event: 'attempt-failed',
+        attempt: `${attempt}/${maxAttempts}`,
+        port: addressedPort,
+        stopped: results.stopped.length,
+        failed: results.failed.length,
+        reason: `port-still-owned-by-pid-${survivingOwner}`
+      });
       return { success: false, meta: null, attempt, blockedPid: survivingOwner, diagnostic };
     }
 
@@ -648,6 +744,15 @@ async function restartDaemonGraceful(options = {}) {
       if (!kicked || kicked.success !== true) {
         const diagnostic = `${supervisor.kind} restart failed: ${(kicked && kicked.error) || 'unknown error'}`;
         console.error(`\x1b[31m❌ Daemon restart blocked: ${diagnostic}\x1b[0m`);
+        writeLog({
+          event: 'attempt-failed',
+          attempt: `${attempt}/${maxAttempts}`,
+          port: addressedPort,
+          supervisor: supervisor.kind,
+          stopped: results.stopped.length,
+          failed: results.failed.length,
+          reason: `supervisor-kickstart-failed:${(kicked && kicked.error) || 'unknown'}`
+        });
         return { success: false, meta: null, attempt, supervisor: supervisor.kind, diagnostic };
       }
     } else {
@@ -669,11 +774,25 @@ async function restartDaemonGraceful(options = {}) {
       return { success: false, meta, attempt, refused: true, diagnostic };
     }
 
+    // gh#82 (E): the attempt failed — say WHY, on stderr and in the log. The reporter saw three
+    // bare "attempt n/3 failed" lines and an empty ~/.telepty/logs, which is why the cause took
+    // a multi-round remote diagnosis to establish.
+    const failureReason = describeRestartFailure(meta, supervisorPresent, supervisor.kind);
+    writeLog({
+      event: 'attempt-failed',
+      attempt: `${attempt}/${maxAttempts}`,
+      port: addressedPort,
+      supervisor: supervisorPresent ? supervisor.kind : null,
+      stopped: results.stopped.length,
+      failed: results.failed.length,
+      reason: failureReason
+    });
+
     // Retry with backoff
     if (attempt < maxAttempts) {
       const backoff = 1000 * attempt;
       // stderr (not stdout): banner must not contaminate `telepty list --json` (task #400, telepty#15)
-      process.stderr.write(`\x1b[33m⚠️ Daemon restart attempt ${attempt}/${maxAttempts} failed. Retrying in ${backoff / 1000}s...\x1b[0m\n`);
+      process.stderr.write(`\x1b[33m⚠️ Daemon restart attempt ${attempt}/${maxAttempts} failed (${failureReason}). Retrying in ${backoff / 1000}s...\x1b[0m\n`);
       await new Promise(r => setTimeout(r, backoff));
     }
   }
@@ -852,7 +971,7 @@ async function discoverSessions(options = {}) {
   // Local daemon sessions
   try {
     const res = await fetchWithAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
-      signal: AbortSignal.timeout(1500)
+      signal: AbortSignal.timeout(probeTimeoutMs())
     });
     // #835: the local daemon is the authority for local sessions. A refusal or a 5xx from it
     // means we do not KNOW what is running — which is not the same as knowing nothing is. Every
@@ -941,7 +1060,7 @@ async function resolveLocalSessionTarget(sessionRef) {
   let sessions;
   try {
     const res = await fetchWithAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
-      signal: AbortSignal.timeout(1500)
+      signal: AbortSignal.timeout(probeTimeoutMs())
     });
     if (!res.ok) return null;
     sessions = await res.json();
@@ -1003,7 +1122,15 @@ async function resolveSessionTarget(sessionRef, options = {}) {
 // global `ps` scan thinks is a telepty daemon, and the confirmed port owner. A daemon that
 // refuses us is RUNNING and owns every live PTY session, so the verdict is `abort` — the
 // caller must fail loudly instead of remediating.
-function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessionsReachable = false } = {}) {
+//
+// gh#82 (B): `healthOk` is the third probe — `/api/health` answered 200. It is consulted ONLY on
+// the path that would otherwise return `start`, because `start` is the verdict that authorizes
+// restartDaemonGraceful → cleanupDaemonProcesses → SIGTERM/SIGKILL. A daemon that answers health
+// while /api/meta and /api/sessions time out is SLOW, not absent, and the two are the same input
+// to every probe this function has had until now. `noop` (leave it alone) with the reason spelled
+// out is deliberately reused rather than a fourth action string: every caller already handles
+// noop correctly, and "do not touch it" is exactly the behaviour we want.
+function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessionsReachable = false, healthOk = false } = {}) {
   // #844: a 404 on `/api/meta` is the one answer that names its own cause — the ROUTE is not
   // there. It was added 2026-03-12, so a daemon predating it answers 404 for exactly the reason
   // it answers 200 on `/api/sessions`: it is an OLD daemon, which is the case the sessionsReachable
@@ -1039,6 +1166,10 @@ function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessi
   // gets a legit restart; a genuinely absent/unreachable daemon gets auto-started.
   if (sessionsReachable) {
     return { action: 'restart', reason: 'legacy-daemon-no-meta' };
+  }
+  // gh#82 (B): before calling it an absence, ask the one endpoint we never asked. 200 ⇒ alive.
+  if (healthOk) {
+    return { action: 'noop', reason: 'alive-but-slow' };
   }
   return { action: 'start', reason: 'daemon-unreachable' };
 }
@@ -1120,6 +1251,7 @@ async function ensureDaemonRunning(options = {}) {
   const fetchAuth = options._fetchWithAuth || fetchWithAuth;
   const doRestart = options._restartDaemonGraceful || restartDaemonGraceful;
   const portOwner = options._findPortOwnerPid || findPortOwnerPid;
+  const probeHealth = options._probeDaemonHealth || probeDaemonHealth;
   const readFailureMarker = options._readRestartFailureMarker || readRestartFailureMarker;
   const writeFailureMarker = options._writeRestartFailureMarker || writeRestartFailureMarker;
   const clearFailureMarker = options._clearRestartFailureMarker || clearRestartFailureMarker;
@@ -1131,9 +1263,14 @@ async function ensureDaemonRunning(options = {}) {
   // ride out a transient timeout under concurrent-spawn load before concluding (#567).
   // getDaemonMeta already swallows timeouts/refusals and returns null, so a null here
   // means "not (yet) confirmed healthy", not "definitely dead".
+  //
+  // gh#82 (C): the retries all used the SAME 1500 ms deadline, so three attempts against a daemon
+  // that is merely slow produce three identical timeouts and one confident "absent". The deadline
+  // now escalates on attempt ≥2 (1500 → 3000 by default), so the `start` verdict requires the
+  // probe to have failed at TWO different patience levels, not the same one three times.
   let meta = null;
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    meta = await getMeta('127.0.0.1');
+    meta = await getMeta('127.0.0.1', attempt === 1 ? probeTimeoutMs() : probeTimeoutMs() * 2);
     if (meta && meta.version) break;
     if (attempt < attempts) {
       await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
@@ -1160,7 +1297,27 @@ async function ensureDaemonRunning(options = {}) {
     }
   }
 
-  let decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable });
+  // (3) gh#82 (B): the absence verdict may not be reached without asking `/api/health` — the
+  // cheapest liveness signal telepty has, and the one the probe never used. Only consulted when
+  // the two probes above produced NO answer at all: an answered non-200 is #835's case (abort,
+  // already decided below) and a confirmed meta needs nothing further. The deadline is 3× the
+  // probe that just failed, because "too slow for 1500 ms" is the condition under test.
+  let healthOk = false;
+  if (!(meta && (meta.version || meta.answered)) && !sessionsReachable) {
+    healthOk = await probeHealth(Number(PORT), probeTimeoutMs() * 3);
+  }
+
+  let decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable, healthOk });
+
+  // gh#82 (B): alive, just slow. Say so once — the operator otherwise sees a command that simply
+  // fails, with the daemon it needs sitting right there.
+  if (decision.reason === 'alive-but-slow') {
+    process.stderr.write(
+      `\x1b[33m⚠️ Daemon on port ${PORT} answered /api/health but not /api/meta within ${probeTimeoutMs() * 2}ms — `
+      + `alive, only slow. Not restarting it. Retry the command; raise TELEPTY_PROBE_TIMEOUT_MS if it persists.\x1b[0m\n`
+    );
+    return;
+  }
 
   if (decision.action === 'noop') {
     return; // healthy + correct version + all capabilities → leave the daemon alone (#567)
@@ -1217,7 +1374,11 @@ async function ensureDaemonRunning(options = {}) {
   } else {
     process.stderr.write('\x1b[33m⚙️ Auto-starting local telepty daemon...\x1b[0m\n');
   }
-  const result = await doRestart({ requiredCapabilities });
+  // gh#82 (A): tell restartDaemonGraceful WHICH verdict sent it here. `start` means we concluded
+  // nothing answered — the one verdict whose first act (stopping the port's owner) contradicts
+  // itself, so it re-confirms liveness before stopping anything. `restart` is a decision to
+  // replace a daemon we know answered, and must keep stopping it.
+  const result = await doRestart({ requiredCapabilities, absenceVerdict: decision.action === 'start' });
   if (signature && result && result.success === false && result.blockedPid) {
     writeFailureMarker({
       signature: `${decision.reason}:${meta && meta.version ? meta.version : 'none'}->${pkg.version}:pid${result.blockedPid}`,
@@ -4520,6 +4681,8 @@ module.exports = {
   updateRestartSucceeded, // gh#61: did `update` leave a running daemon — skip is not a failure
   formatDaemonStopDiagnostic, // telepty#15: actionable can't-stop-daemon diagnostic (pure)
   restartDaemonGraceful,  // telepty#15: injectable seams for the blocked-restart fail-fast path
+  probeTimeoutMs,         // gh#82 (C): the one probe deadline, TELEPTY_PROBE_TIMEOUT_MS-overridable
+  probeDaemonHealth,      // gh#82 (A/B): unauthenticated /api/health liveness re-confirmation
   resolveTargetToken,     // #844 F1: which credential belongs to THIS address — refuses, never assumes
   fetchWithAuth,          // #844 F1: the wire itself, so a test can assert what would have been sent
 };

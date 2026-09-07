@@ -184,6 +184,8 @@ test('ensureDaemonRunning: a refusal reached through the supervisor path never b
       ensureDaemonRunning({
         _getDaemonMeta: async () => (probes++ === 0 ? null : answer(401)),
         _fetchWithAuth: async () => { throw Object.assign(new Error('aborted'), { name: 'AbortError' }); },
+        // gh#82 (B): absent on /api/health too, so this still reaches the supervisor path it tests.
+        _probeDaemonHealth: async () => false,
         _restartDaemonGraceful: doRestart,
         _findPortOwnerPid: () => 0,
         _readRestartFailureMarker: () => null,

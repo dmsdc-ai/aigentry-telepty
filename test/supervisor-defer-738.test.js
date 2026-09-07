@@ -219,6 +219,10 @@ function ensureOptions(overrides = {}) {
     supervisorPollMs: 20,
     _detectSupervisor: launchd,
     _fetchWithAuth: async () => ({ ok: false }),
+    // gh#82 (B): the absence verdict now has a THIRD probe — /api/health. Left unstubbed, these
+    // in-process tests reach the developer's live daemon on 3848, which answers 200, and the
+    // "nothing answered" model they are built on stops being true. Absent means absent on all three.
+    _probeDaemonHealth: async () => false,
     _findPortOwnerPid: () => null,
     _readRestartFailureMarker: () => null,
     _writeRestartFailureMarker: () => {},
