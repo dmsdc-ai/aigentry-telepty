@@ -146,6 +146,8 @@ test('ensureDaemonRunning: no daemon at all (meta null + sessions unreachable) â
     _getDaemonMeta: async () => null,
     _detectSupervisor: () => ({ present: false, kind: null, detail: null }),
     _fetchWithAuth: timeoutFetch(),
+    // gh#82 (B): absent on /api/health too â€” otherwise this reaches the live local daemon.
+    _probeDaemonHealth: async () => false,
     _restartDaemonGraceful: restart,
     _probe: { attempts: 2, backoffMs: 0 }
   });

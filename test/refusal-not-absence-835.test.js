@@ -135,6 +135,8 @@ test('#835 ensureDaemonRunning: a genuinely absent daemon is still auto-started'
   await ensureDaemonRunning({
     _getDaemonMeta: async () => null,
     _fetchWithAuth: async () => { throw Object.assign(new Error('ECONNREFUSED'), { code: 'ECONNREFUSED' }); },
+    // gh#82 (B): absent on /api/health too — otherwise this reaches the live local daemon.
+    _probeDaemonHealth: async () => false,
     _restartDaemonGraceful: doRestart,
     _detectSupervisor: noSupervisor,
     _probe: { attempts: 1, backoffMs: 0 }
