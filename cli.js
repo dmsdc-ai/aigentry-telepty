@@ -2419,7 +2419,16 @@ async function main() {
     // is swallowed), its auto-register used to invent `command: 'wrapped'` and silently kill
     // every identity-gated feature. The bridge is the one process that always knows.
     const wsOwnerBase = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}`;
-    const wsUrl = `${wsOwnerBase}?token=${encodeURIComponent(resolveTargetToken(wsOwnerBase))}&owner=1&owner_pid=${process.pid}&command=${encodeURIComponent(command)}`;
+    // gh#82(D): the claim URL is BUILT PER ATTEMPT, not resolved once for the life of the bridge.
+    // A daemon that came back holding a different secret (the reporter's environment B: "every
+    // telepty CLI call → HTTP 401" with config.json untouched) is otherwise dialled forever with
+    // the token this process read at launch — a reconnect loop that cannot converge no matter how
+    // long it runs. Called once here too, so a target this bridge cannot credential still fails
+    // loudly at launch exactly as it did when this was a `const` (resolveTargetToken throws).
+    function buildOwnerWsUrl() {
+      return `${wsOwnerBase}?token=${encodeURIComponent(resolveTargetToken(wsOwnerBase))}&owner=1&owner_pid=${process.pid}&command=${encodeURIComponent(command)}`;
+    }
+    let wsUrl = buildOwnerWsUrl();
     let daemonWs = null;
     let wsReady = false;
     let reconnectAttempts = 0;
@@ -2481,6 +2490,16 @@ async function main() {
     async function connectDaemonWs() {
       // Re-register session BEFORE WebSocket connect (daemon rejects WS if session unknown)
       if (reconnectAttempts > 0) {
+        // gh#82(D): forget the daemon token this process resolved at launch, so BOTH the
+        // re-register POST below and the claim URL are built from the credential that is on disk
+        // NOW. `getAuthToken()` caches (cli.js), `getConfig()` does not (auth.js) — so dropping
+        // the cache genuinely re-reads env-then-file. A re-read that THROWS (#835 fails closed on
+        // an unreadable config) puts the credential back exactly as it was and keeps the last URL
+        // that resolved: the target has not changed, so retrying the address we know beats both
+        // not retrying and leaving this process with no token for its teardown DELETE.
+        const priorAuthToken = cachedAuthToken;
+        cachedAuthToken = null;
+        try { wsUrl = buildOwnerWsUrl(); } catch { cachedAuthToken = priorAuthToken; }
         try {
           const rereg = await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
             method: 'POST',
@@ -2657,10 +2676,26 @@ async function main() {
           process.stderr.write(
             `\x1b[31m❌ [allow] The daemon REFUSED this bridge's credentials (HTTP ${res.statusCode}) for session '${sessionId}'. ` +
             'It is running and this session is alive, but unreachable until the token matches — ' +
-            'reconnecting will not fix it.\x1b[0m\n'
+            'retrying with the credential re-read from disk.\x1b[0m\n'
           );
         }
         res.resume();
+        // gh#82(D) — THE freeze. `ws` calls abortHandshake (error + close 1006) only when nobody
+        // listens for this event: `else if (!websocket.emit('unexpected-response', req, res))`,
+        // node_modules/ws/lib/websocket.js:917. The listener above — added by #835 so a refusal
+        // could be NAMED instead of being read as "nothing answered" — suppresses that abort, so
+        // an ANSWERED refusal produced no `error` and no `close` at all, `scheduleReconnect()`
+        // was never reached, and the bridge sat on a live PTY forever: `active_clients: 0`,
+        // OWNER_DISCONNECTED_STALE, every inject rejected [STALE], measured at 10h36m.
+        //
+        // terminate() ends the handshake ourselves, which is what emits the close the reconnect
+        // path is built on. Reconnect is the correct response even though the refusal is a
+        // credential fault: this process owns a live PTY (exiting would kill the user's CLI), and
+        // the attempt above now re-reads the token, so the loop can actually converge once the
+        // daemon and this bridge agree again. The #17 rows are untouched — a daemon-issued 1000
+        // 'Session destroyed', a 4001 replacement and a 4003 refused claim all still return from
+        // the close handler before scheduleReconnect().
+        try { daemonWs.terminate(); } catch { /* already gone — the close is on its way */ }
       });
     }
 

@@ -1,5 +1,13 @@
 'use strict';
 
+// gh#82(F): this suite asserts WHAT the source is told when an absence is delivered. The daemon
+// no longer PUSHES screen-derived absences while `outcome_protocol: 'unavailable'` — they fired
+// on essentially every inject to a Claude Code worker and were wrong every time — so WHETHER one
+// is pushed is now a policy decision, owned by test/completion-unknown-gate-82.test.js. Opting in
+// here keeps this file testing its own subject. The bus event and the ledger are unconditional
+// either way; only the notification to the source is gated.
+process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = '1';
+
 // #721 — TASK_IDLE_UNCONFIRMED false-NEGATIVE (cry-wolf), RESIDUAL classes after #619.
 //
 // Root-cause analysis (idle721-analyst, 2026-07-25) pinned two causes and refined the repro

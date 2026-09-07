@@ -37,24 +37,59 @@ function formatSessionHealth(session) {
   return status;
 }
 
+// gh#82(D) — a pid probe answers for THIS machine only. `discoverSessions` mixes local sessions
+// with peers' (session-routing), and `process.kill(pid, 0)` against a remote peer's pid number
+// reads whatever local process happens to hold it: a lie in the one place the operator is being
+// told what is safe to kill. Remote sessions therefore report `null`, not `false`.
+function isLocalSessionHost(host) {
+  return !host || host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+}
+
 function enrichSessionIdle(session, nowMs = Date.now()) {
   const idleSeconds = typeof session.idleSeconds === 'number'
     ? session.idleSeconds
     : lifecycle.computeIdleSeconds(session.lastActivityAt, nowMs);
+  // gh#82(D) — `telepty list` printed the same line for a live-but-unregistered wrapper and a dead
+  // leftover: `STALE (OWNER_DISCONNECTED_STALE), Clients: 0`, which reads as "safe to clean up".
+  // The reporter's STALE session was the LIVE one, serving a human at the keyboard, and
+  // `telepty kill` would have destroyed 10 hours of work. The daemon already ships the pids
+  // (serializeSession: ownerPid/ptyPid) — nothing was missing but the probe and the words.
+  // `null` where there is nothing to probe (no pid on the record, or a remote session), `false`
+  // only where a pid WAS probed and answered dead — an operator reading "false" is being told a
+  // measurement was taken.
+  const probe = (pid) => (isLocalSessionHost(session.host) && Number.isInteger(pid) && pid > 0
+    ? lifecycle.isProcessAlive(pid)
+    : null);
+  const ownerAlive = probe(session.ownerPid);
+  const ptyAlive = probe(session.ptyPid);
   return {
     ...session,
     idleSeconds,
-    idle_seconds: idleSeconds
+    idle_seconds: idleSeconds,
+    owner_alive: ownerAlive,
+    pty_alive: ptyAlive
   };
+}
+
+// A STALE record whose processes are still running is not a leftover, and the difference has to be
+// on the LINE — `session info --json` is where it used to live, and nobody reads that before
+// running `telepty kill` on something the list already called stale.
+function formatLivenessNote(session) {
+  const status = session.healthStatus || '';
+  if (status !== 'STALE' && status !== 'DISCONNECTED') return '';
+  if (session.owner_alive === true) return ` — owner pid ${session.ownerPid} ALIVE: not a leftover`;
+  if (session.pty_alive === true) return ` — pty pid ${session.ptyPid} ALIVE: not a leftover`;
+  return '';
 }
 
 function formatSessionStatusWithIdle(session) {
   const base = formatSessionHealth(session);
+  const note = formatLivenessNote(session);
   const idleSeconds = typeof session.idleSeconds === 'number' ? session.idleSeconds : null;
   if (idleSeconds !== null && idleSeconds > 60) {
-    return `${base} 💤 idle (${lifecycle.formatIdleDuration(idleSeconds)})`;
+    return `${base} 💤 idle (${lifecycle.formatIdleDuration(idleSeconds)})${note}`;
   }
-  return base;
+  return `${base}${note}`;
 }
 
 // #60 Stage A §8.5 — presentation for the external activity vocabulary.
@@ -150,6 +185,7 @@ module.exports = {
   formatSessionHealth,
   enrichSessionIdle,
   formatSessionStatusWithIdle,
+  formatLivenessNote,
   printSessionInfo,
   // #60 Stage A
   OBSERVATION_TONE_COLOR,

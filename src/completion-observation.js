@@ -189,6 +189,52 @@ function buildCompletionUnknown({ sessionId, injectId, observation, consumption,
   };
 }
 
+// gh#82(F) — the observation kinds whose evidence is a DAEMON-MEASURED process or transport fact
+// rather than a reading of the screen. Every other row in session-state.js OBSERVATION_CAUSES is
+// derived from PTY bytes: silence, a prompt glyph, a busy/error pattern, a ready frame.
+//
+// That distinction is the whole gate. Against a Claude Code TUI the screen-derived rows mis-read
+// routinely — `pty_quiet ≈ 5s` is a model thinking, and the reporter confirmed with `read-screen`
+// that a `repeated_error_pattern_observed` alarm was firing on spinner frames (`Twisting… ✻ ✽ ✶`).
+// In one working day roughly a dozen injects to five workers produced a TASK_COMPLETION_UNKNOWN
+// for essentially every one, and every one was contradicted by the worker's own REPORT. A
+// notification that is wrong every time is worse than none: an orchestrator that acts on it
+// interrupts healthy work, and one that learns to ignore it also ignores the true positives.
+//
+// The four kept here are not screen scrapes and are the absences an orchestrator must not miss:
+// the wrapped CLI was OBSERVED exiting; a kill threw, so a process may be alive with nothing
+// tracking it; or the owner lane was replaced/detached under it (#815).
+//
+// `session_termination_requested` is deliberately NOT here even though it is daemon-measured: the
+// source asked for the DELETE, so it only tells the requester what the requester just did, about
+// a session that is already gone.
+const PROCESS_FACT_OBSERVATION_KINDS = Object.freeze([
+  'session_process_exited',
+  'session_termination_kill_failed',
+  'owner_replaced_observed',
+  'owner_transport_detached',
+]);
+
+/**
+ * May this absence be PUSHED to the source session? PURE.
+ *
+ * Gates the notification ONLY. The bus event and the ledger append are unconditional at the call
+ * site — the observation stays recorded and queryable either way, which is what keeps this a
+ * change to who gets interrupted rather than a return to silence (§A2).
+ *
+ * While `outcome_protocol: 'unavailable'` (Stage B deferred to 0.9.0) the screen heuristics carry
+ * the whole judgement, which is the condition this gate exists for. When Stage B lands and the
+ * protocol reports anything else, every kind pushes again with no code change here.
+ * `TELEPTY_COMPLETION_UNKNOWN_PUSH=1` restores 0.8.1 behaviour for an operator who wants it.
+ */
+function shouldPushCompletionUnknown(envelope, env = process.env) {
+  if (env && env.TELEPTY_COMPLETION_UNKNOWN_PUSH === '1') return true;
+  const capability = (envelope && envelope.capability) || {};
+  if (capability.outcome_protocol !== 'unavailable') return true;
+  const kind = envelope && envelope.observation ? envelope.observation.kind : null;
+  return PROCESS_FACT_OBSERVATION_KINDS.includes(kind);
+}
+
 /**
  * The source-facing text. Literal by design: it states the measurement and the absence, and it
  * contains no word that could be read as "the task is done".
@@ -230,4 +276,7 @@ module.exports = {
   classifyConsumption,
   buildCompletionUnknown,
   formatCompletionUnknownText,
+  // gh#82(F)
+  PROCESS_FACT_OBSERVATION_KINDS,
+  shouldPushCompletionUnknown,
 };
