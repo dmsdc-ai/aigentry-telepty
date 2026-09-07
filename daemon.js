@@ -22,7 +22,7 @@ const { SessionStateManager, STATE_DISPLAY, OBSERVATION_DISPLAY, mapObservationC
 // #816 supplies a private report channel and #817 supplies cross-machine sender identity.
 const { buildAutoSummary } = require('./src/report-enforcement');
 const completionObservation = require('./src/completion-observation');
-const { CAPABILITY_STAGE_A, classifyConsumption, buildCompletionUnknown, formatCompletionUnknownText } = completionObservation;
+const { CAPABILITY_STAGE_A, classifyConsumption, buildCompletionUnknown, formatCompletionUnknownText, shouldPushCompletionUnknown } = completionObservation;
 const submitGate = require('./src/submit-gate');
 const { stripAnsiForScreen } = require('./src/screen-ansi'); // #715: read-screen ANSI/VT stripper
 const { sampleChildCpuSeconds } = require('./src/child-cpu'); // #52: quiet-thinking CPU recheck
@@ -980,6 +980,19 @@ function recordObservation({
   });
 
   if (deliverToSource && pendingReport && result !== 'observation_duplicate') {
+    // gh#82(F): while there is no outcome protocol, only absences made of a daemon-measured
+    // process/transport fact are PUSHED to the source; the screen-derived rows (pty_quiet, a
+    // repeated-error pattern matched on spinner frames, …) fired on essentially every inject to a
+    // Claude Code worker and were wrong every time. Gated BEFORE the #914 bookkeeping below,
+    // because an absence that was never delivered must not be recorded as delivered. The bus
+    // event above and the ledger append are unconditional, so the observation stays recorded and
+    // queryable — and the suppression is logged, never silent.
+    if (!shouldPushCompletionUnknown(envelope)) {
+      console.log(`[OBSERVE] ${sessionId}: ${observation.kind} NOT pushed to ${pendingReport.source} — `
+        + 'screen-derived absence while outcome_protocol=unavailable (gh#82 F; recorded on the bus '
+        + 'and in the ledger; TELEPTY_COMPLETION_UNKNOWN_PUSH=1 to push it anyway)');
+      return result;
+    }
     // #914: the source hears each DISTINCT absence once per inject. The bus above is
     // unconditional and the ledger below already recorded this observation — only the
     // notification is suppressed, and only for an identity this inject already sent.
