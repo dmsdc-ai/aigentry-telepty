@@ -322,3 +322,74 @@ test('R5b: the supervisor is still used when the CLI addresses the default port'
 
   assert.equal(kicked, 1, '#738 supervisor ownership is preserved on the port it serves');
 });
+
+// ── R6 — the ADVICE is scoped to the addressed port too (#1125) ──────────────────────────
+// Measured 2026-09-07: after every restart attempt failed, the telepty#44 survivor message
+// named the port owner via a literal `findPortOwnerPid(3848)` — bypassing BOTH `addressedPort`
+// and the `_findPortOwnerPid` seam the rest of this function routes through. A test addressing
+// :51821 with every seam stubbed was told to `kill <pid>` where the pid was this machine's REAL
+// :3848 daemon. Read-only, so no kill hazard — but it is #902's invariant (detection scope ==
+// destruction scope) failing in the one place that tells a human what to destroy by hand.
+const ADVICE_PORT = 51821; // the port from the tp1121 measurement — deliberately not 3848
+
+function captureConsoleError() {
+  const chunks = [];
+  const original = console.error;
+  console.error = (...args) => { chunks.push(args.join(' ')); };
+  return { text: () => chunks.join('\n'), restore: () => { console.error = original; } };
+}
+
+// The port owner as it really behaves across the failing restart: free when the loop checks it
+// (otherwise the telepty#15 fail-fast returns before any advice is printed), owned again by the
+// time the advice is composed — the replacement daemon bound the port and then failed health.
+function ownerFreeThenBound(probed, byPort) {
+  let calls = 0;
+  return (port) => {
+    probed.push(port);
+    calls += 1;
+    return calls === 1 ? null : (byPort[port] ?? null);
+  };
+}
+
+function failingRestartSeams(port, probed) {
+  return inertRestartSeams({
+    port,
+    _waitForDaemonHealth: async () => null, // every attempt fails ⇒ reach the survivor advice
+    _findPortOwnerPid: ownerFreeThenBound(probed, { [ADVICE_PORT]: 99001, 3848: 98714 }),
+    _logDaemonRestartEvent: () => {}
+  });
+}
+
+test('R6: the survivor advice names the ADDRESSED port and its owner, never 3848', async () => {
+  const probed = [];
+  const errors = captureConsoleError();
+  let text;
+  try {
+    await cli.restartDaemonGraceful(failingRestartSeams(ADVICE_PORT, probed));
+    text = errors.text();
+  } finally {
+    errors.restore();
+  }
+
+  assert.match(text, /port 51821 owner pid 99001/, 'the advice must name the addressed port and ITS owner');
+  assert.match(text, /kill 99001/, 'the hand-recovery command must target the addressed port\'s owner');
+  assert.doesNotMatch(text, /3848/, 'a CLI addressing :51821 must not mention :3848 at all');
+  assert.doesNotMatch(text, /98714/, "…and must never advise killing another port's owner");
+  assert.deepEqual(probed, [ADVICE_PORT, ADVICE_PORT], 'the advice must consult the seam, on the addressed port only');
+});
+
+test('R6b: a CLI addressing :3848 still gets :3848 advice (negative control)', async () => {
+  const probed = [];
+  const errors = captureConsoleError();
+  let text;
+  try {
+    await cli.restartDaemonGraceful(failingRestartSeams(3848, probed));
+    text = errors.text();
+  } finally {
+    errors.restore();
+  }
+
+  assert.match(text, /port 3848 owner pid 98714/, 'the default port is still advised on when it IS the addressed port');
+  assert.match(text, /kill 98714/);
+  assert.deepEqual(probed, [3848, 3848]);
+});

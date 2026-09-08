@@ -810,11 +810,15 @@ async function restartDaemonGraceful(options = {}) {
   let survivor = '';
   try {
     const statePid = (readDaemonState() || {}).pid;
-    const portOwner = findPortOwnerPid(3848);
+    // #1125: the ADDRESSED port, through the same seam the rest of this function uses. A literal
+    // findPortOwnerPid(3848) here read the machine's real :3848 daemon and told a CLI addressing
+    // another port to kill it — #902's invariant (detection scope == destruction scope) has to
+    // hold for the advice too, since the advice is what a human executes by hand.
+    const survivingPid = portOwner(addressedPort);
     const parts = [];
     if (Number.isInteger(statePid) && statePid > 0) parts.push(`state-file pid ${statePid}`);
-    if (Number.isInteger(portOwner) && portOwner > 0 && portOwner !== statePid) parts.push(`port 3848 owner pid ${portOwner}`);
-    if (parts.length) survivor = ` Old daemon still alive (${parts.join(', ')}) — run "kill ${portOwner || statePid}" then "telepty daemon".`;
+    if (Number.isInteger(survivingPid) && survivingPid > 0 && survivingPid !== statePid) parts.push(`port ${addressedPort} owner pid ${survivingPid}`);
+    if (parts.length) survivor = ` Old daemon still alive (${parts.join(', ')}) — run "kill ${survivingPid || statePid}" then "telepty daemon".`;
   } catch {}
   // #902: name the machine-wide escape hatch here — the repair path is now scoped to the
   // addressed daemon, so a daemon on an unexpected port is deliberately out of its reach.
