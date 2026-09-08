@@ -16,16 +16,19 @@ function stripAnsiForScreen(str) {
     // private markers and colon sub-params, so a partial match leaked the tail as
     // literal text (DECSCUSR ESC[0 q -> `0 q`, kitty ESC[>1u -> `>1u`, etc.).
     .replace(/\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/g, '')
-    // OSC sequences: ESC ] ... BEL
-    .replace(/\][^]*/g, '')
-    // OSC sequences: ESC ] ... ST (ESC \)
-    .replace(/\][^]*\\/g, '')
+    // OSC: ESC ] payload ST-or-BEL. #1099: the payload class must exclude BOTH
+    // terminator lead-bytes. The old BEL arm excluded only BEL, so an `ESC ]` matched
+    // forward to ANY later BEL — across ESCs and newlines — and one match wiped the
+    // whole 200 KB /screen ring (198 KB of text -> ''). Bounded by construction, so no
+    // lazy backtracking; the terminator is required, so a sequence the ring boundary
+    // cut leaks its payload rather than eating the buffer.
+    .replace(/\][^]*(?:\\|)/g, '')
     // Character set selection: ESC ( / ) + charset
     .replace(/[()][AB012]/g, '')
     // Keypad and other 2-char ESC sequences
     .replace(/[>=<78DMEHcNOZ~}|]/g, '')
-    // DCS / PM / APC sequences
-    .replace(/[P^_][^]*\\/g, '')
+    // DCS / PM / APC sequences — same rule; #1099: gains the BEL terminator
+    .replace(/[P^_][^]*(?:\\|)/g, '')
     // Any remaining bare ESC + single char
     .replace(/./g, '')
     // Carriage returns
