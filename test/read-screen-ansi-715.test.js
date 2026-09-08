@@ -66,3 +66,54 @@ test('#715: realistic codex boot frame renders clean (no escape remnants)', () =
   assert.match(out, /› Find and fix a bug in @filename/);
   assert.match(out, /gpt-5\.5 default fast/);
 });
+
+// ---------------------------------------------------------------------------
+// #1099 — read-screen went permanently empty on sessions whose TUI emits string
+// sequences into a 200 KB output ring. `/screen` joins the whole ring and strips,
+// so ONE unbounded match wipes the buffer. The OSC-BEL arm's payload class
+// excluded only BEL, so it spanned ESC and \n from an `ESC ]` to ANY later BEL —
+// 198 KB of answer text -> ''. (The APC arm's `[^ESC]*` was already bounded; the
+// bug report's greedy `[^]*` reading was a `cat` artefact of the literal ESC bytes
+// stored in the source.) Both arms now carry the same bounded rule: a payload that
+// excludes BOTH terminator lead-bytes, and a REQUIRED terminator.
+// Invariant: a strip that can eat the whole ring can eat the next frame too.
+
+const APC = `${E}_Ga=d,d=i,i=1,q=2${E}\\`; // kitty graphics image-DELETE, the frame grok floods
+
+test('#1099: no string sequence may eat the ring — a 200 KB span survives', () => {
+  const text = 'IMPORTANT ANSWER TEXT '.repeat(9000); // ~198 KB, no newlines (grok emits none)
+  // (i) ST-terminated OSC, then text, then a BEL-terminated OSC far away: the BEL arm
+  // used to swallow everything between the first `ESC ]` and that trailing BEL.
+  assert.equal(stripAnsiForScreen(`${E}]0;grok${E}\\${text}${E}]0;t${BEL}`), text);
+  // and the dispatch's APC shape, which the bounded `[^ESC]*` already handled
+  assert.equal(stripAnsiForScreen(`${APC}${text}${APC}`), text);
+});
+
+test('#1099: one sequence is consumed at a time, not first..last', () => {
+  assert.equal(stripAnsiForScreen(`abc${APC}def`), 'abcdef');          // single frame mid-line
+  assert.equal(stripAnsiForScreen(`abc${APC}${APC}def`), 'abcdef');    // adjacent frames
+  assert.equal(stripAnsiForScreen(`a${APC}b${APC}c`), 'abc');          // text between frames kept
+  assert.equal(stripAnsiForScreen(`a${E}]0;t${BEL}b${E}]0;t${BEL}c`), 'abc'); // same for OSC
+});
+
+test('#1099: DCS / PM / APC accept both terminators (ST and BEL)', () => {
+  for (const [name, opener] of [['DCS', 'P'], ['PM', '^'], ['APC', '_']]) {
+    assert.equal(stripAnsiForScreen(`x${E}${opener}payload${E}\\y`), 'xy', `${name} + ST`);
+    assert.equal(stripAnsiForScreen(`x${E}${opener}payload${BEL}y`), 'xy', `${name} + BEL`);
+  }
+  // the OSC arm keeps both terminators too (it is now the same rule)
+  assert.equal(stripAnsiForScreen(`x${E}]0;title${BEL}y`), 'xy');
+  assert.equal(stripAnsiForScreen(`x${E}]8;;http://e.x${E}\\y`), 'xy');
+});
+
+test('#1099: a sequence the ring boundary cut leaks its payload, never wipes', () => {
+  // PINNED DECISION: the terminator is REQUIRED. An opener whose terminator fell off
+  // the end of the ring does not match, so the 2-byte opener is dropped by the bare-ESC
+  // arm and ~12 bytes of payload leak as literal text. A bounded leak beats an empty
+  // screen — this is exactly the boundary that produced #1099.
+  assert.equal(stripAnsiForScreen(`visible text${E}_Ga=d,d=i`), 'visible textGa=d,d=i');
+  assert.equal(stripAnsiForScreen(`visible text${E}]0;win-title`), 'visible text0;win-title');
+  // a frame whose OPENER fell off the front leaks too: with nothing to anchor on, only
+  // the orphaned `ESC \\` goes, and the payload stays literal. Bounded either way.
+  assert.equal(stripAnsiForScreen(`a=d,d=i${E}\\visible text`), 'a=d,d=ivisible text');
+});
