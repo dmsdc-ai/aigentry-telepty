@@ -28,7 +28,8 @@
 // the package version and the release it describes drift apart in the first place: the notes
 // said 0.8.0 in their prose while the manifest said 0.7.1, and nothing compared them. A version
 // number is a claim to BE a release; this file makes the release notes the thing that has to
-// agree with it.
+// agree with it. A leading Unreleased section may collect future changes; the first
+// released section must still match the manifest.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -52,9 +53,9 @@ function versionHeadings() {
     .map((m) => m[1]);
 }
 
-// Every `## ` heading, version-shaped or not — `## Unreleased` has to be visible to be refused.
-function allSectionHeadings() {
-  return changelog.split('\n').filter((line) => /^##\s+\S/.test(line));
+// Every `## ` heading, version-shaped or not — only a leading Unreleased may be skipped.
+function allSectionHeadings(text = changelog) {
+  return text.split('\n').filter((line) => /^##\s+\S/.test(line));
 }
 
 test('package-lock.json carries the same version as package.json, in both of its fields', () => {
@@ -89,18 +90,28 @@ test("README.md's ecosystem row for this package names the version package.json 
     + 'generated, so fix it with `node scripts/gen-readme.mjs`, not by hand');
 });
 
-test('CHANGELOG.md files its newest section under exactly the version package.json claims', () => {
-  const headings = allSectionHeadings();
+function assertNewestReleasedVersion(text, expectedVersion) {
+  const headings = allSectionHeadings(text);
   assert.ok(headings.length > 0, 'CHANGELOG.md has no `## ` sections at all');
 
-  const newest = headings[0];
-  const match = VERSION_HEADING.exec(newest);
+  const newest = /^## Unreleased\s*$/.test(headings[0]) ? headings[1] : headings[0];
+  const match = VERSION_HEADING.exec(newest || '');
   assert.ok(match,
-    `the newest CHANGELOG section is "${newest.trim()}" — a version number in package.json is a `
-    + `claim to BE that release, so the notes for it must be filed under "## ${pkg.version}", not `
+    `the newest released CHANGELOG section is "${(newest || '').trim()}" — a version number in package.json is a `
+    + `claim to BE that release, so the notes for it must be filed under "## ${expectedVersion}", not `
     + 'under a placeholder heading that can never disagree with anything');
-  assert.equal(match[1], pkg.version,
-    `CHANGELOG.md's newest section describes ${match[1]} but package.json says ${pkg.version}`);
+  assert.equal(match[1], expectedVersion,
+    `CHANGELOG.md's newest released section describes ${match[1]} but package.json says ${expectedVersion}`);
+}
+
+test('CHANGELOG.md files its newest released section under exactly the version package.json claims', () => {
+  assertNewestReleasedVersion(changelog, pkg.version);
+});
+
+test('leading Unreleased allows matching release notes but cannot hide a wrong release version', () => {
+  assert.doesNotThrow(() => assertNewestReleasedVersion('## Unreleased\n## 0.8.2', '0.8.2'));
+  assert.throws(() => assertNewestReleasedVersion('## Unreleased\n## 0.8.1', '0.8.2'),
+    { code: 'ERR_ASSERTION' });
 });
 
 test('the claimed version is not one already shipped — no version has two sections', () => {

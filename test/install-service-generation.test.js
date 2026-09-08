@@ -63,3 +63,28 @@ test('Windows install registers a real logon task with absolute node and cli.js'
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+for (const [name, extraEnv, expected] of [
+  ['preferred only', { TELEPTY_PORT: '5001' }, 5001],
+  ['legacy only', { PORT: '5002' }, 5002],
+  ['preferred wins', { TELEPTY_PORT: '5001', PORT: '5002' }, 5001],
+  ['invalid preferred', { TELEPTY_PORT: 'invalid', PORT: '5002' }, 3848],
+  ['ephemeral', { PORT: '0' }, 0],
+]) {
+  test(`service descriptors normalize both port variables: ${name}`, (t) => {
+    t.mock.method(console, 'error', () => {});
+    const original = { ...extraEnv };
+    const plist = buildLaunchdPlist({ extraEnv });
+    const unit = buildSystemdService({ extraEnv });
+    for (const key of ['PORT', 'TELEPTY_PORT']) {
+      assert.ok(plist.includes(`<key>${key}</key>\n        <string>${expected}</string>`));
+      assert.ok(unit.includes(`Environment="${key}=${expected}"`));
+    }
+    assert.deepEqual(extraEnv, original);
+  });
+}
+
+test('default service descriptors remain portless', () => {
+  assert.doesNotMatch(buildLaunchdPlist(), /<key>(?:TELEPTY_)?PORT<\/key>/);
+  assert.doesNotMatch(buildSystemdService(), /Environment="?(?:TELEPTY_)?PORT=/);
+});

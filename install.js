@@ -4,6 +4,7 @@ const { execSync, spawn } = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const { resolveBindPort } = require('./src/bind-port');
 const { DEFAULT_PORT, cleanupDaemonProcesses } = require('./daemon-control');
 
 function run(cmd) {
@@ -87,6 +88,13 @@ function quoteWindowsArg(value) {
   return `"${String(value).replace(/"/g, '\\"')}"`;
 }
 
+// Keep #902's descriptor PORT reader aligned with the daemon's preferred variable.
+function normalizePortEnv(extraEnv = {}) {
+  if (!Object.hasOwn(extraEnv, 'PORT') && !Object.hasOwn(extraEnv, 'TELEPTY_PORT')) return extraEnv;
+  const port = String(resolveBindPort(extraEnv));
+  return { ...extraEnv, PORT: port, TELEPTY_PORT: port };
+}
+
 function buildLaunchdPlist(options = {}) {
   const label = options.label || 'com.aigentry.telepty';
   const nodeBin = options.nodeBin || process.execPath;
@@ -96,7 +104,7 @@ function buildLaunchdPlist(options = {}) {
   const daemonPath = buildDaemonPath(nodeBin, ['/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin']);
   const stdoutPath = path.join(logDir, 'launchd.out.log');
   const stderrPath = path.join(logDir, 'launchd.err.log');
-  const envPairs = [['PATH', daemonPath], ...Object.entries(options.extraEnv || {})];
+  const envPairs = [['PATH', daemonPath], ...Object.entries(normalizePortEnv(options.extraEnv || {}))];
   const envXml = envPairs
     .map(([key, value]) => `        <key>${escapeXml(key)}</key>\n        <string>${escapeXml(value)}</string>`)
     .join('\n');
@@ -143,7 +151,7 @@ function buildSystemdService(options = {}) {
   const wantedBy = options.wantedBy || 'multi-user.target';
   const command = options.command || 'daemon';
   const description = options.description || 'Telepty Daemon';
-  const extraEnvLines = Object.entries(options.extraEnv || {})
+  const extraEnvLines = Object.entries(normalizePortEnv(options.extraEnv || {}))
     .map(([key, value]) => `${systemdEnvLine(key, value)}\n`)
     .join('');
 
