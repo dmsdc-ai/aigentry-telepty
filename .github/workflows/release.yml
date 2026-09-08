@@ -260,36 +260,93 @@ jobs:
       # returns 403 on this account today. The migration is trusted publishing (OIDC), which needs
       # npm >= 11.5.1 and therefore `node-version: 24`. Do NOT reach for node 22 on the strength of
       # npm's "Node 22.14.0 or higher" line: node 22 ships npm 10.9.8, has no OIDC, and says nothing.
+      # #1127: `id` so the step below can name PUBLISH_FAILED specifically. And the condition
+      # here is what makes the existing-tag re-run a REMEDY rather than a second publish —
+      # measured on run 34129124454 (the v0.8.2 dispatch re-run): this step reported `skipped`
+      # and every step below it still reported `success`. `skipped` is not `failure`, so the
+      # steps below carry NO `if:` and all run on the already-published path. Do not add a
+      # condition to any step below this one; that is precisely what would break the remedy.
       - name: Publish to npm
+        id: publish
         if: steps.registry.outputs.exists != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish "${{ steps.pack.outputs.tarball }}" --access public
 
+      # #1127, third outcome. A red run has two causes that demand opposite responses, and the
+      # 0.8.2 release proved a reader cannot tell them apart from the badge. This step speaks
+      # for exactly one of them: npm REJECTED the publish, so nothing was shipped.
+      - name: Name the outcome when the publish itself failed
+        if: failure() && steps.publish.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          {
+            echo "### Registry proof — \`${PACKAGE}@${VERSION}\`"
+            echo
+            echo "**PUBLISH_FAILED** — \`npm publish\` was rejected, so ${VERSION} never reached the registry. Nothing was shipped; the publish step's own error says why. Fixing that cause and re-running is safe: there is no published version to collide with."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "PUBLISH_FAILED: npm publish was rejected; ${PACKAGE}@${VERSION} was not shipped."
+
       # The verification that matters. A local build agreeing with itself proves nothing about
       # what users download. This reads the shasum back from the registry and compares it to the
       # tarball we packed. It runs on the fresh-publish path AND the already-published path, so
       # a green run always states the same true thing: npm serves these bytes.
+      #
+      # #1127 — WHY THE BUDGET IS 15 MINUTES AND WHY IT READS THE PACKUMENT. On 2026-09-07 the
+      # 0.8.2 publish SUCCEEDED, npm replied "being processed and may take a few minutes", and
+      # this step's 6 x 10 s = 60 s ran out. The version became readable 3 m 09 s after publish
+      # (packument time 13:42:16Z, publish ~13:39). The run went red, steps 9 and 10 skipped, and
+      # a finished release looked like a failed one. The gate is right — a green badge is not the
+      # proof, the registry's bytes are — but its budget was shorter than npm's own asynchronous
+      # processing, and A RED BADGE IS NOT PROOF OF FAILURE EITHER unless the step says which
+      # failure it is. So: 25 attempts spanning 900 s (attempt 1 immediately, then 10 s x6,
+      # 30 s x8, 60 s x10 = 15 min of waiting), and the read is a plain HTTP GET of the packument
+      # rather than `npm view`, which can answer from a local cache that has nothing to do with
+      # what the registry is serving.
       - name: The registry must serve the bytes we packed
         run: |
           set -euo pipefail
           LOCAL="${{ steps.pack.outputs.shasum }}"
+          export PACKUMENT="${RUNNER_TEMP}/packument.json"
           REMOTE=""
-          for attempt in 1 2 3 4 5 6; do
-            REMOTE="$(npm view --prefer-online "${PACKAGE}@${VERSION}" dist.shasum 2>/dev/null || true)"
+          ATTEMPT=0
+          # The wait BEFORE each attempt; 0 means "read immediately". 24 waits = 900 s total.
+          for WAIT in 0 10 10 10 10 10 10 30 30 30 30 30 30 30 30 60 60 60 60 60 60 60 60 60 60; do
+            if [ "$WAIT" -gt 0 ]; then
+              echo "registry has not surfaced ${VERSION} yet (attempt ${ATTEMPT}/25); waiting ${WAIT}s"
+              sleep "$WAIT"
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+            if curl -fsSL -H 'Cache-Control: no-cache' "https://registry.npmjs.org/${PACKAGE}" -o "$PACKUMENT"; then
+              # readFileSync, not require: require() caches by path and would keep serving the
+              # first (empty) answer for every later attempt.
+              REMOTE="$(node -e 'const d=JSON.parse(require("fs").readFileSync(process.env.PACKUMENT,"utf8"));const v=(d.versions||{})[process.env.VERSION];process.stdout.write((v&&v.dist&&v.dist.shasum)||"")' || true)"
+            fi
             [ -n "$REMOTE" ] && break
-            echo "registry has not surfaced ${VERSION} yet (attempt ${attempt}/6); waiting 10s"
-            sleep 10
           done
           if [ -z "$REMOTE" ]; then
-            echo "::error::${PACKAGE}@${VERSION} is still not readable from the registry after publishing. The publish is NOT confirmed."
+            {
+              echo "### Registry proof — \`${PACKAGE}@${VERSION}\`"
+              echo
+              echo "**PUBLISHED_NOT_YET_READABLE** — npm ACCEPTED the publish; the registry had not surfaced ${VERSION} after 25 reads over 15 minutes. This is npm's asynchronous processing running long, not a failed publish, so this red run does NOT mean nothing shipped."
+              echo
+              echo "Remedy: once npm serves ${VERSION}, re-run this workflow from the Actions tab (Run workflow) with tag \`${TAG}\`. That run finds the version already present, skips the publish, verifies the bytes, and creates the GitHub Release."
+              echo
+              echo "NOT the remedy: publishing again, or retagging. npm versions are immutable and this one is already taken by this tag's tarball."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::PUBLISHED_NOT_YET_READABLE: ${PACKAGE}@${VERSION} was published but is still not readable from the registry after 25 reads over 15 minutes. The publish was ACCEPTED — do NOT re-publish and do NOT retag. Re-run this workflow for the existing tag ${TAG} once npm serves it; that path skips the publish, verifies the bytes and creates the GitHub Release."
             exit 1
           fi
           if [ "$LOCAL" != "$REMOTE" ]; then
             echo "::error::npm serves ${PACKAGE}@${VERSION} with sha1 ${REMOTE}, but this tag packs to ${LOCAL}. The registry's bytes are not this tag's bytes. npm versions are immutable — republish under a new version rather than assuming this is cosmetic."
             exit 1
           fi
-          echo "registry sha1 ${REMOTE} matches the packed tarball"
+          {
+            echo "### Registry proof — \`${PACKAGE}@${VERSION}\`"
+            echo
+            echo "**PUBLISHED_AND_READABLE** — the registry serves sha1 \`${REMOTE}\`, the tarball this tag packs. Read on attempt ${ATTEMPT} of 25."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "PUBLISHED_AND_READABLE: registry sha1 ${REMOTE} matches the packed tarball (attempt ${ATTEMPT}/25)"
 
       # Second, independent proof: not the metadata npm reports, but the artifact a user
       # actually gets. Clean temp dir, private npm cache so nothing can be served from an
