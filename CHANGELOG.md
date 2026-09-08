@@ -2,11 +2,90 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## Unreleased
+## 0.8.3 — 2026-09-08
+
+Patch release: fixes only, **not a protocol release** — the wire semantics are unchanged and no
+session has to be re-registered for the protocol's sake. But two of the three code fixes live in
+the **daemon**, so upgrading the CLI alone changes nothing for them:
+
+- the **daemon** fixes — the bind-port variable (#1124) and the `read-screen` ANSI strip (#1099) —
+  take effect only after the daemon restarts
+  (`launchctl kickstart -k gui/$UID/com.aigentry.telepty`, or `systemctl restart` for the unit);
+- the **CLI** fix — the restart-failure advice (#1125) — applies on the next `telepty` invocation,
+  nothing to restart;
+- the **service descriptors** are rewritten on the next `telepty install-service` (#1124);
+- the release workflow change (#1127) is CI-only and ships nothing to users.
+
+`npm i -g @dmsdc-ai/aigentry-telepty@0.8.3`. #1124 and #1125 are the two follow-ups
+[gh#82](https://github.com/dmsdc-ai/aigentry-telepty/issues/82) raised that 0.8.2 listed as open
+and did not fix; #1099 and #1127 are unrelated to that report.
 
 ### Changed
 
-- Daemon bind port now resolves `TELEPTY_PORT` → `PORT` → `3848` (#1124); users who set both to different values on purpose get the CLI's variable. Invalid ports fall back to `3848` with a stderr diagnostic; `0` retains OS-assigned ephemeral binding. Explicit service descriptor ports set both variables consistently.
+- **The daemon and the CLI now agree on which variable names the port (#1124).** The daemon read
+  `PORT`; the CLI dials `TELEPTY_PORT`. Bind now resolves `TELEPTY_PORT` → `PORT` → `3848` through
+  one shared resolver (`src/bind-port.js`), and `telepty install-service` writes BOTH variables
+  into the launchd plist and the systemd unit when a port is given, so a descriptor cannot
+  reintroduce the split. **What a 0.8.2 user sees**: a `PORT=5000` shell no longer leaves a daemon
+  the CLI cannot find — gh#82 reported this as a second, independent way the absence verdict can be
+  wrong, and later withdrew it as *that incident's* cause while keeping it as a defect. It was
+  never destructive: since 0.8.1 `cleanupDaemonProcesses` refuses a state-file pid whose recorded
+  port disagrees with the addressed one (#902's `portMatchesAddress`).
+  **This is a behaviour change**, and the only one here: a host that sets `PORT` and `TELEPTY_PORT`
+  to *different* values on purpose now binds the CLI's variable rather than the daemon's. Invalid
+  values fall back to `3848` with a stderr diagnostic instead of being passed through; `0` still
+  requests an OS-assigned ephemeral port. Pinned by `test/daemon-bind-default.test.js` and
+  `test/install-service-generation.test.js`.
+
+### Fixed
+
+- **A failed restart now names the owner of the port the CLI is addressing, not 3848's (#1125).**
+  After all three attempts failed, the telepty#44 survivor line looked up the surviving pid with a
+  literal `findPortOwnerPid(3848)`, bypassing both `addressedPort` and the seam the rest of
+  `restartDaemonGraceful` routes through. **What a 0.8.2 user sees**: a CLI addressing :51821 was
+  told `Old daemon still alive (port 3848 owner pid …) — run "kill <pid>"`, where the pid was the
+  machine's real :3848 daemon — advice to destroy by hand exactly what #902 stopped the code from
+  destroying. Read-only, so nothing was ever killed by this line itself; what was wrong is that
+  detection scope, destruction scope and ADVICE scope have to be the same scope. Pinned by R6/R6b
+  in `test/sweep-scoping-902.test.js` (R6b is the negative control: a CLI on :3848 still gets
+  :3848 advice).
+- **`read-screen`'s OSC strip could empty the whole 200 KB ring (#1099).** `/screen` joins the
+  output ring and strips ANSI by regex, so one unbounded match wipes the buffer. The OSC-BEL arm's
+  payload class excluded only BEL (`/\x1b\][^\x07]*\x07/g`), so an `ESC ]` matched forward to
+  ANY later BEL — across ESC bytes and newlines. **What a 0.8.2 user sees**: measured on the
+  unmodified file, an ST-terminated OSC followed by 198 KB of answer text and then a
+  BEL-terminated OSC stripped to the empty string, and a ring-boundary-truncated OSC plus a later
+  BEL cut 200 KB down to one word. Both string-sequence arms now carry one rule — a payload
+  excluding both terminator lead-bytes, and a **required** terminator — so an opener whose
+  terminator fell off the ring leaks ~12 bytes of literal text instead of eating the screen. The
+  report blamed the DCS/PM/APC arm; `od -c` showed that arm was already ESC-bounded and its repro
+  is green on the old code (the `[^]*` reading is a `cat` artefact of literal ESC bytes). Strip
+  cost over a 200 KB ring of 1000 frames, 20 iterations, median: 0.39 ms → 0.36 ms. Pinned by four
+  new blocks in `test/read-screen-ansi-715.test.js`. `stripAnsiForScreen` has exactly one
+  non-test caller — `daemon.js` — so this one needs the daemon restarted, not just a new CLI.
+- **The release workflow's registry proof waits for npm's asynchronous processing, and names its
+  outcome (#1127).** 0.8.2's publish SUCCEEDED and its run went red: npm accepted the tarball and
+  replied "being processed and may take a few minutes", the proof step's 6 × 10 s budget ran out,
+  and the version became readable 3 m 09 s later — a finished release indistinguishable from a
+  failed one, closed out by re-running the workflow at the existing tag. The gate is unchanged in
+  kind (a green badge is not the proof; the registry's bytes are); its budget is now 25 reads over
+  15 minutes of a plain packument GET, and it ends in one of three named outcomes —
+  `PUBLISHED_AND_READABLE`, `PUBLISHED_NOT_YET_READABLE` (the publish was ACCEPTED; re-run the
+  workflow for the existing tag, do **not** re-publish or retag) and `PUBLISH_FAILED` (nothing
+  shipped) — in the step log and in the job summary. This release is its first live run.
+
+### Known
+
+- **Whether #1099 restores the screen that reported it is unproven (#1129).** The fix is measured
+  against constructed rings; the original capture is not on disk and no grok session was live to
+  re-run it. The same gradient the report described is also what a *correct* stripper yields on a
+  ring saturated by content-free frames, so the symptom cannot be called fixed from here.
+- **Two other messages in the restart path still print the CLI's module-level `PORT` (#1125,
+  deferred).** The credential-refusal diagnostic (`cli.js:771`) and the supervisor-failure line
+  (`cli.js:803`) interpolate `PORT` rather than `addressedPort`. In production they are the same
+  number — `addressedPort` defaults to `PORT` and no shipped caller injects `options.port` — so
+  this is reachable only under an injected seam today; the survivor line was fixed first because
+  it is the one that tells a human which pid to kill.
 
 ## 0.8.2 — 2026-09-07
 
