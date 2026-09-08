@@ -2,6 +2,12 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## Unreleased
+
+### Changed
+
+- Daemon bind port now resolves `TELEPTY_PORT` → `PORT` → `3848` (#1124); users who set both to different values on purpose get the CLI's variable. Invalid ports fall back to `3848` with a stderr diagnostic; `0` retains OS-assigned ephemeral binding. Explicit service descriptor ports set both variables consistently.
+
 ## 0.8.2 — 2026-09-07
 
 Patch release: fixes only, **not a protocol release** — the wire semantics are unchanged and no

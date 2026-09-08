@@ -17,7 +17,38 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const projectRoot = path.resolve(__dirname, '..');
-const { resolveBindHost, formatBindHint } = require('../daemon');
+const { resolveBindPort, resolveBindHost, formatBindHint } = require('../daemon');
+
+// #1124: daemon and CLI prefer the same port variable; zero remains ephemeral.
+for (const [name, env, expected] of [
+  ['default', {}, 3848],
+  ['TELEPTY_PORT only', { TELEPTY_PORT: '5001' }, 5001],
+  ['legacy PORT only', { PORT: '5002' }, 5002],
+  ['TELEPTY_PORT wins', { TELEPTY_PORT: '5001', PORT: '5002' }, 5001],
+  ['empty preferred falls through', { TELEPTY_PORT: '', PORT: '5002' }, 5002],
+  ['ephemeral preferred', { TELEPTY_PORT: '0', PORT: '5002' }, 0],
+  ['ephemeral legacy', { PORT: '0' }, 0],
+  ['upper boundary', { TELEPTY_PORT: '65535' }, 65535],
+]) {
+  test(`resolveBindPort: ${name}`, () => {
+    assert.equal(resolveBindPort(env), expected);
+  });
+}
+
+for (const value of ['no-port', '-1', '65536', 'Infinity', '1.5']) {
+  for (const key of ['TELEPTY_PORT', 'PORT']) {
+    test(`resolveBindPort: invalid ${key}=${value} defaults with one diagnostic`, (t) => {
+      const warnings = [];
+      t.mock.method(console, 'error', (message) => warnings.push(message));
+      const env = { [key]: value };
+      if (key === 'TELEPTY_PORT') env.PORT = '5002';
+      assert.equal(resolveBindPort(env), 3848);
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /3848/);
+      assert.equal(warnings[0].split('\n').length, 1);
+    });
+  }
+}
 
 // ── pure bind-address policy ────────────────────────────────────────────────────
 
@@ -58,6 +89,7 @@ function startDaemon(extraEnv) {
   };
   // The default-bind test needs HOST/TELEPTY_BIND genuinely absent, not inherited.
   if (!('HOST' in (extraEnv || {}))) delete env.HOST;
+  if (!('TELEPTY_PORT' in (extraEnv || {}))) delete env.TELEPTY_PORT;
   if (!('TELEPTY_BIND' in (extraEnv || {}))) delete env.TELEPTY_BIND;
 
   const child = spawn(process.execPath, ['daemon.js'], {
@@ -116,6 +148,18 @@ test('TELEPTY_BIND wins over legacy HOST on the real listen path', async () => {
   try {
     const banner = await waitForBanner(child);
     assert.match(banner, /listening on http:\/\/127\.0\.0\.1:\d+/);
+  } finally {
+    await stopDaemon(child);
+  }
+});
+
+test('TELEPTY_PORT wins over legacy PORT on the real listen path', async () => {
+  const child = startDaemon({ TELEPTY_PORT: '0', PORT: '-1' });
+  try {
+    const banner = await waitForBanner(child);
+    const port = Number(banner.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/)[1]);
+    assert.ok(port > 0 && port <= 65535);
+    assert.notEqual(port, 3848);
   } finally {
     await stopDaemon(child);
   }

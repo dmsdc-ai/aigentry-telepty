@@ -390,7 +390,8 @@ app.get('/api/health', (req, res) => {
 // Authentication Middleware
 app.use(createAuthMiddleware({ isAllowedPeer, expectedToken: EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin }));
 
-const PORT = process.env.PORT || 3848;
+const { resolveBindPort } = require('./src/bind-port');
+const PORT = resolveBindPort(process.env);
 // Actual bound port. Equals PORT for a fixed port; when PORT=0 the OS assigns an
 // ephemeral port and this is resolved to the real value in the listen callback.
 // Reported by /api/meta so callers (e.g. the test harness) can read it back.
@@ -6307,6 +6308,7 @@ module.exports = {
   awaitModalParkDrain,            // #760: poll → drain in order, or flush on TTL
   drainBootstrapQueue,            // #760: modal-guarded FIFO drain (also the boot drain)
   deliverInjectionToSession,      // #760: park-vs-deliver decision at the text path
+  resolveBindPort,                // #1124: TELEPTY_PORT first, shared with service descriptors
   resolveBindHost,                // telepty#50 + #672: pure bind-address policy (loopback default, env opt-in, tailnet auto)
   formatBindHint,                 // telepty#50 + #672: startup bind/exposure banner line
   isTailnetAuto,                  // #672: pure predicate — is the zero-config tailnet path active
