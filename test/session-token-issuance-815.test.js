@@ -22,10 +22,10 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
 const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
+const { createProvisionedTestHome } = require('../test-support/setup-env');
 
 let daemon;
 let logPath;
@@ -240,7 +240,9 @@ test('#815 GUARD: first registration of an unknown sid still mints a usable toke
 test('#815 item4: the same bearer still verifies after a daemon RESTART (verifier persisted)', async () => {
   // An isolated daemon PAIR over one shared HOME, so the file-backed handover is the real thing
   // and the suite's own daemon is left untouched.
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-815-restart-'));
+  // T0 (#1170): the factory, not `mkdtempSync` — a caller-supplied homeDir skips provisioning, and
+  // an uninitialized store fences every sid, refusing the inject below before the bearer verifies.
+  const home = createProvisionedTestHome('telepty-815-restart-');
   const sid = createSessionId('restart815');
   const first = await startTestDaemon({ homeDir: home, env: { TELEPTY_AUDIT_FLUSH_MS: '10' } });
   let second = null;
