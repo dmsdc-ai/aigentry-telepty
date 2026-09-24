@@ -1389,6 +1389,136 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
 
 // --- W6: cooperating concurrent writers, 20 iterations x 8 children ------------------------------
 
+// ==== BEGIN W6-INERT-ORACLE ====================================================================
+// The W6 loser-vocabulary and independent-opener oracles, factored out as PURE functions so the
+// inert control file (w6-vocabulary-control.cjs) can extract THIS EXACT REGION as text and drive
+// the real maintained logic without loading better-sqlite3, the slice, or any native binding.
+// Nothing in this region may require(), read process, touch the filesystem or mutate its argument;
+// the control file asserts that inertness before it evaluates the region. The region is kept
+// self-contained, so it declares the reason literals it needs, and the W6 test asserts those
+// literals still equal the module-level REASON_ constants - the two copies cannot drift silently.
+//
+// Contract basis: L91 (W6) as SUPERSEDED by section 9 (L131) through R2-1 (L61 + L151). A throw
+// raised BY COMMIT is experimental_store_commit_uncertain whatever err.code reports, INCLUDING a
+// BUSY code; the section 3 busy row (L54) covers BEGIN IMMEDIATE and pre-COMMIT statements only
+// and never captures a commit-phase BUSY.
+const W6_LOSER_REASONS = {
+  conflict: "experimental_store_generation_conflict",
+  busy: "experimental_store_busy",
+  commitUncertain: "experimental_store_commit_uncertain",
+};
+
+function w6HasField(result, name) {
+  return Object.prototype.hasOwnProperty.call(result, name);
+}
+
+// Returns [] when the loser is admissible, otherwise one message per violation. It never throws
+// and never reads anything outside `result`, so no caller can obtain a verdict by supplying
+// context instead of evidence.
+function w6LoserViolations(result) {
+  const out = [];
+  if (result === null || result === undefined) {
+    out.push("a missing child result is NEVER folded into a refusal and NEVER synthesized into "
+      + "commit_uncertain (R2-2, L167): a loser row must be a value the child actually returned");
+    return out;
+  }
+  const reason = typeof result.reason === "string" ? result.reason : null;
+  if (reason !== W6_LOSER_REASONS.conflict
+    && reason !== W6_LOSER_REASONS.busy
+    && reason !== W6_LOSER_REASONS.commitUncertain) {
+    out.push("a loser refuses generation_conflict, busy or commit_uncertain and NOTHING else, "
+      + "observed " + String(result.reason));
+    return out;
+  }
+  if (reason === W6_LOSER_REASONS.busy) {
+    const primary = typeof result.sqliteCode === "string" && result.sqliteCode !== ""
+      ? result.sqliteCode
+      : null;
+    if (primary !== "SQLITE_BUSY") {
+      out.push("a busy refusal carries the primary SQLITE_BUSY, observed "
+        + String(result.sqliteCode));
+    }
+    if (result.commitAttempted !== false) {
+      out.push("an ordinary busy is PRE-COMMIT and requires commitAttempted:false - a BUSY met AT "
+        + "COMMIT is commit_uncertain instead (R2-1, L151), observed commitAttempted "
+        + String(result.commitAttempted));
+    }
+    if (result.committed !== false) {
+      out.push("a busy loser never reports a commit, observed committed "
+        + String(result.committed));
+    }
+    if (result.retrySafe !== true) {
+      out.push("a pre-COMMIT busy is retry-safe, observed retrySafe " + String(result.retrySafe));
+    }
+    return out;
+  }
+  if (reason === W6_LOSER_REASONS.conflict) {
+    if (result.committed !== false) {
+      out.push("a conflict loser never reports a commit, observed committed "
+        + String(result.committed));
+    }
+    if (result.retrySafe !== false) {
+      out.push("a generation conflict is NOT retry-safe, observed retrySafe "
+        + String(result.retrySafe));
+    }
+    return out;
+  }
+  // commit_uncertain is admitted ONLY as the exact R2-1 tuple. The outcome stays UNKNOWN, and this
+  // branch is never reached by relabelling it retryable (retrySafe:true) or not-committed
+  // (committed:false) - both of those are violations below, not tolerated shapes.
+  if (result.commitAttempted !== true) {
+    out.push("commit_uncertain requires commitAttempted:true as an established fact, observed "
+      + String(result.commitAttempted));
+  }
+  if (!w6HasField(result, "committed") || result.committed !== null) {
+    out.push("commit_uncertain leaves the outcome UNKNOWN: committed must be PRESENT and null, "
+      + "never relabelled false and never absent, observed " + String(result.committed));
+  }
+  if (result.retrySafe !== false) {
+    out.push("commit_uncertain is NEVER retry-safe, observed retrySafe " + String(result.retrySafe));
+  }
+  return out;
+}
+
+// The independent-opener tuple, unchanged in strength: a read that ACTUALLY succeeded, generation
+// exactly g + 1, exactly one new row, that row carrying the winner key, and no hot sidecar. This
+// tuple is what keeps an admitted commit_uncertain honest (ORACLE-REVIEW N3): the uncertainty may
+// survive in the loser vocabulary only while the ledger still shows exactly one winner at g + 1.
+// A broken read or a broken tuple stays a HARD FAILURE, never a retry.
+function w6LedgerViolations(latch, expected) {
+  const out = [];
+  if (latch === null || latch === undefined || latch.ledgerRead !== true) {
+    out.push("the independent opener must actually read the store - a failed read is a failed "
+      + "measurement, NEVER evidence that nothing landed");
+    return out;
+  }
+  // Exactly null, as the assertion this replaced required. An ABSENT inventoryError is not a
+  // clean inventory, it is a missing measurement, and a missing measurement is never evidence.
+  if (latch.inventoryError !== null) {
+    out.push("the on-disk inventory must actually be observed - inventoryError must be PRESENT "
+      + "and exactly null, never absent, observed " + String(latch.inventoryError));
+  }
+  if (latch.generationAfter !== expected.generation) {
+    out.push("the opener reports generation exactly g + 1 (" + String(expected.generation)
+      + "), observed " + String(latch.generationAfter));
+  }
+  if (latch.rowsAfter !== 1) {
+    out.push("EXACTLY one new row - no second write landed, observed " + String(latch.rowsAfter));
+  }
+  const keys = Array.isArray(latch.sectionKeysAfter) ? latch.sectionKeysAfter : null;
+  if (keys === null || keys.length !== 1 || keys[0] !== expected.winnerKey) {
+    out.push("the single row is the key of the unique confirmed winner ("
+      + String(expected.winnerKey) + "), observed " + JSON.stringify(latch.sectionKeysAfter));
+  }
+  const hot = Array.isArray(latch.sidecarsAfter) ? latch.sidecarsAfter : null;
+  if (hot === null || hot.length !== 0) {
+    out.push("no hot sidecar survives the iteration, observed "
+      + JSON.stringify(latch.sidecarsAfter));
+  }
+  return out;
+}
+// ==== END W6-INERT-ORACLE ======================================================================
+
 // Every option value crossing the IPC boundary is authored HERE; the child echoes the slice result
 // back verbatim and the parent never synthesizes one.
 function raceOptions(iteration, index) {
@@ -1602,19 +1732,17 @@ async function runRaceIteration(iteration) {
   assert.equal(winners[0].committed, true,
     "W6 iteration " + iteration + ": the winner's COMMIT returned and its close returned");
 
+  // The inert region declares its own reason literals so the control file can evaluate it stand
+  // alone; this is the guard that stops that copy and the module constants drifting apart.
+  assert.deepEqual(
+    [W6_LOSER_REASONS.busy, W6_LOSER_REASONS.commitUncertain, W6_LOSER_REASONS.conflict],
+    [REASON_BUSY, REASON_COMMIT_UNCERTAIN, REASON_GENERATION_CONFLICT],
+    "W6: the inert-extractable oracle literals must still equal the module reason constants");
   for (const result of losers) {
-    assert.equal(
-      result.reason === REASON_GENERATION_CONFLICT || result.reason === REASON_BUSY, true,
-      "W6 iteration " + iteration + ": a loser refuses generation_conflict or busy and NOTHING "
-      + "else, observed " + String(result.reason));
-    if (result.reason === REASON_BUSY) {
-      assert.equal(codeOf(result.sqliteCode), "SQLITE_BUSY",
-        "W6 iteration " + iteration + ": a busy refusal carries the primary SQLITE_BUSY");
-      assert.equal(result.retrySafe, true, "W6: a pre-COMMIT busy is retry-safe");
-    } else {
-      assert.equal(result.retrySafe, false, "W6: a generation conflict is NOT retry-safe");
-    }
-    assert.equal(result.committed, false, "W6: a loser never reports a commit");
+    assert.deepEqual(w6LoserViolations(result), [],
+      "W6 iteration " + iteration + ": loser vocabulary (L91 as superseded by R2-1) admits "
+      + "generation_conflict, busy, or a genuine surviving commit_uncertain carrying "
+      + "commitAttempted:true, committed:null, retrySafe:false - and NOTHING else");
     assertRetrySafeIsWellFormed(result, "W6 iteration " + iteration + " loser");
   }
 
@@ -1622,20 +1750,15 @@ async function runRaceIteration(iteration) {
   // the latch above; a FAILED read is asserted as a failed read and is never silently treated as
   // "zero rows", so no iteration can be called clean on the strength of an observation that did
   // not succeed.
-  assert.equal(latch.ledgerRead, true,
-    "W6 iteration " + iteration + ": the independent opener must actually read the store - a "
-    + "failed read is a failed measurement, NEVER evidence that nothing landed ("
-    + JSON.stringify(latch.ledgerError) + ")");
-  assert.equal(latch.inventoryError, null,
-    "W6 iteration " + iteration + ": the on-disk inventory must actually be observed");
-  assert.equal(latch.generationAfter, 2,
-    "W6 iteration " + iteration + ": the opener reports generation exactly g + 1");
-  assert.equal(latch.rowsAfter, 1,
-    "W6 iteration " + iteration + ": EXACTLY one new row - no second write landed");
-  assert.deepEqual(latch.sectionKeysAfter, [winners[0].key],
-    "W6 iteration " + iteration + ": the single row is the winner's key");
-  assert.deepEqual(latch.sidecarsAfter, [],
-    "W6 iteration " + iteration + ": no hot sidecar survives the iteration");
+  // Unchanged in strength, and now the same function the inert control file drives: a failed read,
+  // a generation other than g + 1, a second row, a row under any key but the unique confirmed
+  // winner, or a surviving hot sidecar each remain a HARD FAILURE. This is also what bounds an
+  // admitted commit_uncertain loser - the uncertainty is allowed to stand only while this tuple
+  // still holds (ORACLE-REVIEW N3).
+  assert.deepEqual(
+    w6LedgerViolations(latch, { generation: 2, winnerKey: winners[0].key }), [],
+    "W6 iteration " + iteration + ": the independent opener tuple, ledgerError "
+    + JSON.stringify(latch.ledgerError));
 
   // Sealed only now, after every assertion above has passed.
   latch.status = "passed";
@@ -1690,8 +1813,12 @@ test("W6 concurrent writers: exactly one winner in every iteration", async () =>
 
   const reasonsObserved = [...new Set(iterations.flatMap(entry => entry.loserReasons))].sort();
   for (const reason of reasonsObserved) {
-    assert.equal(reason === REASON_GENERATION_CONFLICT || reason === REASON_BUSY, true,
-      "W6: the loser vocabulary is closed to generation_conflict and busy");
+    assert.equal(
+      reason === REASON_GENERATION_CONFLICT
+      || reason === REASON_BUSY
+      || reason === REASON_COMMIT_UNCERTAIN, true,
+      "W6: the loser vocabulary is closed to generation_conflict, busy and commit_uncertain, "
+      + "observed " + String(reason));
   }
 
   // Augmented in place, NEVER reassigned: replacing the object here would discard the latched
@@ -1712,11 +1839,18 @@ test("W6 concurrent writers: exactly one winner in every iteration", async () =>
       + "runners are exercised, and only alias equivalence is unclaimed.",
     retryPolicy: "no retry, no retry-to-green: a non-unique winner, a generation other than g + 1 "
       + "or more than one new row is a hard failure",
-    vocabularyNote: "the loser vocabulary stays CLOSED to generation_conflict and busy, exactly "
-      + "as written. It is deliberately NOT widened to admit experimental_store_commit_uncertain: "
-      + "an uncertain COMMIT leaves \"exactly one new row at g + 1\" genuinely UNKNOWN for that "
-      + "iteration, and this acceptance experiment keeps its hard rejection of that uncertainty. "
-      + "No retry, no busy_timeout, no PRAGMA and no journal_mode change is introduced here.",
+    vocabularyNote: "the loser vocabulary is CLOSED to generation_conflict, busy and "
+      + "experimental_store_commit_uncertain. commit_uncertain is admitted ONLY as the exact R2-1 "
+      + "tuple returned by a SURVIVING child - commitAttempted:true, committed:null, "
+      + "retrySafe:false - because L151 makes a throw raised BY COMMIT dominate classification "
+      + "whatever err.code reports, INCLUDING a BUSY code, and L131 makes that supersede the L91 "
+      + "conflict-or-busy phrasing. The section 3 busy row still covers BEGIN IMMEDIATE and "
+      + "pre-COMMIT statements only. That result stays UNKNOWN: it is never relabelled retryable "
+      + "and never relabelled not-committed. Exactly-once is proven INDEPENDENTLY by the opener "
+      + "tuple - one winner, generation exactly g + 1, exactly one new row under the winner key - "
+      + "so a commit_uncertain loser beside a broken read or a broken tuple remains a hard "
+      + "failure, and no missing child result is ever synthesized into it (R2-2, L167). No retry, "
+      + "no busy_timeout, no PRAGMA and no journal_mode change is introduced here.",
   });
   maybeForceFail("W6");
 });
