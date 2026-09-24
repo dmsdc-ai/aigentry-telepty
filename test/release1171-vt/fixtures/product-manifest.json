@@ -1,0 +1,409 @@
+{
+  "schema": "release1171-vt/product-manifest@1",
+  "operation": "vt1170ae-v1",
+  "frozen_from": "vt1170ae input/source (controller-supplied, read-only)",
+  "frozen_at": "test authorship (vt1170ae-v1); NOT generated from the tree under validation",
+  "package": {
+    "name": "@dmsdc-ai/aigentry-telepty",
+    "version": "0.8.3"
+  },
+  "measured_from": [
+    "package.json .files (shipped set)",
+    "package.json .bin / .main",
+    "DISPATCH product-root list: root runtime JS, src/**, mcp-server/**, scripts/**, package.json/lock, install.*, runtime assets/notices"
+  ],
+  "product_roots": {
+    "recursive": [
+      "src",
+      "mcp-server",
+      "scripts",
+      "skills",
+      "third-party-notices"
+    ],
+    "root_files": [
+      "package.json",
+      "package-lock.json",
+      "install.sh",
+      "install.ps1"
+    ],
+    "root_file_pattern": "^[^.][^/]*\\.(js|mjs|cjs)$"
+  },
+  "excluded": {
+    "node_modules/**": "third-party dependencies, not first-party product",
+    "test/**, tests/**, test-support/**": "test harness, goldens and fixtures",
+    "artifacts/**": "live run evidence written DURING the suite (root cause of the vt1170ae race)",
+    ".github/**": "CI definition",
+    ".git/**": "version control metadata",
+    "docs/**, demo/**, specs/**, scratchpad/**, protocol/**, templates/**": "documentation and development material, not shipped runtime",
+    ".claude/**, .gemini/**": "agent tooling configuration",
+    "CHANGELOG.md, README.md, README.tmpl.md, LICENSE, AGENTS.md, CLAUDE.md, GEMINI.md, BOUNDARY.md, BUS_EVENT_SCHEMA.md": "documentation; CHANGELOG.md and LICENSE are shipped by package.json .files but carry no runtime behaviour, so they are OUTSIDE this inventory by explicit declaration",
+    "tsconfig.json, ecosystem.json, clipboard_image.png, .gitignore, .npmignore, .gitattributes": "build/dev/process configuration and stray assets, not shipped runtime"
+  },
+  "not_claimed": "This inventory does NOT claim every repository file is product. It covers exactly the roots listed in product_roots; everything in excluded is outside the oracle by declaration, not by blanket ignore.",
+  "authorized_alternates": {
+    "package.json": [
+      {
+        "sha256": "08dd342f59b9bfe8b3a346106521aea5bbb79964d52859f8a51ac0620dcc4c78",
+        "reason": "fh1170ad (independently reviewed) adds ONLY test/conditional-test-setup.test.js to scripts.test:ci. Test-only; no runtime byte changes. Controller-authorized alongside the frozen original.",
+        "owner": "fh1170ad"
+      }
+    ],
+    "src/vt/session-screen.js": [
+      {
+        "sha256": "428cb2e6f24c2b0d367e0458a29b179854eece6f38d04af1500f464ee81dcc1f",
+        "reason": "corrective-manifest.json / DISPATCH-pinned VT leaf; identical to the frozen input byte-for-byte, retained as an explicit second exact pin.",
+        "owner": "controller"
+      }
+    ]
+  },
+  "alternates_policy": "An alternate is an EXACT additional sha256 for one named leaf. There is no path-based ignore and no byte-range tolerance anywhere in this manifest. Any leaf hash outside its authorized set is a failure.",
+  "leaf_count": 69,
+  "inventory_sha256": "7a43c788e36f169b6bcc9d921f105aa7f2cc4d9bad9e6615df78896e0ce6cae7",
+  "files": [
+    {
+      "path": "auth.js",
+      "sha256": "8408f61668d412a3553175117af8530125baaaab4fb2f24857bc576233435a17",
+      "bytes": 5795
+    },
+    {
+      "path": "cli.js",
+      "sha256": "9f16f65b8f878aec96929feee6fbc516963c523141148be21acecb3153e37308",
+      "bytes": 251008
+    },
+    {
+      "path": "cross-machine.js",
+      "sha256": "bfa8f677418e3d017c12a490a067526bfce8010ebf95048852261895cc909cd2",
+      "bytes": 22538
+    },
+    {
+      "path": "daemon-control.js",
+      "sha256": "ff9f360347ee5bdc9247f5fba7dac96c41143525231aef9e01b660a43c0af06b",
+      "bytes": 16416
+    },
+    {
+      "path": "daemon.js",
+      "sha256": "93214bc0a4d057000cddca7077000cce5023cc0d6d393c7f946a6b0e50e7713c",
+      "bytes": 366925
+    },
+    {
+      "path": "entitlement.js",
+      "sha256": "d596d0f437fe10d62258103701ddf2139d4ac56140952e7759c3f11f0b3022b0",
+      "bytes": 2223
+    },
+    {
+      "path": "host-spec.js",
+      "sha256": "f0f5e077f4f17b11a328d5a5b32b4846524b8af93b1e47ea65b3c83eece11c09",
+      "bytes": 1530
+    },
+    {
+      "path": "install.js",
+      "sha256": "f0fd1e5eba0a5b5b22cf190eb0cd434dec8e0ae81d56a47bd3e8995c952547c6",
+      "bytes": 13576
+    },
+    {
+      "path": "install.ps1",
+      "sha256": "effa7aa6553cbe8ba9cbced8758214a2b5b61c160852ecf3067f9ce9f4952bfd",
+      "bytes": 1926
+    },
+    {
+      "path": "install.sh",
+      "sha256": "76576b0b560086b412ef91bc65481c701ffa8e367d8c80a0622c528bed2dab52",
+      "bytes": 4328
+    },
+    {
+      "path": "interactive-terminal.js",
+      "sha256": "6bf423e2f413c7f963c13f626da436db7cd1738b3ed84ba8a0f700b87e1d37bb",
+      "bytes": 3048
+    },
+    {
+      "path": "mcp-server/index.mjs",
+      "sha256": "fc9b79d7d1c8cdd08952469c8dd72dddba02b2517bf61432d08283703d09687d",
+      "bytes": 10112
+    },
+    {
+      "path": "package-lock.json",
+      "sha256": "995a1ee7e2bb9292926585b6adc06b463688ea3091b1b78d96c94e2c897c4e9f",
+      "bytes": 44522
+    },
+    {
+      "path": "package.json",
+      "sha256": "b2051b72bc4a0fbbde5b9ae43d98e786d98aa11ee1b0a926bf6898e3f0f6b46d",
+      "bytes": 15813
+    },
+    {
+      "path": "runtime-info.js",
+      "sha256": "e08204d3227eba4c2e0239a4377db848fc5a4a97c473ecac5efbecb8c222142e",
+      "bytes": 1231
+    },
+    {
+      "path": "scripts/gen-readme.mjs",
+      "sha256": "3bdae1bff396f9a9f581b604e5a058667b17dcb3254e1e45056c89a872ad13fb",
+      "bytes": 3483
+    },
+    {
+      "path": "scripts/postinstall.js",
+      "sha256": "8dd7415ddf7f4682843c89e13dd1e87c6b4c10094eede7df231a6ef6e807e368",
+      "bytes": 5955
+    },
+    {
+      "path": "scripts/preuninstall.js",
+      "sha256": "36cc056f78298c389f55559a5f554d82c23d84b6c7c1cca49656423fa8e41e9c",
+      "bytes": 957
+    },
+    {
+      "path": "scripts/regen-snippet-fixtures.js",
+      "sha256": "560439459040d3a875aac65aae91a8338c19fe8def032fc2627648e3df8300e8",
+      "bytes": 1127
+    },
+    {
+      "path": "session-routing.js",
+      "sha256": "f4f6e15b7ac4590f0f5a9ca2486a2ae5e0e9e3ecc705b20bc9e3971a9eff659d",
+      "bytes": 2659
+    },
+    {
+      "path": "session-state.js",
+      "sha256": "d5c5f06faed72495fa2b3ebe8ca950fa2bdcc1ef319aaa5df8f58c4c7b8f10b1",
+      "bytes": 35267
+    },
+    {
+      "path": "shared-context.js",
+      "sha256": "c6a045e1d716e589d0d4e5dd22ce5ea9058e1f5a7d0ef0cb1b6868fab7308586",
+      "bytes": 3721
+    },
+    {
+      "path": "skill-installer.js",
+      "sha256": "191a3e7a2b85c29c5b47a47d94a956c793862bc6490f2764ecc79ef6627de59b",
+      "bytes": 8845
+    },
+    {
+      "path": "skills/telepty-allow/SKILL.md",
+      "sha256": "a9e6b03bbc9e2492f2665af21db95a1d679452e25c683dd84831f45cf3516ca7",
+      "bytes": 3385
+    },
+    {
+      "path": "skills/telepty-attach/SKILL.md",
+      "sha256": "7e92c103afcc2751ab610e63094824f9471d5c5951bea9af76a1beada104eefb",
+      "bytes": 1442
+    },
+    {
+      "path": "skills/telepty-broadcast/SKILL.md",
+      "sha256": "2f96df9dac5fe6a87ee986799663f35bba5bc3ecc5ec4a1a985a4a3c665427c8",
+      "bytes": 1895
+    },
+    {
+      "path": "skills/telepty-daemon/SKILL.md",
+      "sha256": "59dc49e1915e34d5cdeb46eebbc4ef9b7684e46128d86f6ee7142cf77ca92678",
+      "bytes": 4149
+    },
+    {
+      "path": "skills/telepty-inject/SKILL.md",
+      "sha256": "f3e7d2e739e5d3e73348942243a090f5698858829433b14af89571ee88e904a3",
+      "bytes": 6156
+    },
+    {
+      "path": "skills/telepty-list/SKILL.md",
+      "sha256": "fe10efc099e298363980fc29e6d17b79b996b7c957ee3dcaf116347e557f88e1",
+      "bytes": 2300
+    },
+    {
+      "path": "skills/telepty-listen/SKILL.md",
+      "sha256": "61b35ef4048b5f596da559f46107570509cabf54477a0427b1321acc2ec08479",
+      "bytes": 2431
+    },
+    {
+      "path": "skills/telepty-rename/SKILL.md",
+      "sha256": "c0d6ab4b14739cd5640433df376c17a2cf86490fc36fc7b4b451f0b3e6f636ab",
+      "bytes": 1622
+    },
+    {
+      "path": "skills/telepty/SKILL.md",
+      "sha256": "8874e8539688f27a75ac85a4a4a456bf63bf84a23c16b7f556cfd1e1217f36a9",
+      "bytes": 2286
+    },
+    {
+      "path": "src/audit/inject-log.js",
+      "sha256": "297522746ef1c92a39cbef58682ec3412e4cccdb140a83b6ad2c1d473d14dd0b",
+      "bytes": 10649
+    },
+    {
+      "path": "src/audit/provenance.js",
+      "sha256": "dd4968e4ad2b5ae134094d91a57eb7346e33a87c78bd3f43a0cd60320b4538d9",
+      "bytes": 4149
+    },
+    {
+      "path": "src/bind-port.js",
+      "sha256": "8c07f992a89314f4ee77f3fb74146e85f406f6f85820b2e8874415e159c35ecb",
+      "bytes": 520
+    },
+    {
+      "path": "src/child-cpu.js",
+      "sha256": "941794a06650f49b203056fdc4b168b9c230a6e2989eef8deb88c73016c85528",
+      "bytes": 2245
+    },
+    {
+      "path": "src/cli/session-view.js",
+      "sha256": "3fdeddcdbdeac3e1ab244d363df682a2da5b60e346564827a0b740265f2c8de4",
+      "bytes": 8457
+    },
+    {
+      "path": "src/completion-observation.js",
+      "sha256": "82819954e9007d4d2b4aabd6cb28d69e6d927c77eb3c0aa070b964b3f3f317aa",
+      "bytes": 14085
+    },
+    {
+      "path": "src/config-file.js",
+      "sha256": "d9d77bb8fa863f5c0c27aca53865981e7d6c49af45cce74e041cdd92daafc8d3",
+      "bytes": 2393
+    },
+    {
+      "path": "src/init/print-snippet.js",
+      "sha256": "3806581b270aba912414ddb17fe9778aa431fd465dca70c540ace998447a7f99",
+      "bytes": 3077
+    },
+    {
+      "path": "src/init/snippets/agents.md",
+      "sha256": "f5a0986a29a334ab0a12e672f4f3428c0c6f1458d35d6d0263a5ec3c33721195",
+      "bytes": 723
+    },
+    {
+      "path": "src/init/snippets/claude.md",
+      "sha256": "305aad8181c1e75bb94589386cbc34f2b5103d6b5c1f6a7f01c99f1fbf6ed8c3",
+      "bytes": 723
+    },
+    {
+      "path": "src/init/snippets/gemini.md",
+      "sha256": "c97635b0d684552aa060a969981c2be11cf49b60f5a6237d52f5214e9ecc1a07",
+      "bytes": 723
+    },
+    {
+      "path": "src/lifecycle.js",
+      "sha256": "7b55dea104ad098cfefe498018ec9e332125d54a07e26ee7bbabd64505480921",
+      "bytes": 13532
+    },
+    {
+      "path": "src/mailbox/bridge-flush-filter.js",
+      "sha256": "3c0a322263581ade7240e9af93a5f851d1fbd06d3daffe6371ce735c45ef6e0c",
+      "bytes": 2210
+    },
+    {
+      "path": "src/mailbox/config.js",
+      "sha256": "9aeda5d8f8b958a9297be1ec43cdc37db5a2960e9751168586d86a5a6f4a5a8f",
+      "bytes": 1329
+    },
+    {
+      "path": "src/mailbox/delivery.js",
+      "sha256": "a0968d4b8c3fbd1bd08d500c0d0b146b70331caaa28aa87c04ba69d330304d23",
+      "bytes": 6888
+    },
+    {
+      "path": "src/mailbox/index.js",
+      "sha256": "15a0baa0f1e94ef194f3f77151f1540feddca1e3e035ec750aa7d11ad0174f62",
+      "bytes": 11730
+    },
+    {
+      "path": "src/mailbox/notifier.js",
+      "sha256": "4ac85f8d583dbb08d8c778651adec0cebd0ff598797bd47089d109aa3fe70fcc",
+      "bytes": 2703
+    },
+    {
+      "path": "src/mailbox/storage.js",
+      "sha256": "eb4c9a1f5c4a264e070551c1b350e6b31c549e4c811c65011833cbf2e12d814b",
+      "bytes": 7569
+    },
+    {
+      "path": "src/net/tailnet.js",
+      "sha256": "0865e35e9785eb1faa202c3a966983dca578bf19defce2a901d269b10d591c10",
+      "bytes": 3016
+    },
+    {
+      "path": "src/net/win-firewall.js",
+      "sha256": "f2b99fb72e3d695e322d5189efab1308810f02e189d1ca3949845d40d74669dc",
+      "bytes": 2748
+    },
+    {
+      "path": "src/prompt-symbol-registry.js",
+      "sha256": "86e9075d218dae0ffdf889f12bc6ef35e93aedce8915e6628f2db5e044ab1a90",
+      "bytes": 21721
+    },
+    {
+      "path": "src/protocol/http-auth.js",
+      "sha256": "306c5ec8d4c061ef6b1d68b4baf17f1d4cfe122f3bea6ef817fb2b0c8789d246",
+      "bytes": 9948
+    },
+    {
+      "path": "src/report-enforcement.js",
+      "sha256": "b3c85aa3c170a32e7725de9698e367a7813f81a78df649e644be1f8f19cfd544",
+      "bytes": 2770
+    },
+    {
+      "path": "src/screen-ansi.js",
+      "sha256": "eeb135d0a3d42f8957dfb7eb63f1839792dd9c974b5dba738e18999e3df407ec",
+      "bytes": 2207
+    },
+    {
+      "path": "src/session-store/conditional-admission.js",
+      "sha256": "be3194e2d7382b43dfd4638613b4b9ba4c6b568473b3578f4f4f1d2555065620",
+      "bytes": 45247
+    },
+    {
+      "path": "src/session-store/persistence.js",
+      "sha256": "c9d458a5ffa7a4422b09fcdcd8f7442f26da5612a1e85f38d6494e058dc110e0",
+      "bytes": 22187
+    },
+    {
+      "path": "src/session-store/session-credentials.js",
+      "sha256": "0eadf5b24306488e7f59577afe0bf76cb4f832a2bc69485ff975990e3c68c917",
+      "bytes": 5689
+    },
+    {
+      "path": "src/submit-gate.js",
+      "sha256": "dbd11f930215acb0b5bcd62a854d837da445da15c3ba30fd39b0faa6078fdf53",
+      "bytes": 36462
+    },
+    {
+      "path": "src/supervisor.js",
+      "sha256": "c4ef40e83c76553a4516776a24cc096b05b18b554d77e2d6dae1064cbb2e8562",
+      "bytes": 9497
+    },
+    {
+      "path": "src/transport/websocket.js",
+      "sha256": "b11123542322b70b22cb27a86ecb17e0a6eb81e4d5d63d4d68ca89f43c8af879",
+      "bytes": 52336
+    },
+    {
+      "path": "src/uninstall.js",
+      "sha256": "1f78f2634ac532514a26564de228f49a70a9c8f8b47d4c5c20c54b5246f0d189",
+      "bytes": 5147
+    },
+    {
+      "path": "src/version-handshake.js",
+      "sha256": "a946eb6836435c21f6680f8156b53234722610715e57f5a3aa741f9fd815db94",
+      "bytes": 2814
+    },
+    {
+      "path": "src/vt/session-screen.js",
+      "sha256": "428cb2e6f24c2b0d367e0458a29b179854eece6f38d04af1500f464ee81dcc1f",
+      "bytes": 63578
+    },
+    {
+      "path": "src/win-kill-process.js",
+      "sha256": "b10b5b983bbd97f61b6e3486f4b27e307d4e80cc14feaa59a3a171aca9d4eeae",
+      "bytes": 1563
+    },
+    {
+      "path": "src/win-resolve-executable.js",
+      "sha256": "c5e8639127f2da6f40c83c92e608d20dea1745a42a019b00b4fd3bebfa7e3cc9",
+      "bytes": 3412
+    },
+    {
+      "path": "terminal-backend.js",
+      "sha256": "dba4e56fa1788e75ab8b5224106187017ac5e5dc1c5576a899bb0f84c12fa170",
+      "bytes": 20023
+    },
+    {
+      "path": "third-party-notices/xterm-headless-LICENSE",
+      "sha256": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+      "bytes": 1261
+    }
+  ]
+}
