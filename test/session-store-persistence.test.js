@@ -147,6 +147,28 @@ test('persisted wrapped-session restore keeps awaiting-reconnect shape', () => {
     idleTtlMs: 1800000,
     ownerPid: 1234,
     ptyPid: 5678,
+    // #1136 §5/§9 — the permanent partial-restore mark. NO VT state survives a daemon restart,
+    // so every restored record carries this and `src/vt/session-screen.js` floors it at
+    // `partial_since_restore`. Listed as an exact expected key (not matched loosely) so that a
+    // future change which stops marking restored records, or marks them `false`, is a red here.
+    vtRestored: true,
     clients: new Set(), isClosing: false, outputRing: [], ready: true,     });
   assert.equal(persistence.buildRestoredWrappedSession('beta', { type: 'spawned' }), null);
+});
+
+// #1136 §5/§9 — the mark is unconditional, and a persisted file can never talk the restore path
+// out of it. A hand-edited `vtRestored: false`, or persisted ring bytes that look like surviving
+// VT state, must not produce a record that later reads as a complete screen.
+test('restored wrapped-session is marked vtRestored regardless of persisted input', () => {
+  const base = { type: 'wrapped', command: 'claude', cwd: '/work/g' };
+
+  for (const [label, meta] of [
+    ['minimal meta', { ...base }],
+    ['hand-edited vtRestored:false', { ...base, vtRestored: false }],
+    ['persisted ring bytes', { ...base, outputRing: ['stale-vt-bytes'] }],
+  ]) {
+    const restored = persistence.buildRestoredWrappedSession('gamma', meta, { cwd: '/fallback' });
+    assert.equal(restored.vtRestored, true, `${label}: restored record must carry the mark`);
+    assert.deepEqual(restored.outputRing, [], `${label}: no VT state may survive the restore`);
+  }
 });
