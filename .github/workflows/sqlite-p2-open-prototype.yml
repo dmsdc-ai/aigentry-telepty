@@ -334,6 +334,42 @@ jobs:
             console.error("missing or empty evidence artifacts:", missing.join(", "));
             process.exit(1);
           }
+          // A nonempty file is not evidence. Both JSON artifacts must actually
+          // parse to a plain object, or this gate refuses instead of waving the
+          // bytes through. Nothing here repairs, defaults or rewrites evidence.
+          const failures = [];
+          const brief = (v) => {
+            const s = JSON.stringify(v) ?? "undefined";
+            return s.length > 200 ? `${s.slice(0, 200)}...(truncated)` : s;
+          };
+          const readObject = (f) => {
+            let parsed;
+            try { parsed = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")); }
+            catch (e) { failures.push(`${f} is not readable JSON: ${e.message}`); return null; }
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+              failures.push(`${f} did not parse to a JSON object`);
+              return null;
+            }
+            return parsed;
+          };
+          const result = readObject("result.json");
+          readObject("evidence.json");
+          // The collect step records whether it actually read the suite evidence.json
+          // on this run. A leftover or hand-placed artifact copy must never stand in
+          // for evidence that collection failed to produce.
+          if (result) {
+            if (result.suiteEvidenceRead !== true) {
+              failures.push(`result.suiteEvidenceRead is not true: ${brief(result.suiteEvidenceRead)}`);
+            }
+            if (!Object.hasOwn(result, "suiteEvidenceError") || result.suiteEvidenceError !== null) {
+              failures.push(`result.suiteEvidenceError must be present and null; recorded: ${brief(result.suiteEvidenceError)}`);
+            }
+          }
+          if (failures.length) {
+            console.error("evidence gate refused:");
+            for (const f of failures) console.error(" -", f);
+            process.exit(1);
+          }
           console.log("evidence present:", fs.readdirSync(dir).join(", "));
           NODE
 
@@ -342,7 +378,7 @@ jobs:
         run: |
           set -euo pipefail
           node <<"NODE"
-          const fs = require("node:fs");
+          const fs = require("node:fs"), path = require("node:path");
           const work = process.env.P2_WORK_DIR;
           if (!work) { console.error("P2_WORK_DIR is not set; cleanup cannot be verified"); process.exit(1); }
           if (!fs.existsSync(work)) { console.error("work root missing:", work); process.exit(1); }
@@ -351,7 +387,56 @@ jobs:
             console.error("temp roots not cleaned:", leftovers.join(", "));
             process.exit(1);
           }
+          // An empty work root shows only that nothing is left NOW; it cannot show
+          // that the suite created and removed what it claims. The recorded cleanup
+          // report is checked too, and a missing or mistyped field is a refusal.
+          const evDir = process.env.P2_EVIDENCE_DIR;
+          if (!evDir) { console.error("P2_EVIDENCE_DIR is not set; recorded cleanup cannot be verified"); process.exit(1); }
+          const failures = [];
+          const brief = (v) => {
+            const s = JSON.stringify(v) ?? "undefined";
+            return s.length > 200 ? `${s.slice(0, 200)}...(truncated)` : s;
+          };
+          const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+          const readObject = (f) => {
+            let parsed;
+            try { parsed = JSON.parse(fs.readFileSync(path.join(evDir, f), "utf8")); }
+            catch (e) { failures.push(`${f} is not readable JSON: ${e.message}`); return null; }
+            if (!isObject(parsed)) { failures.push(`${f} did not parse to a JSON object`); return null; }
+            return parsed;
+          };
+          const result = readObject("result.json");
+          const evidence = readObject("evidence.json");
+          const emptyArray = (v) => Array.isArray(v) && v.length === 0;
+          const counted = (v) => Number.isSafeInteger(v) && v >= 0;
+          // Field names below are the existing suite cleanup fields; none is
+          // invented, defaulted or repaired here.
+          const checkCleanup = (label, c) => {
+            if (!isObject(c)) { failures.push(`${label} cleanup is not an object: ${brief(c)}`); return; }
+            if (c.clean !== true) failures.push(`${label} cleanup.clean is not true: ${brief(c.clean)}`);
+            if (!counted(c.rootsCreated) || !counted(c.rootsRemoved)) {
+              failures.push(`${label} cleanup root counts are not nonnegative safe integers: created=${brief(c.rootsCreated)} removed=${brief(c.rootsRemoved)}`);
+            } else if (c.rootsCreated !== c.rootsRemoved) {
+              failures.push(`${label} cleanup root counts disagree: created=${c.rootsCreated} removed=${c.rootsRemoved}`);
+            }
+            if (!emptyArray(c.failedToRemove)) failures.push(`${label} cleanup.failedToRemove is not an empty array: ${brief(c.failedToRemove)}`);
+            if (!emptyArray(c.residualTmpRootsUnderWorkDir)) failures.push(`${label} cleanup.residualTmpRootsUnderWorkDir is not an empty array: ${brief(c.residualTmpRootsUnderWorkDir)}`);
+          };
+          if (result) checkCleanup("result.json", result.cleanup);
+          if (evidence) checkCleanup("evidence.json", evidence.cleanup);
+          // The summary must not diverge from the raw record it was copied from.
+          if (result && evidence) {
+            const canon = (v) => JSON.stringify(v, (_k, x) => (isObject(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x)) ?? "undefined";
+            const a = canon(result.cleanup), b = canon(evidence.cleanup);
+            if (a !== b) failures.push(`recorded cleanup differs between result.json and evidence.json: ${a.slice(0, 200)} vs ${b.slice(0, 200)}`);
+          }
+          if (failures.length) {
+            console.error("cleanup gate refused:");
+            for (const f of failures) console.error(" -", f);
+            process.exit(1);
+          }
           console.log("no leftover temp roots under", work);
+          console.log("recorded cleanup verified: rootsCreated = rootsRemoved =", result.cleanup.rootsCreated, "| failedToRemove and residualTmpRootsUnderWorkDir empty");
           NODE
 
       # Uploaded on failure too, so a red run still produces the TAP and the JSON
