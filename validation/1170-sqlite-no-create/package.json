@@ -1,0 +1,16 @@
+{
+  "name": "validation-1170-sqlite-no-create",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Isolated prototype validation of better-sqlite3@13.0.3 no-create/readonly/corruption behaviour for task 1170. Experiment only - not a product package, adopted by nothing.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=tap --test-reporter-destination=stdout no-create.test.cjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3"
+  }
+}

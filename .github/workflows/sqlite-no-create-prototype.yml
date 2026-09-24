@@ -1,0 +1,234 @@
+# Task #1170 / no-create prototype - ISOLATED EXPERIMENT ONLY.
+#
+# Executes the isolated better-sqlite3@13.0.3 native no-create/readonly/corruption
+# suite on three runner OSes against synthetic fixtures in the runner's temp
+# directory. It adopts nothing into the product, touches no live store, changes no
+# product engine/dependency, and qualifies no production behaviour. Node 24.21.0 and
+# better-sqlite3 are authorised for this experiment only.
+#
+# Conventions (checkout/ref, permissions, evidence gating, artifact upload) follow the
+# staged P1 prototype workflow. Reusing those conventions is NOT a claim that P1 is
+# adopted, nor a claim that any P1 file is unchanged.
+#
+# Not live-activated: runs only on explicit workflow_dispatch, or on a pull request
+# touching AT LEAST ONE of the four leaf paths below. `paths:` filters are OR triggers.
+
+name: sqlite-no-create-prototype (task 1170)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'validation/1170-sqlite-no-create/no-create.test.cjs'
+      - 'validation/1170-sqlite-no-create/package.json'
+      - 'validation/1170-sqlite-no-create/package-lock.json'
+      - '.github/workflows/sqlite-no-create-prototype.yml'
+
+# Read-only: the prototype never needs write scopes.
+permissions:
+  contents: read
+
+jobs:
+  no-create:
+    name: no-create prototype (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # Exact ref: the PR head commit under test, not the synthetic merge commit.
+      - name: Checkout exact ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Record actual git HEAD provenance
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          echo "resolved HEAD: ${HEAD_SHA}"
+          echo "NV1170AV_GIT_HEAD=${HEAD_SHA}" >> "$GITHUB_ENV"
+
+      - name: Set up pinned Node 24 (experiment-scoped)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+
+      # Owned roots only: npm cache/config, temp fixtures and evidence all live under
+      # RUNNER_TEMP. Paths are joined by Node so Windows separators stay correct.
+      - name: Stage isolated npm config/cache and owned temp roots
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs"), path = require("node:path");
+            const base = process.env.RUNNER_TEMP;
+            const mk = (n) => { const p = path.join(base, n); fs.mkdirSync(p, { recursive: true }); return p; };
+            const cache = mk("nc-npm-cache");
+            const work = mk("nc-work");
+            const evidence = mk("nc-evidence");
+            // Empty, project-independent npm config files: no inherited registry,
+            // scope, proxy or auth settings leak into this install.
+            const userconfig = path.join(base, "nc-npmrc-user");
+            const globalconfig = path.join(base, "nc-npmrc-global");
+            fs.writeFileSync(userconfig, "");
+            fs.writeFileSync(globalconfig, "");
+            fs.appendFileSync(process.env.GITHUB_ENV, [
+              `npm_config_cache=${cache}`,
+              `npm_config_userconfig=${userconfig}`,
+              `npm_config_globalconfig=${globalconfig}`,
+              `npm_config_registry=https://registry.npmjs.org/`,
+              `npm_config_audit=false`,
+              `npm_config_fund=false`,
+              `npm_config_update_notifier=false`,
+              `NV1170AV_WORK_DIR=${work}`,
+              `NV1170AV_EVIDENCE_DIR=${evidence}`,
+              "",
+            ].join("\n"));
+            console.log("npm cache:", cache, "\nwork:", work, "\nevidence:", evidence);
+          '
+
+      - name: Verify runtime provenance
+        run: |
+          set -euo pipefail
+          node -v
+          npm -v
+          test "$(node -p 'process.version')" = "v24.21.0"
+
+      # Validation-only install prefix: node_modules is created inside the validation
+      # leaf directory. The repository root package tree is never installed or touched.
+      # --ignore-scripts: no lifecycle/build script from any dependency is executed;
+      # the shipped prebuilt binary is what gets exercised.
+      - name: Install pinned validation dependencies (validation prefix only)
+        working-directory: validation/1170-sqlite-no-create
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      # Two TAP reporters (console + file) so the artifact is written without `tee`,
+      # which keeps the real process exit code on every OS. No continue-on-error:
+      # a failure on any OS fails the job and is reported as an actual failure.
+      - name: Run no-create suite
+        working-directory: validation/1170-sqlite-no-create
+        run: |
+          set -euo pipefail
+          node --test --test-timeout=30000 \
+            --test-reporter=tap --test-reporter-destination=stdout \
+            --test-reporter=tap --test-reporter-destination="$NV1170AV_EVIDENCE_DIR/no-create.tap" \
+            no-create.test.cjs
+
+      # Runs even when the suite fails, so failure evidence is captured too.
+      - name: Collect hashes and result JSON
+        if: always()
+        working-directory: validation/1170-sqlite-no-create
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
+            const evDir = process.env.NV1170AV_EVIDENCE_DIR;
+            const workDir = process.env.NV1170AV_WORK_DIR;
+            const sha = (p) => (fs.existsSync(p)
+              ? { bytes: fs.statSync(p).size, sha256: crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex") }
+              : { bytes: null, sha256: null, missing: true });
+
+            const suiteEvidencePath = path.join(workDir, "evidence.json");
+            let suiteEvidence = null, suiteEvidenceError = null;
+            try { suiteEvidence = JSON.parse(fs.readFileSync(suiteEvidencePath, "utf8")); }
+            catch (e) { suiteEvidenceError = e.message; }
+
+            const result = {
+              schema: "nv1170av-no-create-result/1",
+              track: "nv1170av",
+              task: 1170,
+              phase: "isolated-prototype-experiment",
+              scope: "single runner OS; three-OS acceptance is the matrix as a whole",
+              provenance: {
+                repository: process.env.GITHUB_REPOSITORY ?? null,
+                workflow: process.env.GITHUB_WORKFLOW ?? null,
+                runId: process.env.GITHUB_RUN_ID ?? null,
+                runNumber: process.env.GITHUB_RUN_NUMBER ?? null,
+                runAttempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+                eventName: process.env.GITHUB_EVENT_NAME ?? null,
+                githubSha: process.env.GITHUB_SHA ?? null,
+                actualGitHead: process.env.NV1170AV_GIT_HEAD ?? null,
+                runnerOs: process.env.RUNNER_OS ?? null,
+              },
+              runtime: {
+                nodeVersion: process.version,
+                execPath: process.execPath,
+                platform: process.platform,
+                arch: process.arch,
+              },
+              hashes: {
+                test: { path: "validation/1170-sqlite-no-create/no-create.test.cjs", ...sha("no-create.test.cjs") },
+                package: { path: "validation/1170-sqlite-no-create/package.json", ...sha("package.json") },
+                packageLock: { path: "validation/1170-sqlite-no-create/package-lock.json", ...sha("package-lock.json") },
+                workflow: { path: ".github/workflows/sqlite-no-create-prototype.yml", ...sha(path.join("..", "..", ".github", "workflows", "sqlite-no-create-prototype.yml")) },
+                tap: { path: "no-create.tap", ...sha(path.join(evDir, "no-create.tap")) },
+              },
+              installedPackageVersions: (() => {
+                const read = (n) => { try { return JSON.parse(fs.readFileSync(path.join("node_modules", n, "package.json"), "utf8")).version; } catch { return null; } };
+                return { "better-sqlite3": read("better-sqlite3"), "node-addon-api": read("node-addon-api") };
+              })(),
+              // Selected-vs-mapped native binary comes from the suite itself, which
+              // observes the mapping at runtime. Never re-derived or guessed here.
+              selectedPrebuild: suiteEvidence?.selectedPrebuild ?? null,
+              mappedNativeBinary: suiteEvidence?.mappedNativeBinary ?? null,
+              selectedMatchesMapped: suiteEvidence?.selectedMatchesMapped ?? null,
+              cleanup: suiteEvidence?.cleanup ?? null,
+              suiteEvidenceError,
+              generatedAt: new Date().toISOString(),
+            };
+            fs.writeFileSync(path.join(evDir, "result.json"), JSON.stringify(result, null, 2) + "\n");
+            if (suiteEvidence) fs.copyFileSync(suiteEvidencePath, path.join(evDir, "evidence.json"));
+            console.log("result.json written to", evDir);
+          '
+
+      - name: Assert evidence artifacts exist and are nonempty
+        if: always()
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs"), path = require("node:path");
+            const dir = process.env.NV1170AV_EVIDENCE_DIR;
+            const missing = ["no-create.tap", "result.json", "evidence.json"].filter((f) => {
+              const p = path.join(dir, f);
+              return !fs.existsSync(p) || fs.statSync(p).size === 0;
+            });
+            if (missing.length) {
+              console.error("missing or empty evidence artifacts:", missing.join(", "));
+              process.exit(1);
+            }
+            console.log("evidence present:", fs.readdirSync(dir).join(", "));
+          '
+
+      - name: Assert owned temp roots were cleaned
+        if: always()
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const work = process.env.NV1170AV_WORK_DIR;
+            const leftovers = fs.readdirSync(work).filter((n) => n.startsWith(".tmp-"));
+            if (leftovers.length) {
+              console.error("temp roots not cleaned:", leftovers.join(", "));
+              process.exit(1);
+            }
+            console.log("no leftover temp roots under", work);
+          '
+
+      - name: Upload TAP + JSON evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: no-create-evidence-${{ matrix.os }}
+          path: ${{ runner.temp }}/nc-evidence/
+          if-no-files-found: error
+          retention-days: 7
