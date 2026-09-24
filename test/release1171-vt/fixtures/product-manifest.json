@@ -60,17 +60,24 @@
   "authorized_additions": [
     {
       "path": "scripts/diagnose-conditional-initialization.cjs",
-      "sha256": "d2e8bde6ae1984dcaac46cfd41f73a5f4d550002c9942429d592ca8c680ca3a4",
-      "bytes": 10455,
-      "lines": 258,
-      "owner": "im1170al-v1 (controller-approved, reviewed under the prior additive-diagnostic integration)",
-      "reason": "Additive diagnostic script integrated with its CI workflow; no prior product bytes changed. CI 36009876701 (ubuntu-latest and macos-latest) failed G-COMPAT inventory on this path alone: 'PRODUCT leaves present that the frozen manifest does not authorize'. Re-measured locally before the edit: 70 actual leaves vs 69 frozen, exactly one addition, zero deletions, zero mutations, zero byte mismatches.",
-      "delta": "ONE leaf appended to files[]; leaf_count 69 -> 70; inventory_sha256 recomputed over the new (path:sha256) list. No pre-existing leaf, hash, byte count, root, exclusion, alternate or assertion was altered."
+      "sha256": "dd816829d7911951fa438c957abeea400c4243e492b1f4fb64232d3c0c7f1918",
+      "bytes": 18964,
+      "lines": 462,
+      "sha256_prior": "d2e8bde6ae1984dcaac46cfd41f73a5f4d550002c9942429d592ca8c680ca3a4",
+      "bytes_prior": 10455,
+      "lines_prior": 258,
+      "owner": "fp1170an-v1 (controller-approved, revised under the same additive-diagnostic authorization; originally integrated by im1170al-v1)",
+      "reason": "Additive diagnostic script integrated with its CI workflow; no prior product bytes changed. CI 36009876701 (ubuntu-latest and macos-latest) failed G-COMPAT inventory on this path alone: 'PRODUCT leaves present that the frozen manifest does not authorize'. Re-measured locally before the edit: 70 actual leaves vs 69 frozen, exactly one addition, zero deletions, zero mutations, zero byte mismatches. REVISED by fp1170an-v1: Windows CI 36009876886 left the recovered EPERM/-4048 fsync errno unattributed, because static evidence permits BOTH the marker-file fsync at persistence.js:424 and the directory fsync at persistence.js:428 and the two share that errno. Stage B now traces the product's real openSync/fsyncSync/closeSync calls in-process, classifies each descriptor by exact own-root path and records call order, restoring the originals in finally. Re-measured locally before the edit: 70 actual leaves vs 70 frozen, zero additions, zero deletions, exactly one authorized mutation on this path.",
+      "delta": "im1170al-v1: ONE leaf appended to files[]; leaf_count 69 -> 70; inventory_sha256 recomputed over the new (path:sha256) list. fp1170an-v1: NO leaf added or removed; leaf_count stays 70; this leaf's hash/bytes/lines updated in place in both files[] and authorized_additions[], inventory_sha256 recomputed over the unchanged (path:sha256) ordering. No other leaf, hash, byte count, root, exclusion, authorized alternate or assertion was altered."
     }
   ],
   "leaf_count": 70,
-  "inventory_sha256": "fc19b5292684ee48f320e56f4c6d4c3c86503ace3c7c9ec8d038bd183fb7d83c",
-  "inventory_sha256_prior": "7a43c788e36f169b6bcc9d921f105aa7f2cc4d9bad9e6615df78896e0ce6cae7",
+  "inventory_sha256": "36b7b8255885524055512cc656a8a973a4712bf6a5770f968ea3bb645e4a0471",
+  "inventory_sha256_prior": "fc19b5292684ee48f320e56f4c6d4c3c86503ace3c7c9ec8d038bd183fb7d83c",
+  "inventory_sha256_history": [
+    "7a43c788e36f169b6bcc9d921f105aa7f2cc4d9bad9e6615df78896e0ce6cae7",
+    "fc19b5292684ee48f320e56f4c6d4c3c86503ace3c7c9ec8d038bd183fb7d83c"
+  ],
   "files": [
     {
       "path": "auth.js",
@@ -149,8 +156,8 @@
     },
     {
       "path": "scripts/diagnose-conditional-initialization.cjs",
-      "sha256": "d2e8bde6ae1984dcaac46cfd41f73a5f4d550002c9942429d592ca8c680ca3a4",
-      "bytes": 10455
+      "sha256": "dd816829d7911951fa438c957abeea400c4243e492b1f4fb64232d3c0c7f1918",
+      "bytes": 18964
     },
     {
       "path": "scripts/gen-readme.mjs",
