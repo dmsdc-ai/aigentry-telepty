@@ -57,8 +57,20 @@
     ]
   },
   "alternates_policy": "An alternate is an EXACT additional sha256 for one named leaf. There is no path-based ignore and no byte-range tolerance anywhere in this manifest. Any leaf hash outside its authorized set is a failure.",
-  "leaf_count": 69,
-  "inventory_sha256": "7a43c788e36f169b6bcc9d921f105aa7f2cc4d9bad9e6615df78896e0ce6cae7",
+  "authorized_additions": [
+    {
+      "path": "scripts/diagnose-conditional-initialization.cjs",
+      "sha256": "d2e8bde6ae1984dcaac46cfd41f73a5f4d550002c9942429d592ca8c680ca3a4",
+      "bytes": 10455,
+      "lines": 258,
+      "owner": "im1170al-v1 (controller-approved, reviewed under the prior additive-diagnostic integration)",
+      "reason": "Additive diagnostic script integrated with its CI workflow; no prior product bytes changed. CI 36009876701 (ubuntu-latest and macos-latest) failed G-COMPAT inventory on this path alone: 'PRODUCT leaves present that the frozen manifest does not authorize'. Re-measured locally before the edit: 70 actual leaves vs 69 frozen, exactly one addition, zero deletions, zero mutations, zero byte mismatches.",
+      "delta": "ONE leaf appended to files[]; leaf_count 69 -> 70; inventory_sha256 recomputed over the new (path:sha256) list. No pre-existing leaf, hash, byte count, root, exclusion, alternate or assertion was altered."
+    }
+  ],
+  "leaf_count": 70,
+  "inventory_sha256": "fc19b5292684ee48f320e56f4c6d4c3c86503ace3c7c9ec8d038bd183fb7d83c",
+  "inventory_sha256_prior": "7a43c788e36f169b6bcc9d921f105aa7f2cc4d9bad9e6615df78896e0ce6cae7",
   "files": [
     {
       "path": "auth.js",
@@ -134,6 +146,11 @@
       "path": "runtime-info.js",
       "sha256": "e08204d3227eba4c2e0239a4377db848fc5a4a97c473ecac5efbecb8c222142e",
       "bytes": 1231
+    },
+    {
+      "path": "scripts/diagnose-conditional-initialization.cjs",
+      "sha256": "d2e8bde6ae1984dcaac46cfd41f73a5f4d550002c9942429d592ca8c680ca3a4",
+      "bytes": 10455
     },
     {
       "path": "scripts/gen-readme.mjs",
