@@ -476,6 +476,18 @@ function spawnChild(extraEnv) {
     result: null,
     exitCode: null,
     signal: null,
+    // Immutable observed exit facts. exited is set ONLY by the exit event, never by cleanup.
+    exited: false,
+    // Cleanup bookkeeping, kept separate from the observed exit facts above:
+    //   killRequested - the test asked the OS to terminate a child it had observed to be LIVE.
+    //   killDelivered - that request was accepted by the OS (null while none was ever made).
+    //   killedByTest  - this child died because the test terminated it. A request that was not
+    //                   delivered NEVER sets this: a failed kill cannot prove a termination.
+    //   cleanupCalls  - how many times cleanup ran; repeated cleanup must not invent observations.
+    killRequested: false,
+    killDelivered: null,
+    killError: null,
+    cleanupCalls: 0,
     killedByTest: false,
     stderrHead: '',
   };
@@ -500,20 +512,66 @@ function spawnChild(extraEnv) {
     child.on('exit', (code, signal) => {
       record.exitCode = code;
       record.signal = signal;
+      record.exited = true;
       liveChildren.delete(handle);
       resolve(record);
     });
   });
   // The test owns this exact handle. No global process kill is ever issued.
+  //
+  // Cleanup is bookkeeping, not an observation. A child ALREADY observed to exit is never
+  // relabelled as test-killed: its death was reported by the exit event before cleanup ran, so
+  // attributing it to the test would contradict the very facts that event recorded. Cleanup of a
+  // child that is still LIVE (the timeout / abandoned-handle path) is a real termination by the
+  // test and IS labelled and recorded, including a request the OS refused.
   handle.kill = () => {
-    record.killedByTest = true;
+    record.cleanupCalls += 1;
+    // Already exited: nothing to terminate, and nothing new to observe. Idempotent by construction.
+    if (record.exited) return false;
+    record.killRequested = true;
+    let delivered = false;
     try {
-      child.kill('SIGKILL');
-    } catch {
-      // The child had already exited; nothing to do.
+      // child.kill() reports whether the signal was accepted by the OS.
+      delivered = child.kill('SIGKILL') === true;
+    } catch (error) {
+      record.killError = String((error && error.code) || error);
+      delivered = false;
     }
+    record.killDelivered = delivered;
+    // Only a DELIVERED kill against a live child makes this death test-caused. A refused kill
+    // leaves the fate unknown, which childLifecycle() reports as a failure-worthy state.
+    record.killedByTest = delivered;
+    return delivered;
   };
   return handle;
+}
+
+// Derives a child lifecycle from the recorded facts alone. Failed cleanup and an unknown fate are
+// distinct, reportable states - never quietly folded into a clean exit.
+function childLifecycle(record) {
+  if (record.exited) {
+    return record.killedByTest ? 'terminated-by-test' : 'exited-observed';
+  }
+  if (record.killRequested && record.killDelivered !== true) return 'kill-failed-unknown';
+  if (record.killRequested) return 'kill-delivered-exit-unobserved';
+  return 'live-never-cleaned-up';
+}
+
+// The observation-bearing fields only - exactly what a repeated cleanup must never change. The
+// cleanup call COUNT is deliberately excluded: counting a second cleanup is bookkeeping, whereas
+// changing any field below would be inventing an observation.
+function lifecycleFacts(record) {
+  return {
+    exited: record.exited,
+    exitCode: record.exitCode,
+    signal: record.signal,
+    result: record.result,
+    killRequested: record.killRequested,
+    killDelivered: record.killDelivered,
+    killError: record.killError,
+    killedByTest: record.killedByTest,
+    lifecycle: childLifecycle(record),
+  };
 }
 
 // Bounds a wait without ever masking a non-unique winner: a timeout is a hard failure, never a
@@ -1263,6 +1321,26 @@ test('K1 interruption: a terminated initializer leaves state that a fresh one re
       );
       assert.notEqual(record.exitCode, 0, `K1 ${crashAt}: a terminated initializer never exits 0`);
 
+      // Cleanup-bookkeeping regression (child-lifecycle oracle). The seam terminated this child and
+      // the exit event recorded that BEFORE the finally-cleanup above ran, so the cleanup must have
+      // been a no-op that relabelled nothing. The original handle.kill() instead set killedByTest
+      // unconditionally, contradicting the exit facts and failing the assertion above on all three
+      // runners. These checks pin the corrected bookkeeping rather than the symptom.
+      assert.equal(record.exited, true, `K1 ${crashAt}: the child exit is observed before cleanup runs`);
+      assert.equal(record.killRequested, false, `K1 ${crashAt}: cleanup of an exited child requests no kill`);
+      assert.equal(record.killDelivered, null, `K1 ${crashAt}: no kill is delivered to an already exited child`);
+      assert.equal(record.killError, null, `K1 ${crashAt}: a no-op cleanup reports no kill error`);
+      assert.equal(record.cleanupCalls, 1, `K1 ${crashAt}: the finally-cleanup ran exactly once`);
+      assert.equal(childLifecycle(record), 'exited-observed',
+        `K1 ${crashAt}: the lifecycle is a plain observed exit, not a test-caused death`);
+
+      // Repeated cleanup must not invent observations: a second call may only advance the counter.
+      const factsBeforeRepeatCleanup = lifecycleFacts(record);
+      handle.kill();
+      assert.equal(record.cleanupCalls, 2, `K1 ${crashAt}: the repeated cleanup is counted`);
+      assert.deepEqual(lifecycleFacts(record), factsBeforeRepeatCleanup,
+        `K1 ${crashAt}: repeated cleanup invents no new observation`);
+
       // The leftover inventory, recorded VERBATIM before anything else touches it.
       assert.equal(fs.existsSync(storeRoot), true, `K1 ${crashAt}: the claimed root survives the termination`);
       const leftoverBefore = stateSnapshot(storeRoot);
@@ -1288,6 +1366,14 @@ test('K1 interruption: a terminated initializer leaves state that a fresh one re
           ? 'posix signal SIGKILL'
           : 'no signal reported (Windows TerminateProcess), nonzero exit code',
         childReportedResult: record.result,
+        childLifecycle: childLifecycle(record),
+        cleanupBookkeeping: {
+          cleanupCalls: record.cleanupCalls,
+          killRequested: record.killRequested,
+          killDelivered: record.killDelivered,
+          killError: record.killError,
+          killedByTest: record.killedByTest,
+        },
         leftoverInventory: leftoverBefore,
         leftoverSidecars,
         leftoverUnchangedAfterRefusal: true,
@@ -1313,6 +1399,9 @@ test('K1 interruption: a terminated initializer leaves state that a fresh one re
     evidence.cases.K1 = {
       crashPoints: CRASH_POINTS,
       observations,
+      cleanupOracle: 'a child already observed to exit is never labelled test-killed; cleanup of a '
+        + 'still-live owned handle is labelled, attempted and recorded; a kill the OS refuses never '
+        + 'proves termination; repeated cleanup invents no observation',
       establishes: 'leftover CLASSIFICATION only: a later initializer refuses '
         + `${REASON_ROOT_EXISTS} and removes nothing`,
       doesNotEstablish: [
