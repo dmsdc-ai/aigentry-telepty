@@ -449,7 +449,22 @@ function applyExperimentalStoreMutation(storeRoot, options) {
     // instead of failing on a later lock upgrade. Everything below runs on this one handle while
     // it holds that lock: there is no pre-open probe, no second connection and no separate race
     // window.
-    db.exec(`BEGIN IMMEDIATE`);
+    // W5/c and W5/d. A corrupt body and a legacy JSON body both OPEN: the native open does not
+    // read page 1, so an unopenable store first surfaces HERE, when the immediate begin takes the
+    // RESERVED lock and SQLite reads the header. Left unguarded that throw reaches the generic
+    // pre-commit catch below and is reported experimental_write_transaction_failed, which
+    // contradicts the section 3 row requiring corrupt bytes and a JSON body to refuse
+    // experimental_store_unavailable. The mapping is the SAME helper the R2-3 preflight reads
+    // already use, so no new reason, detail or code vocabulary is introduced, the observed
+    // sqliteCode and errno are preserved verbatim, and SQLITE_BUSY, constraint, I/O and unknown
+    // codes are rethrown UNTOUCHED - a busy begin is still experimental_store_busy, and nothing
+    // else is masked as corruption. beginReturned stays false, so no rollback is issued for a
+    // transaction that never began, and R2-1 (b) holds with retrySafe true.
+    try {
+      db.exec(`BEGIN IMMEDIATE`);
+    } catch (error) {
+      throw shapeRefusalOrRethrow(error);
+    }
     beginReturned = true;
 
     // R2-3 step 1.
