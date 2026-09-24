@@ -1,0 +1,39 @@
+name: Conditional Initialization Diagnostic
+
+# #1170 instrumentation job. NOT a support/release gate: it does not run the regression suite and
+# cannot turn the red windows-latest run green. It exists to recover the runtime errno that the
+# refusal string `first_initialization_failed:conditional_initialization_failed` drops.
+on:
+  pull_request:
+    paths:
+      - 'scripts/diagnose-conditional-initialization.cjs'
+      - '.github/workflows/conditional-initialization-diagnostic.yml'
+      - 'src/session-store/persistence.js'
+      - 'src/session-store/conditional-admission.js'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # No `npm ci`: persistence.js imports only node:fs, node:os and node:path, so the probe's
+      # direct imports need no installed dependency.
+      - name: Run conditional-initialization probe
+        run: node scripts/diagnose-conditional-initialization.cjs
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conditional-initialization-diagnostic
+          path: conditional-initialization-diagnostic.json
+          # A missing artifact means the measurement was lost; that must fail, not warn.
+          if-no-files-found: error
+          retention-days: 7
