@@ -1,0 +1,104 @@
+name: Release 1171 telepty acceptance
+
+# tt1170aa: added `pull_request` so the suite actually runs on this release PR branch;
+# `workflow_dispatch` is retained for manual re-runs. No other trigger, no host credentials.
+on:
+  pull_request:
+  workflow_dispatch:
+
+# The job needs nothing but the checkout; declaring it explicitly keeps the default
+# token read-only and guarantees no host credential is reachable from the suite.
+permissions:
+  contents: read
+
+jobs:
+  synthetic-acceptance:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          # tt1170aa DEFECT-1: the release branch package lives at the REPOSITORY ROOT.
+          # There is no `source/` sibling to key the cache off.
+          cache-dependency-path: package-lock.json
+      - name: Locked install
+        # tt1170aa DEFECT-1: `npm ci` runs at the ROOT, which is where package.json,
+        # package-lock.json and the resulting node_modules all live.
+        run: npm ci
+      - name: Run retained synthetic suites
+        shell: bash
+        env:
+          NODE: node
+          # The harness defaults already resolve to `<repo root>` and
+          # `<repo root>/node_modules`. These are set only to pin the selection
+          # explicitly in CI; unsetting them would select the identical paths.
+          NODE_PATH: ${{ github.workspace }}/node_modules
+          TELEPTY_DEPENDENCY_ROOT: ${{ github.workspace }}/node_modules
+          VT_SOURCE_ROOT: ${{ github.workspace }}
+        run: |
+          set +e
+          ARTIFACT_DIR="$GITHUB_WORKSPACE/artifacts/release1171-telepty"
+          mkdir -p "$ARTIFACT_DIR"
+
+          # tt1170aa DEFECT-3: `first_failure` must be assigned in THIS shell. The previous
+          # workflow ran the legacy suites inside a `( cd source ... )` subshell, so every
+          # assignment made there died with the subshell and a real legacy failure exited 0.
+          # There is no `cd` at all now (DEFECT-1: everything is already at the root), so no
+          # subshell exists and the variable survives every call.
+          first_failure=""
+
+          # tt1170aa DEFECT-2: the function itself invokes "$NODE". Call sites must therefore
+          # pass ONLY the arguments. Previously both did, producing `node node --test ...`,
+          # which makes node execute a file literally named "node" -- it fails for a reason
+          # that has nothing to do with the suite under test.
+          run_suite() {
+            name="$1"
+            shift
+            "$NODE" "$@" >"$ARTIFACT_DIR/${name}.tap" 2>&1
+            rc=$?
+            printf '%s\n' "$rc" >"$ARTIFACT_DIR/${name}.exit"
+            if [ "$rc" -ne 0 ] && [ -z "$first_failure" ]; then first_failure="$rc"; fi
+            return 0
+          }
+
+          # Retained synthetic suites (VT, focused, T0 conditional admission).
+          run_suite vt --test test/release1171-vt/tests/*.test.js
+          run_suite vt-focused --test test/release1171-vt/focused/*.test.js
+          run_suite t0 --test test/conditional-admission.test.js
+
+          # tt1170aa: the guard for the three corrected workflow defects. It re-extracts this
+          # very step and re-checks the command vector, the ROOT layout and failure propagation
+          # against inert stubs, so a regression in this file fails the job that contains it.
+          run_suite wf-vector --test test/release1171-vt/ci/*.test.js
+
+          # The six existing regressions that make up the 70-case half of the T0 split.
+          run_suite t0-legacy-six --require ./test-support/setup-env.js --test \
+            test/http-auth.test.js test/provenance.test.js test/peer-inject-validator.test.js \
+            test/inject-redeliver.test.js test/inject-consumption-evidence.test.js \
+            test/session-credentials.test.js
+
+          # The four exact real-transport suites carried over from the prior workflow. These
+          # exercise daemon/WS/bridge behaviour and are claimed as evidence only from a real
+          # GitHub VM, never from the local sandbox.
+          run_suite legacy-owner-displaced --require ./test-support/setup-env.js --test test/owner-displaced-observation-60.test.js
+          run_suite legacy-ws-owner-swap --require ./test-support/setup-env.js --test test/ws-owner-record-swap-732.test.js
+          run_suite legacy-bridge-pipe --require ./test-support/setup-env.js --test test/bridge-output-pipe-732.test.js
+          run_suite legacy-bridge-levers --require ./test-support/setup-env.js --test test/bridge-output-pipe-732-levers.test.js
+
+          # Any nonzero suite fails the job, including one that only fails after earlier
+          # suites have already passed.
+          exit "${first_failure:-0}"
+      - name: Upload synthetic diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release1171-telepty-${{ matrix.os }}
+          path: artifacts/release1171-telepty/
+          if-no-files-found: error
