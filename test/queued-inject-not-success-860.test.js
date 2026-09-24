@@ -19,15 +19,15 @@
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
 const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
+const { createProvisionedTestHome } = require('../test-support/setup-env');
 
 // Hermetic require, same reason as test/completion-unknown-observation-60.test.js: `require`ing
 // the daemon reads $HOME at load and would otherwise restore and supervise the developer's live
 // sessions inside this test process.
-const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty860-f2-'));
+// T0 (#1170): the factory, not `mkdtempSync` — this replaces the preload's provisioned HOME, and an
+// uninitialized store fences every sid, so writeDataToSession refuses before the arms below.
+const TMP_HOME = createProvisionedTestHome('telepty860-f2-');
 process.env.HOME = TMP_HOME;
 process.env.USERPROFILE = TMP_HOME;
 process.env.PORT = '0';
