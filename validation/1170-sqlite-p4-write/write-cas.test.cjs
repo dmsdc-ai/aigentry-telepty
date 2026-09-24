@@ -1218,11 +1218,34 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
     // The open failure must carry the observed PRIMARY sqliteCode. An extended code is RECORDED
     // when observed and is never asserted (P2 captured none on any runner).
     const sqliteCode = codeOf(result.sqliteCode);
-    assert.notEqual(sqliteCode, null,
-      "W5/" + arm + ": an open failure must report the observed sqliteCode");
+    // R3-2. An ABSENT binding code is a MEASURED UNKNOWN, never permission to invent one: the
+    // pinned binding can refuse before sqlite3_open_v2, in which case no SQLite code was ever
+    // observable. The W11 arms already pass with sqliteCode null on this same reason. The hard
+    // requirement is therefore that the code is RECORDED EXPLICITLY - never that one must exist.
+    // No assertion is deleted and none is weakened into a mere recording: all three below are hard.
+    const sqliteCodeKeyPresent = Object.hasOwn(result, "sqliteCode");
+    const sqliteCodeObserved = sqliteCode !== null;
+    // (i) a PRESENT key is never undefined, empty or otherwise a placeholder for an unknown.
+    if (sqliteCodeKeyPresent) {
+      assert.equal(typeof result.sqliteCode === "string" && result.sqliteCode !== "", true,
+        "W5/" + arm + ": a PRESENT sqliteCode key must carry a non-empty observed string, never an "
+        + "invented, empty or undefined placeholder");
+    }
+    // (ii) the explicit observation flag is a boolean, and the code is a string or an explicit null.
+    assert.equal(typeof sqliteCodeObserved, "boolean",
+      "W5/" + arm + ": sqliteCodeObserved must be recorded EXPLICITLY as a boolean");
+    assert.equal(sqliteCode === null || typeof sqliteCode === "string", true,
+      "W5/" + arm + ": sqliteCode must be recorded as a string or as an explicit null");
+    // (iii) an OBSERVED code must be the PRIMARY one. An extended code stays recorded, never
+    // asserted (P2 captured none on any runner), so observing one here is a hard failure.
+    if (sqliteCodeObserved) {
+      assert.equal(isExtendedCode(sqliteCode), false,
+        "W5/" + arm + ": an observed open-failure code must be the PRIMARY sqliteCode, observed "
+        + String(sqliteCode));
+    }
     assert.notEqual(result.reason, "conditional_store_not_initialized",
       "W5/" + arm + ": a product reason code is never emitted, and no initialize decision is made");
-    return { result, sqliteCode };
+    return { result, sqliteCode, sqliteCodeKeyPresent, sqliteCodeObserved };
   }
 
   // (a) absent storeRoot: the name is never created, recursively or otherwise.
@@ -1230,12 +1253,13 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
     const parent = ownedParent("w5a");
     const storeRoot = path.join(parent, "absent-store-root");
     const before = inventory(parent);
-    const { result, sqliteCode } = record("a:absent-store-root", { storeRoot });
+    const { result, sqliteCode, sqliteCodeKeyPresent, sqliteCodeObserved } =
+      record("a:absent-store-root", { storeRoot });
     assert.equal(fs.existsSync(storeRoot), false,
       "W5/a: the absent storeRoot must NOT be created - the slice has no mkdir of any kind");
     assert.deepEqual(inventory(parent), before, "W5/a: the owned parent is untouched");
     arms.push({
-      arm: "a:absent-store-root", result, sqliteCode,
+      arm: "a:absent-store-root", result, sqliteCode, sqliteCodeKeyPresent, sqliteCodeObserved,
       storeRootCreated: false, parentInventory: inventory(parent),
       absenceClaim: "NOT CLAIMED: a refused open does not establish absence rather than "
         + "inaccessibility (P2-CORRECTIONS C1). The code is recorded, the cause is not inferred.",
@@ -1246,15 +1270,16 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
   {
     const spec = newStateStore("w5b", "empty-root");
     const before = snapshotRoot(spec.storeRoot);
-    const { result, sqliteCode } = record("b:no-db-file", spec);
+    const { result, sqliteCode, sqliteCodeKeyPresent, sqliteCodeObserved } =
+      record("b:no-db-file", spec);
     const after = snapshotRoot(spec.storeRoot);
     assert.equal(fs.existsSync(spec.dbPath), false,
       "W5/b: the missing database file must NOT be created - fileMustExist omits SQLITE_OPEN_CREATE");
     assert.deepEqual(after.inventory, before.inventory, "W5/b: the inventory is identical");
     assert.deepEqual(after.members, before.members, "W5/b: every pre-existing byte is identical");
     assert.deepEqual(after.sidecars, [], "W5/b: no -journal, -wal or -shm is created");
-    arms.push({ arm: "b:no-db-file", result, sqliteCode, dbCreated: false,
-      byteObservation: byteObservation(before, after) });
+    arms.push({ arm: "b:no-db-file", result, sqliteCode, sqliteCodeKeyPresent, sqliteCodeObserved,
+      dbCreated: false, byteObservation: byteObservation(before, after) });
   }
 
   // (c) corrupt bytes (P2 F7 body) and (d) a legacy JSON body (P2 F8 body).
@@ -1262,14 +1287,15 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
     const spec = newStateStore("w5-" + kind, kind);
     const before = snapshotRoot(spec.storeRoot);
     const beforeSha = sha256File(spec.dbPath);
-    const { result, sqliteCode } = record(arm, spec);
+    const { result, sqliteCode, sqliteCodeKeyPresent, sqliteCodeObserved } = record(arm, spec);
     const after = snapshotRoot(spec.storeRoot);
     assert.equal(sha256File(spec.dbPath), beforeSha,
       "W5/" + arm + ": the pre-existing body is byte-identical - never truncated, repaired or replaced");
     assert.deepEqual(after.inventory, before.inventory, "W5/" + arm + ": the inventory is identical");
     assert.deepEqual(after.members, before.members, "W5/" + arm + ": every byte is identical");
     assert.deepEqual(after.sidecars, [], "W5/" + arm + ": no sidecar is created");
-    arms.push({ arm, result, sqliteCode, sha256Before: beforeSha, sha256After: sha256File(spec.dbPath),
+    arms.push({ arm, result, sqliteCode, sqliteCodeKeyPresent, sqliteCodeObserved,
+      sha256Before: beforeSha, sha256After: sha256File(spec.dbPath),
       byteObservation: byteObservation(before, after) });
   }
 
@@ -1278,11 +1304,13 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
     const parent = ownedParent("w5e-win");
     const storeRoot = overLongStoreRoot(parent);
     const before = inventory(parent);
-    const { result, sqliteCode } = record("e:windows-over-length-path", { storeRoot });
+    const { result, sqliteCode, sqliteCodeKeyPresent, sqliteCodeObserved } =
+      record("e:windows-over-length-path", { storeRoot });
     assert.deepEqual(inventory(parent), before,
       "W5/e: no component of the over-length path is created");
     arms.push({
-      arm: "e:windows-over-length-path", result, sqliteCode,
+      arm: "e:windows-over-length-path", result, sqliteCode, sqliteCodeKeyPresent,
+      sqliteCodeObserved,
       pathLength: storeRoot.length,
       claimScope: "a LENGTH case only. No ACL, DACL, confinement, hostile-path or path-identity "
         + "claim is made, and no privilege expansion or denial bypass is attempted.",
@@ -1302,10 +1330,14 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
     fs.chmodSync(spec.storeRoot, 0o000);
     let result;
     let sqliteCode;
+    let sqliteCodeKeyPresent;
+    let sqliteCodeObserved;
     try {
       const recorded = record("e:posix-denied-path", spec);
       result = recorded.result;
       sqliteCode = recorded.sqliteCode;
+      sqliteCodeKeyPresent = recorded.sqliteCodeKeyPresent;
+      sqliteCodeObserved = recorded.sqliteCodeObserved;
     } finally {
       fs.chmodSync(spec.storeRoot, 0o700);
     }
@@ -1315,7 +1347,8 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
     assert.deepEqual(after.inventory, before.inventory, "W5/e: the inventory is identical");
     assert.deepEqual(after.sidecars, [], "W5/e: no sidecar is created");
     arms.push({
-      arm: "e:posix-denied-path", result, sqliteCode, euid,
+      arm: "e:posix-denied-path", result, sqliteCode, sqliteCodeKeyPresent, sqliteCodeObserved,
+      euid,
       modeApplied: "0o000 on an owned fixture directory under WORK_DIR, restored before removal",
       sha256Before: beforeSha, sha256After: sha256File(spec.dbPath),
       byteObservation: byteObservation(before, after),
@@ -1329,6 +1362,14 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
   for (const entry of arms) {
     assert.equal(entry.result.reason, REASON_UNAVAILABLE,
       "W5: every arm refuses with the same experimental unavailable code");
+    // R3-2: EVERY arm must have recorded its code observation explicitly - a missing flag is the
+    // silent omission section 8 forbids, and is a hard failure rather than a tolerated unknown.
+    assert.equal(typeof entry.sqliteCodeObserved, "boolean",
+      "W5/" + entry.arm + ": the code observation must be recorded explicitly as a boolean");
+    assert.equal(entry.sqliteCode === null || typeof entry.sqliteCode === "string", true,
+      "W5/" + entry.arm + ": the recorded sqliteCode is a string or an explicit null");
+    assert.equal(entry.sqliteCodeObserved, entry.sqliteCode !== null,
+      "W5/" + entry.arm + ": the observation flag must agree with the recorded code");
   }
 
   evidence.cases.W5 = {
@@ -1338,6 +1379,10 @@ test("W5 storage loss: every unopenable store refuses closed and nothing is crea
       + "a no-modification observation, not a zero-call or access-ordering proof.",
     extendedCodePolicy: "an extended SQLite result code is RECORDED when observed and asserted "
       + "never; P2 captured none on any runner",
+    absentCodePolicy: "R3-2: where the pinned binding refuses BEFORE sqlite3_open_v2 no SQLite "
+      + "code is observable at all. That is a MEASURED UNKNOWN recorded as sqliteCode null with "
+      + "sqliteCodeObserved false - never an invented code, and never a silently omitted one. An "
+      + "OBSERVED code is still hard-asserted to be the PRIMARY code.",
   };
   maybeForceFail("W5");
 });
@@ -1352,6 +1397,50 @@ function raceOptions(iteration, index) {
     expectedGeneration: 1,
     mutation: mutationOf("binding-child-" + index, { iteration, child: index }),
     requestId: "p4-race-" + iteration + "-" + index,
+  };
+}
+
+// Every scalar of a race child result that survives the IPC JSON boundary, recorded VERBATIM.
+// write-child.cjs drops error and cleanupError across that boundary, so these are the only
+// cause-side facts that can ever reach the parent: if they are not recorded they are lost for
+// good, which is exactly what happened to Windows iteration 14. A missing result is an explicit
+// null plus resultReceived:false - never silently folded into a refusal.
+function raceScalars(result) {
+  if (result === null || result === undefined) {
+    return {
+      resultReceived: false, ok: null, reason: null, detail: null,
+      sqliteCode: null, sqliteCodeObserved: false, errno: null, errnoObserved: false,
+      commitAttempted: null, committed: null, retrySafe: null, generation: null,
+      key: null, requestId: null,
+    };
+  }
+  const sqliteCode = codeOf(result.sqliteCode);
+  return {
+    resultReceived: true,
+    ok: result.ok === true,
+    reason: result.reason === undefined ? null : result.reason,
+    detail: result.detail === undefined ? null : result.detail,
+    sqliteCode,
+    sqliteCodeObserved: sqliteCode !== null,
+    errno: result.errno === undefined ? null : result.errno,
+    errnoObserved: result.errno !== undefined,
+    commitAttempted: result.commitAttempted === undefined ? null : result.commitAttempted,
+    committed: result.committed === undefined ? null : result.committed,
+    retrySafe: result.retrySafe === undefined ? null : result.retrySafe,
+    generation: result.generation === undefined ? null : result.generation,
+    key: result.key === undefined ? null : result.key,
+    requestId: result.requestId === undefined ? null : result.requestId,
+  };
+}
+
+// A failed observation is recorded as an observation, never as a verdict: no branch anywhere in
+// this suite reads this text to decide an outcome (R2-7 forbids message-derived verdicts).
+function observationFailure(error) {
+  return {
+    observed: String((error && error.code) || (error && error.name) || "error"),
+    diagnostic: String((error && error.message) || error),
+    note: "OBSERVATION ONLY - recorded so a failed read is visible as a failed read. No verdict "
+      + "is derived from this text, and a failed read is NEVER reported as zero rows.",
   };
 }
 
@@ -1375,6 +1464,120 @@ async function runRaceIteration(iteration) {
 
   const records = handles.map(handle => handle.record);
   const facts = records.map(lifecycleFacts);
+  const results = records.map(record => record.result);
+
+  // ---- FAILURE-SAFE EVIDENCE LATCH: every record below PRECEDES every assertion -------------
+  // Windows iteration 14 destroyed its own evidence because every record call sat AFTER the
+  // loser-vocabulary assertion: the 8 lifecycle facts, the 7 loser vocabulary rows, the
+  // independent ledger read, the row count, the winner key, the sidecars and the inventory were
+  // all lost, and iterations 15-20 never ran at all. The one question that mattered - whether
+  // the uncertain child row landed (rows 2) or not (rows 1) - was precisely the one the aborted
+  // read would have answered. Recording now happens first and unconditionally.
+  //
+  // NOTHING below is weakened to achieve this: every original assertion still runs, still hard,
+  // immediately after the latch, and the loser vocabulary stays closed to conflict-or-busy.
+
+  // (1) all 8 child lifecycles, unconditionally and exactly once per child.
+  evidence.children.records.push(...facts.map(fact => ({ caseId: "W6", iteration, ...fact })));
+
+  // (2) all 8 child outcomes verbatim, including the phase scalars that survive IPC JSON.
+  const outcomes = records.map((record, index) => ({
+    child: index,
+    ...lifecycleFacts(record),
+    stderrHead: record.stderrHead === "" ? null : record.stderrHead,
+    ...raceScalars(record.result),
+  }));
+
+  const winners = results.filter(result =>
+    result !== null && result !== undefined && result.ok === true);
+  const losers = results.filter(result =>
+    result === null || result === undefined || result.ok !== true);
+
+  // (3) a vocabulary row for EVERY loser. recordVocabulary itself asserts, so each call is
+  // guarded: one failing row can no longer discard the other six. The collected failures are
+  // re-raised as a hard assertion once the latch is sealed - deferred, never dropped.
+  const vocabularyErrors = [];
+  records.forEach((record, index) => {
+    const result = record.result;
+    if (result === null || result === undefined || result.ok === true) return;
+    try {
+      recordVocabulary("W6",
+        "iteration-" + iteration + ":child-" + index + ":" + String(result.reason),
+        result, { synthetic: false });
+    } catch (error) {
+      vocabularyErrors.push({ child: index, reason: String(result.reason), ...observationFailure(error) });
+    }
+  });
+
+  // (4) the INDEPENDENT P2 opener read: generation, row count and section keys. A failed or
+  // missing read is recorded as an explicit null with ledgerRead:false and is NEVER reported as
+  // zero rows - "nothing landed" may only ever be claimed from a read that actually succeeded.
+  let ledger = null;
+  let ledgerError = null;
+  let generationObserved = null;
+  let rowsObserved = null;
+  let sectionKeysObserved = null;
+  let ledgerKeysObserved = null;
+  try {
+    ledger = requireLedger(store.dbPath, "W6 iteration " + iteration);
+    generationObserved = ledger.generation;
+    rowsObserved = totalSectionRows(ledger);
+    sectionKeysObserved = sectionKeys(ledger, TARGET_SECTION);
+    ledgerKeysObserved = Object.keys(ledger).sort();
+  } catch (error) {
+    ledger = null;
+    ledgerError = observationFailure(error);
+  }
+
+  // (5) the on-disk inventory and sidecars, guarded the same way.
+  let inventoryAfter = null;
+  let sidecarsAfter = null;
+  let inventoryError = null;
+  try {
+    inventoryAfter = inventory(store.storeRoot);
+    sidecarsAfter = sidecars(store.storeRoot);
+  } catch (error) {
+    inventoryError = observationFailure(error);
+  }
+
+  const latch = {
+    iteration,
+    // Explicitly incomplete until every assertion below has passed. A partial iteration is
+    // NEVER recorded as a success to satisfy a downstream gate.
+    status: "incomplete",
+    childrenPerIteration: RACE_CHILD_COUNT,
+    childrenObserved: outcomes.length,
+    outcomes,
+    winners: winners.length,
+    losers: losers.length,
+    retriesUsed: 0,
+    winnerKey: winners.length === 1 && winners[0].key !== undefined ? winners[0].key : null,
+    winnerRequestId: winners.length === 1 && winners[0].requestId !== undefined
+      ? winners[0].requestId : null,
+    winnerGeneration: winners.length === 1 && winners[0].generation !== undefined
+      ? winners[0].generation : null,
+    loserReasons: losers.map(result =>
+      result === null || result === undefined ? null : result.reason).sort(),
+    loserScalars: outcomes.filter(outcome => outcome.ok !== true),
+    vocabularyErrors,
+    ledgerRead: ledger !== null,
+    ledgerError,
+    generationAfter: generationObserved,
+    rowsAfter: rowsObserved,
+    sectionKeysAfter: sectionKeysObserved,
+    ledgerKeysAfter: ledgerKeysObserved,
+    inventoryAfter,
+    sidecarsAfter,
+    inventoryError,
+    childFacts: facts,
+    zeroRowPolicy: "a missing or failed ledger read is recorded as null with ledgerRead:false "
+      + "and is NEVER reported as zero rows",
+    recordingOrder: "every field above was recorded BEFORE the first assertion below",
+  };
+  evidence.cases.W6.iterations.push(latch);
+  evidence.cases.W6.iterationsRecorded = evidence.cases.W6.iterations.length;
+
+  // ---- ASSERTIONS: unchanged in strength, now running against a sealed record ----------------
   for (const record of records) {
     assert.equal(record.exited, true,
       "W6 iteration " + iteration + ": every child exit must be OBSERVED, never assumed");
@@ -1387,10 +1590,8 @@ async function runRaceIteration(iteration) {
     assert.equal(childLifecycle(record), "exited-observed",
       "W6 iteration " + iteration + ": a plain observed exit, not a test-caused death");
   }
-
-  const results = records.map(record => record.result);
-  const winners = results.filter(result => result.ok === true);
-  const losers = results.filter(result => result.ok !== true);
+  assert.deepEqual(vocabularyErrors, [],
+    "W6 iteration " + iteration + ": every loser vocabulary row must record without error");
   // A non-unique winner is a HARD FAILURE, never a retry. There is no retry-to-green anywhere.
   assert.equal(winners.length, 1,
     "W6 iteration " + iteration + ": EXACTLY one ok:true winner, observed " + winners.length);
@@ -1415,42 +1616,51 @@ async function runRaceIteration(iteration) {
     }
     assert.equal(result.committed, false, "W6: a loser never reports a commit");
     assertRetrySafeIsWellFormed(result, "W6 iteration " + iteration + " loser");
-    recordVocabulary("W6", "iteration-" + iteration + ":" + result.reason, result, { synthetic: false });
   }
 
-  // The INDEPENDENT verifier decides what actually landed.
-  const ledger = requireLedger(store.dbPath, "W6 iteration " + iteration);
-  assert.equal(ledger.generation, 2,
+  // The INDEPENDENT verifier decides what actually landed. The read itself already happened in
+  // the latch above; a FAILED read is asserted as a failed read and is never silently treated as
+  // "zero rows", so no iteration can be called clean on the strength of an observation that did
+  // not succeed.
+  assert.equal(latch.ledgerRead, true,
+    "W6 iteration " + iteration + ": the independent opener must actually read the store - a "
+    + "failed read is a failed measurement, NEVER evidence that nothing landed ("
+    + JSON.stringify(latch.ledgerError) + ")");
+  assert.equal(latch.inventoryError, null,
+    "W6 iteration " + iteration + ": the on-disk inventory must actually be observed");
+  assert.equal(latch.generationAfter, 2,
     "W6 iteration " + iteration + ": the opener reports generation exactly g + 1");
-  assert.equal(totalSectionRows(ledger), 1,
+  assert.equal(latch.rowsAfter, 1,
     "W6 iteration " + iteration + ": EXACTLY one new row - no second write landed");
-  assert.deepEqual(sectionKeys(ledger, TARGET_SECTION), [winners[0].key],
+  assert.deepEqual(latch.sectionKeysAfter, [winners[0].key],
     "W6 iteration " + iteration + ": the single row is the winner's key");
-
-  const inventoryAfter = inventory(store.storeRoot);
-  assert.deepEqual(sidecars(store.storeRoot), [],
+  assert.deepEqual(latch.sidecarsAfter, [],
     "W6 iteration " + iteration + ": no hot sidecar survives the iteration");
 
-  evidence.children.records.push(...facts.map(fact => ({ caseId: "W6", iteration, ...fact })));
-  return {
-    iteration,
-    childrenPerIteration: RACE_CHILD_COUNT,
-    winners: winners.length,
-    losers: losers.length,
-    retriesUsed: 0,
-    winnerKey: winners[0].key,
-    winnerRequestId: winners[0].requestId,
-    generationAfter: ledger.generation,
-    rowsAfter: totalSectionRows(ledger),
-    loserReasons: losers.map(result => result.reason).sort(),
-    inventoryAfter,
-    childFacts: facts,
-  };
+  // Sealed only now, after every assertion above has passed.
+  latch.status = "passed";
+  return latch;
 }
 
 test("W6 concurrent writers: exactly one winner in every iteration", async () => {
   const startedAt = Date.now();
   const iterations = [];
+  // Seeded BEFORE the first iteration so the per-iteration latch has somewhere durable to write
+  // and the case evidence survives a failing iteration. status stays "incomplete" until every
+  // assertion in this test has passed: a partial pass is never dressed up as a complete one, and
+  // the 20 x 8 requirement is not relaxed by the case being recorded.
+  evidence.cases.W6 = {
+    status: "incomplete",
+    platform: process.platform,
+    childrenPerIteration: RACE_CHILD_COUNT,
+    iterationsRequired: RACE_ITERATIONS,
+    iterationsRecorded: 0,
+    iterations: [],
+    evidenceLatchNote: "every iteration records its 8 child lifecycles, its 8 child outcomes, "
+      + "its 7 loser scalars and vocabulary rows, the independent P2 opener generation, row "
+      + "count and section keys, and the on-disk inventory BEFORE its first assertion, so a "
+      + "stopped iteration still reports what actually landed instead of destroying it.",
+  };
   for (let iteration = 1; iteration <= RACE_ITERATIONS; iteration += 1) {
     iterations.push(await runRaceIteration(iteration));
   }
@@ -1458,6 +1668,17 @@ test("W6 concurrent writers: exactly one winner in every iteration", async () =>
 
   assert.equal(iterations.length, RACE_ITERATIONS,
     "W6: exactly " + RACE_ITERATIONS + " iterations must run on this OS");
+  // A recorded iteration is not a passed iteration. Both counts are asserted, so a run that
+  // stopped partway can never be read as a complete pass.
+  assert.equal(evidence.cases.W6.iterations.length, RACE_ITERATIONS,
+    "W6: exactly " + RACE_ITERATIONS + " iterations must be RECORDED on this OS");
+  assert.deepEqual([...new Set(evidence.cases.W6.iterations.map(entry => entry.status))], ["passed"],
+    "W6: every recorded iteration must have completed its assertions - an iteration left "
+    + "incomplete is a stopped iteration, never a whole pass");
+  assert.deepEqual([...new Set(iterations.map(entry => entry.childrenObserved))], [RACE_CHILD_COUNT],
+    "W6: every iteration observes exactly " + RACE_CHILD_COUNT + " children");
+  assert.deepEqual([...new Set(iterations.map(entry => entry.ledgerRead))], [true],
+    "W6: every iteration must have actually read the independent opener");
   assert.deepEqual([...new Set(iterations.map(entry => entry.winners))], [1],
     "W6: every iteration has exactly one winner");
   assert.deepEqual([...new Set(iterations.map(entry => entry.generationAfter))], [2],
@@ -1473,22 +1694,30 @@ test("W6 concurrent writers: exactly one winner in every iteration", async () =>
       "W6: the loser vocabulary is closed to generation_conflict and busy");
   }
 
-  evidence.cases.W6 = {
+  // Augmented in place, NEVER reassigned: replacing the object here would discard the latched
+  // per-iteration records that the whole point of this restructure was to preserve.
+  Object.assign(evidence.cases.W6, {
+    status: "passed",
     platform: process.platform,
     childrenPerIteration: RACE_CHILD_COUNT,
+    iterationsRequired: RACE_ITERATIONS,
     iterationsRun: iterations.length,
     retriesUsed: 0,
     elapsedMs,
     suiteRaceBudgetMs: SUITE_RACE_BUDGET_MS,
     loserReasonsObserved: reasonsObserved,
-    iterations,
     cooperationNote: "cooperating writers against owned local throwaway roots only. Hostile paths, "
       + "symlink/TOCTOU, case-alias and path-identity behaviour, remote filesystems and multi-host "
       + "locking are OUT (section 7); the case-insensitive default volumes of the macOS and Windows "
       + "runners are exercised, and only alias equivalence is unclaimed.",
     retryPolicy: "no retry, no retry-to-green: a non-unique winner, a generation other than g + 1 "
       + "or more than one new row is a hard failure",
-  };
+    vocabularyNote: "the loser vocabulary stays CLOSED to generation_conflict and busy, exactly "
+      + "as written. It is deliberately NOT widened to admit experimental_store_commit_uncertain: "
+      + "an uncertain COMMIT leaves \"exactly one new row at g + 1\" genuinely UNKNOWN for that "
+      + "iteration, and this acceptance experiment keeps its hard rejection of that uncertainty. "
+      + "No retry, no busy_timeout, no PRAGMA and no journal_mode change is introduced here.",
+  });
   maybeForceFail("W6");
 });
 
@@ -1496,6 +1725,18 @@ test("W6 concurrent writers: exactly one winner in every iteration", async () =>
 
 test("W7 kill boundary: no partial application survives a mid-transaction SIGKILL", async () => {
   const arms = [];
+  // Seeded BEFORE the first seam so each arm latch has somewhere durable to write and the case
+  // evidence survives a failing arm. status stays "incomplete" until every assertion has passed.
+  evidence.cases.W7 = {
+    status: "incomplete",
+    platform: process.platform,
+    seamsRequired: CRASH_SEAMS,
+    arms: [],
+    evidenceLatchNote: "each seam records its raw exitCode, signal, resultReceived, "
+      + "killRequested and already-captured stderr, then the pre-reopen leftover and sidecars, "
+      + "then the recovery observation, then the post-recovery inventory and the independent "
+      + "opener ledger - all BEFORE its first assertion, and in that R2-2 pre/post order.",
+  };
   for (const crashSeam of CRASH_SEAMS) {
     const store = newStore("w7-" + crashSeam);
     const beforeCrash = inventoryWithHashes(store.storeRoot);
@@ -1513,42 +1754,91 @@ test("W7 kill boundary: no partial application survives a mid-transaction SIGKIL
     }
 
     const record = handle.record;
-    // R2-2: the writer signals its OWN pid only. This suite requested no kill for this child.
-    assert.equal(record.killRequested, false,
-      "W7/" + crashSeam + ": the child terminates itself; the suite scans no processes and kills none");
-    assert.equal(record.signal, "SIGKILL",
-      "W7/" + crashSeam + ": the child must be terminated at the named point");
-    assert.equal(record.exitCode, null,
-      "W7/" + crashSeam + ": a signalled child reports no exit code");
-    // A SIGKILLed process cannot return a JS object: fabricating one is a hard failure.
-    assert.equal(record.result, null,
-      "W7/" + crashSeam + ": a killed child returns NOTHING - no reason code, no committed, no retrySafe");
+
+    // ---- FAILURE-SAFE EVIDENCE LATCH: every record below PRECEDES every assertion ------------
+    // On Windows the ONLY fact this arm ever measured was record.signal, because every record
+    // call sat after that assertion: the raw exit code, the result flag, the pre-reopen leftover
+    // and its hashes, the sidecar list, the recovery observation, the post-recovery inventory and
+    // the ledger were all lost; the lifecycle record was never pushed (113 spawned against 104
+    // recorded); and the after_row_insert and before_commit seams never ran at all.
+    //
+    // The R2-2 ordering is preserved EXACTLY and is not merely reordered for convenience:
+    // (1) the leftover is recorded BEFORE anything reopens the store, (2) the observer runs,
+    // (3) the post-recovery state is recorded SEPARATELY afterwards. Neither overwrites the other.
+
+    // (0) the raw observed child scalars, verbatim, before any oracle reads them.
+    const rawObserved = {
+      pid: record.pid,
+      exitCode: record.exitCode,
+      signal: record.signal,
+      exited: record.exited,
+      resultReceived: record.result !== null && record.result !== undefined,
+      killRequested: record.killRequested,
+      killDelivered: record.killDelivered,
+      killedByTest: record.killedByTest,
+      lifecycle: childLifecycle(record),
+      // Already captured by the existing stderr listener. Recorded because it was captured -
+      // no new instrumentation, no breadcrumb and no coder-file edit is introduced here.
+      stderrHead: record.stderrHead === "" ? null : record.stderrHead,
+      representationNote: "RAW observed values, recorded before any assertion reads them. This "
+        + "suite asserts the POSIX representation (signal SIGKILL, exitCode null) unchanged and "
+        + "hard. The actual representation of a self-delivered SIGKILL on a platform without "
+        + "POSIX signal delivery remains UNKNOWN until a CI run measures it; nothing here is "
+        + "relaxed to SIGKILL-or-null, reinterpreted, retried or fabricated.",
+    };
+    // Exactly ONE lifecycle record per child, pushed here and nowhere else in this case - never
+    // from the finally above, so a cleanup pass cannot double-count a child.
+    evidence.children.records.push({ caseId: "W7", crashSeam, ...lifecycleFacts(record) });
 
     // (1) The leftover, recorded VERBATIM before anything reopens the store.
-    const leftover = inventoryWithHashes(store.storeRoot);
-    const leftoverSidecars = sidecars(store.storeRoot);
+    let leftover = null;
+    let leftoverSidecars = null;
+    let leftoverError = null;
+    try {
+      leftover = inventoryWithHashes(store.storeRoot);
+      leftoverSidecars = sidecars(store.storeRoot);
+    } catch (error) {
+      leftoverError = observationFailure(error);
+    }
 
     // (2) The tester-lane observer: one read-write open, one close, nothing else.
-    const observation = observeRecoveryOpen(store.dbPath);
-    assert.equal(observation.opened, true,
-      "W7/" + crashSeam + ": the observer must be able to open the leftover read-write");
-    assert.equal(observation.closed, true, "W7/" + crashSeam + ": the observer closes its handle");
-    assert.equal(observation.openError, null, "W7/" + crashSeam + ": no open fault");
-    assert.equal(observation.closeError, null, "W7/" + crashSeam + ": no close fault");
+    let observation = null;
+    let observationError = null;
+    try {
+      observation = observeRecoveryOpen(store.dbPath);
+    } catch (error) {
+      observationError = observationFailure(error);
+    }
 
     // (3) Post-recovery state, recorded SEPARATELY, neither record overwriting the other.
-    const afterRecovery = inventoryWithHashes(store.storeRoot);
-    const ledger = requireLedger(store.dbPath, "W7/" + crashSeam);
-    assert.equal(ledger.generation, 1,
-      "W7/" + crashSeam + ": the opener reports generation g - no bump survived");
-    assert.equal(totalSectionRows(ledger), 0,
-      "W7/" + crashSeam + ": ZERO new rows - no partial application survived");
+    let afterRecovery = null;
+    let afterRecoveryError = null;
+    try {
+      afterRecovery = inventoryWithHashes(store.storeRoot);
+    } catch (error) {
+      afterRecoveryError = observationFailure(error);
+    }
+    let ledgerRead = false;
+    let ledgerError = null;
+    let generationAfterRecovery = null;
+    let rowsAfterRecovery = null;
+    try {
+      const ledger = requireLedger(store.dbPath, "W7/" + crashSeam);
+      generationAfterRecovery = ledger.generation;
+      rowsAfterRecovery = totalSectionRows(ledger);
+      ledgerRead = true;
+    } catch (error) {
+      ledgerError = observationFailure(error);
+    }
 
-    // The parent record carries exactly the R2-2 field set and NOTHING resembling a returned result.
+    // The parent record carries exactly the R2-2 field set and NOTHING resembling a returned
+    // result. exitCode and signal are the RAW OBSERVED values, never hardcoded expectations:
+    // writing the expected literal into the evidence would fabricate the very datum the oracle
+    // below is supposed to be measuring.
     const parentRecord = {
       crashSeam,
-      exitCode: null,
-      signal: "SIGKILL",
+      exitCode: record.exitCode,
+      signal: record.signal,
       childOutcome: "unknown",
       commitOutcome: "unknown",
     };
@@ -1558,18 +1848,27 @@ test("W7 kill boundary: no partial application survives a mid-transaction SIGKIL
         + " for a process that returned nothing");
     }
 
-    const membersChanged = JSON.stringify(leftover) !== JSON.stringify(afterRecovery);
-    evidence.children.records.push({ caseId: "W7", crashSeam, ...lifecycleFacts(record) });
-    arms.push({
+    const membersChanged = leftover === null || afterRecovery === null
+      ? null : JSON.stringify(leftover) !== JSON.stringify(afterRecovery);
+    const arm = {
+      crashSeam,
+      // Explicitly incomplete until every assertion below has passed. A partial arm is recorded
+      // as partial; it is never dressed up as a successful case to satisfy a downstream gate.
+      status: "incomplete",
+      rawObserved,
       parentRecord,
       synthetic: true,
       leftoverBeforeAnyReopen: leftover,
       leftoverSidecars,
-      hotJournalPresentInLeftover: leftoverSidecars.some(name => name.endsWith("-journal")),
+      leftoverError,
+      hotJournalPresentInLeftover: leftoverSidecars === null
+        ? null : leftoverSidecars.some(name => name.endsWith("-journal")),
       hotJournalPolicy: "MEASURED, not assumed: section 0 K1 expects a hot -journal at "
         + "before_commit, and this record reports what this run actually observed",
       recoveryObservation: observation,
+      recoveryObservationError: observationError,
       afterRecovery,
+      afterRecoveryError,
       leftoverChangedByReopen: membersChanged,
       playbackNote: "a read-write open lets SQLite play back the rollback journal, so the leftover "
         + "is NOT byte-identical across the reopen - unlike P3 K1, which never opened its leftover. "
@@ -1581,21 +1880,68 @@ test("W7 kill boundary: no partial application survives a mid-transaction SIGKIL
           + "(P2-CONTRACT section 3), so the read-only opener is NOT the verifier on the "
           + "pre-reopen leftover and no such attempt is made before the ordering above completes",
       },
-      generationAfterRecovery: ledger.generation,
-      totalSectionRowsAfterRecovery: totalSectionRows(ledger),
-    });
+      ledgerRead,
+      ledgerError,
+      generationAfterRecovery,
+      totalSectionRowsAfterRecovery: rowsAfterRecovery,
+      zeroRowPolicy: "a missing or failed ledger read is recorded as null with ledgerRead:false "
+        + "and is NEVER reported as zero rows",
+    };
+    evidence.cases.W7.arms.push(arm);
+    arms.push(arm);
+
+    // ---- ASSERTIONS: unchanged in strength, now running against a sealed record --------------
+    // R2-2: the writer signals its OWN pid only. This suite requested no kill for this child.
+    assert.equal(record.killRequested, false,
+      "W7/" + crashSeam + ": the child terminates itself; the suite scans no processes and kills none");
+    // The strict POSIX oracle is KEPT as written. It is deliberately NOT relaxed to
+    // "SIGKILL or null": that would make the arm pass without measuring anything, and the
+    // Windows representation is UNKNOWN rather than known-to-be-null. If this fails on a
+    // runner, the latched rawObserved above is what the next revision will be decided from.
+    assert.equal(record.signal, "SIGKILL",
+      "W7/" + crashSeam + ": the child must be terminated at the named point");
+    assert.equal(record.exitCode, null,
+      "W7/" + crashSeam + ": a signalled child reports no exit code");
+    // A SIGKILLed process cannot return a JS object: fabricating one is a hard failure.
+    assert.equal(record.result, null,
+      "W7/" + crashSeam + ": a killed child returns NOTHING - no reason code, no committed, no retrySafe");
+
+    assert.equal(leftoverError, null,
+      "W7/" + crashSeam + ": the pre-reopen leftover must actually be observed");
+    assert.equal(observationError, null,
+      "W7/" + crashSeam + ": the recovery observer must actually run");
+    assert.equal(observation.opened, true,
+      "W7/" + crashSeam + ": the observer must be able to open the leftover read-write");
+    assert.equal(observation.closed, true, "W7/" + crashSeam + ": the observer closes its handle");
+    assert.equal(observation.openError, null, "W7/" + crashSeam + ": no open fault");
+    assert.equal(observation.closeError, null, "W7/" + crashSeam + ": no close fault");
+    assert.equal(afterRecoveryError, null,
+      "W7/" + crashSeam + ": the post-recovery inventory must actually be observed");
+    assert.equal(ledgerRead, true,
+      "W7/" + crashSeam + ": the independent opener must actually read the store - a failed read "
+      + "is a failed measurement, NEVER evidence that no partial application survived ("
+      + JSON.stringify(ledgerError) + ")");
+    assert.equal(generationAfterRecovery, 1,
+      "W7/" + crashSeam + ": the opener reports generation g - no bump survived");
+    assert.equal(rowsAfterRecovery, 0,
+      "W7/" + crashSeam + ": ZERO new rows - no partial application survived");
+
+    arm.status = "passed";
   }
 
   assert.equal(arms.length, CRASH_SEAMS.length, "W7: every named crash seam must be exercised");
-  evidence.cases.W7 = {
+  assert.deepEqual([...new Set(arms.map(entry => entry.status))], ["passed"],
+    "W7: every recorded arm must have completed its assertions");
+  // Augmented in place, NEVER reassigned: replacing the object would discard the latched arms.
+  Object.assign(evidence.cases.W7, {
+    status: "passed",
     seams: CRASH_SEAMS,
-    arms,
     terminationClaim: "PROCESS TERMINATION, never power loss. No durability or fsync claim is made.",
     killScope: "the writer signals its own pid only - no process scan, no global kill, and the "
       + "suite kills only the exact handles it created",
     fabricationPolicy: "the parent NEVER synthesizes experimental_store_commit_uncertain for a "
       + "killed child; that reason stays reserved for the surviving-process COMMIT-throw case",
-  };
+  });
   maybeForceFail("W7");
 });
 
@@ -1611,13 +1957,42 @@ function distinctCauses(result, context, expected) {
   };
   assert.deepEqual(present, expected, context + ": exactly these causes must be present, each in "
     + "its own field, none overwriting another");
-  const serialized = [];
-  if (present.error) serialized.push(JSON.stringify(result.error));
-  if (present.rollback) serialized.push(JSON.stringify(cleanup.rollback));
-  if (present.close) serialized.push(JSON.stringify(cleanup.close));
-  assert.equal(new Set(serialized).size, serialized.length,
-    context + ": the retained causes must be DISTINCT - no cause overwrites another");
-  return { present, cleanup };
+  // "No cause overwrites another" is a statement about OBJECT IDENTITY, so it is measured by
+  // REFERENCE. JSON.stringify(err) is not a usable discriminator here: on an Error, message, stack
+  // and name are all non-enumerable, so two separately allocated Errors both serialize to the same
+  // text (for the synthetic seams, {"synthetic":true}) and a Set of those texts collapses to 1 even
+  // though nothing was overwritten. Reference distinctness is exactly the asserted property.
+  //
+  // R2-7 forbids message-derived verdicts, so error.message is deliberately NOT read here and is
+  // never used as a discriminator - doing so would introduce an Error.message classifier.
+  const retained = [];
+  if (present.error) retained.push(result.error);
+  if (present.rollback) retained.push(cleanup.rollback);
+  if (present.close) retained.push(cleanup.close);
+  assert.equal(new Set(retained).size, retained.length,
+    context + ": the retained causes must be DISTINCT OBJECTS - no cause overwrites another. "
+    + "Measured by reference identity, never by serialization and never by message.");
+  // Aliasing is named separately from distinctness so a collapse is reported as what it is.
+  const aliasedPairs = [];
+  for (let i = 0; i < retained.length; i += 1) {
+    for (let j = i + 1; j < retained.length; j += 1) {
+      if (retained[i] === retained[j]) aliasedPairs.push([i, j]);
+    }
+  }
+  assert.deepEqual(aliasedPairs, [],
+    context + ": no two retained cause fields may be the SAME object reference");
+  return {
+    present,
+    cleanup,
+    causeIdentity: {
+      retainedCount: retained.length,
+      distinctReferences: new Set(retained).size,
+      aliasedPairs,
+      method: "reference identity (===) over the retained cause fields",
+      notUsed: "JSON.stringify is NOT a discriminator (Error message/stack/name are "
+        + "non-enumerable); error.message is NEVER read as a verdict (R2-7)",
+    },
+  };
 }
 
 test("W8 synthetic rollback and close faults: the four cleanup outcomes", () => {
@@ -2336,10 +2711,27 @@ test("E1 error vocabulary: codes, errnos and classifier verdicts recorded per OS
   const nakedVerdict = classifyWriteFailure(new Error("synthetic error carrying no code"));
   assert.equal(nakedVerdict.classification, "unclassified",
     "E1: an error with no code is unclassified - an unknown classification never blocks a refusal");
-  // The contract states that an absent code is a MEASURED UNKNOWN; it states no representation for
-  // it, so the oracle requires the field to carry no code rather than one exact empty value.
-  assert.equal(codeOf(nakedVerdict.sqliteCode), null,
-    "E1: an absent code is reported as absent, never invented");
+  // R3-1, resolved: for the DIRECT classifyWriteFailure return a measured unknown is a PRESENT key
+  // carrying null - never a silently omitted key (section 8: "an explicit unknown acceptable, a
+  // silent omission not"; R2-5 W12(c): "an explicit flag for whether an extended code was
+  // observed"). The SAME representation is required of sqliteCode and errno alike, and it is
+  // asserted identically here and in the probe loop below - the v1 lane accepted an absent
+  // sqliteCode while rejecting an absent errno, which is the inconsistency this resolves.
+  //
+  // Scope: this governs the CLASSIFIER RETURN ONLY. The mutation RESULT object keeps its
+  // documented optional-key behaviour unchanged (section 3 marks detail?, sqliteCode?, errno?
+  // optional), which is what the passing W0, W5 and W11 result-object arms depend on. codeOf()
+  // normalisation therefore stays in use for RESULT fields and is not applied as a classifier gate.
+  for (const key of ["sqliteCode", "errno", "classification"]) {
+    assert.equal(Object.hasOwn(nakedVerdict, key), true,
+      "E1: the classifier return must OWN " + key + " explicitly, never omit it silently");
+  }
+  assert.equal(nakedVerdict.sqliteCode, null,
+    "E1: an unobserved sqliteCode is an explicit null on the classifier return, never invented "
+    + "and never a silently absent key");
+  assert.equal(nakedVerdict.errno, null,
+    "E1: an unobserved errno is an explicit null on the classifier return - the SAME "
+    + "representation required of sqliteCode, applied consistently");
 
   const probes = [];
   for (const spec of [
@@ -2353,6 +2745,13 @@ test("E1 error vocabulary: codes, errnos and classifier verdicts recorded per OS
     const verdict = classifyWriteFailure(spec.error);
     assert.deepEqual(Object.keys(verdict).sort(), ["classification", "errno", "sqliteCode"],
       "E1: classifyWriteFailure returns exactly { sqliteCode, errno, classification }");
+    // R3-1 applied consistently: BOTH unknown-capable keys are present, each either an observed
+    // value or an explicit null. Neither key may be silently omitted.
+    assert.equal(verdict.sqliteCode === null || typeof verdict.sqliteCode === "string", true,
+      "E1: " + spec.label + " - sqliteCode is an observed string or an explicit null");
+    const expectedErrno = spec.error.errno === undefined ? null : spec.error.errno;
+    assert.equal(verdict.errno, expectedErrno,
+      "E1: " + spec.label + " - errno is the observed value or an explicit null, never omitted");
     assert.equal(CLASSIFICATIONS.includes(verdict.classification), true,
       "E1: " + spec.label + " must classify inside the closed vocabulary");
     assert.equal(verdict.sqliteCode, spec.error.code,
@@ -2370,6 +2769,8 @@ test("E1 error vocabulary: codes, errnos and classifier verdicts recorded per OS
       synthetic: true,
       input: { code: spec.error.code, errno: spec.error.errno === undefined ? null : spec.error.errno },
       verdict,
+      sqliteCodeObserved: verdict.sqliteCode !== null,
+      errnoObserved: verdict.errno !== null,
       classificationAsserted: spec.asserted,
     });
   }

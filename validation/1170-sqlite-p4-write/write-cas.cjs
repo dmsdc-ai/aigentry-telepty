@@ -109,8 +109,11 @@ function ownValue(map, key) {
 }
 
 // Every returned map is built this way (contract section 4). An entry whose value is undefined is
-// OMITTED rather than defined as undefined, so an unobserved sqliteCode or errno is an absent key
-// - a measured unknown per E1, never a failure and never an invented value.
+// OMITTED rather than defined as undefined. That is how the mutation RESULT object keeps the
+// section 3 optional-key convention (detail?, sqliteCode?, errno?, error?) unchanged: an
+// unobserved sqliteCode or errno stays an absent key THERE - a measured unknown per E1, never a
+// failure and never an invented value. The classifyWriteFailure return shape is deliberately NOT
+// optional in this way (R3-1 below).
 function materialize(entries) {
   const result = {};
   for (const entry of entries) {
@@ -120,20 +123,49 @@ function materialize(entries) {
   return result;
 }
 
+// R3-1 classifier-to-result boundary for sqliteCode, and the ONLY place a classifier null is
+// re-read. The classifier always owns sqliteCode and errno and states a measured unknown as an
+// explicit null; the mutation RESULT object keeps those keys OPTIONAL, which the passing W0, W5
+// and W11 arms depend on. Mapping null back to undefined here lets materialize omit the key
+// exactly as before, so result key presence stays the prior convention. Used for sqliteCode ONLY:
+// err.code is read as a non-empty string or nothing at all, so a classifier sqliteCode null can
+// only mean unobserved and the mapping is lossless there. No observed value is altered and no
+// code or errno is invented.
+function classifiedOptional(value) {
+  return value === null ? undefined : value;
+}
+
+// errno carries no such guarantee: null is a legal OBSERVED errno value, indistinguishable in the
+// classifier return from the unobserved null, so routing errno through classifiedOptional would
+// ERASE an observed literal null that the prior RESULT convention kept present. The RESULT errno
+// is therefore derived from the ORIGINAL thrown value, with the baseline expression verbatim: an
+// observed errno is preserved verbatim INCLUDING null, and only absent/undefined stays an omitted
+// key via materialize. Nothing is asserted about what the real binding can or cannot report.
+function observedErrno(err) {
+  return err && err.errno !== undefined ? err.errno : undefined;
+}
+
 /**
  * Classify a thrown write failure. Codes and observed values only; no message is ever read.
  *
+ * R3-1 FIXED RETURN SHAPE: sqliteCode, errno and classification are ALWAYS own keys of the
+ * returned object. A value that was not observed is an EXPLICIT null - the section 8 reading that
+ * an explicit unknown is acceptable and a silent omission is not - never an absent key. An
+ * observed value is preserved VERBATIM, primary or extended, exactly as err.code reported it; an
+ * unmapped or absent code stays unclassified. Nothing is fabricated and no message is consulted.
+ *
+ * This is a REPRESENTATION correction only. Reason selection, commit accounting, retry safety and
+ * cleanup ordering are untouched, and the mutation RESULT object keeps its optional keys optional
+ * at the single boundary above - sqliteCode via classifiedOptional, errno via observedErrno.
+ *
  * @param {*} err the thrown value.
- * @returns {{sqliteCode: string|undefined, errno: *, classification: string}}
+ * @returns {{sqliteCode: string|null, errno: *, classification: string}}
  *          classification is one of busy, conflict, constraint, unavailable, unclassified.
  */
 function classifyWriteFailure(err) {
-  const rawCode = err && typeof err.code === "string" && err.code !== "" ? err.code : undefined;
-  const errno = err && err.errno !== undefined ? err.errno : undefined;
-  if (rawCode === undefined) {
-    return materialize([["errno", errno], ["classification", "unclassified"]]);
-  }
-  const classification = Object.hasOwn(CLASSIFICATION_BY_PRIMARY_CODE, rawCode)
+  const rawCode = err && typeof err.code === "string" && err.code !== "" ? err.code : null;
+  const errno = err && err.errno !== undefined ? err.errno : null;
+  const classification = rawCode !== null && Object.hasOwn(CLASSIFICATION_BY_PRIMARY_CODE, rawCode)
     ? CLASSIFICATION_BY_PRIMARY_CODE[rawCode]
     : "unclassified";
   return materialize([["sqliteCode", rawCode], ["errno", errno], ["classification", classification]]);
@@ -200,8 +232,8 @@ function shapeRefusalOrRethrow(error) {
     return refuse({
       reason: REASON_UNAVAILABLE,
       detail: "invalid_store_shape",
-      sqliteCode: classified.sqliteCode,
-      errno: classified.errno,
+      sqliteCode: classifiedOptional(classified.sqliteCode),
+      errno: observedErrno(error),
       retrySafeMax: true,
     });
   }
@@ -209,8 +241,8 @@ function shapeRefusalOrRethrow(error) {
     return refuse({
       reason: REASON_UNAVAILABLE,
       detail: "unparseable",
-      sqliteCode: classified.sqliteCode,
-      errno: classified.errno,
+      sqliteCode: classifiedOptional(classified.sqliteCode),
+      errno: observedErrno(error),
       retrySafeMax: true,
     });
   }
@@ -395,8 +427,8 @@ function applyExperimentalStoreMutation(storeRoot, options) {
     return materialize([
       ["ok", false],
       ["reason", REASON_UNAVAILABLE],
-      ["sqliteCode", classified.sqliteCode],
-      ["errno", classified.errno],
+      ["sqliteCode", classifiedOptional(classified.sqliteCode)],
+      ["errno", observedErrno(error)],
       ["commitAttempted", false],
       ["committed", false],
       ["retrySafe", true],
@@ -524,22 +556,22 @@ function applyExperimentalStoreMutation(storeRoot, options) {
         // pre-commit steps only and never captures a commit-phase BUSY.
         failure = {
           reason: REASON_COMMIT_UNCERTAIN,
-          sqliteCode: classified.sqliteCode,
-          errno: classified.errno,
+          sqliteCode: classifiedOptional(classified.sqliteCode),
+          errno: observedErrno(error),
           retrySafeMax: false,
         };
       } else if (classified.classification === "busy") {
         failure = {
           reason: REASON_BUSY,
-          sqliteCode: classified.sqliteCode,
-          errno: classified.errno,
+          sqliteCode: classifiedOptional(classified.sqliteCode),
+          errno: observedErrno(error),
           retrySafeMax: true,
         };
       } else {
         failure = {
           reason: REASON_TRANSACTION_FAILED,
-          sqliteCode: classified.sqliteCode,
-          errno: classified.errno,
+          sqliteCode: classifiedOptional(classified.sqliteCode),
+          errno: observedErrno(error),
           retrySafeMax: true,
         };
       }
