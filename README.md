@@ -193,6 +193,63 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 
 ## Environment variables
 
+## Conditional store: explicit first initialization
+
+The daemon loads the conditional-admission ledger before accepting daemon-mediated
+writes. Missing, unreadable, corrupt, unsupported or mismatched initialization
+state leaves conditional delivery and unbound writes disabled. Daemon startup,
+session registration, binding, inject, submit, queue drain, redelivery, health and
+status do not initialize the store. The authenticated HTTP service remains
+available for the explicit initialization request.
+
+For a verified **new store**, run from an existing authenticated controller session:
+
+```sh
+telepty conditional-store-init --new-store
+```
+
+This command sends exactly one POST to `/api/conditional-store/initialize` on the
+local daemon, using the existing host credential and session bearer path. It does
+not start or restart a daemon. The exact canonical request body is
+`{"version":1,"intent":"new-store"}`. Authentication requires both the normal
+origin/IP/host-token-or-JWT checks and a current verified controller session bearer.
+The bearer SID must belong to the daemon's existing `ORCHESTRATOR_SIDS` policy.
+A claimed sender name, arbitrary worker bearer, host credential alone, localhost
+address or environment flag does not authorize initialization.
+
+The operator's `--new-store` intent matters: absence of both files cannot distinguish
+a new installation from total loss of previously initialized state. Establish that
+no conditional history ever existed before asserting new-store intent. Do not use
+this command after losing initialized state.
+
+The store uses `conditional-admissions.json` in the existing session-store directory
+and the separate `conditional-admissions.json.initialized` marker. Initialization
+requires both paths to be definitively absent and no conditional transaction
+temporary files in that directory. Existing files, symlinks, partial state, denied
+access and uncertain filesystem results are refused without reset. The marker is
+created exclusively with mode 0600, file-fsynced and directory-fsynced before the
+initial ledger is committed. A partial failure leaves initialization evidence in
+place and writes disabled. Concurrent or repeated requests cannot reset initialized
+records. A repeated request to a ready store returns `409 CONFLICT`.
+
+A successful response is HTTP 201 with `version`, `initialization:"created"` and
+`marker_id`. An invalid invocation, authentication refusal, conflict or storage
+failure exits nonzero. An unknown response or lost connection reports
+`HOLD initialization=unknown` without retry: reconcile persisted state before
+making another request. Existing initialized stores retain their fences, bindings,
+admissions and message tombstones.
+
+First initialization is **not recovery**. There is no `--force`, automatic reset,
+automatic migration or automatic recovery. Preserve damaged or remaining files and
+use a separately reviewed recovery procedure with a verified backup of the matching
+ledger and marker. A matching marker is an identity check, not proof that a backup
+contains the latest admissions or tombstones; rollback can erase replay history.
+Take consistent backups of both artifacts and preserve tombstones indefinitely.
+
+An older ledger with only its embedded marker is refused and retained unchanged;
+first initialization cannot migrate it. A separately approved migration or recovery
+procedure is required before activating this change on such an installation.
+
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
 | `TELEPTY_SUBMIT_FORCE_DEFAULT` | `1`, `true`, `yes`, `on` to enable; unset, `0`, or `off` to disable | unset | Makes `telepty inject --submit <id> "text"` behave as if `--submit-force` was passed. |
