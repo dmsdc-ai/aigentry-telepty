@@ -110,6 +110,11 @@ const LABELS = ["after_cas_read", "after_row_insert", "before_commit"];
 // The exact typed announce form. Anything else is not an identity.
 const MARKER_RE = /^TM_MARKER v1 point=([a-z_]+) nonce=([0-9a-f]{32}) pid=(\d+)$/;
 
+// The exact typed orderly-exit sentinel form, written by the child's 'exit'
+// listener. Recorded as a COUNT plus an EXACTNESS check, kept in its own table.
+// It is deliberately NOT a gate input and NOT part of the raw OS pair.
+const EXIT_HOOK_RE = /^TM_EXIT_HOOK v1 point=([a-z_]+) nonce=([0-9a-f]{32}) pid=(\d+)$/;
+
 const NOT_ESTABLISHED = [
   "marker_does_not_prove_no_js_ran_after_the_announce",
   "marker_does_not_prove_the_bounded_hold_was_entered_or_observed",
@@ -121,6 +126,10 @@ const NOT_ESTABLISHED = [
   "point_labels_are_synthetic_process_markers_not_sqlite_boundaries",
   "windows_mappings_cannot_be_inferred_from_a_non_win32_run",
   "no_w7_acceptance_predicate_is_evaluated_or_licensed_here",
+  "exit_hook_sentinel_absence_does_not_prove_no_orderly_code_ran",
+  "exit_hook_sentinel_absence_is_failure_or_unknown_not_proof_of_abrupt_termination",
+  "exit_hook_observations_are_not_mixed_into_the_raw_os_pair_comparison",
+  "an_ordinary_exit1_at_a_marker_is_not_a_termination_and_is_not_a_w7_pass",
 ];
 
 // ---------------------------------------------------------------------------
@@ -218,6 +227,13 @@ function runTrial({ mode, point, holdMs, lingerMs, parentPolicy }) {
       holdReleasedObserved: false,
       holdReleasedSeq: null,
       holdMechanismReported: null,
+      // Orderly-exit sentinel accounting. Counted and checked for exactness,
+      // recorded separately from the raw OS exit pair below and never fed to
+      // the gate or to classification.
+      exitHookLinesObserved: 0,
+      exitHookExactMatches: 0,
+      exitHookFirstLine: null,
+      exitHookFirstObservedSeq: null,
       markerObservedAfterExit: null,
       gateDecision: null,
       killRequested: false,
@@ -338,6 +354,26 @@ function runTrial({ mode, point, holdMs, lingerMs, parentPolicy }) {
         obs.resultChannel = "stdout";
         obs.resultObservedSeq = nextSeq();
         obs.events.push({ seq: obs.resultObservedSeq, name: "result_observed", atMs: Date.now() - t0 });
+        return;
+      }
+      if (line.startsWith("TM_EXIT_HOOK")) {
+        // Recorded only. The sentinel is NOT a gate input: the gate's decision
+        // inputs are unchanged by this branch, and a sentinel cannot cause or
+        // suppress a signal. It is also not merged into the raw pair.
+        obs.exitHookLinesObserved += 1;
+        const h = EXIT_HOOK_RE.exec(line);
+        if (h && h[1] === point && h[2] === nonce && Number(h[3]) === child.pid) {
+          obs.exitHookExactMatches += 1;
+        }
+        if (obs.exitHookFirstLine === null) {
+          obs.exitHookFirstLine = line;
+          obs.exitHookFirstObservedSeq = nextSeq();
+          obs.events.push({
+            seq: obs.exitHookFirstObservedSeq,
+            name: "exit_hook_sentinel_observed",
+            atMs: Date.now() - t0,
+          });
+        }
         return;
       }
       if (line.startsWith("TM_HOLD_RELEASED") && !obs.holdReleasedObserved) {
@@ -497,6 +533,34 @@ for (const point of LABELS) {
     expectClass: "TERMINATION_OBSERVED_NO_PARENT_SIGNAL",
     expectSignalled: false,
   });
+  // PAIRED LIVENESS arm for the self-kill arm, at the SAME synthetic marker and
+  // under the SAME observe_only policy (ZERO experimental parent signals). The
+  // only difference from the self-kill arm is the manner of leaving: an ordinary
+  // process.exit(1) instead of a self-directed SIGKILL.
+  //
+  // This is the positive side of the sentinel pair. It is an ordinary exit, not
+  // a termination observation, and its raw exit 1 is never a W7 pass.
+  //
+  // Its predeclared class is TERMINATION_OBSERVED_NO_PARENT_SIGNAL, the SAME
+  // class the self-kill arm gets. That is not an oversight and it is not an
+  // acceptance: `classify` sees the declared policy and the observations only,
+  // never the assigned mode, and on those inputs alone an exact announce under a
+  // zero-signal policy with a recorded end-state is indistinguishable between
+  // the two arms. What DOES separate them is recorded elsewhere and left
+  // uninterpreted: the raw OS pair (1, null) vs a signal pair, and the
+  // orderly-exit sentinel table. The classifier is not taught the difference,
+  // because teaching it would mean classifying from the assigned mode.
+  CASES.push({
+    id: `liveness/ordinary_exit1_at_marker/${point}`,
+    family: "liveness",
+    mode: "ordinary_exit1_at_marker",
+    parentPolicy: POLICY_OBSERVE_ONLY,
+    point,
+    holdMs: 0,
+    trials: PRIMARY_TRIALS,
+    expectClass: "TERMINATION_OBSERVED_NO_PARENT_SIGNAL",
+    expectSignalled: false,
+  });
   // Parent arms: validate the announce, then signal the exact handle.
   CASES.push({
     id: `primary/parent_sigkill/${point}`,
@@ -618,6 +682,61 @@ function buildPairEntry(label) {
 }
 
 // ---------------------------------------------------------------------------
+// The orderly-exit sentinel table. SEPARATE from the raw-pair table above, on
+// purpose: that table is a comparison of OS-REPORTED fields only, and mixing a
+// hook or policy fact into it would stop it being that. Nothing below is read by
+// projectPair, by the gate, or by classify.
+//
+// Each row is one scenario's sentinel accounting: how many sentinel lines this
+// parent read, and how many were the exact typed form bound to that trial's
+// assigned point, assigned nonce and forked handle pid.
+//
+// The paired reading, and its limit. The ordinary-exit arm announces at a marker
+// and leaves by process.exit(1); it MUST produce the exact sentinel, and that is
+// what shows the detector is live in this bounded run. The self-kill arm
+// producing none is recorded as an OBSERVED DIFFERENCE in this source-pinned
+// apparatus and nothing more. It is not evidence that no orderly code ran, not
+// evidence about signal delivery, not a claim about JS after the marker, not a
+// causal-authorship claim, and not a storage, journal or power-loss claim.
+// ---------------------------------------------------------------------------
+
+function buildExitHookEntry(scenarioId) {
+  const rows = runState.rows.filter((r) => r.scenarioId === scenarioId);
+  return {
+    scenarioId,
+    trials: rows.length,
+    parentPolicy: rows.length ? rows[0].observation.parentPolicy : null,
+    sentinelLinesObserved: rows.reduce((n, r) => n + r.observation.exitHookLinesObserved, 0),
+    sentinelExactMatches: rows.reduce((n, r) => n + r.observation.exitHookExactMatches, 0),
+    trialsWithExactSentinel: rows.filter((r) => r.observation.exitHookExactMatches > 0).length,
+    trialsWithNoSentinelLine: rows.filter((r) => r.observation.exitHookLinesObserved === 0).length,
+    allJoined: rows.every((r) => r.observation.joined),
+    anyTimedOut: rows.some((r) => r.observation.timedOut),
+    anyResultObserved: rows.some((r) => r.observation.resultObserved),
+    experimentalSignalsIssued: rows.filter((r) => r.observation.killRequested).length,
+  };
+}
+
+function buildExitHookTable() {
+  return {
+    typedForm: "TM_EXIT_HOOK v1 point=<point> nonce=<32 hex> pid=<pid>",
+    registeredBeforeScenarios: true,
+    emittedSynchronouslyFromProcessExitHook: true,
+    boundTo: ["assigned_point", "assigned_nonce", "forked_handle_pid"],
+    mixedIntoRawPairComparison: false,
+    usedAsGateInput: false,
+    usedByClassification: false,
+    absenceInterpretation: "failure_or_unknown_not_proof_of_abrupt_termination",
+    pairedLiveness: LABELS.map((label) => ({
+      label,
+      orderlyExitArm: buildExitHookEntry(`liveness/ordinary_exit1_at_marker/${label}`),
+      selfKillArm: buildExitHookEntry(`primary/self_sigkill/${label}`),
+    })),
+    allScenarios: CASES.map((c) => buildExitHookEntry(c.id)),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Execution. Strictly sequential, bounded, one pass. No trial is ever re-run.
 // ---------------------------------------------------------------------------
 
@@ -686,6 +805,8 @@ test.before(async () => {
     },
     notEstablished: NOT_ESTABLISHED,
     pairTable: LABELS.map((label) => buildPairEntry(label)),
+    // Separate table. Not merged into pairTable above by design.
+    exitHookSentinel: buildExitHookTable(),
     classCounts: runState.rows.reduce((acc, r) => {
       acc[r.observedClass] = (acc[r.observedClass] || 0) + 1;
       return acc;
@@ -1046,6 +1167,155 @@ test("mapping: self and parent SIGKILL pairs are recorded per label without an a
   }
   assert.ok(
     runState.evidence.notEstablished.includes("same_raw_pair_does_not_establish_same_kill_authorship"),
+  );
+});
+
+test("exit hook: the paired orderly-exit arm emits the exact sentinel, the self-kill arm none", () => {
+  for (const label of LABELS) {
+    const orderly = runState.rows.filter(
+      (r) => r.scenarioId === `liveness/ordinary_exit1_at_marker/${label}`,
+    );
+    const selfKill = runState.rows.filter((r) => r.scenarioId === `primary/self_sigkill/${label}`);
+    assert.equal(orderly.length, PRIMARY_TRIALS);
+    assert.equal(selfKill.length, PRIMARY_TRIALS);
+
+    // POSITIVE side. This is the liveness proof: without it, the negative side
+    // below would be an absence this apparatus could not interpret at all.
+    for (const row of orderly) {
+      const o = row.observation;
+      assert.equal(o.exitHookExactMatches, 1, `${row.scenarioId}#${row.trial} exact sentinel count`);
+      assert.equal(o.exitHookLinesObserved, 1, `${row.scenarioId}#${row.trial} sentinel line count`);
+      // It really did leave by an ordinary exit, not by a signal.
+      assert.equal(o.rawExitCode, 1);
+      assert.equal(o.rawSignal, null);
+      // The pair only means something if both arms were bounded and clean.
+      assert.equal(o.joined, true);
+      assert.equal(o.timedOut, false);
+      assert.equal(o.resultObserved, false);
+      assert.equal(o.killRequested, false);
+      // The announce itself was the exact assigned identity, same as the
+      // self-kill arm, so the two arms are paired at the SAME valid marker.
+      assert.equal(o.markerValidForm, true);
+      assert.equal(o.markerPointMatches, true);
+      assert.equal(o.markerNonceMatches, true);
+      assert.equal(o.markerPidMatchesHandle, true);
+    }
+
+    // NEGATIVE side. Recorded as an observation of THIS bounded run. A missing
+    // sentinel is failure-or-unknown; it is not read as proof of anything.
+    for (const row of selfKill) {
+      const o = row.observation;
+      assert.equal(o.exitHookExactMatches, 0, `${row.scenarioId}#${row.trial} exact sentinel count`);
+      assert.equal(o.exitHookLinesObserved, 0, `${row.scenarioId}#${row.trial} sentinel line count`);
+      assert.equal(o.joined, true);
+      assert.equal(o.timedOut, false);
+      assert.equal(o.resultObserved, false);
+      assert.equal(o.killRequested, false);
+    }
+  }
+  assert.ok(
+    runState.evidence.notEstablished.includes(
+      "exit_hook_sentinel_absence_is_failure_or_unknown_not_proof_of_abrupt_termination",
+    ),
+  );
+});
+
+test("exit hook: sentinel facts are kept out of the raw pair comparison and out of the gate", () => {
+  // The raw-pair projection must stay OS-reported plus parent-operational only.
+  for (const entry of runState.evidence.pairTable) {
+    for (const pair of [...entry.selfSigkill, ...entry.parentSigkill]) {
+      for (const key of Object.keys(pair)) {
+        assert.ok(!/exithook/i.test(key), `raw pair projection must not carry ${key}`);
+      }
+    }
+    assert.deepEqual(entry.comparedOsFieldNames, OS_REPORTED_FIELDS);
+  }
+  // The gate decided on identity and prior disqualifiers only. No sentinel input,
+  // so a sentinel can neither cause nor suppress an experimental signal.
+  for (const row of runState.rows) {
+    if (!row.observation.gateDecision) continue;
+    for (const key of Object.keys(row.observation.gateDecision)) {
+      assert.ok(!/exithook/i.test(key), `gate decision must not carry ${key}`);
+    }
+  }
+  const t = runState.evidence.exitHookSentinel;
+  assert.equal(t.mixedIntoRawPairComparison, false);
+  assert.equal(t.usedAsGateInput, false);
+  assert.equal(t.usedByClassification, false);
+  assert.ok(
+    runState.evidence.notEstablished.includes(
+      "exit_hook_observations_are_not_mixed_into_the_raw_os_pair_comparison",
+    ),
+  );
+  assert.ok(
+    runState.evidence.notEstablished.includes(
+      "exit_hook_sentinel_absence_does_not_prove_no_orderly_code_ran",
+    ),
+  );
+});
+
+test("exit hook: the sentinel table is recorded separately and every sentinel read was exact", () => {
+  const t = runState.evidence.exitHookSentinel;
+  assert.equal(t.registeredBeforeScenarios, true);
+  assert.equal(t.emittedSynchronouslyFromProcessExitHook, true);
+  assert.equal(t.pairedLiveness.length, LABELS.length);
+  for (const p of t.pairedLiveness) {
+    assert.equal(p.orderlyExitArm.trialsWithExactSentinel, PRIMARY_TRIALS);
+    assert.equal(p.orderlyExitArm.sentinelExactMatches, PRIMARY_TRIALS);
+    assert.equal(p.selfKillArm.trialsWithExactSentinel, 0);
+    assert.equal(p.selfKillArm.sentinelExactMatches, 0);
+    assert.equal(p.selfKillArm.trialsWithNoSentinelLine, PRIMARY_TRIALS);
+    // Both sides of the pair ran under the SAME zero-signal policy, which is
+    // what makes the sentinel difference attributable to the manner of leaving
+    // rather than to this parent having operated on one arm and not the other.
+    for (const arm of [p.orderlyExitArm, p.selfKillArm]) {
+      assert.equal(arm.trials, PRIMARY_TRIALS);
+      assert.equal(arm.parentPolicy, POLICY_OBSERVE_ONLY);
+      assert.equal(arm.experimentalSignalsIssued, 0);
+      assert.equal(arm.allJoined, true);
+      assert.equal(arm.anyTimedOut, false);
+      assert.equal(arm.anyResultObserved, false);
+    }
+  }
+  // Every sentinel line read anywhere in the run was the exact typed form for
+  // that trial, and no process emitted more than one.
+  for (const row of runState.rows) {
+    const o = row.observation;
+    assert.equal(
+      o.exitHookExactMatches,
+      o.exitHookLinesObserved,
+      `${row.scenarioId}#${row.trial} read a non-exact sentinel line`,
+    );
+    assert.ok(
+      o.exitHookLinesObserved <= 1,
+      `${row.scenarioId}#${row.trial} read ${o.exitHookLinesObserved} sentinels`,
+    );
+  }
+});
+
+test("policy: the added liveness arm issued zero signals and left the 11 accounting intact", () => {
+  const liveness = runState.rows.filter((r) => r.scenario.family === "liveness");
+  assert.equal(liveness.length, LABELS.length * PRIMARY_TRIALS);
+  for (const row of liveness) {
+    assert.equal(row.observation.parentPolicy, POLICY_OBSERVE_ONLY);
+    assert.equal(row.observation.killRequested, false);
+    assert.equal(row.observation.killApiReturn, null);
+    assert.equal(row.observation.apparatusTimeoutKill, false);
+  }
+  // The pre-existing experimental-signal accounting is unchanged, and its shape
+  // is preserved as it actually is: 11 signals = 9 primary parent-kill trials
+  // PLUS 2 hold-release controls. The hold-release control has TWO parent
+  // signals, not zero.
+  assert.equal(custody.experimentalSignalsIssued, 11);
+  const primaryParent = runState.rows.filter(
+    (r) => r.scenario.family === "primary" && r.scenario.mode === "parent_sigkill",
+  );
+  assert.equal(primaryParent.filter((r) => r.observation.killRequested).length, 9);
+  const releaseControls = runState.rows.filter((r) => r.scenario.mode === "nc_boundedhold_release");
+  assert.equal(releaseControls.filter((r) => r.observation.killRequested).length, 2);
+  assert.equal(
+    runState.evidence.parentOperationPolicies.experimentalSignalsByPolicy[POLICY_OBSERVE_ONLY],
+    0,
   );
 });
 

@@ -28,6 +28,12 @@
 //       value; an arm that produces one is not a termination observation.
 //   TM_HOLD_RELEASED
 //       the bounded hold expired and this process resumed executing JS.
+//   TM_EXIT_HOOK v1 point=<point> nonce=<32 hex> pid=<pid>
+//       the orderly-exit sentinel, written from a process.on('exit') listener
+//       registered BEFORE any scenario below runs. Its PRESENCE means Node's
+//       orderly exit path ran in this process. Its ABSENCE means only that
+//       this parent did not read one: it is failure-or-unknown, NOT proof that
+//       no orderly code ran and NOT proof of abrupt termination.
 //
 // This file signals nothing except its own pid, and only in the self_sigkill
 // mode whose entire purpose is to record what a self-directed SIGKILL looks
@@ -83,6 +89,29 @@ function boundedHold(ms) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The orderly-exit hook sentinel. ONE fixed typed line, emitted synchronously
+// with fs.writeSync from a process.on('exit') listener registered HERE, before
+// the scenario switch below, so every mode runs under the same registration and
+// no arm is advantaged by when the listener was installed.
+//
+// Bound to this trial's assigned point and nonce and to this pid, so the parent
+// can separate an exact sentinel from any other line on the pipe.
+//
+// Scope of what a sentinel can support: presence shows the orderly exit path
+// ran in THIS process, in THIS source-pinned apparatus. Absence is recorded as
+// absence. It does not establish that no JS ran, does not establish how the
+// process ended, and says nothing about kill delivery or storage.
+// ---------------------------------------------------------------------------
+
+function exitHookLine() {
+  return `TM_EXIT_HOOK v1 point=${POINT} nonce=${NONCE} pid=${process.pid}`;
+}
+
+process.on("exit", () => {
+  fs.writeSync(1, exitHookLine() + "\n");
+});
+
 function dropIpc() {
   // Release the IPC channel so the event loop drains and this process exits on
   // its own with code 0. No process.exit on this path.
@@ -102,6 +131,25 @@ switch (MODE) {
     // itself is a measurement, so it is announced rather than swallowed.
     writeOut("TM_HOLD_RELEASED");
     process.exit(3);
+    break;
+  }
+
+  case "ordinary_exit1_at_marker": {
+    // The PAIRED LIVENESS ARM for self_sigkill. It announces the SAME exact
+    // identity at the SAME synthetic marker, then leaves by an ORDINARY
+    // process.exit(1) instead of a self-directed SIGKILL. Its declared parent
+    // policy is observe_only, identical to the self-kill arm, so this parent
+    // issues zero experimental signals for it either.
+    //
+    // Why it exists: an orderly exit at this marker MUST produce the exact
+    // sentinel. That is what makes the self-kill arm's silence an observed
+    // difference rather than an unexplained absence. Without this positive
+    // side, a missing sentinel could not be told apart from a broken detector.
+    //
+    // This arm is an ordinary exit and is NOT a termination observation. Its
+    // raw (1, null) pair is recorded as observed and is never read as a W7 pass.
+    writeOut(markerLine(NONCE, POINT));
+    process.exit(1);
     break;
   }
 
@@ -143,7 +191,8 @@ switch (MODE) {
   }
 
   case "nc_missing_marker": {
-    // Prints no typed line at all.
+    // Prints no announce at all. (The orderly-exit sentinel registered above
+    // still fires on the way out; it is not an announce and the gate ignores it.)
     dropIpc();
     break;
   }
