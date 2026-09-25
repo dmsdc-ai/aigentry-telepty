@@ -68,9 +68,11 @@ const P3_INITIALIZER_COPY = path.join(SLICE_DIR, "p3-init-exclusive.cjs");
 // ACTUALLY recorded during the run; it is never a hardcoded pass total. T itself is a TAP test
 // that records NO case id, so the TAP test count is one higher than executedCaseCount - exactly
 // the distinction P3 kept between its 18 TAP tests and its 17 recorded case ids.
+// W7x is a SEPARATE case id, never a replacement for W7: the two arms assert opposite things about
+// killRequested, so they could not share a case even if the storage observations coincide.
 const EXPECTED_CASE_IDS = [
   "P0",
-  "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7", "W8", "W9", "W10", "W11", "W12",
+  "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7", "W7x", "W8", "W9", "W10", "W11", "W12",
   "E1",
 ].sort();
 
@@ -153,6 +155,53 @@ const modesToRestore = [];
 // Exact child handles this suite owns. The finaliser kills these handles only; no global process
 // scan and no global kill is ever performed.
 const liveChildren = new Set();
+
+// --- owned-root preservation (v3) ----------------------------------------------------------------
+
+// v2 said an unjoined W7x arm "preserved" its store, but finalize() then removed EVERY createdRoot
+// unconditionally - so the preserved store was deleted moments later and the claim was false. The
+// decision below is the SINGLE place that answers "may this owned root be cleaned up?", and the
+// finaliser consults exactly this map. Controls exercise these same functions rather than a
+// duplicated hardcoded rule, so a control passing means the real finalisation path is the one that
+// was proven.
+const preservedRoots = new Map();
+
+// PURE. exited is the OBSERVED exit of the exact owned handle - never inferred, never assumed.
+function preservationDecision(entry) {
+  if (entry.exited === true) return { preserve: false, because: null };
+  return { preserve: true, because: entry.because === undefined ? "child_not_joined" : entry.because };
+}
+
+function registerRootPreservation(entry) {
+  const decision = preservationDecision(entry);
+  if (decision.preserve) {
+    preservedRoots.set(entry.root, {
+      root: entry.root,
+      caseId: entry.caseId,
+      seam: entry.seam === undefined ? null : entry.seam,
+      pid: entry.pid === undefined ? null : entry.pid,
+      because: decision.because,
+    });
+  }
+  return decision;
+}
+
+// The one predicate the finaliser uses to decide whether a surviving handle may be signalled
+// again. A handle that already had its bounded cleanup attempt may NOT: its fate is recorded as
+// unknown, and a second untracked signal would not make it known.
+function mayReSignalHandle(handle) {
+  return handle.cleanupAttempted !== true;
+}
+
+// The one predicate the finaliser uses for removal AND for mode restoration. A preserved root is
+// left exactly as the arm left it: not removed, not chmod-ed, not re-pointed.
+function mayCleanUpRoot(root) {
+  if (preservedRoots.has(root)) return false;
+  for (const preserved of preservedRoots.keys()) {
+    if (root === preserved || root.startsWith(preserved + path.sep)) return false;
+  }
+  return true;
+}
 
 // One owned parent directory per case. states.cjs creates storeRoot itself with a single
 // non-recursive mkdir, so the parent is always this mkdtemp root and storeRoot is a name inside it.
@@ -342,7 +391,14 @@ function totalSectionRows(ledger) {
 
 // --- synthetic seam control ------------------------------------------------------------------------
 
-const SEAM_VARIABLES = ["P4_FAIL_AT", "P4_CRASH_AT", "P4_ROLLBACK_FAULT", "P4_CLOSE_FAULT", "P4_COMMIT_FAULT"];
+// P4_HOLD_AT and P4_HOLD_NONCE are MANDATORY members of this list, not an optional addition:
+// withSeams and childEnv both delete every name here, and that deletion is the only thing standing
+// between an indefinite in-process block and the seamedCall path. A hold seam that leaked into
+// seamedCall would hang the suite itself with no budget to expire.
+const SEAM_VARIABLES = [
+  "P4_FAIL_AT", "P4_CRASH_AT", "P4_ROLLBACK_FAULT", "P4_CLOSE_FAULT", "P4_COMMIT_FAULT",
+  "P4_HOLD_AT", "P4_HOLD_NONCE",
+];
 
 // Sets the named SYNTHETIC seams for exactly one call and restores the previous environment
 // unconditionally, so a seam can never leak into a later case.
@@ -482,6 +538,216 @@ const SUITE_RACE_BUDGET_MS = 8 * 60 * 1000;
 const RACE_CHILD_COUNT = 8;
 const RACE_ITERATIONS = 20;
 
+// --- run-wide signal audit (W7x) -----------------------------------------------------------------
+
+// Counters incremented at the ONE place each event can occur, so these are measured totals rather
+// than asserted constants. pidScans and processGroupsSignalled have no incrementer anywhere in this
+// file: the suite owns exact handles and has no code path that enumerates processes or signals a
+// group, which is why their run-wide zero is structural and not merely observed.
+//
+// EXPERIMENTAL and CLEANUP kills are counted SEPARATELY and never summed into a single "signals"
+// claim. W7x issues exactly one experimental signal per arm; cleanup may still legitimately need a
+// signal for a child that was refused or never announced, and the arm reports that honestly rather
+// than promising a zero total it cannot keep.
+const signalAudit = {
+  pidScans: 0,
+  processGroupsSignalled: 0,
+  realSignalsIssued: 0,
+  experimentalKillsIssued: 0,
+  cleanupKillsIssued: 0,
+  simulatedSignalsIssued: 0,
+  killIntents: [],
+};
+
+// --- W7x seam-marker protocol --------------------------------------------------------------------
+
+// The marker the coder seam writes, authored HERE from the contract prose rather than imported from
+// the leaf under test, so a green parse cannot mean self-agreement.
+//
+// Byte-exact typed form, anchored at both ends. point is matched against the closed seam vocabulary
+// by the caller, not by this pattern; the pattern only enforces the SHAPE.
+const SEAM_MARKER_LINE =
+  /^P4_SEAM_HOLD v1 point=([a-z][a-z_]{0,31}) nonce=([0-9a-f]{32}) pid=([1-9][0-9]{0,9})$/;
+
+// The PARSE RETENTION buffer is HARD BOUNDED. A child that writes without ever emitting a newline,
+// or that floods fd1, hits this cap and the arm is refused - there is no unbounded stdout buffer
+// anywhere. v2: retention and DIGEST are now separate concerns. Retention is what is still waiting
+// to become a line and is trimmed as lines are consumed; the digest is fed EVERY received byte
+// before any trimming, so it describes what actually arrived rather than what happens to be left
+// over. v1 hashed the post-trim retention, which meant a correctly parsed marker hashed the EMPTY
+// string - the digest was structurally incapable of witnessing a successful arm.
+const SEAM_MARKER_BUFFER_CAP = 1024;
+
+function newSeamMarkerState() {
+  return {
+    // v3: RETENTION IS RAW BYTES. v2 held a JS string and bounded it with string.length/slice,
+    // which are UTF-16 code units, not bytes - so a multibyte chunk silently violated the declared
+    // 1024-BYTE cap. Worse, v2 decoded each chunk independently with toString("utf8"), so a
+    // multibyte sequence split across a chunk boundary decoded to U+FFFD on both sides and the
+    // retained material no longer WAS what arrived. A Buffer retains the exact bytes, the cap is
+    // applied in bytes, and the marker parser refuses anything outside printable ASCII.
+    retained: Buffer.alloc(0),
+    bytesObserved: 0,
+    linesObserved: 0,
+    overflowed: false,
+    // Set once, by the FIRST complete line only. Every later line is a duplicate and is refused.
+    verdict: null,
+    duplicateLinesRefused: 0,
+    // Streaming digest over every received byte, in arrival order, fed before trimming.
+    digest: crypto.createHash("sha256"),
+    // CHUNKS that arrived on a stream nothing challenged. Their bytes are digested and counted in
+    // bytesObserved like any other; this counter is the number of such arrivals, not a byte total.
+    unchallengedChunks: 0,
+  };
+}
+
+// Every byte that arrives goes through here exactly once, whether or not it is ever parsed, so the
+// digest and the byte count cannot disagree with each other.
+function absorbSeamBytes(state, chunk) {
+  const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
+  state.bytesObserved += bytes.length;
+  state.digest.update(bytes);
+  return bytes;
+}
+
+// Raw child stdout is EXTERNAL TEXT and never reaches the evidence. Only these bounded, structured
+// facts do: how many bytes and lines arrived, whether the cap was hit, and a digest of the raw
+// bytes so two runs can be compared without the text itself being republished.
+function seamMarkerObservation(state) {
+  return {
+    bytesObserved: state.bytesObserved,
+    linesObserved: state.linesObserved,
+    overflowed: state.overflowed,
+    duplicateLinesRefused: state.duplicateLinesRefused,
+    // v2: the digest of EVERY received byte, taken from the streaming hash rather than from the
+    // post-trim retention. copy() is used so the state stays usable after an observation is taken.
+    rawSha256: state.bytesObserved === 0 ? null : state.digest.copy().digest("hex"),
+    unchallengedChunks: state.unchallengedChunks,
+    retainedUnparsedBytes: state.retained.length,
+    retentionPolicy: "retention is raw Buffer bytes, capped at SEAM_MARKER_BUFFER_CAP BYTES. No "
+      + "chunk is decoded before the cap is applied and no line is decoded before it is proven to "
+      + "be printable ASCII, so a split multibyte sequence can never be replaced or mis-bounded.",
+    verdict: state.verdict,
+    rawTextPolicy: "raw child stdout is NEVER copied into evidence - only these bounded counters "
+      + "and a digest, so no external text can be republished as a measurement",
+    digestPolicy: "the digest covers every byte received in arrival order, fed BEFORE any parse "
+      + "trimming, so it witnesses a successful arm rather than the empty leftover of one",
+  };
+}
+
+// Decides ONE complete line against the parent's challenge. Every refusal names its exact cause and
+// none of them is a classification of the child: a child that lies about its point, nonce or pid is
+// REFUSED, never identified, and this is not an authorship oracle.
+function judgeSeamMarkerLine(lineBytes, expected) {
+  // Byte-exact gate FIRST. The typed form is pure printable ASCII, so any byte outside 0x20-0x7e -
+  // a multibyte lead or continuation byte, a stray CR, a control or a NUL - is marker material
+  // this parser refuses outright rather than decoding, replacing or normalising.
+  for (const byte of lineBytes) {
+    if (byte < 0x20 || byte > 0x7e) {
+      return { accepted: false, refusedBecause: "non_ascii_marker_material" };
+    }
+  }
+  // Every byte is now known to be single-byte printable ASCII, so latin1 is a byte-exact decode.
+  const line = lineBytes.toString("latin1");
+  const match = SEAM_MARKER_LINE.exec(line);
+  if (match === null) return { accepted: false, refusedBecause: "malformed_typed_form" };
+  const point = match[1];
+  const nonce = match[2];
+  const pid = Number(match[3]);
+  if (!CRASH_SEAMS.includes(point)) return { accepted: false, refusedBecause: "point_not_in_closed_set" };
+  if (point !== expected.point) return { accepted: false, refusedBecause: "wrong_point" };
+  if (nonce !== expected.nonce) return { accepted: false, refusedBecause: "wrong_nonce" };
+  if (pid !== expected.pid) return { accepted: false, refusedBecause: "wrong_pid" };
+  return { accepted: true, refusedBecause: null, point, nonce, pid };
+}
+
+// Chunk boundaries are arbitrary: a marker may arrive as one write, as several, or glued to a later
+// line. Only COMPLETE newline-terminated lines are ever judged, and the first one decides.
+function feedSeamMarker(state, chunk, expected) {
+  // The digest is fed first and unconditionally, over the ORIGINAL Buffer, before any trimming.
+  const bytes = absorbSeamBytes(state, chunk);
+  let pending = Buffer.concat([state.retained, bytes]);
+  if (pending.length > SEAM_MARKER_BUFFER_CAP) {
+    // The cap is a BYTE cap. Once it is hit the state is dirty and every verdict is a refusal, so
+    // truncating mid-sequence cannot produce a false acceptance.
+    state.overflowed = true;
+    pending = pending.subarray(0, SEAM_MARKER_BUFFER_CAP);
+  }
+  state.retained = pending;
+  for (;;) {
+    const at = state.retained.indexOf(0x0a);
+    if (at === -1) break;
+    const line = state.retained.subarray(0, at);
+    state.retained = state.retained.subarray(at + 1);
+    state.linesObserved += 1;
+    if (state.verdict !== null) {
+      // A second line is a protocol violation whatever it says. It can never upgrade an earlier
+      // refusal into an acceptance, and it never re-decides an earlier acceptance.
+      state.duplicateLinesRefused += 1;
+      if (state.verdict.accepted) {
+        state.verdict = { accepted: false, refusedBecause: "duplicate_marker_after_acceptance" };
+      }
+      continue;
+    }
+    state.verdict = state.overflowed
+      ? { accepted: false, refusedBecause: "buffer_cap_exceeded" }
+      : judgeSeamMarkerLine(line, expected);
+  }
+  return state.verdict;
+}
+
+// The single decision point for whether the experimental signal may be issued. Both the real arm
+// and every negative control run through THIS function, so the controls exercise the production
+// decision rather than a parallel copy of it.
+function decideExperimentalKill(state, record) {
+  if (record.exited) {
+    return { issueSignal: false, failure: "exit_observed_before_kill_request" };
+  }
+  if (state.verdict === null) {
+    return { issueSignal: false, failure: "no_marker_observed" };
+  }
+  if (!state.verdict.accepted) {
+    return { issueSignal: false, failure: "marker_refused:" + state.verdict.refusedBecause };
+  }
+  // v2. An acceptance is a statement about ONE line, and v1 stopped there - so a marker that was
+  // accepted and then followed by over-cap or trailing junk still issued the signal. The state as
+  // a WHOLE must be clean at the moment of decision, not merely the line that was judged.
+  if (state.overflowed) {
+    return { issueSignal: false, failure: "marker_refused:buffer_cap_exceeded" };
+  }
+  if (state.duplicateLinesRefused > 0) {
+    return { issueSignal: false, failure: "marker_refused:duplicate_marker_after_acceptance" };
+  }
+  if (state.retained.length > 0) {
+    return { issueSignal: false, failure: "marker_refused:trailing_partial_content" };
+  }
+  return { issueSignal: true, failure: null };
+}
+
+// This is a decision about the bytes observed UP TO THIS POINT and nothing more. It is explicitly
+// NOT a claim that no further data can arrive: the child is still live when the decision is taken,
+// and anything it writes afterwards is outside what this function can see. What is claimed is only
+// that the signal is never issued on a state that is ALREADY known to be dirty.
+const SEAM_DECISION_LIMIT = "bounded by the bytes observed at decision time. No protection is "
+  + "claimed or implied against data that arrives AFTER the decision is taken.";
+
+// v2. The owned store may be inventoried, reopened or read as recovery evidence ONLY after this
+// exact handle's exit has been OBSERVED. A live child still holds the transaction and its lock, so
+// touching the store before the join would be reading a mid-transaction fixture and calling it a
+// recovery observation.
+function mayObserveRecovery(record) {
+  return record.exited === true;
+}
+
+// The pinned platform pair for a PARENT-issued SIGKILL through an owned handle, authored here from
+// the contract prose. This is what the arm MEASURES against; it is never copied from the observed
+// values, which would fabricate the datum being measured.
+const W7X_PINNED_PARENT_KILL_PAIR = {
+  darwin: { exitCode: null, signal: "SIGKILL" },
+  linux: { exitCode: null, signal: "SIGKILL" },
+  win32: { exitCode: null, signal: "SIGKILL" },
+};
+
 // Children never inherit this suite own seams: every synthetic hook is removed from the base
 // environment and re-added only where a case deliberately asks for one.
 function childEnv(extra) {
@@ -514,13 +780,40 @@ function spawnChild(extraEnv) {
     cleanupCalls: 0,
     killedByTest: false,
     stderrHead: "",
+    // W7x kill accounting, kept SEPARATE by intent. A cleanup signal is a real signal and is
+    // counted as one; it is never folded into the experimental count to make a zero look cleaner.
+    experimentalKills: 0,
+    cleanupKills: 0,
+    killIntents: [],
+    // Set only when this handle is a declared SIMULATION double (W7x negative controls).
+    simulated: false,
   };
-  const handle = { child, record };
+  const handle = { child, record, simulated: false };
   liveChildren.add(handle);
   evidence.children.spawned += 1;
 
   child.stderr.on("data", chunk => {
     if (record.stderrHead.length < 1024) record.stderrHead += String(chunk).slice(0, 1024);
+  });
+
+  // W7x fd1 listener. fd1 was already piped with NO reader, so attaching this listener adds no new
+  // stream and cannot interleave with the native SQLite stderr line that stderrHead captures; the
+  // 1024-byte stderrHead cap keeps exactly its current meaning. The accumulator is separately and
+  // hard bounded, so an unreadable or flooding child costs a refusal, never unbounded memory.
+  record.seamMarkerState = newSeamMarkerState();
+  handle.seamExpectation = null;
+  handle.seamMarker = new Promise(resolve => {
+    child.stdout.on("data", chunk => {
+      if (handle.seamExpectation === null) {
+        // Nothing challenged this child, so nothing on fd1 can be a marker. Digested and counted,
+        // never parsed and never retained - an unchallenged stream cannot produce a verdict.
+        absorbSeamBytes(record.seamMarkerState, chunk);
+        record.seamMarkerState.unchallengedChunks += 1;
+        return;
+      }
+      const verdict = feedSeamMarker(record.seamMarkerState, chunk, handle.seamExpectation);
+      if (verdict !== null) resolve(verdict);
+    });
   });
   handle.ready = new Promise(resolve => {
     child.on("message", message => {
@@ -545,14 +838,39 @@ function spawnChild(extraEnv) {
       resolve(record);
     });
   });
-  // The test owns this exact handle and signals this exact pid. No process scan, no global kill.
-  handle.kill = () => {
+  attachOwnedKill(handle);
+  return handle;
+}
+
+// The test owns this exact handle and signals this exact pid. No process scan, no global kill.
+//
+// intent separates the W7x EXPERIMENTAL signal - the one the arm is measuring - from an ordinary
+// CLEANUP signal, which may still be required for a child that was refused or never announced. The
+// intent changes the ACCOUNTING only; the delivery path is byte-for-byte the same one every
+// existing caller already used, and an omitted intent is "cleanup", exactly as before.
+function attachOwnedKill(handle) {
+  const record = handle.record;
+  handle.kill = (intent) => {
+    const label = intent === "experimental" ? "experimental" : "cleanup";
     record.cleanupCalls += 1;
+    // An already-exited child is never signalled again. This is the existing guard, unchanged, and
+    // it is what lets a W7x arm end with exactly one signal despite a cleanup pass in its finally.
     if (record.exited) return false;
     record.killRequested = true;
+    record.killIntents.push(label);
+    if (label === "experimental") record.experimentalKills += 1;
+    else record.cleanupKills += 1;
+    if (handle.simulated) {
+      signalAudit.simulatedSignalsIssued += 1;
+    } else {
+      signalAudit.realSignalsIssued += 1;
+      if (label === "experimental") signalAudit.experimentalKillsIssued += 1;
+      else signalAudit.cleanupKillsIssued += 1;
+    }
+    signalAudit.killIntents.push({ pid: record.pid, intent: label, simulated: handle.simulated });
     let delivered = false;
     try {
-      delivered = child.kill("SIGKILL") === true;
+      delivered = handle.child.kill("SIGKILL") === true;
     } catch (error) {
       record.killError = String((error && error.code) || error);
       delivered = false;
@@ -588,7 +906,74 @@ function lifecycleFacts(record) {
     killError: record.killError,
     killedByTest: record.killedByTest,
     lifecycle: childLifecycle(record),
+    // W7x: separate, never summed. A child with one experimental kill and no cleanup kill is a
+    // different fact from a child that needed a cleanup signal, and both are reported as they are.
+    experimentalKills: record.experimentalKills,
+    cleanupKills: record.cleanupKills,
+    killIntents: [...record.killIntents],
+    // Real forked children carry this as false. It is recorded rather than omitted so the child
+    // accounting can assert positively that no double ever entered it.
+    simulated: record.simulated === true,
   };
+}
+
+// --- W7x injected owned-handle DOUBLES (declared SIMULATION) --------------------------------------
+
+// An owned-handle double for the protocol and kill-failure negative controls. NO process is forked
+// and NO operating-system signal is ever issued: handle.child is a plain object whose kill() does
+// what the control declares. It is wired through the SAME attachOwnedKill accounting the real
+// handles use, so a control exercises the production kill path rather than a parallel copy.
+//
+// HARD BOUNDARY, stated wherever these appear: a double is SIMULATION. It is evidence about this
+// suite's own protocol handling and about nothing else. No double is counted in the child
+// accounting, none contributes a lifecycle record, and NO double is ever storage proof - the real
+// three-seam W7x arm is the only native-run evidence in this case.
+function injectedOwnedHandleDouble(options) {
+  const settings = options === undefined ? {} : options;
+  const record = {
+    pid: settings.pid === undefined ? 424242 : settings.pid,
+    ready: true,
+    result: null,
+    exitCode: null,
+    signal: null,
+    exited: settings.alreadyExited === true,
+    killRequested: false,
+    killDelivered: null,
+    killError: null,
+    cleanupCalls: 0,
+    killedByTest: false,
+    stderrHead: "",
+    experimentalKills: 0,
+    cleanupKills: 0,
+    killIntents: [],
+    simulated: true,
+    seamMarkerState: newSeamMarkerState(),
+  };
+  if (settings.alreadyExited === true) {
+    record.exitCode = settings.exitCode === undefined ? 0 : settings.exitCode;
+    record.signal = settings.signal === undefined ? null : settings.signal;
+  }
+  const child = {
+    pid: record.pid,
+    kill: () => {
+      if (settings.killThrows === true) {
+        const error = new Error("simulated kill failure - not a measured native failure");
+        error.code = "EPERM";
+        error.synthetic = true;
+        throw error;
+      }
+      if (settings.killReturns === false) return false;
+      if (settings.joins !== false) {
+        record.exitCode = null;
+        record.signal = "SIGKILL";
+        record.exited = true;
+      }
+      return true;
+    },
+  };
+  const handle = { child, record, simulated: true, seamExpectation: null };
+  attachOwnedKill(handle);
+  return handle;
 }
 
 // Bounds a wait without ever masking a non-unique winner: a timeout is a HARD FAILURE, never a
@@ -2079,6 +2464,865 @@ test("W7 kill boundary: no partial application survives a mid-transaction SIGKIL
   maybeForceFail("W7");
 });
 
+// --- W7x: EXTERNAL termination at the pinned seams, a SEPARATE case from W7 ----------------------
+
+// W7x measures a PARENT-issued SIGKILL through the owned ChildProcess handle, at the same three
+// seams W7 uses. It is NOT a replacement for W7 and NOT a resolution of it:
+//   - W7 asserts killRequested === false. W7x deliberately violates that, which is precisely why
+//     the two cannot share a case id.
+//   - The self-delivered-SIGKILL win32 UNKNOWN that W7 records STANDS. Nothing in this case
+//     relabels it as proven self-abruptness, converts it into a skip, or ships it as supported.
+//     A parent-issued kill is a different event with a different reporting path, and measuring
+//     this one says nothing about that one.
+// This is PROCESS TERMINATION, never power loss, and no durability, fsync, OS-delivery-chronology
+// or authentication claim is made anywhere below.
+
+function newSeamNonce() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+// The parent-local order is parent-local. kill() returning true is API ACCEPTANCE, not delivery,
+// and nothing here infers OS chronology from it.
+const W7X_AUTHORSHIP_NOTE = "authorship is DECLARED and RECORDED - this parent issued one signal "
+  + "to one handle it owns - and is never inferred from the observed pair. This is not an identity "
+  + "or authorship oracle: a child that lies about its point, nonce or pid is REFUSED, not "
+  + "classified, and a hostile child is outside what this fixture observes.";
+
+const W7X_BARRIER_NOTE = "the block is indefinite, not a sleep, so there is no window in which the "
+  + "child advances past the seam before the kill lands. It does NOT establish that no JS ran "
+  + "between the marker write and entering the wait, that the hold was actually entered, or that "
+  + "the kill was delivered at the seam in OS chronology.";
+
+test("W7x external kill boundary: a parent-issued SIGKILL at the pinned seams", async () => {
+  const arms = [];
+  evidence.cases.W7x = {
+    status: "incomplete",
+    platform: process.platform,
+    seamsRequired: CRASH_SEAMS,
+    arms: [],
+    negativeControls: [],
+    separateFromW7: "W7x is a NEW case, not a relabelling of W7. W7's killRequested:false assertion "
+      + "and its self-kill win32 UNKNOWN are untouched and remain exactly as recorded.",
+    pinnedParentKillPair: W7X_PINNED_PARENT_KILL_PAIR,
+    authorshipNote: W7X_AUTHORSHIP_NOTE,
+    barrierNote: W7X_BARRIER_NOTE,
+    terminationClaim: "PROCESS TERMINATION, never power loss. No durability or fsync claim.",
+  };
+
+  // The mechanism precondition, MEASURED before any arm rather than assumed. When it does not hold
+  // the arms below fail as an unmet precondition (N9); there is deliberately no spin fallback.
+  const sharedMemoryWaitAvailable =
+    typeof SharedArrayBuffer === "function" && typeof Atomics === "object" && Atomics !== null;
+  evidence.cases.W7x.mechanism = {
+    requested: "atomics_wait",
+    available: sharedMemoryWaitAvailable,
+    note: "RECORDED, never assumed. The seam fails as an unmet precondition where this is false.",
+  };
+
+  for (const holdSeam of CRASH_SEAMS) {
+    const store = newStore("w7x-" + holdSeam);
+    const nonce = newSeamNonce();
+    const beforeHold = inventoryWithHashes(store.storeRoot);
+    const signalsBefore = signalAudit.realSignalsIssued;
+
+    const handle = spawnChild({ P4_HOLD_AT: holdSeam, P4_HOLD_NONCE: nonce });
+    // The challenge is installed BEFORE any data can be judged. handle.child.pid is known the
+    // moment fork returns, so the pid check is bound to this exact spawned process.
+    const expectation = { point: holdSeam, nonce, pid: handle.child.pid };
+    handle.seamExpectation = expectation;
+
+    let markerVerdict = null;
+    let markerError = null;
+    let decision = null;
+    let killReturn = null;
+    let joinError = null;
+    let cleanupJoinError = null;
+    let readyError = null;
+
+    try {
+      // v3: the READINESS path is caught like every other budgeted await. v2 let a readiness or
+      // send failure propagate straight out of the arm, which skipped the evidence latch AND the
+      // preservation decision below - so the very case most likely to leave a live child holding
+      // the store was the one case that never registered the store as preserved.
+      try {
+        await withDeadline(handle.ready, PER_CHILD_TIMEOUT_MS, "W7x " + holdSeam + " ready");
+        handle.child.send({
+          type: "go",
+          storeRoot: store.storeRoot,
+          options: callOptions({ mutation: mutationOf("binding-hold", { seam: holdSeam }) }),
+        });
+      } catch (error) {
+        readyError = observationFailure(error);
+      }
+
+      // Budget expiry HERE is a failure of the arm - never an acceptance, and never recorded as
+      // the crash arm. The existing per-child budget is used unchanged.
+      if (readyError === null) {
+        try {
+          markerVerdict = await withDeadline(
+            handle.seamMarker, PER_CHILD_TIMEOUT_MS, "W7x " + holdSeam + " marker",
+          );
+        } catch (error) {
+          markerError = observationFailure(error);
+        }
+      }
+
+      decision = decideExperimentalKill(handle.record.seamMarkerState, handle.record);
+      if (readyError === null && decision.issueSignal) {
+        // The ONE experimental signal, to the ONE handle this suite owns, AFTER the exact marker
+        // and never before.
+        killReturn = handle.kill("experimental");
+        try {
+          await withDeadline(handle.exited, PER_CHILD_TIMEOUT_MS, "W7x " + holdSeam + " join");
+        } catch (error) {
+          joinError = observationFailure(error);
+        }
+      }
+    } finally {
+      // Cleanup. For a joined child the existing exited guard makes this a no-op that issues NO
+      // signal, which is how the arm keeps its exactly-one-signal property. For a refused or
+      // never-announced child it DOES signal, and that cleanup kill is counted as the real signal
+      // it is rather than hidden to protect a zero.
+      //
+      // v2: the cleanup signal is now JOINED through this same exact handle, within the unchanged
+      // per-child bound. v1 signalled and walked away, so a child that refused to die was still
+      // followed by an inventory and a read-write reopen of a store it was holding open - the
+      // reopen would have been reading a live mid-transaction fixture and recording it as recovery
+      // evidence. No new budget and no extra signal is introduced: this only waits for the kill
+      // that was already issued.
+      if (!handle.record.exited) {
+        handle.kill("cleanup");
+        // v3: this handle has now had its ONE bounded cleanup attempt. The finaliser reads this
+        // flag and does NOT issue a second, untracked signal to it.
+        handle.cleanupAttempted = true;
+        try {
+          await withDeadline(
+            handle.exited, PER_CHILD_TIMEOUT_MS, "W7x " + holdSeam + " cleanup join",
+          );
+        } catch (error) {
+          cleanupJoinError = observationFailure(error);
+        }
+      }
+    }
+
+    const record = handle.record;
+
+    // v3 PRESERVATION DECISION, taken here so EVERY exit path from the block above reaches it -
+    // readiness timeout, send failure, marker refusal, kill failure or unjoined cleanup alike.
+    // This is the same function the finaliser consults; registering here is what actually makes
+    // the v2 "store preserved" claim true instead of merely stated.
+    const preservation = registerRootPreservation({
+      caseId: "W7x",
+      seam: holdSeam,
+      root: store.parent,
+      pid: record.pid,
+      exited: record.exited,
+    });
+
+    // ---- FAILURE-SAFE EVIDENCE LATCH: every record below PRECEDES every assertion -------------
+    const rawObserved = {
+      pid: record.pid,
+      exitCode: record.exitCode,
+      signal: record.signal,
+      exited: record.exited,
+      resultReceived: record.result !== null && record.result !== undefined,
+      killRequested: record.killRequested,
+      killDelivered: record.killDelivered,
+      killError: record.killError,
+      killedByTest: record.killedByTest,
+      lifecycle: childLifecycle(record),
+      experimentalKills: record.experimentalKills,
+      cleanupKills: record.cleanupKills,
+      killIntents: [...record.killIntents],
+      stderrHead: record.stderrHead === "" ? null : record.stderrHead,
+    };
+    evidence.children.records.push({ caseId: "W7x", holdSeam, ...lifecycleFacts(record) });
+
+    // v2 GATE. The owned store is not touched AT ALL until this exact handle's exit has been
+    // observed. An unjoined child still holds the transaction and its lock, so an inventory would
+    // hash a live mid-transaction file and the read-write reopen would replay a journal underneath
+    // a running writer - and both would then be recorded as recovery evidence, which they are not.
+    // When the join did not happen the arm keeps the store UNTOUCHED, persists the unknown, and
+    // fails below. The observations stay in the unchanged R2-2 order within the gate.
+    const recoveryObservable = mayObserveRecovery(record);
+    let leftover = null;
+    let leftoverSidecars = null;
+    let leftoverError = null;
+    let observation = null;
+    let observationError = null;
+    let afterRecovery = null;
+    let afterRecoveryError = null;
+    let ledgerRead = false;
+    let ledgerError = null;
+    let generationAfterRecovery = null;
+    let rowsAfterRecovery = null;
+    let recoveryOpenCalls = 0;
+    let notObservedBecause = null;
+
+    if (!recoveryObservable) {
+      notObservedBecause = "child_not_joined";
+    } else {
+      // (1) The leftover, recorded VERBATIM before anything reopens the store. No store was opened
+      // by this parent during the hold: the held child owned the transaction and its lock.
+      try {
+        leftover = inventoryWithHashes(store.storeRoot);
+        leftoverSidecars = sidecars(store.storeRoot);
+      } catch (error) {
+        leftoverError = observationFailure(error);
+      }
+
+      // (2) The tester-lane observer: one read-write open, one close, nothing else.
+      try {
+        recoveryOpenCalls += 1;
+        observation = observeRecoveryOpen(store.dbPath);
+      } catch (error) {
+        observationError = observationFailure(error);
+      }
+
+      // (3) Post-recovery state, recorded SEPARATELY, neither record overwriting the other.
+      try {
+        afterRecovery = inventoryWithHashes(store.storeRoot);
+      } catch (error) {
+        afterRecoveryError = observationFailure(error);
+      }
+      try {
+        const ledger = requireLedger(store.dbPath, "W7x/" + holdSeam);
+        generationAfterRecovery = ledger.generation;
+        rowsAfterRecovery = totalSectionRows(ledger);
+        ledgerRead = true;
+      } catch (error) {
+        ledgerError = observationFailure(error);
+      }
+    }
+
+    const parentRecord = {
+      holdSeam,
+      exitCode: record.exitCode,
+      signal: record.signal,
+      childOutcome: "unknown",
+      commitOutcome: "unknown",
+    };
+    for (const forbidden of ["reason", "ok", "committed", "commitAttempted", "retrySafe"]) {
+      assert.equal(Object.hasOwn(parentRecord, forbidden), false,
+        "W7x/" + holdSeam + ": the parent record must NOT synthesize " + forbidden
+        + " for a process that returned nothing");
+    }
+
+    const pinnedPair = Object.hasOwn(W7X_PINNED_PARENT_KILL_PAIR, process.platform)
+      ? W7X_PINNED_PARENT_KILL_PAIR[process.platform] : null;
+    const arm = {
+      holdSeam,
+      status: "incomplete",
+      simulation: false,
+      nonceChallenged: true,
+      rawObserved,
+      parentRecord,
+      seamMarker: seamMarkerObservation(record.seamMarkerState),
+      readyError,
+      markerError,
+      decision,
+      decisionLimit: SEAM_DECISION_LIMIT,
+      killReturn,
+      joinError,
+      cleanupJoinError,
+      // v2 gate facts. recoveryOpenCalls is 1 for a joined arm and 0 for an unjoined one, so the
+      // evidence shows positively that no reopen was attempted against a live child.
+      recoveryObservable,
+      notObservedBecause,
+      recoveryOpenCalls,
+      storePreservedUnobserved: recoveryObservable === false,
+      // The owned root and what the SHARED decision said about it. A preserved root is reported
+      // by the finaliser and forces cleanup clean:false rather than being silently removed.
+      ownedRoot: store.parent,
+      preservation,
+      cleanupAttempted: handle.cleanupAttempted === true,
+      signalsIssuedByThisArm: signalAudit.realSignalsIssued - signalsBefore,
+      mechanismUsed: sharedMemoryWaitAvailable ? "atomics_wait" : null,
+      observedPair: { exitCode: record.exitCode, signal: record.signal },
+      pinnedPair,
+      beforeHold,
+      leftoverBeforeAnyReopen: leftover,
+      leftoverSidecars,
+      leftoverError,
+      hotJournalPresentInLeftover: leftoverSidecars === null
+        ? null : leftoverSidecars.some(name => name.endsWith("-journal")),
+      hotJournalPolicy: "MEASURED, not assumed: this record reports what this run observed, and a "
+        + "hot journal is never treated as recovery, durability or power-loss evidence",
+      recoveryObservation: observation,
+      recoveryObservationError: observationError,
+      afterRecovery,
+      afterRecoveryError,
+      leftoverChangedByReopen: leftover === null || afterRecovery === null
+        ? null : JSON.stringify(leftover) !== JSON.stringify(afterRecovery),
+      ledgerRead,
+      ledgerError,
+      generationAfterRecovery,
+      totalSectionRowsAfterRecovery: rowsAfterRecovery,
+      zeroRowPolicy: "a missing or failed ledger read is recorded as null with ledgerRead:false "
+        + "and is NEVER reported as zero rows",
+      dwellNote: "the held process dwells in the open transaction for an unbounded interval before "
+        + "the kill, where the W7 self-kill is immediate. Nothing here measures a time-dependent "
+        + "effect, and the shared-memory wait stops JS progress, not the operating system.",
+    };
+    evidence.cases.W7x.arms.push(arm);
+    arms.push(arm);
+
+    // ---- ASSERTIONS ---------------------------------------------------------------------------
+    assert.equal(sharedMemoryWaitAvailable, true,
+      "W7x/" + holdSeam + ": the shared-memory wait mechanism is an UNMET PRECONDITION on this "
+      + "runtime - the arm fails rather than falling back to a timed sleep or a spin");
+    assert.equal(readyError, null,
+      "W7x/" + holdSeam + ": the child must announce readiness and accept the go message within "
+      + "the existing per-child budget - a readiness failure is a FAILURE of this arm, and it "
+      + "still records its evidence and its preservation decision rather than escaping both ("
+      + JSON.stringify(readyError) + ")");
+    assert.equal(markerError, null,
+      "W7x/" + holdSeam + ": the marker must arrive within the existing per-child budget - budget "
+      + "expiry is a FAILURE of this arm, never an acceptance and never the crash arm ("
+      + JSON.stringify(markerError) + ")");
+    assert.notEqual(markerVerdict, null, "W7x/" + holdSeam + ": a marker verdict must exist");
+    assert.equal(markerVerdict.accepted, true,
+      "W7x/" + holdSeam + ": the marker must be byte-exact for the typed form, at the challenged "
+      + "point, carrying the challenged nonce and this child's own pid (refused because "
+      + String(markerVerdict.refusedBecause) + ")");
+    assert.equal(record.seamMarkerState.overflowed, false,
+      "W7x/" + holdSeam + ": the bounded fd1 accumulator must not have overflowed");
+    assert.equal(record.seamMarkerState.duplicateLinesRefused, 0,
+      "W7x/" + holdSeam + ": the seam emits exactly one marker line");
+
+    assert.equal(decision.issueSignal, true,
+      "W7x/" + holdSeam + ": the signal is issued only after an accepted marker");
+    assert.equal(killReturn, true,
+      "W7x/" + holdSeam + ": kill() through the owned handle must return true - API ACCEPTANCE, "
+      + "which is not delivery and not OS chronology");
+    assert.equal(joinError, null,
+      "W7x/" + holdSeam + ": the joined exit must be OBSERVED within budget ("
+      + JSON.stringify(joinError) + ")");
+    assert.equal(cleanupJoinError, null,
+      "W7x/" + holdSeam + ": a cleanup signal must itself be JOINED through this same exact "
+      + "handle within the unchanged bound - an unjoined cleanup leaves the fate unknown ("
+      + JSON.stringify(cleanupJoinError) + ")");
+    assert.equal(record.exited, true, "W7x/" + holdSeam + ": the child exit is observed, never assumed");
+    // The gate itself is asserted, so an arm can never reach the storage oracle below by way of a
+    // store it was not entitled to touch.
+    assert.equal(recoveryObservable, true,
+      "W7x/" + holdSeam + ": the store may be read as recovery evidence ONLY after an observed "
+      + "exit - an unjoined child leaves the owned store untouched and fails the arm ("
+      + String(notObservedBecause) + ")");
+    assert.equal(recoveryOpenCalls, 1,
+      "W7x/" + holdSeam + ": exactly one recovery open, and only after the observed exit");
+
+    // Exactly one signal, to exactly one owned handle, after the exact marker and never before.
+    assert.equal(record.experimentalKills, 1,
+      "W7x/" + holdSeam + ": exactly ONE experimental signal to exactly one owned handle");
+    assert.equal(record.cleanupKills, 0,
+      "W7x/" + holdSeam + ": a joined child needs no cleanup signal, so the arm total is one");
+    assert.deepEqual(record.killIntents, ["experimental"],
+      "W7x/" + holdSeam + ": the only signal this arm issued was the experimental one");
+    assert.equal(arm.signalsIssuedByThisArm, 1,
+      "W7x/" + holdSeam + ": exactly one real signal is attributable to this arm");
+    assert.equal(signalAudit.pidScans, 0, "W7x/" + holdSeam + ": no process scan, run-wide");
+    assert.equal(signalAudit.processGroupsSignalled, 0,
+      "W7x/" + holdSeam + ": no process group is ever signalled, run-wide");
+
+    // The platform pair, MEASURED in this fixture against the pinned table - never inherited.
+    assert.notEqual(pinnedPair, null,
+      "W7x/" + holdSeam + ": platform " + process.platform + " is not in the pinned table, so the "
+      + "parent-issued pair is UNMEASURED here and the arm fails rather than guessing");
+    assert.equal(record.signal, pinnedPair.signal,
+      "W7x/" + holdSeam + ": the parent-issued kill must report the pinned signal");
+    assert.equal(record.exitCode, pinnedPair.exitCode,
+      "W7x/" + holdSeam + ": the parent-issued kill must report the pinned exit code");
+
+    // A killed child returns NOTHING. No field is synthesized for it.
+    assert.equal(record.result, null,
+      "W7x/" + holdSeam + ": a killed child returns NOTHING - no reason code, no committed, no "
+      + "retrySafe");
+
+    // Every existing W7 storage observation, unchanged and in the same R2-2 order.
+    assert.equal(leftoverError, null,
+      "W7x/" + holdSeam + ": the pre-reopen leftover must actually be observed");
+    assert.equal(observationError, null,
+      "W7x/" + holdSeam + ": the recovery observer must actually run");
+    assert.equal(observation.opened, true,
+      "W7x/" + holdSeam + ": the observer must be able to open the leftover read-write");
+    assert.equal(observation.closed, true, "W7x/" + holdSeam + ": the observer closes its handle");
+    assert.equal(observation.openError, null, "W7x/" + holdSeam + ": no open fault");
+    assert.equal(observation.closeError, null, "W7x/" + holdSeam + ": no close fault");
+    assert.equal(afterRecoveryError, null,
+      "W7x/" + holdSeam + ": the post-recovery inventory must actually be observed");
+    assert.equal(ledgerRead, true,
+      "W7x/" + holdSeam + ": the independent opener must actually read the store - a failed read "
+      + "is a failed measurement, NEVER evidence that no partial application survived ("
+      + JSON.stringify(ledgerError) + ")");
+    assert.equal(generationAfterRecovery, 1,
+      "W7x/" + holdSeam + ": the opener reports generation g - no bump survived");
+    assert.equal(rowsAfterRecovery, 0,
+      "W7x/" + holdSeam + ": ZERO new rows - no partial application survived");
+
+    arm.status = "passed";
+  }
+
+  assert.equal(arms.length, CRASH_SEAMS.length, "W7x: every named hold seam must be exercised");
+  assert.deepEqual([...new Set(arms.map(entry => entry.status))], ["passed"],
+    "W7x: every recorded arm must have completed its assertions");
+
+  // ---- Negative controls: each must FAIL, none may accept --------------------------------------
+  // These run against INJECTED OWNED-HANDLE DOUBLES and are labelled SIMULATION everywhere they
+  // appear. No process is forked and no operating-system signal is issued by any of them. They
+  // exercise the SAME decideExperimentalKill and marker parser the real arms above used, so they
+  // are evidence about this suite's protocol handling - and about nothing else. NO control below
+  // is storage proof; the three real arms are the only native-run evidence in this case.
+  const exactMarker = (point, nonce, pid) =>
+    "P4_SEAM_HOLD v1 point=" + point + " nonce=" + nonce + " pid=" + String(pid) + "\n";
+
+  const goodNonce = "0123456789abcdef0123456789abcdef";
+  const foreignNonce = "fedcba9876543210fedcba9876543210";
+  const controlPoint = "after_row_insert";
+  const controlPid = 424242;
+
+  const controls = [];
+  function runControl(id, description, setup) {
+    const simulatedBefore = signalAudit.simulatedSignalsIssued;
+    const realBefore = signalAudit.realSignalsIssued;
+    const outcome = setup();
+    const entry = {
+      id,
+      description,
+      simulation: true,
+      simulationNote: "INJECTED OWNED-HANDLE DOUBLE - no process forked, no OS signal issued. "
+        + "Protocol evidence only; this is NOT storage proof and NOT a native-run observation.",
+      ...outcome,
+      simulatedSignalsIssued: signalAudit.simulatedSignalsIssued - simulatedBefore,
+      realSignalsIssued: signalAudit.realSignalsIssued - realBefore,
+    };
+    assert.equal(entry.realSignalsIssued, 0,
+      "W7x/" + id + ": a simulated control must never issue a real operating-system signal");
+    evidence.cases.W7x.negativeControls.push(entry);
+    controls.push(entry);
+    return entry;
+  }
+
+  // A POSITIVE protocol control first, so the refusals below cannot pass merely because the parser
+  // refuses everything: the exact marker, split across arbitrary chunk boundaries, is ACCEPTED.
+  runControl("P1", "exact marker split across chunk boundaries is accepted", () => {
+    const state = newSeamMarkerState();
+    const expected = { point: controlPoint, nonce: goodNonce, pid: controlPid };
+    const line = exactMarker(controlPoint, goodNonce, controlPid);
+    let verdict = null;
+    for (const piece of [line.slice(0, 7), line.slice(7, 31), line.slice(31, 60), line.slice(60)]) {
+      verdict = feedSeamMarker(state, piece, expected);
+    }
+    assert.notEqual(verdict, null, "W7x/P1: a split marker must still produce a verdict");
+    assert.equal(verdict.accepted, true, "W7x/P1: chunk splits must not defeat the parser");
+    assert.equal(state.linesObserved, 1, "W7x/P1: exactly one line");
+    return { accepted: verdict.accepted, refusedBecause: verdict.refusedBecause, mustAccept: true };
+  });
+
+  runControl("D1", "a duplicate marker line after acceptance is refused", () => {
+    const state = newSeamMarkerState();
+    const expected = { point: controlPoint, nonce: goodNonce, pid: controlPid };
+    const line = exactMarker(controlPoint, goodNonce, controlPid);
+    feedSeamMarker(state, line, expected);
+    const verdict = feedSeamMarker(state, line, expected);
+    assert.equal(verdict.accepted, false, "W7x/D1: a duplicate must revoke acceptance, never confirm it");
+    assert.equal(verdict.refusedBecause, "duplicate_marker_after_acceptance", "W7x/D1: exact cause");
+    assert.equal(state.duplicateLinesRefused, 1, "W7x/D1: the duplicate is counted");
+    const handle = injectedOwnedHandleDouble({ pid: controlPid });
+    const decision = decideExperimentalKill(state, handle.record);
+    assert.equal(decision.issueSignal, false, "W7x/D1: NO signal is issued for a duplicate");
+    return { accepted: false, refusedBecause: verdict.refusedBecause, failure: decision.failure };
+  });
+
+  // F1: the streaming digest is verified against INDEPENDENT known chunk fixtures. The expected
+  // value is computed here, from the concatenation of the exact chunks fed, by a hash that never
+  // touches the parser state - so this cannot pass by the parser agreeing with itself. This is the
+  // v1 defect made unmissable: v1 hashed the post-trim retention, so a fully consumed marker
+  // hashed the empty string and the digest could never witness a successful arm.
+  runControl("F1", "streaming digest matches an independent digest of the known chunks", () => {
+    const state = newSeamMarkerState();
+    const expected = { point: controlPoint, nonce: goodNonce, pid: controlPid };
+    const chunks = [
+      "P4_SEAM_HOLD v1 poi",
+      "nt=" + controlPoint + " nonce=",
+      goodNonce + " pid=" + String(controlPid) + "\n",
+    ];
+    for (const piece of chunks) feedSeamMarker(state, piece, expected);
+    const independent = sha256Buffer(Buffer.from(chunks.join(""), "utf8"));
+    const observed = seamMarkerObservation(state);
+    assert.equal(state.retained.length, 0,
+      "W7x/F1: the retention buffer is empty once the line is consumed - which is exactly why "
+      + "hashing the retention could never describe what arrived");
+    assert.equal(observed.rawSha256, independent,
+      "W7x/F1: the digest must cover every byte RECEIVED, not the post-parse leftover");
+    assert.equal(observed.bytesObserved, Buffer.byteLength(chunks.join(""), "utf8"),
+      "W7x/F1: the byte count and the digest describe the same bytes");
+    assert.equal(observed.retainedUnparsedBytes, 0, "W7x/F1: nothing is left unparsed");
+    return { digestMatchesIndependentFixture: true, bytesObserved: observed.bytesObserved };
+  });
+
+  // D2 and D3: an ACCEPTED marker does not license the signal if the state as a whole is already
+  // dirty at decision time. v1 checked only the judged line and signalled anyway.
+  runControl("D2", "accepted marker followed by an over-cap suffix issues no signal", () => {
+    const state = newSeamMarkerState();
+    const expected = { point: controlPoint, nonce: goodNonce, pid: controlPid };
+    const accepted = feedSeamMarker(
+      state, exactMarker(controlPoint, goodNonce, controlPid), expected,
+    );
+    assert.equal(accepted.accepted, true, "W7x/D2: the first line really was accepted");
+    feedSeamMarker(state, "x".repeat(SEAM_MARKER_BUFFER_CAP + 64), expected);
+    assert.equal(state.overflowed, true, "W7x/D2: the retention cap was exceeded");
+    const handle = injectedOwnedHandleDouble({ pid: controlPid });
+    const decision = decideExperimentalKill(state, handle.record);
+    assert.equal(decision.issueSignal, false,
+      "W7x/D2: an over-cap suffix after acceptance must withdraw the signal");
+    assert.equal(decision.failure, "marker_refused:buffer_cap_exceeded", "W7x/D2: exact cause");
+    assert.equal(handle.record.experimentalKills, 0, "W7x/D2: ZERO experimental signals");
+    return { failure: decision.failure, experimentalKills: 0, mustFail: true };
+  });
+
+  runControl("D3", "accepted marker with a trailing partial suffix in the same chunk", () => {
+    const state = newSeamMarkerState();
+    const expected = { point: controlPoint, nonce: goodNonce, pid: controlPid };
+    // One single write carrying the exact marker AND unterminated trailing bytes behind it.
+    const verdict = feedSeamMarker(
+      state, exactMarker(controlPoint, goodNonce, controlPid) + "P4_SEAM_HOLD v1 poi", expected,
+    );
+    assert.equal(verdict.accepted, true, "W7x/D3: the complete line itself was exact");
+    assert.equal(state.retained.length > 0, true, "W7x/D3: unterminated bytes remain retained");
+    const handle = injectedOwnedHandleDouble({ pid: controlPid });
+    const decision = decideExperimentalKill(state, handle.record);
+    assert.equal(decision.issueSignal, false,
+      "W7x/D3: trailing partial content at decision time must withdraw the signal");
+    assert.equal(decision.failure, "marker_refused:trailing_partial_content", "W7x/D3: exact cause");
+    assert.equal(handle.record.experimentalKills, 0, "W7x/D3: ZERO experimental signals");
+    return { failure: decision.failure, experimentalKills: 0, mustFail: true };
+  });
+
+  // M1-M3: the BYTE-cap and byte-exactness controls. v2 bounded a JS string by code units and
+  // decoded each chunk independently, so these are the cases that were previously unprotected.
+  // Each asserts retained bytes <= the declared cap, an exact original-byte digest, and NO
+  // experimental kill. No raw external text is emitted by any of them.
+  const multibyteChunkControls = [
+    {
+      id: "M1",
+      description: "multibyte sequence split across a chunk boundary is refused, not replaced",
+      // A 4-byte astral sequence deliberately cut between chunks, then a newline.
+      chunks: [
+        Buffer.from([0x50, 0x34, 0x5f, 0xf0, 0x9f]),
+        Buffer.from([0x92, 0xa9, 0x0a]),
+      ],
+      expectRefusal: "non_ascii_marker_material",
+    },
+    {
+      id: "M2",
+      description: "an otherwise exact marker carrying one non-ASCII byte is refused",
+      chunks: [
+        Buffer.concat([
+          Buffer.from("P4_SEAM_HOLD v1 point=after_row_insert nonce=", "latin1"),
+          Buffer.from([0xc3, 0xa9]),
+          Buffer.from("0123456789abcdef0123456789abcd pid=424242\n", "latin1"),
+        ]),
+      ],
+      expectRefusal: "non_ascii_marker_material",
+    },
+    {
+      id: "M3",
+      description: "over-cap multibyte flood is bounded in BYTES, not code units",
+      // Every character here is 2 bytes, so a code-unit cap would have retained twice the bytes.
+      chunks: [Buffer.from("e".repeat(SEAM_MARKER_BUFFER_CAP).replace(/e/g, "é"), "utf8")],
+      expectRefusal: null,
+    },
+  ];
+  for (const control of multibyteChunkControls) {
+    runControl(control.id, control.description, () => {
+      const state = newSeamMarkerState();
+      const expected = { point: controlPoint, nonce: goodNonce, pid: controlPid };
+      for (const piece of control.chunks) feedSeamMarker(state, piece, expected);
+      const joined = Buffer.concat(control.chunks);
+      const observed = seamMarkerObservation(state);
+
+      // The declared bound is a BYTE bound, and it holds for every one of these.
+      assert.equal(state.retained.length <= SEAM_MARKER_BUFFER_CAP, true,
+        "W7x/" + control.id + ": retained bytes must never exceed the declared byte cap (got "
+        + state.retained.length + ")");
+      assert.equal(observed.retainedUnparsedBytes, state.retained.length,
+        "W7x/" + control.id + ": the reported retention is the actual byte length");
+      // The digest covers the ORIGINAL bytes, verified against an independent digest of them.
+      assert.equal(observed.rawSha256, sha256Buffer(joined),
+        "W7x/" + control.id + ": the digest must be of the original bytes, before any trimming "
+        + "or decoding");
+      assert.equal(observed.bytesObserved, joined.length,
+        "W7x/" + control.id + ": every original byte is counted");
+      if (control.expectRefusal !== null) {
+        assert.notEqual(state.verdict, null, "W7x/" + control.id + ": a verdict must exist");
+        assert.equal(state.verdict.accepted, false,
+          "W7x/" + control.id + ": non-ASCII marker material is REFUSED, never decoded or replaced");
+        assert.equal(state.verdict.refusedBecause, control.expectRefusal,
+          "W7x/" + control.id + ": exact refusal cause");
+      }
+      const handle = injectedOwnedHandleDouble({ pid: controlPid });
+      const decision = decideExperimentalKill(state, handle.record);
+      assert.equal(decision.issueSignal, false,
+        "W7x/" + control.id + ": NO experimental kill is issued for this state");
+      assert.equal(handle.record.experimentalKills, 0,
+        "W7x/" + control.id + ": ZERO experimental signals");
+      return {
+        retainedBytes: state.retained.length,
+        byteCapRespected: true,
+        digestMatchesOriginalBytes: true,
+        refusedBecause: state.verdict === null ? null : state.verdict.refusedBecause,
+        failure: decision.failure,
+        experimentalKills: 0,
+        mustFail: true,
+      };
+    });
+  }
+
+  // R1-R3: the OWNED-ROOT PRESERVATION controls. These call the exact functions the finaliser
+  // calls - preservationDecision, registerRootPreservation, mayCleanUpRoot and mayReSignalHandle -
+  // rather than restating the rule, so a green control means the real finalisation path is the one
+  // that was proven. R1 deregisters its synthetic root afterwards and proves the deregistration,
+  // so it cannot alter what the real run preserves. No filesystem call is made by any of them.
+  const syntheticRoot = path.join(WORK_DIR, TMP_PREFIX + "w7x-simulated-unjoined-root");
+
+  runControl("R1", "an unjoined W7x root is preserved by the shared finaliser decision", () => {
+    const handle = injectedOwnedHandleDouble({ pid: controlPid, joins: false });
+    handle.kill("experimental");
+    assert.equal(handle.record.exited, false, "W7x/R1: the child was never joined");
+    const decision = registerRootPreservation({
+      caseId: "W7x", seam: controlPoint, root: syntheticRoot, pid: handle.record.pid,
+      exited: handle.record.exited,
+    });
+    assert.equal(decision.preserve, true, "W7x/R1: an unobserved exit preserves the owned root");
+    assert.equal(decision.because, "child_not_joined", "W7x/R1: exact cause");
+    assert.equal(mayCleanUpRoot(syntheticRoot), false,
+      "W7x/R1: the finaliser's own predicate must refuse to remove or chmod this root");
+    assert.equal(mayCleanUpRoot(path.join(syntheticRoot, "store")), false,
+      "W7x/R1: everything under a preserved root is preserved with it");
+    // Deregister, so this simulation cannot change what the real run preserves - and prove it.
+    preservedRoots.delete(syntheticRoot);
+    assert.equal(mayCleanUpRoot(syntheticRoot), true,
+      "W7x/R1: the decision is driven by the shared map, not by a hardcoded path");
+    // The closed failure cause is the one the shared preservation decision just returned, read
+    // back from that decision rather than retyped - so this record cannot drift from the cause
+    // the assertions above proved. mustFail stays, and the shared audit below now accepts it
+    // because it carries HOW it failed.
+    return {
+      preserve: true,
+      because: decision.because,
+      failure: decision.because,
+      deregistered: true,
+      mustFail: true,
+    };
+  });
+
+  runControl("R2", "a joined root is NOT preserved and still cleans normally", () => {
+    const handle = injectedOwnedHandleDouble({ pid: controlPid });
+    handle.kill("experimental");
+    assert.equal(handle.record.exited, true, "W7x/R2: this child WAS joined");
+    const decision = registerRootPreservation({
+      caseId: "W7x", seam: controlPoint, root: syntheticRoot, pid: handle.record.pid,
+      exited: handle.record.exited,
+    });
+    assert.equal(decision.preserve, false,
+      "W7x/R2: an OBSERVED exit means the root is cleaned normally - preservation is not blanket");
+    assert.equal(preservedRoots.has(syntheticRoot), false,
+      "W7x/R2: a joined root is never entered into the preservation map");
+    assert.equal(mayCleanUpRoot(syntheticRoot), true, "W7x/R2: the finaliser may clean it");
+    return { preserve: false, cleansNormally: true };
+  });
+
+  runControl("R3", "a handle with a bounded cleanup attempt is not re-signalled", () => {
+    const handle = injectedOwnedHandleDouble({ pid: controlPid, joins: false });
+    assert.equal(mayReSignalHandle(handle), true,
+      "W7x/R3: before any cleanup attempt the finaliser would still signal it");
+    handle.kill("cleanup");
+    handle.cleanupAttempted = true;
+    const signalsBeforeFinaliser = signalAudit.simulatedSignalsIssued;
+    assert.equal(mayReSignalHandle(handle), false,
+      "W7x/R3: after its ONE bounded cleanup attempt the finaliser must NOT signal it again");
+    assert.equal(signalAudit.simulatedSignalsIssued, signalsBeforeFinaliser,
+      "W7x/R3: consulting the predicate issues nothing");
+    assert.equal(handle.record.cleanupKills, 1,
+      "W7x/R3: exactly one cleanup signal was ever issued to this handle");
+    assert.equal(childLifecycle(handle.record), "kill-delivered-exit-unobserved",
+      "W7x/R3: the fate stays recorded as unknown rather than re-signalled off the books");
+    // The closed cause here is the LIFECYCLE verdict already asserted above, taken from
+    // childLifecycle rather than restated: the fate is unknown because the exit was never
+    // observed, and that is exactly how this control fails.
+    return {
+      reSignalled: false,
+      cleanupKills: handle.record.cleanupKills,
+      lifecycle: childLifecycle(handle.record),
+      failure: childLifecycle(handle.record),
+      mustFail: true,
+    };
+  });
+
+  // N8b: the recovery gate itself. For an unjoined handle the store is NOT read - no inventory,
+  // no reopen, no ledger - and the arm fails instead.
+  runControl("N8b", "recovery is never called for an unjoined handle", () => {
+    const handle = injectedOwnedHandleDouble({ pid: controlPid, joins: false });
+    handle.kill("experimental");
+    assert.equal(handle.record.exited, false, "W7x/N8b: the child was never joined");
+    assert.equal(mayObserveRecovery(handle.record), false,
+      "W7x/N8b: an unjoined handle may NOT have its store read as recovery evidence");
+    let recoveryOpenCalls = 0;
+    if (mayObserveRecovery(handle.record)) recoveryOpenCalls += 1;
+    assert.equal(recoveryOpenCalls, 0,
+      "W7x/N8b: zero recovery opens against a store a live child may still be holding");
+    // The closed cause comes from the SAME shared preservation decision the finaliser uses, so
+    // this record names the unjoined cause in the one vocabulary the rest of the case uses rather
+    // than in a literal of its own.
+    const notObservedBecause = preservationDecision({ exited: handle.record.exited }).because;
+    assert.equal(notObservedBecause, "child_not_joined",
+      "W7x/N8b: the unjoined cause is the shared closed cause, not a control-local string");
+    return {
+      recoveryOpenCalls,
+      notObservedBecause,
+      failure: notObservedBecause,
+      storePreserved: true,
+      mustFail: true,
+    };
+  });
+
+  // N1-N5: refused inertly, NO signal issued, the arm fails.
+  const refusalControls = [
+    ["N1", "no marker ever emitted", null, "no_marker_observed"],
+    ["N2", "well-formed marker carrying a foreign nonce",
+      exactMarker(controlPoint, foreignNonce, controlPid), "marker_refused:wrong_nonce"],
+    ["N3", "well-formed marker naming the wrong point",
+      exactMarker("after_cas_read", goodNonce, controlPid), "marker_refused:wrong_point"],
+    ["N4", "otherwise exact marker carrying a foreign pid",
+      exactMarker(controlPoint, goodNonce, 999999), "marker_refused:wrong_pid"],
+    ["N5", "truncated or malformed typed prefix",
+      "P4_SEAM_HOLD point=" + controlPoint + " nonce=" + goodNonce + "\n",
+      "marker_refused:malformed_typed_form"],
+  ];
+  for (const [id, description, line, expectedFailure] of refusalControls) {
+    runControl(id, description, () => {
+      const state = newSeamMarkerState();
+      const expected = { point: controlPoint, nonce: goodNonce, pid: controlPid };
+      if (line !== null) feedSeamMarker(state, line, expected);
+      const handle = injectedOwnedHandleDouble({ pid: controlPid });
+      const decision = decideExperimentalKill(state, handle.record);
+      assert.equal(decision.issueSignal, false,
+        "W7x/" + id + ": a refused or absent marker issues NO signal");
+      assert.equal(decision.failure, expectedFailure, "W7x/" + id + ": exact refusal cause");
+      assert.equal(handle.record.killRequested, false,
+        "W7x/" + id + ": nothing was signalled, not even the double");
+      return { accepted: false, failure: decision.failure, mustFail: true };
+    });
+  }
+
+  // N6: the child announces, then exits ordinarily BEFORE the kill request. The arm fails and is
+  // never recorded as a crash arm.
+  runControl("N6", "child announces then exits ordinarily before the kill request", () => {
+    const state = newSeamMarkerState();
+    const expected = { point: controlPoint, nonce: goodNonce, pid: controlPid };
+    const verdict = feedSeamMarker(state, exactMarker(controlPoint, goodNonce, controlPid), expected);
+    assert.equal(verdict.accepted, true, "W7x/N6: the marker itself was exact");
+    const handle = injectedOwnedHandleDouble({ pid: controlPid, alreadyExited: true, exitCode: 0 });
+    const decision = decideExperimentalKill(state, handle.record);
+    assert.equal(decision.issueSignal, false, "W7x/N6: no signal is issued to an exited child");
+    assert.equal(decision.failure, "exit_observed_before_kill_request", "W7x/N6: exact cause");
+    return {
+      exitObservedBeforeKillRequest: true,
+      failure: decision.failure,
+      neverACrashArm: "an ordinary self-exit before the kill is a FAILED W7x arm and is never "
+        + "recorded as, or merged into, the W7 crash arm",
+    };
+  });
+
+  // N7: kill() returns false, or throws. Both fail. A signal IS attempted here, against the
+  // double only, and is counted as the simulated attempt it is.
+  runControl("N7a", "kill() returns false", () => {
+    const handle = injectedOwnedHandleDouble({ pid: controlPid, killReturns: false });
+    const returned = handle.kill("experimental");
+    assert.equal(returned, false, "W7x/N7a: a refused kill must be reported as refused");
+    assert.equal(handle.record.killedByTest, false,
+      "W7x/N7a: a refused kill leaves the fate UNKNOWN - it is never read as a clean exit");
+    assert.equal(childLifecycle(handle.record), "kill-failed-unknown", "W7x/N7a: exact lifecycle");
+    return { killReturn: returned, lifecycle: childLifecycle(handle.record), mustFail: true };
+  });
+
+  runControl("N7b", "kill() throws", () => {
+    const handle = injectedOwnedHandleDouble({ pid: controlPid, killThrows: true });
+    const returned = handle.kill("experimental");
+    assert.equal(returned, false, "W7x/N7b: a throwing kill must be reported as not delivered");
+    assert.notEqual(handle.record.killError, null, "W7x/N7b: the thrown cause is recorded");
+    assert.equal(childLifecycle(handle.record), "kill-failed-unknown", "W7x/N7b: exact lifecycle");
+    return { killReturn: returned, lifecycle: childLifecycle(handle.record), mustFail: true };
+  });
+
+  // N8: marker observed, kill accepted, child NOT joined within budget.
+  runControl("N8", "kill accepted but the child is never joined", () => {
+    const handle = injectedOwnedHandleDouble({ pid: controlPid, joins: false });
+    const returned = handle.kill("experimental");
+    assert.equal(returned, true, "W7x/N8: the kill was accepted");
+    assert.equal(handle.record.exited, false, "W7x/N8: no exit was observed");
+    assert.equal(childLifecycle(handle.record), "kill-delivered-exit-unobserved",
+      "W7x/N8: an unobserved exit stays distinct from an observed one and is never folded into it");
+    return { killReturn: returned, lifecycle: childLifecycle(handle.record), mustFail: true };
+  });
+
+  // N9: the shared-memory wait mechanism is unavailable - an UNMET PRECONDITION, never a fallback.
+  // Modelled at the parent boundary: the seam throws instead of holding, so the child returns a
+  // result and no marker ever arrives.
+  runControl("N9", "shared-memory wait unavailable: unmet precondition, no fallback", () => {
+    const state = newSeamMarkerState();
+    const handle = injectedOwnedHandleDouble({ pid: controlPid });
+    handle.record.result = { ok: false, reason: REASON_TRANSACTION_FAILED };
+    const decision = decideExperimentalKill(state, handle.record);
+    assert.equal(decision.issueSignal, false, "W7x/N9: no marker, so no signal");
+    assert.equal(decision.failure, "no_marker_observed", "W7x/N9: exact cause");
+    return {
+      failure: decision.failure,
+      mustFail: true,
+      fallbackPolicy: "there is deliberately NO spin fallback: an indefinite spin executes JS "
+        + "continuously. An unavailable mechanism fails the arm as an unmet precondition.",
+    };
+  });
+
+  assert.equal(controls.length, 22,
+    "W7x: every declared control must have run - P1, D1, F1, D2, D3, M1-M3, R1-R3, N8b and N1-N9 "
+    + "with N7 split into N7a and N7b");
+  for (const entry of controls) {
+    if (entry.mustFail === true) {
+      assert.notEqual(entry.failure === undefined && entry.killReturn === undefined, true,
+        "W7x/" + entry.id + ": a failing control must record how it failed");
+    }
+  }
+
+  Object.assign(evidence.cases.W7x, {
+    status: "passed",
+    seams: CRASH_SEAMS,
+    signalAccounting: {
+      experimentalKillsIssued: signalAudit.experimentalKillsIssued,
+      cleanupKillsIssued: signalAudit.cleanupKillsIssued,
+      realSignalsIssued: signalAudit.realSignalsIssued,
+      simulatedSignalsIssued: signalAudit.simulatedSignalsIssued,
+      pidScans: signalAudit.pidScans,
+      processGroupsSignalled: signalAudit.processGroupsSignalled,
+      note: "experimental and cleanup kills are counted SEPARATELY and never summed into one "
+        + "zero-signal claim. A refused or never-announced child still has to be joined through "
+        + "its exact handle, and the cleanup signal that requires is reported as a real signal.",
+    },
+    decisionLimit: SEAM_DECISION_LIMIT,
+    recoveryGate: "the owned store is read as recovery evidence ONLY after an observed exit of "
+      + "the exact handle. An unjoined child leaves the store untouched, persists the unknown and "
+      + "fails the arm; it is never reopened underneath a live writer.",
+    simulationBoundary: "the three seam arms above are REAL native-run evidence. Every negative "
+      + "control is an injected owned-handle double, labelled simulation, and NO simulation is "
+      + "counted as storage proof or as an observation of any operating system.",
+    notClaimed: "no power-loss, durability, fsync or hot-journal-recovery proof; no malicious-writer "
+      + "or authorship proof; no OS delivery chronology; no authentication evidence; and no "
+      + "statement whatsoever about the W7 self-kill win32 UNKNOWN, which stands.",
+  });
+  maybeForceFail("W7x");
+});
+
 // --- W8: rollback and close faults - all four cleanup outcomes, all SYNTHETIC -------------------
 
 function distinctCauses(result, context, expected) {
@@ -2352,7 +3596,8 @@ test("W9 structural ownership of the runtime leaf, and fixture unreachability", 
       "W9: write-cas.cjs must not contain " + token + " (code, not comments)");
   }
   assert.equal(/\bfs\s*\./.test(writeCas.code), false,
-    "W9: the runtime leaf touches no fs surface at all");
+    "W9: the runtime leaf binds no fs namespace - there is no fs.<member> call site anywhere, and "
+    + "the one gated W7x require below is consumed inline rather than bound to a name");
 
   // R2-6 (b): it requires neither node:fs nor node:path, and only builtins plus the pinned binding.
   const allowedSpecifier = specifier =>
@@ -2362,10 +3607,62 @@ test("W9 structural ownership of the runtime leaf, and fixture unreachability", 
   const disallowed = writeCas.requires.filter(specifier => !allowedSpecifier(specifier));
   assert.deepEqual(disallowed, [],
     "W9: the runtime leaf may require only node builtins and better-sqlite3");
-  for (const banned of ["fs", "node:fs", "path", "node:path"]) {
+  // R2-6 (b), restated at the strength it actually holds now that the W7x hold seam exists.
+  //
+  // The path module stays banned OUTRIGHT, and so does any unqualified "fs" specifier. The
+  // filesystem module is banned AT THE TOP LEVEL, which is the property R2-6 (b) was protecting:
+  // with the seam unset that require is never evaluated, so the module's LOADED dependency surface
+  // is the pinned native binding alone. The weaker source-level property is asserted as the weaker
+  // property it is, and is then FENCED - the single permitted occurrence must lie inside
+  // holdIfRequested, behind its gate - rather than being dropped.
+  for (const banned of ["fs", "path", "node:path"]) {
     assert.equal(writeCas.requires.includes(banned), false,
-      "W9: R2-6 (b) - the runtime leaf requires neither node:fs nor node:path (" + banned + ")");
+      "W9: R2-6 (b) - the runtime leaf requires no path module and no unqualified fs (" + banned + ")");
   }
+
+  // Every require site, with its position, so "top level" and "inside the gated branch" are
+  // MEASURED positions rather than asserted claims.
+  const requireSites = [];
+  const sitePattern = /require\(\s*\u0001S(\d+)\u0001\s*\)/g;
+  let siteMatch = sitePattern.exec(writeCas.code);
+  while (siteMatch !== null) {
+    requireSites.push({
+      specifier: writeCas.strings[Number(siteMatch[1])].literal,
+      at: siteMatch.index,
+    });
+    siteMatch = sitePattern.exec(writeCas.code);
+  }
+
+  const holdStart = writeCas.code.indexOf("function holdIfRequested(");
+  assert.notEqual(holdStart, -1, "W9: the W7x hold seam must be present as a named function");
+  // The function ends where the next top-level declaration begins. Both leaves keep every
+  // declaration at column zero, so this boundary is exact for this source.
+  const afterHold = writeCas.code.indexOf("\nfunction ", holdStart + 1);
+  const holdEnd = afterHold === -1 ? writeCas.code.length : afterHold;
+
+  const fsSites = requireSites.filter(site => site.specifier === "node:fs");
+  assert.equal(fsSites.length, 1,
+    "W9: the runtime leaf contains EXACTLY ONE node:fs require - the W7x seam's, and no other");
+  assert.equal(fsSites[0].at > holdStart && fsSites[0].at < holdEnd, true,
+    "W9: the single node:fs require must lie INSIDE holdIfRequested, so it is unreachable unless "
+    + "P4_HOLD_AT names the point being passed");
+
+  // The gate textually precedes the require inside that function, so the require cannot be
+  // reached before the seam has been positively requested for this exact point.
+  const holdBody = writeCas.code.slice(holdStart, holdEnd);
+  const gateAt = holdBody.indexOf("process.env.P4_HOLD_AT");
+  assert.notEqual(gateAt, -1, "W9: the hold seam must gate on P4_HOLD_AT");
+  assert.equal(gateAt < fsSites[0].at - holdStart, true,
+    "W9: the P4_HOLD_AT gate must textually precede the node:fs require it guards");
+
+  // No require of any kind sits at the top level except the pinned binding: everything else is
+  // inside a function body, which is what keeps the load-time surface unchanged.
+  const firstFunctionAt = writeCas.code.indexOf("\nfunction ");
+  assert.notEqual(firstFunctionAt, -1, "W9: the leaf must declare functions");
+  const topLevelRequires = requireSites.filter(site => site.at < firstFunctionAt);
+  assert.deepEqual(topLevelRequires.map(site => site.specifier), ["better-sqlite3"],
+    "W9: R2-6 (b) - the ONLY top-level require is the pinned native binding, so with the seam "
+    + "unset the loaded dependency surface is unchanged");
   assert.deepEqual(writeCas.requires.filter(specifier => specifier.startsWith(".")), [],
     "W9: the runtime leaf has NO relative require - no product import, no states.cjs, no fixture");
 
@@ -2974,13 +4271,55 @@ test("T teardown: the recorded case-id list is derived from execution, and child
     assert.equal(fact.exited, true, "T: every child exit is OBSERVED, never assumed");
     assert.equal(fact.exitCode !== null || fact.signal !== null, true,
       "T: every child records an exit code or a signal");
-    assert.equal(fact.lifecycle, "exited-observed",
-      "T: every child died on its own - no test-caused kill and no unknown fate");
+    // W7x is the ONLY case that may terminate a child, and it must do so through the exact handle
+    // it owns. The pre-existing rule is kept at full strength for every other case rather than
+    // relaxed run-wide: outside W7x an unknown fate or a test-caused kill is still a failure.
+    if (fact.caseId === "W7x") {
+      assert.equal(fact.lifecycle, "terminated-by-test",
+        "T: a W7x child is terminated by this suite through its own handle, and that is recorded "
+        + "as what it is rather than dressed up as a self-exit");
+      assert.equal(fact.experimentalKills, 1,
+        "T: a W7x child receives exactly ONE experimental signal");
+      assert.equal(fact.cleanupKills, 0,
+        "T: a joined W7x child needs no cleanup signal");
+    } else {
+      assert.equal(fact.lifecycle, "exited-observed",
+        "T: every child outside W7x died on its own - no test-caused kill and no unknown fate");
+      assert.equal(fact.killRequested, false,
+        "T: no child outside W7x is ever signalled by this suite");
+    }
   }
-  const expectedChildren = RACE_ITERATIONS * RACE_CHILD_COUNT + CRASH_SEAMS.length;
+  const expectedChildren =
+    RACE_ITERATIONS * RACE_CHILD_COUNT + CRASH_SEAMS.length + CRASH_SEAMS.length;
   assert.equal(evidence.children.spawned, expectedChildren,
     "T: exactly " + expectedChildren + " children (W6 " + RACE_ITERATIONS + "x" + RACE_CHILD_COUNT
-    + " plus W7 " + CRASH_SEAMS.length + ")");
+    + ", W7 " + CRASH_SEAMS.length + ", W7x " + CRASH_SEAMS.length + ")");
+
+  // The W7x negative controls are DOUBLES and must not appear in the child accounting at all: a
+  // simulation that inflated the spawned/reaped totals would be a simulation counted as a run.
+  assert.equal(evidence.children.records.every(fact => fact.simulated !== true), true,
+    "T: no simulated double may appear in the child accounting");
+
+  // Run-wide, and measured rather than asserted as a constant: this suite owns exact handles and
+  // has no code path that enumerates processes or signals a process group.
+  assert.equal(signalAudit.pidScans, 0, "T: pidScans is zero run-wide");
+  assert.equal(signalAudit.processGroupsSignalled, 0,
+    "T: processGroupsSignalled is zero run-wide");
+  assert.equal(signalAudit.experimentalKillsIssued, CRASH_SEAMS.length,
+    "T: exactly one experimental signal per W7x seam, run-wide");
+  assert.equal(signalAudit.realSignalsIssued,
+    signalAudit.experimentalKillsIssued + signalAudit.cleanupKillsIssued,
+    "T: every real signal is attributed to exactly one intent");
+  evidence.signalAudit = {
+    pidScans: signalAudit.pidScans,
+    processGroupsSignalled: signalAudit.processGroupsSignalled,
+    experimentalKillsIssued: signalAudit.experimentalKillsIssued,
+    cleanupKillsIssued: signalAudit.cleanupKillsIssued,
+    realSignalsIssued: signalAudit.realSignalsIssued,
+    simulatedSignalsIssued: signalAudit.simulatedSignalsIssued,
+    note: "experimental and cleanup kills are counted separately and never summed into a single "
+      + "zero-signal claim. Simulated signals went to injected doubles and reached no process.",
+  };
 
   evidence.executedCaseIds = recorded;
   evidence.executedCaseCount = recorded.length;
@@ -3005,8 +4344,25 @@ function finalize() {
   finalized = true;
 
   // Only the exact child handles this suite created, and only if any survived.
+  //
+  // v3: a handle that already had its ONE bounded cleanup attempt is NOT signalled again here.
+  // v2 issued a second SIGKILL straight through handle.child.kill, bypassing the kill accounting
+  // entirely - so the run-wide signal totals under-reported by exactly the signals sent to the
+  // children that mattered most. Skipping it is the honest option: the fate is already recorded as
+  // unknown, and a second untracked signal would not make it known. No process scan, no process
+  // group, and no global kill is ever performed.
   const orphanedChildrenKilled = [];
+  const unjoinedHandlesNotReSignalled = [];
   for (const handle of liveChildren) {
+    if (!mayReSignalHandle(handle)) {
+      unjoinedHandlesNotReSignalled.push({
+        pid: handle.record.pid,
+        lifecycle: childLifecycle(handle.record),
+        because: "a bounded cleanup signal was already issued and joined-for through this exact "
+          + "handle; its fate stays recorded as unknown rather than re-signalled off the books",
+      });
+      continue;
+    }
     orphanedChildrenKilled.push(handle.record.pid);
     try {
       handle.child.kill("SIGKILL");
@@ -3019,7 +4375,13 @@ function finalize() {
   // WORK_DIR only. Never a privileged operation, never anything outside WORK_DIR.
   const permissionsRestored = [];
   const permissionRestoreFailures = [];
+  const permissionRestoresSkippedForPreserved = [];
   for (const entry of modesToRestore) {
+    // A preserved root is left EXACTLY as the arm left it - not removed and not chmod-ed.
+    if (!mayCleanUpRoot(entry.dir)) {
+      permissionRestoresSkippedForPreserved.push(entry.dir);
+      continue;
+    }
     try {
       fs.chmodSync(entry.dir, entry.mode);
       permissionsRestored.push(entry.dir);
@@ -3028,9 +4390,18 @@ function finalize() {
     }
   }
 
+  // v3: the removal loop consults the SHARED preservation decision. Successfully joined roots
+  // still clean normally; only the exact owned root of a W7x arm whose exit was never observed is
+  // kept, because a live child may still be holding that store open.
   const removed = [];
   const failedToRemove = [];
+  const preservedUnjoinedRoots = [];
   for (const root of createdRoots) {
+    if (!mayCleanUpRoot(root)) {
+      const entry = preservedRoots.get(root);
+      preservedUnjoinedRoots.push(entry === undefined ? { root, because: "under_preserved_root" } : entry);
+      continue;
+    }
     try {
       fs.rmSync(root, { recursive: true, force: true });
       removed.push(root);
@@ -3054,7 +4425,20 @@ function finalize() {
     rootsRemoved: removed.length,
     failedToRemove,
     residualTmpRootsUnderWorkDir,
-    clean: failedToRemove.length === 0 && residualTmpRootsUnderWorkDir.length === 0,
+    // v3. A PRESERVED root is a deliberate, reported outcome - never a silent removal and never a
+    // silent leak. It is listed explicitly and it forces clean:false, because the suite did not in
+    // fact leave the work directory empty and saying otherwise would be the same false claim v2
+    // made when it deleted the store it said it had preserved.
+    preservedUnjoinedRoots,
+    preservedRootCount: preservedUnjoinedRoots.length,
+    permissionRestoresSkippedForPreserved,
+    unjoinedHandlesNotReSignalled,
+    clean: failedToRemove.length === 0
+      && residualTmpRootsUnderWorkDir.length === 0
+      && preservedUnjoinedRoots.length === 0,
+    cleanPolicy: "clean is false whenever any owned root was preserved. A preserved root is a "
+      + "REPORTED consequence of an unobserved child exit, distinct from a removal failure and "
+      + "distinct from an unexplained residual leak; all three are listed separately.",
     tmpRootPrefix: TMP_PREFIX,
     orphanedChildrenKilled,
     permissionsRestored,

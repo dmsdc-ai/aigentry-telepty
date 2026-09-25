@@ -14,10 +14,19 @@
 // mapping and review later. D1, D2 and D3 are untouched and remain open.
 //
 // Deliberately absent from this runtime leaf (W9, R2-6b):
-//   - neither the core filesystem module nor the core path module is required at all. The only
-//     dependency is the pinned native binding, so this file issues no filesystem call of any kind
-//     and no probe of any kind before the open. The single native open without
-//     SQLITE_OPEN_CREATE is the whole mechanism.
+//   - the core path module is not required at all, and the core filesystem module is not required
+//     at the top level. The only top-level dependency is the pinned native binding, so this file
+//     issues no filesystem call of any kind and no probe of any kind before the open. The single
+//     native open without SQLITE_OPEN_CREATE is the whole mechanism.
+//
+//     W7x STATES THE ONE EXCEPTION RATHER THAN SMOOTHING IT: holdIfRequested below contains a
+//     require of the core filesystem module INSIDE its gated branch, reached only when P4_HOLD_AT
+//     names the point being passed. When the seam is unset that require is never evaluated, so the
+//     module's LOADED dependency surface stays the pinned native binding alone - but the require
+//     is nonetheless present in this SOURCE, which is a weaker property than the v1 wording above
+//     claimed and is asserted as the weaker property it is (W9 scopes the ban to top level and
+//     asserts the single occurrence is the gated one). No filesystem call is added to any path the
+//     seam does not gate, and no path module appears anywhere.
 //   - no directory creation, no removal, no shortening and no re-pointing of any name.
 //   - no repair, adopt, migrate or JSON fallback path; no second connection; no compile-time
 //     option is written, and the journal mode is left at the SQLite default.
@@ -74,9 +83,16 @@ const REASON_COMMIT_UNCERTAIN = "experimental_store_commit_uncertain";
 const REASON_ROLLBACK_FAILED = "experimental_store_rollback_failed";
 const REASON_CLOSE_FAILED = "experimental_store_close_failed";
 
-// W3 / W7 seams. Closed sets of named points; nothing else in this file is interruptible.
+// W3 / W7 / W7x seams. Closed sets of named points; nothing else in this file is interruptible.
 const FAIL_POINTS = ["after_open", "after_cas_read", "after_row_insert", "before_commit"];
 const CRASH_POINTS = ["after_cas_read", "after_row_insert", "before_commit"];
+
+// W7x. The hold seam reuses the CRASH_POINTS set VERBATIM rather than declaring a second list, so
+// the two termination arms can never drift onto different points.
+// The nonce is the parent's per-spawn challenge and is echoed back on fd1. It is validated HERE as
+// exactly 32 lowercase hex digits before anything is written, so an oversized or shell-injected
+// environment value can never become an unbounded line on fd1.
+const HOLD_NONCE_TEXT = /^[0-9a-f]{32}$/;
 
 // The closed classification vocabulary of the contract: busy, conflict, constraint, unavailable,
 // unclassified. PRIMARY codes only. An extended code a runner happens to produce is preserved
@@ -195,6 +211,64 @@ function failIfRequested(point) {
 function crashIfRequested(point) {
   if (!CRASH_POINTS.includes(point)) return;
   if (process.env.P4_CRASH_AT === point) process.kill(process.pid, "SIGKILL");
+}
+
+// W7x. EXTERNAL termination at the same three points, and a SEPARATE case from W7 rather than a
+// replacement for it: W7 measures a SELF-delivered SIGKILL, whose win32 representation stays an
+// UNKNOWN that nothing here resolves, relabels or converts into a skip.
+//
+// Inert when unset, and a NON-FAILURE seam when unset: it registers no listener, schedules no
+// callback, signals nothing, scans nothing and touches no process but this one. When and only when
+// P4_HOLD_AT names the point it does exactly two things - one synchronous line on fd1, then an
+// indefinite block - and it never emits a commit, a result or an ordinary exit. The parent, which
+// owns this ChildProcess handle, validates that line and then issues the one signal.
+//
+// fd1 rather than fd2 because the existing spawn pipes fd1 with no reader, so a dedicated listener
+// there cannot interleave with a native SQLite stderr line and the 1024-byte stderrHead cap keeps
+// its current meaning. writeSync rather than process.stdout.write because a write to a pipe is
+// ASYNCHRONOUS: a buffered marker followed by an indefinite block is a deadlock, not a hold.
+//
+// Every way out of this function other than the indefinite block is a FAILURE that leaves the
+// transaction unadvanced. An unmet precondition throws BEFORE the marker is written, so the parent
+// sees no marker and issues no signal. Atomics.wait returning AT ALL is unexpected - the wait has
+// no timeout and nothing ever notifies that location - so it throws too, immediately, rather than
+// falling through to the next SQLite step. There is deliberately NO spin fallback: an indefinite
+// spin executes JS continuously, which is not the barrier this seam is for.
+function holdIfRequested(point) {
+  if (!CRASH_POINTS.includes(point)) return;
+  if (process.env.P4_HOLD_AT !== point) return;
+
+  const nonce = process.env.P4_HOLD_NONCE;
+  if (typeof nonce !== "string" || !HOLD_NONCE_TEXT.test(nonce)) {
+    throw syntheticError(
+      `synthetic hold seam P4_HOLD_AT=${point} unmet precondition: P4_HOLD_NONCE is not 32 `
+      + `lowercase hex digits - no marker written, nothing held, not a measured native failure`,
+    );
+  }
+  // The mechanism is the one already proven in termination-map-child.cjs. Where it is unavailable
+  // the arm fails as an UNMET PRECONDITION and is never downgraded to a timed sleep.
+  if (typeof SharedArrayBuffer !== "function" || typeof Atomics !== "object" || Atomics === null) {
+    throw syntheticError(
+      `synthetic hold seam P4_HOLD_AT=${point} unmet precondition: the shared-memory wait `
+      + `mechanism is unavailable - no marker written, nothing held, not a measured native failure`,
+    );
+  }
+
+  // Typed, byte-exact, single synchronous write. The nonce is the validated one above and the pid
+  // is this process's own, so every field the parent checks is authored here and none is echoed
+  // from unvalidated input.
+  require("node:fs").writeSync(1, `P4_SEAM_HOLD v1 point=${point} nonce=${nonce} pid=${process.pid}\n`);
+
+  // No timeout. The thread stops here for as long as this process exists.
+  const waitOutcome = Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+
+  // Unreachable by design. If it IS reached, the hold did not hold, and the one thing that must
+  // NOT happen is this function returning into the next SQLite step.
+  throw syntheticError(
+    `synthetic hold seam P4_HOLD_AT=${point} did not hold: the shared-memory wait returned `
+    + `${String(waitOutcome)} with no timeout set - failing here rather than advancing, and not a `
+    + `measured native failure`,
+  );
 }
 
 // W10c. Fires immediately before the commit step is executed, and the commit phase is entered
@@ -522,6 +596,7 @@ function applyExperimentalStoreMutation(storeRoot, options) {
 
     failIfRequested("after_cas_read");
     crashIfRequested("after_cas_read");
+    holdIfRequested("after_cas_read");
 
     // R2-5. Key-exists is established POSITIVELY by query on the handle already holding the
     // RESERVED lock, which makes it race-free without any pre-open probe or second connection.
@@ -537,6 +612,7 @@ function applyExperimentalStoreMutation(storeRoot, options) {
 
     failIfRequested("after_row_insert");
     crashIfRequested("after_row_insert");
+    holdIfRequested("after_row_insert");
 
     // The generation key is BOUND from a module constant. Double quotes are identifier quoting in
     // SQLite and the fallback to a text literal is a build-configurable legacy behaviour, not a
@@ -553,6 +629,7 @@ function applyExperimentalStoreMutation(storeRoot, options) {
     // The row and the bump share this one transaction, so neither can land alone.
     failIfRequested("before_commit");
     crashIfRequested("before_commit");
+    holdIfRequested("before_commit");
 
     commitAttempted = true;
     commitFaultIfRequested();
