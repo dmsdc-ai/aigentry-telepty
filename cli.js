@@ -1245,7 +1245,108 @@ async function deferToSupervisor(options = {}) {
   return null;
 }
 
+// #751: explicit no-daemon-lifecycle safety mode.
+//
+// Some deployments own the daemon's lifecycle outside this CLI — a supervisor unit the operator
+// manages, a container entrypoint, a shared host daemon nobody's client may replace. Until now
+// the CLI had no way to be TOLD that: every "not healthy" verdict authorized remediation
+// (spawn / restart / repair / marker write), and the only escape hatches were per-symptom
+// booleans (TELEPTY_SKIP_DAEMON_REPAIR, TELEPTY_NO_SUPERVISOR_DEFER) that each cover one seam.
+//
+// TELEPTY_DAEMON_LIFECYCLE states the ownership once, for the whole ensureDaemonRunning path:
+//   external — something else owns the lifecycle. Validation still runs IN FULL; what changes is
+//              the remedy. Verified-healthy ⇒ proceed with zero side effects; anything else ⇒
+//              fail closed. SCOPE: this governs the LOCAL (127.0.0.1) daemon only — the only
+//              daemon this CLI ever had a lifecycle over. The REMOTE_HOST guard below is
+//              unchanged, so a non-local address still returns early without probing.
+//   managed  — the pre-#751 behavior, spelled out explicitly.
+//   (unset)  — managed. Legacy behavior is untouched; this mode is opt-in only.
+//
+// Fail-closed is the whole point, so an unrecognized value is NOT coerced to a default: a typo
+// ("externl") or a truthy-looking value ("1") that quietly re-enabled management would hand the
+// operator the exact outcome they set the variable to prevent. Only a genuinely absent variable
+// means "legacy"; a present-but-unreadable one is an error.
+const LIFECYCLE_MODES = Object.freeze({
+  MANAGED: 'managed',
+  EXTERNAL: 'external',
+  INVALID: 'invalid'
+});
+
+function resolveDaemonLifecycleMode(env = process.env) {
+  const raw = env ? env.TELEPTY_DAEMON_LIFECYCLE : undefined;
+  if (raw == null) return { mode: LIFECYCLE_MODES.MANAGED, explicit: false, raw: null };
+  if (typeof raw !== 'string') return { mode: LIFECYCLE_MODES.INVALID, explicit: true, raw };
+  const value = raw.trim().toLowerCase();
+  if (value === LIFECYCLE_MODES.EXTERNAL) return { mode: LIFECYCLE_MODES.EXTERNAL, explicit: true, raw };
+  if (value === LIFECYCLE_MODES.MANAGED) return { mode: LIFECYCLE_MODES.MANAGED, explicit: true, raw };
+  return { mode: LIFECYCLE_MODES.INVALID, explicit: true, raw };
+}
+
+// #751: the refusal messages below interpolate two untrusted strings (the operator's mode value
+// and the daemon's reported version). Neither is length- or charset-checked at its source, so both
+// are sanitized AND clamped here — a bounded one-line error is part of failing closed.
+//
+// Length alone is not enough: an embedded newline splits the refusal across lines (so the
+// one-line render at the top-level catch is no longer one line, and a forged second line can be
+// made to look like separate CLI output), and an ESC byte lets a hostile version string emit
+// arbitrary ANSI — colour, cursor moves, line erase — into the operator's terminal. Every C0/C1
+// control and DEL is therefore replaced by a fixed '·'. The substitution is 1:1, so it cannot
+// expand the string and cannot be cut mid-escape by the clamp that follows.
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/g;
+
+function boundedLabel(value, max = 64) {
+  const text = typeof value === 'string' ? value : String(value == null ? '' : value);
+  const safe = text.replace(CONTROL_CHARS, '·');
+  return safe.length > max ? `${safe.slice(0, max)}…` : safe;
+}
+
+function daemonLifecycleModeError(raw) {
+  const error = new Error(
+    `TELEPTY_DAEMON_LIFECYCLE="${boundedLabel(raw)}" is not a recognized daemon lifecycle mode `
+    + `(expected "${LIFECYCLE_MODES.EXTERNAL}" or "${LIFECYCLE_MODES.MANAGED}", or leave it unset). `
+    + 'Refusing to continue: a mode this CLI cannot read must not silently re-enable daemon '
+    + 'lifecycle management.'
+  );
+  error.name = 'DaemonLifecycleModeError';
+  error.mode = null;
+  error.raw = boundedLabel(raw);
+  markCommandFailed();
+  return error;
+}
+
+function externalDaemonUnusableError(decision, meta) {
+  const version = meta && meta.version ? boundedLabel(meta.version, 32) : 'unknown';
+  const error = new Error(
+    `No usable local telepty daemon on port ${PORT} `
+    + `(verdict: ${boundedLabel(decision && decision.reason)}; daemon version: ${version}). `
+    + `TELEPTY_DAEMON_LIFECYCLE=${LIFECYCLE_MODES.EXTERNAL} is set, so this CLI does not own the `
+    + 'daemon lifecycle: nothing was started, restarted, repaired or installed. Bring a matching '
+    + 'daemon up externally and retry.'
+  );
+  error.name = 'DaemonLifecycleExternalError';
+  error.mode = LIFECYCLE_MODES.EXTERNAL;
+  error.reason = decision && decision.reason ? decision.reason : null;
+  // What managed mode WOULD have done here — the one fact an operator needs to see that the
+  // refusal is the mode working, not a bug.
+  error.suppressedAction = decision && decision.action ? decision.action : null;
+  markCommandFailed();
+  return error;
+}
+
+function isDaemonLifecycleError(error) {
+  return Boolean(error)
+    && (error.name === 'DaemonLifecycleModeError' || error.name === 'DaemonLifecycleExternalError');
+}
+
 async function ensureDaemonRunning(options = {}) {
+  // #751: resolved BEFORE the REMOTE_HOST return below, because an unreadable mode must fail
+  // closed on every address. A VALID external mode, by contrast, only takes effect past that
+  // guard — i.e. for the local 127.0.0.1 daemon, the only one this CLI manages.
+  const lifecycle = resolveDaemonLifecycleMode(options._env || process.env);
+  if (lifecycle.mode === LIFECYCLE_MODES.INVALID) {
+    throw daemonLifecycleModeError(lifecycle.raw);
+  }
+
   if (REMOTE_HOST !== '127.0.0.1') return; // Only auto-start local daemon
 
   const requiredCapabilities = options.requiredCapabilities || [];
@@ -1312,6 +1413,34 @@ async function ensureDaemonRunning(options = {}) {
   }
 
   let decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable, healthOk });
+
+  // #751: the explicit no-lifecycle gate. Deliberately placed HERE — after all three probes and
+  // the full decision policy — because the requirement is not "skip the work" (that is the
+  // REMOTE_HOST bare return above, and it would let an unverified daemon through). External mode
+  // validates exactly as hard as managed mode and then diverges only on the REMEDY. Reached only
+  // for the local 127.0.0.1 daemon; remote addresses returned at that guard, unchanged.
+  //
+  // The single allowed outcome is reason 'healthy': decideDaemonAction reaches it only after a
+  // version decision of noop AND every required capability present, so it is the one verdict that
+  // has actually verified the daemon. Every other verdict is refused BEFORE the supervisor defer,
+  // the restart banners, the marker read/write and doRestart() below — so no spawn, restart,
+  // repair, install, or lifecycle-marker mutation can happen on this path.
+  //
+  // 'alive-but-slow' is refused on purpose despite being a noop in managed mode: /api/health
+  // answering proves liveness, not version or capabilities, and "we could not verify it" is not
+  // permission to use it when we are also forbidden from fixing it.
+  if (lifecycle.mode === LIFECYCLE_MODES.EXTERNAL) {
+    // #835: a refusal is an answer. It keeps its own error here rather than being folded into the
+    // lifecycle refusal — a daemon that declines our credentials is a demonstrably running daemon
+    // and an auth problem, and reclassifying it would lose that.
+    if (decision.action === 'abort') {
+      throw daemonAnswerError(meta, '127.0.0.1');
+    }
+    if (decision.action === 'noop' && decision.reason === 'healthy') {
+      return; // verified: matching version + every required capability. Use it, touch nothing.
+    }
+    throw externalDaemonUnusableError(decision, meta);
+  }
 
   // gh#82 (B): alive, just slow. Say so once — the operator otherwise sees a command that simply
   // fails, with the daemon it needs sitting right there.
@@ -4698,8 +4827,11 @@ if (require.main === module) {
   // #835: a refusal thrown from the daemon-probe path can surface on commands that do not wrap
   // their own call (`spawn`, `allow`). It must read as one clear line and exit non-zero — not as
   // an unhandled-rejection stack. Anything else keeps its previous crash behavior exactly.
+  // #751: the explicit no-lifecycle refusals join that same one-line path. They are already
+  // bounded messages, and rendering one as a stack trace would make the safety mode read as a
+  // crash rather than as the deliberate fail-closed it is.
   main().catch((error) => {
-    if (!isDaemonAnswerError(error)) throw error;
+    if (!isDaemonAnswerError(error) && !isDaemonLifecycleError(error)) throw error;
     console.error(`❌ ${error.message}`);
     process.exit(1);
   });
@@ -4715,6 +4847,8 @@ module.exports = {
   decideDaemonAction,     // #567: pure restart-decision policy (meta-primary; no I/O)
   deferToSupervisor,      // #738: supervisor-aware defer (injectable detect/probe/marker seams)
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
+  resolveDaemonLifecycleMode, // #751: TELEPTY_DAEMON_LIFECYCLE mode policy (pure; fail-closed)
+  isDaemonLifecycleError, // #751: classify the explicit no-lifecycle refusals
   helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
   updateRestartSucceeded, // gh#61: did `update` leave a running daemon — skip is not a failure
