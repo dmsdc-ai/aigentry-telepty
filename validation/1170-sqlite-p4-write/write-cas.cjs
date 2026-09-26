@@ -19,14 +19,16 @@
 //     issues no filesystem call of any kind and no probe of any kind before the open. The single
 //     native open without SQLITE_OPEN_CREATE is the whole mechanism.
 //
-//     W7x STATES THE ONE EXCEPTION RATHER THAN SMOOTHING IT: holdIfRequested below contains a
-//     require of the core filesystem module INSIDE its gated branch, reached only when P4_HOLD_AT
-//     names the point being passed. When the seam is unset that require is never evaluated, so the
-//     module's LOADED dependency surface stays the pinned native binding alone - but the require
-//     is nonetheless present in this SOURCE, which is a weaker property than the v1 wording above
-//     claimed and is asserted as the weaker property it is (W9 scopes the ban to top level and
-//     asserts the single occurrence is the gated one). No filesystem call is added to any path the
-//     seam does not gate, and no path module appears anywhere.
+//     W7/W7x STATE THE ONE EXCEPTION RATHER THAN SMOOTHING IT: emitSeamLine below contains a
+//     require of the core filesystem module, and it is reached ONLY from inside the gated branch
+//     of one of the three seam functions - crashIfRequested, exitControlIfRequested and
+//     holdIfRequested - each of which tests its own environment name first. With no seam set that
+//     require is never evaluated, so the module's LOADED dependency surface stays the pinned
+//     native binding alone - but the require is nonetheless present in this SOURCE, which is a
+//     weaker property than the v1 wording above claimed and is asserted as the weaker property it
+//     is (W9 scopes the ban to top level, FENCES the single occurrence inside the one emitter, and
+//     fences every emitter call site inside a gated seam). No filesystem call is added to any path
+//     a seam does not gate, and no path module appears anywhere.
 //   - no directory creation, no removal, no shortening and no re-pointing of any name.
 //   - no repair, adopt, migrate or JSON fallback path; no second connection; no compile-time
 //     option is written, and the journal mode is left at the SQLite default.
@@ -87,12 +89,20 @@ const REASON_CLOSE_FAILED = "experimental_store_close_failed";
 const FAIL_POINTS = ["after_open", "after_cas_read", "after_row_insert", "before_commit"];
 const CRASH_POINTS = ["after_cas_read", "after_row_insert", "before_commit"];
 
-// W7x. The hold seam reuses the CRASH_POINTS set VERBATIM rather than declaring a second list, so
-// the two termination arms can never drift onto different points.
+// W7x hold, W7 self-kill marker and the W7 ordinary-exit control all reuse the CRASH_POINTS set
+// VERBATIM rather than declaring a second list, so the termination arms can never drift onto
+// different points.
 // The nonce is the parent's per-spawn challenge and is echoed back on fd1. It is validated HERE as
 // exactly 32 lowercase hex digits before anything is written, so an oversized or shell-injected
 // environment value can never become an unbounded line on fd1.
-const HOLD_NONCE_TEXT = /^[0-9a-f]{32}$/;
+const SEAM_NONCE_TEXT = /^[0-9a-f]{32}$/;
+
+// The three typed line kinds this file can emit on fd1, each exactly one line, each bound to the
+// controller-assigned nonce, the exact seam and this process's own pid. The exit-hook sentinel is
+// NOT in this list: it belongs to write-child.cjs, which is where an exit witness has to live.
+const SEAM_LINE_CRASH = "P4_SEAM_CRASH";
+const SEAM_LINE_EXIT = "P4_SEAM_EXIT";
+const SEAM_LINE_HOLD = "P4_SEAM_HOLD";
 
 // The closed classification vocabulary of the contract: busy, conflict, constraint, unavailable,
 // unclassified. PRIMARY codes only. An extended code a runner happens to produce is preserved
@@ -203,14 +213,71 @@ function failIfRequested(point) {
   throw syntheticError(`synthetic failure seam P4_FAIL_AT=${point} - not a measured native failure`);
 }
 
+// The ONE fd1 emitter, and the ONE require of the core filesystem module in this file. Every
+// caller is a gated seam branch below; nothing on an unseamed path can reach it, so with no seam
+// set this require is never evaluated and the module's loaded dependency surface is unchanged.
+//
+// writeSync rather than process.stdout.write because a write to a pipe is ASYNCHRONOUS: a
+// buffered line followed by a self-kill or an immediate exit is a lost line, not a marker. fd1
+// rather than fd2 because the existing spawn pipes fd1 with no reader, so these lines cannot
+// interleave with a native SQLite stderr line and the 1024-byte stderrHead cap keeps its meaning.
+//
+// Every field is authored HERE: the kind is a module constant, the point is the closed-set seam
+// this call is passing, the nonce is the caller-validated 32 hex digits and the pid is this
+// process's own. Nothing is echoed from unvalidated input, so the line is bounded by construction.
+function emitSeamLine(kind, point, nonce) {
+  require("node:fs").writeSync(1, `${kind} v1 point=${point} nonce=${nonce} pid=${process.pid}\n`);
+}
+
+// The nonce precondition shared by all three seams. An unmet precondition THROWS before anything
+// is written, so the arm fails as an unmet precondition and the parent sees no line - it is never
+// downgraded into an unwitnessed termination.
+function seamNonceOrThrow(variable, point) {
+  const nonce = process.env[variable];
+  if (typeof nonce !== "string" || !SEAM_NONCE_TEXT.test(nonce)) {
+    throw syntheticError(
+      `synthetic seam at ${point} unmet precondition: ${variable} is not 32 lowercase hex digits `
+      + `- no line written, nothing terminated, not a measured native failure`,
+    );
+  }
+  return nonce;
+}
+
 // W7. Deterministic mid-transaction termination for leftover CLASSIFICATION only. This is PROCESS
 // TERMINATION, never power-loss evidence: nothing is flushed and no durability claim is made. It
 // signals exactly this process id - no process scan, no signal to any other process, no global
 // kill. A killed process returns nothing at all, so no reason code, committed or retrySafe field
 // exists for it (R2-2); the parent records an unknown outcome and MUST NOT synthesize one.
+//
+// W7 COMPOUND CONTRACT: the positive marker is emitted SYNCHRONOUSLY IMMEDIATELY BEFORE the
+// self-termination, bound to the controller-assigned fresh nonce, this exact seam and this owned
+// pid. It exists because the (exitCode, signal) pair alone is non-discriminating on win32 - a
+// libuv self-kill lands on the literal exit code 1 with no signal channel - so the pair may never
+// be an attribution predicate there. The marker is one CONJUNCT of the parent's oracle and proves
+// only that this seam was reached and a line was written; it attributes nothing on its own.
 function crashIfRequested(point) {
   if (!CRASH_POINTS.includes(point)) return;
-  if (process.env.P4_CRASH_AT === point) process.kill(process.pid, "SIGKILL");
+  if (process.env.P4_CRASH_AT !== point) return;
+  const nonce = seamNonceOrThrow("P4_CRASH_NONCE", point);
+  emitSeamLine(SEAM_LINE_CRASH, point, nonce);
+  process.kill(process.pid, "SIGKILL");
+}
+
+// W7 ORDINARY-EXIT CONTROL, at the SAME three points as the self-kill arm and declared as its own
+// arm rather than as a variant of it. It emits the same typed line shape with its OWN nonce and
+// pid and then leaves by an ORDINARY process.exit(1) - the path that provably DOES run Node's JS
+// exit hooks - so the parent's same-run, same-seam control can show positively that the exit-hook
+// sentinel it looks for is emittable here. Without that control, the sentinel's absence in the
+// self-kill arm would be an unfalsifiable absence rather than a measurement.
+//
+// This arm is an ORDINARY EXIT and is never a termination observation: its (1, null) pair is
+// recorded as observed and is never read as a W7 pass.
+function exitControlIfRequested(point) {
+  if (!CRASH_POINTS.includes(point)) return;
+  if (process.env.P4_EXIT_AT !== point) return;
+  const nonce = seamNonceOrThrow("P4_EXIT_NONCE", point);
+  emitSeamLine(SEAM_LINE_EXIT, point, nonce);
+  process.exit(1);
 }
 
 // W7x. EXTERNAL termination at the same three points, and a SEPARATE case from W7 rather than a
@@ -223,10 +290,8 @@ function crashIfRequested(point) {
 // indefinite block - and it never emits a commit, a result or an ordinary exit. The parent, which
 // owns this ChildProcess handle, validates that line and then issues the one signal.
 //
-// fd1 rather than fd2 because the existing spawn pipes fd1 with no reader, so a dedicated listener
-// there cannot interleave with a native SQLite stderr line and the 1024-byte stderrHead cap keeps
-// its current meaning. writeSync rather than process.stdout.write because a write to a pipe is
-// ASYNCHRONOUS: a buffered marker followed by an indefinite block is a deadlock, not a hold.
+// The line goes out through the one shared emitSeamLine above, which is also where the single
+// require of the core filesystem module lives; the gate below textually precedes that call.
 //
 // Every way out of this function other than the indefinite block is a FAILURE that leaves the
 // transaction unadvanced. An unmet precondition throws BEFORE the marker is written, so the parent
@@ -238,13 +303,7 @@ function holdIfRequested(point) {
   if (!CRASH_POINTS.includes(point)) return;
   if (process.env.P4_HOLD_AT !== point) return;
 
-  const nonce = process.env.P4_HOLD_NONCE;
-  if (typeof nonce !== "string" || !HOLD_NONCE_TEXT.test(nonce)) {
-    throw syntheticError(
-      `synthetic hold seam P4_HOLD_AT=${point} unmet precondition: P4_HOLD_NONCE is not 32 `
-      + `lowercase hex digits - no marker written, nothing held, not a measured native failure`,
-    );
-  }
+  const nonce = seamNonceOrThrow("P4_HOLD_NONCE", point);
   // The mechanism is the one already proven in termination-map-child.cjs. Where it is unavailable
   // the arm fails as an UNMET PRECONDITION and is never downgraded to a timed sleep.
   if (typeof SharedArrayBuffer !== "function" || typeof Atomics !== "object" || Atomics === null) {
@@ -254,10 +313,8 @@ function holdIfRequested(point) {
     );
   }
 
-  // Typed, byte-exact, single synchronous write. The nonce is the validated one above and the pid
-  // is this process's own, so every field the parent checks is authored here and none is echoed
-  // from unvalidated input.
-  require("node:fs").writeSync(1, `P4_SEAM_HOLD v1 point=${point} nonce=${nonce} pid=${process.pid}\n`);
+  // Typed, byte-exact, single synchronous write through the one shared emitter.
+  emitSeamLine(SEAM_LINE_HOLD, point, nonce);
 
   // No timeout. The thread stops here for as long as this process exists.
   const waitOutcome = Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
@@ -596,6 +653,7 @@ function applyExperimentalStoreMutation(storeRoot, options) {
 
     failIfRequested("after_cas_read");
     crashIfRequested("after_cas_read");
+    exitControlIfRequested("after_cas_read");
     holdIfRequested("after_cas_read");
 
     // R2-5. Key-exists is established POSITIVELY by query on the handle already holding the
@@ -612,6 +670,7 @@ function applyExperimentalStoreMutation(storeRoot, options) {
 
     failIfRequested("after_row_insert");
     crashIfRequested("after_row_insert");
+    exitControlIfRequested("after_row_insert");
     holdIfRequested("after_row_insert");
 
     // The generation key is BOUND from a module constant. Double quotes are identifier quoting in
@@ -629,6 +688,7 @@ function applyExperimentalStoreMutation(storeRoot, options) {
     // The row and the bump share this one transaction, so neither can land alone.
     failIfRequested("before_commit");
     crashIfRequested("before_commit");
+    exitControlIfRequested("before_commit");
     holdIfRequested("before_commit");
 
     commitAttempted = true;
