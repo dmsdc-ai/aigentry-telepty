@@ -61,6 +61,9 @@ const WRITE_CAS_SOURCE = path.join(SLICE_DIR, "write-cas.cjs");
 const STATES_SOURCE = path.join(SLICE_DIR, "states.cjs");
 const WRITE_CHILD_SOURCE = path.join(SLICE_DIR, "write-child.cjs");
 const RECOVERY_OBSERVE_SOURCE = path.join(SLICE_DIR, "recovery-observe.cjs");
+// W6-R, additive: the tester-lane controlled lock-holding peer. It is a PEER, never the slice - W9
+// asserts below that it is unreachable from both runtime leaves and that it modifies nothing.
+const LOCK_HOLD_CHILD_SOURCE = path.join(SLICE_DIR, "lock-hold-child.cjs");
 const P2_OPENER_COPY = path.join(SLICE_DIR, "p2-open-existing.cjs");
 const P3_INITIALIZER_COPY = path.join(SLICE_DIR, "p3-init-exclusive.cjs");
 
@@ -70,9 +73,12 @@ const P3_INITIALIZER_COPY = path.join(SLICE_DIR, "p3-init-exclusive.cjs");
 // the distinction P3 kept between its 18 TAP tests and its 17 recorded case ids.
 // W7x is a SEPARATE case id, never a replacement for W7: the two arms assert opposite things about
 // killRequested, so they could not share a case even if the storage observations coincide.
+// W6-R is likewise a SEPARATE case id, never a replacement for W6 and never a relaxation of it: W6
+// keeps its 20 x 8 race, its exactly-one-winner oracle and its closed loser vocabulary exactly as
+// written, red or green, and W6-R adds a deterministic one-writer-one-peer observation beside it.
 const EXPECTED_CASE_IDS = [
   "P0",
-  "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7", "W7x", "W8", "W9", "W10", "W11", "W12",
+  "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W6-R", "W7", "W7x", "W8", "W9", "W10", "W11", "W12",
   "E1",
 ].sort();
 
@@ -127,6 +133,15 @@ const evidence = {
     + "validation runs.",
     "R2-6: byte identity is not a zero-call proof and proves no access ordering. Ordering is "
     + "claimed from the W9 structural source-order oracle alone.",
+    "W6-R is ADDITIVE instrumentation and is the ONE place in this suite where commit-phase "
+    + "contention is met NATIVELY, with no seam set: its arms are labelled native (synthetic:false) "
+    + "and its cause-side scalars come from a real thrown value, never from an induced one. It "
+    + "changes nothing about W6, and it does not extend the W8, W10 or E1 scope note above - native "
+    + "ROLLBACK and native close FAILURE behaviour stays UNMEASURED, because W6-R measures a clean "
+    + "rollback and a clean close, not a failing one. W6-R is ONE DISCRIMINATING OBSERVATION: it is "
+    + "not proof that the same lock holder caused any earlier W6 outcome, and a successful commit "
+    + "after a release does not uniquely establish release latency. No lock-hold DURATION is "
+    + "measured or claimed anywhere.",
   ],
 };
 
@@ -2240,6 +2255,1309 @@ test("W6 concurrent writers: exactly one winner in every iteration", async () =>
   maybeForceFail("W6");
 });
 
+// --- W6-R: additive, DETERMINISTIC lock-contention instrumentation, a SEPARATE case from W6 -------
+//
+// ADDITIVE. W6 above is untouched: its 20 x 8 race, its exactly-one-winner oracle, its closed loser
+// vocabulary and its independent-opener tuple are exactly as written, and stay exactly as written
+// whether they are green or red. Nothing here relaxes an acceptance threshold, and none of the
+// oracle-relaxation, BEGIN EXCLUSIVE or retry options discussed elsewhere is implemented: no retry,
+// no busy_timeout, no PRAGMA, no journal-mode change, no skip and no continue-on-error appears
+// below, and write-cas.cjs, write-child.cjs, states.cjs and recovery-observe.cjs are not edited.
+//
+// What this case adds is ONE controlled observation with ONE writer and ONE owned peer, so that a
+// contention outcome can be read off a deterministic arrangement instead of an 8-way scramble.
+//
+//   CONTROL      - an owned native peer holds a READ transaction on a READ-ONLY handle. The actual
+//                  unmodified writer is then invoked, in-process and with NO seam set, and its exact
+//                  result and cleanup metadata are measured. The store is re-read afterwards through
+//                  the INDEPENDENT P2 opener, never through the slice.
+//   DISCRIMINATOR - the tester's OWN declared fixture connection holds the write-intent lock while
+//                  the peer observes its own immediate start FAIL. Only after that refused attempt
+//                  has been VERIFIED against the parent's challenge is the fixture released and the
+//                  writer invoked, and the outcome recorded.
+//
+// WHAT THIS DOES NOT ESTABLISH, stated here rather than buried in the evidence:
+//   - The read/retention result is ONE DISCRIMINATING OBSERVATION. It is NOT proof that the same
+//     lock holder caused any earlier W6 outcome.
+//   - A successful commit after the fixture is released does NOT uniquely prove release latency. It
+//     is consistent with that reading and with others, and the arm says so instead of choosing.
+//   - No lock-hold DURATION is measured, and no timing threshold is proposed or implied.
+//   - No byte-identity claim is made across the writer's call: R2-2 bounds byte preservation to the
+//     clean W5 (a)-(e) fixtures where the open itself fails, and both arms open successfully, so the
+//     before/after observation is RECORDED and deliberately NOT asserted.
+//   - Nothing about win32 internals, better-sqlite3 internals, power loss, fsync, durability, D1,
+//     D2 or D3.
+//
+// The writer runs IN-PROCESS on purpose. A forked child would cross the Node IPC JSON boundary,
+// which destroys result.error and result.cleanupError - the exact cleanup facts this case exists to
+// measure. In-process there is no such boundary, and the peer, which does cross it, projects every
+// cause it observes to explicit scalars before sending so nothing of its own is lost either.
+
+// The closed peer mode vocabulary, authored HERE from the protocol prose rather than imported from
+// lock-hold-child.cjs, so a green run cannot mean self-agreement.
+const W6R_MODE_READ_TXN = "read_txn";
+const W6R_MODE_FAILED_BEGIN = "failed_begin";
+
+// Exactly one owned peer per arm, and exactly two arms. T names both of these in its child total,
+// which is a DECLARED arithmetic change and not a relaxation: that assertion stays exact.
+const W6R_CONTROL_PEERS = 1;
+const W6R_DISCRIMINATOR_PEERS = 1;
+
+// A hard bound on the IPC failure evidence a single peer may accumulate. The protocol sends exactly
+// two commands, so a healthy arm never approaches this; it exists so that a channel erroring in a
+// loop is REFUSED rather than allowed to grow without limit. Dropping past the cap is itself
+// visible, because the cap is larger than the protocol and any list at it is already a failure.
+const W6R_IPC_EVIDENCE_CAP = 8;
+
+// The owned peer handle. It deliberately does NOT reuse spawnChild: that function forks
+// write-child.cjs and installs the W7x fd1 marker machinery, and neither belongs to a peer that
+// never calls the writer and writes no marker. Everything that must stay shared IS shared - the
+// liveChildren set, the spawned/reaped accounting, attachOwnedKill, childLifecycle and
+// lifecycleFacts - so this peer is audited by the same T oracle as every other child.
+function spawnLockHoldPeer() {
+  const child = fork(LOCK_HOLD_CHILD_SOURCE, [], {
+    cwd: SLICE_DIR,
+    env: childEnv(),
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  const record = {
+    pid: child.pid,
+    ready: false,
+    // The peer never calls the writer, so it returns no mutation result at any point in its life.
+    // result stays null, which is what lets it share lifecycleFacts with the write children.
+    result: null,
+    exitCode: null,
+    signal: null,
+    exited: false,
+    killRequested: false,
+    killDelivered: null,
+    killError: null,
+    cleanupCalls: 0,
+    killedByTest: false,
+    stderrHead: "",
+    experimentalKills: 0,
+    cleanupKills: 0,
+    killIntents: [],
+    simulated: false,
+    // Protocol state. Each phase is received AT MOST ONCE; a repeat is a RECORDED VIOLATION, never
+    // an overwrite, so a second message can never re-decide an earlier one.
+    heldReceived: false,
+    holdObservation: null,
+    releasedReceived: false,
+    releaseObservation: null,
+    protocolViolations: [],
+    // fd1 is piped so the peer inherits no console. It writes NO marker there, so these bytes are
+    // COUNTED and drained and never parsed - an unchallenged stream cannot produce a verdict.
+    // Draining matters on its own: an unread pipe that filled would block a peer this arm must be
+    // able to join.
+    stdoutBytes: 0,
+    // IPC FAILURE EVIDENCE. A channel error and an undelivered command are FACTS about this arm and
+    // are recorded here as scalars, latched with the rest of the arm and then hard-asserted empty.
+    // Nothing here is swallowed, nothing here is retried, and an undelivered command is NEVER read
+    // as a peer that received it and chose to answer nothing. Both lists are hard bounded, so an
+    // erroring channel costs a refusal rather than unbounded memory.
+    ipcErrors: [],
+    sendAttempts: [],
+  };
+  const handle = { child, record, simulated: false };
+  liveChildren.add(handle);
+  evidence.children.spawned += 1;
+
+  child.stderr.on("data", chunk => {
+    if (record.stderrHead.length < 1024) record.stderrHead += String(chunk).slice(0, 1024);
+  });
+  child.stdout.on("data", chunk => {
+    record.stdoutBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+  });
+
+  // The ChildProcess 'error' listener, and the reason this arm cannot do without one. A send() whose
+  // message cannot be delivered - the usual cause being that the peer already exited, so the channel
+  // is closed - does NOT throw at the call site: it reports ASYNCHRONOUSLY. With no callback and no
+  // listener that report becomes an 'error' event on an EventEmitter that has none, which Node
+  // THROWS as an uncaughtException; no try/catch around the send can contain it, and it would end
+  // the run before this arm's evidence latch was ever written - destroying exactly the record that
+  // an early-dying peer makes most valuable. This listener keeps that failure inside the arm.
+  //
+  // It is the BACKSTOP, not the mechanism: sendToPeer below supplies a send callback so an ordinary
+  // undelivered command is reported there instead, and this listener then covers what remains - a
+  // spawn failure, or a channel error raised outside any send. Either way the failure is recorded,
+  // asserted and never absorbed.
+  child.on("error", error => {
+    if (record.ipcErrors.length >= W6R_IPC_EVIDENCE_CAP) return;
+    record.ipcErrors.push({ source: "child_process_error_event", ...observationFailure(error) });
+  });
+
+  let announceReady = null;
+  let announceHeld = null;
+  let announceReleased = null;
+  handle.ready = new Promise(resolve => { announceReady = resolve; });
+  handle.held = new Promise(resolve => { announceHeld = resolve; });
+  handle.released = new Promise(resolve => { announceReleased = resolve; });
+  child.on("message", message => {
+    if (!message || typeof message !== "object") {
+      record.protocolViolations.push("non_object_message");
+      return;
+    }
+    if (message.type === "ready") {
+      if (record.ready) { record.protocolViolations.push("duplicate_ready"); return; }
+      record.ready = true;
+      announceReady(record);
+      return;
+    }
+    if (message.type === "held") {
+      if (record.heldReceived) { record.protocolViolations.push("duplicate_held"); return; }
+      record.heldReceived = true;
+      record.holdObservation = message.observation === undefined ? null : message.observation;
+      announceHeld(record.holdObservation);
+      return;
+    }
+    if (message.type === "released") {
+      if (record.releasedReceived) { record.protocolViolations.push("duplicate_released"); return; }
+      record.releasedReceived = true;
+      record.releaseObservation = message.observation === undefined ? null : message.observation;
+      announceReleased(record.releaseObservation);
+      return;
+    }
+    record.protocolViolations.push("unknown_message_type");
+  });
+  handle.exited = new Promise(resolve => {
+    child.on("exit", (code, signal) => {
+      record.exitCode = code;
+      record.signal = signal;
+      record.exited = true;
+      liveChildren.delete(handle);
+      evidence.children.reaped += 1;
+      resolve(record);
+    });
+  });
+  attachOwnedKill(handle);
+  return handle;
+}
+
+// The ONE place this case addresses a peer. Both commands route through it, so there is exactly one
+// send path and exactly one shape of send evidence, and no second spelling of a send can appear.
+//
+// A `connected` test ALONE IS RACY and is deliberately not relied on as the fix: the channel can
+// close between the test and the call, which is precisely the window an early-dying peer occupies.
+// It is kept only to avoid addressing a peer whose exit this parent has ALREADY observed, and its
+// value at the moment of the attempt is recorded rather than trusted.
+//
+// The completeness comes from the CALLBACK. Node reports an undeliverable message to the send
+// callback when one is supplied, instead of emitting 'error' on the ChildProcess - so the failure
+// arrives here as ordinary data on a promise rather than as an uncaughtException that would abort
+// the run. A synchronous throw is caught as well, and the boolean return is RECORDED, never read as
+// a verdict: false is not by itself a delivery failure, and the callback is what decides.
+//
+// The promise settles when the send has been ACKNOWLEDGED one way or the other, so a peer that died
+// before being commanded fails at the send - with a recorded cause - instead of the arm waiting out
+// a per-child budget for a reply that can never arrive. It RESOLVES ONLY and never rejects, so no
+// path through it can throw past the arm's evidence latch. No budget is extended, no send is
+// repeated, and no failure is converted into a success.
+function sendToPeer(handle, phase, message) {
+  const record = handle.record;
+  const attempt = {
+    phase,
+    exitedBeforeSend: record.exited === true,
+    connectedBeforeSend: handle.child.connected === true,
+    delivered: false,
+    returned: null,
+    failure: null,
+  };
+  const capped = record.sendAttempts.length >= W6R_IPC_EVIDENCE_CAP;
+  if (!capped) record.sendAttempts.push(attempt);
+  if (capped) {
+    attempt.failure = {
+      source: "send_refused_evidence_cap",
+      observed: "send_attempt_evidence_cap_reached",
+      diagnostic: "this peer has already accumulated " + W6R_IPC_EVIDENCE_CAP + " send attempts, "
+        + "which the two-command protocol cannot produce, so the " + phase + " command is REFUSED",
+      note: "OBSERVATION ONLY - a refused command is recorded as refused and is never read as a "
+        + "delivered one.",
+    };
+    return Promise.resolve(attempt);
+  }
+  if (attempt.exitedBeforeSend || !attempt.connectedBeforeSend) {
+    attempt.failure = {
+      source: "send_refused_channel_closed",
+      observed: "ipc_channel_already_closed",
+      diagnostic: "the peer's IPC channel was already closed when the " + phase + " command was due "
+        + "(exited " + String(attempt.exitedBeforeSend) + ", connected "
+        + String(attempt.connectedBeforeSend) + "), so the command was never sent",
+      note: "OBSERVATION ONLY - an undelivered command is recorded as undelivered and is NEVER read "
+        + "as a peer that received it and answered nothing.",
+    };
+    return Promise.resolve(attempt);
+  }
+  return new Promise(resolve => {
+    try {
+      attempt.returned = handle.child.send(message, error => {
+        if (error === null || error === undefined) attempt.delivered = true;
+        else attempt.failure = { source: "send_callback", ...observationFailure(error) };
+        resolve(attempt);
+      });
+    } catch (error) {
+      // A synchronous throw out of send() itself. Caught rather than allowed to unwind, for the same
+      // reason the 'error' listener exists: this arm reports its failures, it does not escape with
+      // them.
+      attempt.failure = { source: "send_synchronous_throw", ...observationFailure(error) };
+      resolve(attempt);
+    }
+  });
+}
+
+// A cause field as it arrives over IPC, read defensively and projected to scalars. present:false
+// means the field itself was absent, which is a MISSING MEASUREMENT; observed:false means the peer
+// positively reported that no error occurred; observed:true with code null means an error DID occur
+// whose code was not a non-empty string. None of the three is ever collapsed into another, which is
+// what stops an IPC-lost Error from masquerading as "no error".
+function w6rCause(container, field) {
+  const value = container === null || container === undefined ? undefined : container[field];
+  if (value === null || value === undefined || typeof value !== "object") {
+    return { present: false, observed: null, code: null, errno: null, synthetic: null };
+  }
+  return {
+    present: true,
+    observed: value.observed === true ? true : (value.observed === false ? false : null),
+    code: codeOf(value.code),
+    errno: Object.hasOwn(value, "errno") ? value.errno : null,
+    synthetic: value.synthetic === true ? true : (value.synthetic === false ? false : null),
+  };
+}
+
+// The parent's verification of its OWN challenge, returning [] when the hold is admissible. A peer
+// that reports the wrong mode, nonce or pid is REFUSED, never identified and never classified: this
+// is not an identity or authorship oracle, and a hostile peer is outside what this fixture observes.
+// Pure: it reads nothing outside its two arguments and mutates neither.
+function w6rHoldViolations(observation, expected) {
+  const out = [];
+  if (observation === null || observation === undefined) {
+    out.push("no hold observation was received - a missing observation is a FAILED MEASUREMENT and "
+      + "is NEVER read as a peer that held nothing");
+    return out;
+  }
+  if (observation.nonce !== expected.nonce) {
+    out.push("the peer must echo this parent's exact 32-lowercase-hex challenge, observed "
+      + String(observation.nonce));
+  }
+  if (observation.pid !== expected.pid) {
+    out.push("the observation must come from the exact pid this parent forked (" + String(expected.pid)
+      + "), observed " + String(observation.pid));
+  }
+  if (observation.mode !== expected.mode) {
+    out.push("the peer must report the exact mode it was commanded (" + String(expected.mode)
+      + "), observed " + String(observation.mode));
+  }
+  if (observation.unmetPrecondition !== null) {
+    out.push("the peer reported an UNMET PRECONDITION and therefore held nothing, so this arm "
+      + "measured nothing: " + String(observation.unmetPrecondition));
+  }
+  if (observation.held !== true) {
+    out.push("the peer must report a positive hold, observed held " + String(observation.held));
+  }
+  if (observation.handleOpen !== true) {
+    out.push("the peer's own handle must be open at the moment it reports, observed handleOpen "
+      + String(observation.handleOpen));
+  }
+  const options = observation.openOptions === null || observation.openOptions === undefined
+    || typeof observation.openOptions !== "object" ? null : observation.openOptions;
+  if (options === null || options.timeout !== 0) {
+    out.push("the peer must open with timeout 0, so contention is MEASURED rather than waited out - "
+      + "a nonzero value would turn this instrument into a hidden wait");
+  }
+  if (expected.mode === W6R_MODE_READ_TXN) {
+    if (options !== null && options.readonly !== true) {
+      out.push("the read peer must open READ-ONLY, so it cannot modify the store even by accident");
+    }
+    if (observation.beginReturned !== true) {
+      out.push("the deferred transaction start must have returned, observed beginReturned "
+        + String(observation.beginReturned));
+    }
+    if (w6rCause(observation, "beginError").observed !== false) {
+      out.push("the deferred transaction start must report NO error, observed code "
+        + String(w6rCause(observation, "beginError").code));
+    }
+    if (observation.readProbeReturned !== true || observation.readProbeKeyIsString !== true) {
+      out.push("the keyed metadata read must have RETURNED A ROW - a deferred start alone takes no "
+        + "lock, so an unread row is not a held read transaction, observed returned "
+        + String(observation.readProbeReturned) + " keyIsString "
+        + String(observation.readProbeKeyIsString));
+    }
+    if (w6rCause(observation, "readProbeError").observed !== false) {
+      out.push("the keyed metadata read must report NO error, observed code "
+        + String(w6rCause(observation, "readProbeError").code));
+    }
+    if (observation.inTransaction !== true) {
+      out.push("an OPEN transaction is what holds the lock, observed inTransaction "
+        + String(observation.inTransaction));
+    }
+    return out;
+  }
+  // The refused-start peer. The refusal must be REAL and NATIVE: a synthetic label here, or an
+  // absent cause, would mean the arm froze a state it did not actually observe.
+  //
+  // READ-WRITE is checked EXPLICITLY, in the same direction the read arm checks read-only. An
+  // immediate transaction start on a read-only connection fails FOR BEING READ-ONLY, which is a
+  // DIFFERENT FAULT from the write-lock contention this arm exists to observe - and both surface as
+  // a thrown error, so the refusal alone does not distinguish them. Distinguishing fault causes is
+  // this arm's entire purpose, so the one place the challenge was weaker than the peer's own stated
+  // reasoning is closed here. A read-only mix-up would very likely also be caught by the
+  // SQLITE_BUSY code check below, since a read-only violation reports SQLITE_READONLY; that is a
+  // second line of defence and not a reason to leave the first one unstated. The null case is
+  // already reported by the timeout check above and is deliberately not reported twice.
+  if (options !== null && options.readonly === true) {
+    out.push("the refused-start peer must open READ-WRITE - a read-only connection refuses an "
+      + "immediate start FOR BEING READ-ONLY, which is a different fault from the write-lock "
+      + "contention this arm measures, observed readonly " + String(options.readonly));
+  }
+  if (observation.beginReturned !== false) {
+    out.push("the immediate transaction start must NOT have returned - the parent's own fixture was "
+      + "holding the write-intent lock, so a return means the precondition did not hold, observed "
+      + "beginReturned " + String(observation.beginReturned));
+  }
+  const beginCause = w6rCause(observation, "beginError");
+  if (beginCause.present !== true || beginCause.observed !== true) {
+    out.push("an error must ACTUALLY have been observed on the refused start: observed:false is no "
+      + "error at all and an absent field is a missing measurement, and neither is the same fact as "
+      + "a cause whose code did not survive, observed present " + String(beginCause.present)
+      + " observed " + String(beginCause.observed));
+  }
+  if (beginCause.code !== "SQLITE_BUSY") {
+    out.push("the refused start carries the primary SQLITE_BUSY verbatim, observed "
+      + String(beginCause.code));
+  }
+  if (beginCause.synthetic !== false) {
+    out.push("this must be a REAL NATIVE refusal, never a synthetic one and never an unlabelled "
+      + "one, observed synthetic " + String(beginCause.synthetic));
+  }
+  if (observation.rollbackAttempted !== false) {
+    out.push("a refused start leaves nothing to discard, so the peer must have attempted none, "
+      + "observed rollbackAttempted " + String(observation.rollbackAttempted));
+  }
+  return out;
+}
+
+// The release oracle: the peer must have actually let go, because an unreleased lock would confound
+// the store observations that follow AND, on win32, would make the owned root unremovable.
+function w6rReleaseViolations(observation) {
+  const out = [];
+  if (observation === null || observation === undefined) {
+    out.push("no release observation was received - a missing observation is a FAILED MEASUREMENT "
+      + "and is NEVER read as a peer that let go");
+    return out;
+  }
+  if (observation.handleConstructed !== true) {
+    out.push("the release must describe a handle that was actually constructed, observed "
+      + String(observation.handleConstructed));
+  }
+  if (observation.closeAttempted !== true) {
+    out.push("the peer must actually attempt its close - an unattempted close is never a released "
+      + "lock, observed closeAttempted " + String(observation.closeAttempted));
+  }
+  const rollbackCause = w6rCause(observation, "rollbackError");
+  if (rollbackCause.observed !== false) {
+    out.push("the peer's transaction discard must return without throwing, observed code "
+      + String(rollbackCause.code));
+  }
+  const closeCause = w6rCause(observation, "closeError");
+  if (closeCause.observed !== false) {
+    out.push("the peer's close must return without throwing, observed code "
+      + String(closeCause.code));
+  }
+  if (observation.inTransaction !== false) {
+    out.push("no transaction may remain open on the peer's handle after its release, observed "
+      + String(observation.inTransaction));
+  }
+  if (observation.handleOpen !== false) {
+    out.push("the peer's handle must be CLOSED after its release - an open handle is an unreleased "
+      + "lock and, on win32, an unremovable root, observed handleOpen "
+      + String(observation.handleOpen));
+  }
+  return out;
+}
+
+// SOURCE-BACKED SCALAR PROJECTION of the writer's result, and the ONLY shape W6-R records.
+//
+// The raw result is deliberately NOT pushed into the evidence. result.error, and the members of
+// result.cleanupError, are Error objects whose message, stack and name are all non-enumerable, so
+// JSON.stringify turns each of them into {} - the same silent cause-side loss the IPC boundary
+// inflicts on a race child result. Recording explicit scalars instead is what keeps a native cause
+// visible AS native.
+//
+// cleanupError is read WITHOUT ever being dereferenced unconditionally. cleanupErrorMap in the slice
+// returns undefined when BOTH the rollback and the close returned, and materialize then OMITS the
+// key - so on a clean cleanup the key is ABSENT, and it is NOT present-and-null. Reading
+// cleanupError.rollback straight off the result would therefore throw on exactly the outcome this
+// case most expects. Only the two member names the slice actually builds, rollback and close, are
+// named here; no field is invented, and no value is read out of a container before that container
+// has been proven to be a non-null object.
+function w6rResultProjection(result) {
+  if (result === null || result === undefined) {
+    return {
+      resultReceived: false,
+      note: "no result object - a failed invocation is a FAILED MEASUREMENT and is never recorded "
+        + "as an outcome the writer produced",
+    };
+  }
+  const errorKeyPresent = Object.hasOwn(result, "error");
+  const errorValue = errorKeyPresent ? result.error : undefined;
+  const errorIsObject = errorValue !== null && errorValue !== undefined
+    && typeof errorValue === "object";
+  const cleanupKeyPresent = Object.hasOwn(result, "cleanupError");
+  const cleanupValue = cleanupKeyPresent ? result.cleanupError : undefined;
+  const cleanupIsObject = cleanupValue !== null && cleanupValue !== undefined
+    && typeof cleanupValue === "object";
+  const memberSynthetic = (name) => {
+    if (!cleanupIsObject || !Object.hasOwn(cleanupValue, name)) return null;
+    const member = cleanupValue[name];
+    if (member === null || member === undefined || typeof member !== "object") return null;
+    return member.synthetic === true;
+  };
+  return {
+    resultReceived: true,
+    ok: result.ok === true,
+    reason: result.reason === undefined ? null : result.reason,
+    detail: result.detail === undefined ? null : result.detail,
+    sqliteCodeKeyPresent: Object.hasOwn(result, "sqliteCode"),
+    sqliteCode: codeOf(result.sqliteCode),
+    extendedCodeObserved: isExtendedCode(codeOf(result.sqliteCode)),
+    errnoKeyPresent: Object.hasOwn(result, "errno"),
+    errno: Object.hasOwn(result, "errno") ? result.errno : null,
+    commitAttempted: result.commitAttempted === undefined ? null : result.commitAttempted,
+    committedKeyPresent: Object.hasOwn(result, "committed"),
+    committed: Object.hasOwn(result, "committed") ? result.committed : null,
+    retrySafe: result.retrySafe === undefined ? null : result.retrySafe,
+    generation: result.generation === undefined ? null : result.generation,
+    section: result.section === undefined ? null : result.section,
+    key: result.key === undefined ? null : result.key,
+    requestId: result.requestId === undefined ? null : result.requestId,
+    // The native-versus-synthetic label, read from the observed value alone. A native fault carries
+    // no such property, so this is false for it; only a deliberately labelled synthetic reports true.
+    errorKeyPresent,
+    errorIsObject,
+    errorSynthetic: errorIsObject ? errorValue.synthetic === true : null,
+    errorCode: errorIsObject ? codeOf(errorValue.code) : null,
+    // CLEANUP, as the source actually shapes it.
+    cleanupErrorKeyPresent: cleanupKeyPresent,
+    cleanupErrorIsNull: cleanupKeyPresent && cleanupValue === null,
+    cleanupErrorIsObject: cleanupIsObject,
+    cleanupRollbackKeyPresent: cleanupIsObject && Object.hasOwn(cleanupValue, "rollback"),
+    cleanupCloseKeyPresent: cleanupIsObject && Object.hasOwn(cleanupValue, "close"),
+    cleanupRollbackSynthetic: memberSynthetic("rollback"),
+    cleanupCloseSynthetic: memberSynthetic("close"),
+    cleanupProjectionPolicy: "cleanupErrorMap returns undefined when BOTH the rollback and the close "
+      + "returned, and materialize omits an undefined entry, so a CLEAN cleanup means the "
+      + "cleanupError KEY IS ABSENT - not present-and-null. Presence is therefore tested with "
+      + "Object.hasOwn and nothing is dereferenced before its container is proven to be a non-null "
+      + "object. Only rollback and close, the two members the slice actually builds, are ever named.",
+    representationPolicy: "scalars only. The raw result is NEVER serialized into this evidence: "
+      + "Error message, stack and name are non-enumerable, so a retained cause would arrive as {} "
+      + "and a real native failure would read as an empty object.",
+  };
+}
+
+// The CONTROL oracle. Strict and CLOSED: the unmodified writer, invoked with NO seam set against a
+// store whose only other holder is the peer's read transaction, must meet that holder AT COMMIT and
+// report the exact R2-1 uncertain tuple. This is deliberately NOT relaxed to "busy or uncertain": a
+// PRE-COMMIT busy would mean the write-intent lock was refused rather than the commit, which is a
+// DIFFERENT observation, and it is reported as a failure of this arm rather than absorbed by it.
+function w6rControlViolations(result) {
+  const out = [];
+  if (result === null || result === undefined) {
+    out.push("no writer result - a failed invocation is a FAILED MEASUREMENT and is NEVER evidence "
+      + "about what the writer does under contention");
+    return out;
+  }
+  if (result.ok !== false) {
+    out.push("the writer must refuse while a read transaction is held, observed ok "
+      + String(result.ok));
+    return out;
+  }
+  if (result.reason !== REASON_COMMIT_UNCERTAIN) {
+    out.push("the reason is exactly experimental_store_commit_uncertain - R2-1 makes a throw raised "
+      + "BY COMMIT dominate classification whatever err.code reports, INCLUDING a BUSY code, and the "
+      + "section 3 busy row covers the immediate begin and the pre-commit statements only - observed "
+      + String(result.reason));
+    return out;
+  }
+  if (result.commitAttempted !== true) {
+    out.push("commit_uncertain requires commitAttempted:true as an established fact, observed "
+      + String(result.commitAttempted));
+  }
+  if (!Object.hasOwn(result, "committed") || result.committed !== null) {
+    out.push("commit_uncertain leaves the outcome UNKNOWN: committed must be PRESENT and null, "
+      + "never relabelled false and never absent, observed " + String(result.committed));
+  }
+  if (result.retrySafe !== false) {
+    out.push("commit_uncertain is NEVER retry-safe, observed retrySafe " + String(result.retrySafe));
+  }
+  if (codeOf(result.sqliteCode) !== "SQLITE_BUSY") {
+    out.push("the commit-phase contention carries the primary SQLITE_BUSY VERBATIM, observed "
+      + String(result.sqliteCode));
+  }
+  return out;
+}
+
+// The DISCRIMINATOR oracle. Exactly two branches are admissible and each is FULLY specified; a
+// result matching neither is a HARD FAILURE. This is a closed admissible set, not a relaxation:
+// neither branch tolerates a partial tuple, and neither is reachable by relabelling the other -
+// retained cannot be reached by calling an uncertain commit successful, and released cannot be
+// reached by calling a refusal a commit. Which branch held is RECORDED; what it means is not
+// decided here.
+function w6rDiscriminatorBranch(result) {
+  if (result === null || result === undefined) {
+    return {
+      branch: null,
+      violations: ["no writer result - a failed invocation is a FAILED MEASUREMENT and discriminates "
+        + "nothing"],
+    };
+  }
+  if (result.ok === true) {
+    const out = [];
+    if (result.commitAttempted !== true) {
+      out.push("a successful write records commitAttempted:true, observed "
+        + String(result.commitAttempted));
+    }
+    if (result.committed !== true) {
+      out.push("a successful write records committed:true, observed " + String(result.committed));
+    }
+    if (result.generation !== 2) {
+      out.push("the winner commits exactly g + 1 (2), observed " + String(result.generation));
+    }
+    if (result.section !== TARGET_SECTION) {
+      out.push("the write targets the named section (" + TARGET_SECTION + "), observed "
+        + String(result.section));
+    }
+    if (typeof result.key !== "string" || result.key === "") {
+      out.push("a successful write names its key, observed " + String(result.key));
+    }
+    if (Object.hasOwn(result, "retrySafe")) {
+      out.push("a successful result carries no retrySafe field, observed "
+        + String(result.retrySafe));
+    }
+    return { branch: "released", violations: out };
+  }
+  const out = [];
+  if (result.reason !== REASON_COMMIT_UNCERTAIN) {
+    out.push("a refusal on this arm is admissible ONLY as experimental_store_commit_uncertain - any "
+      + "other refusal means neither branch was observed and the arm discriminated nothing, observed "
+      + String(result.reason));
+    return { branch: null, violations: out };
+  }
+  if (result.commitAttempted !== true) {
+    out.push("commit_uncertain requires commitAttempted:true as an established fact, observed "
+      + String(result.commitAttempted));
+  }
+  if (!Object.hasOwn(result, "committed") || result.committed !== null) {
+    out.push("commit_uncertain leaves the outcome UNKNOWN: committed must be PRESENT and null, "
+      + "never relabelled false and never absent, observed " + String(result.committed));
+  }
+  if (result.retrySafe !== false) {
+    out.push("commit_uncertain is NEVER retry-safe, observed retrySafe " + String(result.retrySafe));
+  }
+  if (codeOf(result.sqliteCode) !== "SQLITE_BUSY") {
+    out.push("the commit-phase contention carries the primary SQLITE_BUSY VERBATIM, observed "
+      + String(result.sqliteCode));
+  }
+  return { branch: "retained", violations: out };
+}
+
+// The independent-opener tuple for a W6-R arm, at the SAME strength W6 applies to its own: a read
+// that ACTUALLY succeeded, the exact seven-key ledger, the exact generation, the exact row count,
+// the exact section keys, and no hot sidecar. A broken read or a broken tuple stays a HARD FAILURE
+// and is never reported as "nothing landed". Pure: every expectation is supplied by the caller.
+function w6rLedgerViolations(latch, expected) {
+  const out = [];
+  if (latch === null || latch === undefined || latch.ledgerRead !== true) {
+    out.push("the independent opener must actually read the store - a failed read is a failed "
+      + "measurement, NEVER evidence that nothing landed");
+    return out;
+  }
+  if (latch.inventoryError !== null) {
+    out.push("the on-disk inventory must actually be observed - inventoryError must be PRESENT and "
+      + "exactly null, never absent, observed " + String(latch.inventoryError));
+  }
+  if (JSON.stringify(latch.ledgerKeysAfter) !== JSON.stringify(expected.ledgerKeys)) {
+    out.push("the reconstructed ledger carries exactly the expected key set, observed "
+      + JSON.stringify(latch.ledgerKeysAfter));
+  }
+  if (latch.generationAfter !== expected.generation) {
+    out.push("the opener reports generation exactly " + String(expected.generation) + ", observed "
+      + String(latch.generationAfter));
+  }
+  if (latch.rowsAfter !== expected.rows) {
+    out.push("the opener reports exactly " + String(expected.rows) + " row(s) across every section, "
+      + "observed " + String(latch.rowsAfter));
+  }
+  if (JSON.stringify(latch.sectionKeysAfter) !== JSON.stringify(expected.sectionKeys)) {
+    out.push("the target section carries exactly the expected keys ("
+      + JSON.stringify(expected.sectionKeys) + "), observed "
+      + JSON.stringify(latch.sectionKeysAfter));
+  }
+  const hot = Array.isArray(latch.sidecarsAfter) ? latch.sidecarsAfter : null;
+  if (hot === null || hot.length !== 0) {
+    out.push("no hot sidecar survives the arm, observed " + JSON.stringify(latch.sidecarsAfter));
+  }
+  return out;
+}
+
+const W6R_SORTED_LEDGER_KEYS = [...EXPECTED_LEDGER_KEYS].sort();
+
+// One bounded orchestration, shared by both arms, so there is exactly one code path that spawns a
+// peer, verifies a hold, invokes the writer, releases and joins. Every phase is budgeted by the
+// existing PER_CHILD_TIMEOUT_MS; a budget expiry is a FAILURE of the arm, never a retry and never an
+// acceptance. Nothing is signalled on the success path.
+async function runW6RArm(spec) {
+  const store = newStore("w6r-" + spec.label);
+  const nonce = newSeamNonce();
+  let beforeArm = null;
+  let beforeArmError = null;
+  try {
+    beforeArm = snapshotRoot(store.storeRoot);
+  } catch (error) {
+    beforeArmError = observationFailure(error);
+  }
+
+  // The tester's OWN declared fixture connection, used by the discriminator arm only. W9 scopes the
+  // single-writer oracle to the RUNTIME leaf precisely so that a tester-owned fixture connection on
+  // a root this suite created is legitimate. It issues the write-intent start and the discard and NO
+  // data statement of any kind, so it modifies nothing, and it is labelled a fixture in the evidence
+  // rather than presented as a measurement of the slice.
+  let fixtureHandle = null;
+  const fixtureFacts = {
+    used: spec.holdsFixture === true,
+    role: "TESTER-OWNED FIXTURE holder, not the slice and not a measurement of it. It takes the "
+      + "write-intent lock and discards it; it writes no row and commits nothing.",
+    opened: false,
+    beginReturned: false,
+    openError: null,
+    rollbackAttempted: false,
+    rollbackError: null,
+    closeAttempted: false,
+    closeError: null,
+    handleOpenAfterRelease: null,
+    released: false,
+  };
+  const releaseFixture = () => {
+    if (fixtureHandle === null) return;
+    const handleToRelease = fixtureHandle;
+    fixtureHandle = null;
+    if (handleToRelease.inTransaction === true) {
+      fixtureFacts.rollbackAttempted = true;
+      try {
+        handleToRelease.exec("ROLLBACK");
+      } catch (error) {
+        fixtureFacts.rollbackError = observationFailure(error);
+      }
+    }
+    fixtureFacts.closeAttempted = true;
+    try {
+      handleToRelease.close();
+    } catch (error) {
+      fixtureFacts.closeError = observationFailure(error);
+    }
+    fixtureFacts.handleOpenAfterRelease = handleToRelease.open === true;
+    fixtureFacts.released = fixtureFacts.rollbackError === null
+      && fixtureFacts.closeError === null
+      && fixtureFacts.handleOpenAfterRelease === false;
+  };
+
+  const handle = spawnLockHoldPeer();
+  const expectation = { mode: spec.mode, nonce, pid: handle.child.pid };
+  let readyError = null;
+  let holdSendFailure = null;
+  let releaseSendFailure = null;
+  let holdError = null;
+  let holdObservation = null;
+  let holdViolations = ["the hold phase did not run"];
+  let fixtureReleasedBeforeWriter = null;
+  let writerInvoked = false;
+  let result = null;
+  let callError = null;
+  let releaseError = null;
+  let releaseObservation = null;
+  let joinError = null;
+  let cleanupJoinError = null;
+
+  try {
+    // PHASE 1, discriminator only: the tester's own fixture takes the write-intent lock FIRST, so
+    // the peer's attempt below is guaranteed to meet it rather than racing it.
+    if (spec.holdsFixture) {
+      try {
+        fixtureHandle = new Database(store.dbPath, { fileMustExist: true, timeout: 0 });
+        fixtureFacts.opened = true;
+        fixtureHandle.exec("BEGIN IMMEDIATE");
+        fixtureFacts.beginReturned = true;
+      } catch (error) {
+        fixtureFacts.openError = observationFailure(error);
+      }
+    }
+
+    // PHASE 2: the peer announces itself, then is commanded exactly once. The announcement and the
+    // command are now two RECORDED steps rather than one, because they fail for different reasons
+    // and an arm that cannot say which of them failed has lost the measurement. The command's
+    // DELIVERY is awaited inside the existing per-child budget - no new budget, no extension - so a
+    // peer that died between announcing and being commanded fails HERE, with a recorded cause,
+    // instead of raising a channel error this arm could not contain.
+    try {
+      await withDeadline(handle.ready, PER_CHILD_TIMEOUT_MS, "W6-R " + spec.label + " ready");
+    } catch (error) {
+      readyError = observationFailure(error);
+    }
+    if (readyError === null) {
+      try {
+        const holdAttempt = await withDeadline(
+          sendToPeer(handle, "hold", { type: "hold", mode: spec.mode, dbPath: store.dbPath, nonce }),
+          PER_CHILD_TIMEOUT_MS, "W6-R " + spec.label + " hold command",
+        );
+        holdSendFailure = holdAttempt.failure;
+      } catch (error) {
+        holdSendFailure = observationFailure(error);
+      }
+    }
+
+    // PHASE 3: the single hold observation, verified against this parent's own challenge. It is
+    // waited for ONLY when the command was actually delivered: waiting for a reply to a command the
+    // peer never received would spend a per-child budget to learn what the send already reported,
+    // and holdViolations then stays at its "the hold phase did not run" default, which is a
+    // violation and therefore a failure - never an empty list that could read as a clean hold.
+    if (readyError === null && holdSendFailure === null) {
+      try {
+        holdObservation = await withDeadline(
+          handle.held, PER_CHILD_TIMEOUT_MS, "W6-R " + spec.label + " hold",
+        );
+      } catch (error) {
+        holdError = observationFailure(error);
+      }
+      holdViolations = holdError === null
+        ? w6rHoldViolations(holdObservation, expectation)
+        : ["the hold observation never arrived inside the per-child budget"];
+    }
+
+    // PHASE 4, discriminator only: the fixture lets go, and ONLY AFTER the peer's refused attempt
+    // has been VERIFIED. Releasing earlier would let the peer's own start succeed; not releasing at
+    // all would make the writer meet the fixture instead of the peer, which is a different
+    // measurement wearing this arm's name.
+    if (spec.holdsFixture && holdViolations.length === 0) {
+      releaseFixture();
+      fixtureReleasedBeforeWriter = fixtureFacts.released;
+    }
+
+    // PHASE 5: the ACTUAL, UNMODIFIED writer, in-process, with NO seam set (cleanCall deletes every
+    // seam variable first). It runs ONLY when the hold was positively verified and, on the
+    // discriminator arm, only when the fixture actually let go - a writer invoked against an
+    // unverified arrangement measures nothing and must not be recorded as if it did.
+    const preconditionsMet = readyError === null && holdError === null
+      && holdViolations.length === 0
+      && (spec.holdsFixture !== true || fixtureFacts.released === true);
+    if (preconditionsMet) {
+      writerInvoked = true;
+      try {
+        result = cleanCall(store.storeRoot, callOptions({
+          mutation: mutationOf(spec.mutationKey, { arm: spec.arm }),
+        }));
+      } catch (error) {
+        callError = observationFailure(error);
+      }
+    }
+
+    // PHASE 6: cooperative release, then JOIN. No signal is issued anywhere on this path.
+    //
+    // This is the WIDEST window in the arm: it spans the entire writer call, including a commit that
+    // is DESIGNED to block on a lock. It is therefore the one place the peer is most likely to have
+    // died before the parent speaks to it again - a native fault, an exhausted process, or a throw
+    // out of the peer's own handle reads - which is exactly the shape that used to escape this arm
+    // as an uncaught channel error and take the evidence latch down with it. The command goes
+    // through the same acknowledged send, and the reply is waited for ONLY when the command was
+    // delivered. The JOIN below runs either way, so the peer's fate is established on every path.
+    if (readyError === null) {
+      if (holdSendFailure === null) {
+        try {
+          const releaseAttempt = await withDeadline(
+            sendToPeer(handle, "release", { type: "release" }),
+            PER_CHILD_TIMEOUT_MS, "W6-R " + spec.label + " release command",
+          );
+          releaseSendFailure = releaseAttempt.failure;
+        } catch (error) {
+          releaseSendFailure = observationFailure(error);
+        }
+        if (releaseSendFailure === null) {
+          try {
+            releaseObservation = await withDeadline(
+              handle.released, PER_CHILD_TIMEOUT_MS, "W6-R " + spec.label + " release",
+            );
+          } catch (error) {
+            releaseError = observationFailure(error);
+          }
+        }
+      }
+      try {
+        await withDeadline(handle.exited, PER_CHILD_TIMEOUT_MS, "W6-R " + spec.label + " join");
+      } catch (error) {
+        joinError = observationFailure(error);
+      }
+    }
+  } finally {
+    // The fixture is released on EVERY exit path, so a failure above can never leave a tester-owned
+    // write-intent lock on the root the finaliser then tries to remove.
+    releaseFixture();
+    // For a cooperatively released and joined peer the existing exited guard makes this a no-op that
+    // issues NO signal, which is what keeps this case's killRequested:false property intact under T.
+    // For a peer that never announced or never let go it DOES signal, that cleanup kill is counted
+    // as the real signal it is rather than hidden to protect a zero, and it is then JOINED inside
+    // the unchanged per-child budget.
+    if (!handle.record.exited) {
+      handle.kill("cleanup");
+      handle.cleanupAttempted = true;
+      try {
+        await withDeadline(
+          handle.exited, PER_CHILD_TIMEOUT_MS, "W6-R " + spec.label + " cleanup join",
+        );
+      } catch (error) {
+        cleanupJoinError = observationFailure(error);
+      }
+    }
+  }
+
+  const record = handle.record;
+
+  // PRESERVATION DECISION, taken here so EVERY exit path above reaches it - readiness timeout, hold
+  // refusal, release failure or unjoined cleanup alike. This is the same shared function the
+  // finaliser consults, so a peer whose exit was never observed keeps its store instead of having it
+  // removed from under a live handle, and clean:false is reported honestly when that happens.
+  const preservation = registerRootPreservation({
+    caseId: "W6-R",
+    seam: spec.arm,
+    root: store.parent,
+    pid: record.pid,
+    exited: record.exited,
+  });
+
+  // ---- FAILURE-SAFE EVIDENCE LATCH: every record below PRECEDES every assertion ----------------
+  const rawObserved = {
+    pid: record.pid,
+    exitCode: record.exitCode,
+    signal: record.signal,
+    exited: record.exited,
+    ready: record.ready,
+    heldReceived: record.heldReceived,
+    releasedReceived: record.releasedReceived,
+    killRequested: record.killRequested,
+    killDelivered: record.killDelivered,
+    killError: record.killError,
+    killedByTest: record.killedByTest,
+    lifecycle: childLifecycle(record),
+    experimentalKills: record.experimentalKills,
+    cleanupKills: record.cleanupKills,
+    killIntents: [...record.killIntents],
+    protocolViolations: [...record.protocolViolations],
+    // Copied, not referenced, so the latched evidence is a snapshot of this arm rather than a live
+    // view that a later event could still edit.
+    ipcErrors: record.ipcErrors.map(entry => ({ ...entry })),
+    sendAttempts: record.sendAttempts.map(entry => ({ ...entry })),
+    stderrHead: record.stderrHead === "" ? null : record.stderrHead,
+    stdoutBytes: record.stdoutBytes,
+  };
+  // Exactly ONE lifecycle record per peer, pushed here and nowhere else, so a cleanup pass cannot
+  // double-count it.
+  evidence.children.records.push({ caseId: "W6-R", arm: spec.arm, ...lifecycleFacts(record) });
+
+  const resultProjection = w6rResultProjection(result);
+
+  // The E1 vocabulary row, recorded HERE and guarded so one failing row cannot discard the rest of
+  // the latch. synthetic:false: this is a NATIVE measurement with no seam set, and labelling it
+  // synthetic would misdescribe the only native contention evidence in this suite. A SUCCESSFUL
+  // writer is not a refusal and contributes no row - recording one would invent a refusal.
+  const vocabularyErrors = [];
+  if (result !== null && result !== undefined && result.ok !== true) {
+    try {
+      recordVocabulary("W6-R", spec.arm + ":" + String(result.reason), result, { synthetic: false });
+    } catch (error) {
+      vocabularyErrors.push({
+        arm: spec.arm, reason: String(result.reason), ...observationFailure(error),
+      });
+    }
+  }
+
+  // The owned store is not touched AT ALL until this exact peer's exit has been OBSERVED. A live
+  // peer still holds its handle, so an inventory would hash a file a running process has open and a
+  // ledger read would be reading underneath it - and both would then be recorded as post-arm state,
+  // which they are not. When the join did not happen the arm leaves the store UNTOUCHED, persists
+  // the unknown, and fails below.
+  const storeObservable = mayObserveRecovery(record);
+  let ledgerRead = false;
+  let ledgerError = null;
+  let generationAfter = null;
+  let rowsAfter = null;
+  let sectionKeysAfter = null;
+  let ledgerKeysAfter = null;
+  let inventoryAfter = null;
+  let sidecarsAfter = null;
+  let inventoryError = null;
+  let afterArm = null;
+  if (storeObservable) {
+    try {
+      const ledger = requireLedger(store.dbPath, "W6-R/" + spec.arm);
+      generationAfter = ledger.generation;
+      rowsAfter = totalSectionRows(ledger);
+      sectionKeysAfter = sectionKeys(ledger, TARGET_SECTION);
+      ledgerKeysAfter = Object.keys(ledger).sort();
+      ledgerRead = true;
+    } catch (error) {
+      ledgerError = observationFailure(error);
+    }
+    try {
+      inventoryAfter = inventory(store.storeRoot);
+      sidecarsAfter = sidecars(store.storeRoot);
+      afterArm = snapshotRoot(store.storeRoot);
+    } catch (error) {
+      inventoryError = observationFailure(error);
+    }
+  } else {
+    ledgerError = {
+      observed: "not_observed",
+      diagnostic: "the peer's exit was never observed, so the store was deliberately left untouched",
+      note: "OBSERVATION ONLY - a store that was never read is recorded as never read and is NEVER "
+        + "reported as zero rows",
+    };
+    inventoryError = ledgerError;
+  }
+
+  const branchVerdict = spec.holdsFixture === true ? w6rDiscriminatorBranch(result) : null;
+  const latch = {
+    arm: spec.arm,
+    label: spec.label,
+    mode: spec.mode,
+    // Explicitly incomplete until every assertion below has passed. A partial arm is recorded as
+    // partial and is never dressed up as a complete one to satisfy a downstream gate.
+    status: "incomplete",
+    synthetic: false,
+    nativeLabel: "NATIVE: no seam variable is set on this arm - cleanCall deletes every one of them "
+      + "before the call - so every cause recorded here was thrown by the real pinned binding.",
+    retriesUsed: 0,
+    rawObserved,
+    holdExpectation: { mode: expectation.mode, pid: expectation.pid, nonceIsHex: true },
+    holdObservation,
+    holdViolations,
+    readyError,
+    holdSendFailure,
+    holdError,
+    ipcFailurePolicy: "a ChildProcess channel error and an UNDELIVERED command are recorded here as "
+      + "the failures they are, BEFORE the assertions below, and are then asserted absent. An "
+      + "undelivered command is never read as a peer that received it and answered nothing, no such "
+      + "failure is retried, and none is absorbed into a pass.",
+    fixture: fixtureFacts,
+    fixtureReleasedBeforeWriter,
+    writerInvoked,
+    callError,
+    resultProjection,
+    vocabularyErrors,
+    releaseObservation,
+    releaseViolations: w6rReleaseViolations(releaseObservation),
+    releaseSendFailure,
+    releaseError,
+    joinError,
+    cleanupJoinError,
+    preservation,
+    storeObservable,
+    ledgerRead,
+    ledgerError,
+    generationAfter,
+    rowsAfter,
+    sectionKeysAfter,
+    ledgerKeysAfter,
+    inventoryAfter,
+    sidecarsAfter,
+    inventoryError,
+    beforeArm,
+    beforeArmError,
+    afterArm,
+    byteObservation: beforeArm === null || afterArm === null
+      ? null : byteObservation(beforeArm, afterArm),
+    byteObservationPolicy: "RECORDED, NOT ASSERTED. R2-2 bounds byte identity to the clean W5 "
+      + "(a)-(e) fixtures where the open itself fails and no handle is ever constructed; this arm "
+      + "opens successfully, so no byte-identity claim is made here.",
+    discriminator: branchVerdict === null ? null : {
+      branch: branchVerdict.branch,
+      violations: branchVerdict.violations,
+      interpretationLimit: "RECORDED, NOT CONCLUDED. branch retained is ONE observation that a "
+        + "refused write-intent start can leave a lock a later commit meets; it is NOT proof that "
+        + "the same holder caused any earlier W6 outcome. branch released is ONE observation that "
+        + "the commit succeeded once the tester's own holder let go; a successful commit does NOT "
+        + "uniquely prove release latency, and no duration is measured here to support such a claim.",
+    },
+    zeroRowPolicy: "a missing or failed ledger read is recorded with ledgerRead:false and is NEVER "
+      + "reported as zero rows",
+    recordingOrder: "every field above was recorded BEFORE the first assertion below",
+  };
+  evidence.cases["W6-R"].arms.push(latch);
+
+  // ---- ASSERTIONS: hard, no retry, no skip, running against a sealed record --------------------
+  const context = "W6-R/" + spec.arm;
+  assert.equal(readyError, null, context + ": the owned peer must announce itself inside the "
+    + "per-child budget - a budget expiry is a FAILURE of this arm, never a retry ("
+    + JSON.stringify(readyError) + ")");
+  assert.equal(holdSendFailure, null, context + ": the single hold command must have been DELIVERED "
+    + "to a live peer - an undelivered command is a FAILED MEASUREMENT reported as one, never a "
+    + "peer that received it and held nothing (" + JSON.stringify(holdSendFailure) + ")");
+  assert.equal(holdError, null, context + ": the single hold observation must arrive inside the "
+    + "per-child budget (" + JSON.stringify(holdError) + ")");
+  assert.deepEqual(holdViolations, [], context + ": the peer's hold must satisfy this parent's own "
+    + "challenge and the declared arrangement for this mode");
+  if (spec.holdsFixture) {
+    assert.equal(fixtureFacts.opened, true,
+      context + ": the tester-owned fixture holder must actually open ("
+      + JSON.stringify(fixtureFacts.openError) + ")");
+    assert.equal(fixtureFacts.beginReturned, true,
+      context + ": the tester-owned fixture holder must actually take the write-intent lock");
+    assert.equal(fixtureFacts.released, true,
+      context + ": the tester-owned fixture holder must have fully let go BEFORE the writer ran - "
+      + "otherwise the writer met the fixture rather than the peer and this arm measured the wrong "
+      + "arrangement (" + JSON.stringify({
+        rollbackError: fixtureFacts.rollbackError, closeError: fixtureFacts.closeError,
+        handleOpenAfterRelease: fixtureFacts.handleOpenAfterRelease,
+      }) + ")");
+    assert.equal(fixtureReleasedBeforeWriter, true,
+      context + ": the fixture release must be recorded as having happened before the writer ran");
+  } else {
+    assert.equal(fixtureFacts.used, false,
+      context + ": the control arm uses no fixture holder - the peer's read transaction is the only "
+      + "other party on this store");
+  }
+  assert.equal(writerInvoked, true,
+    context + ": the ACTUAL unmodified writer must have been invoked - an arm that never called it "
+    + "measured nothing");
+  assert.equal(callError, null,
+    context + ": the writer must return a result rather than throwing out of the call - a throw here "
+    + "is a FAILED MEASUREMENT (" + JSON.stringify(callError) + ")");
+  assert.deepEqual(vocabularyErrors, [],
+    context + ": the E1 vocabulary row must record without error");
+
+  if (spec.holdsFixture) {
+    // The discriminating pair. Exactly one fully specified branch must hold cleanly; a result
+    // outside both is a hard failure, and no branch is reachable by relabelling the other.
+    assert.notEqual(branchVerdict.branch, null,
+      context + ": the outcome must match one of the two fully specified branches - retained "
+      + "(commit_uncertain with the exact R2-1 tuple and the primary SQLITE_BUSY) or released "
+      + "(ok:true at generation exactly g + 1) - and nothing else");
+    assert.deepEqual(branchVerdict.violations, [],
+      context + ": the observed branch (" + String(branchVerdict.branch) + ") must hold CLEANLY - a "
+      + "partial tuple is a failure, never an admissible variant");
+  } else {
+    assert.deepEqual(w6rControlViolations(result), [],
+      context + ": the unmodified writer must meet the held read transaction AT COMMIT and report "
+      + "the exact R2-1 uncertain tuple");
+    // The existing R2-1 negative oracle, reused unchanged.
+    assertRetrySafeIsWellFormed(result, context);
+    // The existing cleanup-cause oracle, reused unchanged. It reads cleanupError through the same
+    // null-and-absent-safe projection this file already used for W8, so a CLEAN cleanup - the
+    // expected shape here, where the key is absent entirely - is handled rather than dereferenced.
+    distinctCauses(result, context, { error: true, rollback: false, close: false });
+    assert.equal(resultProjection.errorKeyPresent, true,
+      context + ": the original native cause must be RETAINED on the result, not dropped");
+    assert.equal(resultProjection.errorSynthetic, false,
+      context + ": this contention is a REAL NATIVE failure and must never be labelled synthetic - "
+      + "no seam is set on this arm");
+    assert.equal(resultProjection.cleanupErrorKeyPresent, false,
+      context + ": with both the rollback and the close returning, cleanupErrorMap returns undefined "
+      + "and materialize OMITS the key, so cleanupError is ABSENT here - it is not present-and-null, "
+      + "and it is never dereferenced to establish that");
+    assert.equal(resultProjection.cleanupRollbackKeyPresent, false,
+      context + ": no rollback cleanup member exists on a clean cleanup, and none is invented");
+    assert.equal(resultProjection.cleanupCloseKeyPresent, false,
+      context + ": no close cleanup member exists on a clean cleanup, and none is invented");
+  }
+
+  assert.deepEqual(record.protocolViolations, [],
+    context + ": the peer must speak the declared protocol exactly - a repeated or unknown message "
+    + "is a recorded violation and a failure, never an overwrite");
+  assert.deepEqual(rawObserved.ipcErrors, [],
+    context + ": the peer's IPC channel must raise NO error. An error here is a FAILURE of this arm "
+    + "and is reported from inside its latch, which is the whole point of catching it: unlistened, "
+    + "it would surface as an uncaughtException and end the run BEFORE any of this arm's evidence "
+    + "was written (" + JSON.stringify(rawObserved.ipcErrors) + ")");
+  assert.equal(releaseSendFailure, null,
+    context + ": the single release command must have been DELIVERED to a live peer - a command that "
+    + "never reached the peer is reported as undelivered and is never read as a peer that refused to "
+    + "let go (" + JSON.stringify(releaseSendFailure) + ")");
+  assert.deepEqual(rawObserved.sendAttempts.map(entry => entry.phase), ["hold", "release"],
+    context + ": exactly two commands are sent to a W6-R peer, in that order - the protocol has no "
+    + "third command and no command is ever repeated");
+  assert.deepEqual([...new Set(rawObserved.sendAttempts.map(entry => entry.delivered))], [true],
+    context + ": both commands must be positively acknowledged as delivered - a send whose return "
+    + "value alone looked acceptable is not a delivered command");
+  assert.equal(releaseError, null,
+    context + ": the peer's single release observation must arrive inside the per-child budget ("
+    + JSON.stringify(releaseError) + ")");
+  assert.deepEqual(latch.releaseViolations, [],
+    context + ": the peer must have fully let go - discard returned, close returned, no transaction "
+    + "open and no handle left open");
+  assert.equal(joinError, null,
+    context + ": the peer's exit must be OBSERVED inside the per-child budget ("
+    + JSON.stringify(joinError) + ")");
+  assert.equal(cleanupJoinError, null,
+    context + ": no cleanup join was needed, so none may have failed ("
+    + JSON.stringify(cleanupJoinError) + ")");
+  assert.equal(record.exited, true,
+    context + ": the peer's exit must be OBSERVED, never assumed");
+  assert.equal(record.signal, null,
+    context + ": a cooperatively released peer is NEVER signalled");
+  assert.equal(record.exitCode, 0,
+    context + ": a released peer disconnects and exits 0 by itself");
+  assert.equal(record.killRequested, false,
+    context + ": this suite requests no kill for a W6-R peer - the release is cooperative and the "
+    + "join is what ends the arm");
+  assert.equal(childLifecycle(record), "exited-observed",
+    context + ": a plain observed exit, not a test-caused death");
+  assert.equal(preservation.preserve, false,
+    context + ": a joined peer leaves no preserved root, so this arm's owned root cleans up normally "
+    + "and the honest preservation fallback stays reserved for an unobserved exit");
+
+  // The INDEPENDENT verifier decides what actually landed, at the same strength W6 applies.
+  //
+  // DISCLOSURE, because this tuple asserts more than the commit-BUSY reason does. On the control arm
+  // the writer reports committed:null - UNKNOWN - and this arm then hard-asserts generation 1 with
+  // zero rows, i.e. that nothing landed. Those are two DIFFERENT facts and the second does not
+  // convert the first into a certainty: committed:null stays exactly what the writer said, an
+  // unresolved self-report, and nothing here rewrites it. What the ledger tuple adds is an
+  // INDEPENDENT measurement by the P2 opener of what is actually in the file, which is a different
+  // instrument answering a different question.
+  //
+  // That measurement rests on a premise this suite ASSERTS rather than assumes: journal mode is the
+  // SQLite default `delete` rollback journal, asserted by the PRE-EXISTING W1 test, under which a
+  // held SHARED read lock prevents the commit from acquiring EXCLUSIVE, so the database file cannot
+  // have changed. The coupling is therefore declared, not hidden - and it is a COUPLING: under WAL a
+  // reader would not block the commit at all and this arm's whole mechanism would be different. No
+  // journal-mode change is introduced anywhere by this case, so the coupling is latent.
+  //
+  // If a runner ever produced a genuinely uncertain commit that DID land, this assertion goes red.
+  // That is the intended and honest outcome - the arm fails loudly rather than absorbing the
+  // surprise - and it is stated here so no reader has to discover it from a failure.
+  const expectedLedger = spec.holdsFixture !== true || branchVerdict.branch === "retained"
+    ? { generation: 1, rows: 0, sectionKeys: [], ledgerKeys: W6R_SORTED_LEDGER_KEYS }
+    : { generation: 2, rows: 1, sectionKeys: [spec.mutationKey], ledgerKeys: W6R_SORTED_LEDGER_KEYS };
+  assert.deepEqual(w6rLedgerViolations(latch, expectedLedger), [],
+    context + ": the independent opener tuple for the observed outcome, ledgerError "
+    + JSON.stringify(latch.ledgerError));
+
+  latch.status = "passed";
+  return latch;
+}
+
+test("W6-R additive lock-contention discriminator: one writer, one owned peer", async () => {
+  // Seeded BEFORE the first arm so each arm latch has somewhere durable to write and the case
+  // evidence survives a failing arm. status stays "incomplete" until every assertion has passed.
+  evidence.cases["W6-R"] = {
+    status: "incomplete",
+    platform: process.platform,
+    arms: [],
+    armsRequired: 2,
+    peersPerArm: 1,
+    separateFromW6: "W6-R is a NEW case, never a relabelling of W6 and never a relaxation of it. "
+      + "W6 keeps its 20 x 8 race, its exactly-one-winner oracle, its closed loser vocabulary and "
+      + "its independent-opener tuple exactly as written, red or green. No oracle relaxation, no "
+      + "BEGIN EXCLUSIVE, no retry, no busy_timeout, no PRAGMA, no journal-mode change, no skip and "
+      + "no continue-on-error is introduced by this case.",
+    inProcessWriterRationale: "the writer is invoked IN-PROCESS because the Node IPC JSON boundary a "
+      + "forked child crosses destroys result.error and result.cleanupError, and those cleanup facts "
+      + "are exactly what this case measures. The peer, which does cross that boundary, projects "
+      + "every cause it observes to explicit scalars before sending, so nothing of its own is lost "
+      + "either and no absent field can pass for 'no error'.",
+    coordinationRationale: "the peer is RELEASED COOPERATIVELY over IPC and then JOINED - never "
+      + "signalled. A SIGKILLed peer would break the existing T rules that every child outside W7x "
+      + "has lifecycle exited-observed with killRequested:false and that the run-wide experimental "
+      + "signal total stays exactly one per W7x seam, which would be a relaxation of existing "
+      + "acceptance rather than an addition to it. Joining also lets the owned root be removed on "
+      + "win32, where an open database handle blocks removal, without weakening cleanup.",
+    evidenceLatchNote: "each arm records its raw peer scalars, its lifecycle, the verified hold "
+      + "observation, the tester-owned fixture facts, the scalar projection of the writer result "
+      + "including its cleanup shape, the release observation and the independent opener ledger - all "
+      + "BEFORE its first assertion, so a stopped arm still reports what actually happened.",
+    ipcFailureNote: "the latch above is only worth its claim if nothing can abort the arm before it "
+      + "is written. An undeliverable IPC command reports ASYNCHRONOUSLY, so with no send callback "
+      + "and no 'error' listener it would arrive as an uncaughtException that no try/catch at the "
+      + "send site could contain - and the one scenario where the latch is most valuable, a peer "
+      + "that died early, is exactly the scenario that would have destroyed it. Both commands "
+      + "therefore go through a single acknowledged send whose failure is DATA, and the peer carries "
+      + "an 'error' listener as the backstop. A connected check alone would be racy and is not "
+      + "relied on. Every such failure is recorded in the arm's latch and asserted there; none is "
+      + "swallowed, retried, or allowed to read as a peer that simply said nothing.",
+    unmeasuredBoundaries: [
+      "the control arm's independent ledger tuple (generation 1, zero rows) is a measurement by the "
+      + "P2 opener of what is in the FILE. It rests on the journal mode the PRE-EXISTING W1 test "
+      + "already asserts - the SQLite default `delete` rollback journal, under which a held SHARED "
+      + "read lock prevents the commit acquiring EXCLUSIVE - and it does NOT turn the writer's own "
+      + "committed:null into a certainty: that self-report stays UNRESOLVED. The arm is thereby "
+      + "COUPLED to rollback-journal semantics; under WAL a reader would not block the commit and "
+      + "the mechanism would differ. No journal-mode change is introduced here",
+      "no lock-hold DURATION is measured, and no timing threshold is proposed or implied",
+      "the retention/release outcome is ONE DISCRIMINATING OBSERVATION and is NOT proof that the "
+      + "same lock holder caused any earlier W6 outcome",
+      "a successful commit after the tester's own holder lets go does NOT uniquely prove release "
+      + "latency",
+      "native ROLLBACK and native close FAILURE behaviour stays UNMEASURED: this case measures a "
+      + "clean rollback and a clean close, not a failing one, and asserts nothing about a failing one",
+      "no byte-identity claim is made across the writer's call (R2-2 bounds that to the clean W5 "
+      + "(a)-(e) fixtures); the before/after observation is RECORDED and not asserted",
+      "nothing about win32 internals, better-sqlite3 internals, power loss, fsync, durability, "
+      + "multi-host locking, D1, D2 or D3",
+    ],
+  };
+
+  const arms = [];
+  // The CONTROL arm first: it proves the instrument and the documented mechanism, so a failing
+  // discriminator can be read against a control that is known to have worked.
+  arms.push(await runW6RArm({
+    arm: "control:read-transaction-peer",
+    label: "control",
+    mode: W6R_MODE_READ_TXN,
+    holdsFixture: false,
+    mutationKey: "binding-w6r-control",
+  }));
+  arms.push(await runW6RArm({
+    arm: "discriminator:refused-start-peer",
+    label: "discriminator",
+    mode: W6R_MODE_FAILED_BEGIN,
+    holdsFixture: true,
+    mutationKey: "binding-w6r-discriminator",
+  }));
+
+  assert.equal(arms.length, 2, "W6-R: both arms must run");
+  assert.equal(evidence.cases["W6-R"].arms.length, 2,
+    "W6-R: both arms must be RECORDED - a recorded arm is not a passed arm, and both counts are "
+    + "asserted so a run that stopped partway can never read as a complete pass");
+  assert.deepEqual([...new Set(evidence.cases["W6-R"].arms.map(entry => entry.status))], ["passed"],
+    "W6-R: every recorded arm must have completed its assertions");
+  assert.deepEqual([...new Set(arms.map(entry => entry.writerInvoked))], [true],
+    "W6-R: the ACTUAL unmodified writer must have been invoked on both arms");
+  assert.deepEqual([...new Set(arms.map(entry => entry.synthetic))], [false],
+    "W6-R: both arms are NATIVE measurements and neither may be labelled synthetic");
+  assert.deepEqual([...new Set(arms.map(entry => entry.ledgerRead))], [true],
+    "W6-R: both arms must have actually read the independent opener");
+  assert.deepEqual([...new Set(arms.map(entry => entry.retriesUsed))], [0],
+    "W6-R: no retry, on either arm, ever");
+  assert.deepEqual(arms.map(entry => entry.mode), [W6R_MODE_READ_TXN, W6R_MODE_FAILED_BEGIN],
+    "W6-R: the two arms exercise the two declared peer modes, in that order");
+
+  const observedBranch = arms[1].discriminator.branch;
+  Object.assign(evidence.cases["W6-R"], {
+    status: "passed",
+    armsRun: arms.length,
+    retriesUsed: 0,
+    controlOutcome: arms[0].resultProjection.reason,
+    discriminatorBranch: observedBranch,
+    discriminatorBranchMeaning: observedBranch === "retained"
+      ? "RECORDED: the refused write-intent start left a lock the later commit met. This is ONE "
+        + "observation of that mechanism; it does NOT establish that the same holder caused any "
+        + "earlier W6 outcome, and no frequency, duration or platform generalisation follows from it."
+      : "RECORDED: the commit succeeded once the tester's own holder let go. This does NOT uniquely "
+        + "prove release latency - no duration is measured here - and it does not establish what "
+        + "caused any earlier W6 outcome either.",
+    decisionPolicy: "this case RECORDS a discriminating observation. It takes no scope decision, "
+      + "proposes no threshold, changes no acceptance criterion and recommends no product adoption.",
+  });
+  maybeForceFail("W6-R");
+});
+
 // --- W7: the kill boundary - a killed writer returns nothing, recovery is only observed ---------
 
 test("W7 kill boundary: no partial application survives a mid-transaction SIGKILL", async () => {
@@ -3587,6 +4905,7 @@ test("W9 structural ownership of the runtime leaf, and fixture unreachability", 
   const writeCas = scanSource(WRITE_CAS_SOURCE);
   const writeChild = scanSource(WRITE_CHILD_SOURCE);
   const observer = scanSource(RECOVERY_OBSERVE_SOURCE);
+  const lockHoldPeer = scanSource(LOCK_HOLD_CHILD_SOURCE);
 
   // No filesystem mutation, no probe, and no fs surface at all in the runtime leaf. The match is
   // word-bounded so that an ordinary identifier CONTAINING a banned word (for example
@@ -3738,9 +5057,81 @@ test("W9 structural ownership of the runtime leaf, and fixture unreachability", 
       "W9: the tester-lane recovery observer must never be required by " + entry);
     assert.equal(closure.includes(path.basename(P2_OPENER_COPY)), false,
       "W9: the independent verifier must never be required by " + entry);
+    // W6-R, asserted here rather than scoped out of this oracle: the lock-holding peer is a TESTER
+    // instrument, so the slice and its child must not be able to reach it in either direction.
+    assert.equal(closure.includes(path.basename(LOCK_HOLD_CHILD_SOURCE)), false,
+      "W9: the W6-R lock-holding peer must be unreachable from " + entry);
   }
   assert.deepEqual(fromWriteChild, ["write-cas.cjs"],
     "W9: write-child.cjs requires the slice and nothing else relative");
+
+  // --- W6-R: the lock-holding peer's REACHABILITY and its READ-ONLY statement vocabulary ---------
+  //
+  // The peer is additive TESTER instrumentation, so W9 is EXTENDED to cover it at the same strength
+  // it covers the runtime leaves rather than being scoped around it. Three properties are asserted
+  // from this SOURCE: it reaches nothing, it modifies nothing, and it terminates nothing.
+  const fromLockHoldPeer = relativeClosure(LOCK_HOLD_CHILD_SOURCE);
+  assert.deepEqual(fromLockHoldPeer, [],
+    "W9: the W6-R peer reaches NO relative module - not the slice, not write-child.cjs, not "
+    + "states.cjs, not the recovery observer and not the independent P2 opener, so it can never "
+    + "create, adopt, repair or verify a store");
+  assert.deepEqual(lockHoldPeer.requires, ["better-sqlite3"],
+    "W9: the W6-R peer's ONLY require is the pinned native binding");
+  assert.equal(lockHoldPeer.code.includes("applyExperimentalStoreMutation"), false,
+    "W9: the W6-R peer never calls the mutation API - it is a lock holder, never a writer");
+  // No filesystem surface at all, exactly as the runtime leaf is held to.
+  for (const token of FORBIDDEN_RUNTIME_TOKENS) {
+    assert.equal(new RegExp("\\b" + token + "\\b").test(lockHoldPeer.code), false,
+      "W9: the W6-R peer must not contain " + token + " (code, not comments)");
+  }
+  assert.equal(/\bfs\s*\./.test(lockHoldPeer.code), false,
+    "W9: the W6-R peer binds no fs namespace and has no fs call site anywhere");
+  // It terminates nothing and signals nothing: the parent releases it over IPC and joins it, which
+  // is what keeps this case inside the existing run-wide signal accounting.
+  assert.equal(/\bprocess\s*\.\s*exit\b/.test(lockHoldPeer.code), false,
+    "W9: the W6-R peer calls process.exit on NO path - it disconnects and exits by itself");
+  assert.equal(/\bprocess\s*\.\s*kill\b/.test(lockHoldPeer.code), false,
+    "W9: the W6-R peer signals nothing and looks at no other process");
+  // Exactly one handle, and READ-ONLY statements only: the peer's whole statement vocabulary is a
+  // CLOSED, ENUMERATED set, so "it modifies nothing" is measured from source rather than asserted as
+  // a claim. No data statement, no PRAGMA, no busy_timeout and no COMMIT of any kind appears - the
+  // transaction is always discarded, so not even an empty commit can be attributed to this peer.
+  assert.equal(countOccurrences(lockHoldPeer.code, "new Database("), 1,
+    "W9: the W6-R peer constructs exactly one handle, and no default-constructor Database");
+  const peerSql = sqlLiterals(lockHoldPeer);
+  const W6R_PEER_STATEMENTS = [
+    "BEGIN DEFERRED",
+    "BEGIN IMMEDIATE",
+    "ROLLBACK",
+    "SELECT key FROM store_meta ORDER BY key LIMIT 1",
+  ];
+  assert.deepEqual([...peerSql].sort(), [...W6R_PEER_STATEMENTS].sort(),
+    "W9: the W6-R peer's statement vocabulary is exactly the closed read/lock set - one deferred "
+    + "start, one immediate start, one keyed metadata read and one discard, each appearing once");
+  for (const banned of [/\bINSERT\b/i, /\bUPDATE\b/i, /\bDELETE\b/i, /\bREPLACE\b/i, /\bDROP\b/i,
+    /\bALTER\b/i, /\bVACUUM\b/i, /\bPRAGMA\b/i, /\bCOMMIT\b/i, /\bCREATE\b/i, /\bATTACH\b/i]) {
+    assert.deepEqual(peerSql.filter(literal => banned.test(literal)), [],
+      "W9: the W6-R peer contains no SQL matching " + String(banned));
+  }
+  // READ THESE TWO AGAINST `.code`, NOT AGAINST THE RAW FILE. scanSource strips comments and
+  // replaces every string body before any code assertion runs, so `.code` is the peer's EXECUTABLE
+  // text. The peer's header prose does discuss busy_timeout and PRAGMA by name - it has to, to state
+  // why neither is used - and a reviewer grepping the raw file will get those hits. They are COMMENT
+  // TOKENS, they are not code, and they are not violations of these assertions, which pass exactly
+  // as written. Nothing here is scoped around that fact: these checks are correct and are kept. Do
+  // NOT weaken or delete either one to make a raw-file grep quieter; the assertion messages say
+  // "anywhere in the W6-R peer" and mean anywhere in the peer's CODE.
+  assert.equal(/\bPRAGMA\b/i.test(lockHoldPeer.code), false, "W9: no PRAGMA anywhere in the W6-R peer");
+  assert.equal(/busy_timeout/i.test(lockHoldPeer.code), false,
+    "W9: no busy_timeout anywhere in the W6-R peer - contention is MEASURED, never waited out");
+  for (const literal of peerSql) {
+    assert.equal(literal.includes("\""), false,
+      "W9: no double-quoted token inside a W6-R peer SQL string - offending: " + literal);
+  }
+  // The declared scanner limitation, closed by measurement for this leaf too.
+  assert.equal(/\/[^\n/*][^\n]*['"`][^\n]*\//.test(lockHoldPeer.code), false,
+    "W9: the W6-R peer contains no regular-expression literal carrying a quote character, so the "
+    + "scanner's declared limitation cannot apply to it");
 
   // The observer itself: open + close only, asserted here per R2-2.
   assert.equal(countOccurrences(observer.code, "new Database("), 1,
@@ -3768,6 +5159,22 @@ test("W9 structural ownership of the runtime leaf, and fixture unreachability", 
     writeChildRelativeClosure: fromWriteChild,
     writeCasRelativeClosure: fromWriteCas,
     observer: { requires: observer.requires, statements: sqlLiterals(observer) },
+    // W6-R, additive: the lock-holding peer measured at the same strength as the runtime leaves.
+    lockHoldPeer: {
+      requires: lockHoldPeer.requires,
+      relativeClosure: fromLockHoldPeer,
+      reachableFromWriteCas: fromWriteCas.includes(path.basename(LOCK_HOLD_CHILD_SOURCE)),
+      reachableFromWriteChild: fromWriteChild.includes(path.basename(LOCK_HOLD_CHILD_SOURCE)),
+      databaseConstructions: countOccurrences(lockHoldPeer.code, "new Database("),
+      statements: peerSql,
+      statementVocabularyClosedTo: W6R_PEER_STATEMENTS,
+      role: "TESTER-LANE lock holder for W6-R. Read/lock only: no data statement, no PRAGMA, no "
+        + "busy_timeout, no COMMIT of any kind, exactly one handle, and no process.exit or signal on "
+        + "any path - the parent releases it over IPC and joins it.",
+      scopeNote: "asserted, not scoped around. This oracle claims nothing about the peer beyond "
+        + "these SOURCE properties; whether the lock it holds behaves as the documentation says is "
+        + "what W6-R MEASURES, not what W9 asserts.",
+    },
     scannerLimitation: "comments are removed and string bodies replaced before any code assertion; "
       + "a regex literal carrying a quote character would be mis-scanned, and the runtime leaf is "
       + "asserted above to contain none",
@@ -4289,11 +5696,19 @@ test("T teardown: the recorded case-id list is derived from execution, and child
         "T: no child outside W7x is ever signalled by this suite");
     }
   }
+  // W6-R adds exactly TWO children run-wide: one owned lock-holding peer per arm, named term by
+  // term below. This is a DECLARED arithmetic change (166 + 2 = 168), NOT a relaxation - the
+  // assertion stays exact and is still derived from the per-case constants rather than hardcoded.
+  // Both W6-R peers are RELEASED COOPERATIVELY over IPC and JOINED, never signalled, so the
+  // outside-W7x killRequested:false rule above and the run-wide signal totals below are untouched.
   const expectedChildren =
-    RACE_ITERATIONS * RACE_CHILD_COUNT + CRASH_SEAMS.length + CRASH_SEAMS.length;
+    RACE_ITERATIONS * RACE_CHILD_COUNT + CRASH_SEAMS.length + CRASH_SEAMS.length
+    + W6R_CONTROL_PEERS + W6R_DISCRIMINATOR_PEERS;
   assert.equal(evidence.children.spawned, expectedChildren,
     "T: exactly " + expectedChildren + " children (W6 " + RACE_ITERATIONS + "x" + RACE_CHILD_COUNT
-    + ", W7 " + CRASH_SEAMS.length + ", W7x " + CRASH_SEAMS.length + ")");
+    + ", W7 " + CRASH_SEAMS.length + ", W7x " + CRASH_SEAMS.length
+    + ", W6-R control:read-transaction-peer " + W6R_CONTROL_PEERS
+    + ", W6-R discriminator:refused-start-peer " + W6R_DISCRIMINATOR_PEERS + ")");
 
   // The W7x negative controls are DOUBLES and must not appear in the child accounting at all: a
   // simulation that inflated the spawned/reaped totals would be a simulation counted as a run.
@@ -4327,6 +5742,15 @@ test("T teardown: the recorded case-id list is derived from execution, and child
     childrenSpawned: evidence.children.spawned,
     childrenReaped: evidence.children.reaped,
     expectedChildren,
+    // Named per arm rather than folded into one total, so the declared 166 + 2 = 168 change is
+    // readable from the evidence without re-deriving it.
+    expectedChildrenByCase: {
+      W6: RACE_ITERATIONS * RACE_CHILD_COUNT,
+      W7: CRASH_SEAMS.length,
+      W7x: CRASH_SEAMS.length,
+      "W6-R:control:read-transaction-peer": W6R_CONTROL_PEERS,
+      "W6-R:discriminator:refused-start-peer": W6R_DISCRIMINATOR_PEERS,
+    },
     note: "T records NO case id of its own, so the TAP test count is one higher than "
       + "executedCaseCount - exactly the distinction P3 kept between 18 TAP tests and 17 case ids",
   };

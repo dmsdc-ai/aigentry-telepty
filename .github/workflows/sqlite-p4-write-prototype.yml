@@ -42,7 +42,7 @@
 # a failure; this job never sets one and never suppresses one.
 #
 # Not live-activated: runs only on explicit workflow_dispatch, or on a pull
-# request touching AT LEAST ONE of the ten leaf paths below. paths: filters
+# request touching AT LEAST ONE of the eleven leaf paths below. paths: filters
 # are OR triggers.
 
 name: sqlite-p4-write-prototype (task 1170)
@@ -51,7 +51,7 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      # Exactly the eight new P4 leaves, one entry per file, INCLUDING the path
+      # Exactly the nine new P4 leaves, one entry per file, INCLUDING the path
       # of this workflow file, PLUS the two reused frozen sources. Omitting the
       # workflow path would let an edit to it merge unexercised; omitting a
       # coder or tester leaf would let the slice under test change unexercised.
@@ -66,6 +66,10 @@ on:
       - "validation/1170-sqlite-p4-write/write-child.cjs"
       - "validation/1170-sqlite-p4-write/write-cas.test.cjs"
       - "validation/1170-sqlite-p4-write/recovery-observe.cjs"
+      # The W6-R lock-holding peer. Listed for the same reason as every other
+      # leaf: an edit to the instrument that holds the lock changes what W6-R
+      # measures, so the job must re-run.
+      - "validation/1170-sqlite-p4-write/lock-hold-child.cjs"
       - "validation/1170-sqlite-p4-write/package.json"
       - "validation/1170-sqlite-p4-write/package-lock.json"
       - ".github/workflows/sqlite-p4-write-prototype.yml"
@@ -208,7 +212,7 @@ jobs:
           test "$(node -p process.version)" = "v24.21.0"
 
       # No missing input is skipped, defaulted or substituted. Every one of the
-      # eight new P4 leaves and both reused frozen sources must be present in
+      # nine new P4 leaves and both reused frozen sources must be present in
       # the checkout before anything installs or runs. A missing leaf fails the
       # job here rather than producing a suite that quietly exercises less.
       - name: Assert all P4 leaves and both reused sources are present
@@ -229,6 +233,7 @@ jobs:
             path.join(leaf, "write-child.cjs"),
             path.join(leaf, "write-cas.test.cjs"),
             path.join(leaf, "recovery-observe.cjs"),
+            path.join(leaf, "lock-hold-child.cjs"),
             path.join(leaf, "package.json"),
             path.join(leaf, "package-lock.json"),
             path.join(".github", "workflows", "sqlite-p4-write-prototype.yml"),
@@ -390,7 +395,7 @@ jobs:
                     ? `partially unmeasured: cases.P0 does not record ${missingNativeKeys.join(", ")}`
                     : "tester suite runtime evidence (evidence.json -> cases.P0)";
 
-          // All eight new P4 source leaves, plus the two frozen reused sources
+          // All nine new P4 source leaves, plus the two frozen reused sources
           // and their two mechanically produced copies, hashed as they exist ON
           // THIS RUNNER. Cross-OS hash equality is NOT asserted anywhere: Git
           // may check text files out with CRLF line endings on Windows, which
@@ -409,6 +414,7 @@ jobs:
             writeChild: { path: leafFile("write-child.cjs"), ...sha(leafFile("write-child.cjs")) },
             test: { path: leafFile("write-cas.test.cjs"), ...sha(leafFile("write-cas.test.cjs")) },
             recoveryObserver: { path: leafFile("recovery-observe.cjs"), ...sha(leafFile("recovery-observe.cjs")) },
+            lockHoldPeer: { path: leafFile("lock-hold-child.cjs"), ...sha(leafFile("lock-hold-child.cjs")) },
             package: { path: leafFile("package.json"), ...sha(leafFile("package.json")) },
             packageLock: { path: leafFile("package-lock.json"), ...sha(leafFile("package-lock.json")) },
             workflow: { path: ".github/workflows/sqlite-p4-write-prototype.yml", ...sha(workflowPath) },
