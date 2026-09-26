@@ -3560,8 +3560,47 @@ test("W6-R additive lock-contention discriminator: one writer, one owned peer", 
 
 // --- W7: the kill boundary - a killed writer returns nothing, recovery is only observed ---------
 
+// W7 assertion SCHEDULING, and nothing else. Every oracle below is kept verbatim, still runs in its
+// existing order and still fails the case; only the moment a failure is THROWN moves - out of the
+// seam loop and into an aggregate raised after all three seams have run and latched. Windows
+// measured the FIRST arm (after_cas_read, exitCode 1 / signal null) throwing inside the loop, which
+// discarded the after_row_insert and before_commit arms entirely and left the child accounting at
+// 166 against 168 spawned.
+//
+// Within one arm the first failure still short-circuits THAT arm exactly as an inline assert does:
+// nothing after it is asserted for that seam, so no predicate is ever evaluated against a record an
+// earlier predicate has already rejected. A non-assertion throw (a TypeError, say) is captured and
+// re-raised identically - an error or an unknown is NEVER downgraded into a zero, a skip or a pass.
+function captureArmOracles(crashSeam, runOracles) {
+  try {
+    runOracles();
+    return null;
+  } catch (error) {
+    return {
+      crashSeam,
+      // The original error object, re-raised unchanged by the aggregate below so the failure keeps
+      // its own type, stack and cause rather than being restated as a new generic verdict.
+      error,
+      record: {
+        crashSeam,
+        // The EXACT message of the existing assertion that failed, verbatim.
+        failedAssertion: String((error && error.message) || error),
+        errorName: String((error && error.name) || "Error"),
+        errorCode: (error && error.code) === undefined ? null : (error && error.code) || null,
+        operator: (error && error.operator) === undefined ? null : error.operator,
+        note: "DEFERRED, never weakened: this predicate rejected the arm and the case cannot pass. "
+          + "The raw values it rejected stay latched in this arm's rawObserved and observation "
+          + "fields and are not re-derived from this record.",
+      },
+    };
+  }
+}
+
 test("W7 kill boundary: no partial application survives a mid-transaction SIGKILL", async () => {
   const arms = [];
+  // Captured per-arm oracle failures, re-raised as one aggregate AFTER every seam has been
+  // collected. A non-empty list is a FAILED case; it is never a tolerated or absorbed condition.
+  const armFailures = [];
   // Seeded BEFORE the first seam so each arm latch has somewhere durable to write and the case
   // evidence survives a failing arm. status stays "incomplete" until every assertion has passed.
   evidence.cases.W7 = {
@@ -3573,6 +3612,10 @@ test("W7 kill boundary: no partial application survives a mid-transaction SIGKIL
       + "killRequested and already-captured stderr, then the pre-reopen leftover and sidecars, "
       + "then the recovery observation, then the post-recovery inventory and the independent "
       + "opener ledger - all BEFORE its first assertion, and in that R2-2 pre/post order.",
+    assertionSchedulingNote: "every seam's oracles run per arm and any failure is CAPTURED, so a "
+      + "failing seam no longer aborts the seams after it: all three arms are observed and latched, "
+      + "and the captured failures are re-raised together after the loop. Scheduling only - no "
+      + "predicate is relaxed, no seam is skipped or retried, and a failed arm stays failed.",
   };
   for (const crashSeam of CRASH_SEAMS) {
     const store = newStore("w7-" + crashSeam);
@@ -3679,11 +3722,9 @@ test("W7 kill boundary: no partial application survives a mid-transaction SIGKIL
       childOutcome: "unknown",
       commitOutcome: "unknown",
     };
-    for (const forbidden of ["reason", "ok", "committed", "commitAttempted", "retrySafe"]) {
-      assert.equal(Object.hasOwn(parentRecord, forbidden), false,
-        "W7/" + crashSeam + ": the parent record must NOT synthesize " + forbidden
-        + " for a process that returned nothing");
-    }
+    // The no-synthesis oracle on this record moved DOWN into the captured block below with every
+    // other W7 predicate, unchanged and still first in order, so that it too cannot abort the loop
+    // before the remaining seams have been observed.
 
     const membersChanged = leftover === null || afterRecovery === null
       ? null : JSON.stringify(leftover) !== JSON.stringify(afterRecovery);
@@ -3728,6 +3769,18 @@ test("W7 kill boundary: no partial application survives a mid-transaction SIGKIL
     arms.push(arm);
 
     // ---- ASSERTIONS: unchanged in strength, now running against a sealed record --------------
+    // Identical predicates, identical order, identical messages. The only change is that the first
+    // failure is captured here and re-raised by the aggregate after the loop, instead of aborting
+    // the loop and destroying the two seams behind it. The assert lines below are deliberately left
+    // at their original indentation inside this callback so the diff shows a zero-column shift and
+    // each predicate can be read as byte-identical to the version it replaces.
+    const armFailure = captureArmOracles(crashSeam, () => {
+    for (const forbidden of ["reason", "ok", "committed", "commitAttempted", "retrySafe"]) {
+      assert.equal(Object.hasOwn(parentRecord, forbidden), false,
+        "W7/" + crashSeam + ": the parent record must NOT synthesize " + forbidden
+        + " for a process that returned nothing");
+    }
+
     // R2-2: the writer signals its OWN pid only. This suite requested no kill for this child.
     assert.equal(record.killRequested, false,
       "W7/" + crashSeam + ": the child terminates itself; the suite scans no processes and kills none");
@@ -3762,8 +3815,41 @@ test("W7 kill boundary: no partial application survives a mid-transaction SIGKIL
       "W7/" + crashSeam + ": the opener reports generation g - no bump survived");
     assert.equal(rowsAfterRecovery, 0,
       "W7/" + crashSeam + ": ZERO new rows - no partial application survived");
+    });
 
-    arm.status = "passed";
+    if (armFailure === null) {
+      arm.status = "passed";
+    } else {
+      // A rejected arm is recorded as FAILED - never left looking untested, never promoted, and
+      // never merged into a neighbouring arm that did pass. The next seam still runs so that its
+      // own observations exist; that is collection, not tolerance.
+      arm.status = "failed";
+      arm.assertionFailure = armFailure.record;
+      armFailures.push(armFailure);
+    }
+  }
+
+  // ---- AGGREGATE FAILURE: raised only AFTER all three arms have run and latched ---------------
+  // Each captured failure is re-raised with its own seam, its own verbatim assertion message and
+  // its original error as the cause. Nothing is summarised away, relaxed, retried or waived: one
+  // rejected seam still fails this case exactly as the inline throw did.
+  if (armFailures.length > 0) {
+    Object.assign(evidence.cases.W7, {
+      status: "failed",
+      failedSeams: armFailures.map(entry => entry.crashSeam),
+      observedSeams: arms.map(entry => entry.crashSeam),
+      aggregateFailureNote: "every named seam was still exercised, observed and latched before this "
+        + "failure was raised. The case is FAILED, not incomplete-by-abort: W7 kill-proof remains "
+        + "REQUIRED and OPEN, and no arm here is read as a pass.",
+    });
+    throw new AggregateError(
+      armFailures.map(entry => entry.error),
+      "W7: " + armFailures.length + " of " + CRASH_SEAMS.length + " crash seams FAILED their "
+      + "existing oracles. All " + arms.length + " arms were observed and latched first; each "
+      + "failure keeps its seam, its assertion and its cause, and none is relaxed or converted "
+      + "into a pass:\n"
+      + armFailures.map(entry => "  - " + entry.record.failedAssertion).join("\n"),
+    );
   }
 
   assert.equal(arms.length, CRASH_SEAMS.length, "W7: every named crash seam must be exercised");
