@@ -1,0 +1,310 @@
+# Task #1170 - OS termination REPRESENTATION apparatus. PROCESS-ONLY
+# MEASUREMENT, ISOLATED EXPERIMENT ONLY.
+#
+# Runs one bounded, zero-dependency, Node-builtins-only apparatus on three
+# runner OSes. For three synthetic point labels it records the RAW
+# (exitCode, signal, error) triple the local OS reports for two authorships of
+# one SIGKILL - the child killing itself, and the parent killing the exact
+# ChildProcess handle it forked - together with a set of negative controls.
+#
+# The two arms are kept causally separable by an explicit PARENT OPERATION
+# POLICY fixed before each child is spawned and recorded with every trial: the
+# self arms run observe_only, where this parent issues ZERO experimental
+# signals, and the parent arms run kill_on_valid_marker. Apparatus timeout
+# cleanup is a separate mechanism, counted separately under both policies. Only
+# the OS-reported fields are compared between the arms; parent-side operational
+# facts differ by construction and are recorded, not compared.
+#
+# WHAT THIS WORKFLOW IS NOT:
+#  - Not SQLite and not storage. No native SQL installation is performed or
+#    needed, no better-sqlite3, no npm install of any kind, no product
+#    dependency and no product Node floor change. The apparatus requires only
+#    Node builtins.
+#  - Not a change to the original failing W7 workflow. This is a SEPARATE
+#    workflow file with its own name, its own triggers and its own three leaf
+#    paths. It does not read, reference, reuse or alter
+#    sqlite-p4-write-prototype.yml, and the P4 native suite runs exactly as
+#    before. Nothing here re-runs, relaxes, waives or re-scores W7.
+#  - Not a W7 acceptance gate and not a licence for one. A generic exit 1 is
+#    never read as a W7 pass anywhere in this lane.
+#  - Not a Windows result inferred from anywhere else. Each OS measures only
+#    itself; the apparatus records `windowsMeasured` from the actual platform.
+#    A darwin or linux run establishes NOTHING about win32 mappings.
+#  - Not an adoption, not a durability claim, not a release gate.
+#
+# Conventions (exact-ref checkout with persist-credentials: false, read-only
+# permissions, owned RUNNER_TEMP roots supplied already existing, fail-closed
+# interface assertions, dual TAP reporters with no tee so the real exit code
+# survives on every OS, if: always() evidence collection, artifact upload with
+# if-no-files-found: error) are mechanically copied from the reviewed
+# sqlite-p4-write-prototype workflow. Reusing those conventions is NOT a claim
+# that any P2/P3/P4 slice or result is adopted or inherited here.
+#
+# No continue-on-error, no `|| true`, no bypass, no credential, no network
+# beyond the checkout and the Node setup, no provider or inference variable
+# reachable from a measured child.
+#
+# D1/D2/D3, the security / Snyk, installation, backup, recovery, migration, OS
+# and release gates, the full SQLite and storage questions, Windows adoption and
+# release acceptance all remain OPEN. Parent task #1170 and release #1171 remain
+# incomplete.
+#
+# Not live-activated: explicit workflow_dispatch, or a pull request touching at
+# least one of the three leaf paths below. paths: filters are OR triggers.
+
+name: sqlite-termination-map-prototype (task 1170)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      # Exactly the three leaves of this lane, one entry per file, INCLUDING
+      # this workflow file. Omitting the workflow path would let an edit to it
+      # merge unexercised; omitting either apparatus leaf would let the thing
+      # doing the measuring change unexercised. No product path and no P4
+      # native path is listed: this lane must never be triggered by a product
+      # file change, and must never re-trigger the P4 native suite.
+      - "validation/1170-sqlite-p4-write/termination-map.test.cjs"
+      - "validation/1170-sqlite-p4-write/termination-map-child.cjs"
+      - ".github/workflows/sqlite-termination-map-prototype.yml"
+
+# Read-only: this apparatus never needs a write scope.
+permissions:
+  contents: read
+
+jobs:
+  termination-map:
+    name: termination map apparatus (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The apparatus bounds itself: 3000 ms per child, 60000 ms whole run. This
+    # cap only bounds a hung job; it gates nothing and weakens no assertion.
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      # Single source of truth for the leaf directory, so no step can drift.
+      TM_LEAF_DIR: validation/1170-sqlite-p4-write
+
+    steps:
+      # Exact ref: the PR head commit under test, not the synthetic merge
+      # commit. persist-credentials: false - no credential is left in the
+      # checkout for any later step to reach.
+      - name: Checkout exact ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Record actual git HEAD provenance
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          echo "resolved HEAD: ${HEAD_SHA}"
+          echo "TM_GIT_HEAD=${HEAD_SHA}" >> "$GITHUB_ENV"
+
+      # Same pin as the P4 prototype lane, for comparability of the runtime
+      # under measurement. Authorised for this experiment only; the product Node
+      # floor is untouched.
+      - name: Set up pinned Node 24 (experiment-scoped)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+
+      - name: Verify runtime provenance
+        run: |
+          set -euo pipefail
+          node -v
+          test "$(node -p process.version)" = "v24.21.0"
+
+      # Owned roots only: the evidence root and the fake HOME/TMP sandbox root
+      # both live under RUNNER_TEMP, and both are supplied ALREADY EXISTING -
+      # the apparatus creates no parent of any kind. Paths are joined by Node so
+      # Windows separators stay correct. No npm config, cache or registry is
+      # staged: nothing in this lane installs anything.
+      - name: Stage owned temp roots
+        run: |
+          set -euo pipefail
+          node <<"NODE"
+          const fs = require("node:fs"), path = require("node:path");
+          const base = process.env.RUNNER_TEMP;
+          if (!base) { console.error("RUNNER_TEMP is not set"); process.exit(1); }
+          const mk = (n) => { const p = path.join(base, n); fs.mkdirSync(p, { recursive: true }); return p; };
+          const evidence = mk("tm-evidence");
+          const sandbox = mk("tm-sandbox");
+          fs.appendFileSync(process.env.GITHUB_ENV, [
+            // Interface contract with the apparatus:
+            //   TM_EVIDENCE_DIR - raw TAP, structured JSON and the JSONL
+            //                     rawlog are written here and uploaded.
+            //   TM_SANDBOX_DIR  - the fake HOME and TMP handed to every
+            //                     measured child live under this root.
+            `TM_EVIDENCE_DIR=${evidence}`,
+            `TM_SANDBOX_DIR=${sandbox}`,
+            "",
+          ].join("\n"));
+          console.log("evidence:", evidence, "\nsandbox:", sandbox);
+          NODE
+
+      # Fail closed: a missing interface variable, a missing owned root or a
+      # missing apparatus leaf is a job failure HERE, never a silently degraded
+      # run that reports success later. Nothing is defaulted or substituted.
+      - name: Assert interface env, owned roots and both apparatus leaves exist
+        run: |
+          set -euo pipefail
+          node <<"NODE"
+          const fs = require("node:fs"), path = require("node:path");
+          const leaf = process.env.TM_LEAF_DIR;
+          if (!leaf) { console.error("missing TM_LEAF_DIR"); process.exit(1); }
+          const required = ["TM_GIT_HEAD", "TM_EVIDENCE_DIR", "TM_SANDBOX_DIR"];
+          const missing = required.filter((k) => !process.env[k]);
+          if (missing.length) {
+            console.error("missing required env:", missing.join(", "));
+            process.exit(1);
+          }
+          for (const k of ["TM_EVIDENCE_DIR", "TM_SANDBOX_DIR"]) {
+            const dir = process.env[k];
+            if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+              console.error(`${k} is not an existing directory: ${dir}`);
+              process.exit(1);
+            }
+          }
+          for (const f of ["termination-map.test.cjs", "termination-map-child.cjs"]) {
+            const p = path.join(leaf, f);
+            if (!fs.existsSync(p) || !fs.statSync(p).isFile()) {
+              console.error(`missing apparatus leaf: ${p}`);
+              process.exit(1);
+            }
+            console.log("present:", p, fs.statSync(p).size, "bytes");
+          }
+          console.log("TM_GIT_HEAD =", process.env.TM_GIT_HEAD);
+          NODE
+
+      # Two TAP reporters (console and file) so the artifact is written without
+      # tee, which keeps the real process exit code on every OS. No
+      # continue-on-error and no `|| true`: a failing apparatus assertion on any
+      # OS fails this job and is reported as an actual failure. --test-timeout
+      # bounds a hung case inside the job cap; the real bounds (3000 ms per
+      # child, 60000 ms whole run) are owned by the apparatus itself. Both bound
+      # a hang only and assert nothing.
+      - name: Run termination map apparatus
+        working-directory: validation/1170-sqlite-p4-write
+        run: |
+          set -euo pipefail
+          node --test --test-timeout=120000 \
+            --test-reporter=tap --test-reporter-destination=stdout \
+            --test-reporter=tap --test-reporter-destination="$TM_EVIDENCE_DIR/termination-map.tap" \
+            termination-map.test.cjs
+
+      # Runs even when the apparatus fails, so failure evidence is captured too.
+      # This step records measurements only: it derives no verdict, parses no
+      # TAP, computes no pass count, and repairs, defaults or recomputes
+      # nothing. The raw TAP stream is the authoritative record of what passed.
+      - name: Collect leaf hashes and echo the recorded measurement
+        if: always()
+        run: |
+          set -euo pipefail
+          node <<"NODE"
+          const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
+          const evDir = process.env.TM_EVIDENCE_DIR;
+          const leaf = process.env.TM_LEAF_DIR;
+          if (!evDir || !leaf) {
+            console.error("missing TM_EVIDENCE_DIR / TM_LEAF_DIR; cannot collect evidence");
+            process.exit(1);
+          }
+          const sha = (p) => crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+          const leaves = {};
+          for (const f of ["termination-map.test.cjs", "termination-map-child.cjs"]) {
+            const p = path.join(leaf, f);
+            leaves[f] = { bytes: fs.statSync(p).size, sha256: sha(p) };
+          }
+          const wf = ".github/workflows/sqlite-termination-map-prototype.yml";
+          if (fs.existsSync(wf)) leaves[wf] = { bytes: fs.statSync(wf).size, sha256: sha(wf) };
+          fs.writeFileSync(path.join(evDir, "provenance.json"), JSON.stringify({
+            gitHead: process.env.TM_GIT_HEAD || null,
+            runnerOs: process.env.RUNNER_OS || null,
+            platform: process.platform,
+            arch: process.arch,
+            nodeVersion: process.version,
+            leaves,
+          }, null, 2) + "\n");
+          for (const [k, v] of Object.entries(leaves)) console.log(k, v.sha256, v.bytes, "bytes");
+
+          // Echo only. The apparatus JSON is reproduced verbatim as recorded;
+          // no field is recomputed and no conclusion is drawn from it here.
+          const jsonPath = path.join(evDir, "termination-map.json");
+          if (!fs.existsSync(jsonPath)) {
+            console.log("termination-map.json absent - the apparatus did not reach its finaliser");
+          } else {
+            const ev = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+            console.log("scope:", ev.scope, "| windowsMeasured:", ev.runtime.windowsMeasured);
+            console.log("bounds:", JSON.stringify(ev.bounds));
+            console.log("custody:", JSON.stringify(ev.custody));
+            console.log("parentOperationPolicies:", JSON.stringify(ev.parentOperationPolicies));
+            console.log("classCounts:", JSON.stringify(ev.classCounts));
+            for (const row of ev.pairTable) {
+              const fmt = (a) => a.map((p) => `(${p.rawExitCode},${p.rawSignal}) api=${p.killApiReturn}`).join(" ");
+              console.log(`label ${row.label}`);
+              console.log(`  self   [${row.selfArmPolicy}, parentSignals=${row.selfArmExperimentalSignalsIssued}]:`,
+                          fmt(row.selfSigkill));
+              console.log(`  parent [${row.parentArmPolicy}, parentSignals=${row.parentArmExperimentalSignalsIssued}]:`,
+                          fmt(row.parentSigkill));
+              console.log("  recordedOsPairSetsEqual:", row.recordedOsPairSetsEqual,
+                          "| distinguishingOsFieldNames:", JSON.stringify(row.distinguishingOsFieldNames));
+            }
+            console.log("notEstablished:", JSON.stringify(ev.notEstablished, null, 2));
+          }
+          NODE
+
+      # Fail closed on the evidence itself: a missing or empty artifact is a
+      # failure, never a waived upload. This step asserts EXISTENCE and
+      # NONEMPTINESS only; it asserts nothing about the measurement's content.
+      - name: Assert evidence artifacts exist and are nonempty
+        if: always()
+        run: |
+          set -euo pipefail
+          node <<"NODE"
+          const fs = require("node:fs"), path = require("node:path");
+          const evDir = process.env.TM_EVIDENCE_DIR;
+          if (!evDir) { console.error("missing TM_EVIDENCE_DIR"); process.exit(1); }
+          const required = [
+            "termination-map.tap",
+            "termination-map.json",
+            "termination-map-rawlog.jsonl",
+            "provenance.json",
+          ];
+          let bad = 0;
+          for (const name of required) {
+            const p = path.join(evDir, name);
+            if (!fs.existsSync(p) || !fs.statSync(p).isFile() || fs.statSync(p).size === 0) {
+              console.error("missing or empty evidence file:", p);
+              bad += 1;
+            } else {
+              console.log("evidence ok:", name, fs.statSync(p).size, "bytes");
+            }
+          }
+          for (const name of ["termination-map.json", "provenance.json"]) {
+            const p = path.join(evDir, name);
+            if (!fs.existsSync(p)) continue;
+            try { JSON.parse(fs.readFileSync(p, "utf8")); console.log("parses:", name); }
+            catch (err) { console.error("does not parse:", name, String(err.message)); bad += 1; }
+          }
+          if (bad) process.exit(1);
+          NODE
+
+      # Uploaded on failure too, so a red run still produces the TAP and the
+      # JSON that explain it. if-no-files-found: error - a missing artifact is a
+      # failure, never a waived upload.
+      - name: Upload TAP + JSON evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termination-map-evidence-${{ matrix.os }}
+          path: ${{ runner.temp }}/tm-evidence/
+          if-no-files-found: error
+          retention-days: 7

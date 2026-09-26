@@ -1,0 +1,452 @@
+# Task #1170 / release #1171 - P2 isolated existing-store opener prototype.
+# ISOLATED EXPERIMENT ONLY.
+#
+# Runs the isolated better-sqlite3@13.0.3 read-only "open an already existing
+# store" suite on three runner OSes against synthetic fixtures created under the
+# runner temp directory. It adopts nothing into the product, imports no product
+# module, touches no live store, changes no product dependency and no product Node
+# floor, and qualifies no production behaviour. Node 24.21.0 and better-sqlite3
+# 13.0.3 are authorised for this experiment only.
+#
+# Conventions (exact-ref checkout, read-only permissions, isolated npm config and
+# cache, owned RUNNER_TEMP roots, dual TAP reporters, if: always() evidence gating,
+# artifact upload) are adapted from the verified no-create prototype workflow.
+# Reusing those conventions is NOT a claim that the no-create slice is adopted, nor
+# that any of its files are unchanged, nor that P2 inherits its results.
+#
+# This workflow emits and gates evidence. It asserts nothing about the semantics of
+# the suite: the raw TAP stream is the authoritative record of what passed. No TAP
+# total and no passing count is computed, asserted or invented here.
+#
+# Not live-activated: runs only on explicit workflow_dispatch, or on a pull request
+# touching AT LEAST ONE of the six leaf paths below. paths: filters are OR triggers.
+
+name: sqlite-p2-open-prototype (task 1170)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      # Exactly the six new P2 leaves, one entry per file, including the path of
+      # this workflow file. Omitting the workflow path would let an edit to it
+      # merge unexercised; omitting the opener or the fixture would let the slice
+      # under test change unexercised. No product path is listed: the prototype
+      # must never be triggered by a product file change.
+      - "validation/1170-sqlite-p2-open/open-existing.cjs"
+      - "validation/1170-sqlite-p2-open/fixture.cjs"
+      - "validation/1170-sqlite-p2-open/open-existing.test.cjs"
+      - "validation/1170-sqlite-p2-open/package.json"
+      - "validation/1170-sqlite-p2-open/package-lock.json"
+      - ".github/workflows/sqlite-p2-open-prototype.yml"
+
+# Read-only: the prototype never needs write scopes.
+permissions:
+  contents: read
+
+jobs:
+  p2-open:
+    name: p2 open-existing prototype (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      # Single source of truth for the leaf directory, so no step can drift.
+      P2_LEAF_DIR: validation/1170-sqlite-p2-open
+
+    steps:
+      # Exact ref: the PR head commit under test, not the synthetic merge commit.
+      # persist-credentials: false - no credential is left in the checkout for any
+      # later step or dependency to reach.
+      - name: Checkout exact ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Record actual git HEAD provenance
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          echo "resolved HEAD: ${HEAD_SHA}"
+          echo "P2_GIT_HEAD=${HEAD_SHA}" >> "$GITHUB_ENV"
+
+      - name: Set up pinned Node 24 (experiment-scoped)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+
+      # Owned roots only: npm cache and config, the work root for the suite and the
+      # evidence root all live under RUNNER_TEMP. Paths are joined by Node so the
+      # Windows separators stay correct. No host credential, registry, scope or
+      # proxy setting can reach this install: both npm config files are written
+      # empty and the public registry is pinned explicitly.
+      - name: Stage isolated npm config/cache and owned temp roots
+        run: |
+          set -euo pipefail
+          node <<"NODE"
+          const fs = require("node:fs"), path = require("node:path");
+          const base = process.env.RUNNER_TEMP;
+          if (!base) { console.error("RUNNER_TEMP is not set"); process.exit(1); }
+          const mk = (n) => { const p = path.join(base, n); fs.mkdirSync(p, { recursive: true }); return p; };
+          const cache = mk("p2-npm-cache");
+          const work = mk("p2-work");
+          const evidence = mk("p2-evidence");
+          const userconfig = path.join(base, "p2-npmrc-user");
+          const globalconfig = path.join(base, "p2-npmrc-global");
+          fs.writeFileSync(userconfig, "");
+          fs.writeFileSync(globalconfig, "");
+          fs.appendFileSync(process.env.GITHUB_ENV, [
+            `npm_config_cache=${cache}`,
+            `npm_config_userconfig=${userconfig}`,
+            `npm_config_globalconfig=${globalconfig}`,
+            `npm_config_registry=https://registry.npmjs.org/`,
+            `npm_config_audit=false`,
+            `npm_config_fund=false`,
+            `npm_config_update_notifier=false`,
+            // Interface contract with the tester session:
+            //   P2_WORK_DIR     - the suite creates its per-case roots here, each
+            //                     named with a ".tmp-" prefix, and writes
+            //                     evidence.json here from its exit finaliser.
+            //   P2_EVIDENCE_DIR - raw TAP, result.json and the copied evidence.json
+            //                     are collected here and uploaded.
+            `P2_WORK_DIR=${work}`,
+            `P2_EVIDENCE_DIR=${evidence}`,
+            "",
+          ].join("\n"));
+          console.log("npm cache:", cache, "\nwork:", work, "\nevidence:", evidence);
+          NODE
+
+      # Fail closed: a missing interface variable or a missing owned root is a job
+      # failure here, never a silently degraded run that reports success later.
+      - name: Assert tester interface env and owned roots exist
+        run: |
+          set -euo pipefail
+          node <<"NODE"
+          const fs = require("node:fs");
+          const required = ["P2_GIT_HEAD", "P2_WORK_DIR", "P2_EVIDENCE_DIR"];
+          const missing = required.filter((k) => !process.env[k]);
+          if (missing.length) {
+            console.error("missing required env:", missing.join(", "));
+            process.exit(1);
+          }
+          for (const k of ["P2_WORK_DIR", "P2_EVIDENCE_DIR"]) {
+            const dir = process.env[k];
+            if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+              console.error(`${k} is not an existing directory: ${dir}`);
+              process.exit(1);
+            }
+          }
+          console.log("P2_GIT_HEAD =", process.env.P2_GIT_HEAD);
+          console.log("P2_WORK_DIR =", process.env.P2_WORK_DIR);
+          console.log("P2_EVIDENCE_DIR =", process.env.P2_EVIDENCE_DIR);
+          NODE
+
+      - name: Verify runtime provenance
+        run: |
+          set -euo pipefail
+          node -v
+          npm -v
+          test "$(node -p process.version)" = "v24.21.0"
+
+      # Validation-only install prefix: node_modules is created inside the P2
+      # validation leaf directory. The repository root package tree is never
+      # installed and never touched. --ignore-scripts: no lifecycle or build script
+      # from any dependency runs, so the shipped prebuilt binary is what gets
+      # exercised rather than a local compile. npm ci (not npm install) - the
+      # committed lock is authoritative and is never re-resolved here.
+      - name: Install pinned validation dependencies (validation prefix only)
+        working-directory: validation/1170-sqlite-p2-open
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      # Two TAP reporters (console and file) so the artifact is written without tee,
+      # which keeps the real process exit code on every OS. No continue-on-error and
+      # no || true: a failing oracle on any OS fails this job and is reported as an
+      # actual failure. --test-timeout bounds a hung case inside the 10-minute cap.
+      - name: Run P2 open-existing suite
+        working-directory: validation/1170-sqlite-p2-open
+        run: |
+          set -euo pipefail
+          node --test --test-timeout=60000 \
+            --test-reporter=tap --test-reporter-destination=stdout \
+            --test-reporter=tap --test-reporter-destination="$P2_EVIDENCE_DIR/open-existing.tap" \
+            open-existing.test.cjs
+
+      # Runs even when the suite fails, so failure evidence is captured too. This
+      # step records measurements only; it derives no verdict and parses no TAP.
+      - name: Collect hashes and result JSON
+        if: always()
+        run: |
+          set -euo pipefail
+          node <<"NODE"
+          const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
+          const evDir = process.env.P2_EVIDENCE_DIR;
+          const workDir = process.env.P2_WORK_DIR;
+          const leaf = process.env.P2_LEAF_DIR;
+          if (!evDir || !workDir || !leaf) {
+            console.error("missing P2_EVIDENCE_DIR / P2_WORK_DIR / P2_LEAF_DIR; cannot collect evidence");
+            process.exit(1);
+          }
+          const sha = (p) => (fs.existsSync(p)
+            ? { bytes: fs.statSync(p).size, sha256: crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex") }
+            : { bytes: null, sha256: null, missing: true, reason: "file not present on this runner at collect time" });
+
+          const suiteEvidencePath = path.join(workDir, "evidence.json");
+          let suiteEvidence = null, suiteEvidenceError = null;
+          try { suiteEvidence = JSON.parse(fs.readFileSync(suiteEvidencePath, "utf8")); }
+          catch (e) { suiteEvidenceError = e.message; }
+          const fromSuite = (key) => (suiteEvidence ? (suiteEvidence[key] ?? null) : null);
+
+          // The tester suite records its native-mapping measurements under
+          // evidence.cases.P0, NOT at the evidence root. For the supplied evidence
+          // shape a root read would yield null even though the value was measured,
+          // so the summary would silently lose a measured result. Nothing is
+          // re-derived or guessed here: fields are read from cases.P0 as-is, and
+          // when the case or a field is absent the value stays null with a reason.
+          const suiteCases = (suiteEvidence && typeof suiteEvidence.cases === "object" && suiteEvidence.cases !== null)
+            ? suiteEvidence.cases
+            : null;
+          const p0 = (suiteCases && typeof suiteCases.P0 === "object" && suiteCases.P0 !== null)
+            ? suiteCases.P0
+            : null;
+          // Object.hasOwn distinguishes an ABSENT key from a present one, which is
+          // what missingNativeKeys below reports on. It is not about falsy values:
+          // ?? already preserves a measured false such as selectedMatchesMapped.
+          const fromP0 = (key) => (p0 && Object.hasOwn(p0, key) ? p0[key] : null);
+          const NATIVE_MAPPING_KEYS = ["selectedPrebuild", "mappedNativeBinary", "selectedMatchesMapped"];
+          const missingNativeKeys = p0
+            ? NATIVE_MAPPING_KEYS.filter((k) => !Object.hasOwn(p0, k))
+            : NATIVE_MAPPING_KEYS.slice();
+          const nativeMappingSource = !suiteEvidence
+            ? `unmeasured: suite evidence.json was not readable at collect time (${suiteEvidenceError ?? "no error recorded"})`
+            : !suiteCases
+              ? "unmeasured: suite evidence.json records no cases object"
+              : !p0
+                ? "unmeasured: suite evidence.json records no cases.P0 entry, so the P0 oracle observed no native mapping"
+                : missingNativeKeys.length === NATIVE_MAPPING_KEYS.length
+                  ? "unmeasured: cases.P0 is present but records none of the native-mapping fields"
+                  : missingNativeKeys.length
+                    ? `partially unmeasured: cases.P0 does not record ${missingNativeKeys.join(", ")}`
+                    : "tester suite runtime evidence (evidence.json -> cases.P0)";
+
+          // All six P2 source leaves, hashed as they exist ON THIS RUNNER. Cross-OS
+          // hash equality is NOT asserted anywhere: Git may check text files out
+          // with CRLF line endings on Windows, which changes the bytes and
+          // therefore the hash. A CRLF difference is a line-ending transform, not
+          // corruption.
+          const leafFile = (name) => path.join(leaf, name);
+          const hashes = {
+            note: "on-disk hashes for this runner only; a Windows CRLF checkout yields different bytes than an LF checkout, which is a line-ending transform and not corruption. No cross-OS hash equality is claimed.",
+            opener: { path: leafFile("open-existing.cjs"), ...sha(leafFile("open-existing.cjs")) },
+            fixture: { path: leafFile("fixture.cjs"), ...sha(leafFile("fixture.cjs")) },
+            test: { path: leafFile("open-existing.test.cjs"), ...sha(leafFile("open-existing.test.cjs")) },
+            package: { path: leafFile("package.json"), ...sha(leafFile("package.json")) },
+            packageLock: { path: leafFile("package-lock.json"), ...sha(leafFile("package-lock.json")) },
+            workflow: { path: ".github/workflows/sqlite-p2-open-prototype.yml", ...sha(path.join(".github", "workflows", "sqlite-p2-open-prototype.yml")) },
+            tap: { path: "open-existing.tap", ...sha(path.join(evDir, "open-existing.tap")) },
+          };
+
+          const result = {
+            schema: "sb1170az-p2-open-result/1",
+            track: "sb1170az",
+            task: 1170,
+            release: 1171,
+            phase: "isolated-prototype-experiment",
+            scope: "single runner OS; three-OS acceptance is the matrix as a whole",
+            provenance: {
+              repository: process.env.GITHUB_REPOSITORY ?? null,
+              workflow: process.env.GITHUB_WORKFLOW ?? null,
+              job: process.env.GITHUB_JOB ?? null,
+              runId: process.env.GITHUB_RUN_ID ?? null,
+              runNumber: process.env.GITHUB_RUN_NUMBER ?? null,
+              runAttempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+              eventName: process.env.GITHUB_EVENT_NAME ?? null,
+              githubRef: process.env.GITHUB_REF ?? null,
+              githubSha: process.env.GITHUB_SHA ?? null,
+              actualGitHead: process.env.P2_GIT_HEAD ?? null,
+              runnerOs: process.env.RUNNER_OS ?? null,
+              runnerArch: process.env.RUNNER_ARCH ?? null,
+            },
+            runtime: {
+              nodeVersion: process.version,
+              execPath: process.execPath,
+              platform: process.platform,
+              arch: process.arch,
+            },
+            hashes,
+            installedPackageVersions: (() => {
+              const read = (n) => {
+                try { return JSON.parse(fs.readFileSync(path.join(leaf, "node_modules", n, "package.json"), "utf8")).version; }
+                catch { return null; }
+              };
+              return { "better-sqlite3": read("better-sqlite3"), "node-addon-api": read("node-addon-api") };
+            })(),
+            // The raw TAP stream is authoritative. This workflow deliberately does
+            // not parse it and records no pass, fail or total counts: any number
+            // here would be a second, weaker copy of a record that already exists.
+            tapSummary: {
+              parsed: null,
+              reason: "not parsed in CI by design; open-existing.tap is the authoritative record of case outcomes",
+            },
+            // Native binary mapping comes ONLY from the tester suite runtime
+            // observation, which the suite records under cases.P0. It is never
+            // re-derived here and never guessed from a prebuild filename.
+            selectedPrebuild: fromP0("selectedPrebuild"),
+            mappedNativeBinary: fromP0("mappedNativeBinary"),
+            selectedMatchesMapped: fromP0("selectedMatchesMapped"),
+            nativeMappingSource,
+            cases: fromSuite("cases"),
+            cleanup: fromSuite("cleanup"),
+            suiteEvidenceRead: suiteEvidence !== null,
+            suiteEvidenceError,
+            generatedAt: new Date().toISOString(),
+          };
+          fs.mkdirSync(evDir, { recursive: true });
+          fs.writeFileSync(path.join(evDir, "result.json"), JSON.stringify(result, null, 2) + "\n");
+          if (suiteEvidence) fs.copyFileSync(suiteEvidencePath, path.join(evDir, "evidence.json"));
+          else console.error("suite evidence.json not copied:", suiteEvidenceError);
+          console.log("result.json written to", evDir);
+          NODE
+
+      - name: Assert evidence artifacts exist and are nonempty
+        if: always()
+        run: |
+          set -euo pipefail
+          node <<"NODE"
+          const fs = require("node:fs"), path = require("node:path");
+          const dir = process.env.P2_EVIDENCE_DIR;
+          if (!dir) { console.error("P2_EVIDENCE_DIR is not set; evidence cannot be verified"); process.exit(1); }
+          if (!fs.existsSync(dir)) { console.error("evidence root missing:", dir); process.exit(1); }
+          const missing = ["open-existing.tap", "result.json", "evidence.json"].filter((f) => {
+            const p = path.join(dir, f);
+            return !fs.existsSync(p) || fs.statSync(p).size === 0;
+          });
+          if (missing.length) {
+            console.error("missing or empty evidence artifacts:", missing.join(", "));
+            process.exit(1);
+          }
+          // A nonempty file is not evidence. Both JSON artifacts must actually
+          // parse to a plain object, or this gate refuses instead of waving the
+          // bytes through. Nothing here repairs, defaults or rewrites evidence.
+          const failures = [];
+          const brief = (v) => {
+            const s = JSON.stringify(v) ?? "undefined";
+            return s.length > 200 ? `${s.slice(0, 200)}...(truncated)` : s;
+          };
+          const readObject = (f) => {
+            let parsed;
+            try { parsed = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")); }
+            catch (e) { failures.push(`${f} is not readable JSON: ${e.message}`); return null; }
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+              failures.push(`${f} did not parse to a JSON object`);
+              return null;
+            }
+            return parsed;
+          };
+          const result = readObject("result.json");
+          readObject("evidence.json");
+          // The collect step records whether it actually read the suite evidence.json
+          // on this run. A leftover or hand-placed artifact copy must never stand in
+          // for evidence that collection failed to produce.
+          if (result) {
+            if (result.suiteEvidenceRead !== true) {
+              failures.push(`result.suiteEvidenceRead is not true: ${brief(result.suiteEvidenceRead)}`);
+            }
+            if (!Object.hasOwn(result, "suiteEvidenceError") || result.suiteEvidenceError !== null) {
+              failures.push(`result.suiteEvidenceError must be present and null; recorded: ${brief(result.suiteEvidenceError)}`);
+            }
+          }
+          if (failures.length) {
+            console.error("evidence gate refused:");
+            for (const f of failures) console.error(" -", f);
+            process.exit(1);
+          }
+          console.log("evidence present:", fs.readdirSync(dir).join(", "));
+          NODE
+
+      - name: Assert owned temp roots were cleaned
+        if: always()
+        run: |
+          set -euo pipefail
+          node <<"NODE"
+          const fs = require("node:fs"), path = require("node:path");
+          const work = process.env.P2_WORK_DIR;
+          if (!work) { console.error("P2_WORK_DIR is not set; cleanup cannot be verified"); process.exit(1); }
+          if (!fs.existsSync(work)) { console.error("work root missing:", work); process.exit(1); }
+          const leftovers = fs.readdirSync(work).filter((n) => n.startsWith(".tmp-"));
+          if (leftovers.length) {
+            console.error("temp roots not cleaned:", leftovers.join(", "));
+            process.exit(1);
+          }
+          // An empty work root shows only that nothing is left NOW; it cannot show
+          // that the suite created and removed what it claims. The recorded cleanup
+          // report is checked too, and a missing or mistyped field is a refusal.
+          const evDir = process.env.P2_EVIDENCE_DIR;
+          if (!evDir) { console.error("P2_EVIDENCE_DIR is not set; recorded cleanup cannot be verified"); process.exit(1); }
+          const failures = [];
+          const brief = (v) => {
+            const s = JSON.stringify(v) ?? "undefined";
+            return s.length > 200 ? `${s.slice(0, 200)}...(truncated)` : s;
+          };
+          const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+          const readObject = (f) => {
+            let parsed;
+            try { parsed = JSON.parse(fs.readFileSync(path.join(evDir, f), "utf8")); }
+            catch (e) { failures.push(`${f} is not readable JSON: ${e.message}`); return null; }
+            if (!isObject(parsed)) { failures.push(`${f} did not parse to a JSON object`); return null; }
+            return parsed;
+          };
+          const result = readObject("result.json");
+          const evidence = readObject("evidence.json");
+          const emptyArray = (v) => Array.isArray(v) && v.length === 0;
+          const counted = (v) => Number.isSafeInteger(v) && v >= 0;
+          // Field names below are the existing suite cleanup fields; none is
+          // invented, defaulted or repaired here.
+          const checkCleanup = (label, c) => {
+            if (!isObject(c)) { failures.push(`${label} cleanup is not an object: ${brief(c)}`); return; }
+            if (c.clean !== true) failures.push(`${label} cleanup.clean is not true: ${brief(c.clean)}`);
+            if (!counted(c.rootsCreated) || !counted(c.rootsRemoved)) {
+              failures.push(`${label} cleanup root counts are not nonnegative safe integers: created=${brief(c.rootsCreated)} removed=${brief(c.rootsRemoved)}`);
+            } else if (c.rootsCreated !== c.rootsRemoved) {
+              failures.push(`${label} cleanup root counts disagree: created=${c.rootsCreated} removed=${c.rootsRemoved}`);
+            }
+            if (!emptyArray(c.failedToRemove)) failures.push(`${label} cleanup.failedToRemove is not an empty array: ${brief(c.failedToRemove)}`);
+            if (!emptyArray(c.residualTmpRootsUnderWorkDir)) failures.push(`${label} cleanup.residualTmpRootsUnderWorkDir is not an empty array: ${brief(c.residualTmpRootsUnderWorkDir)}`);
+          };
+          if (result) checkCleanup("result.json", result.cleanup);
+          if (evidence) checkCleanup("evidence.json", evidence.cleanup);
+          // The summary must not diverge from the raw record it was copied from.
+          if (result && evidence) {
+            const canon = (v) => JSON.stringify(v, (_k, x) => (isObject(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x)) ?? "undefined";
+            const a = canon(result.cleanup), b = canon(evidence.cleanup);
+            if (a !== b) failures.push(`recorded cleanup differs between result.json and evidence.json: ${a.slice(0, 200)} vs ${b.slice(0, 200)}`);
+          }
+          if (failures.length) {
+            console.error("cleanup gate refused:");
+            for (const f of failures) console.error(" -", f);
+            process.exit(1);
+          }
+          console.log("no leftover temp roots under", work);
+          console.log("recorded cleanup verified: rootsCreated = rootsRemoved =", result.cleanup.rootsCreated, "| failedToRemove and residualTmpRootsUnderWorkDir empty");
+          NODE
+
+      # Uploaded on failure too, so a red run still produces the TAP and the JSON
+      # that explain it. if-no-files-found: error - a missing artifact is a failure,
+      # never a waived upload.
+      - name: Upload TAP + JSON evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2-open-evidence-${{ matrix.os }}
+          path: ${{ runner.temp }}/p2-evidence/
+          if-no-files-found: error
+          retention-days: 7

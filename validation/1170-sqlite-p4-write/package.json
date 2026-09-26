@@ -1,0 +1,16 @@
+{
+  "name": "validation-1170-sqlite-p4-write",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Isolated P4 prototype: transactional one-row store write with an in-transaction generation CAS, plus pre-existing store states and a concurrent-writer child, for a conditional-admission SQLite store (task 1170). Experiment only - not a product package, adopted by nothing, imported by nothing.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=tap --test-reporter-destination=stdout write-cas.test.cjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3"
+  }
+}

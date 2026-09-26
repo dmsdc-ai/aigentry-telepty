@@ -1,0 +1,16 @@
+{
+  "name": "validation-1170-sqlite-p2-open",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Isolated P2 prototype: read-only opener + fixture schema for an already existing SQLite conditional-admission store (task 1170). Experiment only - not a product package, adopted by nothing, imported by nothing.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=tap --test-reporter-destination=stdout open-existing.test.cjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3"
+  }
+}
