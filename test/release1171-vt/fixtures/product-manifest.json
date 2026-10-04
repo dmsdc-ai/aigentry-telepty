@@ -48,6 +48,13 @@
         "owner": "fh1170ad"
       }
     ],
+    "cli.js": [
+      {
+        "sha256": "9b586e76d2b9d1a36334e2751b698cee226b5fdb4a652fd475ff04a9db86c866",
+        "reason": "#751 daemon-lifecycle port onto release e230c90 (cli.js 9f16f65b -> 9b586e76), confined to decideDaemonAction/ensureDaemonRunning/#751 block per pv751ade source/unit review. Controller explicitly authorizes THIS exact byte identity for cli.js only; frozen original, leaf_count and inventory_sha256 unchanged; not a rebaseline of any other leaf.",
+        "owner": "controller (task 751)"
+      }
+    ],
     "src/vt/session-screen.js": [
       {
         "sha256": "428cb2e6f24c2b0d367e0458a29b179854eece6f38d04af1500f464ee81dcc1f",
