@@ -107,8 +107,22 @@ test('gh#82 B: health silent too ⇒ still the one legitimate absence (negative 
   assert.equal(d.reason, 'daemon-unreachable');
 });
 
-test('gh#82 B: health is not consulted once /api/sessions answered — legacy restart is unchanged', () => {
+// #751 amended: null meta is UNKNOWN (usually a timeout), not proof of a legacy daemon; health does not soften it.
+test('gh#82 B: sessions answered but meta null ⇒ abort meta-unverified, health does not turn it into a restart (#751)', () => {
   const d = decideDaemonAction({ meta: null, cliVersion: pkg.version, sessionsReachable: true, healthOk: true });
+  assert.notEqual(d.action, 'restart');
+  assert.equal(d.action, 'abort');
+  assert.equal(d.reason, 'meta-unverified');
+});
+
+// #751 positive control: an explicit /api/meta 404 + sessions answer is still the legacy daemon.
+test('gh#82 B: health is not consulted once /api/sessions answered — legacy restart (/api/meta 404) is unchanged', () => {
+  const d = decideDaemonAction({
+    meta: { answered: true, status: 404, refused: false, endpoint: '/api/meta' },
+    cliVersion: pkg.version,
+    sessionsReachable: true,
+    healthOk: true
+  });
   assert.equal(d.action, 'restart');
   assert.equal(d.reason, 'legacy-daemon-no-meta');
 });

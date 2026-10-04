@@ -1250,7 +1250,17 @@ function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessi
   // No meta after probing. An older daemon (answers /api/sessions, lacks /api/meta)
   // gets a legit restart; a genuinely absent/unreachable daemon gets auto-started.
   if (sessionsReachable) {
-    return { action: 'restart', reason: 'legacy-daemon-no-meta' };
+    // #751: "older" needs the POSITIVE statement — /api/meta answered 404 (the route is absent).
+    // A null/malformed meta is UNKNOWN, most often a timeout, and a daemon too slow for the meta
+    // deadline still answers /api/sessions — so that pair proves nothing about its age and must not
+    // authorize restart(absenceVerdict:false), which stops the daemon without a health re-check.
+    if (isMissingMetaRoute) return { action: 'restart', reason: 'legacy-daemon-no-meta' };
+    return { action: 'abort', reason: 'meta-unverified' };
+  }
+  // #751: /api/meta answered 404 — something IS serving this port, so this is not an absence and
+  // must not become `start`. The legacy restart above needs /api/sessions 200 as well.
+  if (isMissingMetaRoute) {
+    return { action: 'abort', reason: 'daemon-answered-error:404' };
   }
   // gh#82 (B): before calling it an absence, ask the one endpoint we never asked. 200 ⇒ alive.
   if (healthOk) {
@@ -1326,7 +1336,132 @@ async function deferToSupervisor(options = {}) {
   return null;
 }
 
+// #751: explicit no-daemon-lifecycle safety mode.
+//
+// Some deployments own the daemon's lifecycle outside this CLI — a supervisor unit the operator
+// manages, a container entrypoint, a shared host daemon nobody's client may replace. Until now
+// the CLI had no way to be TOLD that: every "not healthy" verdict authorized remediation
+// (spawn / restart / repair / marker write), and the only escape hatches were per-symptom
+// booleans (TELEPTY_SKIP_DAEMON_REPAIR, TELEPTY_NO_SUPERVISOR_DEFER) that each cover one seam.
+//
+// TELEPTY_DAEMON_LIFECYCLE states the ownership once, for the whole ensureDaemonRunning path:
+//   external — something else owns the lifecycle. Validation still runs IN FULL; what changes is
+//              the remedy. Verified-healthy ⇒ proceed with zero side effects; anything else ⇒
+//              fail closed. SCOPE: this governs the LOCAL (127.0.0.1) daemon only — the only
+//              daemon this CLI ever had a lifecycle over. The REMOTE_HOST guard below is
+//              unchanged, so a non-local address still returns early without probing.
+//   managed  — the pre-#751 behavior, spelled out explicitly.
+//   (unset)  — managed. Legacy behavior is untouched; this mode is opt-in only.
+//
+// Fail-closed is the whole point, so an unrecognized value is NOT coerced to a default: a typo
+// ("externl") or a truthy-looking value ("1") that quietly re-enabled management would hand the
+// operator the exact outcome they set the variable to prevent. Only a genuinely absent variable
+// means "legacy"; a present-but-unreadable one is an error.
+const LIFECYCLE_MODES = Object.freeze({
+  MANAGED: 'managed',
+  EXTERNAL: 'external',
+  INVALID: 'invalid'
+});
+
+function resolveDaemonLifecycleMode(env = process.env) {
+  const raw = env ? env.TELEPTY_DAEMON_LIFECYCLE : undefined;
+  if (raw == null) return { mode: LIFECYCLE_MODES.MANAGED, explicit: false, raw: null };
+  if (typeof raw !== 'string') return { mode: LIFECYCLE_MODES.INVALID, explicit: true, raw };
+  const value = raw.trim().toLowerCase();
+  if (value === LIFECYCLE_MODES.EXTERNAL) return { mode: LIFECYCLE_MODES.EXTERNAL, explicit: true, raw };
+  if (value === LIFECYCLE_MODES.MANAGED) return { mode: LIFECYCLE_MODES.MANAGED, explicit: true, raw };
+  return { mode: LIFECYCLE_MODES.INVALID, explicit: true, raw };
+}
+
+// #751: the refusal messages below interpolate two untrusted strings (the operator's mode value
+// and the daemon's reported version). Neither is length- or charset-checked at its source, so both
+// are sanitized AND clamped here — a bounded one-line error is part of failing closed.
+//
+// Length alone is not enough: an embedded newline splits the refusal across lines (so the
+// one-line render at the top-level catch is no longer one line, and a forged second line can be
+// made to look like separate CLI output), and an ESC byte lets a hostile version string emit
+// arbitrary ANSI — colour, cursor moves, line erase — into the operator's terminal. Every C0/C1
+// control and DEL is therefore replaced by a fixed '·'. The substitution is 1:1, so it cannot
+// expand the string and cannot be cut mid-escape by the clamp that follows.
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/g;
+
+function boundedLabel(value, max = 64) {
+  const text = typeof value === 'string' ? value : String(value == null ? '' : value);
+  const safe = text.replace(CONTROL_CHARS, '·');
+  return safe.length > max ? `${safe.slice(0, max)}…` : safe;
+}
+
+function daemonLifecycleModeError(raw) {
+  const error = new Error(
+    `TELEPTY_DAEMON_LIFECYCLE="${boundedLabel(raw)}" is not a recognized daemon lifecycle mode `
+    + `(expected "${LIFECYCLE_MODES.EXTERNAL}" or "${LIFECYCLE_MODES.MANAGED}", or leave it unset). `
+    + 'Refusing to continue: a mode this CLI cannot read must not silently re-enable daemon '
+    + 'lifecycle management.'
+  );
+  error.name = 'DaemonLifecycleModeError';
+  error.mode = null;
+  error.raw = boundedLabel(raw);
+  markCommandFailed();
+  return error;
+}
+
+function externalDaemonUnusableError(decision, meta) {
+  const version = meta && meta.version ? boundedLabel(meta.version, 32) : 'unknown';
+  const error = new Error(
+    `No usable local telepty daemon on port ${PORT} `
+    + `(verdict: ${boundedLabel(decision && decision.reason)}; daemon version: ${version}). `
+    + `TELEPTY_DAEMON_LIFECYCLE=${LIFECYCLE_MODES.EXTERNAL} is set, so this CLI does not own the `
+    + 'daemon lifecycle: nothing was started, restarted, repaired or installed. Bring a matching '
+    + 'daemon up externally and retry.'
+  );
+  error.name = 'DaemonLifecycleExternalError';
+  error.mode = LIFECYCLE_MODES.EXTERNAL;
+  error.reason = decision && decision.reason ? decision.reason : null;
+  // What managed mode WOULD have done here — the one fact an operator needs to see that the
+  // refusal is the mode working, not a bug.
+  error.suppressedAction = decision && decision.action ? decision.action : null;
+  markCommandFailed();
+  return error;
+}
+
+// #751: meta unknown (timeout/malformed on every attempt) while /api/sessions answers 200. There is
+// no daemon answer to render, so it gets its own bounded, credential-free message. Named
+// DaemonResponseError so every existing catch (and the one-line top-level render) handles it.
+function daemonMetaUnverifiedError() {
+  const error = new Error(
+    `Local telepty daemon (port ${PORT}) answered /api/sessions, but /api/meta returned no readable `
+    + 'version or capabilities on any attempt (timeout or malformed reply). Its version is '
+    + 'UNVERIFIED, which is not evidence of an older daemon: nothing was stopped, restarted or '
+    + 'started. Retry the command; if it persists, check the daemon directly.'
+  );
+  error.name = 'DaemonResponseError';
+  error.status = null;
+  error.refused = false;
+  error.reason = 'meta-unverified';
+  markCommandFailed();
+  return error;
+}
+
+// #751: every other abort is a #835 daemon answer and keeps daemonAnswerError unchanged.
+function daemonAbortError(decision, meta) {
+  if (decision && decision.reason === 'meta-unverified') return daemonMetaUnverifiedError();
+  return daemonAnswerError(meta, '127.0.0.1');
+}
+
+function isDaemonLifecycleError(error) {
+  return Boolean(error)
+    && (error.name === 'DaemonLifecycleModeError' || error.name === 'DaemonLifecycleExternalError');
+}
+
 async function ensureDaemonRunning(options = {}) {
+  // #751: resolved BEFORE the REMOTE_HOST return below, because an unreadable mode must fail
+  // closed on every address. A VALID external mode, by contrast, only takes effect past that
+  // guard — i.e. for the local 127.0.0.1 daemon, the only one this CLI manages.
+  const lifecycle = resolveDaemonLifecycleMode(options._env || process.env);
+  if (lifecycle.mode === LIFECYCLE_MODES.INVALID) {
+    throw daemonLifecycleModeError(lifecycle.raw);
+  }
+
   if (REMOTE_HOST !== '127.0.0.1') return; // Only auto-start local daemon
 
   const requiredCapabilities = options.requiredCapabilities || [];
@@ -1354,13 +1489,22 @@ async function ensureDaemonRunning(options = {}) {
   // now escalates on attempt ≥2 (1500 → 3000 by default), so the `start` verdict requires the
   // probe to have failed at TWO different patience levels, not the same one three times.
   let meta = null;
+  let answered = null; // #751: strongest daemon ANSWER seen on any attempt
   for (let attempt = 1; attempt <= attempts; attempt++) {
     meta = await getMeta('127.0.0.1', attempt === 1 ? probeTimeoutMs() : probeTimeoutMs() * 2);
     if (meta && meta.version) break;
+    // #751: a later timeout (null) must not erase an earlier 401/5xx into "nothing answered", and
+    // a 404 (legacy route) never outranks a refusal/error answer.
+    if (meta && meta.answered && (!answered || (answered.status === 404 && meta.status !== 404))) {
+      answered = meta;
+    }
     if (attempt < attempts) {
       await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
     }
   }
+  // #751: no version ⇒ the preserved answer, else unknown. A malformed meta (no version, not an
+  // answer) is unknown exactly like a timeout — never a statement about the daemon's age.
+  if (!(meta && meta.version)) meta = answered;
 
   // (2) Only when meta never came back do we consult /api/sessions — purely to tell an
   // older daemon (answers sessions, lacks /api/meta) apart from no daemon at all. A slow
@@ -1374,8 +1518,11 @@ async function ensureDaemonRunning(options = {}) {
       sessionsReachable = !!(sessionsRes && sessionsRes.ok);
       // #835: a non-200 here is an ANSWER too. Folding it into "nothing answered" is what
       // turned a refused legacy probe into the verdict that authorizes the kill.
-      if (sessionsRes && !sessionsRes.ok && !meta) {
-        meta = daemonAnswer(sessionsRes.status, '/api/sessions');
+      // #751: also over a meta 404 — a 404 is legacy proof only next to sessions 200, so a refused
+      // or failing sessions answer must surface rather than leave the 404 to stand alone.
+      const metaRouteMissing = meta && meta.answered && meta.status === 404 && meta.endpoint === '/api/meta';
+      if (sessionsRes && !sessionsRes.ok && (!meta || metaRouteMissing)) {
+        meta = daemonAnswer(sessionsRes.status, '/api/sessions') || meta;
       }
     } catch {
       sessionsReachable = false; // timeout/refused while probing the legacy fallback
@@ -1394,6 +1541,34 @@ async function ensureDaemonRunning(options = {}) {
 
   let decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable, healthOk });
 
+  // #751: the explicit no-lifecycle gate. Deliberately placed HERE — after all three probes and
+  // the full decision policy — because the requirement is not "skip the work" (that is the
+  // REMOTE_HOST bare return above, and it would let an unverified daemon through). External mode
+  // validates exactly as hard as managed mode and then diverges only on the REMEDY. Reached only
+  // for the local 127.0.0.1 daemon; remote addresses returned at that guard, unchanged.
+  //
+  // The single allowed outcome is reason 'healthy': decideDaemonAction reaches it only after a
+  // version decision of noop AND every required capability present, so it is the one verdict that
+  // has actually verified the daemon. Every other verdict is refused BEFORE the supervisor defer,
+  // the restart banners, the marker read/write and doRestart() below — so no spawn, restart,
+  // repair, install, or lifecycle-marker mutation can happen on this path.
+  //
+  // 'alive-but-slow' is refused on purpose despite being a noop in managed mode: /api/health
+  // answering proves liveness, not version or capabilities, and "we could not verify it" is not
+  // permission to use it when we are also forbidden from fixing it.
+  if (lifecycle.mode === LIFECYCLE_MODES.EXTERNAL) {
+    // #835: a refusal is an answer. It keeps its own error here rather than being folded into the
+    // lifecycle refusal — a daemon that declines our credentials is a demonstrably running daemon
+    // and an auth problem, and reclassifying it would lose that.
+    if (decision.action === 'abort') {
+      throw daemonAbortError(decision, meta);
+    }
+    if (decision.action === 'noop' && decision.reason === 'healthy') {
+      return; // verified: matching version + every required capability. Use it, touch nothing.
+    }
+    throw externalDaemonUnusableError(decision, meta);
+  }
+
   // gh#82 (B): alive, just slow. Say so once — the operator otherwise sees a command that simply
   // fails, with the daemon it needs sitting right there.
   if (decision.reason === 'alive-but-slow') {
@@ -1411,7 +1586,7 @@ async function ensureDaemonRunning(options = {}) {
   // #835: the daemon answered and declined (or is failing). It is alive — killing it is the
   // one thing we must not do. Fail the command loudly instead of remediating.
   if (decision.action === 'abort') {
-    throw daemonAnswerError(meta, '127.0.0.1');
+    throw daemonAbortError(decision, meta);
   }
 
   // #738: ONLY the 'start' path (nothing answered on the port) can be a supervisor restart
@@ -1425,12 +1600,30 @@ async function ensureDaemonRunning(options = {}) {
       // Re-run the same policy against it: healthy ⇒ done; wrong version/capabilities ⇒
       // fall through to the normal restart path with this daemon in hand.
       meta = supervised;
-      decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable: true });
+      // #751: a delivered /api/meta 404 is legacy proof only next to a MEASURED /api/sessions 200 —
+      // the primary path's rule. Passing `true` here fabricated that evidence: the sessions probe
+      // above had just failed. Ask this daemon once, with the same bounded probe; a non-200 answer
+      // keeps its typed status, and a timeout/unreadable reply leaves the 404 alone (⇒ abort).
+      let supervisedSessionsReachable = false;
+      if (meta.answered && meta.status === 404 && meta.endpoint === '/api/meta') {
+        try {
+          const sessionsRes = await fetchAuth(`${DAEMON_URL}/api/sessions`, {
+            signal: AbortSignal.timeout(5000)
+          });
+          supervisedSessionsReachable = !!(sessionsRes && sessionsRes.ok);
+          if (sessionsRes && !sessionsRes.ok) {
+            meta = daemonAnswer(sessionsRes.status, '/api/sessions') || meta;
+          }
+        } catch {
+          supervisedSessionsReachable = false;
+        }
+      }
+      decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable: supervisedSessionsReachable });
       if (decision.action === 'noop') return;
       // #844: re-deciding can now produce `abort` — the supervisor's daemon answered and declined.
       // The abort check above ran before this block, so without this line the refusal fell straight
       // through to the restart banner and doRestart(), i.e. the kill it exists to prevent.
-      if (decision.action === 'abort') throw daemonAnswerError(meta, '127.0.0.1');
+      if (decision.action === 'abort') throw daemonAbortError(decision, meta);
     }
   }
 
@@ -5249,8 +5442,11 @@ if (require.main === module) {
   // #835: a refusal thrown from the daemon-probe path can surface on commands that do not wrap
   // their own call (`spawn`, `allow`). It must read as one clear line and exit non-zero — not as
   // an unhandled-rejection stack. Anything else keeps its previous crash behavior exactly.
+  // #751: the explicit no-lifecycle refusals join that same one-line path. They are already
+  // bounded messages, and rendering one as a stack trace would make the safety mode read as a
+  // crash rather than as the deliberate fail-closed it is.
   main().catch((error) => {
-    if (!isDaemonAnswerError(error)) throw error;
+    if (!isDaemonAnswerError(error) && !isDaemonLifecycleError(error)) throw error;
     console.error(`❌ ${error.message}`);
     process.exit(1);
   });
@@ -5266,6 +5462,8 @@ module.exports = {
   decideDaemonAction,     // #567: pure restart-decision policy (meta-primary; no I/O)
   deferToSupervisor,      // #738: supervisor-aware defer (injectable detect/probe/marker seams)
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
+  resolveDaemonLifecycleMode, // #751: TELEPTY_DAEMON_LIFECYCLE mode policy (pure; fail-closed)
+  isDaemonLifecycleError, // #751: classify the explicit no-lifecycle refusals
   helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
   updateRestartSucceeded, // gh#61: did `update` leave a running daemon — skip is not a failure
