@@ -3,6 +3,12 @@
 const crypto = require('node:crypto');
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
+// T0 (#1170) ¶14 — the owner-pin discriminator is minted HERE, at the transport events that make
+// the destination a different destination. Pure function, no store access.
+const { rotateDeliveryGeneration } = require('../session-store/conditional-admission');
+// #1136 — stateful VT observation. Required directly, same convention as the line above: it is a
+// pure leaf with no store, socket or disk access, and every helper it exports is total.
+const vtObservation = require('../vt/session-screen');
 
 function isOpenWebSocket(ws) {
   return Boolean(ws && ws.readyState === 1);
@@ -44,7 +50,11 @@ function installWebSocketTransport(deps) {
     // #826 — policy + audit for the viewer write path, so it matches POST /inject. Returns
     // whether the frame may be forwarded, and records the attempt either way. Optional, same
     // convention as above; the daemon always passes it.
-    authorizeViewerInject
+    authorizeViewerInject,
+    // T0 (#1170) ¶39 — is this session record permanently fenced against unbound writes? Optional,
+    // same convention: a construction site without it behaves exactly as before the fence existed,
+    // and the daemon always passes it. Returns a boolean; never throws.
+    isConditionallyFenced
   } = deps;
 
   /**
@@ -123,7 +133,26 @@ function installWebSocketTransport(deps) {
       if (!isOpenWebSocket(owner)) return null;
       return (cols, rows) => owner.send(JSON.stringify({ type: 'resize', cols, rows }));
     }
-    if (session.ptyProcess) return (cols, rows) => session.ptyProcess.resize(cols, rows);
+    if (session.ptyProcess) {
+      return (cols, rows) => {
+        session.ptyProcess.resize(cols, rows);
+        // #1136 §5/§7 — a spawned session's resize is executed BY THIS DAEMON, so it knows both
+        // the new geometry and the exact stream position it took effect at. `atUnits: null` tells
+        // the observation module to stamp the boundary from its own queue rather than validating
+        // an externally asserted one: there is no second party here whose claim could disagree.
+        // Recorded AFTER the actual resize, so the daemon never states a geometry the PTY refused.
+        // `cols`/`rows` come off a viewer frame and are attacker-controlled, so the stored fact is
+        // only overwritten by a value that is actually a usable geometry; the observation module
+        // applies the same bound and degrades rather than accepting one that is not.
+        if (Number.isInteger(cols) && Number.isInteger(rows) && cols > 0 && rows > 0) {
+          session.ptyCols = cols;
+          session.ptyRows = rows;
+        }
+        vtObservation.noteSessionGeometry(session, {
+          cols, rows, atUnits: null, source: 'local_pty',
+        });
+      };
+    }
     return null;
   }
 
@@ -271,6 +300,8 @@ function installWebSocketTransport(deps) {
     // ?owner=1 reclaim handles the stale-ownerWs bug: allow bridge reconnects but stale TCP
     // half-open connection still holds ownerWs slot → reconnect wrongly becomes a viewer.
     if (activeSession.type === 'wrapped' && (!activeSession.ownerWs || isOwnerConnect) && mayClaimOwnership) {
+      // ¶14: invalidate before displacement can close a socket or mutate ownership.
+      rotateDeliveryGeneration(activeSession);
       const hadDisconnectedOwner = !isOpenWebSocket(activeSession.ownerWs) && activeSession.lastDisconnectedAt;
       // #815: was the incumbent owner ALIVE when it got displaced? That is the case that ends a
       // running agent — the displaced bridge reads close 4001 and exits the session (cli.js:534,
@@ -331,9 +362,34 @@ function installWebSocketTransport(deps) {
       // so the live current owner always holds the current token while a displaced owner keeps a
       // stale one.
       activeSession.ownerToken = crypto.randomUUID();
+      // T0 (#1170) ¶14 — delivery_generation was rotated before displacement above.
+      //
+      // This is the field that makes a same-epoch owner replacement visible. `sessionEpoch`,
+      // `credentialGeneration` and the sid are all unchanged across a reclaim of the same
+      // credentialed session, and the socket is open at both ends of it, so a pin built only from
+      // those would still "match" a successor that the binding principal never authorized (AC2).
+      // Minting it here, unconditionally on both the proved and unproved arms, means the OLD pin
+      // stops matching the moment ownership moves — which is the invalidate-before-changing-
+      // destination-state half of ¶14. It is a non-secret: it identifies an ownership, and holding
+      // it grants nothing without the bearer and the binding.
       try { ws.send(JSON.stringify({ type: 'owner_token', token: activeSession.ownerToken })); } catch {}
       markSessionConnected(activeSession);
       initializeBootstrapState(activeSession);
+      // #1136 §5/§9 — an owner claim starts a NEW VT GENERATION and never manufactures
+      // completeness. `owner_replaced` when a live owner was displaced, `attached_mid_stream`
+      // for a first connect or a reconnect: in both cases whatever the child printed before
+      // this socket existed was never seen, so the grid is `partial_since_attach` (or worse)
+      // and stays that way for the life of the generation. It can still become `complete`
+      // LATER only if the bridge positively attests offset 0 with a prior geometry (U1+U2) —
+      // and `owner_replaced` cannot reach that at all.
+      //
+      // Done BEFORE the lifecycle events below so no frame can be read against the superseded
+      // generation, and placed here rather than on the first `output` frame so a geometry
+      // frame that arrives first is not dropped for want of a VT.
+      vtObservation.rotateSessionScreen(
+        activeSession,
+        displacedLiveOwner ? 'owner_replaced' : 'attached_mid_stream'
+      );
       console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
       scheduleBootstrapPromptPoll(sessionId, activeSession);
       // #815: emit the honest lifecycle fact BEFORE any continuity claim. A live owner was
@@ -404,22 +460,95 @@ function installWebSocketTransport(deps) {
         // and only when no other owner socket is open, so a live owner is never displaced.
         if (activeSession.type === 'wrapped' && isOwnerConnect
             && activeSession.ownerWs !== ws && !isOpenWebSocket(activeSession.ownerWs)) {
+          rotateDeliveryGeneration(activeSession);
           activeSession.ownerWs = ws;
           activeSession.clients.add(ws);
           markSessionConnected(activeSession);
-          console.log(`[WS] Re-adopted owner for session ${sessionId} (session record was replaced under a live owner)`);
+          // #1136 §5/§9 — the record was swapped underneath a live owner, so this is a DIFFERENT
+          // record with an empty ring and no VT history. `record_replaced` is not origin-eligible:
+          // it can never reach `complete`, whatever the bridge goes on to assert.
+          vtObservation.rotateSessionScreen(activeSession, 'record_replaced');
+          // T0 (#1170) ¶15 — READOPTION MUST REVERIFY, against the CURRENT credential.
+          //
+          // `presentedPrincipal` above was resolved once, at connect time, against the credential
+          // the record held THEN. This branch exists precisely because the record was replaced
+          // underneath — a delete+recreate reissues, so the credential this socket proved may no
+          // longer be this session's credential at all. Copying the connect-time proof forward, or
+          // inferring one from the fact that the owner slot was free and the PID is alive, would
+          // let a socket that authenticated to a destroyed instance inherit the successor's pin.
+          // That is the #815 substitution in its readoption form.
+          //
+          // So: verify again, now, and assign the result on BOTH arms. An unproved readoption
+          // CLEARS the proof rather than leaving a predecessor's in place — the socket keeps the
+          // owner slot (legacy behaviour is untouched, ¶8), but the scoped lane sees an
+          // authentication-unavailable session and refuses to name it as a target.
+          const readoptedEpoch = (credentials && claimedBearer && typeof credentials.verify === 'function')
+            ? (() => {
+              const p = credentials.verify(claimedBearer);
+              return p && p.sid === sessionId ? p.epoch : null;
+            })()
+            : null;
+          // ONLY the proof field is written. `sessionEpoch` is deliberately left alone: it is read
+          // by #60's beginTrackedInjection and #860 F1's sessionAuthenticationCapability, and
+          // nulling it on an unproved readoption would erase a legitimately restored epoch and
+          // change what those two report for ordinary unpinned traffic (¶8/¶59). Nulling the PROOF
+          // is both sufficient and correct — describeConditionalTarget requires
+          // `sessionEpochProved === sessionEpoch`, so an unproved readoption fails that equality
+          // and the scoped lane refuses the target, while every legacy consumer sees exactly what
+          // it saw before.
+          activeSession.sessionEpochProved = readoptedEpoch;
+          // ¶14 — readoption invalidated the old pin before changing the owner slot.
+          console.log(`[WS] Re-adopted owner for session ${sessionId} (session record was replaced under a live owner, `
+            + `principal ${readoptedEpoch ? 'reverified' : 'UNPROVED — scoped lane ineligible'})`);
         }
 
         if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
           // Owner sending output -> broadcast to other clients + update activity
           if (type === 'output') {
             activeSession.lastActivityAt = new Date().toISOString();
-            appendToOutputRing(activeSession, data);
+            // #1136 U2 — `stream_id` / `stream_offset` are ADDITIVE and OPTIONAL. An old bridge
+            // sends neither; the daemon then reports `continuity: "unverified"` ⇒
+            // `vt_grid_degraded` and never a false `complete`. They are handed straight through
+            // to the one choke point, unvalidated on purpose: the observation module owns every
+            // bound and every refusal, so there is exactly one place that decides what a
+            // malformed offset means.
+            appendToOutputRing(activeSession, data, {
+              stream_id: msg.stream_id,
+              stream_offset: msg.stream_offset,
+            });
             sessionStateManager.feed(sessionId, data);
             activeSession.clients.forEach(client => {
               if (client !== ws && client.readyState === 1) {
                 client.send(JSON.stringify({ type: 'output', data }));
               }
+            });
+          } else if (type === 'geometry') {
+            // #1136 U1 — ADDITIVE, wrapped sessions only, in-order with `output` on this same
+            // socket. The daemon holds NO authoritative geometry for a wrapped session: the
+            // bridge's spawn defaults are not stored here and a viewer resize is forwarded blind
+            // and never recorded. This frame is the only way one can be known, and an old bridge
+            // sends it never — in which case the frame stays `geometry_source: "unverified"`
+            // rather than borrowing a default and calling it measured.
+            //
+            // It touches the VT queue and NOTHING else: no PTY write, no broadcast, no state
+            // machine feed, no lifecycle event. A geometry statement is not an inject and not a
+            // readiness claim.
+            vtObservation.noteSessionGeometry(activeSession, {
+              cols: msg.cols,
+              rows: msg.rows,
+              streamId: msg.stream_id,
+              atUnits: msg.at_units,
+              source: 'bridge_reported',
+            });
+          } else if (type === 'dropped') {
+            // #1136 §6 — the bridge's bounded pre-connect hold overflowed and is SAYING SO, at
+            // the exact stream position. That is the whole point of the frame: the daemon records
+            // a gap (sticky `partial_after_loss`) instead of receiving a coalesced buffer that
+            // silently lost its oldest bytes and looks contiguous.
+            vtObservation.noteSessionDropped(activeSession, {
+              streamId: msg.stream_id,
+              fromUnits: msg.from_units,
+              toUnits: msg.to_units,
             });
           } else if (type === 'heartbeat') {
             // #732: bridge-side liveness. It rides the exact same gate as an 'output'
@@ -504,6 +633,21 @@ function installWebSocketTransport(deps) {
             //
             // Optional dep, per this file's convention: a construction site without it forwards
             // as before rather than throwing. The daemon always passes it.
+            // T0 (#1170) ¶39 — a FENCED record rejects WS viewer writes, at the physical adapter
+            // boundary, before authorization is even consulted.
+            //
+            // The fence is permanent and per record: once a session has been bound to a principal,
+            // an unbound write into it is exactly the thing the binding was taken out to prevent.
+            // This door is the one #826 had to be retrofitted onto, and it is the cheapest bypass
+            // of the whole scoped lane — an attacker who cannot mint a binding can still open a
+            // viewer socket and type. Refused SILENTLY for the same reason the pre-existing
+            // closed-owner drop is silent: this is a viewer frame, not a request, and there is no
+            // response channel to refuse on. The attempt is still auditable through
+            // `authorizeViewerInject`'s existing record on the paths that reach it.
+            if (typeof isConditionallyFenced === 'function' && isConditionallyFenced(sessionId)) {
+              console.warn(`[WS] Refused viewer input into conditionally fenced session ${sessionId}`);
+              return;
+            }
             const deliver = viewerInputDeliverer(activeSession);
             if (deliver) {
               const allowed = typeof authorizeViewerInject === 'function'
@@ -574,6 +718,7 @@ function installWebSocketTransport(deps) {
       }
 
       if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+        rotateDeliveryGeneration(activeSession);
         activeSession.ownerWs = null;
         // #29: cancel any pending owner-alive optimistic timer — the owner is gone, so the
         // floor must not flip a disconnected session ready (hygiene; the timer also re-guards

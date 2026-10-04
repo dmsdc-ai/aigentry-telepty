@@ -304,6 +304,87 @@ const fetchWithAuth = (url, options = {}) => {
   return fetch(url, { ...options, headers }).catch((error) => { throw namedTransportError(url, error); });
 };
 
+// ---------------------------------------------------------------------------
+// T0 (#1170) ¶45–¶47 — the conditional CLI.
+// ---------------------------------------------------------------------------
+//
+// Two real callers, not helpers: `telepty target-binding` and `telepty inject
+// --conditional-request`. Both go through `fetchWithAuth` above, which already presents the host
+// token AND the per-session bearer — ¶46's "existing authenticated HTTP path", and the reason no
+// credential handling is added here. ¶46 forbids a credential or config export, so nothing below
+// ever prints, writes or forwards a token.
+
+const conditionalCli = require('./src/session-store/conditional-admission');
+
+/**
+ * ¶46 — SNAPSHOT THE FILE ONCE, then verify it.
+ *
+ * Read once into a buffer and validate that buffer; every later use is of the snapshot, never a
+ * re-read. A re-read between validation and send is a TOCTOU on the caller's own request: the
+ * bytes that were checked would not be the bytes that were sent, and the payload hash inside the
+ * document describes the checked ones.
+ */
+function readConditionalRequestFile(filePath, kind) {
+  let raw;
+  try {
+    raw = require('fs').readFileSync(filePath);
+  } catch (error) {
+    return { ok: false, error: `Could not read ${kind} file '${filePath}': ${error.message}` };
+  }
+  const text = raw.toString('utf8');
+  // ¶11 — duplicate keys are refused on the raw text, before parsing makes them invisible.
+  if (conditionalCli.hasDuplicateKeys(text)) {
+    return { ok: false, error: `${kind} file '${filePath}' contains duplicate JSON keys (¶11 forbids them).` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return { ok: false, error: `${kind} file '${filePath}' is not valid JSON: ${error.message}` };
+  }
+  return { ok: true, raw, text, value: parsed };
+}
+
+/**
+ * ¶30/¶47 — the transport-unknown HOLD.
+ *
+ * An unrecognized response or a lost connection is NOT a failure and NOT a success: the daemon may
+ * have admitted and emitted before the answer was lost. So the CLI says exactly that, correlates
+ * it with whatever identity it holds, and exits nonzero WITHOUT retrying.
+ *
+ * No automatic POST retry, deliberately (¶30, ¶47). The controller may repeat the identical
+ * request later to retrieve the durable receipt — that is safe because (P, msg_id) is idempotent
+ * — but only after an explicit reconciliation, and never to force delivery. Retrying here would
+ * make that decision on the operator's behalf, which is the one thing a HOLD exists to prevent.
+ */
+function printConditionalHold(reason, correlation) {
+  console.error('HOLD transport=unknown');
+  console.error(`   reason: ${reason}`);
+  for (const [key, value] of Object.entries(correlation || {})) {
+    if (value != null) console.error(`   ${key}: ${value}`);
+  }
+  console.error('   The daemon may or may not have emitted. Do NOT re-send to force delivery;');
+  console.error('   repeat the identical request only to retrieve the durable receipt.');
+  markCommandFailed();
+}
+
+/** ¶46 — print the structured receipt, then the existing `inject_id: ` line every caller scrapes. */
+function printConditionalReceipt(receipt) {
+  console.log(`acceptance: ${receipt.acceptance}`);
+  console.log(`   duplicate: ${receipt.duplicate}`);
+  console.log(`   msg_id: ${receipt.msg_id}`);
+  console.log(`   transport: ${receipt.transport}`);
+  console.log(`   consumption: ${receipt.consumption}`);
+  console.log(`   semantic_ack: ${receipt.semantic_ack}`);
+  // ¶27/¶44 — say plainly what the receipt does not mean, on the line where an operator will
+  // read it. `transport: written` is adapter emission; it is not a PTY write, not consumption,
+  // and not an ACK, and no value this command prints can advance a task.
+  console.log('   (transport is adapter emission only; physical write, consumption and semantic');
+  console.log('    ACK are separately unmeasured — this receipt cannot advance a task)');
+  // #60 Stage A — the stable, plain-text correlation line, same prefix as `telepty inject`.
+  console.log(`   inject_id: ${receipt.inject_id}`);
+}
+
 function isSubmitForceDefaultEnabled(env = process.env) {
   const value = (env.TELEPTY_SUBMIT_FORCE_DEFAULT || '').trim().toLowerCase();
   return value === '1' || value === 'true' || value === 'yes' || value === 'on';
@@ -1169,7 +1250,17 @@ function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessi
   // No meta after probing. An older daemon (answers /api/sessions, lacks /api/meta)
   // gets a legit restart; a genuinely absent/unreachable daemon gets auto-started.
   if (sessionsReachable) {
-    return { action: 'restart', reason: 'legacy-daemon-no-meta' };
+    // #751: "older" needs the POSITIVE statement — /api/meta answered 404 (the route is absent).
+    // A null/malformed meta is UNKNOWN, most often a timeout, and a daemon too slow for the meta
+    // deadline still answers /api/sessions — so that pair proves nothing about its age and must not
+    // authorize restart(absenceVerdict:false), which stops the daemon without a health re-check.
+    if (isMissingMetaRoute) return { action: 'restart', reason: 'legacy-daemon-no-meta' };
+    return { action: 'abort', reason: 'meta-unverified' };
+  }
+  // #751: /api/meta answered 404 — something IS serving this port, so this is not an absence and
+  // must not become `start`. The legacy restart above needs /api/sessions 200 as well.
+  if (isMissingMetaRoute) {
+    return { action: 'abort', reason: 'daemon-answered-error:404' };
   }
   // gh#82 (B): before calling it an absence, ask the one endpoint we never asked. 200 ⇒ alive.
   if (healthOk) {
@@ -1245,7 +1336,132 @@ async function deferToSupervisor(options = {}) {
   return null;
 }
 
+// #751: explicit no-daemon-lifecycle safety mode.
+//
+// Some deployments own the daemon's lifecycle outside this CLI — a supervisor unit the operator
+// manages, a container entrypoint, a shared host daemon nobody's client may replace. Until now
+// the CLI had no way to be TOLD that: every "not healthy" verdict authorized remediation
+// (spawn / restart / repair / marker write), and the only escape hatches were per-symptom
+// booleans (TELEPTY_SKIP_DAEMON_REPAIR, TELEPTY_NO_SUPERVISOR_DEFER) that each cover one seam.
+//
+// TELEPTY_DAEMON_LIFECYCLE states the ownership once, for the whole ensureDaemonRunning path:
+//   external — something else owns the lifecycle. Validation still runs IN FULL; what changes is
+//              the remedy. Verified-healthy ⇒ proceed with zero side effects; anything else ⇒
+//              fail closed. SCOPE: this governs the LOCAL (127.0.0.1) daemon only — the only
+//              daemon this CLI ever had a lifecycle over. The REMOTE_HOST guard below is
+//              unchanged, so a non-local address still returns early without probing.
+//   managed  — the pre-#751 behavior, spelled out explicitly.
+//   (unset)  — managed. Legacy behavior is untouched; this mode is opt-in only.
+//
+// Fail-closed is the whole point, so an unrecognized value is NOT coerced to a default: a typo
+// ("externl") or a truthy-looking value ("1") that quietly re-enabled management would hand the
+// operator the exact outcome they set the variable to prevent. Only a genuinely absent variable
+// means "legacy"; a present-but-unreadable one is an error.
+const LIFECYCLE_MODES = Object.freeze({
+  MANAGED: 'managed',
+  EXTERNAL: 'external',
+  INVALID: 'invalid'
+});
+
+function resolveDaemonLifecycleMode(env = process.env) {
+  const raw = env ? env.TELEPTY_DAEMON_LIFECYCLE : undefined;
+  if (raw == null) return { mode: LIFECYCLE_MODES.MANAGED, explicit: false, raw: null };
+  if (typeof raw !== 'string') return { mode: LIFECYCLE_MODES.INVALID, explicit: true, raw };
+  const value = raw.trim().toLowerCase();
+  if (value === LIFECYCLE_MODES.EXTERNAL) return { mode: LIFECYCLE_MODES.EXTERNAL, explicit: true, raw };
+  if (value === LIFECYCLE_MODES.MANAGED) return { mode: LIFECYCLE_MODES.MANAGED, explicit: true, raw };
+  return { mode: LIFECYCLE_MODES.INVALID, explicit: true, raw };
+}
+
+// #751: the refusal messages below interpolate two untrusted strings (the operator's mode value
+// and the daemon's reported version). Neither is length- or charset-checked at its source, so both
+// are sanitized AND clamped here — a bounded one-line error is part of failing closed.
+//
+// Length alone is not enough: an embedded newline splits the refusal across lines (so the
+// one-line render at the top-level catch is no longer one line, and a forged second line can be
+// made to look like separate CLI output), and an ESC byte lets a hostile version string emit
+// arbitrary ANSI — colour, cursor moves, line erase — into the operator's terminal. Every C0/C1
+// control and DEL is therefore replaced by a fixed '·'. The substitution is 1:1, so it cannot
+// expand the string and cannot be cut mid-escape by the clamp that follows.
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/g;
+
+function boundedLabel(value, max = 64) {
+  const text = typeof value === 'string' ? value : String(value == null ? '' : value);
+  const safe = text.replace(CONTROL_CHARS, '·');
+  return safe.length > max ? `${safe.slice(0, max)}…` : safe;
+}
+
+function daemonLifecycleModeError(raw) {
+  const error = new Error(
+    `TELEPTY_DAEMON_LIFECYCLE="${boundedLabel(raw)}" is not a recognized daemon lifecycle mode `
+    + `(expected "${LIFECYCLE_MODES.EXTERNAL}" or "${LIFECYCLE_MODES.MANAGED}", or leave it unset). `
+    + 'Refusing to continue: a mode this CLI cannot read must not silently re-enable daemon '
+    + 'lifecycle management.'
+  );
+  error.name = 'DaemonLifecycleModeError';
+  error.mode = null;
+  error.raw = boundedLabel(raw);
+  markCommandFailed();
+  return error;
+}
+
+function externalDaemonUnusableError(decision, meta) {
+  const version = meta && meta.version ? boundedLabel(meta.version, 32) : 'unknown';
+  const error = new Error(
+    `No usable local telepty daemon on port ${PORT} `
+    + `(verdict: ${boundedLabel(decision && decision.reason)}; daemon version: ${version}). `
+    + `TELEPTY_DAEMON_LIFECYCLE=${LIFECYCLE_MODES.EXTERNAL} is set, so this CLI does not own the `
+    + 'daemon lifecycle: nothing was started, restarted, repaired or installed. Bring a matching '
+    + 'daemon up externally and retry.'
+  );
+  error.name = 'DaemonLifecycleExternalError';
+  error.mode = LIFECYCLE_MODES.EXTERNAL;
+  error.reason = decision && decision.reason ? decision.reason : null;
+  // What managed mode WOULD have done here — the one fact an operator needs to see that the
+  // refusal is the mode working, not a bug.
+  error.suppressedAction = decision && decision.action ? decision.action : null;
+  markCommandFailed();
+  return error;
+}
+
+// #751: meta unknown (timeout/malformed on every attempt) while /api/sessions answers 200. There is
+// no daemon answer to render, so it gets its own bounded, credential-free message. Named
+// DaemonResponseError so every existing catch (and the one-line top-level render) handles it.
+function daemonMetaUnverifiedError() {
+  const error = new Error(
+    `Local telepty daemon (port ${PORT}) answered /api/sessions, but /api/meta returned no readable `
+    + 'version or capabilities on any attempt (timeout or malformed reply). Its version is '
+    + 'UNVERIFIED, which is not evidence of an older daemon: nothing was stopped, restarted or '
+    + 'started. Retry the command; if it persists, check the daemon directly.'
+  );
+  error.name = 'DaemonResponseError';
+  error.status = null;
+  error.refused = false;
+  error.reason = 'meta-unverified';
+  markCommandFailed();
+  return error;
+}
+
+// #751: every other abort is a #835 daemon answer and keeps daemonAnswerError unchanged.
+function daemonAbortError(decision, meta) {
+  if (decision && decision.reason === 'meta-unverified') return daemonMetaUnverifiedError();
+  return daemonAnswerError(meta, '127.0.0.1');
+}
+
+function isDaemonLifecycleError(error) {
+  return Boolean(error)
+    && (error.name === 'DaemonLifecycleModeError' || error.name === 'DaemonLifecycleExternalError');
+}
+
 async function ensureDaemonRunning(options = {}) {
+  // #751: resolved BEFORE the REMOTE_HOST return below, because an unreadable mode must fail
+  // closed on every address. A VALID external mode, by contrast, only takes effect past that
+  // guard — i.e. for the local 127.0.0.1 daemon, the only one this CLI manages.
+  const lifecycle = resolveDaemonLifecycleMode(options._env || process.env);
+  if (lifecycle.mode === LIFECYCLE_MODES.INVALID) {
+    throw daemonLifecycleModeError(lifecycle.raw);
+  }
+
   if (REMOTE_HOST !== '127.0.0.1') return; // Only auto-start local daemon
 
   const requiredCapabilities = options.requiredCapabilities || [];
@@ -1273,13 +1489,22 @@ async function ensureDaemonRunning(options = {}) {
   // now escalates on attempt ≥2 (1500 → 3000 by default), so the `start` verdict requires the
   // probe to have failed at TWO different patience levels, not the same one three times.
   let meta = null;
+  let answered = null; // #751: strongest daemon ANSWER seen on any attempt
   for (let attempt = 1; attempt <= attempts; attempt++) {
     meta = await getMeta('127.0.0.1', attempt === 1 ? probeTimeoutMs() : probeTimeoutMs() * 2);
     if (meta && meta.version) break;
+    // #751: a later timeout (null) must not erase an earlier 401/5xx into "nothing answered", and
+    // a 404 (legacy route) never outranks a refusal/error answer.
+    if (meta && meta.answered && (!answered || (answered.status === 404 && meta.status !== 404))) {
+      answered = meta;
+    }
     if (attempt < attempts) {
       await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
     }
   }
+  // #751: no version ⇒ the preserved answer, else unknown. A malformed meta (no version, not an
+  // answer) is unknown exactly like a timeout — never a statement about the daemon's age.
+  if (!(meta && meta.version)) meta = answered;
 
   // (2) Only when meta never came back do we consult /api/sessions — purely to tell an
   // older daemon (answers sessions, lacks /api/meta) apart from no daemon at all. A slow
@@ -1293,8 +1518,11 @@ async function ensureDaemonRunning(options = {}) {
       sessionsReachable = !!(sessionsRes && sessionsRes.ok);
       // #835: a non-200 here is an ANSWER too. Folding it into "nothing answered" is what
       // turned a refused legacy probe into the verdict that authorizes the kill.
-      if (sessionsRes && !sessionsRes.ok && !meta) {
-        meta = daemonAnswer(sessionsRes.status, '/api/sessions');
+      // #751: also over a meta 404 — a 404 is legacy proof only next to sessions 200, so a refused
+      // or failing sessions answer must surface rather than leave the 404 to stand alone.
+      const metaRouteMissing = meta && meta.answered && meta.status === 404 && meta.endpoint === '/api/meta';
+      if (sessionsRes && !sessionsRes.ok && (!meta || metaRouteMissing)) {
+        meta = daemonAnswer(sessionsRes.status, '/api/sessions') || meta;
       }
     } catch {
       sessionsReachable = false; // timeout/refused while probing the legacy fallback
@@ -1313,6 +1541,34 @@ async function ensureDaemonRunning(options = {}) {
 
   let decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable, healthOk });
 
+  // #751: the explicit no-lifecycle gate. Deliberately placed HERE — after all three probes and
+  // the full decision policy — because the requirement is not "skip the work" (that is the
+  // REMOTE_HOST bare return above, and it would let an unverified daemon through). External mode
+  // validates exactly as hard as managed mode and then diverges only on the REMEDY. Reached only
+  // for the local 127.0.0.1 daemon; remote addresses returned at that guard, unchanged.
+  //
+  // The single allowed outcome is reason 'healthy': decideDaemonAction reaches it only after a
+  // version decision of noop AND every required capability present, so it is the one verdict that
+  // has actually verified the daemon. Every other verdict is refused BEFORE the supervisor defer,
+  // the restart banners, the marker read/write and doRestart() below — so no spawn, restart,
+  // repair, install, or lifecycle-marker mutation can happen on this path.
+  //
+  // 'alive-but-slow' is refused on purpose despite being a noop in managed mode: /api/health
+  // answering proves liveness, not version or capabilities, and "we could not verify it" is not
+  // permission to use it when we are also forbidden from fixing it.
+  if (lifecycle.mode === LIFECYCLE_MODES.EXTERNAL) {
+    // #835: a refusal is an answer. It keeps its own error here rather than being folded into the
+    // lifecycle refusal — a daemon that declines our credentials is a demonstrably running daemon
+    // and an auth problem, and reclassifying it would lose that.
+    if (decision.action === 'abort') {
+      throw daemonAbortError(decision, meta);
+    }
+    if (decision.action === 'noop' && decision.reason === 'healthy') {
+      return; // verified: matching version + every required capability. Use it, touch nothing.
+    }
+    throw externalDaemonUnusableError(decision, meta);
+  }
+
   // gh#82 (B): alive, just slow. Say so once — the operator otherwise sees a command that simply
   // fails, with the daemon it needs sitting right there.
   if (decision.reason === 'alive-but-slow') {
@@ -1330,7 +1586,7 @@ async function ensureDaemonRunning(options = {}) {
   // #835: the daemon answered and declined (or is failing). It is alive — killing it is the
   // one thing we must not do. Fail the command loudly instead of remediating.
   if (decision.action === 'abort') {
-    throw daemonAnswerError(meta, '127.0.0.1');
+    throw daemonAbortError(decision, meta);
   }
 
   // #738: ONLY the 'start' path (nothing answered on the port) can be a supervisor restart
@@ -1344,12 +1600,30 @@ async function ensureDaemonRunning(options = {}) {
       // Re-run the same policy against it: healthy ⇒ done; wrong version/capabilities ⇒
       // fall through to the normal restart path with this daemon in hand.
       meta = supervised;
-      decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable: true });
+      // #751: a delivered /api/meta 404 is legacy proof only next to a MEASURED /api/sessions 200 —
+      // the primary path's rule. Passing `true` here fabricated that evidence: the sessions probe
+      // above had just failed. Ask this daemon once, with the same bounded probe; a non-200 answer
+      // keeps its typed status, and a timeout/unreadable reply leaves the 404 alone (⇒ abort).
+      let supervisedSessionsReachable = false;
+      if (meta.answered && meta.status === 404 && meta.endpoint === '/api/meta') {
+        try {
+          const sessionsRes = await fetchAuth(`${DAEMON_URL}/api/sessions`, {
+            signal: AbortSignal.timeout(5000)
+          });
+          supervisedSessionsReachable = !!(sessionsRes && sessionsRes.ok);
+          if (sessionsRes && !sessionsRes.ok) {
+            meta = daemonAnswer(sessionsRes.status, '/api/sessions') || meta;
+          }
+        } catch {
+          supervisedSessionsReachable = false;
+        }
+      }
+      decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable: supervisedSessionsReachable });
       if (decision.action === 'noop') return;
       // #844: re-deciding can now produce `abort` — the supervisor's daemon answered and declined.
       // The abort check above ran before this block, so without this line the refusal fell straight
       // through to the restart banner and doRestart(), i.e. the kill it exists to prevent.
-      if (decision.action === 'abort') throw daemonAnswerError(meta, '127.0.0.1');
+      if (decision.action === 'abort') throw daemonAbortError(decision, meta);
     }
   }
 
@@ -1769,6 +2043,42 @@ async function main() {
   // tp941 Guard A: before ANY command branch, so no subcommand can execute on its way to
   // printing its own usage. Deliberately below the version check, which takes no argv.
   if (interceptHelp(cmd, args.slice(1))) return;
+
+  if (cmd === 'conditional-store-init') {
+    if (args.length !== 2 || args[1] !== '--new-store') {
+      console.error('Usage: telepty conditional-store-init --new-store');
+      console.error(conditionalCli.FIRST_INITIALIZATION_GUIDANCE);
+      markCommandFailed();
+      return;
+    }
+    // One authenticated request to the selected local daemon. No discovery, start/restart,
+    // retry, force flag or environment switch can turn absence into initialization authority.
+    try {
+      const res = await fetchWithAuth(`${daemonUrl('127.0.0.1')}/api/conditional-store/initialize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: conditionalCli.canonicalJson({ version: 1, intent: 'new-store' }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.status === 201 && data && data.version === 1 && data.initialization === 'created'
+        && conditionalCli.isUuid(data.marker_id)
+        && Object.keys(data).length === 3) {
+        console.log(conditionalCli.canonicalJson(data));
+        return;
+      }
+      if (!res.ok && data && (data.acceptance === 'refused' || data.error)) {
+        console.error(`Initialization refused: ${data.code || `HTTP ${res.status}`}.`);
+      } else {
+        console.error('HOLD initialization=unknown: unrecognized response; reconcile persisted state before another request.');
+      }
+    } catch (error) {
+      console.error(`HOLD initialization=unknown: ${error.message}`);
+      console.error('The daemon may have committed initialization. Reconcile persisted state before another request.');
+    }
+    console.error(conditionalCli.FIRST_INITIALIZATION_GUIDANCE);
+    markCommandFailed();
+    return;
+  }
 
   if (cmd === 'init') {
     const { main: runInit } = require('./src/init/print-snippet');
@@ -2255,7 +2565,30 @@ async function main() {
       }
     }
 
+    // #1136 U2 — CONTINUITY IDENTITY. `relayPtyOutput` used to send `{type:'output', data}` with
+    // no sequence, offset or stream id, so a reconnect, a lost chunk and ordinary contiguity were
+    // indistinguishable to the daemon and it had to treat all three the same way.
+    //
+    // `streamId` is minted PER CHILD SPAWN, so the auto-restart respawn below is visible as a new
+    // stream rather than as more of the old one. `streamOffset` is a NEW per-spawn counter reset
+    // to 0 in spawnChild, because only a counter that starts at 0 can express an origin.
+    //
+    // `ptyBytesRead` is deliberately NOT reused and NOT reset: it is bridge-process-scoped and it
+    // is the heartbeat's number (#732 reads it as "the read side is alive"), so resetting it on a
+    // respawn would make a living bridge look frozen.
+    let streamId = null;
+    let streamOffset = 0;
+    let streamCols = 0;
+    let streamRows = 0;
+    let streamSpawnSeq = 0;
+
     function spawnChild() {
+      // #1136 U1 — the geometry this bridge passes to `pty.spawn` is the child's INITIAL size and
+      // is first-hand. It was computed inline and discarded; named here so the geometry frame can
+      // state it, and so a later `child.resize` updates one variable rather than two expressions
+      // that can drift.
+      streamCols = process.stdout.columns || 80;
+      streamRows = process.stdout.rows || 30;
       // Windows: walk %PATHEXT% so bare names (`claude`, `codex`, `gemini`)
       // resolve to their npm-global `.cmd`/`.ps1` shims. POSIX: no-op. (#25)
       const resolvedCommand = resolveWindowsExecutable(command, process.env);
@@ -2265,11 +2598,16 @@ async function main() {
       // finding; not fixable without removing `telepty allow`.
       child = pty.spawn(resolvedCommand, cmdArgs, {
         name: 'xterm-256color',
-        cols: process.stdout.columns || 80,
-        rows: process.stdout.rows || 30,
+        cols: streamCols,
+        rows: streamRows,
         cwd: sessionCwd,
         env: sessionEnv
       });
+      // #1136 — minted AFTER the spawn succeeded, so a failed spawn never advertises a stream
+      // that produced nothing. Per-spawn, and short: the daemon bounds `stream_id` length.
+      streamSpawnSeq += 1;
+      streamId = `${sessionId}-${process.pid}-${streamSpawnSeq}-${Date.now().toString(36)}`;
+      streamOffset = 0;
       sessionStartTime = Date.now();
       updateDaemonProcessMetadata();
       return child;
@@ -2468,28 +2806,147 @@ async function main() {
     // ptyBytesRead reports, so it equals bytes for ASCII and over-allocates by up to 3x for
     // CJK-heavy output — still a fixed ceiling, which is the property that matters here.
     // ponytail: flat array + running counter; a ring buffer buys nothing at this size.
+    //
+    // #1136 §6 — THE HOLD IS NOW AN ORDERED OP LOG, not a bag of characters.
+    //
+    // Two defects of the flat version are fixed here and nothing else changes: the 256 K ceiling,
+    // the drop-the-oldest rule and the keep-at-least-one-run guarantee are all preserved.
+    //   1. It held only `output`, so a `geometry` op minted while the socket was down had nowhere
+    //      to go and its ORDER relative to the output around it was destroyed. Output runs may
+    //      still be coalesced BETWEEN geometry boundaries; they may never be merged ACROSS one,
+    //      because the two sides of a resize describe different screens.
+    //   2. Overflow dropped the oldest bytes SILENTLY, so the daemon received a buffer that looks
+    //      contiguous and is not — a lie it had no way to detect. Overflow now emits an explicit
+    //      `dropped` op AT THE DROP POSITION, so the daemon records a gap instead.
+    // Coalescing that preserves only characters is forbidden.
     const PRECONNECT_MAX_CHARS = 256 * 1024;
-    let preConnectHeld = [];
+    let preConnectOps = [];
     let preConnectChars = 0;
-    function holdPreConnectOutput(data) {
-      preConnectHeld.push(data);
-      preConnectChars += data.length;
-      while (preConnectChars > PRECONNECT_MAX_CHARS && preConnectHeld.length > 1) {
-        preConnectChars -= preConnectHeld.shift().length;
+
+    function preConnectOutputUnits() {
+      let n = 0;
+      for (const op of preConnectOps) if (op.type === 'output') n += op.data.length;
+      return n;
+    }
+
+    function holdPreConnectOp(op) {
+      // BOUND ON WHAT THIS CHANGE INTRODUCES. The char ceiling below bounds held OUTPUT; it says
+      // nothing about how many geometry ops can pile up while the socket is down, and a flapping
+      // terminal can emit those indefinitely. Two geometry ops with NO output between them are
+      // collapsible without losing anything: the first described a screen that never received a
+      // single unit, so no boundary is destroyed by dropping it. Enforced on every push rather
+      // than only on overflow, so the count cannot grow in the first place.
+      if (op.type === 'geometry') {
+        const last = preConnectOps[preConnectOps.length - 1];
+        if (last && last.type === 'geometry' && last.stream_id === op.stream_id) {
+          preConnectOps[preConnectOps.length - 1] = op;
+          return;
+        }
+      }
+      preConnectOps.push(op);
+      if (op.type === 'output') preConnectChars += op.data.length;
+      while (preConnectChars > PRECONNECT_MAX_CHARS) {
+        const idx = preConnectOps.findIndex((o) => o.type === 'output');
+        if (idx === -1) break;
+        // #768's guarantee, unchanged: never drop the LAST remaining output run. The newest
+        // output is what still describes the screen, and that is the thing the hold exists for.
+        const isOnlyOutput = !preConnectOps.some((o, i) => o.type === 'output' && i !== idx);
+        if (isOnlyOutput) break;
+        const victim = preConnectOps[idx];
+        preConnectChars -= victim.data.length;
+        const fromUnits = victim.stream_offset;
+        const toUnits = victim.stream_offset + victim.data.length;
+        const prev = idx > 0 ? preConnectOps[idx - 1] : null;
+        if (prev && prev.type === 'dropped' && prev.stream_id === victim.stream_id
+            && prev.to_units === fromUnits) {
+          // Extend the adjacent drop rather than emitting a run of them — one honest range.
+          prev.to_units = toUnits;
+          preConnectOps.splice(idx, 1);
+        } else {
+          preConnectOps[idx] = {
+            type: 'dropped', stream_id: victim.stream_id, from_units: fromUnits, to_units: toUnits
+          };
+        }
       }
     }
-    // Flushed as ONE 'output' frame: the daemon appends it to the ring and feeds the session
-    // state machine exactly as it would the same bytes arriving in pieces.
-    function flushPreConnectOutput() {
-      if (!preConnectHeld.length) return;
+
+    // Flush in order. Consecutive, CONTIGUOUS output ops of the same stream are coalesced into
+    // one frame — the daemon appends that to the ring and feeds the state machine exactly as it
+    // would the same units arriving in pieces — but a geometry or dropped op always closes the
+    // run, so every boundary survives the flush.
+    function flushPreConnectOps() {
+      if (!preConnectOps.length) return;
+      const frames = [];
+      let run = null;
+      for (const op of preConnectOps) {
+        if (op.type === 'output') {
+          if (run && run.stream_id === op.stream_id
+              && run.stream_offset + run.data.length === op.stream_offset) {
+            run.data += op.data;
+            continue;
+          }
+          if (run) frames.push(run);
+          run = {
+            type: 'output', data: op.data, stream_id: op.stream_id, stream_offset: op.stream_offset
+          };
+          continue;
+        }
+        if (run) { frames.push(run); run = null; }
+        frames.push(op);
+      }
+      if (run) frames.push(run);
+
+      let sent = 0;
       try {
-        daemonWs.send(JSON.stringify({ type: 'output', data: preConnectHeld.join('') }));
-        preConnectHeld = [];
-        preConnectChars = 0;
+        for (; sent < frames.length; sent += 1) daemonWs.send(JSON.stringify(frames[sent]));
       } catch {
-        // Socket died mid-flush — keep the bytes for the next open rather than lose them.
+        // Socket died mid-flush — keep the UNSENT remainder for the next open rather than lose
+        // it, and never resend what already went out (a resend would arrive as a backward
+        // offset the daemon has to reconcile).
       }
+      preConnectOps = frames.slice(sent);
+      preConnectChars = preConnectOutputUnits();
     }
+
+    // The one emit path for every stream op: straight out when the owner socket is up, into the
+    // ordered hold when it is not. Nothing else in this bridge may write a stream op.
+    function sendStreamOp(op) {
+      const socketUp = wsReady && daemonWs && daemonWs.readyState === 1;
+      // The fast path is taken ONLY when nothing is held. While the hold is non-empty every op
+      // goes through it, so a frame minted now can never overtake units minted earlier — which
+      // is the whole reason the daemon can trust `at_units` and `stream_offset` against each
+      // other.
+      if (socketUp && preConnectOps.length === 0) {
+        try {
+          daemonWs.send(JSON.stringify(op));
+          return;
+        } catch {
+          // Fall through and hold: a send that threw did not arrive.
+        }
+      }
+      holdPreConnectOp(op);
+      if (socketUp) flushPreConnectOps();
+    }
+
+    // #1136 U1 — state the child's CURRENT geometry at the CURRENT stream position. Sent on
+    // owner-WS open and after every `child.resize`; `at_units` is this bridge's stream offset at
+    // the moment it applied the resize, which is what lets the daemon apply it at the same
+    // boundary the child saw it rather than on arrival.
+    function emitStreamGeometry() {
+      if (!streamId) return;
+      sendStreamOp({
+        type: 'geometry',
+        cols: streamCols,
+        rows: streamRows,
+        stream_id: streamId,
+        at_units: streamOffset
+      });
+    }
+
+    // The initial child's geometry, stated BEFORE its first output unit — which is the half of
+    // the origin proof the bridge owns. (`child.onData` is not attached until further below, so
+    // no output op can precede this one.)
+    emitStreamGeometry();
 
     async function connectDaemonWs() {
       // Re-register session BEFORE WebSocket connect (daemon rejects WS if session unknown)
@@ -2549,10 +3006,17 @@ async function main() {
 
       daemonWs.on('open', () => {
         wsReady = true;
+        // #1136 U1 — restate the geometry on every owner-WS open. Appended to the END of the
+        // hold, not sent ahead of it: the held ops already carry this stream's earlier geometry
+        // and output in order, and jumping this frame in front of them would put an `at_units`
+        // from the present in front of units from the past. Appending keeps every `at_units`
+        // consistent with the output that precedes it, which is the property the daemon's
+        // boundary validation checks.
+        emitStreamGeometry();
         // #768: before anything else this owner says, hand over what the PTY printed while the
         // socket was still coming up — so the ring's first content is the CLI's actual screen
         // and not whatever it happened to write next.
-        flushPreConnectOutput();
+        flushPreConnectOps();
         // No resize trick on reconnect — it causes visible flickering across all
         // terminals when the daemon restarts and multiple sessions reconnect at once.
         reconnectAttempts = 0;
@@ -2614,6 +3078,13 @@ async function main() {
             }
           } else if (msg.type === 'resize') {
             child.resize(msg.cols, msg.rows);
+            // #1136 U1 — the daemon forwards a viewer resize BLIND and records nothing, so this
+            // is the only place the new geometry becomes a stated fact. Emitted AFTER the resize
+            // actually applied, at the current stream offset, so a frame is never sent for a
+            // geometry the child refused.
+            streamCols = msg.cols;
+            streamRows = msg.rows;
+            emitStreamGeometry();
           }
         } catch (e) {
           // ignore malformed messages
@@ -2730,6 +3201,10 @@ async function main() {
       onResize: () => {
         const size = getTerminalSize(process.stdout, { cols: 120, rows: 40 });
         child.resize(size.cols, size.rows);
+        // #1136 U1 — the local terminal resized. Same rule as the daemon-forwarded resize above.
+        streamCols = size.cols;
+        streamRows = size.rows;
+        emitStreamGeometry();
       }
     });
     let allowSessionClosed = false;
@@ -2798,11 +3273,15 @@ async function main() {
       ptyBytesRead += data.length;
       const rewritten = rewriteTitleSequences(data);
       process.stdout.write(rewritten);
-      if (wsReady && daemonWs.readyState === 1) {
-        daemonWs.send(JSON.stringify({ type: 'output', data }));
-      } else {
-        holdPreConnectOutput(data);
-      }
+      // #1136 U2 — the offset stamped on a frame is the position of its FIRST unit, so a frame
+      // carrying `stream_offset: 0` is the positive statement "this is the first thing the child
+      // ever printed". Read before the advance, for exactly that reason. The daemon is sent the
+      // UNREWRITTEN `data`, unchanged from before: `rewriteTitleSequences` is a local display
+      // concern and feeding its output upstream would make the counted units and the relayed
+      // units two different things.
+      const at = streamOffset;
+      streamOffset += data.length;
+      sendStreamOp({ type: 'output', data, stream_id: streamId, stream_offset: at });
       // Detect prompt in output to enable inject delivery
       if (observePromptReady(data)) {
         promptReady = true;
@@ -2885,6 +3364,11 @@ async function main() {
               firstReadyObserved = false;
               readyNotified = false;
               outputTail = '';
+              // #1136 U1/U2 — `spawnChild` above minted a NEW stream_id and reset stream_offset
+              // to 0, so this respawn is visible to the daemon as a new child rather than as more
+              // of the dead one's stream. State the new child's geometry BEFORE re-attaching the
+              // relay, so the first unit of the new stream is preceded by its own geometry.
+              emitStreamGeometry();
               // Re-attach output relay, prompt detection, and exit handler
               child.onData(relayPtyOutput);
               attachChildExitHandler();
@@ -3088,7 +3572,261 @@ async function main() {
     return;
   }
 
+  // -------------------------------------------------------------------------
+  // #1136 §9 — telepty read-frame <sid> [--json] [--drain-wait-ms N]
+  // -------------------------------------------------------------------------
+  //
+  // OBSERVATION ONLY, and a strictly ADDITIVE command: `read-screen` above is byte-for-byte
+  // unchanged and keeps its exact behaviour, because consumers still read it and its defect
+  // (the tail of accumulated history, never a grid) is not fixed by hiding it.
+  //
+  // The qualification fields are the point, not the text. A grid says WHAT IS ON THE SCREEN; it
+  // never says who put it there, what the CLI is waiting for, or that a turn finished. Unknown
+  // and degraded are printed EXPLICITLY — an old daemon has no route, so a 404 here means
+  // UNKNOWN and the command says so rather than falling back to `read-screen` and quietly
+  // presenting history as a screen.
+  if (cmd === 'read-frame') {
+    const sessionId = args[1];
+    if (!sessionId) { console.error('❌ Usage: telepty read-frame <session_id> [--json] [--drain-wait-ms N]'); process.exit(1); }
+
+    const asJson = args.includes('--json');
+    const waitIndex = args.indexOf('--drain-wait-ms');
+    const drainWaitMs = (waitIndex !== -1 && args[waitIndex + 1]) ? args[waitIndex + 1] : null;
+
+    try {
+      const target = await resolveSessionTarget(sessionId);
+      if (!target) {
+        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
+        process.exit(1);
+      }
+
+      const query = drainWaitMs === null ? '' : `?drain_wait_ms=${encodeURIComponent(drainWaitMs)}`;
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/frame${query}`);
+      if (res.status === 404) {
+        // Absence, named. This daemon predates the route, or the session is gone — either way
+        // nothing about the screen is known, and nothing is synthesised from that.
+        if (asJson) {
+          console.log(JSON.stringify({ session_id: target.id, observation_basis: 'unavailable', degraded_reasons: ['frame_route_absent'] }));
+        } else {
+          console.error(`❌ No frame observation available for '${sessionId}' (this daemon has no /frame route, or the session is gone). UNKNOWN — not empty.`);
+        }
+        process.exit(1);
+      }
+      const data = await res.json();
+      if (!res.ok) { console.error(`❌ Error: ${data.error}`); process.exit(1); }
+
+      if (asJson) {
+        console.log(JSON.stringify(data));
+        return;
+      }
+
+      const reasons = Array.isArray(data.degraded_reasons) && data.degraded_reasons.length
+        ? data.degraded_reasons.join(',')
+        : 'none';
+      console.log(`basis=${data.observation_basis} completeness=${data.completeness} freshness=${data.freshness} `
+        + `continuity=${data.continuity} geometry=${data.geometry_source} ${data.cols}x${data.rows} `
+        + `screen=${data.screen_kind} gen=${data.vt_generation}/${data.generation_cause} `
+        + `applied=${data.applied_units} observed=${data.observed_units} lag=${data.lag_units} `
+        + `dropped=${data.dropped_units} unit=${data.unit} degraded=${reasons}`);
+      if (Array.isArray(data.rows_text)) {
+        console.log(data.rows_text.join('\n'));
+      }
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    return;
+  }
+
+  // -------------------------------------------------------------------------
+  // T0 (#1170) ¶45 — telepty target-binding <sid> [--request <canonical-json-file>]
+  // -------------------------------------------------------------------------
+  //
+  // Without --request: print the GET snapshot (E), so a controller can see the destination it is
+  // about to pin. With --request: take the binding.
+  //
+  // The sid is sent EXACTLY as typed. `resolveSessionTarget` is deliberately not used — it
+  // performs host discovery and alias resolution, and ¶8 rejects alias targets outright. A pin
+  // that followed a repointable name would not be a pin, and a pin taken on a host the CLI chose
+  // by discovery would not be the host the controller meant.
+  if (cmd === 'target-binding') {
+    // No interceptSubcommandHelp call here: tp941 Guard A (interceptHelp, above main's dispatch)
+    // already answered `--help` for EVERY subcommand before this branch could run, including ones
+    // that did not exist when it was written. Re-calling it here would be dead code that reads
+    // like a guard.
+    const sessionId = args[1];
+    if (!sessionId) {
+      console.error('❌ Usage: telepty target-binding <session_id> [--request <canonical-json-file>]');
+      process.exit(1);
+    }
+    const requestIndex = args.indexOf('--request');
+    const requestPath = requestIndex !== -1 ? args[requestIndex + 1] : null;
+    if (requestIndex !== -1 && !requestPath) {
+      console.error('❌ --request requires a path to a canonical JSON file.');
+      process.exit(1);
+    }
+
+    const url = `${daemonUrl('127.0.0.1')}/api/sessions/${encodeURIComponent(sessionId)}/conditional-binding`;
+    try {
+      if (!requestPath) {
+        // GET snapshot. Returns an identity, never a secret (¶16).
+        const res = await fetchWithAuth(
+          `${daemonUrl('127.0.0.1')}/api/sessions/${encodeURIComponent(sessionId)}/conditional-target`,
+          { method: 'GET' });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data || data.version !== 1 || !data.target) {
+          console.error(`❌ ${data && data.code ? data.code : `HTTP ${res.status}`}`);
+          if (data && data.code === 'STORE_UNAVAILABLE') console.error(conditionalCli.FIRST_INITIALIZATION_GUIDANCE);
+          markCommandFailed();
+          return;
+        }
+        // Canonical compact form, so the operator can pipe it straight into a request file
+        // without a reformat changing the bytes.
+        console.log(conditionalCli.canonicalJson(data.target));
+        return;
+      }
+
+      const snapshot = readConditionalRequestFile(requestPath, 'binding request');
+      if (!snapshot.ok) { console.error(`❌ ${snapshot.error}`); markCommandFailed(); return; }
+      // ¶46 — verify the EXACT schema before sending. A request the daemon would refuse is
+      // refused here first, so a malformed file costs no round trip and produces no ambiguity
+      // about whether it reached the daemon.
+      const parsed = conditionalCli.parseBindingRequest(snapshot.value);
+      if (!parsed.ok || !conditionalCli.isCanonicalRequestBytes(snapshot.raw, parsed.value)) {
+        console.error(`❌ Binding request is not canonical: ${parsed.reason || 'noncanonical_bytes'}`);
+        markCommandFailed();
+        return;
+      }
+      if (parsed.value.target.sid !== sessionId) {
+        console.error(`❌ Binding request targets '${parsed.value.target.sid}' but the command names '${sessionId}'.`);
+        markCommandFailed();
+        return;
+      }
+      const res = await fetchWithAuth(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // The snapshot was byte-checked against this exact canonical serialization.
+        body: conditionalCli.canonicalJson(parsed.value),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || data.version !== 1 || !data.binding) {
+        console.error(`❌ ${data && data.code ? data.code : `HTTP ${res.status}`}`);
+        if (data && data.code === 'STORE_UNAVAILABLE') console.error(conditionalCli.FIRST_INITIALIZATION_GUIDANCE);
+        markCommandFailed();
+        return;
+      }
+      console.log(conditionalCli.canonicalJson(data.binding));
+      console.log(`   binding_id: ${data.binding.binding_id}`);
+    } catch (e) {
+      // ¶30 — a lost connection on the BINDING call is an ordinary failure, not a HOLD: a binding
+      // writes no bytes to any session, so "did it happen" is answerable by simply asking again.
+      // The HOLD vocabulary is reserved for the inject, where repeating the question is exactly
+      // what must not be done casually.
+      console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`);
+      markCommandFailed();
+    }
+    return;
+  }
+
   if (cmd === 'inject') {
+    // -----------------------------------------------------------------------
+    // T0 (#1170) ¶45–¶47 — telepty inject <sid> --conditional-request <file>
+    // -----------------------------------------------------------------------
+    //
+    // Handled FIRST, before `interceptSubcommandHelp` and before any legacy flag parsing, for the
+    // same reason the daemon selects its branch on the raw body: this is a closed branch, and a
+    // closed branch that can be reached only after the legacy parser has had a turn at the
+    // arguments is not closed.
+    const conditionalIndex = args.indexOf('--conditional-request');
+    if (conditionalIndex !== -1) {
+      const requestPath = args[conditionalIndex + 1];
+      const sessionId = args[1];
+      if (!sessionId || !requestPath) {
+        console.error('❌ Usage: telepty inject <session_id> --conditional-request <canonical-json-file>');
+        process.exit(1);
+      }
+      // ¶46 — reject the combinations outright. These are not merely unsupported here; each one
+      // names a behaviour ¶22 forbids inside the closed branch (a ref expansion rewrites the
+      // payload the hash covers; a separate --submit is a second physical attempt the admission
+      // does not own; --submit-force bypasses the gate; --submit-retry re-fires an Enter). Failing
+      // loudly beats silently ignoring them, which would let a caller believe it had forced
+      // something.
+      const forbidden = ['--ref', '--submit', '--submit-force', '--submit-retry', '--no-enter', '--from'];
+      const offending = forbidden.filter((flag) => args.includes(flag));
+      if (offending.length > 0) {
+        console.error(`❌ ${offending.join(', ')} cannot be combined with --conditional-request.`);
+        console.error('   The conditional branch owns exactly one body and one CR, its sender is the');
+        console.error('   verified bearer, and its payload hash covers the prompt as written.');
+        process.exit(1);
+      }
+
+      const snapshot = readConditionalRequestFile(requestPath, 'conditional request');
+      if (!snapshot.ok) { console.error(`❌ ${snapshot.error}`); markCommandFailed(); return; }
+      const parsed = conditionalCli.parseInjectRequest(snapshot.value);
+      if (!parsed.ok || !conditionalCli.isCanonicalRequestBytes(snapshot.raw, parsed.value)) {
+        console.error(`❌ Conditional request is not canonical: ${parsed.reason || 'noncanonical_bytes'}`);
+        markCommandFailed();
+        return;
+      }
+      const request = parsed.value;
+      // ¶46 "verifies exact schema/hash" — recompute the payload digest locally too. The daemon
+      // checks this as well; checking it here means a mistyped hash is caught before a request
+      // goes out, so it cannot land as an INVALID_REQUEST the operator has to correlate.
+      if (conditionalCli.sha256Hex(Buffer.from(request.prompt, 'utf8')) !== request.payload_sha256) {
+        console.error('❌ payload_sha256 does not match the prompt bytes in the request file.');
+        markCommandFailed();
+        return;
+      }
+      if (request.key.sid !== sessionId) {
+        console.error(`❌ Request key names sid '${request.key.sid}' but the command names '${sessionId}'.`);
+        markCommandFailed();
+        return;
+      }
+
+      const correlation = { msg_id: request.msg_id, binding_id: request.binding_id, sid: sessionId };
+      let res;
+      try {
+        // ¶46 — SENDS ONCE. There is no retry loop around this call and must not be one.
+        res = await fetchWithAuth(
+          `${daemonUrl('127.0.0.1')}/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: conditionalCli.canonicalJson(request),
+          });
+      } catch (e) {
+        // ¶30 — LOST CONNECTION. The request may have been admitted and emitted before the
+        // socket died; nothing here can distinguish that from never having arrived.
+        printConditionalHold(e.message || 'connection lost before a response was read', correlation);
+        return;
+      }
+
+      let data = null;
+      try { data = await res.json(); } catch { data = null; }
+
+      // ¶29 — a refusal is a DEFINITE answer: zero admission, zero bytes. Exit nonzero, but not
+      // as a HOLD; the caller knows exactly what happened and may fix and resend.
+      if (data && data.version === 1 && data.acceptance === 'refused' && typeof data.code === 'string') {
+        console.error(`❌ ${data.code}`);
+        if (data.code === 'STORE_UNAVAILABLE') console.error(conditionalCli.FIRST_INITIALIZATION_GUIDANCE);
+        markCommandFailed();
+        return;
+      }
+      // ¶26 — the acceptance receipt.
+      if (res.ok && data && data.version === 1 && data.acceptance === 'accepted'
+        && typeof data.inject_id === 'string') {
+        printConditionalReceipt(data);
+        // ¶27 — `transport: "unknown"` is itself a HOLD condition even on a 2xx: the daemon
+        // admitted the request and cannot say whether the adapter emission happened.
+        if (data.transport === 'unknown') {
+          printConditionalHold('daemon reported transport=unknown for an accepted admission',
+            { ...correlation, inject_id: data.inject_id });
+        }
+        return;
+      }
+      // ¶30 — ANY UNRECOGNIZED RESPONSE. Includes the existing middleware's own 401/403 body,
+      // which ¶30 explicitly allows to be returned before these routes and which this branch
+      // cannot read as either an acceptance or a scoped refusal.
+      printConditionalHold(`unrecognized daemon response (HTTP ${res.status})`, correlation);
+      return;
+    }
+
     if (interceptSubcommandHelp(cmd, args.slice(1))) return; // telepty#51: help must never become the injected prompt
     // telepty#51: an explicit `--` separator marks the rest as literal payload
     // (e.g. `telepty inject my-session -- --help` sends the literal text).
@@ -4647,6 +5385,12 @@ function printGlobalHelp() {
   telepty multicast <id1,id2> "<prompt>"         Inject into multiple sessions
   telepty broadcast [--ref [file]] "<prompt>"    Inject into ALL sessions
   telepty read-screen <id[@host]> [--lines N]    Read session screen buffer
+  telepty read-frame <id[@host]> [--json]       Read the VT grid + its qualification (observation only)
+
+\x1b[1mConditional Admission (principal-bound, single target):\x1b[0m
+  telepty target-binding <id> [--request <file>]  Show pinned target, or take a binding
+  telepty conditional-store-init --new-store  Explicit first store initialization (authenticated controller)
+  telepty inject <id> --conditional-request <file>  Bound inject (one body, one CR)
 
 \x1b[1mCross-Machine:\x1b[0m
   telepty connect <user@host> [--name N] [--port P]      SSH tunnel to remote host
@@ -4698,8 +5442,11 @@ if (require.main === module) {
   // #835: a refusal thrown from the daemon-probe path can surface on commands that do not wrap
   // their own call (`spawn`, `allow`). It must read as one clear line and exit non-zero — not as
   // an unhandled-rejection stack. Anything else keeps its previous crash behavior exactly.
+  // #751: the explicit no-lifecycle refusals join that same one-line path. They are already
+  // bounded messages, and rendering one as a stack trace would make the safety mode read as a
+  // crash rather than as the deliberate fail-closed it is.
   main().catch((error) => {
-    if (!isDaemonAnswerError(error)) throw error;
+    if (!isDaemonAnswerError(error) && !isDaemonLifecycleError(error)) throw error;
     console.error(`❌ ${error.message}`);
     process.exit(1);
   });
@@ -4715,6 +5462,8 @@ module.exports = {
   decideDaemonAction,     // #567: pure restart-decision policy (meta-primary; no I/O)
   deferToSupervisor,      // #738: supervisor-aware defer (injectable detect/probe/marker seams)
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
+  resolveDaemonLifecycleMode, // #751: TELEPTY_DAEMON_LIFECYCLE mode policy (pure; fail-closed)
+  isDaemonLifecycleError, // #751: classify the explicit no-lifecycle refusals
   helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
   updateRestartSucceeded, // gh#61: did `update` leave a running daemon — skip is not a failure

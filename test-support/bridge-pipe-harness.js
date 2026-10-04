@@ -15,9 +15,9 @@
 
 const fs = require('node:fs');
 const net = require('node:net');
-const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { createProvisionedTestHome } = require('./setup-env');
 
 const projectRoot = path.resolve(__dirname, '..');
 const LISTENING_BANNER = /listening on https?:\/\/[^\s]+:(\d+)/;
@@ -38,9 +38,12 @@ async function waitFor(check, { timeoutMs = 10000, intervalMs = 50, description 
 }
 
 function makeHome() {
-  // /tmp on darwin keeps socket paths short (see bridge-e2e.test.js).
-  const base = process.platform === 'darwin' && fs.existsSync('/tmp') ? '/tmp' : os.tmpdir();
-  return fs.mkdtempSync(path.join(base, 'tp732-'));
+  // T0 (#1170): a bare mkdtemp leaves the daemon on a home with no conditional-admission store, so
+  // isFenced() fails closed for every sid and these transport assertions fail behind an
+  // uninitialized-store banner. The factory creates and initializes in one step; `shortSocketPath`
+  // keeps the darwin /tmp base this harness needs (see bridge-e2e.test.js), since a socket path
+  // under /var/folders/... does not fit sun_path.
+  return createProvisionedTestHome('tp732-', { baseKind: 'shortSocketPath' });
 }
 
 function startDaemon({ home, port = 0, env = {} }) {

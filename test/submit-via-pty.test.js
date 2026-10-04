@@ -79,7 +79,10 @@ test('terminalLevelSubmit performs NO cmux/kitty surface shell-out (no child_pro
 
 test('submitViaPty writes a SINGLE 0x0D into the spawned ptyProcess (non-wrapped)', () => {
   const writes = [];
-  const session = { type: 'pty', ptyProcess: { write: (d) => writes.push(d) } };
+  // T0 (#1170) ¶39: submitViaPty resolves a sid and refuses when it has none. A real caller always
+  // has one, so the fixture carries it explicitly rather than relying on a fallback — production
+  // has none, and none is wanted.
+  const session = { id: 'p1', type: 'pty', ptyProcess: { write: (d) => writes.push(d) } };
   const ok = submitViaPty(session);
 
   assert.equal(ok, true);
@@ -88,6 +91,32 @@ test('submitViaPty writes a SINGLE 0x0D into the spawned ptyProcess (non-wrapped
   const bytes = Buffer.from(writes[0], 'utf8');
   assert.equal(bytes.length, 1);
   assert.equal(bytes[0], 0x0d);
+});
+
+test('submitViaPty refuses a record with no sid, and never falls back to a map key', () => {
+  // T0 (#1170): before the three explicit fixture ids were added, this refusal was exercised only
+  // by accident — the fixtures happened to lack a sid. With the accident gone, the production
+  // guard (`!submitSid → return false`) needs a test of its own, or a map-key fallback could be
+  // added later without anything going red. An Enter is a write, so the refusal must write nothing.
+  const writes = [];
+  const sent = [];
+  const noIdPty = { type: 'pty', ptyProcess: { write: (d) => writes.push(d) } };
+  const noIdWrapped = { type: 'wrapped', command: 'claude', ownerWs: { readyState: 1, send: (m) => sent.push(m) } };
+
+  assert.equal(submitViaPty(noIdPty), false, 'a record without a sid is refused');
+  assert.equal(submitViaPty(noIdWrapped), false);
+
+  // The map KEY is a sid-shaped string sitting right next to the record. It must not be adopted.
+  const results = runSubmitAll({ 'looks-like-a-sid': noIdWrapped });
+  assert.equal(results.successful.length, 0, 'the map key is not a substitute for the record sid');
+  assert.equal(results.failed.length, 1);
+
+  assert.equal(writes.length, 0, 'a refused submit writes no 0x0D to the PTY');
+  assert.equal(sent.length, 0, 'a refused submit sends no inject to the owner socket');
+
+  // And the explicit-sid route still works, so the refusal is about the missing id, not the shape.
+  assert.equal(submitViaPty(noIdPty, { sessionId: 'p1' }), true);
+  assert.deepEqual(writes, ['\r']);
 });
 
 test('submitViaPty returns false (no submit) when the wrapped ownerWs is not connected', () => {
@@ -336,10 +365,13 @@ test('forceSubmitDeliveredToSurface: pty_cr is delivered on cmux (PTY-native) an
 test('#546: submit-all delivers a single 0x0D via the PTY path to ≥2 wrapped sessions (no cmux send-key)', () => {
   const sentA = [];
   const sentB = [];
+  // T0 (#1170) ¶39: the record carries its own `id`. runSubmitAll's map key is NOT copied onto the
+  // session, and submitViaPty deliberately does not fall back to it — a record without a sid is
+  // refused, by design. The fixture supplies the sid a real session always has.
   const sessionsMap = {
-    a: { type: 'wrapped', command: 'claude', backend: 'cmux', cmuxWorkspaceId: 'ws:1',
+    a: { id: 'a', type: 'wrapped', command: 'claude', backend: 'cmux', cmuxWorkspaceId: 'ws:1',
          ownerWs: { readyState: 1, send: (m) => sentA.push(m) } },
-    b: { type: 'wrapped', command: 'codex', backend: 'cmux', cmuxWorkspaceId: 'ws:2',
+    b: { id: 'b', type: 'wrapped', command: 'codex', backend: 'cmux', cmuxWorkspaceId: 'ws:2',
          ownerWs: { readyState: 1, send: (m) => sentB.push(m) } },
   };
   const realExecSync = child_process.execSync;

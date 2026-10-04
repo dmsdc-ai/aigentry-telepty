@@ -21,11 +21,11 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
 
 const { isBusyDispatchState } = require('../src/submit-gate');
+const { createProvisionedTestHome } = require('../test-support/setup-env');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const TOKEN = 'test-694-token';
@@ -162,7 +162,9 @@ function attachOwnerBridge(port, sessionId, bearer) {
 // (a) idle path BYTE-UNCHANGED — the clean render-gate ready branch, untouched by #694.
 // ---------------------------------------------------------------------------
 test('#694(a) idle target: clean ready path (gate_wait_ms=0, consumed, no gated_dispatch flag)', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tp694i-'));
+  // T0 (#1170): the factory, not `mkdtempSync` — `bootDaemon` never provisions, and an
+  // uninitialized store fences every sid, refusing /submit before the render-gate.
+  const home = createProvisionedTestHome('tp694i-');
   let d;
   try {
     d = await bootDaemon(home);
@@ -198,7 +200,8 @@ test('#694(a) idle target: clean ready path (gate_wait_ms=0, consumed, no gated_
 // (b) busy path — fast-path dispatches best-effort instead of burning the full gate timeout.
 // ---------------------------------------------------------------------------
 test('#694(b) busy target: fast-path dispatches without the full-timeout burn', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tp694b-'));
+  // T0 (#1170): provisioned home, same reason as #694(a) above.
+  const home = createProvisionedTestHome('tp694b-');
   let d;
   try {
     d = await bootDaemon(home);

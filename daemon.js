@@ -25,12 +25,17 @@ const completionObservation = require('./src/completion-observation');
 const { CAPABILITY_STAGE_A, classifyConsumption, buildCompletionUnknown, formatCompletionUnknownText, shouldPushCompletionUnknown } = completionObservation;
 const submitGate = require('./src/submit-gate');
 const { stripAnsiForScreen } = require('./src/screen-ansi'); // #715: read-screen ANSI/VT stripper
+// #1136: stateful VT observation. Strictly ALONGSIDE the ring — `stripAnsiForScreen`, `/screen`
+// and `read-screen` are byte-for-byte unchanged, because their defect is that they return the
+// tail of accumulated history and that is what some consumers still read.
+const vtObservation = require('./src/vt/session-screen');
 const { sampleChildCpuSeconds } = require('./src/child-cpu'); // #52: quiet-thinking CPU recheck
 const readyRegistry = require('./src/prompt-symbol-registry');
 const lifecycle = require('./src/lifecycle');
 const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, decideSurfaceGcAction, applySurfaceMismatchProbe } = lifecycle;
 const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
+const conditionalAdmission = require('./src/session-store/conditional-admission'); // T0 (#1170)
 const { createCredentialStore } = require('./src/session-store/session-credentials');
 const { createAuditWriter, readInjectLog } = require('./src/audit/inject-log');
 const { mintSessionNonce, applyProvenance } = require('./src/audit/provenance');
@@ -247,7 +252,20 @@ function loadPersistedSessions() {
 const app = express();
 app.use(cors());
 
-app.use(express.json());
+// T0 (#1170) ¶11 — capture the RAW body bytes alongside the parsed object.
+//
+// `express.json()` cannot express two of the contract's rules. Duplicate keys are invisible after
+// parsing (JSON silently takes last-wins), and ¶11 forbids them outright — a `{"prompt":"a",
+// "prompt":"b"}` request would otherwise be hashed by the caller over one document and admitted by
+// the daemon over another. And ¶21 requires the payload hash to be recomputed over the EXACT
+// prompt bytes, which means the daemon has to have seen them.
+//
+// The `verify` hook is the seam express provides for exactly this. It attaches the buffer and
+// changes nothing else: every existing route reads `req.body` as before, and a route that never
+// looks at `req.rawBody` cannot behave differently because it exists.
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
 const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -552,6 +570,136 @@ let trackedLedgerUnavailableReason = null;
 
 function commitTrackedInjections() {
   return sessionPersistence.saveTrackedInjections(trackedInjections, TRACKED_INJECTIONS_PATH);
+}
+
+// ---------------------------------------------------------------------------
+// T0 (#1170) — the scoped conditional-admission lane.
+// ---------------------------------------------------------------------------
+//
+// Separate store, separate authority, separate failure mode from the #60 observation ledger
+// above. That one records what was OBSERVED about a delivery; this one decides whether a delivery
+// may happen at all. Collapsing them would make an observation-store outage into a delivery
+// authorization, which is the wrong direction for both.
+//
+// The store is constructed here and LOADED before readiness (see the restore call beside
+// restoreTrackedInjections). Until then it refuses everything — a store that has not been read
+// cannot know what it has already admitted.
+const conditionalStore = new conditionalAdmission.ConditionalAdmissionStore({
+  path: process.env.TELEPTY_CONDITIONAL_ADMISSIONS_PATH
+    || sessionPersistence.defaultConditionalAdmissionsPath(),
+});
+
+/**
+ * ¶39 — is this session permanently fenced against UNBOUND writes?
+ *
+ * Unavailable history cannot prove that a record was never bound. Refuse unbound
+ * writes on storage failure; healthy, never-bound records retain their legacy path.
+ */
+function isConditionallyFenced(sid) {
+  try { return conditionalStore.isFenced(sid); } catch { return true; }
+}
+
+/**
+ * ¶23 — "Principal must equal B.principal AND STILL VERIFY."
+ *
+ * Re-verification without a bearer in hand. The credential store is keyed by epoch and exposes
+ * `verify(bearer)` / `hasCredential(sid)` / `matches(sid, bearer)`; there is no lookup by epoch,
+ * and `src/session-store/session-credentials.js` is NOT an owned leaf in T0, so this cannot be
+ * answered by adding one. Two facts are available and both are required:
+ *
+ *   1. the store still holds SOME credential for that sid — `revoke()` drops every epoch of a sid
+ *      on each destroy path, so a revoked or destroyed principal fails here; and
+ *   2. the sid's live record still carries the SAME epoch and generation the principal names — a
+ *      delete/recreate reissues, and the successor's epoch differs, so a reused name fails here.
+ *
+ * Both must hold. Absence of either is a refusal, never a pass: this predicate is consulted before
+ * bytes move, so its failure mode has to be "do not deliver".
+ *
+ * MEASUREMENT GAP, recorded rather than papered over: (1)+(2) prove the principal's credential was
+ * not revoked and its instance was not replaced. They do not re-prove POSSESSION of the secret —
+ * only a presented bearer does that, and the CR phase has no request to carry one. Possession was
+ * proved at admission, on the request that carried the bearer; what this re-checks is that the
+ * identity it resolved to still exists and still means the same instance. A future revision that
+ * wants possession re-proved at CR needs the epoch-lookup seam and a separate approval.
+ */
+function conditionalPrincipalStillVerifies(principal) {
+  if (!principal) return false;
+  if (!sessionCredentials.hasCredential(principal.sid)) return false;
+  const session = sessions[principal.sid];
+  if (!session || !session.sessionEpoch) return false;
+  return session.sessionEpoch === principal.epoch
+    && (Number(session.credentialGeneration) || 1) === principal.generation;
+}
+
+/** The shared refusal responder for every scoped route — ¶29's body and nothing else. */
+function respondConditionalRefusal(res, refusal, context) {
+  if (refusal.reason) {
+    console.warn(`[COND] refused ${context || 'request'} — ${refusal.code} (${refusal.reason})`);
+  }
+  return res.status(refusal.status).json(refusal.body);
+}
+
+/**
+ * ¶9 — a verified SESSION BEARER is required on these routes, IN ADDITION to the existing
+ * origin/IP/host-token-or-JWT middleware that already ran (app.use(createAuthMiddleware) above).
+ *
+ * Two independent facts, and the contract is explicit that neither substitutes for the other: the
+ * host auth says this request came from somewhere allowed to talk to the daemon, and the bearer
+ * says WHICH principal is talking. P is derived from the bearer alone — never from body.from,
+ * which is attacker-controlled (the #43/#815 rule, applied to a lane where it decides delivery
+ * rather than labelling it).
+ */
+function conditionalPrincipalFromReq(req) {
+  return conditionalAdmission.principalFromCredential(verifiedPrincipalFromReq(req));
+}
+
+/**
+ * ¶11 — the raw-body gate every scoped POST passes through first.
+ *
+ * Duplicate keys are refused here, on the bytes, because this is the only place they are still
+ * visible. Returns a refusal or null.
+ */
+function checkCanonicalRawBody(req, parseRequest) {
+  const raw = req.rawBody;
+  if (!raw || !raw.length) {
+    return conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, 'empty_body');
+  }
+  if (conditionalAdmission.hasDuplicateKeys(raw.toString('utf8'))) {
+    return conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, 'duplicate_keys');
+  }
+  const parsed = parseRequest(req.body);
+  if (!parsed.ok || !conditionalAdmission.isCanonicalRequestBytes(raw, parsed.value)) {
+    return conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST,
+      parsed.reason || 'noncanonical_bytes');
+  }
+  return null;
+}
+
+/**
+ * ¶43 — restore receipts before readiness, and send nothing.
+ *
+ * Runs beside restoreTrackedInjections for the same reason it does: the first request after a
+ * restart must be answered from durable state, not from an empty map. The difference is what
+ * "restored" means here — every in-flight phase becomes `held`/`unknown`, and no stored E can
+ * match any live owner because no owner has claimed a `delivery_generation` yet in this process.
+ */
+function restoreConditionalAdmissions() {
+  const initialized = conditionalStore.initialize();
+  if (!initialized.ok) {
+    console.warn(`[COND] conditional-admission store unavailable (${initialized.reason}) — `
+      + 'scoped delivery and unbound daemon writes are disabled while fence history is unavailable. '
+      + conditionalAdmission.FIRST_INITIALIZATION_GUIDANCE);
+    return;
+  }
+  const restored = conditionalAdmission.restoreAdmissions(conditionalStore);
+  if (!restored.ok) {
+    console.warn(`[COND] conditional-admission restore failed (${restored.reason}) — scoped lane disabled`);
+    return;
+  }
+  if (restored.held.length > 0) {
+    console.log(`[COND] restored ${restored.held.length} in-flight admission phase(s) as held/unknown — `
+      + 'none will be resent');
+  }
 }
 
 // Restore BEFORE HTTP/WS readiness. A restored record gets `daemon_restart_observed` appended: a
@@ -1756,6 +1904,42 @@ function bootstrapQueuedResponse(op, extra = {}) {
 }
 
 async function executeBootstrapInject(sessionId, session, op) {
+  // T0 (#1170) ¶35/¶42 — a parked SCOPED op is replayed from its admission record, never from the
+  // sid it was filed under.
+  //
+  // This is where "delayed queues never inherit a replacement's sid-only identity" is enforced.
+  // `sessionId` and `session` here are whatever holds that name NOW, which after a delete/recreate
+  // or an owner replacement is a different destination than the one the binding authorized. The
+  // record carries E; re-deriving the destination from it, and letting the guarded writer refuse
+  // when it no longer matches, is the only correct replay.
+  if (op.admissionInjectId) {
+    if (!conditionalStore.available()) {
+      return { success: false, code: 'STORE_UNAVAILABLE', error: 'conditional store unavailable', bytes_written: 0 };
+    }
+    const record = conditionalStore.getAdmissionByInjectId(op.admissionInjectId);
+    if (!record) {
+      // ¶35 — "absent/mismatched records ... refuse". A queued op whose record is gone cannot be
+      // replayed as an ordinary inject: that would be an unbound write built out of a bound one.
+      return { success: false, code: 'UNBOUND_TARGET', error: 'conditional admission record missing', bytes_written: 0 };
+    }
+    if (record.body_phase !== 'pending') {
+      // ¶41 — the phase already accounts for a physical attempt; the drain does not get another.
+      return { success: true, strategy: 'conditional_skipped', bytes_written: 0 };
+    }
+    const enqueued = enqueueConditionalBody(record, sessions[record.target.sid]);
+    if (!enqueued.ok) {
+      return { success: false, code: enqueued.code, error: enqueued.reason, bytes_written: 0 };
+    }
+    try {
+      await mailboxDelivery.tick();
+    } catch {}
+    const settled = conditionalStore.getAdmissionByInjectId(record.inject_id) || record;
+    if (settled.body_phase !== 'emitted') {
+      return { success: false, code: 'UNBOUND_TARGET', error: `conditional body ${settled.body_phase}`, bytes_written: 0 };
+    }
+    return { success: true, strategy: 'conditional_mailbox', bytes_written: 0 };
+  }
+
   const prompt = typeof op.prompt === 'string' ? op.prompt : '';
   // #760: this is the ONLY inject path that wrote the body un-enveloped — the mailbox path
   // has wrapped it since #716/#730, and #730 measured that the un-enveloped MULTI-LINE shape
@@ -2454,7 +2638,29 @@ function emitInjectFailureEvent(sessionId, code, error, extra = {}, session = nu
   });
 }
 
-async function writeDataToSession(id, session, data) {
+/**
+ * @param {Object} [options] - T0 (#1170): `{ admission }` marks this write as BOUND, i.e. carried
+ *   by a committed conditional admission whose destination was rechecked immediately before the
+ *   call. Absent (every pre-existing caller) means UNBOUND, which is what the ¶39 fence refuses.
+ */
+async function writeDataToSession(id, session, data, options = {}) {
+  // T0 (#1170) ¶39 — THE PHYSICAL ADAPTER BOUNDARY.
+  //
+  // Placed at the top of the one function every text/CR delivery funnels through, rather than at
+  // each of its nine call sites, because a fence with nine copies is a fence with nine chances to
+  // be forgotten — and the call sites are exactly the delayed timers, queue drains and fallback
+  // paths that get added without anyone rereading this rule. A fenced record accepts writes only
+  // from the scoped lane; everything else — legacy inject, /submit, bootstrap drain, mailbox
+  // delivery of an unbound message, fanout — is refused here regardless of how it got this far.
+  //
+  // ¶39's "cancel already-pending unbound writes" lands here too: a `setTimeout`-deferred CR armed
+  // before the binding existed still has to pass this check when it fires, and now does not.
+  // Scoped writes use claimAndSend; an options object cannot bypass that guard.
+  if (isConditionallyFenced(id)) {
+    return buildErrorBody('UNBOUND_TARGET', 'Session is bound to a conditional admission; unbound writes are refused.', {
+      httpStatus: 409,
+    });
+  }
   if (session.type === 'aterm') {
     // UDS delivery via net.connect()
     if (session.delivery && session.delivery.transport === 'unix_socket' && session.delivery.address) {
@@ -2466,6 +2672,12 @@ async function writeDataToSession(id, session, data) {
           resolve(buildErrorBody('TIMEOUT', 'UDS delivery timed out.', { httpStatus: 504 }));
         }, DELIVERY_TIMEOUT_MS);
         const sock = net.connect(session.delivery.address, () => {
+          if (isConditionallyFenced(id)) {
+            clearTimeout(timeout);
+            sock.destroy();
+            resolve(buildErrorBody('UNBOUND_TARGET', 'Fence history prohibits this pending write.', { httpStatus: 409 }));
+            return;
+          }
           sock.end(payload);
         });
         sock.on('data', (chunk) => { responseBuf += chunk.toString(); });
@@ -2570,7 +2782,11 @@ async function writeDataToSession(id, session, data) {
  * Returns the strategy name ('pty_cr') or null on failure.
  */
 function terminalLevelSubmit(id, session) {
-  if (submitViaPty(session)) return 'pty_cr';
+  // T0 (#1170) ¶39 — pass the ROUTE'S id rather than letting the fence fall back to `session.id`.
+  // Every session record does carry `id` today, but a missed fence is a silent authorization
+  // failure rather than a cosmetic one, so the check does not depend on a field the record has to
+  // remember to keep in sync.
+  if (submitViaPty(session, { sessionId: id })) return 'pty_cr';
   return null;
 }
 
@@ -2968,12 +3184,22 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       // and the ledger part company — the route returns, and whatever this queue eventually does
       // with the op is the only thing left that can answer for it.
       injectId: options.injectId || null,
+      // T0 (#1170) ¶35 — the IMMUTABLE A identity rides on the op for the same reason, and it
+      // carries more weight here: the drain that eventually runs this op must re-derive E, P and
+      // B from the record rather than from the sid the op was filed under. ¶42's "Delayed queues
+      // never inherit a replacement's sid-only identity" is precisely this hazard.
+      admissionInjectId: options.admission ? options.admission.inject_id : null,
       options: {
         source: options.source || 'inject',
         from: options.from || 'daemon'
       }
     });
     parkTrackedInjection(options.injectId, 'bootstrap_queue', 'bootstrap_not_ready');
+    if (options.admission) {
+      conditionalStore.commitPhase(options.admission, { transport: 'queued', consumption: 'queued' }, {
+        kind: 'body_parked', queue: 'bootstrap', reason: 'bootstrap_not_ready', op_id: op.op_id,
+      });
+    }
     session.lastActivityAt = new Date(now).toISOString();
     return bootstrapQueuedResponse(op, {
       msg_id: op.op_id,
@@ -3015,9 +3241,15 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
         prompt,
         noEnter: !!options.noEnter,
         injectId: options.injectId || null,     // #860 F2 — see the bootstrap-queue push above
+        admissionInjectId: options.admission ? options.admission.inject_id : null, // ¶35
         options: { source: options.source || 'inject', from: options.from || 'daemon' },
       }, injectParkDecision);
       parkTrackedInjection(options.injectId, 'bootstrap_queue', injectParkDecision.reason);
+      if (options.admission) {
+        conditionalStore.commitPhase(options.admission, { transport: 'queued', consumption: 'queued' }, {
+          kind: 'body_parked', queue: 'modal', reason: injectParkDecision.reason, op_id: op.op_id,
+        });
+      }
       session.lastActivityAt = new Date(now).toISOString();
       return modalParkResponse(op, injectParkDecision, {
         msg_id: op.op_id,
@@ -3054,6 +3286,33 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   // deferred/gated submit CR (written separately, outside the 200~/201~ envelope)
   // reliably fires instead of being swallowed into the paste burst. No-op otherwise.
   const deliveredBody = maybeBracketedPaste(deliveredPrompt, session);
+
+  // T0 (#1170) ¶35/¶36 — the scoped fork. Everything above this point (bootstrap gate, modal
+  // gate, park-behind-backlog ordering) is SHARED deliberately: the scoped lane must obey the
+  // same surface rules as every other write, and giving it a private path around the modal gate
+  // would reintroduce #737 for the one lane that claims the strongest guarantees.
+  //
+  // What diverges is the enqueue and everything after it: the scoped body is keyed by the
+  // admission, digested before it is queued, and delivered by the guarded synchronous writer in
+  // deliverConditionalBody. It does NOT arm the generic deferred CR below — the scoped CR is
+  // armed by that writer, only once the body actually emitted (¶40).
+  if (options.admission) {
+    const enqueued = enqueueConditionalBody(options.admission, session);
+    if (!enqueued.ok) {
+      return { success: false, httpStatus: enqueued.status, code: enqueued.code, error: `conditional enqueue refused: ${enqueued.reason}` };
+    }
+    try {
+      await mailboxDelivery.tick();
+    } catch {}
+    session.lastActivityAt = new Date(now).toISOString();
+    return {
+      success: true,
+      msg_id: options.admission.mailbox_msg_id,
+      queued: true,
+      strategy: 'conditional_mailbox',
+      submit: 'conditional_cr',
+    };
+  }
 
   try {
     const ack = mailbox.enqueue({
@@ -3126,7 +3385,228 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   }
 }
 
-function appendToOutputRing(session, data) {
+// ---------------------------------------------------------------------------
+// T0 (#1170) — scoped delivery. One body, one CR, one admission record.
+// ---------------------------------------------------------------------------
+
+/** The live B for an admission, or null when it is gone (¶23 — a missing binding refuses). */
+function conditionalBindingFor(record) {
+  const stored = conditionalStore.getBinding(record.binding_id);
+  return stored ? stored.binding : null;
+}
+
+/** The recheck arguments every scoped phase shares, so no caller can assemble a weaker set. */
+function conditionalGuardArgs(record, nowMs) {
+  return {
+    sessions,
+    record,
+    binding: conditionalBindingFor(record),
+    nowMs: nowMs == null ? Date.now() : nowMs,
+    verifyPrincipal: conditionalPrincipalStillVerifies,
+    isOpenWebSocket,
+  };
+}
+
+/**
+ * ¶36 — the DEQUEUE half of the scoped body path.
+ *
+ * Returns null when `msg` is not a conditional message, so the ordinary mailbox delivery below is
+ * untouched (¶8: existing unpinned traffic keeps its current behavior). Otherwise it owns the
+ * outcome completely and never falls through to `writeDataToSession`.
+ *
+ * Three refusals before anything can be written, and each one exists because the queue is the
+ * gap between the admission and the wire:
+ *
+ *   no record       — ¶57. A forged `conditional:<uuid>:body` id naming nothing, or naming a real
+ *                     inject_id whose record does not claim that mailbox id, never writes.
+ *   digest mismatch — ¶36. The stored payload was altered between enqueue and dequeue. The bytes
+ *                     on the queue are no longer the bytes that were admitted, and the hash the
+ *                     caller signed describes the ones that were.
+ *   phase not pending — ¶41. A generic mailbox nack or recoverInflight MAY revisit an item; that
+ *                     is the queue's business and it is allowed to. What it may not do is produce
+ *                     a second PHYSICAL attempt for a body already claimed, emitted or held.
+ *
+ * Synchronous by contract (¶34): there is no `await` between the recheck inside claimAndSend and
+ * the captured `ownerWs.send`.
+ */
+function deliverConditionalBody(sessionId, session, msg) {
+  const mailboxId = msg && msg.msg_id;
+  if (typeof mailboxId !== 'string' || !mailboxId.startsWith('conditional:')) return null;
+
+  // ¶32 — the scoped store is the authority. With it unavailable, a conditional message cannot be
+  // validated at all, and delivering it unvalidated is the one thing that must not happen.
+  if (!conditionalStore.available()) {
+    return { success: false, error: 'conditional_store_unavailable' };
+  }
+  const record = conditionalStore.getAdmissionByMailboxId(mailboxId);
+  if (!record) {
+    console.warn(`[COND] refused mailbox delivery for ${sessionId} — no matching admission record (${mailboxId})`);
+    return { success: false, error: 'conditional_admission_record_missing' };
+  }
+  const payload = typeof msg.payload === 'string' ? msg.payload : '';
+  if (conditionalAdmission.sha256Hex(Buffer.from(payload, 'utf8')) !== record.body_bytes_sha256) {
+    console.warn(`[COND] refused mailbox delivery for ${sessionId} — stored payload digest mismatch (${mailboxId})`);
+    return { success: false, error: 'conditional_body_digest_mismatch' };
+  }
+  if (record.body_phase !== 'pending') {
+    // Not an error the queue should retry: the physical attempt is already accounted for.
+    console.warn(`[COND] skipped re-delivery for ${sessionId} — body phase is ${record.body_phase} (${mailboxId})`);
+    return { success: true, conditional_skipped: record.body_phase };
+  }
+
+  const sent = conditionalAdmission.claimAndSend({
+    store: conditionalStore,
+    record,
+    phase: 'body',
+    payload,
+    ...conditionalGuardArgs(record),
+  });
+  if (!sent.ok) {
+    if (!sent.unknown) {
+      // ¶42 — zero-byte stale rejection is permitted ONLY because nothing was emitted here: the
+      // refusal happened at the recheck, before any handoff.
+      conditionalStore.commitPhase(record, { body_phase: 'held', transport: 'failed' }, {
+        kind: 'body_refused', code: sent.code, reason: sent.reason,
+      });
+    }
+    return { success: false, error: `conditional_${sent.code}:${sent.reason}` };
+  }
+
+  session.lastActivityAt = new Date().toISOString();
+  // #732 — a wrapped delivery doubles as an upstream probe, exactly as writeDataToSession does
+  // for the unbound path. Kept AFTER the send and outside the guarded window.
+  armUpstreamProbe(session);
+  // ¶40 — the CR becomes eligible HERE and nowhere else: the same A's body was emitted. Not
+  // because enqueue succeeded, and not because mailbox.tick returned.
+  scheduleConditionalCr(record);
+  return { success: true };
+}
+
+/**
+ * ¶40/¶42 — the one delayed CR this admission owns.
+ *
+ * Separate from the body write for the reason #716/#730 established: text and CR in one write get
+ * swallowed by bracketed paste, so the CR is a separate frame after a delay. That delay is an
+ * await in every sense that matters, which is why ¶37 requires a FRESH check when it fires —
+ * everything the body write verified may have changed while the timer was pending.
+ *
+ * ¶42 — a replacement between body and CR SUPPRESSES the CR and records the reason. It does not
+ * retry, and it does not chase the successor: the successor is a different destination, and the
+ * body is already on the predecessor's surface.
+ */
+function scheduleConditionalCr(record) {
+  if (record.cr_phase !== 'pending') return;
+  setTimeout(() => {
+    // Re-read the record from the store: a restart or a phase commit may have moved it, and the
+    // captured reference must not become the authority (the same rule the #732 WS guard applies
+    // to session records).
+    const live = conditionalStore.available()
+      ? conditionalStore.getAdmissionByInjectId(record.inject_id)
+      : null;
+    if (!live) return;
+    if (live.body_phase !== 'emitted') {
+      conditionalStore.commitPhase(live, { cr_phase: 'held' }, {
+        kind: 'cr_suppressed', reason: `body_phase:${live.body_phase}`,
+      });
+      return;
+    }
+    if (live.cr_phase !== 'pending') return;
+
+    const session = sessions[live.target.sid];
+    // #737/#760 — the surface gate. A CR into a surface whose Enter is wired to something other
+    // than "submit my message" is the #737 defect; the scoped lane consults the same predicate the
+    // unbound paths do rather than inventing a second policy. Fail-open is the existing behaviour
+    // of that predicate and is not widened here.
+    if (session && isSurfaceBlockedByModal(session)) {
+      conditionalStore.commitPhase(live, { cr_phase: 'held' }, {
+        kind: 'cr_suppressed', reason: 'surface_modal',
+      });
+      return;
+    }
+
+    const sent = conditionalAdmission.claimAndSend({
+      store: conditionalStore,
+      record: live,
+      phase: 'cr',
+      payload: '\r',
+      ...conditionalGuardArgs(live),
+    });
+    if (!sent.ok) {
+      if (!sent.unknown) {
+        conditionalStore.commitPhase(live, { cr_phase: 'held' }, {
+          kind: 'cr_refused', code: sent.code, reason: sent.reason,
+        });
+      }
+      console.warn(`[COND] CR suppressed for ${live.inject_id} — ${sent.code} (${sent.reason})`);
+      return;
+    }
+    if (session) armUpstreamProbe(session);
+  }, WRAPPED_SUBMIT_DELAY_MS);
+}
+
+/**
+ * ¶35/¶36 — the ENQUEUE half. Commits the body digest BEFORE the bytes reach the queue.
+ *
+ * The transformation (provenance banner, bracketed-paste envelope) is applied here, exactly as
+ * the unbound path applies it, and the digest is taken over the TRANSFORMED bytes — those are the
+ * bytes that will sit on the queue and the bytes the dequeue check has to reproduce. The RAW
+ * request hash lives on separately in `request_sha256`; ¶36 wants both, because they answer
+ * different questions ("did the caller's payload arrive intact" vs "was the queued item altered").
+ *
+ * ¶36 also requires provenance/bracketed-paste behaviour to be PRESERVED. Note what provenance
+ * identifies: P, the principal that authenticated. Not an attested worker — no such attestation
+ * exists in T0 (¶18/¶63), and labelling the banner as one would be the substitution this release
+ * is built to refuse.
+ */
+function enqueueConditionalBody(record, session) {
+  const prompt = record.request.prompt;
+  const deliveredPrompt = applyProvenance(prompt, {
+    capable: !!(session && session.provenanceCapable),
+    nonce: session && session.provenanceNonce,
+    verified: record.principal.sid,
+    claimed: null,
+    origin: 'trusted-local',
+  }).payload;
+  const deliveredBody = maybeBracketedPaste(deliveredPrompt, session);
+
+  const committed = conditionalStore.commitPhase(record, {
+    body_bytes_sha256: conditionalAdmission.sha256Hex(Buffer.from(deliveredBody, 'utf8')),
+    transport: 'queued',
+    consumption: 'queued',
+  }, { kind: 'body_enqueue_prepared' });
+  if (!committed.ok) {
+    return conditionalAdmission.refuse(conditionalAdmission.REFUSAL.STORE_UNAVAILABLE, committed.reason);
+  }
+
+  try {
+    mailbox.enqueue({
+      msg_id: record.mailbox_msg_id,
+      from: record.principal.sid,
+      to: record.target.sid,
+      payload: deliveredBody,
+      created_at: Math.floor(Date.now() / 1000),
+      attempt: 0,
+    });
+  } catch (error) {
+    // ¶41 — NEVER direct-fallback after an uncertain enqueue. The unbound path above does exactly
+    // that (`strategy: 'direct_fallback'`), and it is safe there because nothing has promised
+    // exactly-one physical attempt. Here the enqueue may have landed before throwing, so a direct
+    // write could be the second attempt at the same body. `held` + `unknown` is the honest answer.
+    conditionalStore.commitPhase(record, { body_phase: 'held', transport: 'unknown' }, {
+      kind: 'enqueue_failed', detail: String(error && error.message),
+    });
+    return conditionalAdmission.refuse(conditionalAdmission.REFUSAL.STORE_UNAVAILABLE, 'enqueue_failed');
+  }
+  return { ok: true };
+}
+
+/**
+ * @param {object} session
+ * @param {string} data
+ * @param {object} [streamMeta] — #1136 U2: `{ stream_id, stream_offset }` as stated by the
+ *   wrapped bridge. Absent on the direct-spawn path below, where this daemon is the producer.
+ */
+function appendToOutputRing(session, data, streamMeta) {
   if (!session.outputRing) session.outputRing = [];
   // #716: track bracketed-paste capability from the CLI's own mode-set output so
   // injects are wrapped (maybeBracketedPaste) only for paste-capable composers —
@@ -3137,6 +3617,16 @@ function appendToOutputRing(session, data) {
   // #52: monotonic byte counter — the inject-time watermark that scopes echo-evidence
   // matching to frames appended AFTER the inject (survives ring trimming below).
   session.outputRingTotalBytes = (session.outputRingTotalBytes || 0) + data.length;
+  // #1136 §3 — ONE WRITER. This function is the single choke point for both producers (the
+  // spawned PTY's onData below, and the wrapped bridge's `output` frame in
+  // src/transport/websocket.js), so the VT is fed here and ONLY here. Feeding it anywhere else
+  // would put stream production, ordering and consumption under two authorities that can
+  // disagree about units and lifecycle. Placed immediately after `outputRingTotalBytes`
+  // advances so the two counters measure the same units at the same instant.
+  //
+  // Total by construction (every helper in that module swallows its own failures): observation
+  // must never be able to break the terminal path.
+  vtObservation.noteSessionOutput(session, data, streamMeta);
   session.outputRing.push(data);
   // Keep total data under ~200KB limit by trimming old entries
   let totalLen = session.outputRing.reduce((sum, d) => sum + d.length, 0);
@@ -3283,6 +3773,7 @@ async function teardownSessionById(id, options = {}) {
   cancelModalParkPoll(session);   // #760: a destroyed session must not keep polling its surface
 
   delete sessions[id];
+  vtObservation.disposeSessionScreen(session);   // #1136 §8: lifetime ends with the record
   revokeSessionCredential(id);    // #815: kill path — the epoch dies with the instance
   sessionStateManager.unregister(id);
   try { mailbox.purge(id); } catch {}
@@ -3309,6 +3800,12 @@ console.log(`[DAEMON] Terminal backend: ${DETECTED_TERMINAL}`);
 // gains `daemon_restart_observed` and stays completion-unknown; it can never settle a dispatch.
 restoreTrackedInjections();
 
+// T0 (#1170) ¶33/¶43 — initialize the scoped store and restore its receipts, also BEFORE
+// readiness. The marker is written here, before the first admission can be enabled, so a store
+// that cannot be initialized disables the scoped lane instead of admitting into a ledger nobody
+// can answer for. Nothing is ever resent.
+restoreConditionalAdmissions();
+
 // Restore persisted session metadata (wrapped sessions await reconnect)
 const _persisted = loadPersistedSessions();
 for (const [id, meta] of Object.entries(_persisted)) {
@@ -3320,6 +3817,13 @@ for (const [id, meta] of Object.entries(_persisted)) {
   // this, every restored session silently becomes an unauthenticated sender — the child's env
   // cannot be updated from outside, so a fresh credential would never reach it.
   sessionCredentials.adopt(id, meta);
+  // T0 (#1170) ¶14 — RESTORE mints a fresh delivery_generation, and ¶43's "changed
+  // delivery_generation invalidates pins" is exactly the intended consequence. A restored record
+  // has no owner socket and has proved nothing to THIS daemon (persistence.js deliberately does
+  // not serialize `sessionEpochProved`), so any pin taken before the restart must stop matching.
+  // Minting here rather than leaving the field undefined makes that a positive fact instead of an
+  // absence a later writer could fill in by accident.
+  conditionalAdmission.rotateDeliveryGeneration(sessions[id]);
   initializeBootstrapState(sessions[id]);
   // #678: a session restored across a daemon restart must get a render-state machine,
   // else the submit gate reads getState()=null → no_state and never fires the CR. The
@@ -3426,10 +3930,17 @@ app.post('/api/sessions/spawn', (req, res) => {
       }
     }
 
+    // #1136 §5 — the geometry this daemon ITSELF passes to `pty.spawn` is first-hand knowledge
+    // of the child's size. It was computed inline and thrown away; named and stored below so
+    // the VT can be constructed at the right size and `geometry_source: "local_pty"` describes
+    // a fact rather than a guess.
+    const spawnCols = parseInt(cols);
+    const spawnRows = parseInt(rows);
+
     const ptyProcess = pty.spawn(shell, shellArgs, {
       name: isWin ? 'Windows Terminal' : 'xterm-256color',
-      cols: parseInt(cols),
-      rows: parseInt(rows),
+      cols: spawnCols,
+      rows: spawnRows,
       cwd,
       env: customEnv
     });
@@ -3450,9 +3961,27 @@ app.post('/api/sessions/spawn', (req, res) => {
       clients: new Set(),
       isClosing: false,
       outputRing: [],
+      // #1136 §5 — the daemon's own authoritative geometry for a spawned session. Kept current
+      // by the resize path (src/transport/websocket.js viewerResizeDeliverer), which this
+      // daemon executes itself and therefore always knows the new size of.
+      ptyCols: Number.isInteger(spawnCols) ? spawnCols : null,
+      ptyRows: Number.isInteger(spawnRows) ? spawnRows : null,
       ready: true,
           };
     sessions[session_id] = sessionRecord;
+
+    // #1136 §5 — origin-0, positively. Created HERE, inside the spawn handler and BEFORE
+    // `ptyProcess.onData` is registered below, so the first unit this VT ever sees is the first
+    // unit the child ever produced. That, plus the geometry above being known before it, is the
+    // ONLY way a session reaches `completeness: "complete"` on this path. Attaching to an
+    // already-running child cannot reproduce either fact and never claims to.
+    vtObservation.ensureSessionScreen(sessionRecord, {
+      cause: 'stream_origin',
+      localSource: true,
+      cols: sessionRecord.ptyCols,
+      rows: sessionRecord.ptyRows,
+      geometrySource: 'local_pty',
+    });
 
     // Broadcast session creation to bus
     const spawnMsg = JSON.stringify({
@@ -3493,6 +4022,7 @@ app.post('/api/sessions/spawn', (req, res) => {
       sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
       if (sessions[currentId] === sessionRecord) {
         delete sessions[currentId];
+        vtObservation.disposeSessionScreen(sessionRecord);   // #1136 §8: lifetime ends with the record
         revokeSessionCredential(currentId);   // #815: PTY exit — the instance is gone
         sessionStateManager.unregister(currentId);
       }
@@ -3523,6 +4053,24 @@ app.post('/api/sessions/register', (req, res) => {
     // identical here since we are inside `if (sessions[session_id])`, but it keeps
     // attacker-controlled text out of the credential path entirely.
     const credentialed = sessionCredentials.matches(existing.id, req.headers['x-telepty-session-token']);
+    const mayRedirectDelivery = credentialed || !sessionCredentials.hasCredential(existing.id);
+    // Invalidate BEFORE any destination, process identity or payload metadata mutation.
+    const destinationChanged = [
+      [command, existing.command], [cwd, existing.cwd], [backend, existing.backend],
+      [cmux_workspace_id, existing.cmuxWorkspaceId], [cmux_surface_id, existing.cmuxSurfaceId],
+      [req.body.delivery_type, existing.type],
+    ].some(([next, current]) => next && next !== current)
+      || ['term_program', 'term'].some(key => Object.prototype.hasOwnProperty.call(req.body, key)
+        && (req.body[key] || null) !== existing[key === 'term_program' ? 'termProgram' : 'term'])
+      || [['owner_pid', 'ownerPid'], ['pty_pid', 'ptyPid']].some(([key, prop]) =>
+        Number.isInteger(Number(req.body[key])) && Number(req.body[key]) > 0
+        && Number(req.body[key]) !== existing[prop])
+      || (req.body.provenance_capable === true && !existing.provenanceCapable)
+      || (mayRedirectDelivery && (
+        (req.body.delivery_endpoint && req.body.delivery_endpoint !== existing.deliveryEndpoint)
+        || (req.body.delivery && (JSON.stringify(req.body.delivery) !== JSON.stringify(existing.delivery)
+          || (!existing.deliveryEndpoint && req.body.delivery.address)))));
+    if (destinationChanged) conditionalAdmission.rotateDeliveryGeneration(existing);
     if (command) existing.command = command;
     if (cwd) existing.cwd = cwd;
     if (backend) existing.backend = backend;
@@ -3536,7 +4084,6 @@ app.post('/api/sessions/register', (req, res) => {
     // the same "keyed to a name" flaw as the token disclosure, on the same endpoint. A session
     // that has no credential at all (aterm/external registrants) is unchanged: nothing to prove
     // against, so those registrations keep working exactly as before.
-    const mayRedirectDelivery = credentialed || !sessionCredentials.hasCredential(existing.id);
     if (mayRedirectDelivery) {
       if (req.body.delivery_endpoint) existing.deliveryEndpoint = req.body.delivery_endpoint;
       if (req.body.delivery) {
@@ -3921,6 +4468,14 @@ app.post('/api/sessions/multicast/inject', async (req, res) => {
 
   for (const id of session_ids) {
     const session = sessions[id];
+    // T0 (#1170) ¶39 — fanout into a fenced record is refused per target, at admission, with zero
+    // queue entries and zero bytes. The rest of the fan-out is unaffected: one bound session does
+    // not cancel a multicast to twenty unbound ones (¶8).
+    if (isConditionallyFenced(id)) {
+      results.failed.push({ id, code: 'UNBOUND_TARGET', error: 'Session is conditionally bound; unbound fanout refused.' });
+      auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, 'failed:UNBOUND_TARGET');
+      continue;
+    }
     if (session) {
       try {
         const delivery = await deliverInjectionToSession(id, session, prompt, {
@@ -4000,6 +4555,13 @@ app.post('/api/sessions/broadcast/inject', async (req, res) => {
 
   for (const id of targetIds) {
     const session = sessions[id];
+    // T0 (#1170) ¶39 — same per-target fence as multicast. A broadcast is the widest unbound
+    // write there is, and a bound session must not be reachable by naming no target at all.
+    if (isConditionallyFenced(id)) {
+      results.failed.push({ id, code: 'UNBOUND_TARGET', error: 'Session is conditionally bound; unbound broadcast refused.' });
+      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, 'failed:UNBOUND_TARGET');
+      continue;
+    }
     try {
       const delivery = await deliverInjectionToSession(id, session, prompt, {
         source: 'broadcast',
@@ -4051,7 +4613,19 @@ function getSubmitStrategy(command) {
   return SUBMIT_STRATEGIES[base] || 'pty_cr'; // default to \r
 }
 
-function submitViaPty(session) {
+/**
+ * @param {Object} [options] - T0 (#1170): `{ admission }` marks a BOUND submit; see
+ *   writeDataToSession. Unbound submits into a fenced record are refused (¶39).
+ */
+function submitViaPty(session, options = {}) {
+  // ¶39 — the second physical adapter boundary. `submitViaPty` is not reachable from
+  // writeDataToSession (it writes its own bare 0x0D straight at the owner socket or the PTY), so
+  // fencing only the other door would leave `/submit`, `submit-all` and the force path writing
+  // Enter into a bound session. An Enter is a write: it runs whatever is sitting in the composer.
+  const submitSid = options.sessionId || (session && session.id) || null;
+  if (!submitSid || isConditionallyFenced(submitSid)) {
+    return false;
+  }
   if (session.type === 'wrapped') {
     if (session.ownerWs && session.ownerWs.readyState === 1) {
       session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
@@ -4175,6 +4749,17 @@ app.post('/api/sessions/:id/submit', async (req, res) => {
   if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
   const session = sessions[resolvedId];
   const id = resolvedId;
+
+  // T0 (#1170) ¶39/¶40 — an unbound /submit into a fenced record is refused at admission. This
+  // route is the reason the fence had to cover `submitViaPty` as well as `writeDataToSession`: a
+  // submit writes no text, so it looks harmless, and what it actually does is press Enter on
+  // whatever is already in the composer. ¶40 also puts this out of scope by construction — the
+  // scoped lane owns exactly one body and one CR, and the CLI makes no separate /submit.
+  if (isConditionallyFenced(id)) {
+    return respondWithError(res, 409, 'UNBOUND_TARGET',
+      'Session is bound to a conditional admission; unbound submits are refused.',
+      { session_id: id });
+  }
 
   const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
   // Default raised 5000 → 10000 (0.3.1) to cover empirical claude REPL
@@ -4633,6 +5218,14 @@ function runSubmitAll(sessionsMap) {
   const results = { successful: [], failed: [] };
 
   for (const [id, session] of Object.entries(sessionsMap)) {
+    // T0 (#1170) ¶39 — submit-all is a FANOUT, and a fanout into a bound record is an unbound
+    // write like any other. Reported as a named failure rather than skipped silently: an operator
+    // running submit-all should see that one session declined, not a result set that quietly has
+    // one fewer entry than the session list.
+    if (isConditionallyFenced(id)) {
+      results.failed.push({ id, strategy: null, error: 'UNBOUND_TARGET: session is conditionally bound' });
+      continue;
+    }
     const strategy = getSubmitStrategy(session.command);
     let success = false;
 
@@ -4657,12 +5250,350 @@ app.post('/api/sessions/submit-all', (req, res) => {
   res.json({ success: true, results: runSubmitAll(sessions) });
 });
 
+// Explicit first initialization has no target and cannot use body.from as authority. Host
+// middleware has already checked origin/IP/credentials; the verified live session must also
+// belong to the existing controller SID policy. An arbitrary worker bearer cannot initialize.
+app.post('/api/conditional-store/initialize', (req, res) => {
+  const principal = conditionalPrincipalFromReq(req);
+  if (!principal) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.PRINCIPAL_REQUIRED, 'no_verified_bearer'),
+      'conditional-store-initialize');
+  }
+  if (!ORCHESTRATOR_SIDS.includes(principal.sid) || !conditionalPrincipalStillVerifies(principal)) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.POLICY_DENIED, 'authenticated_controller_required'),
+      'conditional-store-initialize');
+  }
+  const rawRefusal = checkCanonicalRawBody(req, conditionalAdmission.parseInitializationRequest);
+  if (rawRefusal) return respondConditionalRefusal(res, rawRefusal, 'conditional-store-initialize');
+  const initialized = conditionalStore.initializeNewStore();
+  if (!initialized.ok) {
+    console.warn(`[COND] ${conditionalAdmission.FIRST_INITIALIZATION_GUIDANCE}`);
+    return respondConditionalRefusal(res, initialized, 'conditional-store-initialize');
+  }
+  console.log(`[COND] first initialization by authenticated controller ${principal.sid}`);
+  return res.status(201).json({ version: 1, initialization: 'created', marker_id: initialized.marker_id });
+});
+
+// ---------------------------------------------------------------------------
+// T0 (#1170) ¶16 — GET /api/sessions/:sid/conditional-target
+// ---------------------------------------------------------------------------
+//
+// The snapshot a controller reads to learn E before it asks for a binding. It returns an
+// IDENTITY, not a secret: sid, the proved session epoch, the credential generation and the
+// current owner's delivery generation. Holding E grants nothing — the binding still requires the
+// principal's bearer, and the inject still requires the binding.
+//
+// `sid` is matched EXACTLY and canonically: `resolveSessionAlias` is deliberately NOT called here
+// (¶8 rejects alias targets). An alias is a name that can be repointed, and a pin that follows a
+// repointable name is not a pin.
+app.get('/api/sessions/:sid/conditional-target', (req, res) => {
+  const principal = conditionalPrincipalFromReq(req);
+  if (!principal) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.PRINCIPAL_REQUIRED, 'no_verified_bearer'),
+      'conditional-target');
+  }
+  const sid = req.params.sid;
+  if (!conditionalAdmission.isId(sid)) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, 'sid_not_canonical'),
+      'conditional-target');
+  }
+  const described = conditionalAdmission.describeConditionalTarget(sid, sessions[sid], { isOpenWebSocket });
+  if (!described.ok) {
+    // ¶16 — "missing/unproved/unsupported owners refuse, no secret returned". The reason stays in
+    // the log; the body carries the code alone.
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(described.code, described.reason), 'conditional-target');
+  }
+  return res.json({ version: 1, target: described.target });
+});
+
+// ---------------------------------------------------------------------------
+// T0 (#1170) ¶17–¶20 — POST /api/sessions/:sid/conditional-binding
+// ---------------------------------------------------------------------------
+//
+// Take the pin. The request names the E the controller just read, the task/attempt/manifest it
+// obtained from its SEALED WORKER BOUNDARY, and an expiry.
+//
+// ¶18 is the load-bearing caveat and it is a statement about the CALLER, not about this route:
+// the host controller must obtain task/attempt/manifest from that sealed boundary BEFORE asking,
+// and MATCHING THESE FIELDS DOES NOT PROVE WORKER IDENTITY. This daemon cannot verify the claim —
+// it verifies the principal, and it records what the principal asserted. T0 fixtures supply
+// trusted host facts. Paragraph 60 describes historical orchestrator source; the
+// current sealed dispatch carries attempt/manifest facts, without establishing U1 completion.
+app.post('/api/sessions/:sid/conditional-binding', (req, res) => {
+  const principal = conditionalPrincipalFromReq(req);
+  if (!principal) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.PRINCIPAL_REQUIRED, 'no_verified_bearer'),
+      'conditional-binding');
+  }
+  const rawRefusal = checkCanonicalRawBody(req, conditionalAdmission.parseBindingRequest);
+  if (rawRefusal) return respondConditionalRefusal(res, rawRefusal, 'conditional-binding');
+
+  const sid = req.params.sid;
+  if (!conditionalAdmission.isId(sid)) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, 'sid_not_canonical'),
+      'conditional-binding');
+  }
+  const parsed = conditionalAdmission.parseBindingRequest(req.body);
+  if (!parsed.ok) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, parsed.reason),
+      'conditional-binding');
+  }
+  const request = parsed.value;
+  if (request.target.sid !== sid) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, 'target_sid_mismatch'),
+      'conditional-binding');
+  }
+  const nowMs = Date.now();
+  const expiryProblem = conditionalAdmission.checkBindingExpiry(request.expires_at, nowMs);
+  if (expiryProblem) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, expiryProblem),
+      'conditional-binding');
+  }
+
+  // ¶19 — compare E to the LIVE authenticated owner, synchronously. No await between this check
+  // and the commit below, so a claim landing on the event loop cannot slip between them.
+  const current = conditionalAdmission.describeConditionalTarget(sid, sessions[sid], { isOpenWebSocket });
+  if (!current.ok) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(current.code, current.reason), 'conditional-binding');
+  }
+  if (!conditionalAdmission.targetEquals(current.target, request.target)) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.STALE_TARGET, 'target_no_longer_current'),
+      'conditional-binding');
+  }
+
+  const created = conditionalStore.createBinding({ principal, request, nowMs });
+  if (!created.ok) return respondConditionalRefusal(res, created, 'conditional-binding');
+
+  // ¶39 — fencing is now in force for this record, and it is PERMANENT. Any pending unbound write
+  // is cancelled by the boundary checks in writeDataToSession/submitViaPty the moment it fires;
+  // there is nothing to unwind here because those checks read the fence, not a cached decision.
+  console.log(`[COND] ${created.duplicate ? 'returned existing' : 'bound'} ${sid} to `
+    + `${principal.sid} (binding_id: ${created.binding.binding_id}, task: ${request.task})`);
+  return res.status(created.status).json({ version: 1, binding: created.binding });
+});
+
+/**
+ * ¶21–¶28 — the conditional inject handler.
+ *
+ * Order matters throughout and is not arbitrary; each step below is placed where it is because of
+ * what the step before it has already proved.
+ */
+async function handleConditionalInject(req, res) {
+  // ¶9 — P from the VERIFIED BEARER. Never body.from; there is no `from` in this envelope at all.
+  const principal = conditionalPrincipalFromReq(req);
+  if (!principal) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.PRINCIPAL_REQUIRED, 'no_verified_bearer'),
+      'conditional-inject');
+  }
+  const rawRefusal = checkCanonicalRawBody(req, conditionalAdmission.parseInjectRequest);
+  if (rawRefusal) return respondConditionalRefusal(res, rawRefusal, 'conditional-inject');
+
+  // ¶8 — exact canonical sid. No alias resolution, for the same reason as the GET route.
+  const sid = req.params.id;
+  if (!conditionalAdmission.isId(sid)) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, 'sid_not_canonical'),
+      'conditional-inject');
+  }
+  const parsed = conditionalAdmission.parseInjectRequest(req.body);
+  if (!parsed.ok) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, parsed.reason),
+      'conditional-inject');
+  }
+  const request = parsed.value;
+
+  // ¶21 — the hash is RECOMPUTED over the exact prompt bytes. A caller-supplied hash that the
+  // daemon does not reproduce is not a checksum, it is a decoration.
+  const promptBytes = Buffer.from(request.prompt, 'utf8');
+  if (conditionalAdmission.sha256Hex(promptBytes) !== request.payload_sha256) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, 'payload_sha256_mismatch'),
+      'conditional-inject');
+  }
+  if (request.key.sid !== sid) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.INVALID_REQUEST, 'key_sid_mismatch'),
+      'conditional-inject');
+  }
+  if (!conditionalStore.available()) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.STORE_UNAVAILABLE, conditionalStore.reason),
+      'conditional-inject');
+  }
+
+  // ---------------------------------------------------------------------------
+  // ¶28 — THE DUPLICATE CHECK COMES BEFORE THE TARGET CHECKS, DELIBERATELY.
+  // ---------------------------------------------------------------------------
+  //
+  // "Authenticated exact duplicate returns the same inject_id / current receipt EVEN AFTER TARGET
+  // REPLACEMENT, EXPIRY OR RESTART, with zero enqueue/write/CR." Running the owner and expiry
+  // checks first would refuse precisely those cases — and refusing to hand back a receipt for
+  // work that was already admitted is how a controller loses track of a dispatch that did happen
+  // and re-issues it.
+  //
+  // What IS revalidated is P: ¶28 says "revalidate P for reads". What is NOT done is retargeting —
+  // the receipt describes the destination as it was at admission, and it is returned unchanged.
+  const primaryKey = conditionalAdmission.admissionPrimaryKey(principal, request.msg_id);
+  const existing = conditionalStore.getAdmissionByKey(primaryKey);
+  if (existing) {
+    if (existing.request_sha256 !== conditionalAdmission.canonicalDigest(request)) {
+      // ¶24 — same msg_id, changed anything. CONFLICT, and specifically never a fresh id.
+      return respondConditionalRefusal(res,
+        conditionalAdmission.refuse(conditionalAdmission.REFUSAL.CONFLICT, 'msg_id_reused_with_changed_request'),
+        'conditional-inject');
+    }
+    return res.status(200).json(conditionalAdmission.acceptanceBody(existing, true));
+  }
+
+  // --- not a duplicate: full validation before anything is committed (¶11 "Errors before
+  // --- admission emit zero scoped queue entries/bytes") ---
+
+  const stored = conditionalStore.getBinding(request.binding_id);
+  if (!stored) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.UNBOUND_TARGET, 'binding_unknown'),
+      'conditional-inject');
+  }
+  const binding = stored.binding;
+  // ¶23 — P must EQUAL B.principal. A different principal holding a valid bearer is not this
+  // binding's principal, and PRINCIPAL_MISMATCH is a different fact from POLICY_DENIED.
+  if (!conditionalAdmission.principalEquals(binding.principal, principal)) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.PRINCIPAL_MISMATCH, 'principal_not_binding_holder'),
+      'conditional-inject');
+  }
+  // ¶23 — K's task/sid/attempt must equal B's. `operation_id` and `revision` are NOT compared to
+  // B (B does not carry them); they are bound into the admission record instead, which is what
+  // ¶58's "changing operation/revision needs fresh msg_id" then rests on — a changed operation
+  // produces a different canonical request, so it cannot reuse this msg_id.
+  if (binding.task !== request.key.task
+    || binding.target.sid !== request.key.sid
+    || binding.attempt !== request.key.attempt) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.CONFLICT, 'key_does_not_match_binding'),
+      'conditional-inject');
+  }
+  if (binding.target.sid !== sid) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.CONFLICT, 'binding_target_sid_mismatch'),
+      'conditional-inject');
+  }
+
+  const nowMs = Date.now();
+  if (binding.expires_at <= nowMs) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.EXPIRED, 'binding_expired'),
+      'conditional-inject');
+  }
+  // ¶23 — E and the CURRENT owner must match. Synchronous, and re-done again before the send.
+  const current = conditionalAdmission.describeConditionalTarget(sid, sessions[sid], { isOpenWebSocket });
+  if (!current.ok) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(current.code, current.reason), 'conditional-inject');
+  }
+  if (!conditionalAdmission.targetEquals(current.target, binding.target)) {
+    return respondConditionalRefusal(res,
+      conditionalAdmission.refuse(conditionalAdmission.REFUSAL.STALE_TARGET, 'owner_replaced_since_binding'),
+      'conditional-inject');
+  }
+
+  // ¶25 — COMMIT A BEFORE ENQUEUE. Not after, not concurrently: a body on the queue that no
+  // durable record answers for is the silence this whole lane exists to remove.
+  const admitted = conditionalStore.admit({
+    principal,
+    target: binding.target,
+    binding,
+    request,
+    nowMs,
+  });
+  if (!admitted.ok) return respondConditionalRefusal(res, admitted, 'conditional-inject');
+  const record = admitted.record;
+  if (admitted.duplicate) {
+    return res.status(200).json(conditionalAdmission.acceptanceBody(record, true));
+  }
+
+  // ¶35/¶38/¶55 — go through deliverInjectionToSession, not around it. That function owns the
+  // bootstrap gate, the modal gate and the #760 park-behind-backlog ordering, and the scoped lane
+  // is subject to all three. A tick failure there is neither a delivery failure nor a delivery
+  // success; the record's own phase is the authority, and it is read back below rather than
+  // inferred from the call returning.
+  const delivery = await deliverInjectionToSession(sid, sessions[sid], record.request.prompt, {
+    source: 'conditional-inject',
+    from: principal.sid,
+    verifiedSenderSid: principal.sid,
+    admission: record,
+  });
+  if (!delivery.success) {
+    // ¶29 fixes the vocabulary of this branch: only the eleven named codes may appear on a scoped
+    // refusal. `deliverInjectionToSession` speaks the LEGACY vocabulary ('STALE', 'DISCONNECTED',
+    // a modal rejection code), so its answer is translated rather than passed through — leaking an
+    // unlisted code here would hand the CLI a value ¶30 tells it to treat as unrecognized, and it
+    // would then map a perfectly well-understood refusal to transport-unknown HOLD.
+    const code = conditionalAdmission.REFUSAL[delivery.code]
+      || (delivery.code === 'STALE' ? conditionalAdmission.REFUSAL.STALE_TARGET
+        : conditionalAdmission.REFUSAL.UNBOUND_TARGET);
+    return respondConditionalRefusal(res, {
+      status: conditionalAdmission.refusalStatus(code),
+      code,
+      reason: `${delivery.code || 'delivery_refused'}:${delivery.error || ''}`,
+      body: conditionalAdmission.refusalBody(code),
+    }, 'conditional-inject');
+  }
+
+  const settled = conditionalStore.getAdmissionByInjectId(record.inject_id) || record;
+  console.log(`[COND] admitted ${sid} inject_id=${settled.inject_id} `
+    + `body_phase=${settled.body_phase} transport=${settled.transport}`);
+  // ¶26/¶27 — 202, and a receipt with no success boolean anywhere in it.
+  return res.status(202).json(conditionalAdmission.acceptanceBody(settled, false));
+}
+
 app.post('/api/sessions/:id/inject', async (req, res) => {
+  // ---------------------------------------------------------------------------
+  // T0 (#1170) ¶22 — THE CLOSED CONDITIONAL BRANCH.
+  // ---------------------------------------------------------------------------
+  //
+  // Selected FIRST, on the raw body, before `resolveSessionAlias` and before a single legacy
+  // field is read. The ordering is the security property: a malformed partial envelope must be
+  // refused BY THIS BRANCH, never fall through to the legacy path below where `prompt` is the
+  // only required field and none of the identity checks exist. A branch you can fall out of by
+  // sending a broken request is not closed.
+  //
+  // ¶22 also forbids, inside this branch: ref expansion, routing suffixes, a supplied `from`,
+  // `no_enter`, `force` and retry flags. That is enforced by construction rather than by a
+  // blocklist — `parseInjectRequest` rejects ANY key outside the six the contract names, so a
+  // flag that does not exist yet is already refused.
+  if (conditionalAdmission.isConditionalInjectBody(req.body)) {
+    return handleConditionalInject(req, res);
+  }
   const requestedId = req.params.id;
   const resolvedId = resolveSessionAlias(requestedId);
   if (!resolvedId) return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
   const session = sessions[resolvedId];
   const id = resolvedId;
+  // T0 (#1170) ¶39 — reject an unbound inject into a fenced record AT ADMISSION, not only at the
+  // adapter boundary. Both checks are required and they answer different questions: this one
+  // gives the caller a named refusal and guarantees zero queue entries and zero bytes, while the
+  // boundary check catches everything that reached a write by another route. Refusing only at the
+  // boundary would still enqueue, park and audit a delivery that can never happen.
+  if (isConditionallyFenced(id)) {
+    return respondWithError(res, 409, 'UNBOUND_TARGET',
+      'Session is bound to a conditional admission; unbound injects are refused.',
+      { session_id: id });
+  }
   const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
   let { from, reply_to } = req.body;
   if (typeof prompt !== 'string') return respondWithError(res, 400, 'INVALID_REQUEST', 'prompt is required');
@@ -5148,6 +6079,37 @@ app.get('/api/sessions/:id/screen', (req, res) => {
   });
 });
 
+// GET /api/sessions/:id/frame — #1136 §9: read the stateful VT grid.
+//
+// OBSERVATION ONLY. Alias-resolved exactly like /screen above and under the SAME auth posture —
+// no new authentication, no new session-control credential, no new authorizer, and no weakening
+// of an existing one. It writes nothing, actuates nothing and authorizes nothing: a complete
+// grid proves WHAT IS ON THE SCREEN, never who put it there, never what the CLI is waiting for,
+// never that a turn finished.
+//
+// /screen, stripAnsiForScreen and `telepty read-screen` are untouched above. An OLD daemon has
+// no route here at all, so a consumer gets 404 ⇒ UNKNOWN; nothing synthesises `ready`, `idle`,
+// `permission` or `complete` from an absent frame.
+app.get('/api/sessions/:id/frame', async (req, res) => {
+  const requestedId = req.params.id;
+  const resolvedId = resolveSessionAlias(requestedId);
+  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+  const session = sessions[resolvedId];
+
+  // A wrapped session whose owner socket is down cannot be `current` at any lag — see §7. The
+  // daemon is the only party that knows this, so it is passed IN rather than guessed at by the
+  // observation module.
+  const ownerDisconnected = session.type === 'wrapped' && !isOpenWebSocket(session.ownerWs);
+
+  const frame = await vtObservation.readSessionFrame(session, {
+    sessionId: resolvedId,
+    ownerDisconnected,
+    drainWaitMs: req.query.drain_wait_ms === undefined ? undefined : Number(req.query.drain_wait_ms),
+  });
+  // `session_id` is the RESOLVED id, matching /screen's contract for an alias request.
+  res.json({ ...frame, session_id: resolvedId });
+});
+
 app.patch('/api/sessions/:id', (req, res) => {
   const requestedId = req.params.id;
   const resolvedId = resolveSessionAlias(requestedId);
@@ -5158,6 +6120,8 @@ app.patch('/api/sessions/:id', (req, res) => {
   if (!new_id) return res.status(400).json({ error: 'new_id is required' });
   if (sessions[new_id]) return res.status(409).json({ error: `Session ID '${new_id}' is already in use.` });
 
+  // Invalidate the old pin before moving destination state (¶14).
+  conditionalAdmission.rotateDeliveryGeneration(session);
   // Move session to new key (including state machine)
   sessions[new_id] = session;
   delete sessions[id];
@@ -5174,6 +6138,11 @@ app.patch('/api/sessions/:id', (req, res) => {
   sessionStateManager.unregister(id);
   sessionStateManager.register(new_id);
   session.id = new_id;
+  // T0 (#1170) ¶14 — RENAME mints a fresh delivery_generation, even though #815 deliberately
+  // keeps the epoch (same instance, same child, same bearer). E carries `sid`, so a rename makes
+  // every stored E for this session unmatchable on its first field anyway; minting here is what
+  // stops the reverse case — a pin taken against the NEW name inheriting an ownership that was
+  // authorized under the old one. ¶14 lists rename explicitly for this reason.
 
   // Broadcast rename to bus
   const busMsg = JSON.stringify({
@@ -5311,6 +6280,7 @@ app.delete('/api/sessions/:id', (req, res) => {
   sessionStateManager.markTerminationRequested(id, 'operator_delete', killError && killError.message);
   sessionStateManager.unregister(id);
   delete sessions[id];
+  vtObservation.disposeSessionScreen(session);   // #1136 §8: lifetime ends with the record
   revokeSessionCredential(id);    // #815: DELETE — revoke before the id can be reused
   try { mailbox.purge(id); } catch {}
   lifecycle.cleanupSessionArtifacts(id);
@@ -5816,6 +6786,11 @@ const mailboxDelivery = new DeliveryEngine(mailbox, {
   deliverFn: async (sessionId, msg) => {
     const session = sessions[sessionId];
     if (!session) return { success: false, error: 'Session not found' };
+    // T0 (#1170) ¶36 — a conditional message is owned end-to-end by the scoped lane: its own
+    // digest check, its own destination recheck, its own guarded synchronous send. Returns null
+    // for every other message, so ordinary mailbox delivery below is byte-identical.
+    const conditional = deliverConditionalBody(sessionId, session, msg);
+    if (conditional) return conditional;
     const result = await writeDataToSession(sessionId, session, msg.payload);
     if (result.success) {
       session.lastActivityAt = new Date().toISOString();
@@ -6164,6 +7139,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
         disconnectedSeconds
       });
       delete sessions[id];
+      vtObservation.disposeSessionScreen(session);  // #1136 §8: lifetime ends with the record
       revokeSessionCredential(id);  // #815: TTL/GC is the routine reuse path — revoke here too
       sessionStateManager.unregister(id);
       console.log(`[CLEANUP] Removed stale session ${id} after ${disconnectedSeconds}s disconnected`);
@@ -6231,7 +7207,9 @@ installWebSocketTransport({
   listTrackedInjectionsForSession,
   // #826 — the viewer write path gets the same policy verdict and the same audit line as
   // POST /api/sessions/:id/inject. See authorizeViewerInject.
-  authorizeViewerInject
+  authorizeViewerInject,
+  // T0 (#1170) ¶39 — the viewer door's fence check. A bound record refuses unbound WS writes.
+  isConditionallyFenced
 });
 
 function shutdown(code) {
@@ -6313,4 +7291,30 @@ module.exports = {
   formatBindHint,                 // telepty#50 + #672: startup bind/exposure banner line
   isTailnetAuto,                  // #672: pure predicate — is the zero-config tailnet path active
   resolveEffectivePeerAllowlist,  // #672: pure allowlist policy — auto-trust tailnet without widening a manual set
+  // -------------------------------------------------------------------------
+  // T0 (#1170) ¶50 — the MINIMAL seams the conditional-admission fixture needs.
+  //
+  // Deliberately the existing app/state/queue objects and nothing purpose-built: ¶50 requires that
+  // "validators/admission/delivery/persistence are never mocked", so the fixture has to drive the
+  // real express app with synthetic req/res, read the real session map, and let the real mailbox
+  // and DeliveryEngine carry the bytes. Exporting a test-only shim of any of those would let a
+  // test pass against machinery production never runs.
+  //
+  // Nothing here starts anything. `app` is not listening (the listen call is guarded on
+  // require.main === module, as is DeliveryEngine.start), so a fixture that requires this module
+  // with its storage and platform primitives redirected gets an inert, fully wired daemon.
+  // -------------------------------------------------------------------------
+  app,                            // real route handlers, incl. the three conditional routes
+  sessions,                       // live session map — fake owner sockets are installed here
+  conditionalStore,               // the scoped ledger (¶31)
+  conditionalAdmission,           // the pure validator/identity module (¶11–¶14), never mocked
+  mailbox,                        // real FileMailbox (¶49 temporary storage)
+  mailboxDelivery,                // real DeliveryEngine — `tick()` is the fixture's drain
+  isConditionallyFenced,          // ¶39: the fence predicate both write boundaries consult
+  deliverConditionalBody,         // ¶36: dequeue-side digest check + guarded synchronous send
+  enqueueConditionalBody,         // ¶36: enqueue-side digest commit
+  scheduleConditionalCr,          // ¶40: the one delayed CR an admission owns
+  restoreConditionalAdmissions,   // ¶43: restore receipts, resend nothing
+  conditionalPrincipalStillVerifies, // ¶23: the re-verification predicate (see its own caveat)
+  executeBootstrapInject,         // ¶35: parked-op replay, re-derived from the record
 };

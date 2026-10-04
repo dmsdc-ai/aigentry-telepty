@@ -87,8 +87,21 @@ test('#835 decideDaemonAction: nothing answered still auto-starts (the one legit
   assert.equal(d.reason, 'daemon-unreachable');
 });
 
-test('#835 decideDaemonAction: legacy daemon (sessions answer, no meta) still restarts', () => {
+// #751 amended: null meta is UNKNOWN (usually a timeout), not proof of a legacy daemon.
+test('#835 decideDaemonAction: sessions answer but meta null → abort meta-unverified, not a legacy restart (#751)', () => {
   const d = decideDaemonAction({ meta: null, cliVersion: pkg.version, sessionsReachable: true });
+  assert.notEqual(d.action, 'restart');
+  assert.equal(d.action, 'abort');
+  assert.equal(d.reason, 'meta-unverified');
+});
+
+// #751 positive control: an explicit /api/meta 404 + sessions answer is still the legacy daemon.
+test('#835 decideDaemonAction: legacy daemon (/api/meta 404, sessions answer) still restarts', () => {
+  const d = decideDaemonAction({
+    meta: { answered: true, status: 404, refused: false, endpoint: '/api/meta' },
+    cliVersion: pkg.version,
+    sessionsReachable: true
+  });
   assert.equal(d.action, 'restart');
   assert.equal(d.reason, 'legacy-daemon-no-meta');
 });

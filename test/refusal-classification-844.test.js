@@ -70,12 +70,30 @@ test('404 on /api/meta + sessions reachable → the legacy-daemon restart, not a
   assert.equal(d.reason, 'legacy-daemon-no-meta');
 });
 
-test('404 on /api/meta + nothing else answering → start, i.e. the pre-#835 verdict', () => {
+test('404 on /api/meta + sessions probe failed → abort, a 404 is something serving the port', () => {
+  // #751: the 404 is a POSITIVE statement that the port is alive; a failed /api/sessions probe is
+  // not an absence. `start` here would spawn against a live owner, so only abort is safe.
   const d = decideDaemonAction({
     meta: answer(404), requiredCapabilities: [], cliVersion: pkg.version, sessionsReachable: false
   });
-  assert.equal(d.action, 'start');
-  assert.equal(d.reason, 'daemon-unreachable');
+  assert.equal(d.action, 'abort');
+  assert.equal(d.reason, 'daemon-answered-error:404');
+  assert.notEqual(d.action, 'start');
+});
+
+test('#751 boundaries: no meta and no sessions → start; no meta but sessions → abort, never restart', () => {
+  // ABSENT: nothing answered anything, so the auto-start path is still the verdict.
+  const absent = decideDaemonAction({
+    meta: null, requiredCapabilities: [], cliVersion: pkg.version, sessionsReachable: false
+  });
+  assert.equal(absent.action, 'start');
+  assert.equal(absent.reason, 'daemon-unreachable');
+  // UNKNOWN: a null meta is not the positive 404, so sessions 200 alone cannot name a legacy daemon.
+  const unknown = decideDaemonAction({
+    meta: null, requiredCapabilities: [], cliVersion: pkg.version, sessionsReachable: true
+  });
+  assert.equal(unknown.action, 'abort');
+  assert.equal(unknown.reason, 'meta-unverified');
 });
 
 test('401 on /api/meta still aborts — a refusal is an answer and the daemon is alive', () => {

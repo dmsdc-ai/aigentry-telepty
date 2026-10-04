@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
+const { createProvisionedTestHome } = require('./setup-env');
 
 const projectRoot = path.resolve(__dirname, '..');
 
@@ -59,7 +60,11 @@ function getShellSpec() {
 }
 
 function createTempHome() {
-  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-home-'));
+  // T0 (#1170): the factory creates the directory and initializes its conditional-admission store
+  // in one step (see test-support/setup-env.js). Reached ONLY from the `ownsHome` branch in
+  // startTestDaemon — a caller-supplied homeDir is never passed through here, so daemon-RESTART
+  // and lost-pair tests keep observing the real fail-closed refusal.
+  const homeDir = createProvisionedTestHome('telepty-home-');
   return {
     homeDir,
     env: process.platform === 'win32'

@@ -29,6 +29,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
+const { createProvisionedTestHome } = require('../test-support/setup-env');
 
 let daemon;
 
@@ -137,7 +138,9 @@ test('tracking_unknown_survives_restart: a record survives a daemon restart and 
     // A dedicated daemon whose HOME the test owns, so a second daemon can be started against the
     // same state directory. `kill()` rather than `stop()`: stop() DELETEs every session on the way
     // out, which would destroy the very state the restart is supposed to carry across.
-    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty60-restart-'));
+    // T0 (#1170): the factory, not `mkdtempSync` — a caller-supplied homeDir skips the harness's
+    // `ownsHome` provisioning, and an uninitialized store fences every sid. Restart only LOADS it.
+    const homeDir = createProvisionedTestHome('telepty60-restart-');
     const first = await startTestDaemon({ homeDir });
     let second = null;
     try {
