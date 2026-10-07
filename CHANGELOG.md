@@ -2,7 +2,12 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## Unreleased
+## 0.8.4 — 2026-10-07
+
+Patch release: one fix, **not a protocol release** — the wire semantics are unchanged and no session
+has to be re-registered. The fix lives in the **daemon**, so upgrading the CLI alone changes nothing:
+it takes effect after the daemon restarts (`launchctl kickstart -k gui/$UID/com.aigentry.telepty`,
+or `systemctl restart` for the unit). `npm i -g @dmsdc-ai/aigentry-telepty@0.8.4`.
 
 ### Fixed
 
