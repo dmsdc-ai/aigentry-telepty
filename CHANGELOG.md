@@ -2,6 +2,24 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## Unreleased
+
+### Fixed
+
+- **`telepty attach` now shows the session's current screen instead of joining blank
+  ([gh#89](https://github.com/dmsdc-ai/aigentry-telepty/issues/89)).** The daemon held the screen —
+  the output ring `GET /api/sessions/:id/screen` renders — but the WS connect handler's viewer
+  branch only logged `Client attached`, and a viewer was relayed the owner's `output` frames from
+  that moment on. **What a 0.8.3 user sees**: attaching to a live, idle TUI printed
+  `Entered room '<sid>'.` and then nothing, because an idle TUI emits no frames and the ones it
+  emits later are cursor-relative diffs against a screen the viewer never got. A viewer attaching
+  to a wrapped session is now sent the ring tail as an ordinary `output` frame, synchronously at
+  attach and so ahead of any live frame: from the last full-screen reset (`ESC[H ESC[2J`,
+  `ESC[2J`, `ESC c`, `ESC[?1049h`), or the whole ring when it holds none. Not a protocol change —
+  same frame type, owner socket untouched, bounded by the ring's existing ~200 KB cap, and not
+  counted as session activity or re-fed to the state detector. A **daemon** fix: it takes effect
+  after the daemon restarts. Pinned by `test/attach-viewer-replay-89.test.js`.
+
 ## 0.8.3 — 2026-09-08
 
 Patch release: fixes only, **not a protocol release** — the wire semantics are unchanged and no

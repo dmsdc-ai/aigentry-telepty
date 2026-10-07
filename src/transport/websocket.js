@@ -8,6 +8,22 @@ function isOpenWebSocket(ws) {
   return Boolean(ws && ws.readyState === 1);
 }
 
+// #89 — what a viewer that attaches NOW must be sent so its terminal shows the current screen.
+// Live `output` frames are cursor-relative diffs against a screen the viewer never received, and
+// an idle TUI sends none, so `telepty attach` joined blank. The ring already holds the bytes (it
+// is what `/screen` renders); this picks the tail from the LAST full-screen reset — `ESC[H ESC[2J`
+// (taken from its ESC[H), `ESC[2J`, `ESC c` (RIS), `ESC[?1049h` (alt-screen enter) — so the
+// viewer replays one coherent redraw, not 200 KB of superseded frames. No reset: the whole ring.
+// Joined first, because a marker can straddle a chunk boundary. Bounded by the ring's own cap.
+function outputRingReplay(outputRing) {
+  if (!Array.isArray(outputRing) || outputRing.length === 0) return '';
+  const all = outputRing.join('');
+  let start = all.lastIndexOf('\x1b[2J');
+  if (start >= 3 && all.startsWith('\x1b[H', start - 3)) start -= 3;
+  start = Math.max(start, all.lastIndexOf('\x1bc'), all.lastIndexOf('\x1b[?1049h'));
+  return start > 0 ? all.slice(start) : all;
+}
+
 function installWebSocketTransport(deps) {
   const {
     server,
@@ -380,6 +396,16 @@ function installWebSocketTransport(deps) {
       persistSessions();
     } else {
       console.log(`[WS] Client attached to session ${sessionId} (Total: ${activeSession.clients.size})`);
+      // #89 — replay the current screen to THIS viewer, synchronously, so it is queued ahead of
+      // any live frame the owner relays later. A plain `output` frame: no protocol change. Not
+      // session activity (no `lastActivityAt`), and not re-fed to sessionStateManager — those
+      // bytes were fed when they arrived.
+      if (activeSession.type === 'wrapped') {
+        const replay = outputRingReplay(activeSession.outputRing);
+        if (replay) {
+          try { ws.send(JSON.stringify({ type: 'output', data: replay })); } catch {}
+        }
+      }
     }
 
     ws.on('message', (message) => {
@@ -738,5 +764,6 @@ function installWebSocketTransport(deps) {
 
 module.exports = {
   installWebSocketTransport,
-  isOpenWebSocket
+  isOpenWebSocket,
+  outputRingReplay
 };
