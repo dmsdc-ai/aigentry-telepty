@@ -200,6 +200,15 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | `TELEPTY_MODAL_HOLD_MS` | milliseconds | `30000` | How long `TELEPTY_MODAL_REMEDY=hold` waits for the modal to clear before falling back to `reject`. |
 | `TELEPTY_MODAL_PARK_TTL_MS` | milliseconds | `600000` | How long `TELEPTY_MODAL_REMEDY=park` holds queued injects for a modal that never clears, before flushing them with an actionable `modal_park_timeout` event. Matches `TELEPTY_BRIDGE_INJECT_TTL_SECS`. |
 | `TELEPTY_SHARED_REF_TTL_DAYS` | days (`0` disables the sweep) | `7` | Age at which `~/.telepty/shared/*.md` payloads from `inject --ref` are deleted. The sweep runs at the start of each `--ref` write, not on a timer. |
+| `TELEPTY_CLIENT_RESTART` | `auto`, `off` | `auto` | Whether a `telepty` command may stop, start or kickstart the local daemon when it finds it missing or outdated. Also settable as `"clientRestart"` in `~/.telepty/config.json`; the env var wins. |
+
+`TELEPTY_CLIENT_RESTART=off` is for hosts where launchd/systemd supervises the daemon and many
+sessions share it: no client ever stops, spawns or kickstarts the daemon, and a command that cannot
+reach it fails at once with the command to run instead (`launchctl kickstart -k
+gui/<uid>/com.aigentry.telepty`, `systemctl --user restart telepty`, or `telepty daemon start`).
+Under the default `auto`, a daemon owned by launchd/systemd/schtasks is already left to its
+supervisor on every verdict (missing, slow or outdated); `off` applies the same refusal on hosts
+with no supervisor.
 
 `TELEPTY_SUBMIT_FORCE_DEFAULT=1` is for orchestrators and automation that
 already know their targets are real, initialized REPLs. It avoids the transient

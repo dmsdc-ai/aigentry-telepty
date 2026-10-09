@@ -218,7 +218,8 @@ function ensureOptions(overrides = {}) {
     supervisorWaitMs: 400,
     supervisorPollMs: 20,
     _detectSupervisor: launchd,
-    _fetchWithAuth: async () => ({ ok: false }),
+    // gh#82 round 2 (a): "nothing answered" has to be a REFUSED connection to be an absence.
+    _fetchWithAuth: async () => { throw Object.assign(new Error('fetch failed'), { code: 'ECONNREFUSED' }); },
     // gh#82 (B): the absence verdict now has a THIRD probe — /api/health. Left unstubbed, these
     // in-process tests reach the developer's live daemon on 3848, which answers 200, and the
     // "nothing answered" model they are built on stops being true. Absent means absent on all three.
@@ -247,19 +248,31 @@ test('ensureDaemonRunning: supervisor restores a matching daemon → no spawn at
   assert.equal(restarts, 0, 'deferring to the supervisor must not spawn an orphan');
 });
 
-test('ensureDaemonRunning: supervisor restores a STALE daemon → still restarts (no blind accept)', async () => {
+test('ensureDaemonRunning: supervisor restores a STALE daemon → not accepted, and not stopped (gh#82 round 2)', async () => {
   // An upgrade window can leave the supervisor launching an older install. Deferring must
-  // not mean silently accepting whatever came back.
+  // not mean silently accepting whatever came back. gh#82 round 2 (c): nor may the client stop a
+  // supervised daemon — it fails, naming the version verdict and the supervisor command.
   let restarts = 0;
   let probes = 0;
-  await ensureDaemonRunning(ensureOptions({
-    _getDaemonMeta: async () => {
-      probes += 1;
-      return probes === 1 ? null : { version: '0.0.1-ancient', capabilities: [] };
-    },
-    _restartDaemonGraceful: async () => { restarts += 1; return { success: true }; }
-  }));
-  assert.equal(restarts, 1, 'a version-mismatched daemon from the supervisor still gets restarted');
+  const original = console.error;
+  const said = [];
+  console.error = (...a) => { said.push(a.join(' ')); };
+  let result;
+  try {
+    result = await ensureDaemonRunning(ensureOptions({
+      _getDaemonMeta: async () => {
+        probes += 1;
+        return probes === 1 ? null : { version: '0.0.1-ancient', capabilities: [] };
+      },
+      _restartDaemonGraceful: async () => { restarts += 1; return { success: true }; }
+    }));
+  } finally {
+    console.error = original;
+  }
+  assert.equal(restarts, 0, 'a supervised daemon is never stopped by a client');
+  assert.equal(result && result.success, false, 'the stale daemon must not be silently accepted');
+  assert.match(said.join('\n'), /version-/);
+  assert.match(said.join('\n'), /launchctl kickstart -k/);
 });
 
 test('ensureDaemonRunning: no supervisor and no daemon → spawns exactly as before #738', async () => {

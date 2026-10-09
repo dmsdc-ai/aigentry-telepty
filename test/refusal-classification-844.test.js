@@ -71,8 +71,9 @@ test('404 on /api/meta + sessions reachable → the legacy-daemon restart, not a
 });
 
 test('404 on /api/meta + nothing else answering → start, i.e. the pre-#835 verdict', () => {
+  // gh#82 round 2 (a): "nothing else answering" means REFUSED — a timeout is not an absence.
   const d = decideDaemonAction({
-    meta: answer(404), requiredCapabilities: [], cliVersion: pkg.version, sessionsReachable: false
+    meta: answer(404), requiredCapabilities: [], cliVersion: pkg.version, sessionsReachable: false, connectionRefused: true
   });
   assert.equal(d.action, 'start');
   assert.equal(d.reason, 'daemon-unreachable');
@@ -183,7 +184,8 @@ test('ensureDaemonRunning: a refusal reached through the supervisor path never b
     await assert.rejects(
       ensureDaemonRunning({
         _getDaemonMeta: async () => (probes++ === 0 ? null : answer(401)),
-        _fetchWithAuth: async () => { throw Object.assign(new Error('aborted'), { name: 'AbortError' }); },
+        // gh#82 round 2 (a): refused, so the first verdict is still `start` (a timeout no longer is).
+        _fetchWithAuth: async () => { throw Object.assign(new Error('fetch failed'), { code: 'ECONNREFUSED' }); },
         // gh#82 (B): absent on /api/health too, so this still reaches the supervisor path it tests.
         _probeDaemonHealth: async () => false,
         _restartDaemonGraceful: doRestart,
