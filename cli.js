@@ -38,6 +38,9 @@ const {
 const { resolveWindowsExecutable } = require('./src/win-resolve-executable');
 const { decideVersionAction } = require('./src/version-handshake');
 const {
+  LAUNCHD_LABEL,
+  SYSTEMD_SERVICE_NAME,
+  WINDOWS_TASK_NAME,
   clearSupervisorDeferMarker,
   detectSupervisor,
   isDeferMarkerFresh,
@@ -383,15 +386,31 @@ function probeTimeoutMs() {
 // re-confirmation gate immediately before any stop on the `start` path, and as the third probe
 // in the absence verdict itself. A 200 here means ALIVE; anything else (refused connection,
 // timeout, non-200) means we learned nothing new and the caller's existing policy stands.
+//
+// gh#82 round 2 (a): tri-state, because the two failures are opposite evidence on loopback. A
+// connect to a port with no listener is REFUSED at once; a TIMEOUT means something accepted or
+// queued the connection — a stalled or still-booting daemon. → true (200) | false (refused, or an
+// answer that is not 200) | null (no answer: timed out). Both failures stay falsy, so a caller
+// that only asks "alive?" reads exactly what it read before.
 async function probeDaemonHealth(port, timeoutMs, host = '127.0.0.1') {
   try {
     const res = await fetch(`${buildDaemonUrl(host, port)}/api/health`, {
       signal: AbortSignal.timeout(timeoutMs > 0 ? timeoutMs : probeTimeoutMs() * 3)
     });
     return Boolean(res && res.ok);
-  } catch {
-    return false; // connect error / timeout: no evidence of life
+  } catch (error) {
+    return isConnectionRefused(error) ? false : null;
   }
+}
+
+// gh#82 round 2 (a): the ONLY transport failure that is evidence of absence. undici puts the code
+// on `cause` (namedTransportError copies it up), so walk the chain; anything else — a timeout, a
+// reset, an error with no code — is "did not answer", never "not there".
+function isConnectionRefused(error) {
+  for (let e = error, depth = 0; e && depth < 4; e = e.cause, depth++) {
+    if (e.code === 'ECONNREFUSED') return true;
+  }
+  return false;
 }
 
 async function getDaemonMeta(host = REMOTE_HOST, timeoutMs = 0) {
@@ -613,6 +632,88 @@ function logDaemonRestartEvent(fields) {
   } catch { /* best effort — a missing log must never break a restart */ }
 }
 
+// gh#82 follow-up (2026-10-09, ask 1): a launchd daemon was stopped twice in six minutes and the
+// host could not say by whom — only FAILED attempts were logged, and a failure line names no
+// initiator. Every client-initiated stop or kickstart now writes one line BEFORE acting, through
+// the same writer. argv is capped at 200 chars and JSON-quoted, so an `inject` body's spaces and
+// newlines stay one field on one line.
+function logRestartInitiated(writeLog, event, { verdict, port }) {
+  writeLog({
+    event,
+    initiator_pid: process.pid,
+    initiator_ppid: process.ppid,
+    initiator_argv: JSON.stringify(process.argv.slice(2).join(' ').slice(0, 200)),
+    verdict,
+    port,
+    session: process.env.TELEPTY_SESSION_ID || null
+  });
+}
+
+// gh#82 follow-up (ask 2): one restart owner per host. N clients whose probes time out together
+// all reach the restart path together, and each one stopped and kickstarted the daemon. The client
+// that creates ~/.telepty/restart.lease (O_EXCL) acts; the rest wait for health. A lease older than
+// 60 s, or whose holder is dead, is replaced. Best effort: a lease I/O error forfeits the
+// protection (logged as lease-unavailable); it never blocks a restart.
+const RESTART_LEASE_PATH = () => path.join(os.homedir(), '.telepty', 'restart.lease');
+const RESTART_LEASE_TTL_MS = 60 * 1000;
+
+function readRestartLease(leasePath) {
+  const raw = fs.readFileSync(leasePath, 'utf8');
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // Created but not yet written (open and write are two syscalls): judge it by its mtime alone.
+    return { pid: null, startedAt: new Date(fs.statSync(leasePath).mtimeMs).toISOString(), partial: true };
+  }
+}
+
+function isRestartLeaseFresh(lease) {
+  const age = Date.now() - Date.parse(lease && lease.startedAt);
+  if (!(age < RESTART_LEASE_TTL_MS)) return false; // expired or unparseable
+  if (lease.partial) return true;
+  const { isProcessRunning } = require('./daemon-control'); // process.kill(pid, 0)
+  return isProcessRunning(lease.pid);
+}
+
+// → { held: true, body } | { held: false, holder }. Throws on any I/O error other than contention.
+function acquireRestartLease(leasePath, fields) {
+  fs.mkdirSync(path.dirname(leasePath), { recursive: true });
+  for (let tries = 0; tries < 3; tries++) {
+    let fd;
+    try {
+      fd = fs.openSync(leasePath, 'wx');
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      let holder;
+      try {
+        holder = readRestartLease(leasePath);
+      } catch (readError) {
+        if (readError.code === 'ENOENT') continue; // released between our open and our read
+        throw readError;
+      }
+      if (isRestartLeaseFresh(holder)) return { held: false, holder };
+      try { fs.unlinkSync(leasePath); } catch (unlinkError) { if (unlinkError.code !== 'ENOENT') throw unlinkError; }
+      continue;
+    }
+    const body = JSON.stringify({ ...fields, startedAt: new Date().toISOString() });
+    let writeError = null;
+    try { fs.writeSync(fd, body); } catch (error) { writeError = error; }
+    fs.closeSync(fd); // before any unlink: win32 cannot unlink an open file
+    if (writeError) {
+      try { fs.unlinkSync(leasePath); } catch {} // an empty lease would read as fresh for 60 s
+      throw writeError;
+    }
+    return { held: true, body };
+  }
+  return { held: false, holder: { pid: null } }; // lost every race — someone else holds it now
+}
+
+function releaseRestartLease(leasePath, body) {
+  try {
+    if (fs.readFileSync(leasePath, 'utf8') === body) fs.unlinkSync(leasePath); // only our own
+  } catch { /* best effort — an unreleased lease expires after RESTART_LEASE_TTL_MS */ }
+}
+
 // gh#82 (A): why the restart could not be completed, in terms of what we actually observed.
 function describeRestartFailure(meta, supervisorPresent, supervisorKind) {
   if (meta && meta.refused) return `daemon-answered-refused:${meta.status}`;
@@ -621,7 +722,63 @@ function describeRestartFailure(meta, supervisorPresent, supervisorKind) {
   return supervisorPresent ? `no-daemon-after-${supervisorKind}-restart` : 'no-daemon-after-spawn';
 }
 
+// gh#82 round 2 (a): → a no-stop result when the addressed port shows a daemon that is present
+// but not answering — a probe that TIMED OUT, or a LISTEN socket on the port — and null when only
+// refusals were seen (the one shape that may be stopped and replaced as absent).
+function refusePresentButSilent(timeoutReason, port, portOwner, writeLog) {
+  const listener = timeoutReason ? null : portOwner(port);
+  const listening = Number.isInteger(listener) && listener > 0 && listener !== process.pid;
+  if (!timeoutReason && !listening) return null;
+  const reason = timeoutReason || `port-listener-pid-${listener}`;
+  writeLog({ event: 'stop-refused', port, verdict: 'present-not-answering', reason });
+  process.stderr.write(
+    `\x1b[33m⚠️ Daemon on port ${port} did not answer in time, but it is there (${reason}) — not stopping it. `
+    + `On loopback only a refused connection means nothing is running. Retry the command; raise `
+    + `TELEPTY_PROBE_TIMEOUT_MS (currently ${probeTimeoutMs()}ms) if it keeps timing out.\x1b[0m\n`
+  );
+  return { success: false, meta: null, attempt: 0, notAnswering: true, reason: 'present-not-answering' };
+}
+
+// gh#82 follow-up (ask 2): the lease gate in front of every stop/kickstart on the start/restart
+// path. `options.verdict` is the decideDaemonAction reason that sent the caller here.
 async function restartDaemonGraceful(options = {}) {
+  const addressedPort = Number.isInteger(options.port) && options.port > 0
+    ? options.port
+    : Number(PORT);
+  const writeLog = options._logDaemonRestartEvent || logDaemonRestartEvent;
+  const leasePath = options._restartLeasePath || RESTART_LEASE_PATH();
+  const verdict = options.verdict == null ? null : options.verdict;
+  let lease = null;
+  try {
+    lease = acquireRestartLease(leasePath, { pid: process.pid, ppid: process.ppid, port: addressedPort, verdict });
+  } catch (error) {
+    writeLog({ event: 'lease-unavailable', port: addressedPort, verdict, reason: error.code || error.message });
+  }
+
+  if (lease && !lease.held) {
+    // Another client is already restarting this host's daemon. Acting too is the incident: a second
+    // stop/kickstart lands on the daemon the first one just brought back. Wait for it instead.
+    const holderPid = lease.holder.pid;
+    writeLog({ event: 'restart-deferred-to-lease', holder_pid: holderPid, port: addressedPort, verdict });
+    process.stderr.write(`\x1b[33m⏳ Another telepty client (pid ${holderPid || 'unknown'}) is already restarting the daemon on port ${addressedPort}; waiting up to ${Math.max(1, Math.round(SUPERVISOR_DEFER_MS / 1000))}s for it...\x1b[0m\n`);
+    const waitHealth = options._waitForDaemonHealth || waitForDaemonHealth;
+    const meta = await waitHealth(SUPERVISOR_DEFER_MS);
+    const requiredCapabilities = options.requiredCapabilities || [];
+    if (meta && meta.version === pkg.version && requiredCapabilities.every(c => (meta.capabilities || []).includes(c))) {
+      return { success: true, meta, attempt: 0, deferredToLease: true };
+    }
+    console.error(`\x1b[31m❌ Daemon on port ${addressedPort} did not come back while pid ${holderPid || 'unknown'} held the restart lease. Not stopping it from this client — retry the command.\x1b[0m`);
+    return { success: false, meta: null, attempt: 0, deferredToLease: true, holderPid };
+  }
+
+  try {
+    return await restartDaemonUnderLease(options);
+  } finally {
+    if (lease) releaseRestartLease(leasePath, lease.body);
+  }
+}
+
+async function restartDaemonUnderLease(options = {}) {
   const maxAttempts = options.maxAttempts || 3;
   const requiredCapabilities = options.requiredCapabilities || [];
   // Injectable seams (default to the real implementations) so the blocked-restart
@@ -680,6 +837,11 @@ async function restartDaemonGraceful(options = {}) {
       );
       return { success: false, meta: null, attempt: 0, aliveButSlow: true, reason: 'alive-but-slow' };
     }
+    // gh#82 round 2 (a): no 200 is not yet absence. A health TIMEOUT (null) means something holds
+    // the connection, and a LISTEN socket on the port means something is there — the 10:29 KST
+    // kill was a stalled daemon whose every probe, health included, timed out.
+    const refusal = refusePresentButSilent(alive === false ? null : 'health-timeout', addressedPort, portOwner, writeLog);
+    if (refusal) return refusal;
   }
   // #902: a supervisor restart is LABEL-scoped (`launchctl kickstart -k gui/<uid>/<label>`,
   // src/supervisor.js) — it kills the supervised daemon whatever port we are addressing. So it
@@ -694,7 +856,15 @@ async function restartDaemonGraceful(options = {}) {
   };
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // gh#82 round 2 (a): a retry exists because the previous attempt's daemon did not answer in
+    // time. If it is LISTENING, that is a timeout, and stopping it again is a timeout-driven kill
+    // (the 02:31Z storm: each attempt killed the instance that would have answered next).
+    if (attempt > 1) {
+      const refusal = refusePresentButSilent(null, addressedPort, portOwner, writeLog);
+      if (refusal) return { ...refusal, attempt };
+    }
     // (a) Stop the daemon we are addressing (#902: the sweep is told which one)
+    logRestartInitiated(writeLog, 'stop-initiated', { verdict: options.verdict, port: addressedPort });
     const results = cleanup({ port: addressedPort });
 
     // (b) Wait up to 3s for old processes to fully exit
@@ -740,6 +910,7 @@ async function restartDaemonGraceful(options = {}) {
     // (c) Start the replacement. On supervised installs, the replacement must be
     // launched by that supervisor; a detached child would recreate #757's orphan.
     if (supervisorPresent) {
+      logRestartInitiated(writeLog, 'kickstart-initiated', { verdict: options.verdict, port: addressedPort });
       const kicked = restartSupervisor(supervisor);
       if (!kicked || kicked.success !== true) {
         const diagnostic = `${supervisor.kind} restart failed: ${(kicked && kicked.error) || 'unknown error'}`;
@@ -937,14 +1108,24 @@ async function repairLocalDaemon(options = {}) {
   }
 
   const restart = options.restart !== false;
+  // Injectable seams (default to the real implementations), as in restartDaemonGraceful.
+  const stop = options._stopDaemon || stopDaemon;
+  const doRestart = options._restartDaemonGraceful || restartDaemonGraceful;
+  // gh#82 round 2 (c): repair stops the daemon too, so it obeys the same gate as every other caller.
+  const refusal = clientRestartRefusal('repair', Number(PORT), options);
+  if (refusal) {
+    console.error(`\x1b[31m❌ ${refusal.diagnostic}\x1b[0m`);
+    return { stopped: 0, failed: 0, meta: null, versionMatch: false, clientRestartRefused: refusal.mode, diagnostic: refusal.diagnostic };
+  }
   // #902: "repair MY daemon" — the one this CLI addresses, not every daemon on the machine.
-  const results = stopDaemon({ port: Number(PORT) });
+  logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
+  const results = stop({ port: Number(PORT) });
 
   if (!restart) {
     return { stopped: results.stopped.length, failed: results.failed.length, meta: null };
   }
 
-  const restartResult = await restartDaemonGraceful();
+  const restartResult = await doRestart({ verdict: 'explicit' });
   return {
     stopped: results.stopped.length,
     failed: results.failed.length,
@@ -964,7 +1145,10 @@ function getDiscoveryHosts() {
 }
 
 async function discoverSessions(options = {}) {
-  await ensureDaemonRunning();
+  // Injectable seams (default to the real implementations), as in ensureDaemonRunning.
+  const ensure = options._ensureDaemonRunning || ensureDaemonRunning;
+  const fetchAuth = options._fetchWithAuth || fetchWithAuth;
+  await ensure();
   const allSessions = [];
   const peerFailures = [];
 
@@ -974,7 +1158,7 @@ async function discoverSessions(options = {}) {
 
   // Local daemon sessions
   try {
-    const res = await fetchWithAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
+    const res = await fetchAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
       signal: AbortSignal.timeout(probeTimeoutMs())
     });
     // #835: the local daemon is the authority for local sessions. A refusal or a 5xx from it
@@ -989,6 +1173,21 @@ async function discoverSessions(options = {}) {
     if (isDaemonAnswerError(error)) throw error;
     // connect error / timeout only: the daemon is genuinely unreachable, so "no local
     // sessions" is an honest answer.
+    //
+    // gh#82 round 2 (d): only for a REFUSED connection. A timeout means a daemon is there and did
+    // not answer, so its sessions are UNKNOWN — and `inject` printed "session … was not found on
+    // any discovered host" for sessions that were live and producing output.
+    if (!isConnectionRefused(error)) {
+      const failure = new Error(
+        `Local telepty daemon (port ${PORT}) did not answer /api/sessions within ${probeTimeoutMs()}ms `
+        + `(${error && error.message ? error.message : 'no answer'}). Its sessions are unknown, not absent — `
+        + 'retry the command; raise TELEPTY_PROBE_TIMEOUT_MS if it keeps timing out.'
+      );
+      failure.name = 'DaemonNotAnsweringError';
+      failure.cause = error;
+      markCommandFailed();
+      throw failure;
+    }
   }
 
   // Remote peer sessions via SSH direct
@@ -1134,7 +1333,14 @@ async function resolveSessionTarget(sessionRef, options = {}) {
 // to every probe this function has had until now. `noop` (leave it alone) with the reason spelled
 // out is deliberately reused rather than a fourth action string: every caller already handles
 // noop correctly, and "do not touch it" is exactly the behaviour we want.
-function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessionsReachable = false, healthOk = false } = {}) {
+//
+// gh#82 round 2: `connectionRefused` — the loopback port REFUSED the connection (ECONNREFUSED on
+// every probe whose failure could be classified). It is the only input that may produce `start`:
+// a timeout means something accepted or queued the connection, so "nothing answered in time" is
+// `noop` / `not-answering`, never the verdict that begins by stopping the port owner. And a legacy
+// daemon is the #844 shape only — a 404 on /api/meta — never a meta TIMEOUT beside a /api/sessions
+// 200, which is a slow daemon and was the unguarded restart behind the 10:29 KST kill.
+function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessionsReachable = false, healthOk = false, connectionRefused = false } = {}) {
   // #844: a 404 on `/api/meta` is the one answer that names its own cause — the ROUTE is not
   // there. It was added 2026-03-12, so a daemon predating it answers 404 for exactly the reason
   // it answers 200 on `/api/sessions`: it is an OLD daemon, which is the case the sessionsReachable
@@ -1168,12 +1374,17 @@ function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessi
 
   // No meta after probing. An older daemon (answers /api/sessions, lacks /api/meta)
   // gets a legit restart; a genuinely absent/unreachable daemon gets auto-started.
-  if (sessionsReachable) {
+  if (sessionsReachable && isMissingMetaRoute) {
     return { action: 'restart', reason: 'legacy-daemon-no-meta' };
   }
+  // gh#82 round 2 (b): /api/sessions answered and /api/meta did not answer at all — slow, not old.
   // gh#82 (B): before calling it an absence, ask the one endpoint we never asked. 200 ⇒ alive.
-  if (healthOk) {
+  if (sessionsReachable || healthOk) {
     return { action: 'noop', reason: 'alive-but-slow' };
+  }
+  // gh#82 round 2 (a): nothing answered, but nothing refused either — present, not answering.
+  if (!connectionRefused) {
+    return { action: 'noop', reason: 'not-answering' };
   }
   return { action: 'start', reason: 'daemon-unreachable' };
 }
@@ -1241,7 +1452,59 @@ async function deferToSupervisor(options = {}) {
   }
 
   writeMarker({ signature, recordedAt: new Date().toISOString() });
-  process.stderr.write(`\x1b[33m⚠️ ${supervisor.kind} did not restore the daemon in time — starting one directly.\x1b[0m\n`);
+  // gh#82 follow-up (ask 3): no longer "starting one directly" — with a supervisor present the
+  // caller (ensureDaemonRunning) now leaves the daemon to it and fails with the command to run.
+  process.stderr.write(`\x1b[33m⚠️ ${supervisor.kind} did not restore the daemon in time.\x1b[0m\n`);
+  return null;
+}
+
+// gh#82 follow-up (ask 3): `auto` (default) | `off`. Env wins over `clientRestart` in
+// ~/.telepty/config.json. Read directly, not through auth.js getConfig(), which would MINT a config
+// (and a token) on a host that has none just to answer this question.
+function clientRestartMode() {
+  let value = process.env.TELEPTY_CLIENT_RESTART;
+  if (!value) {
+    try {
+      value = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.telepty', 'config.json'), 'utf8')).clientRestart;
+    } catch { /* no or unreadable config → default */ }
+  }
+  return String(value || '').trim().toLowerCase() === 'off' ? 'off' : 'auto';
+}
+
+// The command a human runs instead — the same per-kind actions restartSupervisorDaemon performs.
+function supervisorRestartCommand(supervisor) {
+  const kind = supervisor && supervisor.present ? supervisor.kind : null;
+  if (kind === 'launchd') {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : '$UID';
+    return `launchctl kickstart -k gui/${uid}/${LAUNCHD_LABEL}`;
+  }
+  if (kind === 'systemd') return `systemctl restart ${SYSTEMD_SERVICE_NAME}`;
+  if (kind === 'systemd-user') return `systemctl --user restart ${SYSTEMD_SERVICE_NAME}`;
+  if (kind === 'schtasks') return `schtasks /run /tn ${WINDOWS_TASK_NAME}`;
+  return 'telepty daemon start';
+}
+
+// gh#82 round 2 (c): the one gate every caller that would stop the daemon consults — every
+// ensureDaemonRunning verdict (start, legacy, version, capability) and repairLocalDaemon. Not only
+// the start path: the 10:29 KST kill could have come through the legacy restart, which the
+// start-path gate never saw. → null (this client may act) | { mode, supervisor, diagnostic }.
+function clientRestartRefusal(verdict, addressedPort, options = {}) {
+  const detect = options._detectSupervisor || detectSupervisor;
+  const supervisor = supervisorFor(detect(), addressedPort, options);
+  if (clientRestartMode() === 'off') {
+    return {
+      mode: 'off',
+      supervisor,
+      diagnostic: `Daemon on port ${addressedPort} needs a restart (${verdict}) but client-initiated restarts are disabled (TELEPTY_CLIENT_RESTART=off). Run: ${supervisorRestartCommand(supervisor)}`
+    };
+  }
+  if (supervisor.present) {
+    return {
+      mode: 'supervised',
+      supervisor,
+      diagnostic: `Daemon on port ${addressedPort} needs a restart (${verdict}) but ${supervisor.kind} owns it — this client does not stop or restart a supervised daemon. If it stays down or outdated, run: ${supervisorRestartCommand(supervisor)}`
+    };
+  }
   return null;
 }
 
@@ -1285,6 +1548,7 @@ async function ensureDaemonRunning(options = {}) {
   // older daemon (answers sessions, lacks /api/meta) apart from no daemon at all. A slow
   // sessions probe on an otherwise-confirmed daemon is irrelevant and never reached here.
   let sessionsReachable = false;
+  let sessionsRefused = false;
   if (!(meta && meta.version)) {
     try {
       const sessionsRes = await fetchAuth(`${DAEMON_URL}/api/sessions`, {
@@ -1296,8 +1560,10 @@ async function ensureDaemonRunning(options = {}) {
       if (sessionsRes && !sessionsRes.ok && !meta) {
         meta = daemonAnswer(sessionsRes.status, '/api/sessions');
       }
-    } catch {
+    } catch (error) {
       sessionsReachable = false; // timeout/refused while probing the legacy fallback
+      // gh#82 round 2 (a): which of the two — only a refusal is evidence that nothing listens.
+      sessionsRefused = isConnectionRefused(error);
     }
   }
 
@@ -1311,16 +1577,34 @@ async function ensureDaemonRunning(options = {}) {
     healthOk = await probeHealth(Number(PORT), probeTimeoutMs() * 3);
   }
 
-  let decision = decideDaemonAction({ meta, requiredCapabilities, cliVersion: pkg.version, sessionsReachable, healthOk });
+  // gh#82 round 2 (a): healthOk is tri-state (probeDaemonHealth) — false = refused, null = timed out.
+  let decision = decideDaemonAction({
+    meta,
+    requiredCapabilities,
+    cliVersion: pkg.version,
+    sessionsReachable,
+    healthOk: healthOk === true,
+    connectionRefused: sessionsRefused && healthOk === false
+  });
 
   // gh#82 (B): alive, just slow. Say so once — the operator otherwise sees a command that simply
   // fails, with the daemon it needs sitting right there.
   if (decision.reason === 'alive-but-slow') {
     process.stderr.write(
-      `\x1b[33m⚠️ Daemon on port ${PORT} answered /api/health but not /api/meta within ${probeTimeoutMs() * 2}ms — `
+      `\x1b[33m⚠️ Daemon on port ${PORT} answered ${sessionsReachable ? '/api/sessions' : '/api/health'} but not /api/meta within ${probeTimeoutMs() * 2}ms — `
       + `alive, only slow. Not restarting it. Retry the command; raise TELEPTY_PROBE_TIMEOUT_MS if it persists.\x1b[0m\n`
     );
     return;
+  }
+
+  // gh#82 round 2 (a): every probe timed out and none was refused — something holds the port (a
+  // stalled or still-booting daemon). The verdict that used to SIGTERM it; now named, not acted on.
+  if (decision.reason === 'not-answering') {
+    const diagnostic = `Daemon on port ${PORT} did not answer within ${probeTimeoutMs() * 3}ms, but the connection was not refused — `
+      + 'it is there and not responding (stalled or still starting). Not restarting it: on loopback only a refused '
+      + 'connection means nothing is running. Retry the command; raise TELEPTY_PROBE_TIMEOUT_MS if it persists.';
+    process.stderr.write(`\x1b[33m⚠️ ${diagnostic}\x1b[0m\n`);
+    return { success: false, meta: null, notAnswering: true, diagnostic };
   }
 
   if (decision.action === 'noop') {
@@ -1331,6 +1615,16 @@ async function ensureDaemonRunning(options = {}) {
   // one thing we must not do. Fail the command loudly instead of remediating.
   if (decision.action === 'abort') {
     throw daemonAnswerError(meta, '127.0.0.1');
+  }
+
+  // gh#82 follow-up (ask 3): TELEPTY_CLIENT_RESTART=off — on a host whose daemon is supervised and
+  // shared by many sessions, a client never stops, spawns or kickstarts it. Fail fast (no
+  // supervisor wait) and name the command to run instead.
+  const addressedPort = Number.isInteger(options.port) && options.port > 0 ? options.port : Number(PORT);
+  const refusedOff = clientRestartRefusal(decision.reason, addressedPort, options);
+  if (refusedOff && refusedOff.mode === 'off') {
+    console.error(`\x1b[31m❌ ${refusedOff.diagnostic}\x1b[0m`);
+    return { success: false, meta: null, clientRestart: 'off', diagnostic: refusedOff.diagnostic };
   }
 
   // #738: ONLY the 'start' path (nothing answered on the port) can be a supervisor restart
@@ -1351,6 +1645,16 @@ async function ensureDaemonRunning(options = {}) {
       // through to the restart banner and doRestart(), i.e. the kill it exists to prevent.
       if (decision.action === 'abort') throw daemonAnswerError(meta, '127.0.0.1');
     }
+  }
+
+  // gh#82 follow-up (ask 3) + round 2 (c): the supervisor owns this port. Falling through here was
+  // the 2026-10-09 incident — restartDaemonGraceful SIGTERMed (and then `kickstart -k`ed) a live
+  // daemon that was only slow. Leave it to the supervisor for EVERY verdict, not only `start`
+  // (after the defer above): legacy, version and capability restarts stop it just the same.
+  const refusedSupervised = clientRestartRefusal(decision.reason, addressedPort, options);
+  if (refusedSupervised) {
+    console.error(`\x1b[31m❌ ${refusedSupervised.diagnostic}\x1b[0m`);
+    return { success: false, meta: null, supervisor: refusedSupervised.supervisor.kind, deferred: true, diagnostic: refusedSupervised.diagnostic };
   }
 
   // telepty#15: a restart blocked by a daemon the CLI cannot stop (foreign parent
@@ -1382,7 +1686,7 @@ async function ensureDaemonRunning(options = {}) {
   // nothing answered — the one verdict whose first act (stopping the port's owner) contradicts
   // itself, so it re-confirms liveness before stopping anything. `restart` is a decision to
   // replace a daemon we know answered, and must keep stopping it.
-  const result = await doRestart({ requiredCapabilities, absenceVerdict: decision.action === 'start' });
+  const result = await doRestart({ requiredCapabilities, absenceVerdict: decision.action === 'start', verdict: decision.reason });
   if (signature && result && result.success === false && result.blockedPid) {
     writeFailureMarker({
       signature: `${decision.reason}:${meta && meta.version ? meta.version : 'none'}->${pkg.version}:pid${result.blockedPid}`,
@@ -1513,6 +1817,7 @@ async function manageInteractive() {
 
     if (response.action === 'daemon') {
       console.log('\n\x1b[33mStarting daemon in background...\x1b[0m');
+      logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: null });
       cleanupDaemonProcesses();
       startDetachedDaemon();
       console.log('✅ Daemon started.\n');
@@ -1790,6 +2095,12 @@ async function main() {
       // last thing said, and the consequence users actually care about is named: the sessions
       // are gone until a daemon is back. restartDaemonGraceful has already printed WHY.
       if (!updateRestartSucceeded(repair)) {
+        // gh#82 round 2 (c): this client did not touch the daemon — say that, not "did not come back".
+        if (repair && repair.clientRestartRefused) {
+          console.error('\n\x1b[31m❌ Update installed, but this client did not restart the daemon (see above).\x1b[0m');
+          process.exitCode = 1;
+          return;
+        }
         console.error('\n\x1b[31m❌ Update installed, but the daemon did NOT come back up.\x1b[0m');
         console.error('\x1b[31m   Existing sessions are disconnected until a daemon is running again.\x1b[0m');
         console.error('   Retry with: telepty daemon restart    then check: telepty list');
@@ -1853,6 +2164,7 @@ async function main() {
   if (cmd === 'cleanup-daemons') {
     // #902: the one command whose contract IS machine-wide — it names the default port
     // explicitly now that the sweep no longer assumes one.
+    logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: DEFAULT_PORT });
     const results = cleanupDaemonProcesses({ port: DEFAULT_PORT });
     console.log(`Stopped ${results.stopped.length} telepty daemon(s).`);
     if (results.failed.length > 0) {
@@ -1883,6 +2195,7 @@ async function main() {
       // Terminate the running daemon (state-file pid + configured-port owner),
       // graceful SIGTERM→SIGKILL. Surgical: never a system-wide process sweep
       // (that's `cleanup-daemons`). Internal auto-restart is untouched.
+      logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
       const results = stopDaemon({ port: Number(PORT) });
       if (results.stopped.length === 0 && results.failed.length === 0) {
         console.log('No telepty daemon running.');
@@ -1902,6 +2215,7 @@ async function main() {
       // Clean cross-platform restart = surgical stop + detached start. Replaces
       // the mac-only `launchctl kickstart` and gives Windows a restart it never
       // had. Internal auto-restart (ensureDaemonRunning) is NOT touched.
+      logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
       stopDaemon({ port: Number(PORT) });
       const cp = startDetachedDaemon();
       console.log(`\x1b[32m✅ Telepty daemon restarted (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
@@ -4715,6 +5029,8 @@ module.exports = {
   decideDaemonAction,     // #567: pure restart-decision policy (meta-primary; no I/O)
   deferToSupervisor,      // #738: supervisor-aware defer (injectable detect/probe/marker seams)
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
+  repairLocalDaemon,      // gh#82 round 2 (c): update/repair stop path (injectable stop/restart/detect)
+  discoverSessions,       // gh#82 round 2 (d): local timeout ≠ no sessions (injectable ensure/fetch)
   helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
   updateRestartSucceeded, // gh#61: did `update` leave a running daemon — skip is not a failure

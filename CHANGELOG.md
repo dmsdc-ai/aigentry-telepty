@@ -2,6 +2,62 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.8.5 — 2026-10-09
+
+The three asks of the 2026-10-09 [gh#82](https://github.com/dmsdc-ai/aigentry-telepty/issues/82)
+report: a launchd-supervised daemon restarted twice in six minutes under ~12 sessions and load > 14,
+because clients whose probes all timed out concluded "absent" and took the restart path, several at
+once, and nothing recorded who did it. The host's own logs then showed what the asks alone would
+not have fixed: the one client SIGTERM they record (10:29 KST) needed no concurrency at all — a
+daemon too stalled to answer ANY probe, `/api/health` included, was read as absent or as "legacy"
+and stopped. So the last three entries fix the verdict itself. All five are **CLI** changes: they
+apply on the next `telepty` invocation, nothing to restart.
+
+- **Every client-initiated stop or kickstart now says who did it.** Before acting, the CLI appends
+  `event=stop-initiated` / `event=kickstart-initiated` to `~/.telepty/logs/daemon-restart.log` with
+  `initiator_pid`, `initiator_ppid`, `initiator_argv` (≤ 200 chars, quoted), the `verdict` that sent
+  it there, the addressed `port` and the `session`. **What a 0.8.4 user sees**: that log recorded a
+  restart only when it FAILED, so a successful stop — the one that actually took the daemon down —
+  left no line at all, and the report could only infer its cause. Explicit `telepty daemon
+  stop|restart`, `cleanup-daemons` and the update repair are logged too, with `verdict=explicit`.
+  Pinned by `test/restart-attribution-82.test.js`.
+- **One restart owner per host.** Before any stop or kickstart, `restartDaemonGraceful` takes
+  `~/.telepty/restart.lease` with an exclusive create. A client that finds a fresh lease (under 60 s
+  old, holder alive) does not act: it waits up to `TELEPTY_SUPERVISOR_WAIT_MS` for the daemon to come
+  back, logs `event=restart-deferred-to-lease holder_pid=…`, and fails without a kill if it does not.
+  A stale lease is replaced; a lease I/O error only forfeits the protection (`event=lease-unavailable`)
+  and never blocks a restart. Pinned by `test/restart-lease-82.test.js`.
+- **On loopback, a timeout is no longer an absence.** A connect to a port with nothing listening is
+  refused at once; a timeout means something accepted the connection. The `start` verdict now needs a
+  REFUSED `/api/sessions` and `/api/health`; every-probe-timed-out is reported as a daemon that is
+  there and not answering, and nothing is stopped. The same rule holds at the stop itself: on an
+  absence verdict `restartDaemonGraceful` does not stop when `/api/health` timed out or a LISTEN
+  socket holds the port, and a retry never stops a daemon that is listening but slow (each attempt
+  used to kill the instance that would have answered next). And a **legacy** daemon is now only the
+  #844 shape — a 404 on `/api/meta` — not a meta timeout beside a `/api/sessions` 200: that was a slow
+  daemon read as an old one, an unguarded restart, and the likeliest path of the 10:29 kill. **What a
+  0.8.4 user sees**: under load, `⚠️ … did not answer …, but the connection was not refused — Not
+  restarting it` instead of `Found an older local telepty daemon. Restarting it...`. Pinned by
+  `test/timeout-not-absence-82.test.js`.
+- **Under a supervisor, no client stops the daemon — on any verdict.** When launchd, systemd or
+  schtasks owns the addressed port, `ensureDaemonRunning` (absence after the #738 wait, legacy,
+  version and capability mismatch alike) and the `telepty update` / repair path leave the daemon to
+  the supervisor and fail with the command to run instead of `cleanupDaemonProcesses` and
+  `kickstart -k`. **This is a behaviour change**: a supervised daemon that is down or outdated is now
+  restarted by its supervisor (KeepAlive / `Restart=`, or the post-install kickstart) or by hand, not
+  by the next `telepty` call, and `telepty update` on such a host exits 1 saying it did not restart
+  the daemon. Explicit `telepty daemon stop|restart` are unchanged. New switch
+  `TELEPTY_CLIENT_RESTART=off` (or `"clientRestart": "off"` in `~/.telepty/config.json`) applies the
+  same refusal on unsupervised hosts: the client never stops, spawns or kickstarts a daemon and fails
+  fast naming the command. Pinned by `test/client-restart-off-82.test.js` and
+  `test/timeout-not-absence-82.test.js`.
+- **A local `/api/sessions` timeout is reported as a timeout.** Discovery used to treat it as "no
+  local sessions", so `telepty inject` printed `session <id> was not found on discovered hosts` for
+  sessions that were live and producing output — the second error the workers saw. It now fails the
+  command with `Local telepty daemon (port …) did not answer /api/sessions within …ms … Its sessions
+  are unknown, not absent`; only a refused connection still yields an empty local list. Pinned by
+  `test/timeout-not-absence-82.test.js`.
+
 ## 0.8.4 — 2026-10-07
 
 Patch release: one fix, **not a protocol release** — the wire semantics are unchanged and no session

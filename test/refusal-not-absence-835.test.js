@@ -82,13 +82,15 @@ test('#835 decideDaemonAction: a 5xx answer is "broken", not "absent"', () => {
 });
 
 test('#835 decideDaemonAction: nothing answered still auto-starts (the one legitimate absence)', () => {
-  const d = decideDaemonAction({ meta: null, cliVersion: pkg.version, sessionsReachable: false });
+  // gh#82 round 2 (a): "nothing answered" must be a REFUSED connection to be an absence.
+  const d = decideDaemonAction({ meta: null, cliVersion: pkg.version, sessionsReachable: false, connectionRefused: true });
   assert.equal(d.action, 'start');
   assert.equal(d.reason, 'daemon-unreachable');
 });
 
 test('#835 decideDaemonAction: legacy daemon (sessions answer, no meta) still restarts', () => {
-  const d = decideDaemonAction({ meta: null, cliVersion: pkg.version, sessionsReachable: true });
+  // gh#82 round 2 (b): "no meta" for a legacy daemon is the 404 on /api/meta (#844), not a timeout.
+  const d = decideDaemonAction({ meta: { answered: true, status: 404, refused: false, endpoint: '/api/meta' }, cliVersion: pkg.version, sessionsReachable: true });
   assert.equal(d.action, 'restart');
   assert.equal(d.reason, 'legacy-daemon-no-meta');
 });

@@ -71,9 +71,10 @@ test('decideDaemonAction: required capability genuinely missing → restart', ()
   assert.equal(d.action, 'restart');
 });
 
-test('decideDaemonAction: no meta but /api/sessions answers → restart (legacy daemon)', () => {
+test('decideDaemonAction: /api/meta 404 but /api/sessions answers → restart (legacy daemon)', () => {
+  // gh#82 round 2 (b): legacy is the #844 shape — a 404 on /api/meta — not a meta timeout.
   const d = decideDaemonAction({
-    meta: null,
+    meta: { answered: true, status: 404, refused: false, endpoint: '/api/meta' },
     requiredCapabilities: [CAP],
     cliVersion: pkg.version,
     sessionsReachable: true
@@ -81,12 +82,14 @@ test('decideDaemonAction: no meta but /api/sessions answers → restart (legacy 
   assert.equal(d.action, 'restart');
 });
 
-test('decideDaemonAction: no meta and /api/sessions unreachable → start', () => {
+test('decideDaemonAction: no meta and /api/sessions refused → start', () => {
+  // gh#82 round 2 (a): only a refused loopback connection is an absence.
   const d = decideDaemonAction({
     meta: null,
     requiredCapabilities: [CAP],
     cliVersion: pkg.version,
-    sessionsReachable: false
+    sessionsReachable: false,
+    connectionRefused: true
   });
   assert.equal(d.action, 'start');
 });
@@ -139,13 +142,14 @@ test('ensureDaemonRunning: required capability missing → DOES restart (legit)'
   assert.equal(restart.calls.length, 1, 'a genuinely missing capability must still restart');
 });
 
-test('ensureDaemonRunning: no daemon at all (meta null + sessions unreachable) → DOES start (legit)', async () => {
+test('ensureDaemonRunning: no daemon at all (meta null + sessions refused) → DOES start (legit)', async () => {
   const restart = recordingRestart();
   await ensureDaemonRunning({
     requiredCapabilities: [CAP],
     _getDaemonMeta: async () => null,
     _detectSupervisor: () => ({ present: false, kind: null, detail: null }),
-    _fetchWithAuth: timeoutFetch(),
+    // gh#82 round 2 (a): a REFUSED connection — a timeout is no longer an absence verdict.
+    _fetchWithAuth: () => Promise.reject(Object.assign(new Error('fetch failed'), { code: 'ECONNREFUSED' })),
     // gh#82 (B): absent on /api/health too — otherwise this reaches the live local daemon.
     _probeDaemonHealth: async () => false,
     _restartDaemonGraceful: restart,

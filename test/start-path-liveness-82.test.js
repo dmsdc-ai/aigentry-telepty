@@ -101,16 +101,19 @@ test('gh#82 B: meta timeout + health 200 is alive-but-slow, NEVER the verdict th
   assert.equal(d.reason, 'alive-but-slow');
 });
 
-test('gh#82 B: health silent too ⇒ still the one legitimate absence (negative control)', () => {
-  const d = decideDaemonAction({ meta: null, cliVersion: pkg.version, sessionsReachable: false, healthOk: false });
+test('gh#82 B: health refused too ⇒ still the one legitimate absence (negative control)', () => {
+  // Round 2 (a): the absence has to be a REFUSED connection, not just silence.
+  const d = decideDaemonAction({ meta: null, cliVersion: pkg.version, sessionsReachable: false, healthOk: false, connectionRefused: true });
   assert.equal(d.action, 'start');
   assert.equal(d.reason, 'daemon-unreachable');
 });
 
-test('gh#82 B: health is not consulted once /api/sessions answered — legacy restart is unchanged', () => {
+test('gh#82 round 2 (b): meta TIMEOUT + /api/sessions answered is a slow daemon, not a legacy one', () => {
+  // This row used to pin `restart / legacy-daemon-no-meta` for meta: null (a timeout) — the
+  // unguarded restart behind the 10:29 KST kill. Legacy is a 404 on /api/meta (refusal-classification-844).
   const d = decideDaemonAction({ meta: null, cliVersion: pkg.version, sessionsReachable: true, healthOk: true });
-  assert.equal(d.action, 'restart');
-  assert.equal(d.reason, 'legacy-daemon-no-meta');
+  assert.equal(d.action, 'noop');
+  assert.equal(d.reason, 'alive-but-slow');
 });
 
 test('gh#82 B: #567 still holds — meta answered healthy, health irrelevant, never a restart', () => {
@@ -310,13 +313,16 @@ test('gh#82 T6 (E): a failed restart attempt writes one line saying what was att
     _waitForDaemonHealth: async () => null, // nothing came back — the environment-A shape
     _logDaemonRestartEvent: log
   }));
-  assert.equal(log.lines.length, 2, 'one line per failed attempt');
-  assert.equal(log.lines[0].event, 'attempt-failed');
-  assert.equal(log.lines[0].attempt, '1/2');
-  assert.equal(log.lines[0].port, 51821);
-  assert.equal(log.lines[0].stopped, 1);
-  assert.equal(log.lines[0].reason, 'no-daemon-after-spawn', 'a bare "attempt n/N failed" is what made this a multi-round remote diagnosis');
-  assert.equal(log.lines[1].attempt, '2/2');
+  // gh#82 follow-up: each attempt's stop is now attributed (event=stop-initiated, see
+  // test/restart-attribution-82.test.js) through the same writer, so count the failure lines.
+  const failed = log.lines.filter((l) => l.event === 'attempt-failed');
+  assert.equal(failed.length, 2, 'one line per failed attempt');
+  assert.equal(failed[0].event, 'attempt-failed');
+  assert.equal(failed[0].attempt, '1/2');
+  assert.equal(failed[0].port, 51821);
+  assert.equal(failed[0].stopped, 1);
+  assert.equal(failed[0].reason, 'no-daemon-after-spawn', 'a bare "attempt n/N failed" is what made this a multi-round remote diagnosis');
+  assert.equal(failed[1].attempt, '2/2');
 });
 
 test('gh#82 T6 (E): the reason reaches the real log file under ~/.telepty/logs', async () => {
