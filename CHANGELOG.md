@@ -2,7 +2,7 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## 0.8.5 (unreleased)
+## 0.8.5 — 2026-10-09
 
 The three asks of the 2026-10-09 [gh#82](https://github.com/dmsdc-ai/aigentry-telepty/issues/82)
 report: a launchd-supervised daemon restarted twice in six minutes under ~12 sessions and load > 14,
