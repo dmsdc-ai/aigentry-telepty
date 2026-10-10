@@ -1,0 +1,123 @@
+# Task #1170 / P1 - isolated SQLite primitive prototype (EXPERIMENT ONLY).
+#
+# This workflow executes the isolated prototype suite on three runner OSes against
+# synthetic fixtures in the runner's temp directory. It adopts nothing, installs nothing,
+# touches no live store, and qualifies no production behaviour. Node 24 is authorised for
+# this experiment only; product engines (>=20) and defaults are unchanged.
+#
+# Not live-activated: it runs only on explicit workflow_dispatch, or on a pull request that
+# touches AT LEAST ONE of the two P1 leaf paths below. `paths:` filters are OR triggers -
+# either path alone fires the workflow; it is not a requirement that both be touched.
+
+name: sqlite-conditional-prototype (task 1170 P1)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'validation/1170-sqlite/primitive.test.cjs'
+      - '.github/workflows/sqlite-conditional-prototype.yml'
+
+# Read-only: the prototype never needs write scopes.
+permissions:
+  contents: read
+
+jobs:
+  primitive:
+    name: P1 primitive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      # Exact ref: the PR head commit under test, not the synthetic merge commit.
+      - name: Checkout exact ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Record actual git HEAD provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          echo "resolved HEAD: ${HEAD_SHA}"
+          echo "P1_GIT_HEAD=${HEAD_SHA}" >> "$GITHUB_ENV"
+
+      - name: Set up pinned Node 24 (experiment-scoped)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+
+      # No npm ci / install / build: the suite uses only Node standard library modules.
+      - name: Verify runtime provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -v
+          node -e 'const{DatabaseSync}=require("node:sqlite");
+            const d=new DatabaseSync(":memory:");
+            console.log("sqlite:",d.prepare("select sqlite_version() v").get().v);
+            d.close();'
+
+      # runner.* context is not valid in job-level `env:`, so the temp roots are staged
+      # here in a step. Paths are joined by Node so Windows separators stay correct.
+      - name: Stage owned runner temp roots
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs"), path = require("node:path");
+            const base = process.env.RUNNER_TEMP;
+            const tmp = path.join(base, "p1-sqlite");
+            const evidence = path.join(base, "p1-evidence");
+            fs.mkdirSync(tmp, { recursive: true });
+            fs.mkdirSync(evidence, { recursive: true });
+            fs.appendFileSync(process.env.GITHUB_ENV,
+              `P1_TMP_ROOT=${tmp}\nP1_EVIDENCE_DIR=${evidence}\n`);
+            console.log("tmp:", tmp, "\nevidence:", evidence);
+          '
+
+      # Two TAP reporters (console + file) so the artifact is written without `tee`,
+      # which keeps the real process exit code on every OS. No continue-on-error:
+      # a failure on any OS fails the job and is reported as an actual failure.
+      - name: Run P1 primitive suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test \
+            --test-reporter=tap --test-reporter-destination=stdout \
+            --test-reporter=tap --test-reporter-destination="$P1_EVIDENCE_DIR/primitive.tap" \
+            validation/1170-sqlite/primitive.test.cjs
+
+      - name: Assert evidence artifacts exist
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs"), path = require("node:path");
+            const dir = process.env.P1_EVIDENCE_DIR;
+            const missing = ["primitive.tap", "primitive-summary.json"].filter((f) => {
+              const p = path.join(dir, f);
+              return !fs.existsSync(p) || fs.statSync(p).size === 0;
+            });
+            if (missing.length) {
+              console.error("missing or empty evidence artifacts:", missing.join(", "));
+              process.exit(1);
+            }
+            console.log("evidence present:", fs.readdirSync(dir).join(", "));
+          '
+
+      - name: Upload TAP + JSON evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p1-evidence-${{ matrix.os }}
+          path: ${{ runner.temp }}/p1-evidence/
+          if-no-files-found: error
+          retention-days: 7
