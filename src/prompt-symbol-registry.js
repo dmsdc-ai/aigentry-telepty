@@ -28,7 +28,7 @@ const CODEX_MODAL_PATTERNS = [
 // ("gpt-5.5 xhigh fast" / "gpt-5.5 default · /path"). It repaints on every composer frame
 // and is absent while a modal owns the screen, so its LAST position is reliable evidence
 // that the composer was alive after that point in the stream.
-const CODEX_COMPOSER_FOOTER = /gpt-\S+\s+\S+(\s+fast|\s*·)/;
+const CODEX_COMPOSER_FOOTER = /gpt-\S+\s+\S+(\s+fast|\s*·)/i;
 
 // #760 — the same two lists for Claude Code, measured against real 2.1.220 surfaces
 // (scratchpad/capture-760-claude-modals.js, scratchpad/EVIDENCE-760.md).
@@ -225,7 +225,7 @@ const ENTRIES = {
       // names ("gpt-5.6-sol"), where `[0-9.]+` stopped at "5.6" and the `\s`
       // never reached past the "-sol". `\S+` cannot cross whitespace, so the
       // trailing `\s+\S+(\s+fast|\s*·)` profile/tail signal is preserved.
-      if (/OpenAI Codex \(v/.test(text) && /gpt-\S+\s+\S+(\s+fast|\s*·)/.test(text)) {
+      if (/OpenAI Codex \(v/.test(text) && /gpt-\S+\s+\S+(\s+fast|\s*·)/i.test(text)) {
         return { found: true, reason: 'codex_multi_signal' };
       }
 
@@ -238,7 +238,7 @@ const ENTRIES = {
         // captures kept one leading space — accept both.
         if (!/^ ?› /.test(line)) continue;
         const footer = (lines[i + 1] || '') + '\n' + (lines[i + 2] || '');
-        if (/gpt-\d/.test(footer)) {
+        if (/gpt-\d/i.test(footer)) {
           return { found: true, line_index: i, col: 2, reason: 'codex_strict_line' };
         }
       }
