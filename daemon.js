@@ -3509,6 +3509,16 @@ app.post('/api/sessions/spawn', (req, res) => {
 app.post('/api/sessions/register', (req, res) => {
   const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id, term_program, term } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+  // #1215 — opt-in create-if-absent. Checked BEFORE any existing-record mutation below, and the
+  // handler stays synchronous from here to the insert, so the check and the create are atomic.
+  // Without the boolean `true` the idempotent (mutating) re-register below is unchanged.
+  if (req.body.create_only === true) {
+    if (typeof session_id !== 'string') return respondWithError(res, 400, 'INVALID_REQUEST', 'session_id must be a string');
+    if (Object.prototype.hasOwnProperty.call(sessions, session_id)) {
+      return respondWithError(res, 409, 'SESSION_EXISTS', 'Session already exists; create_only refused it unchanged.', { session_id });
+    }
+    if (sessions[session_id]) return respondWithError(res, 400, 'SESSION_ID_RESERVED', 'session_id is reserved');
+  }
   const parsedIdleTtl = parseOptionalIdleTtl(req.body);
   if (parsedIdleTtl.error) {
     return res.status(400).json({ error: parsedIdleTtl.error, code: 'INVALID_IDLE_TTL' });
@@ -3782,7 +3792,7 @@ app.get('/api/meta', (req, res) => {
     port: boundPort,
     machine_id: MACHINE_ID,
     terminal: DETECTED_TERMINAL,
-    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox']
+    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session']
   });
 });
 
@@ -4659,8 +4669,10 @@ app.post('/api/sessions/submit-all', (req, res) => {
 
 app.post('/api/sessions/:id/inject', async (req, res) => {
   const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
-  if (!resolvedId) return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
+  // #1215 — opt-in exact routing: own-property match only, no alias/sibling fallback.
+  const exactTarget = !!(req.body && req.body.exact_target === true);
+  const resolvedId = exactTarget ? (Object.prototype.hasOwnProperty.call(sessions, requestedId) ? requestedId : null) : resolveSessionAlias(requestedId);
+  if (!resolvedId) return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId, ...(exactTarget ? { exact_target: true } : {}) });
   const session = sessions[resolvedId];
   const id = resolvedId;
   const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
@@ -4894,6 +4906,7 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       inject_id,
       strategy: delivery.strategy,
       submit: delivery.submit,
+      ...(exactTarget ? { exact_target: true, session_id: id } : {}),
       ...(delivery.bootstrap_queued ? {
         bootstrap_queued: true,
         bootstrap_op_id: delivery.bootstrap_op_id || delivery.msg_id,
@@ -5252,11 +5265,22 @@ function describeSessionTeardown(killError) {
 
 app.delete('/api/sessions/:id', (req, res) => {
   const requestedId = req.params.id;
+  // #1215 — opt-in owned delete: exact own-property id only, no alias resolution.
+  const ownedDelete = req.query.owned === 'true';
   // #548: destructive op — must not cascade across alias-sharing siblings.
-  const resolvedId = resolveSessionForDestroy(requestedId);
+  const resolvedId = ownedDelete ? (Object.prototype.hasOwnProperty.call(sessions, requestedId) ? requestedId : null) : resolveSessionForDestroy(requestedId);
   if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
   const session = sessions[resolvedId];
   const id = resolvedId;
+  // #1215 — the caller must present THIS instance's current credential (sid + epoch + generation),
+  // checked before isClosing or any other side effect. Missing/stale/other bearer: no mutation.
+  if (ownedDelete) {
+    const principal = verifiedPrincipalFromReq(req);
+    if (!principal || principal.sid !== id || !session.sessionEpoch
+        || principal.epoch !== session.sessionEpoch || principal.generation !== session.credentialGeneration) {
+      return respondWithError(res, 403, 'OWNED_DELETE_FORBIDDEN', 'Owned delete requires the current session credential.', { requested: requestedId });
+    }
+  }
   if (session.isClosing) return res.json({ success: true, status: 'closing' });
   // BUG-C (shared-fate): a wrapped session can be co-bound by a stale/displaced owner bridge
   // (duplicate --id). A DELETE carrying a token that is NOT the current owner's, while a live
