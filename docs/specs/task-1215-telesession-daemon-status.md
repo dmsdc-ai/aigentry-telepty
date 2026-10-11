@@ -40,11 +40,11 @@ Those code paths are byte-identical to the baseline. Restart risks in those area
 |---|---|
 | Patch identity | `daemon.js` on this branch equals the baseline plus the candidate diff, byte for byte (checked at assembly with sha256 and `cmp`). |
 | `test/restart-credential-reclaim-1215.test.js` | Supplied as-is from the authoring stage. That stage reported a syntax check (`node --check`) only. Assembly did not run it. **All actual daemon tests: NOTRUN.** |
-| Test fixture dependency | The test expects `test-support/restart-credential-child-1215.js`, which is **not on this branch**. As committed, the test file cannot pass, and it fails by assertion when that fixture is missing. It is not listed in `npm test` / `test:ci` / `test:ci:pty`. |
+| Test fixture | `test-support/restart-credential-child-1215.js` is the in-PTY sender used by the RC suite. It was supplied as-is from the authoring stage, needs only Node built-ins, and talks only to loopback fixture daemons (never port 3848). Assembly did not run it: **NOTRUN**. The RC suite is not listed in `npm test` / `test:ci` / `test:ci:pty`. |
 | Earlier fake-VM run (22 acceptance checks, 36 pass, 13 excluded) | Ran against a fake telepty and a synthetic suite. **It is not real-daemon evidence** for this candidate. |
 | Current `main` / live 0.8.5 | Does **not** advertise or implement these three capabilities. |
 | Real end-to-end check (Dot client, tunnel) | **Pending.** Not run. |
-| Security scan | No new scan was run for this branch. `daemon.js` is the supplied candidate bytes, and the test was authored upstream with a Snyk scan reported as owed (CLI unavailable at authoring). This branch makes no "clean" claim. |
+| Security scan | No new scan was run for this branch. `daemon.js` is the supplied candidate bytes, and the RC test and its fixture were authored upstream with a Snyk scan reported as owed (CLI unavailable at authoring). This branch makes no "clean" claim. |
 
 ## 5. Hashes (sha256)
 
@@ -54,9 +54,10 @@ Those code paths are byte-identical to the baseline. Restart risks in those area
 | candidate `daemon.js` (this branch) | `70dd0ca7a322e465f7c940b9b6cdd8c4e3446ba799034ba25b3e0269f1dabdcf` |
 | candidate diff (`diff -u`, `a/daemon.js` → `b/daemon.js`) | `ddcd4a5f2974a3869e6028f2c43724fff94daedfc4d309fd7875d60776298f54` |
 | `test/restart-credential-reclaim-1215.test.js` | `190ad68503885b32c57513c0cb6cb5c8a7fb65a6f515df0f8768007c40d39e5f` |
+| `test-support/restart-credential-child-1215.js` | `e72407ec02f6cf85859f17dc0ba5346d85fbeaf6097b0e448708780dd3c29d6f` |
 
 ## 6. What this branch does not imply
 
 - No version bump, tag, npm publish or GitHub Release.
 - No restart or reconfiguration of any operating daemon.
-- No claim of release readiness. Moving forward needs at least: the missing test fixture, a real-daemon test run, a security scan of the new first-party test code, and the pending end-to-end verification.
+- No claim of release readiness. Moving forward needs at least: a real-daemon test run, a security scan of the new first-party test code, and the pending end-to-end verification.
