@@ -129,3 +129,59 @@ test('#109(b): the barrier wait is bounded — late callers get QUEUE_TIMEOUT, a
   assert.deepEqual(frames.filter((f) => f !== '\r').sort(), [...delivered].sort(), JSON.stringify(frames));
   for (let i = 0; i < frames.length; i += 2) assert.equal(frames[i + 1], '\r', JSON.stringify(frames));
 });
+
+// N5: accepted callers are served in arrival order. Staggered starts make arrival order known;
+// three injects fit inside the bound (2 × 500 ms wrapped submit delay < QUEUE_BOUND_MS).
+test('#109(b): queued callers are delivered in arrival order, each text followed by its own CR', async (t) => {
+  const sid = createSessionId('i109-fifo');
+  const { ws, frames } = await wrappedOwner(sid);
+  t.after(() => { try { ws.close(); } catch {} });
+
+  const pending = [];
+  for (const p of ['f1', 'f2', 'f3']) {
+    pending.push(inject(sid, p));
+    await sleep(30);
+  }
+  const results = await Promise.all(pending);
+  for (const r of results) assert.equal(r.status, 200, JSON.stringify(r.body));
+  await waitFor(() => frames.length >= 6, { timeoutMs: 3000, description: 'three texts and three CRs' });
+
+  assert.deepEqual(frames, ['f1', '\r', 'f2', '\r', 'f3', '\r'], JSON.stringify(frames));
+});
+
+// Review 1 B1, measured on aeb436b: a rename inside the submit delay left the owner with
+// ['hello'] and no CR (inject_failed SESSION_GONE). A rename moves the SAME live instance —
+// it received the text, so it must receive the CR.
+test('#109: a rename inside the submit delay still delivers the CR to the same live instance', async (t) => {
+  const sid = createSessionId('i109-rename');
+  const newId = `${sid}-renamed`;
+  const { ws, frames } = await wrappedOwner(sid);
+  t.after(() => { try { ws.close(); } catch {} });
+
+  const inj = await inject(sid, 'hello');
+  assert.equal(inj.status, 200, JSON.stringify(inj.body));
+  const ren = await harness.request(`/api/sessions/${encodeURIComponent(sid)}`, { method: 'PATCH', body: { new_id: newId } });
+  assert.equal(ren.status, 200, JSON.stringify(ren.body));
+  await sleep(1200);
+
+  assert.deepEqual(frames, ['hello', '\r'], JSON.stringify(frames));
+});
+
+// Guard for the CR timer recheck: destroy (and recreate under the same id) inside the submit
+// delay must not put a bare CR into the replacement, which never received this inject's text.
+test('#109: a destroy+recreate inside the submit delay writes no CR to the replacement', async (t) => {
+  const sid = createSessionId('i109-destroy-cr');
+  const old = await wrappedOwner(sid);
+  t.after(() => { try { old.ws.close(); } catch {} });
+
+  const inj = await inject(sid, 'hello');
+  assert.equal(inj.status, 200, JSON.stringify(inj.body));
+  const del = await destroy(sid);
+  assert.ok(del.status < 300, `delete -> ${del.status}`);
+  const replacement = await wrappedOwner(sid);
+  t.after(() => { try { replacement.ws.close(); } catch {} });
+  await sleep(1200);
+
+  assert.deepEqual(old.frames, ['hello'], JSON.stringify(old.frames));
+  assert.deepEqual(replacement.frames, [], JSON.stringify(replacement.frames));
+});
