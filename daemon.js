@@ -3055,6 +3055,19 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   // reliably fires instead of being swallowed into the paste burst. No-op otherwise.
   const deliveredBody = maybeBracketedPaste(deliveredPrompt, session);
 
+  // #107: the deferred CR below belongs to THIS text. Without a barrier, a second inject
+  // arriving inside the submit delay writes its text first and the target reads
+  // text1 text2 CR CR — one glued line (and the bridge's #720 filter then drops the second,
+  // now consecutive, CR as a duplicate). Wait for any earlier submit on this session, then
+  // claim the barrier synchronously so a third inject queues behind this one.
+  while (session.pendingSubmit) await session.pendingSubmit;
+  let releaseSubmit = () => {};
+  if (!options.noEnter && session.type !== 'aterm') {
+    session.pendingSubmit = new Promise((resolve) => {
+      releaseSubmit = () => { session.pendingSubmit = null; resolve(); };
+    });
+  }
+
   try {
     const ack = mailbox.enqueue({
       msg_id: msgId,
@@ -3079,7 +3092,12 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
     if (!options.noEnter && session.type !== 'aterm') {
       const submitDelay = session.type === 'wrapped' ? 500 : 300;
       setTimeout(async () => {
-        const submitResult = await writeDataToSession(id, session, '\r');
+        let submitResult;
+        try {
+          submitResult = await writeDataToSession(id, session, '\r');
+        } finally {
+          releaseSubmit();
+        }
         if (!submitResult.success) {
           emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
             phase: 'submit',
@@ -3102,12 +3120,17 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
     console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
     // Fallback: direct delivery (backward compat during migration)
     const textResult = await writeDataToSession(id, session, deliveredBody);
-    if (!textResult.success) return textResult;
+    if (!textResult.success) { releaseSubmit(); return textResult; }
 
     if (!options.noEnter && session.type !== 'aterm') {
       const submitDelay = session.type === 'wrapped' ? 500 : 300;
       setTimeout(async () => {
-        const submitResult = await writeDataToSession(id, session, '\r');
+        let submitResult;
+        try {
+          submitResult = await writeDataToSession(id, session, '\r');
+        } finally {
+          releaseSubmit();
+        }
         if (!submitResult.success) {
           emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
             phase: 'submit',
