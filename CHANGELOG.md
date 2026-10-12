@@ -9,12 +9,17 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   waits for the previous inject's deferred CR (a per-session submit barrier), so a wrapped target no
   longer reads `text1 text2 CR CR` as one glued line. Pinned by `test/inject-submit-order-107.test.js`.
   - **Follow-up ([gh#109](https://github.com/dmsdc-ai/aigentry-telepty/issues/109)): the barrier
-    re-checks the session and is bounded.** After the wait, and again in the deferred CR timer, the
-    id must still name the same session instance (same record, same epoch). An inject whose session
-    was destroyed, renamed or recreated under the same id while it waited answers **410
-    `SESSION_GONE`** and writes nothing; a CR whose session is gone is not written and is reported
-    as `inject_failed` (`phase: submit`, `code: SESSION_GONE`). The wait is capped at **10000 ms**
-    (`TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS`); a caller still queued then gets **503 `QUEUE_TIMEOUT`** and
+    re-checks the session and is bounded.** After the wait the id must still name the same session
+    instance (same record, same epoch). An inject whose session was destroyed, renamed or recreated
+    under the same id, or whose wrapped owner was replaced (a new owner claim resets the epoch),
+    while it waited answers **410 `SESSION_GONE`** and writes nothing. The deferred CR timer checks
+    the **instance**, not the id: a session renamed inside the submit delay is the same live
+    instance that received the text, so it still gets its CR; a destroyed, recreated or
+    owner-replaced instance gets no CR, and that is reported as `inject_failed` (`phase: submit`,
+    `code: SESSION_GONE`). The wait is capped at **10000 ms**
+    (`TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS`); the cap covers the barrier wait only, which starts after
+    any modal-gate hold (`TELEPTY_MODAL_HOLD_MS`, default 30000 ms), so total request time can
+    still exceed it. A caller still queued then gets **503 `QUEUE_TIMEOUT`** and
     nothing is enqueued, so it can retry instead of hitting its own client timeout while the text
     lands later. Basis: the CLI's local inject request sets no timeout of its own (only undici's
     300 s default applies), and the tightest client deadline on the inject path is the cross-machine

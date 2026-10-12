@@ -2964,6 +2964,13 @@ function isSameSessionInstance(id, session, sessionEpoch) {
   return sessions[id] === session && (session.sessionEpoch || null) === sessionEpoch;
 }
 
+// #109 review 1 B1: the deferred CR follows the INSTANCE, not the id. A rename moves the same
+// live record to `session.id` (same PTY, owner, epoch) — that record got the text, so it gets the
+// CR. Destroy/recreate leave the record unregistered; owner replacement changes the epoch.
+function isLiveSessionInstance(session, sessionEpoch) {
+  return sessions[session.id] === session && (session.sessionEpoch || null) === sessionEpoch;
+}
+
 function sessionGoneResult() {
   return { success: false, httpStatus: 410, code: 'SESSION_GONE',
     error: 'Session was destroyed or replaced while this write was pending; it was not written.' };
@@ -3131,7 +3138,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
         let submitResult;
         try {
           // #109: never a bare CR into an instance that did not get this inject's text.
-          submitResult = isSameSessionInstance(id, session, sessionEpoch)
+          submitResult = isLiveSessionInstance(session, sessionEpoch)
             ? await writeDataToSession(id, session, '\r')
             : sessionGoneResult();
         } finally {
@@ -3167,7 +3174,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
         let submitResult;
         try {
           // #109: never a bare CR into an instance that did not get this inject's text.
-          submitResult = isSameSessionInstance(id, session, sessionEpoch)
+          submitResult = isLiveSessionInstance(session, sessionEpoch)
             ? await writeDataToSession(id, session, '\r')
             : sessionGoneResult();
         } finally {
