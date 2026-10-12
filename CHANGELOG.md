@@ -2,6 +2,28 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## Unreleased
+
+- **Back-to-back injects into one session keep each text paired with its own submit CR**
+  ([gh#107](https://github.com/dmsdc-ai/aigentry-telepty/issues/107)). The next inject's text now
+  waits for the previous inject's deferred CR (a per-session submit barrier), so a wrapped target no
+  longer reads `text1 text2 CR CR` as one glued line. Pinned by `test/inject-submit-order-107.test.js`.
+  - **Follow-up ([gh#109](https://github.com/dmsdc-ai/aigentry-telepty/issues/109)): the barrier
+    re-checks the session and is bounded.** After the wait, and again in the deferred CR timer, the
+    id must still name the same session instance (same record, same epoch). An inject whose session
+    was destroyed, renamed or recreated under the same id while it waited answers **410
+    `SESSION_GONE`** and writes nothing; a CR whose session is gone is not written and is reported
+    as `inject_failed` (`phase: submit`, `code: SESSION_GONE`). The wait is capped at **10000 ms**
+    (`TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS`); a caller still queued then gets **503 `QUEUE_TIMEOUT`** and
+    nothing is enqueued, so it can retry instead of hitting its own client timeout while the text
+    lands later. Basis: the CLI's local inject request sets no timeout of its own (only undici's
+    300 s default applies), and the tightest client deadline on the inject path is the cross-machine
+    SSH `telepty inject` at 15000 ms; 15000 − one 5000 ms delivery timeout = 10000 ms. With the
+    500 ms wrapped submit delay that is ≈ 20 queued injects. **What a user sees before this**: a
+    deleted session's queued inject answered 200, a recreated session received its predecessor's
+    queued text without a CR, and the 6th of six concurrent injects waited 2.5 s with no signal.
+    Pinned by `test/inject-barrier-identity-109.test.js`.
+
 ## 0.8.5 — 2026-10-09
 
 The three asks of the 2026-10-09 [gh#82](https://github.com/dmsdc-ai/aigentry-telepty/issues/82)

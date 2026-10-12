@@ -81,6 +81,10 @@ const SESSION_PERSIST_PATH = sessionPersistence.defaultSessionPersistPath();
 const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STALE_SECONDS || 60));
 const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
 const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
+// #109: max wait behind the #107 submit barrier. The tightest client deadline on the inject path is
+// the cross-machine SSH `telepty inject` (15000 ms, cross-machine.js); minus one DELIVERY_TIMEOUT_MS
+// for the write itself, the caller still gets a typed QUEUE_TIMEOUT before it gives up.
+const SUBMIT_QUEUE_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS || 10000));
 const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS || 10000));
 // #732: how long a wrapped session may return ZERO upstream bytes after the daemon has
 // written to it before the output pipe is declared dead. An open owner socket proves the
@@ -2953,8 +2957,21 @@ function modalParkResponse(op, decision, extra = {}) {
   });
 }
 
+// #109: `sessions[id]` is the identity. Delete, rename and recreate all leave `sessions[id]`
+// pointing at a different object (or nothing); the epoch is compared as well so a future
+// in-place re-key cannot slip past.
+function isSameSessionInstance(id, session, sessionEpoch) {
+  return sessions[id] === session && (session.sessionEpoch || null) === sessionEpoch;
+}
+
+function sessionGoneResult() {
+  return { success: false, httpStatus: 410, code: 'SESSION_GONE',
+    error: 'Session was destroyed or replaced while this write was pending; it was not written.' };
+}
+
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
   const now = Date.now();
+  const sessionEpoch = session.sessionEpoch || null;
   if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
     const healthStatus = getSessionHealthStatus(session, { nowMs: now });
     if (healthStatus === 'STALE') {
@@ -3060,7 +3077,26 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   // text1 text2 CR CR — one glued line (and the bridge's #720 filter then drops the second,
   // now consecutive, CR as a duplicate). Wait for any earlier submit on this session, then
   // claim the barrier synchronously so a third inject queues behind this one.
-  while (session.pendingSubmit) await session.pendingSubmit;
+  //
+  // #109: the wait is bounded (SUBMIT_QUEUE_TIMEOUT_MS) and answered with a typed QUEUE_TIMEOUT
+  // instead of the caller's own client timeout; nothing is enqueued for a timed-out caller.
+  // After the wait (and resolveModalGate above) the id must still name THIS instance — a session
+  // destroyed, renamed or recreated meanwhile gets SESSION_GONE, never the text.
+  const queueDeadline = Date.now() + SUBMIT_QUEUE_TIMEOUT_MS;
+  while (session.pendingSubmit) {
+    const remaining = queueDeadline - Date.now();
+    let timer;
+    const timedOut = remaining <= 0 || await Promise.race([
+      session.pendingSubmit.then(() => false),
+      new Promise((resolve) => { timer = setTimeout(resolve, remaining, true); })
+    ]);
+    clearTimeout(timer);
+    if (timedOut) {
+      return { success: false, httpStatus: 503, code: 'QUEUE_TIMEOUT',
+        error: `Earlier submits on this session did not clear within ${SUBMIT_QUEUE_TIMEOUT_MS} ms; nothing was written. Retry.` };
+    }
+  }
+  if (!isSameSessionInstance(id, session, sessionEpoch)) return sessionGoneResult();
   let releaseSubmit = () => {};
   if (!options.noEnter && session.type !== 'aterm') {
     session.pendingSubmit = new Promise((resolve) => {
@@ -3094,7 +3130,10 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       setTimeout(async () => {
         let submitResult;
         try {
-          submitResult = await writeDataToSession(id, session, '\r');
+          // #109: never a bare CR into an instance that did not get this inject's text.
+          submitResult = isSameSessionInstance(id, session, sessionEpoch)
+            ? await writeDataToSession(id, session, '\r')
+            : sessionGoneResult();
         } finally {
           releaseSubmit();
         }
@@ -3127,7 +3166,10 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       setTimeout(async () => {
         let submitResult;
         try {
-          submitResult = await writeDataToSession(id, session, '\r');
+          // #109: never a bare CR into an instance that did not get this inject's text.
+          submitResult = isSameSessionInstance(id, session, sessionEpoch)
+            ? await writeDataToSession(id, session, '\r')
+            : sessionGoneResult();
         } finally {
           releaseSubmit();
         }
