@@ -99,7 +99,7 @@ test('telepty connect / disconnect / peers --remove pass the ssh target as one a
   if (posixOnly(t)) return;
   const { dir, log, crossMachine } = fakeSshEnv(t);
   const marker = path.join(dir, 'ran');
-  const target = `u@h;touch ${marker}`;
+  const target = `u@h;touch ${marker};#`; // `#`: an unfixed shell ignores the rest of its string
   const result = await crossMachine.connect(target, { name: 'p' });          // aadc4863
   assert.equal(fs.existsSync(marker), false, 'connect ran the target as a shell command');
   assert.equal(result.success, true, JSON.stringify(result));
