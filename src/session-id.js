@@ -7,9 +7,11 @@ const SESSION_ID_PATTERN = /^[A-Za-z0-9._:@-]+$/;
 // Accepted by the null-prototype session maps, but plain objects elsewhere (sessions.json,
 // getAllStates) treat them as the prototype (PR #108 review N5).
 const RESERVED_SESSION_IDS = new Set(['__proto__', 'constructor', 'prototype']);
+// `.`/`..` are path segments: the mailbox dir is path.join(root, id) (PR #108 review NB4).
+const DOTS_ONLY = /^\.+$/;
 
 function isValidSessionId(id) {
-  return typeof id === 'string' && SESSION_ID_PATTERN.test(id) && !RESERVED_SESSION_IDS.has(id);
+  return typeof id === 'string' && SESSION_ID_PATTERN.test(id) && !RESERVED_SESSION_IDS.has(id) && !DOTS_ONLY.test(id);
 }
 
 // C0, DEL and C1 controls: ESC/BEL/CSI in an id would end or rewrite an escape sequence.

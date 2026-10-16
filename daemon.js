@@ -3544,7 +3544,7 @@ app.post('/api/sessions/spawn', (req, res) => {
   }
   // session_id is interpolated into PS1/PROMPT below, which the shell expands on every prompt.
   if (!isValidSessionId(session_id)) {
-    return respondWithError(res, 400, 'INVALID_SESSION_ID', 'session_id must match [A-Za-z0-9._:@-]+ and not be __proto__, constructor or prototype');
+    return respondWithError(res, 400, 'INVALID_SESSION_ID', 'session_id must match [A-Za-z0-9._:@-]+, not be only dots and not be __proto__, constructor or prototype');
   }
 
   const isWin = os.platform() === 'win32';

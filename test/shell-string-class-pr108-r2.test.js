@@ -90,6 +90,19 @@ test('C2: spawn session_id is an allowlist — control chars, zsh % sequences, s
   }
 });
 
+test('NB4: spawn refuses ids made only of dots (the mailbox dir is path.join(root, id))', async () => {
+  const { isValidSessionId } = require('../src/session-id');
+  for (const sid of ['.', '..', '...']) {
+    const res = await daemon.spawnSession(sid);
+    if (res.status === 201) await destroy(sid);
+    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(sid)}, got ${res.status}`);
+    assert.equal(res.body.code, 'INVALID_SESSION_ID');
+    assert.equal(isValidSessionId(sid), false, JSON.stringify(sid));
+  }
+  assert.equal(isValidSessionId('a..b'), true);
+  assert.equal(isValidSessionId('.a'), true);
+});
+
 test('C2: ids in use across the ecosystem still spawn', async () => {
   const n = Date.now();
   for (const sid of [`tp-r2-108-${n}`, `kkoma-${n.toString(16)}`, `aigentry_orchestrator.claude-${n}`, `w:${n}`, `name-${n}@host`]) {
