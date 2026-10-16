@@ -15,6 +15,7 @@ const { detectTailnet, TAILNET_CIDR } = require('./src/net/tailnet');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
 const { isValidSessionId } = require('./src/session-id');
+const { findKittySocket, findKittyWindowId } = require('./src/kitty-control');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
 const { SessionStateManager, STATE_DISPLAY, OBSERVATION_DISPLAY, mapObservationCause, stripAnsi: stripAnsiState } = require('./session-state');
 // #60 Stage A: `classifyReportPrompt` is GONE. 0.8.0 parses no text as a terminal report — the
@@ -4210,36 +4211,6 @@ function submitViaPty(session) {
     session.ptyProcess.write('\r');
     return true;
   }
-}
-
-// Send text directly to Kitty tab via remote control (bypasses allow bridge entirely)
-function findKittySocket() {
-  try {
-    const files = require('fs').readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
-    return files.length > 0 ? '/tmp/' + files[0] : null;
-  } catch { return null; }
-}
-
-function findKittyWindowId(socket, sessionId) {
-  const { execSync } = require('child_process');
-  try {
-    const raw = execSync(`kitty @ --to unix:${socket} ls`, { timeout: 3000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-    const data = JSON.parse(raw);
-    for (const osw of data) {
-      for (const tab of osw.tabs) {
-        for (const w of tab.windows) {
-          // Only check process cmdlines for --id SESSION_ID pattern (not output text)
-          for (const p of (w.foreground_processes || [])) {
-            const cmd = (p.cmdline || []).join(' ');
-            if (cmd.includes('--id ' + sessionId) || cmd.includes('--id=' + sessionId)) {
-              return w.id;
-            }
-          }
-        }
-      }
-    }
-  } catch {}
-  return null;
 }
 
 function submitViaOsascript(sessionId, keyCombo) {
