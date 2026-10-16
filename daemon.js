@@ -1402,9 +1402,11 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
   return emit();
 }
 
-const sessions = {};
-const handoffs = {};
-const threads = {};
+// Null-prototype maps: every key comes from a request (route :id, body session_id/new_id), and
+// on a plain object `__proto__` resolved to Object.prototype, which the handlers then wrote to.
+const sessions = Object.create(null);
+const handoffs = Object.create(null);
+const threads = Object.create(null);
 let teleptyConfig;
 try {
   teleptyConfig = loadTeleptyConfig();
