@@ -17,7 +17,7 @@ input a token holder relays from somewhere else (e.g. a session id derived from 
 
 | id | sev | line | verdict | fix / disposition |
 |---|---|---|---|---|
-| ace25647 | HIGH | 3501 | TRUE POSITIVE (via session_id → PS1) | fixed e40997d |
+| ace25647 | HIGH | 3501 | TRUE POSITIVE (via session_id **and type** → PS1) | session_id: e40997d; type: **missed in round 1**, fixed 9826617 (round 2) |
 | 9ca81d65 | MED | 251 | TRUE POSITIVE (information exposure) | fixed 29b0de7 |
 | 4ce269b3 | MED | 3484 | TRUE POSITIVE (log rewriting) | fixed e40997d |
 | 7e65d918 | MED | 3473 | FALSE POSITIVE as a security boundary | disposition below, no change |
@@ -49,6 +49,10 @@ Flow: `req.body.{command,args,cwd,session_id}` → `pty.spawn`.
 - Fix (e40997d): spawn refuses a `session_id` containing `$`, `` ` `` or `\` with
   400 `INVALID_SESSION_ID`, before any env is built. Ordinary ids (`createSessionId` shape) still spawn
   (test "an ordinary session id still spawns").
+- **Correction (round 2):** that fix was incomplete. `type` is upper-cased into the same PS1/PROMPT
+  label and was only checked to be a string, so `USER$($'\164…' …)` still ran a command
+  (review B1/C1, reproduced on 5ddcecb). The id denylist also let control characters and zsh `%`
+  sequences through (C2). Both are fixed in round 2 below.
 - Residual, not changed: on Windows the daemon runs `cmd.exe /c <command> <args…>`, so cmd
   metacharacters in `args` are interpreted by cmd. Same principal (the caller already chooses the
   command), not testable on this Linux host, and switching to direct exec changes `.cmd` shim
@@ -180,3 +184,44 @@ Residuals (not changed):
   generic refusal arm.
 - The non-blocking review notes are not addressed here: `pendingSubmit` is not durable, and the
   10000 ms barrier bound sits against telesession's 10000 ms client deadline.
+
+# Round 2 — shell-string class (independent review ROUND2-REVIEW.md, verdict REVISE)
+
+Scope from the orchestrator: fix C1–C5, C7, C8 and N1. C6 is unchanged. N2/N3/N4 are unchanged.
+Every item has a test in `test/shell-string-class-pr108-r2.test.js`. On 5ddcecb the final file
+has 14 fail / 1 pass (`round2-fix-evidence/red-final-file-on-5ddcecb.log`; the committed RED
+state, before the `messageState` unit test was added, was 13 / 1 in `red-on-5ddcecb.log`). The only
+pass is "ids in use still spawn", a guard against over-blocking. On the new head: 15 / 15
+(`green-on-head.log`).
+
+| item | sink | reproduced on 5ddcecb | fix |
+|---|---|---|---|
+| C1 | spawn `type` → PS1/PROMPT label | marker created by `$'\NNN'` payload, 201 | 9826617: `type` ∈ {USER, AGENT}, else 400 `INVALID_SESSION_TYPE` |
+| C2 | spawn `session_id` → PS1/PROMPT | ESC/BEL id → 201 | f8d43bf: `^[A-Za-z0-9._:@-]+$` and not `__proto__`/`constructor`/`prototype` (`src/session-id.js`), else 400 `INVALID_SESSION_ID` |
+| C3 | WS id → `kitty @ … set-tab-title '…${id}'` via /bin/sh | `';touch$IFS$VAR;'` id ran `touch` in the transport | bc8d00d: `src/kitty-control.js`, `execFileSync('kitty', argv)` |
+| C4 | `/tmp/kitty-sock*` name → same shell strings | `kitty-sock;touch <tmp>` name ran `touch` in the transport | bc8d00d: argv only, and the socket must match `kitty-sock[A-Za-z0-9._-]*` and pass `lstat` as a socket, not a symlink, owned by `process.getuid()` |
+| C5 | id / cwd basename → AppleScript in `osascript -e '…'` via /bin/sh | `submitViaOsascript` was not exported (module-missing fail) | df90fcd: `execFileSync('osascript', ['-e', script, ...terms])` with `on run argv` |
+| C7 | id → OSC 0 title in cli.js (3 sites) | helper missing; source still interpolated the raw id | 18ef9eb: `formatTerminalTitle` strips U+0000–001F, U+007F–009F |
+| C8 | id → `ssh … telepty attach <id>` remote shell | `w1;touch <tmp>` ran `touch` when the joined remote command went through /bin/sh | d6bc8a9: `shellQuote(sessionId)`, as `remoteInject` already does |
+| N1 | destroyed session's unpaired text | 504 `DELIVERY_UNCERTAIN` | 4cf6414: `FileMailbox.messageState()`. If `withdraw` fails: no record → 410 `SESSION_GONE`; `dead_letter` → typed non-delivery; else `DELIVERY_UNCERTAIN` |
+
+How the C3/C4 reproduction was made safe: the test calls the real `installWebSocketTransport`. It
+injects `findKittySocket` (the socket name) and `findKittyWindowId`, and sets `PATH` to a temp dir
+that holds only `touch`. The real `kitty` installed on this host is never reached, and no
+`/tmp/kitty-sock*` file is created. The `findKittySocket` ownership check uses an injected `fs`
+for the socket cases, because this sandbox refuses `listen` on unix sockets (EPERM). It uses the
+real fs for the planted regular file and the symlink.
+
+C6 (Windows `cmd.exe /c`): unchanged. `test/win32-cmd-argv-characterisation-c6.test.js` pins the
+current argv and command line on Linux (platform faked for the spawn route's `isWin` line only;
+node-pty spawn recorded, nothing executed).
+
+Not measured: macOS `osascript` with `on run argv` (no macOS here; only the argv is tested). A
+live kitty with a real socket (sandbox EPERM; seam only). zsh. The ssh attach against a real peer
+(the argv was checked through /bin/sh locally). Windows.
+
+Remaining, not changed (Rule 29, mention only):
+- `POST /api/sessions/register` and the WS auto-register accept ids without the allowlist. Their
+  sinks are now argv or stripped. `constructor` via register remains (N5, register path).
+- `cli.js` `findKittySocketCli` and `terminal-backend.js` `detectTerminal` still test
+  `startsWith('kitty-sock')` in `/tmp`. They only check that such a file exists and execute nothing.

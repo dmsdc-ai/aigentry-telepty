@@ -8,7 +8,8 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   are in `FINDINGS.md`; reproductions in `test/snyk-pr108-findings.test.js`.
   - `POST /api/sessions/spawn` refuses a `session_id` containing `$`, `` ` `` or `\`
     (400 `INVALID_SESSION_ID`). The id is put into PS1/PROMPT, and bash expanded `$(...)` in it on
-    every prompt, so the id ran as a command (Snyk ace25647).
+    every prompt, so the id ran as a command (Snyk ace25647). **Incomplete:** `type` reached the
+    same sink. Round 2 below closes it.
   - Spawn requires `session_id`, `command`, `cwd`, `type` to be strings and `args` an array of
     strings (400 `INVALID_REQUEST`); a non-string used to reach the PTY or answer 500
     (Snyk d07e1fda, 39d3b3ec). The spawn log no longer uses the caller's command as the format
@@ -20,6 +21,29 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
     (Snyk e933068f).
   - Responses no longer send `X-Powered-By: Express` (Snyk 9ca81d65).
   - Snyk 7e65d918 (spawn route without limits): no change; disposition in `FINDINGS.md`.
+- **Security: shell-string class (PR #108 review round 2, C1–C8 except C6).** Reproductions in
+  `test/shell-string-class-pr108-r2.test.js`, all RED on 5ddcecb.
+  - Spawn `type` must be `USER` or `AGENT` (400 `INVALID_SESSION_TYPE`). It is the PS1/PROMPT
+    label, and an uppercase-invariant `$(...)` in it ran on every bash prompt (C1).
+  - Spawn `session_id` must match `^[A-Za-z0-9._:@-]+$` and must not be `__proto__`,
+    `constructor` or `prototype` (400 `INVALID_SESSION_ID`). This replaces the `$`/`` ` ``/`\`
+    denylist, which still let control characters and zsh `%` sequences through (C2, N5).
+  - `kitty @` calls use an argv array, not a `/bin/sh` string, for both the window lookup and the
+    auto-register tab title. A `/tmp/kitty-sock*` socket is used only if `lstat` shows a socket,
+    not a symlink, owned by the daemon uid. Before this, a file named `kitty-sock;<cmd>`, which any
+    local user can create in a shared `/tmp`, ran `<cmd>` as the daemon user on an auto-register,
+    and a `'` in a WS session id broke out of the title command (C3, C4, both pre-existing).
+  - `osascript` gets the window search terms as `on run argv` arguments, not inside the script
+    text. This path is latent: no submit strategy selects it (C5).
+  - CLI terminal titles (`attach`, `allow`, remote attach) strip C0/C1 control characters from the
+    id (C7).
+  - `ssh … telepty attach` quotes the id for the remote shell (C8).
+  - Windows `cmd.exe /c <command> <args…>` is unchanged (C6). The current argv is pinned by
+    `test/win32-cmd-argv-characterisation-c6.test.js`, and the fix is tracked separately.
+- **Inject: a session destroyed while its text is pending answers 410 `SESSION_GONE`**
+  (review N1). Before this, it answered 504 `DELIVERY_UNCERTAIN` ("may still arrive"). A
+  dead-lettered text gets the typed non-delivery. Only a text that is really in flight still gets
+  `DELIVERY_UNCERTAIN`. The full text wait still elapses first.
 - **Inject submit pairing (PR #108 re-review TP1/TP2).** Pinned by `test/inject-owner-pairing-pr108.test.js`.
   - The deferred CR goes only to the owner socket that received the text. An inject queued behind
     the submit barrier answers 410 `SESSION_GONE` if the owner socket changed while it waited, which
