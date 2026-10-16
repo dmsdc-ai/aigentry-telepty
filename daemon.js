@@ -2979,9 +2979,36 @@ function sessionGoneResult() {
     error: 'Session was destroyed or replaced while this write was pending; it was not written.' };
 }
 
+// PR #108 TP2: an inject that owes a CR waits for ITS msg_id to be written, not for "a tick".
+// mailboxDelivery.tick() returns at once while another tick is in flight (e.g. one stuck on a slow
+// session), so the CR used to be scheduled — and written — before the text. The deliverFn settles
+// the waiter with the owner socket the text was actually written to; the CR goes only there.
+// Bound: one in-flight delivery to another session plus our own.
+const MAILBOX_TEXT_WAIT_MS = 2 * DELIVERY_TIMEOUT_MS;
+const mailboxTextWaiters = new Map(); // msg_id → { settle(ownerWs), lastFailure }
+
+function awaitMailboxText(msgId, timeoutMs) {
+  return new Promise((resolve) => {
+    const waiter = { lastFailure: null };
+    const timer = setTimeout(() => {
+      mailboxTextWaiters.delete(msgId);
+      resolve({ delivered: false, lastFailure: waiter.lastFailure });
+    }, timeoutMs);
+    waiter.settle = (ownerWs) => {
+      clearTimeout(timer);
+      mailboxTextWaiters.delete(msgId);
+      resolve({ delivered: true, ownerWs });
+    };
+    mailboxTextWaiters.set(msgId, waiter);
+  });
+}
+
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
   const now = Date.now();
   const sessionEpoch = session.sessionEpoch || null;
+  // PR #108 TP1: the owner generation is the owner SOCKET. A same-bearer re-claim keeps the
+  // record and the epoch but replaces ownerWs, and that replacement never saw this inject.
+  const entryOwnerWs = session.ownerWs;
   if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
     const healthStatus = getSessionHealthStatus(session, { nowMs: now });
     if (healthStatus === 'STALE') {
@@ -3106,7 +3133,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
         error: `Earlier submits on this session did not clear within ${SUBMIT_QUEUE_TIMEOUT_MS} ms; nothing was written. Retry.` };
     }
   }
-  if (!isSameSessionInstance(id, session, sessionEpoch)) return sessionGoneResult();
+  if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
   let releaseSubmit = () => {};
   if (!options.noEnter && session.type !== 'aterm') {
     session.pendingSubmit = new Promise((resolve) => {
@@ -3123,6 +3150,9 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       created_at: Math.floor(now / 1000),
       attempt: 0,
     });
+    // Registered synchronously after the enqueue: no tick can run in between.
+    const owesSubmit = !options.noEnter && session.type !== 'aterm';
+    const textWait = owesSubmit ? awaitMailboxText(msgId, MAILBOX_TEXT_WAIT_MS) : null;
 
     // Notify aterm sessions immediately via UDS wake
     if (session.type === 'aterm') {
@@ -3135,13 +3165,30 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
     } catch {}
 
     // Send CR separately after delay (outside paste brackets)
-    if (!options.noEnter && session.type !== 'aterm') {
+    if (owesSubmit) {
+      const text = await textWait;
+      if (!text.delivered) {
+        // Not written in time. Withdraw it if no deliverer holds it, so it can never land later
+        // without its CR and a retry cannot duplicate it; if one does hold it, say so.
+        let withdrawn = false;
+        try { withdrawn = mailbox.withdraw(id, msgId, 'submit_unpaired: text not delivered in time'); } catch {}
+        releaseSubmit();
+        const failure = text.lastFailure;
+        return withdrawn
+          ? { success: false, httpStatus: (failure && failure.httpStatus) || 504, code: (failure && failure.code) || 'TIMEOUT',
+            error: `The text was not delivered within ${MAILBOX_TEXT_WAIT_MS} ms${failure && failure.error ? ` (${failure.error})` : ''}; it was withdrawn and will not be written. Retry.`,
+            msg_id: msgId }
+          : { success: false, httpStatus: 504, code: 'DELIVERY_UNCERTAIN',
+            error: `The text was handed to delivery but not confirmed within ${MAILBOX_TEXT_WAIT_MS} ms; it may still arrive, without a CR. Do not retry blindly.`,
+            msg_id: msgId };
+      }
       const submitDelay = session.type === 'wrapped' ? 500 : 300;
       setTimeout(async () => {
         let submitResult;
         try {
           // #109: never a bare CR into an instance that did not get this inject's text.
-          submitResult = isLiveSessionInstance(session, sessionEpoch)
+          // PR #108 TP1: nor into an owner socket other than the one that got it.
+          submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === text.ownerWs
             ? await writeDataToSession(id, session, '\r')
             : sessionGoneResult();
         } finally {
@@ -3168,6 +3215,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   } catch (err) {
     console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
     // Fallback: direct delivery (backward compat during migration)
+    const textOwnerWs = session.ownerWs;
     const textResult = await writeDataToSession(id, session, deliveredBody);
     if (!textResult.success) { releaseSubmit(); return textResult; }
 
@@ -3177,7 +3225,8 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
         let submitResult;
         try {
           // #109: never a bare CR into an instance that did not get this inject's text.
-          submitResult = isLiveSessionInstance(session, sessionEpoch)
+          // PR #108 TP1: nor into an owner socket other than the one that got it.
+          submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === textOwnerWs
             ? await writeDataToSession(id, session, '\r')
             : sessionGoneResult();
         } finally {
@@ -5926,9 +5975,16 @@ const mailboxDelivery = new DeliveryEngine(mailbox, {
   deliverFn: async (sessionId, msg) => {
     const session = sessions[sessionId];
     if (!session) return { success: false, error: 'Session not found' };
+    // Captured before the call: a wrapped write sends on this socket synchronously.
+    const ownerWs = session.ownerWs;
     const result = await writeDataToSession(sessionId, session, msg.payload);
     if (result.success) {
       session.lastActivityAt = new Date().toISOString();
+    }
+    const waiter = mailboxTextWaiters.get(msg.msg_id);
+    if (waiter) {
+      if (result.success) waiter.settle(ownerWs);
+      else waiter.lastFailure = result;
     }
     return result;
   },
