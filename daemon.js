@@ -5738,6 +5738,9 @@ app.patch('/api/handoff/:id', (req, res) => {
 app.post('/api/threads', (req, res) => {
   const { topic, orchestrator_session_id, participant_session_ids, context } = req.body;
   if (!topic) return res.status(400).json({ error: 'topic is required' });
+  if (participant_session_ids && (!Array.isArray(participant_session_ids) || !participant_session_ids.every(id => typeof id === 'string'))) {
+    return respondWithError(res, 400, 'INVALID_REQUEST', 'participant_session_ids must be an array of strings');
+  }
 
   const thread_id = crypto.randomUUID();
   const thread = {
