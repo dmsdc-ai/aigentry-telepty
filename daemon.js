@@ -14,6 +14,8 @@ const { createAuthMiddleware, createIsAllowedPeer, createOriginGuard, createVeri
 const { detectTailnet, TAILNET_CIDR } = require('./src/net/tailnet');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
+const { isValidSessionId } = require('./src/session-id');
+const { findKittySocket, findKittyWindowId } = require('./src/kitty-control');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
 const { SessionStateManager, STATE_DISPLAY, OBSERVATION_DISPLAY, mapObservationCause, stripAnsi: stripAnsiState } = require('./session-state');
 // #60 Stage A: `classifyReportPrompt` is GONE. 0.8.0 parses no text as a terminal report — the
@@ -81,6 +83,10 @@ const SESSION_PERSIST_PATH = sessionPersistence.defaultSessionPersistPath();
 const SESSION_STALE_SECONDS = Math.max(1, Number(process.env.TELEPTY_SESSION_STALE_SECONDS || 60));
 const SESSION_CLEANUP_SECONDS = Math.max(SESSION_STALE_SECONDS, Number(process.env.TELEPTY_SESSION_CLEANUP_SECONDS || 300));
 const DELIVERY_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_DELIVERY_TIMEOUT_MS || 5000));
+// #109: max wait behind the #107 submit barrier. The tightest client deadline on the inject path is
+// the cross-machine SSH `telepty inject` (15000 ms, cross-machine.js); minus one DELIVERY_TIMEOUT_MS
+// for the write itself, the caller still gets a typed QUEUE_TIMEOUT before it gives up.
+const SUBMIT_QUEUE_TIMEOUT_MS = Math.max(100, Number(process.env.TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS || 10000));
 const HEALTH_POLL_MS = Math.max(100, Number(process.env.TELEPTY_HEALTH_POLL_MS || 10000));
 // #732: how long a wrapped session may return ZERO upstream bytes after the daemon has
 // written to it before the output pipe is declared dead. An open owner socket proves the
@@ -245,6 +251,7 @@ function loadPersistedSessions() {
 }
 
 const app = express();
+app.disable('x-powered-by');
 app.use(cors());
 
 app.use(express.json());
@@ -1397,9 +1404,11 @@ function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = 
   return emit();
 }
 
-const sessions = {};
-const handoffs = {};
-const threads = {};
+// Null-prototype maps: every key comes from a request (route :id, body session_id/new_id), and
+// on a plain object `__proto__` resolved to Object.prototype, which the handlers then wrote to.
+const sessions = Object.create(null);
+const handoffs = Object.create(null);
+const threads = Object.create(null);
 let teleptyConfig;
 try {
   teleptyConfig = loadTeleptyConfig();
@@ -2953,8 +2962,55 @@ function modalParkResponse(op, decision, extra = {}) {
   });
 }
 
+// #109: `sessions[id]` is the identity. Delete, rename and recreate all leave `sessions[id]`
+// pointing at a different object (or nothing); the epoch is compared as well so a future
+// in-place re-key cannot slip past.
+function isSameSessionInstance(id, session, sessionEpoch) {
+  return sessions[id] === session && (session.sessionEpoch || null) === sessionEpoch;
+}
+
+// #109 review 1 B1: the deferred CR follows the INSTANCE, not the id. A rename moves the same
+// live record to `session.id` (same PTY, owner, epoch) — that record got the text, so it gets the
+// CR. Destroy/recreate leave the record unregistered; owner replacement changes the epoch.
+function isLiveSessionInstance(session, sessionEpoch) {
+  return sessions[session.id] === session && (session.sessionEpoch || null) === sessionEpoch;
+}
+
+function sessionGoneResult() {
+  return { success: false, httpStatus: 410, code: 'SESSION_GONE',
+    error: 'Session was destroyed or replaced while this write was pending; it was not written.' };
+}
+
+// PR #108 TP2: an inject that owes a CR waits for ITS msg_id to be written, not for "a tick".
+// mailboxDelivery.tick() returns at once while another tick is in flight (e.g. one stuck on a slow
+// session), so the CR used to be scheduled — and written — before the text. The deliverFn settles
+// the waiter with the owner socket the text was actually written to; the CR goes only there.
+// Bound: one in-flight delivery to another session plus our own.
+const MAILBOX_TEXT_WAIT_MS = 2 * DELIVERY_TIMEOUT_MS;
+const mailboxTextWaiters = new Map(); // msg_id → { settle(ownerWs), lastFailure }
+
+function awaitMailboxText(msgId, timeoutMs) {
+  return new Promise((resolve) => {
+    const waiter = { lastFailure: null };
+    const timer = setTimeout(() => {
+      mailboxTextWaiters.delete(msgId);
+      resolve({ delivered: false, lastFailure: waiter.lastFailure });
+    }, timeoutMs);
+    waiter.settle = (ownerWs) => {
+      clearTimeout(timer);
+      mailboxTextWaiters.delete(msgId);
+      resolve({ delivered: true, ownerWs });
+    };
+    mailboxTextWaiters.set(msgId, waiter);
+  });
+}
+
 async function deliverInjectionToSession(id, session, prompt, options = {}) {
   const now = Date.now();
+  const sessionEpoch = session.sessionEpoch || null;
+  // PR #108 TP1: the owner generation is the owner SOCKET. A same-bearer re-claim keeps the
+  // record and the epoch but replaces ownerWs, and that replacement never saw this inject.
+  const entryOwnerWs = session.ownerWs;
   if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
     const healthStatus = getSessionHealthStatus(session, { nowMs: now });
     if (healthStatus === 'STALE') {
@@ -3055,6 +3111,38 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   // reliably fires instead of being swallowed into the paste burst. No-op otherwise.
   const deliveredBody = maybeBracketedPaste(deliveredPrompt, session);
 
+  // #107: the deferred CR below belongs to THIS text. Without a barrier, a second inject
+  // arriving inside the submit delay writes its text first and the target reads
+  // text1 text2 CR CR — one glued line (and the bridge's #720 filter then drops the second,
+  // now consecutive, CR as a duplicate). Wait for any earlier submit on this session, then
+  // claim the barrier synchronously so a third inject queues behind this one.
+  //
+  // #109: the wait is bounded (SUBMIT_QUEUE_TIMEOUT_MS) and answered with a typed QUEUE_TIMEOUT
+  // instead of the caller's own client timeout; nothing is enqueued for a timed-out caller.
+  // After the wait (and resolveModalGate above) the id must still name THIS instance — a session
+  // destroyed, renamed or recreated meanwhile gets SESSION_GONE, never the text.
+  const queueDeadline = Date.now() + SUBMIT_QUEUE_TIMEOUT_MS;
+  while (session.pendingSubmit) {
+    const remaining = queueDeadline - Date.now();
+    let timer;
+    const timedOut = remaining <= 0 || await Promise.race([
+      session.pendingSubmit.then(() => false),
+      new Promise((resolve) => { timer = setTimeout(resolve, remaining, true); })
+    ]);
+    clearTimeout(timer);
+    if (timedOut) {
+      return { success: false, httpStatus: 503, code: 'QUEUE_TIMEOUT',
+        error: `Earlier submits on this session did not clear within ${SUBMIT_QUEUE_TIMEOUT_MS} ms; nothing was written. Retry.` };
+    }
+  }
+  if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
+  let releaseSubmit = () => {};
+  if (!options.noEnter && session.type !== 'aterm') {
+    session.pendingSubmit = new Promise((resolve) => {
+      releaseSubmit = () => { session.pendingSubmit = null; resolve(); };
+    });
+  }
+
   try {
     const ack = mailbox.enqueue({
       msg_id: msgId,
@@ -3064,6 +3152,9 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       created_at: Math.floor(now / 1000),
       attempt: 0,
     });
+    // Registered synchronously after the enqueue: no tick can run in between.
+    const owesSubmit = !options.noEnter && session.type !== 'aterm';
+    const textWait = owesSubmit ? awaitMailboxText(msgId, MAILBOX_TEXT_WAIT_MS) : null;
 
     // Notify aterm sessions immediately via UDS wake
     if (session.type === 'aterm') {
@@ -3076,10 +3167,40 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
     } catch {}
 
     // Send CR separately after delay (outside paste brackets)
-    if (!options.noEnter && session.type !== 'aterm') {
+    if (owesSubmit) {
+      const text = await textWait;
+      if (!text.delivered) {
+        // Not written in time. Withdraw it if no deliverer holds it, so it can never land later
+        // without its CR and a retry cannot duplicate it; if one does hold it, say so.
+        let withdrawn = false;
+        try { withdrawn = mailbox.withdraw(id, msgId, 'submit_unpaired: text not delivered in time'); } catch {}
+        // Not withdrawable is not always "in flight" (review N1): a purge (session destroyed) leaves
+        // no record and a dead-lettered message cannot be written any more either.
+        let state;
+        if (!withdrawn) { try { state = mailbox.messageState(id, msgId); } catch {} }
+        releaseSubmit();
+        if (!withdrawn && state === null) return { ...sessionGoneResult(), msg_id: msgId };
+        const failure = text.lastFailure;
+        return withdrawn || state === 'dead_letter'
+          ? { success: false, httpStatus: (failure && failure.httpStatus) || 504, code: (failure && failure.code) || 'TIMEOUT',
+            error: `The text was not delivered within ${MAILBOX_TEXT_WAIT_MS} ms${failure && failure.error ? ` (${failure.error})` : ''}; it was ${withdrawn ? 'withdrawn' : 'dead-lettered'} and will not be written. Retry.`,
+            msg_id: msgId }
+          : { success: false, httpStatus: 504, code: 'DELIVERY_UNCERTAIN',
+            error: `The text was handed to delivery but not confirmed within ${MAILBOX_TEXT_WAIT_MS} ms; it may still arrive, without a CR. Do not retry blindly.`,
+            msg_id: msgId };
+      }
       const submitDelay = session.type === 'wrapped' ? 500 : 300;
       setTimeout(async () => {
-        const submitResult = await writeDataToSession(id, session, '\r');
+        let submitResult;
+        try {
+          // #109: never a bare CR into an instance that did not get this inject's text.
+          // PR #108 TP1: nor into an owner socket other than the one that got it.
+          submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === text.ownerWs
+            ? await writeDataToSession(id, session, '\r')
+            : sessionGoneResult();
+        } finally {
+          releaseSubmit();
+        }
         if (!submitResult.success) {
           emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
             phase: 'submit',
@@ -3101,13 +3222,23 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
   } catch (err) {
     console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
     // Fallback: direct delivery (backward compat during migration)
+    const textOwnerWs = session.ownerWs;
     const textResult = await writeDataToSession(id, session, deliveredBody);
-    if (!textResult.success) return textResult;
+    if (!textResult.success) { releaseSubmit(); return textResult; }
 
     if (!options.noEnter && session.type !== 'aterm') {
       const submitDelay = session.type === 'wrapped' ? 500 : 300;
       setTimeout(async () => {
-        const submitResult = await writeDataToSession(id, session, '\r');
+        let submitResult;
+        try {
+          // #109: never a bare CR into an instance that did not get this inject's text.
+          // PR #108 TP1: nor into an owner socket other than the one that got it.
+          submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === textOwnerWs
+            ? await writeDataToSession(id, session, '\r')
+            : sessionGoneResult();
+        } finally {
+          releaseSubmit();
+        }
         if (!submitResult.success) {
           emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
             phase: 'submit',
@@ -3403,13 +3534,25 @@ app.post('/api/sessions/spawn', (req, res) => {
   if (!session_id) return res.status(400).json({ error: 'session_id is strictly required.' });
   if (sessions[session_id]) return res.status(409).json({ error: `Session ID '${session_id}' is already active.` });
   if (!command) return res.status(400).json({ error: 'command is required' });
+  if (typeof session_id !== 'string' || typeof command !== 'string' || typeof cwd !== 'string' || typeof type !== 'string'
+    || !Array.isArray(args) || !args.every(a => typeof a === 'string')) {
+    return respondWithError(res, 400, 'INVALID_REQUEST', 'session_id, command, cwd and type must be strings; args an array of strings');
+  }
+  // type becomes the PS1/PROMPT label below; every shipped client sends 'USER', the default is 'AGENT'.
+  if (type !== 'USER' && type !== 'AGENT') {
+    return respondWithError(res, 400, 'INVALID_SESSION_TYPE', 'type must be USER or AGENT');
+  }
+  // session_id is interpolated into PS1/PROMPT below, which the shell expands on every prompt.
+  if (!isValidSessionId(session_id)) {
+    return respondWithError(res, 400, 'INVALID_SESSION_ID', 'session_id must match [A-Za-z0-9._:@-]+ and not be __proto__, constructor or prototype');
+  }
 
   const isWin = os.platform() === 'win32';
   const shell = isWin ? (command === 'powershell' ? 'powershell.exe' : 'cmd.exe') : command;
   const shellArgs = isWin ? (command === 'powershell' || command === 'cmd' ? args : ['/c', command, ...args]) : args;
 
   try {
-    console.log(`[SPAWN] Spawning ${shell} with args:`, shellArgs, "in cwd:", cwd);
+    console.log('[SPAWN] Spawning %s with args:', shell, shellArgs, "in cwd:", cwd);
 
     const customEnv = buildSessionEnv(session_id);
     
@@ -4075,38 +4218,7 @@ function submitViaPty(session) {
   }
 }
 
-// Send text directly to Kitty tab via remote control (bypasses allow bridge entirely)
-function findKittySocket() {
-  try {
-    const files = require('fs').readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
-    return files.length > 0 ? '/tmp/' + files[0] : null;
-  } catch { return null; }
-}
-
-function findKittyWindowId(socket, sessionId) {
-  const { execSync } = require('child_process');
-  try {
-    const raw = execSync(`kitty @ --to unix:${socket} ls`, { timeout: 3000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-    const data = JSON.parse(raw);
-    for (const osw of data) {
-      for (const tab of osw.tabs) {
-        for (const w of tab.windows) {
-          // Only check process cmdlines for --id SESSION_ID pattern (not output text)
-          for (const p of (w.foreground_processes || [])) {
-            const cmd = (p.cmdline || []).join(' ');
-            if (cmd.includes('--id ' + sessionId) || cmd.includes('--id=' + sessionId)) {
-              return w.id;
-            }
-          }
-        }
-      }
-    }
-  } catch {}
-  return null;
-}
-
-function submitViaOsascript(sessionId, keyCombo) {
-  const { execSync } = require('child_process');
+function submitViaOsascript(sessionId, keyCombo, { execFileSync = require('child_process').execFileSync } = {}) {
   const session = sessions[sessionId];
   // Build fallback search terms: session ID, project dir name, CLI-specific patterns
   const searchTerms = [sessionId];
@@ -4124,13 +4236,13 @@ function submitViaOsascript(sessionId, keyCombo) {
     ? 'key code 36 using command down'
     : 'key code 36';
 
-  // Try each search term until we find a matching window
-  const searchTermsStr = searchTerms.map(t => `"${t}"`).join(', ');
+  // Try each search term until we find a matching window. The terms (caller data: session id,
+  // cwd basename) are run-handler arguments, never AppleScript or shell text (PR #108 review C5).
   const script = `
+    on run argv
     tell application "System Events"
       tell process "stable"
-        set searchList to {${searchTermsStr}}
-        repeat with term in searchList
+        repeat with term in argv
           repeat with w in windows
             if name of w contains (term as text) then
               perform action "AXRaise" of w
@@ -4142,10 +4254,11 @@ function submitViaOsascript(sessionId, keyCombo) {
         end repeat
         return "window_not_found"
       end tell
-    end tell`;
+    end tell
+    end run`;
 
   try {
-    const result = execSync(`osascript -e '${script}'`, { timeout: 5000 }).toString().trim();
+    const result = execFileSync('osascript', ['-e', script, ...searchTerms], { timeout: 5000 }).toString().trim();
     const ok = result.startsWith('ok:');
     if (ok) console.log(`[SUBMIT] osascript matched: ${result}`);
     return ok;
@@ -5655,6 +5768,9 @@ app.patch('/api/handoff/:id', (req, res) => {
 app.post('/api/threads', (req, res) => {
   const { topic, orchestrator_session_id, participant_session_ids, context } = req.body;
   if (!topic) return res.status(400).json({ error: 'topic is required' });
+  if (participant_session_ids && (!Array.isArray(participant_session_ids) || !participant_session_ids.every(id => typeof id === 'string'))) {
+    return respondWithError(res, 400, 'INVALID_REQUEST', 'participant_session_ids must be an array of strings');
+  }
 
   const thread_id = crypto.randomUUID();
   const thread = {
@@ -5840,9 +5956,16 @@ const mailboxDelivery = new DeliveryEngine(mailbox, {
   deliverFn: async (sessionId, msg) => {
     const session = sessions[sessionId];
     if (!session) return { success: false, error: 'Session not found' };
+    // Captured before the call: a wrapped write sends on this socket synchronously.
+    const ownerWs = session.ownerWs;
     const result = await writeDataToSession(sessionId, session, msg.payload);
     if (result.success) {
       session.lastActivityAt = new Date().toISOString();
+    }
+    const waiter = mailboxTextWaiters.get(msg.msg_id);
+    if (waiter) {
+      if (result.success) waiter.settle(ownerWs);
+      else waiter.lastFailure = result;
     }
     return result;
   },
@@ -6308,6 +6431,7 @@ module.exports = {
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
   isTerminalGateFailure,          // #678: submit-gate disposition — no_state is best-effort dispatch, not hard-fail
   terminalLevelSubmit,            // #544: PTY-only submit path (pty_cr | null)
+  submitViaOsascript,             // PR #108 C5: osascript argv seam (deps DI: execFileSync)
   submitViaPty,                   // #544: bare-0x0D submit into the innermost node-pty
   runSubmitAll,                   // #546: submit-all via PTY for every backend (no cmux send-key)
   failBootstrapQueueOnTimeout,    // #31: actionable bootstrap-timeout queue flush

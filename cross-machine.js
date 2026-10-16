@@ -385,7 +385,8 @@ function remoteAttach(name, sessionId) {
     '-o', `ControlPath=${peer.controlSocket}`,
     '-t', // Force TTY allocation
     peer.target,
-    'telepty', 'attach', sessionId
+    // ssh joins these into one remote shell command line; quote the id as remoteInject does.
+    'telepty', 'attach', shellQuote(sessionId)
   ], { stdio: ['pipe', 'pipe', 'pipe'] });
 }
 

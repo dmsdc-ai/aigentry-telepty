@@ -24,6 +24,7 @@ const {
 const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
 const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, parseSessionReference, pickSessionTarget } = require('./session-routing');
+const { formatTerminalTitle } = require('./src/session-id');
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const {
@@ -1726,7 +1727,7 @@ async function manageInteractiveAttach(sessionId, targetHost) {
     });
     ws.on('open', () => {
       // Set Ghostty tab title to show session ID
-      process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
+      process.stdout.write(formatTerminalTitle(sessionId));
       console.log(`\n\x1b[32mEntered room '${sessionId}'.\x1b[0m\n`);
       cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
         onData: (d) => ws.send(JSON.stringify({ type: 'input', data: d.toString() })),
@@ -3033,7 +3034,7 @@ async function main() {
     connectDaemonWs();
 
     // Set terminal title
-    process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
+    process.stdout.write(formatTerminalTitle(sessionId));
     console.log(`\x1b[32m⚡ '${command}' is now session '\x1b[36m${sessionId}\x1b[32m'. Inject allowed.\x1b[0m\n`);
 
     const cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
@@ -3308,7 +3309,7 @@ async function main() {
     ws.on('open', () => {
       // Set Ghostty tab title to show session ID
       const hostSuffix = targetHost === '127.0.0.1' ? '' : ` @ ${targetHost}`;
-      process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}${hostSuffix}\x07`);
+      process.stdout.write(formatTerminalTitle(sessionId, hostSuffix));
       console.log(`\x1b[32mEntered room '${sessionId}'${hostSuffix ? ` (${targetHost})` : ''}.\x1b[0m\n`);
 
       cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {

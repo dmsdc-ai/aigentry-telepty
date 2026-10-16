@@ -2,6 +2,85 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## Unreleased
+
+- **Security: Snyk Code findings on PR #108 (all pre-existing).** Per-finding verdicts and evidence
+  are in `FINDINGS.md`; reproductions in `test/snyk-pr108-findings.test.js`.
+  - `POST /api/sessions/spawn` refuses a `session_id` containing `$`, `` ` `` or `\`
+    (400 `INVALID_SESSION_ID`). The id is put into PS1/PROMPT, and bash expanded `$(...)` in it on
+    every prompt, so the id ran as a command (Snyk ace25647). **Incomplete:** `type` reached the
+    same sink. Round 2 below closes it.
+  - Spawn requires `session_id`, `command`, `cwd`, `type` to be strings and `args` an array of
+    strings (400 `INVALID_REQUEST`); a non-string used to reach the PTY or answer 500
+    (Snyk d07e1fda, 39d3b3ec). The spawn log no longer uses the caller's command as the format
+    string (Snyk 4ce269b3).
+  - The session, handoff and thread maps are null-prototype objects: `__proto__` as a route id
+    resolved to `Object.prototype`, and rename/claim/PATCH then wrote to it. Those requests now
+    answer 404 (Snyk c28e5ccb, 824c56bc, f29f900e, 655151ed).
+  - `POST /api/threads` requires `participant_session_ids`, when given, to be an array of strings
+    (Snyk e933068f).
+  - Responses no longer send `X-Powered-By: Express` (Snyk 9ca81d65).
+  - Snyk 7e65d918 (spawn route without limits): no change; disposition in `FINDINGS.md`.
+- **Security: shell-string class (PR #108 review round 2, C1–C8 except C6).** Reproductions in
+  `test/shell-string-class-pr108-r2.test.js`, all RED on 5ddcecb.
+  - Spawn `type` must be `USER` or `AGENT` (400 `INVALID_SESSION_TYPE`). It is the PS1/PROMPT
+    label, and an uppercase-invariant `$(...)` in it ran on every bash prompt (C1).
+  - Spawn `session_id` must match `^[A-Za-z0-9._:@-]+$` and must not be `__proto__`,
+    `constructor` or `prototype` (400 `INVALID_SESSION_ID`). This replaces the `$`/`` ` ``/`\`
+    denylist, which still let control characters and zsh `%` sequences through (C2, N5).
+  - `kitty @` calls use an argv array, not a `/bin/sh` string, for both the window lookup and the
+    auto-register tab title. A `/tmp/kitty-sock*` socket is used only if `lstat` shows a socket,
+    not a symlink, owned by the daemon uid. Before this, a file named `kitty-sock;<cmd>`, which any
+    local user can create in a shared `/tmp`, ran `<cmd>` as the daemon user on an auto-register,
+    and a `'` in a WS session id broke out of the title command (C3, C4, both pre-existing).
+  - `osascript` gets the window search terms as `on run argv` arguments, not inside the script
+    text. This path is latent: no submit strategy selects it (C5).
+  - CLI terminal titles (`attach`, `allow`, remote attach) strip C0/C1 control characters from the
+    id (C7).
+  - `ssh … telepty attach` quotes the id for the remote shell (C8).
+  - Windows `cmd.exe /c <command> <args…>` is unchanged (C6). The current argv is pinned by
+    `test/win32-cmd-argv-characterisation-c6.test.js`, and the fix is tracked separately.
+- **Inject: a session destroyed while its text is pending answers 410 `SESSION_GONE`**
+  (review N1). Before this, it answered 504 `DELIVERY_UNCERTAIN` ("may still arrive"). A
+  dead-lettered text gets the typed non-delivery. Only a text that is really in flight still gets
+  `DELIVERY_UNCERTAIN`. The full text wait still elapses first.
+- **Inject submit pairing (PR #108 re-review TP1/TP2).** Pinned by `test/inject-owner-pairing-pr108.test.js`.
+  - The deferred CR goes only to the owner socket that received the text. An inject queued behind
+    the submit barrier answers 410 `SESSION_GONE` if the owner socket changed while it waited, which
+    includes a same-bearer re-claim that keeps the epoch. Before this, the replacement owner got a
+    bare CR and the queued text.
+  - An inject that owes a CR now waits for its own `msg_id` to be written (bound:
+    2 × `TELEPTY_DELIVERY_TIMEOUT_MS`) instead of trusting `mailboxDelivery.tick()`, which returns
+    at once while another tick is in flight. Before this, the CR could arrive before the text. If
+    the text is not written in time, a still-pending message is withdrawn to dead letter and the
+    call fails with the delivery error (else 504 `TIMEOUT`). One already in flight answers 504
+    `DELIVERY_UNCERTAIN`. No CR follows either way.
+
+- **Back-to-back injects into one session keep each text paired with its own submit CR**
+  ([gh#107](https://github.com/dmsdc-ai/aigentry-telepty/issues/107)). The next inject's text now
+  waits for the previous inject's deferred CR (a per-session submit barrier), so a wrapped target no
+  longer reads `text1 text2 CR CR` as one glued line. Pinned by `test/inject-submit-order-107.test.js`.
+  - **Follow-up ([gh#109](https://github.com/dmsdc-ai/aigentry-telepty/issues/109)): the barrier
+    re-checks the session and is bounded.** After the wait the id must still name the same session
+    instance (same record, same epoch). An inject whose session was destroyed, renamed or recreated
+    under the same id, or whose wrapped owner was replaced (a new owner claim resets the epoch),
+    while it waited answers **410 `SESSION_GONE`** and writes nothing. The deferred CR timer checks
+    the **instance**, not the id: a session renamed inside the submit delay is the same live
+    instance that received the text, so it still gets its CR; a destroyed, recreated or
+    owner-replaced instance gets no CR, and that is reported as `inject_failed` (`phase: submit`,
+    `code: SESSION_GONE`). The wait is capped at **10000 ms**
+    (`TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS`); the cap covers the barrier wait only, which starts after
+    any modal-gate hold (`TELEPTY_MODAL_HOLD_MS`, default 30000 ms), so total request time can
+    still exceed it. A caller still queued then gets **503 `QUEUE_TIMEOUT`** and
+    nothing is enqueued, so it can retry instead of hitting its own client timeout while the text
+    lands later. Basis: the CLI's local inject request sets no timeout of its own (only undici's
+    300 s default applies), and the tightest client deadline on the inject path is the cross-machine
+    SSH `telepty inject` at 15000 ms; 15000 − one 5000 ms delivery timeout = 10000 ms. With the
+    500 ms wrapped submit delay that is ≈ 20 queued injects. **What a user sees before this**: a
+    deleted session's queued inject answered 200, a recreated session received its predecessor's
+    queued text without a CR, and the 6th of six concurrent injects waited 2.5 s with no signal.
+    Pinned by `test/inject-barrier-identity-109.test.js`.
+
 ## 0.8.5 — 2026-10-09
 
 The three asks of the 2026-10-09 [gh#82](https://github.com/dmsdc-ai/aigentry-telepty/issues/82)

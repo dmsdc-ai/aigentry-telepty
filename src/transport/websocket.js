@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
+const { setKittyTabTitle } = require('../kitty-control');
 
 function isOpenWebSocket(ws) {
   return Boolean(ws && ws.readyState === 1);
@@ -208,9 +209,7 @@ function installWebSocketTransport(deps) {
         const wid = findKittyWindowId(sock, sessionId);
         if (sock && wid) {
           try {
-            require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${wid} '⚡ telepty :: ${sessionId}'`, {
-              timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
-            });
+            setKittyTabTitle(sock, wid, sessionId);
           } catch {}
         }
       }, 1000);
