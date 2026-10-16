@@ -24,10 +24,15 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 - **Security: shell-string class (PR #108 review round 2, C1–C8 except C6).** Reproductions in
   `test/shell-string-class-pr108-r2.test.js`, all RED on 5ddcecb.
   - Spawn `type` must be `USER` or `AGENT` (400 `INVALID_SESSION_TYPE`). It is the PS1/PROMPT
-    label, and an uppercase-invariant `$(...)` in it ran on every bash prompt (C1).
+    label, and an uppercase-invariant `$(...)` in it ran on every bash prompt (C1). The check is
+    case-sensitive: lowercase `user`/`agent`, which `toUpperCase()` used to accept, is now 400
+    (NB5; the CLI sends `USER`).
   - Spawn `session_id` must match `^[A-Za-z0-9._:@-]+$` and must not be `__proto__`,
     `constructor` or `prototype` (400 `INVALID_SESSION_ID`). This replaces the `$`/`` ` ``/`\`
-    denylist, which still let control characters and zsh `%` sequences through (C2, N5).
+    denylist, which still let control characters and zsh `%` sequences through (C2, N5). Ids made
+    only of dots (`.`, `..`) are also 400: the mailbox dir is `path.join(root, id)` (NB4). Non-ASCII
+    ids, spaces, `+`, `/` and `#` are now 400 on spawn. `POST /api/sessions/register` and WS
+    auto-register do not apply this check yet.
   - `kitty @` calls use an argv array, not a `/bin/sh` string, for both the window lookup and the
     auto-register tab title. A `/tmp/kitty-sock*` socket is used only if `lstat` shows a socket,
     not a symlink, owned by the daemon uid. Before this, a file named `kitty-sock;<cmd>`, which any
