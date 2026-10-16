@@ -204,6 +204,42 @@ class FileMailbox {
   }
 
   /**
+   * Withdraw a message that has not been handed to a deliverer: only a `pending` message moves to
+   * dead letter (with `reason`), so it can never be delivered afterwards. Returns true if it did;
+   * false if the message is in flight, already delivered or already gone.
+   */
+  withdraw(sessionId, msgId, reason) {
+    const sessionDir = this._sessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) return false;
+
+    const release = acquireLock(sessionDir);
+    try {
+      const st = loadStates(sessionDir).get(msgId);
+      if (!st || st.state !== 'pending') return false;
+
+      const msg = loadMessages(sessionDir)
+        .filter(m => m.msg_id === msgId)
+        .reduce((latest, m) => (!latest || (m.attempt || 0) > (latest.attempt || 0) ? m : latest), null);
+      if (!msg) return false;
+
+      const now = unixNow();
+      appendJsonl(path.join(sessionDir, 'dead-letter.jsonl'), {
+        msg_id: msg.msg_id,
+        from: msg.from,
+        to: msg.to,
+        payload: msg.payload,
+        reason: reason || 'withdrawn',
+        failed_at: now,
+        attempts: msg.attempt || 0,
+      });
+      appendState(sessionDir, msgId, 'dead_letter', now);
+      return true;
+    } finally {
+      release();
+    }
+  }
+
+  /**
    * Peek at pending messages without dequeueing.
    */
   peek(sessionId) {
