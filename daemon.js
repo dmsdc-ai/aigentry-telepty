@@ -3478,13 +3478,21 @@ app.post('/api/sessions/spawn', (req, res) => {
   if (!session_id) return res.status(400).json({ error: 'session_id is strictly required.' });
   if (sessions[session_id]) return res.status(409).json({ error: `Session ID '${session_id}' is already active.` });
   if (!command) return res.status(400).json({ error: 'command is required' });
+  if (typeof session_id !== 'string' || typeof command !== 'string' || typeof cwd !== 'string' || typeof type !== 'string'
+    || !Array.isArray(args) || !args.every(a => typeof a === 'string')) {
+    return respondWithError(res, 400, 'INVALID_REQUEST', 'session_id, command, cwd and type must be strings; args an array of strings');
+  }
+  // session_id is interpolated into PS1/PROMPT below, which the shell expands on every prompt.
+  if (/[$`\\]/.test(session_id)) {
+    return respondWithError(res, 400, 'INVALID_SESSION_ID', 'session_id must not contain $, ` or \\');
+  }
 
   const isWin = os.platform() === 'win32';
   const shell = isWin ? (command === 'powershell' ? 'powershell.exe' : 'cmd.exe') : command;
   const shellArgs = isWin ? (command === 'powershell' || command === 'cmd' ? args : ['/c', command, ...args]) : args;
 
   try {
-    console.log(`[SPAWN] Spawning ${shell} with args:`, shellArgs, "in cwd:", cwd);
+    console.log('[SPAWN] Spawning %s with args:', shell, shellArgs, "in cwd:", cwd);
 
     const customEnv = buildSessionEnv(session_id);
     
