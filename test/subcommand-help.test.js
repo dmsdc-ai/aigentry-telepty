@@ -115,6 +115,24 @@ test('wrap/enable aliases share the allow help', async () => {
   assert.match(result.stdout, /Usage: telepty allow/);
 });
 
+// #1227: `service` is a lifecycle command, so answering its help must never be an action.
+// It is on no allow-list, which is exactly the tp941 property under test: the guard defaults
+// to help for every subcommand instead of requiring someone to remember to add it.
+test('service --help prints the global help and performs no service action', async () => {
+  const result = await runCli(['service', '--help']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /telepty service status\|install\|uninstall\|start\|stop\|restart/);
+  assert.doesNotMatch(result.stdout, /would:|completed|Dry run/);
+  assert.doesNotMatch(result.stderr, /Usage: telepty service/);
+});
+
+test('service with no subcommand is a usage error, not an action', async () => {
+  const result = await runCli(['service']);
+  assert.equal(result.code, 2, 'a usage error exits 2 — nothing changed');
+  assert.match(result.stderr, /Usage: telepty service status/);
+  assert.doesNotMatch(result.stdout, /completed/);
+});
+
 // ── defense-in-depth: bare help payload is refused without an explicit -- ──────
 
 test('broadcast refuses a payload that is exactly --help and hints at --', async () => {

@@ -111,7 +111,9 @@ test('#910: postinstall reaches its upgrade path once a state file exists', asyn
   const postinstall = require('../scripts/postinstall.js');
   const logs = [];
   let cleanupCalled = 0;
-  let respawned = null;
+  let respawnCalls = 0;
+  let respawnArgs = null;
+  let resolveBinCalls = 0;
 
   await postinstall.main({
     env: { npm_config_global: 'true' }, // postinstall only acts on a GLOBAL install
@@ -119,17 +121,23 @@ test('#910: postinstall reaches its upgrade path once a state file exists', asyn
     readDaemonState: () => ({ pid: 4242, port: 3848, version: '0.0.1-stale' }),
     detectSupervisor: () => ({ present: false, kind: null, detail: null }),
     cleanupDaemonProcesses: () => { cleanupCalled += 1; return { stopped: [], failed: [] }; },
-    // EVERY side effect of the unsupervised branch is injected. Without these two the real
-    // `resolveTeleptyBin()` + `spawnDetachedDaemon()` run: postinstall.main() returns while a
-    // REAL detached daemon it spawned is still starting — which is both a process this test has
-    // no business creating (it would target :3848, the operator's port) and the leaked async
-    // activity node:test reports after the test ends.
-    resolveTeleptyBin: () => '/nonexistent/telepty',
-    spawnDetachedDaemon: (bin) => { respawned = bin; },
+    // The spawn seam is the load-bearing injection: without it the real
+    // `spawnDetachedDaemon()` runs, postinstall.main() returns while a REAL detached daemon it
+    // spawned is still starting — a process this test has no business creating (it would target
+    // :3848, the operator's port) and the leaked async activity node:test reports after the test
+    // ends. The bin seam below is deliberately INERT: #1228 stopped main() from consulting the
+    // PATH `telepty` at all, so it is kept only to DETECT a regression back to it.
+    resolveTeleptyBin: () => { resolveBinCalls += 1; return '/nonexistent/telepty'; },
+    spawnDetachedDaemon: (...args) => { respawnCalls += 1; respawnArgs = args; },
   });
 
   assert.equal(cleanupCalled, 1, 'a stale running daemon is what postinstall exists to replace');
-  assert.equal(respawned, '/nonexistent/telepty', 'the upgrade path ran to its respawn — through seams, spawning nothing');
+  assert.equal(respawnCalls, 1, 'the upgrade path ran to its respawn — through the seam, spawning nothing');
+  // #1228: the replacement daemon is THIS package's cli.js by construction. main() hands the
+  // seam NO argument, so `spawnDetachedDaemon`'s own `path.join(__dirname,'..','cli.js')`
+  // default decides — never whatever currently owns the `telepty` link on PATH.
+  assert.deepEqual(respawnArgs, [], 'no caller-provided binary may reach the spawn seam');
+  assert.equal(resolveBinCalls, 0, 'resolving the PATH `telepty` is exactly the #1228 regression this discriminates');
   assert.equal(
     logs.some((m) => /No running daemon detected/.test(m)),
     false,
