@@ -94,7 +94,7 @@ test('R1: register / rename / spawn / WS / restored legacy id / encoded routes l
   // The restored legacy id is reachable through the encoded route, so the storage boundary is
   // what protects the siblings here.
   assert.equal((await daemon.request('/api/sessions/..%2Fvictim')).status, 200, 'legacy record restored');
-  await daemon.request('/api/sessions/..%2Fvictim/inject', { method: 'POST', body: { prompt: 'x', no_submit: true } });
+  await daemon.request('/api/sessions/..%2Fvictim/inject', { method: 'POST', body: { prompt: 'x', no_enter: true } });
   await daemon.request('/api/sessions/..%2Fvictim/mailbox', { method: 'DELETE' });            // 4fc6e5b9
   await daemon.request('/api/sessions/..%2Fvictim/mailbox/dead-letter', { method: 'DELETE' }); // 4158b586
   await daemon.request('/api/sessions/..%2Fvictim', { method: 'DELETE' });                    // 20746b91

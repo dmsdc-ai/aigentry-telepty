@@ -739,11 +739,21 @@ function beginTrackedInjection({ injectId, sessionId, source, session }) {
  *                             drain writes the body and the submit CR separately, and a CR that
  *                             fails after the body landed must not be recorded as a delivery of
  *                             nothing.
+ *   inject_delivery_uncertain — the text was handed to mailbox delivery and not confirmed in time
+ *                             (DELIVERY_UNCERTAIN): it may still land, so `bytes_written` is null
+ *                             (not measured), never a measured 0 (Mac re-review of 9cff4bf).
  *   inject_delivery_dropped — the write was NEVER attempted. The op was accepted, parked, and
  *                             discarded by a queue timeout or TTL. `bytes_written` is 0, measured.
  *
  * Returns a named result, never undefined.
  */
+// The cause for the inject route's refusal arm: DELIVERY_UNCERTAIN is not a refusal of zero bytes.
+function deliveryAbortCause(deliveryCode) {
+  return deliveryCode === 'DELIVERY_UNCERTAIN'
+    ? { kind: 'inject_delivery_uncertain', trigger: 'delivery_uncertain', bytesWritten: null }
+    : {};
+}
+
 function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError, cause = {}) {
   const record = getTrackedInjection(injectId);
   if (!record) return 'tracking_unavailable';
@@ -2987,7 +2997,12 @@ function sessionGoneResult() {
 // the waiter with the owner socket the text was actually written to; the CR goes only there.
 // Bound: one in-flight delivery to another session plus our own.
 const MAILBOX_TEXT_WAIT_MS = 2 * DELIVERY_TIMEOUT_MS;
-const mailboxTextWaiters = new Map(); // msg_id → { settle(ownerWs), lastFailure }
+const mailboxTextWaiters = new Map(); // msg_id → { settle(ownerWs), refuse(result), lastFailure }
+// Mac re-review R2: the text is written by whichever tick dequeues it, possibly after an owner
+// takeover or a same-name re-create. Each enqueued inject is bound to the instance and owner socket
+// it was admitted for; deliverFn writes only to that binding (in memory: a message restored after a
+// daemon restart has no binding and is delivered as before).
+const mailboxAdmissions = new Map(); // msg_id → { session, sessionEpoch, ownerWs }
 
 function awaitMailboxText(msgId, timeoutMs) {
   return new Promise((resolve) => {
@@ -3000,6 +3015,11 @@ function awaitMailboxText(msgId, timeoutMs) {
       clearTimeout(timer);
       mailboxTextWaiters.delete(msgId);
       resolve({ delivered: true, ownerWs });
+    };
+    waiter.refuse = (result) => {
+      clearTimeout(timer);
+      mailboxTextWaiters.delete(msgId);
+      resolve({ delivered: false, refused: result });
     };
     mailboxTextWaiters.set(msgId, waiter);
   });
@@ -3152,6 +3172,7 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
       created_at: Math.floor(now / 1000),
       attempt: 0,
     });
+    mailboxAdmissions.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs });
     // Registered synchronously after the enqueue: no tick can run in between.
     const owesSubmit = !options.noEnter && session.type !== 'aterm';
     const textWait = owesSubmit ? awaitMailboxText(msgId, MAILBOX_TEXT_WAIT_MS) : null;
@@ -3169,11 +3190,17 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
     // Send CR separately after delay (outside paste brackets)
     if (owesSubmit) {
       const text = await textWait;
+      if (text.refused) {
+        // Not written: the instance or owner it was admitted for was replaced first (R2).
+        releaseSubmit();
+        return { ...text.refused, msg_id: msgId };
+      }
       if (!text.delivered) {
         // Not written in time. Withdraw it if no deliverer holds it, so it can never land later
         // without its CR and a retry cannot duplicate it; if one does hold it, say so.
         let withdrawn = false;
         try { withdrawn = mailbox.withdraw(id, msgId, 'submit_unpaired: text not delivered in time'); } catch {}
+        if (withdrawn) mailboxAdmissions.delete(msgId);
         // Not withdrawable is not always "in flight" (review N1): a purge (session destroyed) leaves
         // no record and a dead-lettered message cannot be written any more either.
         let state;
@@ -4909,7 +4936,7 @@ app.post('/api/sessions/:id/inject', async (req, res) => {
       // body for the same reason: a caller told its dispatch was refused must be able to poll the
       // record that says so.
       const aborted = trackedRecord
-        ? abortTrackedInjection(inject_id, id, delivery.code, delivery.error)
+        ? abortTrackedInjection(inject_id, id, delivery.code, delivery.error, deliveryAbortCause(delivery.code))
         : 'no_tracked_inject';
       return respondWithError(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error,
         { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable' });
@@ -5962,11 +5989,20 @@ const mailboxDelivery = new DeliveryEngine(mailbox, {
   deliverFn: async (sessionId, msg) => {
     const session = sessions[sessionId];
     if (!session) return { success: false, error: 'Session not found' };
+    const admitted = mailboxAdmissions.get(msg.msg_id);
+    if (admitted && (admitted.session !== session || (session.sessionEpoch || null) !== admitted.sessionEpoch
+      || session.ownerWs !== admitted.ownerWs)) {
+      const refused = { ...sessionGoneResult(), admissionRefused: true };
+      const waiter = mailboxTextWaiters.get(msg.msg_id);
+      if (waiter) waiter.refuse(refused);
+      return refused; // onDelivery withdraws it, so no retry reaches the replacement either
+    }
     // Captured before the call: a wrapped write sends on this socket synchronously.
     const ownerWs = session.ownerWs;
     const result = await writeDataToSession(sessionId, session, msg.payload);
     if (result.success) {
       session.lastActivityAt = new Date().toISOString();
+      mailboxAdmissions.delete(msg.msg_id);
     }
     const waiter = mailboxTextWaiters.get(msg.msg_id);
     if (waiter) {
@@ -5976,6 +6012,21 @@ const mailboxDelivery = new DeliveryEngine(mailbox, {
     return result;
   },
   onDelivery: (sessionId, msgId, result) => {
+    // R2: a message refused by its admission binding was nacked to pending; dead-letter it now.
+    if (!result.success && mailboxAdmissions.has(msgId)) {
+      const admitted = mailboxAdmissions.get(msgId);
+      const current = sessions[sessionId];
+      if (!current || admitted.session !== current || (current.sessionEpoch || null) !== admitted.sessionEpoch
+        || current.ownerWs !== admitted.ownerWs) {
+        try { mailbox.withdraw(sessionId, msgId, 'owner_replaced: admitted owner or instance is gone'); } catch {}
+        mailboxAdmissions.delete(msgId);
+      } else {
+        // An ordinary failure keeps the binding for the retry, until the message is terminal.
+        let state;
+        try { state = mailbox.messageState(sessionId, msgId); } catch {}
+        if (state === null || state === 'dead_letter' || state === 'expired' || state === 'acked') mailboxAdmissions.delete(msgId);
+      }
+    }
     const session = sessions[sessionId];
     if (!session) return;
     if (result.success) {
@@ -6431,6 +6482,7 @@ module.exports = {
   sessionAuthenticationCapability, // #860 F1: "observed" requires a bearer that was PRESENTED and verified
   deliveryAuditResult,            // #860 F2: audit `delivery_result` — `queued` is not `success`
   getTrackedInjection,            // #60 Stage A: ledger read by inject_id
+  deliveryAbortCause,             // Mac re-review of 9cff4bf: DELIVERY_UNCERTAIN is not "0 bytes written"
   listTrackedInjectionsForSession, // #60 Stage A: ledger read by session (owner-lifecycle fan-out)
   restoreTrackedInjections,       // #60 Stage A: restore + daemon_restart_observed, before readiness
   observeInjectEchoEvidence,      // #60 Stage A: ring-scoped echo evidence (a field, no longer a gate)

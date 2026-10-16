@@ -161,6 +161,84 @@ test('TP2: text not delivered within the bound is withdrawn — typed failure, a
   assert.deepEqual(frames, [], `withdrawn text or a CR still arrived: ${JSON.stringify(frames)}`);
 });
 
+// Mac re-review of 9cff4bf, R2: the checks above run at admission and at CR time, but the TEXT is
+// written by whichever tick dequeues it, and deliverFn re-resolved sessions[id] and its current
+// owner socket. With the tick held by a slow unrelated session, the text sat in the mailbox across
+// an owner replacement and was then written to the replacement (whose socket the waiter recorded,
+// so the CR followed).
+async function slowTickHolder(t, label) {
+  const slowServer = http.createServer((req, res) => {
+    req.resume();
+    setTimeout(() => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"ok":true}'); }, 2000);
+  });
+  await new Promise((resolve) => slowServer.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => slowServer.close(resolve)));
+  const slow = createSessionId(label);
+  const reg = await harness.registerSession(slow, {
+    delivery_type: 'aterm', delivery_endpoint: `http://127.0.0.1:${slowServer.address().port}/deliver`
+  });
+  assert.equal(reg.status, 201, JSON.stringify(reg.body));
+  return () => inject(slow, 'occupies the delivery tick');
+}
+
+for (const noEnter of [false, true]) {
+  test(`R2: text queued behind a slow tick is not written to a same-bearer replacement owner (no_enter=${noEnter})`, async (t) => {
+    const hold = await slowTickHolder(t, `pr108-r2-slow-${noEnter}`);
+    const sid = createSessionId(`pr108-r2-takeover-${noEnter}`);
+    const first = await wrappedOwner(sid);
+    t.after(() => { try { first.ws.close(); } catch {} });
+
+    const slowInject = hold();
+    await sleep(150); // the tick is now awaiting the slow endpoint
+    const pending = harness.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, {
+      method: 'POST', body: { prompt: 'queued text', no_enter: noEnter }
+    });
+    await sleep(150); // admitted for `first` and enqueued; not yet dequeued
+    const second = await ownerSocket(sid); // same bearer: same record, same epoch, new socket
+    t.after(() => { try { second.ws.close(); } catch {} });
+    const res = await pending;
+    await slowInject;
+    await sleep(4000); // past the held tick and the retry backoffs
+
+    assert.deepEqual(second.frames, [], `the replacement owner received: ${JSON.stringify(second.frames)}`);
+    assert.deepEqual(first.frames, [], `the displaced owner received: ${JSON.stringify(first.frames)}`);
+    if (!noEnter) {
+      assert.equal(res.status, 410, `inject answered ${res.status}: ${JSON.stringify(res.body)}`);
+      assert.equal(res.body.code, 'SESSION_GONE', JSON.stringify(res.body));
+    }
+  });
+}
+
+test('R2: text queued behind a slow tick is not written to a same-name re-created session', async (t) => {
+  const hold = await slowTickHolder(t, 'pr108-r2-slow-recreate');
+  const sid = createSessionId('pr108-r2-recreate');
+  const first = await wrappedOwner(sid);
+  t.after(() => { try { first.ws.close(); } catch {} });
+
+  const slowInject = hold();
+  await sleep(150);
+  const pending = inject(sid, 'queued text');
+  await sleep(150);
+  assert.equal((await harness.request(`/api/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE' })).status, 200);
+  const replacement = await wrappedOwner(sid); // same name, new instance
+  t.after(() => { try { replacement.ws.close(); } catch {} });
+  const res = await pending;
+  await slowInject;
+  await sleep(4000);
+
+  assert.deepEqual(replacement.frames, [], `the re-created session received: ${JSON.stringify(replacement.frames)}`);
+  assert.ok([410, 504].includes(res.status), `inject answered ${res.status}: ${JSON.stringify(res.body)}`);
+  assert.ok(['SESSION_GONE', 'TIMEOUT'].includes(res.body.code), JSON.stringify(res.body));
+});
+
+test('DELIVERY_UNCERTAIN closes the tracked record as uncertain (bytes not measured), not as a refusal of 0 bytes', () => {
+  const { deliveryAbortCause } = require('../daemon');
+  assert.equal(typeof deliveryAbortCause, 'function');
+  assert.deepEqual(deliveryAbortCause('DELIVERY_UNCERTAIN'),
+    { kind: 'inject_delivery_uncertain', trigger: 'delivery_uncertain', bytesWritten: null });
+  for (const code of ['SESSION_GONE', 'TIMEOUT', 'QUEUE_TIMEOUT', undefined]) assert.deepEqual(deliveryAbortCause(code), {});
+});
+
 test('FileMailbox.withdraw dead-letters only a pending message', () => {
   const fs = require('node:fs');
   const os = require('node:os');
