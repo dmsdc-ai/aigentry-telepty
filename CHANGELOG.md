@@ -20,6 +20,17 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
     (Snyk e933068f).
   - Responses no longer send `X-Powered-By: Express` (Snyk 9ca81d65).
   - Snyk 7e65d918 (spawn route without limits): no change; disposition in `FINDINGS.md`.
+- **Inject submit pairing (PR #108 re-review TP1/TP2).** Pinned by `test/inject-owner-pairing-pr108.test.js`.
+  - The deferred CR goes only to the owner socket that received the text. An inject queued behind
+    the submit barrier answers 410 `SESSION_GONE` if the owner socket changed while it waited, which
+    includes a same-bearer re-claim that keeps the epoch. Before this, the replacement owner got a
+    bare CR and the queued text.
+  - An inject that owes a CR now waits for its own `msg_id` to be written (bound:
+    2 × `TELEPTY_DELIVERY_TIMEOUT_MS`) instead of trusting `mailboxDelivery.tick()`, which returns
+    at once while another tick is in flight. Before this, the CR could arrive before the text. If
+    the text is not written in time, a still-pending message is withdrawn to dead letter and the
+    call fails with the delivery error (else 504 `TIMEOUT`). One already in flight answers 504
+    `DELIVERY_UNCERTAIN`. No CR follows either way.
 
 - **Back-to-back injects into one session keep each text paired with its own submit CR**
   ([gh#107](https://github.com/dmsdc-ai/aigentry-telepty/issues/107)). The next inject's text now

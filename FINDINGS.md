@@ -117,3 +117,66 @@ Reproduced: `command: ['bash']` → 500 on db2f532. Fix (e40997d): `session_id`,
 `participant_session_ids` was stored and `.length`-counted as given: `"abc"` was accepted (201) and
 broadcast to the bus as a participant list. Fix (3600a8a): when supplied (truthy) it must be an array
 of strings, else 400; omitted still defaults to `[]`. The CLI sends an array of ids (cli.js `threads`).
+
+# Mac static re-review of db2f532 — TP1 / TP2 (P1, owned here)
+
+Source: orchestrator `state/reviews/snyk-1238/2026-10-16-mac-transport-rereview.md` (source-derived,
+not executed). Both are reproduced here as tests (`test/inject-owner-pairing-pr108.test.js`, RED on
+29498cd before the fix, 4 fail / 1 pass: `evidence-snyk/tp-repro-before-full.log`; GREEN after,
+5/5).
+
+| id | verdict | fix |
+|---|---|---|
+| TP1 owner takeover | TRUE POSITIVE, reproduced | f0525371 |
+| TP2 CR before text | TRUE POSITIVE, reproduced | 1845b131 + f0525371 |
+
+## TP1 — same-bearer owner takeover during the queued wait / deferred CR
+
+A second `?owner=1` claim that presents the same bearer keeps the session record and its epoch
+(`verify(bearer).epoch` does not change), so the #109 checks (`sessions[id] === session` and the
+epoch) pass, but `ownerWs` is replaced (src/transport/websocket.js ownership transfer). Measured:
+- deferred CR: the replacement owner received `["\r"]` for text that went to the displaced owner;
+- queued inject: the replacement received `["\r","second queued behind it","\r"]`, and the call
+  answered 200.
+
+Fix (f0525371): the ownership generation is the owner **socket**. `deliverInjectionToSession`
+captures `session.ownerWs` on entry, and after the barrier wait it requires the same socket as well as
+the same instance, or it answers 410 `SESSION_GONE`. The deferred CR goes only to the socket that
+the text was actually written to, otherwise it emits `inject_failed` (`phase: submit`,
+`SESSION_GONE`). The direct-fallback path applies the same rule. No token is compared or logged. Rename
+keeps the socket, so it still gets its CR (the #109 rename test still passes). A reconnect *between* text and
+CR now gets the typed failure and no CR, because the daemon cannot tell a reconnect from a same-bearer
+takeover by the bearer alone. Injects sent after a reconnect deliver normally.
+
+## TP2 — CR before text when `mailboxDelivery.tick()` returns during an in-flight tick
+
+`DeliveryEngine._tick` returns immediately when `_tickInProgress` (src/mailbox/delivery.js), so the
+inject path's `await mailboxDelivery.tick()` did not mean its text was written. The CR timer then
+wrote `\r` first. Measured with an aterm session whose HTTP endpoint answers after 2 s occupying the
+tick: the wrapped owner received `["\r","hello"]`.
+
+Fix:
+- 1845b131: `FileMailbox.withdraw(sessionId, msgId, reason)`. Under the session lock, a message
+  still in `pending` goes to dead letter (existing state/vocabulary, so the Rust crate's format is
+  unaffected). It returns false if a deliverer holds it (`in_flight`) or it is already done.
+- f0525371: when an inject owes a CR (not `noEnter`, not aterm) it waits for **its msg_id** to be written.
+  The mailbox `deliverFn` settles the waiter with the owner socket it wrote to, and any failed
+  attempt is remembered while the engine's normal nack and retry continue. The wait is bounded by
+  `2 × TELEPTY_DELIVERY_TIMEOUT_MS` (default 10000 ms): one in-flight delivery to another session plus
+  our own.
+  - Delivered → 200 as before, and the CR (after the same 500/300 ms delay) goes only to that socket.
+  - Not delivered and still pending → withdrawn → typed failure (the last delivery error, else
+    504 `TIMEOUT`). It can never land later without its CR, and a retry cannot duplicate it.
+  - Not delivered but in flight → 504 `DELIVERY_UNCERTAIN` with no CR, so the caller is told not
+    to retry blindly. No-duplicate is kept because nothing is re-sent.
+  - The barrier is released on every outcome.
+- `noEnter` and aterm injects keep the old path: no CR is owed.
+
+Residuals (not changed):
+- The engine's single-flight tick still makes one slow session delay other sessions'
+  deliveries (head-of-line, pre-existing). This now shows up as a bounded wait or a typed TIMEOUT
+  instead of a CR before its text.
+- Not measured: how the route's ledger and audit classify the new `DELIVERY_UNCERTAIN`. It takes the
+  generic refusal arm.
+- The non-blocking review notes are not addressed here: `pendingSubmit` is not durable, and the
+  10000 ms barrier bound sits against telesession's 10000 ms client deadline.
