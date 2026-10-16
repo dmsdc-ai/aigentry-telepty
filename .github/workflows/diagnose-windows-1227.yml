@@ -31,10 +31,24 @@ name: Diagnose Windows hang (#1227)
 #   NOT A PASS, and must never be read as acceptance or copied into a package script or into
 #   test-install.yml / release.yml.
 #
-# Delete this workflow once #1227 is understood. It is dispatch-only, reads nothing but the repo,
-# takes no inputs and no secrets, and publishes nothing.
+# Delete this workflow once #1227 is understood. It reads nothing but the repo, takes no inputs and
+# no secrets, and publishes nothing.
 
+# GitHub will only offer the manual "Run workflow" button for a `workflow_dispatch` workflow that
+# exists ON THE DEFAULT BRANCH:
+# https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow
+# A diagnostic must not have to be merged to `main` in order to be runnable, so it gets one
+# dedicated branch whose pushes arm it — and nothing else:
+#   * the branch is named in full, literally, with no glob and no second entry, so no other branch
+#     can trigger this;
+#   * there is deliberately NO `pull_request` trigger, so no PR (from a fork or otherwise) can
+#     start it;
+#   * there is deliberately NO default-branch or general `push`, so if this file ever does land on
+#     `main` it stays inert there and the manual button is the only way in.
 on:
+  push:
+    branches:
+      - validation/1238-telepty-win-diagnostic
   workflow_dispatch:
 
 permissions:
