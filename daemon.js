@@ -14,7 +14,7 @@ const { createAuthMiddleware, createIsAllowedPeer, createOriginGuard, createVeri
 const { detectTailnet, TAILNET_CIDR } = require('./src/net/tailnet');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
-const { isValidSessionId } = require('./src/session-id');
+const { isValidSessionId, isSafeRegisteredSessionId } = require('./src/session-id');
 const { findKittySocket, findKittyWindowId } = require('./src/kitty-control');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
 const { SessionStateManager, STATE_DISPLAY, OBSERVATION_DISPLAY, mapObservationCause, stripAnsi: stripAnsiState } = require('./session-state');
@@ -3652,6 +3652,9 @@ app.post('/api/sessions/spawn', (req, res) => {
 app.post('/api/sessions/register', (req, res) => {
   const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id, term_program, term } = req.body;
   if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+  if (typeof session_id === 'string' && !isSafeRegisteredSessionId(session_id)) {
+    return respondWithError(res, 400, 'INVALID_SESSION_ID', 'session_id must not be only dots, contain / or \\ or control characters, or be __proto__, constructor or prototype');
+  }
   // #1215 — opt-in create-if-absent. Checked BEFORE any existing-record mutation below, and the
   // handler stays synchronous from here to the insert, so the check and the create are atomic.
   // Without the boolean `true` the idempotent (mutating) re-register below is unchanged.

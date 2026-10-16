@@ -59,8 +59,9 @@ test('daemon: the DELETE routes of a registered `../x` session do not touch file
   const x = path.join(daemon.homeDir, '.aigentry', 'x'); // mailbox root is ~/.aigentry/mailbox
   fs.mkdirSync(x, { recursive: true });
   for (const f of ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl']) fs.writeFileSync(path.join(x, f), 'keep\n');
+  // Since NB4 option A, register refuses `../x` (400); the files are checked first so this stays
+  // RED on 9cff4bf, where the register succeeded and the DELETE routes truncated them.
   const reg = await daemon.registerSession('../x');
-  assert.ok(reg.status === 200 || reg.status === 201, `register: ${reg.status}`);
   // `..%2Fx` survives URL normalisation and express decodes it to `../x` (a bare `..` segment
   // does not survive, so `..` itself is covered by the FileMailbox test above).
   await daemon.request('/api/sessions/..%2Fx/mailbox', { method: 'DELETE' });           // 4fc6e5b9
@@ -69,6 +70,7 @@ test('daemon: the DELETE routes of a registered `../x` session do not touch file
   for (const f of ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl']) {
     assert.equal(fs.readFileSync(path.join(x, f), 'utf8'), 'keep\n', `~/.aigentry/x/${f} was truncated`);
   }
+  assert.equal(reg.status, 400, 'register refuses an id containing /');
 });
 
 // ------------------------------------------------------------------------ cross-machine ssh

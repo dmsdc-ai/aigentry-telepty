@@ -103,6 +103,37 @@ test('NB4: spawn refuses ids made only of dots (the mailbox dir is path.join(roo
   assert.equal(isValidSessionId('.a'), true);
 });
 
+test('NB4: register refuses only ids unsafe for every producer; producer-shaped ids still register', async () => {
+  const bad = ['.', '..', '...', 'a/b', '../x', 'a\\b', 'a\x01b', 'a\x1bb', 'a\x7fb', 'a\x9bb', '__proto__', 'constructor', 'prototype'];
+  for (const sid of bad) {
+    const res = await daemon.registerSession(sid);
+    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(sid)}, got ${res.status}`);
+    assert.equal(res.body.code, 'INVALID_SESSION_ID');
+  }
+  // `telepty allow` defaults to `${basename(cwd)}-${cli}`, and the owner WS URL is percent-encoded.
+  const n = Date.now();
+  for (const sid of [`my project-${n}-claude`, `프로젝트-${n}-claude`, `a+b-${n}`, `w:${n}`, `n-${n}@host`, `w%3A${n}`, `.a-${n}`]) {
+    const res = await daemon.registerSession(sid);
+    assert.ok(res.status === 200 || res.status === 201, `${sid}: ${res.status} ${JSON.stringify(res.body)}`);
+    await destroy(sid);
+  }
+});
+
+test('NB4: WS auto-register refuses unsafe ids without registering them', async () => {
+  // `..`, `\` and control characters cannot survive URL parsing; these arrive as written.
+  for (const sid of ['...', 'constructor', '__proto__']) {
+    const ws = await daemon.connectSession(sid); // any connect to an unknown id auto-registers it
+    const code = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('open'), 1500);
+      ws.once('close', (c) => { clearTimeout(timer); resolve(c); });
+    });
+    if (code === 'open') ws.terminate();
+    const listed = (await daemon.request('/api/sessions')).body.map((s) => s.id);
+    assert.ok(!listed.includes(sid), `${sid} was auto-registered`);
+    assert.equal(code, 4400, `${sid}: close code`);
+  }
+});
+
 test('C2: ids in use across the ecosystem still spawn', async () => {
   const n = Date.now();
   for (const sid of [`tp-r2-108-${n}`, `kkoma-${n.toString(16)}`, `aigentry_orchestrator.claude-${n}`, `w:${n}`, `name-${n}@host`]) {

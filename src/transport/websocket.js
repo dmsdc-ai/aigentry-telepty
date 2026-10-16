@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
 const { setKittyTabTitle } = require('../kitty-control');
+const { isSafeRegisteredSessionId } = require('../session-id');
 
 function isOpenWebSocket(ws) {
   return Boolean(ws && ws.readyState === 1);
@@ -170,6 +171,14 @@ function installWebSocketTransport(deps) {
       isAlive = false;
       ws.ping();
     }, 30000);
+
+    if (!session && !isSafeRegisteredSessionId(sessionId)) {
+      // Same rule as POST /api/sessions/register (NB4 option A): refused, never auto-registered.
+      console.warn(`[WS] Refused auto-register of invalid session id ${JSON.stringify(sessionId)}`);
+      clearInterval(pingInterval);
+      try { ws.close(4400, 'Invalid session id'); } catch {}
+      return;
+    }
 
     if (!session) {
       const connectedAt = new Date().toISOString();

@@ -14,6 +14,16 @@ function isValidSessionId(id) {
   return typeof id === 'string' && SESSION_ID_PATTERN.test(id) && !RESERVED_SESSION_IDS.has(id) && !DOTS_ONLY.test(id);
 }
 
+// Register and WS auto-register take ids the spawn allowlist would break (`telepty allow` defaults
+// to `${basename(cwd)}-${cli}`; the owner WS URL is percent-encoded), so they refuse only what is
+// unsafe for every producer: path separators, dots only, controls, prototype names (NB4, option A).
+const UNSAFE_REGISTERED_ID_CHARS = /[/\\\u0000-\u001f\u007f-\u009f]/;
+
+function isSafeRegisteredSessionId(id) {
+  return typeof id === 'string' && id.length > 0 && !UNSAFE_REGISTERED_ID_CHARS.test(id)
+    && !DOTS_ONLY.test(id) && !RESERVED_SESSION_IDS.has(id);
+}
+
 // C0, DEL and C1 controls: ESC/BEL/CSI in an id would end or rewrite an escape sequence.
 function stripControlChars(value) {
   return String(value).replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
@@ -23,4 +33,4 @@ function formatTerminalTitle(sessionId, suffix = '') {
   return `\x1b]0;⚡ telepty :: ${stripControlChars(sessionId)}${stripControlChars(suffix)}\x07`;
 }
 
-module.exports = { SESSION_ID_PATTERN, isValidSessionId, stripControlChars, formatTerminalTitle };
+module.exports = { SESSION_ID_PATTERN, isValidSessionId, isSafeRegisteredSessionId, stripControlChars, formatTerminalTitle };
