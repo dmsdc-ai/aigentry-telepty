@@ -549,17 +549,35 @@ function ensureRemoteSharedReference(peerName, descriptor, message = '') {
   };
 }
 
-function resolveTeleptyEntryPoint() {
-  // After npm upgrade, process.argv[1] still points to the OLD version's cli.js.
-  // Resolve the current telepty binary from PATH, which npm updates on install.
+// #1228: the PATH `telepty` is only trusted when it provably belongs to THIS
+// package. Two packages declare that bin name (the legacy unscoped
+// `aigentry-telepty` and this scoped one), so on a dual install this function
+// used to hand the LEGACY cli.js to every detached daemon start. It also split
+// on '\n' only, so a Windows `where` reply left a trailing '\r' that failed
+// existsSync and fell back to argv[1] — the stale path the lookup exists to fix.
+// Now: every line is considered, and a candidate must realpath to a `cli.js`
+// whose sibling package.json names this package. The documented upgrade intent
+// survives, because an in-place global upgrade keeps the same path.
+function resolveTeleptyEntryPoint(deps = {}) {
+  const ownCli = path.join(__dirname, 'cli.js');
+  const platform = deps.platform || process.platform;
+  const exec = deps.execSync || execSync;
+  const fsx = deps.fs || fs;
   try {
-    const cmd = process.platform === 'win32' ? 'where telepty' : 'which telepty';
-    const binPath = execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n')[0];
-    if (binPath && fs.existsSync(binPath)) {
-      return fs.realpathSync(binPath);
+    const cmd = platform === 'win32' ? 'where telepty' : 'which telepty';
+    const output = exec(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    for (const line of String(output).split(/\r?\n/)) {
+      const candidate = line.trim();
+      if (!candidate || !fsx.existsSync(candidate)) continue;
+      const real = fsx.realpathSync(candidate);
+      if (path.basename(real) !== 'cli.js') continue; // a shim, not an entry point
+      try {
+        const manifest = JSON.parse(String(fsx.readFileSync(path.join(path.dirname(real), 'package.json'), 'utf8')));
+        if (manifest && manifest.name === '@dmsdc-ai/aigentry-telepty') return real;
+      } catch { /* unreadable sibling manifest ⇒ not provably ours */ }
     }
   } catch {}
-  return process.argv[1];
+  return ownCli;
 }
 
 function startDetachedDaemon() {
@@ -615,6 +633,30 @@ function supervisorFor(detected, addressedPort, options = {}) {
   const servedPort = readPort(detected);
   const effective = Number.isInteger(servedPort) && servedPort > 0 ? servedPort : DEFAULT_PORT;
   return addressedPort === effective ? detected : { present: false };
+}
+
+// #1227: ONE policy for `telepty daemon start|stop|restart`. Pre-#1227 these verbs ignored an
+// installed supervisor: `start`/`restart` spawned a detached daemon next to the supervised one,
+// and `stop` against a launchd KeepAlive job was simply undone — the opposite of the #738/#757/#82
+// rule that a supervisor owns its daemon. Pure decision (no I/O), so the routing is testable
+// without a service manager: the detection is src/supervisor.js's, the action is src/service.js's.
+//   'service' → delegate to the service verb for that kind
+//   'manual'  → a root-owned system unit: print the sudo command, change nothing (exit 5)
+//   'local'   → no supervisor for this port: the pre-#1227 path, byte-identical
+function decideDaemonVerbRoute(supervisor, sub) {
+  if (!supervisor || !supervisor.present) return { route: 'local', kind: null };
+  if (supervisor.kind === 'systemd') {
+    return {
+      route: 'manual',
+      kind: 'systemd',
+      exitCode: 5,
+      command: `sudo systemctl ${sub} ${SYSTEMD_SERVICE_NAME}`
+    };
+  }
+  if (['launchd', 'systemd-user', 'schtasks'].includes(supervisor.kind)) {
+    return { route: 'service', kind: supervisor.kind };
+  }
+  return { route: 'local', kind: supervisor.kind || null };
 }
 
 // gh#82 (E): environment A's `~/.telepty/logs` was EMPTY after three failed restart attempts, so
@@ -2037,6 +2079,48 @@ function isHelpLikePayload(payload) {
 // executed command — the inverse of the failure mode TRAILING_PAYLOAD_HELP had.
 const SELF_HELP_COMMANDS = new Set(['init']);
 
+// #1227: the seams `telepty service` and the supervised `telepty daemon` verbs share. Lazy
+// require keeps cli.js startup cost unchanged (the same idiom as ./src/uninstall below), and the
+// daemon probe is passed IN so src/service.js stays free of auth.js and fetch.
+function serviceDeps(extra = {}) {
+  return {
+    port: Number(PORT),
+    getDaemonMeta: (host) => getDaemonMeta(host || '127.0.0.1'),
+    readDaemonState,
+    ...extra
+  };
+}
+
+function printServiceSteps(result) {
+  for (const step of result.steps || []) {
+    if (step.ok) continue;
+    console.error(`   ${step.command}${step.stderr ? `: ${step.stderr}` : ''}`);
+  }
+  for (const manual of result.manualCommands || []) {
+    console.error(`   needs admin: ${manual}`);
+  }
+}
+
+async function runSupervisedDaemonVerb(route, sub) {
+  if (route.route === 'manual') {
+    // A root-owned unit is surfaced, never driven: no sudo from product code.
+    console.error(`❌ A system-scope systemd unit owns this daemon — run: ${route.command}`);
+    process.exitCode = route.exitCode;
+    return;
+  }
+
+  const { runServiceVerb, SERVICE_EXIT } = require('./src/service');
+  const result = await runServiceVerb(sub, { yes: true, isTTY: false }, serviceDeps());
+  console.log(`→ managed by ${route.kind}`);
+  if (result.exitCode === SERVICE_EXIT.OK) {
+    console.log(`\x1b[32m✅ Telepty daemon ${sub === 'stop' ? 'stopped' : `${sub}ed`} through ${route.kind}.\x1b[0m`);
+    return;
+  }
+  console.error(`\x1b[31m❌ ${route.kind} could not ${sub} the daemon (${result.reason || 'failed'}).\x1b[0m`);
+  printServiceSteps(result);
+  process.exitCode = result.exitCode;
+}
+
 // tp941 (gh#79, gh#61) — help is a QUESTION; answering it is never an ACTION.
 //
 // telepty#51 gated interception on membership in TRAILING_PAYLOAD_HELP and called it from INSIDE
@@ -2143,6 +2227,23 @@ async function main() {
       }
     }
 
+    // #1227: the systemd-user unit and the Windows task used to be invisible here — src/uninstall.js
+    // said they were "reported as a manual step" and nothing printed one. A root-owned system unit
+    // still is manual, because removing it needs admin this command never acquires.
+    const service = result.services;
+    if (service && service.plan && service.plan.kind !== 'none') {
+      if (service.manualCommands && service.manualCommands.length > 0) {
+        console.log(`A system-scope ${service.plan.kind} service owns this daemon — remove it manually:`);
+        for (const manual of service.manualCommands) console.log(`  ${manual}`);
+      } else {
+        const { formatPlan } = require('./src/service');
+        for (const line of formatPlan(service.plan, { dryRun, startup: false })) console.log(line);
+        if (!dryRun && !service.ok) {
+          console.log(`⚠️ Service uninstall incomplete (${service.reason || 'unknown'}) — see "telepty service status".`);
+        }
+      }
+    }
+
     const existingDirs = result.stateDirs.filter((d) => d.exists);
     if (purge) {
       for (const dir of existingDirs) {
@@ -2158,6 +2259,84 @@ async function main() {
     if (!dryRun) {
       console.log('\nNow remove the package: npm rm -g @dmsdc-ai/aigentry-telepty');
     }
+    return;
+  }
+
+  if (cmd === 'service') {
+    // #1227: the consented OS-service lifecycle. Named `service`, never `install` — a
+    // receiver-side `telepty install` is rejected by ADR 2026-05-05-telepty-devkit-boundary
+    // (README "Integration scope"). `service --help` never reaches here: interceptHelp above
+    // answers it first (tp941).
+    const { SERVICE_EXIT, formatPlan, getServiceStatus, runServiceVerb } = require('./src/service');
+    const { diagnoseBinOwnership } = require('./src/bin-ownership');
+    const sub = args[1];
+    const asJson = args.includes('--json');
+    const yes = args.includes('--yes');
+    const dryRun = args.includes('--dry-run');
+    const replace = args.includes('--replace');
+
+    if (!['status', 'install', 'uninstall', 'start', 'stop', 'restart'].includes(sub)) {
+      console.error('❌ Usage: telepty service status [--json] | install [--yes] [--dry-run] [--replace] | uninstall [--yes] [--dry-run] | start | stop | restart');
+      process.exitCode = SERVICE_EXIT.CONSENT;
+      return;
+    }
+
+    if (sub === 'status') {
+      let binOwnership = null;
+      try { binOwnership = diagnoseBinOwnership(); } catch { /* diagnosis is additive */ }
+      const status = await getServiceStatus(serviceDeps({ binOwnership }));
+      if (asJson) {
+        console.log(JSON.stringify(status, null, 2));
+      } else {
+        console.log(`Service: ${status.kind}${status.installed ? '' : ' (not installed)'}`);
+        console.log(`  descriptor: ${status.descriptor.path} (${status.descriptor.ownership}${status.descriptor.drift.length ? `: ${status.descriptor.drift.join(', ')}` : ''})`);
+        console.log(`  loaded: ${status.loaded}   active: ${status.active}   daemon answering: ${status.daemon.answering}`);
+        console.log(`  startup: at login = ${status.startup.atLogin}, boot without login = ${status.startup.bootWithoutLogin}, linger = ${status.startup.linger}`);
+        if (status.startup.reason) console.log(`  reason: ${status.startup.reason}`);
+        if (status.startup.hint) console.log(`  note: ${status.startup.hint}`);
+        for (const conflict of status.conflicts) console.log(`  conflict: ${conflict.kind} at ${conflict.path}`);
+        if (binOwnership && binOwnership.bins && binOwnership.bins.telepty) {
+          console.log(`  telepty command owned by: ${binOwnership.bins.telepty.owner}`);
+        }
+        for (const remedy of status.remedies) console.log(`  remedy: ${remedy}`);
+      }
+      process.exitCode = status.exitCode;
+      return;
+    }
+
+    // Consent is explicit: the plan is printed, then a TTY y/N (default No). A non-TTY
+    // without --yes exits 2 before anything is planned, probed or executed.
+    const confirm = async (plan) => {
+      console.log(`telepty service ${sub} would:`);
+      for (const line of formatPlan(plan)) console.log(`  ${line}`);
+      const answer = await prompts({ type: 'confirm', name: 'ok', message: 'Proceed?', initial: false });
+      return answer.ok === true;
+    };
+
+    const result = await runServiceVerb(sub, {
+      yes,
+      dryRun,
+      replace,
+      isTTY: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+      confirm
+    }, serviceDeps());
+
+    if (dryRun && result.plan) {
+      console.log(`🔎 Dry run — nothing was written, loaded, removed or started.`);
+      for (const line of formatPlan(result.plan, { dryRun: true })) console.log(`  ${line}`);
+    } else if (result.exitCode === SERVICE_EXIT.OK) {
+      console.log(`\x1b[32m✅ telepty service ${sub} completed (${result.plan ? result.plan.kind : 'service'}).\x1b[0m`);
+    } else if (result.reason === 'consent-required') {
+      console.error('❌ Consent required: re-run with --yes (or from a terminal) — nothing was changed.');
+    } else if (result.reason === 'declined') {
+      console.error('Cancelled — nothing was changed.');
+    } else if (result.reason === 'foreign-descriptor') {
+      console.error(`❌ ${result.plan.descriptorPath} exists but is not a telepty descriptor — re-run with --replace to overwrite it. Nothing was changed.`);
+    } else {
+      console.error(`\x1b[31m❌ telepty service ${sub} failed (${result.reason || 'unknown'}).\x1b[0m`);
+      printServiceSteps(result);
+    }
+    process.exitCode = result.exitCode;
     return;
   }
 
@@ -2181,6 +2360,16 @@ async function main() {
     // didn't exist. We now parse the subcommand; bare `telepty daemon` keeps the
     // foreground behavior for back-compat (install/launchd flows depend on it).
     const sub = args[1];
+
+    // #1227: an installed supervisor owns its daemon. Routing happens before each sub-branch;
+    // when no supervisor serves the addressed port, every path below is unchanged.
+    const daemonVerbRoute = ['start', 'stop', 'restart'].includes(sub)
+      ? decideDaemonVerbRoute(supervisorFor(detectSupervisor(), Number(PORT)), sub)
+      : { route: 'local' };
+    if (daemonVerbRoute.route !== 'local') {
+      await runSupervisedDaemonVerb(daemonVerbRoute, sub);
+      return;
+    }
 
     if (sub === 'start') {
       // Detached/background start: return control to the shell immediately
@@ -4985,6 +5174,7 @@ function printGlobalHelp() {
 
 \x1b[1mOther:\x1b[0m
   telepty update                                 Update to latest version
+  telepty service status|install|uninstall|start|stop|restart  Manage the OS service (launchd/systemd --user/Task Scheduler)
   telepty uninstall [--purge] [--dry-run]        Stop daemon + unload service; keep user data unless --purge
   telepty status-report --phase <p> [options]    Emit structured status event
 
@@ -5031,6 +5221,8 @@ module.exports = {
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
   repairLocalDaemon,      // gh#82 round 2 (c): update/repair stop path (injectable stop/restart/detect)
   discoverSessions,       // gh#82 round 2 (d): local timeout ≠ no sessions (injectable ensure/fetch)
+  decideDaemonVerbRoute,  // #1227: pure routing — supervised verbs go to the service, not a spawn
+  resolveTeleptyEntryPoint, // #1228: the daemon entry point is pinned to THIS package
   helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast
   updateRestartSucceeded, // gh#61: did `update` leave a running daemon — skip is not a failure

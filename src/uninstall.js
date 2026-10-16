@@ -34,17 +34,45 @@ function launchdPlistPaths(homedir) {
   return LAUNCHD_PLIST_NAMES.map((name) => path.join(homedir, 'Library', 'LaunchAgents', name));
 }
 
-// What an uninstall on this platform would touch. Pure (no I/O).
+// The seams src/service.js needs, assembled from this module's own injected
+// deps so an uninstall plan can never reach the real fs or a real service.
+function serviceDepsFrom(opts) {
+  return {
+    platform: opts.platform || process.platform,
+    homedir: opts.homedir || os.homedir(),
+    fs: opts.fs || fs,
+    execFileSync: opts.execFileSync || execFileSync,
+    probe: false, // descriptor-only: a PLAN must not shell out to systemctl
+    ...(opts.serviceDeps || {})
+  };
+}
+
+// What an uninstall on this platform would touch. Read-only: the launchd and
+// state-dir parts are pure, and the #1227 service part only stats descriptors.
 function planUninstall(opts = {}) {
   const platform = opts.platform || process.platform;
   const homedir = opts.homedir || os.homedir();
-  return {
+  const plan = {
     platform,
-    // launchd is macOS-only; on linux/windows the generated service (systemd
-    // unit / scheduled task) is reported as a manual step instead of guessed at.
+    // launchd is macOS-only and handled in step (2) below. #1227: the linux
+    // systemd-user unit and the Windows scheduled task are no longer "a manual
+    // step instead of guessed at" — they go through src/service.js, which knows
+    // their exact descriptors. A root-owned system unit stays manual, because
+    // removing it needs admin this process must never acquire.
     plists: platform === 'darwin' ? launchdPlistPaths(homedir) : [],
-    stateDirs: stateDirPaths(homedir)
+    stateDirs: stateDirPaths(homedir),
+    services: null
   };
+
+  if (platform !== 'darwin') {
+    try {
+      plan.services = require('./service').planUninstall(serviceDepsFrom(opts), { yes: true });
+    } catch {
+      plan.services = null; // a missing/unusable service module never blocks an uninstall
+    }
+  }
+
+  return plan;
 }
 
 function runUninstall(opts = {}) {
@@ -65,7 +93,8 @@ function runUninstall(opts = {}) {
     stopped: [],
     failed: [],
     plists: [],
-    stateDirs: []
+    stateDirs: [],
+    services: null
   };
 
   // (1) Stop running daemons via the full discovery chain (state file →
@@ -108,6 +137,19 @@ function runUninstall(opts = {}) {
       }
     }
     result.plists.push(entry);
+  }
+
+  // (2b) #1227: the generated systemd-user unit / Windows task. Consent was
+  // already given by the `telepty uninstall` command itself, so no prompt is
+  // involved. Skipped entirely for the preuninstall pass (removePlists===false),
+  // which keeps that hook's exact daemon-stop + plist-unload scope.
+  if (plan.services && removePlists) {
+    try {
+      const { runServiceVerbSync } = require('./service');
+      result.services = runServiceVerbSync('uninstall', { yes: true, dryRun }, serviceDepsFrom(opts));
+    } catch (err) {
+      result.services = { ok: false, reason: err.message };
+    }
   }
 
   // (3) State directories: user data stays by default — callers print the
