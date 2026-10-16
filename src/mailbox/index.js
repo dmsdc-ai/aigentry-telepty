@@ -240,6 +240,23 @@ class FileMailbox {
   }
 
   /**
+   * Latest state of one message (`pending`, `in_flight`, `dead_letter`, …), or null when the
+   * mailbox has no record of it (never enqueued, or purged with its session).
+   */
+  messageState(sessionId, msgId) {
+    const sessionDir = this._sessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) return null;
+
+    const release = acquireLock(sessionDir);
+    try {
+      const st = loadStates(sessionDir).get(msgId);
+      return st ? st.state : null;
+    } finally {
+      release();
+    }
+  }
+
+  /**
    * Peek at pending messages without dequeueing.
    */
   peek(sessionId) {

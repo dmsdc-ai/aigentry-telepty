@@ -3174,11 +3174,16 @@ async function deliverInjectionToSession(id, session, prompt, options = {}) {
         // without its CR and a retry cannot duplicate it; if one does hold it, say so.
         let withdrawn = false;
         try { withdrawn = mailbox.withdraw(id, msgId, 'submit_unpaired: text not delivered in time'); } catch {}
+        // Not withdrawable is not always "in flight" (review N1): a purge (session destroyed) leaves
+        // no record and a dead-lettered message cannot be written any more either.
+        let state;
+        if (!withdrawn) { try { state = mailbox.messageState(id, msgId); } catch {} }
         releaseSubmit();
+        if (!withdrawn && state === null) return { ...sessionGoneResult(), msg_id: msgId };
         const failure = text.lastFailure;
-        return withdrawn
+        return withdrawn || state === 'dead_letter'
           ? { success: false, httpStatus: (failure && failure.httpStatus) || 504, code: (failure && failure.code) || 'TIMEOUT',
-            error: `The text was not delivered within ${MAILBOX_TEXT_WAIT_MS} ms${failure && failure.error ? ` (${failure.error})` : ''}; it was withdrawn and will not be written. Retry.`,
+            error: `The text was not delivered within ${MAILBOX_TEXT_WAIT_MS} ms${failure && failure.error ? ` (${failure.error})` : ''}; it was ${withdrawn ? 'withdrawn' : 'dead-lettered'} and will not be written. Retry.`,
             msg_id: msgId }
           : { success: false, httpStatus: 504, code: 'DELIVERY_UNCERTAIN',
             error: `The text was handed to delivery but not confirmed within ${MAILBOX_TEXT_WAIT_MS} ms; it may still arrive, without a CR. Do not retry blindly.`,

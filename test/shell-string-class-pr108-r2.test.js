@@ -320,3 +320,19 @@ test('N1: a session destroyed while its text is pending answers 410 SESSION_GONE
   assert.equal(res.status, 410, JSON.stringify(res.body));
   assert.equal(res.body.code, 'SESSION_GONE');
 });
+
+test('N1: FileMailbox.messageState tells purged/unknown (null) from in flight and dead letter', () => {
+  const { FileMailbox } = require('../src/mailbox/index');
+  const mb = new FileMailbox({ root: fs.mkdtempSync(path.join(os.tmpdir(), 'r2-n1-state-')) });
+  const msg = { from: 'a', to: 's', payload: 'p', created_at: Math.floor(Date.now() / 1000) - 1, attempt: 0 };
+  mb.enqueue({ ...msg, msg_id: 'm1' });
+  mb.enqueue({ ...msg, msg_id: 'm2' });
+  assert.equal(mb.messageState('s', 'm1'), 'pending');
+  assert.equal(mb.dequeue('s').msg_id, 'm1');
+  assert.equal(mb.messageState('s', 'm1'), 'in_flight');
+  assert.equal(mb.withdraw('s', 'm2', 'test'), true);
+  assert.equal(mb.messageState('s', 'm2'), 'dead_letter');
+  assert.equal(mb.messageState('s', 'nope'), null);
+  mb.purge('s');
+  assert.equal(mb.messageState('s', 'm1'), null, 'a destroyed session leaves no record');
+});
