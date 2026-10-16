@@ -197,6 +197,22 @@ test('C4: findKittySocket accepts only a socket owned by the daemon uid (injecte
   assert.equal(findKittySocket({ dir: '/d', fs: fakeFs, uid: uid + 2 }), null, 'no socket owned by this uid');
 });
 
+test('C4: findKittySocket does not follow a symlink to our socket and refuses our regular file (NB1)', () => {
+  const uid = 1000;
+  // lstat describes the entry itself, stat the link target; one entry per directory so a valid
+  // socket next to it cannot mask the result.
+  const oneEntryFs = (name, lstat, stat) => ({
+    readdirSync: () => [name],
+    lstatSync: () => ({ isSocket: () => lstat.socket, isSymbolicLink: () => lstat.symlink, uid: lstat.uid }),
+    statSync: () => ({ isSocket: () => stat.socket, isSymbolicLink: () => false, uid: stat.uid })
+  });
+  const { findKittySocket } = kittyControl();
+  const link = oneEntryFs('kitty-sock-link', { socket: false, symlink: true, uid }, { socket: true, uid });
+  assert.equal(findKittySocket({ dir: '/d', fs: link, uid }), null, 'a symlink to a socket we own is followed');
+  const file = { socket: false, symlink: false, uid };
+  assert.equal(findKittySocket({ dir: '/d', fs: oneEntryFs('kitty-sock-1234', file, file), uid }), null, 'a regular file we own is used as a socket');
+});
+
 test('C3/C4: every kitty @ call is an argv array (no shell)', () => {
   const { findKittyWindowId, setKittyTabTitle } = kittyControl();
   const calls = [];
