@@ -257,6 +257,29 @@ test('C4: findKittySocket does not follow a symlink to our socket and refuses ou
   assert.equal(findKittySocket({ dir: '/d', fs: oneEntryFs('kitty-sock-1234', file, file), uid }), null, 'a regular file we own is used as a socket');
 });
 
+test('C4: real fs — a valid-name regular file we own and a valid-name symlink to our real socket are refused (Mac re-review)', async (t) => {
+  if (posixOnly(t)) return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'r2-realsock-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { findKittySocket } = kittyControl();
+  fs.writeFileSync(path.join(dir, 'kitty-sock-1'), '');
+  assert.equal(findKittySocket({ dir }), null, 'an owned regular file with a valid name is used as a socket');
+  fs.rmSync(path.join(dir, 'kitty-sock-1'));
+  // A real socket under a name outside the allowlist, reached only through a valid-name symlink.
+  const server = require('node:net').createServer();
+  const listened = await new Promise((resolve) => {
+    server.once('error', (e) => resolve(e.code));
+    server.listen(path.join(dir, 'real.sock'), () => resolve(true));
+  });
+  if (listened !== true) return t.skip(`unix listen refused here (${listened}); the injected-fs NB1 test covers it`);
+  t.after(() => server.close());
+  fs.symlinkSync(path.join(dir, 'real.sock'), path.join(dir, 'kitty-sock-link'));
+  assert.equal(findKittySocket({ dir }), null, 'a symlink to our socket is followed');
+  fs.renameSync(path.join(dir, 'real.sock'), path.join(dir, 'kitty-sock-real'));
+  fs.rmSync(path.join(dir, 'kitty-sock-link'));
+  assert.equal(findKittySocket({ dir }), path.join(dir, 'kitty-sock-real'), 'positive control: our real socket is found');
+});
+
 test('C3/C4: every kitty @ call is an argv array (no shell)', () => {
   const { findKittyWindowId, setKittyTabTitle } = kittyControl();
   const calls = [];
@@ -294,6 +317,22 @@ test('C5: osascript gets the search terms as run-handler arguments, never inside
   assert.match(args[1], /on run argv/);
   assert.match(args[1], /key code 36 using command down/);
   assert.deepEqual(args.slice(2), [sid]);
+});
+
+test('C5: the cwd basename search term is a run-handler argument too (Mac re-review)', () => {
+  const { submitViaOsascript } = require('../daemon');
+  const evil = `p" & (do shell script "touch never") & "`; // a basename: no "/"
+  const calls = [];
+  const ok = submitViaOsascript('w1', 'enter', {
+    sessionMap: { w1: { cwd: `/home/u/${evil}`, command: 'claude' } },
+    execFileSync: (file, args, opts) => { calls.push({ file, args, shell: opts && opts.shell }); return Buffer.from('ok:win'); }
+  });
+  assert.equal(ok, true);
+  const [{ file, args, shell }] = calls;
+  assert.equal(file, 'osascript');
+  assert.equal(shell, undefined);
+  assert.ok(!args[1].includes(evil) && !args[1].includes('touch'), 'cwd-derived text is part of the AppleScript source');
+  assert.deepEqual(args.slice(2), ['w1', evil]);
 });
 
 // ---------------------------------------------------------------------------------------- C7

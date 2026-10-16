@@ -4221,8 +4221,8 @@ function submitViaPty(session) {
   }
 }
 
-function submitViaOsascript(sessionId, keyCombo, { execFileSync = require('child_process').execFileSync } = {}) {
-  const session = sessions[sessionId];
+function submitViaOsascript(sessionId, keyCombo, { execFileSync = require('child_process').execFileSync, sessionMap = sessions } = {}) {
+  const session = sessionMap[sessionId];
   // Build fallback search terms: session ID, project dir name, CLI-specific patterns
   const searchTerms = [sessionId];
   if (session) {
@@ -6437,7 +6437,7 @@ module.exports = {
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
   isTerminalGateFailure,          // #678: submit-gate disposition — no_state is best-effort dispatch, not hard-fail
   terminalLevelSubmit,            // #544: PTY-only submit path (pty_cr | null)
-  submitViaOsascript,             // PR #108 C5: osascript argv seam (deps DI: execFileSync)
+  submitViaOsascript,             // PR #108 C5: osascript argv seam (deps DI: execFileSync, sessionMap)
   submitViaPty,                   // #544: bare-0x0D submit into the innermost node-pty
   runSubmitAll,                   // #546: submit-all via PTY for every backend (no cmux send-key)
   failBootstrapQueueOnTimeout,    // #31: actionable bootstrap-timeout queue flush
