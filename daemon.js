@@ -4213,8 +4213,7 @@ function submitViaPty(session) {
   }
 }
 
-function submitViaOsascript(sessionId, keyCombo) {
-  const { execSync } = require('child_process');
+function submitViaOsascript(sessionId, keyCombo, { execFileSync = require('child_process').execFileSync } = {}) {
   const session = sessions[sessionId];
   // Build fallback search terms: session ID, project dir name, CLI-specific patterns
   const searchTerms = [sessionId];
@@ -4232,13 +4231,13 @@ function submitViaOsascript(sessionId, keyCombo) {
     ? 'key code 36 using command down'
     : 'key code 36';
 
-  // Try each search term until we find a matching window
-  const searchTermsStr = searchTerms.map(t => `"${t}"`).join(', ');
+  // Try each search term until we find a matching window. The terms (caller data: session id,
+  // cwd basename) are run-handler arguments, never AppleScript or shell text (PR #108 review C5).
   const script = `
+    on run argv
     tell application "System Events"
       tell process "stable"
-        set searchList to {${searchTermsStr}}
-        repeat with term in searchList
+        repeat with term in argv
           repeat with w in windows
             if name of w contains (term as text) then
               perform action "AXRaise" of w
@@ -4250,10 +4249,11 @@ function submitViaOsascript(sessionId, keyCombo) {
         end repeat
         return "window_not_found"
       end tell
-    end tell`;
+    end tell
+    end run`;
 
   try {
-    const result = execSync(`osascript -e '${script}'`, { timeout: 5000 }).toString().trim();
+    const result = execFileSync('osascript', ['-e', script, ...searchTerms], { timeout: 5000 }).toString().trim();
     const ok = result.startsWith('ok:');
     if (ok) console.log(`[SUBMIT] osascript matched: ${result}`);
     return ok;
@@ -6426,6 +6426,7 @@ module.exports = {
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
   isTerminalGateFailure,          // #678: submit-gate disposition — no_state is best-effort dispatch, not hard-fail
   terminalLevelSubmit,            // #544: PTY-only submit path (pty_cr | null)
+  submitViaOsascript,             // PR #108 C5: osascript argv seam (deps DI: execFileSync)
   submitViaPty,                   // #544: bare-0x0D submit into the innermost node-pty
   runSubmitAll,                   // #546: submit-all via PTY for every backend (no cmux send-key)
   failBootstrapQueueOnTimeout,    // #31: actionable bootstrap-timeout queue flush
