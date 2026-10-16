@@ -31,8 +31,13 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
     `constructor` or `prototype` (400 `INVALID_SESSION_ID`). This replaces the `$`/`` ` ``/`\`
     denylist, which still let control characters and zsh `%` sequences through (C2, N5). Ids made
     only of dots (`.`, `..`) are also 400: the mailbox dir is `path.join(root, id)` (NB4). Non-ASCII
-    ids, spaces, `+`, `/` and `#` are now 400 on spawn. `POST /api/sessions/register` and WS
-    auto-register do not apply this check yet.
+    ids, spaces, `+`, `/` and `#` are now 400 on spawn.
+  - `POST /api/sessions/register` and `PATCH /api/sessions/:id` (`new_id`) answer 400
+    `INVALID_SESSION_ID`, and WS auto-register closes 4400 without registering, for ids that are
+    unsafe for every producer: dots only, containing `/` or `\`, C0/DEL/C1 control characters,
+    `__proto__`/`constructor`/`prototype` (NB4). Other ids (spaces, non-ASCII, `+`, the
+    percent-encoded WS form) are unchanged there, because `telepty allow` derives its default id
+    from the folder name.
   - `kitty @` calls use an argv array, not a `/bin/sh` string, for both the window lookup and the
     auto-register tab title. A `/tmp/kitty-sock*` socket is used only if `lstat` shows a socket,
     not a symlink, owned by the daemon uid. Before this, a file named `kitty-sock;<cmd>`, which any
@@ -53,6 +58,11 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
     (4fc6e5b9, 4158b586, 20746b91, 0b79a913).
   - `telepty connect` / `disconnect` / `peers --remove` run ssh as argv, not a `/bin/sh` string,
     and refuse a target that starts with `-` (aadc4863, 0ab74261, deee8c0c).
+- **Inject: queued text goes only to the instance and owner socket it was admitted for** (Mac
+  re-review of 9cff4bf, R2). Before this, a text waiting behind a slow delivery tick was written,
+  and its CR followed, to a same-bearer replacement owner. It now answers 410 `SESSION_GONE` and the
+  text is dead-lettered unwritten. A tracked inject that ends `DELIVERY_UNCERTAIN` is recorded as
+  `inject_delivery_uncertain` with `bytes_written: null`, not as a refusal of 0 bytes.
 - **Inject: a session destroyed while its text is pending answers 410 `SESSION_GONE`**
   (review N1). Before this, it answered 504 `DELIVERY_UNCERTAIN` ("may still arrive"). A
   dead-lettered text gets the typed non-delivery. Only a text that is really in flight still gets
