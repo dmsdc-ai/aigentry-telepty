@@ -1,6 +1,6 @@
 'use strict';
 
-const { execSync, spawn, spawnSync } = require('child_process');
+const { execFileSync, spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -176,6 +176,10 @@ async function connect(target, options = {}) {
   }
 
   const name = options.name || target.split('@').pop().split('.')[0];
+  // ssh reads a leading '-' as an option (e.g. -oProxyCommand=…), even from argv.
+  if (sshTarget.startsWith('-')) {
+    return { success: false, error: `Invalid SSH target: ${target}` };
+  }
 
   if (activePeers.has(name)) {
     return { success: false, error: `Already connected to ${name}` };
@@ -188,8 +192,9 @@ async function connect(target, options = {}) {
 
   // Start SSH ControlMaster
   try {
-    execSync([
-      'ssh', '-o', 'ControlMaster=auto',
+    // argv, not a shell string: the target comes from the command line (Snyk aadc4863).
+    execFileSync('ssh', [
+      '-o', 'ControlMaster=auto',
       '-o', `ControlPath=${ctrlPath}`,
       '-o', 'ControlPersist=600',
       '-o', 'ConnectTimeout=10',
@@ -198,7 +203,7 @@ async function connect(target, options = {}) {
       '-o', 'StrictHostKeyChecking=accept-new',
       '-N', '-f', // Go to background
       sshTarget
-    ].join(' '), { timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
+    ], { timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (err) {
     return { success: false, error: `SSH connection failed: ${err.message}` };
   }
@@ -206,8 +211,8 @@ async function connect(target, options = {}) {
   // Verify remote telepty is available
   let machineId = name;
   try {
-    const output = execSync(
-      `ssh -o ControlPath=${ctrlPath} ${sshTarget} "hostname"`,
+    const output = execFileSync(
+      'ssh', ['-o', `ControlPath=${ctrlPath}`, sshTarget, 'hostname'],
       { timeout: 5000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
     ).trim();
     if (output) machineId = output;
@@ -215,13 +220,13 @@ async function connect(target, options = {}) {
 
   // Verify telepty CLI is available on remote
   try {
-    execSync(
-      `ssh -o ControlPath=${ctrlPath} ${sshTarget} "telepty list --json"`,
+    execFileSync(
+      'ssh', ['-o', `ControlPath=${ctrlPath}`, sshTarget, 'telepty list --json'],
       { timeout: 10000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
     );
   } catch (err) {
     // Clean up ControlMaster
-    try { execSync(`ssh -O exit -o ControlPath=${ctrlPath} ${sshTarget}`, { stdio: 'pipe' }); } catch {}
+    try { execFileSync('ssh', ['-O', 'exit', '-o', `ControlPath=${ctrlPath}`, sshTarget], { stdio: 'pipe' }); } catch {}
     return { success: false, error: `Remote telepty not available: ${err.message}` };
   }
 
@@ -255,7 +260,7 @@ function disconnect(name) {
 
   // Close ControlMaster
   try {
-    execSync(`ssh -O exit -o ControlPath=${peer.controlSocket} ${peer.target}`, {
+    execFileSync('ssh', ['-O', 'exit', '-o', `ControlPath=${peer.controlSocket}`, peer.target], {
       timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
     });
   } catch {}

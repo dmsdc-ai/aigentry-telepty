@@ -70,3 +70,52 @@ test('daemon: the DELETE routes of a registered `../x` session do not touch file
     assert.equal(fs.readFileSync(path.join(x, f), 'utf8'), 'keep\n', `~/.aigentry/x/${f} was truncated`);
   }
 });
+
+// ------------------------------------------------------------------------ cross-machine ssh
+
+// A temp HOME and a PATH with only a fake `ssh` (logs its argv, succeeds) and `touch`: an unfixed
+// shell string runs the injected `touch`, while no real ssh is ever reached.
+function fakeSshEnv(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 's9-ssh-'));
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin);
+  fs.symlinkSync(childProcess.execFileSync('/bin/sh', ['-c', 'command -v touch'], { encoding: 'utf8' }).trim(), path.join(bin, 'touch'));
+  const log = path.join(dir, 'ssh.log');
+  fs.writeFileSync(path.join(bin, 'ssh'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\nexit 0\n`, { mode: 0o755 });
+  const saved = { PATH: process.env.PATH, HOME: process.env.HOME };
+  process.env.PATH = bin;
+  process.env.HOME = dir;
+  delete require.cache[require.resolve('../cross-machine')];
+  t.after(() => {
+    process.env.PATH = saved.PATH;
+    process.env.HOME = saved.HOME;
+    delete require.cache[require.resolve('../cross-machine')];
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  return { dir, log, crossMachine: require('../cross-machine') };
+}
+
+test('telepty connect / disconnect / peers --remove pass the ssh target as one argv element', async (t) => {
+  if (posixOnly(t)) return;
+  const { dir, log, crossMachine } = fakeSshEnv(t);
+  const marker = path.join(dir, 'ran');
+  const target = `u@h;touch ${marker}`;
+  const result = await crossMachine.connect(target, { name: 'p' });          // aadc4863
+  assert.equal(fs.existsSync(marker), false, 'connect ran the target as a shell command');
+  assert.equal(result.success, true, JSON.stringify(result));
+  crossMachine.disconnect('p');                                               // 0ab74261
+  assert.equal(fs.existsSync(marker), false, 'disconnect ran the target as a shell command');
+  await crossMachine.connect(target, { name: 'p' });
+  crossMachine.removePeer('p');                                               // deee8c0c
+  assert.equal(fs.existsSync(marker), false, 'peers --remove ran the target as a shell command');
+  const calls = fs.readFileSync(log, 'utf8').trim().split('\n');
+  assert.ok(calls.length >= 6 && calls.every((c) => c.endsWith(target) || c.includes(`${target} `)), calls.join('\n'));
+});
+
+test('telepty connect refuses a target that ssh would read as an option', async (t) => {
+  if (posixOnly(t)) return;
+  const { log, crossMachine } = fakeSshEnv(t);
+  const result = await crossMachine.connect('-oProxyCommand=touch@x', { name: 'q' });
+  assert.equal(result.success, false);
+  assert.equal(fs.existsSync(log), false, 'ssh was invoked with an option-shaped target');
+});

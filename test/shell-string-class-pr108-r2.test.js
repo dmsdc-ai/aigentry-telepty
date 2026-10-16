@@ -285,10 +285,12 @@ test('C8: telepty attach over ssh quotes the session id for the remote shell', (
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'r2-c8-'));
   const savedHome = process.env.HOME;
   const savedExec = childProcess.execSync;
+  const savedExecFile = childProcess.execFileSync;
   const savedSpawn = childProcess.spawn;
   const spawned = [];
   process.env.HOME = home;
   childProcess.execSync = () => '';
+  childProcess.execFileSync = () => ''; // connect() runs ssh as argv (Snyk aadc4863 fix)
   childProcess.spawn = (file, args) => { spawned.push({ file, args }); return {}; };
   delete require.cache[require.resolve('../cross-machine')];
   let crossMachine;
@@ -296,6 +298,7 @@ test('C8: telepty attach over ssh quotes the session id for the remote shell', (
     crossMachine = require('../cross-machine');
   } finally {
     childProcess.execSync = savedExec;
+    childProcess.execFileSync = savedExecFile;
     childProcess.spawn = savedSpawn;
   }
   t.after(() => {
