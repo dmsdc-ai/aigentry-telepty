@@ -4,6 +4,23 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## Unreleased
 
+- **Security: Snyk Code findings on PR #108 (all pre-existing).** Per-finding verdicts and evidence
+  are in `FINDINGS.md`; reproductions in `test/snyk-pr108-findings.test.js`.
+  - `POST /api/sessions/spawn` refuses a `session_id` containing `$`, `` ` `` or `\`
+    (400 `INVALID_SESSION_ID`). The id is put into PS1/PROMPT, and bash expanded `$(...)` in it on
+    every prompt, so the id ran as a command (Snyk ace25647).
+  - Spawn requires `session_id`, `command`, `cwd`, `type` to be strings and `args` an array of
+    strings (400 `INVALID_REQUEST`); a non-string used to reach the PTY or answer 500
+    (Snyk d07e1fda, 39d3b3ec). The spawn log no longer uses the caller's command as the format
+    string (Snyk 4ce269b3).
+  - The session, handoff and thread maps are null-prototype objects: `__proto__` as a route id
+    resolved to `Object.prototype`, and rename/claim/PATCH then wrote to it. Those requests now
+    answer 404 (Snyk c28e5ccb, 824c56bc, f29f900e, 655151ed).
+  - `POST /api/threads` requires `participant_session_ids`, when given, to be an array of strings
+    (Snyk e933068f).
+  - Responses no longer send `X-Powered-By: Express` (Snyk 9ca81d65).
+  - Snyk 7e65d918 (spawn route without limits): no change; disposition in `FINDINGS.md`.
+
 - **Back-to-back injects into one session keep each text paired with its own submit CR**
   ([gh#107](https://github.com/dmsdc-ai/aigentry-telepty/issues/107)). The next inject's text now
   waits for the previous inject's deferred CR (a per-session submit barrier), so a wrapped target no
