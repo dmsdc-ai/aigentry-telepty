@@ -20,6 +20,7 @@ process.env.NO_UPDATE_NOTIFIER = '1';
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const { randomUUID } = require('node:crypto');
 const fsReal = require('fs');
 const path = require('path');
 
@@ -934,7 +935,12 @@ test('R-1: an existing config is used read-only — exact token sent, bytes unch
   const pkgVersion = require('../package.json').version;
   const configDir = path.join(PROBE_HOME, '.telepty');
   const configFile = path.join(configDir, 'config.json');
-  const synthetic = `${JSON.stringify({ authToken: 'synthetic-token-1227', clientRestart: 'auto' }, null, 2)}\n`;
+  // Generated per run, never a literal: a checked-in token-shaped string is a
+  // hardcoded-secret finding, and these assertions only ever need THIS run's
+  // value to be the one that reached the wire. Still entirely synthetic — no
+  // real token or config is read, written or consulted anywhere in this file.
+  const syntheticToken = `synthetic-${randomUUID()}`;
+  const synthetic = `${JSON.stringify({ authToken: syntheticToken, clientRestart: 'auto' }, null, 2)}\n`;
   fsReal.mkdirSync(configDir, { recursive: true, mode: 0o700 });
   fsReal.writeFileSync(configFile, synthetic, { mode: 0o600 });
 
@@ -946,7 +952,7 @@ test('R-1: an existing config is used read-only — exact token sent, bytes unch
       json: async () => ({ version: pkgVersion, pid: 4242 })
     }));
 
-    assert.equal(fetches[0].headers['x-telepty-token'], 'synthetic-token-1227',
+    assert.equal(fetches[0].headers['x-telepty-token'], syntheticToken,
       'an existing credential is presented as-is');
     assert.equal(fsReal.readFileSync(configFile, 'utf8'), synthetic,
       'the probe must not rewrite, rotate or re-mint an existing config');
