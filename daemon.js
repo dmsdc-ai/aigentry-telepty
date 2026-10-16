@@ -14,6 +14,7 @@ const { createAuthMiddleware, createIsAllowedPeer, createOriginGuard, createVeri
 const { detectTailnet, TAILNET_CIDR } = require('./src/net/tailnet');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
+const { isValidSessionId } = require('./src/session-id');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
 const { SessionStateManager, STATE_DISPLAY, OBSERVATION_DISPLAY, mapObservationCause, stripAnsi: stripAnsiState } = require('./session-state');
 // #60 Stage A: `classifyReportPrompt` is GONE. 0.8.0 parses no text as a terminal report — the
@@ -3536,8 +3537,8 @@ app.post('/api/sessions/spawn', (req, res) => {
     return respondWithError(res, 400, 'INVALID_SESSION_TYPE', 'type must be USER or AGENT');
   }
   // session_id is interpolated into PS1/PROMPT below, which the shell expands on every prompt.
-  if (/[$`\\]/.test(session_id)) {
-    return respondWithError(res, 400, 'INVALID_SESSION_ID', 'session_id must not contain $, ` or \\');
+  if (!isValidSessionId(session_id)) {
+    return respondWithError(res, 400, 'INVALID_SESSION_ID', 'session_id must match [A-Za-z0-9._:@-]+ and not be __proto__, constructor or prototype');
   }
 
   const isWin = os.platform() === 'win32';
