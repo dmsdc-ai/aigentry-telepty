@@ -2079,13 +2079,49 @@ function isHelpLikePayload(payload) {
 // executed command — the inverse of the failure mode TRAILING_PAYLOAD_HELP had.
 const SELF_HELP_COMMANDS = new Set(['init']);
 
+// #1227 R-1: the credential this probe may use is the one that ALREADY exists — never a new one.
+//
+// `getAuthToken()` → `auth.js getConfig()`, which `mkdirSync(~/.telepty, 0o700)`s and, on a host
+// with no config, MINTS a token and writes config.json. That is fine for a command that is about
+// to talk to a daemon as its operator; it is not fine for `telepty service status`, a read-only
+// question that was creating a credential just by being asked (and so was every service verb and
+// the routed `telepty daemon start|stop|restart`). Same idiom, and same reason, as
+// `clientRestartMode()` below: read the file directly, present a token only if one is there.
+function existingAuthToken() {
+  if (process.env.TELEPTY_AUTH_TOKEN) return process.env.TELEPTY_AUTH_TOKEN;
+  try {
+    const { authToken } = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.telepty', 'config.json'), 'utf8'));
+    return typeof authToken === 'string' && authToken !== '' ? authToken : null;
+  } catch {
+    return null; // no config, unreadable, or no token — ask without one, create nothing
+  }
+}
+
+// A credential-less probe still answers the only question `service status` asks. #835/#844: an
+// answer that DECLINES is an answer, so a 401/403 is evidence of a daemon that is there and
+// reachable — `probeDaemon` counts it as `answering: true`. Nothing is inferred beyond that:
+// a refusal carries no version, so `version`/`matchesPackage` stay null rather than fabricated.
+async function getDaemonMetaWithoutMinting(host = '127.0.0.1') {
+  const token = existingAuthToken();
+  try {
+    const res = await fetch(`${daemonUrl(host)}/api/meta`, {
+      headers: token ? { 'x-telepty-token': token } : {},
+      signal: AbortSignal.timeout(probeTimeoutMs())
+    });
+    if (!res.ok) return daemonAnswer(res.status, '/api/meta');
+    return await res.json();
+  } catch {
+    return null; // connect error / timeout: genuinely nothing answered
+  }
+}
+
 // #1227: the seams `telepty service` and the supervised `telepty daemon` verbs share. Lazy
 // require keeps cli.js startup cost unchanged (the same idiom as ./src/uninstall below), and the
 // daemon probe is passed IN so src/service.js stays free of auth.js and fetch.
 function serviceDeps(extra = {}) {
   return {
     port: Number(PORT),
-    getDaemonMeta: (host) => getDaemonMeta(host || '127.0.0.1'),
+    getDaemonMeta: (host) => getDaemonMetaWithoutMinting(host || '127.0.0.1'),
     readDaemonState,
     ...extra
   };
@@ -2291,6 +2327,11 @@ async function main() {
         console.log(`Service: ${status.kind}${status.installed ? '' : ' (not installed)'}`);
         console.log(`  descriptor: ${status.descriptor.path} (${status.descriptor.ownership}${status.descriptor.drift.length ? `: ${status.descriptor.drift.join(', ')}` : ''})`);
         console.log(`  loaded: ${status.loaded}   active: ${status.active}   daemon answering: ${status.daemon.answering}`);
+        // #1227 R-5: null is UNMEASURED, so say which answers are missing instead of
+        // letting a degraded exit code imply something was found to be wrong.
+        if (status.inconclusive && status.inconclusive.length > 0) {
+          console.log(`  not measured: ${status.inconclusive.join(', ')}`);
+        }
         console.log(`  startup: at login = ${status.startup.atLogin}, boot without login = ${status.startup.bootWithoutLogin}, linger = ${status.startup.linger}`);
         if (status.startup.reason) console.log(`  reason: ${status.startup.reason}`);
         if (status.startup.hint) console.log(`  note: ${status.startup.hint}`);
@@ -2325,13 +2366,27 @@ async function main() {
       console.log(`🔎 Dry run — nothing was written, loaded, removed or started.`);
       for (const line of formatPlan(result.plan, { dryRun: true })) console.log(`  ${line}`);
     } else if (result.exitCode === SERVICE_EXIT.OK) {
-      console.log(`\x1b[32m✅ telepty service ${sub} completed (${result.plan ? result.plan.kind : 'service'}).\x1b[0m`);
+      const kind = result.plan ? result.plan.kind : 'service';
+      // #1227 R-5: the commands succeeding and the service being OBSERVED up are two
+      // different claims. Only the second one is a verified success.
+      if (result.verified === false) {
+        const unmeasured = (result.status && result.status.inconclusive) || [];
+        console.log(`\x1b[33m✅ telepty service ${sub} commands completed (${kind}), but the result could not be verified`
+          + `${unmeasured.length ? ` — not measured: ${unmeasured.join(', ')}` : ''}. Check: telepty service status\x1b[0m`);
+      } else {
+        console.log(`\x1b[32m✅ telepty service ${sub} completed (${kind}).\x1b[0m`);
+      }
     } else if (result.reason === 'consent-required') {
       console.error('❌ Consent required: re-run with --yes (or from a terminal) — nothing was changed.');
     } else if (result.reason === 'declined') {
       console.error('Cancelled — nothing was changed.');
     } else if (result.reason === 'foreign-descriptor') {
-      console.error(`❌ ${result.plan.descriptorPath} exists but is not a telepty descriptor — re-run with --replace to overwrite it. Nothing was changed.`);
+      // #1227 R-3: `--replace` is install-time replacement, NOT permission to drive a job
+      // this package does not own — so it is only offered where it actually applies.
+      console.error(`❌ ${result.plan.descriptorPath} exists but is not a telepty descriptor — nothing was changed.`);
+      console.error(sub === 'install'
+        ? '   Re-run with --replace to overwrite it.'
+        : `   telepty will not ${sub} a service it does not own; remove or rename that descriptor first.`);
     } else {
       console.error(`\x1b[31m❌ telepty service ${sub} failed (${result.reason || 'unknown'}).\x1b[0m`);
       printServiceSteps(result);
@@ -5232,4 +5287,5 @@ module.exports = {
   probeDaemonHealth,      // gh#82 (A/B): unauthenticated /api/health liveness re-confirmation
   resolveTargetToken,     // #844 F1: which credential belongs to THIS address — refuses, never assumes
   fetchWithAuth,          // #844 F1: the wire itself, so a test can assert what would have been sent
+  serviceDeps,            // #1227 R-1: the probe `telepty service` really injects — so a test can prove it mints nothing
 };

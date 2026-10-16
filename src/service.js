@@ -39,12 +39,9 @@ const {
   resolveServiceProfile
 } = require('../install');
 const {
-  LAUNCHD_LABEL,
-  LAUNCHD_PLIST_NAME,
   SYSTEMD_SERVICE_NAME,
   SYSTEMD_UNIT_PATH,
-  SYSTEMD_USER_UNIT_NAME,
-  WINDOWS_TASK_NAME
+  SYSTEMD_USER_UNIT_NAME
 } = require('./supervisor');
 const { DEFAULT_PORT } = require('../daemon-control');
 const pkg = require('../package.json');
@@ -63,9 +60,6 @@ const SERVICE_EXIT = Object.freeze({
   DEGRADED: 4,
   NEEDS_ADMIN: 5
 });
-
-// Read-only probes, named so a dry run can prove it issued nothing else.
-const READ_ONLY = /(^| )(print|\/query|show|show-environment|show-user)( |$)/;
 
 function resolve(deps = {}) {
   const env = deps.env || process.env;
@@ -396,7 +390,11 @@ function observe(ctx, target) {
       const eq = line.indexOf('=');
       if (eq > 0) fields[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
     }
-    out.installed = out.text != null || (fields.UnitFileState && fields.UnitFileState !== 'not-found');
+    // Boolean(): `A && B` yields A when A is falsy, so an empty UnitFileState (a
+    // reachable manager with no unit — the common fresh host) used to emit
+    // `"installed": ""`, and an absent property made JSON.stringify drop the key
+    // altogether. `installed` is a boolean in telepty.service-status/v1, always.
+    out.installed = Boolean(out.text != null || (fields.UnitFileState && fields.UnitFileState !== 'not-found'));
     out.loaded = fields.LoadState === 'loaded';
     out.active = fields.ActiveState === 'active';
     out.unitFileState = fields.UnitFileState || null;
@@ -416,7 +414,7 @@ function observe(ctx, target) {
   return out; // kind 'none'
 }
 
-function describeStartup(ctx, target, observed, daemon) {
+function describeStartup(ctx, target, observed) {
   const startup = { atLogin: 'no', bootWithoutLogin: 'unknown', linger: 'n/a', reason: target.reason, hint: null };
 
   if (target.kind === 'launchd') {
@@ -464,7 +462,7 @@ function sudoCommands(verb) {
   return [`sudo systemctl ${verb} ${SYSTEMD_SERVICE_NAME}`];
 }
 
-function remediesFor(status, target) {
+function remediesFor(status, target, ctx) {
   const remedies = [];
   if (target.kind === 'systemd') return sudoCommands('restart');
   if (target.kind === 'none') return remedies;
@@ -473,17 +471,35 @@ function remediesFor(status, target) {
     remedies.push('telepty service restart');
   }
   if (status.descriptor.ownership === 'drifted') remedies.push('telepty service install');
-  if (status.startup.linger === 'no') remedies.push(`loginctl enable-linger ${status.startup.hint ? status.startup.hint.split('enable-linger ')[1] : ''}`.trim());
+  // The user name comes from the structured ctx — the same value describeStartup
+  // built the hint from. Parsing it back out of a human-readable sentence was
+  // correct only as long as that sentence never changed wording.
+  if (status.startup.linger === 'no') remedies.push(`loginctl enable-linger ${ctx.user}`);
   return remedies;
 }
 
+// Which observations could not be made. `null` is UNMEASURED everywhere in this
+// module, so naming the gaps is what keeps "we could not look" from reading as
+// "it is broken" — without inventing an observation no OS gave us.
+function inconclusiveFields(status) {
+  const unmeasured = [];
+  if (status.loaded === null) unmeasured.push('loaded');
+  if (status.active === null) unmeasured.push('active');
+  if (status.daemon.answering === null) unmeasured.push('daemon.answering');
+  return unmeasured;
+}
+
+// ONE rule for null (R-5): unmeasured is never success and never failure. Exit 0
+// is documented as "installed + loaded + active + daemon answering", so an
+// unmeasured field cannot produce it — and it degrades the same way on every
+// platform, instead of reading as success on darwin and as drift on win32.
 function statusExitCode(status, target) {
   if (target.kind === 'none') return SERVICE_EXIT.NEEDS_ADMIN;
   if (!status.installed) return SERVICE_EXIT.NOT_INSTALLED;
   if (status.conflicts.length > 0) return SERVICE_EXIT.DEGRADED;
   if (status.descriptor.ownership !== 'managed') return SERVICE_EXIT.DEGRADED;
   if (status.loaded !== true || status.active !== true) return SERVICE_EXIT.DEGRADED;
-  if (status.daemon.answering === false) return SERVICE_EXIT.DEGRADED;
+  if (status.daemon.answering !== true) return SERVICE_EXIT.DEGRADED;
   return SERVICE_EXIT.OK;
 }
 
@@ -512,12 +528,14 @@ async function getServiceStatus(deps = {}) {
       drift: ownership === 'drifted' ? descriptorDrift(observed.text, target.kind, expected) : []
     },
     daemon,
-    startup: describeStartup(ctx, target, observed, daemon),
+    startup: describeStartup(ctx, target, observed),
     conflicts: target.conflicts,
-    remedies: []
+    remedies: [],
+    inconclusive: []
   };
 
-  status.remedies = remediesFor(status, target);
+  status.remedies = remediesFor(status, target, ctx);
+  status.inconclusive = inconclusiveFields(status);
   if (deps.binOwnership) status.binOwnership = deps.binOwnership;
   status.exitCode = statusExitCode(status, target);
   return status;
@@ -545,14 +563,20 @@ function windowsCreateCommand(target) {
 
 // ── plans ─────────────────────────────────────────────────────────────────────
 
-function refusalFor(verb, ctx, target, observed, ownership, opts) {
+function refusalFor(verb, target, ownership, opts) {
   if (target.kind === 'none') {
     return { exitCode: SERVICE_EXIT.NEEDS_ADMIN, reason: target.reason || 'unsupported' };
   }
   if (target.kind === 'systemd') {
     return { exitCode: SERVICE_EXIT.NEEDS_ADMIN, reason: 'requires-owner' };
   }
-  if (verb === 'install' && ownership === 'foreign' && !opts.replace) {
+  // A descriptor at OUR label that is not ours belongs to another product, and
+  // every verb here is a mutation of it: `start` would bootstrap and RUN that
+  // job, `stop`/`restart` would bootout/kickstart it, `uninstall` would unload
+  // it. Refused with exit 2 (nothing changed) for all of them. `--replace` is
+  // install-time REPLACEMENT only — it is not permission to drive someone
+  // else's job, so it unblocks `install` and nothing else.
+  if (ownership === 'foreign' && !(verb === 'install' && opts.replace)) {
     return { exitCode: SERVICE_EXIT.CONSENT, reason: 'foreign-descriptor' };
   }
   if (verb === 'install' && target.kind === 'schtasks' && windowsCreateCommand(target) === null) {
@@ -581,13 +605,13 @@ function planShell(verb, deps, opts) {
       ownership,
       drift: ownership === 'drifted' ? descriptorDrift(observed.text, target.kind, expected) : [],
       conflicts: target.conflicts,
-      startup: describeStartup(ctx, target, observed, { answering: null }),
+      startup: describeStartup(ctx, target, observed),
       writes: [],
       removals: [],
       commands: [],
       post: [],
       manualCommands: [],
-      refusal: refusalFor(verb, ctx, target, observed, ownership, opts || {})
+      refusal: refusalFor(verb, target, ownership, opts || {})
     }
   };
 }
@@ -700,7 +724,7 @@ function planFor(verb, deps, opts) {
 
 // ── execution ─────────────────────────────────────────────────────────────────
 
-function failureReason(verb, step, kind) {
+function failureReason(step, kind) {
   if (kind === 'launchd' && /launchctl bootstrap/.test(step.command)
       && /input\/output error|bootstrap failed/i.test(step.stderr)) {
     // No GUI login session (SSH-only). Reported, never worked around with a
@@ -754,12 +778,17 @@ function executePlan(ctx, plan, verb) {
     }
   }
 
-  const tolerate = Boolean(plan.tolerate);
-  for (const argv of plan.commands || []) {
+  // The plans encode WHICH step may fail (`tolerate: [0]` — the leading
+  // unload/stop that is expected to fail when nothing is loaded). `Boolean([0])`
+  // is true, so every command in a tolerated plan used to be tolerated: a denied
+  // `schtasks /delete /tn telepty-daemon /f` still reported "uninstall completed"
+  // and exit 0 while the logon task survived. Honor the indices.
+  const tolerated = new Set(Array.isArray(plan.tolerate) ? plan.tolerate : []);
+  for (const [index, argv] of (plan.commands || []).entries()) {
     const step = run(ctx, argv[0], argv.slice(1));
     steps.push({ command: step.command, ok: step.ok, stderr: step.stderr });
-    if (!step.ok && !tolerate) {
-      return { steps, exitCode: SERVICE_EXIT.FAILED, reason: failureReason(verb, step, plan.kind) };
+    if (!step.ok && !tolerated.has(index)) {
+      return { steps, exitCode: SERVICE_EXIT.FAILED, reason: failureReason(step, plan.kind) };
     }
   }
 
@@ -791,14 +820,19 @@ function consentGate(verb, opts) {
   return { exitCode: SERVICE_EXIT.CONSENT, reason: 'consent-required' };
 }
 
-function refusedResult(verb, plan) {
+// A refusal carries the measured status when one is available, so "I will not
+// touch this" can still say what it found. Read-only: no mutating command and no
+// system-scope call is issued to produce it. The sync door passes none (it cannot
+// await, and src/uninstall.js does not read it).
+function refusedResult(verb, plan, status = null) {
   return {
     ok: false,
     verb,
     exitCode: plan.refusal.exitCode,
     reason: plan.refusal.reason,
     steps: [],
-    status: null,
+    status,
+    verified: null,
     plan,
     manualCommands: plan.manualCommands || []
   };
@@ -830,7 +864,7 @@ async function runServiceVerb(verb, opts = {}, deps = {}) {
   const scoped = { ...deps, __ctx: ctx };
   const plan = planFor(verb, scoped, opts);
 
-  if (plan.refusal) return refusedResult(verb, plan);
+  if (plan.refusal) return refusedResult(verb, plan, await getServiceStatus(scoped));
 
   if (opts.dryRun) {
     return { ok: true, verb, exitCode: SERVICE_EXIT.OK, reason: 'dry-run', steps: [], status: null, plan, manualCommands: plan.manualCommands || [] };
@@ -846,11 +880,26 @@ async function runServiceVerb(verb, opts = {}, deps = {}) {
   const executed = executePlan(ctx, plan, verb);
   let status = null;
   let exitCode = executed.exitCode;
+  // The command result and the post-state measurement stay SEPARATE (R-5):
+  // `exitCode` says what the commands did, `verified` says whether the service
+  // was then observed to be up. `null` = no post-state oracle for this verb.
+  let verified = null;
+  let reason = executed.reason;
 
   if (exitCode === SERVICE_EXIT.OK && verb === 'install') {
     status = await verifyInstalled(ctx, scoped);
-    if (status.exitCode !== SERVICE_EXIT.OK && status.daemon.answering === false) {
+    verified = status.exitCode === SERVICE_EXIT.OK;
+    // Only a MEASURED negative is a failed install. An unmeasured post-state
+    // (no probe injected, nothing the OS would tell us) keeps the result the
+    // commands earned — but it is never reported as a verified success.
+    const measuredDown = status.daemon.answering === false
+      || status.loaded === false
+      || status.active === false;
+    if (!verified && measuredDown) {
       exitCode = SERVICE_EXIT.FAILED;
+      reason = reason || 'post-state-failed';
+    } else if (!verified) {
+      reason = reason || 'unverified-post-state';
     }
   } else {
     status = await getServiceStatus(scoped);
@@ -860,7 +909,8 @@ async function runServiceVerb(verb, opts = {}, deps = {}) {
     ok: exitCode === SERVICE_EXIT.OK,
     verb,
     exitCode,
-    reason: executed.reason,
+    reason,
+    verified,
     steps: executed.steps,
     status,
     plan,

@@ -214,7 +214,7 @@ module.exports = {
   main,
   printServiceHint,
   readDaemonState,
-  resolveTeleptyBin, // #1228: unused by main() now, exported for compatibility
+  resolveTeleptyBin, // pre-existing export (#469); #1228 only stopped main() from CALLING it
   shouldSkip,
   spawnDetachedDaemon,
   waitForDaemonVersion

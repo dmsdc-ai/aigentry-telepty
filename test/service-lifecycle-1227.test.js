@@ -9,13 +9,27 @@
 // is read or written. A platform branch exercised here is evidence about the
 // COMMANDS and EXIT CODES we would issue — it is explicitly not native
 // acceptance for that OS (facts F-1..F-12 stay controller-owned).
+//
+// ONE exception, and it is the point of the R-1 section: those cases exercise the
+// probe cli.js REALLY injects, so "does asking this question create a credential?"
+// is asked against a real filesystem — a private HOME whose emptiness IS the
+// assertion. `globalThis.fetch` is stubbed there, so still no socket and no daemon.
 
 process.env.TELEPTY_DISABLE_UPDATE_NOTIFIER = '1';
 process.env.NO_UPDATE_NOTIFIER = '1';
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fsReal = require('fs');
 const path = require('path');
+
+// #1227 R-1: a private HOME for the probe cases, created INSIDE the per-process
+// temp HOME that test-support/setup-env.js already installed (so it is removed
+// when this process exits). Set BEFORE any `require('../cli')` in this file:
+// auth.js captures CONFIG_DIR from os.homedir() at require time, so a later
+// override would measure a different directory than the product would mint into.
+const PROBE_HOME = fsReal.mkdtempSync(path.join(process.env.HOME, 'probe-home-'));
+process.env.HOME = PROBE_HOME;
 
 const {
   SERVICE_EXIT,
@@ -853,6 +867,267 @@ test('A-U15: decideDaemonVerbRoute sends supervised verbs to the service and kee
   for (const supervisor of [{ present: false }, null, { present: false, kind: null, detail: 'disabled-by-env' }]) {
     assert.equal(decideDaemonVerbRoute(supervisor, 'start').route, 'local');
   }
+});
+
+// ── R-1: the probe cli.js actually injects must never mint a credential ───────
+
+// The seam under test is the SHIPPED one: `serviceDeps()` is exactly what
+// cli.js hands to getServiceStatus for `telepty service status`, so the token
+// resolution and the HTTP call below are real product code, not a mock. Only the
+// OS seams stay faked, and `globalThis.fetch` is stubbed — nothing opens a socket.
+function listTree(root, prefix = '') {
+  const found = [];
+  for (const entry of fsReal.readdirSync(root, { withFileTypes: true })) {
+    const rel = prefix ? path.join(prefix, entry.name) : entry.name;
+    found.push(rel);
+    if (entry.isDirectory()) found.push(...listTree(path.join(root, entry.name), rel));
+  }
+  return found.sort();
+}
+
+async function probeThroughCli(world, respond) {
+  const { serviceDeps } = require('../cli');
+  const fetches = [];
+  const realFetch = globalThis.fetch;
+  const ambientToken = process.env.TELEPTY_AUTH_TOKEN;
+  // An ambient token would answer the question without reading any config, which
+  // would make this case pass for the wrong reason.
+  delete process.env.TELEPTY_AUTH_TOKEN;
+  globalThis.fetch = async (url, options = {}) => {
+    fetches.push({ url: String(url), headers: { ...(options.headers || {}) } });
+    return respond();
+  };
+  try {
+    return { status: await getServiceStatus(serviceDeps(world.deps)), fetches };
+  } finally {
+    globalThis.fetch = realFetch;
+    if (ambientToken !== undefined) process.env.TELEPTY_AUTH_TOKEN = ambientToken;
+  }
+}
+
+test('R-1: status through the real CLI probe mints no config on a host that has none', async () => {
+  assert.deepEqual(listTree(PROBE_HOME), [], 'the private HOME must start empty');
+
+  const world = macWorld({ plist: expectedPlist(), loaded: true });
+  // A refusal is an ANSWER (#835/#844): the daemon is there, it just declined.
+  const { status, fetches } = await probeThroughCli(world, () => ({ ok: false, status: 401 }));
+
+  // THE assertion: asking a read-only question left nothing behind.
+  assert.deepEqual(
+    listTree(PROBE_HOME), [],
+    'telepty service status created something under a config-less HOME (R-1: a read-only question must not mint a credential)'
+  );
+
+  assert.equal(fetches.length, 1, 'the real CLI probe must have been traced, not a mock');
+  assert.equal(fetches[0].url, 'http://127.0.0.1:3848/api/meta');
+  assert.equal(
+    Object.hasOwn(fetches[0].headers, 'x-telepty-token'), false,
+    'with no config on disk there is no credential to present — and none may be invented'
+  );
+
+  assert.equal(status.daemon.answering, true, 'an HTTP refusal is evidence of an answering daemon');
+  assert.equal(status.daemon.version, null, 'no version may be fabricated from a refusal');
+  assert.equal(status.daemon.matchesPackage, null);
+});
+
+test('R-1: an existing config is used read-only — exact token sent, bytes unchanged', async () => {
+  const pkgVersion = require('../package.json').version;
+  const configDir = path.join(PROBE_HOME, '.telepty');
+  const configFile = path.join(configDir, 'config.json');
+  const synthetic = `${JSON.stringify({ authToken: 'synthetic-token-1227', clientRestart: 'auto' }, null, 2)}\n`;
+  fsReal.mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  fsReal.writeFileSync(configFile, synthetic, { mode: 0o600 });
+
+  try {
+    const world = macWorld({ plist: expectedPlist(), loaded: true });
+    const { status, fetches } = await probeThroughCli(world, () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ version: pkgVersion, pid: 4242 })
+    }));
+
+    assert.equal(fetches[0].headers['x-telepty-token'], 'synthetic-token-1227',
+      'an existing credential is presented as-is');
+    assert.equal(fsReal.readFileSync(configFile, 'utf8'), synthetic,
+      'the probe must not rewrite, rotate or re-mint an existing config');
+    assert.deepEqual(listTree(PROBE_HOME), ['.telepty', path.join('.telepty', 'config.json')],
+      'nothing beyond the pre-existing config may appear');
+
+    assert.equal(status.daemon.answering, true);
+    assert.equal(status.daemon.version, pkgVersion);
+    assert.equal(status.daemon.matchesPackage, true);
+    assert.equal(status.exitCode, SERVICE_EXIT.OK);
+  } finally {
+    fsReal.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+// ── R-2: `tolerate` is a list of step indices, not a boolean ──────────────────
+
+test('R-2: a tolerated first step may fail, but a denied final delete is exit 1 and never completed', async () => {
+  // win32 uninstall plans `/end` (tolerate: [0]) and then `/delete … /f`.
+  const toleratedWorld = winWorld({});
+  toleratedWorld.deps.execFileSync = ((inner) => (cmd, argv) => {
+    const record = [cmd, ...(argv || [])];
+    if (record.join(' ') === 'schtasks /end /tn telepty-daemon') {
+      toleratedWorld.calls.exec.push(record);
+      throw Object.assign(new Error('ERROR: The system cannot find the task specified.'), {
+        status: 1, stderr: 'ERROR: The system cannot find the task specified.'
+      });
+    }
+    return inner(cmd, argv);
+  })(toleratedWorld.deps.execFileSync);
+
+  const tolerated = await runServiceVerb('uninstall', CONSENTED, toleratedWorld.deps);
+  assert.equal(tolerated.exitCode, SERVICE_EXIT.OK, 'a not-running task is exactly what step 0 tolerates');
+  assert.equal(tolerated.ok, true);
+  assert.ok(
+    toleratedWorld.calls.exec.some((c) => c.join(' ') === 'schtasks /delete /tn telepty-daemon /f'),
+    'a tolerated failure must not stop the plan'
+  );
+  assert.equal(tolerated.steps.find((s) => s.ok === false).command, 'schtasks /end /tn telepty-daemon',
+    'a tolerated failure is still reported');
+
+  const deniedWorld = winWorld({});
+  deniedWorld.deps.execFileSync = ((inner) => (cmd, argv) => {
+    const record = [cmd, ...(argv || [])];
+    if (record.join(' ') === 'schtasks /delete /tn telepty-daemon /f') {
+      deniedWorld.calls.exec.push(record);
+      throw Object.assign(new Error('ERROR: Access is denied.'), { status: 1, stderr: 'ERROR: Access is denied.' });
+    }
+    return inner(cmd, argv);
+  })(deniedWorld.deps.execFileSync);
+
+  const denied = await runServiceVerb('uninstall', CONSENTED, deniedWorld.deps);
+  assert.equal(denied.exitCode, SERVICE_EXIT.FAILED,
+    'the logon task still exists, so the uninstall did NOT complete (R-2)');
+  assert.equal(denied.ok, false);
+  assert.equal(denied.reason, 'step-failed');
+  assert.equal(denied.steps.find((s) => s.ok === false).command, 'schtasks /delete /tn telepty-daemon /f');
+  assert.notEqual(denied.exitCode, tolerated.exitCode,
+    'a tolerated step failure and a non-tolerated one must not be the same result');
+});
+
+// ── R-3: a foreign descriptor is never driven as if it were ours ──────────────
+
+const FOREIGN_PLIST = `<?xml version="1.0"?><plist><dict><key>Label</key><string>com.example.other</string>
+<key>ProgramArguments</key><array><string>/usr/bin/sleep</string><string>99</string></array></dict></plist>`;
+
+function mutatingCalls(calls) {
+  return calls.exec.filter((c) => !/(^| )(print|\/query|show|show-environment|show-user)( |$)/.test(c.join(' ')));
+}
+
+test('R-3: foreign start/stop/restart/uninstall refuse with zero mutating exec and zero removals', async () => {
+  for (const verb of ['start', 'stop', 'restart', 'uninstall']) {
+    const world = macWorld({ plist: FOREIGN_PLIST, loaded: true });
+    const result = await runServiceVerb(verb, CONSENTED, world.deps);
+
+    assert.equal(result.exitCode, SERVICE_EXIT.CONSENT, `${verb} must refuse a foreign descriptor`);
+    assert.equal(result.reason, 'foreign-descriptor', verb);
+    assert.deepEqual(mutatingCalls(world.calls), [],
+      `${verb} drove a job it does not own: ${JSON.stringify(mutatingCalls(world.calls))}`);
+    assert.deepEqual(world.calls.removals, [], `${verb} removed a foreign descriptor`);
+    assert.equal(world.files.get(PLIST_PATH), FOREIGN_PLIST, `${verb} altered the foreign descriptor`);
+    // The refusal still explains the host it refused on.
+    assert.equal(result.status.descriptor.ownership, 'foreign', verb);
+  }
+});
+
+test('R-3: --replace stays install-only, and owned descriptors are still driven', async () => {
+  for (const verb of ['start', 'stop', 'restart', 'uninstall']) {
+    const world = macWorld({ plist: FOREIGN_PLIST, loaded: true });
+    const result = await runServiceVerb(verb, { yes: true, isTTY: false, replace: true }, world.deps);
+    assert.equal(result.exitCode, SERVICE_EXIT.CONSENT,
+      `--replace must not become permission to ${verb} an unrelated job`);
+    assert.deepEqual(mutatingCalls(world.calls), [], `${verb} --replace drove a foreign job`);
+    assert.deepEqual(world.calls.removals, []);
+  }
+
+  // Positive controls: ownership gating must not have disarmed the owned paths.
+  const stopWorld = macWorld({ plist: expectedPlist(), loaded: true });
+  const stopped = await runServiceVerb('stop', CONSENTED, stopWorld.deps);
+  assert.equal(stopped.exitCode, SERVICE_EXIT.OK);
+  assert.deepEqual(mutatingCalls(stopWorld.calls), [['launchctl', 'bootout', TARGET]]);
+
+  const uninstallWorld = macWorld({ plist: expectedPlist(), loaded: true });
+  const uninstalled = await runServiceVerb('uninstall', CONSENTED, uninstallWorld.deps);
+  assert.equal(uninstalled.exitCode, SERVICE_EXIT.OK);
+  assert.deepEqual(uninstallWorld.calls.removals, [PLIST_PATH]);
+});
+
+// ── R-4: `installed` is a boolean in v1, always ───────────────────────────────
+
+test('R-4: linux status with a reachable manager and no unit reports installed === false', async () => {
+  const shapes = [
+    ['empty UnitFileState', 'LoadState=not-found\nActiveState=inactive\nSubState=dead\nUnitFileState=\nMainPID=0'],
+    ['absent UnitFileState', 'LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0']
+  ];
+
+  for (const [label, shown] of shapes) {
+    // No unit file on disk, but the user manager answers — the common fresh host.
+    const world = linuxWorld({ files: {} });
+    world.deps.execFileSync = ((inner) => (cmd, argv) => {
+      const record = [cmd, ...(argv || [])];
+      if (record.join(' ').startsWith('systemctl --user show telepty')) {
+        world.calls.exec.push(record);
+        return shown;
+      }
+      return inner(cmd, argv);
+    })(world.deps.execFileSync);
+
+    const status = await getServiceStatus(world.deps);
+    assert.equal(status.kind, 'systemd-user', label);
+    assert.strictEqual(status.installed, false, `${label}: installed must be exactly false, not '' or undefined`);
+    assert.equal(status.exitCode, SERVICE_EXIT.NOT_INSTALLED, label);
+
+    const roundTripped = JSON.parse(JSON.stringify(status));
+    assert.ok(Object.hasOwn(roundTripped, 'installed'), `${label}: JSON.stringify dropped the installed key`);
+    assert.strictEqual(roundTripped.installed, false, label);
+  }
+});
+
+// ── R-5: one rule for null — unmeasured is neither success nor failure ────────
+
+test('R-5: an unmeasured observation degrades identically on every platform and is named', async () => {
+  const mac = macWorld({ plist: expectedPlist(), loaded: true });
+  const macStatus = await getServiceStatus(mac.deps);
+  assert.equal(macStatus.daemon.answering, null, 'no probe injected ⇒ unmeasured');
+  assert.deepEqual(macStatus.inconclusive, ['daemon.answering']);
+  assert.equal(macStatus.exitCode, SERVICE_EXIT.DEGRADED,
+    'exit 0 means installed+loaded+active+answering; an unmeasured daemon is not that');
+
+  const win = winWorld({});
+  const winStatus = await getServiceStatus(win.deps);
+  assert.equal(winStatus.active, null);
+  assert.deepEqual(winStatus.inconclusive, ['active', 'daemon.answering']);
+  assert.equal(winStatus.exitCode, SERVICE_EXIT.DEGRADED,
+    'the same unmeasured state must not read as success on one platform and drift on another');
+
+  const measured = macWorld({ plist: expectedPlist(), loaded: true, deps: { getDaemonMeta: answering() } });
+  const measuredStatus = await getServiceStatus(measured.deps);
+  assert.deepEqual(measuredStatus.inconclusive, [], 'a measured status is conclusive');
+  assert.equal(measuredStatus.exitCode, SERVICE_EXIT.OK);
+});
+
+test('R-5: install separates the command result from an unmeasured post-state', async () => {
+  // These three cases differ ONLY in the injected daemon probe.
+  const unmeasured = linuxWorld({ files: {} });
+  const u = await runServiceVerb('install', CONSENTED, unmeasured.deps);
+  assert.equal(u.exitCode, SERVICE_EXIT.OK, 'every command the plan issued did succeed');
+  assert.equal(u.verified, false, 'an unmeasured post-state is never a verified success');
+  assert.equal(u.reason, 'unverified-post-state');
+  assert.deepEqual(u.status.inconclusive, ['daemon.answering']);
+
+  const measuredDead = linuxWorld({ files: {}, deps: { getDaemonMeta: silent() } });
+  const d = await runServiceVerb('install', CONSENTED, measuredDead.deps);
+  assert.equal(d.exitCode, SERVICE_EXIT.FAILED, 'a daemon measured as dead after install is a failed install');
+  assert.equal(d.verified, false);
+  assert.notEqual(d.exitCode, u.exitCode, 'unmeasured and measured-dead must not be the same result');
+
+  const measuredLive = linuxWorld({ files: {}, deps: { getDaemonMeta: answering() } });
+  const l = await runServiceVerb('install', CONSENTED, measuredLive.deps);
+  assert.equal(l.exitCode, SERVICE_EXIT.OK);
+  assert.equal(l.verified, true, 'a measured, answering daemon is the only verified success');
 });
 
 // ── invariants ────────────────────────────────────────────────────────────────
