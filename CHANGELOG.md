@@ -45,6 +45,14 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   - `ssh … telepty attach` quotes the id for the remote shell (C8).
   - Windows `cmd.exe /c <command> <args…>` is unchanged (C6). The current argv is pinned by
     `test/win32-cmd-argv-characterisation-c6.test.js`, and the fix is tracked separately.
+- **Security: Snyk Code findings on 9cff4bf (`FINDINGS-9CFF4BF.md`, all pre-existing).**
+  Reproductions in `test/snyk-9cff4bf-findings.test.js`, RED on 9cff4bf.
+  - Mailbox session dirs must resolve inside the mailbox root. A session registered as `../x` had
+    its DELETE mailbox / dead-letter / session routes truncate `~/.aigentry/x/*.jsonl`. Such an id
+    now gets 500 `Invalid mailbox session id` on the mailbox routes, and its enqueue throws
+    (4fc6e5b9, 4158b586, 20746b91, 0b79a913).
+  - `telepty connect` / `disconnect` / `peers --remove` run ssh as argv, not a `/bin/sh` string,
+    and refuse a target that starts with `-` (aadc4863, 0ab74261, deee8c0c).
 - **Inject: a session destroyed while its text is pending answers 410 `SESSION_GONE`**
   (review N1). Before this, it answered 504 `DELIVERY_UNCERTAIN` ("may still arrive"). A
   dead-lettered text gets the typed non-delivery. Only a text that is really in flight still gets
