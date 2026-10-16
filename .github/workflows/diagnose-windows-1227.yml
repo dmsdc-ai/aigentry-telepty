@@ -1,0 +1,228 @@
+name: Diagnose Windows hang (#1227)
+
+# TEMPORARY DIAGNOSTIC INSTRUMENT — NOT A FIX, NOT A GATE.
+#
+# Run 38875470444 was killed by `test-install.yml`'s job-level `timeout-minutes: 20` after the
+# windows-latest leg went silent for 17m55s. The spec reporter emits results grouped per file in
+# sorted-path order, so the last line printed names the last file that FINISHED, not the file that
+# stalled: position 75 (`observation-cause-matrix-60`) flushed at 08:44:37.03, position 76 never
+# did. Position 76 is `test/observation-tracking-endpoint-60.test.js`.
+#
+# Two hypotheses survive the static evidence, and nothing in the source can separate them:
+#
+#   H1  the test tree never finishes — a teardown hook is blocked. `test-support/daemon-harness.js`
+#       :268 and :287 `await once(child, 'exit')` with no timeout (the bounded sibling,
+#       `waitForChildExit()` at :249, is right there), reached from the frontier file at :36, :157,
+#       :176, :177 and :216. With no `--test-timeout` anywhere, nothing bounds a node:test hook.
+#
+#   H2  the tree finishes and the process cannot exit — a leaked handle. `test-support/setup-env.js`
+#       :35-37 and test-install.yml:17-20 describe this class in the repo's own words, and the
+#       runner reaped 7 orphan `powershell` + 7 orphan `conhost` at cleanup — the exact shape of a
+#       handle that keeps an event loop open, and the exact count of this file's 7 default-shell
+#       sessions (`daemon-harness.js:53-59` -> `powershell -NoLogo -NoProfile` on win32).
+#
+# `--test-force-exit` acts only AFTER the test tree completes, so it discriminates: leg 2 still
+# hanging means H1; leg 2 exiting with verdicts means H2.
+#
+#   *** `--test-force-exit` BELONGS TO THIS FILE AND NOWHERE ELSE. ***
+#   #861 retired it for truncating the TAP stream — it reports fewer tests than ran and still
+#   prints `fail 0`, which is the exact defect class 0.8.0 exists to remove; see
+#   test/no-force-exit-in-test-hooks-861.test.js. A green on the force-exit leg is EVIDENCE FOR H2,
+#   NOT A PASS, and must never be read as acceptance or copied into a package script or into
+#   test-install.yml / release.yml.
+#
+# Delete this workflow once #1227 is understood. It is dispatch-only, reads nothing but the repo,
+# takes no inputs and no secrets, and publishes nothing.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: windows probe (${{ matrix.leg }})
+    # Two legs on two SEPARATE windows-latest VMs. That separation is load-bearing, not tidiness:
+    # the plain leg is expected to leave live powershell/conhost children behind, and residual
+    # children from leg 1 must not contaminate leg 2's process inventory. `fail-fast: false` keeps
+    # leg 2 running after leg 1 fails or is killed by its cap — the whole point is to compare them.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: plain
+            force_exit: '0'
+          - leg: force-exit
+            force_exit: '1'
+    runs-on: windows-latest
+    # Measured from run 38875470444 (CI.json, windows leg): job start -> suite start was 27s
+    # (set-up 1s, checkout 6s, setup-node 10s, `npm ci` 6s incl. native node-pty, typecheck 3s).
+    # 27s prelude + the 3-minute probe cap + inventory + upload is under 4 minutes; 10 leaves room
+    # for a cold npm cache or a native rebuild. This is BELOW the production 20-minute cap, not an
+    # enlargement of it — and it must stay well above the step cap below, because a STEP timeout
+    # fails the step and still runs `if: always()` steps, whereas a JOB timeout cancels the job and
+    # would take the diagnostics with it.
+    timeout-minutes: 10
+    steps:
+      # The exact diagnostic commit, not the branch tip: the tip is the child commit that adds this
+      # workflow, and the tree under measurement must stay byte-identical to the candidate the
+      # diagnosis analysed. The workflow definition comes from the dispatched ref regardless.
+      - uses: actions/checkout@v4
+        with:
+          ref: ae563a6d0f3a377b88c05c035533eb141154cfd6
+
+      # Install strategy inherited unchanged from test-install.yml:28-34. The runner resolved
+      # v20.20.2 on the measured run; the preflight below records what it actually resolves here, so
+      # any drift is measured rather than assumed. `npm ci` runs the package's own postinstall
+      # exactly as it already does on this runner today — inherited, not new.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+
+      # NOTRUN, never a silent skip. `daemon.js:3` is a top-level `require('node-pty')` with no
+      # try/catch and the probe drives a real daemon child, so an unloadable native binding already
+      # fails closed (`startTestDaemon` readiness wait, daemon-harness.js:224, 7000ms, throws
+      # "Daemon exited early"). This step exists to make that case DISTINGUISHABLE: "the native
+      # dependency is unusable on this runner" and "the probe ran and stalled" are different
+      # findings and a red job alone cannot tell them apart. It loads the third-party native
+      # dependency only — no product module, no test.
+      # Symlink capability is not probed because this path does not use one: neither the frontier
+      # file nor test-support/daemon-harness.js contains any symlink call.
+      - name: Record runner and native PTY capability
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path diagnostics | Out-Null
+          Write-Host "PROBE_LEG: $env:PROBE_LEG"
+          Write-Host "PLATFORM: $env:RUNNER_OS $env:RUNNER_ARCH"
+          Write-Host "NODE_VERSION: $(node -v)"
+          Write-Host "NPM_VERSION: $(npm -v)"
+          npm ls node-pty --depth=0
+          Write-Host "npm ls exit: $LASTEXITCODE (informational only, does not gate this step)"
+          node -e "const pty = require('node-pty'); if (typeof pty.spawn !== 'function') { throw new Error('node-pty loaded without a spawn function'); } console.log('NODE_PTY: loaded, spawn present');"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::NOTRUN - native node-pty could not be loaded on this runner, so NOTHING was measured about the #1227 hang. This is an explicit failure, not a skip.'
+            exit 1
+          }
+          exit 0
+        env:
+          PROBE_LEG: ${{ matrix.leg }}
+
+      # The measurement. Same runner, same --require, same reporter as `package.json` test:ci; the
+      # file list is reduced to the one file §3.2 proved incomplete, and test:ci's trailing
+      # `git diff --exit-code tests/snippet-protocol/v1/` is dropped (a snippet-fixture check, not
+      # part of the hang).
+      #
+      # 3 minutes is a BOUND FOR THIS PROBE, not a production fix: it is >15x the file's own largest
+      # internal wait (:288, timeoutMs 10000) and ~18x the whole suite's measured productive window
+      # on windows (1m40.5s for 75 files), so a stall here is unambiguous rather than a budget
+      # question. No `continue-on-error`: a timeout must surface AS a timeout. The flag is injected
+      # through `env` rather than interpolated into the command text, so the run block contains no
+      # `${{ }}` expansion at all.
+      - name: Probe - run the frontier file alone
+        id: probe
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path diagnostics | Out-Null
+          $nodeArgs = @('--require', './test-support/setup-env.js', '--test', '--test-reporter=spec')
+          if ($env:PROBE_FORCE_EXIT -eq '1') { $nodeArgs += '--test-force-exit' }
+          $nodeArgs += 'test/observation-tracking-endpoint-60.test.js'
+          $commandLine = "node $($nodeArgs -join ' ')"
+          Write-Host "COMMAND: $commandLine"
+          Set-Content -Path diagnostics/command.txt -Value $commandLine -Encoding utf8
+          & node @nodeArgs 2>&1 | Tee-Object -FilePath diagnostics/probe-stdout.log
+          $code = $LASTEXITCODE
+          Write-Host "EXIT_CODE: $code"
+          Set-Content -Path diagnostics/exit-code.txt -Value "$code" -Encoding utf8
+          exit $code
+        env:
+          PROBE_FORCE_EXIT: ${{ matrix.force_exit }}
+
+      # `if: always()` so it runs after the 3-minute kill — that is when the orphans are still live
+      # and the measurement is worth taking. Name/ProcessId/ParentProcessId ONLY: CommandLine and
+      # the process environment are never read, so a session token or a registry credential on a
+      # child's command line cannot reach this log or the artifact. ParentProcessId is why this uses
+      # Get-CimInstance rather than the `tasklist /FI` of the diagnosis proposal — tasklist cannot
+      # report it, and it is the field that turns "7 orphans exist" into "7 orphans are children of
+      # THIS node process". Bounded to 200 rows; nothing is killed here.
+      - name: Process inventory (bounded)
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path diagnostics | Out-Null
+          $names = @('node.exe', 'powershell.exe', 'pwsh.exe', 'conhost.exe', 'cmd.exe')
+          $rows = Get-CimInstance -ClassName Win32_Process |
+            Where-Object { $names -contains $_.Name } |
+            Select-Object -Property Name, ProcessId, ParentProcessId |
+            Sort-Object -Property Name, ProcessId |
+            Select-Object -First 200
+          Write-Host "PROCESS_ROWS: $(@($rows).Count) (cap 200)"
+          $table = $rows | Format-Table -AutoSize | Out-String -Width 120
+          Write-Host $table
+          Set-Content -Path diagnostics/process-inventory.txt -Value $table -Encoding utf8
+          exit 0
+
+      # Records what happened without coercing it. A hang has no exit code: if the probe was killed
+      # before it could write exit-code.txt, that is reported as "(none - step killed by the
+      # 3-minute cap)" rather than as a number this job does not have.
+      - name: Summarise the probe outcome
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path diagnostics | Out-Null
+          $exit = if (Test-Path diagnostics/exit-code.txt) {
+            (Get-Content diagnostics/exit-code.txt -Raw).Trim()
+          } else {
+            '(none - step killed by the 3-minute cap)'
+          }
+          $lines = @(
+            "probe_leg: $env:PROBE_LEG",
+            "force_exit_flag: $env:PROBE_FORCE_EXIT",
+            "diagnostic_commit: ae563a6d0f3a377b88c05c035533eb141154cfd6",
+            "node_version: $(node -v)",
+            "npm_version: $(npm -v)",
+            "platform: $env:RUNNER_OS $env:RUNNER_ARCH",
+            "probe_step_outcome: $env:PROBE_OUTCOME",
+            "probe_step_conclusion: $env:PROBE_CONCLUSION",
+            "probe_exit_code: $exit",
+            "run_url: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          )
+          $text = $lines -join "`n"
+          Write-Host $text
+          Set-Content -Path diagnostics/metadata.txt -Value $text -Encoding utf8
+          # Built as an array, not one escaped string: Add-Content writes each element on its own
+          # line, so the fence opens and closes on lines of their own. A single interpolated string
+          # would need stacked backtick escapes and would emit the opening fence and the first
+          # metadata line together, which markdown reads as an info string and never closes.
+          $summary = @("### windows probe ($env:PROBE_LEG)", '', '```')
+          $summary += $lines
+          $summary += '```'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+          exit 0
+        env:
+          PROBE_LEG: ${{ matrix.leg }}
+          PROBE_FORCE_EXIT: ${{ matrix.force_exit }}
+          PROBE_OUTCOME: ${{ steps.probe.outcome }}
+          PROBE_CONCLUSION: ${{ steps.probe.conclusion }}
+
+      # The Actions step log above is the authority for stdout/stderr — probe-stdout.log is written
+      # through Tee-Object, so on a killed leg its tail may be short of what the step log holds.
+      # upload-artifact@v4 matches the repo's existing major-version convention (checkout@v4,
+      # setup-node@v4) and is the only version of this action named anywhere in the repo
+      # (docs/plans/2026-05-12-phase1-sidecar-spike-plan.md:633). No dependency is upgraded.
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnose-windows-1227-${{ matrix.leg }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
