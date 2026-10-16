@@ -3531,6 +3531,10 @@ app.post('/api/sessions/spawn', (req, res) => {
     || !Array.isArray(args) || !args.every(a => typeof a === 'string')) {
     return respondWithError(res, 400, 'INVALID_REQUEST', 'session_id, command, cwd and type must be strings; args an array of strings');
   }
+  // type becomes the PS1/PROMPT label below; every shipped client sends 'USER', the default is 'AGENT'.
+  if (type !== 'USER' && type !== 'AGENT') {
+    return respondWithError(res, 400, 'INVALID_SESSION_TYPE', 'type must be USER or AGENT');
+  }
   // session_id is interpolated into PS1/PROMPT below, which the shell expands on every prompt.
   if (/[$`\\]/.test(session_id)) {
     return respondWithError(res, 400, 'INVALID_SESSION_ID', 'session_id must not contain $, ` or \\');
