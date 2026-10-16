@@ -5,6 +5,7 @@ const fs = require('fs');
 const {
   acquireLock,
   breakStaleLocks,
+  sessionDirPath,
   ensureSessionDir,
   loadStates,
   appendState,
@@ -34,7 +35,7 @@ class FileMailbox {
   }
 
   _sessionDir(sessionId) {
-    return path.join(this.config.root, sessionId);
+    return sessionDirPath(this.config.root, sessionId);
   }
 
   /**

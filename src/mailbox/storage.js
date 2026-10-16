@@ -167,8 +167,18 @@ function writeJsonl(filePath, objects) {
 
 // --- Session directory helpers ---
 
-function ensureSessionDir(root, sessionId) {
+// Register accepts any session id, so `..` or `../x` must not leave the mailbox root (Snyk
+// 4fc6e5b9, 4158b586, 20746b91 on 9cff4bf).
+function sessionDirPath(root, sessionId) {
   const dir = path.join(root, sessionId);
+  if (!path.resolve(dir).startsWith(path.resolve(root) + path.sep)) {
+    throw new Error(`Invalid mailbox session id: ${JSON.stringify(sessionId)}`);
+  }
+  return dir;
+}
+
+function ensureSessionDir(root, sessionId) {
+  const dir = sessionDirPath(root, sessionId);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;
 }
@@ -253,6 +263,7 @@ module.exports = {
   readJsonl,
   appendJsonl,
   writeJsonl,
+  sessionDirPath,
   ensureSessionDir,
   listSessionDirs,
   loadStates,
