@@ -5285,6 +5285,9 @@ app.patch('/api/sessions/:id', (req, res) => {
   const id = resolvedId;
   const { new_id } = req.body;
   if (!new_id) return res.status(400).json({ error: 'new_id is required' });
+  if (typeof new_id === 'string' && !isSafeRegisteredSessionId(new_id)) {
+    return respondWithError(res, 400, 'INVALID_SESSION_ID', 'new_id must not be only dots, contain / or \\ or control characters, or be __proto__, constructor or prototype');
+  }
   if (sessions[new_id]) return res.status(409).json({ error: `Session ID '${new_id}' is already in use.` });
 
   // Move session to new key (including state machine)

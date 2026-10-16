@@ -53,24 +53,59 @@ test('FileMailbox refuses ids that resolve to the root or outside it', (t) => {
   assert.equal(fs.readFileSync(path.join(root, 'w-1.claude', 'inbox.jsonl'), 'utf8'), '');
 });
 
-test('daemon: the DELETE routes of a registered `../x` session do not touch files outside the mailbox root', async (t) => {
-  const daemon = await startTestDaemon();
+// Mac re-review R1: every producer of a session id (register, PATCH rename, spawn, WS, a legacy
+// sessions.json record from before the refusal, the CLI bridge mailbox) and every encoded route
+// into FileMailbox must leave sibling files of the mailbox root unchanged.
+test('R1: register / rename / spawn / WS / restored legacy id / encoded routes leave sibling files unchanged', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 's9-r1-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const aigentry = path.join(home, '.aigentry'); // mailbox root is ~/.aigentry/mailbox
+  const victim = path.join(aigentry, 'victim');
+  fs.mkdirSync(victim, { recursive: true });
+  const files = ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl'];
+  const siblings = [...files.map((f) => path.join(victim, f)), ...files.map((f) => path.join(aigentry, f))];
+  for (const f of siblings) fs.writeFileSync(f, 'keep\n');
+  // A record persisted before register refused `../victim` is restored as-is (no migration).
+  const persist = path.join(home, '.config', 'aigentry-telepty', 'sessions.json');
+  fs.mkdirSync(path.dirname(persist), { recursive: true });
+  fs.writeFileSync(persist, JSON.stringify({ '../victim': { id: '../victim', type: 'wrapped', command: 'legacy', cwd: home, createdAt: new Date().toISOString() } }));
+
+  const daemon = await startTestDaemon({ homeDir: home });
   t.after(() => daemon.stop());
-  const x = path.join(daemon.homeDir, '.aigentry', 'x'); // mailbox root is ~/.aigentry/mailbox
-  fs.mkdirSync(x, { recursive: true });
-  for (const f of ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl']) fs.writeFileSync(path.join(x, f), 'keep\n');
-  // Since NB4 option A, register refuses `../x` (400); the files are checked first so this stays
-  // RED on 9cff4bf, where the register succeeded and the DELETE routes truncated them.
-  const reg = await daemon.registerSession('../x');
-  // `..%2Fx` survives URL normalisation and express decodes it to `../x` (a bare `..` segment
-  // does not survive, so `..` itself is covered by the FileMailbox test above).
-  await daemon.request('/api/sessions/..%2Fx/mailbox', { method: 'DELETE' });           // 4fc6e5b9
-  await daemon.request('/api/sessions/..%2Fx/mailbox/dead-letter', { method: 'DELETE' }); // 4158b586
-  await daemon.request('/api/sessions/..%2Fx', { method: 'DELETE' });                   // 20746b91
-  for (const f of ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl']) {
-    assert.equal(fs.readFileSync(path.join(x, f), 'utf8'), 'keep\n', `~/.aigentry/x/${f} was truncated`);
+
+  for (const sid of ['../victim', '..', 'a/../../victim']) {
+    const reg = await daemon.registerSession(sid);
+    assert.equal(reg.status, 400, `register ${sid}`);
+    const sp = await daemon.spawnSession(sid);
+    // `../victim` is taken by the restored legacy record, and spawn answers 409 before its id check.
+    assert.ok(sp.status === 400 || (sid === '../victim' && sp.status === 409), `spawn ${sid}: ${sp.status}`);
   }
-  assert.equal(reg.status, 400, 'register refuses an id containing /');
+  const okId = `r1-ok-${Date.now()}`;
+  assert.equal((await daemon.registerSession(okId)).status, 201);
+  for (const newId of ['../renamed', '..']) {
+    const ren = await daemon.request(`/api/sessions/${okId}`, { method: 'PATCH', body: { new_id: newId } });
+    assert.equal(ren.status, 400, `rename to ${newId}: ${JSON.stringify(ren.body)}`);
+    assert.equal(ren.body.code, 'INVALID_SESSION_ID');
+  }
+  const ws = await daemon.connectSession('...');
+  await new Promise((resolve) => { ws.once('close', resolve); setTimeout(resolve, 1500); });
+  ws.terminate();
+
+  // The restored legacy id is reachable through the encoded route, so the storage boundary is
+  // what protects the siblings here.
+  assert.equal((await daemon.request('/api/sessions/..%2Fvictim')).status, 200, 'legacy record restored');
+  await daemon.request('/api/sessions/..%2Fvictim/inject', { method: 'POST', body: { prompt: 'x', no_submit: true } });
+  await daemon.request('/api/sessions/..%2Fvictim/mailbox', { method: 'DELETE' });            // 4fc6e5b9
+  await daemon.request('/api/sessions/..%2Fvictim/mailbox/dead-letter', { method: 'DELETE' }); // 4158b586
+  await daemon.request('/api/sessions/..%2Fvictim', { method: 'DELETE' });                    // 20746b91
+
+  // The CLI bridge mailbox (cli.js:3066, 0b79a913) is a FileMailbox under mailbox/bridge.
+  const bridge = new FileMailbox({ root: path.join(aigentry, 'mailbox', 'bridge') });
+  assert.throws(() => bridge.purge('../../victim'), /session id/);
+  assert.throws(() => bridge.enqueue({ msg_id: 'b1', from: 'a', to: '../../victim', payload: 'p', created_at: Math.floor(Date.now() / 1000) }), /session id/);
+
+  for (const f of siblings) assert.equal(fs.readFileSync(f, 'utf8'), 'keep\n', `${path.relative(home, f)} changed`);
+  assert.equal(fs.existsSync(path.join(aigentry, 'mailbox', 'victim')), false);
 });
 
 // ------------------------------------------------------------------------ cross-machine ssh
