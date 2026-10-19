@@ -1,15 +1,51 @@
 'use strict';
 
-const { execSync, spawn, spawnSync } = require('child_process');
+const { execFileSync: defaultExecFileSync, spawn: defaultSpawn, spawnSync: defaultSpawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { isIP } = require('net');
 const { getSharedContextPromptPath } = require('./shared-context');
 const { parseHostSpec } = require('./host-spec');
 
 const PEERS_PATH = path.join(os.homedir(), '.telepty', 'peers.json');
 const BROKER_CONFIG_PATH = path.join(os.homedir(), '.telepty', 'broker.json');
 const CONTROL_DIR = path.join(os.homedir(), '.telepty', 'ssh');
+
+// Construct one coupled peer store; production exports below use one default instance.
+function createPeerContext({
+  execFileSync = defaultExecFileSync,
+  spawn = defaultSpawn,
+  spawnSync = defaultSpawnSync,
+  PEERS_PATH: peersPath = PEERS_PATH,
+  CONTROL_DIR: controlDir = CONTROL_DIR,
+  getUsername = () => os.userInfo().username
+} = {}) {
+
+function validSshUser(user) {
+  return typeof user === 'string' && !/[\s\x00-\x1f\x7f-\x9f]/.test(user) && /^[A-Za-z0-9_][A-Za-z0-9_.-]*\$?$/.test(user);
+}
+
+function validSshTarget(target) {
+  if (typeof target !== 'string' || !target || /[\s\x00-\x1f\x7f-\x9f%]/.test(target)) return false;
+  const parts = target.split('@');
+  if (parts.length > 2 || (parts.length === 2 && !validSshUser(parts[0]))) return false;
+  const host = parts[parts.length - 1];
+  if (/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(host)) return true;
+  const address = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  return isIP(address) === 6;
+}
+
+function requireSshTarget(target) {
+  if (!validSshTarget(target)) {
+    throw Object.assign(new Error('Invalid SSH target.'), { code: 'INVALID_SSH_TARGET' });
+  }
+  return target;
+}
+
+function sshPeerArgs(peer) {
+  return ['-S', peer.controlSocket, requireSshTarget(peer.target)];
+}
 
 function getPeerTransport(entry) {
   if (!entry) return null;
@@ -54,20 +90,20 @@ function collectPeerResults(settled) {
 
 // SSH ControlMaster socket path pattern
 function controlPath(target) {
-  return path.join(CONTROL_DIR, `ctrl-${target.replace(/[^a-zA-Z0-9@.-]/g, '_')}`);
+  return path.join(controlDir, `ctrl-${target.replace(/[^a-zA-Z0-9@.-]/g, '_')}`);
 }
 
 function loadPeers() {
   try {
-    if (!fs.existsSync(PEERS_PATH)) return { peers: {} };
-    return JSON.parse(fs.readFileSync(PEERS_PATH, 'utf8'));
+    if (!fs.existsSync(peersPath)) return { peers: {} };
+    return JSON.parse(fs.readFileSync(peersPath, 'utf8'));
   } catch { return { peers: {} }; }
 }
 
 function savePeers(data) {
   try {
-    fs.mkdirSync(path.dirname(PEERS_PATH), { recursive: true });
-    fs.writeFileSync(PEERS_PATH, JSON.stringify(data, null, 2));
+    fs.mkdirSync(path.dirname(peersPath), { recursive: true });
+    fs.writeFileSync(peersPath, JSON.stringify(data, null, 2));
   } catch {}
 }
 
@@ -107,7 +143,7 @@ const activePeers = new Map(); // name -> { target, controlSocket, connectedAt, 
 function listSshPeers() {
   const peers = loadPeers().peers || {};
   return Object.entries(peers)
-    .filter(([, entry]) => getPeerTransport(entry) === 'ssh' && entry && entry.target)
+    .filter(([, entry]) => getPeerTransport(entry) === 'ssh' && entry)
     .map(([name, entry]) => ({
       name,
       target: entry.target,
@@ -117,10 +153,15 @@ function listSshPeers() {
 }
 
 function getSshPeerHandle(name) {
-  if (activePeers.has(name)) return activePeers.get(name);
+  if (activePeers.has(name)) {
+    const peer = activePeers.get(name);
+    requireSshTarget(peer.target);
+    return peer;
+  }
   const peers = loadPeers().peers || {};
   const entry = peers[name];
-  if (!entry || getPeerTransport(entry) !== 'ssh' || !entry.target) return null;
+  if (!entry || getPeerTransport(entry) !== 'ssh') return null;
+  requireSshTarget(entry.target);
   return {
     target: entry.target,
     controlSocket: controlPath(entry.target),
@@ -135,8 +176,7 @@ function shellQuote(value) {
 
 function runRemoteCommand(peer, remoteCommand, options = {}) {
   const result = spawnSync('ssh', [
-    '-o', `ControlPath=${peer.controlSocket}`,
-    peer.target,
+    ...sshPeerArgs(peer),
     remoteCommand
   ], {
     timeout: options.timeout ?? 15000,
@@ -170,9 +210,12 @@ function runRemoteCommand(peer, remoteCommand, options = {}) {
  * Connect to a remote machine via SSH ControlMaster.
  */
 async function connect(target, options = {}) {
+  if (!validSshTarget(target)) return { success: false, error: 'Invalid SSH target.' };
   let sshTarget = target;
   if (!target.includes('@')) {
-    sshTarget = `${os.userInfo().username}@${target}`;
+    const username = getUsername();
+    if (!validSshUser(username)) return { success: false, error: 'Invalid SSH target.' };
+    sshTarget = `${username}@${target}`;
   }
 
   const name = options.name || target.split('@').pop().split('.')[0];
@@ -182,15 +225,15 @@ async function connect(target, options = {}) {
   }
 
   // Ensure control directory exists
-  fs.mkdirSync(CONTROL_DIR, { recursive: true });
+  fs.mkdirSync(controlDir, { recursive: true });
 
   const ctrlPath = controlPath(sshTarget);
 
   // Start SSH ControlMaster
   try {
-    execSync([
-      'ssh', '-o', 'ControlMaster=auto',
-      '-o', `ControlPath=${ctrlPath}`,
+    execFileSync('ssh', [
+      '-o', 'ControlMaster=auto',
+      '-S', ctrlPath,
       '-o', 'ControlPersist=600',
       '-o', 'ConnectTimeout=10',
       '-o', 'ServerAliveInterval=30',
@@ -198,7 +241,7 @@ async function connect(target, options = {}) {
       '-o', 'StrictHostKeyChecking=accept-new',
       '-N', '-f', // Go to background
       sshTarget
-    ].join(' '), { timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
+    ], { timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (err) {
     return { success: false, error: `SSH connection failed: ${err.message}` };
   }
@@ -206,8 +249,8 @@ async function connect(target, options = {}) {
   // Verify remote telepty is available
   let machineId = name;
   try {
-    const output = execSync(
-      `ssh -o ControlPath=${ctrlPath} ${sshTarget} "hostname"`,
+    const output = execFileSync('ssh',
+      ['-S', ctrlPath, sshTarget, 'hostname'],
       { timeout: 5000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
     ).trim();
     if (output) machineId = output;
@@ -215,13 +258,13 @@ async function connect(target, options = {}) {
 
   // Verify telepty CLI is available on remote
   try {
-    execSync(
-      `ssh -o ControlPath=${ctrlPath} ${sshTarget} "telepty list --json"`,
+    execFileSync('ssh',
+      ['-S', ctrlPath, sshTarget, 'telepty list --json'],
       { timeout: 10000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
     );
   } catch (err) {
     // Clean up ControlMaster
-    try { execSync(`ssh -O exit -o ControlPath=${ctrlPath} ${sshTarget}`, { stdio: 'pipe' }); } catch {}
+    try { execFileSync('ssh', ['-O', 'exit', '-S', ctrlPath, sshTarget], { stdio: 'pipe' }); } catch {}
     return { success: false, error: `Remote telepty not available: ${err.message}` };
   }
 
@@ -253,9 +296,11 @@ function disconnect(name) {
     return { success: false, error: `Not connected to ${name}` };
   }
 
+  // Reject malformed stored destinations before the transport-error catch.
+  const args = sshPeerArgs(peer);
   // Close ControlMaster
   try {
-    execSync(`ssh -O exit -o ControlPath=${peer.controlSocket} ${peer.target}`, {
+    execFileSync('ssh', ['-O', 'exit', ...args], {
       timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
     });
   } catch {}
@@ -289,6 +334,7 @@ function listRemoteSessions(name) {
     // where "no sessions" is honest. Anything else is the remote telepty answering that it could
     // not tell us (after this fix it exits non-zero on a refusal instead of printing `[]`), and
     // that must never read here as "that machine is empty".
+    if (error && error.code === 'INVALID_SSH_TARGET') throw error;
     if (error && (error.status === 255 || error.transportFailure)) return [];
     throw peerAnswerError(name, peer.target, null, error && error.message);
   }
@@ -327,10 +373,9 @@ function discoverAllRemoteSessions() {
  * Inject text into a remote session via SSH.
  */
 function remoteInject(name, sessionId, prompt, options = {}) {
-  const peer = getSshPeerHandle(name);
-  if (!peer) return { success: false, error: `Not connected to ${name}` };
-
   try {
+    const peer = getSshPeerHandle(name);
+    if (!peer) return { success: false, error: `Not connected to ${name}` };
     const parts = ['telepty', 'inject'];
     if (options.ref) parts.push('--ref');
     if (options.no_enter) parts.push('--no-enter');
@@ -348,10 +393,9 @@ function remoteInject(name, sessionId, prompt, options = {}) {
 }
 
 function remoteEnsureSharedContext(name, descriptor) {
-  const peer = getSshPeerHandle(name);
-  if (!peer) return { success: false, error: `Not connected to ${name}` };
-
   try {
+    const peer = getSshPeerHandle(name);
+    if (!peer) return { success: false, error: `Not connected to ${name}` };
     const remotePath = `$HOME/.telepty/shared/${descriptor.fileName}`;
     const remoteCommand = [
       'sh',
@@ -382,9 +426,8 @@ function remoteAttach(name, sessionId) {
   if (!peer) return null;
 
   return spawn('ssh', [
-    '-o', `ControlPath=${peer.controlSocket}`,
     '-t', // Force TTY allocation
-    peer.target,
+    ...sshPeerArgs(peer),
     'telepty', 'attach', sessionId
   ], { stdio: ['pipe', 'pipe', 'pipe'] });
 }
@@ -658,7 +701,9 @@ async function discoverBrokerRemoteSessions(options = {}) {
   return collectPeerResults(await Promise.allSettled([listBrokerRemoteSessions(options)]));
 }
 
-module.exports = {
+return {
+  controlPath,
+  savePeers,
   connect,
   disconnect,
   disconnectAll,
@@ -689,6 +734,10 @@ module.exports = {
   listSshPeers,
   getSshPeerHandle,
   getPeerTransport,
-  PEERS_PATH,
+  PEERS_PATH: peersPath,
   BROKER_CONFIG_PATH
 };
+}
+
+const defaultPeerContext = createPeerContext();
+module.exports = { ...defaultPeerContext, createPeerContext };

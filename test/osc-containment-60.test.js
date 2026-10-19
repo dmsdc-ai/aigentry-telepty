@@ -219,11 +219,15 @@ test('osc_containment: 0.8.0 contains no terminal outcome validator or producer'
     'src/completion-observation.js',
     'src/report-enforcement.js',
     'src/session-store/persistence.js',
+    'src/mailbox/delivery-runtime.js',
+    'src/mailbox/session-delivery.js',
+    'src/routes/session-actions.js',
+    'src/routes/session-inspection.js',
   ];
   // Emission sites, not prose: a broadcast/return/assignment of a terminal name. Comments and
   // CHANGELOG history legitimately still NAME the removed vocabulary — this release is the thing
   // that removed it, and forbidding the words would forbid explaining them.
-  const PRODUCER_RE = /(broadcastSessionEvent|broadcastBusEvent)\(\s*['"`](TASK_COMPLETE|TASK_COMPLETE_WITH_REPORT|TASK_IDLE_UNCONFIRMED|TASK_ERROR|TASK_IDLE_NO_REPORT|TASK_DEAD_NO_REPORT)/;
+  const PRODUCER_RE = /(broadcastSessionEvent|broadcastBusEvent|\(0,\s*shared\.(?:broadcastSessionEvent|broadcastBusEvent)\))\(\s*['"`](TASK_COMPLETE|TASK_COMPLETE_WITH_REPORT|TASK_IDLE_UNCONFIRMED|TASK_ERROR|TASK_IDLE_NO_REPORT|TASK_DEAD_NO_REPORT)/;
   const TEXT_RE = /['"`]TASK_COMPLETE(_WITH_REPORT)?:/;
 
   for (const rel of sources) {

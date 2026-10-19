@@ -39,7 +39,7 @@ const noSupervisor = () => ({ present: false, kind: null, detail: null });
 
 // Every destructive or spawning act, counted.
 function recorder() {
-  const r = { cleanup: 0, spawn: 0, kickstart: 0, restartCalls: 0, metaPolls: 0 };
+  const r = { cleanup: 0, spawn: 0, kickstart: 0, restartCalls: 0, metaPolls: 0, livenessPids: [] };
   r.restart = (opts) => {
     r.restartCalls += 1;
     return restartDaemonGraceful({
@@ -48,6 +48,7 @@ function recorder() {
       port: PORT,
       _supervisedPort: () => PORT,
       _detectSupervisor: r.detect,
+      _isProcessRunning: (pid) => { r.livenessPids.push(pid); return false; },
       _probeDaemonHealth: async () => false,
       _cleanupDaemonProcesses: () => { r.cleanup += 1; return { stopped: [{ pid: 4242 }], failed: [] }; },
       _startDetachedDaemon: () => { r.spawn += 1; },
@@ -189,7 +190,7 @@ test('off (env): no supervisor ⇒ no spawn either; names `telepty daemon start`
 test('off (config.json clientRestart): same as the env switch', async () => {
   const restore = withEnv(undefined);
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify({ authToken: 'test-token', clientRestart: 'off' }));
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify({ authToken: require('node:crypto').randomBytes(32).toString('hex'), clientRestart: 'off' }));
   const r = recorder();
   try {
     const { text } = await captureStderr(() => ensureDaemonRunning(ensureOptions(r, { detect: noSupervisor })));
@@ -224,6 +225,7 @@ test('control (auto): no supervisor + absence verdict ⇒ the absent daemon is s
     await captureStderr(() => ensureDaemonRunning(ensureOptions(r, { detect: noSupervisor })));
     assert.equal(r.restartCalls, 1);
     assert.equal(r.spawn, 1, 'unsupervised hosts keep the pre-gh#82 auto-start');
+    assert.deepEqual(r.livenessPids, [4242]);
   } finally {
     restore();
   }

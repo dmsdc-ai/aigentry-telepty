@@ -22,6 +22,7 @@ const {
   writeRestartFailureMarker
 } = require('./daemon-control');
 const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
+const interaction = require('./src/interaction');
 const { getRuntimeInfo } = require('./runtime-info');
 const { formatHostLabel, groupSessionsByHost, parseSessionReference, pickSessionTarget } = require('./session-routing');
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
@@ -175,12 +176,23 @@ let cachedAuthToken = null;
 // TELEPTY_AUTH_TOKEN for a client but not for the daemon produces a 401 that looks like a
 // credential bug; the variable is therefore documented (BOUNDARY.md) as something you set for
 // BOTH ends or neither, and never silently preferred at one end only.
-function getAuthToken() {
-  if (cachedAuthToken == null) {
-    cachedAuthToken = process.env.TELEPTY_AUTH_TOKEN || getConfig().authToken;
-  }
-  return cachedAuthToken;
-}
+const { createCliSecurityActions, createAllowSecurityContext } = require('./src/cli/security-actions');
+const cliSecurity = createCliSecurityActions({
+  get cachedAuthToken() { return cachedAuthToken; },
+  get cachedPeerTokens() { return cachedPeerTokens; },
+  get getConfig() { return getConfig; },
+  get crossMachine() { return crossMachine; },
+  get PORT() { return PORT; },
+  get TRAILING_PAYLOAD_HELP() { return TRAILING_PAYLOAD_HELP; },
+  get path() { return path; },
+  get lifecycle() { return lifecycle; },
+  get execSync() { return execSync; },
+  get execFileSync() { return execFileSync; },
+  set cachedAuthToken(value) { cachedAuthToken = value; },
+  set cachedPeerTokens(value) { cachedPeerTokens = value; },
+  get isMainModule() { return require.main === module; }
+});
+const { getAuthToken, peerTokenFor, isLocalHostname, resolveTargetToken, credentialRefusalError, credentialRefusalHint, namedTransportError, markCommandFailed, classifyBackend, runUpdateInstall, helpRequested, interceptSubcommandHelp, fetchWithAuth, parseAllowInvocation } = cliSecurity;
 
 // #823 — which token belongs to THIS target?
 //
@@ -194,23 +206,9 @@ function getAuthToken() {
 // and the ecosystem's real addressing (`<sid>@<tailnet-ip>`, TELEPTY_HOST) has no peers.json
 // entry at all. Address-keying is what makes that stored credential reachable.
 let cachedPeerTokens = null;
-function peerTokenFor(host, port) {
-  if (cachedPeerTokens == null) {
-    cachedPeerTokens = new Map();
-    try {
-      for (const entry of Object.values(crossMachine.loadPeers().peers || {})) {
-        if (entry && entry.token && entry.host) {
-          cachedPeerTokens.set(`${entry.host}:${entry.port}`, entry.token);
-        }
-      }
-    } catch { /* no peers.json, or unreadable — nothing to resolve, fall through to the local token */ }
-  }
-  return cachedPeerTokens.get(`${host}:${port}`) || null;
-}
 
-function isLocalHostname(host) {
-  return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
-}
+
+
 
 // Resolution order: explicit env → the peer's stored token → the local token, and the last step
 // is reachable ONLY for this machine. NEVER "no token" for a target we do dial: a wrong
@@ -228,50 +226,17 @@ function isLocalHostname(host) {
 // So `isLocalHostname()` decides RESOLUTION now, not just error wording: a non-local address with
 // no credential of its own is REFUSED before the socket opens, naming the fix. A refusal an
 // operator can act on beats a send they never saw.
-function resolveTargetToken(url) {
-  if (process.env.TELEPTY_AUTH_TOKEN) return process.env.TELEPTY_AUTH_TOKEN;
-  let host = null;
-  try {
-    const parsed = new URL(url);
-    host = parsed.hostname;
-    // Keyed on host AND port, so two daemons on one host are two targets. Not skipped for
-    // loopback: nobody runs `connect-http` against their own daemon, so the local address has no
-    // entry and this falls through — but if an entry for that exact address DOES exist, it is a
-    // deliberate act and honouring it is correct.
-    const peerToken = peerTokenFor(host, Number(parsed.port) || PORT);
-    if (peerToken) return peerToken;
-  } catch { /* not a URL we can read — see below: no host, so nothing is dialled from here */ }
-  if (host && !isLocalHostname(host)) throw credentialRefusalError(host);
-  return getAuthToken();
-}
+
 
 // #844 F1 — the refusal itself. `markCommandFailed()` so a caller that prints the message but
 // swallows the throw still cannot exit 0 on it (#835: a zero is what scripts read as "nothing to
 // do"), and the operator-facing half is `credentialRefusalHint` — the same one refusal message
 // every other surface prints, naming `connect-http --token` and `TELEPTY_AUTH_TOKEN`.
-function credentialRefusalError(host) {
-  const error = new Error(
-    `Refusing to send this machine's daemon token to ${host} — no stored credential for that address, `
-    + 'and the local token is not valid there.\n  '
-    + credentialRefusalHint(host)
-  );
-  error.name = 'CredentialRefusalError';
-  error.code = 'NO_TARGET_CREDENTIAL';
-  markCommandFailed();
-  return error;
-}
+
 
 // #823 — ONE refusal message for every surface, naming the fix. A refusal that tells you how to
 // stop being refused is worth more than five call sites each inventing their own wording.
-function credentialRefusalHint(host) {
-  if (!host || isLocalHostname(host)) {
-    return 'The local daemon is running and REFUSED this token. It freezes the token at start, by design, '
-      + 'so a rotated ~/.telepty/config.json needs a daemon restart to take effect.';
-  }
-  return `Each node mints its own token, so the local one is not valid at ${host}. Store that host's token:\n`
-    + `    telepty connect-http ${host} --token <that host's authToken>\n`
-    + '  or export TELEPTY_AUTH_TOKEN with a token both ends share (the daemon must see it too).';
-}
+
 
 // #837 — `fetch failed` names nothing. undici's message for every connect-level failure is that
 // one string with no host in it, and this CLI talks to at least three kinds of origin (the local
@@ -279,33 +244,9 @@ function credentialRefusalHint(host) {
 // tell the local daemon being down from a socket that died for some other reason — which is
 // exactly how a poisoned local socket got diagnosed as daemon-down and a working peer got parked
 // for a day. Say which origin, and carry the cause code that says why.
-function namedTransportError(url, cause) {
-  let origin = String(url);
-  try { origin = new URL(url).origin; } catch { /* not parseable — naming the raw target still beats naming nothing */ }
-  const code = (cause && (cause.code || (cause.cause && cause.cause.code))) || null;
-  const detail = cause && cause.name === 'TimeoutError'
-    ? 'timed out'
-    : `${(cause && cause.message) || 'unknown error'}${code ? ` (${code})` : ''}`;
-  const error = new Error(`Could not reach ${origin} — ${detail}`);
-  error.name = 'TransportError';
-  error.origin = origin;
-  error.code = code;
-  error.cause = cause;
-  return error;
-}
 
-const fetchWithAuth = (url, options = {}) => {
-  const headers = { ...options.headers, 'x-telepty-token': resolveTargetToken(url) };
-  // #43 P2 — present the per-session verified-sender token (minted at register, carried in the
-  // parent-hijack-protected env beside TELEPTY_SESSION_ID) so the daemon can map token→sid and
-  // record verified_sender_sid. Header only, never the body. Absent for operator/human shells.
-  const sessionToken = process.env.TELEPTY_SESSION_TOKEN;
-  if (sessionToken) headers['x-telepty-session-token'] = sessionToken;
-  // Wrapped here rather than at the 45 call sites: every one of them either prints `e.message`
-  // or swallows the throw, so this is the single place the origin can be attached without
-  // changing what any caller does with the error.
-  return fetch(url, { ...options, headers }).catch((error) => { throw namedTransportError(url, error); });
-};
+
+
 
 function isSubmitForceDefaultEnabled(env = process.env) {
   const value = (env.TELEPTY_SUBMIT_FORCE_DEFAULT || '').trim().toLowerCase();
@@ -339,9 +280,7 @@ function daemonAnswer(status, endpoint) {
 // `session-cleanup.sh` and friends read as "nothing to do". Set centrally because every
 // discovery caller is a catch-and-print, and guarded on `require.main` so a cli.js required as
 // a library (tests, mcp-server) never has its host process's exit code rewritten under it.
-function markCommandFailed() {
-  if (require.main === module) process.exitCode = 1;
-}
+
 
 // The error for a daemon answer that is not a result. Tolerates a null answer (see
 // daemonAnswer) so an unclassifiable response still fails loudly instead of throwing here.
@@ -869,7 +808,8 @@ async function restartDaemonUnderLease(options = {}) {
 
     // (b) Wait up to 3s for old processes to fully exit
     if (results.stopped.length > 0) {
-      const { isProcessRunning } = require('./daemon-control');
+      const { isProcessRunning: defaultIsProcessRunning } = require('./daemon-control');
+      const isProcessRunning = options._isProcessRunning || defaultIsProcessRunning;
       const killDeadline = Date.now() + 3000;
       for (const item of results.stopped) {
         while (Date.now() < killDeadline && isProcessRunning(item.pid)) {
@@ -1037,11 +977,7 @@ function sanitizePathArg(input, label = 'path') {
 // #29: per-session backend classification, exposed for unit-testing. `env` and the kitty-socket
 // probe are injected (findKittySocketCli is nested in main()), so a test can drive each branch
 // without real env/sockets. Behavior matches the original inline ternary exactly.
-function classifyBackend(env, findKitty) {
-  if (env.TERM_PROGRAM === 'WarpTerminal') return 'warp';
-  if (env.CMUX_WORKSPACE_ID) return 'cmux';
-  return findKitty() ? 'kitty' : 'pty';
-}
+
 
 // #17 (OQ-2): decide whether a daemon WS 'close' is the daemon's explicit session-destroy
 // (code 1000 'Session destroyed') — in which case the bridge must terminate, not reconnect.
@@ -1068,23 +1004,7 @@ function isOwnerClaimRefusedClose(code) {
   return code === 4003;
 }
 
-function runUpdateInstall() {
-  if (process.env.TELEPTY_SKIP_PACKAGE_UPDATE === '1') {
-    return;
-  }
 
-  // #26: default self-update runs npm with a fixed arg array via execFileSync (no shell →
-  // no command injection). An explicit operator-supplied TELEPTY_UPDATE_COMMAND is a trusted
-  // env override (the operator deliberately chose to run a custom shell command — setting the
-  // env already implies shell control, so no privilege boundary is crossed). This execSync is
-  // accepted-by-design, consistent with the documented Snyk baseline waiver (CHANGELOG).
-  const override = process.env.TELEPTY_UPDATE_COMMAND;
-  if (override) {
-    execSync(override, { stdio: 'inherit' });
-    return;
-  }
-  execFileSync('npm', ['install', '-g', '@dmsdc-ai/aigentry-telepty@latest'], { stdio: 'inherit' });
-}
 
 // gh#61 defect 1 — did the update leave a daemon actually running?
 //
@@ -1978,51 +1898,13 @@ async function manageInteractive() {
 // payload parser: a bare `-h`/`--help` appearing before an explicit `--` separator
 // prints the subcommand usage and stops — zero network / fan-out side effects.
 // `telepty <subcommand> -- --help` remains the deliberate way to send the literal text.
-const TRAILING_PAYLOAD_HELP = {
-  allow: [
-    'Usage: telepty allow [--id <session_id>] [--idle-ttl <duration|off>] [--auto-restart] <command> [args...]',
-    '',
-    'Wrap a CLI so other sessions can inject into it. Aliases: enable, wrap.',
-    'Use `--` before the command to pass hyphenated arguments literally:',
-    '  telepty allow -- claude --help'
-  ],
-  inject: [
-    'Usage: telepty inject [--ref [file]] [--from <id>] [--reply-to <id>] [--submit] [--submit-force] [--submit-retry N] <session_id> "<prompt text>"',
-    '',
-    'Inject prompt text into a session. Use `--` before the prompt to send a payload',
-    'that starts with a hyphen: telepty inject my-session -- --help'
-  ],
-  multicast: [
-    'Usage: telepty multicast <id1,id2,...> "<prompt text>"',
-    '',
-    'Inject prompt text into multiple sessions. Use `--` before the prompt to send',
-    'a payload that starts with a hyphen: telepty multicast id1,id2 -- --help'
-  ],
-  broadcast: [
-    'Usage: telepty broadcast [--ref [file]] "<prompt text>"',
-    '',
-    'Inject prompt text into ALL active sessions. Use `--` before the prompt to send',
-    'a payload that starts with a hyphen: telepty broadcast -- --help'
-  ]
-};
+const TRAILING_PAYLOAD_HELP = cliSecurity.createTrailingPayloadHelp();
 
 // True when a bare `-h`/`--help` token appears before the first `--` separator
 // (everything after `--` is literal payload by universal CLI convention).
-function helpRequested(argv) {
-  for (const arg of argv) {
-    if (arg === '--') return false;
-    if (arg === '--help' || arg === '-h') return true;
-  }
-  return false;
-}
 
-function interceptSubcommandHelp(cmd, argv) {
-  const canonical = (cmd === 'enable' || cmd === 'wrap') ? 'allow' : cmd;
-  const lines = TRAILING_PAYLOAD_HELP[canonical];
-  if (!lines || !helpRequested(argv)) return false;
-  console.log(lines.join('\n'));
-  return true;
-}
+
+
 
 // telepty#51 defense-in-depth: even if help interception regresses, broadcast/multicast
 // must never fan out a bare help flag to every session. Literal sends remain possible
@@ -2380,77 +2262,9 @@ async function main() {
   }
 
   if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap') {
-    if (interceptSubcommandHelp(cmd, args.slice(1))) return; // telepty#51: never wrap "--help" as a command
-    // Parse arguments: telepty allow [--id <session_id>] <command> [args...]
-    // Also supports legacy: telepty allow [--id <session_id>] -- <command> [args...]
-    const allowArgs = args.slice(1);
-
-    // Extract --id flag
-    let sessionId;
-    const idIndex = allowArgs.indexOf('--id');
-    if (idIndex !== -1 && allowArgs[idIndex + 1]) {
-      sessionId = allowArgs[idIndex + 1];
-      allowArgs.splice(idIndex, 2);
-    }
-
-    // Extract per-session idle TTL override
-    let idleTtl = null;
-    const idleTtlIndex = allowArgs.indexOf('--idle-ttl');
-    if (idleTtlIndex !== -1) {
-      if (!allowArgs[idleTtlIndex + 1]) {
-        console.error('❌ Usage: telepty allow [--id <session_id>] [--idle-ttl <duration|off>] <command> [args...]');
-        process.exit(1);
-      }
-      idleTtl = allowArgs[idleTtlIndex + 1];
-      try {
-        lifecycle.parseDuration(idleTtl, { fieldName: 'idle_ttl' });
-      } catch (err) {
-        console.error(`❌ ${err.message}`);
-        process.exit(1);
-      }
-      allowArgs.splice(idleTtlIndex, 2);
-    }
-
-    // Extract --auto-restart flag
-    const autoRestartIndex = allowArgs.indexOf('--auto-restart');
-    const autoRestart = autoRestartIndex !== -1;
-    if (autoRestart) allowArgs.splice(autoRestartIndex, 1);
-
-    // Strip optional -- separator for backward compat
-    const sepIndex = allowArgs.indexOf('--');
-    if (sepIndex !== -1) allowArgs.splice(sepIndex, 1);
-
-    const command = allowArgs[0];
-    const cmdArgs = allowArgs.slice(1);
-
-    if (!command) {
-      console.error('❌ Usage: telepty allow [--id <session_id>] <command> [args...]');
-      process.exit(1);
-    }
-
-    // Default session ID = {folder}-{cli} (e.g. aigentry-dustcraw-claude)
-    if (!sessionId) {
-      const folder = path.basename(process.cwd());
-      const cli = path.basename(command).replace(/\..*$/, '');
-      sessionId = `${folder}-${cli}`;
-    }
-
-    // Override inherited TELEPTY_SESSION_ID — prevent parent session hijacking
-    // When launched via kitty @ launch, the parent's env leaks through.
-    // With --id flag, we always use the explicitly requested session ID.
-    if (process.env.TELEPTY_SESSION_ID && process.env.TELEPTY_SESSION_ID !== sessionId) {
-      console.error(`⚠️  [allow] Overriding inherited TELEPTY_SESSION_ID="${process.env.TELEPTY_SESSION_ID}" → "${sessionId}"`);
-    }
-    delete process.env.TELEPTY_SESSION_ID;
-    process.env.TELEPTY_SESSION_ID = sessionId;
-    process.env.TELEPTY_AVAILABLE = 'true';
-    // #43 P2 — drop any inherited verified-sender token so a parent process cannot smuggle one
-    // in; the daemon mints the real one at register (below) and we set it into the same
-    // protected env.
-    delete process.env.TELEPTY_SESSION_TOKEN;
-    // #47 P4 — same parent-hijack defense for the per-session provenance nonce: drop any inherited
-    // value so a parent cannot pre-seed a known nonce, then carry the daemon-minted one (below).
-    delete process.env.TELEPTY_SESSION_NONCE;
+    const allowInvocation = parseAllowInvocation(cmd, args);
+    if (!allowInvocation) return;
+    const { sessionId, command, cmdArgs, idleTtl, autoRestart } = allowInvocation;
 
     await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
@@ -2515,26 +2329,65 @@ async function main() {
     const MAX_CRASHES = 3;
     const DEATH_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'session-deaths.log');
 
-    function updateDaemonProcessMetadata() {
-      const body = {
-        session_id: sessionId,
-        command,
-        cwd: process.cwd(),
-        backend: detectedBackend,
-        cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
-        cmux_surface_id: process.env.CMUX_SURFACE_ID || null,
-        term_program: terminalProgram,
-        term: terminalType,
-        owner_pid: process.pid,
-        ...(child && child.pid ? { pty_pid: child.pid } : {}),
-        ...(idleTtl !== null ? { idle_ttl: idleTtl } : {})
-      };
-      fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      }).catch(() => {});
-    }
+    let allowSessionClosed = false;
+    const allowSecurity = createAllowSecurityContext({
+      get sessionId() { return sessionId; },
+      get command() { return command; },
+      get detectedBackend() { return detectedBackend; },
+      get terminalProgram() { return terminalProgram; },
+      get terminalType() { return terminalType; },
+      get child() { return child; },
+      get idleTtl() { return idleTtl; },
+      get DAEMON_URL() { return DAEMON_URL; },
+      get fetchWithAuth() { return fetchWithAuth; },
+      get resolveWindowsExecutable() { return resolveWindowsExecutable; },
+      get cmdArgs() { return cmdArgs; },
+      get sessionCwd() { return sessionCwd; },
+      get sessionEnv() { return sessionEnv; },
+      get sessionStartTime() { return sessionStartTime; },
+      get bridgeMailbox() { return bridgeMailbox; },
+      get bridgeTarget() { return bridgeTarget; },
+      get bridgeMsgSeq() { return bridgeMsgSeq; },
+      get bridgePendingCount() { return bridgePendingCount; },
+      get promptReady() { return promptReady; },
+      get lastUserInputTime() { return lastUserInputTime; },
+      get IDLE_THRESHOLD() { return IDLE_THRESHOLD; },
+      get knownAiCli() { return knownAiCli; },
+      get outputTail() { return outputTail; },
+      get readyRegistry() { return readyRegistry; },
+      get readyQualification() { return readyQualification; },
+      get promptPattern() { return promptPattern; },
+      get queueFlushTimer() { return queueFlushTimer; },
+      get idleCheckTimer() { return idleCheckTimer; },
+      get filterBridgeBatch() { return filterBridgeBatch; },
+      get bridgeInjectTtlSecs() { return bridgeInjectTtlSecs; },
+      get firstReadyObserved() { return firstReadyObserved; },
+      get interactionBinding() { return interactionBinding; },
+      get wsReady() { return wsReady; },
+      get daemonWs() { return daemonWs; },
+      get getTerminalSize() { return getTerminalSize; },
+      get allowSessionClosed() { return allowSessionClosed; },
+      get cleanupTerminal() { return cleanupTerminal; },
+      get currentOwnerToken() { return currentOwnerToken; },
+      get reconnectTimer() { return reconnectTimer; },
+      get heartbeatTimer() { return heartbeatTimer; },
+      get allowSignalHandlers() { return allowSignalHandlers; },
+      get FileMailbox() { return FileMailbox; },
+      get path() { return path; },
+      get os() { return os; },
+      get pty() { return pty; },
+      set child(value) { child = value; },
+      set sessionStartTime(value) { sessionStartTime = value; },
+      set bridgeMsgSeq(value) { bridgeMsgSeq = value; },
+      set bridgePendingCount(value) { bridgePendingCount = value; },
+      set outputTail(value) { outputTail = value; },
+      set readyQualification(value) { readyQualification = value; },
+      set queueFlushTimer(value) { queueFlushTimer = value; },
+      set idleCheckTimer(value) { idleCheckTimer = value; },
+      set promptReady(value) { promptReady = value; },
+      set allowSessionClosed(value) { allowSessionClosed = value; },
+    });
+    const { updateDaemonProcessMetadata, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession } = allowSecurity;
 
     function logSessionDeath(exitCode, signal, duration) {
       try {
@@ -2569,25 +2422,7 @@ async function main() {
       }
     }
 
-    function spawnChild() {
-      // Windows: walk %PATHEXT% so bare names (`claude`, `codex`, `gemini`)
-      // resolve to their npm-global `.cmd`/`.ps1` shims. POSIX: no-op. (#25)
-      const resolvedCommand = resolveWindowsExecutable(command, process.env);
-      // #26 (Snyk waiver, accepted-by-design): spawning the operator/user-chosen CLI IS the
-      // `telepty allow` feature — `command` comes from the local CLI invocation, not an
-      // untrusted boundary, so this is not an exploitable injection. Pre-existing baseline
-      // finding; not fixable without removing `telepty allow`.
-      child = pty.spawn(resolvedCommand, cmdArgs, {
-        name: 'xterm-256color',
-        cols: process.stdout.columns || 80,
-        rows: process.stdout.rows || 30,
-        cwd: sessionCwd,
-        env: sessionEnv
-      });
-      sessionStartTime = Date.now();
-      updateDaemonProcessMetadata();
-      return child;
-    }
+
 
     spawnChild();
 
@@ -2603,40 +2438,17 @@ async function main() {
     const IDLE_THRESHOLD = 2000; // ms after last user input to consider idle
 
     // Mailbox-backed inject queue (replaces in-memory array for crash resilience)
-    const bridgeMailbox = new FileMailbox({
-      root: path.join(os.homedir(), '.aigentry', 'mailbox', 'bridge'),
-    });
+    const bridgeMailbox = allowSecurity.createBridgeMailbox();
     const bridgeTarget = sessionId;
     let bridgeMsgSeq = 0;
     let bridgePendingCount = 0;
 
     // Recover undelivered messages from a previous crash
-    try {
-      const leftover = bridgeMailbox.peek(bridgeTarget).filter(m => m.state === 'pending' || m.state === 'in_flight');
-      bridgePendingCount = leftover.length;
-      if (bridgePendingCount > 0) {
-        console.log(`\x1b[33m[BRIDGE] Recovered ${bridgePendingCount} undelivered message(s) from previous session\x1b[0m`);
-      }
-    } catch {}
+    allowSecurity.recoverBridgeMailbox();
 
-    function enqueueBridgeMessage(text) {
-      const msgId = `${sessionId}:${Date.now()}:${++bridgeMsgSeq}`;
-      try {
-        bridgeMailbox.enqueue({
-          msg_id: msgId, from: 'daemon', to: bridgeTarget,
-          payload: text, created_at: Math.floor(Date.now() / 1000), attempt: 0,
-        });
-        bridgePendingCount++;
-      } catch (err) {
-        // Fallback: write directly if mailbox fails
-        console.error(`[BRIDGE] Mailbox enqueue failed, writing directly: ${err.message}`);
-        child.write(text);
-      }
-    }
 
-    function isIdle() {
-      return promptReady && (Date.now() - lastUserInputTime > IDLE_THRESHOLD);
-    }
+
+
 
     // #60 Stage A §3.7 — a ready frame is a DELIVERY-readiness hint, and the two ways we detect it
     // are not equally strong. A registry-tail match sees a known CLI's actual composer surface; a
@@ -2646,86 +2458,13 @@ async function main() {
     // turn ended. Qualify at the detection site and remember it, so the reconnect re-send below
     // cannot silently downgrade a qualified session to the legacy unqualified frame.
     let readyQualification = null;
-    function observePromptReady(data) {
-      if (knownAiCli) {
-        outputTail = (outputTail + data).slice(-20000);
-        const hit = readyRegistry.detectOutput(command, outputTail);
-        if (!hit.found) return false;
-        readyQualification = {
-          ready_kind: 'composer_surface_observed',
-          detector: hit.reason || 'registry_match',
-          cli_key: readyRegistry.commandKey(command),
-        };
-        return true;
-      }
-      if (!promptPattern.test(data)) return false;
-      readyQualification = {
-        ready_kind: 'prompt_suffix_observed',
-        detector: 'generic_prompt_suffix',
-        cli_key: null,
-      };
-      return true;
-    }
+
 
     let queueFlushTimer = null;
     let idleCheckTimer = null;
 
-    function flushBridgeMailbox() {
-      if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
-      if (idleCheckTimer) { clearInterval(idleCheckTimer); idleCheckTimer = null; }
-      if (bridgePendingCount === 0) return;
-      let delay = 0;
-      const batch = [];
-      // Dequeue all pending messages
-      while (true) {
-        const msg = bridgeMailbox.dequeue(bridgeTarget);
-        if (!msg) break;
-        batch.push(msg);
-      }
-      if (batch.length === 0) { bridgePendingCount = 0; return; }
-      // #720: drop stale-parked and consecutive-duplicate injects before writing,
-      // so a long-closed gate does not deliver the same question N times or replay
-      // an inject that went stale while parked.
-      const nowSecs = Math.floor(Date.now() / 1000);
-      const { deliver, dropped } = filterBridgeBatch(batch, {
-        ttlSecs: bridgeInjectTtlSecs(process.env), nowSecs,
-      });
-      for (const { msg, reason } of dropped) {
-        // Ack so the dropped inject clears in_flight instead of lingering; never write it.
-        try { bridgeMailbox.ack(bridgeTarget, msg.msg_id); } catch {}
-        console.warn(`\x1b[33m[BRIDGE] dropped ${reason} inject ${msg.msg_id} (age=${nowSecs - msg.created_at}s)\x1b[0m`);
-      }
-      for (const msg of deliver) {
-        const text = msg.payload;
-        const msgId = msg.msg_id;
-        setTimeout(() => {
-          child.write(text);
-          try { bridgeMailbox.ack(bridgeTarget, msgId); } catch {}
-        }, delay);
-        delay += text === '\r' ? 0 : 100;
-      }
-      bridgePendingCount = Math.max(0, bridgePendingCount - batch.length);
-      promptReady = false;
-    }
-    function scheduleIdleFlush() {
-      if (idleCheckTimer) return;
-      // Poll every 500ms for idle state
-      idleCheckTimer = setInterval(() => {
-        if (isIdle() && bridgePendingCount > 0) {
-          flushBridgeMailbox();
-        }
-      }, 500);
-      // Safety fallback is compatibility-only during known AI CLI bootstrap:
-      // first dispatch must wait for a strong ready signal.
-      if ((!knownAiCli || firstReadyObserved) && !queueFlushTimer) {
-        queueFlushTimer = setTimeout(() => {
-          queueFlushTimer = null;
-          if (bridgePendingCount > 0) {
-            flushBridgeMailbox();
-          }
-        }, 5000);
-      }
-    }
+
+
 
     // Connect to daemon WebSocket with auto-reconnect
     // owner=1 tells daemon this is the allow bridge (owner), not an attach viewer.
@@ -2756,6 +2495,14 @@ async function main() {
     // We echo it on the teardown DELETE so the daemon can tell our (current-owner) exit apart
     // from a stale/displaced owner's exit and avoid the shared-fate teardown.
     let currentOwnerToken = null;
+    let interactionBinding = null;
+
+    const writeInteraction = interaction.createInteractionWriter({
+      observe: () => readyRegistry.observeInteraction({ command }),
+      binding: () => interactionBinding,
+      encode: readyRegistry.encodeInteraction,
+      write: bytes => { child.write(bytes); invalidateBridgeInteraction('interaction'); }
+    });
     let lastInjectTextTime = 0;
     const MAX_RECONNECT_DELAY = 30000;
     // #732: bridge→daemon liveness interval. Must stay well under the daemon's
@@ -2883,9 +2630,20 @@ async function main() {
           const msg = JSON.parse(message);
           if (msg.type === 'owner_token') {
             currentOwnerToken = msg.token || null;
+            interactionBinding = msg.interaction_binding || null;
+            invalidateBridgeInteraction('owner_bound');
+            return;
+          }
+          if (msg.type === 'interaction') {
+            const receipt = !interactionBinding || msg.owner_generation !== interactionBinding.owner_generation
+              ? interaction.refusal('wrong_owner') : writeInteraction(msg);
+            daemonWs.send(JSON.stringify({ type: 'interaction_receipt',
+              action_id: msg.request?.action_id, request_digest: msg.request_digest,
+              receipt: { ...receipt, action_id: msg.request?.action_id, request_digest: msg.request_digest } }));
             return;
           }
           if (msg.type === 'inject') {
+            invalidateBridgeInteraction('automated_input');
             const chunks = [];
             const rawData = typeof msg.data === 'string' ? msg.data : String(msg.data ?? '');
             // Keep text+CR combined — do NOT split them.
@@ -2927,6 +2685,7 @@ async function main() {
               readyNotified = false;
             }
           } else if (msg.type === 'resize') {
+            invalidateBridgeInteraction('resize');
             child.resize(msg.cols, msg.rows);
           }
         } catch (e) {
@@ -2935,6 +2694,7 @@ async function main() {
       });
 
       daemonWs.on('close', (code, reason) => {
+        interactionBinding = null;
         wsReady = false;
         // #17 (OQ-2): the daemon explicitly destroyed this session (manual kill or the
         // surface-gone GC) → close code 1000 'Session destroyed'. Terminate the bridge
@@ -3039,50 +2799,22 @@ async function main() {
     const cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
       onData: (data) => {
         lastUserInputTime = Date.now();
+        invalidateBridgeInteraction('local_input');
         child.write(data.toString());
       },
       onResize: () => {
         const size = getTerminalSize(process.stdout, { cols: 120, rows: 40 });
+        invalidateBridgeInteraction('resize');
         child.resize(size.cols, size.rows);
       }
     });
-    let allowSessionClosed = false;
     const allowSignalHandlers = new Map();
 
     // #844: `destroySession: false` closes THIS bridge's own resources and nothing else — no
     // teardown DELETE, no mailbox purge. It is for the one caller that has been told, by the
     // daemon, that it does not own this id (close 4003): the session and its queued deliveries
     // belong to somebody else, so neither is ours to discard.
-    function closeAllowSession({ destroySession = true } = {}) {
-      if (allowSessionClosed) {
-        return false;
-      }
 
-      allowSessionClosed = true;
-      cleanupTerminal();
-      // Purge bridge mailbox on clean exit (undelivered messages are stale)
-      if (destroySession) {
-        try { bridgeMailbox.purge(bridgeTarget); } catch {}
-      }
-      process.stdout.write(`\x1b]0;\x07`);
-      // BUG-C: carry our owner token so the daemon destroys only on the CURRENT owner's exit;
-      // a stale/displaced owner's DELETE (mismatched token) must not tear down the live owner.
-      if (destroySession) {
-        const deleteUrl = currentOwnerToken
-          ? `${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}?owner_token=${encodeURIComponent(currentOwnerToken)}`
-          : `${DAEMON_URL}/api/sessions/${encodeURIComponent(sessionId)}`;
-        fetchWithAuth(deleteUrl, { method: 'DELETE' }).catch(() => {});
-      }
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (heartbeatTimer) clearInterval(heartbeatTimer);   // #732
-      try {
-        daemonWs.close();
-      } catch {}
-      for (const [signalName, handler] of allowSignalHandlers) {
-        process.off(signalName, handler);
-      }
-      return true;
-    }
 
     function exitAllowSession(code, exitCtx) {
       if (exitCtx) {
@@ -3109,6 +2841,8 @@ async function main() {
     // below cannot drift from it.
     let ptyBytesRead = 0;
     function relayPtyOutput(data) {
+      // No additional output frame: the daemon sees this same output and invalidates there.
+      if (interactionBinding) interactionBinding.input_generation++;
       ptyBytesRead += data.length;
       const rewritten = rewriteTitleSequences(data);
       process.stdout.write(rewritten);
@@ -3703,6 +3437,37 @@ async function main() {
       console.log(`✅ Enter sent successfully into '\x1b[36m${target.id}\x1b[0m'.`);
     } catch (e) {
       console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`);
+    }
+    return;
+  }
+
+  if (cmd === 'session' && args[1] === 'interaction') {
+    // JSON only, explicit target; no target discovery/SSH fallback or shell evaluation.
+    const [, , sid, operation, value, ...extra] = args;
+    try {
+      if (!interaction.validId(sid) || !['observe', 'receipt', 'act'].includes(operation)
+          || extra.length || (operation === 'observe' ? value !== undefined : value === undefined)) {
+        throw new Error('Usage: telepty session interaction <sid> observe | receipt <action-id> | act <JSON>');
+      }
+      let body;
+      if (operation === 'act') {
+        if (Buffer.byteLength(value) > 16384) throw new Error('Interaction request exceeds 16384 bytes');
+        body = JSON.parse(value);
+        const invalid = interaction.validateRequest(body);
+        if (invalid && invalid !== 'expired') throw new Error(invalid);
+        if (body.identity.sid !== sid) throw new Error('wrong_owner');
+      }
+      if (operation === 'receipt' && !interaction.validId(value)) throw new Error('invalid_request');
+      const suffix = operation === 'receipt' ? `/receipts/${encodeURIComponent(value)}` : '';
+      const response = await fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(sid)}/interaction${suffix}`,
+        operation === 'act' ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+      const result = await response.json();
+      console.log(JSON.stringify(result));
+      if (!response.ok || result.stage === 'refused' || result.stage === 'outcome_unknown'
+          || result.available === false) process.exitCode = 1;
+    } catch (error) {
+      console.error(JSON.stringify(interaction.refusal('invalid_request', { detail: error.message })));
+      process.exitCode = 1;
     }
     return;
   }
@@ -4953,6 +4718,9 @@ function printGlobalHelp() {
   telepty kill <id[@host]> [--force] [--timeout N]  Gracefully terminate a session
   telepty clean [--older-than 7d] [--idle] [--dry-run]  Clean ghost or old sessions
   telepty session info <id[@host]> [--json]      Show session metadata
+  telepty session interaction <sid> observe     Typed capabilities (live adapter unavailable)
+  telepty session interaction <sid> receipt <action-id>  Read durable action receipt
+  telepty session interaction <sid> act <JSON>  Bound opt-in action; JSON response, no legacy force
 
 \x1b[1mInject & Communicate:\x1b[0m
   telepty inject [--ref [file]] [--from <id>] <id[@host]> "<prompt>"  Inject text

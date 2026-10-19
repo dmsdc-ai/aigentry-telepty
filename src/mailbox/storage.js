@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { resolveSessionDir, checkRoot, checkFile, openFile, readFile, writeFile, unlinkFile, rethrowBoundary } = require('./path-boundary');
 
 // --- Advisory file locking (PID-based, per-session) ---
 
@@ -33,11 +34,10 @@ function acquireLock(sessionDir, options = {}) {
 
   while (Date.now() < deadline) {
     try {
-      const fd = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      fs.writeSync(fd, String(process.pid));
-      fs.closeSync(fd);
+      const fd = openFile(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }
       return () => {
-        try { fs.unlinkSync(lockPath); } catch {}
+        try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
       };
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
@@ -47,29 +47,31 @@ function acquireLock(sessionDir, options = {}) {
       // Fix 2: Lock age threshold — if lock is older than staleLockAgeMs,
       // break regardless of PID (handles PID recycling)
       try {
-        const stat = fs.statSync(lockPath);
+        const stat = checkFile(lockPath);
         const ageMs = Date.now() - stat.mtimeMs;
         if (ageMs > staleLockAgeMs) {
-          try { fs.unlinkSync(lockPath); } catch {}
+          try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
           continue;
         }
-      } catch {
+      } catch (err) {
+        rethrowBoundary(err);
         // stat failed — file may have been removed between EEXIST and stat
         continue;
       }
 
       // Fix 1: Invalid PID handling — treat NaN, 0, negative, empty as stale
       try {
-        const content = fs.readFileSync(lockPath, 'utf8').trim();
+        const content = readFile(lockPath).trim();
         const pid = Number(content);
         if (!Number.isFinite(pid) || pid <= 0 || !isProcessAlive(pid)) {
           // Invalid PID (empty, NaN, 0, negative) OR dead PID → stale lock
-          try { fs.unlinkSync(lockPath); } catch {}
+          try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
           continue;
         }
-      } catch {
+      } catch (err) {
+        rethrowBoundary(err);
         // Can't read lock file — remove and retry
-        try { fs.unlinkSync(lockPath); } catch {}
+        try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
         continue;
       }
 
@@ -98,13 +100,13 @@ function breakStaleLocks(root, options = {}) {
 
   for (const { sessionId, dir } of dirs) {
     const lockPath = path.join(dir, '.lock');
-    if (!fs.existsSync(lockPath)) continue;
+    if (!checkFile(lockPath)) continue;
 
     let shouldBreak = false;
     let reason = '';
 
     try {
-      const stat = fs.statSync(lockPath);
+      const stat = checkFile(lockPath);
       const ageMs = Date.now() - stat.mtimeMs;
 
       if (ageMs > staleLockAgeMs) {
@@ -112,7 +114,7 @@ function breakStaleLocks(root, options = {}) {
         reason = `age ${Math.round(ageMs / 1000)}s > ${Math.round(staleLockAgeMs / 1000)}s threshold`;
       } else {
         // Check PID validity
-        const content = fs.readFileSync(lockPath, 'utf8').trim();
+        const content = readFile(lockPath).trim();
         const pid = Number(content);
         if (!Number.isFinite(pid) || pid <= 0) {
           shouldBreak = true;
@@ -122,14 +124,15 @@ function breakStaleLocks(root, options = {}) {
           reason = `dead PID ${pid}`;
         }
       }
-    } catch {
+    } catch (err) {
+      rethrowBoundary(err);
       // Can't read/stat lock — treat as stale
       shouldBreak = true;
       reason = 'unreadable lock file';
     }
 
     if (shouldBreak) {
-      try { fs.unlinkSync(lockPath); } catch {}
+      try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
       console.log(`[MAILBOX] Broke stale lock for ${sessionId}: ${reason}`);
       broken++;
     }
@@ -141,8 +144,8 @@ function breakStaleLocks(root, options = {}) {
 // --- JSONL read/write ---
 
 function readJsonl(filePath) {
-  if (!fs.existsSync(filePath)) return [];
-  const content = fs.readFileSync(filePath, 'utf8');
+  if (!checkFile(filePath)) return [];
+  const content = readFile(filePath);
   const results = [];
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
@@ -157,27 +160,29 @@ function readJsonl(filePath) {
 }
 
 function appendJsonl(filePath, obj) {
-  fs.appendFileSync(filePath, JSON.stringify(obj) + '\n');
+  writeFile(filePath, JSON.stringify(obj) + '\n', true);
 }
 
 function writeJsonl(filePath, objects) {
   const content = objects.map(o => JSON.stringify(o)).join('\n') + (objects.length > 0 ? '\n' : '');
-  fs.writeFileSync(filePath, content);
+  writeFile(filePath, content);
 }
 
 // --- Session directory helpers ---
 
 function ensureSessionDir(root, sessionId) {
-  const dir = path.join(root, sessionId);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  return dir;
+  const dir = resolveSessionDir(root, sessionId);
+  try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (err) {
+    if (err.code !== 'EEXIST') throw err;
+  }
+  return resolveSessionDir(root, sessionId);
 }
 
 function listSessionDirs(root) {
-  if (!fs.existsSync(root)) return [];
+  checkRoot(root);
   return fs.readdirSync(root, { withFileTypes: true })
-    .filter(d => d.isDirectory() && !d.name.startsWith('.'))
-    .map(d => ({ sessionId: d.name, dir: path.join(root, d.name) }));
+    .filter(d => d.isDirectory() || d.isSymbolicLink())
+    .map(d => ({ sessionId: d.name, dir: resolveSessionDir(root, d.name) }));
 }
 
 // --- State helpers ---

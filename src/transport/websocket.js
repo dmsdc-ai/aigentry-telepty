@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { invalidateInteraction } = require('../interaction');
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
 
@@ -60,7 +61,8 @@ function installWebSocketTransport(deps) {
     // #826 — policy + audit for the viewer write path, so it matches POST /inject. Returns
     // whether the frame may be forwarded, and records the attempt either way. Optional, same
     // convention as above; the daemon always passes it.
-    authorizeViewerInject
+    authorizeViewerInject,
+    acceptInteractionReceipt
   } = deps;
 
   /**
@@ -347,7 +349,15 @@ function installWebSocketTransport(deps) {
       // so the live current owner always holds the current token while a displaced owner keeps a
       // stale one.
       activeSession.ownerToken = crypto.randomUUID();
-      try { ws.send(JSON.stringify({ type: 'owner_token', token: activeSession.ownerToken })); } catch {}
+      activeSession.interactionOwnerGeneration = crypto.randomUUID();
+      invalidateInteraction(activeSession, 'owner_replaced');
+      try { ws.send(JSON.stringify({ type: 'owner_token', token: activeSession.ownerToken,
+        interaction_binding: { sid: sessionId, session_epoch: activeSession.sessionEpoch,
+          credential_generation: activeSession.credentialGeneration || 1,
+          owner_generation: activeSession.interactionOwnerGeneration,
+          input_generation: activeSession.interactionInputGeneration || 0,
+          geometry_generation: activeSession.interactionGeometryGeneration || 0,
+          surface_id: activeSession.cmuxSurfaceId || sessionId } })); } catch {}
       markSessionConnected(activeSession);
       initializeBootstrapState(activeSession);
       console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
@@ -437,8 +447,26 @@ function installWebSocketTransport(deps) {
         }
 
         if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+          if (type === 'interaction_receipt') {
+            if (typeof acceptInteractionReceipt === 'function') acceptInteractionReceipt(sessionId, activeSession, ws, msg);
+            return;
+          }
+          if (type === 'interaction_invalidated') {
+            if (msg.owner_generation !== activeSession.interactionOwnerGeneration) return;
+            if (!Number.isSafeInteger(msg.input_generation) || msg.input_generation < 0
+                || !Number.isSafeInteger(msg.geometry_generation) || msg.geometry_generation < 0) return;
+            activeSession.interactionInputGeneration = Math.max(activeSession.interactionInputGeneration || 0, msg.input_generation);
+            activeSession.interactionGeometryGeneration = Math.max(activeSession.interactionGeometryGeneration || 0, msg.geometry_generation);
+            if (Number.isInteger(msg.cols) && msg.cols > 0 && msg.cols <= 1000
+                && Number.isInteger(msg.rows) && msg.rows > 0 && msg.rows <= 1000) {
+              activeSession.cols = msg.cols;
+              activeSession.rows = msg.rows;
+            }
+            return;
+          }
           // Owner sending output -> broadcast to other clients + update activity
           if (type === 'output') {
+            invalidateInteraction(activeSession, 'output');
             activeSession.lastActivityAt = new Date().toISOString();
             appendToOutputRing(activeSession, data);
             sessionStateManager.feed(sessionId, data);
@@ -541,7 +569,10 @@ function installWebSocketTransport(deps) {
                   principal: presentedPrincipal
                 })
                 : true;
-              if (allowed) deliver(data);
+              if (allowed) {
+                invalidateInteraction(activeSession, 'viewer_input');
+                deliver(data);
+              }
             }
           } else if (type === 'resize') {
             // RESIZE IS DELIBERATELY NOT BEHIND THE INJECT GATE.
@@ -559,7 +590,10 @@ function installWebSocketTransport(deps) {
             // Accountability for geometry, if it is wanted, needs its own record kind with its
             // own fields — a decision, not a side effect of tidying this branch.
             const resize = viewerResizeDeliverer(activeSession);
-            if (resize) resize(cols, rows);
+            if (resize) {
+              invalidateInteraction(activeSession, 'resize');
+              resize(cols, rows);
+            }
           }
         }
       } catch (e) {

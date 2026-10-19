@@ -159,7 +159,8 @@ function stripAnsi(str) {
 // ---------------------------------------------------------------------------
 
 class SessionStateMachine {
-  constructor(sessionId, config = {}) {
+  constructor(sessionId, config = {}, scheduler = { setInterval, clearInterval }) {
+    this._scheduler = scheduler;
     this.sessionId = sessionId;
     this.config = { ...DEFAULT_CONFIG, ...config };
 
@@ -188,7 +189,7 @@ class SessionStateMachine {
     this._listeners = [];
 
     // Periodic state check
-    this._pollTimer = setInterval(() => this._tick(), this.config.poll_interval_ms);
+    this._pollTimer = this._scheduler.setInterval(() => this._tick(), this.config.poll_interval_ms);
 
     // #60 §2.3 row 1 — stamp the start phase through markStarting() rather than leaving `_detail`
     // null. The constructor used to assign the STARTING state directly, so a session that had only
@@ -276,7 +277,7 @@ class SessionStateMachine {
 
   destroy() {
     if (this._pollTimer) {
-      clearInterval(this._pollTimer);
+      this._scheduler.clearInterval(this._pollTimer);
       this._pollTimer = null;
     }
     this._listeners = [];
@@ -547,7 +548,8 @@ class SessionStateMachine {
 // ---------------------------------------------------------------------------
 
 class SessionStateManager {
-  constructor(config = {}) {
+  constructor(config = {}, scheduler = { setInterval, clearInterval }) {
+    this._scheduler = scheduler;
     this.config = config;
     this._machines = new Map();  // sessionId → SessionStateMachine
     this._globalListeners = [];  // (sessionId, from, to, detail) => {}
@@ -562,7 +564,7 @@ class SessionStateManager {
     }
 
     const mergedConfig = { ...this.config, ...sessionConfig };
-    const sm = new SessionStateMachine(sessionId, mergedConfig);
+    const sm = new SessionStateMachine(sessionId, mergedConfig, this._scheduler);
 
     // Wire global listeners
     sm.onTransition((from, to, detail) => {

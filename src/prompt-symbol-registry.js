@@ -13,6 +13,16 @@
 
 'use strict';
 
+// Interaction observations intentionally do not reuse detectOutput or strip an output ring.
+// No measured current-frame provider is staged. This module is the future adapter boundary,
+// not a request-controlled capability toggle. Legacy readiness predicates stay unchanged.
+function observeInteraction() {
+  return require('./interaction').unavailableObservation();
+}
+
+function encodeInteraction() { return null; }
+
+
 // #737: the pre-prompt UIs codex's detect() step 1 rejects, hoisted so the delivery-path
 // modal predicate (detectSurfaceModal, below) scans for EXACTLY the same shapes and the two
 // cannot drift apart. Flags are per-pattern and deliberate — the first two are
@@ -405,6 +415,8 @@ function detectOutput(command, output) {
 }
 
 module.exports = {
+  observeInteraction,
+  encodeInteraction,
   lookup,
   commandKey,
   isKnownAiCli,

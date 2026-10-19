@@ -15,7 +15,7 @@ const { DeliveryEngine } = require('../src/mailbox/delivery');
 // --- Helpers ---
 
 function createTmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-lock-test-'));
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-lock-test-')));
 }
 
 function createSessionDir(root, sessionId) {

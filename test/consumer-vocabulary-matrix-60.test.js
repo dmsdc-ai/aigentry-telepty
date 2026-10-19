@@ -200,19 +200,45 @@ test('consumer_vocabulary_matrix_is_total: telepty list --json exposes no intern
   // because the shape is what consumers bind to, and a re-added field would not fail any behaviour
   // test until a consumer read it again.
   const daemonSrc = fs.readFileSync(path.join(__dirname, '..', 'daemon.js'), 'utf8');
-  const serializeStart = daemonSrc.indexOf('activityObservation:');
-  assert.ok(serializeStart > 0, 'serializeSession must expose activityObservation');
+  const inspectionSrc = fs.readFileSync(path.join(__dirname, '..', 'src/routes/session-inspection.js'), 'utf8');
+  const serializeStart = inspectionSrc.indexOf('function serializeSession(');
+  const serializeEnd = inspectionSrc.indexOf('\nfunction getSubmitStrategy(', serializeStart);
+  assert.ok(serializeStart >= 0 && serializeEnd > serializeStart, 'inspect the actual serializeSession body');
+  const serializeSrc = inspectionSrc.slice(serializeStart, serializeEnd);
+  assert.ok(serializeSrc.includes('activityObservation:'), 'serializeSession must expose activityObservation');
+
+  // Follow the actual factory, shared capability binding and registered HTTP consumers.
+  assert.ok(daemonSrc.includes("const { createSessionInspectionContext } = require('./src/routes/session-inspection');"));
+  const contextStart = daemonSrc.indexOf('const sessionInspection = createSessionInspectionContext({');
+  const contextEnd = daemonSrc.indexOf('\n});', contextStart);
+  assert.ok(contextStart >= 0 && contextEnd > contextStart, 'daemon must construct the inspection context');
+  assert.ok(daemonSrc.slice(contextStart, contextEnd).includes('get CAPABILITY_STAGE_A() { return CAPABILITY_STAGE_A; }'),
+    'the serializer capability must come from the daemon shared binding');
+  assert.ok(daemonSrc.includes("const completionObservation = require('./src/completion-observation');"));
+  assert.ok(daemonSrc.includes('const { CAPABILITY_STAGE_A, classifyConsumption, buildCompletionUnknown, formatCompletionUnknownText, shouldPushCompletionUnknown } = completionObservation;'));
+  assert.ok(inspectionSrc.includes('module.exports = { createSessionInspectionContext };'));
+  assert.ok(inspectionSrc.includes('  serializeSession,\n'));
+  assert.ok(daemonSrc.includes('const { serializeSession, getSubmitStrategy, submitViaOsascript, runSubmitAll } = sessionInspection;'));
+  for (const route of ['registerListRoute', 'registerGetRoute']) {
+    assert.ok(inspectionSrc.includes('function ' + route + '(app) {'));
+    assert.ok(inspectionSrc.includes('  ' + route + ',\n'));
+    assert.ok(daemonSrc.includes('sessionInspection.' + route + '(app);'), route + ' must be registered');
+  }
+  assert.ok(inspectionSrc.includes("app.get('/api/sessions', (req, res) => {"));
+  assert.ok(inspectionSrc.includes('Object.entries(shared.sessions).map(([id, session]) => serializeSession(id, session, { nowMs: now }))'));
+  assert.ok(inspectionSrc.includes("app.get('/api/sessions/:id', (req, res) => {"));
+  assert.ok(inspectionSrc.includes('...serializeSession(resolvedId, session),'));
 
   // The removed field, in the shape a consumer would read: `autoState: {` inside the serialized
   // payload. Its absence is what makes `activityObservation` load-bearing rather than additive.
-  const emitsAutoState = /^\s{4}autoState:/m.test(daemonSrc);
+  const emitsAutoState = /^\s{4}autoState:/m.test(serializeSrc);
   assert.equal(emitsAutoState, false,
     'serializeSession must not export the internal FSM value as autoState — consumers read it as "the turn is over"');
 
   // …and the completion block travels beside it, permanently unknown.
-  assert.ok(/completion:\s*\{[\s\S]{0,200}completion_fact:\s*null/.test(daemonSrc),
+  assert.ok(/completion:\s*\{[\s\S]{0,200}completion_fact:\s*null/.test(serializeSrc),
     'the serialized session must carry a separate, permanently-null completion block');
-  assert.ok(/capability:\s*\{\s*\.\.\.CAPABILITY_STAGE_A\s*\}/.test(daemonSrc),
+  assert.ok(/capability:\s*\{\s*\.\.\.shared\.CAPABILITY_STAGE_A\s*\}/.test(serializeSrc),
     'the completion block must carry the explicit capability gaps (§A4)');
 });
 

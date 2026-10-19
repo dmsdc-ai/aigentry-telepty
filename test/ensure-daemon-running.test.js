@@ -120,26 +120,32 @@ test('ensureDaemonRunning: healthy daemon + slow /api/sessions (timeout) → NO 
 
 test('ensureDaemonRunning: version mismatch → DOES restart (legit)', async () => {
   const restart = recordingRestart();
+  const portOwnerQueries = [];
   await ensureDaemonRunning({
     requiredCapabilities: [CAP],
     _getDaemonMeta: async () => ({ version: '0.0.1', capabilities: [CAP] }),
     _fetchWithAuth: okFetch(),
     _restartDaemonGraceful: restart,
+    _findPortOwnerPid: (port) => { portOwnerQueries.push(port); return null; },
     _probe: { attempts: 3, backoffMs: 0 }
   });
   assert.equal(restart.calls.length, 1, 'a genuine version mismatch must still restart');
+  assert.deepEqual(portOwnerQueries, [Number(process.env.TELEPTY_PORT || 3848)]);
 });
 
 test('ensureDaemonRunning: required capability missing → DOES restart (legit)', async () => {
   const restart = recordingRestart();
+  const portOwnerQueries = [];
   await ensureDaemonRunning({
     requiredCapabilities: [CAP],
     _getDaemonMeta: async () => ({ version: pkg.version, capabilities: [] }),
     _fetchWithAuth: okFetch(),
     _restartDaemonGraceful: restart,
+    _findPortOwnerPid: (port) => { portOwnerQueries.push(port); return null; },
     _probe: { attempts: 3, backoffMs: 0 }
   });
   assert.equal(restart.calls.length, 1, 'a genuinely missing capability must still restart');
+  assert.deepEqual(portOwnerQueries, [Number(process.env.TELEPTY_PORT || 3848)]);
 });
 
 test('ensureDaemonRunning: no daemon at all (meta null + sessions refused) → DOES start (legit)', async () => {

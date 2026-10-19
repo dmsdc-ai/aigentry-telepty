@@ -29,6 +29,8 @@ class DeliveryEngine {
     this.sessionResolver = options.sessionResolver || (() => this.mailbox.listSessions());
     this.pollMs = options.pollMs || mailbox.config.deliveryPollMs || 200;
     this.onDelivery = options.onDelivery || null;
+    this._setInterval = options.setInterval || setInterval;
+    this._clearInterval = options.clearInterval || clearInterval;
     this._timer = null;
     this._running = false;
     this._tickInProgress = false;
@@ -44,7 +46,7 @@ class DeliveryEngine {
   start() {
     if (this._running) return;
     this._running = true;
-    this._timer = setInterval(() => this._tick(), this.pollMs);
+    this._timer = this._setInterval(() => this._tick(), this.pollMs);
     if (this._timer.unref) this._timer.unref();
     console.log(`[MAILBOX] DeliveryEngine started (poll: ${this.pollMs}ms)`);
   }
@@ -55,7 +57,7 @@ class DeliveryEngine {
   stop() {
     this._running = false;
     if (this._timer) {
-      clearInterval(this._timer);
+      this._clearInterval(this._timer);
       this._timer = null;
     }
     console.log('[MAILBOX] DeliveryEngine stopped');

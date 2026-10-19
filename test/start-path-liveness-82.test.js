@@ -177,17 +177,20 @@ test('gh#82 T2 (control): health silent too ⇒ the absent daemon is still auto-
 });
 
 test('gh#82 A: a version-mismatch restart is NOT flagged as an absence verdict', async () => {
+  const portOwnerQueries = [];
   const doRestart = recordingRestart();
   await ensureDaemonRunning({
     _getDaemonMeta: async () => ({ version: '0.0.1', capabilities: [CAP] }),
     _fetchWithAuth: async () => ({ ok: true, json: async () => [] }),
     _probeDaemonHealth: async () => { throw new Error('health must not be probed on a confirmed daemon'); },
     _restartDaemonGraceful: doRestart,
+    _findPortOwnerPid: (port) => { portOwnerQueries.push(port); return null; },
     _detectSupervisor: noSupervisor,
     _probe: { attempts: 1, backoffMs: 0 }
   });
   assert.equal(doRestart.calls.length, 1);
   assert.equal(doRestart.calls[0].absenceVerdict, false, 'replacing a daemon we KNOW answered must keep stopping it');
+  assert.deepEqual(portOwnerQueries, [Number(process.env.TELEPTY_PORT || 3848)]);
 });
 
 // ── (A) the guard at the choke point ──────────────────────────────────────────
@@ -306,9 +309,11 @@ test('gh#82 C: the meta deadline escalates on retry, so `start` needs failure at
 // ── (E) the log ───────────────────────────────────────────────────────────────
 
 test('gh#82 T6 (E): a failed restart attempt writes one line saying what was attempted and why', async () => {
+  const checkedPids = [];
   const log = recordingLog();
   await restartDaemonGraceful(restartSeams({
     maxAttempts: 2,
+    _isProcessRunning: (pid) => { checkedPids.push(pid); return false; },
     _cleanupDaemonProcesses: () => ({ stopped: [{ pid: 4242 }], failed: [] }),
     _waitForDaemonHealth: async () => null, // nothing came back — the environment-A shape
     _logDaemonRestartEvent: log
@@ -323,6 +328,7 @@ test('gh#82 T6 (E): a failed restart attempt writes one line saying what was att
   assert.equal(failed[0].stopped, 1);
   assert.equal(failed[0].reason, 'no-daemon-after-spawn', 'a bare "attempt n/N failed" is what made this a multi-round remote diagnosis');
   assert.equal(failed[1].attempt, '2/2');
+  assert.deepEqual(checkedPids, [4242, 4242]);
 });
 
 test('gh#82 T6 (E): the reason reaches the real log file under ~/.telepty/logs', async () => {

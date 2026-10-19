@@ -71,12 +71,15 @@ test('restartSupervisorDaemon: systemd variants and schtasks use their superviso
 
 test('restartDaemonGraceful: supervised restart uses supervisor and never starts detached (#757)', async () => {
   let detachedStarts = 0;
+  const checkedPids = [];
   let supervisorRestarts = 0;
   let healthCalls = 0;
 
   const result = await restartDaemonGraceful({
     maxAttempts: 1,
     _detectSupervisor: launchd,
+    _supervisedPort: (detected) => { assert.deepEqual(detected, launchd()); return 3848; },
+    _isProcessRunning: (pid) => { checkedPids.push(pid); return false; },
     _cleanupDaemonProcesses: () => ({ stopped: [{ pid: 111 }], failed: [] }),
     _startDetachedDaemon: () => { detachedStarts += 1; },
     _restartSupervisorDaemon: () => { supervisorRestarts += 1; return { success: true }; },
@@ -92,15 +95,19 @@ test('restartDaemonGraceful: supervised restart uses supervisor and never starts
   assert.equal(result.supervisor, 'launchd');
   assert.equal(supervisorRestarts, 1);
   assert.equal(detachedStarts, 0);
+  assert.deepEqual(checkedPids, [111]);
 });
 
 test('restartDaemonGraceful: supervisor auto-restore is accepted without detached spawn', async () => {
   let detachedStarts = 0;
+  const checkedPids = [];
   let supervisorRestarts = 0;
 
   const result = await restartDaemonGraceful({
     maxAttempts: 1,
     _detectSupervisor: launchd,
+    _supervisedPort: (detected) => { assert.deepEqual(detected, launchd()); return 3848; },
+    _isProcessRunning: (pid) => { checkedPids.push(pid); return false; },
     _cleanupDaemonProcesses: () => ({ stopped: [{ pid: 111 }], failed: [] }),
     _startDetachedDaemon: () => { detachedStarts += 1; },
     _restartSupervisorDaemon: () => { supervisorRestarts += 1; return { success: true }; },
@@ -112,6 +119,7 @@ test('restartDaemonGraceful: supervisor auto-restore is accepted without detache
   assert.equal(result.success, true);
   assert.equal(supervisorRestarts, 0);
   assert.equal(detachedStarts, 0);
+  assert.deepEqual(checkedPids, [111]);
 });
 
 test('restartDaemonGraceful: supervised restart failure does not fall back to detached spawn', async () => {
@@ -121,6 +129,7 @@ test('restartDaemonGraceful: supervised restart failure does not fall back to de
     const result = await restartDaemonGraceful({
       maxAttempts: 1,
       _detectSupervisor: launchd,
+      _supervisedPort: (detected) => { assert.deepEqual(detected, launchd()); return 3848; },
       _cleanupDaemonProcesses: () => ({ stopped: [], failed: [] }),
       _startDetachedDaemon: () => { detachedStarts += 1; },
       _restartSupervisorDaemon: () => ({ success: false, error: 'launchctl failed' }),
