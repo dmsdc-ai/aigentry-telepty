@@ -14,7 +14,7 @@ nodeTest('lifecycle-cleanup-681', { concurrency: false }, async t => {
     return fn();
   }
   const lifecycle=step('import-lifecycle',()=>require('../src/lifecycle'));
-  const fixtureRoot=fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-cleanup-681-'));
+  const fixtureRoot=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-cleanup-681-')));
   try {
     step('fixture-root',()=>assert.ok(fs.statSync(fixtureRoot).isDirectory()));
   const helperOutcomes = [];

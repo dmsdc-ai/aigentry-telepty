@@ -2329,6 +2329,7 @@ async function main() {
     const MAX_CRASHES = 3;
     const DEATH_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'session-deaths.log');
 
+    let allowSessionClosed = false;
     const allowSecurity = createAllowSecurityContext({
       get sessionId() { return sessionId; },
       get command() { return command; },
@@ -2807,7 +2808,6 @@ async function main() {
         child.resize(size.cols, size.rows);
       }
     });
-    let allowSessionClosed = false;
     const allowSignalHandlers = new Map();
 
     // #844: `destroySession: false` closes THIS bridge's own resources and nothing else — no
