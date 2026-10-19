@@ -131,6 +131,7 @@ test('deferToSupervisor: a daemon that came back REFUSING is delivered, not decl
   let markerWritten = null;
   const result = await quietStderr(() => deferToSupervisor({
     _detectSupervisor: supervisorPresent,
+    _supervisedPort: (detected) => { assert.deepEqual(detected, supervisorPresent()); return 3848; },
     _getDaemonMeta: async () => refusal,
     _readSupervisorDeferMarker: () => null,
     _writeSupervisorDeferMarker: (m) => { markerWritten = m; },
@@ -148,6 +149,7 @@ test('deferToSupervisor: an old daemon (404 on /api/meta) is delivered too', asy
   const legacy = answer(404);
   const result = await quietStderr(() => deferToSupervisor({
     _detectSupervisor: supervisorPresent,
+    _supervisedPort: (detected) => { assert.deepEqual(detected, supervisorPresent()); return 3848; },
     _getDaemonMeta: async () => legacy,
     _readSupervisorDeferMarker: () => null,
     _writeSupervisorDeferMarker: () => {},
@@ -162,6 +164,7 @@ test('deferToSupervisor: genuine silence is still a non-delivery — the #738 be
   let markerWritten = null;
   const result = await quietStderr(() => deferToSupervisor({
     _detectSupervisor: supervisorPresent,
+    _supervisedPort: (detected) => { assert.deepEqual(detected, supervisorPresent()); return 3848; },
     _getDaemonMeta: async () => null,
     _readSupervisorDeferMarker: () => null,
     _writeSupervisorDeferMarker: (m) => { markerWritten = m; },
@@ -194,6 +197,7 @@ test('ensureDaemonRunning: a refusal reached through the supervisor path never b
         _writeRestartFailureMarker: () => {},
         _clearRestartFailureMarker: () => {},
         _detectSupervisor: supervisorPresent,
+        _supervisedPort: (detected) => { assert.deepEqual(detected, supervisorPresent()); return 3848; },
         _readSupervisorDeferMarker: () => null,
         _writeSupervisorDeferMarker: () => {},
         _clearSupervisorDeferMarker: () => {},

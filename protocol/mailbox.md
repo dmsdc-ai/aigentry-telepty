@@ -239,6 +239,53 @@ export interface MailboxProtocol {
 
 ## 11. Changelog
 
+### Node FileMailbox storage boundary
+
+Session IDs used by FileMailbox must be primitive, nonempty strings of at most
+128 UTF-8 bytes. C0, DEL and C1 controls, slash, backslash, `.` and `..`, absolute
+paths and drive-prefixed names are rejected with `MAILBOX_INVALID_SESSION_ID`.
+IDs are never normalized, encoded or migrated. Ordinary Unicode, `__proto__`,
+`constructor` and other valid dot-prefixed names remain literal directory names.
+`msg_id` and payload remain journal data, never path components.
+
+The operator-configured root is created and canonicalized once at construction;
+an operator root symlink is deliberately resolved. Session children must be real
+directories. Existing child symlinks (including dangling links), non-directory
+children, and symlink/non-regular/multiply-linked journal or lock leaves reject
+with `MAILBOX_UNSAFE_PATH` before session effects. All session APIs, recovery,
+expiry and discovery use this boundary; malformed IDs never return empty success.
+Unknown valid IDs retain the existing empty/no-op results. Discovery includes
+valid dot-prefixed directories and rejects unsafe directory/link candidates before
+a stale-lock sweep starts. Unrelated ordinary files at the root are not mailboxes.
+
+Fixed leaves are checked again at access. Reads/writes use descriptors with
+`O_NOFOLLOW` where supported, absent-file creation is exclusive, and truncation
+occurs only after a regular-file descriptor check. Existing JSONL serialization,
+FIFO, deduplication, TTL, ACK and lock timing remain unchanged. Directory creation
+uses mode 0700, locks 0600, and journal creation 0666 subject to the process umask.
+
+This is not a hostile-host sandbox: path checks do not prevent concurrent ancestor
+replacement, mount substitution, hard-link creation after checks, or lock ownership
+races. Platforms without `O_NOFOLLOW` retain a leaf substitution race. Operators
+must keep the root and its ancestors under trusted ownership. Case-insensitive or
+Unicode-normalizing filesystems may alias distinct spellings; distinct identities
+that differ only by those equivalences are unsupported. Ill-formed UTF-16 strings
+whose filesystem encoding aliases replacement characters are likewise unsupported.
+Windows device names, stream/forbidden characters and trailing dots/spaces reject
+as unsafe paths; no Windows/native interoperability acceptance is claimed. No
+automatic cleanup, migration or recovery of rejected paths occurs. HTTP error
+mapping and caller authorization remain separate responsibilities.
+
 | Version | Date | Change |
 |---------|------|--------|
 | 1.0-draft | 2026-04-07 | Initial protocol definition |
+# Opt-in interaction retention (task681, partial)
+
+Interaction answers use a distinct owner frame, never the ordinary idle-gated inject
+queue. The existing tracked-injections ledger v3 retains a referenced parked task's
+original inject ID, payload/digest, FIFO position and submit intent. A queued receipt
+does not mean written, and a written action does not mean that the task was consumed.
+Held content survives uncertain action outcomes and queue expiry; it is not automatically
+replayed after restart. Automatic release remains disabled pending measured empty
+composer evidence and final-writer task/submit pairing. See
+[agent-cli-interaction.md](../docs/agent-cli-interaction.md) for stages and recovery.

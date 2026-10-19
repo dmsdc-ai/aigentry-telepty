@@ -141,6 +141,7 @@ function policyOptions(overrides = {}) {
     supervisorWaitMs: 400,
     supervisorPollMs: 20,
     _detectSupervisor: launchd,
+    _supervisedPort: (detected) => { assert.deepEqual(detected, launchd()); return 3848; },
     _getDaemonMeta: async () => null,
     _readSupervisorDeferMarker: () => null,
     _writeSupervisorDeferMarker: () => {},
@@ -218,6 +219,7 @@ function ensureOptions(overrides = {}) {
     supervisorWaitMs: 400,
     supervisorPollMs: 20,
     _detectSupervisor: launchd,
+    _supervisedPort: (detected) => { assert.deepEqual(detected, launchd()); return 3848; },
     // gh#82 round 2 (a): "nothing answered" has to be a REFUSED connection to be an absence.
     _fetchWithAuth: async () => { throw Object.assign(new Error('fetch failed'), { code: 'ECONNREFUSED' }); },
     // gh#82 (B): the absence verdict now has a THIRD probe — /api/health. Left unstubbed, these

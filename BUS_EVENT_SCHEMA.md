@@ -377,3 +377,11 @@ previous wording said "both write paths" because two had been looked at, not bec
 ```
 
 **Note:** The canonical body field is `prompt`, NOT `text`, `content`, or `message`.
+# Interaction core (task681, partial)
+
+The opt-in interaction API uses durable action receipts, not completion bus events.
+No new interaction bus event is emitted in this slice. Stages `prepared`, `dispatched`,
+`written`, `refused` and `outcome_unknown` are distinct; written is not a selected value,
+prompt transition, task consumption or semantic completion. Request bodies, authority
+references and retained task payloads stay in the private ledger. See
+[agent-cli-interaction.md](docs/agent-cli-interaction.md).

@@ -11,7 +11,7 @@ function defaultSessionPersistPath(homeDir = os.homedir()) {
 function serializePersistedSessions(sessions) {
   const data = {};
   for (const [id, s] of Object.entries(sessions)) {
-    data[id] = {
+    Object.defineProperty(data, id, { enumerable: true, writable: true, configurable: true, value: {
       id,
       type: s.type,
       command: s.command,
@@ -57,7 +57,7 @@ function serializePersistedSessions(sessions) {
       // observed, so a session that never saw the mode-set serializes byte-identically
       // to the pre-#730 format.
       ...(s.bracketedPasteCapable === undefined ? {} : { bracketedPasteCapable: s.bracketedPasteCapable })
-    };
+    } });
   }
   return data;
 }
@@ -145,7 +145,7 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
 // complete old generation or the complete new one, never an empty or half-written file. That
 // matters because this write is the thing that has to happen BEFORE bytes reach the target.
 
-const TRACKED_INJECTIONS_SCHEMA_VERSION = 2;
+const TRACKED_INJECTIONS_SCHEMA_VERSION = 3;
 const LEDGER_FILE_MODE = 0o600;
 // Bounded history per record: enough to see the sequence, capped so a long-lived session cannot
 // grow the file without limit. ponytail: a flat cap, not a retention policy — revisit if anyone
@@ -157,7 +157,8 @@ function defaultTrackedInjectionsPath(homeDir = os.homedir()) {
 }
 
 function emptyTrackedInjections() {
-  return { schema_version: TRACKED_INJECTIONS_SCHEMA_VERSION, generation: 0, injections: {} };
+  return { schema_version: TRACKED_INJECTIONS_SCHEMA_VERSION, generation: 0, injections: {},
+    interactions: { actions: {}, pending: {} } };
 }
 
 /**
@@ -206,7 +207,7 @@ function loadTrackedInjections(persistPath = defaultTrackedInjectionsPath()) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return { ok: false, reason: 'observation_store_unavailable', detail: 'not_an_object' };
     }
-    if (Number(parsed.schema_version) !== TRACKED_INJECTIONS_SCHEMA_VERSION) {
+    if (![2, TRACKED_INJECTIONS_SCHEMA_VERSION].includes(Number(parsed.schema_version))) {
       // A pre-v2 or future file is not silently migrated: an inject recorded under a schema this
       // daemon does not understand is explicitly unavailable, never absent.
       return { ok: false, reason: 'observation_store_unavailable', detail: `schema_version=${parsed.schema_version}` };
@@ -214,7 +215,77 @@ function loadTrackedInjections(persistPath = defaultTrackedInjectionsPath()) {
     if (!parsed.injections || typeof parsed.injections !== 'object' || Array.isArray(parsed.injections)) {
       return { ok: false, reason: 'observation_store_unavailable', detail: 'injections_not_an_object' };
     }
-    return { ok: true, ledger: { ...emptyTrackedInjections(), ...parsed } };
+    // v2 has no interaction effects to recover. v3 must carry both maps; corruption must
+    // not erase deduplication or original task content by silently creating empty maps.
+    const interactions = Number(parsed.schema_version) === 2 ? { actions: {}, pending: {} } : parsed.interactions;
+    if (!interactions || ['actions', 'pending'].some(k => !interactions[k]
+        || typeof interactions[k] !== 'object' || Array.isArray(interactions[k]))) {
+      return { ok: false, reason: 'observation_store_unavailable', detail: 'invalid_interactions' };
+    }
+    for (const [id, record] of Object.entries(interactions.actions)) {
+      const interaction = require('../interaction');
+      // Validate structure before hashing, but not admission against today's clock: expired
+      // historical requests must retain their exact dedup identity after restart.
+      if (!record || typeof record !== 'object' || Array.isArray(record)
+          || !interaction.validId(id) || record.action_id !== id
+          || interaction.validateRequestStructure(record.request) !== null
+          || record.request.action_id !== id
+          || record.request.interaction_request_id !== record.interaction_request_id
+          || record.request.identity.sid !== record.sid
+          || record.pending_inject_id !== (Object.prototype.hasOwnProperty.call(record.request, 'pending_inject_id')
+            ? record.request.pending_inject_id : null)
+          || interaction.digest(record.request) !== record.request_digest
+          || !Number.isSafeInteger(record.receipt_seq) || record.receipt_seq < 1
+          || record.receipt_seq >= Number.MAX_SAFE_INTEGER
+          || !Number.isSafeInteger(record.updated_at) || record.updated_at < 0) {
+        return { ok: false, reason: 'observation_store_unavailable', detail: 'invalid_interaction_receipt' };
+      }
+      const validStage = (
+        (record.stage === 'prepared' && record.bytes_written === 0 && record.terminal === false && record.reason === null)
+        || (record.stage === 'dispatched' && record.bytes_written === null && record.terminal === false && record.reason === null)
+        || (record.stage === 'written' && Number.isSafeInteger(record.bytes_written) && record.bytes_written > 0
+          && record.bytes_written <= 8192 && record.terminal === false && record.reason === null)
+        || (record.stage === 'refused' && record.bytes_written === 0 && record.terminal === true
+          && interaction.REFUSALS.includes(record.reason))
+        || (record.stage === 'outcome_unknown' && record.bytes_written === null && record.terminal === true
+          && record.reason === 'outcome_unknown')
+      );
+      if (!validStage) {
+        return { ok: false, reason: 'observation_store_unavailable', detail: 'invalid_interaction_receipt' };
+      }
+      // Never re-dispatch after restart. Prepared has not crossed the transport boundary;
+      // dispatched may have reached the PTY. Written remains written, never consumed.
+      if (record.stage === 'prepared' || record.stage === 'dispatched') {
+        const dispatched = record.stage === 'dispatched';
+        Object.assign(record, { stage: dispatched ? 'outcome_unknown' : 'refused',
+          reason: dispatched ? 'outcome_unknown' : 'stale_prompt', terminal: true,
+          bytes_written: dispatched ? null : 0, receipt_seq: (record.receipt_seq || 0) + 1 });
+      }
+    }
+    for (const [id, pending] of Object.entries(interactions.pending)) {
+      const interaction = require('../interaction');
+      if (!pending || !interaction.validId(id) || pending.inject_id !== id || pending.state !== 'held'
+          || typeof pending.payload !== 'string' || interaction.payloadDigest(pending.payload) !== pending.payload_digest
+          || pending.identity?.sid !== pending.sid || pending.binding?.sid !== pending.sid
+          || typeof pending.binding?.session_epoch !== 'string') {
+        return { ok: false, reason: 'observation_store_unavailable', detail: 'invalid_interaction_pending' };
+      }
+    }
+    for (const record of Object.values(interactions.actions)) {
+      if (record.pending_inject_id === null) continue;
+      const interaction = require('../interaction');
+      const id = record.pending_inject_id;
+      const pending = interactions.pending[id];
+      // A durable action reference must retain its original content in this same ledger.
+      if (!Object.prototype.hasOwnProperty.call(interactions.pending, id)
+          || pending.inject_id !== id || pending.sid !== record.sid
+          || interaction.digest(pending.identity) !== interaction.digest(record.request.identity)
+          || pending.payload_digest !== record.request.payload_digest) {
+        return { ok: false, reason: 'observation_store_unavailable', detail: 'invalid_interaction_pending_reference' };
+      }
+    }
+    return { ok: true, ledger: { ...emptyTrackedInjections(), ...parsed,
+      schema_version: TRACKED_INJECTIONS_SCHEMA_VERSION, interactions } };
   } catch (error) {
     return { ok: false, reason: 'observation_store_unavailable', detail: 'unparseable', error };
   }

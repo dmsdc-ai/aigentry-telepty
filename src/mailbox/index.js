@@ -13,9 +13,11 @@ const {
   compact,
   appendJsonl,
   readJsonl,
+  writeJsonl,
   listSessionDirs,
 } = require('./storage');
 const { createConfig } = require('./config');
+const { canonicalRoot, resolveSessionDir, rethrowBoundary } = require('./path-boundary');
 
 function unixNow() {
   return Math.floor(Date.now() / 1000);
@@ -30,11 +32,11 @@ function unixNow() {
 class FileMailbox {
   constructor(overrides = {}) {
     this.config = createConfig(overrides);
-    fs.mkdirSync(this.config.root, { recursive: true, mode: 0o700 });
+    this.config.root = canonicalRoot(this.config.root);
   }
 
   _sessionDir(sessionId) {
-    return path.join(this.config.root, sessionId);
+    return resolveSessionDir(this.config.root, sessionId);
   }
 
   /**
@@ -253,7 +255,7 @@ class FileMailbox {
     try {
       for (const file of ['inbox.jsonl', 'state.jsonl']) {
         const p = path.join(sessionDir, file);
-        try { fs.writeFileSync(p, ''); } catch {}
+        try { writeJsonl(p, []); } catch (err) { rethrowBoundary(err); }
       }
     } finally {
       release();
@@ -276,7 +278,7 @@ class FileMailbox {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) return;
     const p = path.join(sessionDir, 'dead-letter.jsonl');
-    try { fs.writeFileSync(p, ''); } catch {}
+    try { writeJsonl(p, []); } catch (err) { rethrowBoundary(err); }
   }
 
   /**

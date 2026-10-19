@@ -31,9 +31,260 @@ const lifecycle = require('./src/lifecycle');
 const { SURFACE_ORPHAN_SECONDS, SURFACE_MISMATCH_SECONDS, decideSurfaceGc, decideSurfaceGcAction, applySurfaceMismatchProbe } = lifecycle;
 const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
+const interaction = require('./src/interaction');
 const { createCredentialStore } = require('./src/session-store/session-credentials');
 const { createAuditWriter, readInjectLog } = require('./src/audit/inject-log');
-const { mintSessionNonce, applyProvenance } = require('./src/audit/provenance');
+const { applyProvenance } = require('./src/audit/provenance');
+const { registerSpawnRoute, buildSessionEnv } = require('./src/routes/spawn');
+const { createSessionRecordContext, registerSessionRegisterRoute, registerSessionRenameRoute } = require('./src/routes/session-records');
+const { registerHandoffRoutes, registerThreadRoutes } = require('./src/routes/coordination');
+const { createHttpApp, registerHealthAndAuth } = require('./src/protocol/http-app');
+const { registerMailboxRoutes } = require('./src/routes/mailbox');
+const { registerFanoutRoutes } = require('./src/routes/fanout');
+const { createSessionDeliveryContext } = require('./src/mailbox/session-delivery');
+const {
+  parseOptionalIdleTtl, applyProcessMetadata, applyIdleTtlMetadata, applyTimestampMetadata,
+  isBootstrapGatedSession, initializeBootstrapState, markSessionConnected
+} = require('./src/session-store/route-metadata');
+
+const { createSessionActions } = require('./src/routes/session-actions');
+const sessionActions = createSessionActions({
+  get AUTO_REPORT_MIN_REAL_SECONDS() { return AUTO_REPORT_MIN_REAL_SECONDS; },
+  get CAPABILITY_STAGE_A() { return CAPABILITY_STAGE_A; },
+  get FORCE_CR_GAP_DEFAULT_MS() { return FORCE_CR_GAP_DEFAULT_MS; },
+  get IDLE_UNCONFIRMED_CPU_DELTA_SECONDS() { return IDLE_UNCONFIRMED_CPU_DELTA_SECONDS; },
+  get IDLE_UNCONFIRMED_CPU_MAX_REARMS() { return IDLE_UNCONFIRMED_CPU_MAX_REARMS; },
+  get IDLE_UNCONFIRMED_SETTLE_MAX_REARMS() { return IDLE_UNCONFIRMED_SETTLE_MAX_REARMS; },
+  get IDLE_UNCONFIRMED_SETTLE_SECONDS() { return IDLE_UNCONFIRMED_SETTLE_SECONDS; },
+  get LAUNCHER_CONSUMPTION_MIN_SECONDS() { return LAUNCHER_CONSUMPTION_MIN_SECONDS; },
+  get MACHINE_ID() { return MACHINE_ID; },
+  get NON_TERMINAL_GATE_REASONS() { return NON_TERMINAL_GATE_REASONS; },
+  get ORCHESTRATOR_SIDS() { return ORCHESTRATOR_SIDS; },
+  get REDELIVER_ENABLED() { return REDELIVER_ENABLED; },
+  get REDELIVER_IDLE_WAIT_MS() { return REDELIVER_IDLE_WAIT_MS; },
+  get REDELIVER_MAX_ATTEMPTS() { return REDELIVER_MAX_ATTEMPTS; },
+  get REDELIVER_TOTAL_TIMEOUT_MS() { return REDELIVER_TOTAL_TIMEOUT_MS; },
+  get REPORT_AUTO_SUMMARY_LINES() { return REPORT_AUTO_SUMMARY_LINES; },
+  get REPORT_AUTO_SUMMARY_MAX_BYTES() { return REPORT_AUTO_SUMMARY_MAX_BYTES; },
+  get SUBMIT_BUSY_DISPATCH_ENABLED() { return SUBMIT_BUSY_DISPATCH_ENABLED; },
+  get SUBMIT_BUSY_GRACE_MS() { return SUBMIT_BUSY_GRACE_MS; },
+  get abortTrackedInjection() { return abortTrackedInjection; },
+  get auditAppend() { return auditAppend; },
+  get beginTrackedInjection() { return beginTrackedInjection; },
+  get bootstrapQueuedResponse() { return bootstrapQueuedResponse; },
+  get broadcastSessionEvent() { return broadcastSessionEvent; },
+  get buildAutoSummary() { return buildAutoSummary; },
+  get buildCompletionUnknown() { return buildCompletionUnknown; },
+  get buildErrorBody() { return buildErrorBody; },
+  get buildSessionSemanticBlock() { return buildSessionSemanticBlock; },
+  get buildSessionTransportBlock() { return buildSessionTransportBlock; },
+  get buildSubmitVerify() { return buildSubmitVerify; },
+  get busClients() { return busClients; },
+  get cancelModalParkPoll() { return cancelModalParkPoll; },
+  get classifyConsumption() { return classifyConsumption; },
+  get classifyPeerLaneInject() { return classifyPeerLaneInject; },
+  get commitTrackedInjections() { return commitTrackedInjections; },
+  get completionObservation() { return completionObservation; },
+  get confirmSubmitAfterDispatch() { return confirmSubmitAfterDispatch; },
+  get crypto() { return crypto; },
+  get deliverInjectionToSession() { return deliverInjectionToSession; },
+  get deliveredAbsenceIdentities() { return deliveredAbsenceIdentities; },
+  get deliveryAuditResult() { return deliveryAuditResult; },
+  get drainBootstrapQueue() { return drainBootstrapQueue; },
+  get emitInjectFailureEvent() { return emitInjectFailureEvent; },
+  get enqueueBootstrapOperation() { return enqueueBootstrapOperation; },
+  get formatCompletionUnknownText() { return formatCompletionUnknownText; },
+  get gatedTerminalSubmit() { return gatedTerminalSubmit; },
+  get getPendingReport() { return getPendingReport; },
+  get getSessionHealthReason() { return getSessionHealthReason; },
+  get getSessionHealthStatus() { return getSessionHealthStatus; },
+  get getTrackedInjection() { return getTrackedInjection; },
+  get hasBootstrapBacklog() { return hasBootstrapBacklog; },
+  get isBootstrapGatedSession() { return isBootstrapGatedSession; },
+  get isBootstrapReady() { return isBootstrapReady; },
+  get isOpenWebSocket() { return isOpenWebSocket; },
+  get isSurfaceBlockedByModal() { return isSurfaceBlockedByModal; },
+  get lifecycle() { return lifecycle; },
+  get mailbox() { return mailbox; },
+  get mapObservationCause() { return mapObservationCause; },
+  get markPendingReportSubmitConfirmed() { return markPendingReportSubmitConfirmed; },
+  get markPendingReportSubmitStarted() { return markPendingReportSubmitStarted; },
+  get markPendingReportSubmitUnconfirmed() { return markPendingReportSubmitUnconfirmed; },
+  get maybeBracketedPaste() { return maybeBracketedPaste; },
+  get modalDeliveryDecision() { return modalDeliveryDecision; },
+  get modalRejectionResponse() { return modalRejectionResponse; },
+  get parkOperationOnModal() { return parkOperationOnModal; },
+  get parseSubmitRetryOptions() { return parseSubmitRetryOptions; },
+  get pendingReports() { return pendingReports; },
+  get persistSessions() { return persistSessions; },
+  get readyRegistry() { return readyRegistry; },
+  get resolveModalGate() { return resolveModalGate; },
+  get resolveSessionAlias() { return resolveSessionAlias; },
+  get resolveSessionForDestroy() { return resolveSessionForDestroy; },
+  get respondWithError() { return respondWithError; },
+  get revokeSessionCredential() { return revokeSessionCredential; },
+  get sampleChildCpuSeconds() { return sampleChildCpuSeconds; },
+  get scheduleModalParkDrain() { return scheduleModalParkDrain; },
+  get sessionPersistence() { return sessionPersistence; },
+  get sessionStateManager() { return sessionStateManager; },
+  get sessions() { return sessions; },
+  get shouldPushCompletionUnknown() { return shouldPushCompletionUnknown; },
+  get stripAnsiState() { return stripAnsiState; },
+  get submitGate() { return submitGate; },
+  get terminalBackend() { return terminalBackend; },
+  get terminalLevelSubmit() { return terminalLevelSubmit; },
+  get verifiedPrincipalFromReq() { return verifiedPrincipalFromReq; },
+  get verifiedSenderFields() { return verifiedSenderFields; },
+  get waitForBootstrapSubmit() { return waitForBootstrapSubmit; },
+});
+const {
+  buildAutoSummaryWithDefaults,
+  observationIdentity,
+  markAbsenceDeliveredToSource,
+  recordObservation,
+  pendingReportHasSubmitEvidence,
+  maybeRecordInjectConsumption,
+  maybeRecordLauncherConsumption,
+  observeInjectEchoEvidence,
+  detectIdleAfterError,
+  fireAutoReport,
+  normalizeNullableText,
+  scheduleQueuedRedeliver,
+  parseSessionStateReport,
+  applySessionStateReport,
+  emitSessionLifecycleEvent,
+  forceSubmitDeliveredToSurface,
+  isTerminalGateFailure,
+  forceSubmitCrGapMs,
+  teardownSessionById,
+  describeSessionTeardown,
+  busAutoRoute,
+} = sessionActions;
+
+const { createDeliveryRuntime } = require('./src/mailbox/delivery-runtime');
+const deliveryRuntime = createDeliveryRuntime({
+  get auditWriter() { return auditWriter; },
+  get sessionCredentials() { return sessionCredentials; },
+  get sessionPersistence() { return sessionPersistence; },
+  get trackedInjections() { return trackedInjections; },
+  get TRACKED_INJECTIONS_PATH() { return TRACKED_INJECTIONS_PATH; },
+  get interactionCore() { return interactionCore; },
+  get pendingReports() { return pendingReports; },
+  get busClients() { return busClients; },
+  get PEER_INJECT_KINDS() { return PEER_INJECT_KINDS; },
+  get UPSTREAM_STALL_SECONDS() { return UPSTREAM_STALL_SECONDS; },
+  get SESSION_STALE_SECONDS() { return SESSION_STALE_SECONDS; },
+  get fs() { return fs; },
+  get crypto() { return crypto; },
+  get isBootstrapGatedSession() { return isBootstrapGatedSession; },
+  get initializeBootstrapState() { return initializeBootstrapState; },
+  get WRAPPED_SUBMIT_DELAY_MS() { return WRAPPED_SUBMIT_DELAY_MS; },
+  get writeDataToSession() { return writeDataToSession; },
+  get stripAnsiState() { return stripAnsiState; },
+  get sessionStateManager() { return sessionStateManager; },
+  get submitGate() { return submitGate; },
+  get BOOTSTRAP_READY_TIMEOUT_MS() { return BOOTSTRAP_READY_TIMEOUT_MS; },
+  get isProcessRunning() { return isProcessRunning; },
+  get isOpenWebSocket() { return isOpenWebSocket; },
+  get interaction() { return interaction; },
+  get BRACKETED_PASTE_START() { return BRACKETED_PASTE_START; },
+  get BRACKETED_PASTE_END() { return BRACKETED_PASTE_END; },
+  get MODAL_RING_TAIL_BYTES() { return MODAL_RING_TAIL_BYTES; },
+  get readyRegistry() { return readyRegistry; },
+  get MODAL_REMEDIES() { return MODAL_REMEDIES; },
+  get MODAL_REMEDY_BY_CLI() { return MODAL_REMEDY_BY_CLI; },
+  get MODAL_REMEDY_DEFAULT() { return MODAL_REMEDY_DEFAULT; },
+  get MODAL_HINT_BY_CLI() { return MODAL_HINT_BY_CLI; },
+  get MODAL_HOLD_DEFAULT_MS() { return MODAL_HOLD_DEFAULT_MS; },
+  get MODAL_PARK_TTL_DEFAULT_MS() { return MODAL_PARK_TTL_DEFAULT_MS; },
+  get MODAL_PARK_POLL_MS() { return MODAL_PARK_POLL_MS; },
+  get sessions() { return sessions; },
+  get interactionWaiters() { return interactionWaiters; },
+  get trackedLedgerHealthy() { return trackedLedgerHealthy; },
+  get trackedLedgerUnavailableReason() { return trackedLedgerUnavailableReason; },
+  get CAPABILITY_STAGE_A() { return CAPABILITY_STAGE_A; },
+  set trackedInjections(value) { trackedInjections = value; },
+  set trackedLedgerHealthy(value) { trackedLedgerHealthy = value; },
+  set trackedLedgerUnavailableReason(value) { trackedLedgerUnavailableReason = value; },
+});
+const {
+  auditAppend,
+  verifiedPrincipalFromReq,
+  verifiedSenderFields,
+  commitTrackedInjections,
+  interactionBinding,
+  hasHeldInteraction,
+  dispatchInteraction,
+  restoreTrackedInjections,
+  getTrackedInjection,
+  sessionAuthenticationCapability,
+  beginTrackedInjection,
+  abortTrackedInjection,
+  parkTrackedInjection,
+  deliveryAuditResult,
+  getPendingReport,
+  markPendingReportSubmitStarted,
+  markPendingReportSubmitConfirmed,
+  markPendingReportSubmitUnconfirmed,
+  broadcastBusEvent,
+  buildErrorBody,
+  respondWithError,
+  classifyPeerLaneInject,
+  getSessionDisconnectedMs,
+  armUpstreamProbe,
+  isUpstreamStalled,
+  getSessionHealthStatus,
+  getSessionHealthReason,
+  sleep,
+  isBootstrapReady,
+  buildBootstrapBlock,
+  shouldQueueBootstrapOperation,
+  hasBootstrapBacklog,
+  emitBootstrapEvent,
+  enqueueBootstrapOperation,
+  resolveBootstrapSubmit,
+  bootstrapQueuedResponse,
+  executeBootstrapInject,
+  parseSubmitRetryOptions,
+  buildSubmitVerify,
+  buildSubmitConfirmOptions,
+  confirmSubmitAfterDispatch,
+  gatedTerminalSubmit,
+  executeBootstrapSubmit,
+  drainBootstrapQueue,
+  markBootstrapReady,
+  failBootstrapQueueOnTimeout,
+  shouldApplyOwnerAliveFloor,
+  scheduleBootstrapPromptPoll,
+  waitForBootstrapSubmit,
+  buildSessionTransportBlock,
+  buildSessionSemanticBlock,
+  buildSessionEvent,
+  broadcastSessionEvent,
+  getInjectFailure,
+  markSessionDisconnected,
+  emitInjectFailureEvent,
+  terminalLevelSubmit,
+  maybeBracketedPaste,
+  readOutputRingTail,
+  isSurfaceBlockedByModal,
+  modalRemedy,
+  modalDeliveryDecision,
+  modalHoldMs,
+  awaitSurfaceModalClear,
+  resolveModalGate,
+  modalRejectionResponse,
+  modalParkTtlMs,
+  flushModalParkQueue,
+  awaitModalParkDrain,
+  cancelModalParkPoll,
+  scheduleModalParkDrain,
+  parkOperationOnModal,
+  modalParkResponse,
+  getSessionTerminalLabel,
+  submitViaPty,
+} = deliveryRuntime;
+
 
 // #835: the daemon is the process that must not be fooled. It freezes EXPECTED_TOKEN below and
 // never re-reads it, while every CLI process re-reads the file — so a daemon that came up on a
@@ -131,12 +382,6 @@ if (process.env.reportTimeoutSecs) {
 }
 
 // Wrap buildAutoSummary with daemon config defaults
-function buildAutoSummaryWithDefaults(session) {
-  return buildAutoSummary(session, {
-    maxLines: REPORT_AUTO_SUMMARY_LINES,
-    maxBytes: REPORT_AUTO_SUMMARY_MAX_BYTES
-  });
-}
 
 // #60 Stage A — every state transition is an OBSERVATION, and every eligible transition on a
 // tracked inject routes through the total emitter. There is no branch here that can produce a
@@ -150,104 +395,15 @@ function buildAutoSummaryWithDefaults(session) {
 //   3. it handled only working/thinking, idle and dead — a waiting-pattern or repeated-error
 //      entrance produced NOTHING at all, and both of those states are absorbing, so a dispatch
 //      could park in one forever with no statement ever made about it.
-sessionStateManager.onTransition((sessionId, from, to, detail) => {
-  const session = sessions[sessionId];
-  if (!session) return;
-  const cause = detail && detail.detail ? detail.detail.trigger : null;
-  const evidence = { ...(detail && detail.detail ? detail.detail : {}), confidence: detail ? detail.confidence : undefined };
+sessionActions.registerStateObserver();
 
-  // External activity vocabulary (§2.3/§3.8). The internal 8-state FSM is unchanged — submit and
-  // readiness code branches on it (src/submit-gate.js:21-46, :498-508) — but what leaves this
-  // process is the measured cause, never the state name.
-  const mapped = mapObservationCause({ destination: to, cause, evidence });
-  broadcastSessionEvent('session_activity_observation', sessionId, session, {
-    extra: {
-      schema_version: 2,
-      observation: { kind: mapped.kind, trigger: mapped.cause, ...mapped.fields },
-      from_observation_state: from,
-      completion_fact: null,
-      terminal: false,
-    }
-  });
 
-  const pendingReport = getPendingReport(sessionId);
-  if (!pendingReport) return;
-
-  if (to === 'working' || to === 'thinking') {
-    if (!pendingReport.submitExpected || pendingReport.submitStartedAt) {
-      pendingReport.sawWorkingAfterInject = true;
-      pendingReport.workingAfterInjectAt = new Date().toISOString();
-    }
-    // #619 lineage: capture the fresh-turn edge the instant it fires, because the outputRing it
-    // would otherwise be re-derived from has scrolled off by the time a long turn goes quiet.
-    // Stage A records it as a CANDIDATE only — see maybeRecordInjectConsumption for why the
-    // submit-confirmation conjuncts cannot be evaluated at this point.
-    maybeRecordInjectConsumption(pendingReport, from, to, sessionStateManager.getState(sessionId)?.since_ms);
-    recordObservation({ sessionId, session, pendingReport, destination: to, cause, evidence, trigger: 'transition' });
-    return;
-  }
-
-  if (to === 'idle') {
-    // #545: reliability of the idle evidence is still computed, and is still worth recording —
-    // it is now a FIELD on the observation rather than an input to a promotion decision. Note
-    // both OSC-133 causes count: the raw marker and quiet-after-a-recent-marker are different
-    // measurements, and the old code compared against the single overloaded `osc_133_prompt`.
-    const bodyText = pendingReport.injectedBodyPreview;
-    const bodyVisible = bodyText
-      ? submitGate.observeBodyVisibility(session, bodyText).visible === true
-      : false;
-    const idleEvidenceReliable = (cause === 'osc_133_a_or_b_received' || cause === 'quiet_after_recent_osc_133_a_or_b')
-      && !bodyVisible;
-    return fireAutoReport(sessionId, session, pendingReport, 'real-idle', {
-      idleEvidenceReliable,
-      observationCause: cause,
-      observationEvidence: evidence,
-      silenceMs: evidence.silence_ms,
-    });
-  }
-
-  // §3.4 / §7 items 4 and 5: the entrances that used to produce nothing. Each emits IMMEDIATELY
-  // (no settle debounce) because there is no ambiguity to settle — a waiting pattern matched, or
-  // an error fingerprint repeated, or a thinking classification timed out. Each keeps its own
-  // name and its own fields, and each carries completion_fact:null. A repeated-error entrance is
-  // NOT the same measurement as a thinking timeout, and neither is a task failure.
-  if (to === 'waiting' || to === 'error' || to === 'restarting' || to === 'starting') {
-    return recordObservation({
-      sessionId, session, pendingReport, destination: to, cause, evidence,
-      deliverToSource: to === 'waiting' || to === 'error', trigger: 'transition',
-    });
-  }
-
-  if (to === 'dead') {
-    // The pending entry is released, but the ledger record is NOT: it stays queryable so a poll
-    // after the process is gone still gets a named observation instead of a 404.
-    delete pendingReports[sessionId];
-    return recordObservation({
-      // #843 — no `|| 'process_exit'` fallback. A transition that arrived at `dead` without a
-      // measured cause is not evidence of a process exit; substituting the strongest name in the
-      // table for a missing measurement is the defect this release removes, in one line. With no
-      // cause the mapper fails closed to `unmapped_transition_cause`, which is the honest answer.
-      sessionId, session, pendingReport, destination: 'dead', cause,
-      evidence: { ...evidence, auto_summary: buildAutoSummaryWithDefaults(session) },
-      deliverToSource: true, trigger: 'transition',
-    });
-  }
-
-  return recordObservation({ sessionId, session, pendingReport, destination: to, cause, evidence, trigger: 'transition' });
-});
-
-function persistSessions() {
-  sessionPersistence.savePersistedSessions(sessions, SESSION_PERSIST_PATH);
-}
 
 function loadPersistedSessions() {
   return sessionPersistence.loadPersistedSessions(SESSION_PERSIST_PATH);
 }
 
-const app = express();
-app.use(cors());
-
-app.use(express.json());
+const app = createHttpApp({ express, cors });
 
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
 const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -307,9 +463,7 @@ auditWriter.on('audit_error', (err) => {
   console.warn(`[AUDIT] write error: ${err && err.message ? err.message : err}`);
 });
 // Fire-and-forget append — swallow any sync error so the audit log can never break delivery.
-function auditAppend(record) {
-  try { auditWriter.append(record); } catch { /* audit must never throw into a handler */ }
-}
+
 
 // #43 P2 / #815 — per-session verified-sender credentials. The principal is
 // (sid, epoch, generation), NOT a bare sid: an id is routinely destroyed and recreated here
@@ -334,29 +488,12 @@ const sessionCredentials = createCredentialStore();
 // disclosed only at that first registration, revoked with the epoch.
 const sidNonces = new Map(); // sid → nonce
 
-// Mint the credential + nonce for a NEW instance of `sid`. The bearer and nonce it returns are
-// handed to exactly one caller, exactly once, and are never recoverable afterwards.
-function issueSessionCredential(sid) {
-  const credential = sessionCredentials.issue(sid);
-  const nonce = mintSessionNonce();
-  sidNonces.set(sid, nonce);
-  return { ...credential, nonce };
-}
 
-// Called from EVERY destroy path before the id can be reused.
-function revokeSessionCredential(sid) {
-  sessionCredentials.revoke(sid);
-  sidNonces.delete(sid);
-}
 
 // Resolve the presented bearer to the full principal (header only — never the body, which is
 // attacker-controlled). Fail closed: unparseable, unknown, stale or revoked yields null, never a
 // fallback to the name the caller claimed.
-function verifiedPrincipalFromReq(req) {
-  const bearer = req.headers && req.headers['x-telepty-session-token'];
-  if (!bearer) return null;
-  return sessionCredentials.verify(bearer);
-}
+
 // Back-compat shorthand for the call sites that only need the sid half of the principal.
 function verifiedSenderFromReq(req) {
   const principal = verifiedPrincipalFromReq(req);
@@ -365,13 +502,7 @@ function verifiedSenderFromReq(req) {
 // The three audit/bus fields for a principal, emitted TOGETHER so a consumer never sees a
 // verified sid beside a null epoch — that combination would read as "verified, instance unknown",
 // which is not a state this daemon can be in. All three are null, or all three are set.
-function verifiedSenderFields(principal) {
-  return {
-    verified_sender_sid: principal ? principal.sid : null,
-    verified_sender_epoch: principal ? principal.epoch : null,
-    verified_sender_generation: principal ? principal.generation : null
-  };
-}
+
 
 // JWT auth: set TELEPTY_JWT_SECRET to enable. Tokens in Authorization: Bearer <token>
 const JWT_SECRET = process.env.TELEPTY_JWT_SECRET || null;
@@ -382,13 +513,7 @@ const isAllowedPeer = createIsAllowedPeer(effectivePeerAllowlist);
 // entrances a browser can reach.
 const isForbiddenOrigin = createOriginGuard(ALLOWED_ORIGINS);
 
-// Health check – no auth required
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', version: pkg.version });
-});
-
-// Authentication Middleware
-app.use(createAuthMiddleware({ isAllowedPeer, expectedToken: EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin }));
+registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin });
 
 const { resolveBindPort } = require('./src/bind-port');
 const PORT = resolveBindPort(process.env);
@@ -550,41 +675,64 @@ let trackedInjections = sessionPersistence.emptyTrackedInjections();
 let trackedLedgerHealthy = true;
 let trackedLedgerUnavailableReason = null;
 
-function commitTrackedInjections() {
-  return sessionPersistence.saveTrackedInjections(trackedInjections, TRACKED_INJECTIONS_PATH);
+
+
+// Partial interaction core: existing host credential only, no report/worker principal grant.
+// Task identity is deliberately unavailable until a trusted controller binding is wired.
+const interactionWaiters = new Map();
+
+
+function acceptInteractionReceipt(sid, session, ws, message) {
+  const waiting = interactionWaiters.get(message.action_id);
+  if (!waiting || waiting.sid !== sid || waiting.owner !== ws || sessions[sid] !== session
+      || session.ownerWs !== ws || message.request_digest !== waiting.digest) return;
+  const result = message.receipt;
+  if (!result || result.action_id !== message.action_id || result.request_digest !== waiting.digest) return;
+  if (result.stage === 'refused' && result.bytes_written !== 0) return;
+  if (result.stage === 'written' && (!Number.isSafeInteger(result.bytes_written) || result.bytes_written <= 0)) return;
+  waiting.finish(result);
 }
+
+const interactionCore = deliveryRuntime.createInteractionRuntime();
+
+function requireInteractionController(req, res, next) {
+  // General middleware permits JWTs too; this opt-in path deliberately requires the existing
+  // host token header, not a query token, sender bearer, or a claimed authority in JSON.
+  const supplied = req.headers['x-telepty-token'];
+  if (typeof EXPECTED_TOKEN !== 'string' || !EXPECTED_TOKEN || typeof supplied !== 'string'
+      || Buffer.byteLength(supplied) !== Buffer.byteLength(EXPECTED_TOKEN)
+      || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(EXPECTED_TOKEN))) {
+    return res.status(403).json(interaction.refusal('authority_required'));
+  }
+  next();
+}
+app.get('/api/sessions/:id/interaction', requireInteractionController, (req, res) => {
+  const s = sessions[req.params.id];
+  if (!s) return res.status(404).json(interaction.refusal('wrong_owner'));
+  res.json({ ...readyRegistry.observeInteraction(s), identity: interactionBinding(req.params.id),
+    protocol_version: 1, live_adapter: false, task_binding_available: false,
+    retained_pending: Object.values(trackedInjections.interactions?.pending || {})
+      .filter(p => p.sid === req.params.id).map(p => ({ inject_id: p.inject_id, payload_digest: p.payload_digest, state: p.state })) });
+});
+app.get('/api/sessions/:id/interaction/receipts/:action', requireInteractionController, (req, res) => {
+  const receipt = interactionCore.lookup(req.params.action);
+  if (!receipt || (receipt.sid && receipt.sid !== req.params.id)) return res.status(404).json(interaction.refusal('wrong_owner'));
+  res.status(receipt.reason === 'storage_unavailable' ? 503 : 200).json(receipt);
+});
+app.post('/api/sessions/:id/interaction', requireInteractionController, async (req, res) => {
+  if (req.body?.identity?.sid !== req.params.id) return res.status(409).json(interaction.refusal('wrong_owner'));
+  try {
+    const receipt = await interactionCore.act(req.body, 'authenticated-host-controller');
+    res.status(receipt.stage === 'refused' ? 409 : receipt.stage === 'outcome_unknown' ? 202 : 200).json(receipt);
+  } catch { res.status(503).json(interaction.refusal('storage_unavailable', { bytes_written: null })); }
+});
 
 // Restore BEFORE HTTP/WS readiness. A restored record gets `daemon_restart_observed` appended: a
 // dispatch that was in flight across a restart is still explicitly unknown, and a missing record
 // can never settle, delete or suspend it.
-function restoreTrackedInjections() {
-  const loaded = sessionPersistence.loadTrackedInjections(TRACKED_INJECTIONS_PATH);
-  if (!loaded.ok) {
-    trackedLedgerHealthy = false;
-    trackedLedgerUnavailableReason = loaded.reason;
-    console.warn(`[OBSERVE] tracked-injection store unavailable (${loaded.reason}${loaded.detail ? `: ${loaded.detail}` : ''}) — every poll answers tracking_state=unavailable`);
-    return;
-  }
-  trackedInjections = loaded.ledger;
-  const nowIso = new Date().toISOString();
-  let restored = 0;
-  for (const record of Object.values(trackedInjections.injections)) {
-    sessionPersistence.appendLedgerObservation(record, { kind: 'daemon_restart_observed', trigger: 'daemon_restart' }, nowIso);
-    restored++;
-  }
-  if (restored > 0) {
-    commitTrackedInjections();
-    console.log(`[OBSERVE] restored ${restored} tracked injection(s) — all still completion-unknown`);
-  }
-}
 
-function getTrackedInjection(injectId) {
-  if (typeof injectId !== 'string' || !injectId) return null;
-  if (injectId === '__proto__' || injectId === 'prototype' || injectId === 'constructor') return null;
-  const store = trackedInjections.injections;
-  if (!Object.prototype.hasOwnProperty.call(store, injectId)) return null;
-  return store[injectId];
-}
+
+
 
 /**
  * Every tracked inject assigned to a session. #60 Stage A §3 "consumption of #815 owner
@@ -636,13 +784,7 @@ function listTrackedInjectionsForSession(sessionId) {
  * Returns the OVERLAY onto CAPABILITY_STAGE_A, so the no-epoch case returns {} and leaves the
  * frozen default exactly as it was.
  */
-function sessionAuthenticationCapability(session) {
-  if (!session || !session.sessionEpoch) return {};
-  if (session.sessionEpochProved && session.sessionEpochProved === session.sessionEpoch) {
-    return { session_authentication: 'observed', session_authentication_reason: null };
-  }
-  return { session_authentication: 'unavailable', session_authentication_reason: 'no_815_bearer_presented' };
-}
+
 
 /**
  * Create the durable transport-observation record for a tracked inject. MUST complete before the
@@ -651,61 +793,7 @@ function sessionAuthenticationCapability(session) {
  *
  * Returns {ok:true, record} or {ok:false, reason} — on failure the caller must NOT deliver.
  */
-function beginTrackedInjection({ injectId, sessionId, source, session }) {
-  const nowIso = new Date().toISOString();
-  // Supersession: a second tracked dispatch for the same session retains the OLD record and
-  // appends `tracking_superseded` before the active pointer moves. The previous code only logged
-  // a warning and destructively overwrote a SID-keyed entry, so the old inject_id became
-  // unqueryable — and an inject_id nobody can query is indistinguishable from one that never
-  // existed.
-  for (const record of Object.values(trackedInjections.injections)) {
-    if (record.session_id === sessionId && record.tracking_state === 'tracked') {
-      record.tracking_state = 'superseded';
-      sessionPersistence.appendLedgerObservation(record, {
-        kind: 'tracking_superseded', trigger: 'superseded_by_new_tracked_inject', superseded_by: injectId,
-      }, nowIso);
-    }
-  }
 
-  const record = {
-    inject_id: injectId,
-    session_id: sessionId,
-    // #815 gives an epoch only where a session actually proved one. Stage A records the absence
-    // with a reason rather than inventing availability from a bare SID or an open socket.
-    session_epoch: (session && session.sessionEpoch) || null,
-    session_epoch_reason: (session && session.sessionEpoch) ? null : 'no_815_epoch_fact',
-    transport_source: source || null,
-    created_at: nowIso,
-    observation_seq: 0,
-    observations: [],
-    last_observation: null,
-    // #843 — the capability block must not contradict the record it is stamped on.
-    // `CAPABILITY_STAGE_A` is frozen with `session_authentication_reason: 'no_815_epoch_fact'` and
-    // was spread onto EVERY record, including records whose own `session_epoch` two lines up holds
-    // the epoch the session PROVED on its #815 handshake. One response body then carried both the
-    // epoch and a reason denying any epoch fact was measured, leaving a reader to pick which half
-    // of one object to believe. §A4 requires gaps to be explicit; it does not license reporting a
-    // gap that was measured shut. #860 F1: nor does it license the opposite — see
-    // sessionAuthenticationCapability, which is what decides the three cases.
-    capability: {
-      ...CAPABILITY_STAGE_A,
-      ...sessionAuthenticationCapability(session),
-    },
-    tracking_state: 'tracked',
-  };
-  trackedInjections.injections[injectId] = record;
-  sessionPersistence.appendLedgerObservation(record, { kind: 'tracking_started', trigger: 'inject_accepted' }, nowIso);
-
-  const committed = commitTrackedInjections();
-  if (!committed.ok) {
-    delete trackedInjections.injections[injectId];
-    console.error(`[OBSERVE] tracking persistence FAILED for ${injectId} — refusing delivery (${committed.reason})`);
-    return { ok: false, reason: 'tracking_persistence_failed' };
-  }
-  trackedLedgerHealthy = true;
-  trackedLedgerUnavailableReason = null;
-  return { ok: true, record };
-}
 
 /**
  * #843 — the write-ahead record's ABORT. The record is opened before the bytes are handed over
@@ -737,34 +825,7 @@ function beginTrackedInjection({ injectId, sessionId, source, session }) {
  *
  * Returns a named result, never undefined.
  */
-function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError, cause = {}) {
-  const record = getTrackedInjection(injectId);
-  if (!record) return 'tracking_unavailable';
-  record.tracking_state = 'aborted';
-  sessionPersistence.appendLedgerObservation(record, {
-    kind: cause.kind || 'inject_delivery_refused',
-    trigger: cause.trigger || 'delivery_refused',
-    delivery_code: deliveryCode || 'DELIVERY_FAILED',
-    delivery_error: deliveryError || null,
-    // Omitting `bytesWritten` means the caller MEASURED zero (the synchronous refusal arm: the
-    // route never handed a byte over). An explicit `null` means it could not measure — a throw
-    // mid-drain can land on either side of the body write — and null is recorded rather than a
-    // guessed zero.
-    bytes_written: cause.bytesWritten === undefined ? 0 : cause.bytesWritten,
-  }, new Date().toISOString());
-  // The pending entry goes too. It is what makes the session look like it is awaiting a turn, and
-  // it belongs to an inject whose bytes were never delivered — every later observation on this
-  // session would otherwise be filed against it.
-  if (sessionId && pendingReports[sessionId] && pendingReports[sessionId].injectId === injectId) {
-    delete pendingReports[sessionId];
-  }
-  const committed = commitTrackedInjections();
-  if (!committed.ok) {
-    console.error(`[OBSERVE] abort commit FAILED for ${injectId} (${committed.reason})`);
-    return 'tracking_persistence_failed';
-  }
-  return 'tracking_aborted';
-}
+
 
 /**
  * #860 F2 — record the PARK itself, at the moment it happens.
@@ -781,23 +842,7 @@ function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError,
  *
  * No-ops for an untracked inject (multicast / broadcast / bus route open no record).
  */
-function parkTrackedInjection(injectId, strategy, reason) {
-  if (!injectId) return 'no_tracked_inject';
-  const record = getTrackedInjection(injectId);
-  if (!record) return 'tracking_unavailable';
-  sessionPersistence.appendLedgerObservation(record, {
-    kind: 'inject_parked',
-    trigger: strategy,
-    reason: reason || null,
-    bytes_written: 0,
-  }, new Date().toISOString());
-  const committed = commitTrackedInjections();
-  if (!committed.ok) {
-    console.error(`[OBSERVE] park commit FAILED for ${injectId} (${committed.reason})`);
-    return 'tracking_persistence_failed';
-  }
-  return 'tracking_parked';
-}
+
 
 /**
  * #860 F2 — the audit log's `delivery_result` for a delivery that has not been written.
@@ -814,17 +859,12 @@ function parkTrackedInjection(injectId, strategy, reason) {
  * like: the mailbox path returns `{strategy: 'mailbox', queued: ack.queued}` for a delivery it has
  * already written synchronously (`mailboxDelivery.tick()`), and that one is a write.
  */
-function deliveryAuditResult(delivery) {
-  return delivery && delivery.queued === true && delivery.strategy === 'bootstrap_queue' ? 'queued' : 'success';
-}
+
 
 // Observation identity. Dedup is keyed on WHAT WAS MEASURED, not on a one-way "already notified"
 // bit. That distinction is the whole repair: `idleNotified` was burned by a wrong-label emission
 // and then dropped the later genuine one, and because it was a single bit it could never
 // distinguish "we already said this" from "we are no longer allowed to speak".
-function observationIdentity(kind, cause) {
-  return `${kind}|${cause == null ? '' : cause}`;
-}
 
 // #914: source-delivery dedup — the SET of absence identities this inject has already told its
 // source about.
@@ -846,16 +886,6 @@ const deliveredAbsenceIdentities = new WeakMap();
 // Returns true when `identity` has already been delivered to the source for this record; records
 // it as delivered otherwise. Deliberately NOT a pure predicate — the claim and the check must be
 // one step, or two observations in the same tick both see "not yet delivered".
-function markAbsenceDeliveredToSource(record, identity) {
-  let delivered = deliveredAbsenceIdentities.get(record);
-  if (!delivered) {
-    delivered = new Set();
-    deliveredAbsenceIdentities.set(record, delivered);
-  }
-  if (delivered.has(identity)) return true;
-  delivered.add(identity);
-  return false;
-}
 
 /**
  * THE TOTAL EMITTER. Every observation entry point routes through here, and every eligible
@@ -864,160 +894,7 @@ function markAbsenceDeliveredToSource(record, identity) {
  * Named results: observation_emitted · observation_duplicate · unmapped_transition_cause ·
  * tracking_superseded · tracking_unavailable · observation_deferred · tracking_persistence_failed
  */
-function recordObservation({
-  sessionId,
-  session,
-  pendingReport,
-  destination,
-  cause,
-  evidence,
-  deliverToSource = false,
-  trigger,
-  deps = {},
-}) {
-  const _broadcast = deps.broadcastSessionEvent || broadcastSessionEvent;
-  const _sessions = deps.sessions || sessions;
-  const _resolveAlias = deps.resolveSessionAlias || resolveSessionAlias;
-  const _deliver = deps.deliverInjectionToSession || deliverInjectionToSession;
-  const nowIso = new Date().toISOString();
 
-  const mapped = mapObservationCause({ destination, cause, evidence });
-  const observation = { kind: mapped.kind, trigger: mapped.cause, ...mapped.fields };
-  if (trigger) observation.emitted_via = trigger;
-
-  // #801 output marker, attached HERE rather than by widening mapObservationCause's evidence
-  // whitelist. The whitelist is a contract — a name may not travel with evidence its cause row
-  // did not require — and widening it would let every unrelated field leak into every row. This
-  // is the one sanctioned exception, so it is made at the call site where it is visible.
-  //
-  // What these two fields say: a known error banner was MATCHED IN THE OUTPUT BYTES of this
-  // turn, by detectIdleAfterError, scoped past the inject watermark. That is a measured fact
-  // about output — the text was there. What they do NOT say, and must never be read as: that
-  // the session failed, that the task failed, or that the inject went unprocessed. Those are
-  // outcome claims and remain unmeasurable; this envelope still carries completion_fact:null
-  // and terminal:false alongside them, and the observation's KIND is unchanged — a marker
-  // cannot rename the measurement it rode in on.
-  //
-  // Without this, a CLI dying on a 529 and an unmeasured CLI printing the same banner emit
-  // byte-identical observations: the daemon measured the difference and then discarded it,
-  // which is the inverse of this release's thesis rather than an instance of it (§A4 —
-  // capability gaps are reported, not erased).
-  if (evidence && evidence.error_marker) {
-    observation.error_marker = evidence.error_marker;
-    if (evidence.error_detail) observation.error_detail = evidence.error_detail;
-  }
-
-  const injectId = pendingReport ? pendingReport.injectId : null;
-  const record = injectId ? getTrackedInjection(injectId) : null;
-
-  const consumption = pendingReport
-    ? classifyConsumption(pendingReport, {
-      echoObserved: deps.echoObserved === true,
-      echoReason: deps.echoReason || null,
-    })
-    : { status: 'not_established', basis: 'no_tracked_inject' };
-
-  // Duplicate suppression by observation identity. It suppresses the repeat NOTIFICATION; it is
-  // not an authority gate, and it can never prevent a future genuine observation of a different
-  // kind from being recorded.
-  let result = 'observation_emitted';
-  if (record) {
-    const identity = observationIdentity(mapped.kind, mapped.cause);
-    if (record.last_observation && observationIdentity(record.last_observation.kind, record.last_observation.trigger) === identity) {
-      result = 'observation_duplicate';
-    } else {
-      // #843 — snapshot BEFORE the in-memory append, because the append is speculative until the
-      // commit lands. Two defects rode on its absence, and they compounded:
-      //   1. the failed-commit branch below used to `return` HERE, ahead of the broadcast, so a
-      //      store that could not be written emitted NOTHING — no bus event, no source delivery.
-      //      That is §A2 ("absence is emitted, never silence") violated inside the emitter written
-      //      to enforce §A2, on the one condition an operator most needs to hear about;
-      //   2. `appendLedgerObservation` had already moved `last_observation`, so the identity dedup
-      //      then suppressed every RETRY of that same measurement as a duplicate of an append that
-      //      never reached disk. The first attempt was silent and it silenced all the rest.
-      // The rollback is what makes the retry meaningful; falling through to the broadcast is what
-      // makes the failure audible. Neither alone is enough.
-      const priorSeq = record.observation_seq;
-      const priorLast = record.last_observation;
-      const priorObservations = Array.isArray(record.observations) ? record.observations.slice() : [];
-      const priorCapability = record.capability;
-      sessionPersistence.appendLedgerObservation(record, { ...observation, consumption_status: consumption.status }, nowIso);
-      record.capability = { ...CAPABILITY_STAGE_A, ...(record.capability || {}) };
-      const committed = commitTrackedInjections();
-      if (!committed.ok) {
-        record.observation_seq = priorSeq;
-        record.last_observation = priorLast;
-        record.observations = priorObservations;
-        record.capability = priorCapability;
-        result = 'tracking_persistence_failed';
-        console.error(`[OBSERVE] ledger commit FAILED for ${injectId} (${committed.reason}) — `
-          + `${observation.kind} was emitted on the bus but is NOT durable`);
-      } else if (record.tracking_state === 'superseded') {
-        result = 'tracking_superseded';
-      }
-    }
-  } else if (injectId) {
-    // A tracked inject whose record we cannot find (pre-v2, another daemon epoch, corrupt store).
-    // Explicit, named, never silence.
-    result = 'tracking_unavailable';
-  }
-
-  if (mapped.kind === 'unmapped_transition_cause') result = 'unmapped_transition_cause';
-
-  const envelope = buildCompletionUnknown({
-    sessionId,
-    injectId,
-    observation,
-    consumption,
-    capability: record ? record.capability : CAPABILITY_STAGE_A,
-    observationSeq: record ? record.observation_seq : undefined,
-  });
-
-  // The bus always hears the absence, even when the ledger deduped or is unavailable — a
-  // subscriber must never have to infer from silence.
-  _broadcast('task_completion_unknown', sessionId, session, {
-    timestamp: nowIso,
-    extra: { ...envelope, tracking_result: result, source: pendingReport ? pendingReport.source : null },
-  });
-
-  if (deliverToSource && pendingReport && result !== 'observation_duplicate') {
-    // gh#82(F): while there is no outcome protocol, only absences made of a daemon-measured
-    // process/transport fact are PUSHED to the source; the screen-derived rows (pty_quiet, a
-    // repeated-error pattern matched on spinner frames, …) fired on essentially every inject to a
-    // Claude Code worker and were wrong every time. Gated BEFORE the #914 bookkeeping below,
-    // because an absence that was never delivered must not be recorded as delivered. The bus
-    // event above and the ledger append are unconditional, so the observation stays recorded and
-    // queryable — and the suppression is logged, never silent.
-    if (!shouldPushCompletionUnknown(envelope)) {
-      console.log(`[OBSERVE] ${sessionId}: ${observation.kind} NOT pushed to ${pendingReport.source} — `
-        + 'screen-derived absence while outcome_protocol=unavailable (gh#82 F; recorded on the bus '
-        + 'and in the ledger; TELEPTY_COMPLETION_UNKNOWN_PUSH=1 to push it anyway)');
-      return result;
-    }
-    // #914: the source hears each DISTINCT absence once per inject. The bus above is
-    // unconditional and the ledger below already recorded this observation — only the
-    // notification is suppressed, and only for an identity this inject already sent.
-    if (record && markAbsenceDeliveredToSource(record, observationIdentity(mapped.kind, mapped.cause))) {
-      console.log(`[OBSERVE] ${sessionId}: ${observation.kind} already delivered for ${injectId} — not re-notifying source`);
-      return result;
-    }
-    const srcId = _resolveAlias(pendingReport.source) || pendingReport.source;
-    const srcSession = _sessions[srcId];
-    if (srcSession) {
-      _deliver(srcId, srcSession, formatCompletionUnknownText(envelope), { noEnter: false, source: 'auto_report' });
-      console.log(`[OBSERVE] ${sessionId} → ${srcId}: ${observation.kind} (${result}, via ${trigger || mapped.cause})`);
-    }
-  }
-  return result;
-}
-
-function pendingReportHasSubmitEvidence(pendingReport) {
-  return !!(pendingReport && (
-    pendingReport.submitConfirmedAt ||
-    pendingReport.sawWorkingAfterInject ||
-    (pendingReport.submitConfirm && pendingReport.submitConfirm.accepted === true)
-  ));
-}
 
 // #619: persist inject-CONSUMPTION as a DURABLE FACT at consumption-time. The #52/#545 idle-
 // gate re-derives consumption from the outputRing/OSC133 marks AT IDLE-TIME; on a long Claude
@@ -1049,18 +926,6 @@ function pendingReportHasSubmitEvidence(pendingReport) {
 // conjuncts move to classifyConsumption, which runs when the confirmation actually exists. Same
 // conjuncts, correct evaluation point. Provenance for both halves is recorded so a reader can see
 // why a verdict was reached and where.
-function maybeRecordInjectConsumption(pendingReport, fromState, toState, transitionSinceMs) {
-  if (!pendingReport || pendingReport.injectConsumptionCandidate) return false;
-  const candidate = {
-    from: fromState,
-    to: toState,
-    sinceMs: transitionSinceMs,
-    at: Number.isFinite(transitionSinceMs) ? new Date(transitionSinceMs).toISOString() : null,
-  };
-  if (!completionObservation.isFreshBusyEdge(candidate, pendingReport.submitStartedAt)) return false;
-  pendingReport.injectConsumptionCandidate = candidate;
-  return true;
-}
 
 // #60 Stage A / §7 item 10: `resolveOutboundReportStatus` is GONE, and with it the entire
 // reverse-text report path. It mapped EVERY reverse-routed payload to `report_complete` — a
@@ -1108,21 +973,6 @@ function maybeRecordInjectConsumption(pendingReport, fromState, toState, transit
 // longer flows through `consumed_recorded`. It records `submit_accepted_and_output_advanced`
 // telemetry (acceptance basis, ring-byte delta, elapsed) and consumption stays
 // `not_established`. Stage D may delete the calculation; Stage A only stops it lying.
-function maybeRecordLauncherConsumption(session, pendingReport, elapsedSinceInjectSec, nowMs) {
-  if (!pendingReport || pendingReport.launcherWatermarkAt) return false;
-  if (!session || session.type !== 'wrapped') return false;
-  if (!pendingReport.submitExpected || !pendingReport.submitStartedAt) return false;
-  const confirm = pendingReport.submitConfirm;
-  if (!(confirm && confirm.accepted === true)) return false;
-  const ringNow = Number.isFinite(session.outputRingTotalBytes) ? session.outputRingTotalBytes : 0;
-  const ringAtInject = Number.isFinite(pendingReport.ringBytesAtInject) ? pendingReport.ringBytesAtInject : 0;
-  if (ringNow <= ringAtInject) return false;
-  if (!(elapsedSinceInjectSec >= LAUNCHER_CONSUMPTION_MIN_SECONDS)) return false;
-  pendingReport.launcherWatermarkAt = new Date(Number.isFinite(nowMs) ? nowMs : Date.now()).toISOString();
-  pendingReport.launcherRingBytesDelta = ringNow - ringAtInject;
-  pendingReport.launcherElapsedMs = Math.round(elapsedSinceInjectSec * 1000);
-  return true;
-}
 
 // #52: the TASK_IDLE_UNCONFIRMED semantic is "inject may NOT have been processed" — gate it
 // on CONSUMPTION evidence the daemon already owns instead of screen idleness. Evidence:
@@ -1138,13 +988,6 @@ function maybeRecordLauncherConsumption(session, pendingReport, elapsedSinceInje
 // nothing). Consumption is now a FIELD on the observation, computed by
 // src/completion-observation.js#classifyConsumption, which is total and has rejection precedence.
 // This helper only gathers the one piece of evidence that needs the session's output ring.
-function observeInjectEchoEvidence(pendingReport, session) {
-  const echo = submitGate.observeInjectEcho(session, pendingReport.injectedBodyPreview, {
-    sinceBytes: Number.isFinite(pendingReport.ringBytesAtInject) ? pendingReport.ringBytesAtInject : null,
-    stripAnsi: stripAnsiState,
-  });
-  return { observed: echo.observed === true, reason: echo.reason };
-}
 
 // #801 — TASK_COMPLETE vs error-death. A wrapped session whose CLI dies on an API/transport
 // error goes quiet, so the idle detector fires and the auto-report asserts the worker "is now
@@ -1160,65 +1003,14 @@ function observeInjectEchoEvidence(pendingReport, session) {
 // FAIL-OPEN by construction — no watermark, no ring, no per-CLI rule, or no marker => null =>
 // the caller emits exactly what it emits today. Only positive error evidence may relabel, so a
 // genuine TASK_COMPLETE can never be suppressed by an unrecognised screen.
-function detectIdleAfterError(session, pendingReport) {
-  if (!session || !pendingReport) return null;
-  if (!Array.isArray(session.outputRing) || session.outputRing.length === 0) return null;
-  if (!Number.isFinite(session.outputRingTotalBytes)) return null;
-  if (!Number.isFinite(pendingReport.ringBytesAtInject)) return null;
-  const appended = Math.max(0, session.outputRingTotalBytes - pendingReport.ringBytesAtInject);
-  if (appended === 0) return null;
-  const all = session.outputRing.join('');
-  const verdict = readyRegistry.detectSurfaceError(session.command, all.slice(Math.max(0, all.length - appended)));
-  return verdict.errored === true ? verdict : null;
-}
 
-function getPendingReport(sessionId, registry = pendingReports) {
-  if (typeof sessionId !== 'string') return null;
-  if (sessionId === '__proto__' || sessionId === 'prototype' || sessionId === 'constructor') return null;
-  if (!registry || !Object.prototype.hasOwnProperty.call(registry, sessionId)) return null;
-  return registry[sessionId];
-}
 
-function markPendingReportSubmitStarted(sessionId, bodyText) {
-  const pendingReport = getPendingReport(sessionId);
-  if (!pendingReport) return;
-  pendingReport.submitExpected = true;
-  pendingReport.submitInProgress = true;
-  pendingReport.submitStartedAt = new Date().toISOString();
-  if (typeof bodyText === 'string') {
-    pendingReport.injectedBodyPreview = bodyText.slice(0, 500);
-  }
-}
 
-function markPendingReportSubmitConfirmed(sessionId, confirm) {
-  const pendingReport = getPendingReport(sessionId);
-  if (!pendingReport) return;
-  pendingReport.submitExpected = true;
-  pendingReport.submitInProgress = false;
-  pendingReport.submitFinishedAt = new Date().toISOString();
-  pendingReport.submitConfirmedAt = pendingReport.submitFinishedAt;
-  pendingReport.submitConfirm = {
-    accepted: true,
-    reason: confirm && confirm.reason ? confirm.reason : 'confirmed',
-    attempts: confirm && confirm.attempts ? confirm.attempts : undefined,
-    ambiguous: !!(confirm && confirm.ambiguous),
-  };
-}
 
-function markPendingReportSubmitUnconfirmed(sessionId, confirm) {
-  const pendingReport = getPendingReport(sessionId);
-  if (!pendingReport) return;
-  pendingReport.submitExpected = true;
-  pendingReport.submitInProgress = false;
-  pendingReport.submitFinishedAt = new Date().toISOString();
-  pendingReport.submitUnconfirmedAt = pendingReport.submitFinishedAt;
-  pendingReport.submitConfirm = {
-    accepted: false,
-    reason: confirm && confirm.reason ? confirm.reason : 'submit_unconfirmed',
-    attempts: confirm && confirm.attempts ? confirm.attempts : undefined,
-    retryable: !!(confirm && confirm.retryable),
-  };
-}
+
+
+
+
 
 // #32 lineage: this was the single provenance-tagged AUTO-REPORT path, and its job was to decide
 // TASK_COMPLETE vs TASK_IDLE_UNCONFIRMED from elapsed time, submit flags and a prompt glyph.
@@ -1241,163 +1033,14 @@ function markPendingReportSubmitUnconfirmed(sessionId, confirm) {
 //
 // `deps` remains the DI seam (clock, setTimeout, bus, deliver, live state, CPU sampler).
 // Returns a NAMED result on every path — never undefined, never a bare return.
-function fireAutoReport(targetId, targetSession, pendingReport, trigger, deps = {}) {
-  const _now = deps.now || Date.now;
-  const _setTimeout = deps.setTimeout || setTimeout;
-  const _sessions = deps.sessions || sessions;
-  const _pendingReports = deps.pendingReports || pendingReports;
-  // #48: live auto-state lookup for the settle recheck (DI for unit tests).
-  const _getAutoState = deps.getAutoState || ((sid) => {
-    const st = sessionStateManager.getState(sid);
-    return st && st.state ? st.state : null;
-  });
-  // #52: wrapped-child CPU sampler for the quiet-thinking recheck (DI for unit tests).
-  const _sampleChildCpu = deps.sampleChildCpu || ((sess) =>
-    sampleChildCpuSeconds(sess ? (sess.ptyPid || (sess.ptyProcess && sess.ptyProcess.pid) || null) : null));
-
-  const elapsedNum = (_now() - new Date(pendingReport.injectedAt).getTime()) / 1000;
-  const elapsed = elapsedNum.toFixed(1);
-  const liveSession = () => _sessions[targetId] || targetSession;
-
-  // Resolve the measured cause for this entrance. The caller passes the state machine's own
-  // normalized cause where it has one (deps.observationCause); otherwise the trigger names it.
-  // Nothing here infers a cause from the destination state.
-  const resolveCause = () => {
-    if (deps.observationCause) return deps.observationCause;
-    if (trigger === 'ready-signal') {
-      const sess = liveSession();
-      const kind = sess && sess.readyKind ? sess.readyKind : 'legacy_unqualified_ready';
-      if (kind === 'composer_surface_observed') return 'ready_frame_composer_surface';
-      if (kind === 'prompt_suffix_observed') return 'ready_frame_prompt_suffix';
-      return 'ready_frame_legacy_unqualified';
-    }
-    return 'silence_timeout';
-  };
-
-  const emit = (extraEvidence = {}, extraDeps = {}) => {
-    const sess = liveSession();
-    const cause = resolveCause();
-    const evidence = {
-      elapsed_ms: Math.round(elapsedNum * 1000),
-      silence_ms: Number.isFinite(deps.silenceMs) ? deps.silenceMs : Math.round(elapsedNum * 1000),
-      ...(deps.observationEvidence || {}),
-      ...extraEvidence,
-    };
-    if (cause.startsWith('ready_frame_')) {
-      evidence.detector = (sess && sess.readyDetector) || 'unqualified';
-      evidence.cli_key = (sess && sess.readyCliKey) || null;
-    }
-    // #545 reliability is no longer a promotion input — nothing here promotes. It is computed and
-    // then DELIBERATELY NOT CARRIED on the emitted observation: §2.3 fixes each row's payload to
-    // the fields that row requires, plus last_output_at and confidence, and mapObservationCause
-    // drops everything else. Do not read the assignment below as "it becomes a field" — an earlier
-    // version of this comment claimed exactly that, and the claim was false, which is the same
-    // defect this release exists to remove.
-    //
-    // It stays computed because it is a real input to the local decisions above and is useful in
-    // the log line, and because OSC 133 has never fired on real traffic (zero hits across 9 live
-    // PTY captures and 15 fixtures) — so as an emitted field it would be permanently false, which
-    // is noise rather than information.
-    //
-    // #801's surface-error verdict is the deliberate exception and IS carried; see recordObservation,
-    // where it is attached explicitly rather than by widening the §2.3 whitelist. Neither signal may
-    // change the observation's NAME — that is fixed by the measured cause.
-    if (deps.idleEvidenceReliable !== undefined) evidence.idle_evidence_reliable = deps.idleEvidenceReliable;
-    const _detectIdleAfterError = deps.detectIdleAfterError || detectIdleAfterError;
-    const errorVerdict = _detectIdleAfterError(sess, pendingReport);
-    if (errorVerdict) {
-      evidence.error_marker = errorVerdict.reason;
-      evidence.error_detail = errorVerdict.detail;
-    }
-    const echo = sess ? observeInjectEchoEvidence(pendingReport, sess) : { observed: false, reason: null };
-    return recordObservation({
-      sessionId: targetId,
-      session: sess,
-      pendingReport,
-      destination: 'idle',
-      cause,
-      evidence,
-      deliverToSource: true,
-      trigger,
-      deps: { ...deps, echoObserved: echo.observed, echoReason: echo.reason, ...extraDeps },
-    });
-  };
-
-  // --- ready-signal dwell (#32): wait for the submit verdict before speaking ---------------
-  if (trigger === 'ready-signal' && pendingReport.submitExpected) {
-    if (pendingReportHasSubmitEvidence(pendingReport)) {
-      // Submit already answered — the ready frame adds no new measurement. Named, not silent.
-      return 'observation_duplicate';
-    }
-    const shouldWaitForSubmit = pendingReport.submitInProgress === true || elapsedNum < AUTO_REPORT_MIN_REAL_SECONDS;
-    if (shouldWaitForSubmit) {
-      if (!pendingReport.readySignalTimer) {
-        const floorDelayMs = Math.max(50, Math.ceil((AUTO_REPORT_MIN_REAL_SECONDS - elapsedNum) * 1000));
-        const delayMs = pendingReport.submitInProgress === true ? Math.min(250, Math.max(50, floorDelayMs)) : floorDelayMs;
-        pendingReport.readySignalTimer = _setTimeout(() => {
-          pendingReport.readySignalTimer = null;
-          const currentPending = getPendingReport(targetId, _pendingReports);
-          if (!currentPending) return;
-          fireAutoReport(targetId, liveSession(), currentPending, 'ready-signal', deps);
-        }, delayMs);
-      }
-      console.log(`[OBSERVE] ${targetId} ready-frame observation deferred; awaiting submit verdict`);
-      return 'observation_deferred';
-    }
-  }
-
-  // --- #721 launcher watermark: telemetry only, never consumption --------------------------
-  if (trigger === 'real-idle') {
-    maybeRecordLauncherConsumption(liveSession(), pendingReport, elapsedNum, _now());
-  }
-
-  // --- #48/#52 settle debounce (follow-ups only; the initial unknown is already durable) ---
-  if (!pendingReport.unconfirmedSettleDone) {
-    if (pendingReport.unconfirmedSettleTimer) return 'observation_deferred'; // window already open
-    const settleMs = Math.max(50, Math.round(IDLE_UNCONFIRMED_SETTLE_SECONDS * 1000));
-    const armSettle = () => {
-      const liveAtArm = liveSession();
-      const activityAtArm = liveAtArm ? liveAtArm.lastActivityAt : null;
-      const cpuAtArm = _sampleChildCpu(liveAtArm); // #52: null when unobservable
-      pendingReport.unconfirmedSettleTimer = _setTimeout(() => {
-        pendingReport.unconfirmedSettleTimer = null;
-        const currentPending = getPendingReport(targetId, _pendingReports);
-        if (currentPending !== pendingReport) return;
-        const autoState = _getAutoState(targetId);
-        if (autoState === 'working' || autoState === 'thinking') {
-          // Still busy: the quiet we were about to describe is gone. Nothing to state.
-          console.log(`[OBSERVE] ${targetId} quiet observation dropped after settle — session is ${autoState}`);
-          return;
-        }
-        const activityNow = liveSession() ? liveSession().lastActivityAt : null;
-        if (activityNow !== activityAtArm
-            && (pendingReport.unconfirmedSettleRearms || 0) < IDLE_UNCONFIRMED_SETTLE_MAX_REARMS) {
-          pendingReport.unconfirmedSettleRearms = (pendingReport.unconfirmedSettleRearms || 0) + 1;
-          armSettle();
-          return;
-        }
-        const cpuNow = _sampleChildCpu(liveSession());
-        if (cpuAtArm != null && cpuNow != null
-            && (cpuNow - cpuAtArm) >= IDLE_UNCONFIRMED_CPU_DELTA_SECONDS
-            && (pendingReport.unconfirmedCpuRearms || 0) < IDLE_UNCONFIRMED_CPU_MAX_REARMS) {
-          pendingReport.unconfirmedCpuRearms = (pendingReport.unconfirmedCpuRearms || 0) + 1;
-          armSettle();
-          return;
-        }
-        pendingReport.unconfirmedSettleDone = true;
-        fireAutoReport(targetId, liveSession() || targetSession, currentPending, trigger, deps);
-      }, settleMs);
-    };
-    armSettle();
-    console.log(`[OBSERVE] ${targetId} quiet at ${elapsed}s (trigger=${trigger}) — settling ${IDLE_UNCONFIRMED_SETTLE_SECONDS}s before the follow-up observation`);
-    return 'observation_deferred';
-  }
-
-  // --- emit. Consumption is a FIELD here, never a gate. -----------------------------------
-  return emit();
-}
 
 const sessions = {};
+const busClients = new Set();
+const sessionRecordContext = createSessionRecordContext({
+  sessions, sessionCredentials, sidNonces, sessionPersistPath: SESSION_PERSIST_PATH
+});
+const { persistSessions, issueSessionCredential, revokeSessionCredential,
+  resolveSessionAlias, resolveSessionForDestroy } = sessionRecordContext;
 const handoffs = {};
 const threads = {};
 let teleptyConfig;
@@ -1423,20 +1066,11 @@ try {
   teleptyConfig = loadTeleptyConfig({ paths: [] });
 }
 
-function broadcastBusEvent(event) {
-  const serialized = JSON.stringify(event);
-  busClients.forEach((client) => {
-    if (client.readyState === 1) client.send(serialized);
-  });
-}
 
-function buildErrorBody(code, error, extra = {}) {
-  return { success: false, code, error, ...extra };
-}
 
-function respondWithError(res, httpStatus, code, error, extra = {}) {
-  return res.status(httpStatus).json(buildErrorBody(code, error, extra));
-}
+
+
+
 
 // #533 Phase 2 — pure peer-lane inject policy verdict (self-contained; no parser
 // dependency). The PEER LANE is sender ≠ orchestrator AND target ≠ orchestrator.
@@ -1449,73 +1083,10 @@ function respondWithError(res, httpStatus, code, error, extra = {}) {
 //   kind ∈ 'ask-request' | 'ask-reply' | null
 const PEER_INJECT_KINDS = new Set(['ask-request', 'ask-reply']);
 
-function classifyPeerLaneInject({ from, to, prompt, orchestratorSids } = {}) {
-  const orchSet = Array.isArray(orchestratorSids) ? orchestratorSids : [];
-  // Fail-OPEN: with no known orchestrator sid we cannot tell the orch lane apart
-  // from the peer lane (every inject would look peer-lane), which would over-block
-  // legitimate orchestrator traffic and brick the mesh. Degrade to allow + warn;
-  // the Phase-1 orchestrator-side auditor still detects raw bypass (defense in depth).
-  if (orchSet.length === 0) {
-    return { lane: 'disabled', decision: 'allow', reason: 'orch-sid-unconfigured-fail-open', kind: null, envelopePresent: false };
-  }
-  // No sender → operator/CLI/multicast/broadcast, never peer-lane.
-  if (!from) {
-    return { lane: 'orchestrator', decision: 'allow', reason: 'no-sender', kind: null, envelopePresent: false };
-  }
-  // Orchestrator lane (either end is the orchestrator) → always allowed, untouched.
-  if (orchSet.includes(from) || orchSet.includes(to)) {
-    return { lane: 'orchestrator', decision: 'allow', reason: 'orch-lane', kind: null, envelopePresent: false };
-  }
 
-  // Peer lane: require a sanctioned envelope on the first non-empty line.
-  let env = null;
-  try {
-    const firstLine = String(prompt || '').split(/\r?\n/).map(l => l.trim()).find(l => l.length > 0);
-    if (firstLine) {
-      const parsed = JSON.parse(firstLine);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) env = parsed;
-    }
-  } catch {
-    env = null;
-  }
-  if (!env) {
-    return { lane: 'peer', decision: 'block', reason: 'malformed-envelope', kind: null, envelopePresent: false };
-  }
-  if (!PEER_INJECT_KINDS.has(env.kind)) {
-    return { lane: 'peer', decision: 'block', reason: 'wrong-kind', kind: null, envelopePresent: true };
-  }
-  // Common required fields + per-kind payload (matches ask.sh build_envelope).
-  const nonEmptyStr = (v) => typeof v === 'string' && v.length > 0;
-  const baseOk = nonEmptyStr(env.from) && nonEmptyStr(env.to) && nonEmptyStr(env.thread_id) && Number.isInteger(env.round);
-  const payloadOk = env.kind === 'ask-request' ? nonEmptyStr(env.question) : nonEmptyStr(env.answer);
-  if (!baseOk || !payloadOk) {
-    return { lane: 'peer', decision: 'block', reason: 'invalid-field', kind: null, envelopePresent: true };
-  }
-  // Sender-consistency: the envelope's declared sender must match the inject's
-  // from (cheap anti-spoof). `to` is NOT cross-checked — the route resolves aliases,
-  // which would false-block legitimate aliased targets.
-  if (env.from !== from) {
-    return { lane: 'peer', decision: 'block', reason: 'from-mismatch', kind: null, envelopePresent: true };
-  }
-  return { lane: 'peer', decision: 'allow', reason: 'sanctioned-envelope', kind: env.kind, envelopePresent: true };
-}
 
-function normalizeNullableText(value) {
-  if (value === undefined || value === null) {
-    return null;
-  }
 
-  const normalized = String(value).trim();
-  return normalized.length > 0 ? normalized : null;
-}
 
-function getSessionDisconnectedMs(session, nowMs = Date.now()) {
-  if (!session.lastDisconnectedAt) {
-    return null;
-  }
-
-  return Math.max(0, nowMs - new Date(session.lastDisconnectedAt).getTime());
-}
 
 // #732 — upstream-liveness probe. The daemon already keeps a monotonic upstream-only byte
 // counter (`outputRingTotalBytes`, stamped in appendToOutputRing and nothing else). Arming a
@@ -1525,308 +1096,54 @@ function getSessionDisconnectedMs(session, nowMs = Date.now()) {
 // The probe is armed only when no UNANSWERED probe is already aging — otherwise a stream of
 // injects would keep resetting the clock and a dead pipe would never trip the threshold.
 // It self-clears: any upstream byte pushes the counter past the watermark.
-function armUpstreamProbe(session, nowMs = Date.now()) {
-  if (!session || session.type !== 'wrapped') return;
-  const watermark = session.outputRingTotalBytes || 0;
-  // `!= null`, not falsiness: a probe armed at epoch 0 is a real probe.
-  if (session.upstreamProbeAt != null && watermark <= (session.upstreamProbeWatermark || 0)) {
-    return;
-  }
-  session.upstreamProbeAt = nowMs;
-  session.upstreamProbeWatermark = watermark;
-}
+
 
 // Pure predicate — exported for unit testing. "Socket alive but pipe dead."
-function isUpstreamStalled(session, nowMs = Date.now(), options = {}) {
-  if (!session || session.type !== 'wrapped') return false;
-  if (session.upstreamProbeAt == null) return false;
-  if ((session.outputRingTotalBytes || 0) > (session.upstreamProbeWatermark || 0)) return false;
-  const stallMs = (options.stallSeconds ?? UPSTREAM_STALL_SECONDS) * 1000;
-  return nowMs - session.upstreamProbeAt >= stallMs;
-}
 
-function getSessionHealthStatus(session, options = {}) {
-  const nowMs = options.nowMs ?? Date.now();
-  const staleMs = (options.staleSeconds ?? SESSION_STALE_SECONDS) * 1000;
-  const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
 
-  if (session.type === 'wrapped') {
-    if (isOpenWebSocket(session.ownerWs)) {
-      // #732: an open owner socket is necessary, not sufficient. A session that has
-      // returned nothing since we last wrote to it is unobservable, not healthy.
-      return isUpstreamStalled(session, nowMs, options) ? 'UPSTREAM_STALLED' : 'CONNECTED';
-    }
-    if (disconnectedMs !== null && disconnectedMs >= staleMs) {
-      return 'STALE';
-    }
-    return 'DISCONNECTED';
-  }
 
-  if (session.type === 'aterm') {
-    const endpoint = session.deliveryEndpoint || (session.delivery && session.delivery.address);
-    if (endpoint) {
-      const isSocketPath = endpoint.startsWith('/');
-      if (isSocketPath) {
-        try {
-          const stat = fs.statSync(endpoint);
-          return stat.isSocket() ? 'CONNECTED' : 'DISCONNECTED';
-        } catch {
-          return 'DISCONNECTED';
-        }
-      }
-      return 'CONNECTED';
-    }
-    if (disconnectedMs !== null && disconnectedMs >= staleMs) {
-      return 'STALE';
-    }
-    return 'DISCONNECTED';
-  }
 
-  return session.ptyProcess && !session.ptyProcess.killed ? 'CONNECTED' : 'DISCONNECTED';
-}
 
-function getSessionHealthReason(session, healthStatus) {
-  if (session.type === 'wrapped') {
-    if (healthStatus === 'CONNECTED') return 'OWNER_CONNECTED';
-    // #732: the owner socket is open and answering pings; the output pipe behind it is not.
-    if (healthStatus === 'UPSTREAM_STALLED') return 'OWNER_CONNECTED_UPSTREAM_STALLED';
-    if (healthStatus === 'STALE') return 'OWNER_DISCONNECTED_STALE';
-    return 'OWNER_DISCONNECTED';
-  }
 
-  if (session.type === 'aterm') {
-    if (healthStatus === 'CONNECTED') return 'DELIVERY_ENDPOINT_AVAILABLE';
-    if (healthStatus === 'STALE') return 'DELIVERY_ENDPOINT_STALE';
-    return 'DELIVERY_ENDPOINT_MISSING';
-  }
 
-  return session.ptyProcess && !session.ptyProcess.killed ? 'PTY_RUNNING' : 'PTY_EXITED';
-}
 
-function parseOptionalIdleTtl(body) {
-  if (!body || !Object.prototype.hasOwnProperty.call(body, 'idle_ttl')) {
-    return { present: false };
-  }
-  try {
-    return {
-      present: true,
-      raw: body.idle_ttl == null ? 'off' : String(body.idle_ttl),
-      ms: lifecycle.parseDuration(body.idle_ttl == null ? 'off' : body.idle_ttl, { fieldName: 'idle_ttl' })
-    };
-  } catch (err) {
-    return { present: true, error: err.message };
-  }
-}
 
-function applyProcessMetadata(session, body) {
-  if (!session || !body) return;
-  const ownerPid = Number(body.owner_pid);
-  const ptyPid = Number(body.pty_pid);
-  if (Number.isInteger(ownerPid) && ownerPid > 0) {
-    session.ownerPid = ownerPid;
-  }
-  if (Number.isInteger(ptyPid) && ptyPid > 0) {
-    session.ptyPid = ptyPid;
-  }
-}
 
-function applyIdleTtlMetadata(session, parsedIdleTtl) {
-  if (!session || !parsedIdleTtl || !parsedIdleTtl.present || parsedIdleTtl.error) return;
-  session.idleTtl = parsedIdleTtl.raw;
-  session.idleTtlMs = parsedIdleTtl.ms;
-}
 
-function applyTimestampMetadata(session, body) {
-  if (!session || !body) return;
-  for (const [field, prop] of [
-    ['created_at', 'createdAt'],
-    ['last_activity_at', 'lastActivityAt']
-  ]) {
-    if (!Object.prototype.hasOwnProperty.call(body, field)) continue;
-    const value = body[field] == null ? null : String(body[field]);
-    if (value && Number.isFinite(new Date(value).getTime())) {
-      session[prop] = value;
-    }
-  }
-}
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
-function isBootstrapGatedSession(session) {
-  return !!(session && session.type === 'wrapped' && readyRegistry.isKnownAiCli(session.command));
-}
 
-function initializeBootstrapState(session) {
-  if (!session) return session;
-  if (!Array.isArray(session.bootstrapQueue)) {
-    session.bootstrapQueue = [];
-  }
-  session.bootstrapDraining = session.bootstrapDraining === true;
-  session.bootstrapDrainPromise = session.bootstrapDrainPromise || null;
-  session.bootstrapPromptPoll = session.bootstrapPromptPoll || null;
 
-  if (isBootstrapGatedSession(session)) {
-    session.bootstrapReady = session.bootstrapReady === true;
-    session.bootstrapReadyAt = session.bootstrapReadyAt || null;
-    session.bootstrapReadyReason = session.bootstrapReadyReason || null;
-    session.ready = session.bootstrapReady === true;
-  } else {
-    session.bootstrapReady = true;
-    session.bootstrapReadyAt = session.bootstrapReadyAt || new Date().toISOString();
-    session.bootstrapReadyReason = session.bootstrapReadyReason || 'generic_command_compat';
-    session.ready = true;
-  }
-  return session;
-}
 
-function isBootstrapReady(session) {
-  return !isBootstrapGatedSession(session) || session.bootstrapReady === true;
-}
 
-function buildBootstrapBlock(session) {
-  return {
-    gated: isBootstrapGatedSession(session),
-    ready: isBootstrapReady(session),
-    ready_at: session.bootstrapReadyAt || null,
-    reason: session.bootstrapReadyReason || null,
-    queued: Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0,
-    draining: session.bootstrapDraining === true
-  };
-}
 
-function shouldQueueBootstrapOperation(session) {
-  return isBootstrapGatedSession(session) && !isBootstrapReady(session);
-}
 
-function hasBootstrapBacklog(session) {
-  return !!(session && Array.isArray(session.bootstrapQueue) && session.bootstrapQueue.length > 0);
-}
 
-function emitBootstrapEvent(eventType, sessionId, session, extra = {}) {
-  broadcastSessionEvent(eventType, sessionId, session, {
-    extra: {
-      bootstrap: buildBootstrapBlock(session),
-      ...extra
-    }
-  });
-}
 
-function enqueueBootstrapOperation(sessionId, session, operation) {
-  initializeBootstrapState(session);
-  const op = {
-    op_id: crypto.randomUUID(),
-    queued_at: new Date().toISOString(),
-    ...operation
-  };
 
-  if (op.type === 'submit') {
-    op.promise = new Promise((resolve) => {
-      op.resolve = resolve;
-    });
-  }
 
-  session.bootstrapQueue.push(op);
-  emitBootstrapEvent('bootstrap_queue_queued', sessionId, session, {
-    op_id: op.op_id,
-    operation: op.type,
-    depth: session.bootstrapQueue.length
-  });
-  scheduleBootstrapPromptPoll(sessionId, session);
-  return op;
-}
 
-function resolveBootstrapSubmit(op, result) {
-  if (op && typeof op.resolve === 'function') {
-    op.resolve(result);
-    op.resolve = null;
-  }
-}
 
-function bootstrapQueuedResponse(op, extra = {}) {
-  return {
-    success: true,
-    strategy: 'bootstrap_queue',
-    queued: true,
-    bootstrap_queued: true,
-    bootstrap_op_id: op.op_id,
-    ...extra
-  };
-}
 
-async function executeBootstrapInject(sessionId, session, op) {
-  const prompt = typeof op.prompt === 'string' ? op.prompt : '';
-  // #760: this is the ONLY inject path that wrote the body un-enveloped — the mailbox path
-  // has wrapped it since #716/#730, and #730 measured that the un-enveloped MULTI-LINE shape
-  // is exactly what swallows the following CR (still 1/7 at a 127ms gap; the envelope was
-  // 0/9). Harmless while this queue only carried boot-time injects; load-bearing now that a
-  // modal park routes worker REPORTs — multi-line by definition — through it. Fixed here
-  // rather than in the park branch so the boot caller stops rolling the same dice.
-  const body = maybeBracketedPaste(prompt, session);
-  const textResult = await writeDataToSession(sessionId, session, body);
-  // #860 F2 — a failure here is reported back with the byte count that actually landed, because
-  // the caller records it in the ledger. The two arms differ: nothing was written when the BODY
-  // was refused, but the body is on the surface by the time the submit CR can fail, and an abort
-  // that stamped `bytes_written: 0` on that one would be the same defect it exists to close.
-  if (!textResult.success) return { ...textResult, bytes_written: 0 };
 
-  if (!op.noEnter) {
-    await sleep(WRAPPED_SUBMIT_DELAY_MS);
-    const submitResult = await writeDataToSession(sessionId, session, '\r');
-    if (!submitResult.success) return { ...submitResult, bytes_written: Buffer.byteLength(body) };
-  }
 
-  session.lastActivityAt = new Date().toISOString();
-  return {
-    success: true,
-    strategy: 'bootstrap_direct',
-    submit: op.noEnter ? 'skipped' : 'sent'
-  };
-}
 
-function parseSubmitRetryOptions(body = {}, injectedBody = null) {
-  const hasExplicitRetries = body && body.retries !== undefined && body.retries !== null;
-  // #568: raise the retry-budget ceiling so a momentarily-busy CLI still gets a
-  // render-gated CR before we return 504 (each retry re-gates on input-ready, so
-  // more attempts = more quiet-window chances to land). Ceilings only — the
-  // default stays 1 for the injected case (behavior-preserving common path);
-  // heavier callers opt into the bigger budget via retries/retry_delay_ms/
-  // verify_timeout_ms. Total worst-case budget stays bounded (~10 attempts).
-  const retries = Math.min(Math.max(Number(hasExplicitRetries ? body.retries : (injectedBody ? 1 : 0)) || 0, 0), 10);
-  const retryDelayMs = Math.min(Math.max(Number(body?.retry_delay_ms) || 500, 100), 3000);
-  const verifyTimeoutMs = Math.min(Math.max(Number(body?.verify_timeout_ms) || 1500, 200), 8000);
-  return { retries, retryDelayMs, verifyTimeoutMs };
-}
 
-function buildSubmitVerify(confirm) {
-  if (!confirm) return null;
-  return {
-    consumed: confirm.accepted === true,
-    waited_ms: confirm.waited_ms || 0,
-    reason: confirm.reason || null,
-    source: confirm.visibility && confirm.visibility.source ? confirm.visibility.source : undefined,
-    ambiguous: confirm.ambiguous === true || undefined,
-    retryable: confirm.retryable === true || undefined,
-  };
-}
 
-function buildSubmitConfirmOptions(id, session, submittedAtMs, verifyTimeoutMs) {
-  return {
-    timeoutMs: verifyTimeoutMs,
-    intervalMs: 50,
-    submittedAtMs,
-    stripAnsi: stripAnsiState,
-    getState: () => sessionStateManager.getState(id),
-  };
-}
 
-async function confirmSubmitAfterDispatch(id, session, injectedBody, submittedAtMs, verifyTimeoutMs) {
-  if (!injectedBody || injectedBody.length === 0) {
-    return null;
-  }
-  return submitGate.confirmSubmitAccepted(session, injectedBody, buildSubmitConfirmOptions(id, session, submittedAtMs, verifyTimeoutMs));
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // #568 — render-gate the submit CR. Before writing the bare 0x0D, wait (bounded)
 // until the injected body is echoed in the PTY outputRing AND the render has gone
@@ -1835,21 +1152,7 @@ async function confirmSubmitAfterDispatch(id, session, injectedBody, submittedAt
 // fall through and still write the CR — never worse than the pre-gate behavior.
 // pty_cr stays the ONLY write path (terminalLevelSubmit); this only times WHEN.
 // Per-request opt-out via `input_settle_gate: false` (rollback/parity escape hatch).
-async function gatedTerminalSubmit(id, session, injectedBody, settleEnabled) {
-  if (injectedBody && injectedBody.length > 0 && settleEnabled !== false) {
-    const settle = await submitGate.awaitInputSettled(session, injectedBody, {
-      timeoutMs: 1200,
-      quietWindowMs: 100,
-      echoGraceMs: 400,
-      pollIntervalMs: 30,
-      stripAnsi: stripAnsiState,
-    });
-    if (!settle.ready) {
-      console.log(`[SUBMIT] input-settle gate timed out for ${id} (${settle.waited_ms}ms, echoed=${settle.echoed}) — sending CR best-effort`);
-    }
-  }
-  return terminalLevelSubmit(id, session);
-}
+
 
 // #617 — detached hold-and-redeliver for a `queued` inject. The /submit response has
 // already returned (the worker's `telepty inject` got consumption='queued' / a plain
@@ -1859,699 +1162,80 @@ async function gatedTerminalSubmit(id, session, injectedBody, settleEnabled) {
 // auto-state for busy→idle (awaitReplReady) and re-firing the bare CR (the body is still
 // parked in the composer) until it is consumed as a fresh turn. Fire-and-forget: never
 // awaited by the handler, so it cannot affect the response or block the caller.
-function scheduleQueuedRedeliver(id, session, injectedBody, opts = {}) {
-  if (!REDELIVER_ENABLED) return;
-  if (!injectedBody || injectedBody.length === 0) return;
-  if (!session) return;
-  // One in-flight redeliver per session — never stack idle-watchers for the same composer.
-  if (session._redeliverInFlight) return;
-  session._redeliverInFlight = true;
 
-  const emitSubmitBus = typeof opts.emitSubmitBus === 'function' ? opts.emitSubmitBus : () => {};
-  const knownConsumption = opts.knownConsumption || null;
 
-  const isParked = () =>
-    submitGate.observeBodyVisibility(session, injectedBody, { stripAnsi: stripAnsiState }).visible === true;
 
-  // Re-fire a bare CR (body already parked) then re-classify against a FRESH watermark:
-  // the recipient is now idle, so a genuine idle→working/thinking turn is observable as
-  // `consumed` (#53). A still-`queued` result means the CR did not fire the composer — retry.
-  const fireCR = async () => {
-    const strategy = await gatedTerminalSubmit(id, session, injectedBody, true);
-    if (!strategy) return { redelivered: false, reason: 'strategy_failed' };
-    const submittedAtMs = Date.now();
-    const sinceBytes = session.outputRingTotalBytes || 0;
-    const c = await submitGate.classifyInjectConsumption(session, injectedBody, {
-      submittedAtMs,
-      sinceBytes,
-      getState: () => sessionStateManager.getState(id),
-      stripAnsi: stripAnsiState,
-    });
-    return { redelivered: c.status === 'consumed', reason: c.reason };
-  };
 
-  const waitForIdle = (remainingMs) =>
-    submitGate.awaitReplReady(id, sessionStateManager, {
-      timeoutMs: Math.min(remainingMs, REDELIVER_IDLE_WAIT_MS),
-    });
 
-  const run = async () => {
-    // Force path skips the synchronous classify — establish the `queued` precondition here
-    // before holding an idle-watcher. Only a busy-parked body needs rescue.
-    if (knownConsumption !== 'queued') {
-      if (Number.isFinite(opts.submittedAtMs)) {
-        const c = await submitGate.classifyInjectConsumption(session, injectedBody, {
-          submittedAtMs: opts.submittedAtMs,
-          sinceBytes: Number.isFinite(opts.ringBytesAtSubmit) ? opts.ringBytesAtSubmit : (session.outputRingTotalBytes || 0),
-          getState: () => sessionStateManager.getState(id),
-          stripAnsi: stripAnsiState,
-        });
-        if (c.status !== 'queued') return; // consumed / unknown — nothing to redeliver
-      } else {
-        return; // no watermark to classify against — cannot safely redeliver
-      }
-    }
 
-    console.log(`[REDELIVER] ${id} inject queued on busy recipient — holding for idle to re-fire`);
-    const result = await submitGate.holdAndRedeliver({
-      waitForIdle,
-      isStillParked: isParked,
-      fireCR,
-      maxAttempts: REDELIVER_MAX_ATTEMPTS,
-      totalTimeoutMs: REDELIVER_TOTAL_TIMEOUT_MS,
-      onAttempt: ({ attempt }) =>
-        console.log(`[REDELIVER] ${id} idle — re-firing queued inject (attempt ${attempt}/${REDELIVER_MAX_ATTEMPTS})`),
-      onExhausted: ({ reason, attempts }) => {
-        console.log(`[REDELIVER] ${id} redeliver-exhausted (${reason}, attempts=${attempts})`);
-        emitSubmitBus({ redeliver: 'exhausted', redeliver_reason: reason, redeliver_attempts: attempts });
-      },
-    });
-
-    if (result.status === 'redelivered') {
-      console.log(`[REDELIVER] ${id} queued inject redelivered after ${result.attempts} attempt(s)`);
-      markPendingReportSubmitConfirmed(id, { reason: 'redelivered', attempts: result.attempts });
-      emitSubmitBus({ redeliver: 'redelivered', redeliver_attempts: result.attempts });
-    } else if (result.status === 'already_consumed') {
-      console.log(`[REDELIVER] ${id} queued inject already consumed (${result.reason}) — no re-fire`);
-    }
-  };
-
-  Promise.resolve()
-    .then(run)
-    .catch((err) => console.log(`[REDELIVER] ${id} redeliver error: ${err && err.message}`))
-    .finally(() => { session._redeliverInFlight = false; });
-}
-
-async function executeBootstrapSubmit(sessionId, session, op) {
-  const body = op.body || {};
-  const injectedBody = typeof body.injected_body === 'string' ? body.injected_body : null;
-  const { retries, retryDelayMs, verifyTimeoutMs } = parseSubmitRetryOptions(body, injectedBody);
-  if (injectedBody) {
-    markPendingReportSubmitStarted(sessionId, injectedBody);
-  }
-
-  const settleEnabled = body.input_settle_gate !== false;
-  let strategy = await gatedTerminalSubmit(sessionId, session, injectedBody, settleEnabled);
-  const submittedAtMs = Date.now();
-  if (!strategy) {
-    if (injectedBody) {
-      markPendingReportSubmitUnconfirmed(sessionId, { reason: 'strategy_failed', attempts: 0, retryable: false });
-    }
-    return {
-      status: 503,
-      body: {
-        error: 'Submit failed via all strategies (kitty/cmux/pty)',
-        strategy: 'none',
-        attempts: 0,
-        gated: false,
-        bootstrap_queued: true
-      }
-    };
-  }
-  let attempts = 1;
-  let confirm = await confirmSubmitAfterDispatch(sessionId, session, injectedBody, submittedAtMs, verifyTimeoutMs);
-  while (confirm && !confirm.accepted && confirm.retryable && attempts <= retries) {
-    await sleep(retryDelayMs);
-    const retryStrategy = await gatedTerminalSubmit(sessionId, session, injectedBody, settleEnabled);
-    const retrySubmittedAtMs = Date.now();
-    if (!retryStrategy) break;
-    strategy = retryStrategy;
-    attempts++;
-    confirm = await confirmSubmitAfterDispatch(sessionId, session, injectedBody, retrySubmittedAtMs, verifyTimeoutMs);
-  }
-
-  if (confirm && !confirm.accepted) {
-    markPendingReportSubmitUnconfirmed(sessionId, { ...confirm, attempts });
-    return {
-      status: 504,
-      body: {
-        error: 'Submit body still visible after bounded confirmation retry',
-        reason: 'submit_unconfirmed',
-        strategy,
-        attempts,
-        gated: false,
-        verify: buildSubmitVerify(confirm),
-        confirm,
-        bootstrap_queued: true
-      }
-    };
-  }
-
-  if (injectedBody) {
-    markPendingReportSubmitConfirmed(sessionId, { ...(confirm || { reason: 'empty_body' }), attempts });
-  }
-  return {
-    status: 200,
-    body: {
-      success: true,
-      strategy,
-      attempts,
-      gated: false,
-      verify: buildSubmitVerify(confirm),
-      confirm,
-      bootstrap_queued: true
-    }
-  };
-}
-
-async function drainBootstrapQueue(sessionId, session) {
-  if (!session || session.bootstrapDraining) {
-    return session ? session.bootstrapDrainPromise : null;
-  }
-  if (!isBootstrapReady(session)) {
-    return null;
-  }
-
-  session.bootstrapDraining = true;
-  session.bootstrapDrainPromise = (async () => {
-    while (hasBootstrapBacklog(session)) {
-      // #760: the drain writes straight to the surface (executeBootstrapInject /
-      // executeBootstrapSubmit), so it has to ask the modal gate itself — markBootstrapReady
-      // reaches it without ever consulting one. Checked BEFORE the shift so the op stays
-      // parked rather than being consumed into a modal, and re-armed so the park poll picks
-      // it up again. Also covers a modal that appears part-way through a drain.
-      //
-      // Asked through modalDeliveryDecision, not the raw predicate, so that
-      // TELEPTY_MODAL_REMEDY=off stays a COMPLETE rollback: with the gate off the drain
-      // writes into the modal exactly as it did before this change.
-      if (modalDeliveryDecision(session).action !== 'deliver') {
-        scheduleModalParkDrain(sessionId, session);
-        break;
-      }
-      const op = session.bootstrapQueue.shift();
-      try {
-        if (op.cancelled) {
-          continue;
-        }
-        if (op.type === 'inject') {
-          const result = await executeBootstrapInject(sessionId, session, op);
-          if (!result.success) {
-            emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
-              op_id: op.op_id,
-              operation: op.type,
-              code: result.code || 'DELIVERY_FAILED',
-              error: result.error || 'bootstrap delivery failed'
-            });
-            // #860 F2 — and durably. The event above is push-only; this is a TERMINAL outcome for
-            // a dispatch whose record has said `tracked` since the route accepted it.
-            abortTrackedInjection(op.injectId, sessionId, result.code || 'DELIVERY_FAILED', result.error, {
-              trigger: 'bootstrap_queue_failed',
-              bytesWritten: result.bytes_written,
-            });
-          }
-        } else if (op.type === 'submit') {
-          const result = await executeBootstrapSubmit(sessionId, session, op);
-          resolveBootstrapSubmit(op, result);
-          if (result.status >= 400) {
-            emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
-              op_id: op.op_id,
-              operation: op.type,
-              code: result.body.code || 'SUBMIT_FAILED',
-              error: result.body.error || 'bootstrap submit failed'
-            });
-          }
-        }
-      } catch (error) {
-        if (op.type === 'submit') {
-          resolveBootstrapSubmit(op, {
-            status: 500,
-            body: {
-              error: error.message || 'bootstrap submit failed',
-              strategy: 'none',
-              attempts: 0,
-              gated: false,
-              bootstrap_queued: true
-            }
-          });
-        }
-        emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
-          op_id: op.op_id,
-          operation: op.type,
-          code: 'BOOTSTRAP_DRAIN_FAILED',
-          error: error.message || 'bootstrap drain failed'
-        });
-        // #860 F2 — the same terminal outcome as the arm above, reached by a throw. `bytesWritten:
-        // null` because a throw can land on either side of the body write, and this is the one
-        // path that cannot say which.
-        abortTrackedInjection(op.injectId, sessionId, 'BOOTSTRAP_DRAIN_FAILED', error.message || 'bootstrap drain failed', {
-          trigger: 'bootstrap_drain_failed',
-          bytesWritten: null,
-        });
-      }
-    }
-
-    emitBootstrapEvent('bootstrap_queue_drained', sessionId, session);
-  })().finally(() => {
-    session.bootstrapDraining = false;
-    session.bootstrapDrainPromise = null;
-  });
-
-  return session.bootstrapDrainPromise;
-}
-
-function markBootstrapReady(sessionId, session, reason) {
-  if (!session) return false;
-  initializeBootstrapState(session);
-  if (!isBootstrapGatedSession(session)) {
-    return false;
-  }
-  if (session.bootstrapReady === true) {
-    return false;
-  }
-
-  session.bootstrapReady = true;
-  session.bootstrapReadyAt = new Date().toISOString();
-  session.bootstrapReadyReason = reason || 'ready';
-  session.ready = true;
-  emitBootstrapEvent('bootstrap_ready', sessionId, session, { reason: session.bootstrapReadyReason });
-  drainBootstrapQueue(sessionId, session);
-  return true;
-}
 
 // #31 (AC-31.4): a session stuck past the bootstrap timeout must surface an ACTIONABLE error
 // and stop queuing forever. Emit an actionable bootstrap_ready_timeout (hint + dropped count)
 // and FLUSH the queue: submit ops resolve 504, inject ops fail — instead of silently
 // accumulating until the process is killed. The caller can re-inject if the target recovers.
-function failBootstrapQueueOnTimeout(sessionId, session, detail = {}) {
-  const queued = Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0;
-  emitBootstrapEvent('bootstrap_ready_timeout', sessionId, session, {
-    ...detail,
-    actionable: true,
-    queued_dropped: queued,
-    hint: `Session '${sessionId}' did not become inject-ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms — the target CLI (e.g. codex MCP init) may be hung. Inspect the surface and re-spawn if needed; queued injects were flushed.`
-  });
-  if (queued === 0) return;
-  const drained = session.bootstrapQueue.splice(0, queued);
-  for (const op of drained) {
-    if (op.type === 'submit') {
-      resolveBootstrapSubmit(op, {
-        status: 504,
-        body: {
-          error: `bootstrap_ready_timeout — '${sessionId}' not ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms`,
-          reason: detail.reason || 'bootstrap_ready_timeout',
-          strategy: 'none',
-          attempts: 0,
-          gated: true,
-          bootstrap_queued: false,
-          bootstrap: buildBootstrapBlock(session)
-        }
-      });
-    }
-    emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
-      op_id: op.op_id,
-      operation: op.type,
-      code: 'BOOTSTRAP_READY_TIMEOUT',
-      error: `target '${sessionId}' not ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms`
-    });
-    // #860 F2 — DROPPED, not refused: this op was accepted, parked, and discarded without the
-    // daemon ever attempting a write. Zero bytes is a measurement here, not an assumption.
-    abortTrackedInjection(op.injectId, sessionId, 'BOOTSTRAP_READY_TIMEOUT',
-      `target '${sessionId}' not ready within ${BOOTSTRAP_READY_TIMEOUT_MS}ms`,
-      { kind: 'inject_delivery_dropped', trigger: 'bootstrap_ready_timeout' });
-  }
-}
+
 
 // #29: pure decision for the non-cmux owner-alive optimistic floor — returns true iff the
 // armed timer should flip bootstrapReady (not already ready; owner PID valid + alive; owner WS
 // open). `deps` injects the liveness predicates for unit-testing (defaults = module globals),
 // mirroring submit-gate.js's opts DI seam. No side effects — pure predicate.
-function shouldApplyOwnerAliveFloor(session, deps = {}) {
-  const _isBootstrapReady = deps.isBootstrapReady || isBootstrapReady;
-  const _isProcessRunning = deps.isProcessRunning || isProcessRunning;
-  const _isOpenWebSocket = deps.isOpenWebSocket || isOpenWebSocket;
-  if (_isBootstrapReady(session)) return false;          // bridge_ready already won
-  const ownerPid = Number(session.ownerPid);
-  if (!Number.isInteger(ownerPid) || ownerPid <= 0 || !_isProcessRunning(ownerPid)) return false;
-  if (!_isOpenWebSocket(session.ownerWs)) return false;
-  return true;
-}
 
-function scheduleBootstrapPromptPoll(sessionId, session, deps = {}) {
-  const _setTimeout = deps.setTimeout || setTimeout;
-  if (!session || !isBootstrapGatedSession(session) || isBootstrapReady(session)) return;
-  if (!isOpenWebSocket(session.ownerWs)) return;
 
-  // cmux: rendered-screen prompt poll (the cmux-only read-screen primitive). Unchanged,
-  // including the #31 actionable bootstrap-timeout on miss/error.
-  if (session.backend === 'cmux' && session.cmuxWorkspaceId) {
-    if (session.bootstrapPromptPoll) return;
-    session.bootstrapPromptPoll = submitGate.awaitPromptSymbol(session, {
-      timeoutMs: BOOTSTRAP_READY_TIMEOUT_MS
-    }).then((result) => {
-      session.bootstrapPromptPoll = null;
-      if (result && result.ready && isOpenWebSocket(session.ownerWs)) {
-        markBootstrapReady(sessionId, session, 'cmux_prompt_symbol');
-      } else if (result && result.reason) {
-        failBootstrapQueueOnTimeout(sessionId, session, {
-          reason: result.reason,
-          waited_ms: result.waited_ms || 0
-        });
-      }
-    }).catch((error) => {
-      session.bootstrapPromptPoll = null;
-      failBootstrapQueueOnTimeout(sessionId, session, {
-        reason: 'prompt_symbol_error',
-        error: error.message || String(error)
-      });
-    });
-    return;
-  }
 
-  // #29: non-cmux (warp/pty/kitty) has NO rendered-screen read primitive, so the cmux poll
-  // would early-return and bootstrapReady could stay false forever (inject queues forever on
-  // Warp). The fast path stays the bridge 'ready' frame; this arms an idempotent owner-alive
-  // optimistic FLOOR — byte-for-byte the shipped runStartupBootstrapRestore precedent
-  // (markBootstrapReady('startup_owner_alive') ~daemon.js:2997) — applied at the LIVE owner
-  // WS-connect path. markBootstrapReady is idempotent, so a late timer after bridge_ready is a
-  // harmless no-op. submit-gate.js read-screen guard stays cmux-only (untouched).
-  if (session.bootstrapOptimisticTimer) return;
-  session.bootstrapOptimisticTimer = _setTimeout(() => {
-    session.bootstrapOptimisticTimer = null;
-    if (!shouldApplyOwnerAliveFloor(session, deps)) return;
-    markBootstrapReady(sessionId, session, 'owner_alive');
-    console.log(`[BOOTSTRAP] Optimistic ready for ${sessionId} (ownerPid=${Number(session.ownerPid)}, backend=${session.backend || 'unknown'})`);
-  }, BOOTSTRAP_READY_TIMEOUT_MS);
-}
 
-async function waitForBootstrapSubmit(op, session, timeoutMs) {
-  const timeout = sleep(timeoutMs).then(() => {
-    op.cancelled = true;
-    return {
-      status: 504,
-      body: {
-        error: 'Submit bootstrap-timeout — target CLI did not become ready',
-        reason: 'bootstrap_not_ready',
-        last_state: sessionStateManager.getState(session.id)?.state || null,
-        strategy: 'none',
-        attempts: 0,
-        gated: true,
-        bootstrap_queued: true,
-        bootstrap_op_id: op.op_id,
-        bootstrap: buildBootstrapBlock(session)
-      }
-    };
-  });
-  return Promise.race([op.promise, timeout]);
-}
 
-function buildSessionTransportBlock(session, options = {}) {
-  if (!session) {
-    return null;
-  }
 
-  const nowMs = options.nowMs ?? Date.now();
-  const idleSeconds = session.lastActivityAt ? Math.floor((nowMs - new Date(session.lastActivityAt).getTime()) / 1000) : null;
-  const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
-  const healthStatus = getSessionHealthStatus(session, { nowMs });
-  const healthReason = getSessionHealthReason(session, healthStatus);
 
-  return {
-    health_status: healthStatus,
-    health_reason: healthReason,
-    type: session.type || 'spawned',
-    backend: session.backend || 'kitty',
-    terminal: getSessionTerminalLabel(session),
-    active_clients: session.clients ? session.clients.size : 0,
-    ready: session.ready || false,
-    idle_seconds: idleSeconds,
-    disconnected_seconds: disconnectedMs === null ? null : Math.floor(disconnectedMs / 1000),
-    last_activity_at: session.lastActivityAt || null,
-    last_connected_at: session.lastConnectedAt || null,
-    last_disconnected_at: session.lastDisconnectedAt || null,
-    last_inject_from: session.lastInjectFrom || null,
-    last_reply_to: session.lastInjectReplyTo || null,
-    last_thread_id: session.lastThreadId || null,
-    // #732 upstream diagnosis. `upstream_silent_seconds` counts from the oldest delivery
-    // that has not produced a single byte back. The bridge_* fields come from the bridge's
-    // own heartbeat and split the two failure shapes apart: a heartbeat that keeps arriving
-    // while `bridge_pty_bytes` is frozen means the PTY read side died inside the bridge; a
-    // heartbeat that stopped means the bridge→daemon leg itself is gone.
-    upstream_silent_seconds: session.upstreamProbeAt != null && (session.outputRingTotalBytes || 0) <= (session.upstreamProbeWatermark || 0)
-      ? Math.floor((nowMs - session.upstreamProbeAt) / 1000)
-      : null,
-    upstream_bytes: session.outputRingTotalBytes || 0,
-    bridge_heartbeat_at: session.bridgeHeartbeatAt || null,
-    bridge_pty_bytes: session.bridgePtyBytes ?? null,
-    bridge_read_side: session.bridgeReadSide || null,
-    bootstrap: buildBootstrapBlock(session)
-  };
-}
 
-function buildSessionSemanticBlock(session) {
-  if (!session || !session.stateReport) {
-    return null;
-  }
 
-  const report = session.stateReport;
-  return {
-    phase: report.phase,
-    current_task: report.current_task,
-    blocker: report.blocker,
-    needs_input: report.needs_input,
-    thread_id: report.thread_id,
-    source: report.source,
-    seq: report.seq
-  };
-}
 
-function buildSessionEvent(eventType, sessionId, session, options = {}) {
-  const nowMs = options.nowMs ?? Date.now();
-  const timestamp = options.timestamp || new Date(nowMs).toISOString();
-  return {
-    type: eventType,
-    event_type: eventType,
-    sender: options.sender || 'daemon',
-    session_id: sessionId,
-    timestamp,
-    transport: options.includeTransport === false ? null : buildSessionTransportBlock(session, { nowMs }),
-    semantic: options.includeSemantic === false ? null : buildSessionSemanticBlock(session),
-    ...(options.extra || {})
-  };
-}
 
-function broadcastSessionEvent(eventType, sessionId, session, options = {}) {
-  const event = buildSessionEvent(eventType, sessionId, session, options);
-  broadcastBusEvent(event);
-  return event;
-}
 
-function parseSessionStateReport(session, payload = {}) {
-  if (!payload || typeof payload !== 'object') {
-    return buildErrorBody('INVALID_REQUEST', 'state report payload must be a JSON object', { httpStatus: 400 });
-  }
 
-  const phase = normalizeNullableText(payload.phase || payload.task_phase);
-  if (!phase) {
-    return buildErrorBody('INVALID_REQUEST', 'phase is required', { httpStatus: 400 });
-  }
 
-  let seq;
-  if (payload.seq === undefined || payload.seq === null || payload.seq === '') {
-    seq = ((session && session.stateReport && session.stateReport.seq) || 0) + 1;
-  } else {
-    seq = Number(payload.seq);
-    if (!Number.isInteger(seq) || seq < 0) {
-      return buildErrorBody('INVALID_REQUEST', 'seq must be a non-negative integer', { httpStatus: 400 });
-    }
-  }
 
-  if (payload.needs_input !== undefined && typeof payload.needs_input !== 'boolean') {
-    return buildErrorBody('INVALID_REQUEST', 'needs_input must be a boolean', { httpStatus: 400 });
-  }
 
-  const source = normalizeNullableText(payload.source) || 'self_report';
-  const timestamp = new Date().toISOString();
-  return {
-    success: true,
-    report: {
-      phase,
-      current_task: normalizeNullableText(payload.current_task ?? payload.task),
-      blocker: normalizeNullableText(payload.blocker),
-      needs_input: payload.needs_input === true,
-      thread_id: normalizeNullableText(payload.thread_id),
-      source,
-      seq,
-      timestamp
-    }
-  };
-}
 
-function applySessionStateReport(sessionId, session, payload = {}) {
-  const parsed = parseSessionStateReport(session, payload);
-  if (!parsed.success) {
-    return parsed;
-  }
 
-  session.stateReport = parsed.report;
-  session.lastStateReportAt = parsed.report.timestamp;
-  if (parsed.report.thread_id) {
-    session.lastThreadId = parsed.report.thread_id;
-  }
 
-  const event = broadcastSessionEvent('session_state_report', sessionId, session, {
-    timestamp: parsed.report.timestamp
-  });
-  return {
-    success: true,
-    event,
-    semantic: buildSessionSemanticBlock(session),
-    transport: buildSessionTransportBlock(session, { nowMs: Date.parse(parsed.report.timestamp) })
-  };
-}
 
-function getInjectFailure(session, options = {}) {
-  const healthStatus = getSessionHealthStatus(session, options);
-  if (healthStatus === 'STALE') {
-    return { httpStatus: 410, code: 'STALE', error: 'Session is stale and awaiting cleanup.' };
-  }
-  if (healthStatus === 'DISCONNECTED') {
-    return { httpStatus: 503, code: 'DISCONNECTED', error: 'Session owner is disconnected.' };
-  }
-  // #732: bytes would physically reach the PTY, but nothing the session produces can be
-  // read back — every reply, echo and REPORT would be invisible. Reporting that as a plain
-  // success is what kept the live incident undetected for ~9h, so fail it loudly instead.
-  if (healthStatus === 'UPSTREAM_STALLED') {
-    return {
-      httpStatus: 503,
-      code: 'UPSTREAM_STALLED',
-      error: 'Session output pipe is dead: the owner is connected but has returned no output since the last delivery.'
-    };
-  }
-  return null;
-}
 
-function markSessionConnected(session, timestamp = new Date().toISOString()) {
-  session.lastConnectedAt = timestamp;
-  session.lastDisconnectedAt = null;
-  session._staleEmitted = false;
-}
 
-function markSessionDisconnected(session, timestamp = new Date().toISOString()) {
-  session.lastDisconnectedAt = timestamp;
-  session.ready = false;
-}
 
-function emitSessionLifecycleEvent(type, sessionId, session, extra = {}) {
-  const now = Date.now();
-  broadcastSessionEvent(type, sessionId, session, {
-    nowMs: now,
-    extra: {
-      healthStatus: getSessionHealthStatus(session, { nowMs: now }),
-      healthReason: getSessionHealthReason(session, getSessionHealthStatus(session, { nowMs: now })),
-      ...extra
-    }
-  });
-}
 
-function emitInjectFailureEvent(sessionId, code, error, extra = {}, session = null) {
-  broadcastSessionEvent('inject_failed', sessionId, session, {
-    extra: {
-      target_agent: sessionId,
-      code,
-      error,
-      ...extra
-    }
-  });
-}
 
-async function writeDataToSession(id, session, data) {
-  if (session.type === 'aterm') {
-    // UDS delivery via net.connect()
-    if (session.delivery && session.delivery.transport === 'unix_socket' && session.delivery.address) {
-      return new Promise((resolve) => {
-        const payload = JSON.stringify({ action: "Inject", workspace: id, text: data }) + '\n';
-        let responseBuf = '';
-        const timeout = setTimeout(() => {
-          sock.destroy();
-          resolve(buildErrorBody('TIMEOUT', 'UDS delivery timed out.', { httpStatus: 504 }));
-        }, DELIVERY_TIMEOUT_MS);
-        const sock = net.connect(session.delivery.address, () => {
-          sock.end(payload);
-        });
-        sock.on('data', (chunk) => { responseBuf += chunk.toString(); });
-        sock.on('end', () => {
-          clearTimeout(timeout);
-          if (responseBuf) {
-            try {
-              const resp = JSON.parse(responseBuf.trim());
-              if (resp.status === 'Error' || resp.success === false) {
-                console.log(`[UDS] Delivery rejected by ${id}: ${resp.error || resp.message || 'unknown'}`);
-                resolve(buildErrorBody('DELIVERY_REJECTED', resp.error || resp.message || 'Target rejected the payload.', {
-                  httpStatus: 502,
-                  detail: resp
-                }));
-                return;
-              }
-            } catch {
-              // Non-JSON response — treat as success (legacy endpoints)
-            }
-          } else {
-            console.log(`[UDS] Empty response from ${id} — delivery unconfirmed (aterm may not have processed)`);
-          }
-          resolve({ success: true });
-        });
-        sock.on('error', (err) => {
-          clearTimeout(timeout);
-          console.log(`[UDS] Connection error for ${id} at ${session.delivery.address}: ${err.message}`);
-          markSessionDisconnected(session);
-          resolve(buildErrorBody('DISCONNECTED', 'UDS endpoint is unreachable.', {
-            httpStatus: 503,
-            detail: err.message
-          }));
-        });
-      });
-    }
-
-    // HTTP delivery (backward compat)
-    if (!session.deliveryEndpoint) {
-      return buildErrorBody('DISCONNECTED', 'Delivery endpoint is missing.', { httpStatus: 503 });
-    }
-
-    try {
-      const response = await fetch(session.deliveryEndpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: data, session_id: id }),
-        signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS)
-      });
-
-      if (!response.ok) {
-        return buildErrorBody('DELIVERY_FAILED', `Delivery endpoint returned ${response.status}.`, {
-          httpStatus: 502,
-          deliveryStatus: response.status
-        });
-      }
-
-      return { success: true };
-    } catch (error) {
-      if (error.name === 'TimeoutError' || error.name === 'AbortError') {
-        return buildErrorBody('TIMEOUT', 'Delivery endpoint timed out.', { httpStatus: 504 });
-      }
-      return buildErrorBody('DISCONNECTED', 'Delivery endpoint is unreachable.', {
-        httpStatus: 503,
-        detail: error.message
-      });
-    }
-  }
-
-  if (session.type === 'wrapped') {
-    if (!isOpenWebSocket(session.ownerWs)) {
-      return buildErrorBody('DISCONNECTED', 'Session owner is disconnected.', { httpStatus: 503 });
-    }
-    session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
-    // #732: every wrapped delivery doubles as an upstream probe — a live PTY answers with
-    // at least an echo. See armUpstreamProbe (no-op while an earlier probe is unanswered).
-    armUpstreamProbe(session);
-    return { success: true };
-  }
-
-  if (!session.ptyProcess || session.ptyProcess.killed) {
-    return buildErrorBody('DISCONNECTED', 'PTY process is not connected.', { httpStatus: 503 });
-  }
-
-  session.ptyProcess.write(data);
-  return { success: true };
-}
+const sessionDeliveryContext = createSessionDeliveryContext({
+  hasHeldInteraction,
+  interaction,
+  buildErrorBody,
+  DELIVERY_TIMEOUT_MS,
+  markSessionDisconnected,
+  isOpenWebSocket,
+  armUpstreamProbe,
+  shouldQueueBootstrapOperation,
+  getSessionHealthStatus,
+  enqueueBootstrapOperation,
+  parkTrackedInjection,
+  bootstrapQueuedResponse,
+  getInjectFailure,
+  resolveModalGate,
+  modalRemedy,
+  hasBootstrapBacklog,
+  parkOperationOnModal,
+  modalParkResponse,
+  modalRejectionResponse,
+  crypto,
+  applyProvenance,
+  maybeBracketedPaste,
+  emitInjectFailureEvent,
+  sessions,
+  broadcastSessionEvent,
+  getMailbox: () => mailbox,
+  getMailboxNotifier: () => mailboxNotifier,
+  getMailboxDelivery: () => mailboxDelivery,
+  net
+});
+const { writeDataToSession, deliverInjectionToSession } = sessionDeliveryContext;
 
 /**
  * Submit Enter to a session via the PTY/context layer.
@@ -2569,10 +1253,7 @@ async function writeDataToSession(id, session, data) {
  *
  * Returns the strategy name ('pty_cr') or null on failure.
  */
-function terminalLevelSubmit(id, session) {
-  if (submitViaPty(session)) return 'pty_cr';
-  return null;
-}
+
 
 // #544 / #537 / Bug B: with PTY-native submit (terminalLevelSubmit → pty_cr only),
 // a successful pty_cr IS real delivery on every backend — the bare 0x0D reaches the
@@ -2584,9 +1265,6 @@ function terminalLevelSubmit(id, session) {
 // direct cause of the BUG B bogus UNCONFIRMED reports + worker re-send loops.
 // Pure + exported so the decision is unit-testable.
 // See docs/adr/2026-06-07-submit-via-pty-context-layer.md.
-function forceSubmitDeliveredToSurface(session, strategy) {
-  return !!strategy;
-}
 
 // #678: which submit render-gate outcomes are TERMINAL (hard-fail 504, never dispatch the CR)
 // vs best-effort DISPATCH (fire the CR anyway). A missing render-state — `no_state` (no state
@@ -2599,14 +1277,6 @@ function forceSubmitDeliveredToSurface(session, strategy) {
 // #694: `busy_settled` (busy-dispatch fast-path) joins the best-effort DISPATCH set — the target is
 // alive and mid-turn, so firing the CR is correct (it queues + #617 redelivers), never a hard-fail.
 const NON_TERMINAL_GATE_REASONS = new Set(['timeout', 'no_state', 'no_state_manager', 'busy_settled']);
-function isTerminalGateFailure(gateResult) {
-  return !!(
-    gateResult &&
-    gateResult.ready !== true &&
-    gateResult.reason &&
-    !NON_TERMINAL_GATE_REASONS.has(gateResult.reason)
-  );
-}
 
 // #716: bracketed-paste submit envelope. codex/claude composers swallow a submit CR
 // that arrives coalesced with the injected text burst (paste-burst / coalesced read).
@@ -2627,15 +1297,7 @@ function isTerminalGateFailure(gateResult) {
 //   undefined → not observed     → wrap iff the CLI is known paste-capable (codex/claude)
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
-function maybeBracketedPaste(text, session) {
-  if (!text) return text;
-  if (!session) return text;
-  const capable = session.bracketedPasteCapable === undefined
-    ? readyRegistry.isPasteCapableCli(session.command)
-    : session.bracketedPasteCapable;
-  if (!capable) return text;
-  return BRACKETED_PASTE_START + text + BRACKETED_PASTE_END;
-}
+
 
 // #730 — defense-in-depth floor on the FORCE submit path only. `force` skips the render
 // gate and fires the CR immediately (measured ~3ms text→CR end-to-end), which lands inside
@@ -2647,16 +1309,6 @@ function maybeBracketedPaste(text, session) {
 // exact failing shape — no envelope AND embedded newlines — waits.
 // Pure + exported so the policy is unit-testable without booting the daemon.
 const FORCE_CR_GAP_DEFAULT_MS = 250;
-function forceSubmitCrGapMs(injectedBody, session, env = process.env) {
-  if (!injectedBody || !injectedBody.includes('\n')) return 0;
-  if (maybeBracketedPaste(injectedBody, session) !== injectedBody) return 0; // enveloped → immune
-  // An UNSET or blank var must fall back to the default, never to 0 — `Number('')` is 0,
-  // so a bare `TELEPTY_FORCE_CR_GAP_MS=` in an env file would silently disable the floor.
-  const raw = String(env.TELEPTY_FORCE_CR_GAP_MS ?? '').trim();
-  if (!raw) return FORCE_CR_GAP_DEFAULT_MS;
-  const configured = Number(raw);
-  return Number.isFinite(configured) && configured >= 0 ? configured : FORCE_CR_GAP_DEFAULT_MS;
-}
 
 // #737 — a codex booted with `dismissed_version` < `latest_version` opens a BLOCKING
 // "Update available … Press enter to continue" modal whose PRE-SELECTED item is
@@ -2675,26 +1327,12 @@ const MODAL_RING_TAIL_BYTES = 65536;
 // Bounded, newest-first read of the PTY ring — same shape as submit-gate's readTail. The
 // positional rule in detectSurfaceModal is window-insensitive, so this budget is about cost,
 // not correctness.
-function readOutputRingTail(session, maxBytes = MODAL_RING_TAIL_BYTES) {
-  if (!session || !Array.isArray(session.outputRing) || session.outputRing.length === 0) return '';
-  let total = 0;
-  const parts = [];
-  for (let i = session.outputRing.length - 1; i >= 0 && total < maxBytes; i--) {
-    parts.unshift(session.outputRing[i]);
-    total += session.outputRing[i].length;
-  }
-  return parts.join('');
-}
+
 
 // FAIL-OPEN by construction: no ring, no codex, or no modal evidence => false => deliver,
 // byte-identical to pre-#737. The force path is production orchestrator dispatch, so a false
 // positive here would stall every dispatch; only positive modal evidence may block.
-function isSurfaceBlockedByModal(session) {
-  if (!session) return false;
-  const tail = readOutputRingTail(session);
-  if (!tail) return false;
-  return readyRegistry.detectSurfaceModal(session.command, tail).blocked === true;
-}
+
 
 // Remedy selector. `hold` (A) is the default: park the body until the surface leaves the
 // modal, then deliver — and fall back to `reject` if it never does (C is A's timeout
@@ -2717,12 +1355,7 @@ function isSurfaceBlockedByModal(session) {
 const MODAL_REMEDY_DEFAULT = 'hold';
 const MODAL_REMEDIES = new Set(['hold', 'park', 'reject', 'off']);
 const MODAL_REMEDY_BY_CLI = { claude: 'park' };
-function modalRemedy(env = process.env, session = null) {
-  const raw = String(env.TELEPTY_MODAL_REMEDY ?? '').trim().toLowerCase();
-  if (MODAL_REMEDIES.has(raw)) return raw;
-  const cli = session ? readyRegistry.commandKey(session.command) : null;
-  return MODAL_REMEDY_BY_CLI[cli] || MODAL_REMEDY_DEFAULT;
-}
+
 
 // Per-CLI remediation copy. The gate is generic; what the operator has to DO to clear the
 // surface is not, so the hint names the actual modal and the actual key.
@@ -2742,73 +1375,26 @@ const MODAL_HINT_BY_CLI = {
 // branched on: force, gated and plain all lose the message identically (measured — all three
 // wrote body+CR into the modal), so they must all get the same answer. It stays in the
 // signature as the attribution seam for logging and for any future per-path divergence.
-function modalDeliveryDecision(session, options = {}, env = process.env) {
-  const remedy = modalRemedy(env, session);
-  if (remedy === 'off') return { action: 'deliver', reason: 'modal_gate_off' };
-  if (!isSurfaceBlockedByModal(session)) return { action: 'deliver', reason: 'surface_clear' };
-  const cli = readyRegistry.commandKey(session && session.command) || 'codex';
-  return {
-    action: remedy,
-    reason: `${cli}_modal_ui`,
-    path: options.force === true ? 'force' : 'gated',
-    hint: MODAL_HINT_BY_CLI[cli] || MODAL_HINT_BY_CLI.codex,
-  };
-}
+
 
 // A's bound. The modal does NOT clear by itself — it needs a keystroke from whoever owns
 // the surface — so the hold must expire into C rather than wait forever. 30s mirrors
 // BOOTSTRAP_READY_TIMEOUT_MS, the existing "how long we wait for a surface to become
 // injectable" budget. Only ever paid when a modal is genuinely up.
 const MODAL_HOLD_DEFAULT_MS = 30000;
-function modalHoldMs(env = process.env) {
-  // An UNSET or blank var must fall back to the default, never to 0 — `Number('')` is 0,
-  // so a bare `TELEPTY_MODAL_HOLD_MS=` in an env file would silently disable the hold.
-  const raw = String(env.TELEPTY_MODAL_HOLD_MS ?? '').trim();
-  if (!raw) return MODAL_HOLD_DEFAULT_MS;
-  const configured = Number(raw);
-  return Number.isFinite(configured) && configured >= 0 ? configured : MODAL_HOLD_DEFAULT_MS;
-}
+
 
 // Park until the surface leaves the modal. Polls the same fail-open predicate, so a
 // surface that was never modal returns immediately with waited_ms 0.
-async function awaitSurfaceModalClear(session, opts = {}) {
-  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : modalHoldMs();
-  const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) ? opts.pollIntervalMs : 150;
-  const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
-  const sleepFn = typeof opts.sleep === 'function' ? opts.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
-  const start = now();
-  while (isSurfaceBlockedByModal(session)) {
-    if (now() - start >= timeoutMs) return { cleared: false, waited_ms: now() - start };
-    await sleepFn(pollIntervalMs);
-  }
-  return { cleared: true, waited_ms: now() - start };
-}
+
 
 // The single gate every write path awaits. Resolves to null when the write may proceed, or
 // to a rejection decision when it must not. `hold` degrades to `reject` on timeout — that
 // is the approved A-with-C-as-its-timeout-branch shape, in one place so force, gated and
 // plain cannot drift apart.
-async function resolveModalGate(id, session, options = {}, holdOpts = {}) {
-  const decision = modalDeliveryDecision(session, options);
-  if (decision.action === 'deliver') return null;
-  if (decision.action !== 'hold') return decision;
-  const held = await awaitSurfaceModalClear(session, holdOpts);
-  if (held.cleared) {
-    console.log(`[MODAL] ${id} surface cleared after ${held.waited_ms}ms — delivering`);
-    return null;
-  }
-  console.log(`[MODAL] ${id} still modal after ${held.waited_ms}ms — refusing (hold timed out)`);
-  return { ...decision, action: 'reject', held_ms: held.waited_ms };
-}
 
-function modalRejectionResponse(decision) {
-  return {
-    error: `${decision.reason} — delivery refused: ${decision.hint}`,
-    reason: decision.reason,
-    code: 'SURFACE_MODAL',
-    hint: decision.hint,
-  };
-}
+
+
 
 // ── #760: the `park` remedy ────────────────────────────────────────────────────────────
 //
@@ -2834,297 +1420,33 @@ function modalRejectionResponse(decision) {
 // number. Only ever paid when a modal is genuinely up.
 const MODAL_PARK_TTL_DEFAULT_MS = 600000;
 const MODAL_PARK_POLL_MS = 500;
-function modalParkTtlMs(env = process.env) {
-  // An UNSET or blank var must fall back to the default, never to 0 — `Number('')` is 0, so
-  // a bare `TELEPTY_MODAL_PARK_TTL_MS=` in an env file would silently disable the park.
-  const raw = String(env.TELEPTY_MODAL_PARK_TTL_MS ?? '').trim();
-  if (!raw) return MODAL_PARK_TTL_DEFAULT_MS;
-  const configured = Number(raw);
-  return Number.isFinite(configured) && configured > 0 ? configured : MODAL_PARK_TTL_DEFAULT_MS;
-}
+
 
 // Mirrors failBootstrapQueueOnTimeout: a park that outlives its TTL must surface an
 // ACTIONABLE event and flush, never accumulate silently. Silence is the #760 bug itself.
-function flushModalParkQueue(sessionId, session, waitedMs) {
-  const queued = Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0;
-  if (queued === 0) return 0;
-  const drained = session.bootstrapQueue.splice(0, queued);
-  for (const op of drained) {
-    if (op.type === 'submit') {
-      resolveBootstrapSubmit(op, {
-        status: 504,
-        body: {
-          error: 'Submit parked behind a surface modal that never cleared',
-          reason: 'surface_modal_park_timeout',
-          strategy: 'none', attempts: 0, gated: true, bootstrap_queued: true, bootstrap_op_id: op.op_id,
-        },
-      });
-    }
-    // #860 F2 — the third terminal path. A submit op answers its caller on the open HTTP request
-    // above; an inject op's caller left long ago, and the ledger is the only thing that can still
-    // tell it the body never reached the surface.
-    abortTrackedInjection(op.injectId, sessionId, 'SURFACE_MODAL_PARK_TIMEOUT',
-      `parked behind a surface modal that did not clear within ${waitedMs}ms`,
-      { kind: 'inject_delivery_dropped', trigger: 'surface_modal_park_timeout' });
-  }
-  emitBootstrapEvent('modal_park_timeout', sessionId, session, {
-    actionable: true,
-    queued_dropped: queued,
-    waited_ms: waitedMs,
-    hint: `Session '${sessionId}' has been showing a blocking modal for ${Math.round(waitedMs / 1000)}s — `
-      + `${queued} parked inject(s) were flushed. Answer or dismiss the prompt on the surface, then re-inject.`,
-  });
-  console.log(`[MODAL] ${sessionId} park TTL expired after ${waitedMs}ms — flushed ${queued} op(s)`);
-  return queued;
-}
+
 
 // Awaitable form: poll until the surface clears (then drain in order) or the TTL expires
 // (then flush). Same fail-open predicate as the hold, so a surface that was never modal
 // returns immediately having paid nothing.
-async function awaitModalParkDrain(sessionId, session, opts = {}) {
-  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : modalParkTtlMs();
-  const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) ? opts.pollIntervalMs : MODAL_PARK_POLL_MS;
-  const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
-  const sleepFn = typeof opts.sleep === 'function' ? opts.sleep : (ms) => new Promise((r) => setTimeout(r, ms));
-  cancelModalParkPoll(session);   // this call supersedes any background poll
-  const start = now();
-  while (isSurfaceBlockedByModal(session)) {
-    if (now() - start >= timeoutMs) {
-      const waited = now() - start;
-      return { cleared: false, waited_ms: waited, flushed: flushModalParkQueue(sessionId, session, waited) };
-    }
-    await sleepFn(pollIntervalMs);
-  }
-  const waited = now() - start;
-  await drainBootstrapQueue(sessionId, session);
-  return { cleared: true, waited_ms: waited, flushed: 0 };
-}
 
-function cancelModalParkPoll(session) {
-  if (session && session.modalParkPoll) {
-    clearTimeout(session.modalParkPoll);
-    session.modalParkPoll = null;
-  }
-}
+
+
 
 // Fire-and-forget form, used by the request paths: single-flight per session, and unref'd so
 // a parked session can never hold the process open. Measured on real claude 2.1.220: a
 // surface sitting on a modal emits ZERO bytes for as long as it is up (+0B over 45s on both
 // the AskUserQuestion and ExitPlanMode captures), so there is no output event to re-arm on —
 // polling is the only way to notice the clear.
-function scheduleModalParkDrain(sessionId, session) {
-  if (!session || session.modalParkPoll) return;
-  const deadline = Date.now() + modalParkTtlMs();
-  const tick = () => {
-    session.modalParkPoll = null;
-    if (!isSurfaceBlockedByModal(session)) {
-      const depth = Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0;
-      console.log(`[MODAL] ${sessionId} surface cleared — draining ${depth} parked op(s)`);
-      drainBootstrapQueue(sessionId, session);
-      return;
-    }
-    if (Date.now() >= deadline) {
-      flushModalParkQueue(sessionId, session, modalParkTtlMs());
-      return;
-    }
-    session.modalParkPoll = setTimeout(tick, MODAL_PARK_POLL_MS);
-    if (session.modalParkPoll.unref) session.modalParkPoll.unref();
-  };
-  session.modalParkPoll = setTimeout(tick, MODAL_PARK_POLL_MS);
-  if (session.modalParkPoll.unref) session.modalParkPoll.unref();
-}
+
 
 // Push one op onto the park and start (or keep) the poll. Returns the queued op so each
 // caller can shape its own ack — inject and submit answer on different response schemas.
-function parkOperationOnModal(sessionId, session, operation, decision) {
-  const op = enqueueBootstrapOperation(sessionId, session, operation);
-  scheduleModalParkDrain(sessionId, session);
-  console.log(`[MODAL] ${sessionId} ${operation.type} parked — ${decision.reason} `
-    + `(depth ${session.bootstrapQueue.length})`);
-  return op;
-}
 
-function modalParkResponse(op, decision, extra = {}) {
-  return bootstrapQueuedResponse(op, {
-    parked: 'surface_modal',
-    reason: decision.reason,
-    hint: decision.hint,
-    ...extra,
-  });
-}
 
-async function deliverInjectionToSession(id, session, prompt, options = {}) {
-  const now = Date.now();
-  if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
-    const healthStatus = getSessionHealthStatus(session, { nowMs: now });
-    if (healthStatus === 'STALE') {
-      return { success: false, httpStatus: 410, code: 'STALE', error: 'Session is stale and awaiting cleanup.' };
-    }
-    const op = enqueueBootstrapOperation(id, session, {
-      type: 'inject',
-      prompt,
-      noEnter: !!options.noEnter,
-      // #860 F2: the tracked record's id rides ON THE OP, because the queue is where the dispatch
-      // and the ledger part company — the route returns, and whatever this queue eventually does
-      // with the op is the only thing left that can answer for it.
-      injectId: options.injectId || null,
-      options: {
-        source: options.source || 'inject',
-        from: options.from || 'daemon'
-      }
-    });
-    parkTrackedInjection(options.injectId, 'bootstrap_queue', 'bootstrap_not_ready');
-    session.lastActivityAt = new Date(now).toISOString();
-    return bootstrapQueuedResponse(op, {
-      msg_id: op.op_id,
-      pending: session.bootstrapQueue.length,
-      submit: options.noEnter ? 'skipped' : 'queued'
-    });
-  }
 
-  const injectFailure = getInjectFailure(session, { nowMs: now });
-  if (injectFailure) {
-    return { success: false, ...injectFailure };
-  }
 
-  // #737: never write into a surface whose Enter key is wired to something other than
-  // "submit my message". This is the TEXT path — bypass #4 in the evidence: it consulted
-  // only the bootstrapReady boolean, which a blind timer flips without ever looking at the
-  // screen (shouldApplyOwnerAliveFloor).
-  const modalDecision = await resolveModalGate(id, session, options);
 
-  // #760: ORDER. Once anything is parked for this session, everything behind it parks too —
-  // including after the modal clears, until the drain has actually caught up. Without this
-  // the second dispatch sees a clear surface, goes straight down the mailbox path, and
-  // overtakes the first one that is still sitting in the queue mid-drain. Same guard the
-  // gated /submit path already uses for the bootstrap queue.
-  const parkBehindBacklog = !modalDecision
-    && modalRemedy(process.env, session) === 'park'
-    && (hasBootstrapBacklog(session) || session.bootstrapDraining === true);
-  const injectParkDecision = modalDecision || (parkBehindBacklog
-    ? { action: 'park', reason: 'modal_park_backlog', hint: 'Queued behind an inject parked by a surface modal.' }
-    : null);
-
-  if (injectParkDecision) {
-    // `park` acks the queue position instead of refusing. A refusal is what makes the caller
-    // re-inject, and re-injecting into a modal that is still up is how #743 turned one
-    // blocked REPORT into three lost ones.
-    if (injectParkDecision.action === 'park') {
-      const op = parkOperationOnModal(id, session, {
-        type: 'inject',
-        prompt,
-        noEnter: !!options.noEnter,
-        injectId: options.injectId || null,     // #860 F2 — see the bootstrap-queue push above
-        options: { source: options.source || 'inject', from: options.from || 'daemon' },
-      }, injectParkDecision);
-      parkTrackedInjection(options.injectId, 'bootstrap_queue', injectParkDecision.reason);
-      session.lastActivityAt = new Date(now).toISOString();
-      return modalParkResponse(op, injectParkDecision, {
-        msg_id: op.op_id,
-        pending: session.bootstrapQueue.length,
-        submit: options.noEnter ? 'skipped' : 'queued',
-      });
-    }
-    console.log(`[INJECT] ${id} refused — ${injectParkDecision.reason}`);
-    return { success: false, httpStatus: 409, ...modalRejectionResponse(injectParkDecision) };
-  }
-
-  // Mailbox payload is TEXT ONLY — CR is sent separately after a delay.
-  // Reason: combining text+CR in one write triggers bracketed paste mode in modern
-  // terminals. CLIs ignore \r inside paste brackets, so Enter never fires.
-  const from = options.from || 'daemon';
-  const msgId = `${from}:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
-
-  // #47 P4 — capability-gated delivery provenance banner (spec §6). Default-OFF: only sessions
-  // that registered as provenance-capable (and have a minted nonce) get the nonce-gated banner;
-  // legacy/byte-exact-sensitive sessions receive `prompt` byte-for-byte (regression guard). The
-  // audit log below still hashes the RAW `prompt`, not the banner — provenance is a delivery
-  // wrapper, not a content change. `from`='daemon'/'inject' are routing sentinels, not real
-  // claimed senders, so they are not surfaced as a `claimed:` label.
-  const claimedSender = (from && from !== 'daemon' && from !== 'inject') ? from : null;
-  const deliveredPrompt = applyProvenance(prompt, {
-    capable: !!(session && session.provenanceCapable),
-    nonce: session && session.provenanceNonce,
-    verified: options.verifiedSenderSid || null,
-    claimed: claimedSender,
-    origin: options.origin
-  }).payload;
-
-  // #716: wrap the delivered text in bracketed paste for paste-capable CLIs so the
-  // deferred/gated submit CR (written separately, outside the 200~/201~ envelope)
-  // reliably fires instead of being swallowed into the paste burst. No-op otherwise.
-  const deliveredBody = maybeBracketedPaste(deliveredPrompt, session);
-
-  try {
-    const ack = mailbox.enqueue({
-      msg_id: msgId,
-      from,
-      to: id,
-      payload: deliveredBody,
-      created_at: Math.floor(now / 1000),
-      attempt: 0,
-    });
-
-    // Notify aterm sessions immediately via UDS wake
-    if (session.type === 'aterm') {
-      mailboxNotifier.notify(id);
-    }
-
-    // Deliver text synchronously — ensures text is written before inject returns success.
-    try {
-      await mailboxDelivery.tick();
-    } catch {}
-
-    // Send CR separately after delay (outside paste brackets)
-    if (!options.noEnter && session.type !== 'aterm') {
-      const submitDelay = session.type === 'wrapped' ? 500 : 300;
-      setTimeout(async () => {
-        const submitResult = await writeDataToSession(id, session, '\r');
-        if (!submitResult.success) {
-          emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
-            phase: 'submit',
-            source: options.source || 'inject'
-          }, session);
-        }
-      }, submitDelay);
-    }
-
-    session.lastActivityAt = new Date(now).toISOString();
-    return {
-      success: true,
-      msg_id: msgId,
-      queued: ack.queued,
-      pending: ack.pending,
-      strategy: 'mailbox',
-      submit: options.noEnter ? 'skipped' : 'deferred'
-    };
-  } catch (err) {
-    console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
-    // Fallback: direct delivery (backward compat during migration)
-    const textResult = await writeDataToSession(id, session, deliveredBody);
-    if (!textResult.success) return textResult;
-
-    if (!options.noEnter && session.type !== 'aterm') {
-      const submitDelay = session.type === 'wrapped' ? 500 : 300;
-      setTimeout(async () => {
-        const submitResult = await writeDataToSession(id, session, '\r');
-        if (!submitResult.success) {
-          emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
-            phase: 'submit',
-            source: options.source || 'inject'
-          }, session);
-        }
-      }, submitDelay);
-    }
-
-    session.lastActivityAt = new Date(now).toISOString();
-    return {
-      success: true,
-      strategy: 'direct_fallback',
-      submit: options.noEnter ? 'skipped' : 'deferred'
-    };
-  }
-}
 
 function appendToOutputRing(session, data) {
   if (!session.outputRing) session.outputRing = [];
@@ -3146,159 +1468,31 @@ function appendToOutputRing(session, data) {
   }
 }
 
-function getSessionTerminalLabel(session) {
-  if (session.termProgram) {
-    return session.termProgram;
-  }
 
-  const term = String(session.term || '').toLowerCase();
-  if (term.includes('kitty')) return 'kitty';
-  if (term.includes('ghostty')) return 'ghostty';
-  if (term.includes('tmux')) return 'tmux';
 
-  if (session.type === 'aterm') return 'aterm';
-  if (session.backend === 'cmux') return 'cmux';
-  if (session.backend === 'kitty') return 'kitty';
-  if ((session.type || 'spawned') === 'spawned') return 'daemon-pty';
+const { createSessionInspectionContext } = require('./src/routes/session-inspection');
+const sessionInspection = createSessionInspectionContext({
+  get getSessionHealthStatus() { return getSessionHealthStatus; },
+  get getSessionHealthReason() { return getSessionHealthReason; },
+  get getSessionDisconnectedMs() { return getSessionDisconnectedMs; },
+  get buildSessionTransportBlock() { return buildSessionTransportBlock; },
+  get buildSessionSemanticBlock() { return buildSessionSemanticBlock; },
+  get sessionStateManager() { return sessionStateManager; },
+  get MACHINE_ID() { return MACHINE_ID; },
+  get getSessionTerminalLabel() { return getSessionTerminalLabel; },
+  get lifecycle() { return lifecycle; },
+  get teleptyConfig() { return teleptyConfig; },
+  get mapObservationCause() { return mapObservationCause; },
+  get OBSERVATION_DISPLAY() { return OBSERVATION_DISPLAY; },
+  get CAPABILITY_STAGE_A() { return CAPABILITY_STAGE_A; },
+  get mailbox() { return mailbox; },
+  get sessions() { return sessions; },
+  get resolveSessionAlias() { return resolveSessionAlias; },
+  get submitViaPty() { return submitViaPty; },
+  get SUBMIT_STRATEGIES() { return SUBMIT_STRATEGIES; },
+});
+const { serializeSession, getSubmitStrategy, submitViaOsascript, runSubmitAll } = sessionInspection;
 
-  return null;
-}
-
-function serializeSession(id, session, options = {}) {
-  const nowMs = options.nowMs ?? Date.now();
-  const idleSeconds = session.lastActivityAt ? Math.floor((nowMs - new Date(session.lastActivityAt).getTime()) / 1000) : null;
-  const projectId = session.cwd ? session.cwd.split('/').pop() : null;
-  const healthStatus = getSessionHealthStatus(session, { nowMs });
-  const healthReason = getSessionHealthReason(session, healthStatus);
-  const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
-  const transport = buildSessionTransportBlock(session, { nowMs });
-  const semantic = buildSessionSemanticBlock(session);
-  const autoState = sessionStateManager.getState(id);
-
-  return {
-    id,
-    locator: { machine_id: MACHINE_ID, session_id: id, project_id: projectId },
-    type: session.type || 'spawned',
-    command: session.command,
-    cwd: session.cwd,
-    backend: session.backend || 'kitty',
-    terminal: getSessionTerminalLabel(session),
-    termProgram: session.termProgram || null,
-    term: session.term || null,
-    cmuxWorkspaceId: session.cmuxWorkspaceId || null,
-    cmuxSurfaceId: session.cmuxSurfaceId || null,
-    createdAt: session.createdAt,
-    lastActivityAt: session.lastActivityAt || null,
-    lastConnectedAt: session.lastConnectedAt || null,
-    lastDisconnectedAt: session.lastDisconnectedAt || null,
-    idleSeconds,
-    active_clients: session.clients ? session.clients.size : 0,
-    ready: session.ready || false,
-    delivery: session.delivery || null,
-    deliveryEndpoint: session.deliveryEndpoint || null,
-    healthStatus,
-    healthReason,
-    disconnectedSeconds: disconnectedMs === null ? null : Math.floor(disconnectedMs / 1000),
-    lastStateReportAt: session.lastStateReportAt || null,
-    idleTtl: session.idleTtl || null,
-    idleTtlMs: session.idleTtlMs == null ? null : session.idleTtlMs,
-    effectiveIdleTtlMs: lifecycle.effectiveIdleTtlMs(session, teleptyConfig),
-    ownerPid: session.ownerPid || null,
-    ptyPid: session.ptyPid || (session.ptyProcess && session.ptyProcess.pid) || null,
-    transport,
-    semantic,
-    // #60 Stage A / §3.8 — BREAKING: `autoState.state:"idle"` is gone from the external surface.
-    // It exported an internal FSM value that consumers read as "the turn is over", and the
-    // sidebar rendered it as a GREEN sleeping pill, i.e. task success. What ships now is the
-    // measured observation (named by cause, neutrally styled) and a SEPARATE completion block
-    // whose fields are permanently null/false in 0.8.0. Consumers must read the two apart.
-    activityObservation: autoState ? (() => {
-      const cause = autoState.detail ? autoState.detail.trigger : null;
-      const mapped = mapObservationCause({
-        destination: autoState.state,
-        cause,
-        evidence: { ...(autoState.detail || {}), confidence: autoState.confidence },
-      });
-      const display = OBSERVATION_DISPLAY[mapped.kind] || OBSERVATION_DISPLAY.unmapped_transition_cause;
-      return {
-        kind: mapped.kind,
-        cause: mapped.cause,
-        emoji: display.emoji,
-        tone: display.tone,
-        since: autoState.since,
-        confidence: autoState.confidence,
-        fields: mapped.fields,
-      };
-    })() : null,
-    completion: {
-      completion_fact: null,
-      terminal: false,
-      capability: { ...CAPABILITY_STAGE_A },
-    },
-    mailbox: (() => {
-      try {
-        const pending = mailbox.peek(id).filter(m => m.state === 'pending' || m.state === 'in_flight');
-        const deadLetter = mailbox.peekDeadLetter(id);
-        return { pending: pending.length, dead_letter: deadLetter.length };
-      } catch { return { pending: 0, dead_letter: 0 }; }
-    })()
-  };
-}
-
-async function teardownSessionById(id, options = {}) {
-  const session = sessions[id];
-  if (!session) {
-    return { success: false, httpStatus: 404, error: 'Session not found' };
-  }
-
-  const timeoutMs = Math.max(0, Number(options.timeoutMs ?? 5000));
-  const force = options.force === true;
-  const reason = options.reason || (force ? 'manual_force' : 'manual');
-  session.isClosing = true;
-
-  const kill = await lifecycle.killSessionProcess(session, { timeoutMs, force });
-  emitSessionLifecycleEvent('session_closed', id, session, {
-    reason,
-    force,
-    pid: kill.pid,
-    signal: kill.signal || null,
-    escalated: kill.escalated === true,
-    source: options.source || 'daemon'
-  });
-
-  if (session.clients) {
-    session.clients.forEach(ws => {
-      try { ws.close(1000, 'Session destroyed'); } catch {}
-    });
-  }
-  if (session.ownerWs) {
-    try { session.ownerWs.close(1000, 'Session destroyed'); } catch {}
-  }
-
-  // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
-  // verdict — this call is a NO-OP on the managed path. It actuates only for a standalone
-  // telepty that opted in via AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
-  try { terminalBackend.closeSurface(session); } catch {}
-
-  cancelModalParkPoll(session);   // #760: a destroyed session must not keep polling its surface
-
-  delete sessions[id];
-  revokeSessionCredential(id);    // #815: kill path — the epoch dies with the instance
-  sessionStateManager.unregister(id);
-  try { mailbox.purge(id); } catch {}
-  lifecycle.cleanupSessionArtifacts(id);
-  persistSessions();
-
-  return {
-    success: true,
-    session_id: id,
-    status: 'closed',
-    reason,
-    force,
-    timeout_ms: timeoutMs,
-    kill
-  };
-}
 
 // Detect terminal environment at daemon startup
 const DETECTED_TERMINAL = terminalBackend.detectTerminal();
@@ -3328,351 +1522,18 @@ for (const [id, meta] of Object.entries(_persisted)) {
   sessionStateManager.register(id);
   console.log(`[PERSIST] Restored session ${id} (awaiting reconnect)`);
 }
-const STRIPPED_SESSION_ENV_KEYS = [
-  'CLAUDECODE',
-  'CODEX_CI',
-  'CODEX_THREAD_ID'
-];
 
-function buildSessionEnv(sessionId) {
-  const env = {
-    ...process.env,
-    TERM: os.platform() === 'win32' ? undefined : 'xterm-256color',
-    TELEPTY_SESSION_ID: sessionId
-  };
 
-  for (const key of STRIPPED_SESSION_ENV_KEYS) {
-    delete env[key];
-  }
 
-  for (const key of Object.keys(env)) {
-    if (key.startsWith('CLAUDECODE_')) {
-      delete env[key];
-    }
-  }
 
-  return env;
-}
-
-// Stable alias routing: resolve alias to latest session with matching prefix
-function resolveSessionAlias(requestedId) {
-  // Exact match first
-  if (sessions[requestedId]) return requestedId;
-
-  // Strip trailing version number to get base alias (e.g., "aigentry-dustcraw-002" → "aigentry-dustcraw")
-  // Also handles bare alias like "aigentry-dustcraw"
-  const baseAlias = requestedId.replace(/-\d+$/, '');
-
-  // Find all sessions matching the base alias
-  const candidates = Object.keys(sessions).filter(id => {
-    const candidateBase = id.replace(/-\d+$/, '');
-    return candidateBase === baseAlias;
-  });
-
-  if (candidates.length === 0) return null;
-
-  // Return the most recently created session
-  candidates.sort((a, b) => {
-    const timeA = new Date(sessions[a].createdAt).getTime();
-    const timeB = new Date(sessions[b].createdAt).getTime();
-    return timeB - timeA;
-  });
-  return candidates[0];
-}
-
-// #548 (alias-cascade shared-fate): resolveSessionAlias' most-recent-wins fuzzy match is correct for
-// READ/inject ("talk to the current `coder`"), but DESTRUCTIVE ops (DELETE / kill) must NEVER cascade
-// across distinct sids that merely share an alias. The incident: cleaning an already-gone `coder-532`
-// fuzzy-fell-through to its live sibling `coder-533` (same `coder` track) and KILLED it. Distinct sids
-// = distinct lifecycles. This resolver enforces "destroy exactly the session you named":
-//   - exact sid match → that sid;
-//   - a fully-qualified sid (ends in `-<digits>`) with no exact match → null (a stale/duplicate DELETE
-//     of a gone sid must NOT fall through to a sibling — this is the exact #548 cascade);
-//   - a bare alias → resolve ONLY when a single session carries it (unambiguous); multiple siblings → null
-//     (refuse rather than silently pick most-recent and kill the wrong one).
-function resolveSessionForDestroy(requestedId) {
-  if (sessions[requestedId]) return requestedId;
-  if (/-\d+$/.test(requestedId)) return null;
-  const baseAlias = requestedId.replace(/-\d+$/, '');
-  const candidates = Object.keys(sessions).filter(id => id.replace(/-\d+$/, '') === baseAlias);
-  return candidates.length === 1 ? candidates[0] : null;
-}
-
-app.post('/api/sessions/spawn', (req, res) => {
-  const { session_id, command, args = [], cwd = process.cwd(), cols = 80, rows = 30, type = 'AGENT' } = req.body;
-  if (!session_id) return res.status(400).json({ error: 'session_id is strictly required.' });
-  if (sessions[session_id]) return res.status(409).json({ error: `Session ID '${session_id}' is already active.` });
-  if (!command) return res.status(400).json({ error: 'command is required' });
-
-  const isWin = os.platform() === 'win32';
-  const shell = isWin ? (command === 'powershell' ? 'powershell.exe' : 'cmd.exe') : command;
-  const shellArgs = isWin ? (command === 'powershell' || command === 'cmd' ? args : ['/c', command, ...args]) : args;
-
-  try {
-    console.log(`[SPAWN] Spawning ${shell} with args:`, shellArgs, "in cwd:", cwd);
-
-    const customEnv = buildSessionEnv(session_id);
-    
-    if (!isWin) {
-      const label = type.toUpperCase();
-      const colorCode = label === 'USER' ? '32' : '35'; // USER: Green (32), AGENT: Magenta (35)
-      const zshColor = label === 'USER' ? 'green' : 'magenta';
-
-      if (command.includes('bash')) {
-        customEnv.PS1 = `\\[\\e[${colorCode}m\\][${label}: ${session_id}]\\[\\e[0m\\] \\w \\$ `;
-      } else if (command.includes('zsh')) {
-        customEnv.DISABLE_AUTO_TITLE = 'true';
-        customEnv.PROMPT = `%F{${zshColor}}[${label}: ${session_id}]%f %~ %# `;
-      }
-    }
-
-    const ptyProcess = pty.spawn(shell, shellArgs, {
-      name: isWin ? 'Windows Terminal' : 'xterm-256color',
-      cols: parseInt(cols),
-      rows: parseInt(rows),
-      cwd,
-      env: customEnv
-    });
-
-    const sessionRecord = {
-      id: session_id,
-      type: 'spawned',
-      ptyProcess,
-      ptyPid: ptyProcess.pid || null,
-      command,
-      cwd,
-      createdAt: new Date().toISOString(),
-      lastActivityAt: new Date().toISOString(),
-      lastConnectedAt: new Date().toISOString(),
-      lastDisconnectedAt: null,
-      lastStateReportAt: null,
-      stateReport: null,
-      clients: new Set(),
-      isClosing: false,
-      outputRing: [],
-      ready: true,
-          };
-    sessions[session_id] = sessionRecord;
-
-    // Broadcast session creation to bus
-    const spawnMsg = JSON.stringify({
-      type: 'session_spawn',
-      sender: 'daemon',
-      session_id,
-      command,
-      cwd,
-      timestamp: new Date().toISOString()
-    });
-    busClients.forEach(client => {
-      if (client.readyState === 1) client.send(spawnMsg);
-    });
-
-    ptyProcess.onData((data) => {
-      const currentSession = sessions[sessionRecord.id];
-      if (!currentSession || currentSession !== sessionRecord) {
-        return;
-      }
-
-      appendToOutputRing(currentSession, data);
-      sessionStateManager.feed(sessionRecord.id, data);
-
-      // Send to direct WS clients
-      currentSession.clients.forEach(ws => {
-        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'output', data }));
-      });
-    });
-
-    // Register session with state machine
-    sessionStateManager.register(session_id);
-
-    ptyProcess.onExit(({ exitCode, signal }) => {
-      const currentId = sessionRecord.id;
-      console.log(`[EXIT] Session ${currentId} exited with code ${exitCode}`);
-      sessionStateManager.markDead(currentId, exitCode, signal);
-      sessionRecord.isClosing = true;
-      sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
-      if (sessions[currentId] === sessionRecord) {
-        delete sessions[currentId];
-        revokeSessionCredential(currentId);   // #815: PTY exit — the instance is gone
-        sessionStateManager.unregister(currentId);
-      }
-    });
-
-    console.log(`[SPAWN] Created session ${session_id} (${command})`);
-    persistSessions();
-    res.status(201).json({ session_id, command, cwd });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+registerSpawnRoute(app, {
+  sessions, sessionStateManager, pty, persistSessions, appendToOutputRing,
+  revokeSessionCredential, busClients, os, buildSessionEnv
 });
 
-app.post('/api/sessions/register', (req, res) => {
-  const { session_id, command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id, term_program, term } = req.body;
-  if (!session_id) return res.status(400).json({ error: 'session_id is required' });
-  const parsedIdleTtl = parseOptionalIdleTtl(req.body);
-  if (parsedIdleTtl.error) {
-    return res.status(400).json({ error: parsedIdleTtl.error, code: 'INVALID_IDLE_TTL' });
-  }
-  // Idempotent: allow re-registration (update command/cwd, keep clients)
-  if (sessions[session_id]) {
-    const existing = sessions[session_id];
-    // #815: does this caller hold the session's CURRENT credential? A re-register never mints,
-    // recovers or discloses credential material either way — this only decides whether the
-    // caller may redirect where the session's injects are delivered (below).
-    // Keyed off the RESOLVED record's own id (daemon-owned state), never the raw body string —
-    // identical here since we are inside `if (sessions[session_id])`, but it keeps
-    // attacker-controlled text out of the credential path entirely.
-    const credentialed = sessionCredentials.matches(existing.id, req.headers['x-telepty-session-token']);
-    if (command) existing.command = command;
-    if (cwd) existing.cwd = cwd;
-    if (backend) existing.backend = backend;
-    if (cmux_workspace_id) existing.cmuxWorkspaceId = cmux_workspace_id;
-    if (cmux_surface_id) existing.cmuxSurfaceId = cmux_surface_id;
-    if (Object.prototype.hasOwnProperty.call(req.body, 'term_program')) existing.termProgram = term_program || null;
-    if (Object.prototype.hasOwnProperty.call(req.body, 'term')) existing.term = term || null;
-    if (req.body.delivery_type) existing.type = req.body.delivery_type;
-    // #815: the delivery endpoint is where this session's injects are WRITTEN. An uncredentialed
-    // re-register that could rewrite it would redirect a live session's traffic to an attacker —
-    // the same "keyed to a name" flaw as the token disclosure, on the same endpoint. A session
-    // that has no credential at all (aterm/external registrants) is unchanged: nothing to prove
-    // against, so those registrations keep working exactly as before.
-    const mayRedirectDelivery = credentialed || !sessionCredentials.hasCredential(existing.id);
-    if (mayRedirectDelivery) {
-      if (req.body.delivery_endpoint) existing.deliveryEndpoint = req.body.delivery_endpoint;
-      if (req.body.delivery) {
-        existing.delivery = req.body.delivery;
-        if (!existing.deliveryEndpoint && req.body.delivery.address) {
-          existing.deliveryEndpoint = req.body.delivery.address;
-        }
-      }
-    } else if (req.body.delivery_endpoint || req.body.delivery) {
-      console.warn(`[REGISTER] Ignored uncredentialed delivery-endpoint change for session ${session_id}`);
-    }
-    if (req.body.delivery_type === 'aterm') {
-      existing.ready = true;
-      markSessionConnected(existing);
-    }
-    applyProcessMetadata(existing, req.body);
-    applyIdleTtlMetadata(existing, parsedIdleTtl);
-    applyTimestampMetadata(existing, req.body);
-    initializeBootstrapState(existing);
-    // #47 P4 — provenance capability is opt-in (default-OFF). Only flip it ON; never silently OFF
-    // on a metadata re-register, or a session's delivered bytes would change mid-flight.
-    if (req.body.provenance_capable === true) existing.provenanceCapable = true;
-    // #678: a bridge reconnecting to an already-known session (e.g. one restored across a
-    // daemon restart, or a re-`allow` of the same id) must still end up with a render-state
-    // machine. register() is idempotent (returns the existing machine untouched), so this is
-    // safe for the normal re-register too — and it is the ONLY thing that recreates the
-    // machine for a same-id reconnect, since a daemon restart is not required to reach here.
-    sessionStateManager.register(session_id);
-    console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
-    // #815: NO credential material in a re-register response — not the bearer, not the nonce, not
-    // even to a caller that proved it holds the current one. This was the disclosure: the branch
-    // used to return `mintSessionToken(session_id)` to whoever named an already-registered id.
-    // The legitimate holder does not need a copy back: the bridge carries the bearer in its env
-    // (cli.js) and the child got its copy at spawn. `session_epoch` is a non-secret instance
-    // discriminator — it identifies WHICH instance answered, and proves nothing on its own.
-    return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_epoch: existing.sessionEpoch || null, provenance_capable: !!existing.provenanceCapable });
-  }
+registerSessionRegisterRoute(app, { context: sessionRecordContext, sessionStateManager, busClients });
 
-  const { delivery_type, delivery_endpoint, delivery } = req.body;
-  const resolvedEndpoint = delivery_endpoint || (delivery && delivery.address) || null;
-  // #815 — THE issuance point, and the only one. This branch runs exactly when the daemon does
-  // not currently hold `session_id`, so every credential belongs to a fresh instance: a recreated
-  // textual sid gets a new epoch and its predecessor's bearer can never resolve to it.
-  const issued = issueSessionCredential(session_id);
-  const sessionRecord = {
-    id: session_id,
-    type: delivery_type || 'wrapped',
-    ptyProcess: null,
-    ownerWs: null,
-    command: command || 'wrapped',
-    cwd,
-    backend: backend || 'kitty',
-    cmuxWorkspaceId: cmux_workspace_id || null,
-    cmuxSurfaceId: cmux_surface_id || null,
-    termProgram: term_program || null,
-    term: term || null,
-    delivery: delivery || null,
-    deliveryEndpoint: resolvedEndpoint,
-    createdAt: new Date().toISOString(),
-    lastActivityAt: new Date().toISOString(),
-    lastConnectedAt: delivery_type === 'aterm' ? new Date().toISOString() : null,
-    lastDisconnectedAt: delivery_type === 'aterm' ? null : new Date().toISOString(),
-    lastStateReportAt: null,
-    stateReport: null,
-    idleTtl: parsedIdleTtl.present ? parsedIdleTtl.raw : null,
-    idleTtlMs: parsedIdleTtl.present ? parsedIdleTtl.ms : null,
-    ownerPid: Number.isInteger(Number(req.body.owner_pid)) && Number(req.body.owner_pid) > 0 ? Number(req.body.owner_pid) : null,
-    ptyPid: Number.isInteger(Number(req.body.pty_pid)) && Number(req.body.pty_pid) > 0 ? Number(req.body.pty_pid) : null,
-    clients: new Set(),
-    isClosing: false,
-    outputRing: [],
-    ready: true,  // unknown commands remain injectable once registered (#150)
-    // #47 P4 — provenance banner is opt-in per session (default-OFF, spec §6 rollout). A nonce is
-    // always minted (cheap) but the capability-gated banner only wraps deliveries when capable.
-    provenanceCapable: req.body.provenance_capable === true,
-    provenanceNonce: issued.nonce,
-    // #815: the VERIFIER is what lives on the record and goes to disk — the bearer never does.
-    sessionEpoch: issued.epoch,
-    credentialVerifier: issued.verifier,
-    credentialGeneration: issued.generation,
-  };
-  initializeBootstrapState(sessionRecord);
-  applyTimestampMetadata(sessionRecord, req.body);
-  // Check for existing session with same base alias and emit replaced event
-  const baseAlias = session_id.replace(/-\d+$/, '');
-  const replaced = Object.keys(sessions).find(id => {
-    return id !== session_id && id.replace(/-\d+$/, '') === baseAlias;
-  });
-  if (replaced) {
-    const replacedMsg = JSON.stringify({
-      type: 'session.replaced',
-      sender: 'daemon',
-      old_id: replaced,
-      new_id: session_id,
-      alias: baseAlias,
-      timestamp: new Date().toISOString()
-    });
-    busClients.forEach(client => {
-      if (client.readyState === 1) client.send(replacedMsg);
-    });
-    console.log(`[ALIAS] Session '${replaced}' replaced by '${session_id}' (alias: ${baseAlias})`);
-  }
-
-  sessions[session_id] = sessionRecord;
-  sessionStateManager.register(session_id);
-
-  const busMsg = JSON.stringify({
-    type: 'session_register',
-    sender: 'daemon',
-    session_id,
-    command: sessionRecord.command,
-    cwd,
-    timestamp: new Date().toISOString()
-  });
-  busClients.forEach(client => {
-    if (client.readyState === 1) client.send(busMsg);
-  });
-
-  console.log(`[REGISTER] Registered wrapped session ${session_id} (epoch: ${issued.epoch})`);
-  // #815: persist the verifier BEFORE acknowledging. persistSessions() is synchronous, so once
-  // this response is on the wire the credential is already durable — a daemon that dies between
-  // the two can never leave a bearer in a child's env with no verifier on disk to match it.
-  persistSessions();
-  // The bearer and nonce cross the wire HERE and only here, once, to this one caller.
-  res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd, session_token: issued.bearer, session_epoch: issued.epoch, credential_generation: issued.generation, session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
-});
-
-app.get('/api/sessions', (req, res) => {
-  const idleGt = req.query.idle_gt ? Number(req.query.idle_gt) : null;
-  const now = Date.now();
-  let list = Object.entries(sessions).map(([id, session]) => serializeSession(id, session, { nowMs: now }));
-  if (idleGt !== null) {
-    list = list.filter(s => s.idleSeconds !== null && s.idleSeconds > idleGt);
-  }
-  res.json(list);
-});
+sessionInspection.registerListRoute(app);
 
 // #43 P3 — token-gated historical inject audit query (spec §7). Behind the SAME shared auth
 // middleware as every /api/* route (app.use(createAuthMiddleware) above), so it is 401 for ANY
@@ -3697,18 +1558,7 @@ app.get('/api/injects', (req, res) => {
   res.json(result);
 });
 
-app.get('/api/sessions/:id', (req, res) => {
-  const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
-  if (!resolvedId) return res.status(404).json({ error: 'Session not found' });
-  const session = sessions[resolvedId];
-  res.json({
-    ...serializeSession(resolvedId, session),
-    alias: requestedId !== resolvedId ? requestedId : null,
-    lastInjectFrom: session.lastInjectFrom || null,
-    lastInjectReplyTo: session.lastInjectReplyTo || null
-  });
-});
+sessionInspection.registerGetRoute(app);
 
 // Auto-detected session state (from PTY output pattern analysis)
 app.get('/api/sessions/:id/state', (req, res) => {
@@ -3754,24 +1604,7 @@ app.get('/api/sessions/:id/state', (req, res) => {
 });
 
 // Self-reported session state (explicit POST from session)
-app.post('/api/sessions/:id/state', (req, res) => {
-  const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
-  if (!resolvedId) return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
-  const session = sessions[resolvedId];
-  const applied = applySessionStateReport(resolvedId, session, req.body);
-  if (!applied.success) {
-    return respondWithError(res, applied.httpStatus || 400, applied.code || 'INVALID_REQUEST', applied.error);
-  }
-
-  persistSessions();
-  res.json({
-    success: true,
-    session_id: resolvedId,
-    transport: applied.transport,
-    semantic: applied.semantic
-  });
-});
+sessionActions.registerStateRoute(app);
 
 app.get('/api/meta', (req, res) => {
   res.json({
@@ -3788,52 +1621,7 @@ app.get('/api/meta', (req, res) => {
 
 // --- Mailbox API endpoints ---
 
-app.get('/api/sessions/:id/mailbox', (req, res) => {
-  const id = resolveSessionAlias(req.params.id);
-  if (!id || !sessions[id]) return res.status(404).json({ error: 'Session not found' });
-  try {
-    const pending = mailbox.peek(id);
-    const deadLetter = mailbox.peekDeadLetter(id);
-    res.json({ session_id: id, pending, dead_letter: deadLetter });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/sessions/:id/mailbox/ack', (req, res) => {
-  const id = resolveSessionAlias(req.params.id);
-  if (!id || !sessions[id]) return res.status(404).json({ error: 'Session not found' });
-  const { msg_id } = req.body;
-  if (!msg_id) return res.status(400).json({ error: 'msg_id is required' });
-  try {
-    mailbox.ack(id, msg_id);
-    res.json({ success: true, msg_id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/sessions/:id/mailbox', (req, res) => {
-  const id = resolveSessionAlias(req.params.id);
-  if (!id || !sessions[id]) return res.status(404).json({ error: 'Session not found' });
-  try {
-    mailbox.purge(id);
-    res.json({ success: true, session_id: id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/sessions/:id/mailbox/dead-letter', (req, res) => {
-  const id = resolveSessionAlias(req.params.id);
-  if (!id || !sessions[id]) return res.status(404).json({ error: 'Session not found' });
-  try {
-    mailbox.purgeDeadLetter(id);
-    res.json({ success: true, session_id: id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+registerMailboxRoutes(app, { sessions, resolveSessionAlias, getMailbox: () => mailbox });
 
 // Peer management endpoint (for cross-machine module)
 app.get('/api/peers', (req, res) => {
@@ -3848,194 +1636,22 @@ app.get('/api/peers', (req, res) => {
   }
 });
 
-// #45 — fan-out (broadcast/multicast) is OPERATOR/ORCHESTRATOR-ONLY. The single-inject
-// path hard-blocks off-policy peer→peer traffic via classifyPeerLaneInject; fan-out
-// one→many is strictly more dangerous (a worm/fan-out primitive), so the peer lane is
-// blocked OUTRIGHT here — even a sanctioned ask-envelope may not fan out. We reuse the
-// SAME classifier (DRY, no second policy) and gate on the LANE, not the per-target
-// decision: classify by SENDER (`to: null`) so the verdict is the sender's lane,
-// independent of any individual target. This is what makes broadcast all-or-nothing on
-// the lane — a peer cannot earn fan-out rights by listing the orchestrator as one
-// target. Operator lane (no `from`, or `from` ∈ orchestrator sids) and the fail-open
-// `disabled` lane proceed to delivery, exactly as single-inject allows them. #533 Phase 2.
-function isPeerLaneFanout(from, prompt) {
-  return classifyPeerLaneInject({ from, to: null, prompt, orchestratorSids: ORCHESTRATOR_SIDS });
-}
-
-// Reject a peer-lane fan-out: emit a per-target peer_inject_blocked bus event for every
-// intended target (mirrors the single-inject block event for reporting parity) and return
-// the same 403 PEER_INJECT_BLOCKED shape, reaching ZERO sessions. `targetIds` is the full
-// intended target set (broadcast = all sessions, multicast = requested session_ids).
-function rejectPeerLaneFanout(res, { from, reason, targetIds, source, verifiedSender = null, prompt = '' }) {
-  const inject_id = crypto.randomUUID();
-  const failed = [];
-  for (const id of targetIds) {
-    broadcastSessionEvent('peer_inject_blocked', id, sessions[id] || null, {
-      extra: {
-        target_agent: id,
-        from: from || null,
-        reason,
-        source,
-        inject_id
-      }
-    });
-    // #47 P5 — one shared-schema audit line per blocked target (mirrors the success per-target
-    // fan-out audit), so a blocked fan-out's blast-radius is queryable just like a delivered one.
-    auditAppend({
-      ts: new Date().toISOString(), inject_id, kind: source, source,
-      claimed_from: from || null, ...verifiedSender,
-      to: id, to_alias: null, origin: 'trusted-local', origin_host: MACHINE_ID,
-      payload: prompt, delivery_result: `blocked:${reason}`
-    });
-    failed.push({ id, code: 'PEER_INJECT_BLOCKED', error: 'Peer-lane fan-out blocked' });
-  }
-  console.warn(`[PEER-GUARD] blocked peer-lane ${source} from ${from || '(none)'} → ${targetIds.length} target(s) (${reason})`);
-  return respondWithError(res, 403, 'PEER_INJECT_BLOCKED',
-    'Peer-lane fan-out blocked: broadcast/multicast is operator-only. Use bin/ask.sh for peer→peer.',
-    { reason, sanctioned_channel: 'bin/ask.sh', results: { successful: [], failed } });
-}
-
-app.post('/api/sessions/multicast/inject', async (req, res) => {
-  const { session_ids, prompt, from } = req.body;
-  if (typeof prompt !== 'string' || prompt.length === 0) return respondWithError(res, 400, 'INVALID_REQUEST', 'prompt is required');
-  if (!Array.isArray(session_ids)) return res.status(400).json({ error: 'session_ids must be an array' });
-
-  // #45 — operator-only fan-out gate (peer lane blocked outright, before any delivery).
-  const verdict = isPeerLaneFanout(from, prompt);
-  if (verdict.lane === 'peer') {
-    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds: session_ids, source: 'multicast', verifiedSender: verifiedSenderFields(verifiedPrincipalFromReq(req)), prompt });
-  }
-  // #45 — defense-in-depth blast-radius cap (operator lane too).
-  if (session_ids.length > FANOUT_MAX_TARGETS) {
-    return respondWithError(res, 429, 'FANOUT_TARGET_CAP',
-      `multicast target count ${session_ids.length} exceeds cap ${FANOUT_MAX_TARGETS}`,
-      { cap: FANOUT_MAX_TARGETS, requested: session_ids.length });
-  }
-
-  const results = { successful: [], failed: [] };
-  // #43 — one inject_id for the whole fan-out; one audit line per target (group by inject_id).
-  const inject_id = crypto.randomUUID();
-  const verifiedPrincipal = verifiedPrincipalFromReq(req);
-  const verifiedSenderSid = verifiedPrincipal ? verifiedPrincipal.sid : null;
-  const verifiedSender = verifiedSenderFields(verifiedPrincipal);   // #815 audit fields
-
-  for (const id of session_ids) {
-    const session = sessions[id];
-    if (session) {
-      try {
-        const delivery = await deliverInjectionToSession(id, session, prompt, {
-          source: 'multicast',
-          from: from || 'inject',
-          verifiedSenderSid // #47 P4 — label the provenance banner with the verified sender
-        });
-        if (!delivery.success) {
-          results.failed.push({ id, code: delivery.code, error: delivery.error });
-          auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, `failed:${delivery.code || 'DELIVERY_FAILED'}`);
-          continue;
-        }
-
-        results.successful.push({ id, strategy: delivery.strategy });
-        // #860 F2 — a fan-out target that parked the op wrote nothing; same three-value rule as
-        // the single-target route.
-        auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, deliveryAuditResult(delivery));
-
-        // Broadcast injection to bus
-        broadcastBusEvent({
-          type: 'injection',
-          sender: 'cli',
-          target_agent: id,
-          content: prompt,
-          timestamp: new Date().toISOString()
-        });
-      } catch (err) {
-        results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
-        auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, 'failed:DELIVERY_FAILED');
-      }
-    } else {
-      results.failed.push({ id, code: 'SESSION_NOT_FOUND', error: 'Session not found' });
-      auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, 'failed:SESSION_NOT_FOUND');
-    }
-  }
-
-  res.json({ success: true, results });
-});
-
-// #43 — shared per-target audit helper for the fan-out handlers (multicast/broadcast). One
-// JSONL line per target so blast-radius is queryable per session; all share `inject_id`.
-// #815: takes the full principal fields (verifiedSenderFields) rather than a bare sid, so a
-// fan-out line carries the same instance identity a single inject does.
-function auditMulticastTarget(inject_id, kind, from, verifiedSender, id, prompt, delivery_result) {
-  auditAppend({
-    ts: new Date().toISOString(), inject_id, kind, source: kind,
-    claimed_from: from || null, ...verifiedSender,
-    to: id, to_alias: null, origin: 'trusted-local', origin_host: MACHINE_ID,
-    payload: prompt, delivery_result
-  });
-}
-
-app.post('/api/sessions/broadcast/inject', async (req, res) => {
-  const { prompt, from } = req.body;
-  if (typeof prompt !== 'string' || prompt.length === 0) return respondWithError(res, 400, 'INVALID_REQUEST', 'prompt is required');
-
-  // #45 — operator-only fan-out gate (peer lane blocked outright, before any delivery).
-  // Broadcast is all-or-nothing on the lane: a peer-lane sender reaches ZERO sessions.
-  const targetIds = Object.keys(sessions);
-  const verdict = isPeerLaneFanout(from, prompt);
-  if (verdict.lane === 'peer') {
-    return rejectPeerLaneFanout(res, { from, reason: verdict.reason, targetIds, source: 'broadcast', verifiedSender: verifiedSenderFields(verifiedPrincipalFromReq(req)), prompt });
-  }
-  // #45 — defense-in-depth blast-radius cap (operator lane too).
-  if (targetIds.length > FANOUT_MAX_TARGETS) {
-    return respondWithError(res, 429, 'FANOUT_TARGET_CAP',
-      `broadcast target count ${targetIds.length} exceeds cap ${FANOUT_MAX_TARGETS}`,
-      { cap: FANOUT_MAX_TARGETS, requested: targetIds.length });
-  }
-
-  const results = { successful: [], failed: [] };
-  // #43 — one inject_id for the whole broadcast; one audit line per target.
-  const inject_id = crypto.randomUUID();
-  const verifiedPrincipal = verifiedPrincipalFromReq(req);
-  const verifiedSenderSid = verifiedPrincipal ? verifiedPrincipal.sid : null;
-  const verifiedSender = verifiedSenderFields(verifiedPrincipal);   // #815 audit fields
-
-  for (const id of targetIds) {
-    const session = sessions[id];
-    try {
-      const delivery = await deliverInjectionToSession(id, session, prompt, {
-        source: 'broadcast',
-        from: from || 'inject',
-        verifiedSenderSid // #47 P4 — label the provenance banner with the verified sender
-      });
-      if (!delivery.success) {
-        results.failed.push({ id, code: delivery.code, error: delivery.error });
-        auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, `failed:${delivery.code || 'DELIVERY_FAILED'}`);
-        continue;
-      }
-
-      results.successful.push({ id, strategy: delivery.strategy });
-      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, deliveryAuditResult(delivery));  // #860 F2
-    } catch (err) {
-      results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
-      auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, 'failed:DELIVERY_FAILED');
-    }
-  }
-
-  // Send a single bus event for the entire broadcast (not per-session)
-  if (results.successful.length > 0) {
-    const busMsg = JSON.stringify({
-      type: 'injection',
-      sender: 'cli',
-      target_agent: 'all',
-      content: prompt,
-      session_ids: results.successful,
-      timestamp: new Date().toISOString()
-    });
-    busClients.forEach(client => {
-      if (client.readyState === 1) client.send(busMsg);
-    });
-  }
-
-  res.json({ success: true, results });
+registerFanoutRoutes(app, {
+  classifyPeerLaneInject,
+  ORCHESTRATOR_SIDS,
+  crypto,
+  sessions,
+  broadcastSessionEvent,
+  auditAppend,
+  MACHINE_ID,
+  respondWithError,
+  FANOUT_MAX_TARGETS,
+  verifiedSenderFields,
+  verifiedPrincipalFromReq,
+  deliverInjectionToSession,
+  deliveryAuditResult,
+  broadcastBusEvent,
+  busClients
 });
 
 // CLI-specific submit strategies
@@ -4046,24 +1662,9 @@ const SUBMIT_STRATEGIES = {
   codex: 'pty_cr',
 };
 
-function getSubmitStrategy(command) {
-  const base = command.split('/').pop().split(' ')[0]; // extract binary name
-  return SUBMIT_STRATEGIES[base] || 'pty_cr'; // default to \r
-}
 
-function submitViaPty(session) {
-  if (session.type === 'wrapped') {
-    if (session.ownerWs && session.ownerWs.readyState === 1) {
-      session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
-      armUpstreamProbe(session);   // #732: a submit is a delivery too — probe with it
-      return true;
-    }
-    return false;
-  } else {
-    session.ptyProcess.write('\r');
-    return true;
-  }
-}
+
+
 
 // Send text directly to Kitty tab via remote control (bypasses allow bridge entirely)
 function findKittySocket() {
@@ -4095,55 +1696,7 @@ function findKittyWindowId(socket, sessionId) {
   return null;
 }
 
-function submitViaOsascript(sessionId, keyCombo) {
-  const { execSync } = require('child_process');
-  const session = sessions[sessionId];
-  // Build fallback search terms: session ID, project dir name, CLI-specific patterns
-  const searchTerms = [sessionId];
-  if (session) {
-    // Extract project name from cwd (e.g., "aigentry-deliberation" from full path)
-    const projectName = session.cwd.split('/').pop();
-    if (projectName) searchTerms.push(projectName);
-    // CLI-specific known window titles
-    if (session.command === 'codex') {
-      searchTerms.push('New agent conversation', 'codex');
-    }
-  }
 
-  const keyAction = keyCombo === 'cmd_enter'
-    ? 'key code 36 using command down'
-    : 'key code 36';
-
-  // Try each search term until we find a matching window
-  const searchTermsStr = searchTerms.map(t => `"${t}"`).join(', ');
-  const script = `
-    tell application "System Events"
-      tell process "stable"
-        set searchList to {${searchTermsStr}}
-        repeat with term in searchList
-          repeat with w in windows
-            if name of w contains (term as text) then
-              perform action "AXRaise" of w
-              delay 0.3
-              ${keyAction}
-              return "ok:" & (name of w)
-            end if
-          end repeat
-        end repeat
-        return "window_not_found"
-      end tell
-    end tell`;
-
-  try {
-    const result = execSync(`osascript -e '${script}'`, { timeout: 5000 }).toString().trim();
-    const ok = result.startsWith('ok:');
-    if (ok) console.log(`[SUBMIT] osascript matched: ${result}`);
-    return ok;
-  } catch (err) {
-    console.error(`[SUBMIT] osascript failed for ${sessionId}:`, err.message);
-    return false;
-  }
-}
 
 // POST /api/sessions/:id/submit — render-gated CLI-aware submit
 //
@@ -4169,742 +1722,19 @@ function submitViaOsascript(sessionId, keyCombo) {
 // TELEPTY_SUBMIT_GATE=off env var, for parity testing and rollback.
 //
 // See: docs/superpowers/specs/2026-04-26-inject-submit-enter-reliability.md
-app.post('/api/sessions/:id/submit', async (req, res) => {
-  const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
-  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
-  const session = sessions[resolvedId];
-  const id = resolvedId;
-
-  const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
-  // Default raised 5000 → 10000 (0.3.1) to cover empirical claude REPL
-  // ready window (3-6s on fresh spawn) with margin. Upper clamp raised
-  // 15000 → 30000 for the rare extreme-cold case.
-  const gateTimeoutMs = Math.min(Math.max(Number(req.body?.gate_timeout_ms) || 10000, 500), 30000);
-  const injectedBody = typeof req.body?.injected_body === 'string' ? req.body.injected_body : null;
-  const { retries, retryDelayMs, verifyTimeoutMs } = parseSubmitRetryOptions(req.body || {}, injectedBody);
-  const minConfidence = req.body?.min_confidence != null
-    ? Math.min(Math.max(Number(req.body.min_confidence), 0), 1)
-    : undefined;
-  // Per-request bypass for manual overrides (`telepty send-key`). Skips gate +
-  // verify and dispatches once via the existing terminal-level chain.
-  const force = req.body?.force === true;
-
-  const gateOff = String(process.env.TELEPTY_SUBMIT_GATE || '').toLowerCase() === 'off';
-
-  console.log(`[SUBMIT] Session ${id} (${session.command})${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}${gateOff ? ' [gate=off]' : ''}`);
-
-  if (injectedBody) {
-    markPendingReportSubmitStarted(id, injectedBody);
-  }
-
-  // #471 (0.4.5): force=true must bypass the bootstrap gate. Without `!force`
-  // here the per-request escape hatch (cli.js --submit-force) is enqueued and
-  // 504s before the force-bypass block below ever runs.
-  if (!force && isBootstrapGatedSession(session) && (!isBootstrapReady(session) || hasBootstrapBacklog(session) || session.bootstrapDraining)) {
-    const op = enqueueBootstrapOperation(id, session, {
-      type: 'submit',
-      body: { ...(req.body || {}) }
-    });
-    // #760: this branch is also how the CR half of `telepty inject --submit` reaches the
-    // queue after its body was modal-parked (hasBootstrapBacklog above). Awaiting it would
-    // 504 at gateTimeoutMs and CANCEL the op, dropping the CR while the body sits parked —
-    // half a message, which is worse than none. Ack the queue position; the park drain runs
-    // both ops in order once the surface clears.
-    if (isSurfaceBlockedByModal(session)) {
-      scheduleModalParkDrain(id, session);
-      console.log(`[SUBMIT] ${id} parked behind a surface modal (depth ${session.bootstrapQueue.length})`);
-      return res.json(bootstrapQueuedResponse(op, {
-        parked: 'surface_modal',
-        reason: modalDeliveryDecision(session, { force: false }).reason,
-        pending: session.bootstrapQueue.length,
-      }));
-    }
-    if (isBootstrapReady(session)) {
-      drainBootstrapQueue(id, session);
-    }
-    const queuedSubmit = await waitForBootstrapSubmit(op, session, gateTimeoutMs);
-    if (queuedSubmit.status >= 400 && injectedBody) {
-      markPendingReportSubmitUnconfirmed(id, {
-        reason: queuedSubmit.body && queuedSubmit.body.reason ? queuedSubmit.body.reason : 'bootstrap_submit_failed',
-        attempts: queuedSubmit.body && queuedSubmit.body.attempts ? queuedSubmit.body.attempts : 0,
-        retryable: false
-      });
-    }
-    return res.status(queuedSubmit.status).json(queuedSubmit.body);
-  }
-
-  function emitSubmitBus(payload) {
-    const busMsg = JSON.stringify({
-      type: 'submit',
-      sender: 'daemon',
-      session_id: id,
-      timestamp: new Date().toISOString(),
-      ...payload,
-    });
-    busClients.forEach(client => {
-      if (client.readyState === 1) client.send(busMsg);
-    });
-  }
-
-  // ── Per-request bypass: { force: true } skips gate + verify (0.3.1+) ──
-  // Used by `telepty send-key` (manual override). Mirrors the env-var
-  // escape-hatch but at request scope.
-  // See: docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md §3.1
-  if (force) {
-    // #737: the force path is the one that kills sessions — it skips the bootstrap gate
-    // (above) and returns before Layer 3 (below), so this is the ONLY place it can be asked.
-    // A bare CR into the update modal activates "1. Update now" and codex exits.
-    const forceModalDecision = await resolveModalGate(id, session, { force: true });
-    if (forceModalDecision) {
-      // #760: `--submit-force` IS the worker REPORT path, and its body was parked by the
-      // /inject request a moment earlier. Park the CR behind it so the pair replays in
-      // order; refusing here would strand the body on the queue with no Enter behind it.
-      if (forceModalDecision.action === 'park') {
-        const op = parkOperationOnModal(id, session, {
-          type: 'submit',
-          body: { ...(req.body || {}) },
-        }, forceModalDecision);
-        emitSubmitBus({
-          strategy: 'none', attempts: 0, gated: false, forced: true,
-          submit_confirmed: false, reason: forceModalDecision.reason, parked: 'surface_modal',
-        });
-        return res.json(bootstrapQueuedResponse(op, {
-          parked: 'surface_modal',
-          reason: forceModalDecision.reason,
-          hint: forceModalDecision.hint,
-          pending: session.bootstrapQueue.length,
-          forced: true,
-        }));
-      }
-      console.log(`[SUBMIT] force refused for ${id} — ${forceModalDecision.reason}`);
-      if (injectedBody) {
-        markPendingReportSubmitUnconfirmed(id, { reason: 'codex_modal_ui', attempts: 0, retryable: true });
-      }
-      emitSubmitBus({ strategy: 'none', attempts: 0, gated: false, forced: true, submit_confirmed: false, reason: 'codex_modal_ui' });
-      return res.status(409).json({
-        ...modalRejectionResponse(forceModalDecision),
-        strategy: 'none',
-        attempts: 0,
-        gated: false,
-        forced: true,
-      });
-    }
-    if (injectedBody) {
-      markPendingReportSubmitStarted(id, injectedBody);
-    }
-    const forceRingBytesAtSubmit = session.outputRingTotalBytes || 0;
-    // #730: hold the CR clear of the composer's paste-burst window for the one shape that
-    // needs it (un-enveloped + multi-line). 0ms — byte-identical to before — otherwise.
-    const forceCrGapMs = forceSubmitCrGapMs(injectedBody, session);
-    if (forceCrGapMs > 0) {
-      console.log(`[SUBMIT] force CR gap ${forceCrGapMs}ms for ${id} (un-enveloped multi-line body)`);
-      await new Promise((resolve) => setTimeout(resolve, forceCrGapMs));
-    }
-    const strategy = terminalLevelSubmit(id, session);
-    const forceSubmittedAtMs = Date.now();
-    if (strategy) {
-      // #537 / Bug B: force-confirm must reflect ACTUAL delivery. A pty_cr fallback on a
-      // cmux surface means cmux send-key failed and Enter never reached the CLI — record
-      // UNCONFIRMED so the ENFORCE-REPORT gate never labels a never-delivered inject DONE.
-      const deliveredToSurface = forceSubmitDeliveredToSurface(session, strategy);
-      if (injectedBody) {
-        if (deliveredToSurface) {
-          markPendingReportSubmitConfirmed(id, { reason: 'force', attempts: 1 });
-        } else {
-          markPendingReportSubmitUnconfirmed(id, { reason: 'cmux_send_failed', attempts: 1, retryable: true });
-        }
-      }
-      // #617: the force path skips the synchronous consumption classify, so a busy-parked
-      // body would silently drop (this IS the worker's `--submit-force` REPORT path). Hand it
-      // to the detached redeliver — it classifies against the CR watermark and only re-fires
-      // if `queued`. No-op when the body was consumed/unknown or absent.
-      if (injectedBody && deliveredToSurface) {
-        scheduleQueuedRedeliver(id, session, injectedBody, {
-          submittedAtMs: forceSubmittedAtMs,
-          ringBytesAtSubmit: forceRingBytesAtSubmit,
-          emitSubmitBus,
-        });
-      }
-      emitSubmitBus({ strategy, attempts: 1, gated: false, forced: true, submit_confirmed: deliveredToSurface });
-      return res.json({ success: true, strategy, attempts: 1, gated: false, forced: true, submit_confirmed: deliveredToSurface });
-    }
-    if (injectedBody) {
-      markPendingReportSubmitUnconfirmed(id, { reason: 'strategy_failed', attempts: 0, retryable: false });
-    }
-    return res.status(503).json({
-      error: 'Submit failed via all strategies (kitty/cmux/pty)',
-      strategy: 'none',
-      attempts: 0,
-      gated: false,
-      forced: true,
-    });
-  }
-
-  // #737: every remaining submit path (gateOff escape hatch + the gated path) converges
-  // here. Layer 3 already knows about `codex_modal_ui` but is cmux-only AND advisory
-  // (`no_prompt_symbol_seen` falls through and submits anyway), so it protects nothing on a
-  // wrapped session — measured: the gated path fired its CR into the modal at +3ms.
-  const submitModalDecision = await resolveModalGate(id, session, { force: false });
-  if (submitModalDecision) {
-    // #760: same park as the force path. Reached when the modal came up between the /inject
-    // and the /submit, so the queue was still empty at the bootstrap branch above.
-    if (submitModalDecision.action === 'park') {
-      const op = parkOperationOnModal(id, session, {
-        type: 'submit',
-        body: { ...(req.body || {}) },
-      }, submitModalDecision);
-      emitSubmitBus({
-        strategy: 'none', attempts: 0, gated: true, forced: false,
-        submit_confirmed: false, reason: submitModalDecision.reason, parked: 'surface_modal',
-      });
-      return res.json(bootstrapQueuedResponse(op, {
-        parked: 'surface_modal',
-        reason: submitModalDecision.reason,
-        hint: submitModalDecision.hint,
-        pending: session.bootstrapQueue.length,
-      }));
-    }
-    console.log(`[SUBMIT] refused for ${id} — ${submitModalDecision.reason}`);
-    if (injectedBody) {
-      markPendingReportSubmitUnconfirmed(id, { reason: 'codex_modal_ui', attempts: 0, retryable: true });
-    }
-    emitSubmitBus({ strategy: 'none', attempts: 0, gated: true, forced: false, submit_confirmed: false, reason: 'codex_modal_ui' });
-    return res.status(409).json({
-      ...modalRejectionResponse(submitModalDecision),
-      strategy: 'none',
-      attempts: 0,
-      gated: true,
-      forced: false,
-    });
-  }
-
-  // ── Legacy escape-hatch path: blind pre-delay + retries (0.2.x behavior) ──
-  if (gateOff) {
-    if (injectedBody) {
-      markPendingReportSubmitStarted(id, injectedBody);
-    }
-    if (preDelayMs > 0) {
-      await new Promise(resolve => setTimeout(resolve, preDelayMs));
-    }
-    let legacyStrategy = terminalLevelSubmit(id, session);
-    let legacyAttempts = legacyStrategy ? 1 : 0;
-    for (let i = 0; i < retries && legacyStrategy; i++) {
-      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
-      terminalLevelSubmit(id, session);
-      legacyAttempts++;
-    }
-    if (legacyStrategy) {
-      if (injectedBody) {
-        markPendingReportSubmitConfirmed(id, { reason: 'gate_off', attempts: legacyAttempts });
-      }
-      emitSubmitBus({ strategy: legacyStrategy, attempts: legacyAttempts, gated: false });
-      return res.json({ success: true, strategy: legacyStrategy, attempts: legacyAttempts, gated: false });
-    }
-    if (injectedBody) {
-      markPendingReportSubmitUnconfirmed(id, { reason: 'strategy_failed', attempts: legacyAttempts, retryable: false });
-    }
-    return res.status(503).json({
-      error: 'Submit failed via all strategies (kitty/cmux/pty)',
-      strategy: 'none',
-      attempts: legacyAttempts,
-      gated: false,
-    });
-  }
-
-  // ── Gated path (default, 0.3.0+; best-effort dispatch on timeout in 0.3.1+) ──
-
-  // Step 0 (Layer 3, 0.3.2+): prompt-symbol render gate — strictly additive.
-  // Polls `cmux read-screen` for the per-CLI prompt symbol and resolves only
-  // when the symbol is stably rendered. Skips cleanly on non-cmux backends
-  // (`no_screen_primitive`) and unknown CLIs (`unknown_cli`); on
-  // `no_prompt_symbol_seen` (timeout) falls through to Layer 1 — never emits
-  // its own 504. Per-request opt-out via `prompt_symbol_gate: false`.
-  // See: docs/superpowers/specs/2026-04-26-prompt-symbol-render-gate.md
-  const promptSymbolGate = req.body?.prompt_symbol_gate !== false;
-  const promptSymbolTimeoutMs = Math.min(
-    Math.max(Number(req.body?.prompt_symbol_timeout_ms) || 8000, 500),
-    30000
-  );
-  let promptSymbol = null;
-  if (promptSymbolGate) {
-    const psResult = await submitGate.awaitPromptSymbol(session, {
-      timeoutMs: promptSymbolTimeoutMs,
-    });
-    promptSymbol = {
-      found: !!psResult.ready,
-      waited_ms: psResult.waited_ms || 0,
-      ...(psResult.reason ? { reason: psResult.reason } : {}),
-      ...(psResult.last_seen_at != null ? { last_seen_at: psResult.last_seen_at } : {}),
-    };
-    if (psResult.reason === 'no_prompt_symbol_seen') {
-      console.log(`[SUBMIT] Layer 3 timeout for ${id} after ${psResult.waited_ms}ms — falling through to Layer 1`);
-    } else if (psResult.ready) {
-      console.log(`[SUBMIT] Layer 3 ready for ${id} after ${psResult.waited_ms}ms`);
-    }
-  }
-
-  // Step 1: wait for REPL readiness — best-effort, proceed on plain `timeout`.
-  // Hard-fail reasons (session_dead/error/restarting/no_state/no_state_manager)
-  // still short-circuit to 504 because dispatching to a dead/missing PTY is
-  // pointless. See spec §1.3 / §3.3.
-  //
-  // #694 busy-dispatch fast-path: a BUSY (mid-turn) recipient sits in working/thinking — neither
-  // is a READY_STATE — so awaitReplReady can never pass mid-turn and would burn the FULL
-  // gateTimeoutMs (up to 10s) before best-effort dispatch. When the target is a GENUINE ongoing
-  // turn (isBusyDispatchState: working/thinking held ≥ SUBMIT_BUSY_GRACE_MS, which excludes the
-  // transient `working` from echoing our OWN just-injected text, duration_ms ≈ 0), wait ONLY for
-  // the input to settle (body echoed + micro-quiet, via awaitInputSettled) and dispatch
-  // best-effort — the same downstream path as a gate timeout, but in ~hundreds of ms. idle/waiting
-  // never match isBusyDispatchState, so the idle path is byte-unchanged. gatedTerminalSubmit below
-  // still runs its OWN echo+quiet gate before the \r (never fires blindly), and a CR into a busy
-  // composer merely queues → #617 redeliver fires it on idle. Rollback: TELEPTY_SUBMIT_BUSY_DISPATCH=off.
-  let gateResult = null;
-  if (injectedBody && SUBMIT_BUSY_DISPATCH_ENABLED) {
-    const cur = sessionStateManager.getState(id);
-    if (submitGate.isBusyDispatchState(cur, SUBMIT_BUSY_GRACE_MS)) {
-      const settle = await submitGate.awaitInputSettled(session, injectedBody, {
-        timeoutMs: 1200,
-        quietWindowMs: 100,
-        echoGraceMs: 400,
-        pollIntervalMs: 30,
-        stripAnsi: stripAnsiState,
-      });
-      gateResult = { ready: false, reason: 'busy_settled', last_state: cur.state, waited_ms: settle.waited_ms };
-      console.log(`[SUBMIT] busy-dispatch fast-path ${id}: state=${cur.state} (${cur.duration_ms}ms) settle=${settle.reason} (${settle.waited_ms}ms) — dispatching without idle-gate burn`);
-    }
-  }
-  if (!gateResult) {
-    gateResult = await submitGate.awaitReplReady(id, sessionStateManager, {
-      timeoutMs: gateTimeoutMs,
-      ...(minConfidence !== undefined ? { minConfidence } : {}),
-    });
-  }
-  const gatedDispatchAfterTimeout = !gateResult.ready;
-  if (isTerminalGateFailure(gateResult)) {
-    console.log(`[SUBMIT] gate hard-fail ${id}: ${gateResult.reason} (last_state=${gateResult.last_state})`);
-    return res.status(504).json({
-      error: 'Submit gated-timeout — target REPL not in a dispatchable state',
-      reason: gateResult.reason,
-      last_state: gateResult.last_state,
-      strategy: 'none',
-      attempts: 0,
-      gated: true,
-      gate_wait_ms: gateResult.waited_ms,
-      ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
-    });
-  }
-  if (gatedDispatchAfterTimeout) {
-    // #678: `no_state`/`no_state_manager` join `timeout` here — dispatch the CR best-effort
-    // rather than hard-fail, so a live-bridge session with no render-state machine still submits.
-    console.log(`[SUBMIT] gate ${gateResult.reason || 'not-ready'} ${id}: dispatching anyway (last_state=${gateResult.last_state})`);
-  }
-
-  // Step 2: dispatch Enter via the PTY/context path, render-gated (#568).
-  if (injectedBody) {
-    markPendingReportSubmitStarted(id, injectedBody);
-  }
-  const settleEnabled = req.body?.input_settle_gate !== false;
-  let strategy = await gatedTerminalSubmit(id, session, injectedBody, settleEnabled);
-  let submittedAtMs = Date.now();
-  // #53: outputRing watermark at the CR — scopes consumption-evidence matching to frames
-  // appended AFTER this submit (composer redraw / new-turn render), surviving ring trimming.
-  let ringBytesAtSubmit = session.outputRingTotalBytes || 0;
-  let attempts = strategy ? 1 : 0;
-  if (!strategy) {
-    if (injectedBody) {
-      markPendingReportSubmitUnconfirmed(id, { reason: 'strategy_failed', attempts: 0, retryable: false });
-    }
-    return res.status(503).json({
-      error: 'Submit failed via all strategies (kitty/cmux/pty)',
-      strategy: 'none',
-      attempts: 0,
-      gated: true,
-      gate_wait_ms: gateResult.waited_ms,
-      ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
-    });
-  }
-
-  // Step 3: confirm the submit was accepted (only when caller provided body).
-  // Without `injected_body`, this is a bare Enter press (`telepty enter` or
-  // `telepty send-key` without force) — there is nothing to confirm and one
-  // shot is enough. A retry is idempotent only when the body is still visible.
-  let verify = null;
-  let confirm = null;
-  let consumption = null;        // #53: 'consumed' | 'queued' | 'unknown'
-  let consumptionReason = null;
-  if (injectedBody && injectedBody.length > 0) {
-    confirm = await confirmSubmitAfterDispatch(id, session, injectedBody, submittedAtMs, verifyTimeoutMs);
-    while (confirm && !confirm.accepted && confirm.retryable && attempts <= retries) {
-      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
-      const retryStrategy = await gatedTerminalSubmit(id, session, injectedBody, settleEnabled);
-      submittedAtMs = Date.now();
-      ringBytesAtSubmit = session.outputRingTotalBytes || 0;
-      if (!retryStrategy) break;
-      strategy = retryStrategy;
-      attempts++;
-      confirm = await confirmSubmitAfterDispatch(id, session, injectedBody, submittedAtMs, verifyTimeoutMs);
-    }
-    verify = buildSubmitVerify(confirm);
-
-    // #53: consumption-evidence on the DELIVERY path. `confirm.accepted` can read a BUSY
-    // recipient's mid-turn output as success (the isAcceptedSubmitState last_output_at leak),
-    // so additionally classify whether the body was CONSUMED as a fresh turn vs QUEUED in a
-    // busy composer vs UNKNOWN — and surface it to the caller. Advisory + additive: it does
-    // NOT change accepted/retryable (back-compat); it only tells the sender what telepty can
-    // actually observe past the PTY layer. Conservative (never-false-consumed).
-    const consumptionResult = await submitGate.classifyInjectConsumption(session, injectedBody, {
-      submittedAtMs,
-      sinceBytes: ringBytesAtSubmit,
-      getState: () => sessionStateManager.getState(id),
-      stripAnsi: stripAnsiState,
-    });
-    consumption = consumptionResult.status;
-    consumptionReason = consumptionResult.reason;
-    if (verify) {
-      verify.consumption = consumptionResult.status;
-      verify.consumption_reason = consumptionResult.reason;
-    }
-
-    // #617: a `queued` body was parked on a busy recipient and will never fire on its own.
-    // Hand it to the detached hold-and-redeliver loop (re-fires the CR on busy→idle). This
-    // runs independent of whether the handler returns 200 or 504 below — delivery is the
-    // daemon's responsibility now that the worker no longer needs to poll the status.
-    if (consumption === 'queued') {
-      scheduleQueuedRedeliver(id, session, injectedBody, {
-        knownConsumption: 'queued',
-        submittedAtMs,
-        ringBytesAtSubmit,
-        emitSubmitBus,
-      });
-    }
-
-    if (confirm && !confirm.accepted) {
-      const reason = gatedDispatchAfterTimeout ? 'gated_dispatch_unconsumed' : 'submit_unconfirmed';
-      const failBody = {
-        error: gatedDispatchAfterTimeout
-          ? 'Submit gated-timeout and body not consumed after best-effort dispatch'
-          : 'Submit body still visible after bounded confirmation retry',
-        reason,
-        last_state: gateResult.last_state,
-        strategy,
-        attempts,
-        gated: true,
-        gate_wait_ms: gateResult.waited_ms,
-        verify,
-        confirm,
-        ...(consumption ? { consumption, consumption_reason: consumptionReason } : {}),
-        gated_dispatch_after_timeout: true,
-        ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
-      };
-      if (!gatedDispatchAfterTimeout) {
-        delete failBody.gated_dispatch_after_timeout;
-      }
-      markPendingReportSubmitUnconfirmed(id, { ...confirm, attempts });
-      emitSubmitBus(failBody);
-      return res.status(504).json(failBody);
-    }
-
-    markPendingReportSubmitConfirmed(id, { ...(confirm || { reason: 'empty_body' }), attempts });
-  }
-
-  const responseBody = {
-    success: true,
-    strategy,
-    attempts,
-    gated: true,
-    gate_wait_ms: gateResult.waited_ms,
-    verify,
-    confirm,
-    ...(consumption ? { consumption, consumption_reason: consumptionReason } : {}),
-    ...(gatedDispatchAfterTimeout ? { gated_dispatch_after_timeout: true } : {}),
-    ...(promptSymbol ? { prompt_symbol: promptSymbol } : {}),
-  };
-  emitSubmitBus(responseBody);
-  return res.json(responseBody);
-});
+sessionActions.registerSubmitRoute(app);
 
 // Submit Enter to every active session. #546: submit is a PTY/context op (bare 0x0D) for every
 // wrapped + spawned backend INCLUDING cmux — the path validated 3/3 live for per-session submit
 // (#544). The cmux `send-key --surface return` surface op is removed (ZERO cmux send-key);
 // osascript Cmd+Enter remains only for app-window sessions with no PTY bridge. Exported (pure
 // over the passed sessions map) so the dispatch is unit-testable without starting the daemon.
-function runSubmitAll(sessionsMap) {
-  const results = { successful: [], failed: [] };
 
-  for (const [id, session] of Object.entries(sessionsMap)) {
-    const strategy = getSubmitStrategy(session.command);
-    let success = false;
-
-    if (strategy === 'pty_cr') {
-      success = submitViaPty(session);
-    } else if (strategy === 'osascript_cmd_enter') {
-      success = submitViaOsascript(id, 'cmd_enter');
-    }
-
-    if (success) {
-      results.successful.push({ id, strategy });
-    } else {
-      results.failed.push({ id, strategy, error: 'Submit failed' });
-    }
-  }
-
-  return results;
-}
 
 // POST /api/sessions/submit-all — Submit all active sessions
-app.post('/api/sessions/submit-all', (req, res) => {
-  res.json({ success: true, results: runSubmitAll(sessions) });
-});
+sessionInspection.registerSubmitAllRoute(app);
 
-app.post('/api/sessions/:id/inject', async (req, res) => {
-  const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
-  if (!resolvedId) return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
-  const session = sessions[resolvedId];
-  const id = resolvedId;
-  const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
-  let { from, reply_to } = req.body;
-  if (typeof prompt !== 'string') return respondWithError(res, 400, 'INVALID_REQUEST', 'prompt is required');
-  // reply_to defaults to from when omitted
-  if (from && !reply_to) reply_to = from;
-
-  // Routing metadata stays in session/bus state, not in the visible prompt text.
-  const finalPrompt = prompt;
-  const inject_id = crypto.randomUUID();
-  // #43 P2 / #815 — daemon-verified sender identity (from the presented bearer, never body.from).
-  // The full principal (sid, epoch, generation) so a consumer can tell WHICH INSTANCE of a sid
-  // sent this; `verifiedSender` spreads the epoch/generation onto every audit line below.
-  const verifiedPrincipal = verifiedPrincipalFromReq(req);
-  const verifiedSenderSid = verifiedPrincipal ? verifiedPrincipal.sid : null;
-  const verifiedSender = verifiedSenderFields(verifiedPrincipal);
-
-  // #533 Phase 2 — peer-lane inject guardrail (in-band hard block, before delivery).
-  // Out-of-policy peer→peer injects (no sanctioned ask-request/ask-reply envelope)
-  // are blocked here so raw work-delegation bypass is prevented, not just detected.
-  // Orchestrator↔peer, broadcast/multicast (no `from`), and existing kinds are untouched.
-  const peerVerdict = classifyPeerLaneInject({ from, to: requestedId, prompt, orchestratorSids: ORCHESTRATOR_SIDS });
-  if (peerVerdict.decision === 'block') {
-    broadcastSessionEvent('peer_inject_blocked', id, session, {
-      extra: {
-        target_agent: id,
-        from: from || null,
-        reason: peerVerdict.reason,
-        attempted_kind: peerVerdict.kind,
-        envelope_present: peerVerdict.envelopePresent,
-        inject_id
-      }
-    });
-    console.warn(`[PEER-GUARD] blocked peer inject ${from} → ${id} (${peerVerdict.reason})`);
-    // #47 P5 — a blocked bypass attempt is auditable too, not just successful deliveries (spec
-    // §5/§9). One shared-schema line with delivery_result:"blocked:<reason>" — the #45 gate logic
-    // itself is unchanged; this only records the attempt.
-    auditAppend({
-      ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
-      claimed_from: from || null, ...verifiedSender,
-      to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
-      origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
-      payload: finalPrompt, delivery_result: `blocked:${peerVerdict.reason}`
-    });
-    return respondWithError(res, 403, 'PEER_INJECT_BLOCKED',
-      'Peer-lane inject blocked: not a sanctioned ask-request/ask-reply envelope. Use bin/ask.sh.',
-      { reason: peerVerdict.reason, sanctioned_channel: 'bin/ask.sh' });
-  }
-  if (peerVerdict.lane === 'disabled') {
-    console.warn('[PEER-GUARD] orchestrator sid unconfigured (AIGENTRY_ORCHESTRATOR_SIDS empty) — peer guardrail disabled (fail-open)');
-  }
-
-  // #60 Stage A / §3 item 1 — DURABLY RECORD ABSENCE BEFORE DELIVERY.
-  //
-  // This used to run after the delivery call, as a best-effort in-memory assignment. That
-  // ordering is what made silence possible: bytes reached a worker, the daemon restarted, and
-  // nothing anywhere could answer for the dispatch — the orchestrator's poll then got a 404 and
-  // read it as a task-state signal. The commit is transactional (temp → fsync → rename → dir
-  // fsync) and its failure ABORTS the delivery: refusing to deliver is honest, delivering and
-  // then forgetting is not.
-  //
-  // Scoped to tracked injects (`from` present) — an untracked operator inject is unaffected.
-  let trackedRecord = null;
-  if (from) {
-    const begun = beginTrackedInjection({ injectId: inject_id, sessionId: id, source: from, session });
-    if (!begun.ok) {
-      emitInjectFailureEvent(id, 'TRACKING_PERSISTENCE_FAILED',
-        'Observation tracking could not be persisted; no task bytes were delivered.',
-        { inject_id, from: from || null }, session);
-      return respondWithError(res, 500, 'TRACKING_PERSISTENCE_FAILED',
-        'Observation tracking could not be persisted; no task bytes were delivered.',
-        { inject_id, tracking_state: 'unavailable', reason: 'tracking_persistence_failed' });
-    }
-    trackedRecord = begun.record;
-    pendingReports[id] = {
-      source: from,
-      injectedAt: new Date().toISOString(),
-      injectId: inject_id,
-      submitExpected: !!no_enter,
-      noEnter: !!no_enter,
-      injectedBodyPreview: prompt.slice(0, 500),
-      // #52: echo-evidence watermark — only frames appended after this inject count.
-      ringBytesAtInject: session.outputRingTotalBytes || 0,
-      awaitingReport: true
-      // NOTE: no `idleNotified`. The one-way "already spoke" bit is gone; duplicate suppression
-      // is keyed on observation identity in the ledger, where it cannot become an authority gate.
-    };
-  }
-
-  try {
-    const delivery = await deliverInjectionToSession(id, session, finalPrompt, {
-      noEnter: !!no_enter,
-      source: 'inject',
-      from: from || 'inject',
-      // #860 F2 — carried so that a park keeps its link to the write-ahead record. Null for an
-      // untracked operator inject (no `from`), and every consumer of it no-ops on null.
-      injectId: trackedRecord ? inject_id : null,
-      // #47 P4 — the daemon-verified sender (never body.from) labels the provenance banner.
-      verifiedSenderSid
-    });
-    if (!delivery.success) {
-      emitInjectFailureEvent(id, delivery.code, delivery.error, {
-        inject_id,
-        from: from || null,
-        reply_to: reply_to || null
-      }, session);
-      auditAppend({
-        ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
-        claimed_from: from || null, ...verifiedSender,
-        to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
-        origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
-        payload: finalPrompt, delivery_result: `failed:${delivery.code || 'DELIVERY_FAILED'}`
-      });
-      // #843 — close the write-ahead record. Without this the refusal is recorded in the AUDIT log
-      // (above) and contradicted in the OBSERVATION ledger, which keeps saying `tracked` /
-      // `inject_accepted` for a dispatch that delivered nothing. `inject_id` rides on the error
-      // body for the same reason: a caller told its dispatch was refused must be able to poll the
-      // record that says so.
-      const aborted = trackedRecord
-        ? abortTrackedInjection(inject_id, id, delivery.code, delivery.error)
-        : 'no_tracked_inject';
-      return respondWithError(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error,
-        { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable' });
-    }
-
-    if (from) session.lastInjectFrom = from;
-    if (reply_to) session.lastInjectReplyTo = reply_to;
-    if (thread_id) session.lastThreadId = thread_id;
-
-    // #860 F2 — the service log gets the same distinction the audit line does. "Wrote" was printed
-    // for a queue push too, so an operator grepping the log for a delivery found one that had not
-    // happened.
-    console.log(`[INJECT] ${deliveryAuditResult(delivery) === 'queued' ? 'Queued for' : 'Wrote to'} session ${id} (inject_id: ${inject_id})`);
-
-    const injectTimestamp = new Date().toISOString();
-    // #43 P1/P2 — one audit line per delivery (claimed + daemon-verified sender, hash-only).
-    auditAppend({
-      ts: injectTimestamp, inject_id, kind: 'inject', source: 'inject',
-      claimed_from: from || null, ...verifiedSender,
-      to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
-      origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: req.body.ref_path || null,
-      // #860 F2 — `queued` when the delivery was parked on the bootstrap / modal queue with zero
-      // bytes written, `success` only for a delivery the machinery reported as written.
-      payload: finalPrompt, delivery_result: deliveryAuditResult(delivery)
-    });
-    broadcastSessionEvent('inject_written', id, session, {
-      timestamp: injectTimestamp,
-      extra: {
-        inject_id,
-        target_agent: id,
-        // #815: the prompt is NO LONGER rebroadcast verbatim. Any local socket may subscribe to
-        // the bus with no token and no Origin, so `content: prompt` published the full text of
-        // every dispatch to any local process — a disclosure in its own right, and the harvest
-        // that hands an adversary the correlation identifiers carried inside dispatches. Only
-        // non-secret transport metadata now: enough to correlate and to verify integrity against
-        // a payload you already hold, and nothing to read if you do not.
-        content_sha256: crypto.createHash('sha256').update(prompt).digest('hex'),
-        content_length: Buffer.byteLength(prompt),
-        from: from || null,
-        // #43 — live bus event enriched with daemon-verified provenance (spec §7).
-        ...verifiedSender,
-        spoof_suspected: !!(from && verifiedSenderSid && from !== verifiedSenderSid),
-        origin: 'trusted-local',
-        reply_to: reply_to || null,
-        thread_id: thread_id || null,
-        reply_expected: !!reply_expected
-      }
-    });
-
-    // #60 Stage A / §3.6: the reverse-text REPORT path is DELETED, not adapted.
-    //
-    // It used to look at any inject a session routed back to its own pending-report source and
-    // call it a completion — `resolveOutboundReportStatus` mapped every payload that was not a
-    // recognised prefix to `report_complete`, so "Can you clarify the requirement?" was recorded
-    // as that worker reporting its task done. It also marked the sender idle from that text and
-    // broadcast TASK_COMPLETE_WITH_REPORT.
-    //
-    // No text can authenticate its sender or correlate itself to a dispatch, so no text may
-    // settle one. In 0.8.0 a reverse-routed inject is an ordinary message and the sender's
-    // tracked record stays completion-unknown. The authenticated, correlated report protocol is
-    // Stage B, and it will not consult pendingReports, the observation ledger, PTY state, or
-    // reverse-route matching (§V2/§7 item 10).
-
-    // The tracked record and the pending entry were both created BEFORE this delivery (see the
-    // begin-tracking block above), so there is nothing to register here. Supersession of a prior
-    // record for the same session is handled there too: the old inject_id keeps its history and
-    // gains `tracking_superseded`, instead of being destructively overwritten.
-
-    // Notify all attached viewers (telepty attach clients) about the inject
-    // This enables aterm and other viewers to show inject events in real-time
-    if (session.clients && session.clients.size > 0) {
-      const viewerMsg = JSON.stringify({
-        type: 'inject_notification',
-        inject_id,
-        session_id: id,
-        from: from || null,
-        content: prompt,
-        timestamp: injectTimestamp
-      });
-      session.clients.forEach(client => {
-        if (client !== session.ownerWs && client.readyState === 1) {
-          client.send(viewerMsg);
-        }
-      });
-    }
-
-    if (requestedId !== resolvedId) {
-      console.log(`[ALIAS] Resolved '${requestedId}' → '${resolvedId}'`);
-    }
-
-    if (from && reply_to) {
-      const routedMsg = JSON.stringify({
-        type: 'message_routed',
-        message_id: inject_id,
-        from,
-        to: id,
-        reply_to,
-        inject_id,
-        deliberation_session_id: req.body.deliberation_session_id || null,
-        thread_id: req.body.thread_id || null,
-        timestamp: new Date().toISOString()
-      });
-      busClients.forEach(client => {
-        if (client.readyState === 1) client.send(routedMsg);
-      });
-    }
-
-    res.json({
-      success: true,
-      inject_id,
-      strategy: delivery.strategy,
-      submit: delivery.submit,
-      ...(delivery.bootstrap_queued ? {
-        bootstrap_queued: true,
-        bootstrap_op_id: delivery.bootstrap_op_id || delivery.msg_id,
-        pending: delivery.pending
-      } : {})
-    });
-  } catch (err) {
-    emitInjectFailureEvent(id, 'DELIVERY_FAILED', err.message, { inject_id }, session);
-    res.status(500).json(buildErrorBody('DELIVERY_FAILED', err.message));
-  }
-});
+sessionActions.registerInjectRoute(app);
 
 // #826 — the OTHER write path, kept next to the route above because they are twins and were
 // diverging silently.
@@ -5148,78 +1978,9 @@ app.get('/api/sessions/:id/screen', (req, res) => {
   });
 });
 
-app.patch('/api/sessions/:id', (req, res) => {
-  const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
-  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
-  const session = sessions[resolvedId];
-  const id = resolvedId;
-  const { new_id } = req.body;
-  if (!new_id) return res.status(400).json({ error: 'new_id is required' });
-  if (sessions[new_id]) return res.status(409).json({ error: `Session ID '${new_id}' is already in use.` });
+registerSessionRenameRoute(app, { context: sessionRecordContext, sessionStateManager, busClients });
 
-  // Move session to new key (including state machine)
-  sessions[new_id] = session;
-  delete sessions[id];
-  // #815: a rename moves ONE LIVE INSTANCE to a new name — same PTY, same owner, same epoch. The
-  // credential follows the instance rather than being revoked, or the running child (which holds
-  // the bearer in an environment nobody can update) would silently lose its identity. Only
-  // canonical_sid changes in the principal; the epoch still says "same instance".
-  sessionCredentials.rename(id, new_id);
-  const renamedNonce = sidNonces.get(id);
-  if (renamedNonce !== undefined) {
-    sidNonces.delete(id);
-    sidNonces.set(new_id, renamedNonce);
-  }
-  sessionStateManager.unregister(id);
-  sessionStateManager.register(new_id);
-  session.id = new_id;
-
-  // Broadcast rename to bus
-  const busMsg = JSON.stringify({
-    type: 'session_rename',
-    sender: 'daemon',
-    old_id: id,
-    new_id,
-    timestamp: new Date().toISOString()
-  });
-  busClients.forEach(client => {
-    if (client.readyState === 1) client.send(busMsg);
-  });
-
-  console.log(`[RENAME] Session '${id}' renamed to '${new_id}'`);
-  res.json({ success: true, old_id: id, new_id });
-});
-
-app.post('/api/sessions/:id/kill', async (req, res) => {
-  const requestedId = req.params.id;
-  // #548: destructive op — must not cascade across alias-sharing siblings.
-  const resolvedId = resolveSessionForDestroy(requestedId);
-  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
-
-  try {
-    const timeoutSeconds = req.body && req.body.timeout != null
-      ? Number(req.body.timeout)
-      : (req.body && req.body.timeout_sec != null ? Number(req.body.timeout_sec) : 5);
-    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) {
-      return res.status(400).json({ error: 'timeout must be a non-negative number of seconds', code: 'INVALID_TIMEOUT' });
-    }
-
-    const result = await teardownSessionById(resolvedId, {
-      force: req.body && req.body.force === true,
-      timeoutMs: Math.floor(timeoutSeconds * 1000),
-      reason: req.body && req.body.reason ? String(req.body.reason) : 'manual',
-      source: req.body && req.body.source ? String(req.body.source) : 'api'
-    });
-    if (!result.success) {
-      return res.status(result.httpStatus || 500).json({ error: result.error || 'Failed to kill session' });
-    }
-    console.log(`[KILL] Session ${resolvedId} closed (reason=${result.reason}, force=${result.force}, pid=${result.kill.pid || 'none'})`);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message || 'Failed to kill session' });
-  }
-});
+sessionActions.registerKillRoute(app);
 
 /**
  * #843 A — the DELETE teardown response, as a value. PURE.
@@ -5234,490 +1995,18 @@ app.post('/api/sessions/:id/kill', async (req, res) => {
  * swallows ESRCH on a reaped child, so nothing an integration test can arrange makes the real call
  * throw — and an unreachable branch that returns success is precisely what shipped.
  */
-function describeSessionTeardown(killError) {
-  if (!killError) return { httpStatus: 200, body: { success: true, status: 'closing' } };
-  return {
-    httpStatus: 500,
-    body: {
-      success: false,
-      code: 'KILL_FAILED',
-      status: 'registry-removed-kill-unconfirmed',
-      error: `Session teardown failed: ${killError.message || String(killError)}. `
-        + 'The registry record was removed, so this process is no longer tracked by the daemon '
-        + 'and may still be running.',
-      registry_removed: true,
-    },
-  };
-}
 
-app.delete('/api/sessions/:id', (req, res) => {
-  const requestedId = req.params.id;
-  // #548: destructive op — must not cascade across alias-sharing siblings.
-  const resolvedId = resolveSessionForDestroy(requestedId);
-  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
-  const session = sessions[resolvedId];
-  const id = resolvedId;
-  if (session.isClosing) return res.json({ success: true, status: 'closing' });
-  // BUG-C (shared-fate): a wrapped session can be co-bound by a stale/displaced owner bridge
-  // (duplicate --id). A DELETE carrying a token that is NOT the current owner's, while a live
-  // owner ws is still open, is that stale bridge exiting — it must NOT tear down the live owner.
-  // Detach-only (no-op): leave the record and every client untouched. Tokenless callers
-  // (operator `telepty delete`, ghost clean) and matching-token current-owner exits are
-  // unaffected. Forceful kills go through POST /:id/kill (teardownSessionById), not here.
-  const ownerToken = req.query.owner_token;
-  if (session.type === 'wrapped'
-      && ownerToken && session.ownerToken && ownerToken !== session.ownerToken
-      && isOpenWebSocket(session.ownerWs)) {
-    return res.json({ success: true, status: 'stale-detached' });
-  }
-  // #843 A — the kill outcome is MEASURED, not inferred from which block ran. The two arms used
-  // to be a `try` returning `{success:true, status:'closing'}` and a `catch` returning
-  // `{success:true, status:'force-removed'}`: a kill that THREW answered success. The process may
-  // still be running, the registry record is gone, so nothing tracks it any more — and
-  // `bin/session-cleanup.sh`, the operator entrance here, read that success as "the worker is
-  // gone". Capturing the error as a value collapses the duplicated teardown into one path and
-  // makes "a failed kill does not report success" structural rather than a thing to remember.
-  let killError = null;
-  try {
-    session.isClosing = true;
-    if (session.type === 'wrapped') {
-      if (session.clients) session.clients.forEach(ws => ws.close(1000, 'Session destroyed'));
-    } else if (session.ptyProcess) {
-      session.ptyProcess.kill();
-    }
-  } catch (err) {
-    killError = err;
-  }
-  // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
-  // verdict — NO-OP on the managed path. The orchestrator's session-cleanup.sh closes the
-  // surface on this normal CLI-exit (CLEANUP_REQUEST→wh_close). Actuates only for a standalone
-  // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
-  try { terminalBackend.closeSurface(session); } catch {}
-  // #60 Stage A §A2 (F1) — OBSERVE THE END BEFORE THE RECORD DISAPPEARS.
-  //
-  // This used to `delete sessions[id]` first and mark nothing at all. The PTY kill's onExit fires
-  // asynchronously, by which point the record is gone, so the transition listener's
-  // `if (!session) return` guard bailed and the end was emitted on NO channel. Silence is the one
-  // output Stage A forbids, and this is the entrance operator tooling uses, so every cleaned-up
-  // session was saying nothing about its own end while the natural-exit path said it correctly.
-  //
-  // #843 A — and it is `markTerminationRequested`, not `markDead`. The A2 repair above was right
-  // to leave exit code and signal null (no exit status was observed at this instant, and
-  // inventing one would be a measurement we did not make) and then routed through the one method
-  // whose external name is `session_process_exited`. Honest fields under a name that contradicted
-  // them. The mark runs synchronously, so the observation is emitted while `sessions[id]` is still
-  // live; unregister then destroys the machine, which also makes the later onExit markDead a no-op
-  // (its `if (sm)` guard) rather than a second, differently-named statement about one ending.
-  sessionStateManager.markTerminationRequested(id, 'operator_delete', killError && killError.message);
-  sessionStateManager.unregister(id);
-  delete sessions[id];
-  revokeSessionCredential(id);    // #815: DELETE — revoke before the id can be reused
-  try { mailbox.purge(id); } catch {}
-  lifecycle.cleanupSessionArtifacts(id);
-  persistSessions();
-  const teardown = describeSessionTeardown(killError);
-  console.log(killError
-    ? `[KILL] Session ${id} registry-removed but the kill was NOT confirmed: ${killError.message}`
-    : `[KILL] Session ${id} removed`);
-  res.status(teardown.httpStatus).json(teardown.body);
-});
+sessionActions.registerDeleteRoute(app);
 
 // Shared auto-router: handles turn_request events from any source (WS or HTTP)
-async function busAutoRoute(msg) {
-  const eventType = msg.type || msg.kind;
-  const isRoutable = (eventType === 'turn_request' || eventType === 'deliberation_route_turn') && (msg.target || msg.target_session_id);
-  if (!isRoutable) {
-    // Log all bus messages for debugging (excluding health checks)
-    if (eventType && eventType !== 'session_health') {
-      console.log(`[BUS] Event: ${eventType} (not routable)`);
-    }
-    return;
-  }
 
-  const rawTarget = (msg.target || msg.target_session_id).split('@')[0];
-  const turnId = (msg.payload && msg.payload.turn_id) || null;
-  console.log(`[BUS-ROUTE] ${eventType}: target=${rawTarget} turn=${turnId} msg_id=${msg.message_id || 'none'}`);
-  const targetId = resolveSessionAlias(rawTarget);
-  const targetSession = targetId ? sessions[targetId] : null;
-  if (!targetSession) {
-    console.log(`[BUS-ROUTE] Target ${rawTarget} not found among: ${Object.keys(sessions).join(', ')}`);
-    emitInjectFailureEvent(rawTarget, 'SESSION_NOT_FOUND', 'Target session was not found.', {
-      source: 'bus_auto_route',
-      turn_id: turnId,
-      original_message_id: msg.message_id || null
-    });
-    return;
-  }
+sessionActions.registerBusPublishRoute(app);
 
-  const prompt = (msg.payload && msg.payload.prompt) || msg.content || msg.prompt || JSON.stringify(msg);
-  const inject_id = crypto.randomUUID();
-
-  // #843 B — the THIRD write door, and until now the only one with no accountability at all.
-  //
-  // This writes into any session's PTY with exactly the authority of
-  // `POST /api/sessions/:id/inject`, and it applied neither of that route's two rules: no
-  // `classifyPeerLaneInject` verdict and no `auditAppend` line. Reproduced against one daemon:
-  // the HTTP door refuses `from:'aigentry-coder-a' → victim` with 403 PEER_INJECT_BLOCKED and
-  // records the attempt; the identical payload re-addressed to `POST /api/bus/publish` returned
-  // 200, landed in the PTY, and left the audit log unchanged. A guardrail enforced at two doors
-  // of three is not a guardrail — it is the false confidence this release exists to remove, and
-  // #826 shipped believing there were two doors.
-  //
-  // The claimed sender is read ONLY from fields that name a session id. `msg.from` is the direct
-  // analogue of `body.from`. `msg.source` is accepted only when it carries no `:` — the bus
-  // envelope defines `source` as `project:session_id` (BUS_EVENT_SCHEMA.md), which is a different
-  // namespace, and mapping it into the sid namespace would invent an identity and false-block
-  // legitimate deliberation routing. An event that names no sender resolves to `null`, which
-  // classifies as `no-sender` and is ALLOWED — deliberately the same answer the HTTP door gives a
-  // body with no `from`. This is accountability parity, not a new restriction: the unattributed
-  // bus route keeps working, and now it leaves a record.
-  const busSource = typeof msg.source === 'string' && !msg.source.includes(':') ? msg.source : null;
-  const claimedFrom = (typeof msg.from === 'string' && msg.from) || busSource || null;
-  const peerVerdict = classifyPeerLaneInject({
-    from: claimedFrom, to: targetId, prompt, orchestratorSids: ORCHESTRATOR_SIDS
-  });
-  const auditBusWrite = (deliveryResult) => auditAppend({
-    ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'bus',
-    claimed_from: claimedFrom,
-    // The bus is not an authorization boundary — any local socket may publish to it with no
-    // credential — so nothing arriving here is a verified identity. Absence, stated as absence.
-    ...verifiedSenderFields(null),
-    to: targetId, to_alias: rawTarget !== targetId ? rawTarget : null,
-    origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: null,
-    payload: prompt, delivery_result: deliveryResult
-  });
-
-  if (peerVerdict.decision === 'block') {
-    broadcastSessionEvent('peer_inject_blocked', targetId, targetSession, {
-      extra: {
-        target_agent: targetId, from: claimedFrom, reason: peerVerdict.reason,
-        attempted_kind: peerVerdict.kind, envelope_present: peerVerdict.envelopePresent,
-        inject_id, source: 'bus_auto_route', turn_id: turnId
-      }
-    });
-    auditBusWrite(`blocked:${peerVerdict.reason}`);
-    console.warn(`[PEER-GUARD] blocked bus-route inject ${claimedFrom} → ${targetId} (${peerVerdict.reason})`);
-    emitInjectFailureEvent(targetId, 'PEER_INJECT_BLOCKED', `Peer-lane inject blocked: ${peerVerdict.reason}`, {
-      source: 'bus_auto_route', turn_id: turnId, original_message_id: msg.message_id || null
-    }, targetSession);
-    return;
-  }
-
-  const delivery = await deliverInjectionToSession(targetId, targetSession, prompt, {
-    source: 'bus_auto_route'
-  });
-  const delivered = delivery.success === true;
-  // #860 F2 — `queued` for an op parked on the bootstrap / modal queue: this route audits the bus
-  // door, and a door that recorded a write which never happened is the gap #826 opened this log to
-  // close.
-  auditBusWrite(delivered ? deliveryAuditResult(delivery) : `failed:${delivery.code || 'DELIVERY_FAILED'}`);
-  if (!delivered) {
-    emitInjectFailureEvent(targetId, delivery.code, delivery.error, {
-      source: 'bus_auto_route',
-      turn_id: turnId,
-      original_message_id: msg.message_id || null
-    }, targetSession);
-  }
-
-  // #861 — `delivered` means BYTES WERE WRITTEN, and a park writes none.
-  //
-  // `bootstrapQueuedResponse` returns `success: true` for an op parked on the bootstrap /
-  // surface-modal queue, so `delivery.success` cannot carry this field on its own. #860 made the
-  // audit log say `queued` for exactly that case and this event went on saying `delivered: true`
-  // about the same inject — and the asymmetry ran the wrong way: `injects.jsonl` is token-gated
-  // while any local process may subscribe to the bus with no credential, so the honest record sat
-  // behind the credential and the false one was in the open.
-  //
-  // Asked THROUGH `deliveryAuditResult` rather than re-expressed here. It is the same question the
-  // audit line two lines up asks, and two writers of one predicate — with nothing binding them — is
-  // the shape every drift defect in this release has: the answers agree until someone edits one.
-  // The keying (strategy as well as flag) and its reason live there, at the single writer.
-  const parked = deliveryAuditResult(delivery) === 'queued';
-  const wrote = delivered && !parked;
-
-  // Emit inject_written ack
-  broadcastSessionEvent('inject_written', targetId, targetSession, {
-    extra: {
-      inject_id,
-      source_host: MACHINE_ID,
-      target_agent: targetId,
-      source_type: 'bus_auto_route',
-      turn_id: (msg.payload && msg.payload.turn_id) || null,
-      original_message_id: msg.message_id || null,
-      delivered: wrote,
-      // The audit log's own vocabulary, carried on the UNGUARDED surface too, so a subscriber can
-      // tell "accepted and parked" from "refused" without opening a log it may hold no token for.
-      // A park is not a failure: `code`/`error` stay null below, because nothing went wrong.
-      delivery_result: wrote ? 'success' : parked ? 'queued' : `failed:${delivery.code || 'DELIVERY_FAILED'}`,
-      code: delivered ? null : delivery.code,
-      error: delivered ? null : delivery.error
-    }
-  });
-  console.log(`[BUS-ROUTE] ${eventType} → ${targetId}: ${wrote ? 'delivered' : parked ? 'queued (parked, 0 bytes)' : 'failed'}`);
-}
-
-app.post('/api/bus/publish', (req, res) => {
-  const payload = req.body;
-
-  if (!payload || typeof payload !== 'object') {
-    return res.status(400).json({ error: 'Payload must be a JSON object' });
-  }
-
-  if (payload.type === 'session_state_report') {
-    const resolvedId = resolveSessionAlias(payload.session_id || '');
-    if (!resolvedId || !sessions[resolvedId]) {
-      return respondWithError(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: payload.session_id || null });
-    }
-
-    const applied = applySessionStateReport(resolvedId, sessions[resolvedId], payload);
-    if (!applied.success) {
-      return respondWithError(res, applied.httpStatus || 400, applied.code || 'INVALID_REQUEST', applied.error);
-    }
-
-    persistSessions();
-    return res.json({ success: true, delivered: busClients.size, event: applied.event });
-  }
-
-  let deliveredCount = 0;
-
-  busClients.forEach(client => {
-    if (client.readyState === 1) { // WebSocket.OPEN
-      client.send(JSON.stringify(payload));
-      deliveredCount++;
-    }
-  });
-
-  // Auto-route if this is a turn_request
-  busAutoRoute(payload);
-
-  res.json({ success: true, delivered: deliveredCount });
-});
-
-app.post('/api/handoff', (req, res) => {
-  const { source_session_id, deliberation_id, synthesis, auto_execute } = req.body;
-  if (!synthesis) return res.status(400).json({ error: 'synthesis is required' });
-
-  const handoff_id = crypto.randomUUID();
-  const handoff = {
-    id: handoff_id,
-    source_session_id: source_session_id || null,
-    deliberation_id: deliberation_id || null,
-    synthesis,
-    status: 'pending',
-    auto_execute: !!auto_execute,
-    claimed_by: null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    progress: [],
-    result: null
-  };
-  handoffs[handoff_id] = handoff;
-
-  const busMsg = JSON.stringify({
-    type: 'handoff.created',
-    handoff_id,
-    source_session_id: handoff.source_session_id,
-    deliberation_id: handoff.deliberation_id,
-    auto_execute: handoff.auto_execute,
-    task_count: Array.isArray(synthesis.tasks) ? synthesis.tasks.length : 0,
-    timestamp: handoff.created_at
-  });
-  busClients.forEach(client => {
-    if (client.readyState === 1) client.send(busMsg);
-  });
-
-  console.log(`[HANDOFF] Created ${handoff_id} (${Array.isArray(synthesis.tasks) ? synthesis.tasks.length : 0} tasks)`);
-  res.status(201).json({ handoff_id, status: 'pending' });
-});
-
-app.get('/api/handoff', (req, res) => {
-  const status = req.query.status;
-  const list = Object.values(handoffs)
-    .filter(h => !status || h.status === status)
-    .map(h => ({
-      id: h.id,
-      status: h.status,
-      deliberation_id: h.deliberation_id,
-      source_session_id: h.source_session_id,
-      auto_execute: h.auto_execute,
-      claimed_by: h.claimed_by,
-      task_count: Array.isArray(h.synthesis.tasks) ? h.synthesis.tasks.length : 0,
-      created_at: h.created_at,
-      updated_at: h.updated_at
-    }));
-  res.json(list);
-});
-
-app.get('/api/handoff/:id', (req, res) => {
-  const handoff = handoffs[req.params.id];
-  if (!handoff) return res.status(404).json({ error: 'Handoff not found' });
-  res.json(handoff);
-});
-
-app.post('/api/handoff/:id/claim', (req, res) => {
-  const handoff = handoffs[req.params.id];
-  if (!handoff) return res.status(404).json({ error: 'Handoff not found' });
-  if (handoff.status !== 'pending') {
-    return res.status(409).json({ error: `Handoff already ${handoff.status}`, claimed_by: handoff.claimed_by });
-  }
-
-  const { agent_session_id } = req.body;
-  if (!agent_session_id) return res.status(400).json({ error: 'agent_session_id is required' });
-
-  handoff.status = 'claimed';
-  handoff.claimed_by = agent_session_id;
-  handoff.updated_at = new Date().toISOString();
-
-  const busMsg = JSON.stringify({
-    type: 'handoff.claimed',
-    handoff_id: handoff.id,
-    agent_session_id,
-    timestamp: handoff.updated_at
-  });
-  busClients.forEach(client => {
-    if (client.readyState === 1) client.send(busMsg);
-  });
-
-  console.log(`[HANDOFF] ${handoff.id} claimed by ${agent_session_id}`);
-  res.json({ success: true, handoff_id: handoff.id, status: 'claimed' });
-});
-
-app.patch('/api/handoff/:id', (req, res) => {
-  const handoff = handoffs[req.params.id];
-  if (!handoff) return res.status(404).json({ error: 'Handoff not found' });
-
-  const { status, message, result } = req.body;
-  const validTransitions = {
-    pending: ['claimed'],
-    claimed: ['executing', 'failed'],
-    executing: ['completed', 'failed'],
-  };
-
-  if (status) {
-    const allowed = validTransitions[handoff.status] || [];
-    if (!allowed.includes(status)) {
-      return res.status(400).json({ error: `Invalid transition: ${handoff.status} -> ${status}` });
-    }
-    handoff.status = status;
-  }
-
-  if (message) {
-    handoff.progress.push({ message, timestamp: new Date().toISOString() });
-  }
-
-  if (result) {
-    handoff.result = result;
-  }
-
-  handoff.updated_at = new Date().toISOString();
-
-  const busMsg = JSON.stringify({
-    type: `handoff.${handoff.status}`,
-    handoff_id: handoff.id,
-    claimed_by: handoff.claimed_by,
-    message: message || null,
-    timestamp: handoff.updated_at
-  });
-  busClients.forEach(client => {
-    if (client.readyState === 1) client.send(busMsg);
-  });
-
-  console.log(`[HANDOFF] ${handoff.id} -> ${handoff.status}${message ? ': ' + message : ''}`);
-  res.json({ success: true, handoff_id: handoff.id, status: handoff.status });
-});
+registerHandoffRoutes(app, { handoffs, crypto, busClients });
 
 // --- Deliberation Thread Tracking ---
 
-app.post('/api/threads', (req, res) => {
-  const { topic, orchestrator_session_id, participant_session_ids, context } = req.body;
-  if (!topic) return res.status(400).json({ error: 'topic is required' });
-
-  const thread_id = crypto.randomUUID();
-  const thread = {
-    id: thread_id,
-    topic,
-    orchestrator_session_id: orchestrator_session_id || null,
-    participant_session_ids: participant_session_ids || [],
-    context: context || null,
-    status: 'active',
-    message_count: 0,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    closed_at: null
-  };
-  threads[thread_id] = thread;
-
-  const busMsg = JSON.stringify({
-    type: 'thread.opened',
-    thread_id,
-    topic,
-    orchestrator_session_id: thread.orchestrator_session_id,
-    participant_session_ids: thread.participant_session_ids,
-    timestamp: thread.created_at
-  });
-  busClients.forEach(client => {
-    if (client.readyState === 1) client.send(busMsg);
-  });
-
-  console.log(`[THREAD] Opened ${thread_id}: "${topic}" (${thread.participant_session_ids.length} participants)`);
-  res.status(201).json({ thread_id, status: 'active' });
-});
-
-app.get('/api/threads', (req, res) => {
-  const status = req.query.status;
-  const list = Object.values(threads)
-    .filter(t => !status || t.status === status)
-    .map(t => ({
-      id: t.id,
-      topic: t.topic,
-      status: t.status,
-      orchestrator_session_id: t.orchestrator_session_id,
-      participant_count: t.participant_session_ids.length,
-      message_count: t.message_count,
-      created_at: t.created_at,
-      updated_at: t.updated_at
-    }));
-  res.json(list);
-});
-
-app.get('/api/threads/:id', (req, res) => {
-  const thread = threads[req.params.id];
-  if (!thread) return res.status(404).json({ error: 'Thread not found' });
-  res.json(thread);
-});
-
-app.patch('/api/threads/:id', (req, res) => {
-  const thread = threads[req.params.id];
-  if (!thread) return res.status(404).json({ error: 'Thread not found' });
-
-  const { status, message_count } = req.body;
-
-  if (status === 'closed' && thread.status === 'active') {
-    thread.status = 'closed';
-    thread.closed_at = new Date().toISOString();
-    thread.updated_at = thread.closed_at;
-
-    const busMsg = JSON.stringify({
-      type: 'thread.closed',
-      thread_id: thread.id,
-      topic: thread.topic,
-      message_count: thread.message_count,
-      timestamp: thread.closed_at
-    });
-    busClients.forEach(client => {
-      if (client.readyState === 1) client.send(busMsg);
-    });
-
-    console.log(`[THREAD] Closed ${thread.id}: "${thread.topic}" (${thread.message_count} messages)`);
-  }
-
-  if (typeof message_count === 'number') {
-    thread.message_count = message_count;
-    thread.updated_at = new Date().toISOString();
-  }
-
-  res.json({ success: true, thread_id: thread.id, status: thread.status });
-});
+registerThreadRoutes(app, { threads, crypto, busClients });
 
 // Bind the port when launched as the daemon. A test can `require('./daemon.js')` to reach the
 // exported decision functions WITHOUT starting the daemon — it just must not set the env below.
@@ -5803,39 +2092,10 @@ const mailbox = new FileMailbox();
 const mailboxNotifier = new UnixSocketNotifier({ coalesceMs: 25 });
 
 // Resolve aterm UDS socket path for a session
-mailboxNotifier.setSocketResolver((sessionId) => {
-  const session = sessions[sessionId];
-  if (!session || session.type !== 'aterm') return null;
-  return (session.delivery && session.delivery.transport === 'unix_socket' && session.delivery.address) || null;
-});
+mailboxNotifier.setSocketResolver(sessionDeliveryContext.resolveMailboxSocket);
 
 // Delivery engine: dequeue → writeDataToSession → ack/nack
-const mailboxDelivery = new DeliveryEngine(mailbox, {
-  pollMs: 200,
-  sessionResolver: () => Object.keys(sessions),
-  deliverFn: async (sessionId, msg) => {
-    const session = sessions[sessionId];
-    if (!session) return { success: false, error: 'Session not found' };
-    const result = await writeDataToSession(sessionId, session, msg.payload);
-    if (result.success) {
-      session.lastActivityAt = new Date().toISOString();
-    }
-    return result;
-  },
-  onDelivery: (sessionId, msgId, result) => {
-    const session = sessions[sessionId];
-    if (!session) return;
-    if (result.success) {
-      broadcastSessionEvent('mailbox_delivered', sessionId, session, {
-        extra: { msg_id: msgId }
-      });
-    } else {
-      broadcastSessionEvent('mailbox_delivery_failed', sessionId, session, {
-        extra: { msg_id: msgId, error: result.error }
-      });
-    }
-  },
-});
+const mailboxDelivery = new DeliveryEngine(mailbox, sessionDeliveryContext.mailboxDeliveryOptions);
 // Startup sweep: break stale lock files before starting delivery. Guarded so a test require
 // of this module neither breaks on-disk locks nor starts the delivery loop.
 //
@@ -6193,7 +2453,6 @@ if (server) server.on('error', async (error) => {
   throw error;
 });
 
-const busClients = new Set();
 
 installWebSocketTransport({
   server,
@@ -6231,7 +2490,8 @@ installWebSocketTransport({
   listTrackedInjectionsForSession,
   // #826 — the viewer write path gets the same policy verdict and the same audit line as
   // POST /api/sessions/:id/inject. See authorizeViewerInject.
-  authorizeViewerInject
+  authorizeViewerInject,
+  acceptInteractionReceipt
 });
 
 function shutdown(code) {

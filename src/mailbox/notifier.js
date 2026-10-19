@@ -14,6 +14,9 @@ class UnixSocketNotifier {
     this.coalesceMs = options.coalesceMs || 25;
     this._pending = new Map(); // sessionId → timer
     this._socketResolver = options.socketResolver || null; // (sessionId) => socketPath | null
+    this._net = options.net || net;
+    this._setTimeout = options.setTimeout || setTimeout;
+    this._clearTimeout = options.clearTimeout || clearTimeout;
   }
 
   /**
@@ -31,7 +34,7 @@ class UnixSocketNotifier {
   notify(sessionId) {
     if (this._pending.has(sessionId)) return; // already scheduled
 
-    const timer = setTimeout(() => {
+    const timer = this._setTimeout(() => {
       this._pending.delete(sessionId);
       this._sendWake(sessionId);
     }, this.coalesceMs);
@@ -47,7 +50,7 @@ class UnixSocketNotifier {
   notifyImmediate(sessionId) {
     const existing = this._pending.get(sessionId);
     if (existing) {
-      clearTimeout(existing);
+      this._clearTimeout(existing);
       this._pending.delete(sessionId);
     }
     this._sendWake(sessionId);
@@ -59,7 +62,7 @@ class UnixSocketNotifier {
   cancel(sessionId) {
     const timer = this._pending.get(sessionId);
     if (timer) {
-      clearTimeout(timer);
+      this._clearTimeout(timer);
       this._pending.delete(sessionId);
     }
   }
@@ -69,7 +72,7 @@ class UnixSocketNotifier {
    */
   cancelAll() {
     for (const timer of this._pending.values()) {
-      clearTimeout(timer);
+      this._clearTimeout(timer);
     }
     this._pending.clear();
   }
@@ -82,7 +85,7 @@ class UnixSocketNotifier {
 
     const payload = JSON.stringify({ action: 'MailboxWake', workspace: sessionId }) + '\n';
 
-    const sock = net.connect(socketPath, () => {
+    const sock = this._net.connect(socketPath, () => {
       sock.end(payload);
     });
 
@@ -94,9 +97,9 @@ class UnixSocketNotifier {
     sock.unref();
 
     // Timeout safety
-    const timeout = setTimeout(() => sock.destroy(), 2000);
+    const timeout = this._setTimeout(() => sock.destroy(), 2000);
     if (timeout.unref) timeout.unref();
-    sock.on('close', () => clearTimeout(timeout));
+    sock.on('close', () => this._clearTimeout(timeout));
   }
 }
 

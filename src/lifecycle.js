@@ -156,13 +156,38 @@ async function killSessionProcess(session, options = {}) {
 }
 
 function cleanupSessionArtifacts(sessionId, options = {}) {
-  const sessionsRoot = options.sessionsRoot || process.env.TELEPTY_SESSIONS_DIR || path.join(os.homedir(), '.telepty', 'sessions');
-  const sessionDir = path.join(sessionsRoot, sessionId);
   const removed = [];
+  if (typeof sessionId !== 'string' || sessionId.length === 0
+    || sessionId === '.' || sessionId === '..'
+    || /[\/\\:\x00-\x1f\x7f-\x9f]/.test(sessionId) || path.isAbsolute(sessionId)) {
+    return removed;
+  }
+
+  let sessionDir;
+  try {
+    const sessionsRoot = options.sessionsRoot || process.env.TELEPTY_SESSIONS_DIR || path.join(os.homedir(), '.telepty', 'sessions');
+    const root = fs.realpathSync(sessionsRoot);
+    if (!fs.statSync(root).isDirectory()) return removed;
+    const candidate = path.join(root, sessionId);
+    const directory = fs.lstatSync(candidate);
+    if (directory.isSymbolicLink() || !directory.isDirectory()) return removed;
+    sessionDir = fs.realpathSync(candidate);
+    const relative = path.relative(root, sessionDir);
+    if (!relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+      return removed;
+    }
+  } catch {
+    return removed;
+  }
+
+  // Path checks contain ordinary cleanup; concurrent parent swaps are not prevented.
   for (const filename of ['supervisor.sock', 'session.sock']) {
     const filePath = path.join(sessionDir, filename);
     try {
-      fs.rmSync(filePath, { force: true });
+      const leaf = fs.lstatSync(filePath);
+      if (leaf.isSymbolicLink() || (!leaf.isFile() && !leaf.isSocket())) continue;
+      if (leaf.isFile() && leaf.nlink !== 1) continue;
+      fs.unlinkSync(filePath);
       removed.push(filePath);
     } catch {}
   }
