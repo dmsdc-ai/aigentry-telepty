@@ -46,3 +46,6 @@ jobs:
       # has the cores. Give it its own step so it runs alone and gates just the same.
       - name: Run PTY-serialized regression tests
         run: npm run test:ci:pty
+      - name: Check packaged consumer
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: node scripts/check-package.mjs

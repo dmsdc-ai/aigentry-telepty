@@ -2,6 +2,14 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.9.0 — 2026-10-19
+
+- Harden untrusted session identities and mailbox paths, own-record checks and serialization, and ledger consistency when persistence fails.
+- Add bounded spawn and submit-all admission; tighten header validation and CLI/SSH lifecycle handling while retaining after-close delivery guards.
+- Add fenced interaction observations, actions and receipts. Tracking and observations do not prove that a live agent semantically consumed input. Live providers, task binding and resuming the original held input (including #1136) remain incomplete.
+- Fix early telepty allow startup initialization and canonical temporary fixture paths on macOS.
+- Add packaged-consumer CI for the shipped CLI and snippet assets. Global installation, upgrade, daemon recovery and full installed lifecycle acceptance remain separate work.
+
 ## 0.8.5 — 2026-10-09
 
 The three asks of the 2026-10-09 [gh#82](https://github.com/dmsdc-ai/aigentry-telepty/issues/82)
