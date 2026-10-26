@@ -145,3 +145,16 @@ test('the newest section is the highest version in the file', () => {
       `CHANGELOG.md's newest section ${versions[0]} is not newer than ${older} below it`);
   }
 });
+
+test("scripts/check-package.mjs pins the version package.json claims", () => {
+  // The fifth tracked place, found the hard way: the 0.9.1 bump (PR #119) updated the four above
+  // and CI's "Check packaged consumer" step still failed on main, because that script pins the
+  // version by hand (c060b19) and nothing here compared it. Same shape as the README row: the
+  // pin stays explicit, this test keeps it honest.
+  const script = fs.readFileSync(path.join(projectRoot, 'scripts', 'check-package.mjs'), 'utf8');
+  const pin = /assert\.equal\(pkg\.version, '(\d+\.\d+\.\d+)'\)/.exec(script);
+  assert.ok(pin,
+    'scripts/check-package.mjs no longer pins pkg.version — move this assertion with it rather than deleting it');
+  assert.equal(pin[1], pkg.version,
+    `scripts/check-package.mjs pins ${pin[1]} but package.json says ${pkg.version} — bump the pin with the version`);
+});
