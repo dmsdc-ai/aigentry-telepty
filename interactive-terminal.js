@@ -83,6 +83,12 @@ function attachInteractiveTerminal(input, output, handlers = {}) {
   }
 
   if (input && onData) {
+    // gh#118: decode stdin as ONE UTF-8 stream. Raw-mode reads cut multi-byte characters at
+    // arbitrary byte offsets (the terminal writes its pty in 64-byte buffers), and every caller
+    // decoded each chunk on its own, so a split character reached the child as U+FFFD.
+    if (typeof input.setEncoding === 'function') {
+      input.setEncoding('utf8');
+    }
     input.on('data', onData);
   }
 

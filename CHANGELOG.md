@@ -2,6 +2,21 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.9.1 — 2026-10-26
+
+One **CLI** fix, [gh#118](https://github.com/dmsdc-ai/aigentry-telepty/issues/118). It applies to every
+`telepty allow` / `telepty attach` started after the upgrade; a bridge that is already running keeps
+the old code until it is restarted, and the daemon is untouched.
+
+- **Terminal stdin is decoded as one UTF-8 stream.** `attachInteractiveTerminal` now calls
+  `setEncoding('utf8')` on the raw-mode input, so a multi-byte character that the terminal's pty
+  delivers across two reads (Ghostty writes its pty in 64-byte buffers; a cmux TextBox submit is a
+  bracketed paste on top of that) is carried across the boundary instead of being decoded chunk by
+  chunk at each call site. **What a 0.9.0 user saw**: Korean pasted into a session under `allow`
+  reached the child with one syllable as three U+FFFD characters (`객관적으로` → `객관적으���`), at
+  a position that moved with timing. `telepty inject` was never affected — its payload arrives as a
+  JSON string. Pinned by `test/stdin-utf8-split-118.test.js`.
+
 ## 0.9.0 — 2026-10-19
 
 - Harden untrusted session identities and mailbox paths, own-record checks and serialization, and ledger consistency when persistence fails.
