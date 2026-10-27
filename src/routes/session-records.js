@@ -109,6 +109,14 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     if (parsedIdleTtl.error) {
       return res.status(400).json({ error: parsedIdleTtl.error, code: 'INVALID_IDLE_TTL' });
     }
+    // #1215 register-create-only — opt-in create-if-absent. A boolean `create_only:true` that names
+    // an id this daemon already holds is refused here, after the identity/idle-ttl validation above
+    // and BEFORE the idempotent re-register branch below can touch the record. Without the boolean
+    // flag the re-register path is unchanged. The refusal discloses nothing about the record.
+    if (req.body.create_only === true && Object.prototype.hasOwnProperty.call(sessions, session_id)) {
+      return res.status(409).json({ success: false, code: 'SESSION_EXISTS',
+        error: 'Session already exists; create_only refused it unchanged.', session_id });
+    }
     // Idempotent: allow re-registration (update command/cwd, keep clients)
     if (Object.prototype.hasOwnProperty.call(sessions, session_id)) {
       const existing = ownRecord(sessions, session_id);

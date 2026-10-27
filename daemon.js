@@ -1615,7 +1615,7 @@ app.get('/api/meta', (req, res) => {
     port: boundPort,
     machine_id: MACHINE_ID,
     terminal: DETECTED_TERMINAL,
-    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox']
+    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session']
   });
 });
 

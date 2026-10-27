@@ -1267,11 +1267,27 @@ function createSessionActions(shared, effects = {}) {
     });
   }
 
+  // #1215 — the exact own-record lookup the opt-in exact-target inject and owned delete share: an
+  // own, object-valued property of `sessions` and nothing else (mirrors ownRecord in
+  // session-records.js). No alias/sibling resolution, no prototype adoption.
+  function exactOwnSessionId(requestedId) {
+    if (typeof requestedId !== 'string') return null;
+    const descriptor = Object.getOwnPropertyDescriptor(shared.sessions, requestedId);
+    const value = descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value') ? descriptor.value : null;
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? requestedId : null;
+  }
+
   function registerInjectRoute(app) {
     app.post('/api/sessions/:id/inject', async (req, res) => {
       const requestedId = req.params.id;
-      const resolvedId = (0, shared.resolveSessionAlias)(requestedId);
-      if (!resolvedId) return (0, shared.respondWithError)(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
+      // #1215 inject-exact-target — opt-in exact routing. With boolean `exact_target:true` the
+      // target is the exact own record or nothing: a bare alias or a `-N` sibling name is 404 here
+      // and never reaches resolveSessionAlias' most-recent-sibling fallback, so no bytes, audit line
+      // or tracking record exist for it. For an exact id every guard below runs unchanged, and only
+      // the success body additionally confirms `exact_target` and the actual `session_id`.
+      const exactTarget = !!(req.body && req.body.exact_target === true);
+      const resolvedId = exactTarget ? exactOwnSessionId(requestedId) : (0, shared.resolveSessionAlias)(requestedId);
+      if (!resolvedId) return (0, shared.respondWithError)(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId, ...(exactTarget ? { exact_target: true } : {}) });
       const session = shared.sessions[resolvedId];
       const id = resolvedId;
       const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
@@ -1505,6 +1521,7 @@ function createSessionActions(shared, effects = {}) {
           inject_id,
           strategy: delivery.strategy,
           submit: delivery.submit,
+          ...(exactTarget ? { exact_target: true, session_id: id } : {}),
           ...(delivery.bootstrap_queued ? {
             bootstrap_queued: true,
             bootstrap_op_id: delivery.bootstrap_op_id || delivery.msg_id,
@@ -1553,11 +1570,27 @@ function createSessionActions(shared, effects = {}) {
   function registerDeleteRoute(app) {
     app.delete('/api/sessions/:id', (req, res) => {
       const requestedId = req.params.id;
+      // #1215 delete-owned-session — opt-in owned delete. `?owned=true` names the exact own record
+      // only (no resolveSessionForDestroy fallback: a bare alias is 404 even with one live sibling).
+      const ownedDelete = req.query.owned === 'true';
       // #548: destructive op — must not cascade across alias-sharing siblings.
-      const resolvedId = (0, shared.resolveSessionForDestroy)(requestedId);
+      const resolvedId = ownedDelete ? exactOwnSessionId(requestedId) : (0, shared.resolveSessionForDestroy)(requestedId);
       if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
       const session = shared.sessions[resolvedId];
       const id = resolvedId;
+      // #1215 — an owned delete must present THIS instance's current credential: the verified
+      // principal's sid, epoch and generation all matching the record. Checked before isClosing and
+      // every side effect below (kill, unregister, revoke, purge, persist); a missing, foreign or
+      // stale bearer is a 403 with no mutation. Requests without `owned=true` are untouched.
+      if (ownedDelete) {
+        const principal = (0, shared.verifiedPrincipalFromReq)(req);
+        const generation = Number(session.credentialGeneration) || 1;
+        if (!principal || principal.sid !== id || !session.sessionEpoch
+            || principal.epoch !== session.sessionEpoch || principal.generation !== generation) {
+          return (0, shared.respondWithError)(res, 403, 'OWNED_DELETE_FORBIDDEN',
+            'Owned delete requires the current session credential.', { requested: requestedId });
+        }
+      }
       if (session.isClosing) return res.json({ success: true, status: 'closing' });
       // BUG-C (shared-fate): a wrapped session can be co-bound by a stale/displaced owner bridge
       // (duplicate --id). A DELETE carrying a token that is NOT the current owner's, while a live
