@@ -53,8 +53,10 @@ describe('report classifier removal (#60 Stage A)', () => {
     const files = ['daemon.js', 'cli.js', 'session-state.js', 'mcp-server/index.mjs', ...srcFiles];
     for (const rel of files) {
       // Strip line comments: both surviving mentions of these names are prose explaining the
-      // deletion, and prose is not a consumer.
-      const code = fs.readFileSync(path.join(root, rel), 'utf8')
+      // deletion, and prose is not a consumer. Line endings are normalised first (#879): on a
+      // CRLF checkout `.` stops before '\r' and `$` then fails, so the comment was never stripped
+      // and daemon.js:19 (prose) read as a consumer on Windows.
+      const code = fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\n/g, '\n')
         .split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
       assert.ok(!/classifyReportPrompt/.test(code),
         `${rel} must not reference the deleted classifier`);

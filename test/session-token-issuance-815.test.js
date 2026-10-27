@@ -26,6 +26,7 @@ const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
 const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
+const { assertOwnerOnlyMode, posixModeSkip } = require('../test-support/platform-contract');
 
 let daemon;
 let logPath;
@@ -237,7 +238,7 @@ test('#815 GUARD: first registration of an unknown sid still mints a usable toke
 // environment, and the environment of a running process cannot be changed from outside: if the
 // credential did not survive the restart, every restored session would silently become an
 // unauthenticated sender and no reissuance could ever reach the child.
-test('#815 item4: the same bearer still verifies after a daemon RESTART (verifier persisted)', async () => {
+test('#815 item4: the same bearer still verifies after a daemon RESTART (verifier persisted)', async (t) => {
   // An isolated daemon PAIR over one shared HOME, so the file-backed handover is the real thing
   // and the suite's own daemon is left untouched.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-815-restart-'));
@@ -261,7 +262,8 @@ test('#815 item4: the same bearer still verifies after a daemon RESTART (verifie
     const persisted = fs.readFileSync(persistedPath, 'utf8');
     assert.equal(persisted.includes(bearer), false, 'the raw bearer must NEVER be persisted');
     assert.equal(persisted.includes(epoch), true, 'the epoch is persisted — non-secret discriminator');
-    assert.equal(fs.statSync(persistedPath).mode & 0o777, 0o600, 'verifier store is owner-only');
+    // #879: named subtest, skipped on win32 (mode bits ≠ ACL); every other assertion stays live.
+    await assertOwnerOnlyMode(t, persistedPath, 'verifier store is owner-only');
 
     second = await startTestDaemon({ homeDir: home, env: { TELEPTY_AUDIT_FLUSH_MS: '10' } });
     const target = createSessionId('target815f');
@@ -290,7 +292,7 @@ test('#815 item4: the same bearer still verifies after a daemon RESTART (verifie
 
 // sessions.json now carries credential verifiers, so it must be owner-only — including a file
 // left world-readable by a pre-#815 daemon, which is why load() chmods too.
-test('#815 item4: sessions.json is 0600', async () => {
+test('#815 item4: sessions.json is 0600', { skip: posixModeSkip() }, async () => {
   const sid = createSessionId('mode815');
   await register(sid);
   const p = path.join(daemon.homeDir, '.config', 'aigentry-telepty', 'sessions.json');
