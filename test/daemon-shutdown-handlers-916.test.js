@@ -87,8 +87,12 @@ function waitExit(child, timeoutMs = 8000) {
   });
 }
 
-test('#916.1: SIGTERM runs the daemon shutdown path — exit 0, state file cleared', async () => {
-  if (process.platform === 'win32') return; // POSIX signal semantics
+// #879: announced skip instead of a silent `return` (a silently returned test counts as a pass).
+// Windows has no POSIX signal delivery (child.kill() is TerminateProcess); Windows-native shutdown
+// semantics are deferred to #577.
+const SIGNAL_WIN32_SKIP = process.platform === 'win32' ? 'win32: POSIX signal semantics (SIGTERM/SIGINT handlers) — Windows-native shutdown deferred, owner #577' : false;
+
+test('#916.1: SIGTERM runs the daemon shutdown path — exit 0, state file cleared', { skip: SIGNAL_WIN32_SKIP }, async () => {
   const homeDir = tempHome();
   const child = bootDaemonChild(homeDir);
   try {
@@ -117,8 +121,7 @@ test('#916.1: SIGTERM runs the daemon shutdown path — exit 0, state file clear
   }
 });
 
-test('#916.1: SIGINT takes the same path', async () => {
-  if (process.platform === 'win32') return;
+test('#916.1: SIGINT takes the same path', { skip: SIGNAL_WIN32_SKIP }, async () => {
   const homeDir = tempHome();
   const child = bootDaemonChild(homeDir);
   try {
@@ -135,8 +138,7 @@ test('#916.1: SIGINT takes the same path', async () => {
   }
 });
 
-test('#916.1: a bare test require registers nothing (the guard still discriminates)', async () => {
-  if (process.platform === 'win32') return;
+test('#916.1: a bare test require registers nothing (the guard still discriminates)', { skip: SIGNAL_WIN32_SKIP }, async () => {
   // No env flag: this is the "somebody required daemon.js for its exports" case. It must neither
   // claim state (#910/#896's contract) nor install process-wide signal handlers.
   const homeDir = tempHome();

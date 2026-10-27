@@ -11,6 +11,7 @@ const path = require('node:path');
 const I = require('../src/interaction');
 const P = require('../src/session-store/persistence');
 const R = require('../src/prompt-symbol-registry');
+const { assertOwnerOnlyMode } = require('../test-support/platform-contract');
 
 nodeTest('interaction-core-681 / baseline', { concurrency: false }, async t => {
   const output = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-interaction-681-baseline-'));
@@ -52,7 +53,7 @@ test('C7-v2-migration',()=>{const old={schema_version:2,generation:8,injections:
 test('C7-recovery-stages',()=>{const l=P.emptyTrackedInjections();for(const [id,stage,bytes] of [['p','prepared',0],['d','dispatched',null],['w','written',3]])l.interactions.actions[id]=record(request(id),stage,bytes);const result=loadCase('recovery',l);assert.equal(result.ok,true);assert.equal(result.ledger.interactions.actions.p.stage,'refused');assert.equal(result.ledger.interactions.actions.p.bytes_written,0);assert.equal(result.ledger.interactions.actions.d.stage,'outcome_unknown');assert.equal(result.ledger.interactions.actions.d.bytes_written,null);assert.equal(result.ledger.interactions.actions.w.stage,'written');});
 for(const kind of ['action-id','request-null-shape','unknown-bytes','written-terminal','request-expiry'])test(`C7-malformed-${kind}`,()=>{const r=request(), rec=record(r);if(kind==='action-id'){rec.request.action_id='other';rec.request_digest=I.digest(rec.request);}if(kind==='request-null-shape'){rec.request={identity:{sid:'s1'}};rec.request_digest=I.digest(rec.request);}if(kind==='unknown-bytes'){rec.stage='outcome_unknown';rec.bytes_written=-7;}if(kind==='written-terminal')rec.terminal=true;if(kind==='request-expiry'){rec.request.expires_at='bad';rec.request_digest=I.digest(rec.request);}const l=P.emptyTrackedInjections();l.interactions.actions.a1=rec;const result=loadCase(`malformed-${kind}`,l);assert.equal(result.ok,false,JSON.stringify(result));});
 test('C7-corrupt-future-maps',()=>{for(const [i,l] of [null,[],{schema_version:99,injections:{}},{schema_version:3,injections:{},interactions:{actions:[],pending:{}}}].entries())assert.equal(loadCase(`invalid-${i}`,l).ok,false);const f=path.join(output,'corrupt.json');fs.writeFileSync(f,'{bad');assert.equal(P.loadTrackedInjections(f).ok,false);assert.equal(fs.readFileSync(f,'utf8'),'{bad');});
-test('C7-atomic-save-private-mode',()=>{const s=store();assert.equal(s.commit(P.emptyTrackedInjections()),true);assert.equal(fs.statSync(s.file).mode&0o777,0o600);assert.equal(P.loadTrackedInjections(s.file).ok,true);});
+test('C7-atomic-save-private-mode',async(t)=>{const s=store();assert.equal(s.commit(P.emptyTrackedInjections()),true);await assertOwnerOnlyMode(t,s.file,'private mode');/* #879: named subtest, skipped on win32; the mode line only */assert.equal(P.loadTrackedInjections(s.file).ok,true);});
 test('C8-provider-disabled',()=>{for(const screen of ['', '› ', 'Press enter to continue','quoted historic prompt']){const result=R.observeInteraction({command:'codex',outputRing:[screen]});assert.equal(result.available,false);assert.deepEqual(result.supported_operations,[]);assert.equal(R.encodeInteraction(request(),result),null);}});
 
     for (const { id, fn } of tests) {

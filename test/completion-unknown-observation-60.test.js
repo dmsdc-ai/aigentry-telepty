@@ -375,11 +375,20 @@ test('failed_commit_is_not_silence: a ledger write failure is still emitted, and
   assert.equal(begun.ok, true, 'the write-ahead record must commit while the store is still writable');
   const seqBefore = daemon.getTrackedInjection(pendingReport.injectId).observation_seq;
 
-  fs.chmodSync(ledgerDir, 0o500);
+  // #879: chmod 0o500 on a DIRECTORY denies nothing on win32 (chmod only toggles a file's
+  // read-only attribute there), so the write succeeded and the product correctly reported
+  // observation_emitted — the failure under test was never produced. On win32 the directory is
+  // moved aside and a FILE is put in its place (the same "parent is not a directory" shape
+  // test/observation-tracking-endpoint-60.test.js uses), which the atomic write cannot traverse
+  // on any platform. POSIX keeps the chmod exactly as before.
+  const blockWin32 = process.platform === 'win32';
+  if (blockWin32) { fs.renameSync(ledgerDir, `${ledgerDir}.aside`); fs.writeFileSync(ledgerDir, 'not a directory'); }
+  else fs.chmodSync(ledgerDir, 0o500);
   let first;
   try {
     first = recordObservation(measurement());
   } finally {
+    if (blockWin32) { fs.rmSync(ledgerDir); fs.renameSync(`${ledgerDir}.aside`, ledgerDir); }
     fs.chmodSync(ledgerDir, 0o700);
   }
 

@@ -4,3 +4,8 @@
 # and the trailing `git diff --exit-code tests/snippet-protocol/v1/` gate in `test:ci`.
 # (#576 P1, triage RC-2)
 tests/snippet-protocol/v1/** text eol=lf
+# #879: the RUNTIME bodies come from src/init/snippets/*.md read off disk. The same CRLF checkout
+# turned them into CRLF output, which fails `snippet bodies are LF-only` and both golden
+# comparisons (measured, run 40500878932). The byte contract of `telepty init --print-snippet`
+# is LF-only on every platform, so the source files are pinned the same way as the fixtures.
+src/init/snippets/** text eol=lf

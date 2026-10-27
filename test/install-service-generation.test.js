@@ -9,7 +9,15 @@ const {
   buildWindowsAutostartCommand,
 } = require('../install');
 
-test('macOS launchd plist uses absolute node and cli.js, with daemon PATH and logs', () => {
+// #879: the launchd plist is a darwin-only artifact (install.js emits it only on darwin), and the
+// builder joins its log paths with the HOST separator, so on win32 the output carries backslashes.
+// Announced skip of this ONE case on win32; the POSIX-path contract is asserted on Linux/macOS.
+// Product change (path.posix) is out of #879 scope — owner #577 if it is ever wanted on Windows.
+const LAUNCHD_WIN32_SKIP = process.platform === 'win32'
+  ? 'win32: darwin-only launchd artifact; path.join separator differs — POSIX path contract measured on Linux/macOS (owner #577)'
+  : false;
+
+test('macOS launchd plist uses absolute node and cli.js, with daemon PATH and logs', { skip: LAUNCHD_WIN32_SKIP }, () => {
   const nodeBin = '/opt/homebrew/bin/node';
   const cliJs = '/usr/local/lib/node_modules/@dmsdc-ai/aigentry-telepty/cli.js';
   const logDir = '/tmp/telepty-install-test';

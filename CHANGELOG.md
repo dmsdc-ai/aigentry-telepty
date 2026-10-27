@@ -2,6 +2,31 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.9.2 — 2026-10-27
+
+Three opt-in **daemon** HTTP contracts for Telesession/Kkoma-class consumers (task 1215). Each is
+selected by an explicit flag; a request without the flag behaves exactly as in 0.9.1, so existing
+bridges, CLIs and operators need no change. `/api/meta` now advertises `register-create-only`,
+`inject-exact-target` and `delete-owned-session` in `capabilities`.
+
+- **`POST /api/sessions/register` with `create_only: true`** (boolean) refuses an id the daemon
+  already holds with `409 SESSION_EXISTS` before the idempotent re-register path can touch the
+  record; a fresh id is created exactly as before (201 with its one-time credential). The invalid-id
+  checks and the #815 uncredentialed delivery-endpoint rule are unchanged.
+- **`POST /api/sessions/:id/inject` with `exact_target: true`** (boolean) delivers only to the
+  exact session id: a bare alias or a `-N` sibling name is `404 SESSION_NOT_FOUND` with nothing
+  delivered, audited or tracked. A successful response additionally carries `exact_target: true`
+  and the actual `session_id`. The sender, peer-lane (#533), payload, tracking, delivery and submit
+  guards run unchanged, so a refusal they produce is returned as-is.
+- **`DELETE /api/sessions/:id?owned=true`** tears down the exact id only, and only for a caller
+  presenting that instance's current session credential (sid, epoch and generation all matching);
+  a missing, foreign or stale bearer is `403 OWNED_DELETE_FORBIDDEN` with no side effect. The
+  tokenless operator `DELETE` and the #548 non-cascading alias rule are unchanged.
+
+Pinned by `test/telesession-capabilities-1215.test.js` (real daemon, loopback aterm sink, no PTY).
+Daemon change only — restart the daemon to pick it up. No CPU, native-module, platform or
+global-install changes are part of this release.
+
 ## 0.9.1 — 2026-10-26
 
 One **CLI** fix, [gh#118](https://github.com/dmsdc-ai/aigentry-telepty/issues/118). It applies to every

@@ -46,12 +46,12 @@ test('listPackagedSkills discovers packaged skills with SKILL.md', () => {
 
 test('resolveTargetDirectory maps global and project roots for each client', () => {
   const cwd = '/tmp/my-project';
-  assert.match(resolveTargetDirectory('claude', 'global', cwd), /\/\.claude\/skills$/);
-  assert.equal(resolveTargetDirectory('claude', 'project', cwd), '/tmp/my-project/.claude/skills');
-  assert.match(resolveTargetDirectory('codex', 'global', cwd), /\/\.codex\/skills$/);
-  assert.equal(resolveTargetDirectory('codex', 'project', cwd), '/tmp/my-project/.codex/skills');
-  assert.match(resolveTargetDirectory('gemini', 'global', cwd), /\/\.gemini\/skills$/);
-  assert.equal(resolveTargetDirectory('gemini', 'project', cwd), '/tmp/my-project/.gemini/skills');
+  // #879: the resolver joins with the host separator (path.join), so the expectation is built the
+  // same way — the contract is "<home>/.<client>/skills" and "<cwd>/.<client>/skills", not '/'.
+  for (const client of ['claude', 'codex', 'gemini']) {
+    assert.equal(resolveTargetDirectory(client, 'global', cwd), path.join(os.homedir(), `.${client}`, 'skills'));
+    assert.equal(resolveTargetDirectory(client, 'project', cwd), path.join(cwd, `.${client}`, 'skills'));
+  }
 });
 
 test('runInteractiveSkillInstaller installs selected skills into multiple clients', async () => {
