@@ -17,6 +17,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 const { randomUUID } = require('crypto');
+const { assertOwnerOnlyMode } = require('../test-support/platform-contract');
 
 const ROOT = path.resolve(__dirname, '..');
 const AUTH = path.join(ROOT, 'auth.js');
@@ -105,14 +106,14 @@ test('a valid config is returned intact — every key preserved, file never rewr
   }
 });
 
-test('no config at all still mints one — first run is the only place a token is created', () => {
+test('no config at all still mints one — first run is the only place a token is created', async (t) => {
   const { home, cfg } = withHome();
   try {
     assert.equal(fs.existsSync(cfg), false);
     const first = runGetConfig(home);
     assert.equal(first.ok, true);
     assert.match(first.token, /^[0-9a-f-]{36}$/i);
-    assert.equal((fs.statSync(cfg).mode & 0o777), 0o600, 'minted config stays 0600');
+    await assertOwnerOnlyMode(t, cfg, 'minted config stays 0600'); // #879: named subtest, skipped on win32
 
     const second = runGetConfig(home);
     assert.equal(second.token, first.token, 'a second call must not re-mint');
@@ -218,7 +219,7 @@ function spawnReader(home) {
   });
 }
 
-test('a reader that arrives mid-mint never sees a partial config — the write is atomic', { timeout: 30000 }, async () => {
+test('a reader that arrives mid-mint never sees a partial config — the write is atomic', { timeout: 30000 }, async (t) => {
   const { home, cfg } = withHome();
   const WINDOW_MS = 1500; // wide enough that four child-process startups fit inside it under load
   try {
@@ -261,7 +262,7 @@ test('a reader that arrives mid-mint never sees a partial config — the write i
     const tokens = [wOut.trim(), ...readers.map((r) => r.out)];
     assert.equal(new Set(tokens).size, 1, `all 5 must agree, got ${JSON.stringify(tokens)}`);
     assert.equal(JSON.parse(fs.readFileSync(cfg, 'utf8')).authToken, tokens[0]);
-    assert.equal((fs.statSync(cfg).mode & 0o777), 0o600, 'the atomically placed config stays 0600');
+    await assertOwnerOnlyMode(t, cfg, 'the atomically placed config stays 0600'); // #879: named subtest, skipped on win32
     assert.deepEqual(
       fs.readdirSync(path.dirname(cfg)),
       ['config.json'],

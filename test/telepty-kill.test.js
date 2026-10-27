@@ -78,7 +78,18 @@ test('telepty kill returns a clear error for a missing session', async () => {
   }
 });
 
-test('telepty kill --force removes a live session from the registry', async () => {
+// #879: on win32 a spawned session exposes NO ptyPid — measured `null` in run 40507287143
+// (parallel test:ci) and run 40507287234 (per-file), from `ptyProcess.pid || null` in
+// src/routes/spawn.js under node-pty ConPTY. That is Windows PTY pid exposure, deferred to #577;
+// the product PID API is not changed here and this case is NOT a pass on Windows — it is skipped
+// WITH this reason so the gap stays visible in the TAP tally. Exact case list: this one test.
+// Remaining Windows coverage in this file: the four pure killSessionProcess cases (including the
+// win32 taskkill path) and the missing-session CLI error, all live.
+const WIN32_PTY_PID_SKIP = process.platform === 'win32'
+  ? 'win32: spawned session exposes no ptyPid (measured null in runs 40507287143 + 40507287234); Windows PTY pid exposure deferred, owner #577'
+  : false;
+
+test('telepty kill --force removes a live session from the registry', { skip: WIN32_PTY_PID_SKIP }, async () => {
   const harness = await startTestDaemon();
   try {
     const sessionId = createSessionId('kill-live');
