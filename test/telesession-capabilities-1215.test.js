@@ -17,14 +17,23 @@
 // are measured at the receiving end rather than inferred from a status code. No PTY, no provider,
 // no OS UI, no external network. The daemon binds PORT=0 on 127.0.0.1 under a private temp HOME.
 //
-// The cases are deliberately independent of each other and of the capability advertisement: on the
-// unchanged 0.9.1 baseline each contract case fails on ITS OWN assertion (wrong status, sibling
-// delivered, record mutated, record deleted), not on a shared metadata precondition. The cases
-// marked "control" pin the non-opt-in behaviour and are expected to pass on both.
+// The cases are deliberately independent of each other and of the capability advertisement. Read
+// against the unchanged 0.9.1 routes, nine cases discriminate the baseline, each on ITS OWN
+// assertion rather than on a shared metadata precondition: the /api/meta case; both exact-target
+// cases (no `exact_target`/`session_id` in the body; alias resolved and delivered); the create-only
+// fresh case (no `session_id` in the exact inject body) and collision case (200 re-register, not
+// 409); the three refused owned deletes (no / wrong / stale bearer all tear the record down); and
+// the bare-alias owned delete (the single sibling is deleted). The remaining cases pass on BOTH:
+// the four marked "control" pin the non-opt-in behaviour, the create-only invalid-id case pins
+// validation the baseline already performs, and the current-bearer owned delete positive passes
+// the baseline too (an unchecked tokenless DELETE of an exact id also returns 200 and removes the
+// record) - it is the positive half of a contract whose discrimination lives in its refusals. The
+// consumer-shape case at the end of the file fails the baseline on the `exact_target` confirmation.
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const crypto = require('node:crypto');
 const { startTestDaemon, createSessionId, delay } = require('../test-support/daemon-harness');
 
 const REQUIRED = ['inject-exact-target', 'register-create-only', 'delete-owned-session'];
@@ -77,6 +86,10 @@ after(async () => {
 
 function enc(sid) {
   return encodeURIComponent(sid);
+}
+
+function sha256(s) {
+  return crypto.createHash('sha256').update(s).digest('hex');
 }
 
 // An alias base that does NOT end in `-<digits>`, so that `base` is a bare alias of `${base}-7`
@@ -422,4 +435,55 @@ test('1215 control: an ordinary tokenless DELETE of an exact id still works', as
   assert.equal(del.status, 200, JSON.stringify(del.body));
   assert.equal(del.body.success, true);
   await daemon.waitFor(async () => (await getSession(sid)).status === 404, { description: `${sid} removed` });
+});
+
+// --- consumer shape: Telesession inbox -> the configured orchestrator sid -----------------------
+
+// The request evidence/telesession-transport.js send() actually issues, end to end: the inbox's
+// CURRENT bearer as x-telepty-session-token, a plain non-JSON first line (no sanctioned peer
+// envelope), `from`/`reply_to` naming the inbox, `exact_target:true`, and a target that is the
+// configured orchestrator sid - the only route admitted for this consumer. The peer-lane guard is
+// not bypassed or weakened: with the orchestrator sid as the target this is the orchestrator lane
+// exactly as #533 defines it, and the peer->peer refusal control above stays in force. Sender
+// attribution is read from the audit surface the consumer itself reads (GET /api/injects,
+// `verified_sender_sid`), which the daemon derives from the presented bearer and never from the
+// unverified `from` field.
+test('1215 consumer shape: inbox bearer + plain first line + exact_target to the orchestrator sid is delivered and attributed', async () => {
+  const target = 'orchestrator'; // the sid pinned via AIGENTRY_ORCHESTRATOR_SIDS in before()
+  const inbox = createSessionId('t1215-consumer-inbox');
+  const inboxReg = await registerAterm(inbox);
+  await registerAterm(target);
+
+  const prompt = '[telesession nonce=fedcba9876543210fedcba9876543210 reply-to=' + inbox + ']\nconsumer hello orchestrator';
+  const res = await inject(target, {
+    prompt, from: inbox, reply_to: inbox, exact_target: true,
+  }, { 'x-telepty-session-token': inboxReg.session_token });
+
+  // HTTP success in the exact shape the consumer requires before it trusts the routing.
+  assert.equal(res.status, 200, `inject failed: ${JSON.stringify(res.body)}`);
+  assert.equal(res.body.success, true);
+  assert.equal(typeof res.body.inject_id, 'string');
+  assert.equal(res.body.exact_target, true, 'response must confirm exact_target');
+  assert.equal(res.body.session_id, target, 'response must name the actual target session id');
+
+  // Delivered: the original message, in full, reached the orchestrator endpoint; the inbox got nothing.
+  const texts = await waitForDelivery(primarySink, target, 1);
+  assert.ok(texts[0].includes(prompt), 'the original message reached the orchestrator endpoint');
+  assert.equal(primarySink.textsFor(inbox).length, 0, 'the sender inbox received nothing');
+
+  // Attributed: the audit row for this inject_id names the inbox as the daemon-VERIFIED sender
+  // (bearer-derived), with the inbox's own epoch, and nothing about it reads as a spoof.
+  const row = await daemon.waitFor(async () => {
+    const audit = await daemon.request(`/api/injects?to=${enc(target)}&limit=200`);
+    if (audit.status !== 200 || !Array.isArray(audit.body.injects)) return null;
+    return audit.body.injects.find((r) => r && r.inject_id === res.body.inject_id) || null;
+  }, { timeoutMs: 4000, description: `audit row for ${res.body.inject_id}` });
+  assert.equal(row.to, target);
+  assert.equal(row.to_alias, null, 'exact routing: no alias was resolved');
+  assert.equal(row.delivery_result, 'success');
+  assert.equal(row.payload_sha256, sha256(prompt), 'the audited payload is the original message');
+  assert.equal(row.claimed_from, inbox);
+  assert.equal(row.verified_sender_sid, inbox, 'attribution comes from the presented bearer, not from `from`');
+  assert.equal(row.verified_sender_epoch, inboxReg.session_epoch, 'and names THIS instance of the inbox');
+  assert.equal(row.spoof_suspected, false);
 });
