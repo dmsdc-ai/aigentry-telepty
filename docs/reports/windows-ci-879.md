@@ -246,3 +246,119 @@ rather than made cleverer:
   launchd path contract, UDS aterm delivery, interactive TUI under ConPTY, Windows PTY pid exposure.
 * Security scan: PENDING for the changed-source list in REVIEW.md; not run by this worker; the
   five-file Snyk approval covers only hotfix #1215.
+
+---
+
+# Phase 3 — finishing candidate (runs 40507287143 / 40507287234, PR #127 head 848718f on main 6746358)
+
+Status: **candidate for one independent Windows + Linux + macOS CI run.** Test files only; no
+product, package-script, dependency, workflow or `scripts/windows-ci-diagnostic.mjs` change. Nothing
+here claims Windows native support, a green suite, or installed verification; CI is the verifier.
+
+Same immutable scope as above, verbatim:
+
+> goal = Windows CI COMPLETION/green only. NO structural changes to telepty product code — live
+> production tool, side-effect risk too high (merge-is-deploy host). Allowed: CI config,
+> test-harness fixes, platform-aware ANNOUNCED skips (silent skip = defect class), timeout/hang
+> diagnosis. Windows-native runtime work (signals/service/ConPTY hardening) is DEFERRED, not part
+> of this task. Any future dispatch on this task must carry this constraint verbatim.
+
+## What the two Windows jobs measured (same source set: 848718f, Windows 10.0.26100, Node 20.20.2)
+
+| job | shape | result |
+|---|---|---|
+| `test (windows-latest, 20)` job 122199725887 | `npm run test:ci`, parallel, one console | 1847 tests · 1794 pass · **3 fail** · 50 skip · 0 cancelled · 149.1 s — completed, no timeout, no cancellation |
+| `per-file diagnostic (windows-latest, 20)` job 122199725640 | one `node --test` per file, concurrency 3, `windowsHide` | 136 files · 128 pass · **2 fail** · 6 all-skipped · 0 timeout · 0 notrun · cleanup verified-clean |
+
+Linux (job 122199726244) and macOS normal jobs passed, including `test:ci:pty` and packaging. The
+hang fixed in phase 2 did not recur: both Windows jobs ran to their summaries. The earlier 137-file
+diagnostic (run 40500878932) included hotfix #1215 tests that are absent from this public-main
+branch, so its counts are not the same coverage set and are not compared here.
+
+The two shapes disagree on one file and agree on two:
+
+| file | parallel job | per-file job |
+|---|---|---|
+| `test/cli.test.js` | 1 fail: "allow queues first fake-claude inject until welcome bootstrap ready" (10.9 s timeout at line 854) | 2 fail: the same case (11.2 s) **plus** "attach resumes stdin after session selection" (8.07 s, room entry never arrived) |
+| `test/daemon-title-claim-896.test.js` | 1 fail: bare require read title `"telepty-daemon"` | pass (2/2) |
+| `test/telepty-kill.test.js` | 1 fail: `ptyPid` is `null` | 1 fail: identical |
+
+## Case dispositions
+
+1. **daemon-title-claim-896 — test-fixture isolation change, assertions unchanged.** Measured:
+   the parallel job read `"telepty-daemon"` from the bare-require probe; the per-file job (which
+   spawns every file with `windowsHide: true`) passed the file 2/2, including the real-daemon case
+   that sets the title and reads it back. The logs do **not** instrument which process wrote the
+   title the probe read. Hypothesis: on win32 `process.title` is backed by the console title
+   (libuv `GetConsoleTitleW` / `SetConsoleTitleW`), which processes on one console share, and a
+   sibling file's real daemon (several run concurrently, e.g. `daemon-state-claim-910`) had set it.
+   Intended isolation: spawn the probe child in `titleAfterRequire` with `windowsHide: true` so it
+   is not attached to the suite's console (no-op on POSIX). Whether that isolates the title on the
+   CI runner is for the actual Windows CI run to verify; both assertions are verbatim, so if the
+   hypothesis is wrong the test fails again with the same message — nothing is skipped.
+2. **telepty-kill "kill --force removes a live session" — narrow announced win32 skip, owner #577.**
+   `ptyPid` is `null` deterministically in both jobs (`src/routes/spawn.js` `ptyProcess.pid ||
+   null` under node-pty 1.2.0-beta.11 ConPTY). The product PID API is unchanged; the case is
+   skipped with the measured reason and is **not** a pass. Remaining Windows coverage in that file:
+   the four pure `killSessionProcess` cases (including the win32 taskkill path) and the
+   missing-session CLI error, all live. POSIX runs the case unchanged.
+3. **cli.test.js "allow queues first fake-claude inject until welcome bootstrap ready" — narrow
+   announced win32 skip, owner #577.** The phase-2 `.cmd` shim is not demonstrably wrong: the stub
+   starts, registers with the daemon and `telepty inject` returns 0 in both jobs. What never arrives
+   (10 s, both jobs) is the stub's `SUBMIT:` line carrying the bracketed-paste envelope. The logs do
+   not identify the layer where the bytes stop (the `.cmd` shim, ConPTY input, or the product's
+   bootstrap drain); no fixture defect is demonstrable from them, and no product cause is claimed.
+   Measured native-wrapped behaviour under ConPTY is deferred to #577; welcome-bootstrap queueing
+   of the first inject is **UNVERIFIED on Windows**.
+4. **cli.test.js "attach resumes stdin after session selection" — narrow announced win32 skip,
+   owner #577.** Intermittent: passed in the parallel job (0.93 s), timed out in the per-file job
+   (8.07 s) and in job 122148002651 (phase 1 FINAL). The selection prompt renders and `1\r` is
+   written; room entry does not arrive within 7 s. Nothing in the fixture is demonstrably wrong; the
+   intermittent interactive wait is the ConPTY/TUI class already deferred for the two interactive
+   cases. Attach stdin-resume is **UNVERIFIED on Windows**. This is the one judgement call in the
+   candidate: leaving it live keeps the per-file job intermittently red; the skip is a one-line
+   revert if the controller prefers visibility over completion.
+5. **scripts/windows-ci-diagnostic.mjs — no verdict bug found, no change.** Read against the
+   requirement: `classifyCleanExit` (lines 390–397) returns `pass` only with exit 0, a complete
+   reconciled tally, zero fail/cancelled and a positive pass count; an all-skipped file is
+   `skipped`, never `pass`; `writeSummary` (lines 570–572) keeps `counts` per class, computes
+   `allPassed` from `pass` only and `allAccounted` from `pass | skipped`, both requiring verified
+   cleanup and no runner error; `main` (lines 722–723) exits 3 on a runner error and otherwise 0 only
+   when `allAccounted`. So the six deliberate all-skipped files alone do not fail the job, while any
+   `fail`, `timeout`, `unknown-tally`, `notrun`, `aborted`, `lost-process` or `cleanup-unknown`
+   file, an unknown leftover or a failed snapshot keeps the exit non-zero. The measured
+   `allAccounted=false` of run 40507287234 was caused by the two real `fail` files, which is the
+   required behaviour.
+
+## Exact win32 skip inventory added by this phase (all announced through TAP with reason + owner)
+
+| file | case | constant |
+|---|---|---|
+| `test/cli.test.js` | telepty attach resumes stdin after session selection and forwards room input | `ATTACH_WIN32_SKIP` |
+| `test/cli.test.js` | telepty allow queues first fake-claude inject until welcome bootstrap ready | `BOOTSTRAP_WIN32_SKIP` |
+| `test/telepty-kill.test.js` | telepty kill --force removes a live session from the registry | `WIN32_PTY_PID_SKIP` |
+
+No POSIX assertion changes; no test body changes; the stale "nothing else in this file is skipped"
+sentence next to `TUI_WIN32_SKIP` was corrected to name the two new constants.
+
+## Expected effect, to be verified by CI (not a claim)
+
+If the title-isolation hypothesis holds on the CI runner, the parallel Windows job reports 0 fail
+with 53 skips (50 + 3) and the per-file job reports 0 fail; `allPassed` stays `false` there because
+six files are all-skipped by design, and `allAccounted` becomes `true`. If the hypothesis is wrong,
+daemon-title-claim-896 fails again with the same message and the candidate has not hidden it. None
+of this is measured yet; only the Windows CI run can confirm or refute it.
+
+## Native gaps now explicitly unverified on Windows (owner #577)
+
+Windows PTY pid exposure (`ptyPid`), ConPTY input delivery into a wrapped CLI (bracketed-paste
+first inject), interactive attach selection and the two interactive-TUI cases from phase 2, plus
+the phase-2 list (Windows ACL 0600, parsed-listing probe, darwin launchd path, UDS aterm delivery).
+
+## Limits
+
+* Authored from the tracked text tree on macOS; **not executed anywhere**. Local check: pinned
+  Node 20 `--check` on each changed JS file only.
+* Security scan: PENDING for the changed-source list (`test/cli.test.js`,
+  `test/daemon-title-claim-896.test.js`, `test/telepty-kill.test.js`); not run by this worker; the
+  five-file Snyk approval covers only hotfix #1215 at 7ee2cfe.
