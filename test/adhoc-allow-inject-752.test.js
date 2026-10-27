@@ -50,6 +50,7 @@ const pty = require('node-pty');
 
 const registry = require('../src/prompt-symbol-registry');
 const { startTestDaemon, createSessionId, waitFor, delay } = require('../test-support/daemon-harness');
+const { writeFakeCli } = require('../test-support/platform-contract');
 
 const projectRoot = path.resolve(__dirname, '..');
 const RULE = '─'.repeat(120);
@@ -110,10 +111,11 @@ test('#752: the legacy empty-caret screen still detects (back-compat)', () => {
 // records every byte it is given. Named `claude` on purpose: the filename is what
 // isKnownAiCli reads, and it is the whole difference between this bug and a healthy
 // generic-command session.
+// #879: { command, env } from writeFakeCli — POSIX: the shebang file path as before; win32: a
+// `claude.cmd` shim + `claude.js` body and the bare name resolved through PATH, because Windows
+// cannot execute a shebang text file (measured: owner never connected, inject answered 503).
 function writeClaudeStub(dir, rxLog) {
-  const file = path.join(dir, 'claude');
-  fs.writeFileSync(file, `#!/usr/bin/env node
-const fs = require('fs');
+  return writeFakeCli(dir, 'claude', `const fs = require('fs');
 const RULE = '\\u2500'.repeat(120);
 const composer = () => process.stdout.write(
   '\\n' + RULE + '\\n\\u276f Try"refactordaemon.test.js"\\n' + RULE
@@ -126,9 +128,7 @@ setInterval(composer, 2000);
 process.stdin.on('data', (chunk) => {
   fs.appendFileSync(${JSON.stringify(rxLog)}, chunk);
 });
-`, 'utf8');
-  fs.chmodSync(file, 0o755);
-  return file;
+`);
 }
 
 let harness;
@@ -147,13 +147,14 @@ test('#752 RED: an ad-hoc `telepty allow claude` session actually receives the i
   fs.writeFileSync(rxLog, '');
   const stub = writeClaudeStub(harness.homeDir, rxLog);
 
-  const bridge = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, stub], {
+  const bridge = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, stub.command], {
     cwd: projectRoot,
     cols: 120,
     rows: 40,
     name: process.platform === 'win32' ? 'xterm' : 'xterm-256color',
     env: {
       ...process.env,
+      ...stub.env,
       HOME: harness.homeDir,
       USERPROFILE: harness.homeDir,
       TELEPTY_HOST: harness.host,
