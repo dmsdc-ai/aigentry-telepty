@@ -6,6 +6,8 @@ telepty ssh user@host --id remote-code --persistent \
   --server-alive-interval 15 --server-alive-count-max 3 --connect-timeout 10
 ```
 
+SSH startup first performs a read-only capability check. The addressed daemon must advertise `ssh-child-write-receipts-v1`; older, refusing or unavailable daemons cause an explicit failure before registration or child spawn. This mode never starts, restarts or repairs a daemon automatically; start/upgrade it explicitly first.
+
 OpenSSH is selected from PATH and launched as an argv array with `-tt`, bounded keepalive/connect options, and `BatchMode=yes`. This requires existing key/agent authentication. Telepty does not accept passwords, automate host-key acceptance, disable host-key verification, alter known_hosts, configure networking, install SSH/autossh, or upgrade a remote provider. Existing SSH config and normal host-key verification apply. This feature uses OpenSSH semantics and a POSIX remote shell; other remote shell implementations remain unsupported.
 
 `--remote-command` names one executable. Pass its arguments after `--`; Telepty quotes every remote argument for the POSIX shell, and quotes the cwd separately. A leading `~/` is expanded using the remote `$HOME`; other relative paths remain relative. `--resume <conversation-id>` constructs explicit Codex `resume <id>` or Claude `--resume <id>` argv. Missing ids, `latest`/interactive picker selection, and other provider resume contracts are refused. No picker is selected automatically. The remote command runs again after reconnect; only the remote provider can establish conversation/session continuity.

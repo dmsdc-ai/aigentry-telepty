@@ -1632,7 +1632,7 @@ app.get('/api/meta', (req, res) => {
     machine_id: MACHINE_ID,
     event_loop: eventLoopTelemetry.snapshot(),
     terminal: DETECTED_TERMINAL,
-    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session']
+    capabilities: ['ssh-child-write-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session']
   });
 });
 

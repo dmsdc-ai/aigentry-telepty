@@ -2560,7 +2560,18 @@ async function main() {
       }
     }
 
-    await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
+    if (sshPlan) {
+      try {
+        const response = await fetchWithAuth(`${DAEMON_URL}/api/meta`, { readOnlyAuth: true, signal: AbortSignal.timeout(2000) });
+        const meta = response.ok ? await response.json() : null;
+        if (!Array.isArray(meta?.capabilities) || !meta.capabilities.includes('ssh-child-write-receipts-v1')) {
+          throw new Error('required SSH receipt capability unavailable');
+        }
+      } catch {
+        console.error('SSH requires a running daemon advertising ssh-child-write-receipts-v1. Start or upgrade it explicitly; no registration or command was started.');
+        process.exitCode = 1; return;
+      }
+    } else await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
     // Detect terminal backend for session registration
     function findKittySocketCli() {
