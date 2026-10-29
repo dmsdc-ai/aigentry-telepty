@@ -2120,6 +2120,13 @@ async function main() {
   }
 
   if (cmd === 'update') {
+    const updatePlanning = require('./src/update-plan');
+    if (args.includes('--plan') || process.platform === 'win32') {
+      const plan = updatePlanning.createUpdatePlan();
+      console.log(args.includes('--json') ? JSON.stringify(plan) : updatePlanning.formatUpdatePlan(plan));
+      if (!args.includes('--plan')) markCommandFailed();
+      return;
+    }
     console.log('\x1b[36m🔄 Updating telepty to the latest version...\x1b[0m');
     try {
       runUpdateInstall();
@@ -5265,7 +5272,8 @@ function printGlobalHelp() {
   telepty deliberate end <thread_id>             Close a thread
 
 \x1b[1mOther:\x1b[0m
-  telepty update                                 Update to latest version
+  telepty update                                 Update to latest version (Windows self-update guarded)
+  telepty update --plan [--json]                  Read-only external quiescence/recovery plan
   telepty service status|install|uninstall|start|stop|restart  Manage the OS service
   telepty uninstall [--purge] [--dry-run]        Stop daemon + unload service; keep user data unless --purge
   telepty status-report --phase <p> [options]    Emit structured status event

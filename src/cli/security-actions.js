@@ -31,7 +31,9 @@ function createCliSecurityActions(shared, {
   execSync = (...args) => (0, shared.execSync)(...args),
   execFileSync = (...args) => (0, shared.execFileSync)(...args),
   fetch = (...args) => (0, globalThis.fetch)(...args),
-  exit = code => process.exit(code)
+  exit = code => process.exit(code),
+  platform = process.platform,
+  guardUpdate = options => require('../update-plan').assertUpdateCanRun(options)
 } = {}) {
 function getAuthToken() {
   if (shared.cachedAuthToken == null) {
@@ -123,6 +125,8 @@ function classifyBackend(env, findKitty) {
 }
 
 function runUpdateInstall() {
+  // Applies to explicit and interactive update entry points before any command or repair.
+  try { guardUpdate({ platform }); } catch (error) { markCommandFailed(); throw error; }
   if (process.env.TELEPTY_SKIP_PACKAGE_UPDATE === '1') {
     return;
   }
