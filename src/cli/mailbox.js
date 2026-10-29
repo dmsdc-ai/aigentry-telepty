@@ -1,7 +1,8 @@
 'use strict';
+const { scopedSessionToken } = require('./security-actions');
 
 async function runMailboxCommand(argv, { daemonUrl, fetchWithAuth, fetch = globalThis.fetch,
-  sessionToken = process.env.TELEPTY_SESSION_TOKEN, log = console.log, error = console.error,
+  sessionToken = process.env.TELEPTY_SESSION_TOKEN, sessionOrigin = process.env.TELEPTY_SESSION_ORIGIN, log = console.log, error = console.error,
   fail = () => { process.exitCode = 1; } }) {
   const ack = argv[0] === 'ack';
   const sid = argv[ack ? 1 : 0];
@@ -20,8 +21,13 @@ async function runMailboxCommand(argv, { daemonUrl, fetchWithAuth, fetch = globa
   try {
     // The mailbox bearer is sufficient for these two narrow operations. Avoid loading
     // the shared daemon credential when the confined poller already has its own bearer.
-    const response = sessionToken
-      ? await fetch(url.toString(), { ...options, headers: { ...options.headers, 'x-telepty-session-token': sessionToken } })
+    const scoped = sessionToken && scopedSessionToken(url.toString(), {
+      env: { TELEPTY_SESSION_TOKEN: sessionToken, TELEPTY_SESSION_ORIGIN: sessionOrigin },
+      localOrigin: `http://127.0.0.1:${new URL(daemonUrl).port || 3848}`
+    });
+    if (sessionToken && !scoped) throw new Error('Mailbox credential belongs to another daemon origin.');
+    const response = scoped
+      ? await fetch(url.toString(), { ...options, redirect: 'error', headers: { ...options.headers, 'x-telepty-session-token': scoped } })
       : await fetchWithAuth(url.toString(), options);
     const data = await response.json();
     if (!response.ok) { error(`Mailbox request failed (${response.status}): ${data.code || 'REQUEST_FAILED'}`); fail(); return; }

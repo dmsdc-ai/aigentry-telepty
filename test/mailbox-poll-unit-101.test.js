@@ -70,3 +70,23 @@ test('#101 failed initial mailbox persistence returns no bearer and revokes the 
   assert.equal(sessions.poll, undefined);
   assert.equal(credentials.verify(minted.bearer), null);
 });
+
+test('#101 mailbox bearer never follows redirects or crosses its bound daemon origin', async () => {
+  for (const [daemonUrl, sessionOrigin] of [
+    ['http://foreign.example:3848', null],
+    ['http://127.0.0.1:2345', 'http://127.0.0.1:1234']
+  ]) {
+    let requests = 0, failures = 0;
+    await runMailboxCommand(['poll', '--json'], { daemonUrl, sessionOrigin,
+      sessionToken: 'synthetic-only', fetch: async () => { requests++; },
+      fetchWithAuth: async () => { requests++; }, log() {}, error() {}, fail: () => { failures++; } });
+    assert.equal(requests, 0);
+    assert.equal(failures, 1);
+  }
+  let redirect;
+  await runMailboxCommand(['poll', '--json'], { daemonUrl: 'http://127.0.0.1:1234', sessionOrigin: null,
+    sessionToken: 'synthetic-only', fetch: async (_url, options) => {
+      redirect = options.redirect; return { ok: true, json: async () => ({ pending: [] }) };
+    }, fetchWithAuth() { throw Error('unexpected shared credential access'); }, log() {}, error() {}, fail() {} });
+  assert.equal(redirect, 'error');
+});
