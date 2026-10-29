@@ -33,6 +33,9 @@ process.env.USERPROFILE = TMP_HOME;
 process.env.PORT = '0';
 
 const daemonModule = require('../daemon');
+const { createSessionDeliveryFixture } = require('../test-support/session-delivery-fixture');
+const queueFixture = createSessionDeliveryFixture();
+after(() => queueFixture.dispose());
 
 let daemon;
 before(async () => { daemon = await startTestDaemon(); });
@@ -136,9 +139,9 @@ const CLEAR_RING = '';
 // Open a tracked record the way the inject route does, then park through the production path —
 // `deliverInjectionToSession` is the enqueue, exactly as the route calls it.
 async function parkTracked(sessionId, session, injectId, opts = {}) {
-  const begun = daemonModule.beginTrackedInjection({ injectId, sessionId, source: 'orchestrator', session });
+  const begun = queueFixture.beginTrackedInjection({ injectId, sessionId, source: 'orchestrator', session });
   assert.equal(begun.ok, true);
-  const delivery = await daemonModule.deliverInjectionToSession(sessionId, session, 'REPORT: stranded', {
+  const delivery = await queueFixture.deliverInjectionToSession(sessionId, session, 'REPORT: stranded', {
     noEnter: true, from: 'orchestrator', injectId, ...opts,
   });
   assert.equal(delivery.queued, true, 'precondition: the op parked instead of being written');
@@ -151,10 +154,10 @@ test('#860 F2: a park dropped at the modal TTL is aborted in the ledger, not onl
   const session = claudeSession(MODAL_RING);              // nobody ever answers the modal
   await parkTracked(sid, session, 'inj-modal-ttl');
 
-  const outcome = await daemonModule.awaitModalParkDrain(sid, session, { timeoutMs: 120, pollIntervalMs: 20 });
+  const outcome = await queueFixture.awaitModalParkDrain(sid, session, { timeoutMs: 120, pollIntervalMs: 20 });
   assert.equal(outcome.flushed, 1, 'precondition: the TTL flushed the parked op');
 
-  const record = daemonModule.getTrackedInjection('inj-modal-ttl');
+  const record = queueFixture.getTrackedInjection('inj-modal-ttl');
   assert.equal(record.tracking_state, 'aborted',
     'the op was discarded and the ledger still said the dispatch was in flight');
   assert.equal(record.last_observation.kind, 'inject_delivery_dropped');
@@ -168,10 +171,10 @@ test('#860 F2: a park dropped at the bootstrap-ready timeout is aborted in the l
   const session = claudeSession(CLEAR_RING, { ready: false });
   await parkTracked(sid, session, 'inj-boot-timeout');
 
-  daemonModule.failBootstrapQueueOnTimeout(sid, session, { reason: 'bootstrap_ready_timeout' });
+  queueFixture.failBootstrapQueueOnTimeout(sid, session, { reason: 'bootstrap_ready_timeout' });
   assert.equal(session.bootstrapQueue.length, 0, 'precondition: the timeout flushed the queue');
 
-  const record = daemonModule.getTrackedInjection('inj-boot-timeout');
+  const record = queueFixture.getTrackedInjection('inj-boot-timeout');
   assert.equal(record.tracking_state, 'aborted');
   assert.equal(record.last_observation.kind, 'inject_delivery_dropped');
   assert.equal(record.last_observation.trigger, 'bootstrap_ready_timeout');
@@ -185,9 +188,9 @@ test('#860 F2: a drain whose write is refused is aborted in the ledger, with the
 
   session.bootstrapReady = true;                           // the CLI comes up …
   session.ownerWs.readyState = 3;                          // … and the bridge is gone by the time it drains
-  await daemonModule.drainBootstrapQueue(sid, session);
+  await queueFixture.drainBootstrapQueue(sid, session);
 
-  const record = daemonModule.getTrackedInjection('inj-drain-fail');
+  const record = queueFixture.getTrackedInjection('inj-drain-fail');
   assert.equal(record.tracking_state, 'aborted');
   assert.equal(record.last_observation.kind, 'inject_delivery_refused',
     'the write was ATTEMPTED and refused — that is not the same measurement as never attempting it');
@@ -205,9 +208,9 @@ test('#860 F2: a submit CR refused AFTER the body landed is not recorded as a de
   await parkTracked(sid, session, 'inj-cr-fail', { noEnter: false });   // this one submits
 
   session.bootstrapReady = true;
-  await daemonModule.drainBootstrapQueue(sid, session);
+  await queueFixture.drainBootstrapQueue(sid, session);
 
-  const record = daemonModule.getTrackedInjection('inj-cr-fail');
+  const record = queueFixture.getTrackedInjection('inj-cr-fail');
   assert.equal(record.tracking_state, 'aborted');
   assert.equal(record.last_observation.kind, 'inject_delivery_refused');
   assert.equal(session.written.length, 1, 'precondition: the body landed, the CR did not');
@@ -220,8 +223,8 @@ test('#860 F2: an UNtracked inject through the same queue changes nothing', asyn
   // inject_id has to no-op on its absence rather than throw inside a drain.
   const sid = 'f2-untracked';
   const session = claudeSession(MODAL_RING);
-  const delivery = await daemonModule.deliverInjectionToSession(sid, session, 'no record', { noEnter: true });
+  const delivery = await queueFixture.deliverInjectionToSession(sid, session, 'no record', { noEnter: true });
   assert.equal(delivery.queued, true);
-  const outcome = await daemonModule.awaitModalParkDrain(sid, session, { timeoutMs: 120, pollIntervalMs: 20 });
+  const outcome = await queueFixture.awaitModalParkDrain(sid, session, { timeoutMs: 120, pollIntervalMs: 20 });
   assert.equal(outcome.flushed, 1, 'the flush must survive an op with no tracked record');
 });
