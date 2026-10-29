@@ -42,7 +42,7 @@ let harness;
 before(async () => { harness = await startTestDaemon(); });
 after(async () => { if (harness) await harness.stop(); });
 
-function spawnBridge(sessionId) {
+function spawnBridge(sessionId, commandArgs = ['bash']) {
   const env = {
     ...process.env,
     HOME: harness.homeDir,
@@ -57,7 +57,7 @@ function spawnBridge(sessionId) {
   delete env.TELEPTY_SESSION_TOKEN;
   delete env.TELEPTY_SESSION_ID;
 
-  const proc = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, 'bash'], {
+  const proc = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, ...commandArgs], {
     cwd: projectRoot,
     cols: 100,
     rows: 30,
@@ -146,4 +146,29 @@ test('the incumbent still accepts an inject after the refused claim — it was n
 
   await waitFor(async () => stripAnsi(a.output.text).includes(MARK),
     { timeoutMs: 10000, description: 'incumbent PTY received the inject' });
+});
+
+
+test('#135: refused claimant never starts its command or announces ownership', async (t) => {
+  const fs = require('node:fs');
+  const sessionId = createSessionId('claim-order-135');
+  const incumbent = spawnBridge(sessionId);
+  t.after(() => { try { incumbent.proc.kill(); } catch {} });
+  await waitFor(() => /Inject allowed/.test(incumbent.output.text),
+    { timeoutMs: 15000, description: 'accepted bridge starts' });
+  const { FileMailbox } = require('../src/mailbox');
+  const mailbox = new FileMailbox({ root: path.join(harness.homeDir, '.aigentry', 'mailbox', 'bridge') });
+  mailbox.enqueue({ msg_id: 'pending-135', from: 'original-sender', to: sessionId,
+    payload: 'pending for incumbent', created_at: Math.floor(Date.now() / 1000), attempt: 0 });
+  const marker = path.join(harness.homeDir, 'refused-child-started');
+  const challenger = spawnBridge(sessionId, [process.execPath, '-e',
+    `require('fs').writeFileSync(${JSON.stringify(marker)}, 'started'); setInterval(() => {}, 1000);`]);
+  t.after(() => { try { challenger.proc.kill(); } catch {} });
+  await waitFor(() => challenger.output.exit !== null,
+    { timeoutMs: 15000, description: 'challenger refused' });
+  assert.match(challenger.output.text, /Owner claim refused/);
+  assert.equal(challenger.output.exit, 1);
+  assert.doesNotMatch(challenger.output.text, /Inject allowed|Recovered .*undelivered/);
+  assert.equal(fs.existsSync(marker), false, 'unowned command must never execute');
+  assert.equal(mailbox.peek(sessionId).length, 1, 'incumbent mailbox must remain intact');
 });

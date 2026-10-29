@@ -11,7 +11,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
 
 const pkg = require('../package.json');
 const { detectSupervisor, restartSupervisorDaemon } = require('../src/supervisor');
@@ -37,19 +37,22 @@ function readDaemonState(homeDir = os.homedir()) {
   }
 }
 
+// Use this install's CLI directly: Windows PATH may select the extensionless npm shim.
 function resolveTeleptyBin() {
-  try {
-    const cmd = os.platform() === 'win32' ? 'where telepty' : 'which telepty';
-    return execSync(cmd, { encoding: 'utf8' }).split('\n')[0].trim() || 'telepty';
-  } catch {
-    return 'telepty';
-  }
+  return process.execPath;
 }
 
-function spawnDetachedDaemon(bin) {
-  const child = spawn(bin, ['daemon'], { detached: true, stdio: 'ignore' });
-  child.unref();
-  return child;
+function spawnDetachedDaemon(bin = process.execPath, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = (options.spawn || spawn)(bin, [path.resolve(__dirname, '../cli.js'), 'daemon'], {
+      detached: true, stdio: 'ignore'
+    });
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref();
+      resolve(child);
+    });
+  });
 }
 
 async function waitForDaemonVersion({ port = 3848, version = pkg.version, timeoutMs = 8000, fetchImpl = fetch } = {}) {
@@ -140,7 +143,7 @@ async function main(options = {}) {
   // standalone/non-root installs without a daemon.
   try {
     const bin = (options.resolveTeleptyBin || resolveTeleptyBin)();
-    (options.spawnDetachedDaemon || spawnDetachedDaemon)(bin);
+    await (options.spawnDetachedDaemon || spawnDetachedDaemon)(bin);
     logger.log(`[telepty postinstall] Stopped ${stopped} stale daemon(s); spawned fresh ${pkg.version} daemon.`);
   } catch (err) {
     logger.warn(`[telepty postinstall] Daemon respawn failed: ${err.message}.`);

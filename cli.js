@@ -2329,7 +2329,10 @@ async function main() {
     const MAX_CRASHES = 3;
     const DEATH_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'session-deaths.log');
 
+    let readyNotified = false;
     let allowSessionClosed = false;
+    let cleanupTerminal = () => {};
+    const allowSignalHandlers = new Map();
     const allowSecurity = createAllowSecurityContext({
       get sessionId() { return sessionId; },
       get command() { return command; },
@@ -2424,8 +2427,6 @@ async function main() {
 
 
 
-    spawnChild();
-
     // Prompt-ready detection for safe inject delivery.
     // Known AI CLIs use the centralized geometry-aware registry; generic
     // commands keep the permissive legacy prompt regex for compatibility.
@@ -2443,8 +2444,7 @@ async function main() {
     let bridgeMsgSeq = 0;
     let bridgePendingCount = 0;
 
-    // Recover undelivered messages from a previous crash
-    allowSecurity.recoverBridgeMailbox();
+    // Recover only after the daemon accepts this bridge as owner (#135).
 
 
 
@@ -2552,6 +2552,11 @@ async function main() {
       }
     }
 
+    let acceptInitialOwner;
+    const initialOwnerAccepted = new Promise(resolve => { acceptInitialOwner = resolve; });
+    const pendingOwnerFrames = [];
+    let replayPendingOwnerFrames = () => {};
+
     async function connectDaemonWs() {
       // Re-register session BEFORE WebSocket connect (daemon rejects WS if session unknown)
       if (reconnectAttempts > 0) {
@@ -2625,13 +2630,20 @@ async function main() {
         }
       });
 
-      daemonWs.on('message', (message) => {
+      daemonWs.on('message', handleOwnerMessage);
+
+      function handleOwnerMessage(message) {
         try {
           const msg = JSON.parse(message);
           if (msg.type === 'owner_token') {
             currentOwnerToken = msg.token || null;
+            if (currentOwnerToken) acceptInitialOwner();
             interactionBinding = msg.interaction_binding || null;
             invalidateBridgeInteraction('owner_bound');
+            return;
+          }
+          if (!child) {
+            pendingOwnerFrames.push(message);
             return;
           }
           if (msg.type === 'interaction') {
@@ -2691,7 +2703,11 @@ async function main() {
         } catch (e) {
           // ignore malformed messages
         }
-      });
+      }
+      // Replay frames that arrived in the same packet as the initial owner token.
+      replayPendingOwnerFrames = () => {
+        for (const frame of pendingOwnerFrames.splice(0)) handleOwnerMessage(frame);
+      };
 
       daemonWs.on('close', (code, reason) => {
         interactionBinding = null;
@@ -2790,13 +2806,23 @@ async function main() {
       }, delay);
     }
 
+    // HTTP registration precedes this handshake; only owner_token proves the WS claim.
+    const claimTimeout = setTimeout(() => {
+      console.error(`❌ [allow] Timed out waiting for owner claim for '${sessionId}'. No command started; retry or choose another --id.`);
+      closeAllowSession({ destroySession: false });
+      exitAllowSession(1);
+    }, 10000);
     connectDaemonWs();
+    await initialOwnerAccepted;
+    clearTimeout(claimTimeout);
+    spawnChild();
+    allowSecurity.recoverBridgeMailbox();
 
     // Set terminal title
     process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
     console.log(`\x1b[32m⚡ '${command}' is now session '\x1b[36m${sessionId}\x1b[32m'. Inject allowed.\x1b[0m\n`);
 
-    const cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
+    cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
       onData: (data) => {
         lastUserInputTime = Date.now();
         invalidateBridgeInteraction('local_input');
@@ -2808,8 +2834,6 @@ async function main() {
         child.resize(size.cols, size.rows);
       }
     });
-    const allowSignalHandlers = new Map();
-
     // #844: `destroySession: false` closes THIS bridge's own resources and nothing else — no
     // teardown DELETE, no mailbox purge. It is for the one caller that has been told, by the
     // daemon, that it does not own this id (close 4003): the session and its queued deliveries
@@ -2833,7 +2857,6 @@ async function main() {
     }
 
     // Relay PTY output to current terminal + send to daemon for attach clients
-    let readyNotified = false;
     // #732: monotonic count of bytes this bridge has actually READ from the PTY. Reported on
     // the heartbeat below; it is what lets the daemon tell "the CLI is quiet" (counter also
     // quiet) from "the PTY read side died inside the bridge" (counter frozen while the
@@ -2983,6 +3006,8 @@ async function main() {
       allowSignalHandlers.set(signalName, handler);
       process.on(signalName, handler);
     }
+
+    replayPendingOwnerFrames();
 
     // Graceful shutdown on SIGINT (let child handle it via PTY)
     process.on('SIGINT', () => {});
@@ -3845,22 +3870,22 @@ async function main() {
     if (timeoutIndex !== -1) {
       if (!killArgs[timeoutIndex + 1]) {
         console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]');
-        process.exit(1);
+        process.exitCode = 1; return;
       }
       timeout = Number(killArgs[timeoutIndex + 1]);
       if (!Number.isFinite(timeout) || timeout < 0) {
         console.error('❌ --timeout must be a non-negative number of seconds.');
-        process.exit(1);
+        process.exitCode = 1; return;
       }
       killArgs.splice(timeoutIndex, 2);
     }
     const filtered = killArgs.filter((item) => item !== '--force');
     const sessionRef = filtered[0];
-    if (!sessionRef) { console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]'); process.exit(1); }
+    if (!sessionRef) { console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]'); process.exitCode = 1; return; }
 
     try {
       const target = await resolveSessionTarget(sessionRef);
-      if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exit(1); }
+      if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exitCode = 1; return; }
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/kill`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3869,12 +3894,12 @@ async function main() {
       const data = await res.json();
       if (!res.ok) {
         console.error(`❌ Error: ${data.error || 'Failed to kill session.'}`);
-        process.exit(1);
+        process.exitCode = 1; return;
       }
       console.log(`✅ Session '\x1b[36m${target.id}\x1b[0m' killed${data.kill && data.kill.escalated ? ' (escalated)' : ''}.`);
     } catch (e) {
       console.error(`❌ ${e.message || 'Failed to kill session.'}`);
-      process.exit(1);
+      process.exitCode = 1; return;
     }
     return;
   }
