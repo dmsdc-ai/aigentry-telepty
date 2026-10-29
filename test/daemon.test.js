@@ -1194,14 +1194,16 @@ test('aterm UDS inject propagates error when target rejects payload', {
       delivery: { transport: 'unix_socket', address: socketPath }
     });
 
-    // Mailbox enqueue succeeds; delivery rejection happens asynchronously via delivery engine
+    // Rejection after a payload write does not prove zero effects; retain uncertainty.
     const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
       method: 'POST',
       body: { prompt: 'hello error' }
     });
 
-    assert.equal(inject.body.success, true);
-    assert.equal(inject.body.strategy, 'mailbox');
+    assert.equal(inject.body.success, false);
+    assert.equal(inject.body.delivery_uncertain, true);
+    assert.equal(inject.body.retryable, false);
+    assert.equal(inject.body.bytes_written, null);
   } finally {
     udsServer.close();
     try { require('fs').unlinkSync(socketPath); } catch {}

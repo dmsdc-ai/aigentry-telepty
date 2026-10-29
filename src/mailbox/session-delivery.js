@@ -60,7 +60,6 @@ function createSessionDeliveryContext({
           const sock = net.connect(session.delivery.address, () => {
             if (settled) return;
             if (session.isClosing || sessions[id] !== session) {
-              clearTimeout(timeout);
               finish({ success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 });
               sock.destroy();
               return;
