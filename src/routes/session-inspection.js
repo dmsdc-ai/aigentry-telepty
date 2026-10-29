@@ -1,3 +1,4 @@
+const { protectedInputFailure } = require('../external-approval');
 // Production session inspection and batch-submit operations.
 // Deliberately retains the daemon's non-strict execution semantics.
 const { defaultSubmitAdmission } = require('../submit-admission');
@@ -19,6 +20,7 @@ function serializeSession(id, session, options = {}) {
     id,
     locator: { machine_id: shared.MACHINE_ID, session_id: id, project_id: projectId },
     type: session.type || 'spawned',
+    ...(session.externalApprovalPolicy ? { input_policy: { authority: 'external-signer', supported_ingress: ['inject'], other_writes: 'denied' } } : {}),
     ...(session.type === 'mailbox' ? { lease_expires_at: session.leaseExpiresAt || null } : {}),
     command: session.command,
     cwd: session.cwd,
@@ -95,6 +97,7 @@ function getSubmitStrategy(command) {
 function submitViaOsascript(sessionId, keyCombo) {
   const execSync = nativeExecSync === undefined ? require('child_process').execSync : nativeExecSync;
   const session = shared.sessions[sessionId];
+  if (protectedInputFailure(session)) return false;
   // Build fallback search terms: session ID, project dir name, CLI-specific patterns
   const searchTerms = [sessionId];
   if (session) {

@@ -18,6 +18,7 @@ function serializePersistedSessions(sessions) {
     Object.defineProperty(data, id, { enumerable: true, writable: true, configurable: true, value: {
       id,
       type: s.type,
+      ...(s.externalApprovalPolicy ? { externalApprovalPolicy: s.externalApprovalPolicy } : {}),
       ...(s.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
       command: s.command,
       cwd: s.cwd,
@@ -191,6 +192,7 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
   const nowIso = options.nowIso || (() => new Date().toISOString());
   return {
     id, type: meta.type,
+    ...(meta.externalApprovalPolicy ? { externalApprovalPolicy: meta.externalApprovalPolicy, requireOwnerProof: true } : {}),
     ...(meta.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
     ptyProcess: null, ownerWs: null,
     ...(meta.type === 'mailbox' ? { leaseExpiresAt: Number.isFinite(meta.leaseExpiresAt) ? meta.leaseExpiresAt : null } : {}),

@@ -1,4 +1,5 @@
 'use strict';
+const { protectedInputFailure } = require('../external-approval');
 
 const crypto = require('node:crypto');
 const { invalidateInteraction } = require('../interaction');
@@ -125,6 +126,7 @@ function installWebSocketTransport(deps) {
   // Checked BEFORE authorizing so the audit line's `forwarded` keeps meaning that the bytes were
   // actually handed over, rather than becoming a claim about a write that had no target.
   function viewerInputDeliverer(session) {
+    if (protectedInputFailure(session)) return null;
     if (session.type === 'wrapped') {
       const owner = session.ownerWs;
       if (!isOpenWebSocket(owner)) return null;
@@ -137,6 +139,7 @@ function installWebSocketTransport(deps) {
   // Geometry, deliberately NOT behind the inject gate — see the resize note in the message
   // handler below.
   function viewerResizeDeliverer(session) {
+    if (protectedInputFailure(session)) return null;
     if (session.type === 'wrapped') {
       const owner = session.ownerWs;
       if (!isOpenWebSocket(owner)) return null;
@@ -573,6 +576,10 @@ function installWebSocketTransport(deps) {
           // any client of a spawned session (a spawned session has no owner bridge, so all of its
           // sockets are viewers). #843 B: these two used to be separate branches with separate
           // rules, which is how #826 came to cover one of them.
+          if ((type === 'input' || type === 'resize') && protectedInputFailure(activeSession)) {
+            ws.send(JSON.stringify({ type: 'input_refused', ...protectedInputFailure(activeSession) }));
+            return;
+          }
           if (type === 'input') {
             // This is a WRITE into somebody's terminal, and until #826 it was the one write path
             // with no accountability: it skipped `auditAppend` (#47 P5), `classifyPeerLaneInject`

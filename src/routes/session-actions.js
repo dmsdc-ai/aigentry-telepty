@@ -1,3 +1,4 @@
+const { protectedInputFailure } = require('../external-approval');
 // Production session actions. Keep non-strict semantics of the original daemon bodies.
 // shared supplies lazy access to the daemon's actual stores and producers.
 // effects is constructor-only: timer scheduling, lifecycle signal/sleep/liveness options,
@@ -835,6 +836,8 @@ function createSessionActions(shared, effects = {}) {
       const id = resolvedId;
       if (session.isClosing) return res.status(409).json({ success: false, code: 'SESSION_CLOSING', error: 'Session is closing' });
 
+      const denied = protectedInputFailure(session);
+      if (denied) return res.status(denied.httpStatus).json(denied);
       const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
       // Default raised 5000 → 10000 (0.3.1) to cover empirical claude REPL
       // ready window (3-6s on fresh spawn) with margin. Upper clamp raised
@@ -1402,6 +1405,7 @@ function createSessionActions(shared, effects = {}) {
         const delivery = await (0, shared.deliverInjectionToSession)(id, session, finalPrompt, {
           noEnter: !!no_enter,
           source: 'inject',
+          externalApproval: req.body.external_approval || null,
           from: from || 'inject',
           // #860 F2 — carried so that a park keeps its link to the write-ahead record. Null for an
           // untracked operator inject (no `from`), and every consumer of it no-ops on null.

@@ -6,7 +6,7 @@ Date: 2026-10-29. Read-only review of the integrated local branch through `f633c
 
 The daemon-wide token remains an operator-equivalent bearer: `src/protocol/http-auth.js:createAuthMiddleware` admits the token or an HS256 JWT but does not attach a distinct authorized user or role. A socket address, session name, caller `from`, JWT `sub` under a shared signing secret, and matching OS account are not independent proof of the original agent. Session credentials prove possession of the current session instance's credential, not historical authorship of a reused name.
 
-`src/routes/session-actions.js:registerKillRoute` has no current-session authorization check. `registerDeleteRoute` checks a current `(sid, epoch, generation)` credential only when `owned=true`; the ordinary delete path retains daemon-token authority. `registerInjectRoute` verifies local session credentials for provenance but stores caller-provided `from`/`reply_to` as routing metadata. These observations keep #113, #134, and the foreign-sender portion of #100 open.
+At the original review baseline, `src/routes/session-actions.js:registerKillRoute` had no current-session authorization check. The owned-kill follow-up below adds an exact-instance opt-in and protected-session requirement. `registerDeleteRoute` checks a current `(sid, epoch, generation)` credential only when `owned=true`; the ordinary delete path retains daemon-token authority. `registerInjectRoute` verifies local session credentials for provenance but stores caller-provided `from`/`reply_to` as routing metadata. These observations keep #113, #134, and the foreign-sender portion of #100 open.
 
 Two additional credential leaks were confirmed during review. `fetchWithAuth` forwarded the local `TELEPTY_SESSION_TOKEN` to foreign destinations, and default Fetch redirects retained both custom credential headers across a different origin. An isolated two-server loopback experiment with synthetic values returned `{daemonHeader:true, sessionHeader:true}` at the redirect destination. Fix candidate **`7e6be46`** denies redirects in CLI, cross-machine, and MCP credential-bearing requests, scopes session bearers to their minting origin, and binds newly issued wrapper credentials to that origin. Its combined isolated security/diagnostics suite passed **229 tests**. The deliberately documented `TELEPTY_AUTH_TOKEN` fleet override remains unchanged; it is an explicit operator credential choice, not foreign session-identity proof.
 
@@ -43,3 +43,24 @@ and DELETE, and protected metadata re-registration requires the same credential.
 The legacy single-user operator default remains available for unprotected
 sessions. This is an instance credential boundary, not an OS/user/human principal
 model; #113/#134 remain partial until scoped peer/operator principals exist.
+
+
+## External signer approval follow-up (#78, partial)
+
+The wrapped HTTP direct-inject path now verifies independent Ed25519 signatures
+against immutable creation-time public keys. Its one-use signing document binds
+canonical sid, credential epoch, current owner generation, operation, Enter mode,
+payload SHA256, daemon challenge and 60-second expiry. A bounded cache is reset
+on restart; no approval survives daemon replacement. Protected prompts remain
+hash-only in audit output even when legacy preview is configured.
+
+Unsupported protected ingress is denied, including fanout, bus, viewer input and
+resize, standalone submit/send-key, typed interaction, bootstrap retries, SSH,
+mailbox and aterm delivery. No approval-bearing message is parked or automatically
+retried. Status, screen and attach output remain readable. Protected destruction
+requires the current instance credential; no private signing key is accepted or
+created by the daemon. This is external signer authority, not human proof.
+
+The API contract, signed-byte format and remaining CLI/enrollment/rotation/recovery
+and unsupported-adapter gaps are in
+[external signer approval](../specs/2026-10-29-external-signer-approval.md).

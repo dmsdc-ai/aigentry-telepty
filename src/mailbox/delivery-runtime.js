@@ -1,4 +1,5 @@
 'use strict';
+const { protectedInputFailure } = require('../external-approval');
 const { mailboxLeaseAlive } = require('./poll-session');
 
 // Accessors retain the daemon's shared instances and original first-use timing.
@@ -7,6 +8,7 @@ function createDeliveryRuntime(shared, {
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
 } = {}) {
   function auditAppend(record) {
+    if (shared.sessions?.[record.to]?.externalApprovalPolicy) record = { ...record, preview: false };
     try { shared.auditWriter.append(record); } catch { /* audit must never throw into a handler */ }
   }
 
@@ -51,6 +53,7 @@ function createDeliveryRuntime(shared, {
     const sid = frame.request.identity.sid;
     const s = shared.sessions[sid];
     if (!s) return Promise.resolve(shared.interaction.refusal('wrong_owner'));
+    if (protectedInputFailure(s)) return Promise.resolve(shared.interaction.refusal('unsupported_capability'));
     if (s.type !== 'wrapped' || !shared.isOpenWebSocket(s.ownerWs)) {
       return Promise.resolve(shared.interaction.refusal('unsupported_capability'));
     }
@@ -1047,6 +1050,7 @@ function createDeliveryRuntime(shared, {
 
   function terminalLevelSubmit(id, session) {
     if (session.isClosing) return null;
+    if (protectedInputFailure(session)) return null;
     if (hasHeldInteraction(session)) return null;
     if (submitViaPty(session)) return 'pty_cr';
     return null;
@@ -1271,6 +1275,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function submitViaPty(session) {
+    if (protectedInputFailure(session)) return false;
     if (hasHeldInteraction(session)) return false;
     shared.interaction.invalidateInteraction(session, 'submit');
     if (session.type === 'wrapped') {

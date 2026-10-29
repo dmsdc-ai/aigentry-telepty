@@ -1,5 +1,6 @@
 'use strict';
 const { createBoundedUdsResponse } = require('./uds-response');
+const { protectedInputFailure, externalApprovalVerifier } = require('../external-approval');
 
 // Domain dependencies are the daemon's actual shared helpers and records.
 // Late mailbox getters are invoked only at the original points of use.
@@ -35,6 +36,8 @@ function createSessionDeliveryContext({
 }) {
   async function writeDataToSession(id, session, data) {
     if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
+    const denied = protectedInputFailure(session);
+    if (denied) return denied;
     if (session.type === 'mailbox') return { success: false, httpStatus: 409, code: 'POLL_ONLY', error: 'Mailbox sessions accept queued text only.' };
     if (hasHeldInteraction(session)) return { success: false, httpStatus: 409,
       code: 'INTERACTION_HELD', error: 'Original task retained pending measured composer readiness.', bytes_written: 0 };
@@ -201,8 +204,84 @@ function createSessionDeliveryContext({
     });
   }
 
+  async function deliverApprovedInjection(id, session, prompt, options) {
+    const epoch = session.sessionEpoch || null;
+    const ownerWs = session.ownerWs;
+    const ownerGeneration = session.interactionOwnerGeneration || null;
+    const gone = () => !isSameSessionInstance(id, session, epoch) || session.isClosing || session.sshRemote
+      || session.ownerWs !== ownerWs || (session.interactionOwnerGeneration || null) !== ownerGeneration;
+    const reject = (code, error, httpStatus = 403) => ({ success: false, code, error, httpStatus, bytes_written: 0 });
+    if (session.sshRemote) return reject('SSH_APPROVAL_TRANSPORT_UNSUPPORTED', 'Protected SSH inject requires a bound SSH write receipt adapter.');
+    if (session.type !== 'wrapped') return reject('APPROVAL_INGRESS_UNSUPPORTED', 'Signed inject currently supports wrapped sessions only.');
+    const deadline = Date.now() + SUBMIT_QUEUE_TIMEOUT_MS;
+    while (session.pendingSubmit) {
+      const remaining = deadline - Date.now();
+      let timer;
+      const expired = remaining <= 0 || await Promise.race([session.pendingSubmit.then(() => false),
+        new Promise(resolve => { timer = setTimeout(resolve, remaining, true); })]);
+      clearTimeout(timer);
+      if (expired) return reject('QUEUE_TIMEOUT', 'Earlier submits did not clear; no approved text was written.', 503);
+      if (gone()) return sessionGoneResult();
+    }
+    if (gone()) return sessionGoneResult();
+    const failure = getInjectFailure(session, { nowMs: Date.now() });
+    if (failure) return { success: false, ...failure };
+    if (shouldQueueBootstrapOperation(session) || hasHeldInteraction(session)) {
+      return reject('APPROVAL_TARGET_NOT_READY', 'Protected inject cannot be parked or retained for later delivery.', 409);
+    }
+    const modal = await resolveModalGate(id, session, options);
+    if (gone()) return sessionGoneResult();
+    if (!isOpenWebSocket(ownerWs)) return reject('DISCONNECTED', 'Session owner disconnected.', 503);
+    if (session.pendingSubmit) return reject('QUEUE_BUSY', 'Another approved write claimed the submit barrier; retry with this unspent approval.', 503);
+    if (modal || hasHeldInteraction(session) || hasBootstrapBacklog(session) || session.bootstrapDraining) {
+      return reject('APPROVAL_TARGET_NOT_READY', 'Protected inject requires a clear surface and empty bootstrap queue.', 409);
+    }
+    const submitDelay = 500;
+    const approval = options.externalApproval;
+    if (!options.noEnter && approval.document?.expires_at <= Date.now() + submitDelay) {
+      return reject('APPROVAL_EXPIRED', 'Approval must remain valid through the deferred submit.');
+    }
+    const checked = externalApprovalVerifier.verifyAndConsume(session, {
+      operation: 'inject', no_enter: !!options.noEnter,
+      payload_sha256: crypto.createHash('sha256').update(prompt).digest('hex')
+    }, approval.document, approval.signature);
+    if (!checked.ok) return reject(checked.code, 'External signer approval was refused.');
+    let release = () => {};
+    if (!options.noEnter) session.pendingSubmit = new Promise(resolve => {
+      release = () => { session.pendingSubmit = null; resolve(); };
+    });
+    try {
+      // Signature covers prompt bytes; transport paste framing carries no extra text.
+      const data = maybeBracketedPaste(prompt, session);
+      interaction.invalidateInteraction(session, 'external_approved_input');
+      ownerWs.send(JSON.stringify({ type: 'inject', data }));
+      armUpstreamProbe(session);
+      if (!options.noEnter) setTimeout(() => {
+        try {
+          if (gone() || !isOpenWebSocket(ownerWs) || Date.now() >= approval.document.expires_at) {
+            emitInjectFailureEvent(id, 'SESSION_GONE', 'Protected submit binding or approval expired.', { phase: 'submit' }, session);
+          } else {
+            ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+            armUpstreamProbe(session);
+          }
+        } catch {
+          emitInjectFailureEvent(id, 'DELIVERY_UNCERTAIN', 'Approved submit could not be confirmed.', { phase: 'submit' }, session);
+        } finally { release(); }
+      }, submitDelay);
+      session.lastActivityAt = new Date().toISOString();
+      return { success: true, strategy: 'external_approved_owner_write', approved: true,
+        queued: false, submit: options.noEnter ? 'skipped' : 'deferred' };
+    } catch {
+      release();
+      return reject('DELIVERY_UNCERTAIN', 'Approved owner write could not be confirmed; approval cannot be reused.', 503);
+    }
+  }
+
   async function deliverInjectionToSession(id, session, prompt, options = {}) {
     if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
+    const denied = protectedInputFailure(session);
+    if (denied) return options.externalApproval
+      ? deliverApprovedInjection(id, session, prompt, options) : denied;
     const now = Date.now();
     const sessionEpoch = session.sessionEpoch || null;
     // PR #108 TP1: the owner generation is the owner SOCKET. A same-bearer re-claim keeps the

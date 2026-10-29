@@ -1540,6 +1540,7 @@ registerSpawnRoute(app, {
 });
 
 registerSessionRegisterRoute(app, { context: sessionRecordContext, sessionStateManager, busClients });
+require('./src/routes/external-approval').registerExternalApprovalRoutes(app, { sessions });
 
 sessionInspection.registerListRoute(app);
 

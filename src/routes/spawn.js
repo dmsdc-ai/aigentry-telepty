@@ -37,6 +37,7 @@ function registerSpawnRoute(app, {
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)
         || ![Object.prototype, null].includes(Object.getPrototypeOf(body))) return invalid('body');
+    if ('external_approval_policy' in body || 'require_owner_proof' in body) return invalid('unsupported protected spawn policy; use register');
     const values = Object.create(null);
     for (const field of ['session_id', 'command', 'args', 'cwd', 'cols', 'rows', 'type']) {
       const descriptor = Object.getOwnPropertyDescriptor(body, field);

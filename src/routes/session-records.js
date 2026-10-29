@@ -1,3 +1,4 @@
+const { parseExternalApprovalPolicy } = require('../external-approval');
 const { parseMailboxLease, renewMailboxLease } = require('../mailbox/poll-session');
 const { validateSessionId: validateMailboxId } = require('../mailbox/path-boundary');
 const sessionPersistence = require('../session-store/persistence');
@@ -109,6 +110,8 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     if (Object.prototype.hasOwnProperty.call(req.body, 'require_owner_proof') && typeof req.body.require_owner_proof !== 'boolean') {
       return res.status(400).json({ code: 'INVALID_OWNER_POLICY', error: 'require_owner_proof must be boolean.' });
     }
+    const external = parseExternalApprovalPolicy(req.body.external_approval_policy);
+    if (external.error) return res.status(400).json({ code: 'INVALID_APPROVAL_POLICY', error: external.error });
     const mailboxRequest = req.body.delivery_type === 'mailbox';
     if (mailboxRequest) {
       try { validateMailboxId(session_id); }
@@ -147,12 +150,19 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       // attacker-controlled text out of the credential path entirely.
       const previous = Object.getOwnPropertyDescriptors(existing);
       const credentialed = sessionCredentials.matches(existing.id, req.headers['x-telepty-session-token']);
+      if (Object.prototype.hasOwnProperty.call(req.body, 'external_approval_policy')) {
+        return res.status(409).json({ code: 'APPROVAL_POLICY_IMMUTABLE', error: 'External approval policy is immutable for this session instance.' });
+      }
       if (Object.prototype.hasOwnProperty.call(req.body, 'require_owner_proof')
           && req.body.require_owner_proof !== (existing.requireOwnerProof === true)) {
         return res.status(409).json({ code: 'OWNER_POLICY_IMMUTABLE', error: 'Owner policy is immutable for this session instance.' });
       }
-      if (existing.requireOwnerProof === true && !credentialed) {
-        return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Current session credential is required.' });
+      if (existing.requireOwnerProof === true) {
+        const principal = sessionCredentials.verify(req.headers['x-telepty-session-token']);
+        if (!principal || principal.sid !== existing.id || principal.epoch !== existing.sessionEpoch
+            || principal.generation !== (Number(existing.credentialGeneration) || 1)) {
+          return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Current session credential is required.' });
+        }
       }
       if (existing.type === 'mailbox' || mailboxRequest) {
         if (!credentialed) return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Current session credential is required.' });
@@ -234,7 +244,8 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     const issued = issueSessionCredential(session_id);
     const sessionRecord = {
       id: session_id,
-      ...(req.body.require_owner_proof === true ? { requireOwnerProof: true } : {}),
+      ...(req.body.require_owner_proof === true || external.policy ? { requireOwnerProof: true } : {}),
+      ...(external.policy ? { externalApprovalPolicy: external.policy } : {}),
       type: delivery_type || 'wrapped',
       ptyProcess: null,
       ownerWs: null,
@@ -334,6 +345,14 @@ function registerSessionRenameRoute(app, { context, sessionStateManager, busClie
     if (!session) return res.status(409).json({ error: 'Invalid existing session record' });
     if (session.isClosing) return res.status(409).json({ code: 'SESSION_CLOSING', error: 'Session is closing' });
     const id = resolvedId;
+    if (session.requireOwnerProof === true) {
+      if (requestedId !== id) return res.status(404).json({ error: 'Exact session id required.' });
+      const principal = sessionCredentials.verify(req.headers['x-telepty-session-token']);
+      if (!principal || principal.sid !== id || principal.epoch !== session.sessionEpoch
+          || principal.generation !== (Number(session.credentialGeneration) || 1)) {
+        return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Protected rename requires the current session credential.' });
+      }
+    }
     const identity = readIdentity(req.body, 'new_id');
     if (identity.error) return res.status(400).json({ error: identity.error });
     const new_id = identity.value;
