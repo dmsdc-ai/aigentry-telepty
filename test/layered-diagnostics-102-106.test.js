@@ -151,3 +151,24 @@ test('hermetic daemon HTTP diagnostics are authenticated, exact and leave sessio
     for (const key of ['id','createdAt','lastActivityAt','lastConnectedAt','lastDisconnectedAt','ready','active_clients']) assert.deepEqual(after[key], before[key]);
   } finally { await harness.stop(); }
 });
+test('fresh-HOME diagnose refuses authentication without creating config or state', { timeout: 10000 }, async () => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), http = require('node:http');
+  const { spawn } = require('node:child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-diagnose-empty-home-'));
+  let requests = 0;
+  const server = http.createServer((req, res) => { requests++; assert.equal(req.method, 'GET'); assert.equal(req.url, '/api/meta'); res.writeHead(401, { 'Content-Type': 'application/json' }); res.end('{"error":"fixture authentication required"}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const env = { ...process.env, HOME: home, USERPROFILE: home, TELEPTY_HOST: '127.0.0.1', TELEPTY_PORT: String(server.address().port) };
+  for (const key of ['TELEPTY_AUTH_TOKEN','TELEPTY_SESSION_TOKEN','TELEPTY_SESSION_ID','TELEPTY_SESSION_ORIGIN']) delete env[key];
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['cli.js','diagnose','exact@127.0.0.1','--json'], { cwd: path.resolve(__dirname, '..'), env, stdio: ['ignore','pipe','pipe'] });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', value => { stdout += value; }); child.stderr.on('data', value => { stderr += value; });
+      child.on('error', reject); child.on('close', code => resolve({ code, stdout, stderr }));
+    });
+    assert.equal(result.code, 1, result.stderr);
+    assert.equal(JSON.parse(result.stdout).layers.daemon_api.status, 'credentials_unavailable');
+    assert.equal(requests, 0); assert.deepEqual(fs.readdirSync(home), []);
+  } finally { await new Promise(resolve => server.close(resolve)); fs.rmSync(home, { recursive: true, force: true }); }
+});

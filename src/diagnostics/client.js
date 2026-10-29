@@ -25,20 +25,20 @@ async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 20
     target: { session_id: parsed.id, host: parsed.host }, identity: null,
     layers: { host_network: { status: httpStatus ? 'http_path_responded' : 'unknown', reason: 'no_independent_host_or_tcp_probe' },
       daemon_api: { status, phase, http_status: httpStatus, elapsed_ms: Math.max(0, Math.round(monotonic() - started)), source: 'client_http_probe' },
-      authentication: { status: httpStatus === 401 || httpStatus === 403 ? 'refused' : 'unknown' },
+      authentication: { status: httpStatus === 401 || httpStatus === 403 ? 'refused' : status === 'credentials_unavailable' ? 'unavailable' : 'unknown' },
       agent_responsiveness: { status: 'unknown', reason: 'daemon_probe_does_not_probe_agent' } },
     confirmed_causes: [], completion_fact: null, next_read_only_observation: 'Verify the exact configured host and existing credentials; repeat the read-only probe.' });
   let phase = 'meta';
   try {
     const base = daemonUrl(parsed.host);
-    const response = await fetchWithAuth(`${base}/api/meta`, { signal: AbortSignal.timeout(timeoutMs) });
+    const response = await fetchWithAuth(`${base}/api/meta`, { signal: AbortSignal.timeout(timeoutMs), readOnlyAuth: true });
     if (!response.ok) return failure(response.status === 401 || response.status === 403 ? 'authentication_refused' : 'http_error', phase, response.status);
     const meta = await boundedJson(response);
     if (typeof meta.machine_id !== 'string' || (machineId && meta.machine_id !== machineId)) return failure('machine_mismatch', phase, response.status);
     phase = 'session';
     const query = new URLSearchParams({ machine_id: meta.machine_id });
     if (sessionEpoch) query.set('session_epoch', sessionEpoch);
-    const result = await fetchWithAuth(`${base}/api/sessions/${encodeURIComponent(parsed.id)}/diagnostics?${query}`, { signal: AbortSignal.timeout(timeoutMs) });
+    const result = await fetchWithAuth(`${base}/api/sessions/${encodeURIComponent(parsed.id)}/diagnostics?${query}`, { signal: AbortSignal.timeout(timeoutMs), readOnlyAuth: true });
     if (!result.ok) return failure(result.status === 409 ? 'identity_mismatch' : result.status === 401 || result.status === 403 ? 'authentication_refused' : result.status === 404 ? 'not_registered' : 'http_error', phase, result.status);
     const report = await boundedJson(result);
     if (report?.identity?.machine_id !== meta.machine_id || report?.identity?.session_id !== parsed.id || (sessionEpoch && report.identity.session_epoch !== sessionEpoch)) return failure('identity_mismatch', phase, result.status);
@@ -48,7 +48,8 @@ async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 20
       requests: 2, host_network: 'http_path_responded', authentication: 'accepted',
       mcp_transport: 'not_measured', agent_responsiveness: 'unknown' };
     return report;
-  } catch (error) { return failure(['TimeoutError', 'AbortError'].includes(error.name) ? 'timeout' : 'unavailable', phase); }
+  } catch (error) { return failure(error.code === 'TELEPTY_CONFIG_UNREADABLE' || error.name === 'CredentialRefusalError'
+    ? 'credentials_unavailable' : ['TimeoutError', 'AbortError'].includes(error.name) ? 'timeout' : 'unavailable', phase); }
 }
 function formatDiagnostics(report) {
   // The human view intentionally preserves the exact structured evidence and uncertainty.
