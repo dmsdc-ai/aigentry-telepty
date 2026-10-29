@@ -1,4 +1,6 @@
 'use strict';
+const { probeTcp } = require('./tcp-probe');
+const { validInjectId } = require('./correlation');
 const { parseSessionReference } = require('../../session-routing');
 async function boundedJson(response, maxBytes = 32768) {
   if (!response.body) throw new Error('invalid_response');
@@ -15,22 +17,25 @@ async function boundedJson(response, maxBytes = 32768) {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } finally { await reader.cancel().catch(() => {}); }
 }
-async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 2000, machineId, sessionEpoch,
+async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 2000, machineId, sessionEpoch, injectId, includeProcessState = false, includeTcp = false, tcpProbe = probeTcp,
   now = Date.now, monotonic = () => performance.now() }) {
   const parsed = parseSessionReference(target);
   if (!parsed.host || !parsed.id || parsed.id.length > 256 || parsed.host.length > 256) throw new Error('diagnose requires an exact session_id@host');
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 5000) throw new Error('timeout must be 1..5000ms per request');
+  if (injectId !== undefined && !validInjectId(injectId)) throw new Error('invalid exact inject ID');
   const started = monotonic(), observed = new Date(now()).toISOString();
+  let networkProbe = { status: 'unknown', reason: 'tcp_probe_not_requested' };
   const failure = (status, phase, httpStatus = null) => ({ schema_version: 1, observed_at: observed, read_only: true,
     target: { session_id: parsed.id, host: parsed.host }, identity: null,
     layers: { host_network: { status: httpStatus ? 'http_path_responded' : 'unknown', reason: 'no_independent_host_or_tcp_probe' },
       daemon_api: { status, phase, http_status: httpStatus, elapsed_ms: Math.max(0, Math.round(monotonic() - started)), source: 'client_http_probe' },
       authentication: { status: httpStatus === 401 || httpStatus === 403 ? 'refused' : status === 'credentials_unavailable' ? 'unavailable' : 'unknown' },
       agent_responsiveness: { status: 'unknown', reason: 'daemon_probe_does_not_probe_agent' } },
-    confirmed_causes: [], completion_fact: null, next_read_only_observation: 'Verify the exact configured host and existing credentials; repeat the read-only probe.' });
+    network_probe: networkProbe, confirmed_causes: [], completion_fact: null, next_read_only_observation: 'Verify the exact configured host and existing credentials; repeat the read-only probe.' });
   let phase = 'meta';
   try {
     const base = daemonUrl(parsed.host);
+    if (includeTcp) networkProbe = await tcpProbe(base, { timeoutMs: Math.min(timeoutMs, 1000), now, monotonic });
     const response = await fetchWithAuth(`${base}/api/meta`, { signal: AbortSignal.timeout(timeoutMs), readOnlyAuth: true });
     if (!response.ok) return failure(response.status === 401 || response.status === 403 ? 'authentication_refused' : 'http_error', phase, response.status);
     const meta = await boundedJson(response);
@@ -38,10 +43,14 @@ async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 20
     phase = 'session';
     const query = new URLSearchParams({ machine_id: meta.machine_id });
     if (sessionEpoch) query.set('session_epoch', sessionEpoch);
+    if (injectId) query.set('inject_id', injectId);
+    if (includeProcessState) query.set('process_state', '1');
     const result = await fetchWithAuth(`${base}/api/sessions/${encodeURIComponent(parsed.id)}/diagnostics?${query}`, { signal: AbortSignal.timeout(timeoutMs), readOnlyAuth: true });
     if (!result.ok) return failure(result.status === 409 ? 'identity_mismatch' : result.status === 401 || result.status === 403 ? 'authentication_refused' : result.status === 404 ? 'not_registered' : 'http_error', phase, result.status);
     const report = await boundedJson(result);
     if (report?.identity?.machine_id !== meta.machine_id || report?.identity?.session_id !== parsed.id || (sessionEpoch && report.identity.session_epoch !== sessionEpoch)) return failure('identity_mismatch', phase, result.status);
+    if (injectId && report.messaging?.inject_id !== injectId) return failure('correlation_mismatch', phase, result.status);
+    report.network_probe = networkProbe;
     report.target = { host: parsed.host, session_id: parsed.id };
     report.client_probe = { source: 'authenticated_http_requests', observed_at: new Date(now()).toISOString(),
       elapsed_ms: Math.max(0, Math.round(monotonic() - started)), timeout_ms_per_request: timeoutMs,

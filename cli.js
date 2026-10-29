@@ -3410,7 +3410,8 @@ async function main() {
       const { diagnoseTarget, formatDiagnostics } = require('./src/diagnostics/client');
       const option = (name) => { const i = args.indexOf(name); if (i < 0) return undefined; if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error(name + ' requires a value'); return args[i + 1]; };
       const report = await diagnoseTarget(args[1], { fetchWithAuth, daemonUrl,
-        machineId: option('--machine-id'), sessionEpoch: option('--epoch') });
+        machineId: option('--machine-id'), sessionEpoch: option('--epoch'), injectId: option('--inject-id'),
+        includeTcp: args.includes('--tcp'), includeProcessState: args.includes('--process-state') });
       console.log(args.includes('--json') ? JSON.stringify(report) : formatDiagnostics(report));
       if (!report.identity) process.exitCode = 1;
     } catch (error) { console.error(error.message); process.exitCode = 1; }
@@ -5040,6 +5041,8 @@ function printGlobalHelp() {
   telepty multicast <id1,id2> "<prompt>"         Inject into multiple sessions
   telepty broadcast [--ref [file]] "<prompt>"    Inject into ALL sessions
   telepty diagnose <exact-id@host> [--json] [--machine-id ID] [--epoch EPOCH]
+    --inject-id UUID correlates ledger facts; --tcp adds one bounded connection probe
+    --process-state reads bounded Linux /proc scheduler state (no responsiveness claim)
     Read-only, two bounded authenticated probes; no discovery or automatic repair
   telepty read-screen <id[@host]> [--lines N]    Read session screen buffer
     --json [--max-bytes N] [--since CURSOR]      Bounded snapshots/deltas (default 4096 content bytes; max 262144)

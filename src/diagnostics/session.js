@@ -1,5 +1,7 @@
 'use strict';
 const { randomUUID } = require('node:crypto');
+const { processState } = require('./process-state');
+const { correlateRequest, validInjectId } = require('./correlation');
 const unknown = reason => ({ status: 'unknown', reason });
 function timestamp(value, now, ttl = 15000) {
   const ms = Date.parse(value);
@@ -12,9 +14,9 @@ function processPresence(pid, kill = process.kill) {
   catch (error) { return { status: error.code === 'ESRCH' ? 'absent' : 'unknown', source: 'signal_zero',
     reason: error.code === 'ESRCH' ? 'process_not_found' : error.code === 'EPERM' ? 'permission_denied' : 'inspection_unavailable' }; }
 }
-function createSessionDiagnostics({ now = Date.now, kill = process.kill, maxWindowMs = 60000 } = {}) {
+function createSessionDiagnostics({ now = Date.now, kill = process.kill, maxWindowMs = 60000, processStateOptions } = {}) {
   const samples = new WeakMap();
-  return (session, { machineId, sessionId, eventLoop }) => {
+  return (session, { machineId, sessionId, eventLoop, correlation, includeProcessState }) => {
     const at = now(), heartbeat = timestamp(session.bridgeHeartbeatAt, at);
     const ownerGeneration = session.interactionOwnerGeneration || null;
     let previous = samples.get(session);
@@ -46,23 +48,32 @@ function createSessionDiagnostics({ now = Date.now, kill = process.kill, maxWind
           forwarding: unknown('no_end_to_end_forwarding_probe'), input_write: unknown('no_correlated_write_receipt'),
           reason: 'output_silence_cannot_distinguish_waiting_suspended_hung_or_blocked_forwarding' },
         wrapped_process: { presence: processPresence(session.ptyPid || session.ptyProcess?.pid, kill),
-          scheduler_state: unknown('portable_process_state_inspection_unavailable'), responsiveness: unknown('no_agent_response_probe') }
+          scheduler_state: includeProcessState ? processState(session.ptyPid || session.ptyProcess?.pid, { ...processStateOptions, now }) : unknown('process_state_probe_not_requested'), responsiveness: unknown('no_agent_response_probe') }
       },
-      messaging: { correlation: 'no_request_selected', request_accepted: unknown('no_correlated_request'), input_written: unknown('no_correlated_write_receipt'),
-        acknowledgement: unknown('no_correlated_acknowledgement'), reply: unknown('no_correlated_reply'), completion_fact: null },
+      messaging: correlation || { correlation: 'no_request_selected', request_accepted: unknown('no_correlated_request'), input_written: unknown('no_correlated_write_receipt'),
+        acknowledgement: unknown('no_correlated_acknowledgement'), consumption: unknown('no_correlated_consumption'), reply: unknown('no_correlated_reply'), completion_fact: null },
       event_loop: eventLoop || unknown('telemetry_unavailable'), measured_symptoms: heartbeat.freshness === 'stale' ? ['stale_bridge_heartbeat'] : [],
       hypotheses: [], confirmed_causes: [], next_read_only_observation: 'Repeat this exact machine/session/epoch diagnostic within 60s to compare counters; inspect owner-side process state with existing permissions if needed.',
       limits: ['No active probe was sent to the wrapped agent.', 'Process existence does not establish agent responsiveness.',
         'PTY read-side strings and counters are bridge-reported; no end-to-end forwarding verification.', 'Messaging stages require a separately correlated request.'] };
   };
 }
-function createDiagnosticsHandler({ sessions, machineId, inspect, eventLoop = () => null }) {
+function createDiagnosticsHandler({ sessions, machineId, inspect, eventLoop = () => null, readTracked = () => null, ledgerAvailable = () => true }) {
   return (req, res) => {
     if (req.query.machine_id !== machineId) return res.status(409).json({ error: 'Exact machine_id required', code: 'MACHINE_MISMATCH' });
     const session = Object.hasOwn(sessions, req.params.id) ? sessions[req.params.id] : null;
     if (!session) return res.status(404).json({ error: 'Exact session ID not registered', code: 'SESSION_NOT_FOUND' });
     if (req.query.session_epoch && req.query.session_epoch !== session.sessionEpoch) return res.status(409).json({ error: 'Session epoch changed', code: 'EPOCH_MISMATCH' });
-    res.json(inspect(session, { machineId, sessionId: req.params.id, eventLoop: eventLoop() }));
+    let correlation;
+    if (req.query.inject_id !== undefined) {
+      if (!validInjectId(req.query.inject_id)) return res.status(400).json({ code: 'INVALID_INJECT_ID' });
+      if (!ledgerAvailable()) return res.status(503).json({ code: 'OBSERVATION_LEDGER_UNAVAILABLE' });
+      try { correlation = correlateRequest(readTracked(req.query.inject_id), { injectId: req.query.inject_id,
+        sessionId: req.params.id, sessionEpoch: session.sessionEpoch, ownerGeneration: session.interactionOwnerGeneration, now: Date.now() }); }
+      catch (error) { return res.status(error.status || 503).json({ code: error.code || 'CORRELATION_UNAVAILABLE' }); }
+    }
+    res.json(inspect(session, { machineId, sessionId: req.params.id, eventLoop: eventLoop(), correlation,
+      includeProcessState: req.query.process_state === '1' }));
   };
 }
 module.exports = { createSessionDiagnostics, createDiagnosticsHandler, processPresence, timestamp };

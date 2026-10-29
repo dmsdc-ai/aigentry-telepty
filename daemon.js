@@ -1617,7 +1617,8 @@ sessionActions.registerStateRoute(app);
 
 const { createSessionDiagnostics, createDiagnosticsHandler } = require('./src/diagnostics/session');
 app.get('/api/sessions/:id/diagnostics', createDiagnosticsHandler({
-  sessions, machineId: MACHINE_ID, inspect: createSessionDiagnostics(), eventLoop: () => eventLoopTelemetry.snapshot()
+  sessions, machineId: MACHINE_ID, inspect: createSessionDiagnostics(), eventLoop: () => eventLoopTelemetry.snapshot(),
+  readTracked: getTrackedInjection, ledgerAvailable: () => trackedLedgerHealthy
 }));
 
 app.get('/api/meta', (req, res) => {

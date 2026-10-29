@@ -148,6 +148,7 @@ function createDeliveryRuntime(shared, {
       // with a reason rather than inventing availability from a bare SID or an open socket.
       session_epoch: (session && session.sessionEpoch) || null,
       session_epoch_reason: (session && session.sessionEpoch) ? null : 'no_815_epoch_fact',
+      owner_generation: (session && session.interactionOwnerGeneration) || null,
       transport_source: source || null,
       created_at: nowIso,
       observation_seq: 0,
