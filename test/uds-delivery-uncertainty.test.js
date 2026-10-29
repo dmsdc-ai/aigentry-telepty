@@ -21,14 +21,14 @@ function fixture(root, address) {
   engine = new DeliveryEngine(mailbox, context.mailboxDeliveryOptions);
   return { mailbox, engine, context, session, events };
 }
-for (const mode of ['oversize', 'timeout']) {
+for (const mode of ['oversize', 'timeout', 'empty', 'malformed', 'no-ack']) {
   test(`UDS ${mode}: source reports unknown, repeated ticks/restart never repeat body or submit`, { skip: process.platform === 'win32', timeout: 10000 }, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 't-uds-unknown-')), address = path.join(root, 'sock'), sockets = new Set();
     let bodies = 0; const texts = [];
     const server = net.createServer({ allowHalfOpen: true }, socket => {
       sockets.add(socket); socket.on('error', () => {}); socket.on('close', () => sockets.delete(socket));
       let input = '';
-      socket.on('data', chunk => { input += chunk.toString(); if (input.includes('\n')) { bodies++; texts.push(JSON.parse(input).text); if (mode === 'oversize') socket.end(Buffer.alloc(70000, 'x')); } });
+      socket.on('data', chunk => { input += chunk.toString(); if (input.includes('\n')) { bodies++; texts.push(JSON.parse(input).text); if (mode === 'oversize') socket.end(Buffer.alloc(70000, 'x')); else if (mode === 'empty') socket.end(); else if (mode === 'malformed') socket.end('not-json'); else if (mode === 'no-ack') socket.end('{}'); } });
     });
     await new Promise(resolve => server.listen(address, resolve));
     try {

@@ -1120,7 +1120,7 @@ test('aterm registration with delivery unix_socket stores delivery and enables U
     conn.on('data', (chunk) => { buf += chunk.toString(); });
     conn.on('end', () => {
       try { received.push(JSON.parse(buf.trim())); } catch {}
-      conn.end();
+      conn.end(JSON.stringify({ success: true }));
     });
   });
 

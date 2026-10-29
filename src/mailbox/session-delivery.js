@@ -88,25 +88,19 @@ function createSessionDeliveryContext({
           });
           sock.on('end', () => {
             if (settled) return;
-            const responseBuf = response.text();
-            if (responseBuf) {
-              try {
-                const resp = JSON.parse(responseBuf.trim());
-                if (resp.status === 'Error' || resp.success === false) {
-                  console.log(`[UDS] Delivery rejected by ${id}: ${resp.error || resp.message || 'unknown'}`);
-                  finish(buildErrorBody('DELIVERY_REJECTED', resp.error || resp.message || 'Target rejected the payload.', {
-                    httpStatus: 502,
-                    detail: resp, delivery_uncertain: attempted, bytes_written: attempted ? null : 0
-                  }));
-                  return;
-                }
-              } catch {
-                // Non-JSON response — treat as success (legacy endpoints)
-              }
+            let receipt;
+            try { receipt = JSON.parse(response.text().trim()); } catch { /* No positive receipt. */ }
+            if (receipt && (receipt.status === 'Error' || receipt.success === false)) {
+              finish(buildErrorBody('DELIVERY_REJECTED', 'UDS endpoint reported an error after the write attempt.', {
+                httpStatus: 502, delivery_uncertain: attempted, bytes_written: attempted ? null : 0
+              }));
+            } else if (receipt && (receipt.success === true || receipt.status === 'Ok')) {
+              finish({ success: true, transport_receipt: 'uds_positive_response', consumption: 'unknown', reply: 'unknown' });
             } else {
-              console.log(`[UDS] Empty response from ${id} — delivery unconfirmed (aterm may not have processed)`);
+              finish(buildErrorBody('DELIVERY_UNCERTAIN', 'UDS response did not confirm endpoint acceptance; do not retry blindly.', {
+                httpStatus: 502, delivery_uncertain: attempted, bytes_written: attempted ? null : 0
+              }));
             }
-            finish({ success: true });
           });
           sock.on('error', (err) => {
             if (settled) return;
@@ -119,34 +113,40 @@ function createSessionDeliveryContext({
         });
       }
 
-      // HTTP delivery (backward compat)
+      // HTTP status can confirm endpoint acceptance, never agent consumption/reply.
       if (!session.deliveryEndpoint) {
-        return buildErrorBody('DISCONNECTED', 'Delivery endpoint is missing.', { httpStatus: 503 });
+        return buildErrorBody('DISCONNECTED', 'Delivery endpoint is missing.', { httpStatus: 503, bytes_written: 0 });
       }
-
+      // Fetch exposes no reliable body-write boundary on errors. Once invoked, even a
+      // timeout/reset/5xx may follow a completed effect; retain the durable attempt fence.
+      try {
+        if (beforeWrite && beforeWrite() !== true) {
+          return buildErrorBody('TRACKING_PERSISTENCE_FAILED', 'HTTP attempt could not be durably fenced; nothing written.', {
+            httpStatus: 503, bytes_written: 0
+          });
+        }
+      } catch {
+        return buildErrorBody('TRACKING_PERSISTENCE_FAILED', 'HTTP attempt could not be durably fenced; nothing written.', {
+          httpStatus: 503, bytes_written: 0
+        });
+      }
       try {
         const response = await fetch(session.deliveryEndpoint, {
-          method: 'POST',
+          method: 'POST', redirect: 'error',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: data, session_id: id }),
           signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS)
         });
-
+        if (response.body) response.body.cancel().catch(() => {});
         if (!response.ok) {
-          return buildErrorBody('DELIVERY_FAILED', `Delivery endpoint returned ${response.status}.`, {
-            httpStatus: 502,
-            deliveryStatus: response.status
+          return buildErrorBody('DELIVERY_UNCERTAIN', `HTTP endpoint returned ${response.status} after an attempt; do not retry blindly.`, {
+            httpStatus: 502, deliveryStatus: response.status, delivery_uncertain: true, bytes_written: null
           });
         }
-
-        return { success: true };
-      } catch (error) {
-        if (error.name === 'TimeoutError' || error.name === 'AbortError') {
-          return buildErrorBody('TIMEOUT', 'Delivery endpoint timed out.', { httpStatus: 504 });
-        }
-        return buildErrorBody('DISCONNECTED', 'Delivery endpoint is unreachable.', {
-          httpStatus: 503,
-          detail: error.message
+        return { success: true, transport_receipt: 'http_2xx', consumption: 'unknown', reply: 'unknown' };
+      } catch {
+        return buildErrorBody('DELIVERY_UNCERTAIN', 'HTTP delivery response unavailable after an attempt; do not retry blindly.', {
+          httpStatus: 503, delivery_uncertain: true, bytes_written: null
         });
       }
     }
@@ -654,7 +654,7 @@ function createSessionDeliveryContext({
         return sessionGoneResult();
       }
       const ownerWs = session.ownerWs;
-      const beforeWrite = session.type === 'aterm' && session.delivery?.transport === 'unix_socket'
+      const beforeWrite = session.type === 'aterm'
         ? () => getMailbox().beginNonRetryableAttempt(sessionId, msg.msg_id) : undefined;
       const result = await writeDataToSession(sessionId, session, msg.payload, { beforeWrite });
       const immediate = immediateAttempts.get(msg.msg_id); if (immediate) immediate.result = result;
