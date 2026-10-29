@@ -142,7 +142,7 @@ test('historical owner-unknown or another principal never receives takeover auth
   }
 });
 
-test('real HTTP expired-mailbox transfer preserves original pending sender/time and audit across restart', { skip: process.platform !== 'linux', timeout: 15000 }, async t => {
+for (const withMessage of [false, true]) test(`real HTTP expired-mailbox transfer preserves ${withMessage ? 'pending messages' : 'initialized empty custody'} and audit across restart`, { skip: process.platform !== 'linux', timeout: 15000 }, async t => {
   const { startTestDaemon } = require('../test-support/daemon-harness');
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-takeover-http-'));
   const pair = crypto.generateKeyPairSync('ed25519');
@@ -163,10 +163,12 @@ test('real HTTP expired-mailbox transfer preserves original pending sender/time 
   }
   const registered = await request('/api/sessions/register', 'session.register', { session_id: 'mail', delivery_type: 'mailbox', lease_seconds: 1 }, { method: 'POST' });
   assert.equal(registered.status, 201);
+  if (withMessage) {
   const injected = await request('/api/sessions/mail/inject', 'session.inject', { prompt: 'original synthetic mailbox text', from: 'orchestrator' }, { method: 'POST' });
   assert.equal(injected.status, 200);
+  }
   const original = (await request('/api/sessions/mail/mailbox', 'mailbox.read')).body.pending;
-  assert.equal(original.length, 1);
+  assert.equal(original.length, withMessage ? 1 : 0);
   await new Promise(resolve => setTimeout(resolve, 1050));
   const transferred = await request('/api/sessions/mail/takeover', 'session.takeover', { expected_epoch: registered.body.session_epoch },
     { method: 'POST', epoch: registered.body.session_epoch });
@@ -219,4 +221,88 @@ test('invalid audit history survives restart and later saves as a refusal marker
   assert.equal(result.body.code, 'TAKEOVER_AUDIT_INVALID');
   assert.ok(f.credentials.verify(f.issued.bearer));
   assert.deepEqual(f.events, []);
+});
+
+function registrationCustodyFixture(t) {
+  const { FileMailbox } = require('../src/mailbox');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-registration-custody-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const mailbox = new FileMailbox({ root: path.join(home, 'mailboxes') });
+  const sessions = Object.create(null), credentials = createCredentialStore(), events = [];
+  const context = createSessionRecordContext({ sessions, sessionCredentials: credentials, sidNonces: new Map(), sessionPersistPath: path.join(home, 'sessions.json') });
+  let handler;
+  require('../src/routes/session-records').registerSessionRegisterRoute({ post: (_path, fn) => { handler = fn; } },
+    { context, getMailbox: () => mailbox, sessionStateManager: { register: () => events.push('register') }, busClients: new Set() });
+  function register() {
+    const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
+    handler({ body: { session_id: 'unused', delivery_type: 'mailbox' }, headers: {} }, res);
+    return res;
+  }
+  return { mailbox, home, sessions, credentials, events, register, context };
+}
+for (const failure of ['write', 'file-fsync', 'directory-fsync']) test(`mailbox registration refuses ${failure} initialization failure before authority publication`, t => {
+  const f = registrationCustodyFixture(t);
+  if (failure === 'write') {
+    const write = fs.writeFileSync;
+    t.mock.method(fs, 'writeFileSync', (fd, content, ...rest) => {
+      if (content === '') throw new Error('synthetic empty-file write failure');
+      return write(fd, content, ...rest);
+    });
+  } else {
+    const flush = fs.fsyncSync;
+    t.mock.method(fs, 'fsyncSync', fd => {
+      if (failure === 'file-fsync' || fs.fstatSync(fd).isDirectory()) throw new Error('synthetic custody flush failure');
+      return flush(fd);
+    });
+  }
+  const result = f.register();
+  assert.equal(result.statusCode, 503);
+  assert.equal(result.body.code, 'MAILBOX_CUSTODY_UNAVAILABLE');
+  assert.equal(result.body.session_token, undefined);
+  assert.deepEqual(Object.keys(f.sessions), []);
+  assert.equal(f.credentials.size(), 0);
+  assert.deepEqual(f.events, []);
+  t.mock.restoreAll();
+  if (failure === 'directory-fsync') {
+    // Both components exist, so retry validates and flushes them without truncation.
+    assert.equal(f.register().statusCode, 201);
+    assert.deepEqual(f.mailbox.snapshotCustody('unused'), []);
+  } else {
+    // An incomplete attempt cannot establish empty custody; do not silently repair it.
+    assert.equal(f.register().statusCode, 503);
+  }
+});
+for (const corruption of ['missing', 'corrupt']) test(`mailbox registration preserves and refuses ${corruption} existing custody`, t => {
+  const f = registrationCustodyFixture(t);
+  f.mailbox.initializeCustody('unused');
+  const inbox = path.join(f.mailbox.config.root, 'unused', 'inbox.jsonl');
+  if (corruption === 'missing') fs.unlinkSync(inbox);
+  else fs.writeFileSync(inbox, '{invalid-json}\n');
+  const result = f.register();
+  assert.equal(result.statusCode, 503);
+  assert.deepEqual(Object.keys(f.sessions), []);
+  assert.equal(f.credentials.size(), 0);
+  assert.equal(fs.existsSync(inbox), corruption !== 'missing');
+  if (corruption === 'corrupt') assert.equal(fs.readFileSync(inbox, 'utf8'), '{invalid-json}\n');
+});
+test('session-store precommit failure leaves initialized custody reusable without publishing authority', t => {
+  const f = registrationCustodyFixture(t);
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', () => { throw new Error('synthetic registry replacement failure'); });
+  assert.equal(f.register().statusCode, 503);
+  assert.deepEqual(Object.keys(f.sessions), []);
+  assert.equal(f.credentials.size(), 0);
+  assert.deepEqual(f.mailbox.snapshotCustody('unused'), []);
+  fs.renameSync.mock.restore();
+  assert.equal(fs.renameSync, rename);
+  assert.equal(f.register().statusCode, 201);
+});
+test('initializing existing valid custody preserves pending message bytes and journal', t => {
+  const f = registrationCustodyFixture(t);
+  f.mailbox.enqueue({ msg_id: 'retained', from: 'synthetic-origin', to: 'unused', payload: 'retain this text', created_at: Math.floor(Date.now() / 1000), attempt: 0 });
+  const dir = path.join(f.mailbox.config.root, 'unused');
+  const before = ['inbox.jsonl', 'state.jsonl'].map(leaf => fs.readFileSync(path.join(dir, leaf), 'utf8'));
+  assert.equal(f.register().statusCode, 201);
+  assert.deepEqual(['inbox.jsonl', 'state.jsonl'].map(leaf => fs.readFileSync(path.join(dir, leaf), 'utf8')), before);
+  assert.equal(f.mailbox.snapshotCustody('unused')[0].msg_id, 'retained');
 });

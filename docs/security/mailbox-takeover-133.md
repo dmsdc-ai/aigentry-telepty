@@ -95,3 +95,19 @@ Full wrapped takeover still needs a signed ownership transport, an authenticated
 graceful-stop acknowledgment, process-birth/custody evidence and a defined handoff
 for in-flight PTY writes. A disconnected socket or a reported PID alone does not
 supply those facts, so this slice does not claim full acceptance of #133.
+
+New poll-mailbox registration initializes custody before issuing or persisting its session
+credential. A newly created queue receives exclusive, private `inbox.jsonl` and `state.jsonl`
+files; both files and, on POSIX, their directory ancestry are flushed before registration
+can acknowledge success. Existing storage is strictly validated and flushed without
+truncation. An existing missing component or corrupt queue is refused, never repaired as
+an empty queue.
+
+Initialization and the session registry are separate commits. An initialization failure
+returns 503 without a session record, credential or publication event. Unpublished storage
+artifacts are retained: incomplete artifacts continue to fail closed and need operator
+inspection; complete artifacts from an uncertain flush can be validated and flushed on a
+later registration attempt. Registry precommit failure likewise leaves initialized custody
+available for retry. Registry post-rename uncertainty retains the existing registry failure
+contract (503 without disclosing a bearer). Windows has file flushes but no portable directory
+fsync guarantee; this does not establish native Windows account identity or ACL isolation.

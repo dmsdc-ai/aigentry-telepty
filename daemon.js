@@ -1542,7 +1542,7 @@ registerSpawnRoute(app, {
   revokeSessionCredential, busClients, os, buildSessionEnv
 });
 
-registerSessionRegisterRoute(app, { context: sessionRecordContext, sessionStateManager, busClients });
+registerSessionRegisterRoute(app, { context: sessionRecordContext, sessionStateManager, busClients, getMailbox: () => mailbox });
 require('./src/routes/external-approval').registerExternalApprovalRoutes(app, { sessions });
 
 sessionInspection.registerListRoute(app);

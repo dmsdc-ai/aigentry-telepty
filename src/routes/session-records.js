@@ -103,7 +103,7 @@ function createSessionRecordContext({ sessions, sessionCredentials, sidNonces, s
     revokeSessionCredential, resolveSessionAlias, resolveSessionForDestroy };
 }
 
-function registerSessionRegisterRoute(app, { context, sessionStateManager, busClients }) {
+function registerSessionRegisterRoute(app, { context, sessionStateManager, busClients, getMailbox = () => new (require('../mailbox').FileMailbox)() }) {
   const { sessions, sessionCredentials, issueSessionCredential, persistSessions } = context;
   app.post('/api/sessions/register', (req, res) => {
     const identity = readIdentity(req.body, 'session_id');
@@ -248,6 +248,10 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     // #815 — THE issuance point, and the only one. This branch runs exactly when the daemon does
     // not currently hold `session_id`, so every credential belongs to a fresh instance: a recreated
     // textual sid gets a new epoch and its predecessor's bearer can never resolve to it.
+    if (mailboxRequest) {
+      try { getMailbox().initializeCustody(session_id); }
+      catch { return res.status(503).json({ code: 'MAILBOX_CUSTODY_UNAVAILABLE', error: 'Mailbox custody initialization failed.' }); }
+    }
     const issued = issueSessionCredential(session_id);
     const owningPrincipal = verifiedOwningPrincipal(req);
     const sessionRecord = {

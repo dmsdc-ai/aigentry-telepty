@@ -285,6 +285,40 @@ class FileMailbox {
     }
   }
 
+  // Registration prepares custody before publishing its verifier. Never repair an existing
+  // partial queue: missing files may represent lost messages rather than an unused mailbox.
+  initializeCustody(sessionId) {
+    const sessionDir = this._sessionDir(sessionId);
+    let created = false;
+    try { fs.mkdirSync(sessionDir, { mode: 0o700 }); created = true; }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const release = acquireLock(sessionDir);
+    try {
+      if (created) {
+        for (const leaf of ['inbox.jsonl', 'state.jsonl']) {
+          const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+          try { fs.writeFileSync(fd, ''); fs.fsyncSync(fd); }
+          finally { fs.closeSync(fd); }
+        }
+      }
+      require('./custody').strictCustodySnapshot(sessionDir, sessionId);
+      // Flush existing valid custody too: a retry after an uncertain flush must establish
+      // durability itself. No successful session ACK depends on a prior failed attempt.
+      for (const leaf of ['inbox.jsonl', 'state.jsonl']) {
+        const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_RDONLY);
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      }
+      if (process.platform !== 'win32') {
+        // Include newly created root ancestors, not merely the queue's own entries.
+        for (let directory = sessionDir; ; directory = path.dirname(directory)) {
+          const fd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0));
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+          if (path.dirname(directory) === directory) break;
+        }
+      }
+    } finally { release(); }
+  }
+
   snapshotCustody(sessionId) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) throw Object.assign(new Error('Mailbox custody is unavailable'), { code: 'MAILBOX_CUSTODY_UNAVAILABLE' });
