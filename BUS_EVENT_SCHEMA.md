@@ -387,3 +387,42 @@ No new interaction bus event is emitted in this slice. Stages `prepared`, `dispa
 prompt transition, task consumption or semantic completion. Request bodies, authority
 references and retained task payloads stay in the private ledger. See
 [agent-cli-interaction.md](docs/agent-cli-interaction.md).
+
+## `session_sustained_idle_observation` (#37, additive)
+
+This observation supplements the unchanged legacy `session.idle` inactivity event.
+It uses the existing daemon `type`/`event_type` envelope and additionally supplies
+canonical `kind`, `version`, `message_id`, `source`, `source_host`, `target:null`, and
+`ts`. Its `observation.identity` binds machine, exact session ID, session epoch and
+owner generation. `completion_fact` is always null and `terminal` always false.
+
+`observation.classification` is one of:
+
+- `composer_ready`: fresh, current-owner qualified composer evidence; task completion remains unknown.
+- `awaiting_input`: a fresh known Codex/Claude modal matched in the bounded output text tail.
+- `transport_unavailable`: an owner socket is not open, a fresh authenticated heartbeat reports a destroyed read stream, an exit callback was observed, or Linux reports the recorded PID stopped/zombie/dead. PID observations do not establish process-start identity.
+- `unknown`: quiet output, stale/unqualified readiness, or an activity state that supplies insufficient evidence.
+
+The event never emits `free`, `stalled`, `hung`, or a completion verdict. An unchanged
+hash does not supply those missing facts. `output_tail_hash` hashes at most 16 KiB
+of UTF-8 output-ring text, explicitly **not a rendered terminal screen**; no prompt,
+screen body, command, environment, or credential is included. No cleanup, input,
+restart, dispatch, or repair action follows from this observation.
+
+Daemon environment options (validated integers, milliseconds):
+
+| Setting | Default | Bounds |
+|---|---:|---:|
+| `TELEPTY_SUSTAINED_IDLE_THRESHOLD_MS` | 60000 | 100–86400000 |
+| `TELEPTY_SUSTAINED_IDLE_DEBOUNCE_MS` | 3000 | 0–60000 |
+| `TELEPTY_SUSTAINED_IDLE_FRESHNESS_MS` | 300000 | 100–86400000 |
+| `TELEPTY_SUSTAINED_IDLE_MAX_PER_SWEEP` | 64 | 1–256 |
+
+Set `TELEPTY_SUSTAINED_IDLE=off` to disable the new observation. Sampling runs on
+the existing health-sweep cadence, so detection includes that cadence's delay.
+Classification must remain stable for the debounce window. At most one event is
+emitted per quiet episode; fresh output, input-generation changes, or a new
+working/thinking transition rearm it. Ready-frame/activity timestamps alone do
+not rearm it. Session/owner replacement starts a new scoped observation episode.
+Each sweep performs at most the configured number of classifications; later
+sessions are evaluated on subsequent sweeps after earlier episodes emit.

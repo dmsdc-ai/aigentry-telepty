@@ -16,7 +16,8 @@ function recordReadyEvidence(session, nowMs = Date.now()) {
 function outputTail(session) {
   let tail = '';
   const ring = session.outputRing || [];
-  for (let i = ring.length - 1; i >= 0 && tail.length < 20000; i--) {
+  // Empty/tiny output chunks must not turn a bounded tail into an unbounded scan.
+  for (let i = ring.length - 1, scanned = 0; i >= 0 && tail.length < 20000 && scanned < 1024; i--, scanned++) {
     tail = String(ring[i]).slice(-(20000 - tail.length)) + tail;
   }
   return tail;
@@ -124,4 +125,4 @@ function registerReadinessRoute(app, { sessions, machineId }) {
     }
   });
 }
-module.exports = { MAX_WAIT_MS, recordReadyEvidence, readinessSnapshot, waitForReadiness, registerReadinessRoute };
+module.exports = { outputTail, MAX_WAIT_MS, recordReadyEvidence, readinessSnapshot, waitForReadiness, registerReadinessRoute };

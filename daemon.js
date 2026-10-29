@@ -2104,6 +2104,8 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
 }
 
 const IDLE_THRESHOLD_SECONDS = 60;
+const { BUS_KIND: SUSTAINED_IDLE_KIND, idleObservationConfig, createSustainedIdleObserver } = require('./src/sustained-idle-observation');
+const sustainedIdleObserver = createSustainedIdleObserver(idleObservationConfig());
 // #916 block 4: the idle-TTL reaper's mode. `enforce` is the pre-#916 behaviour (auto-kill);
 // `warn` computes exactly the same victim list and LOGS what it would reap without touching it;
 // `off` does not arm the sweep at all.
@@ -2213,6 +2215,10 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
   setInterval(() => {
   const now = Date.now();
   for (const [id, session] of Object.entries(sessions)) {
+    const quietObservation = sustainedIdleObserver.observe(id, session, { nowMs: now, machineId: MACHINE_ID, activityState: sessionStateManager.getState(id) });
+    if (quietObservation) broadcastSessionEvent(SUSTAINED_IDLE_KIND, id, session, { nowMs: now, includeTransport: false, includeSemantic: false,
+      extra: { kind: SUSTAINED_IDLE_KIND, version: 1, message_id: crypto.randomUUID(), source: `telepty:${id}`,
+        source_host: MACHINE_ID, target: null, ts: quietObservation.observed_at, observation: quietObservation, completion_fact: null, terminal: false } });
     if (session.isClosing) continue; // A pending teardown owns this namespace until its process action settles.
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
     const healthStatus = getSessionHealthStatus(session, { nowMs: now });
