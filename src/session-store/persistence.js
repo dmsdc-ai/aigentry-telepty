@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { storedOwningPrincipal } = require('../principal/http');
 
 function defaultSessionPersistPath(homeDir = os.homedir()) {
   return path.join(homeDir, '.config', 'aigentry-telepty', 'sessions.json');
@@ -17,6 +18,7 @@ function serializePersistedSessions(sessions) {
     if (s.isClosing) continue;
     Object.defineProperty(data, id, { enumerable: true, writable: true, configurable: true, value: {
       id,
+      ...(storedOwningPrincipal(s.owningPrincipal) ? { owningPrincipal: storedOwningPrincipal(s.owningPrincipal) } : {}),
       type: s.type,
       ...(s.externalApprovalPolicy ? { externalApprovalPolicy: s.externalApprovalPolicy } : {}),
       ...(s.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
@@ -199,6 +201,7 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
     ...(meta.externalApprovalPolicy ? { externalApprovalPolicy: meta.externalApprovalPolicy, requireOwnerProof: true } : {}),
     ...(meta.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
     ptyProcess: null, ownerWs: null,
+    ...(storedOwningPrincipal(meta.owningPrincipal) ? { owningPrincipal: storedOwningPrincipal(meta.owningPrincipal) } : {}),
     ...(meta.type === 'mailbox' ? { leaseExpiresAt: Number.isFinite(meta.leaseExpiresAt) ? meta.leaseExpiresAt : null } : {}),
     command: meta.command || 'wrapped', cwd: meta.cwd || cwd,
     ...(sshRemote ? { sshRemote } : {}),

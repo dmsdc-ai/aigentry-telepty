@@ -101,3 +101,18 @@ test('clock rollback after pruning cannot reopen an expired nonce window', () =>
   f.setNow(NOW);
   assert.equal(f.verifier.verify(f.sign(), f.request).code, 'PRINCIPAL_CLOCK_UNSAFE');
 });
+
+test('signed caller authority claims, private URLs, duplicate query members and malformed trust authority refuse', () => {
+  const f = fixture();
+  const parts = f.sign().split('.');
+  const document = JSON.parse(Buffer.from(parts[1], 'base64url'));
+  document.authority = 'operator';
+  document.sub = 'operator';
+  const payload = canonicalJSON(document);
+  const signature = crypto.sign(null, Buffer.from('telepty.principal-assertion/v1\n' + payload), f.pair.privateKey);
+  assert.equal(f.verifier.verify(`v1.${Buffer.from(payload).toString('base64url')}.${signature.toString('base64url')}`, f.request).ok, false);
+  for (const target of ['http://user:secret@private/api/meta', '/api/meta?token=private', '/api/meta?a=1&a=2']) assert.throws(() => f.sign({ target }));
+  const invalid = structuredClone(f.configuration);
+  invalid.keys[0].authority = null;
+  assert.throws(() => validateTrustConfiguration(invalid, { audience: 'node-a' }));
+});

@@ -1,4 +1,5 @@
 const { protectedInputFailure } = require('../external-approval');
+const { storedOwningPrincipal } = require('../principal/http');
 // Production session inspection and batch-submit operations.
 // Deliberately retains the daemon's non-strict execution semantics.
 const { defaultSubmitAdmission } = require('../submit-admission');
@@ -20,6 +21,7 @@ function serializeSession(id, session, options = {}) {
     id,
     session_epoch: session.sessionEpoch || null,
     lastInjectReturn: session.lastInjectReturn || null,
+    ...(storedOwningPrincipal(session.owningPrincipal) ? { owningPrincipal: storedOwningPrincipal(session.owningPrincipal) } : {}),
     locator: { machine_id: shared.MACHINE_ID, session_id: id, project_id: projectId },
     type: session.type || 'spawned',
     ...(session.externalApprovalPolicy ? { input_policy: { authority: 'external-signer', supported_ingress: ['inject'], other_writes: 'denied' } } : {}),

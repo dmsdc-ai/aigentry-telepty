@@ -19,14 +19,14 @@ function validateTrustConfiguration(configuration, { audience, allowedActions = 
   try { canonicalJSON(configuration); } catch { configError(); }
   if (!exactFields(configuration, ['schema', 'audience', 'keys']) || configuration.schema !== SCHEMA
       || !Array.isArray(configuration.keys) || configuration.keys.length < 1 || configuration.keys.length > 64) configError();
-  const trustedAudience = configuration.audience || audience;
+  const trustedAudience = configuration.audience === undefined ? audience : configuration.audience;
   if (!opaque(trustedAudience) || !Array.isArray(allowedActions) || !allowedActions.length
       || allowedActions.some(action => typeof action !== 'string' || !/^[a-z][a-z0-9_.-]{0,63}$/.test(action))) configError();
   const actions = new Set(allowedActions), keys = new Map(), fingerprints = new Set();
   for (const entry of configuration.keys) {
     if (!exactFields(entry, ['key_id', 'principal_id', 'public_key_spki', 'authority', 'grants'])
         || !identifier(entry.key_id) || !identifier(entry.principal_id) || keys.has(entry.key_id)
-        || !['principal', 'operator'].includes(entry.authority || 'principal')
+        || !['principal', 'operator'].includes(entry.authority === undefined ? 'principal' : entry.authority)
         || typeof entry.public_key_spki !== 'string' || entry.public_key_spki.length > 1024
         || !/^-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+-----END PUBLIC KEY-----\r?\n?$/.test(entry.public_key_spki)
         || !Array.isArray(entry.grants) || entry.grants.length < 1 || entry.grants.length > 128) configError();
@@ -36,7 +36,7 @@ function validateTrustConfiguration(configuration, { audience, allowedActions = 
     const fingerprint = publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
     if (fingerprints.has(fingerprint)) configError();
     fingerprints.add(fingerprint);
-    const authority = entry.authority || 'principal';
+    const authority = entry.authority === undefined ? 'principal' : entry.authority;
     const grants = entry.grants.map(grant => {
       if (!exactFields(grant, ['action', 'targets']) || !actions.has(grant.action) || !Array.isArray(grant.targets)
           || grant.targets.length < 1 || grant.targets.length > 128 || grant.targets.some(target => !opaque(target))

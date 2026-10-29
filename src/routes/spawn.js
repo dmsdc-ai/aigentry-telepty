@@ -1,5 +1,7 @@
 const { buildPtySpawnTarget } = require('../win-spawn-target');
 const os = require('os');
+const crypto = require('node:crypto');
+const { verifiedOwningPrincipal } = require('../principal/http');
 const { defaultSpawnAdmission } = require('../spawn-admission');
 
 const STRIPPED_SESSION_ENV_KEYS = [
@@ -121,8 +123,10 @@ function registerSpawnRoute(app, {
         env: customEnv
       });
 
+      const owningPrincipal = verifiedOwningPrincipal(req);
       const sessionRecord = {
         id: session_id,
+        ...(owningPrincipal ? { owningPrincipal, sessionEpoch: crypto.randomBytes(16).toString('base64url') } : {}),
         type: 'spawned',
         ptyProcess,
         ptyPid: ptyProcess.pid || null,
@@ -199,7 +203,7 @@ function registerSpawnRoute(app, {
         if (client.readyState === 1) client.send(spawnMsg);
       });
 
-      res.status(201).json({ session_id, command, cwd });
+      res.status(201).json({ session_id, command, cwd, ...(owningPrincipal ? { session_epoch: sessionRecord.sessionEpoch, owningPrincipal } : {}) });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

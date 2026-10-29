@@ -1,5 +1,6 @@
 const { parseExternalApprovalPolicy } = require('../external-approval');
 const { validateSshMetadata } = require('../ssh-session');
+const { verifiedOwningPrincipal } = require('../principal/http');
 const { parseMailboxLease, renewMailboxLease } = require('../mailbox/poll-session');
 const { validateSessionId: validateMailboxId } = require('../mailbox/path-boundary');
 const sessionPersistence = require('../session-store/persistence');
@@ -248,10 +249,12 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     // not currently hold `session_id`, so every credential belongs to a fresh instance: a recreated
     // textual sid gets a new epoch and its predecessor's bearer can never resolve to it.
     const issued = issueSessionCredential(session_id);
+    const owningPrincipal = verifiedOwningPrincipal(req);
     const sessionRecord = {
       id: session_id,
       ...(req.body.require_owner_proof === true || external.policy ? { requireOwnerProof: true } : {}),
       ...(external.policy ? { externalApprovalPolicy: external.policy } : {}),
+      ...(owningPrincipal ? { owningPrincipal } : {}),
       type: delivery_type || 'wrapped',
       ptyProcess: null,
       ownerWs: null,
@@ -338,7 +341,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     // this response is on the wire the credential is already durable — a daemon that dies between
     // the two can never leave a bearer in a child's env with no verifier on disk to match it.
     // The bearer and nonce cross the wire HERE and only here, once, to this one caller.
-    res.status(201).json({ session_id, type: mailboxRequest ? 'mailbox' : 'wrapped', ...(mailboxRequest ? { lease_expires_at: sessionRecord.leaseExpiresAt } : {}), command: sessionRecord.command, cwd, session_token: issued.bearer, session_epoch: issued.epoch, credential_generation: issued.generation, session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
+    res.status(201).json({ session_id, ...(owningPrincipal ? { owningPrincipal } : {}), type: mailboxRequest ? 'mailbox' : 'wrapped', ...(mailboxRequest ? { lease_expires_at: sessionRecord.leaseExpiresAt } : {}), command: sessionRecord.command, cwd, session_token: issued.bearer, session_epoch: issued.epoch, credential_generation: issued.generation, session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
   });
 }
 

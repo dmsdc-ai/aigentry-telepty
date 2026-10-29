@@ -781,6 +781,11 @@ function installWebSocketTransport(deps) {
   // populates the list, and a MATCH returns true just as completely as an empty list does), so
   // an uncredentialed handshake — viewer socket and `/api/bus` alike — upgraded with 101.
   function handleUpgrade(req, socket, head) {
+    // HTTP-only strict mode has no per-frame authority adapter. Never let legacy upgrade
+    // credentials turn it into a full-duplex bypass of action/target authorization.
+    if (deps.principalAuthentication) {
+      return refuseUpgrade(socket, 401, 'Unauthorized', 'PRINCIPAL_WEBSOCKET_UNSUPPORTED', 'Strict principal mode currently supports HTTP only.');
+    }
     const url = new URL(req.url, 'http://' + req.headers.host);
     // #843 — TWO named carriers for the daemon token, matching the HTTP door exactly:
     // `x-telepty-token` (header) and `?token=` (query). The HTTP middleware has always accepted

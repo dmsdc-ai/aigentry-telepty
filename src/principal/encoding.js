@@ -115,7 +115,7 @@ function requestBodyDigest(req) {
   }
   // HTTP integration must capture every nonempty request body. Never hash an uncaptured
   // parsed object while pretending duplicate-member ambiguity was checked.
-  if (req.body !== undefined && !(req.method === 'GET' && Object.keys(req.body || {}).length === 0)) invalid();
+  if (req.body !== undefined && !(req.body && Object.getPrototypeOf(req.body) === Object.prototype && Object.keys(req.body).length === 0)) invalid();
   if (req.headers?.['transfer-encoding'] || Number(req.headers?.['content-length'] || 0) > 0) invalid();
   return bodyDigest(undefined);
 }

@@ -328,6 +328,7 @@ if (!ENV_AUTH_TOKEN) {
 }
 const EXPECTED_TOKEN = ENV_AUTH_TOKEN || config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
+const principalAuthentication = require('./src/principal/http').createPrincipalAuthenticationFromEnvironment({ machineId: MACHINE_ID, sessions: () => sessions });
 const net = require('net');
 const fs = require('fs');
 const SESSION_PERSIST_PATH = sessionPersistence.defaultSessionPersistPath();
@@ -520,7 +521,7 @@ const isAllowedPeer = createIsAllowedPeer(effectivePeerAllowlist);
 // entrances a browser can reach.
 const isForbiddenOrigin = createOriginGuard(ALLOWED_ORIGINS);
 
-registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin,
+registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin, principalAuthentication,
   authorizeSessionRequest: req => require('./src/mailbox/poll-session').authorizeMailboxRequest(req, sessions, sessionCredentials) });
 
 const { resolveBindPort } = require('./src/bind-port');
@@ -2447,6 +2448,7 @@ if (server) server.on('error', async (error) => {
 
 
 installWebSocketTransport({
+  principalAuthentication,
   server,
   tailnetServer,
   sessions,

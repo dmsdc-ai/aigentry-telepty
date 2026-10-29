@@ -68,6 +68,15 @@ telepty --version                                     # must print 0.8.5
 the UDS delivery path is POSIX-only, and the inbound tailnet firewall rule only auto-installs
 when the daemon runs elevated — otherwise you run one `netsh` command it prints for you.
 
+## Optional signed HTTP principals
+
+Legacy authentication remains the default. Linux operators can explicitly configure
+public Ed25519 keys and exact action/target grants for an HTTP-only strict mode.
+Missing/unsafe trust configuration refuses startup; shared-token/JWT/session-token
+fallback and all WebSocket upgrades are refused in that mode. Existing session
+credential and approval checks still apply. See the [implemented contract and
+limits](docs/security/principal-http-132.md); no OS-account or OIDC identity is claimed.
+
 ## Quick Start
 
 The installer already started the daemon, so `telepty list` answers immediately. (If it does
