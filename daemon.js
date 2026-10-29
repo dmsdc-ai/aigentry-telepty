@@ -33,7 +33,8 @@ const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
 const interaction = require('./src/interaction');
 const { createCredentialStore } = require('./src/session-store/session-credentials');
-const { createAuditWriter, readInjectLog } = require('./src/audit/inject-log');
+const { createAuditWriter } = require('./src/audit/inject-log');
+const { createAuditReader, registerAuditQueryRoute } = require('./src/audit/query-reader');
 const { applyProvenance } = require('./src/audit/provenance');
 const { registerSpawnRoute, buildSessionEnv } = require('./src/routes/spawn');
 const { createSessionRecordContext, registerSessionRegisterRoute, registerSessionRenameRoute } = require('./src/routes/session-records');
@@ -448,6 +449,7 @@ const FANOUT_MAX_TARGETS = Math.max(1, Number(process.env.TELEPTY_FANOUT_MAX_TAR
 // env-overridable. The writer is off the delivery hot path: auditAppend() never blocks or
 // throws into a handler. P1 records claimed_from only (verified_sender_sid wired in P2).
 const AUDIT_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'injects.jsonl');
+const auditReader = createAuditReader({ path: AUDIT_LOG_PATH });
 const auditWriter = createAuditWriter({
   path: AUDIT_LOG_PATH,
   preview: process.env.TELEPTY_AUDIT_PREVIEW === '1',
@@ -1552,20 +1554,7 @@ sessionInspection.registerListRoute(app);
 // to (alias-resolved), from (claimed OR verified), spoof; pagination via limit/cursor (newest
 // first). Reads the live injects.jsonl (one write path, file-backed) — separate lifecycle from
 // the ephemeral /api/events live bus, so the two are not conflated.
-app.get('/api/injects', (req, res) => {
-  const q = req.query || {};
-  const to = q.to ? (resolveSessionAlias(q.to) || q.to) : undefined;
-  const result = readInjectLog(AUDIT_LOG_PATH, {
-    since: q.since,
-    until: q.until,
-    to,
-    from: q.from,
-    spoof: q.spoof === '1' || q.spoof === 'true',
-    limit: q.limit,
-    cursor: q.cursor
-  });
-  res.json(result);
-});
+registerAuditQueryRoute(app, { reader: auditReader, resolveSessionAlias });
 
 sessionInspection.registerGetRoute(app);
 require('./src/readiness').registerReadinessRoute(app, { sessions, machineId: MACHINE_ID });
@@ -2505,6 +2494,7 @@ async function shutdown(code) {
   mailboxDelivery.stop();
   mailboxNotifier.cancelAll();
   if (server) server.close();
+  await auditReader.close();
   try { await auditWriter.close(); } catch (error) { console.error('[AUDIT] Shutdown flush failed:', error.message); }
   clearDaemonState(process.pid);
   process.exit(code);

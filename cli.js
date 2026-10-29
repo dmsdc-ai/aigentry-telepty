@@ -2476,18 +2476,27 @@ async function main() {
       return `  ${l.ts}  \x1b[36m${l.claimed_from || '-'}\x1b[0m→${l.to}  verified=${verified}  ${l.kind}/${l.delivery_result}${spoofTag}`;
     }
 
+    async function fetchAuditPage() {
+      const res = await fetchWithAuth(buildQuery(), { readOnlyAuth: true, signal: AbortSignal.timeout(12000) });
+      const data = await res.json();
+      if (!res.ok || !Array.isArray(data.injects)) {
+        const error = new Error(res.status === 401 || res.status === 403
+          ? `Inject audit query refused (HTTP ${res.status}).` : 'Inject audit query unavailable.');
+        error.code = res.status === 401 || res.status === 403 ? 'DAEMON_REFUSED'
+          : typeof data.code === 'string' && /^AUDIT_QUERY_[A-Z_]+$/.test(data.code) ? data.code : 'AUDIT_QUERY_FAILED';
+        throw error;
+      }
+      return data;
+    }
+
     try {
       if (tail) {
         // Poll newest lines and print rows as they appear (dedup by inject_id+to).
         const seen = new Set();
         let firstPass = true;
-        console.log('\x1b[1mTailing inject audit log (Ctrl-C to stop)...\x1b[0m');
+        if (!asJson) console.log('\x1b[1mTailing inject audit log (Ctrl-C to stop)...\x1b[0m');
         for (;;) {
-          const res = await fetchWithAuth(buildQuery());
-          // #835: without this, a refusal makes the tail poll forever printing nothing — an
-          // audit log that looks quiet is exactly what an audit log must never fake.
-          if (!res.ok) throw daemonAnswerError(daemonAnswer(res.status, '/api/injects'));
-          const data = await res.json();
+          const data = await fetchAuditPage();
           const fresh = (data.injects || []).slice().reverse(); // oldest→newest for display
           for (const l of fresh) {
             const key = `${l.inject_id}|${l.to}`;
@@ -2504,9 +2513,7 @@ async function main() {
         }
       }
 
-      const res = await fetchWithAuth(buildQuery());
-      const data = await res.json();
-      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); process.exit(1); }
+      const data = await fetchAuditPage();
       if (asJson) { console.log(JSON.stringify(data, null, 2)); return; }
       const injects = data.injects || [];
       if (injects.length === 0) { console.log('No inject audit records found.'); return; }
@@ -2514,8 +2521,10 @@ async function main() {
       injects.forEach((l) => console.log(formatRow(l)));
       if (data.next_cursor != null) console.log(`  … more (--limit/cursor ${data.next_cursor})`);
     } catch (e) {
-      console.error(`❌ ${e.message || 'Failed to query inject audit log.'}`);
-      process.exit(1);
+      const code = typeof e.code === 'string' && /^(AUDIT_QUERY_[A-Z_]+|DAEMON_REFUSED)$/.test(e.code) ? e.code : 'AUDIT_QUERY_FAILED';
+      if (asJson) console.log(JSON.stringify({ success: false, code, error: 'Inject audit query failed; no empty result was substituted.' }));
+      else console.error(`❌ Inject audit query failed (${code}); no empty result was substituted.`);
+      process.exitCode = 1;
     }
     return;
   }

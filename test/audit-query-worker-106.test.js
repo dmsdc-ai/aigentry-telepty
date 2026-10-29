@@ -59,6 +59,10 @@ test('#106 missing file is empty; unreadable/nonregular and oversized rows/repli
   assert.equal((await reader.read()).code, 'AUDIT_QUERY_BUDGET_EXCEEDED');
   fs.writeFileSync(file, (JSON.stringify({ large: 'x'.repeat(3000) })+'\n').repeat(1000));
   assert.equal((await reader.read({ limit: 1000 })).code, 'AUDIT_QUERY_BUDGET_EXCEEDED');
+  fs.truncateSync(file, 64*1024*1024+1);
+  const oversizedFile = await reader.read();
+  assert.equal(oversizedFile.code, 'AUDIT_QUERY_BUDGET_EXCEEDED');
+  assert.equal(oversizedFile.reason, 'file_bytes');
 });
 
 class ControlledWorker extends EventEmitter {
@@ -131,4 +135,59 @@ test('#106 a timed-out worker retains capacity until it actually exits', async t
   await reader.close(); assert.equal((await b).code, 'AUDIT_QUERY_CLOSED'); assert.equal((await c).code, 'AUDIT_QUERY_CLOSED');
   workers[1].emit('error', new Error('late private error')); // listener remains safe until native exit
   workers[1].emit('exit', 1); workers[2].emit('exit', 1);
+});
+
+test('#106 real held worker leaves the actual API route and HTTP health responsive', async t => {
+  const { Worker, MessageChannel } = require('node:worker_threads'); const express = require('express');
+  const release = new SharedArrayBuffer(4); const state = new Int32Array(release);
+  const { port1, port2 } = new MessageChannel();
+  const started = new Promise(resolve => port1.once('message', resolve));
+  const reader = createAuditReader({ path: '/daemon-owned/never-selected-by-query',
+    workerFactory: (file, options) => {
+      assert.match(file, /inject-query-worker\.js$/); assert.equal(options.workerData.path, '/daemon-owned/never-selected-by-query');
+      return new Worker(path.resolve(__dirname, '../test-support/audit-query-held-worker.cjs'), {
+        workerData: { release, started: port2 }, transferList: [port2], resourceLimits: options.resourceLimits
+      });
+    } });
+  const app = express(); app.get('/api/health', (_req,res) => res.json({ status: 'ok' }));
+  registerAuditQueryRoute(app, { reader, resolveSessionAlias: value => value });
+  const server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
+  t.after(async () => { Atomics.store(state,0,1); Atomics.notify(state,0); port1.close(); await reader.close(); await new Promise(resolve => server.close(resolve)); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const query = fetch(`${base}/api/injects?path=/caller-cannot-select-this`); await started;
+  assert.equal((await fetch(`${base}/api/health`)).status, 200);
+  Atomics.store(state,0,1); Atomics.notify(state,0);
+  assert.equal((await query).status, 200);
+});
+
+test('#106 real daemon/API/CLI reports bounded failure rather than empty audit history', async t => {
+  const { startTestDaemon } = require('../test-support/daemon-harness');
+  const daemon = await startTestDaemon(); t.after(() => daemon.stop());
+  const file = path.join(daemon.homeDir, '.telepty', 'logs', 'injects.jsonl');
+  fs.writeFileSync(file, JSON.stringify({ private_payload: 'SECRET'.repeat(60000) })+'\n');
+  const refused = await daemon.request('/api/injects', { noAuth: true });
+  assert.equal(refused.status, 401);
+  const failed = await daemon.request('/api/injects?path=/caller-file');
+  assert.equal(failed.status, 503); assert.equal(failed.body.code, 'AUDIT_QUERY_BUDGET_EXCEEDED');
+  assert.doesNotMatch(JSON.stringify(failed.body), /SECRET|caller-file|injects\.jsonl/);
+  assert.equal((await daemon.request('/api/health')).status, 200);
+  const cli = await daemon.runCli(['injects','--json']);
+  assert.equal(cli.code, 1); const result = JSON.parse(cli.stdout);
+  assert.equal(result.success, false); assert.equal(result.code, 'AUDIT_QUERY_BUDGET_EXCEEDED');
+  assert.equal(Object.hasOwn(result, 'injects'), false);
+  const tail = await daemon.runCli(['injects','--tail','--json']);
+  assert.equal(tail.code, 1); assert.equal(JSON.parse(tail.stdout).success, false);
+  assert.doesNotMatch(tail.stdout, /Tailing inject audit/);
+});
+
+test('#106 malformed filters, worker construction and unexpected exit fail without empty history', async t => {
+  const { reader, workers } = controlled(t);
+  assert.equal((await reader.read({ cursor: ['1','2'] })).code, 'AUDIT_QUERY_INVALID_FILTER');
+  assert.equal(workers.length, 0);
+  const pending = reader.read(); workers[0].emit('exit', 0);
+  assert.equal((await pending).code, 'AUDIT_QUERY_FAILED');
+  const failed = createAuditReader({ path: '/private/daemon-owned', workerFactory: () => { throw new Error('SECRET /private/runtime detail'); } });
+  t.after(() => failed.close());
+  const result = await failed.read(); assert.equal(result.code, 'AUDIT_QUERY_FAILED');
+  assert.doesNotMatch(JSON.stringify(result), /SECRET|private|runtime detail/);
 });
