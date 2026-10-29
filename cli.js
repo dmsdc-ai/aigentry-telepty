@@ -4876,6 +4876,19 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
+  if (cmd === 'discover') {
+    const result = await require('./src/peer-discovery').createPeerDiscovery({
+      loadRegistered: () => crossMachine.loadPeers().peers || {}
+    })({ refresh: args.includes('--refresh') });
+    if (args.includes('--json')) console.log(JSON.stringify(result));
+    else if (result.status !== 'ok') console.error(`Discovery unavailable: ${result.reason}`);
+    else for (const peer of result.candidates) {
+      console.log(`${peer.address}:${peer.port} ${peer.machine_id || '(unnamed)'} [${peer.enrollment}; not authenticated]`);
+    }
+    if (result.status !== 'ok') process.exitCode = 1;
+    return;
+  }
+
   // telepty peers [--remove <name>]
   if (cmd === 'peers') {
     if (args[1] === '--remove' && args[2]) {
@@ -5041,6 +5054,7 @@ function printGlobalHelp() {
   telepty connect-http <host>[:port] [--name N] [--token T]  Register remote daemon via HTTP (no SSH)
   telepty disconnect <name> | --all              Disconnect remote host
   telepty peers [--remove <name>]                List connected peers
+  telepty discover [--json] [--refresh]           Read-only local tailnet candidates; never enroll or authorize
 
 \x1b[1mMonitoring:\x1b[0m
   telepty readiness <exact-id>[@host] [--json]     Inspect qualified composer evidence (read-only)

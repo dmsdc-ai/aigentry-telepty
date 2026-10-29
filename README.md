@@ -2,7 +2,7 @@
 
 **Connect any terminal to any terminal, any machine.**
 
-telepty is an **agent session control plane**: the CLIs keep doing the work (data plane), telepty addresses their sessions by name and guarantees delivery. Concretely, a background daemon plus a session bridge — it lets you spawn, attach to, and inject commands into terminal sessions, locally or across machines via Tailscale.
+telepty is an **agent session control plane**: the CLIs keep doing the work (data plane), telepty addresses their sessions by name and records delivery observations. Acceptance, writes, consumption and replies remain distinct. Concretely, a background daemon plus a session bridge — it lets you spawn, attach to, and inject commands into terminal sessions, locally or across machines via Tailscale.
 
 Built for AI CLI workflows (Claude Code, Codex, Gemini CLI), but works with any interactive terminal program.
 
@@ -279,45 +279,40 @@ delivered in order once the surface clears. A parked inject reports
 
 ## Cross-Machine Sessions
 
-Two different things are at play here, and only one of them is zero-config:
+Reachability, discovery, and authorization are separate.
 
-- **Reachability is zero-config on a tailnet.** The daemon binds and trusts tailnet peers by
-  itself (below), and `<id>@<host>` targeting works right away against any reachable daemon —
-  no registration step. `inject`, `attach`, `read-screen`, `enter`, `multicast` and `rename`
-  all accept `@<host>`.
-- **Discovery is not.** `telepty list` enumerates this daemon's sessions plus the peers
-  recorded in `~/.telepty/peers.json` — it does **not** scan the tailnet. Two fresh tailnet
-  machines each see only their own sessions until you register one with the other:
+- The daemon can bind loopback and a detected tailnet interface automatically.
+- `telepty discover --json` enumerates online IPv4 candidates reported by the local
+  `tailscale status --json` client. It performs no peer requests, writes no configuration,
+  enrolls no keys, and sends no credentials. Advertised names and IPs are observations,
+  **not authentication**. Candidate output is capped at 256 and the provider call at
+  1.5 seconds / 1 MiB. Status is cached for 15 seconds within one process.
+- `telepty list` continues to query only enrolled peers in `~/.telepty/peers.json`.
+  Discovery does not turn a new device into an authorized controller or copy a secret.
+- HTTP peers, including tailnet peers, must present the destination daemon's credential
+  (or a separately configured supported verifier). Loopback also requires authentication.
+  `TELEPTY_AUTH_TOKEN` is the explicit operator override; otherwise the destination's
+  enrolled `host:port` token is used, never the local daemon token as a foreign fallback.
 
-  ```bash
-  telepty connect-http <host>        # HTTP only — no sshd on either side
-  telepty connect <user@host>        # over SSH (ControlMaster)
-  telepty peers                      # what is registered
-  telepty disconnect <name>           # unregister
-  ```
+```bash
+telepty discover --json
+telepty connect-http <host> --token <destination-daemon-token>
+telepty connect <user@host>       # SSH transport, with normal SSH authentication
+telepty peers
+```
 
-  After that, `list` / `broadcast` / `multicast` see the peer's sessions too.
+### Tailscale auto-bind is reachability, not identity
 
-### Zero-config on Tailscale (auto bind + auto trust)
+A detected tailnet interface can make the daemon reachable without setting manual bind
+variables. `TELEPTY_PEER_ALLOWLIST` narrows network admission and
+`TELEPTY_NO_TAILNET_AUTO=1` disables automatic tailnet binding. These controls do not
+replace API authentication. A shared `100.64.0.0/10` address alone does not prove a
+user, agent, or Tailscale identity, and discovery never establishes trust.
 
-On a host that is on a **Tailscale tailnet**, a fresh install is cross-machine-*reachable* with
-**no manual env**. At startup the daemon detects its tailnet interface (a `100.64.0.0/10`
-address) and:
-
-- **binds :3848 to the tailnet IP only** (plus loopback) — LAN/public interfaces stay
-  closed, so the control API is reachable **only from your Tailnet**, never the flat LAN;
-- **trusts tailnet peers automatically** — Tailscale's own ACLs already gate who is on the
-  tailnet, so a tailnet peer needs no token or manual allowlist.
-
-> **Trust boundary:** on a Tailscale host, telepty auto-exposes :3848 to your **entire
-> tailnet** (every peer Tailscale's ACLs let onto it). If you share your tailnet with
-> machines you don't fully trust, set `TELEPTY_PEER_ALLOWLIST` to restrict to specific
-> peers/CIDRs, or `TELEPTY_NO_TAILNET_AUTO=1` to stay loopback-only.
-
-**Zero-config cross-machine is Tailscale-specific.** On a non-Tailscale host (plain LAN,
-other mesh VPNs) the daemon stays **loopback-only** (the safe default) — set `TELEPTY_BIND`
-+ `TELEPTY_PEER_ALLOWLIST` manually to expose it. Manual `TELEPTY_BIND` / `HOST` /
-`TELEPTY_PEER_ALLOWLIST` always win over auto-detect.
+On other networks the daemon stays loopback-only unless explicit bind/allowlist
+configuration is supplied. Manual `TELEPTY_BIND` / `HOST` /
+`TELEPTY_PEER_ALLOWLIST` overrides auto-detection. No such live settings are changed by
+`discover`.
 
 **Windows:** Defender Firewall blocks inbound on the tailnet interface by default. On the
 auto path the daemon adds the inbound allow-rule automatically when run elevated, otherwise
