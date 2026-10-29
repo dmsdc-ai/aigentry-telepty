@@ -134,8 +134,60 @@ function createSessionDeliveryContext({
     return { success: true };
   }
 
+  // #109: `sessions[id]` is the identity. Delete, rename and recreate all leave `sessions[id]`
+  // pointing at a different object (or nothing); the epoch is compared as well so a future
+  // in-place re-key cannot slip past.
+  function isSameSessionInstance(id, session, sessionEpoch) {
+    return sessions[id] === session && (session.sessionEpoch || null) === sessionEpoch;
+  }
+
+  // #109 review 1 B1: the deferred CR follows the INSTANCE, not the id. A rename moves the same
+  // live record to `session.id` (same PTY, owner, epoch) — that record got the text, so it gets the
+  // CR. Destroy/recreate leave the record unregistered; owner replacement changes the epoch.
+  function isLiveSessionInstance(session, sessionEpoch) {
+    return sessions[session.id] === session && (session.sessionEpoch || null) === sessionEpoch;
+  }
+
+  function sessionGoneResult() {
+    return { success: false, httpStatus: 410, code: 'SESSION_GONE',
+      error: 'Session was destroyed or replaced while this write was pending; it was not written.' };
+  }
+
+  // PR #108 TP2: an inject that owes a CR waits for ITS msg_id to be written, not for "a tick".
+  // getMailboxDelivery().tick() returns at once while another tick is in flight (e.g. one stuck on a slow
+  // session), so the CR used to be scheduled — and written — before the text. The deliverFn settles
+  // the waiter with the owner socket the text was actually written to; the CR goes only there.
+  // Bound: one in-flight delivery to another session plus our own.
+  const SUBMIT_QUEUE_TIMEOUT_MS = (() => {
+    const configured = Number(process.env.TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS || 10000);
+    return Number.isFinite(configured) && configured > 0 ? configured : 10000;
+  })();
+  const MAILBOX_TEXT_WAIT_MS = 2 * DELIVERY_TIMEOUT_MS;
+  const injectionTargets = new Map(); // pending text stays bound to its original instance
+  const mailboxTextWaiters = new Map(); // msg_id → { settle(ownerWs), lastFailure }
+
+  function awaitMailboxText(msgId, timeoutMs) {
+    return new Promise((resolve) => {
+      const waiter = { lastFailure: null };
+      const timer = setTimeout(() => {
+        mailboxTextWaiters.delete(msgId);
+        resolve({ delivered: false, lastFailure: waiter.lastFailure });
+      }, timeoutMs);
+      waiter.settle = (ownerWs) => {
+        clearTimeout(timer);
+        mailboxTextWaiters.delete(msgId);
+        resolve({ delivered: true, ownerWs });
+      };
+      mailboxTextWaiters.set(msgId, waiter);
+    });
+  }
+
   async function deliverInjectionToSession(id, session, prompt, options = {}) {
     const now = Date.now();
+    const sessionEpoch = session.sessionEpoch || null;
+    // PR #108 TP1: the owner generation is the owner SOCKET. A same-bearer re-claim keeps the
+    // record and the epoch but replaces ownerWs, and that replacement never saw this inject.
+    const entryOwnerWs = session.ownerWs;
     if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
       const healthStatus = getSessionHealthStatus(session, { nowMs: now });
       if (healthStatus === 'STALE') {
@@ -173,6 +225,9 @@ function createSessionDeliveryContext({
     // only the bootstrapReady boolean, which a blind timer flips without ever looking at the
     // screen (shouldApplyOwnerAliveFloor).
     const modalDecision = await resolveModalGate(id, session, options);
+    if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
+    const currentFailure = getInjectFailure(session, { nowMs: Date.now() });
+    if (currentFailure) return { success: false, ...currentFailure };
 
     // #760: ORDER. Once anything is parked for this session, everything behind it parks too —
     // including after the modal clears, until the drain has actually caught up. Without this
@@ -236,6 +291,40 @@ function createSessionDeliveryContext({
     // reliably fires instead of being swallowed into the paste burst. No-op otherwise.
     const deliveredBody = maybeBracketedPaste(deliveredPrompt, session);
 
+    // #107: the deferred CR below belongs to THIS text. Without a barrier, a second inject
+    // arriving inside the submit delay writes its text first and the target reads
+    // text1 text2 CR CR — one glued line (and the bridge's #720 filter then drops the second,
+    // now consecutive, CR as a duplicate). Wait for any earlier submit on this session, then
+    // claim the barrier synchronously so a third inject queues behind this one.
+    //
+    // #109: the wait is bounded (SUBMIT_QUEUE_TIMEOUT_MS) and answered with a typed QUEUE_TIMEOUT
+    // instead of the caller's own client timeout; nothing is enqueued for a timed-out caller.
+    // After the wait (and resolveModalGate above) the id must still name THIS instance — a session
+    // destroyed, renamed or recreated meanwhile gets SESSION_GONE, never the text.
+    const queueDeadline = Date.now() + SUBMIT_QUEUE_TIMEOUT_MS;
+    while (session.pendingSubmit) {
+      const remaining = queueDeadline - Date.now();
+      let timer;
+      const timedOut = remaining <= 0 || await Promise.race([
+        session.pendingSubmit.then(() => false),
+        new Promise((resolve) => { timer = setTimeout(resolve, remaining, true); })
+      ]);
+      clearTimeout(timer);
+      if (timedOut) {
+        return { success: false, httpStatus: 503, code: 'QUEUE_TIMEOUT',
+          error: `Earlier submits on this session did not clear within ${SUBMIT_QUEUE_TIMEOUT_MS} ms; nothing was written. Retry.` };
+      }
+    }
+    if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
+    const liveFailure = getInjectFailure(session, { nowMs: Date.now() });
+    if (liveFailure) return { success: false, ...liveFailure };
+    let releaseSubmit = () => {};
+    if (!options.noEnter && session.type !== 'aterm') {
+      session.pendingSubmit = new Promise((resolve) => {
+        releaseSubmit = () => { session.pendingSubmit = null; resolve(); };
+      });
+    }
+
     try {
       const ack = getMailbox().enqueue({
         msg_id: msgId,
@@ -245,6 +334,10 @@ function createSessionDeliveryContext({
         created_at: Math.floor(now / 1000),
         attempt: 0,
       });
+      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs });
+      // Registered synchronously after the enqueue: no tick can run in between.
+      const owesSubmit = !options.noEnter && session.type !== 'aterm';
+      const textWait = owesSubmit ? awaitMailboxText(msgId, MAILBOX_TEXT_WAIT_MS) : null;
 
       // Notify aterm sessions immediately via UDS wake
       if (session.type === 'aterm') {
@@ -257,10 +350,41 @@ function createSessionDeliveryContext({
       } catch {}
 
       // Send CR separately after delay (outside paste brackets)
-      if (!options.noEnter && session.type !== 'aterm') {
+      if (owesSubmit) {
+        const text = await textWait;
+        if (!text.delivered) {
+          // Not written in time. Withdraw it if no deliverer holds it, so it can never land later
+          // without its CR and a retry cannot duplicate it; if one does hold it, say so.
+          let withdrawn = false;
+          try { withdrawn = getMailbox().withdraw(id, msgId, 'submit_unpaired: text not delivered in time'); } catch {}
+          // Not withdrawable is not always "in flight" (review N1): a purge (session destroyed) leaves
+          // no record and a dead-lettered message cannot be written any more either.
+          let state;
+          if (!withdrawn) { try { state = getMailbox().messageState(id, msgId); } catch {} }
+          injectionTargets.delete(msgId);
+          releaseSubmit();
+          if (!withdrawn && state === null) return { ...sessionGoneResult(), msg_id: msgId };
+          const failure = text.lastFailure;
+          return withdrawn || state === 'dead_letter'
+            ? { success: false, httpStatus: (failure && failure.httpStatus) || 504, code: (failure && failure.code) || 'TIMEOUT',
+              error: `The text was not delivered within ${MAILBOX_TEXT_WAIT_MS} ms${failure && failure.error ? ` (${failure.error})` : ''}; it was ${withdrawn ? 'withdrawn' : 'dead-lettered'} and will not be written. Retry.`,
+              msg_id: msgId }
+            : { success: false, httpStatus: 504, code: 'DELIVERY_UNCERTAIN',
+              error: `The text was handed to delivery but not confirmed within ${MAILBOX_TEXT_WAIT_MS} ms; it may still arrive, without a CR. Do not retry blindly.`,
+              msg_id: msgId };
+        }
         const submitDelay = session.type === 'wrapped' ? 500 : 300;
         setTimeout(async () => {
-          const submitResult = await writeDataToSession(id, session, '\r');
+          let submitResult;
+          try {
+            // #109: never a bare CR into an instance that did not get this inject's text.
+            // PR #108 TP1: nor into an owner socket other than the one that got it.
+            submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === text.ownerWs
+              ? await writeDataToSession(id, session, '\r')
+              : sessionGoneResult();
+          } finally {
+            releaseSubmit();
+          }
           if (!submitResult.success) {
             emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
               phase: 'submit',
@@ -282,13 +406,25 @@ function createSessionDeliveryContext({
     } catch (err) {
       console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
       // Fallback: direct delivery (backward compat during migration)
+      injectionTargets.delete(msgId);
+      if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) { releaseSubmit(); return sessionGoneResult(); }
+      const textOwnerWs = session.ownerWs;
       const textResult = await writeDataToSession(id, session, deliveredBody);
-      if (!textResult.success) return textResult;
+      if (!textResult.success) { releaseSubmit(); return textResult; }
 
       if (!options.noEnter && session.type !== 'aterm') {
         const submitDelay = session.type === 'wrapped' ? 500 : 300;
         setTimeout(async () => {
-          const submitResult = await writeDataToSession(id, session, '\r');
+          let submitResult;
+          try {
+            // #109: never a bare CR into an instance that did not get this inject's text.
+            // PR #108 TP1: nor into an owner socket other than the one that got it.
+            submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === textOwnerWs
+              ? await writeDataToSession(id, session, '\r')
+              : sessionGoneResult();
+          } finally {
+            releaseSubmit();
+          }
           if (!submitResult.success) {
             emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
               phase: 'submit',
@@ -307,6 +443,7 @@ function createSessionDeliveryContext({
     }
   }
 
+
   const resolveMailboxSocket = (sessionId) => {
     const session = sessions[sessionId];
     if (!session || session.type !== 'aterm') return null;
@@ -319,13 +456,33 @@ function createSessionDeliveryContext({
     deliverFn: async (sessionId, msg) => {
       const session = sessions[sessionId];
       if (!session) return { success: false, error: 'Session not found' };
+      const target = injectionTargets.get(msg.msg_id);
+      if (target && (!isSameSessionInstance(sessionId, target.session, target.sessionEpoch)
+          || session.ownerWs !== target.ownerWs)) {
+        injectionTargets.delete(msg.msg_id);
+        getMailbox().withdraw(sessionId, msg.msg_id, 'session_gone', { inFlight: true });
+        const waiter = mailboxTextWaiters.get(msg.msg_id);
+        if (waiter) waiter.lastFailure = sessionGoneResult();
+        return sessionGoneResult();
+      }
+      const ownerWs = session.ownerWs;
       const result = await writeDataToSession(sessionId, session, msg.payload);
+      const waiter = mailboxTextWaiters.get(msg.msg_id);
+      if (waiter) {
+        if (result.success) waiter.settle(ownerWs);
+        else waiter.lastFailure = result;
+      }
       if (result.success) {
+        injectionTargets.delete(msg.msg_id);
         session.lastActivityAt = new Date().toISOString();
       }
       return result;
     },
     onDelivery: (sessionId, msgId, result) => {
+      if (injectionTargets.has(msgId)) {
+        const state = getMailbox().messageState(sessionId, msgId);
+        if (state === null || state === 'dead_letter') injectionTargets.delete(msgId);
+      }
       const session = sessions[sessionId];
       if (!session) return;
       if (result.success) {
