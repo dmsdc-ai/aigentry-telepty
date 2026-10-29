@@ -123,7 +123,7 @@ test('#22 real owner frames and CLI observe readiness, invalidate on output/inpu
     expectedToken: token, verifyJwt: () => false, isAllowedPeer: () => true,
     initializeBootstrapState: () => {}, findKittySocket: () => null, findKittyWindowId: () => null,
     markSessionConnected: () => {}, scheduleBootstrapPromptPoll: () => {},
-    emitSessionLifecycleEvent: () => {}, persistSessions: () => {},
+    emitSessionLifecycleEvent: () => {}, persistSessions: () => ({ ok: true, committed: true }),
     appendToOutputRing: (session, data) => session.outputRing.push(data),
     sessionStateManager: { feed: () => {} }, isBootstrapGatedSession: () => false,
     markBootstrapReady: () => {}, pendingReports: {}, fireAutoReport: () => {},
