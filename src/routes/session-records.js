@@ -30,7 +30,7 @@ function createSessionRecordContext({ sessions, sessionCredentials, sidNonces, s
   const SESSION_PERSIST_PATH = sessionPersistPath;
 
   function persistSessions() {
-    sessionPersistence.savePersistedSessions(sessions, SESSION_PERSIST_PATH);
+    return sessionPersistence.savePersistedSessions(sessions, SESSION_PERSIST_PATH);
   }
 
   // Mint the credential + nonce for a NEW instance of `sid`. The bearer and nonce it returns are
@@ -127,6 +127,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       // Keyed off the RESOLVED record's own id (daemon-owned state), never the raw body string —
       // identical here since we are inside the own-record branch, but it keeps
       // attacker-controlled text out of the credential path entirely.
+      const previous = Object.getOwnPropertyDescriptors(existing);
       const credentialed = sessionCredentials.matches(existing.id, req.headers['x-telepty-session-token']);
       if (command) existing.command = command;
       if (cwd) existing.cwd = cwd;
@@ -172,6 +173,14 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       // machine. register() is idempotent (returns the existing machine untouched), so this is
       // safe for the normal re-register too — and it is the ONLY thing that recreates the
       // machine for a same-id reconnect, since a daemon restart is not required to reach here.
+      const saved = persistSessions();
+      if (!saved || !saved.ok) {
+        if (!saved || !saved.committed) {
+          for (const key of Object.keys(existing)) delete existing[key];
+          Object.defineProperties(existing, previous);
+        }
+        return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
+      }
       sessionStateManager.register(session_id);
       console.log(`[REGISTER] Re-registered session ${session_id} (type: ${existing.type}, updated metadata)`);
       // #815: NO credential material in a re-register response — not the bearer, not the nonce, not
@@ -228,6 +237,16 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     };
     initializeBootstrapState(sessionRecord);
     applyTimestampMetadata(sessionRecord, req.body);
+    Object.defineProperty(sessions, session_id, { value: sessionRecord, enumerable: true, writable: true, configurable: true });
+    const saved = persistSessions();
+    if (!saved || !saved.ok) {
+      if (!saved || !saved.committed) {
+        delete sessions[session_id];
+        context.revokeSessionCredential(session_id);
+      }
+      return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
+    }
+    sessionStateManager.register(session_id);
     // Check for existing session with same base alias and emit replaced event
     const baseAlias = session_id.replace(/-\d+$/, '');
     const replaced = Object.keys(sessions).find(id => {
@@ -248,9 +267,6 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       console.log(`[ALIAS] Session '${replaced}' replaced by '${session_id}' (alias: ${baseAlias})`);
     }
 
-    Object.defineProperty(sessions, session_id, { value: sessionRecord, enumerable: true, writable: true, configurable: true });
-    sessionStateManager.register(session_id);
-
     const busMsg = JSON.stringify({
       type: 'session_register',
       sender: 'daemon',
@@ -267,14 +283,13 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     // #815: persist the verifier BEFORE acknowledging. persistSessions() is synchronous, so once
     // this response is on the wire the credential is already durable — a daemon that dies between
     // the two can never leave a bearer in a child's env with no verifier on disk to match it.
-    persistSessions();
     // The bearer and nonce cross the wire HERE and only here, once, to this one caller.
     res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd, session_token: issued.bearer, session_epoch: issued.epoch, credential_generation: issued.generation, session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
   });
 }
 
 function registerSessionRenameRoute(app, { context, sessionStateManager, busClients }) {
-  const { sessions, sessionCredentials, sidNonces, resolveSessionAlias } = context;
+  const { sessions, sessionCredentials, sidNonces, resolveSessionAlias, persistSessions } = context;
   app.patch('/api/sessions/:id', (req, res) => {
     const requestedId = req.params.id;
     const resolvedId = resolveSessionAlias(requestedId);
@@ -290,6 +305,17 @@ function registerSessionRenameRoute(app, { context, sessionStateManager, busClie
     // Move session to new key (including state machine)
     Object.defineProperty(sessions, new_id, { value: session, enumerable: true, writable: true, configurable: true });
     delete sessions[id];
+    session.id = new_id;
+    const saved = persistSessions();
+    if (!saved || !saved.ok) {
+      if (!saved || !saved.committed) {
+        delete sessions[new_id];
+        Object.defineProperty(sessions, id, { value: session, enumerable: true, writable: true, configurable: true });
+        session.id = id;
+        return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
+      }
+      // Rename reached disk: keep the credential index consistent, but do not claim durability.
+    }
     // #815: a rename moves ONE LIVE INSTANCE to a new name — same PTY, same owner, same epoch. The
     // credential follows the instance rather than being revoked, or the running child (which holds
     // the bearer in an environment nobody can update) would silently lose its identity. Only
@@ -302,7 +328,7 @@ function registerSessionRenameRoute(app, { context, sessionStateManager, busClie
     }
     sessionStateManager.unregister(id);
     sessionStateManager.register(new_id);
-    session.id = new_id;
+    if (!saved.ok) return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
 
     // Broadcast rename to bus
     const busMsg = JSON.stringify({

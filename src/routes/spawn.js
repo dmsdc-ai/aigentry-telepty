@@ -139,19 +139,15 @@ function registerSpawnRoute(app, {
         ready: true,
             };
       sessions[session_id] = sessionRecord;
-
-      // Broadcast session creation to bus
-      const spawnMsg = JSON.stringify({
-        type: 'session_spawn',
-        sender: 'daemon',
-        session_id,
-        command,
-        cwd,
-        timestamp: new Date().toISOString()
-      });
-      busClients.forEach(client => {
-        if (client.readyState === 1) client.send(spawnMsg);
-      });
+      const saved = persistSessions();
+      if (!saved || !saved.ok) {
+        if (!saved || !saved.committed) {
+          delete sessions[session_id];
+          // This process was created by this request and has not been published to clients.
+          try { ptyProcess.kill(); } catch (error) { console.error('[SPAWN] Rollback kill failed:', error.message); }
+        }
+        if (!saved || !saved.committed) return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
+      }
 
       ptyProcess.onData((data) => {
         const currentSession = sessions[sessionRecord.id];
@@ -181,11 +177,26 @@ function registerSpawnRoute(app, {
           delete sessions[currentId];
           revokeSessionCredential(currentId);   // #815: PTY exit — the instance is gone
           sessionStateManager.unregister(currentId);
+          const saved = persistSessions();
+          if (!saved || !saved.ok) console.error('[EXIT] Session removal was not durably saved:', currentId);
         }
       });
 
+      if (!saved.ok) return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
       console.log('[SPAWN] Created session %s (%s)', session_id, command);
-      persistSessions();
+      // Broadcast session creation to bus
+      const spawnMsg = JSON.stringify({
+        type: 'session_spawn',
+        sender: 'daemon',
+        session_id,
+        command,
+        cwd,
+        timestamp: new Date().toISOString()
+      });
+      busClients.forEach(client => {
+        if (client.readyState === 1) client.send(spawnMsg);
+      });
+
       res.status(201).json({ session_id, command, cwd });
     } catch (err) {
       res.status(500).json({ error: err.message });

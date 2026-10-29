@@ -529,10 +529,20 @@ function createSessionActions(shared, effects = {}) {
       return parsed;
     }
 
+    const previous = Object.getOwnPropertyDescriptors(session);
     session.stateReport = parsed.report;
     session.lastStateReportAt = parsed.report.timestamp;
     if (parsed.report.thread_id) {
       session.lastThreadId = parsed.report.thread_id;
+    }
+
+    const saved = (0, shared.persistSessions)();
+    if (!saved || !saved.ok) {
+      if (!saved || !saved.committed) {
+        for (const key of Object.keys(session)) delete session[key];
+        Object.defineProperties(session, previous);
+      }
+      return { success: false, httpStatus: 503, code: 'SESSION_STORE_WRITE_FAILED', error: 'Session store write failed' };
     }
 
     const event = (0, shared.broadcastSessionEvent)('session_state_report', sessionId, session, {
@@ -624,7 +634,9 @@ function createSessionActions(shared, effects = {}) {
     shared.sessionStateManager.unregister(id);
     try { shared.mailbox.purge(id); } catch {}
     shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
-    (0, shared.persistSessions)();
+    const saved = (0, shared.persistSessions)();
+    if (!saved || !saved.ok) return { success: false, httpStatus: 503, code: 'SESSION_STORE_WRITE_FAILED',
+      error: 'Session was removed but its removal was not durably saved', registry_removed: true, kill };
 
     return {
       success: true,
@@ -797,7 +809,6 @@ function createSessionActions(shared, effects = {}) {
         return (0, shared.respondWithError)(res, applied.httpStatus || 400, applied.code || 'INVALID_REQUEST', applied.error);
       }
 
-      (0, shared.persistSessions)();
       res.json({
         success: true,
         session_id: resolvedId,
@@ -1557,7 +1568,7 @@ function createSessionActions(shared, effects = {}) {
           source: req.body && req.body.source ? String(req.body.source) : 'api'
         });
         if (!result.success) {
-          return res.status(result.httpStatus || 500).json({ error: result.error || 'Failed to kill session' });
+          return res.status(result.httpStatus || 500).json({ ...result, error: result.error || 'Failed to kill session' });
         }
         console.log(`[KILL] Session ${resolvedId} closed (reason=${result.reason}, force=${result.force}, pid=${result.kill.pid || 'none'})`);
         res.json(result);
@@ -1648,7 +1659,10 @@ function createSessionActions(shared, effects = {}) {
       (0, shared.revokeSessionCredential)(id);    // #815: DELETE — revoke before the id can be reused
       try { shared.mailbox.purge(id); } catch {}
       shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
-      (0, shared.persistSessions)();
+      const saved = (0, shared.persistSessions)();
+      if (!saved || !saved.ok) return res.status(503).json({ success: false, code: 'SESSION_STORE_WRITE_FAILED',
+        error: 'Session was removed but its removal was not durably saved', registry_removed: true,
+        kill_error: killError ? killError.message : null });
       const teardown = describeSessionTeardown(killError);
       console.log(killError
         ? `[KILL] Session ${id} registry-removed but the kill was NOT confirmed: ${killError.message}`
@@ -1676,7 +1690,6 @@ function createSessionActions(shared, effects = {}) {
           return (0, shared.respondWithError)(res, applied.httpStatus || 400, applied.code || 'INVALID_REQUEST', applied.error);
         }
 
-        (0, shared.persistSessions)();
         return res.json({ success: true, delivered: shared.busClients.size, event: applied.event });
       }
 

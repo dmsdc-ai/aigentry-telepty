@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 function defaultSessionPersistPath(homeDir = os.homedir()) {
   return path.join(homeDir, '.config', 'aigentry-telepty', 'sessions.json');
@@ -62,29 +63,120 @@ function serializePersistedSessions(sessions) {
   return data;
 }
 
-// #815: this file now carries credential verifiers, so it is owner-only (0600). The mode is
-// passed to writeFileSync for the create case AND chmod'ed explicitly, because writeFileSync's
-// mode applies only when it creates the file — an existing 0644 sessions.json written by an
-// older daemon would otherwise keep its permissions forever.
+// #815: credential verifiers require owner-only files. Each replacement is created private;
+// legacy generations are tightened through their checked descriptor when loaded.
 const SESSION_FILE_MODE = 0o600;
 
-function savePersistedSessions(sessions, persistPath = defaultSessionPersistPath()) {
+function unsafeSessionPath() {
+  return Object.assign(new Error('Unsafe session storage path'), { code: 'SESSION_STORE_UNSAFE_PATH' });
+}
+
+// Reject link/reparse ancestors before mkdir or chmod can follow them. The final directory is
+// daemon-private; ancestors may be shared (e.g. /tmp) and must never be chmod'ed here.
+function checkSessionDirectory(dir, create) {
+  const resolved = path.resolve(dir);
+  let current = path.parse(resolved).root;
+  for (const part of resolved.slice(current.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    let st;
+    try { st = fs.lstatSync(current); } catch (error) {
+      if (!create || error.code !== 'ENOENT') throw error;
+      try { fs.mkdirSync(current, { mode: 0o700 }); } catch (mkdirError) {
+        if (mkdirError.code !== 'EEXIST') throw mkdirError;
+      }
+      st = fs.lstatSync(current);
+    }
+    if (!st.isDirectory() || st.isSymbolicLink()) throw unsafeSessionPath();
+  }
+  const st = fs.lstatSync(resolved);
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw unsafeSessionPath();
+  return resolved;
+}
+
+// macOS exposes /tmp and /var through system aliases. Resolve only the environment's
+// trusted HOME/temp base, then reject any link beneath that base as usual.
+function sessionStoragePath(persistPath) {
+  const file = path.resolve(persistPath);
+  for (const base of [os.homedir(), os.tmpdir()]) {
+    const root = path.resolve(base);
+    const relative = path.relative(root, file);
+    if (relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)) {
+      try { return path.join(fs.realpathSync(root), relative); } catch { /* mkdir handles a missing home */ }
+    }
+  }
+  return file;
+}
+
+function checkSessionLeaf(file) {
   try {
-    const data = serializePersistedSessions(sessions);
-    fs.mkdirSync(path.dirname(persistPath), { recursive: true });
-    fs.writeFileSync(persistPath, JSON.stringify(data, null, 2), { mode: SESSION_FILE_MODE });
-    try { fs.chmodSync(persistPath, SESSION_FILE_MODE); } catch {}
-  } catch {}
+    const st = fs.lstatSync(file);
+    if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1
+        || (typeof process.getuid === 'function' && st.uid !== process.getuid())) throw unsafeSessionPath();
+    return st;
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+// A failure before rename leaves the previous generation untouched. Once rename succeeds,
+// committed:true identifies the new visible generation even if directory fsync then fails;
+// callers must not roll memory back to a generation the disk no longer contains.
+function savePersistedSessions(sessions, persistPath = defaultSessionPersistPath()) {
+  let fd = null, dirFd = null, tmp = null, committed = false;
+  try {
+    const body = JSON.stringify(serializePersistedSessions(sessions), null, 2);
+    const file = sessionStoragePath(persistPath);
+    const dir = checkSessionDirectory(path.dirname(file), true);
+    checkSessionLeaf(file);
+    // Do not tighten arbitrary caller-supplied shared directories.
+    if (process.platform !== 'win32' && (fs.statSync(dir).mode & 0o077) !== 0
+        && dir === path.dirname(sessionStoragePath(defaultSessionPersistPath()))) {
+      fs.chmodSync(dir, 0o700);
+    }
+    // Windows chmod does not express DACL privacy; retain its existing mode request without
+    // interpreting synthetic POSIX permission bits as a reason to reject every NTFS directory.
+    if (process.platform !== 'win32' && (fs.statSync(dir).mode & 0o077) !== 0) {
+      throw Object.assign(new Error('Session storage directory must be owner-private'), { code: 'SESSION_STORE_UNSAFE_PATH' });
+    }
+    tmp = path.join(dir, `.sessions.${process.pid}.${crypto.randomBytes(12).toString('hex')}.tmp`);
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+      | (fs.constants.O_NOFOLLOW || 0), SESSION_FILE_MODE);
+    fs.fchmodSync(fd, SESSION_FILE_MODE);
+    fs.writeFileSync(fd, body);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = null;
+    // Windows does not support opening/fsync'ing a directory. File fsync + rename still
+    // provide complete generations there; native NTFS/DACL crash guarantees need platform QA.
+    if (process.platform !== 'win32') dirFd = fs.openSync(dir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0));
+    checkSessionDirectory(dir, false);
+    checkSessionLeaf(file);
+    fs.renameSync(tmp, file); committed = true; tmp = null;
+    if (dirFd !== null) fs.fsyncSync(dirFd);
+    return { ok: true, committed: true };
+  } catch (error) {
+    return { ok: false, committed, reason: 'session_store_write_failed', error };
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+    if (dirFd !== null) { try { fs.closeSync(dirFd); } catch {} }
+    if (tmp !== null) { try { fs.unlinkSync(tmp); } catch {} }
+  }
 }
 
 function loadPersistedSessions(persistPath = defaultSessionPersistPath()) {
+  let fd = null;
   try {
-    if (!fs.existsSync(persistPath)) return {};
-    // Tighten on the way in too: a file left world-readable by a pre-#815 daemon must not stay
-    // that way until the next write happens to land.
-    try { fs.chmodSync(persistPath, SESSION_FILE_MODE); } catch {}
-    return JSON.parse(fs.readFileSync(persistPath, 'utf8'));
+    const file = sessionStoragePath(persistPath);
+    checkSessionDirectory(path.dirname(file), false);
+    const st = checkSessionLeaf(file);
+    if (!st) return {};
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== st.dev || opened.ino !== st.ino) throw unsafeSessionPath();
+    fs.fchmodSync(fd, SESSION_FILE_MODE);
+    return JSON.parse(fs.readFileSync(fd, 'utf8'));
   } catch { return {}; }
+  finally { if (fd !== null) { try { fs.closeSync(fd); } catch {} } }
 }
 
 function buildRestoredWrappedSession(id, meta, options = {}) {
@@ -140,7 +232,7 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
 // no outcome field, by construction, so there is nothing in it for a future reader to mistake
 // for one.
 //
-// The write is transactional, unlike savePersistedSessions above: same-directory temp file →
+// Like the session store, the ledger uses: same-directory temp file →
 // fsync the file → atomic rename → fsync the directory. A crash therefore leaves either the
 // complete old generation or the complete new one, never an empty or half-written file. That
 // matters because this write is the thing that has to happen BEFORE bytes reach the target.

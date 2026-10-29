@@ -14,7 +14,7 @@ function fixture({ legacy = false } = {}) {
   let handler;
   registerSessionRegisterRoute({ post: (_path, route) => { handler = route; } }, {
     context: { sessions, sessionCredentials, issueSessionCredential: () => { throw Error('must not mint'); },
-      persistSessions: () => { throw Error('existing route should not persist here'); } },
+      persistSessions: () => ({ ok: true, committed: true }) },
     sessionStateManager: { register: () => {} }, busClients: new Set()
   });
   return {

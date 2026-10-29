@@ -2390,15 +2390,25 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
       && disconnectedSeconds >= SESSION_CLEANUP_SECONDS;
 
     if (shouldCleanupDisconnected) {
-      emitSessionLifecycleEvent('session_cleanup', id, session, {
-        reason: 'STALE_DISCONNECTED',
-        disconnectedSeconds
-      });
+      // Commit the removal before revoking authority or publishing a lifecycle transition.
       delete sessions[id];
-      revokeSessionCredential(id);  // #815: TTL/GC is the routine reuse path — revoke here too
+      const saved = persistSessions();
+      if (!saved || !saved.ok) {
+        if (!saved || !saved.committed) {
+          Object.defineProperty(sessions, id, { value: session, enumerable: true, writable: true, configurable: true });
+        } else {
+          revokeSessionCredential(id);
+          sessionStateManager.unregister(id);
+        }
+        console.error('[CLEANUP] Session removal was not durably saved:', id);
+        continue;
+      }
+      revokeSessionCredential(id);
       sessionStateManager.unregister(id);
+      emitSessionLifecycleEvent('session_cleanup', id, session, {
+        reason: 'STALE_DISCONNECTED', disconnectedSeconds
+      });
       console.log(`[CLEANUP] Removed stale session ${id} after ${disconnectedSeconds}s disconnected`);
-      persistSessions();
     }
   }
   }, HEALTH_POLL_MS);
@@ -2465,9 +2475,14 @@ installWebSocketTransport({
   acceptInteractionReceipt
 });
 
-function shutdown(code) {
+let shuttingDown = false;
+async function shutdown(code) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   mailboxDelivery.stop();
   mailboxNotifier.cancelAll();
+  if (server) server.close();
+  try { await auditWriter.close(); } catch (error) { console.error('[AUDIT] Shutdown flush failed:', error.message); }
   clearDaemonState(process.pid);
   process.exit(code);
 }

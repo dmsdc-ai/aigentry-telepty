@@ -206,6 +206,7 @@ function installWebSocketTransport(deps) {
       console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect (command: ${autoSession.command})`);
       // Set tab title via kitty (no \x0c redraw — it causes flickering on multi-session reconnect)
       setTimeout(() => {
+        if (sessions[sessionId] !== autoSession || autoSession.ownerWs !== ws) return;
         const sock = findKittySocket();
         const wid = findKittyWindowId(sock, sessionId);
         if (sock && wid) {
@@ -303,23 +304,8 @@ function installWebSocketTransport(deps) {
       // injects were assigned to, and it is the evidence `owner_epoch_replaced` requires.
       const displacedSessionEpoch = activeSession.sessionEpoch || null;
       const displacedLiveOwnerSocket = displacedLiveOwner ? activeSession.ownerWs : null;
-      if (isOwnerConnect && activeSession.ownerWs && activeSession.ownerWs !== ws) {
-        // telepty#56 (durable last-writer-wins Replace): close the displaced owner with the
-        // dedicated terminal code 4001 'Owner replaced' instead of a bare terminate(). A
-        // terminate() is an abnormal 1006 close, which a bridge reads as a transient drop and
-        // RECONNECTS — re-contending for the id and oscillating forever (Total flaps 1<->2,
-        // injects dropped). 4001 is reason-independent (WS 4000-4999 = app-reserved), so the
-        // displaced bridge exits without reconnecting even when the close reason is lost on a
-        // half-open TCP socket. The session RECORD survives under the new owner; no shared-fate
-        // cascade — the displaced bridge's now-stale ownerToken is suppressed by the #536 DELETE
-        // guard. A fallback terminate() reaps a half-open socket that never ACKs the close.
-        console.log(`[WS] Replacing stale ownerWs for session ${sessionId}`);
-        const displaced = activeSession.ownerWs;
-        try { displaced.close(4001, 'Owner replaced'); } catch {}
-        setTimeout(() => {
-          if (displaced.readyState !== 3) { try { displaced.terminate(); } catch {} }
-        }, 1000);
-      }
+      const previousOwnerWs = activeSession.ownerWs;
+      const previous = Object.getOwnPropertyDescriptors(activeSession);
       activeSession.ownerWs = ws;
       // #60 Stage A §3 item 4/5 — the new owner's authenticated epoch, or NULL when it proved
       // none. Null is written deliberately rather than leaving the predecessor's value in place:
@@ -350,6 +336,40 @@ function installWebSocketTransport(deps) {
       // stale one.
       activeSession.ownerToken = crypto.randomUUID();
       activeSession.interactionOwnerGeneration = crypto.randomUUID();
+      markSessionConnected(activeSession);
+      initializeBootstrapState(activeSession);
+      const saved = persistSessions();
+      if (!saved || !saved.ok) {
+        if (!saved || !saved.committed) {
+          for (const key of Object.keys(activeSession)) delete activeSession[key];
+          Object.defineProperties(activeSession, previous);
+          if (!session) delete sessions[sessionId];
+        } else {
+          // The committed generation names this owner; detach it without restoring stale authority.
+          activeSession.ownerWs = null;
+        }
+        activeSession.clients.delete(ws);
+        clearInterval(pingInterval);
+        try { ws.close(1011, 'Session store write failed'); } catch {}
+        return;
+      }
+      if (isOwnerConnect && previousOwnerWs && previousOwnerWs !== ws) {
+        // telepty#56 (durable last-writer-wins Replace): close the displaced owner with the
+        // dedicated terminal code 4001 'Owner replaced' instead of a bare terminate(). A
+        // terminate() is an abnormal 1006 close, which a bridge reads as a transient drop and
+        // RECONNECTS — re-contending for the id and oscillating forever (Total flaps 1<->2,
+        // injects dropped). 4001 is reason-independent (WS 4000-4999 = app-reserved), so the
+        // displaced bridge exits without reconnecting even when the close reason is lost on a
+        // half-open TCP socket. The session RECORD survives under the new owner; no shared-fate
+        // cascade — the displaced bridge's now-stale ownerToken is suppressed by the #536 DELETE
+        // guard. A fallback terminate() reaps a half-open socket that never ACKs the close.
+        console.log(`[WS] Replacing stale ownerWs for session ${sessionId}`);
+        const displaced = previousOwnerWs;
+        try { displaced.close(4001, 'Owner replaced'); } catch {}
+        setTimeout(() => {
+          if (displaced.readyState !== 3) { try { displaced.terminate(); } catch {} }
+        }, 1000);
+      }
       invalidateInteraction(activeSession, 'owner_replaced');
       try { ws.send(JSON.stringify({ type: 'owner_token', token: activeSession.ownerToken,
         interaction_binding: { sid: sessionId, session_epoch: activeSession.sessionEpoch,
@@ -358,8 +378,7 @@ function installWebSocketTransport(deps) {
           input_generation: activeSession.interactionInputGeneration || 0,
           geometry_generation: activeSession.interactionGeometryGeneration || 0,
           surface_id: activeSession.cmuxSurfaceId || sessionId } })); } catch {}
-      markSessionConnected(activeSession);
-      initializeBootstrapState(activeSession);
+
       console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
       scheduleBootstrapPromptPoll(sessionId, activeSession);
       // #815: emit the honest lifecycle fact BEFORE any continuity claim. A live owner was
@@ -403,7 +422,6 @@ function installWebSocketTransport(deps) {
       if (hadDisconnectedOwner) {
         emitSessionLifecycleEvent('session_reconnect', sessionId, activeSession);
       }
-      persistSessions();
     } else {
       console.log(`[WS] Client attached to session ${sessionId} (Total: ${activeSession.clients.size})`);
       // #89 — replay the current screen to THIS viewer, synchronously, so it is queued ahead of
@@ -647,7 +665,8 @@ function installWebSocketTransport(deps) {
         emitSessionLifecycleEvent('session_disconnect', sessionId, activeSession, {
           clients: activeSession.clients.size
         });
-        persistSessions();
+        const saved = persistSessions();
+        if (!saved || !saved.ok) console.error('[WS] Owner disconnect was not durably saved:', sessionId);
       } else {
         console.log(`[WS] Client detached from session ${sessionId} (Total: ${activeSession.clients.size})`);
       }
@@ -674,7 +693,7 @@ function installWebSocketTransport(deps) {
             return;
           }
 
-          persistSessions();
+          // applySessionStateReport commits before publishing the event.
           return;
         }
 

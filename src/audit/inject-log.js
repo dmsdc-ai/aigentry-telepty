@@ -90,7 +90,7 @@ function createAuditWriter(options = {}) {
   const emitter = new EventEmitter();
   let queue = [];
   let timer = null;
-  let writing = false;
+  let writing = null;
   let closed = false;
   let droppedTotal = 0;
 
@@ -121,14 +121,19 @@ function createAuditWriter(options = {}) {
   }
 
   function scheduleFlush() {
-    if (timer || writing || queue.length === 0) return;
+    if (closed || timer || writing || queue.length === 0) return;
     timer = setTimeout(() => { timer = null; flush().catch(() => {}); }, flushMs);
     if (timer && typeof timer.unref === 'function') timer.unref();
   }
 
   async function flush() {
-    if (writing || queue.length === 0) return;
-    writing = true;
+    if (writing) await writing;
+    if (queue.length === 0) return;
+    writing = writeBatch();
+    await writing;
+  }
+
+  async function writeBatch() {
     const batch = queue;
     queue = [];
     try {
@@ -141,7 +146,7 @@ function createAuditWriter(options = {}) {
     } catch (err) {
       emitter.emit('audit_error', err);
     } finally {
-      writing = false;
+      writing = null;
       if (queue.length > 0) scheduleFlush();
     }
   }
@@ -175,7 +180,7 @@ function createAuditWriter(options = {}) {
   async function close() {
     closed = true;
     if (timer) { clearTimeout(timer); timer = null; }
-    await flush();
+    do { await flush(); } while (writing || queue.length > 0);
   }
 
   return {
