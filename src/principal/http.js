@@ -64,7 +64,7 @@ function resolveAction(req) {
     return { action: pathname.endsWith('/register') ? 'session.register' : 'session.create', target: id.value, creation: true,
       operatorOnly: pathname.endsWith('/spawn') };
   }
-  const match = /^\/api\/sessions\/([^/]+)(?:\/(diagnostics|handshake|screen|inject|state|submit|kill|mailbox(?:\/ack)?|lease))?$/.exec(pathname);
+  const match = /^\/api\/sessions\/([^/]+)(?:\/(diagnostics|handshake|screen|inject|state|submit|kill|takeover|mailbox(?:\/ack)?|lease))?$/.exec(pathname);
   if (!match) return null;
   let id;
   try { id = decodeURIComponent(match[1]); } catch { return null; }
@@ -72,6 +72,7 @@ function resolveAction(req) {
   const suffix = match[2];
   if (method === 'GET' && [undefined, 'diagnostics', 'handshake', 'screen'].includes(suffix)) return { action: 'session.inspect', target: id, readOnly: true };
   if (method === 'GET' && suffix === 'mailbox') return { action: 'mailbox.read', target: id, readOnly: true };
+  if (method === 'POST' && suffix === 'takeover') return { action: 'session.takeover', target: id, epochRequired: true };
   if (method === 'POST' && suffix === 'inject') return { action: 'session.inject', target: id, explicitInject: true };
   if (method === 'POST' && suffix === 'state') return { action: 'session.state', target: id, epochRequired: true };
   if (method === 'POST' && suffix === 'submit') return { action: 'session.input', target: id, epochRequired: true };
@@ -87,10 +88,19 @@ function storedOwningPrincipal(value) {
       || typeof value.audience !== 'string' || !value.audience || Buffer.byteLength(value.audience) > 256) return null;
   return Object.freeze({ id: value.id, source: 'ed25519', audience: value.audience });
 }
-function verifiedOwningPrincipal(req) {
-  return req && Object.hasOwn(req, VERIFIED_REQUEST) && Object.hasOwn(req, 'authenticationPrincipal')
-    && req[VERIFIED_REQUEST] === req.authenticationPrincipal ? storedOwningPrincipal(req.authenticationPrincipal) : null;
+function verifiedRequestPrincipal(req, { action, target } = {}) {
+  if (!req || !Object.hasOwn(req, VERIFIED_REQUEST) || !Object.hasOwn(req, 'authenticationPrincipal')) return null;
+  const context = req[VERIFIED_REQUEST];
+  if (!context || context.principal !== req.authenticationPrincipal || context.method !== req.method
+      || context.requestTarget !== (req.originalUrl || req.url)
+      || (action !== undefined && context.action !== action) || (target !== undefined && context.target !== target)) return null;
+  try { if (requestBodyDigest(req) !== context.bodySha256) return null; } catch { return null; }
+  return context.principal;
 }
+function verifiedOwningPrincipal(req) {
+  return storedOwningPrincipal(verifiedRequestPrincipal(req));
+}
+
 function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, challenge } = {}) {
   if (!sessions || !['object', 'function'].includes(typeof sessions)) unavailable();
   const verifier = createPrincipalVerifier({ trust, now, replayCapacity, challenge });
@@ -132,7 +142,8 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
         if (!sessionId(next) || !key.grants.some(grant => grant.action === 'session.rename' && grant.targets.includes(next))) return denied('PRINCIPAL_GRANT_DENIED');
       }
       req.authenticationPrincipal = principal;
-      req[VERIFIED_REQUEST] = principal;
+      req[VERIFIED_REQUEST] = Object.freeze({ principal, action: result.action, target: result.target,
+        method: req.method, requestTarget: req.originalUrl || req.url, bodySha256: digest });
       return result;
     }
   });
@@ -146,4 +157,4 @@ function createPrincipalAuthenticationFromEnvironment({ env = process.env, machi
   return createPrincipalAuthentication({ trust, sessions, replayCapacity });
 }
 module.exports = { loadPrincipalTrust, createPrincipalAuthentication, createPrincipalAuthenticationFromEnvironment,
-  verifiedOwningPrincipal, storedOwningPrincipal, resolveAction };
+  verifiedOwningPrincipal, verifiedRequestPrincipal, storedOwningPrincipal, resolveAction };

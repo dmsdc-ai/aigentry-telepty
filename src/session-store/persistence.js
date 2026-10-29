@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { storedOwningPrincipal } = require('../principal/http');
+const { normalizeAuthorityAudit } = require('../principal/authority-audit');
 
 function defaultSessionPersistPath(homeDir = os.homedir()) {
   return path.join(homeDir, '.config', 'aigentry-telepty', 'sessions.json');
@@ -19,6 +20,8 @@ function serializePersistedSessions(sessions) {
     Object.defineProperty(data, id, { enumerable: true, writable: true, configurable: true, value: {
       id,
       ...(storedOwningPrincipal(s.owningPrincipal) ? { owningPrincipal: storedOwningPrincipal(s.owningPrincipal) } : {}),
+      ...((s.authorityAuditInvalid === true || normalizeAuthorityAudit(s.authorityAudit) === null) ? { authorityAuditInvalid: true } : {}),
+      ...(normalizeAuthorityAudit(s.authorityAudit)?.length ? { authorityAudit: normalizeAuthorityAudit(s.authorityAudit) } : {}),
       type: s.type,
       ...(s.externalApprovalPolicy ? { externalApprovalPolicy: s.externalApprovalPolicy } : {}),
       ...(s.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
@@ -202,6 +205,8 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
     ...(meta.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
     ptyProcess: null, ownerWs: null,
     ...(storedOwningPrincipal(meta.owningPrincipal) ? { owningPrincipal: storedOwningPrincipal(meta.owningPrincipal) } : {}),
+    ...((meta.authorityAuditInvalid === true || normalizeAuthorityAudit(meta.authorityAudit) === null) ? { authorityAuditInvalid: true } : {}),
+    ...(normalizeAuthorityAudit(meta.authorityAudit)?.length ? { authorityAudit: normalizeAuthorityAudit(meta.authorityAudit) } : {}),
     ...(meta.type === 'mailbox' ? { leaseExpiresAt: Number.isFinite(meta.leaseExpiresAt) ? meta.leaseExpiresAt : null } : {}),
     command: meta.command || 'wrapped', cwd: meta.cwd || cwd,
     ...(sshRemote ? { sshRemote } : {}),

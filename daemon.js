@@ -1629,6 +1629,7 @@ app.get('/api/meta', (req, res) => {
 // --- Mailbox API endpoints ---
 
 registerMailboxRoutes(app, { sessions, resolveSessionAlias, getMailbox: () => mailbox, sessionCredentials, persistSessions });
+require('./src/principal/takeover').registerMailboxTakeoverRoute(app, { context: sessionRecordContext, getMailbox: () => mailbox, broadcastSessionEvent });
 registerSharedReferenceRoutes(app);
 
 // Peer management endpoint (for cross-machine module)

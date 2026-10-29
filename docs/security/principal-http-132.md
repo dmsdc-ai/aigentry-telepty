@@ -136,6 +136,7 @@ loopback, same UID, display names, daemon tokens, JWT `sub` or peer credentials.
 | `session.state` | `POST /api/sessions/:id/state` | Owner and exact signed current epoch |
 | `session.input` | `POST /api/sessions/:id/submit` | Owner and exact signed current epoch |
 | `session.rename` | `PATCH /api/sessions/:id` | Owner, current signed epoch, and explicit grants for both old and new IDs |
+| `session.takeover` | `POST /api/sessions/:id/takeover` | Same owner, exact signed/body epoch and explicit grant; expired poll-only mailbox recovery only ([contract](mailbox-takeover-133.md)) |
 | `session.destroy` | `DELETE /api/sessions/:id`, `POST /api/sessions/:id/kill` | Owner and exact signed current epoch |
 | `mailbox.read` | `GET /api/sessions/:id/mailbox` | Owner or explicit operator inspection grant |
 | `mailbox.ack` | `POST /api/sessions/:id/mailbox/ack` | Owner and exact signed current epoch |

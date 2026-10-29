@@ -1,4 +1,5 @@
 const { protectedInputFailure } = require('../external-approval');
+const { normalizeAuthorityAudit } = require('../principal/authority-audit');
 const { storedOwningPrincipal } = require('../principal/http');
 // Production session inspection and batch-submit operations.
 // Deliberately retains the daemon's non-strict execution semantics.
@@ -21,6 +22,7 @@ function serializeSession(id, session, options = {}) {
     id,
     session_epoch: session.sessionEpoch || null,
     lastInjectReturn: session.lastInjectReturn || null,
+    ...(normalizeAuthorityAudit(session.authorityAudit)?.length ? { authorityAudit: normalizeAuthorityAudit(session.authorityAudit) } : {}),
     ...(storedOwningPrincipal(session.owningPrincipal) ? { owningPrincipal: storedOwningPrincipal(session.owningPrincipal) } : {}),
     locator: { machine_id: shared.MACHINE_ID, session_id: id, project_id: projectId },
     type: session.type || 'spawned',

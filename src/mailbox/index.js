@@ -285,6 +285,14 @@ class FileMailbox {
     }
   }
 
+  snapshotCustody(sessionId) {
+    const sessionDir = this._sessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) throw Object.assign(new Error('Mailbox custody is unavailable'), { code: 'MAILBOX_CUSTODY_UNAVAILABLE' });
+    const release = acquireLock(sessionDir);
+    try { return require('./custody').strictCustodySnapshot(sessionDir, sessionId); }
+    finally { release(); }
+  }
+
   /**
    * Peek at pending messages without dequeueing.
    */
