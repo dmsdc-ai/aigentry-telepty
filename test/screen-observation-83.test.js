@@ -91,3 +91,11 @@ test('changes beyond bounded cache prefix still advance revision', () => {
   assert.equal(next.changed, true); assert.notEqual(next.cursor, first.cursor);
   assert.equal(next.reset_reason, 'snapshot_limit');
 });
+test('same object reused for a new epoch or session ID cannot reuse its cursor', () => {
+  const session = { sessionEpoch: 'epoch-one' }, first = observe(session, 'same');
+  session.sessionEpoch = 'epoch-two';
+  const replacement = observe(session, 'same', { since: first.cursor });
+  assert.equal(replacement.reset, true); assert.notEqual(replacement.session_instance, first.session_instance);
+  const renamed = observe(session, 'same', { sessionId: 'renamed', since: replacement.cursor });
+  assert.equal(renamed.reset, true); assert.notEqual(renamed.session_instance, replacement.session_instance);
+});

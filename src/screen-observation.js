@@ -22,7 +22,10 @@ function parseBudget(value) {
 function observeScreen(session, { sessionId, screen, raw, lines, since, maxBytes, rollover = 0 }) {
   const budget = parseBudget(maxBytes);
   let state = sessions.get(session);
-  if (!state) { state = { instance: randomUUID(), modes: new Map(), revision: 0 }; sessions.set(session, state); }
+  if (!state || state.sessionId !== sessionId || state.epoch !== session.sessionEpoch) {
+    state = { instance: randomUUID(), modes: new Map(), revision: 0, sessionId, epoch: session.sessionEpoch };
+    sessions.set(session, state);
+  }
   const modeKey = JSON.stringify([raw, lines]);
   let mode = state.modes.get(modeKey);
   if (!mode) {
