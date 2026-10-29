@@ -5002,6 +5002,32 @@ Discuss the following topic from your project's perspective. Engage with other s
   }
 
   // telepty peers [--remove <name>]
+  if (cmd === 'broker-inject-v1' || cmd === 'broker-receipt-v1') {
+    const usage = cmd === 'broker-inject-v1'
+      ? 'telepty broker-inject-v1 --config <file> <node> <sid> <epoch> <idempotency-key> <prompt>'
+      : 'telepty broker-receipt-v1 --config <file> <idempotency-key>';
+    if (args[1] === '--help' || args[1] === '-h') { console.log(usage); return; }
+    if (args[1] !== '--config' || args.length !== (cmd === 'broker-inject-v1' ? 8 : 4)) {
+      console.error(usage); markCommandFailed(); return;
+    }
+    try { await require('./src/broker/main').runBrokerRequest(cmd === 'broker-inject-v1' ? 'inject' : 'receipt', args[2], args.slice(3)); }
+    catch { console.error('BROKER_REQUEST_FAILED: query the same idempotency key before considering another send'); markCommandFailed(); }
+    return;
+  }
+
+  if (cmd === 'broker-v1' || cmd === 'relay-node-v1') {
+    if (args[1] === '--help' || args[1] === '-h') {
+      console.log(`Usage: telepty ${cmd} --config <explicit local config file>`);
+      return;
+    }
+    if (args.length !== 3 || args[1] !== '--config') {
+      console.error(`Usage: telepty ${cmd} --config <explicit local config file>`); markCommandFailed(); return;
+    }
+    try { await require('./src/broker/main').runBrokerCommand(cmd === 'broker-v1' ? 'hub' : 'node', args[2]); }
+    catch { console.error('BROKER_START_OR_CHANNEL_FAILED'); markCommandFailed(); }
+    return;
+  }
+
   if (cmd === 'peers') {
     if (args[1] === '--remove' && args[2]) {
       crossMachine.removePeer(args[2]);
@@ -5170,6 +5196,10 @@ function printGlobalHelp() {
   telepty disconnect <name> | --all              Disconnect remote host
   telepty peers [--remove <name>]                List connected peers
   telepty discover [--json] [--refresh]           Read-only local tailnet candidates; never enroll or authorize
+  telepty broker-v1 --config <file>              Opt-in signed SSE hub (exact inject only)
+  telepty relay-node-v1 --config <file>          Outbound recipient bridge, no auto-enrollment
+  telepty broker-inject-v1 --config <file> <node> <sid> <epoch> <key> <prompt>
+  telepty broker-receipt-v1 --config <file> <key> Query acceptance/uncertainty; no resend
 
 \x1b[1mMonitoring:\x1b[0m
   telepty readiness <exact-id>[@host] [--json]     Inspect qualified composer evidence (read-only)

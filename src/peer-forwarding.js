@@ -257,4 +257,4 @@ function registerPeerForwardRoutes(app, { sessions, loadPeers, homeDir = os.home
   });
 }
 
-module.exports = { createForwardLedger, registerPeerForwardRoutes };
+module.exports = { createForwardLedger, registerPeerForwardRoutes, validateForwardBody: validateBody };
