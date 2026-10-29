@@ -13,7 +13,7 @@ test('#128: installed CLI is launched via Node, independent of PATH shims', asyn
   const pending = hook.spawnDetachedDaemon(process.execPath, { spawn: (...args) => { calls.push(args); return child; } });
   child.emit('spawn');
   await pending;
-  assert.deepEqual(calls[0], [process.execPath, [path.resolve(__dirname, '../cli.js'), 'daemon'], { detached: true, stdio: 'ignore' }]);
+  assert.deepEqual(calls[0], [process.execPath, [path.resolve(__dirname, '../cli.js'), 'daemon'], { detached: true, stdio: 'ignore', windowsHide: true }]);
   assert.equal(calls[1], 'unref');
 });
 

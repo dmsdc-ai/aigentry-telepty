@@ -23,7 +23,42 @@ iwr -useb https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/insta
 npm install -g @dmsdc-ai/aigentry-telepty
 ```
 
-The installer sets up telepty as a background service (`launchd` on macOS, `systemd` on Linux, detached process on Windows).
+### Will the daemon come back after a reboot?
+
+`npm install -g` installs the package, not a service: it never creates one, and it prints a
+one-line hint when nothing supervises the daemon. Ask and decide explicitly:
+
+```bash
+telepty service status            # what supervises the daemon, and does it survive a reboot?
+telepty service install           # consented; prints the plan first, needs no admin
+telepty service start|stop|restart
+telepty service uninstall         # back to no service (config and sessions are kept)
+```
+
+| Platform | Mechanism (user scope) | Starts at login | Starts at boot without login |
+| --- | --- | --- | --- |
+| macOS | LaunchAgent `com.aigentry.telepty` in `~/Library/LaunchAgents` | yes | **no** — that needs a root LaunchDaemon (reported, not attempted) |
+| Linux | `systemd --user` unit `~/.config/systemd/user/telepty.service` | yes | only with linger: `loginctl enable-linger $USER`. `service status` reports the current state; telepty never runs that command for you |
+| Windows | Task Scheduler logon task `telepty-daemon` (`/sc onlogon /rl LIMITED`) | yes | **no** — a boot/SYSTEM task needs admin (reported, not attempted) |
+
+`install.sh` and a root `install.js` still write the system-scope Linux unit; `telepty service`
+surfaces it read-only and prints the exact `sudo systemctl …` command rather than competing with
+it. `install.ps1` creates no task (it starts a detached process), so on Windows the logon task
+comes from `telepty service install`.
+
+### Migrating from the unscoped `aigentry-telepty`
+
+The legacy package `aigentry-telepty` declares the same `telepty` command as this scoped one. npm
+keeps one link per command name, so removing the legacy package can take the shared `telepty` link
+with it (`telepty: command not found`). `telepty service status` and `npm i -g` both report which
+package currently owns the command. To migrate:
+
+```bash
+telepty service stop                                  # only if a service is installed
+npm rm -g aigentry-telepty
+npm i -g @dmsdc-ai/aigentry-telepty@0.8.5 --force   # --force relinks the shared command
+telepty --version                                     # must print 0.8.5
+```
 
 **Windows is BETA.** It installs and the cross-machine demo below is a real Windows box, but
 `windows-latest` CI is quarantined as non-blocking (Windows-specific failures tracked in #577),
