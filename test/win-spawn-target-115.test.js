@@ -30,8 +30,9 @@ test('batch percent expansion and line breaks fail closed', () => {
 });
 test('Windows PowerShell scripts use explicit -File argv; unsupported scripts fail closed', () => {
   assert.deepEqual(buildPtySpawnTarget('C:\\bin\\tool.ps1', ['a&b'], env, opts), {
-    file: 'powershell.exe', args: ['-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\bin\\tool.ps1', 'a&b']
+    file: 'powershell.exe', args: ['-NoLogo', '-File', 'C:\\bin\\tool.ps1', 'a&b']
   });
+  assert.ok(!buildPtySpawnTarget('C:\\bin\\tool.ps1', [], env, opts).args.includes('-ExecutionPolicy'));
   assert.throws(() => buildPtySpawnTarget('C:\\bin\\tool.js', [], env, opts), /unsupported Windows executable type/);
 });
 

@@ -21,7 +21,7 @@ function buildPtySpawnTarget(command, args = [], env = process.env, opts = {}) {
   const ext = path.win32.extname(resolved).toLowerCase();
   if (ext === '.exe' || ext === '.com') return { file: resolved, args: args.slice() };
   if (ext === '.ps1') {
-    return { file: env.PSExecutablePath || 'powershell.exe', args: ['-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', resolved, ...args] };
+    return { file: env.PSExecutablePath || 'powershell.exe', args: ['-NoLogo', '-File', resolved, ...args] };
   }
   if (ext !== '.cmd' && ext !== '.bat') throw new Error(`telepty: unsupported Windows executable type: ${ext || '(none)'}`);
   // Percent expansion happens before cmd caret removal; batch files also have
