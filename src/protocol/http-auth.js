@@ -198,6 +198,11 @@ function createAuthMiddleware(options) {
       return next();
     }
 
+    if (options.authorizeSessionRequest && options.authorizeSessionRequest(req)) {
+      req.sessionCredentialOnly = true;
+      return next();
+    }
+
     console.warn(`[AUTH] Rejected unauthorized request from ${clientIp}`);
     res.status(401).json(CREDENTIAL_DENIED);
   };

@@ -262,7 +262,7 @@ class FileMailbox {
   /**
    * Peek at pending messages without dequeueing.
    */
-  peek(sessionId) {
+  peek(sessionId, { includePayload = false } = {}) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) return [];
 
@@ -281,6 +281,7 @@ class FileMailbox {
           created_at: msg.created_at,
           attempt: msg.attempt || 0,
           state: st.state,
+          ...(includePayload ? { payload: msg.payload, to: msg.to } : {}),
         });
       }
 

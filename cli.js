@@ -2400,6 +2400,7 @@ async function main() {
         console.log(`  - ID: \x1b[36m${s.id}\x1b[0m`);
         console.log(`    Host: ${formatHostLabel(s.host)}`);
         console.log(`    Command: ${s.command}`);
+        if (s.type === 'mailbox') console.log(`    Mailbox lease expires: ${new Date(s.lease_expires_at).toISOString()}`);
         console.log(`    Status: ${formatSessionStatusWithIdle(s)}`);
         // #60 Stage A: separate lines, because they are separate domains. Status is transport
         // connectivity; the activity observation is what the PTY was measured doing. Collapsing
@@ -2414,6 +2415,11 @@ async function main() {
     } catch (e) {
       console.error(`❌ ${e.message || 'Failed to discover sessions.'}`);
     }
+    return;
+  }
+
+  if (cmd === 'mailbox') {
+    await require('./src/cli/mailbox').runMailboxCommand(args.slice(1), { daemonUrl: DAEMON_URL, fetchWithAuth });
     return;
   }
 
@@ -5027,6 +5033,8 @@ function printGlobalHelp() {
     --lines N selects last N lines before byte limiting; --raw preserves ANSI
     Cursors are scoped to session instance and raw/lines mode; reset requires refresh
     Delta splice indices use Unicode code points; truncated snapshots are partial
+  telepty mailbox <id> [--json] [--since msg_id] Read a local mailbox
+  telepty mailbox ack <id> <msg_id>            Acknowledge one local mailbox message
 
 \x1b[1mCross-Machine:\x1b[0m
   telepty connect <user@host> [--name N] [--port P]      SSH tunnel to remote host

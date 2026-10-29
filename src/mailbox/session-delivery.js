@@ -33,6 +33,7 @@ function createSessionDeliveryContext({
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
 }) {
   async function writeDataToSession(id, session, data) {
+    if (session.type === 'mailbox') return { success: false, httpStatus: 409, code: 'POLL_ONLY', error: 'Mailbox sessions accept queued text only.' };
     if (hasHeldInteraction(session)) return { success: false, httpStatus: 409,
       code: 'INTERACTION_HELD', error: 'Original task retained pending measured composer readiness.', bytes_written: 0 };
     interaction.invalidateInteraction(session, 'automated_input');
@@ -224,7 +225,7 @@ function createSessionDeliveryContext({
     // "submit my message". This is the TEXT path — bypass #4 in the evidence: it consulted
     // only the bootstrapReady boolean, which a blind timer flips without ever looking at the
     // screen (shouldApplyOwnerAliveFloor).
-    const modalDecision = await resolveModalGate(id, session, options);
+    const modalDecision = session.type === 'mailbox' ? null : await resolveModalGate(id, session, options);
     if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
     const currentFailure = getInjectFailure(session, { nowMs: Date.now() });
     if (currentFailure) return { success: false, ...currentFailure };
@@ -289,7 +290,20 @@ function createSessionDeliveryContext({
     // #716: wrap the delivered text in bracketed paste for paste-capable CLIs so the
     // deferred/gated submit CR (written separately, outside the 200~/201~ envelope)
     // reliably fires instead of being swallowed into the paste burst. No-op otherwise.
-    const deliveredBody = maybeBracketedPaste(deliveredPrompt, session);
+    const deliveredBody = session.type === 'mailbox' ? deliveredPrompt : maybeBracketedPaste(deliveredPrompt, session);
+
+    if (session.type === 'mailbox') {
+      try {
+        const ack = getMailbox().enqueue({ msg_id: msgId, from, to: id, payload: deliveredBody,
+          created_at: Math.floor(now / 1000), attempt: 0 });
+        parkTrackedInjection(options.injectId, 'mailbox', 'poll_pending');
+        session.lastActivityAt = new Date(now).toISOString();
+        return { success: true, msg_id: msgId, strategy: 'mailbox', poll_only: true,
+          queued: true, delivered: false, bytes_written: 0, pending: ack.pending, submit: 'not_applicable' };
+      } catch (error) {
+        return { success: false, httpStatus: 503, code: 'MAILBOX_ENQUEUE_FAILED', error: 'Mailbox enqueue failed.' };
+      }
+    }
 
     // #107: the deferred CR below belongs to THIS text. Without a barrier, a second inject
     // arriving inside the submit delay writes its text first and the target reads
@@ -452,7 +466,7 @@ function createSessionDeliveryContext({
 
   const mailboxDeliveryOptions = {
     pollMs: 200,
-    sessionResolver: () => Object.keys(sessions),
+    sessionResolver: () => Object.keys(sessions).filter(id => sessions[id].type !== 'mailbox'),
     deliverFn: async (sessionId, msg) => {
       const session = sessions[sessionId];
       if (!session) return { success: false, error: 'Session not found' };

@@ -1,3 +1,5 @@
+const { parseMailboxLease, renewMailboxLease } = require('../mailbox/poll-session');
+const { validateSessionId: validateMailboxId } = require('../mailbox/path-boundary');
 const sessionPersistence = require('../session-store/persistence');
 const { mintSessionNonce } = require('../audit/provenance');
 const {
@@ -104,6 +106,18 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     const identity = readIdentity(req.body, 'session_id');
     if (identity.error) return res.status(400).json({ error: identity.error });
     const session_id = identity.value;
+    const mailboxRequest = req.body.delivery_type === 'mailbox';
+    if (mailboxRequest) {
+      try { validateMailboxId(session_id); }
+      catch { return res.status(400).json({ code: 'INVALID_SESSION_ID', error: 'Invalid mailbox session identifier.' }); }
+    }
+    const lease = parseMailboxLease(req.body.lease_seconds);
+    if ((mailboxRequest || Object.prototype.hasOwnProperty.call(req.body, 'lease_seconds')) && lease.error) {
+      return res.status(400).json({ code: 'INVALID_LEASE', error: lease.error });
+    }
+    if (mailboxRequest && (req.body.delivery || req.body.delivery_endpoint)) {
+      return res.status(400).json({ code: 'INVALID_DELIVERY', error: 'Mailbox sessions do not accept delivery endpoints.' });
+    }
     const { command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id, term_program, term } = req.body;
     const parsedIdleTtl = parseOptionalIdleTtl(req.body);
     if (parsedIdleTtl.error) {
@@ -129,6 +143,15 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       // attacker-controlled text out of the credential path entirely.
       const previous = Object.getOwnPropertyDescriptors(existing);
       const credentialed = sessionCredentials.matches(existing.id, req.headers['x-telepty-session-token']);
+      if (existing.type === 'mailbox' || mailboxRequest) {
+        if (!credentialed) return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Current session credential is required.' });
+        if (existing.type !== 'mailbox' || (req.body.delivery_type && !mailboxRequest)) {
+          return res.status(409).json({ code: 'DELIVERY_TYPE_CONFLICT', error: 'Mailbox session type cannot be changed by re-registration.' });
+        }
+        if (lease.error) return res.status(400).json({ code: 'INVALID_LEASE', error: lease.error });
+        const renewed = renewMailboxLease(existing, lease.seconds, persistSessions);
+        return res.status(renewed.success ? 200 : 503).json({ ...renewed, reregistered: renewed.success });
+      }
       if (command) existing.command = command;
       if (cwd) existing.cwd = cwd;
       if (backend) existing.backend = backend;
@@ -205,23 +228,24 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       ownerWs: null,
       command: command || 'wrapped',
       cwd,
-      backend: backend || 'kitty',
+      backend: mailboxRequest ? 'mailbox' : backend || 'kitty',
       cmuxWorkspaceId: cmux_workspace_id || null,
       cmuxSurfaceId: cmux_surface_id || null,
       termProgram: term_program || null,
       term: term || null,
       delivery: delivery || null,
       deliveryEndpoint: resolvedEndpoint,
+      ...(mailboxRequest ? { leaseExpiresAt: Date.now() + lease.seconds * 1000 } : {}),
       createdAt: new Date().toISOString(),
       lastActivityAt: new Date().toISOString(),
-      lastConnectedAt: delivery_type === 'aterm' ? new Date().toISOString() : null,
-      lastDisconnectedAt: delivery_type === 'aterm' ? null : new Date().toISOString(),
+      lastConnectedAt: (mailboxRequest || delivery_type === 'aterm') ? new Date().toISOString() : null,
+      lastDisconnectedAt: (mailboxRequest || delivery_type === 'aterm') ? null : new Date().toISOString(),
       lastStateReportAt: null,
       stateReport: null,
       idleTtl: parsedIdleTtl.present ? parsedIdleTtl.raw : null,
       idleTtlMs: parsedIdleTtl.present ? parsedIdleTtl.ms : null,
-      ownerPid: Number.isInteger(Number(req.body.owner_pid)) && Number(req.body.owner_pid) > 0 ? Number(req.body.owner_pid) : null,
-      ptyPid: Number.isInteger(Number(req.body.pty_pid)) && Number(req.body.pty_pid) > 0 ? Number(req.body.pty_pid) : null,
+      ownerPid: !mailboxRequest && Number.isInteger(Number(req.body.owner_pid)) && Number(req.body.owner_pid) > 0 ? Number(req.body.owner_pid) : null,
+      ptyPid: !mailboxRequest && Number.isInteger(Number(req.body.pty_pid)) && Number(req.body.pty_pid) > 0 ? Number(req.body.pty_pid) : null,
       clients: new Set(),
       isClosing: false,
       outputRing: [],
@@ -252,7 +276,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     const replaced = Object.keys(sessions).find(id => {
       return id !== session_id && id.replace(/-\d+$/, '') === baseAlias && ownRecord(sessions, id) !== null;
     });
-    if (replaced) {
+    if (replaced && !mailboxRequest) {
       const replacedMsg = JSON.stringify({
         type: 'session.replaced',
         sender: 'daemon',
@@ -284,7 +308,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     // this response is on the wire the credential is already durable — a daemon that dies between
     // the two can never leave a bearer in a child's env with no verifier on disk to match it.
     // The bearer and nonce cross the wire HERE and only here, once, to this one caller.
-    res.status(201).json({ session_id, type: 'wrapped', command: sessionRecord.command, cwd, session_token: issued.bearer, session_epoch: issued.epoch, credential_generation: issued.generation, session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
+    res.status(201).json({ session_id, type: mailboxRequest ? 'mailbox' : 'wrapped', ...(mailboxRequest ? { lease_expires_at: sessionRecord.leaseExpiresAt } : {}), command: sessionRecord.command, cwd, session_token: issued.bearer, session_epoch: issued.epoch, credential_generation: issued.generation, session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
   });
 }
 

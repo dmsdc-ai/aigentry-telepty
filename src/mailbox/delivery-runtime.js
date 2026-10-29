@@ -1,4 +1,5 @@
 'use strict';
+const { mailboxLeaseAlive } = require('./poll-session');
 
 // Accessors retain the daemon's shared instances and original first-use timing.
 // Construction only creates functions; effect boundaries run when those functions do.
@@ -243,7 +244,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function deliveryAuditResult(delivery) {
-    return delivery && delivery.queued === true && delivery.strategy === 'bootstrap_queue' ? 'queued' : 'success';
+    return delivery && delivery.queued === true && (delivery.strategy === 'bootstrap_queue' || delivery.poll_only === true) ? 'queued' : 'success';
   }
 
   function getPendingReport(sessionId, registry = shared.pendingReports) {
@@ -394,6 +395,8 @@ function createDeliveryRuntime(shared, {
     const staleMs = (options.staleSeconds ?? shared.SESSION_STALE_SECONDS) * 1000;
     const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
 
+    if (session.type === 'mailbox') return mailboxLeaseAlive(session, nowMs) ? 'CONNECTED' : 'DISCONNECTED';
+
     if (session.type === 'wrapped') {
       if (shared.isOpenWebSocket(session.ownerWs)) {
         // #732: an open owner socket is necessary, not sufficient. A session that has
@@ -430,6 +433,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function getSessionHealthReason(session, healthStatus) {
+    if (session.type === 'mailbox') return healthStatus === 'CONNECTED' ? 'MAILBOX_LEASE_VALID' : 'MAILBOX_LEASE_EXPIRED';
     if (session.type === 'wrapped') {
       if (healthStatus === 'CONNECTED') return 'OWNER_CONNECTED';
       // #732: the owner socket is open and answering pings; the output pipe behind it is not.
@@ -935,6 +939,7 @@ function createDeliveryRuntime(shared, {
       health_status: healthStatus,
       health_reason: healthReason,
       type: session.type || 'spawned',
+      ...(session.type === 'mailbox' ? { lease_expires_at: session.leaseExpiresAt || null } : {}),
       backend: session.backend || 'kitty',
       terminal: getSessionTerminalLabel(session),
       active_clients: session.clients ? session.clients.size : 0,
@@ -1253,6 +1258,7 @@ function createDeliveryRuntime(shared, {
     if (term.includes('ghostty')) return 'ghostty';
     if (term.includes('tmux')) return 'tmux';
 
+    if (session.type === 'mailbox') return 'mailbox';
     if (session.type === 'aterm') return 'aterm';
     if (session.backend === 'cmux') return 'cmux';
     if (session.backend === 'kitty') return 'kitty';

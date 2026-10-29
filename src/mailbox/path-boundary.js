@@ -112,4 +112,4 @@ function rethrowBoundary(err) {
   if (err.code === 'MAILBOX_INVALID_SESSION_ID' || err.code === 'MAILBOX_UNSAFE_PATH') throw err;
 }
 
-module.exports = { canonicalRoot, resolveSessionDir, checkRoot, checkFile, openFile, readFile, writeFile, unlinkFile, rethrowBoundary };
+module.exports = { validateSessionId, canonicalRoot, resolveSessionDir, checkRoot, checkFile, openFile, readFile, writeFile, unlinkFile, rethrowBoundary };

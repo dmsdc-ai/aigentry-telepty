@@ -1445,7 +1445,7 @@ function createSessionActions(shared, effects = {}) {
           // bytes written, `success` only for a delivery the machinery reported as written.
           payload: finalPrompt, delivery_result: (0, shared.deliveryAuditResult)(delivery)
         });
-        (0, shared.broadcastSessionEvent)('inject_written', id, session, {
+        (0, shared.broadcastSessionEvent)((0, shared.deliveryAuditResult)(delivery) === 'queued' ? 'inject_queued' : 'inject_written', id, session, {
           timestamp: injectTimestamp,
           extra: {
             inject_id,
@@ -1532,6 +1532,8 @@ function createSessionActions(shared, effects = {}) {
           inject_id,
           strategy: delivery.strategy,
           submit: delivery.submit,
+          ...(delivery.poll_only ? { queued: true, delivered: false, bytes_written: 0,
+            msg_id: delivery.msg_id, pending: delivery.pending, poll_only: true } : {}),
           ...(exactTarget ? { exact_target: true, session_id: id } : {}),
           ...(delivery.bootstrap_queued ? {
             bootstrap_queued: true,

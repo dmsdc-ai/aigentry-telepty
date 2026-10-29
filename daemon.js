@@ -518,7 +518,8 @@ const isAllowedPeer = createIsAllowedPeer(effectivePeerAllowlist);
 // entrances a browser can reach.
 const isForbiddenOrigin = createOriginGuard(ALLOWED_ORIGINS);
 
-registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin });
+registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin,
+  authorizeSessionRequest: req => require('./src/mailbox/poll-session').authorizeMailboxRequest(req, sessions, sessionCredentials) });
 
 const { resolveBindPort } = require('./src/bind-port');
 const PORT = resolveBindPort(process.env);
@@ -1635,7 +1636,7 @@ app.get('/api/meta', (req, res) => {
 
 // --- Mailbox API endpoints ---
 
-registerMailboxRoutes(app, { sessions, resolveSessionAlias, getMailbox: () => mailbox });
+registerMailboxRoutes(app, { sessions, resolveSessionAlias, getMailbox: () => mailbox, sessionCredentials, persistSessions });
 registerSharedReferenceRoutes(app);
 
 // Peer management endpoint (for cross-machine module)

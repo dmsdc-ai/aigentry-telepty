@@ -19,6 +19,7 @@ function serializeSession(id, session, options = {}) {
     id,
     locator: { machine_id: shared.MACHINE_ID, session_id: id, project_id: projectId },
     type: session.type || 'spawned',
+    ...(session.type === 'mailbox' ? { lease_expires_at: session.leaseExpiresAt || null } : {}),
     command: session.command,
     cwd: session.cwd,
     backend: session.backend || 'kitty',

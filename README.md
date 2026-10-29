@@ -512,3 +512,37 @@ Additional event fields may be present. This describes a session transport
 reconnecting; it is not delivery, consumption or task-completion confirmation.
 If the listener's bus socket disconnects, the current CLI reports that on stderr
 and exits nonzero; it does not promise automatic stream reconnection or replay.
+### Poll-only mailbox sessions
+
+A turn-based agent can register with `delivery_type: "mailbox"` and an integer
+`lease_seconds` from 1 to 3600 (default 300). Registration requires the daemon
+credential and returns a new session credential once. A mailbox session needs no
+PTY, owner WebSocket, HTTP listener, or Unix socket. Its transport status is
+`CONNECTED` only while its lease is valid; the list response includes
+`lease_expires_at` as Unix milliseconds.
+
+Injects return `strategy: "mailbox"`, `queued: true`, `delivered: false`, and
+`bytes_written: 0`. Text remains pending until explicitly acknowledged; the push
+delivery engine does not dequeue or retry mailbox sessions. An acknowledgement
+records receipt only and does not assert that the task was consumed or completed.
+
+A poller provisioned with its session bearer in `TELEPTY_SESSION_TOKEN` can run:
+
+```sh
+telepty mailbox my-agent --json
+telepty mailbox my-agent --since last-message-id --json
+telepty mailbox ack my-agent message-id
+```
+
+These commands target the configured local daemon. With a session bearer they do
+not load or send the shared daemon credential. Otherwise they use the normal
+configured daemon credential. Neither command prints credentials.
+
+Renew with `POST /api/sessions/:id/lease` and `{ "lease_seconds": 300 }`, or
+re-register the same id. Renewal requires the current
+`x-telepty-session-token`, including when the caller also holds the daemon
+credential. A session bearer grants only that exact mailbox's read, ack, and
+renewal operations; it grants no listing, inject, deletion, or other-session
+access. Expiry stops new injects but preserves pending messages and permits the
+owner to read, acknowledge, and renew. Mailbox type and lease survive a daemon
+restart with the same credential verifier; no bearer is saved to disk.

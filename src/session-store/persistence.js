@@ -24,6 +24,7 @@ function serializePersistedSessions(sessions) {
       term: s.term || null,
       delivery: s.delivery || null,
       deliveryEndpoint: s.deliveryEndpoint || null,
+      ...(s.type === 'mailbox' ? { leaseExpiresAt: s.leaseExpiresAt || null } : {}),
       createdAt: s.createdAt,
       lastActivityAt: s.lastActivityAt || null,
       lastConnectedAt: s.lastConnectedAt || null,
@@ -180,12 +181,13 @@ function loadPersistedSessions(persistPath = defaultSessionPersistPath()) {
 }
 
 function buildRestoredWrappedSession(id, meta, options = {}) {
-  if (meta.type !== 'wrapped') return null;
+  if (!['wrapped', 'mailbox'].includes(meta.type)) return null;
 
   const cwd = options.cwd || process.cwd();
   const nowIso = options.nowIso || (() => new Date().toISOString());
   return {
-    id, type: 'wrapped', ptyProcess: null, ownerWs: null,
+    id, type: meta.type, ptyProcess: null, ownerWs: null,
+    ...(meta.type === 'mailbox' ? { leaseExpiresAt: Number.isFinite(meta.leaseExpiresAt) ? meta.leaseExpiresAt : null } : {}),
     command: meta.command || 'wrapped', cwd: meta.cwd || cwd,
     backend: meta.backend || 'kitty',
     cmuxWorkspaceId: meta.cmuxWorkspaceId || null,
