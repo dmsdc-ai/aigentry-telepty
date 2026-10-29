@@ -1063,7 +1063,7 @@ test('broadcast inject reports disconnected wrapped sessions with a reason code'
   assert.match(failure.error, /disconnected/i);
 });
 
-test('aterm delivery timeouts surface a TIMEOUT error code', async () => {
+test('aterm HTTP delivery timeout retains unknown outcome instead of a queued retry', async () => {
   await harness.stop();
   harness = await startTestDaemon({
     env: {
@@ -1089,14 +1089,17 @@ test('aterm delivery timeouts surface a TIMEOUT error code', async () => {
     });
     assert.equal(registered.status, 201);
 
-    // Mailbox enqueue succeeds; delivery timeout happens asynchronously
+    // A response timeout cannot establish whether the endpoint already acted.
     const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
       method: 'POST',
       body: { prompt: 'hello timeout' }
     });
-    assert.equal(inject.status, 200);
-    assert.equal(inject.body.success, true);
-    assert.equal(inject.body.strategy, 'mailbox');
+    assert.equal(inject.status, 503);
+    assert.equal(inject.body.success, false);
+    assert.equal(inject.body.code, 'DELIVERY_UNCERTAIN');
+    assert.equal(inject.body.delivery_uncertain, true);
+    assert.equal(inject.body.retryable, false);
+    assert.equal(inject.body.bytes_written, null);
   } finally {
     await new Promise((resolve) => delayedServer.close(resolve));
   }
