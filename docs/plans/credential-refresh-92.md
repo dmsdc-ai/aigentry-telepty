@@ -93,5 +93,15 @@ The Linux tests use only synthetic credentials and test-owned temporary paths.
 They exercise actual FD-anchored rename and fsync, old-descriptor/new-record reads,
 symlink/hardlink/directory swaps, stale process identity, mismatched owner attempt,
 principal generation and epoch, refused-old-wrapper cleanup, and an already-running
-isolated child reading the updated record through its inherited stable path. No
-live daemon or native service manager is required.
+isolated child reading the updated record through its inherited stable path.
+
+A separate hermetic integration test runs this checkout's actual `cli.js allow`,
+node-pty child and daemon under a temporary HOME on an ephemeral loopback port.
+Held WS upgrades prove no record or child exists before the real owner ACK.
+The child reports only hashes and nonsecret identity fields, which match the
+test daemon's durable credential verifier, epoch, generation and owner PID.
+The test restarts only its own daemon and discards only that daemon's test-owned
+session snapshot to exercise new-epoch re-registration while the same child reads
+the same channel path. A fabricated challenger bearer is refused by the real WS
+owner gate without publishing or changing the incumbent record. Ordinary opt-out
+startup is exercised too. No production daemon or native service manager is used.
