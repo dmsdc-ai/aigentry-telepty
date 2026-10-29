@@ -64,3 +64,30 @@ created by the daemon. This is external signer authority, not human proof.
 The API contract, signed-byte format, digest-only CLI/private-file handoff and remaining enrollment/rotation/recovery
 and unsupported-adapter gaps are in
 [external signer approval](../specs/2026-10-29-external-signer-approval.md).
+
+## Continued Linux pass: opt-in asymmetric HTTP principals and forwarding
+
+The continued pass implements the earlier design as an explicit Linux-only strict
+HTTP mode. Checked startup public trust, exact Ed25519 action grants, replay
+fencing and persisted owner labels are described in
+[principal HTTP](../security/principal-http-132.md). The shared daemon token/JWT
+does not fall through in this mode. Ordinary creation is restricted to mailbox
+sessions: arbitrary process PIDs and native child creation would otherwise let an
+ordinary principal act with the daemon account's OS authority. Existing session
+mutations require the owning configured principal and signed current epoch;
+operator cross-owner mutation/recovery is not silently enabled. Strict WebSocket
+upgrades are currently refused, so wrapped clients need a future signed adapter.
+This does not isolate hostile processes that share unrestricted access to signer
+keys or the daemon's OS account. Native identity providers remain unsupported.
+
+Scoped forwarding now requires explicit stored-peer action/SID/byte grants, an
+exact expected epoch and one hop. Persistent digest-only tombstones precede any
+remote effect; uncertain results cannot authorize an automatic retry. The opt-in
+[broker v1](../api/broker-v1.md) uses independently enrolled node/hub signatures
+and an outbound recipient stream, keeping recipient daemon/session tokens away
+from the source/hub. Neither path claims to verify a foreign session principal.
+
+The protected inject CLI now supports a digest-only external signing handoff;
+its private signing authority stays outside Telepty. Protected SSH and unsupported
+input adapters still refuse. No live trust configuration, signer, secret or
+network policy was created or changed to test any of these source features.
