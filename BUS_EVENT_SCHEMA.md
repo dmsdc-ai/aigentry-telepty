@@ -227,6 +227,8 @@ what it measured. None of them is a task outcome — all carry `completion_fact:
 { "type": "session.idle", "session_id": "string", "idleSeconds": "number", "lastActivityAt": "ISO 8601", "timestamp": "ISO 8601" }
 ```
 
+This event measures elapsed time since `lastActivityAt`, once per inactivity period after 60 seconds. It does not establish task completion, a free worker, or a stalled process. Delivery and transport activity can update the basis timestamp. Qualified composer evidence is available separately from `GET /api/sessions/:id/handshake`; see `docs/readiness-handshake.md`.
+
 ### `session_health` (periodic, every 10s)
 ```json
 { "type": "session_health", "session_id": "string", "payload": { "alive": true, "pid": "number|null", "type": "string", "clients": "number", "idleSeconds": "number|null" }, "timestamp": "ISO 8601" }

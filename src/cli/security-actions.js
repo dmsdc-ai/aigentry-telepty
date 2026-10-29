@@ -58,7 +58,7 @@ function isLocalHostname(host) {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
 }
 
-function resolveTargetToken(url) {
+function resolveTargetToken(url, { readOnly = false } = {}) {
   if (process.env.TELEPTY_AUTH_TOKEN) return process.env.TELEPTY_AUTH_TOKEN;
   let host = null;
   try {
@@ -72,7 +72,7 @@ function resolveTargetToken(url) {
     if (peerToken) return peerToken;
   } catch { /* not a URL we can read — see below: no host, so nothing is dialled from here */ }
   if (host && !isLocalHostname(host)) throw credentialRefusalError(host);
-  return getAuthToken();
+  return readOnly ? (0, shared.getConfig)({ create: false }).authToken : getAuthToken();
 }
 
 function credentialRefusalError(host) {
@@ -187,8 +187,9 @@ function interceptSubcommandHelp(cmd, argv) {
 }
 
 const fetchWithAuth = (url, options = {}) => {
-  const headers = Object.fromEntries(new Headers(options.headers).entries());
-  headers['x-telepty-token'] = resolveTargetToken(url);
+  const { readOnlyAuth = false, ...requestOptions } = options;
+  const headers = Object.fromEntries(new Headers(requestOptions.headers).entries());
+  headers['x-telepty-token'] = resolveTargetToken(url, { readOnly: readOnlyAuth });
   delete headers['x-telepty-session-token'];
   // #43 P2 — present the per-session verified-sender token (minted at register, carried in the
   // parent-hijack-protected env beside TELEPTY_SESSION_ID) so the daemon can map token→sid and
@@ -198,7 +199,7 @@ const fetchWithAuth = (url, options = {}) => {
   // Wrapped here rather than at the 45 call sites: every one of them either prints `e.message`
   // or swallows the throw, so this is the single place the origin can be attached without
   // changing what any caller does with the error.
-  return fetch(url, { ...options, headers, redirect: 'error' }).catch((error) => { throw namedTransportError(url, error); });
+  return fetch(url, { ...requestOptions, headers, redirect: 'error' }).catch((error) => { throw namedTransportError(url, error); });
 };
 
 function parseAllowInvocation(cmd, args) {

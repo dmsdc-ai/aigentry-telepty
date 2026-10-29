@@ -1566,6 +1566,7 @@ app.get('/api/injects', (req, res) => {
 });
 
 sessionInspection.registerGetRoute(app);
+require('./src/readiness').registerReadinessRoute(app, { sessions, machineId: MACHINE_ID });
 
 // Auto-detected session state (from PTY output pattern analysis)
 app.get('/api/sessions/:id/state', (req, res) => {

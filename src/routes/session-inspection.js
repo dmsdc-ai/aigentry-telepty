@@ -1,6 +1,7 @@
 // Production session inspection and batch-submit operations.
 // Deliberately retains the daemon's non-strict execution semantics.
 const { defaultSubmitAdmission } = require('../submit-admission');
+const { readinessSnapshot } = require('../readiness');
 
 function createSessionInspectionContext(shared, { execSync: nativeExecSync, admission = defaultSubmitAdmission } = {}) {
 function serializeSession(id, session, options = {}) {
@@ -33,6 +34,7 @@ function serializeSession(id, session, options = {}) {
     idleSeconds,
     active_clients: session.clients ? session.clients.size : 0,
     ready: session.ready || false,
+    handshake: readinessSnapshot(session, { nowMs, machineId: shared.MACHINE_ID }),
     delivery: session.delivery || null,
     deliveryEndpoint: session.deliveryEndpoint || null,
     healthStatus,

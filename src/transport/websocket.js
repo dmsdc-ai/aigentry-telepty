@@ -2,6 +2,7 @@
 
 const crypto = require('node:crypto');
 const { invalidateInteraction } = require('../interaction');
+const { recordReadyEvidence } = require('../readiness');
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
 
@@ -465,6 +466,10 @@ function installWebSocketTransport(deps) {
         }
 
         if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+          if (type === 'session_died' || type === 'session_restarted') {
+            invalidateInteraction(activeSession, 'child_lifecycle');
+            return;
+          }
           if (type === 'interaction_receipt') {
             if (typeof acceptInteractionReceipt === 'function') acceptInteractionReceipt(sessionId, activeSession, ws, msg);
             return;
@@ -528,6 +533,7 @@ function installWebSocketTransport(deps) {
               ? msg.detector
               : 'unqualified';
             activeSession.readyCliKey = qualified && typeof msg.cli_key === 'string' ? msg.cli_key : null;
+            recordReadyEvidence(activeSession);
 
             console.log(`[READY] Session ${sessionId} surface is ready for inject (${activeSession.readyKind}, detector=${activeSession.readyDetector})`);
             // Broadcast readiness to bus (cmux/kitty paths now enabled for this session).

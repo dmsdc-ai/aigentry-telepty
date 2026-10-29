@@ -2090,6 +2090,13 @@ async function main() {
   // printing its own usage. Deliberately below the version check, which takes no argv.
   if (interceptHelp(cmd, args.slice(1))) return;
 
+  if (cmd === 'readiness' || cmd === 'wait-ready') {
+    process.exitCode = await require('./src/cli/readiness').runReadinessCommand(cmd, args.slice(1), {
+      remoteHost: REMOTE_HOST, daemonUrl, fetchWithAuth
+    });
+    return;
+  }
+
   if (cmd === 'init') {
     const { main: runInit } = require('./src/init/print-snippet');
     const exitCode = runInit(args.slice(1));
@@ -5023,6 +5030,8 @@ function printGlobalHelp() {
   telepty peers [--remove <name>]                List connected peers
 
 \x1b[1mMonitoring:\x1b[0m
+  telepty readiness <exact-id>[@host] [--json]     Inspect qualified composer evidence (read-only)
+  telepty wait-ready <exact-id>[@host] [--timeout-ms N] [--json]  Bounded composer wait
   telepty monitor                                Real-time event billboard
   telepty listen                                 Stream event bus as JSON
 
