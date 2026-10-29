@@ -87,7 +87,7 @@ const PROMPT_PATTERNS = [
 const THINKING_PATTERNS = [
   /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/,             // braille spinner frames
   /[⣾⣽⣻⢿⡿⣟⣯⣷]/,               // braille spinner alt
-  /[|/\-\\]\s/,                 // classic spinner |/-\
+  /^[|/\-\\]$/,                // classic spinner occupies the current line (#67)
   /[◐◓◑◒]/,                    // circle spinner
   /[⠁⠂⠄⡀⢀⠠⠐⠈]/,               // dot spinner
   /\bthinking\b/i,             // literal "thinking"
@@ -235,7 +235,8 @@ class SessionStateMachine {
     if (cleaned.trim().length === 0) {
       return;
     }
-    const lines = cleaned.split(/\r?\n/).filter(l => l.trim().length > 0);
+    // Bare CR repaints/wraps a terminal line; it is not whitespace inside a spinner token (#67).
+    const lines = cleaned.split(/\r\n|[\r\n]/).filter(l => l.trim().length > 0);
 
     for (const line of lines) {
       this._recentLines.push({ text: line.trim(), timestamp: now });
