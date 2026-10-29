@@ -1,5 +1,11 @@
 # Continued Linux issue repair pass
 
+Latest independent-review follow-up: the three reproduced delivery/custody/broker
+defects are fixed; final suite **2,332 total, 2,329 passed, zero failed, three
+skipped**. See [review follow-up](2026-10-29-review-followup.md) for the new
+regressions, re-review and environment limitations. Earlier counts below describe
+the preceding checkpoint.
+
 This pass follows the explicit request to continue all 15 partial and 19 remaining
 items from the first checkpoint. The complete 55-issue disposition is maintained
 in [open issue outcomes](2026-10-29-open-issue-outcomes.md). Local implementation

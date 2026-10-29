@@ -1,5 +1,11 @@
 # Open Telepty issues: local delivery outcome — 2026-10-29
 
+Latest independent-review follow-up: the three reproduced delivery/custody/broker
+defects are fixed; final suite **2,332 total, 2,329 passed, zero failed, three
+skipped**. See [review follow-up](2026-10-29-review-followup.md) for the new
+regressions, re-review and environment limitations. Earlier counts below describe
+the preceding checkpoint.
+
 This is **not a claim that all 55 open issues are resolved**. Every issue and all 11 open PRs were inventoried. Safe independent fixes/features were implemented and composed locally; policy, native runtime and missing-provider work remains explicit. No GitHub issues/PRs were changed.
 
 Input repository: `dmsdc-ai/aigentry-telepty`. Original preserved PR125 head: `2ead16824bf95ad33f8b183a042bf1fa44bf4409`. Earlier local repairs `b6eb33c` and `426df96` remain ancestors. Primary isolated clone: `telepty-issues-128-135`, branch `fix/issues-128-135`.
