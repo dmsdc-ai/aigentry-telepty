@@ -11,7 +11,7 @@ const os = require('os');
 const net = require('net');
 
 // Tailscale assigns node IPs from the CGNAT range 100.64.0.0/10 (100.64.0.0 –
-// 100.127.255.255). This is also the *effective trust CIDR* — safe only because the
+// 100.127.255.255). This is a network-admission CIDR, not an API credential. The
 // daemon binds to the selected interface (see daemon.js); authentication remains
 // mandatory and this range alone does not prove Tailscale or user identity.
 const TAILNET_CIDR = '100.64.0.0/10';
