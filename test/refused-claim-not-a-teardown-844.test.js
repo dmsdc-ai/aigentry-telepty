@@ -115,7 +115,11 @@ test('a bridge whose owner claim is REFUSED does not destroy the session it was 
   assert.equal(survivor.healthStatus, 'CONNECTED',
     'the healthy incumbent must still own its socket after another bridge was refused');
   assert.equal(survivor.ownerPid, beforeChallenge.ownerPid, 'refused challenger must not replace incumbent owner PID');
-  assert.equal(survivor.ptyPid, beforeChallenge.ptyPid, 'incumbent PTY PID is preserved');
+  // The owner claim can precede the incumbent's own asynchronous PTY metadata update.
+  // Only an already observed PTY PID is stable across the challenge.
+  if (beforeChallenge.ptyPid != null) {
+    assert.equal(survivor.ptyPid, beforeChallenge.ptyPid, 'incumbent PTY PID is preserved');
+  }
   assert.equal(a.output.exit, null,
     'the incumbent bridge exited — it was torn down by a bridge the daemon had just refused');
 });
