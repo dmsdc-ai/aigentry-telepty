@@ -366,6 +366,7 @@ function createAllowSecurityContext(shared, {
         env: shared.sshPlan ? require('../ssh-session').sshChildEnvironment(shared.sessionEnv) : shared.sessionEnv
       });
       if (shared.onChildSpawn) (0, shared.onChildSpawn)(shared.child);
+      shared.resetInteractionProvider?.(shared.child);
       shared.sessionStartTime = now();
       updateDaemonProcessMetadata();
       return shared.child;
@@ -512,6 +513,7 @@ function createAllowSecurityContext(shared, {
       closed = true;
       shared.allowSessionClosed = true;
       shared.credentialChannel?.close();
+      shared.disposeInteractionProvider?.();
       for (const timer of deliveryTimers) clearTimeout(timer);
       deliveryTimers.clear();
       if (shared.queueFlushTimer != null) clearTimeout(shared.queueFlushTimer);

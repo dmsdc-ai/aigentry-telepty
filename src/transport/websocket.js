@@ -2,6 +2,7 @@
 const { protectedInputFailure } = require('../external-approval');
 
 const crypto = require('node:crypto');
+const capturedSelector = require('../vt/captured-selector');
 const { invalidateInteraction } = require('../interaction');
 const { recordReadyEvidence } = require('../readiness');
 const { applySshState, acceptSshWriteReceipt } = require('../ssh-session');
@@ -347,6 +348,8 @@ function installWebSocketTransport(deps) {
       // so the live current owner always holds the current token while a displaced owner keeps a
       // stale one.
       activeSession.ownerToken = crypto.randomUUID();
+      activeSession.interactionProvider?.dispose();
+      activeSession.interactionProvider = null;
       activeSession.interactionOwnerGeneration = crypto.randomUUID();
       if (activeSession.sshRemote) activeSession.sshState = { phase: 'connecting', generation: 0, reason: 'owner_changed', owner_generation: activeSession.interactionOwnerGeneration };
       markSessionConnected(activeSession);
@@ -481,7 +484,20 @@ function installWebSocketTransport(deps) {
           if (type === 'ssh_state') { applySshState(activeSession, msg); return; }
           if (type === 'ssh_write_receipt') { acceptSshWriteReceipt(activeSession, ws, msg); return; }
           if (type === 'session_died' || type === 'session_restarted') {
+            if (type === 'session_died') { activeSession.interactionProvider?.dispose(); activeSession.interactionProvider = null; }
             invalidateInteraction(activeSession, 'child_lifecycle');
+            return;
+          }
+          if (type === 'interaction_provider') {
+            if (activeSession.externalApprovalPolicy || msg.owner_generation !== activeSession.interactionOwnerGeneration
+                || !capturedSelector.supportedProfile(msg.profile) || typeof msg.stream_id !== 'string'
+                || !/^[a-f0-9-]{36}$/.test(msg.stream_id) || !Number.isSafeInteger(msg.cols) || !Number.isSafeInteger(msg.rows)
+                || msg.cols < 1 || msg.rows < 1 || msg.cols > 1000 || msg.rows > 1000) return;
+            activeSession.interactionProvider?.dispose();
+            activeSession.cols = msg.cols; activeSession.rows = msg.rows;
+            activeSession.interactionProvider = capturedSelector.createCapturedSelector({ profile: msg.profile,
+              binding: () => capturedSelector.bindingForSession(activeSession), cols: msg.cols, rows: msg.rows,
+              sessionId, streamId: msg.stream_id, localSource: false });
             return;
           }
           if (type === 'interaction_receipt') {
@@ -504,6 +520,7 @@ function installWebSocketTransport(deps) {
           // Owner sending output -> broadcast to other clients + update activity
           if (type === 'output') {
             invalidateInteraction(activeSession, 'output');
+            activeSession.interactionProvider?.feed(data, { stream_id: msg.stream_id, stream_offset: msg.stream_offset });
             activeSession.lastActivityAt = new Date().toISOString();
             appendToOutputRing(activeSession, data);
             sessionStateManager.feed(sessionId, data);

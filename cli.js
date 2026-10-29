@@ -55,6 +55,7 @@ const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec
 const { FileMailbox } = require('./src/mailbox/index');
 const { filterBridgeBatch, bridgeInjectTtlSecs } = require('./src/mailbox/bridge-flush-filter');
 const readyRegistry = require('./src/prompt-symbol-registry');
+const capturedSelector = require('./src/vt/captured-selector');
 const lifecycle = require('./src/lifecycle');
 const args = process.argv.slice(2);
 let pendingTerminalInputError = null;
@@ -2680,6 +2681,8 @@ async function main() {
       get cmdArgs() { return cmdArgs; },
       get sessionCwd() { return sessionCwd; },
       get sessionEnv() { return sessionEnv; },
+      get resetInteractionProvider() { return resetInteractionProvider; },
+      get disposeInteractionProvider() { return () => interactionProvider?.dispose(); },
       get credentialChannel() { return credentialChannel; },
       get sessionStartTime() { return sessionStartTime; },
       get bridgeMailbox() { return bridgeMailbox; },
@@ -2735,6 +2738,7 @@ async function main() {
     }
 
     function emitDeathEvent(exitCode, signal, willRestart) {
+      if (interactionBinding) interactionBinding.input_generation++;
       if (wsReady && daemonWs && daemonWs.readyState === 1) {
         daemonWs.send(JSON.stringify({
           type: 'session_died',
@@ -2749,6 +2753,7 @@ async function main() {
     }
 
     function emitRestartEvent(attempt) {
+      if (interactionBinding) interactionBinding.input_generation++;
       if (wsReady && daemonWs && daemonWs.readyState === 1) {
         daemonWs.send(JSON.stringify({
           type: 'session_restarted',
@@ -2831,9 +2836,24 @@ async function main() {
     // from a stale/displaced owner's exit and avoid the shared-fate teardown.
     let currentOwnerToken = null;
     let interactionBinding = null;
+    let interactionProvider = null;
+    let interactionStream = null;
+    const interactionProfile = process.env.TELEPTY_INTERACTION_PROFILE;
+    function resetInteractionProvider(currentChild) {
+      interactionProvider?.dispose(); interactionProvider = null; interactionStream = null;
+      if (!capturedSelector.supportedProfile(interactionProfile) || !interactionBinding) return;
+      const size = { cols: currentChild.cols, rows: currentChild.rows };
+      Object.assign(interactionBinding, size);
+      interactionStream = { id: require('node:crypto').randomUUID(), offset: 0 };
+      interactionProvider = capturedSelector.createCapturedSelector({ profile: interactionProfile,
+        binding: () => interactionBinding, ...size, sessionId, streamId: interactionStream.id });
+      if (wsReady && daemonWs.readyState === 1) daemonWs.send(JSON.stringify({ type: 'interaction_provider',
+        profile: interactionProfile, stream_id: interactionStream.id,
+        owner_generation: interactionBinding.owner_generation, ...size }));
+    }
 
     const writeInteraction = interaction.createInteractionWriter({
-      observe: () => readyRegistry.observeInteraction({ command }),
+      observe: () => interactionProvider?.observe() || interaction.unavailableObservation(),
       binding: () => interactionBinding,
       encode: readyRegistry.encodeInteraction,
       write: bytes => { child.write(bytes); invalidateBridgeInteraction('interaction'); }
@@ -3252,8 +3272,11 @@ async function main() {
       rewrite: rewriteTitleSequences,
       write: data => process.stdout.write(data),
       sendOutput: data => {
+        const stream = interactionStream ? { stream_id: interactionStream.id, stream_offset: interactionStream.offset } : {};
+        interactionProvider?.feed(data, stream);
+        if (interactionStream) interactionStream.offset += data.length;
         if (wsReady && daemonWs.readyState === 1) {
-          daemonWs.send(JSON.stringify({ type: 'output', data }));
+          daemonWs.send(JSON.stringify({ type: 'output', data, ...stream }));
         } else {
           holdPreConnectOutput(data);
         }

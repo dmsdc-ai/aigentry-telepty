@@ -719,7 +719,7 @@ app.get('/api/sessions/:id/interaction', requireInteractionController, (req, res
   const s = sessions[req.params.id];
   if (!s) return res.status(404).json(interaction.refusal('wrong_owner'));
   res.json({ ...readyRegistry.observeInteraction(s), identity: interactionBinding(req.params.id),
-    protocol_version: 1, live_adapter: false, task_binding_available: false,
+    protocol_version: 1, live_adapter: !!s.interactionProvider, task_binding_available: false,
     retained_pending: Object.values(trackedInjections.interactions?.pending || {})
       .filter(p => p.sid === req.params.id).map(p => ({ inject_id: p.inject_id, payload_digest: p.payload_digest, state: p.state })) });
 });
