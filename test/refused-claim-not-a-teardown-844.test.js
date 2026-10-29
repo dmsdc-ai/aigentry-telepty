@@ -87,6 +87,8 @@ test('a bridge whose owner claim is REFUSED does not destroy the session it was 
     return sessions.some((s) => s.id === sessionId && s.healthStatus === 'CONNECTED');
   }, { timeoutMs: 15000, description: 'incumbent bridge owner connected' });
 
+  const beforeChallenge = (await listSessions()).find(s => s.id === sessionId);
+
   // ── challenger: a re-registration, so #815 hands it no credential and the claim is refused ──
   const b = spawnBridge(sessionId);
   t.after(() => { try { b.proc.kill(); } catch { /* already gone */ } });
@@ -112,6 +114,8 @@ test('a bridge whose owner claim is REFUSED does not destroy the session it was 
     + 'authorise a destructive remediation (#835)');
   assert.equal(survivor.healthStatus, 'CONNECTED',
     'the healthy incumbent must still own its socket after another bridge was refused');
+  assert.equal(survivor.ownerPid, beforeChallenge.ownerPid, 'refused challenger must not replace incumbent owner PID');
+  assert.equal(survivor.ptyPid, beforeChallenge.ptyPid, 'incumbent PTY PID is preserved');
   assert.equal(a.output.exit, null,
     'the incumbent bridge exited — it was torn down by a bridge the daemon had just refused');
 });

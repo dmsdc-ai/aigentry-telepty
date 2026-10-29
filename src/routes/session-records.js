@@ -157,7 +157,10 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
         existing.ready = true;
         markSessionConnected(existing);
       }
-      applyProcessMetadata(existing, req.body);
+      // Process PIDs are lifecycle targets, not descriptive metadata. A challenger that
+      // will fail its WS owner claim must not overwrite the incumbent's process identity.
+      // Reuse the existing session-credential rule; credentialless legacy records stay compatible.
+      if (mayRedirectDelivery) applyProcessMetadata(existing, req.body);
       applyIdleTtlMetadata(existing, parsedIdleTtl);
       applyTimestampMetadata(existing, req.body);
       initializeBootstrapState(existing);
