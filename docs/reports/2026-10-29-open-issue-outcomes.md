@@ -10,7 +10,7 @@ Input repository: `dmsdc-ai/aigentry-telepty`. Original preserved PR125 head: `2
 - **Partial:** a useful correction/surface exists, but explicit requirements or the original reported incident remain unresolved.
 - **Remaining:** no complete implementation; native evidence, security authority, provider dependencies, repository ownership or prohibited publication blocks completion.
 
-The original checkpoint recorded 21 local implementations, 15 partial items and 19 remaining. The continued Linux pass below supersedes those counts; final verification and classification are recorded after integration. #60/#61/#82 were already present and remain preserved.
+The original checkpoint recorded 21 local implementations, 15 partial items and 19 remaining. The continued Linux pass below supersedes those counts. See [continued Linux evidence](2026-10-29-continued-linux-pass.md) for the later tests and reviews. #60/#61/#82 were already present and remain preserved.
 
 ## All 55 outcomes
 
@@ -20,7 +20,7 @@ The original checkpoint recorded 21 local implementations, 15 partial items and 
 | [#134](https://github.com/dmsdc-ai/aigentry-telepty/issues/134) | Partial | Exact owned kill and immutable protected-instance policy now require current sid/epoch/generation credential. Opt-in strict asymmetric principal authorization adds owner/operator grants separately; default legacy operator bearer remains explicitly privileged. |
 | [#133](https://github.com/dmsdc-ai/aigentry-telepty/issues/133) | Remaining | Explicit takeover waits for trusted principal/operator model, epoch CAS, rotation, mailbox custody and audit; default owner protection remains. |
 | [#132](https://github.com/dmsdc-ai/aigentry-telepty/issues/132) | Partial | Opt-in Linux checked public-trust file, Ed25519 method/path/body/audience/challenge/nonce/expiry proofs, exact action grants, persisted verified owning principal and owner/epoch mutations. Ordinary creation is mailbox-only; native process creation requires operator grant. Strict WS is denied until a signed adapter exists; same-UID secret isolation and Windows/macOS identity remain outside this slice. |
-| [#131](https://github.com/dmsdc-ai/aigentry-telepty/issues/131) | Remaining | Windows native locking not reproduced. Installed npm dispatcher shows retirement/unpack precede hooks; a preinstall hook alone is not a verified solution. External quiescence/recovery coordinator and handle-owner evidence needed. |
+| [#131](https://github.com/dmsdc-ai/aigentry-telepty/issues/131) | Partial | Windows self-update now refuses before npm/repair, including interactive/override paths; bounded read-only --plan --json documents exact holder/install/service/rollback blockers. Direct npm upgrade and native transaction/holder verification remain unimplemented. |
 | [#130](https://github.com/dmsdc-ai/aigentry-telepty/issues/130) | Partial | Independent incumbent-PID overwrite defect reproduced/fixed. Original Windows owner-refusal then not-found sequence remains unreproduced. |
 | [#129](https://github.com/dmsdc-ai/aigentry-telepty/issues/129) | Local implementation | Kill errors use natural exitCode/return for transport teardown. Actual Windows UV assertion acceptance remains native-only. |
 | [#128](https://github.com/dmsdc-ai/aigentry-telepty/issues/128) | Local implementation | Owning package CLI launched with Node, spawn errors awaited/caught. Windows global install not run; unrelated startup failures can still require explicit recovery. |
@@ -61,10 +61,10 @@ The original checkpoint recorded 21 local implementations, 15 partial items and 
 | [#47](https://github.com/dmsdc-ai/aigentry-telepty/issues/47) | Partial | Existing opt-in nonce provenance supported; full broker/P5 foreign identity and nonce ratchet remain pending. |
 | [#43](https://github.com/dmsdc-ai/aigentry-telepty/issues/43) | Partial | Existing local inject audit/verified session-bearer attribution retained, audit shutdown repaired; foreign sender identity is still unavailable. |
 | [#42](https://github.com/dmsdc-ai/aigentry-telepty/issues/42) | Partial | Working opt-in signed hub/outbound-recipient/exact-inject topology with pinned node grants, no peer reachability or leaked recipient token, bounded queues and durable dedup receipts. Broadcast/refs/discovery/reply/reconnect, strict-local signer adapter and native VPN acceptance remain unsupported. |
-| [#40](https://github.com/dmsdc-ai/aigentry-telepty/issues/40) | Remaining | Update-modal detection exists; automatic dismissal/provider policy is unimplemented and must not accidentally select an upgrade or trust action. |
-| [#39](https://github.com/dmsdc-ai/aigentry-telepty/issues/39) | Remaining | Typed interaction contract is fail-closed; live full-screen selector observation/action provider is missing and needs native measured binding. |
+| [#40](https://github.com/dmsdc-ai/aigentry-telepty/issues/40) | Partial | Captured Codex0.144.1 update screen is observable but has no permitted actions. Sensitive trust/update/resume/raw-key paths refuse; safe automatic dismissal requires measured provider-specific semantics and explicit authority. |
+| [#39](https://github.com/dmsdc-ai/aigentry-telepty/issues/39) | Partial | Bounded pinned VT parser plus one opt-in exact captured Claude2.1.220 color-question profile supports typed Red/Blue selection. Real test-owned PTY verifies exact bytes and single consumption; version is operator-selected, not binary-attested, and native provider acceptance remains unavailable. |
 | [#37](https://github.com/dmsdc-ai/aigentry-telepty/issues/37) | Partial | Bounded debounced sustained-idle bus observations classify fresh qualified composer, known modal, observed unavailable transport, or unknown; exact epoch/owner and rearming tested. Silence never becomes free/stalled/hung/completed; output-tail hash is explicitly not a VT screen. |
-| [#36](https://github.com/dmsdc-ai/aigentry-telepty/issues/36) | Remaining | Force Enter escape hatch exists, but trusted typed modal provider and explicit human approval remain missing; no automatic folder-trust approval added. |
+| [#36](https://github.com/dmsdc-ai/aigentry-telepty/issues/36) | Partial | Known bootstrap/modal surfaces are observable; typed actions exist only for the exact nonsensitive color fixture. Trust/permission/bootstrap approval remains refused without a supported independent-authority adapter; no raw input bypass added. |
 | [#31](https://github.com/dmsdc-ai/aigentry-telepty/issues/31) | Remaining | Requires native cmux/Codex foreground-versus-background MCP-init reproduction; output silence is not proof of MCP/provider failure. |
 | [#30](https://github.com/dmsdc-ai/aigentry-telepty/issues/30) | Remaining | Warp UI surface close/focus belongs to orchestration Workspace Host per BOUNDARY.md; no Telepty-owned surface adapter or external repository change was made. |
 | [#22](https://github.com/dmsdc-ai/aigentry-telepty/issues/22) | Local implementation | Owner/epoch/generation-bound readiness inspect/wait CLI and exact API; no credential mint, keys or repair. Unsupported/uncertain surfaces remain explicit. |
@@ -86,7 +86,9 @@ The Mac no-ACK incident is not attributed to these defects and is not claimed re
 
 Security decisions and required authority/enrollment/revocation/recovery contracts are detailed in [security-decisions](2026-10-29-security-decisions.md). Original source/PR classifications are retained in [inventory](2026-10-29-open-issue-inventory.md); the earlier focused repair evidence is in [128–135 report](2026-10-29-issues-128-135.md).
 
-## Verification
+## Previous checkpoint verification
+
+Current continued-pass verification is in [continued Linux pass](2026-10-29-continued-linux-pass.md).
 
 Previous checkpoint verification (before the continued pass): **2,092 tests; 2,090 passed, 0 failed, 2 skipped**, 47.3 seconds. Log: `/tmp/telepty-all-integrated-release-review.log`. Skips: existing slow #732 TCP-stall test (`TELEPTY_732_SLOW=1` required) and the new native Windows shim-argv test. Neither is represented as passed. Pinned TypeScript check and `git diff --check` passed. Interim first composition: 2,031 passed, eight failures (seven obsolete unregistered modal fixtures, one initial-PTY metadata race), two skipped. Next composition: 2,084 passed, one failure (new readiness fixture lacked the explicit successful persistence result), two skipped. The fixtures were corrected, not the production guards; targeted final readiness/durability/mailbox composition passed 30/30. The fresh full-suite result above is from the corrected final composition.
 
@@ -97,7 +99,7 @@ Final independent review also reproduced a service confirmation-time ownership r
 Commit `98e653f` now snapshots the approved target/descriptor/actions and rebuilds the
 plan after confirmation; a changed or newly refused plan performs no mutation.
 Independent in-memory install/uninstall changed/unchanged assertions passed, with no
-remaining important findings. The final full-suite numbers above include that fix.
+remaining important findings. The previous-checkpoint full-suite numbers above include that fix.
 
 All checkpoint test files were registered in the repository's explicit npm test commands.
 No application installation, service execution, credential enrollment, publication,
