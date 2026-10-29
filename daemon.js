@@ -1630,7 +1630,7 @@ app.get('/api/peers', (req, res) => {
     const crossMachine = require('./cross-machine');
     res.json({
       active: crossMachine.listActivePeers(),
-      known: crossMachine.listKnownPeers()
+      known: crossMachine.listPublicKnownPeers()
     });
   } catch {
     res.json({ active: [], known: {} });

@@ -445,6 +445,18 @@ function listKnownPeers() {
   return loadPeers().peers;
 }
 
+// Public API projection: adding a persisted credential must never expose it here.
+function listPublicKnownPeers() {
+  return Object.fromEntries(Object.entries(loadPeers().peers || {}).map(([name, peer]) => {
+    const publicPeer = {};
+    for (const key of ['transport', 'host', 'port', 'target', 'machineId', 'lastConnected', 'label']) {
+      if (peer && ['string', 'number'].includes(typeof peer[key])) publicPeer[key] = peer[key];
+    }
+    publicPeer.has_token = Boolean(peer && peer.token);
+    return [name, publicPeer];
+  }));
+}
+
 /**
  * Find which peer has a given session.
  * @returns {{ peerName, peer } | null}
@@ -709,6 +721,7 @@ return {
   disconnectAll,
   listActivePeers,
   listKnownPeers,
+  listPublicKnownPeers,
   getConnectedHosts,
   getPeerHost,
   removePeer,

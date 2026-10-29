@@ -24,7 +24,7 @@ const {
 const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
 const interaction = require('./src/interaction');
 const { getRuntimeInfo } = require('./runtime-info');
-const { formatHostLabel, groupSessionsByHost, parseSessionReference, pickSessionTarget } = require('./session-routing');
+const { formatHostLabel, groupSessionsByHost, parseSessionReference, pickSessionTarget, resolveRegisteredPeerTarget } = require('./session-routing');
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const {
@@ -1197,6 +1197,23 @@ async function resolveLocalSessionTarget(sessionRef) {
 }
 
 async function resolveSessionTarget(sessionRef, options = {}) {
+  // Qualified registered identities retain the peer's endpoint and credential lane,
+  // even when discovery cannot list the session. Never shorten the requested id.
+  const registeredPeers = crossMachine.loadPeers().peers || {};
+  let registered;
+  try { registered = resolveRegisteredPeerTarget(sessionRef, registeredPeers); }
+  catch (error) { markCommandFailed(); throw error; }
+  if (registered) {
+    const discovered = (options.sessions || []).find((session) =>
+      session.id === registered.id && session.peerName === registered.peerName);
+    return { ...discovered, ...registered };
+  }
+  const qualified = parseSessionReference(sessionRef);
+  if (qualified.host && !isLocalHostname(qualified.host) && !process.env.TELEPTY_AUTH_TOKEN) {
+    markCommandFailed();
+    const known = Object.entries(registeredPeers).map(([name, peer]) => (peer && peer.machineId) || name).sort();
+    throw new Error(`No peer registered with machine id or address '${qualified.host}'; known: ${known.join(', ') || '(none)'}. Use telepty connect-http or telepty connect to register it.`);
+  }
   if (!options.sessions) {
     // #837: a hit here means no peer was consulted. A caller that already did its own discovery
     // (and paid for the fan-out) passes `sessions` and keeps its list as the authority.
