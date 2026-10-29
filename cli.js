@@ -3137,29 +3137,13 @@ async function main() {
 
   if (cmd === 'read-screen') {
     const sessionId = args[1];
-    if (!sessionId) { console.error('❌ Usage: telepty read-screen <session_id> [--lines N] [--raw]'); process.exit(1); }
-
-    const linesIndex = args.indexOf('--lines');
-    const lines = (linesIndex !== -1 && args[linesIndex + 1]) ? args[linesIndex + 1] : '50';
-    const raw = args.includes('--raw');
+    if (!sessionId) { console.error('❌ Usage: telepty read-screen <session_id> [--lines N] [--raw] [--json --max-bytes N --since CURSOR]'); process.exit(1); }
 
     try {
-      const target = await resolveSessionTarget(sessionId);
-      if (!target) {
-        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
-        process.exit(1);
-      }
-
-      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/screen?lines=${lines}${raw ? '&raw=1' : ''}`);
-      const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); process.exit(1); }
-
-      if (!data.screen) {
-        console.log('(empty screen)');
-      } else {
-        console.log(data.screen);
-      }
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+      await require('./src/cli/read-screen').readScreen(args, {
+        resolveTarget: resolveSessionTarget, daemonUrl, fetchWithAuth
+      });
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); process.exitCode = 1; }
     return;
   }
 
@@ -4756,6 +4740,10 @@ function printGlobalHelp() {
   telepty multicast <id1,id2> "<prompt>"         Inject into multiple sessions
   telepty broadcast [--ref [file]] "<prompt>"    Inject into ALL sessions
   telepty read-screen <id[@host]> [--lines N]    Read session screen buffer
+    --json [--max-bytes N] [--since CURSOR]      Bounded snapshots/deltas (default 4096 content bytes; max 262144)
+    --lines N selects last N lines before byte limiting; --raw preserves ANSI
+    Cursors are scoped to session instance and raw/lines mode; reset requires refresh
+    Delta splice indices use Unicode code points; truncated snapshots are partial
 
 \x1b[1mCross-Machine:\x1b[0m
   telepty connect <user@host> [--name N] [--port P]      SSH tunnel to remote host

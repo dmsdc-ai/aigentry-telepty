@@ -1465,6 +1465,7 @@ function appendToOutputRing(session, data) {
   while (totalLen > 200000 && session.outputRing.length > 1) {
     totalLen -= session.outputRing[0].length;
     session.outputRing.shift();
+    session.outputRingRollover = (session.outputRingRollover || 0) + 1;
   }
 }
 
@@ -1946,37 +1947,7 @@ app.delete('/api/pendingReports/:id', (req, res) => {
 });
 
 // GET /api/sessions/:id/screen — read current screen buffer
-app.get('/api/sessions/:id/screen', (req, res) => {
-  const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
-  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
-  const session = sessions[resolvedId];
-
-  const lines = parseInt(req.query.lines) || 50;
-  const raw = req.query.raw === '1' || req.query.raw === 'true';
-
-  if (!session.outputRing || session.outputRing.length === 0) {
-    return res.json({ session_id: resolvedId, screen: '', lines: 0, raw: false });
-  }
-
-  // Join all buffered output
-  const fullOutput = session.outputRing.join('');
-
-  const cleaned = raw ? fullOutput : stripAnsiForScreen(fullOutput);
-
-  // Take last N lines
-  const allLines = cleaned.split('\n');
-  const lastLines = allLines.slice(-lines);
-  const screen = lastLines.join('\n').trim();
-
-  res.json({
-    session_id: resolvedId,
-    screen,
-    lines: lastLines.length,
-    total_lines: allLines.length,
-    raw: !!raw
-  });
-});
+app.get('/api/sessions/:id/screen', require('./src/routes/session-screen').createScreenHandler({ sessions, resolveSessionAlias }));
 
 registerSessionRenameRoute(app, { context: sessionRecordContext, sessionStateManager, busClients });
 
