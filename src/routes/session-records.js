@@ -135,6 +135,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     if (Object.prototype.hasOwnProperty.call(sessions, session_id)) {
       const existing = ownRecord(sessions, session_id);
       if (!existing) return res.status(409).json({ error: 'Invalid existing session record' });
+      if (existing.isClosing) return res.status(409).json({ code: 'SESSION_CLOSING', error: 'Session is closing' });
       // #815: does this caller hold the session's CURRENT credential? A re-register never mints,
       // recovers or discloses credential material either way — this only decides whether the
       // caller may redirect where the session's injects are delivered (below).
@@ -320,6 +321,7 @@ function registerSessionRenameRoute(app, { context, sessionStateManager, busClie
     if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
     const session = ownRecord(sessions, resolvedId);
     if (!session) return res.status(409).json({ error: 'Invalid existing session record' });
+    if (session.isClosing) return res.status(409).json({ code: 'SESSION_CLOSING', error: 'Session is closing' });
     const id = resolvedId;
     const identity = readIdentity(req.body, 'new_id');
     if (identity.error) return res.status(400).json({ error: identity.error });

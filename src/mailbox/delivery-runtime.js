@@ -1007,6 +1007,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function getInjectFailure(session, options = {}) {
+    if (session.isClosing) return { httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing' };
     const healthStatus = getSessionHealthStatus(session, options);
     if (healthStatus === 'STALE') {
       return { httpStatus: 410, code: 'STALE', error: 'Session is stale and awaiting cleanup.' };
@@ -1044,6 +1045,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function terminalLevelSubmit(id, session) {
+    if (session.isClosing) return null;
     if (hasHeldInteraction(session)) return null;
     if (submitViaPty(session)) return 'pty_cr';
     return null;

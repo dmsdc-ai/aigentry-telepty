@@ -223,6 +223,12 @@ function installWebSocketTransport(deps) {
     }
 
     const activeSession = sessions[sessionId];
+    if (activeSession.isClosing) {
+      activeSession.clients.delete(ws);
+      clearInterval(pingInterval);
+      try { ws.close(1011, 'Session is closing'); } catch {}
+      return;
+    }
 
     // #815: gate the owner claim. Before this, ANY local process could open ?owner=1 on ANY
     // session and take the PTY byte stream — last-writer-wins displaced the incumbent bridge with
@@ -451,7 +457,7 @@ function installWebSocketTransport(deps) {
         // with a working downstream, i.e. #732 again by a different route. Re-resolve the
         // live record on every frame so the snapshot can never become the routing authority.
         const activeSession = sessions[sessionId];
-        if (!activeSession) return;   // record is gone — nothing to feed
+        if (!activeSession || activeSession.isClosing) return;   // no owner reclaims or writes during teardown
 
         // An owner whose record was swapped re-adopts a FREE owner slot rather than silently
         // degrading into a viewer (the viewer branch drops 'output' entirely). Same

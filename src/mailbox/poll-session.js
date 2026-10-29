@@ -22,7 +22,7 @@ function authorizeMailboxRequest(req, sessions, credentials) {
   const principal = credentials.verify(req.headers?.['x-telepty-session-token']);
   if (!principal) return false;
   const session = Object.prototype.hasOwnProperty.call(sessions, principal.sid) && sessions[principal.sid];
-  if (!session || session.type !== 'mailbox' || session.sessionEpoch !== principal.epoch
+  if (!session || session.isClosing || session.type !== 'mailbox' || session.sessionEpoch !== principal.epoch
       || (session.credentialGeneration || 1) !== principal.generation) return false;
   if (req.method === 'POST' && req.path === '/api/sessions/register') {
     return req.body?.session_id === principal.sid;
@@ -37,6 +37,7 @@ function authorizeMailboxRequest(req, sessions, credentials) {
 }
 
 function renewMailboxLease(session, leaseSeconds, persistSessions, nowMs = Date.now()) {
+  if (session.isClosing) return { success: false, code: 'SESSION_CLOSING', error: 'Session is closing' };
   const previous = { leaseExpiresAt: session.leaseExpiresAt, lastActivityAt: session.lastActivityAt,
     lastConnectedAt: session.lastConnectedAt, lastDisconnectedAt: session.lastDisconnectedAt };
   session.leaseExpiresAt = nowMs + leaseSeconds * 1000;

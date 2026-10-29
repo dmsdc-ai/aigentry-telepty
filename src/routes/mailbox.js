@@ -45,6 +45,7 @@ function registerMailboxRoutes(app, { sessions, resolveSessionAlias, getMailbox,
     if (!sessionCredentials.matches(id, req.headers['x-telepty-session-token'])) {
       return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Current session credential is required.' });
     }
+    if (session.isClosing) return res.status(409).json({ code: 'SESSION_CLOSING', error: 'Session is closing' });
     const lease = parseMailboxLease(req.body?.lease_seconds);
     if (lease.error) return res.status(400).json({ code: 'INVALID_LEASE', error: lease.error });
     const renewed = renewMailboxLease(session, lease.seconds, persistSessions);

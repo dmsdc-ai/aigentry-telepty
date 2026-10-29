@@ -2217,6 +2217,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
   setInterval(() => {
   const now = Date.now();
   for (const [id, session] of Object.entries(sessions)) {
+    if (session.isClosing) continue; // A pending teardown owns this namespace until its process action settles.
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
     const healthStatus = getSessionHealthStatus(session, { nowMs: now });
     const healthReason = getSessionHealthReason(session, healthStatus);

@@ -210,6 +210,7 @@ function selectIdleTtlVictims(sessions, config = {}, options = {}) {
   const victims = [];
 
   for (const [id, session] of entries) {
+    if (session.isClosing) continue;
     const ttlMs = effectiveIdleTtlMs(session, config);
     if (!Number.isFinite(ttlMs) || ttlMs < 0) continue;
     const idleSeconds = computeIdleSeconds(session && session.lastActivityAt, nowMs);

@@ -12,6 +12,9 @@ function defaultSessionPersistPath(homeDir = os.homedir()) {
 function serializePersistedSessions(sessions) {
   const data = {};
   for (const [id, s] of Object.entries(sessions)) {
+    // Closing instances reserve their names in memory while process teardown awaits. Once the
+    // removal is committed, unrelated saves must never reintroduce their credential verifiers.
+    if (s.isClosing) continue;
     Object.defineProperty(data, id, { enumerable: true, writable: true, configurable: true, value: {
       id,
       type: s.type,

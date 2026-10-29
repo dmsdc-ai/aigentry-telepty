@@ -524,6 +524,7 @@ function createSessionActions(shared, effects = {}) {
   }
 
   function applySessionStateReport(sessionId, session, payload = {}) {
+    if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing' };
     const parsed = parseSessionStateReport(session, payload);
     if (!parsed.success) {
       return parsed;
@@ -592,61 +593,68 @@ function createSessionActions(shared, effects = {}) {
     return Number.isFinite(configured) && configured >= 0 ? configured : shared.FORCE_CR_GAP_DEFAULT_MS;
   }
 
+  function beginDurableSessionClose(id, session) {
+    if (session.isClosing && !session.closeDurabilityPending) {
+      return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing' };
+    }
+    const previous = Object.getOwnPropertyDescriptor(session, 'isClosing');
+    session.isClosing = true;
+    const saved = (0, shared.persistSessions)();
+    if (!saved || !saved.ok) {
+      if ((!saved || !saved.committed) && !session.closeDurabilityPending) {
+        if (previous) Object.defineProperty(session, 'isClosing', previous);
+        else delete session.isClosing;
+      } else {
+        // Rename reached disk, but its fsync failed. Keep the namespace reserved and permit
+        // only a close retry, never process actions or reuse before a successful durable save.
+        session.closeDurabilityPending = true;
+      }
+      return { success: false, httpStatus: 503, code: 'SESSION_STORE_WRITE_FAILED',
+        error: 'Session removal was not durably saved; no process action was attempted',
+        process_action_attempted: false, removal_visible: !!saved?.committed };
+    }
+    session.closeDurabilityPending = false;
+    (0, shared.revokeSessionCredential)(id);
+    return { success: true };
+  }
+
   async function teardownSessionById(id, options = {}) {
     const session = shared.sessions[id];
-    if (!session) {
-      return { success: false, httpStatus: 404, error: 'Session not found' };
-    }
+    if (!session) return { success: false, httpStatus: 404, error: 'Session not found' };
+    const prepared = beginDurableSessionClose(id, session);
+    if (!prepared.success) return prepared;
 
     const timeoutMs = Math.max(0, Number(options.timeoutMs ?? 5000));
     const force = options.force === true;
     const reason = options.reason || (force ? 'manual_force' : 'manual');
-    session.isClosing = true;
+    let kill = null, killError = null;
+    try {
+      kill = await shared.lifecycle.killSessionProcess(session, { ...effects.lifecycle, timeoutMs, force });
+      if (kill?.reason === 'ESCALATION_FAILED') killError = new Error('Process escalation was not confirmed');
+    } catch (error) { killError = error; }
 
-    const kill = await shared.lifecycle.killSessionProcess(session, { ...effects.lifecycle, timeoutMs, force });
-    emitSessionLifecycleEvent('session_closed', id, session, {
-      reason,
-      force,
-      pid: kill.pid,
-      signal: kill.signal || null,
-      escalated: kill.escalated === true,
+    // A process exit can remove the old record while killSessionProcess awaits. Never let its
+    // delayed cleanup unregister, revoke, purge or delete a successor with the same textual id.
+    const current = shared.sessions[id] === session;
+    if (current) emitSessionLifecycleEvent('session_closed', id, session, {
+      reason, force, pid: kill?.pid || null, signal: kill?.signal || null,
+      escalated: kill?.escalated === true, process_action_error: killError?.message || null,
       source: options.source || 'daemon'
     });
-
-    if (session.clients) {
-      session.clients.forEach(ws => {
-        try { ws.close(1000, 'Session destroyed'); } catch {}
-      });
+    (0, shared.cancelModalParkPoll)(session);
+    if (current) {
+      if (session.clients) session.clients.forEach(ws => { try { ws.close(1000, 'Session destroyed'); } catch {} });
+      if (session.ownerWs) { try { session.ownerWs.close(1000, 'Session destroyed'); } catch {} }
+      try { shared.terminalBackend.closeSurface(session); } catch {}
+      delete shared.sessions[id];
+      shared.sessionStateManager.unregister(id);
+      try { shared.mailbox.purge(id); } catch {}
+      shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
     }
-    if (session.ownerWs) {
-      try { session.ownerWs.close(1000, 'Session destroyed'); } catch {}
-    }
-
-    // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
-    // verdict — this call is a NO-OP on the managed path. It actuates only for a standalone
-    // telepty that opted in via AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
-    try { shared.terminalBackend.closeSurface(session); } catch {}
-
-    (0, shared.cancelModalParkPoll)(session);   // #760: a destroyed session must not keep polling its surface
-
-    delete shared.sessions[id];
-    (0, shared.revokeSessionCredential)(id);    // #815: kill path — the epoch dies with the instance
-    shared.sessionStateManager.unregister(id);
-    try { shared.mailbox.purge(id); } catch {}
-    shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
-    const saved = (0, shared.persistSessions)();
-    if (!saved || !saved.ok) return { success: false, httpStatus: 503, code: 'SESSION_STORE_WRITE_FAILED',
-      error: 'Session was removed but its removal was not durably saved', registry_removed: true, kill };
-
-    return {
-      success: true,
-      session_id: id,
-      status: 'closed',
-      reason,
-      force,
-      timeout_ms: timeoutMs,
-      kill
-    };
+    if (killError) return { success: false, httpStatus: 500, code: 'KILL_FAILED',
+      status: 'registry-removed-kill-unconfirmed', registry_removed: true, kill,
+      error: `Session was durably removed, but process teardown was not confirmed: ${killError.message}` };
+    return { success: true, session_id: id, status: 'closed', reason, force, timeout_ms: timeoutMs, kill };
   }
 
   function describeSessionTeardown(killError) {
@@ -825,6 +833,7 @@ function createSessionActions(shared, effects = {}) {
       if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
       const session = shared.sessions[resolvedId];
       const id = resolvedId;
+      if (session.isClosing) return res.status(409).json({ success: false, code: 'SESSION_CLOSING', error: 'Session is closing' });
 
       const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
       // Default raised 5000 → 10000 (0.3.1) to cover empirical claude REPL
@@ -1604,7 +1613,7 @@ function createSessionActions(shared, effects = {}) {
             'Owned delete requires the current session credential.', { requested: requestedId });
         }
       }
-      if (session.isClosing) return res.json({ success: true, status: 'closing' });
+      if (session.isClosing && !session.closeDurabilityPending) return res.status(409).json({ success: false, code: 'SESSION_CLOSING', error: 'Session is closing' });
       // BUG-C (shared-fate): a wrapped session can be co-bound by a stale/displaced owner bridge
       // (duplicate --id). A DELETE carrying a token that is NOT the current owner's, while a live
       // owner ws is still open, is that stale bridge exiting — it must NOT tear down the live owner.
@@ -1624,9 +1633,10 @@ function createSessionActions(shared, effects = {}) {
       // `bin/session-cleanup.sh`, the operator entrance here, read that success as "the worker is
       // gone". Capturing the error as a value collapses the duplicated teardown into one path and
       // makes "a failed kill does not report success" structural rather than a thing to remember.
+      const prepared = beginDurableSessionClose(id, session);
+      if (!prepared.success) return res.status(prepared.httpStatus).json(prepared);
       let killError = null;
       try {
-        session.isClosing = true;
         if (session.type === 'wrapped') {
           if (session.clients) session.clients.forEach(ws => ws.close(1000, 'Session destroyed'));
         } else if (session.ptyProcess) {
@@ -1639,7 +1649,7 @@ function createSessionActions(shared, effects = {}) {
       // verdict — NO-OP on the managed path. The orchestrator's session-cleanup.sh closes the
       // surface on this normal CLI-exit (CLEANUP_REQUEST→wh_close). Actuates only for a standalone
       // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
-      try { shared.terminalBackend.closeSurface(session); } catch {}
+      if (shared.sessions[id] === session) { try { shared.terminalBackend.closeSurface(session); } catch {} }
       // #60 Stage A §A2 (F1) — OBSERVE THE END BEFORE THE RECORD DISAPPEARS.
       //
       // This used to `delete sessions[id]` first and mark nothing at all. The PTY kill's onExit fires
@@ -1655,16 +1665,13 @@ function createSessionActions(shared, effects = {}) {
       // them. The mark runs synchronously, so the observation is emitted while `sessions[id]` is still
       // live; unregister then destroys the machine, which also makes the later onExit markDead a no-op
       // (its `if (sm)` guard) rather than a second, differently-named statement about one ending.
-      shared.sessionStateManager.markTerminationRequested(id, 'operator_delete', killError && killError.message);
-      shared.sessionStateManager.unregister(id);
-      delete shared.sessions[id];
-      (0, shared.revokeSessionCredential)(id);    // #815: DELETE — revoke before the id can be reused
-      try { shared.mailbox.purge(id); } catch {}
-      shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
-      const saved = (0, shared.persistSessions)();
-      if (!saved || !saved.ok) return res.status(503).json({ success: false, code: 'SESSION_STORE_WRITE_FAILED',
-        error: 'Session was removed but its removal was not durably saved', registry_removed: true,
-        kill_error: killError ? killError.message : null });
+      if (shared.sessions[id] === session) {
+        shared.sessionStateManager.markTerminationRequested(id, 'operator_delete', killError && killError.message);
+        shared.sessionStateManager.unregister(id);
+        delete shared.sessions[id];
+        try { shared.mailbox.purge(id); } catch {}
+        shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
+      }
       const teardown = describeSessionTeardown(killError);
       console.log(killError
         ? `[KILL] Session ${id} registry-removed but the kill was NOT confirmed: ${killError.message}`

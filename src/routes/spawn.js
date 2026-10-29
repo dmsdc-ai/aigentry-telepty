@@ -151,7 +151,7 @@ function registerSpawnRoute(app, {
 
       ptyProcess.onData((data) => {
         const currentSession = sessions[sessionRecord.id];
-        if (!currentSession || currentSession !== sessionRecord) {
+        if (!currentSession || currentSession.isClosing || currentSession !== sessionRecord) {
           return;
         }
 
@@ -170,6 +170,7 @@ function registerSpawnRoute(app, {
       ptyProcess.onExit(({ exitCode, signal }) => {
         const currentId = sessionRecord.id;
         console.log('[EXIT] Session %s exited with code %s', currentId, exitCode);
+        if (sessions[currentId] !== sessionRecord) return;
         sessionStateManager.markDead(currentId, exitCode, signal);
         sessionRecord.isClosing = true;
         sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));

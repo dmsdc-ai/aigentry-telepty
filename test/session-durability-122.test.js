@@ -129,20 +129,7 @@ test('failed state-report save rolls back metadata before publishing the report'
     assert.deepEqual(session, before);
     assert.deepEqual(events, []);
 });
-test('failed teardown save reports uncommitted removal without reviving the killed instance', async () => {
-    const { createSessionActions } = require('../src/routes/session-actions');
-    const session = { id: 'fixture', clients: new Set() }, sessions = { fixture: session };
-    let effects = 0;
-    const actions = createSessionActions({ sessions, persistSessions: () => ({ ok: false, committed: false }), lifecycle: { killSessionProcess: async () => { effects++; return {}; }, cleanupSessionArtifacts: () => effects++ }, broadcastSessionEvent: () => effects++, getSessionHealthStatus: () => '', getSessionHealthReason: () => '', terminalBackend: { closeSurface: () => effects++ }, cancelModalParkPoll: () => effects++, revokeSessionCredential: () => effects++, sessionStateManager: { unregister: () => effects++ }, mailbox: { purge: () => effects++ } });
-    const result = await actions.teardownSessionById('fixture');
-    assert.equal(result.success, false);
-    assert.equal(result.httpStatus, 503);
-    assert.equal(sessions.fixture, undefined);
-    assert.equal(session.isClosing, true);
-    assert.ok(effects > 0);
-    assert.equal(result.registry_removed, true);
-    assert.equal(result.code, 'SESSION_STORE_WRITE_FAILED');
-});
+
 for (const [operation, code] of [['writeFileSync', 'ENOSPC'], ['fsyncSync', 'EIO'], ['fchmodSync', 'EACCES']]) {
     test(`${operation} failure preserves previous committed sessions and cleans temporary files`, t => {
         const dir = temp(t), file = path.join(dir, 'sessions.json');

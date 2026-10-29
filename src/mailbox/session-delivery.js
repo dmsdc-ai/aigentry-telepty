@@ -33,6 +33,7 @@ function createSessionDeliveryContext({
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
 }) {
   async function writeDataToSession(id, session, data) {
+    if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     if (session.type === 'mailbox') return { success: false, httpStatus: 409, code: 'POLL_ONLY', error: 'Mailbox sessions accept queued text only.' };
     if (hasHeldInteraction(session)) return { success: false, httpStatus: 409,
       code: 'INTERACTION_HELD', error: 'Original task retained pending measured composer readiness.', bytes_written: 0 };
@@ -48,6 +49,12 @@ function createSessionDeliveryContext({
             resolve(buildErrorBody('TIMEOUT', 'UDS delivery timed out.', { httpStatus: 504 }));
           }, DELIVERY_TIMEOUT_MS);
           const sock = net.connect(session.delivery.address, () => {
+            if (session.isClosing || sessions[id] !== session) {
+              clearTimeout(timeout);
+              resolve({ success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 });
+              sock.destroy();
+              return;
+            }
             sock.end(payload);
           });
           sock.on('data', (chunk) => { responseBuf += chunk.toString(); });
@@ -139,14 +146,14 @@ function createSessionDeliveryContext({
   // pointing at a different object (or nothing); the epoch is compared as well so a future
   // in-place re-key cannot slip past.
   function isSameSessionInstance(id, session, sessionEpoch) {
-    return sessions[id] === session && (session.sessionEpoch || null) === sessionEpoch;
+    return !session.isClosing && sessions[id] === session && (session.sessionEpoch || null) === sessionEpoch;
   }
 
   // #109 review 1 B1: the deferred CR follows the INSTANCE, not the id. A rename moves the same
   // live record to `session.id` (same PTY, owner, epoch) — that record got the text, so it gets the
   // CR. Destroy/recreate leave the record unregistered; owner replacement changes the epoch.
   function isLiveSessionInstance(session, sessionEpoch) {
-    return sessions[session.id] === session && (session.sessionEpoch || null) === sessionEpoch;
+    return !session.isClosing && sessions[session.id] === session && (session.sessionEpoch || null) === sessionEpoch;
   }
 
   function sessionGoneResult() {
@@ -184,6 +191,7 @@ function createSessionDeliveryContext({
   }
 
   async function deliverInjectionToSession(id, session, prompt, options = {}) {
+    if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     const now = Date.now();
     const sessionEpoch = session.sessionEpoch || null;
     // PR #108 TP1: the owner generation is the owner SOCKET. A same-bearer re-claim keeps the
@@ -466,7 +474,7 @@ function createSessionDeliveryContext({
 
   const mailboxDeliveryOptions = {
     pollMs: 200,
-    sessionResolver: () => Object.keys(sessions).filter(id => sessions[id].type !== 'mailbox'),
+    sessionResolver: () => Object.keys(sessions).filter(id => !sessions[id].isClosing && sessions[id].type !== 'mailbox'),
     deliverFn: async (sessionId, msg) => {
       const session = sessions[sessionId];
       if (!session) return { success: false, error: 'Session not found' };
