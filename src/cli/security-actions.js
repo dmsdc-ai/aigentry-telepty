@@ -1,3 +1,4 @@
+const { buildPtySpawnTarget } = require('../win-spawn-target');
 // Actual CLI security producers; retain the original non-strict semantics.
 // Construction does not read shared getters or start CLI/native/network work.
 function createCliSecurityActions(shared, {
@@ -293,15 +294,38 @@ function createAllowSecurityContext(shared, {
       }).catch(() => {});
     }
 
+    function createOutputRelay({ onInteraction, onBytes, rewrite, write, sendOutput, observeReady, onReady }) {
+      return data => {
+        onInteraction();
+        onBytes(data.length);
+        write(rewrite(data));
+        sendOutput(data);
+        if (observeReady(data)) onReady();
+      };
+    }
+
+    // Fence retained callbacks before they can touch any shared successor state.
+    function subscribeChild(child, onData, onExit) {
+      let exited = false;
+      const current = () => !exited && canDeliver(child);
+      child.onData(data => { if (current()) onData(data); });
+      child.onExit(event => {
+        if (!current()) return;
+        exited = true;
+        onExit(event);
+      });
+    }
+
     function spawnChild() {
+      if (isClosed()) return null;
       // Windows: walk %PATHEXT% so bare names (`claude`, `codex`, `gemini`)
       // resolve to their npm-global `.cmd`/`.ps1` shims. POSIX: no-op. (#25)
-      const resolvedCommand = (0, shared.resolveWindowsExecutable)(shared.command, process.env);
+      const target = buildPtySpawnTarget(shared.command, shared.cmdArgs, shared.sessionEnv);
       // #26 (Snyk waiver, accepted-by-design): spawning the operator/user-chosen CLI IS the
       // `telepty allow` feature — `command` comes from the local CLI invocation, not an
       // untrusted boundary, so this is not an exploitable injection. Pre-existing baseline
       // finding; not fixable without removing `telepty allow`.
-      shared.child = spawnPty(resolvedCommand, shared.cmdArgs, {
+      shared.child = spawnPty(target.file, target.args, {
         name: 'xterm-256color',
         cols: getStdout().columns || 80,
         rows: getStdout().rows || 30,
@@ -503,7 +527,7 @@ function createAllowSecurityContext(shared, {
     } catch {}
     }
 
-return { updateDaemonProcessMetadata, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox };
+return { updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox };
 }
 
 module.exports = { createCliSecurityActions, createAllowSecurityContext };

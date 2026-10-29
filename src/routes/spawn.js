@@ -1,3 +1,4 @@
+const { buildPtySpawnTarget } = require('../win-spawn-target');
 const os = require('os');
 const { defaultSpawnAdmission } = require('../spawn-admission');
 
@@ -91,10 +92,9 @@ function registerSpawnRoute(app, {
     }
 
     const isWin = os.platform() === 'win32';
-    const shell = isWin ? (command === 'powershell' ? 'powershell.exe' : 'cmd.exe') : command;
-    const shellArgs = isWin ? (command === 'powershell' || command === 'cmd' ? args : ['/c', command, ...args]) : args;
 
     try {
+      const { file: shell, args: shellArgs } = buildPtySpawnTarget(command, args, process.env, { platform: isWin ? 'win32' : process.platform });
       console.log('[SPAWN] Spawning %s with args: %o in cwd: %s', shell, shellArgs, cwd);
 
       const customEnv = buildSessionEnv(session_id);

@@ -2867,30 +2867,29 @@ async function main() {
     // heartbeat keeps arriving). Single definition of the relay so the auto-restart path
     // below cannot drift from it.
     let ptyBytesRead = 0;
-    function relayPtyOutput(data) {
-      // No additional output frame: the daemon sees this same output and invalidates there.
-      if (interactionBinding) interactionBinding.input_generation++;
-      ptyBytesRead += data.length;
-      const rewritten = rewriteTitleSequences(data);
-      process.stdout.write(rewritten);
-      if (wsReady && daemonWs.readyState === 1) {
-        daemonWs.send(JSON.stringify({ type: 'output', data }));
-      } else {
-        holdPreConnectOutput(data);
-      }
-      // Detect prompt in output to enable inject delivery
-      if (observePromptReady(data)) {
+    const relayPtyOutput = allowSecurity.createOutputRelay({
+      onInteraction: () => { if (interactionBinding) interactionBinding.input_generation++; },
+      onBytes: bytes => { ptyBytesRead += bytes; },
+      rewrite: rewriteTitleSequences,
+      write: data => process.stdout.write(data),
+      sendOutput: data => {
+        if (wsReady && daemonWs.readyState === 1) {
+          daemonWs.send(JSON.stringify({ type: 'output', data }));
+        } else {
+          holdPreConnectOutput(data);
+        }
+      },
+      observeReady: observePromptReady,
+      onReady: () => {
         promptReady = true;
         firstReadyObserved = true;
         flushBridgeMailbox();
-        // Notify daemon that CLI is ready for inject
         if (!readyNotified && wsReady && daemonWs.readyState === 1) {
           readyNotified = true;
           daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}) }));
         }
       }
-    }
-    child.onData(relayPtyOutput);
+    });
 
     // #732: PTY read-side self-defense. node-pty gives us two independent halves over one
     // master fd — the read side (`_socket`, a tty.ReadStream) feeding onData, and a separate
@@ -2939,7 +2938,7 @@ async function main() {
 
     // Handle child exit with death tracking + auto-restart
     function attachChildExitHandler() {
-      child.onExit(({ exitCode, signal }) => {
+      allowSecurity.subscribeChild(child, relayPtyOutput, ({ exitCode, signal }) => {
         const duration = Date.now() - sessionStartTime;
         const isAbnormal = exitCode !== 0 || signal;
         const durationStr = duration > 60000 ? `${Math.round(duration / 60000)}m ${Math.round((duration % 60000) / 1000)}s` : `${Math.round(duration / 1000)}s`;
@@ -2955,13 +2954,12 @@ async function main() {
 
           setTimeout(() => {
             try {
-              spawnChild();
+              if (!spawnChild()) return;
               promptReady = false;
               firstReadyObserved = false;
               readyNotified = false;
               outputTail = '';
               // Re-attach output relay, prompt detection, and exit handler
-              child.onData(relayPtyOutput);
               attachChildExitHandler();
               emitRestartEvent(crashCount);
               console.log(`\x1b[32m✅ Session '${sessionId}' restarted (attempt ${crashCount}).\x1b[0m\n`);
