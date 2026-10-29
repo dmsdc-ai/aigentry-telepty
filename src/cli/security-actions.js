@@ -270,6 +270,8 @@ function parseAllowInvocation(cmd, args) {
     // #43 P2 — drop any inherited verified-sender token so a parent process cannot smuggle one
     // in; the daemon mints the real one at register (below) and we set it into the same
     // protected env.
+    delete process.env.TELEPTY_SESSION_CREDENTIAL_PATH;
+    delete process.env.TELEPTY_SESSION_CREDENTIAL_INSTANCE;
     delete process.env.TELEPTY_SESSION_TOKEN;
     delete process.env.TELEPTY_SESSION_ORIGIN;
     // #47 P4 — same parent-hijack defense for the per-session provenance nonce: drop any inherited
@@ -507,6 +509,7 @@ function createAllowSecurityContext(shared, {
       if (closed) return false;
       closed = true;
       shared.allowSessionClosed = true;
+      shared.credentialChannel?.close();
       for (const timer of deliveryTimers) clearTimeout(timer);
       deliveryTimers.clear();
       if (shared.queueFlushTimer != null) clearTimeout(shared.queueFlushTimer);

@@ -2540,6 +2540,17 @@ async function main() {
     const allowInvocation = parseAllowInvocation(cmd, args);
     if (!allowInvocation) return;
     const { sessionId, command, cmdArgs, idleTtl, autoRestart } = allowInvocation;
+    let credentialChannel = null;
+    if (process.env.TELEPTY_SESSION_CREDENTIAL_REFRESH === '1') {
+      try {
+        credentialChannel = require('./src/session-credential-channel').createSessionCredentialChannel({ sessionId });
+        process.once('exit', () => credentialChannel.close());
+      } catch (error) {
+        console.error(`❌ ${error.message}`);
+        process.exitCode = 1;
+        return;
+      }
+    }
 
     await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
@@ -2584,6 +2595,7 @@ async function main() {
       }
       // #43 P2 — store the daemon-minted verified-sender token beside TELEPTY_SESSION_ID so the
       // wrapped CLI (and any `telepty inject` it spawns) inherits it via sessionEnv below.
+      credentialChannel?.stageRegistration(res, data);
       adoptRegistrationCredential(res, data, process.env, process.env, DAEMON_URL);
       // #47 P4 — carry the per-session provenance nonce in the same protected env. This is the
       // agent's trusted bootstrap copy of the nonce: a delivery's origin banner is authoritative
@@ -2597,7 +2609,7 @@ async function main() {
     // Spawn local PTY (preserves isTTY, env, shell config)
     const pty = require('node-pty');
     const sessionCwd = process.cwd();
-    const sessionEnv = { ...process.env, TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true', ...(process.env.TELEPTY_SESSION_TOKEN ? { TELEPTY_SESSION_TOKEN: process.env.TELEPTY_SESSION_TOKEN } : {}), ...(process.env.TELEPTY_SESSION_NONCE ? { TELEPTY_SESSION_NONCE: process.env.TELEPTY_SESSION_NONCE } : {}) };
+    const sessionEnv = { ...process.env, ...(credentialChannel ? { TELEPTY_SESSION_CREDENTIAL_PATH: credentialChannel.credentialPath, TELEPTY_SESSION_CREDENTIAL_INSTANCE: credentialChannel.instance } : {}), TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true', ...(process.env.TELEPTY_SESSION_TOKEN ? { TELEPTY_SESSION_TOKEN: process.env.TELEPTY_SESSION_TOKEN } : {}), ...(process.env.TELEPTY_SESSION_NONCE ? { TELEPTY_SESSION_NONCE: process.env.TELEPTY_SESSION_NONCE } : {}) };
     let child = null;
     let sessionStartTime = Date.now();
     let crashCount = 0;
@@ -2622,6 +2634,7 @@ async function main() {
       get cmdArgs() { return cmdArgs; },
       get sessionCwd() { return sessionCwd; },
       get sessionEnv() { return sessionEnv; },
+      get credentialChannel() { return credentialChannel; },
       get sessionStartTime() { return sessionStartTime; },
       get bridgeMailbox() { return bridgeMailbox; },
       get bridgeTarget() { return bridgeTarget; },
@@ -2833,6 +2846,7 @@ async function main() {
     let replayPendingOwnerFrames = () => {};
 
     async function connectDaemonWs() {
+      if (allowSessionClosed) return;
       // Re-register session BEFORE WebSocket connect (daemon rejects WS if session unknown)
       if (reconnectAttempts > 0) {
         // gh#82(D): forget the daemon token this process resolved at launch, so BOTH the
@@ -2869,9 +2883,11 @@ async function main() {
           // bearer, and our env copy is now stale. Without adopting it here the owner claim below
           // would be refused (4003) and the session could never reconnect. The child keeps the
           // old bearer: an already-running process environment cannot be rewritten. Keep
-          // sessionEnv current for future respawns; running-child refresh still needs the
+          // sessionEnv current for future respawns; opt-in Linux running-child refresh uses the
           // instance-bound channel described in docs/plans/credential-refresh-92.md.
           const reregData = await rereg.json().catch(() => null);
+          if (allowSessionClosed) return;
+          credentialChannel?.stageRegistration(rereg, reregData);
           adoptRegistrationCredential(rereg, reregData, process.env, sessionEnv, DAEMON_URL);
         } catch (e) {
           // Registration may fail if session already exists or daemon not ready
@@ -2882,12 +2898,17 @@ async function main() {
       // already holds a credential unless the matching bearer arrives here — that is what stops
       // any local process from taking over a live PTY byte stream. Sent as a HANDSHAKE HEADER,
       // never on the URL: a query string lands in logs and error reports, a header does not.
+      if (allowSessionClosed) return;
       const ownerCredential = scopedSessionToken(wsUrl, { localOrigin: buildDaemonUrl('127.0.0.1', PORT) });
-      daemonWs = new WebSocket(wsUrl, ownerCredential
-        ? { headers: { 'x-telepty-session-token': ownerCredential } }
+      const ownerBearer = ownerCredential;
+      const credentialAttempt = credentialChannel?.beginAttempt(ownerBearer);
+      const ownerSocket = new WebSocket(wsUrl, ownerBearer
+        ? { headers: { 'x-telepty-session-token': ownerBearer } }
         : undefined);
+      daemonWs = ownerSocket;
 
       daemonWs.on('open', () => {
+        if (allowSessionClosed || daemonWs !== ownerSocket) return;
         wsReady = true;
         // #768: before anything else this owner says, hand over what the PTY printed while the
         // socket was still coming up — so the ring's first content is the CLI's actual screen
@@ -2907,9 +2928,22 @@ async function main() {
       daemonWs.on('message', handleOwnerMessage);
 
       function handleOwnerMessage(message) {
+        if (allowSessionClosed || daemonWs !== ownerSocket) return;
         try {
           const msg = JSON.parse(message);
           if (msg.type === 'owner_token') {
+            if (credentialChannel) {
+              try {
+                if (!credentialChannel.acknowledgeOwner({ attempt: credentialAttempt, bearer: ownerBearer, ownerToken: msg.token, binding: msg.interaction_binding })) {
+                  throw new Error('Credential refresh refused (OWNER_BINDING).');
+                }
+              } catch {
+                console.error('❌ Credential refresh refused (PUBLICATION).');
+                closeAllowSession({ destroySession: false });
+                exitAllowSession(1);
+                return;
+              }
+            }
             currentOwnerToken = msg.token || null;
             if (currentOwnerToken) acceptInitialOwner();
             interactionBinding = msg.interaction_binding || null;
@@ -2984,6 +3018,7 @@ async function main() {
       };
 
       daemonWs.on('close', (code, reason) => {
+        if (allowSessionClosed || daemonWs !== ownerSocket) return;
         interactionBinding = null;
         wsReady = false;
         // #17 (OQ-2): the daemon explicitly destroyed this session (manual kill or the
@@ -3039,6 +3074,11 @@ async function main() {
       // Keep reconnecting (this process owns a live PTY; exiting would kill the user's CLI), but
       // say it once: a credential mismatch does not fix itself with backoff.
       daemonWs.on('unexpected-response', (_req, res) => {
+        if (allowSessionClosed || daemonWs !== ownerSocket) {
+          res.resume();
+          try { ownerSocket.terminate(); } catch {}
+          return;
+        }
         if (!wsRefusalReported && (res.statusCode === 401 || res.statusCode === 403)) {
           wsRefusalReported = true;
           process.stderr.write(
@@ -3063,7 +3103,7 @@ async function main() {
         // daemon and this bridge agree again. The #17 rows are untouched — a daemon-issued 1000
         // 'Session destroyed', a 4001 replacement and a 4003 refused claim all still return from
         // the close handler before scheduleReconnect().
-        try { daemonWs.terminate(); } catch { /* already gone — the close is on its way */ }
+        try { ownerSocket.terminate(); } catch { /* already gone — the close is on its way */ }
       });
     }
 
