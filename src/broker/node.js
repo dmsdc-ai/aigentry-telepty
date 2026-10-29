@@ -1,7 +1,7 @@
 'use strict';
 const { createPrincipalVerifier, validateTrustConfiguration } = require('../principal/proof');
 const { bodyDigest, parseUnambiguousJSON } = require('../principal/encoding');
-const { id, error, origin, readResponse, assertion } = require('./http');
+const { id, error, origin, readResponse, assertion, combineAbortSignals } = require('./http');
 const { ACTIONS } = require('./hub');
 const { validateForwardBody } = require('../peer-forwarding');
 
@@ -21,7 +21,7 @@ function createBrokerClient({ config, privateKey, fetch: send = globalThis.fetch
     const proof = assertion(config, privateKey, current, method, target, body, action, sessionEpoch);
     const response = await send(`${hub}${target}`, { method, redirect: 'error',
       signal: stream ? (signal || AbortSignal.timeout(10000))
-        : AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10000)]), headers: { 'content-type': 'application/json', 'x-telepty-assertion': proof },
+        : combineAbortSignals([...(signal ? [signal] : []), AbortSignal.timeout(10000)]), headers: { 'content-type': 'application/json', 'x-telepty-assertion': proof },
       ...(method === 'GET' ? {} : { body: JSON.stringify(body) }) });
     if (stream) { if (!response.ok) throw error('BROKER_STREAM_REFUSED', response.status); return response; }
     return { status: response.status, body: await readResponse(response) };
@@ -66,7 +66,7 @@ function createBrokerNode({ config, privateKey, localToken, fetch: send = global
     let result;
     try {
       const response = await send(`${local}/api/forwarded/sessions/${encodeURIComponent(envelope.session)}/inject`, {
-        method: 'POST', redirect: 'error', signal: AbortSignal.any([stop.signal, AbortSignal.timeout(config.local_timeout_ms)]),
+        method: 'POST', redirect: 'error', signal: combineAbortSignals([stop.signal, AbortSignal.timeout(config.local_timeout_ms)]),
         headers: { 'content-type': 'application/json', 'x-telepty-token': localToken },
         body: JSON.stringify({ ...payload, exact_target: true, claimed_cross_host: true,
           forwarding: { hop: 1, key: envelope.receipt_id } })

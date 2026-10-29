@@ -48,4 +48,21 @@ function assertion(config, privateKey, challenge, method, target, body, action, 
   return createSignedAssertion({ privateKey, keyId: config.key_id, principalId: config.principal_id,
     audience: config.hub_audience, challenge, method, target, body, action, sessionEpoch });
 }
-module.exports = { MAX_BYTES, id, error, origin, readBody, readResponse, json, verify, assertion };
+// Keep the declared Node20 runtime compatible without relying on optional any().
+// A finite deadline always ends the listeners even if a successful request ends first.
+function combineAbortSignals(signals) {
+  const controller = new AbortController();
+  const listeners = [];
+  const finish = source => {
+    for (const [signal, listener] of listeners) signal.removeEventListener('abort', listener);
+    controller.abort(source.reason);
+  };
+  for (const signal of signals) {
+    if (signal.aborted) { finish(signal); return controller.signal; }
+    const listener = () => finish(signal);
+    listeners.push([signal, listener]);
+    signal.addEventListener('abort', listener, { once: true });
+  }
+  return controller.signal;
+}
+module.exports = { combineAbortSignals, MAX_BYTES, id, error, origin, readBody, readResponse, json, verify, assertion };
