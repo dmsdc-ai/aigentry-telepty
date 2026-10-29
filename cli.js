@@ -488,11 +488,30 @@ function ensureRemoteSharedReference(peerName, descriptor, message = '') {
   };
 }
 
+async function ensureHttpSharedReference(host, descriptor, message = '') {
+  const { MAX_SHARED_REFERENCE_BYTES } = require('./src/shared-reference-transfer');
+  const bytes = Buffer.from(descriptor.content, 'utf8');
+  if (bytes.length > MAX_SHARED_REFERENCE_BYTES) throw new Error('Shared reference exceeds the HTTP transfer size limit.');
+  const response = await fetchWithAuth(`${daemonUrl(host)}/api/shared`, {
+    method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content_base64: bytes.toString('base64'), hash: descriptor.hash, fileName: descriptor.fileName })
+  });
+  if (!response.ok) throw new Error(`Shared reference upload failed (HTTP ${response.status}); nothing injected.`);
+  const receipt = await response.json();
+  if (receipt.success !== true || receipt.hash !== descriptor.hash || receipt.fileName !== descriptor.fileName
+    || receipt.promptPath !== descriptor.promptPath) throw new Error('Shared reference upload returned an invalid commit receipt; nothing injected.');
+  return { descriptor, referencePath: descriptor.promptPath,
+    prompt: buildSharedReferenceInjectPrompt(descriptor.promptPath, message) };
+}
+
+
 function resolveTeleptyEntryPoint(deps = {}) {
   const ownCli = path.join(__dirname, 'cli.js');
   const platform = deps.platform || process.platform;
   const exec = deps.execSync || execSync;
   const fsx = deps.fs || fs;
+
   try {
     const cmd = platform === 'win32' ? 'where telepty' : 'which telepty';
     const output = exec(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
@@ -3522,7 +3541,9 @@ async function main() {
       }
 
       if (useRef) {
-        const reference = ensureLocalSharedReference(refDescriptor, refFilePath ? prompt : '');
+        const reference = target.host === '127.0.0.1'
+          ? ensureLocalSharedReference(refDescriptor, refFilePath ? prompt : '')
+          : await ensureHttpSharedReference(target.host, refDescriptor, refFilePath ? prompt : '');
         injectPrompt = reference.prompt;
         referencePath = reference.referencePath;
       }
@@ -4030,10 +4051,13 @@ async function main() {
         }
 
         for (const host of groupSessionsByHost(local).keys()) {
+          const hostPrompt = useRef && host !== '127.0.0.1'
+            ? (await ensureHttpSharedReference(host, descriptor, refFilePath ? prompt : '')).prompt
+            : localPrompt;
           const res = await fetchWithAuth(`${daemonUrl(host)}/api/sessions/broadcast/inject`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: localPrompt })
+            body: JSON.stringify({ prompt: hostPrompt })
           });
           const data = await res.json();
           if (!res.ok) {
@@ -4074,7 +4098,7 @@ async function main() {
       if (aggregate.failed.length > 0) {
         console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host} [${item.code || 'UNKNOWN'}] ${item.error || ''}`.trim()).join(', '));
       }
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); markCommandFailed(); }
     return;
   }
 

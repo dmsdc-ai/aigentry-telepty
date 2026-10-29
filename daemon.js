@@ -40,6 +40,7 @@ const { createSessionRecordContext, registerSessionRegisterRoute, registerSessio
 const { registerHandoffRoutes, registerThreadRoutes } = require('./src/routes/coordination');
 const { createHttpApp, registerHealthAndAuth } = require('./src/protocol/http-app');
 const { registerMailboxRoutes } = require('./src/routes/mailbox');
+const { registerSharedReferenceRoutes } = require('./src/routes/shared-reference');
 const { registerFanoutRoutes } = require('./src/routes/fanout');
 const { createSessionDeliveryContext } = require('./src/mailbox/session-delivery');
 const {
@@ -1634,6 +1635,7 @@ app.get('/api/meta', (req, res) => {
 // --- Mailbox API endpoints ---
 
 registerMailboxRoutes(app, { sessions, resolveSessionAlias, getMailbox: () => mailbox });
+registerSharedReferenceRoutes(app);
 
 // Peer management endpoint (for cross-machine module)
 app.get('/api/peers', (req, res) => {
