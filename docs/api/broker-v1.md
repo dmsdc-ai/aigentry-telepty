@@ -6,7 +6,7 @@ No node must reach another node. A source signs an HTTP POST to the hub. The des
 
 ## Explicit enrollment and grants
 
-Operators provision separate Ed25519 node and hub keys; this implementation does not generate, enroll or copy real credentials. Public trust uses `telepty.principals/v1` from the principal assertion core. Private keys are loaded only from explicit local paths: regular, unlinked files with no POSIX group/other permissions. Public config is bounded and rejects ambiguous JSON. Windows key/DACL isolation is not claimed.
+Operators provision separate Ed25519 node and hub keys; this implementation does not generate, enroll or copy real credentials. Public trust uses `telepty.principals/v1` from the principal assertion core. Configuration, signing keys, and TLS key/certificate files require absolute normalized paths and the same Linux descriptor-anchored integrity checks as strict principal trust. Every ancestor must be owned by root or the current user and must not be group/other writable (root-owned sticky temporary directories are allowed). Files must be regular, singly linked, root/current-user owned, and not group/other writable; private keys additionally forbid all group/other permissions. Symlinks are refused at every component, reads are bounded, and mutation during a read fails closed. Public config rejects ambiguous JSON. Unsupported platforms fail closed; Windows key/DACL isolation is not claimed.
 
 The hub config schema is `telepty.broker-hub/v1`, with:
 

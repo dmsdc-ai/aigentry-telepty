@@ -1,47 +1,12 @@
 'use strict';
-const fs = require('node:fs');
-const path = require('node:path');
 const { parseUnambiguousJSON, requestBodyDigest } = require('./encoding');
 const { validateTrustConfiguration, createPrincipalVerifier, validTarget } = require('./proof');
 const VERIFIED_REQUEST = Symbol('verified HTTP principal');
-const C = fs.constants;
+const { readAuthorityFile } = require('./authority-file');
 function unavailable() { throw Object.assign(new Error('Principal trust is unavailable or unsafe'), { code: 'PRINCIPAL_TRUST_UNAVAILABLE' }); }
-function anchor(fd, name) {
-  if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\0')) unavailable();
-  return `/proc/self/fd/${fd}/${name}`;
-}
-
-// Only Linux currently supplies the checked descriptor-relative integrity adapter. These are
-// public verification keys, but changing them changes authority: no network lookup or enrollment.
 function loadPrincipalTrust(filePath, { audience, platform = process.platform } = {}) {
-  let dir, file;
-  try {
-    if (platform !== 'linux' || typeof process.getuid !== 'function' || !C.O_NOFOLLOW || !C.O_DIRECTORY
-        || typeof filePath !== 'string' || !path.isAbsolute(filePath) || path.normalize(filePath) !== filePath) unavailable();
-    const uid = process.getuid();
-    dir = fs.openSync('/', C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
-    const parts = filePath.split('/').filter(Boolean), leaf = parts.pop();
-    if (!leaf) unavailable();
-    for (const component of parts) {
-      const next = fs.openSync(anchor(dir, component), C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
-      fs.closeSync(dir); dir = next;
-      const stat = fs.fstatSync(dir);
-      const trustedStickyTemp = stat.uid === 0 && (stat.mode & 0o1777) === 0o1777;
-      if (!stat.isDirectory() || ![0, uid].includes(stat.uid) || ((stat.mode & 0o022) && !trustedStickyTemp)) unavailable();
-    }
-    file = fs.openSync(anchor(dir, leaf), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
-    const stat = fs.fstatSync(file);
-    if (!stat.isFile() || ![0, uid].includes(stat.uid) || (stat.mode & 0o022) || stat.nlink !== 1 || stat.size < 1 || stat.size > 100 * 1024) unavailable();
-    const buffer = Buffer.alloc(stat.size + 1);
-    const bytes = fs.readSync(file, buffer, 0, buffer.length, 0);
-    const after = fs.fstatSync(file);
-    if (bytes !== stat.size || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) unavailable();
-    return validateTrustConfiguration(parseUnambiguousJSON(buffer.subarray(0, bytes)), { audience });
-  } catch { unavailable(); }
-  finally {
-    if (file !== undefined) { try { fs.closeSync(file); } catch {} }
-    if (dir !== undefined) { try { fs.closeSync(dir); } catch {} }
-  }
+  try { return validateTrustConfiguration(parseUnambiguousJSON(readAuthorityFile(filePath, { platform })), { audience }); }
+  catch { unavailable(); }
 }
 const RESERVED_SESSION_PATHS = new Set(['register', 'spawn', 'broadcast', 'multicast', 'submit-all', 'clean']);
 function sessionId(value) {

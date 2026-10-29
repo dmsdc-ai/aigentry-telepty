@@ -1,23 +1,13 @@
 'use strict';
-const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { parseUnambiguousJSON } = require('../principal/encoding');
 const { createBrokerHub } = require('./hub');
 const { createBrokerNode, createBrokerClient } = require('./node');
 const { error } = require('./http');
+const { readAuthorityFile } = require('../principal/authority-file');
 function readFile(file, maximum, privateFile = false) {
-  const before = fs.lstatSync(file);
-  if (!before.isFile() || before.nlink !== 1 || before.size > maximum
-    || (privateFile && process.platform !== 'win32' && (before.mode & 0o077))) throw error('BROKER_FILE_UNSAFE');
-  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-  try {
-    const after = fs.fstatSync(fd);
-    if (after.ino !== before.ino || after.dev !== before.dev) throw error('BROKER_FILE_UNSAFE');
-    const bytes = Buffer.alloc(maximum + 1);
-    const length = fs.readSync(fd, bytes, 0, bytes.length, 0);
-    if (length > maximum) throw error('BROKER_FILE_UNSAFE');
-    return bytes.subarray(0, length);
-  } finally { fs.closeSync(fd); }
+  try { return readAuthorityFile(file, { maximum, privateFile }); }
+  catch { throw error('BROKER_FILE_UNSAFE'); }
 }
 function loadConfiguration(configFile) {
   const config = parseUnambiguousJSON(readFile(configFile, 100 * 1024));
@@ -75,4 +65,4 @@ if (require.main === module) {
   if (flag !== '--config' || !configFile) { console.error('Usage: broker/main.js <hub|node> --config <file>'); process.exitCode = 1; }
   else runBrokerCommand(mode, configFile).catch(() => { console.error('BROKER_START_OR_CHANNEL_FAILED'); process.exitCode = 1; });
 }
-module.exports = { runBrokerCommand, runBrokerRequest };
+module.exports = { runBrokerCommand, runBrokerRequest, loadConfiguration };
