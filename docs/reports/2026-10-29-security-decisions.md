@@ -32,3 +32,14 @@ Two additional credential leaks were confirmed during review. `fetchWithAuth` fo
 ## Delivery boundaries
 
 These are implementation/design prerequisites, not requests to alter live settings. None authorize installing a native addon, enrolling keys, changing firewall/tailnet rules, rotating real credentials, or restarting services. Existing tests can safely cover refusal, replay, redirect, malformed assertion, stale epoch, wrong owner, denied writes and redaction with synthetic identities. Live/native identity verification and any new authorization-mode migration require their own explicit implementation and operator rollout evidence. The issues above must remain open or be marked partial until those guarantees exist.
+
+## Owned kill and protected instance policy follow-up
+
+`POST /api/sessions/:id/kill?owned=true` and `telepty kill <id> --owned`
+require the exact current sid, credential epoch, and credential generation before
+teardown admission. Aliases are refused. New registrations may set
+`require_owner_proof: true`; the immutable instance policy applies to both kill
+and DELETE, and protected metadata re-registration requires the same credential.
+The legacy single-user operator default remains available for unprotected
+sessions. This is an instance credential boundary, not an OS/user/human principal
+model; #113/#134 remain partial until scoped peer/operator principals exist.

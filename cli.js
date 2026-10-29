@@ -4160,7 +4160,7 @@ async function main() {
     try {
       const target = await resolveSessionTarget(sessionRef);
       if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exitCode = 1; return; }
-      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/kill`, {
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/kill${args.includes('--owned') ? '?owned=true' : ''}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force, timeout, source: 'cli' })
@@ -5027,7 +5027,7 @@ function printGlobalHelp() {
   telepty list [--json]                          List sessions (local + Tailnet)
   telepty attach [id[@host]]                     Attach interactively (picker if no ID)
   telepty rename <old_id[@host]> <new_id>        Rename a session
-  telepty kill <id[@host]> [--force] [--timeout N]  Gracefully terminate a session
+  telepty kill <id[@host]> [--owned] [--force] [--timeout N]  Gracefully terminate a session
   telepty clean [--older-than 7d] [--idle] [--dry-run]  Clean ghost or old sessions
   telepty session info <id[@host]> [--json]      Show session metadata
   telepty session interaction <sid> observe     Typed capabilities (live adapter unavailable)

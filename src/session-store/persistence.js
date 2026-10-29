@@ -18,6 +18,7 @@ function serializePersistedSessions(sessions) {
     Object.defineProperty(data, id, { enumerable: true, writable: true, configurable: true, value: {
       id,
       type: s.type,
+      ...(s.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
       command: s.command,
       cwd: s.cwd,
       backend: s.backend || null,
@@ -189,7 +190,9 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
   const cwd = options.cwd || process.cwd();
   const nowIso = options.nowIso || (() => new Date().toISOString());
   return {
-    id, type: meta.type, ptyProcess: null, ownerWs: null,
+    id, type: meta.type,
+    ...(meta.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
+    ptyProcess: null, ownerWs: null,
     ...(meta.type === 'mailbox' ? { leaseExpiresAt: Number.isFinite(meta.leaseExpiresAt) ? meta.leaseExpiresAt : null } : {}),
     command: meta.command || 'wrapped', cwd: meta.cwd || cwd,
     backend: meta.backend || 'kitty',

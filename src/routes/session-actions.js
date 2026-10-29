@@ -1561,8 +1561,18 @@ function createSessionActions(shared, effects = {}) {
     app.post('/api/sessions/:id/kill', async (req, res) => {
       const requestedId = req.params.id;
       // #548: destructive op — must not cascade across alias-sharing siblings.
-      const resolvedId = (0, shared.resolveSessionForDestroy)(requestedId);
+      const ownedKill = req.query?.owned === 'true';
+      const resolvedId = ownedKill ? exactOwnSessionId(requestedId) : (0, shared.resolveSessionForDestroy)(requestedId);
       if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+      const session = shared.sessions[resolvedId];
+      if (ownedKill || session.requireOwnerProof === true) {
+        if (exactOwnSessionId(requestedId) !== resolvedId) return res.status(404).json({ error: 'Exact session id required.' });
+        const principal = (0, shared.verifiedPrincipalFromReq)(req);
+        if (!principal || principal.sid !== resolvedId || !session.sessionEpoch
+            || principal.epoch !== session.sessionEpoch || principal.generation !== (Number(session.credentialGeneration) || 1)) {
+          return (0, shared.respondWithError)(res, 403, 'OWNED_KILL_FORBIDDEN', 'Kill requires the current session credential.');
+        }
+      }
 
       try {
         const timeoutSeconds = req.body && req.body.timeout != null
@@ -1604,7 +1614,8 @@ function createSessionActions(shared, effects = {}) {
       // principal's sid, epoch and generation all matching the record. Checked before isClosing and
       // every side effect below (kill, unregister, revoke, purge, persist); a missing, foreign or
       // stale bearer is a 403 with no mutation. Requests without `owned=true` are untouched.
-      if (ownedDelete) {
+      if (ownedDelete || session.requireOwnerProof === true) {
+        if (exactOwnSessionId(requestedId) !== resolvedId) return res.status(404).json({ error: 'Exact session id required.' });
         const principal = (0, shared.verifiedPrincipalFromReq)(req);
         const generation = Number(session.credentialGeneration) || 1;
         if (!principal || principal.sid !== id || !session.sessionEpoch
