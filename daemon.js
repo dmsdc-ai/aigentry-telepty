@@ -404,6 +404,10 @@ function loadPersistedSessions() {
 }
 
 const app = createHttpApp({ express, cors });
+const { createEventLoopTelemetry, slowRequestObserver } = require('./src/diagnostics/event-loop');
+const eventLoopTelemetry = createEventLoopTelemetry();
+app.use(slowRequestObserver());
+if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') eventLoopTelemetry.start();
 
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
 const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -1459,6 +1463,7 @@ function appendToOutputRing(session, data) {
   // #52: monotonic byte counter — the inject-time watermark that scopes echo-evidence
   // matching to frames appended AFTER the inject (survives ring trimming below).
   session.outputRingTotalBytes = (session.outputRingTotalBytes || 0) + data.length;
+  if (data.length > 0) session.lastActualOutputAt = new Date().toISOString();
   session.outputRing.push(data);
   // Keep total data under ~200KB limit by trimming old entries
   let totalLen = session.outputRing.reduce((sum, d) => sum + d.length, 0);
@@ -1607,6 +1612,11 @@ app.get('/api/sessions/:id/state', (req, res) => {
 // Self-reported session state (explicit POST from session)
 sessionActions.registerStateRoute(app);
 
+const { createSessionDiagnostics, createDiagnosticsHandler } = require('./src/diagnostics/session');
+app.get('/api/sessions/:id/diagnostics', createDiagnosticsHandler({
+  sessions, machineId: MACHINE_ID, inspect: createSessionDiagnostics(), eventLoop: () => eventLoopTelemetry.snapshot()
+}));
+
 app.get('/api/meta', (req, res) => {
   res.json({
     name: pkg.name,
@@ -1615,6 +1625,7 @@ app.get('/api/meta', (req, res) => {
     host: HOST,
     port: boundPort,
     machine_id: MACHINE_ID,
+    event_loop: eventLoopTelemetry.snapshot(),
     terminal: DETECTED_TERMINAL,
     capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session']
   });
@@ -2479,6 +2490,7 @@ let shuttingDown = false;
 async function shutdown(code) {
   if (shuttingDown) return;
   shuttingDown = true;
+  eventLoopTelemetry.stop();
   mailboxDelivery.stop();
   mailboxNotifier.cancelAll();
   if (server) server.close();

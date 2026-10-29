@@ -15,6 +15,7 @@ import { z } from "zod";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import diagnosticsClient from "../src/diagnostics/client.js";
 
 const PKG_VERSION = (() => {
   try {
@@ -192,6 +193,26 @@ server.tool(
     } catch (err) {
       return { content: [{ type: "text", text: `Error querying session: ${err.message}` }], isError: true };
     }
+  }
+);
+
+// Read-only exact-target diagnostics; never borrow credentials for an arbitrary host.
+server.tool(
+  "telepty_diagnose_session",
+  "Read-only layered diagnostics for an exact session on the configured daemon; daemon/MCP availability does not establish agent responsiveness or completion.",
+  { target: z.string().max(513).describe("Exact session_id@configured-host"),
+    machine_id: z.string().max(256).describe("Expected daemon machine identity"),
+    session_epoch: z.string().max(256).optional().describe("Expected session epoch, if already known") },
+  async ({ target, machine_id, session_epoch }) => {
+    const configured = new URL(getDaemonUrl());
+    const host = target.slice(target.lastIndexOf('@') + 1);
+    if (!target.includes('@') || host !== configured.hostname) return { content: [{ type: "text", text: JSON.stringify({ error: "Target must name the configured daemon host exactly", status: "identity_mismatch" }) }], isError: true };
+    const report = await diagnosticsClient.diagnoseTarget(target, {
+      daemonUrl: () => getDaemonUrl(), machineId: machine_id, sessionEpoch: session_epoch,
+      fetchWithAuth: (url, options) => fetch(url, { ...options, headers: { "x-telepty-token": getAuthToken() } })
+    });
+    report.mcp_transport = { status: "tool_handler_reached", agent_responsiveness: "unknown", return_path_to_agent: "unknown" };
+    return { content: [{ type: "text", text: JSON.stringify(report) }], ...(!report.identity ? { isError: true } : {}) };
   }
 );
 
