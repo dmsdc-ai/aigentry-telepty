@@ -1321,6 +1321,9 @@ function createSessionActions(shared, effects = {}) {
       if (req.body.expected_epoch !== undefined && req.body.expected_epoch !== session.sessionEpoch) {
         return (0, shared.respondWithError)(res, 409, 'TARGET_EPOCH_MISMATCH', 'Target session epoch differs');
       }
+      if (req.body.external_approval && !session.externalApprovalPolicy) {
+        return (0, shared.respondWithError)(res, 403, 'APPROVAL_POLICY_REQUIRED', 'Signed inject requires the enrolled target policy.');
+      }
       const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
       let { from, reply_to } = req.body;
       if (typeof prompt !== 'string') return (0, shared.respondWithError)(res, 400, 'INVALID_REQUEST', 'prompt is required');

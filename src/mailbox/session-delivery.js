@@ -301,6 +301,7 @@ function createSessionDeliveryContext({
 
   async function deliverInjectionToSession(id, session, prompt, options = {}) {
     if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
+    if (options.externalApproval && !session.externalApprovalPolicy) return { success: false, httpStatus: 403, code: 'APPROVAL_POLICY_REQUIRED', error: 'Signed inject requires the enrolled target policy.', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return options.externalApproval
       ? deliverApprovedInjection(id, session, prompt, options) : denied;

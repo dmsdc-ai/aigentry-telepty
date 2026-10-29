@@ -61,6 +61,6 @@ retried. Status, screen and attach output remain readable. Protected destruction
 requires the current instance credential; no private signing key is accepted or
 created by the daemon. This is external signer authority, not human proof.
 
-The API contract, signed-byte format and remaining CLI/enrollment/rotation/recovery
+The API contract, signed-byte format, digest-only CLI/private-file handoff and remaining enrollment/rotation/recovery
 and unsupported-adapter gaps are in
 [external signer approval](../specs/2026-10-29-external-signer-approval.md).

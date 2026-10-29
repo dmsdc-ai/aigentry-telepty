@@ -2090,6 +2090,18 @@ async function main() {
   // printing its own usage. Deliberately below the version check, which takes no argv.
   if (interceptHelp(cmd, args.slice(1))) return;
 
+  if (cmd === 'approval-challenge' || (cmd === 'inject' && require('./src/cli/external-approval').approvalOptionRequested(args.slice(1)))) {
+    process.exitCode = await require('./src/cli/external-approval').runApprovalCommand(cmd, args.slice(1), {
+      daemonUrl, remoteHost: REMOTE_HOST, fetchWithAuth
+    });
+    return;
+  }
+  if (['multicast', 'broadcast'].includes(cmd) && require('./src/cli/external-approval').approvalOptionRequested(args.slice(1), ['--approval-file', '--approval-map'])) {
+    console.error(JSON.stringify({ success: false, code: 'APPROVAL_FANOUT_UNSUPPORTED' }));
+    process.exitCode = 1;
+    return;
+  }
+
   if (cmd === 'readiness' || cmd === 'wait-ready') {
     process.exitCode = await require('./src/cli/readiness').runReadinessCommand(cmd, args.slice(1), {
       remoteHost: REMOTE_HOST, daemonUrl, fetchWithAuth
@@ -5173,6 +5185,8 @@ function printGlobalHelp() {
 
 \x1b[1mInject & Communicate:\x1b[0m
   telepty inject [--ref [file]] [--from <id>] <id[@host]> "<prompt>"  Inject text
+  telepty approval-challenge [--no-enter] <exact-id[@host]> -- "<prompt>"  Digest-only signing document
+  telepty inject --approval-file <private-file> [--no-enter] <exact-id[@host]> -- "<prompt>"  Signed direct inject
   telepty enter <id[@host]>                      Send Enter/Return
   telepty reply "<text>"                         Reply to last injector
   telepty multicast <id1,id2> "<prompt>"         Inject into multiple sessions

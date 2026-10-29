@@ -45,8 +45,8 @@ bootstrap replay and other delivery retries fail closed for protected records.
 Protected SSH transport is refused until a signature-bound SSH write receipt
 adapter is implemented. A protected mailbox or aterm session has no approved
 write adapter. Spawn refuses protection fields rather than silently ignoring
-them; protected sessions must be enrolled through register. CLI enrollment and
-approval-file handoff are not implemented.
+them; protected sessions must be enrolled through register. CLI enrollment is not implemented. Digest-only CLI handoff and private approval-file
+submission are supported below.
 
 Read-only status, screen and attach output remain available. Viewer writes return
 `input_refused`; other refusal paths preserve their typed error contracts. Owner
@@ -60,3 +60,39 @@ This is a partial implementation of #78. Unsupported paths remain refused, rathe
 than being represented as approved. Direct same-account OS/PTY access outside
 Telepty, foreign principals, signer trust enrollment, signer revocation/rotation,
 and a human UI approval channel are separate boundaries.
+
+
+## CLI handoff without local approval authority
+
+The client can request the public signing document without starting a daemon,
+discovering targets, minting credentials, or creating config. It addresses the
+exact configured HTTP daemon and uses existing credentials only:
+
+```sh
+telepty approval-challenge --no-enter exact-session -- "<exact prompt>"
+telepty inject --approval-file /private/signed-approval.json --no-enter exact-session -- "<exact prompt>"
+```
+
+The first command prints only the signing document: public session/owner binding,
+payload digest, Enter mode, nonce, expiry and daemon challenge. It never prints
+the prompt, signature, session token, or signing key. An independent external
+signer returns a JSON file with exactly `document` and a base64url `signature`.
+The daemon's one-use verifier remains authoritative; the client reads the file
+without deleting it, and replay is refused by the server.
+
+On POSIX, the approval file must be a regular single-link file owned by the
+invoking user, private to that user (for example mode 0600), no larger than
+16 KiB, and opened with no-follow semantics. The client checks file identity
+before reading and bounds the read even if the file grows. Private-key material,
+unknown fields and payload/Enter/target mismatches are refused before a request.
+Windows approval-file use currently fails closed because native ACL/private-file
+validation is not implemented.
+
+Both commands join literal payload arguments with a single space, matching
+ordinary inject's byte construction. Put options before the payload and use `--`
+when the literal text includes flag-like words. Default mode includes Enter;
+`--no-enter` must be supplied consistently for a text-only approval. Legacy
+`--submit`/force/retry/ref combinations are unsupported on the signed path;
+standalone submit remains denied for protected sessions. Approval-bearing
+multicast/broadcast are explicitly `APPROVAL_FANOUT_UNSUPPORTED`; approvals are
+never silently dropped. This handoff verifies an external signer, not a human.
