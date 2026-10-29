@@ -1752,6 +1752,10 @@ sessionActions.registerSubmitRoute(app);
 // POST /api/sessions/submit-all — Submit all active sessions
 sessionInspection.registerSubmitAllRoute(app);
 
+require('./src/peer-forwarding').registerPeerForwardRoutes(app, {
+  sessions, loadPeers: () => require('./cross-machine').loadPeers()
+});
+sessionActions.registerInjectRoute(app, '/api/forwarded/sessions/:id/inject');
 sessionActions.registerInjectRoute(app);
 
 // #826 — the OTHER write path, kept next to the route above because they are twins and were

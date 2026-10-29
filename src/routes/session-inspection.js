@@ -18,6 +18,7 @@ function serializeSession(id, session, options = {}) {
 
   return {
     id,
+    session_epoch: session.sessionEpoch || null,
     locator: { machine_id: shared.MACHINE_ID, session_id: id, project_id: projectId },
     type: session.type || 'spawned',
     ...(session.externalApprovalPolicy ? { input_policy: { authority: 'external-signer', supported_ingress: ['inject'], other_writes: 'denied' } } : {}),

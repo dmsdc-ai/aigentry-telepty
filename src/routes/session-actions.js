@@ -1300,8 +1300,8 @@ function createSessionActions(shared, effects = {}) {
     return value !== null && typeof value === 'object' && !Array.isArray(value) ? requestedId : null;
   }
 
-  function registerInjectRoute(app) {
-    app.post('/api/sessions/:id/inject', async (req, res) => {
+  function registerInjectRoute(app, routePath = '/api/sessions/:id/inject') {
+    app.post(routePath, async (req, res) => {
       const requestedId = req.params.id;
       // #1215 inject-exact-target — opt-in exact routing. With boolean `exact_target:true` the
       // target is the exact own record or nothing: a bare alias or a `-N` sibling name is 404 here
@@ -1313,6 +1313,9 @@ function createSessionActions(shared, effects = {}) {
       if (!resolvedId) return (0, shared.respondWithError)(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId, ...(exactTarget ? { exact_target: true } : {}) });
       const session = shared.sessions[resolvedId];
       const id = resolvedId;
+      if (req.body.expected_epoch !== undefined && req.body.expected_epoch !== session.sessionEpoch) {
+        return (0, shared.respondWithError)(res, 409, 'TARGET_EPOCH_MISMATCH', 'Target session epoch differs');
+      }
       const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
       let { from, reply_to } = req.body;
       if (typeof prompt !== 'string') return (0, shared.respondWithError)(res, 400, 'INVALID_REQUEST', 'prompt is required');
@@ -1325,7 +1328,7 @@ function createSessionActions(shared, effects = {}) {
       // #43 P2 / #815 — daemon-verified sender identity (from the presented bearer, never body.from).
       // The full principal (sid, epoch, generation) so a consumer can tell WHICH INSTANCE of a sid
       // sent this; `verifiedSender` spreads the epoch/generation onto every audit line below.
-      const verifiedPrincipal = (0, shared.verifiedPrincipalFromReq)(req);
+      const verifiedPrincipal = req.body.forwarding ? null : (0, shared.verifiedPrincipalFromReq)(req);
       const verifiedSenderSid = verifiedPrincipal ? verifiedPrincipal.sid : null;
       const verifiedSender = (0, shared.verifiedSenderFields)(verifiedPrincipal);
 
@@ -1353,7 +1356,8 @@ function createSessionActions(shared, effects = {}) {
           ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
           claimed_from: from || null, ...verifiedSender,
           to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
-          origin: 'trusted-local', origin_host: shared.MACHINE_ID, ref_path: req.body.ref_path || null,
+          origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
+          origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
           payload: finalPrompt, delivery_result: `blocked:${peerVerdict.reason}`
         });
         return (0, shared.respondWithError)(res, 403, 'PEER_INJECT_BLOCKED',
@@ -1423,7 +1427,8 @@ function createSessionActions(shared, effects = {}) {
             ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
             claimed_from: from || null, ...verifiedSender,
             to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
-            origin: 'trusted-local', origin_host: shared.MACHINE_ID, ref_path: req.body.ref_path || null,
+            origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
+            origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
             payload: finalPrompt, delivery_result: `failed:${delivery.code || 'DELIVERY_FAILED'}`
           });
           // #843 — close the write-ahead record. Without this the refusal is recorded in the AUDIT log
@@ -1453,7 +1458,8 @@ function createSessionActions(shared, effects = {}) {
           ts: injectTimestamp, inject_id, kind: 'inject', source: 'inject',
           claimed_from: from || null, ...verifiedSender,
           to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
-          origin: 'trusted-local', origin_host: shared.MACHINE_ID, ref_path: req.body.ref_path || null,
+          origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
+          origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
           // #860 F2 — `queued` when the delivery was parked on the bootstrap / modal queue with zero
           // bytes written, `success` only for a delivery the machinery reported as written.
           payload: finalPrompt, delivery_result: (0, shared.deliveryAuditResult)(delivery)
