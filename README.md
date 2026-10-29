@@ -170,7 +170,7 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | `telepty daemon start\|stop\|restart` | Manage the background daemon (port 3848); `start` is detached and returns immediately |
 | `telepty daemon` | Run the daemon in the **foreground** — this is what launchd/systemd invoke; it blocks your shell |
 | `telepty allow --id <name> <cmd>` | Wrap a CLI for inject control (survives a daemon restart) |
-| `telepty spawn --id <name> <cmd>` | Spawn a new background session (dies with the daemon) |
+| `telepty spawn --id <name> [--background] [--] <cmd>` | Spawn and enter a daemon-owned session; `--background` returns immediately (session dies with daemon) |
 | `telepty list [--json]` | List sessions on this daemon + registered peers |
 | `telepty attach [id[@host]]` | Attach to a session (interactive picker if no ID) |
 | `telepty inject <id[@host]> "text"` | Inject text and submit it. The Enter rides along as a deferred PTY write and is **not** gated — there is no no-submit mode |
@@ -188,7 +188,7 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | `telepty disconnect <name>\|--all` | Remove a registered peer |
 | `telepty reply "text"` | Reply to the last injector |
 | `telepty monitor` | Real-time event billboard |
-| `telepty listen` | Stream event bus as JSON |
+| `telepty listen --json` | Stream event bus as JSON lines without a startup banner |
 | `telepty update` | Update to latest version |
 
 ## Environment variables
@@ -459,3 +459,18 @@ telepty runs **standalone** — it needs none of the other aigentry modules and 
 ## License
 
 MIT
+
+
+### Machine-readable event stream
+
+`telepty listen --json` writes one JSON object per nonempty stdout line, including
+startup: no human banner is emitted in this mode. Each bus payload is preserved and
+includes the source `host`. Diagnostics go to stderr. Plain `listen` keeps its banner;
+`monitor` keeps its human billboard.
+
+A session reconnect is the daemon's event, for example
+`{"type":"session_reconnect","host":"127.0.0.1","session_id":"worker","transport":{"health_status":"CONNECTED"}}`.
+Additional event fields may be present. This describes a session transport
+reconnecting; it is not delivery, consumption or task-completion confirmation.
+If the listener's bus socket disconnects, the current CLI reports that on stderr
+and exits nonzero; it does not promise automatic stream reconnection or replay.

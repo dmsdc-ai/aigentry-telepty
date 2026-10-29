@@ -2238,13 +2238,16 @@ async function main() {
   }
 
   if (cmd === 'spawn') {
-    const idIndex = args.indexOf('--id');
-    if (idIndex === -1 || !args[idIndex + 1]) { console.error('❌ Usage: telepty spawn --id <session_id> <command> [args...]'); process.exit(1); }
-    const sessionId = args[idIndex + 1];
-    const spawnArgs = args.filter((a, i) => a !== 'spawn' && i !== idIndex && i !== idIndex + 1);
-    if (spawnArgs.length === 0) { console.error('❌ Missing command. Example: telepty spawn --id "test" bash'); process.exit(1); }
-    const command = spawnArgs[0]; const cmdArgs = spawnArgs.slice(1);
-    
+    let invocation;
+    try {
+      invocation = require('./src/cli/spawn-invocation').parseSpawnInvocation(args.slice(1));
+    } catch (error) {
+      console.error(`❌ ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const { sessionId, background, command, cmdArgs } = invocation;
+
     const cols = process.stdout.columns || 80;
     const rows = process.stdout.rows || 30;
 
@@ -2254,10 +2257,11 @@ async function main() {
         body: JSON.stringify({ session_id: sessionId, command: command, args: cmdArgs, cwd: process.cwd(), cols, rows, type: 'USER' })
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      if (!res.ok) { console.error(`❌ Error: ${data.error}`); process.exitCode = 1; return; }
+      if (background) { console.log(`✅ Session '${data.session_id}' spawned in background.`); return; }
       console.log(`✅ Session '\x1b[36m${data.session_id}\x1b[0m' spawned. Entering room automatically...`);
       return manageInteractiveAttach(data.session_id, '127.0.0.1');
-    } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+    } catch (e) { console.error(`❌ Failed to spawn session: ${e.message}`); process.exitCode = 1; }
     return;
   }
 
@@ -4651,7 +4655,7 @@ Discuss the following topic from your project's perspective. Engage with other s
     if (cmd === 'monitor') {
       console.log('\x1b[36m\x1b[1m📺 Telepty Event Billboard\x1b[0m');
       console.log('Listening for background agent communications...\n');
-    } else {
+    } else if (!args.includes('--json')) {
       console.log('\x1b[36m👂 Listening to the telepty event bus...\x1b[0m');
     }
 
@@ -4735,7 +4739,7 @@ function printGlobalHelp() {
 \x1b[1mSession Management:\x1b[0m
   telepty daemon                                 Start the daemon in the foreground (port 3848)
   telepty daemon start|stop|restart              Start (detached) / stop / restart the background daemon
-  telepty spawn --id <id> <command> [args...]    Spawn a new background session
+  telepty spawn --id <id> [--background] [--] <command> [args...]  Spawn and enter; --background returns
   telepty allow [--id <id>] [--idle-ttl 1h|off] [--auto-restart] <command> [args...]  Wrap a CLI for remote control
   telepty list [--json]                          List sessions (local + Tailnet)
   telepty attach [id[@host]]                     Attach interactively (picker if no ID)
