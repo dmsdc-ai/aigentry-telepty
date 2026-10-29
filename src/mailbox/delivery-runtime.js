@@ -1051,6 +1051,7 @@ function createDeliveryRuntime(shared, {
   function terminalLevelSubmit(id, session) {
     if (session.isClosing) return null;
     if (protectedInputFailure(session)) return null;
+    if (session.sshRemote) return null;
     if (hasHeldInteraction(session)) return null;
     if (submitViaPty(session)) return 'pty_cr';
     return null;
@@ -1276,6 +1277,7 @@ function createDeliveryRuntime(shared, {
 
   function submitViaPty(session) {
     if (protectedInputFailure(session)) return false;
+    if (session.sshRemote) return false; // SSH submit is admitted by the receipt protocol only.
     if (hasHeldInteraction(session)) return false;
     shared.interaction.invalidateInteraction(session, 'submit');
     if (session.type === 'wrapped') {

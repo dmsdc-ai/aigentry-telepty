@@ -2536,8 +2536,16 @@ async function main() {
     return;
   }
 
-  if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap') {
-    const allowInvocation = parseAllowInvocation(cmd, args);
+  if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap' || cmd === 'ssh') {
+    const sshSupport = require('./src/ssh-session');
+    let sshPlan = null;
+    if (cmd === 'ssh') {
+      try { sshPlan = sshSupport.buildSshPlan(args.slice(1)); }
+      catch (error) { console.error(error.message); process.exitCode = 1; return; }
+    }
+    const allowInvocation = sshPlan
+      ? parseAllowInvocation('allow', ['allow', '--id', sshPlan.id, 'ssh', ...sshPlan.args])
+      : parseAllowInvocation(cmd, args);
     if (!allowInvocation) return;
     const { sessionId, command, cmdArgs, idleTtl, autoRestart } = allowInvocation;
     let credentialChannel = null;
@@ -2575,6 +2583,7 @@ async function main() {
         body: JSON.stringify({
           session_id: sessionId,
           command,
+          ...(sshPlan ? { ssh_remote: sshPlan.metadata } : {}),
           cwd: process.cwd(),
           backend: detectedBackend,
           cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
@@ -2611,6 +2620,9 @@ async function main() {
     const sessionCwd = process.cwd();
     const sessionEnv = { ...process.env, ...(credentialChannel ? { TELEPTY_SESSION_CREDENTIAL_PATH: credentialChannel.credentialPath, TELEPTY_SESSION_CREDENTIAL_INSTANCE: credentialChannel.instance } : {}), TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true', ...(process.env.TELEPTY_SESSION_TOKEN ? { TELEPTY_SESSION_TOKEN: process.env.TELEPTY_SESSION_TOKEN } : {}), ...(process.env.TELEPTY_SESSION_NONCE ? { TELEPTY_SESSION_NONCE: process.env.TELEPTY_SESSION_NONCE } : {}) };
     let child = null;
+    const sshInput = sshPlan ? sshSupport.createSshInputState(sshPlan.metadata.agent, state => {
+      if (wsReady && daemonWs?.readyState === 1) daemonWs.send(JSON.stringify({ type: 'ssh_state', ...state }));
+    }) : null;
     let sessionStartTime = Date.now();
     let crashCount = 0;
     const MAX_CRASHES = 3;
@@ -2623,6 +2635,8 @@ async function main() {
     const allowSecurity = createAllowSecurityContext({
       get sessionId() { return sessionId; },
       get command() { return command; },
+      get sshPlan() { return sshPlan; },
+      get onChildSpawn() { return current => { if (sshInput) sshInput.start(current); }; },
       get detectedBackend() { return detectedBackend; },
       get terminalProgram() { return terminalProgram; },
       get terminalType() { return terminalType; },
@@ -2718,7 +2732,8 @@ async function main() {
     // Prompt-ready detection for safe inject delivery.
     // Known AI CLIs use the centralized geometry-aware registry; generic
     // commands keep the permissive legacy prompt regex for compatibility.
-    const knownAiCli = readyRegistry.isKnownAiCli(command);
+    const readyCommand = sshPlan ? sshPlan.metadata.agent || '' : command;
+    const knownAiCli = readyRegistry.isKnownAiCli(readyCommand);
     const promptPattern = /[❯>$#%]\s*$/;
     let promptReady = false;  // wait for CLI prompt before accepting inject
     let firstReadyObserved = false;
@@ -2866,6 +2881,7 @@ async function main() {
             body: JSON.stringify({
               session_id: sessionId,
               command,
+              ...(sshPlan ? { ssh_remote: sshPlan.metadata } : {}),
               cwd: process.cwd(),
               backend: detectedBackend,
               cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
@@ -2948,8 +2964,27 @@ async function main() {
             if (currentOwnerToken) acceptInitialOwner();
             interactionBinding = msg.interaction_binding || null;
             invalidateBridgeInteraction('owner_bound');
+            if (sshInput && child) {
+              const state = sshInput.snapshot();
+              daemonWs.send(JSON.stringify({ type: 'ssh_state', ...state }));
+              if (state.phase === 'ready' && readyQualification) daemonWs.send(JSON.stringify({ type: 'ready', ...readyQualification }));
+            }
             return;
           }
+          if (sshInput && msg.type === 'ssh_inject') {
+            if (typeof msg.request_id !== 'string' || msg.request_id.length > 64 || typeof msg.data !== 'string') return;
+            const result = msg.generation === sshInput.snapshot().generation
+              ? sshInput.write(child, msg.data, bytes => child.write(bytes))
+              : { stage: 'refused', reason: 'ssh_generation_changed' };
+            invalidateBridgeInteraction('automated_input');
+            daemonWs.send(JSON.stringify({ type: 'ssh_write_receipt', request_id: msg.request_id, generation: msg.generation, ...result }));
+            return;
+          }
+          if (sshInput && msg.type === 'inject') {
+            console.error('[SSH] Refused unbound legacy input; use the current SSH write protocol.');
+            return;
+          }
+          if (sshInput && !child) return;
           if (!child) {
             pendingOwnerFrames.push(message);
             return;
@@ -3130,22 +3165,24 @@ async function main() {
     await initialOwnerAccepted;
     clearTimeout(claimTimeout);
     spawnChild();
-    allowSecurity.recoverBridgeMailbox();
+    if (!sshPlan) allowSecurity.recoverBridgeMailbox();
 
     // Set terminal title
     process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
-    console.log(`\x1b[32m⚡ '${command}' is now session '\x1b[36m${sessionId}\x1b[32m'. Inject allowed.\x1b[0m\n`);
+    if (sshPlan) console.log(`[SSH] '${sessionId}' transport registered. Automated input waits for a qualified remote composer.`);
+    else console.log(`\x1b[32m⚡ '${command}' is now session '\x1b[36m${sessionId}\x1b[32m'. Inject allowed.\x1b[0m\n`);
 
     cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
       onData: (data) => {
         lastUserInputTime = Date.now();
         invalidateBridgeInteraction('local_input');
+        if (sshInput && !sshInput.localInput(child)) { console.error('[SSH] Input refused while reconnecting; nothing was buffered.'); return; }
         child.write(data.toString());
       },
       onResize: () => {
         const size = getTerminalSize(process.stdout, { cols: 120, rows: 40 });
         invalidateBridgeInteraction('resize');
-        child.resize(size.cols, size.rows);
+        if (child) child.resize(size.cols, size.rows);
       }
     });
     // #844: `destroySession: false` closes THIS bridge's own resources and nothing else — no
@@ -3189,11 +3226,17 @@ async function main() {
           holdPreConnectOutput(data);
         }
       },
-      observeReady: observePromptReady,
+      observeReady: data => {
+        if (!sshInput) return observePromptReady(data);
+        promptReady = false; readyNotified = false;
+        if (!sshInput.output(child, data)) return false;
+        readyQualification = { ready_kind: 'composer_surface_observed', detector: 'ssh_remote_registry', cli_key: sshPlan.metadata.agent };
+        return true;
+      },
       onReady: () => {
         promptReady = true;
         firstReadyObserved = true;
-        flushBridgeMailbox();
+        if (!sshPlan) flushBridgeMailbox();
         if (!readyNotified && wsReady && daemonWs.readyState === 1) {
           readyNotified = true;
           daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}) }));
@@ -3254,15 +3297,20 @@ async function main() {
         const durationStr = duration > 60000 ? `${Math.round(duration / 60000)}m ${Math.round((duration % 60000) / 1000)}s` : `${Math.round(duration / 1000)}s`;
 
         logSessionDeath(exitCode, signal, duration);
+        if (sshInput) { sshInput.exit(child); child = null; promptReady = false; readyNotified = false; }
 
-        if (isAbnormal && autoRestart && crashCount < MAX_CRASHES) {
+        const persistentSsh = sshPlan && sshPlan.persistent;
+        if (persistentSsh || (isAbnormal && autoRestart && crashCount < MAX_CRASHES)) {
           crashCount++;
-          const backoffMs = Math.min(1000 * Math.pow(2, crashCount - 1), 8000);
+          const backoffMs = persistentSsh
+            ? Math.min(sshPlan.backoffMs * Math.pow(2, Math.min(crashCount - 1, 16)), sshPlan.backoffMaxMs)
+            : Math.min(1000 * Math.pow(2, crashCount - 1), 8000);
           const willRestart = true;
           emitDeathEvent(exitCode, signal, willRestart);
-          console.log(`\n\x1b[33m⚠️ Session '${sessionId}' died (code ${exitCode}, signal ${signal || 'none'}, ${durationStr}). Restarting in ${backoffMs}ms (attempt ${crashCount}/${MAX_CRASHES})...\x1b[0m`);
+          console.log(`\n\x1b[33m⚠️ Session '${sessionId}' died (code ${exitCode}, signal ${signal || 'none'}, ${durationStr}). Restarting in ${backoffMs}ms (attempt ${crashCount}${persistentSsh ? ', persistent SSH' : `/${MAX_CRASHES}`})...\x1b[0m`);
 
           setTimeout(() => {
+            if (allowSessionClosed) return;
             try {
               if (!spawnChild()) return;
               promptReady = false;
@@ -5105,6 +5153,7 @@ function printGlobalHelp() {
   telepty mailbox ack <id> <msg_id>            Acknowledge one local mailbox message
 
 \x1b[1mCross-Machine:\x1b[0m
+  telepty ssh <user@host> --id <id> [--persistent] [--remote-command <agent>] [--cwd <path>] [--resume <id>]
   telepty connect <user@host> [--name N] [--port P]      SSH tunnel to remote host
   telepty connect-http <host>[:port] [--name N] [--token T]  Register remote daemon via HTTP (no SSH)
   telepty disconnect <name> | --all              Disconnect remote host

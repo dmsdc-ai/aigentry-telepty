@@ -4,6 +4,7 @@ const { protectedInputFailure } = require('../external-approval');
 const crypto = require('node:crypto');
 const { invalidateInteraction } = require('../interaction');
 const { recordReadyEvidence } = require('../readiness');
+const { applySshState, acceptSshWriteReceipt } = require('../ssh-session');
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
 
@@ -127,6 +128,7 @@ function installWebSocketTransport(deps) {
   // actually handed over, rather than becoming a claim about a write that had no target.
   function viewerInputDeliverer(session) {
     if (protectedInputFailure(session)) return null;
+    if (session.sshRemote) return null; // SSH requires a current-child write receipt, never raw viewer bytes.
     if (session.type === 'wrapped') {
       const owner = session.ownerWs;
       if (!isOpenWebSocket(owner)) return null;
@@ -346,6 +348,7 @@ function installWebSocketTransport(deps) {
       // stale one.
       activeSession.ownerToken = crypto.randomUUID();
       activeSession.interactionOwnerGeneration = crypto.randomUUID();
+      if (activeSession.sshRemote) activeSession.sshState = { phase: 'connecting', generation: 0, reason: 'owner_changed', owner_generation: activeSession.interactionOwnerGeneration };
       markSessionConnected(activeSession);
       initializeBootstrapState(activeSession);
       const saved = persistSessions();
@@ -475,6 +478,8 @@ function installWebSocketTransport(deps) {
         }
 
         if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+          if (type === 'ssh_state') { applySshState(activeSession, msg); return; }
+          if (type === 'ssh_write_receipt') { acceptSshWriteReceipt(activeSession, ws, msg); return; }
           if (type === 'session_died' || type === 'session_restarted') {
             invalidateInteraction(activeSession, 'child_lifecycle');
             return;

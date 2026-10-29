@@ -1,6 +1,7 @@
 'use strict';
 const { createBoundedUdsResponse } = require('./uds-response');
 const { protectedInputFailure, externalApprovalVerifier } = require('../external-approval');
+const { sshInputFailure, requestSshWrite } = require('../ssh-session');
 
 // Domain dependencies are the daemon's actual shared helpers and records.
 // Late mailbox getters are invoked only at the original points of use.
@@ -38,6 +39,8 @@ function createSessionDeliveryContext({
     if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return denied;
+    const sshFailure = sshInputFailure(session, data);
+    if (sshFailure) return sshFailure;
     if (session.type === 'mailbox') return { success: false, httpStatus: 409, code: 'POLL_ONLY', error: 'Mailbox sessions accept queued text only.' };
     if (hasHeldInteraction(session)) return { success: false, httpStatus: 409,
       code: 'INTERACTION_HELD', error: 'Original task retained pending measured composer readiness.', bytes_written: 0 };
@@ -141,6 +144,7 @@ function createSessionDeliveryContext({
       if (!isOpenWebSocket(session.ownerWs)) {
         return buildErrorBody('DISCONNECTED', 'Session owner is disconnected.', { httpStatus: 503 });
       }
+      if (session.sshRemote) return requestSshWrite(session, data);
       session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
       // #732: every wrapped delivery doubles as an upstream probe — a live PTY answers with
       // at least an echo. See armUpstreamProbe (no-op while an earlier probe is unanswered).
@@ -282,6 +286,9 @@ function createSessionDeliveryContext({
     const denied = protectedInputFailure(session);
     if (denied) return options.externalApproval
       ? deliverApprovedInjection(id, session, prompt, options) : denied;
+    const sshFailure = sshInputFailure(session, prompt);
+    if (sshFailure) return sshFailure;
+    const sshGeneration = session.sshState?.generation;
     const now = Date.now();
     const sessionEpoch = session.sessionEpoch || null;
     // PR #108 TP1: the owner generation is the owner SOCKET. A same-bearer re-claim keeps the
@@ -438,6 +445,22 @@ function createSessionDeliveryContext({
     }
 
     try {
+      if (session.sshRemote) {
+        const failure = sshInputFailure(session, deliveredBody, sshGeneration);
+        if (failure) { releaseSubmit(); return failure; }
+        const text = await requestSshWrite(session, deliveredBody, { expectedGeneration: sshGeneration });
+        if (!text.success) { releaseSubmit(); return text; }
+        if (!options.noEnter) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) { releaseSubmit(); return sessionGoneResult(); }
+          const submit = await requestSshWrite(session, '\r', { expectedGeneration: sshGeneration });
+          if (!submit.success) { releaseSubmit(); return { ...submit, text_written: true, text_bytes_written: text.bytes_written,
+            error: `Text was written to the SSH child, but submit was not confirmed. Do not retry blindly. ${submit.error}` }; }
+        }
+        releaseSubmit();
+        session.lastActivityAt = new Date().toISOString();
+        return { ...text, submit: options.noEnter ? 'skipped' : 'written', queued: false, consumption: 'unknown' };
+      }
       const ack = getMailbox().enqueue({
         msg_id: msgId,
         from,
@@ -516,6 +539,11 @@ function createSessionDeliveryContext({
         submit: options.noEnter ? 'skipped' : 'deferred'
       };
     } catch (err) {
+      if (session.sshRemote) {
+        releaseSubmit();
+        return { success: false, httpStatus: 504, code: 'SSH_WRITE_UNCONFIRMED',
+          error: 'SSH delivery could not be confirmed; input may have been written. Do not retry blindly.' };
+      }
       console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
       // Fallback: direct delivery (backward compat during migration)
       injectionTargets.delete(msgId);

@@ -72,6 +72,8 @@ function formatIdleDuration(seconds) {
 
 function getSessionPid(session) {
   if (!session) return null;
+  // A persistent SSH child is replaceable; cancel the stable wrapper rather than a stale/reused child PID.
+  if (session.sshRemote && Number.isInteger(session.ownerPid) && session.ownerPid > 0) return session.ownerPid;
   const candidates = [
     session.ptyProcess && session.ptyProcess.pid,
     session.ptyPid,

@@ -27,7 +27,10 @@ function buildSshPlan(argv) {
   for (let i = 1; i < argv.length; i++) {
     const flag = argv[i];
     if (flag === '--persistent') { persistent = true; continue; }
-    if (flag === '--') { remoteArgs = argv.slice(i + 1).map(v => text(v, 'remote argument')); break; }
+    if (flag === '--') { remoteArgs = argv.slice(i + 1).map(v => {
+      if (v === '') return '';
+      return text(v, 'remote argument');
+    }); break; }
     const key = flags[flag];
     if (!key || values[`set_${key}`]) throw new Error(`Unknown or repeated SSH option: ${flag}`);
     values[key] = text(argv[++i], flag); values[`set_${key}`] = true;
@@ -41,7 +44,10 @@ function buildSshPlan(argv) {
   if (values.port) values.port = number(values.port, 'port', 1, 65535);
   if (values.cwd && !values.remoteCommand) throw new Error('--cwd requires --remote-command.');
   if (remoteArgs.length && !values.remoteCommand) throw new Error('Remote arguments require --remote-command.');
-  const agent = values.remoteCommand ? registry.commandKey(values.remoteCommand) : null;
+  if (values.remoteCommand?.startsWith('-')) throw new Error('Remote command must name an executable, not an option.');
+  if (values.resume && (values.resume.startsWith('-') || ['latest', 'interactive'].includes(values.resume))) throw new Error('--resume requires an explicit conversation id; picker automation is unsupported.');
+  const binaryName = values.remoteCommand?.split('/').pop().toLowerCase();
+  const agent = ['codex', 'claude', 'gemini'].includes(binaryName) ? binaryName : null;
   if (values.resume) {
     if (!['codex', 'claude'].includes(agent)) throw new Error('Explicit resume is supported only for declared Codex or Claude commands.');
     remoteArgs = agent === 'codex' ? ['resume', values.resume, ...remoteArgs] : ['--resume', values.resume, ...remoteArgs];
@@ -54,7 +60,7 @@ function buildSshPlan(argv) {
     let script = `exec ${[values.remoteCommand, ...remoteArgs].map(quote).join(' ')}`;
     if (values.cwd) {
       const cwd = values.cwd === '~' ? '"$HOME"' : values.cwd.startsWith('~/')
-        ? `"$HOME"/${quote(values.cwd.slice(2))}` : quote(values.cwd);
+        ? `"$HOME"/${quote(values.cwd.slice(2))}` : quote(values.cwd.startsWith('-') ? `./${values.cwd}` : values.cwd);
       script = `cd ${cwd} && ${script}`;
     }
     args.push(script);
@@ -106,7 +112,10 @@ function createSshInputState(agent, changed = () => {}) {
       if (modal.blocked || (last && !hit?.found)) {
         owed = false; update('blocked', modal.blocked ? modal.reason : 'ssh_authentication_or_connection_blocked'); return false;
       }
-      if (hit?.found) { update('ready', 'qualified_remote_composer'); return true; }
+      if (hit?.found) {
+        update(owed ? 'awaiting_submit' : 'ready', owed ? 'input_written_awaiting_submit' : 'qualified_remote_composer');
+        return !owed;
+      }
       update(owed ? 'awaiting_submit' : 'unknown', agent ? 'waiting_for_composer' : 'remote_agent_readiness_unsupported');
       return false;
     },

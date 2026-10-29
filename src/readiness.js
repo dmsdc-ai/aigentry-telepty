@@ -1,5 +1,6 @@
 'use strict';
 const registry = require('./prompt-symbol-registry');
+const { remoteAgentCommand } = require('./ssh-session');
 
 const MAX_WAIT_MS = 30000;
 
@@ -9,7 +10,7 @@ function recordReadyEvidence(session, nowMs = Date.now()) {
   evidence.set(session, { epoch: session.sessionEpoch, owner: session.ownerWs,
     generation: session.interactionOwnerGeneration, input: session.interactionInputGeneration || 0,
     geometry: session.interactionGeometryGeneration || 0, kind: session.readyKind,
-    detector: session.readyDetector, cli: session.readyCliKey, observedAt: nowMs });
+    detector: session.readyDetector, cli: session.readyCliKey, sshGeneration: session.sshState?.generation, observedAt: nowMs });
 }
 
 function outputTail(session) {
@@ -29,24 +30,28 @@ function readinessSnapshot(session, { nowMs = Date.now(), machineId = null } = {
     observed_at: null, sampled_at: new Date(nowMs).toISOString(),
     source: null, completion_fact: null, terminal: false };
   if (!session) return { ...result, status: 'not_found', reason: 'exact_session_not_found' };
-  const cli = registry.commandKey(session.command);
+  const command = remoteAgentCommand(session);
+  const cli = registry.commandKey(command);
   if (session.type !== 'wrapped' || !cli) {
     return { ...result, status: 'unsupported', reason: 'qualified_composer_unavailable',
       compatibility_ready: session.ready === true };
   }
+  if (session.sshRemote && session.sshState?.phase !== 'ready') return { ...result,
+    status: session.sshState?.phase === 'blocked' ? 'blocked' : 'unknown', reason: session.sshState?.reason || 'ssh_waiting_for_composer' };
   if (session.isClosing) return { ...result, status: 'disconnected', reason: 'session_closing' };
   if (session.bridgeReadSide === 'destroyed') return { ...result, reason: 'pty_read_side_unavailable' };
   if (!session.ownerWs || session.ownerWs.readyState !== 1) {
     return { ...result, status: 'disconnected', reason: 'owner_disconnected' };
   }
-  const modal = registry.detectSurfaceModal(session.command, outputTail(session));
+  const modal = registry.detectSurfaceModal(command, outputTail(session));
   if (modal.blocked) return { ...result, status: 'blocked', reason: modal.reason };
   const seen = evidence.get(session);
   if (!seen) return result;
   const current = seen.epoch && seen.epoch === session.sessionEpoch
     && seen.owner === session.ownerWs && seen.generation && seen.generation === session.interactionOwnerGeneration
     && seen.input === (session.interactionInputGeneration || 0)
-    && seen.geometry === (session.interactionGeometryGeneration || 0);
+    && seen.geometry === (session.interactionGeometryGeneration || 0)
+    && seen.sshGeneration === session.sshState?.generation;
   if (!current) return { ...result, reason: 'composer_evidence_invalidated' };
   if (seen.kind !== 'composer_surface_observed' || seen.cli !== cli || !seen.detector) {
     return { ...result, reason: 'unqualified_ready_frame' };

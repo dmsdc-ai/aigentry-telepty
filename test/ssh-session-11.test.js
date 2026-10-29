@@ -78,3 +78,78 @@ test('#11 daemon receipts are owner/generation bound and waiting is bounded', as
   session.sshState = { phase: 'reconnecting', generation: 2, owner_generation: 'owner' };
   assert.equal(sshInputFailure(session, 'payload').code, 'SSH_NOT_READY');
 });
+
+test('#11 composer repaint with unsent text retains only its owed Enter permit', () => {
+  const state = createSshInputState('codex'); const child = {}; const written = [];
+  state.start(child); state.output(child, composer);
+  state.write(child, 'draft', x => written.push(x));
+  assert.equal(state.output(child, composer), false);
+  assert.equal(state.snapshot().phase, 'awaiting_submit');
+  assert.equal(state.write(child, 'second prompt', x => written.push(x)).stage, 'refused');
+  assert.equal(state.write(child, '\r', x => written.push(x)).stage, 'written');
+  assert.deepEqual(written, ['draft', '\r']);
+});
+
+test('#11 killing persistent SSH targets stable owner, not a stale child PID', async () => {
+  const { killSessionProcess } = require('../src/lifecycle'); const signals = [];
+  await killSessionProcess({ sshRemote: { persistent: true }, ownerPid: 111, ptyPid: 222 }, {
+    force: true, platform: 'linux', processKill: (pid, signal) => signals.push([pid, signal])
+  });
+  assert.deepEqual(signals, [[111, 'SIGKILL']]);
+});
+
+test('#12 SSH metadata persists without readiness or authenticated remote identity claims', () => {
+  const { serializePersistedSessions, buildRestoredWrappedSession } = require('../src/session-store/persistence');
+  const { readinessSnapshot } = require('../src/readiness');
+  const plan = buildSshPlan(['host', '--id', 's', '--persistent', '--remote-command', 'codex']);
+  const stored = serializePersistedSessions({ s: { id: 's', type: 'wrapped', command: 'ssh', sshRemote: plan.metadata,
+    sshState: { phase: 'ready', generation: 99 } } }).s;
+  assert.equal(stored.sshState, undefined);
+  const restored = buildRestoredWrappedSession('s', stored);
+  assert.deepEqual(restored.sshRemote, plan.metadata);
+  assert.equal(readinessSnapshot(restored).ready, false);
+  const shell = buildRestoredWrappedSession('shell', { ...stored,
+    sshRemote: buildSshPlan(['host', '--id', 'shell']).metadata });
+  assert.equal(readinessSnapshot(shell).status, 'unsupported');
+});
+
+test('#12 remote POSIX quoting preserves cwd and literal argv without shell evaluation', {
+  skip: process.platform === 'win32' ? 'Local POSIX shell fixture; native Windows SSH validation remains open' : false
+}, t => {
+  const fs = require('node:fs'); const os = require('node:os'); const path = require('node:path');
+  const { spawnSync } = require('node:child_process');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-ssh-quote-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cwd = path.join(root, "directory's $() space"); fs.mkdirSync(cwd);
+  const script = path.join(root, 'record.js');
+  fs.writeFileSync(script, 'process.stdout.write(JSON.stringify({cwd:process.cwd(),args:process.argv.slice(2)}))');
+  const payload = `literal'; touch ${path.join(root,'must-not-exist')}; $(echo NO) \\"`;
+  const plan = buildSshPlan(['host', '--id', 'quote', '--remote-command', process.execPath, '--cwd', cwd,
+    '--', script, payload, '']);
+  const run = spawnSync('/bin/sh', ['-c', plan.args.at(-1)], { encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(JSON.parse(run.stdout), { cwd, args: [payload, ''] });
+  assert.equal(fs.existsSync(path.join(root, 'must-not-exist')), false);
+});
+
+test('#11 an unexpected submit-path exception never retries text through the mailbox fallback', async () => {
+  const { createSessionDeliveryContext } = require('../src/mailbox/session-delivery');
+  const packets = []; const s = { id: 'ssh', type: 'wrapped', command: 'ssh', sessionEpoch: 'epoch',
+    sshRemote: { agent: 'codex' }, interactionOwnerGeneration: 'owner',
+    sshState: { phase: 'ready', generation: 1, owner_generation: 'owner' } };
+  s.ownerWs = { readyState: 1, send(value) {
+    const msg = JSON.parse(value); packets.push(msg);
+    s.sshState.phase = 'awaiting_submit';
+    acceptSshWriteReceipt(s, s.ownerWs, { ...msg, stage: 'written' });
+  } };
+  const ctx = createSessionDeliveryContext({ sessions: { ssh: s }, shouldQueueBootstrapOperation: () => false,
+    getInjectFailure: () => null, resolveModalGate: async () => null, modalRemedy: () => 'reject',
+    hasBootstrapBacklog: () => false, crypto: require('node:crypto'),
+    applyProvenance: payload => ({ payload }), maybeBracketedPaste: payload => payload,
+    setTimeout: () => { throw new Error('fixture submit timer failure'); }
+  });
+  const result = await ctx.deliverInjectionToSession('ssh', s, 'only once');
+  assert.equal(result.code, 'SSH_WRITE_UNCONFIRMED');
+  assert.equal(packets.length, 1, 'no text replay through generic fallback');
+  assert.equal(s.pendingSubmit, null);
+});

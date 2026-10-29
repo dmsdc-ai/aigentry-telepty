@@ -25,6 +25,7 @@ function serializeSession(id, session, options = {}) {
     ...(session.externalApprovalPolicy ? { input_policy: { authority: 'external-signer', supported_ingress: ['inject'], other_writes: 'denied' } } : {}),
     ...(session.type === 'mailbox' ? { lease_expires_at: session.leaseExpiresAt || null } : {}),
     command: session.command,
+    ...(session.sshRemote ? { sshRemote: session.sshRemote, ssh: session.sshState || { phase: 'connecting', reason: 'owner_not_observed' } } : {}),
     cwd: session.cwd,
     backend: session.backend || 'kitty',
     terminal: (0, shared.getSessionTerminalLabel)(session),

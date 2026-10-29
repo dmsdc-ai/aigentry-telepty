@@ -1,4 +1,5 @@
 const { parseExternalApprovalPolicy } = require('../external-approval');
+const { validateSshMetadata } = require('../ssh-session');
 const { parseMailboxLease, renewMailboxLease } = require('../mailbox/poll-session');
 const { validateSessionId: validateMailboxId } = require('../mailbox/path-boundary');
 const sessionPersistence = require('../session-store/persistence');
@@ -125,6 +126,10 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       return res.status(400).json({ code: 'INVALID_DELIVERY', error: 'Mailbox sessions do not accept delivery endpoints.' });
     }
     const { command, cwd = process.cwd(), backend, cmux_workspace_id, cmux_surface_id, term_program, term } = req.body;
+    let sshRemote;
+    try { sshRemote = validateSshMetadata(req.body.ssh_remote); }
+    catch (error) { return res.status(400).json({ code: 'INVALID_SSH_METADATA', error: error.message }); }
+    if (sshRemote && command !== 'ssh') return res.status(400).json({ code: 'INVALID_SSH_METADATA', error: 'SSH transport command must be ssh.' });
     const parsedIdleTtl = parseOptionalIdleTtl(req.body);
     if (parsedIdleTtl.error) {
       return res.status(400).json({ error: parsedIdleTtl.error, code: 'INVALID_IDLE_TTL' });
@@ -188,6 +193,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       // against, so those registrations keep working exactly as before.
       const mayRedirectDelivery = credentialed || !sessionCredentials.hasCredential(existing.id);
       if (mayRedirectDelivery) {
+        if (sshRemote) existing.sshRemote = sshRemote;
         if (req.body.delivery_endpoint) existing.deliveryEndpoint = req.body.delivery_endpoint;
         if (req.body.delivery) {
           existing.delivery = req.body.delivery;
@@ -250,6 +256,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       ptyProcess: null,
       ownerWs: null,
       command: command || 'wrapped',
+      ...(sshRemote ? { sshRemote } : {}),
       cwd,
       backend: mailboxRequest ? 'mailbox' : backend || 'kitty',
       cmuxWorkspaceId: cmux_workspace_id || null,

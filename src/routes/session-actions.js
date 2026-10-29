@@ -839,6 +839,10 @@ function createSessionActions(shared, effects = {}) {
 
       const denied = protectedInputFailure(session);
       if (denied) return res.status(denied.httpStatus).json(denied);
+      if (session.sshRemote) {
+        const result = await require('../ssh-session').requestSshWrite(session, '\r');
+        return res.status(result.success ? 200 : result.httpStatus || 409).json(result);
+      }
       const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
       // Default raised 5000 → 10000 (0.3.1) to cover empirical claude REPL
       // ready window (3-6s on fresh spawn) with margin. Upper clamp raised
@@ -1443,7 +1447,10 @@ function createSessionActions(shared, effects = {}) {
             ? (0, shared.abortTrackedInjection)(inject_id, id, delivery.code, delivery.error)
             : 'no_tracked_inject';
           return (0, shared.respondWithError)(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error,
-            { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable' });
+            { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable',
+              ...(session.sshRemote ? { text_written: delivery.text_written === true,
+                text_bytes_written: delivery.text_bytes_written ?? null, bytes_written: delivery.bytes_written ?? null,
+                retry_safe: delivery.bytes_written === 0 && delivery.text_written !== true } : {}) });
         }
 
         if (from) session.lastInjectFrom = from;

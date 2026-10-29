@@ -21,6 +21,7 @@ function serializePersistedSessions(sessions) {
       ...(s.externalApprovalPolicy ? { externalApprovalPolicy: s.externalApprovalPolicy } : {}),
       ...(s.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
       command: s.command,
+      ...(s.sshRemote ? { sshRemote: require('../ssh-session').validateSshMetadata(s.sshRemote) } : {}),
       cwd: s.cwd,
       backend: s.backend || null,
       cmuxWorkspaceId: s.cmuxWorkspaceId || null,
@@ -188,6 +189,9 @@ function loadPersistedSessions(persistPath = defaultSessionPersistPath()) {
 function buildRestoredWrappedSession(id, meta, options = {}) {
   if (!['wrapped', 'mailbox'].includes(meta.type)) return null;
 
+  let sshRemote;
+  try { sshRemote = require('../ssh-session').validateSshMetadata(meta.sshRemote); }
+  catch { return null; }
   const cwd = options.cwd || process.cwd();
   const nowIso = options.nowIso || (() => new Date().toISOString());
   return {
@@ -197,6 +201,7 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
     ptyProcess: null, ownerWs: null,
     ...(meta.type === 'mailbox' ? { leaseExpiresAt: Number.isFinite(meta.leaseExpiresAt) ? meta.leaseExpiresAt : null } : {}),
     command: meta.command || 'wrapped', cwd: meta.cwd || cwd,
+    ...(sshRemote ? { sshRemote } : {}),
     backend: meta.backend || 'kitty',
     cmuxWorkspaceId: meta.cmuxWorkspaceId || null,
     cmuxSurfaceId: meta.cmuxSurfaceId || null,

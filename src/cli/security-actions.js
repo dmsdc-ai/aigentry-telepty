@@ -309,6 +309,7 @@ function createAllowSecurityContext(shared, {
       const body = {
         session_id: shared.sessionId,
         command: shared.command,
+        ...(shared.sshPlan ? { ssh_remote: shared.sshPlan.metadata } : {}),
         cwd: process.cwd(),
         backend: shared.detectedBackend,
         cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
@@ -362,8 +363,9 @@ function createAllowSecurityContext(shared, {
         cols: getStdout().columns || 80,
         rows: getStdout().rows || 30,
         cwd: shared.sessionCwd,
-        env: shared.sessionEnv
+        env: shared.sshPlan ? require('../ssh-session').sshChildEnvironment(shared.sessionEnv) : shared.sessionEnv
       });
+      if (shared.onChildSpawn) (0, shared.onChildSpawn)(shared.child);
       shared.sessionStartTime = now();
       updateDaemonProcessMetadata();
       return shared.child;
