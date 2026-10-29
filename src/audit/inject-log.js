@@ -62,6 +62,11 @@ function buildAuditLine(record = {}) {
     payload_preview: previewOn ? truncatePreview(payload, previewBytes) : null,
     delivery_result: record.delivery_result || 'success'
   };
+  if (record.claimed_return && typeof record.claimed_return.locator === 'string') {
+    line.claimed_return_locator = record.claimed_return.locator;
+    line.return_locator_verification = 'unverified';
+    line.claimed_cross_host = record.claimed_return.claimed_cross_host === true;
+  }
   return JSON.stringify(line);
 }
 

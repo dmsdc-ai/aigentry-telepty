@@ -1,4 +1,5 @@
 const { protectedInputFailure } = require('../external-approval');
+const { claimedReturnMetadata } = require('../claimed-return');
 // Production session actions. Keep non-strict semantics of the original daemon bodies.
 // shared supplies lazy access to the daemon's actual stores and producers.
 // effects is constructor-only: timer scheduling, lifecycle signal/sleep/liveness options,
@@ -1321,6 +1322,8 @@ function createSessionActions(shared, effects = {}) {
       if (typeof prompt !== 'string') return (0, shared.respondWithError)(res, 400, 'INVALID_REQUEST', 'prompt is required');
       // reply_to defaults to from when omitted
       if (from && !reply_to) reply_to = from;
+      const claimedReturn = claimedReturnMetadata(reply_to, req.body.claimed_cross_host === true || !!req.body.forwarding);
+      if (reply_to && !claimedReturn) return (0, shared.respondWithError)(res, 400, 'INVALID_RETURN_LOCATOR', 'Invalid claimed return locator');
 
       // Routing metadata stays in session/bus state, not in the visible prompt text.
       const finalPrompt = prompt;
@@ -1354,7 +1357,7 @@ function createSessionActions(shared, effects = {}) {
         // itself is unchanged; this only records the attempt.
         (0, shared.auditAppend)({
           ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
-          claimed_from: from || null, ...verifiedSender,
+          claimed_from: from || null, ...verifiedSender, claimed_return: claimedReturn,
           to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
           origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
           origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
@@ -1425,7 +1428,7 @@ function createSessionActions(shared, effects = {}) {
           }, session);
           (0, shared.auditAppend)({
             ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
-            claimed_from: from || null, ...verifiedSender,
+            claimed_from: from || null, ...verifiedSender, claimed_return: claimedReturn,
             to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
             origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
             origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
@@ -1444,7 +1447,10 @@ function createSessionActions(shared, effects = {}) {
         }
 
         if (from) session.lastInjectFrom = from;
-        if (reply_to) session.lastInjectReplyTo = reply_to;
+        if (reply_to) {
+          session.lastInjectReplyTo = reply_to;
+          session.lastInjectReturn = claimedReturn;
+        }
         if (thread_id) session.lastThreadId = thread_id;
 
         // #860 F2 — the service log gets the same distinction the audit line does. "Wrote" was printed
@@ -1456,7 +1462,7 @@ function createSessionActions(shared, effects = {}) {
         // #43 P1/P2 — one audit line per delivery (claimed + daemon-verified sender, hash-only).
         (0, shared.auditAppend)({
           ts: injectTimestamp, inject_id, kind: 'inject', source: 'inject',
-          claimed_from: from || null, ...verifiedSender,
+          claimed_from: from || null, ...verifiedSender, claimed_return: claimedReturn,
           to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
           origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
           origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,

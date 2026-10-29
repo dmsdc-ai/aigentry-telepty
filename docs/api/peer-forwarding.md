@@ -45,3 +45,9 @@ The response preserves the destination `inject_id` as `remote_inject_id` in `rou
 Both inbound and outbound tombstones count toward a bounded 512-record ledger. They are never expired automatically, because deleting an uncertain tombstone would permit replay. Capacity, corruption or persistence failure denies new forwarding. Archival or reset requires explicit operator handling of replay risk; there is no HTTP deletion API. POSIX file and directory flushes protect receipts before acknowledgment. Windows receives file flushes only; this implementation does not claim portable directory durability or DACL isolation.
 
 Known-peer configuration is authority; tailnet addresses and discovery advertisements are not enrollment or identity proof. Strong authenticated origin/session assertions remain part of the separate principal work in issue #132.
+
+## Claimed return routing
+
+HTTP CLI injects and daemon forwards mark their return metadata as a cross-host claim. An explicitly supplied `from`/`reply_to` such as `orchestrator@registered-machine` is preserved in `lastInjectReturn`, session metadata and hash-only audit records with `verification: "unverified"`. No hostname, socket address or shared daemon token is promoted into a verified foreign principal.
+
+For marked cross-host traffic, `telepty reply` requires a host-qualified return locator naming a registered peer. A bare return is refused with `REPLY_AMBIGUOUS_SENDER`; an unknown peer is refused with `REPLY_UNKNOWN_CLAIMED_PEER`, including when an environment-wide token override is present. Replies use exact destination IDs. Existing unmarked legacy inputs cannot be reliably classified as foreign, so this does not claim complete issue #100 provenance or protection for clients that omit the marker. Strong foreign identity remains blocked on #132. The return claim is routing metadata, not an authorization grant or a verified statement of who sent the prompt.

@@ -3614,6 +3614,7 @@ async function main() {
         replyExpected,
         noEnter: useSubmit
       });
+      if (target.host !== '127.0.0.1') body.claimed_cross_host = true;
 
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
@@ -3851,16 +3852,27 @@ async function main() {
       const meta = await metaRes.json();
       const replyTo = meta.lastInjectReplyTo;
       if (!replyTo) { console.error(`❌ No pending reply-to found for session '${mySessionId}'`); process.exit(1); }
+      const claimedReturn = meta.lastInjectReturn;
+      const parsedReturn = parseSessionReference(replyTo);
+      if (claimedReturn && claimedReturn.claimed_cross_host === true) {
+        if (!parsedReturn.host) {
+          throw new Error('REPLY_AMBIGUOUS_SENDER: cross-host return has no host-qualified locator. Supply an explicit registered peer return locator.');
+        }
+        if (!resolveRegisteredPeerTarget(replyTo, crossMachine.loadPeers().peers || {})) {
+          throw new Error('REPLY_UNKNOWN_CLAIMED_PEER: the unverified return locator does not name a registered peer.');
+        }
+      }
       const target = await resolveSessionTarget(replyTo);
       if (!target) { console.error(`❌ Session '${replyTo}' was not found on any discovered host.`); process.exit(1); }
-      const body = { prompt: replyText, from: mySessionId, reply_to: mySessionId };
+      const body = { prompt: replyText, from: mySessionId, reply_to: mySessionId, exact_target: true,
+        ...(target.host !== '127.0.0.1' ? { claimed_cross_host: true } : {}) };
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
-      console.log(`✅ Reply sent to '\x1b[36m${replyTo}\x1b[0m'.`);
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); markCommandFailed(); return; }
+      console.log(`✅ Reply sent to claimed return locator '\x1b[36m${replyTo}\x1b[0m' (unverified).`);
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); markCommandFailed(); }
     return;
   }
 
