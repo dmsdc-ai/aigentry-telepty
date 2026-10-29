@@ -1,5 +1,9 @@
 # Security decisions and remaining trust requirements
 
+The opening review is historical. See the continued Linux follow-up at the end
+and [current issue outcomes](2026-10-29-open-issue-outcomes.md) for implemented
+strict HTTP principals, signed approval, forwarding and restricted takeover.
+
 Date: 2026-10-29. Read-only review of the integrated local branch through `f633cad`, plus shared-reference candidate `a7ab984` in `telepty-routing`. This is a source review, not a penetration test or a claim that the open security issues are closed. No production credentials, services, network settings, installations, or trust stores were changed.
 
 ## Current boundary and evidence
@@ -91,3 +95,12 @@ The protected inject CLI now supports a digest-only external signing handoff;
 its private signing authority stays outside Telepty. Protected SSH and unsupported
 input adapters still refuse. No live trust configuration, signer, secret or
 network policy was created or changed to test any of these source features.
+
+Expired poll-only mailbox recovery is now available through an explicitly granted
+strict HTTP takeover action. It requires the same configured owning principal
+and exact signed/body epoch, rotates credential/nonce with the persisted bounded
+authority audit, and preserves pending sender/time under a strict locked snapshot.
+Malformed or partial custody and invalid audit history refuse transfer, including
+after restart. Active/wrapped takeover and cross-owner recovery remain unsupported;
+no process is signalled by this mailbox-only recovery adapter. See
+[mailbox takeover](../security/mailbox-takeover-133.md).

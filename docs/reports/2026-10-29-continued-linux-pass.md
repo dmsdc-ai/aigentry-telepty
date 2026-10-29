@@ -15,6 +15,7 @@ GitHub issue. PR125 and all earlier local changes remain in the commit ancestry.
 | #113/#134 | Exact owned kill plus immutable protected-instance policy; strict principal owner mutations | Legacy operator token stays privileged; no cross-owner operator recovery |
 | #78 | One-use external Ed25519 signed inject and digest-only CLI handoff | No human-attestation claim, enrollment service or protected SSH/typed adapter |
 | #132 | Linux checked startup public trust, exact signed HTTP action grants, persisted owner principal, bounded replay/clock handling | Strict WS is refused; no hostile same-UID isolation or Windows/macOS identity adapter |
+| #133 | Explicit expired-mailbox same-principal takeover with signed epoch CAS, atomic credential/audit rotation and strict locked custody | Active/wrapped takeover still needs signed WS, graceful owner ACK and verified process custody |
 | #111/#100 | Scoped exact forwarding, expected epoch, one hop, durable dedup receipts, explicit unverified return host; ambiguity refusal | Foreign session principal remains unverified |
 | #42 | Signed hub and outbound recipient stream; exact injection without peer reachability; own three-process topology test | Discovery/ref/broadcast/reply/reconnect and strict-local signer adapter absent |
 | #102/#106 | Exact inject correlation, bounded TCP/process probes, bounded UDS replies, durable uncertain-attempt quarantine, asynchronous bounded audit worker queries | Original intermittent stall and missing agent ACK/reply evidence remain unknown |
@@ -26,11 +27,34 @@ GitHub issue. PR125 and all earlier local changes remain in the commit ancestry.
 
 Independent review corrected two broker defects before integration: pending or malformed successful receipts now retain outcome_unknown, and result submission combines shutdown cancellation with a finite timeout. The composed close, signed-inject, SSH-refusal and UDS uncertainty paths had no further Important/Critical findings. A separate strict-principal review passed 34 tests without an important defect.
 
+Independent takeover review also found two defects before integration: tolerant JSONL readers could turn corrupt custody into an empty queue, and restore could discard invalid authority history. A strict lock-held bounded snapshot now refuses unknown custody; a persisted invalid-history marker blocks transfer across restarts. Re-review found both addressed. The Node broker cancellation helper also preserves deadlines without requiring optional AbortSignal.any; abort reason/listener cleanup assertions passed.
+
 The source security defaults remain fail-closed. Synthetic test keys do not become
 production enrollment. No code interprets a shared bearer, name, IP address,
 reported PID, or same OS account as a distinct original user/agent principal.
 
-## Verification checkpoints
+## Final integrated verification
+
+**2,311 tests: 2,308 passed, zero failed, three skipped**, 53.5 seconds.
+Command: `NODE_PATH=/tmp/telepty-vt-deps/node_modules npm test`.
+Log: `/tmp/telepty-remaining-final-full.log`; process exit 0.
+The long TCP-stall skip passed separately as recorded below. The other two skips
+require native Windows: npm-style shim argv preservation and update refusal before
+an explicit mock override. They are not represented as passed. Pinned TypeScript,
+changed-JavaScript syntax checks and `git diff --check` passed. All new tests are
+registered in both explicit npm test/CI lists (the separate existing PTY-CI split
+is retained); the final full run covered every newly registered file.
+
+Disposition: **23 local implementations, 29 partial, three remaining** across all
+55 issues. The three remaining are #116 (native Windows/Warp relay stall), #31
+(native cmux/Codex MCP-init reproduction), and #30 (orchestration-owned terminal
+surface lifecycle). Partial rows explicitly retain unimplemented protocol and
+provider/native scope; they are not claims of resolution. Source review completed
+without remaining Important/Critical findings in the reviewed broker, principal,
+takeover, selector, update-guard and composed close/approval/uncertainty paths.
+This is bounded review evidence, not a claim that the entire product is defect-free.
+
+## Earlier verification checkpoints
 
 Before the captured-profile/native-update/takeover follow-ups, full integrated
 verification passed **2,229 tests: 2,227 passed, zero failed, two skipped** in 52.4s:

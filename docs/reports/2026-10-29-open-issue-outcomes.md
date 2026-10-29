@@ -12,13 +12,15 @@ Input repository: `dmsdc-ai/aigentry-telepty`. Original preserved PR125 head: `2
 
 The original checkpoint recorded 21 local implementations, 15 partial items and 19 remaining. The continued Linux pass below supersedes those counts. See [continued Linux evidence](2026-10-29-continued-linux-pass.md) for the later tests and reviews. #60/#61/#82 were already present and remain preserved.
 
+Current source disposition: **23 local implementations, 29 partial items, 3 remaining**. Partial items retain the exact unimplemented or unverified scope shown below; they are not closed.
+
 ## All 55 outcomes
 
 | Issue | Status | Evidence / exact remaining scope |
 |---|---|---|
 | [#135](https://github.com/dmsdc-ai/aigentry-telepty/issues/135) | Local implementation | Child startup, mailbox recovery and success wait for WS owner token after HTTP registration; refused challenger leaves incumbent untouched. |
 | [#134](https://github.com/dmsdc-ai/aigentry-telepty/issues/134) | Partial | Exact owned kill and immutable protected-instance policy now require current sid/epoch/generation credential. Opt-in strict asymmetric principal authorization adds owner/operator grants separately; default legacy operator bearer remains explicitly privileged. |
-| [#133](https://github.com/dmsdc-ai/aigentry-telepty/issues/133) | Remaining | Explicit takeover waits for trusted principal/operator model, epoch CAS, rotation, mailbox custody and audit; default owner protection remains. |
+| [#133](https://github.com/dmsdc-ai/aigentry-telepty/issues/133) | Partial | Explicit strict-HTTP takeover of an expired poll-only mailbox requires the same configured owner principal, exact grant and signed/body epoch CAS. New credential/nonce plus bounded authority audit commit atomically; strict locked custody preserves original sender/time or refuses corrupt/unknown storage. Wrapped/live takeover awaits a signed WS adapter, graceful incumbent ACK and process-custody proof. |
 | [#132](https://github.com/dmsdc-ai/aigentry-telepty/issues/132) | Partial | Opt-in Linux checked public-trust file, Ed25519 method/path/body/audience/challenge/nonce/expiry proofs, exact action grants, persisted verified owning principal and owner/epoch mutations. Ordinary creation is mailbox-only; native process creation requires operator grant. Strict WS is denied until a signed adapter exists; same-UID secret isolation and Windows/macOS identity remain outside this slice. |
 | [#131](https://github.com/dmsdc-ai/aigentry-telepty/issues/131) | Partial | Windows self-update now refuses before npm/repair, including interactive/override paths; bounded read-only --plan --json documents exact holder/install/service/rollback blockers. Direct npm upgrade and native transaction/holder verification remain unimplemented. |
 | [#130](https://github.com/dmsdc-ai/aigentry-telepty/issues/130) | Partial | Independent incumbent-PID overwrite defect reproduced/fixed. Original Windows owner-refusal then not-found sequence remains unreproduced. |
@@ -85,6 +87,10 @@ No installed Telepty, production daemon, service manager, network/security confi
 The Mac no-ACK incident is not attributed to these defects and is not claimed resolved. Delivery acceptance, PTY writes, consumption and reply remain separate observations. Per-request messaging facts in the new diagnostics remain unknown when no correlation is available.
 
 Security decisions and required authority/enrollment/revocation/recovery contracts are detailed in [security-decisions](2026-10-29-security-decisions.md). Original source/PR classifications are retained in [inventory](2026-10-29-open-issue-inventory.md); the earlier focused repair evidence is in [128–135 report](2026-10-29-issues-128-135.md).
+
+## Current continued-pass verification
+
+Final full suite: **2,311 total; 2,308 passed, zero failed, three skipped**, 53.5s (`/tmp/telepty-remaining-final-full.log`). The skipped long TCP test passed separately; the two native Windows cases remain unverified. Pinned typecheck, JavaScript syntax and diff checks passed. Detailed test/review evidence is in [continued Linux pass](2026-10-29-continued-linux-pass.md).
 
 ## Previous checkpoint verification
 
