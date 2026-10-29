@@ -30,6 +30,7 @@
     "scripts/postinstall.js",
     "scripts/preuninstall.js",
     "src/",
+    "third-party-notices/",
     "skills/",
     "CHANGELOG.md"
   ],
@@ -81,7 +82,8 @@
     "node-pty": "^1.2.0-beta.11",
     "prompts": "^2.4.2",
     "ws": "^8.19.0",
-    "zod": "^3.24.0"
+    "zod": "^3.24.0",
+    "@xterm/headless": "6.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.19.41",
