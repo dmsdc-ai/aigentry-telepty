@@ -1309,3 +1309,87 @@ test('Linux uninstall refuses unreadable or foreign unit descriptors before muta
     assert.deepEqual(world.calls.removals, []);
   }
 });
+
+test('confirmation: changed descriptor bytes refuse uninstall and install before mutation', async () => {
+  for (const verb of ['uninstall', 'install']) {
+    for (const replacement of [
+      '<plist><dict><key>ProgramArguments</key><array><string>/foreign/program</string></array></dict></plist>',
+      expectedPlist({ nodeBin: '/changed/node' }), null
+    ]) {
+      const world = macWorld({ plist: expectedPlist(), loaded: true });
+      const result = await runServiceVerb(verb, {
+        isTTY: true,
+        confirm: async () => {
+          if (replacement === null) world.files.delete(PLIST_PATH);
+          else world.files.set(PLIST_PATH, replacement);
+          return true;
+        }
+      }, world.deps);
+      assert.equal(result.reason, 'plan-changed', verb);
+      assert.equal(result.ok, false);
+      assert.deepEqual(world.calls.writes, []);
+      assert.deepEqual(world.calls.removals, []);
+      assert.ok(world.calls.exec.every(call => call[1] === 'print'));
+    }
+  }
+});
+
+test('confirmation: install cannot overwrite a newly appeared foreign descriptor without replacement approval', async () => {
+  const world = macWorld({ loaded: false });
+  const foreign = '<plist><dict><key>Label</key><string>foreign</string></dict></plist>';
+  const result = await runServiceVerb('install', {
+    isTTY: true,
+    confirm: async () => { world.files.set(PLIST_PATH, foreign); return true; }
+  }, world.deps);
+  assert.equal(result.reason, 'plan-changed');
+  assert.equal(world.files.get(PLIST_PATH), foreign);
+  assert.deepEqual(world.calls.writes, []);
+  assert.deepEqual(world.calls.removals, []);
+  assert.ok(world.calls.exec.every(call => call[1] === 'print'));
+});
+
+test('confirmation: a newly detected system target refuses the cached user-service plan', async () => {
+  const world = linuxWorld({ unit: expectedUnit() });
+  const result = await runServiceVerb('uninstall', {
+    isTTY: true,
+    confirm: async () => {
+      world.files.set(SYSTEM_UNIT_PATH, expectedUnit({ wantedBy: 'multi-user.target' }));
+      return true;
+    }
+  }, world.deps);
+  assert.equal(result.reason, 'plan-changed');
+  assert.deepEqual(world.calls.removals, []);
+  assert.ok(!world.calls.exec.some(call => call.includes('disable')));
+});
+
+test('confirmation: unchanged approved descriptor executes the freshly rebuilt uninstall plan', async () => {
+  const world = macWorld({ plist: expectedPlist(), loaded: true });
+  let confirmations = 0;
+  const result = await runServiceVerb('uninstall', {
+    isTTY: true,
+    confirm: async () => { confirmations++; return true; }
+  }, world.deps);
+  assert.equal(confirmations, 1);
+  assert.equal(result.ok, true);
+  assert.ok(world.calls.exec.some(call => call[1] === 'bootout'));
+  assert.deepEqual(world.calls.removals, [PLIST_PATH]);
+});
+
+test('confirmation: Windows task XML is queried again and a replacement is never ended or deleted', async () => {
+  const world = winWorld({ xml: schtasksXml() });
+  let replaced = false;
+  const originalExec = world.deps.execFileSync;
+  world.deps.execFileSync = (command, args) => {
+    if (replaced && command === 'schtasks' && args[0] === '/query') {
+      world.calls.exec.push([command, ...args]);
+      return '<Task><Actions><Exec><Command>C:\\foreign.exe</Command><Arguments>serve</Arguments></Exec></Actions></Task>';
+    }
+    return originalExec(command, args);
+  };
+  const result = await runServiceVerb('uninstall', {
+    isTTY: true, confirm: async () => { replaced = true; return true; }
+  }, world.deps);
+  assert.equal(result.reason, 'plan-changed');
+  assert.ok(world.calls.exec.filter(call => call[1] === '/query').length >= 2);
+  assert.ok(!world.calls.exec.some(call => ['/end', '/delete'].includes(call[1])));
+});

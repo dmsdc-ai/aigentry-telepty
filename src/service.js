@@ -48,6 +48,7 @@ const pkg = require('../package.json');
 
 const SCHEMA = 'telepty.service-status/v1';
 const VERBS = ['install', 'uninstall', 'start', 'stop', 'restart'];
+const planObservations = new WeakMap();
 const DEFAULT_WAIT_MS = Number(process.env.TELEPTY_SUPERVISOR_WAIT_MS) > 0
   ? Number(process.env.TELEPTY_SUPERVISOR_WAIT_MS)
   : 10000;
@@ -614,7 +615,7 @@ function planShell(verb, deps, opts) {
   const expected = { nodeBin: target.nodeBin, cliJs: target.cliJs, text: target.contents };
   const ownership = observed.installed ? classifyDescriptor(observed.text, target.kind, expected) : 'absent';
 
-  return {
+  const planned = {
     verb,
     ctx,
     target,
@@ -636,6 +637,12 @@ function planShell(verb, deps, opts) {
       refusal: refusalFor(verb, target, ownership, opts || {})
     }
   };
+  planObservations.set(planned.base, JSON.stringify({ target, text: observed.text, installed: observed.installed }));
+  return planned;
+}
+
+function approvalSnapshot(plan) {
+  return JSON.stringify({ observation: planObservations.get(plan), plan });
 }
 
 function planInstall(deps = {}, opts = {}) {
@@ -889,7 +896,7 @@ async function runServiceVerb(verb, opts = {}, deps = {}) {
 
   const ctx = resolve(deps);
   const scoped = { ...deps, __ctx: ctx };
-  const plan = planFor(verb, scoped, opts);
+  let plan = planFor(verb, scoped, opts);
 
   if (plan.refusal) return refusedResult(verb, plan, await getServiceStatus(scoped));
 
@@ -898,10 +905,19 @@ async function runServiceVerb(verb, opts = {}, deps = {}) {
   }
 
   if ((verb === 'install' || verb === 'uninstall') && !opts.yes) {
+    // The prompt can remain open while another installer changes this target.
+    // Capture immutable approval evidence before yielding, then rebuild using
+    // fresh descriptor/manager observations. Never execute the cached plan.
+    const approvedSnapshot = approvalSnapshot(plan);
     const approved = await opts.confirm(plan);
     if (!approved) {
       return { ok: false, verb, exitCode: SERVICE_EXIT.CONSENT, reason: 'declined', steps: [], status: null, plan, manualCommands: [] };
     }
+    const freshPlan = planFor(verb, scoped, opts);
+    if (freshPlan.refusal || approvalSnapshot(freshPlan) !== approvedSnapshot) {
+      return { ok: false, verb, exitCode: SERVICE_EXIT.CONSENT, reason: 'plan-changed', steps: [], status: null, plan: freshPlan, manualCommands: [] };
+    }
+    plan = freshPlan;
   }
 
   const executed = executePlan(ctx, plan, verb);
