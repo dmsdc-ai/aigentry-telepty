@@ -43,6 +43,15 @@ function ensurePrivateDirectory(dir) {
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw refusal('SHARED_REF_STORAGE_UNSAFE', 409);
 }
 
+function syncDirectory(dir) {
+  // Node has no portable Windows directory-fsync or DACL API. Windows gets file
+  // data flushes below; POSIX additionally commits directory entries and modes.
+  if (process.platform === 'win32') return;
+  const fd = fs.openSync(dir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0));
+  try { fs.fsyncSync(fd); }
+  finally { fs.closeSync(fd); }
+}
+
 function verifyExisting(filePath, bytes) {
   let fd;
   try {
@@ -50,7 +59,7 @@ function verifyExisting(filePath, bytes) {
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size !== bytes.length) {
       throw refusal('SHARED_REF_STORAGE_CONFLICT', 409);
     }
-    fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    fd = fs.openSync(filePath, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0));
     const opened = fs.fstatSync(fd);
     const existing = Buffer.alloc(bytes.length + 1);
     const count = fs.readSync(fd, existing, 0, existing.length, 0);
@@ -58,6 +67,7 @@ function verifyExisting(filePath, bytes) {
       || opened.size !== bytes.length || count !== bytes.length
       || !existing.subarray(0, count).equals(bytes)) throw refusal('SHARED_REF_STORAGE_CONFLICT', 409);
     fs.fchmodSync(fd, 0o600);
+    fs.fsyncSync(fd);
     return true;
   } catch (error) {
     if (error.code === 'ENOENT') return false;
@@ -91,6 +101,11 @@ function commitSharedReference(body, { homeDir = os.homedir() } = {}) {
     }
     if (!verifyExisting(filePath, bytes)) throw refusal('SHARED_REF_STORAGE_CONFLICT', 409);
   }
+  syncDirectory(dir);
+  // Flush ancestors on retries too: an earlier attempt may have created these
+  // directories but failed before their parent entries reached durable storage.
+  syncDirectory(teleptyDir);
+  syncDirectory(homeDir);
   return { success: true, hash: descriptor.hash, fileName: descriptor.fileName,
     promptPath: getSharedContextPromptPath(descriptor.fileName), created };
 }
