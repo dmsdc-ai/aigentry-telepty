@@ -73,7 +73,7 @@ async function daemonFetch(endpoint, options = {}) {
     ...(token ? { "x-telepty-token": token } : {}),
     ...options.headers,
   };
-  const res = await fetch(url, { ...options, headers });
+  const res = await fetch(url, { ...options, headers, redirect: 'error' });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`telepty daemon ${res.status}: ${body || res.statusText}`);
@@ -209,7 +209,7 @@ server.tool(
     if (!target.includes('@') || host !== configured.hostname) return { content: [{ type: "text", text: JSON.stringify({ error: "Target must name the configured daemon host exactly", status: "identity_mismatch" }) }], isError: true };
     const report = await diagnosticsClient.diagnoseTarget(target, {
       daemonUrl: () => getDaemonUrl(), machineId: machine_id, sessionEpoch: session_epoch,
-      fetchWithAuth: (url, options) => fetch(url, { ...options, headers: { "x-telepty-token": getAuthToken() } })
+      fetchWithAuth: (url, options) => fetch(url, { ...options, headers: { "x-telepty-token": getAuthToken() }, redirect: 'error' })
     });
     report.mcp_transport = { status: "tool_handler_reached", agent_responsiveness: "unknown", return_path_to_agent: "unknown" };
     return { content: [{ type: "text", text: JSON.stringify(report) }], ...(!report.identity ? { isError: true } : {}) };

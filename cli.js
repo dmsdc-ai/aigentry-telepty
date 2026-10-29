@@ -176,7 +176,7 @@ let cachedAuthToken = null;
 // TELEPTY_AUTH_TOKEN for a client but not for the daemon produces a 401 that looks like a
 // credential bug; the variable is therefore documented (BOUNDARY.md) as something you set for
 // BOTH ends or neither, and never silently preferred at one end only.
-const { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential } = require('./src/cli/security-actions');
+const { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken } = require('./src/cli/security-actions');
 const cliSecurity = createCliSecurityActions({
   get cachedAuthToken() { return cachedAuthToken; },
   get cachedPeerTokens() { return cachedPeerTokens; },
@@ -2566,7 +2566,7 @@ async function main() {
       }
       // #43 P2 — store the daemon-minted verified-sender token beside TELEPTY_SESSION_ID so the
       // wrapped CLI (and any `telepty inject` it spawns) inherits it via sessionEnv below.
-      adoptRegistrationCredential(res, data, process.env);
+      adoptRegistrationCredential(res, data, process.env, process.env, DAEMON_URL);
       // #47 P4 — carry the per-session provenance nonce in the same protected env. This is the
       // agent's trusted bootstrap copy of the nonce: a delivery's origin banner is authoritative
       // ONLY if its nonce matches this value. Treat it as secret; never echo it (onboarding §6).
@@ -2854,7 +2854,7 @@ async function main() {
           // sessionEnv current for future respawns; running-child refresh still needs the
           // instance-bound channel described in docs/plans/credential-refresh-92.md.
           const reregData = await rereg.json().catch(() => null);
-          adoptRegistrationCredential(rereg, reregData, process.env, sessionEnv);
+          adoptRegistrationCredential(rereg, reregData, process.env, sessionEnv, DAEMON_URL);
         } catch (e) {
           // Registration may fail if session already exists or daemon not ready
         }
@@ -2864,8 +2864,9 @@ async function main() {
       // already holds a credential unless the matching bearer arrives here — that is what stops
       // any local process from taking over a live PTY byte stream. Sent as a HANDSHAKE HEADER,
       // never on the URL: a query string lands in logs and error reports, a header does not.
-      daemonWs = new WebSocket(wsUrl, process.env.TELEPTY_SESSION_TOKEN
-        ? { headers: { 'x-telepty-session-token': process.env.TELEPTY_SESSION_TOKEN } }
+      const ownerCredential = scopedSessionToken(wsUrl, { localOrigin: buildDaemonUrl('127.0.0.1', PORT) });
+      daemonWs = new WebSocket(wsUrl, ownerCredential
+        ? { headers: { 'x-telepty-session-token': ownerCredential } }
         : undefined);
 
       daemonWs.on('open', () => {

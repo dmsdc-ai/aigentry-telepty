@@ -515,7 +515,7 @@ async function connectHttp(target, options = {}) {
   let healthOk = false;
   try {
     const healthUrl = `http://${spec.host}:${spec.port}/api/health`;
-    const res = await fetch(healthUrl, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(healthUrl, { redirect: 'error', signal: AbortSignal.timeout(5000) });
     if (!res.ok) {
       return { success: false, error: `Daemon at ${spec.host}:${spec.port} returned HTTP ${res.status} on /api/health.` };
     }
@@ -526,7 +526,7 @@ async function connectHttp(target, options = {}) {
 
   try {
     const metaUrl = `http://${spec.host}:${spec.port}/api/meta`;
-    const res = await fetch(metaUrl, { signal: AbortSignal.timeout(3000), headers });
+    const res = await fetch(metaUrl, { redirect: 'error', signal: AbortSignal.timeout(3000), headers });
     if (res.ok) {
       const meta = await res.json();
       if (meta && typeof meta.machine_id === 'string' && meta.machine_id) {
@@ -592,6 +592,7 @@ async function listHttpRemoteSessions(name, options = {}) {
   try {
     const url = `http://${entry.host}:${entry.port}/api/sessions`;
     const res = await fetch(url, {
+      redirect: 'error',
       signal: AbortSignal.timeout(options.timeoutMs || 3000),
       headers
     });
@@ -684,6 +685,7 @@ async function listBrokerRemoteSessions(options = {}) {
 
   try {
     const res = await fetch(`${brokerUrl}/broker/sessions`, {
+      redirect: 'error',
       signal: AbortSignal.timeout(options.timeoutMs || 3000),
       headers: { Authorization: `Bearer ${jwt}` }
     });

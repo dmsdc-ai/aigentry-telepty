@@ -3,8 +3,25 @@ const { buildPtySpawnTarget } = require('../win-spawn-target');
 // Construction does not read shared getters or start CLI/native/network work.
 // A registration error body is not credential issuance. Keep the wrapper and
 // its future child-spawn environment consistent only after successful issuance.
-function adoptRegistrationCredential(response, data, env, childEnv = env) {
+function credentialOrigin(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'ws:') url.protocol = 'http:';
+    if (url.protocol === 'wss:') url.protocol = 'https:';
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
+    return url.origin;
+  } catch { return null; }
+}
+function scopedSessionToken(url, { env = process.env, localOrigin = 'http://127.0.0.1:3848' } = {}) {
+  const destination = credentialOrigin(url);
+  const boundOrigin = credentialOrigin(env.TELEPTY_SESSION_ORIGIN || localOrigin);
+  return destination && destination === boundOrigin ? env.TELEPTY_SESSION_TOKEN || null : null;
+}
+function adoptRegistrationCredential(response, data, env, childEnv = env, origin) {
   if (!response?.ok || typeof data?.session_token !== 'string' || !data.session_token) return false;
+  const boundOrigin = origin === undefined ? null : credentialOrigin(origin);
+  if (origin !== undefined && !boundOrigin) return false;
+  if (boundOrigin) { env.TELEPTY_SESSION_ORIGIN = boundOrigin; childEnv.TELEPTY_SESSION_ORIGIN = boundOrigin; }
   env.TELEPTY_SESSION_TOKEN = data.session_token;
   childEnv.TELEPTY_SESSION_TOKEN = data.session_token;
   return true;
@@ -170,16 +187,18 @@ function interceptSubcommandHelp(cmd, argv) {
 }
 
 const fetchWithAuth = (url, options = {}) => {
-  const headers = { ...options.headers, 'x-telepty-token': resolveTargetToken(url) };
+  const headers = Object.fromEntries(new Headers(options.headers).entries());
+  headers['x-telepty-token'] = resolveTargetToken(url);
+  delete headers['x-telepty-session-token'];
   // #43 P2 — present the per-session verified-sender token (minted at register, carried in the
   // parent-hijack-protected env beside TELEPTY_SESSION_ID) so the daemon can map token→sid and
   // record verified_sender_sid. Header only, never the body. Absent for operator/human shells.
-  const sessionToken = process.env.TELEPTY_SESSION_TOKEN;
+  const sessionToken = scopedSessionToken(url, { localOrigin: shared.localOrigin || `http://127.0.0.1:${shared.PORT || 3848}` });
   if (sessionToken) headers['x-telepty-session-token'] = sessionToken;
   // Wrapped here rather than at the 45 call sites: every one of them either prints `e.message`
   // or swallows the throw, so this is the single place the origin can be attached without
   // changing what any caller does with the error.
-  return fetch(url, { ...options, headers }).catch((error) => { throw namedTransportError(url, error); });
+  return fetch(url, { ...options, headers, redirect: 'error' }).catch((error) => { throw namedTransportError(url, error); });
 };
 
 function parseAllowInvocation(cmd, args) {
@@ -251,6 +270,7 @@ function parseAllowInvocation(cmd, args) {
     // in; the daemon mints the real one at register (below) and we set it into the same
     // protected env.
     delete process.env.TELEPTY_SESSION_TOKEN;
+    delete process.env.TELEPTY_SESSION_ORIGIN;
     // #47 P4 — same parent-hijack defense for the per-session provenance nonce: drop any inherited
     // value so a parent cannot pre-seed a known nonce, then carry the daemon-minted one (below).
     delete process.env.TELEPTY_SESSION_NONCE;
@@ -539,4 +559,4 @@ function createAllowSecurityContext(shared, {
 return { updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox };
 }
 
-module.exports = { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential };
+module.exports = { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken, credentialOrigin };
