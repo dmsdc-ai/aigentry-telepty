@@ -1,4 +1,5 @@
 'use strict';
+const { createBoundedUdsResponse } = require('./uds-response');
 
 // Domain dependencies are the daemon's actual shared helpers and records.
 // Late mailbox getters are invoked only at the original points of use.
@@ -43,10 +44,12 @@ function createSessionDeliveryContext({
       if (session.delivery && session.delivery.transport === 'unix_socket' && session.delivery.address) {
         return new Promise((resolve) => {
           const payload = JSON.stringify({ action: "Inject", workspace: id, text: data }) + '\n';
-          let responseBuf = '';
+          const response = createBoundedUdsResponse();
+          let settled = false;
+          const finish = result => { if (settled) return; settled = true; clearTimeout(timeout); resolve(result); };
           const timeout = setTimeout(() => {
             sock.destroy();
-            resolve(buildErrorBody('TIMEOUT', 'UDS delivery timed out.', { httpStatus: 504 }));
+            finish(buildErrorBody('TIMEOUT', 'UDS delivery timed out.', { httpStatus: 504, delivery_uncertain: true }));
           }, DELIVERY_TIMEOUT_MS);
           const sock = net.connect(session.delivery.address, () => {
             if (session.isClosing || sessions[id] !== session) {
@@ -57,15 +60,23 @@ function createSessionDeliveryContext({
             }
             sock.end(payload);
           });
-          sock.on('data', (chunk) => { responseBuf += chunk.toString(); });
+          sock.on('data', (chunk) => {
+            if (settled) return;
+            if (!response.append(chunk)) {
+              finish(buildErrorBody('DELIVERY_RESPONSE_TOO_LARGE', 'UDS response exceeded 65536 bytes; delivery outcome is uncertain.',
+                { httpStatus: 502, delivery_uncertain: true, bytes_written: null }));
+              sock.destroy();
+            }
+          });
           sock.on('end', () => {
-            clearTimeout(timeout);
+            if (settled) return;
+            const responseBuf = response.text();
             if (responseBuf) {
               try {
                 const resp = JSON.parse(responseBuf.trim());
                 if (resp.status === 'Error' || resp.success === false) {
                   console.log(`[UDS] Delivery rejected by ${id}: ${resp.error || resp.message || 'unknown'}`);
-                  resolve(buildErrorBody('DELIVERY_REJECTED', resp.error || resp.message || 'Target rejected the payload.', {
+                  finish(buildErrorBody('DELIVERY_REJECTED', resp.error || resp.message || 'Target rejected the payload.', {
                     httpStatus: 502,
                     detail: resp
                   }));
@@ -77,13 +88,13 @@ function createSessionDeliveryContext({
             } else {
               console.log(`[UDS] Empty response from ${id} — delivery unconfirmed (aterm may not have processed)`);
             }
-            resolve({ success: true });
+            finish({ success: true });
           });
           sock.on('error', (err) => {
-            clearTimeout(timeout);
+            if (settled) return;
             console.log(`[UDS] Connection error for ${id} at ${session.delivery.address}: ${err.message}`);
             markSessionDisconnected(session);
-            resolve(buildErrorBody('DISCONNECTED', 'UDS endpoint is unreachable.', {
+            finish(buildErrorBody('DISCONNECTED', 'UDS endpoint is unreachable.', {
               httpStatus: 503,
               detail: err.message
             }));
