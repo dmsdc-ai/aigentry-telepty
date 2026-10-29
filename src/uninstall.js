@@ -36,14 +36,14 @@ function launchdPlistPaths(homedir) {
 
 // The seams src/service.js needs, assembled from this module's own injected
 // deps so an uninstall plan can never reach the real fs or a real service.
-function serviceDepsFrom(opts) {
+function serviceDepsFrom(opts, probe = false) {
   return {
     platform: opts.platform || process.platform,
     homedir: opts.homedir || os.homedir(),
     fs: opts.fs || fs,
     execFileSync: opts.execFileSync || execFileSync,
-    probe: false, // descriptor-only: a PLAN must not shell out to systemctl
-    ...(opts.serviceDeps || {})
+    ...(opts.serviceDeps || {}),
+    probe // planning is descriptor-only; execution must freshly establish ownership
   };
 }
 
@@ -120,6 +120,22 @@ function runUninstall(opts = {}) {
     } catch {
       entry.existed = false;
     }
+    // Explicit full uninstall must establish descriptor ownership from fresh
+    // content. The npm preuninstall compatibility pass remains unload-only.
+    let ownedText;
+    if (removePlists) {
+      try {
+        ownedText = entry.existed ? String(fsx.readFileSync(plistPath, 'utf8')) : null;
+        entry.ownership = require('./service').classifyDescriptor(ownedText, 'launchd', {
+          cliJs: path.resolve(__dirname, '..', 'cli.js')
+        });
+      } catch { entry.ownership = 'unknown'; }
+      if (!['managed', 'drifted'].includes(entry.ownership)) {
+        entry.refused = 'ownership-unverified';
+        result.plists.push(entry);
+        continue;
+      }
+    }
     if (entry.existed && !dryRun) {
       try {
         execFile('launchctl', ['unload', plistPath], { stdio: ['ignore', 'ignore', 'ignore'] });
@@ -129,6 +145,11 @@ function runUninstall(opts = {}) {
       }
       if (removePlists) {
         try {
+          if (String(fsx.readFileSync(plistPath, 'utf8')) !== ownedText) {
+            entry.refused = 'descriptor-changed';
+            result.plists.push(entry);
+            continue;
+          }
           fsx.rmSync(plistPath, { force: true });
           entry.removed = true;
         } catch {
@@ -146,7 +167,7 @@ function runUninstall(opts = {}) {
   if (plan.services && removePlists) {
     try {
       const { runServiceVerbSync } = require('./service');
-      result.services = runServiceVerbSync('uninstall', { yes: true, dryRun }, serviceDepsFrom(opts));
+      result.services = runServiceVerbSync('uninstall', { yes: true, dryRun }, serviceDepsFrom(opts, !dryRun));
     } catch (err) {
       result.services = { ok: false, reason: err.message };
     }

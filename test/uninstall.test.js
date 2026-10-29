@@ -15,6 +15,8 @@ const path = require('path');
 const { LAUNCHD_PLIST_NAMES, planUninstall, runPreuninstall, runUninstall } = require('../src/uninstall');
 
 const HOME = '/home/tester';
+const { buildLaunchdPlist } = require('../install');
+const managedPlist = () => buildLaunchdPlist({ cliJs: path.resolve(__dirname, '../cli.js') });
 
 function fakeDeps(overrides = {}) {
   const calls = { cleanup: 0, execFile: [], rm: [], exists: [] };
@@ -33,6 +35,7 @@ function fakeDeps(overrides = {}) {
         calls.exists.push(p);
         return true; // default: plists and state dirs all exist
       },
+      readFileSync: p => p.endsWith('telepty.plist') ? managedPlist() : '<plist><dict><key>Label</key><string>unknown-legacy-broker</string></dict></plist>',
       rmSync: (p, opts) => {
         calls.rm.push([p, opts || {}]);
       }
@@ -70,9 +73,9 @@ test('runUninstall: stops daemons, unloads+removes plists, KEEPS state dirs (pur
   assert.equal(result.stopped.length, 1);
 
   const unloads = calls.execFile.filter(([cmd, sub]) => cmd === 'launchctl' && sub === 'unload');
-  assert.equal(unloads.length, 2, 'both daemon and broker plists are unloaded');
+  assert.equal(unloads.length, 1, 'only the verified daemon plist is unloaded; unknown legacy broker is preserved');
   const plistRms = calls.rm.filter(([p]) => p.endsWith('.plist'));
-  assert.equal(plistRms.length, 2, 'both plist files are removed');
+  assert.equal(plistRms.length, 1, 'only the verified daemon plist is removed');
 
   // THE #49 guard: without --purge, no state directory is ever deleted.
   const dirRms = calls.rm.filter(([p]) => !p.endsWith('.plist'));
@@ -109,13 +112,13 @@ test('runUninstall: non-darwin skips launchctl entirely', () => {
 });
 
 test('runUninstall: missing plist → no unload attempt; launchctl failure tolerated', () => {
-  // First plist absent, second present but launchctl throws (not loaded).
+  // First owned plist present but launchctl throws; second plist absent.
   const { deps, calls } = fakeDeps();
   let existsCall = 0;
   deps.fs.existsSync = (p) => {
     if (p.endsWith('.plist')) {
       existsCall += 1;
-      return existsCall > 1;
+      return existsCall === 1;
     }
     return true;
   };
@@ -125,9 +128,9 @@ test('runUninstall: missing plist → no unload attempt; launchctl failure toler
   };
   const result = runUninstall(deps);
   assert.equal(calls.execFile.length, 1, 'absent plist is never unloaded');
-  assert.equal(result.plists[0].existed, false);
-  assert.equal(result.plists[1].unloaded, false, 'launchctl failure is recorded, not thrown');
-  assert.equal(result.plists[1].removed, true, 'plist file still removed after a failed unload');
+  assert.equal(result.plists[1].existed, false);
+  assert.equal(result.plists[0].unloaded, false, 'launchctl failure is recorded, not thrown');
+  assert.equal(result.plists[0].removed, true, 'owned plist file still removed after a failed unload');
 });
 
 // ── runPreuninstall: npm hook — quiet, partial, unbreakable ─────────────────────
@@ -158,4 +161,31 @@ test('runPreuninstall: a purge option smuggled in is ignored (hard guard)', () =
   const { deps, calls } = fakeDeps();
   runPreuninstall({ ...deps, purge: true });
   assert.equal(calls.rm.length, 0, 'the npm hook can never delete user data');
+});
+
+test('explicit macOS uninstall fresh-reads ownership and preserves foreign/missing/unreadable descriptors', () => {
+  const foreign = managedPlist().replace(path.resolve(__dirname, '../cli.js'), '/opt/unrelated/cli.js');
+  for (const fixture of [foreign, null, new Error('unreadable')]) {
+    const { deps, calls } = fakeDeps();
+    deps.fs.existsSync = p => p.endsWith('telepty.plist') && fixture !== null;
+    deps.fs.readFileSync = () => {
+      if (fixture instanceof Error) throw fixture;
+      return fixture;
+    };
+    const result = runUninstall(deps);
+    assert.deepEqual(calls.execFile, [], 'no launchctl against unverified ownership');
+    assert.deepEqual(calls.rm, [], 'no removal against unverified ownership');
+    assert.ok(result.plists.every(entry => entry.refused === 'ownership-unverified'));
+  }
+});
+
+test('explicit macOS uninstall accepts owned descriptor but refuses a replacement before remove', () => {
+  const { deps, calls } = fakeDeps();
+  deps.fs.existsSync = p => p.endsWith('telepty.plist');
+  let reads = 0;
+  deps.fs.readFileSync = () => ++reads === 1 ? managedPlist() : '<plist>foreign replacement</plist>';
+  const result = runUninstall(deps);
+  assert.equal(calls.execFile.length, 1, 'owned initial descriptor may be unloaded');
+  assert.deepEqual(calls.rm, [], 'replacement is never removed');
+  assert.equal(result.plists[0].refused, 'descriptor-changed');
 });

@@ -157,18 +157,25 @@ function systemdExecParts(text) {
 // Is this descriptor a telepty daemon at all? `drifted` (ours, but different)
 // and `foreign` (someone else's) must never be collapsed: install overwrites
 // the first and refuses the second.
-function recognizesTelepty(text, kind) {
+function recognizesTelepty(text, kind, expected) {
+  // A generic cli.js plus "daemon" is not ownership: unrelated products use
+  // both. Require this install's entrypoint or an explicit telepty package path.
+  const isCli = value => value === expected.cliJs
+    || /(?:^|[\\/])(?:@dmsdc-ai[\\/])?aigentry-telepty[\\/]cli\.js$/.test(value);
   if (kind === 'launchd') {
     const args = plistProgramArguments(text);
-    const ours = args.some((a) => /cli\.js$/.test(a) || path.basename(a) === 'telepty');
-    return ours && args.includes('daemon');
+    const label = String(text).match(/<key>\s*Label\s*<\/key>\s*<string>([^<]+)<\/string>/);
+    return label?.[1] === 'com.aigentry.telepty' && args.length === 3
+      && isCli(args[1]) && args[2] === 'daemon';
   }
   if (kind === 'systemd' || kind === 'systemd-user') {
-    return /^ExecStart=.*(cli\.js|[\\/]telepty)\s+daemon\b/m.test(String(text));
+    const args = systemdExecParts(text);
+    return args.length === 3 && isCli(args[1]) && args[2] === 'daemon';
   }
   if (kind === 'schtasks') {
-    const body = `${xmlTag(text, 'Command') || ''} ${xmlTag(text, 'Arguments') || ''}`;
-    return /cli\.js/.test(body) && /\bdaemon\b/.test(body);
+    const args = (xmlTag(text, 'Arguments') || '').match(/^"([^"\r\n]+)"\s+daemon$/)
+      || (xmlTag(text, 'Arguments') || '').match(/^(\S+)\s+daemon$/);
+    return Boolean(args && isCli(args[1]));
   }
   return false;
 }
@@ -177,7 +184,7 @@ function classifyDescriptor(text, kind, expected = {}) {
   if (text == null) return 'absent';
   const body = String(text);
   if (expected.text != null && body === String(expected.text)) return 'managed';
-  return recognizesTelepty(body, kind) ? 'drifted' : 'foreign';
+  return recognizesTelepty(body, kind, expected) ? 'drifted' : 'foreign';
 }
 
 // WHICH part drifted, so `status` can say "your node moved" instead of "broken".
@@ -340,7 +347,7 @@ async function probeDaemon(ctx) {
 // What the supervisor itself says. `installed` is the descriptor; `loaded` and
 // `active` are the manager's own answer — the gap #1227 exists to close.
 function observe(ctx, target) {
-  const out = { installed: false, loaded: false, active: null, pid: null, text: null, unitFileState: null };
+  const out = { installed: false, loaded: false, active: null, pid: null, text: null, unitFileState: null, loginEnabled: null };
 
   // Descriptor-only mode (`probe: false`): the caller wants a PLAN, not a
   // measurement. It must issue no command at all — src/uninstall.js builds a
@@ -374,6 +381,15 @@ function observe(ctx, target) {
     out.installed = queried.ok;
     out.loaded = queried.ok;
     out.text = queried.ok ? queried.stdout : null;
+    if (queried.ok) {
+      const settings = queried.stdout.match(/<Settings\b[^>]*>([\s\S]*?)<\/Settings>/i);
+      const triggers = queried.stdout.match(/<Triggers\b[^>]*>([\s\S]*?)<\/Triggers>/i);
+      const enabled = settings && xmlTag(settings[1], 'Enabled');
+      const logon = triggers && triggers[1].match(/<LogonTrigger\b[^>]*>([\s\S]*?)<\/LogonTrigger>/i);
+      const logonEnabled = logon && xmlTag(logon[1], 'Enabled');
+      if (enabled === 'false' || logonEnabled === 'false') out.loginEnabled = false;
+      else if (enabled === 'true' && logonEnabled === 'true') out.loginEnabled = true;
+    }
     // Liveness comes from the daemon probe: `/fo LIST`'s `Status:` label is
     // localized (F-8), so it is never the oracle.
     return out;
@@ -418,25 +434,31 @@ function describeStartup(ctx, target, observed) {
   const startup = { atLogin: 'no', bootWithoutLogin: 'unknown', linger: 'n/a', reason: target.reason, hint: null };
 
   if (target.kind === 'launchd') {
-    startup.atLogin = observed.installed && observed.loaded ? 'yes' : 'no';
+    // bootout changes current loading, not next-login policy. We do not query
+    // launchd's disabled overrides, so an installed plist has unknown enablement.
+    startup.atLogin = !observed.installed ? 'no' : 'unknown';
     startup.bootWithoutLogin = 'unsupported-requires-admin';
     return startup;
   }
   if (target.kind === 'schtasks') {
-    startup.atLogin = observed.installed ? 'yes' : 'no';
+    startup.atLogin = !observed.installed ? 'no' : observed.loginEnabled === null ? 'unknown' : observed.loginEnabled ? 'yes' : 'no';
     startup.bootWithoutLogin = 'unsupported-requires-admin';
     return startup;
   }
   if (target.kind === 'systemd') {
     startup.atLogin = 'n/a';
-    startup.bootWithoutLogin = 'yes';
+    startup.bootWithoutLogin = 'unknown';
     return startup;
   }
   if (target.kind === 'systemd-user') {
-    startup.atLogin = observed.unitFileState === 'enabled' || observed.installed ? 'yes' : 'no';
+    const state = observed.unitFileState;
+    startup.atLogin = state === 'enabled' ? 'yes'
+      : ['disabled', 'masked', 'masked-runtime', 'not-found'].includes(state) ? 'no'
+      : 'unknown';
     const linger = probeLinger({ __ctx: ctx });
     startup.linger = linger;
-    startup.bootWithoutLogin = linger;
+    startup.bootWithoutLogin = startup.atLogin === 'no' || linger === 'no' ? 'no'
+      : startup.atLogin === 'yes' && linger === 'yes' ? 'yes' : 'unknown';
     if (linger === 'no') {
       startup.hint = `boot without login also needs: loginctl enable-linger ${ctx.user}`;
     }
@@ -650,6 +672,11 @@ function planUninstall(deps = {}, opts = {}) {
   const { target, observed, ownership, base } = planShell('uninstall', deps, opts);
   if (base.refusal) {
     if (target.kind === 'systemd') base.manualCommands = sudoCommands('uninstall');
+    return base;
+  }
+
+  if (!observed.installed || ownership === 'absent') {
+    base.refusal = { exitCode: SERVICE_EXIT.NOT_INSTALLED, reason: 'ownership-unverified' };
     return base;
   }
 

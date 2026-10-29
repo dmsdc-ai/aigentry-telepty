@@ -317,7 +317,7 @@ test('A-U2: classifyDescriptor separates managed, drifted (nodeBin / install.sh 
 
   // install.sh:96-99 writes [<prefix>/bin/telepty, daemon] — ours, older shape.
   const installShPlist = expectedPlist({ nodeBin: '/usr/local/bin/telepty', cliJs: 'daemon', command: 'daemon' });
-  assert.equal(classifyDescriptor(installShPlist, 'launchd', expected), 'drifted');
+  assert.equal(classifyDescriptor(installShPlist, 'launchd', expected), 'foreign', 'bare legacy bin name no longer proves ownership');
 
   const foreign = `<?xml version="1.0"?><plist><dict><key>Label</key><string>com.example.other</string>
 <key>ProgramArguments</key><array><string>/usr/bin/sleep</string><string>99</string></array></dict></plist>`;
@@ -525,7 +525,7 @@ test('A-U7: status on a host with a system unit lists it in conflicts and stays 
   const status = await getServiceStatus(deps);
   assert.equal(status.kind, 'systemd');
   assert.deepEqual(status.conflicts, [{ kind: 'systemd', path: SYSTEM_UNIT_PATH }]);
-  assert.equal(status.startup.bootWithoutLogin, 'yes');
+  assert.equal(status.startup.bootWithoutLogin, 'unknown');
   assert.ok(status.remedies.some((r) => /^sudo systemctl /.test(r)));
 });
 
@@ -633,7 +633,7 @@ test('A-U10: win32 /create access-denied exits 5 requires-admin and never runs t
 
 test('A-U11: win32 task pointing at another cli.js is drifted, and liveness comes from the probe', async () => {
   const { deps } = winWorld({
-    xml: schtasksXml({ args: '"C:\\other\\pkg\\cli.js" daemon' }),
+    xml: schtasksXml({ args: '"C:\\old\\node_modules\\@dmsdc-ai\\aigentry-telepty\\cli.js" daemon' }),
     deps: { getDaemonMeta: answering({ version: PKG_VERSION }) }
   });
   const status = await getServiceStatus(deps);
@@ -1201,4 +1201,111 @@ test('INV: a failing mutating step reports exit 1 and names the exact command', 
   const failed = result.steps.find((s) => s.ok === false);
   assert.equal(failed.command, 'systemctl --user enable telepty');
   assert.match(failed.stderr, /Permission denied/);
+});
+
+test('startup: systemd enablement and linger are independent of loaded/active state', async () => {
+  for (const [state, atLogin, boot] of [
+    ['enabled', 'yes', 'yes'], ['disabled', 'no', 'no'],
+    ['masked', 'no', 'no'], ['masked-runtime', 'no', 'no'],
+    ['indirect', 'unknown', 'unknown'], ['static', 'unknown', 'unknown'],
+    ['enabled-runtime', 'unknown', 'unknown'], ['', 'unknown', 'unknown']
+  ]) {
+    for (const loaded of ['loaded', 'not-found']) {
+      const world = linuxWorld({ unit: expectedUnit(), state: { UnitFileState: state, LoadState: loaded, ActiveState: 'inactive' } });
+      const status = await getServiceStatus(world.deps);
+      assert.equal(status.startup.atLogin, atLogin, `${state}/${loaded}`);
+      assert.equal(status.startup.bootWithoutLogin, boot, `${state}/${loaded}`);
+      assert.deepEqual(world.calls.writes, []);
+    }
+  }
+  const world = linuxWorld({ unit: expectedUnit(), linger: 'yes', state: { UnitFileState: 'disabled' } });
+  assert.equal((await getServiceStatus(world.deps)).startup.bootWithoutLogin, 'no', 'linger alone does not enable a unit');
+});
+
+test('startup: launchd loaded and booted-out descriptors have unknown next-login enablement', async () => {
+  for (const loaded of [true, false]) {
+    const world = macWorld({ plist: expectedPlist(), loaded });
+    const status = await getServiceStatus(world.deps);
+    assert.equal(status.loaded, loaded);
+    assert.equal(status.startup.atLogin, 'unknown');
+  }
+});
+
+test('startup: Windows login persistence requires measured task and logon-trigger enablement', async () => {
+  for (const [settings, trigger, expected] of [
+    ['true', 'true', 'yes'], ['false', 'true', 'no'],
+    ['true', 'false', 'no'], ['', 'true', 'unknown'], ['true', '', 'unknown']
+  ]) {
+    const extra = `<Settings>${settings ? `<Enabled>${settings}</Enabled>` : ''}</Settings><Triggers><LogonTrigger>${trigger ? `<Enabled>${trigger}</Enabled>` : ''}</LogonTrigger></Triggers>`;
+    const xml = schtasksXml().replace('</Task>', `${extra}</Task>`);
+    const world = winWorld({ xml });
+    const status = await getServiceStatus(world.deps);
+    assert.equal(status.startup.atLogin, expected, `${settings}/${trigger}`);
+    assert.equal(status.startup.bootWithoutLogin, 'unsupported-requires-admin');
+  }
+  assert.equal((await getServiceStatus(winWorld({ xml: schtasksXml() }).deps)).startup.atLogin, 'unknown');
+});
+
+test('full Windows uninstall freshly queries task ownership and refuses foreign or unknown XML', () => {
+  const { runUninstall } = require('../src/uninstall');
+  for (const response of [
+    '<Task><Actions><Exec><Command>C:\\foreign.exe</Command><Arguments>serve</Arguments></Exec></Actions></Task>',
+    '', Object.assign(new Error('query denied'), { stderr: 'query denied' })
+  ]) {
+    const calls = [];
+    const result = runUninstall({
+      platform: 'win32', homedir: HOME,
+      cleanupDaemonProcesses: () => ({ stopped: [], failed: [] }),
+      fs: { existsSync: () => false },
+      serviceDeps: { packageRoot: PKG_ROOT, nodeBin: NODE_BIN, uid: UID, user: 'tester' },
+      execFileSync: (command, argv) => {
+        calls.push([command, ...argv]);
+        if (command === 'schtasks' && argv[0] === '/query') {
+          if (response instanceof Error) throw response;
+          return response;
+        }
+        throw new Error('unexpected mutation');
+      }
+    });
+    assert.ok(calls.some(call => call[1] === '/query'));
+    assert.ok(!calls.some(call => ['/end', '/delete'].includes(call[1])));
+    assert.equal(result.services.ok, false);
+  }
+});
+
+test('full Windows uninstall deletes only after a fresh owned-task query', () => {
+  const { runUninstall } = require('../src/uninstall');
+  const calls = [];
+  const result = runUninstall({
+    platform: 'win32', homedir: HOME,
+    cleanupDaemonProcesses: () => ({ stopped: [], failed: [] }),
+    fs: { existsSync: () => false },
+    serviceDeps: { packageRoot: PKG_ROOT, nodeBin: NODE_BIN, uid: UID, user: 'tester' },
+    execFileSync: (command, argv) => {
+      calls.push([command, ...argv]);
+      return argv[0] === '/query' ? schtasksXml() : '';
+    }
+  });
+  const query = calls.findIndex(call => call[1] === '/query');
+  const deletion = calls.findIndex(call => call[1] === '/delete');
+  assert.ok(query >= 0 && deletion > query);
+  assert.equal(result.services.ok, true);
+});
+
+test('generic cli.js daemon is foreign on every descriptor platform', () => {
+  const expected = { cliJs: CLI_JS };
+  assert.equal(classifyDescriptor(expectedPlist({ cliJs: '/opt/foreign/cli.js' }), 'launchd', expected), 'foreign');
+  assert.equal(classifyDescriptor(expectedUnit({ cliJs: '/opt/foreign/cli.js' }), 'systemd-user', expected), 'foreign');
+  assert.equal(classifyDescriptor(schtasksXml({ args: '"C:\\foreign\\cli.js" daemon' }), 'schtasks', expected), 'foreign');
+});
+
+test('Linux uninstall refuses unreadable or foreign unit descriptors before mutation', async () => {
+  for (const unreadable of [true, false]) {
+    const world = linuxWorld({ unit: unreadable ? expectedUnit() : expectedUnit({ cliJs: '/opt/foreign/cli.js' }) });
+    if (unreadable) world.deps.fs.readFileSync = () => { throw new Error('unreadable'); };
+    const result = await runServiceVerb('uninstall', CONSENTED, world.deps);
+    assert.equal(result.ok, false);
+    assert.ok(!world.calls.exec.some(call => call.includes('disable')));
+    assert.deepEqual(world.calls.removals, []);
+  }
 });

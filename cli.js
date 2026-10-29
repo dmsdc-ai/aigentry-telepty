@@ -2158,6 +2158,11 @@ async function main() {
 
     for (const plist of result.plists) {
       if (!plist.existed) continue;
+      if (plist.refused) {
+        console.log(`Kept launchd descriptor with unverified ownership: ${plist.path}`);
+        process.exitCode = 1;
+        continue;
+      }
       if (dryRun) {
         console.log(`${would}unload and remove launchd service: ${plist.path}`);
       } else {

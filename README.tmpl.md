@@ -46,6 +46,9 @@ surfaces it read-only and prints the exact `sudo systemctl …` command rather t
 it. `install.ps1` creates no task (it starts a detached process), so on Windows the logon task
 comes from `telepty service install`.
 
+Explicit uninstall preserves descriptors whose ownership cannot be established, including
+legacy broker or bin-only plists. Inspect those descriptors before removing them manually.
+
 ### Migrating from the unscoped `aigentry-telepty`
 
 The legacy package `aigentry-telepty` declares the same `telepty` command as this scoped one. npm
