@@ -1,6 +1,15 @@
 const { buildPtySpawnTarget } = require('../win-spawn-target');
 // Actual CLI security producers; retain the original non-strict semantics.
 // Construction does not read shared getters or start CLI/native/network work.
+// A registration error body is not credential issuance. Keep the wrapper and
+// its future child-spawn environment consistent only after successful issuance.
+function adoptRegistrationCredential(response, data, env, childEnv = env) {
+  if (!response?.ok || typeof data?.session_token !== 'string' || !data.session_token) return false;
+  env.TELEPTY_SESSION_TOKEN = data.session_token;
+  childEnv.TELEPTY_SESSION_TOKEN = data.session_token;
+  return true;
+}
+
 function createCliSecurityActions(shared, {
   execSync = (...args) => (0, shared.execSync)(...args),
   execFileSync = (...args) => (0, shared.execFileSync)(...args),
@@ -530,4 +539,4 @@ function createAllowSecurityContext(shared, {
 return { updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox };
 }
 
-module.exports = { createCliSecurityActions, createAllowSecurityContext };
+module.exports = { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential };

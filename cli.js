@@ -176,7 +176,7 @@ let cachedAuthToken = null;
 // TELEPTY_AUTH_TOKEN for a client but not for the daemon produces a 401 that looks like a
 // credential bug; the variable is therefore documented (BOUNDARY.md) as something you set for
 // BOTH ends or neither, and never silently preferred at one end only.
-const { createCliSecurityActions, createAllowSecurityContext } = require('./src/cli/security-actions');
+const { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential } = require('./src/cli/security-actions');
 const cliSecurity = createCliSecurityActions({
   get cachedAuthToken() { return cachedAuthToken; },
   get cachedPeerTokens() { return cachedPeerTokens; },
@@ -2330,7 +2330,7 @@ async function main() {
       }
       // #43 P2 — store the daemon-minted verified-sender token beside TELEPTY_SESSION_ID so the
       // wrapped CLI (and any `telepty inject` it spawns) inherits it via sessionEnv below.
-      if (data.session_token) process.env.TELEPTY_SESSION_TOKEN = data.session_token;
+      adoptRegistrationCredential(res, data, process.env);
       // #47 P4 — carry the per-session provenance nonce in the same protected env. This is the
       // agent's trusted bootstrap copy of the nonce: a delivery's origin banner is authoritative
       // ONLY if its nonce matches this value. Treat it as secret; never echo it (onboarding §6).
@@ -2614,13 +2614,11 @@ async function main() {
           // the POST above was a FIRST registration of a fresh instance — a new epoch, a new
           // bearer, and our env copy is now stale. Without adopting it here the owner claim below
           // would be refused (4003) and the session could never reconnect. The child keeps the
-          // old bearer either way: its environment cannot be updated from outside, so it becomes
-          // an unauthenticated sender against the new instance — which is correct, it IS a
-          // different instance now.
+          // old bearer: an already-running process environment cannot be rewritten. Keep
+          // sessionEnv current for future respawns; running-child refresh still needs the
+          // instance-bound channel described in docs/plans/credential-refresh-92.md.
           const reregData = await rereg.json().catch(() => null);
-          if (reregData && reregData.session_token) {
-            process.env.TELEPTY_SESSION_TOKEN = reregData.session_token;
-          }
+          adoptRegistrationCredential(rereg, reregData, process.env, sessionEnv);
         } catch (e) {
           // Registration may fail if session already exists or daemon not ready
         }
