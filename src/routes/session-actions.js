@@ -1444,13 +1444,16 @@ function createSessionActions(shared, effects = {}) {
           // body for the same reason: a caller told its dispatch was refused must be able to poll the
           // record that says so.
           const aborted = trackedRecord
-            ? (0, shared.abortTrackedInjection)(inject_id, id, delivery.code, delivery.error)
+            ? (0, shared.abortTrackedInjection)(inject_id, id, delivery.code, delivery.error, delivery.delivery_uncertain
+              ? { kind: 'inject_delivery_unknown', trigger: 'delivery_outcome_unknown', bytesWritten: null } : {})
             : 'no_tracked_inject';
           return (0, shared.respondWithError)(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error,
             { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable',
               ...(session.sshRemote ? { text_written: delivery.text_written === true,
                 text_bytes_written: delivery.text_bytes_written ?? null, bytes_written: delivery.bytes_written ?? null,
-                retry_safe: delivery.bytes_written === 0 && delivery.text_written !== true } : {}) });
+                retry_safe: delivery.bytes_written === 0 && delivery.text_written !== true } : {}),
+
+              ...(delivery.delivery_uncertain ? { delivery_uncertain: true, retryable: false, bytes_written: null, submit: 'skipped' } : {}) });
         }
 
         if (from) session.lastInjectFrom = from;

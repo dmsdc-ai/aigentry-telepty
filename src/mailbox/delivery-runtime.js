@@ -248,7 +248,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function deliveryAuditResult(delivery) {
-    return delivery && delivery.queued === true && (delivery.strategy === 'bootstrap_queue' || delivery.poll_only === true) ? 'queued' : 'success';
+    return delivery && delivery.queued === true && (delivery.strategy === 'bootstrap_queue' || delivery.poll_only === true || delivery.delivery_status === 'retry_pending') ? 'queued' : 'success';
   }
 
   function getPendingReport(sessionId, registry = shared.pendingReports) {
@@ -738,7 +738,8 @@ function createDeliveryRuntime(shared, {
               // a dispatch whose record has said `tracked` since the route accepted it.
               abortTrackedInjection(op.injectId, sessionId, result.code || 'DELIVERY_FAILED', result.error, {
                 trigger: 'bootstrap_queue_failed',
-                bytesWritten: result.bytes_written,
+                ...(result.delivery_uncertain ? { kind: 'inject_delivery_unknown' } : {}),
+                bytesWritten: result.delivery_uncertain ? null : result.bytes_written,
               });
             }
           } else if (op.type === 'submit') {

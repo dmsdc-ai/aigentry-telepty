@@ -7,10 +7,10 @@ const path = require('path');
  * DeliveryEngine — polls mailbox for pending messages and delivers them.
  *
  * For each registered session, dequeues messages and calls the deliverFn callback.
- * On success: ack. On failure: nack (retry with backoff, then dead-letter).
+ * On success: ack. Definite failures nack; uncertain outcomes are quarantined without retry.
  *
  * Also handles:
- * - In-flight timeout recovery (auto-nack stuck messages)
+ * - In-flight recovery (fenced attempts stay unknown; untouched legacy entries can retry)
  * - TTL expiry (expire stale pending messages)
  * - Stale lock detection: consecutive failure tracking + exponential backoff
  */
@@ -134,11 +134,15 @@ class DeliveryEngine {
               continue;
             }
 
-            let result;
-            try {
-              result = await this.deliverFn(sessionId, msg);
-            } catch (err) {
-              result = { success: false, error: err.message };
+            let result, fenced = false;
+            try { fenced = this.mailbox.beginNonRetryableAttempt(sessionId, msg.msg_id); }
+            catch { /* Fail before entering an effectful callback if durability is unavailable. */ }
+            if (!fenced) result = { success: false, code: 'TRACKING_PERSISTENCE_FAILED', bytes_written: 0,
+              error: 'Delivery attempt fence unavailable; callback was not invoked.' };
+            else {
+              try { result = await this.deliverFn(sessionId, msg); }
+              catch { result = { success: false, code: 'DELIVERY_UNCERTAIN', delivery_uncertain: true, bytes_written: null,
+                error: 'Delivery callback threw; physical outcome is unknown.' }; }
             }
 
             if (result && result.success) {
@@ -146,12 +150,18 @@ class DeliveryEngine {
               if (this.onDelivery) {
                 this.onDelivery(sessionId, msg.msg_id, { success: true });
               }
+            } else if (result && result.delivery_uncertain === true) {
+              let quarantined = false;
+              try { quarantined = this.mailbox.withdraw(sessionId, msg.msg_id, 'delivery_outcome_unknown', { inFlight: true, deliveryUncertain: true }); }
+              catch { /* The fsynced attempt fence still prevents restart recovery from retrying. */ }
+              if (this.onDelivery) this.onDelivery(sessionId, msg.msg_id, { ...result, success: false, outcome: 'unknown', retryable: false, quarantined });
+              console.warn(`[MAILBOX] Delivery outcome unknown for ${sessionId}/${msg.msg_id}; automatic retry disabled`);
             } else {
               const reason = (result && result.error) || 'delivery failed';
               this.mailbox.nack(sessionId, msg.msg_id, reason);
               console.log(`[MAILBOX] Delivery failed for ${sessionId}/${msg.msg_id}: ${reason} (attempt ${msg.attempt})`);
               if (this.onDelivery) {
-                this.onDelivery(sessionId, msg.msg_id, { success: false, error: reason });
+                this.onDelivery(sessionId, msg.msg_id, { ...result, success: false, error: reason });
               }
             }
 

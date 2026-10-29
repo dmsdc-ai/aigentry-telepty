@@ -17,7 +17,7 @@ const {
   listSessionDirs,
 } = require('./storage');
 const { createConfig } = require('./config');
-const { canonicalRoot, resolveSessionDir, rethrowBoundary } = require('./path-boundary');
+const { canonicalRoot, resolveSessionDir, rethrowBoundary, openFile } = require('./path-boundary');
 
 function unixNow() {
   return Math.floor(Date.now() / 1000);
@@ -137,7 +137,7 @@ class FileMailbox {
       const states = loadStates(sessionDir);
       const st = states.get(msgId);
       // Idempotent: already acked → no-op
-      if (st && st.state === 'acked') return;
+      if (st && (st.state === 'acked' || st.state === 'dead_letter')) return;
 
       appendState(sessionDir, msgId, 'acked', unixNow());
       compact(sessionDir, this.config.compactionThreshold);
@@ -211,7 +211,26 @@ class FileMailbox {
    * false if the message is in flight, already delivered or already gone. The active
    * deliverer may opt into `inFlight` to reject text bound to a displaced session.
    */
-  withdraw(sessionId, msgId, reason, { inFlight = false } = {}) {
+  // Durably fence a non-idempotent write BEFORE crossing its effect boundary. A daemon
+  // interruption after this point is unknown, never evidence that retry is safe.
+  beginNonRetryableAttempt(sessionId, msgId) {
+    const sessionDir = this._sessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) return false;
+    const release = acquireLock(sessionDir);
+    try {
+      const st = loadStates(sessionDir).get(msgId);
+      if (!st || st.state !== 'in_flight') return false;
+      if (st.non_retryable_attempt === true) return true;
+      const fd = openFile(path.join(sessionDir, 'state.jsonl'), fs.constants.O_WRONLY | fs.constants.O_APPEND);
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ msg_id: msgId, state: 'in_flight', ts: unixNow(), non_retryable_attempt: true }) + '\n');
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      return true;
+    } finally { release(); }
+  }
+
+  withdraw(sessionId, msgId, reason, { inFlight = false, deliveryUncertain = false } = {}) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) return false;
 
@@ -232,10 +251,17 @@ class FileMailbox {
         to: msg.to,
         payload: msg.payload,
         reason: reason || 'withdrawn',
+        ...(deliveryUncertain ? { delivery_uncertain: true, outcome: 'unknown', retryable: false } : {}),
         failed_at: now,
         attempts: msg.attempt || 0,
       });
-      appendState(sessionDir, msgId, 'dead_letter', now);
+      if (deliveryUncertain) {
+        const fd = openFile(path.join(sessionDir, 'dead-letter.jsonl'), fs.constants.O_WRONLY);
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        appendJsonl(path.join(sessionDir, 'state.jsonl'), { msg_id: msgId, state: 'dead_letter', ts: now, delivery_uncertain: true, outcome: 'unknown', retryable: false });
+        const stateFd = openFile(path.join(sessionDir, 'state.jsonl'), fs.constants.O_WRONLY);
+        try { fs.fsyncSync(stateFd); } finally { fs.closeSync(stateFd); }
+      } else appendState(sessionDir, msgId, 'dead_letter', now);
       return true;
     } finally {
       release();
@@ -354,7 +380,7 @@ class FileMailbox {
   }
 
   /**
-   * Recover in-flight messages that timed out → auto-nack.
+   * Recover timed-out in-flight messages: quarantine fenced attempts; retry legacy untouched entries.
    * Called by DeliveryEngine.
    */
   recoverInflight(sessionId) {
@@ -381,7 +407,11 @@ class FileMailbox {
           if (!msg) continue;
 
           const attempt = (msg.attempt || 0) + 1;
-          if (attempt >= this.config.maxRetries) {
+          if (entry.non_retryable_attempt) {
+            appendJsonl(path.join(sessionDir, 'dead-letter.jsonl'), { msg_id: msg.msg_id, from: msg.from, to: msg.to, payload: msg.payload,
+              reason: 'delivery_outcome_unknown_after_interruption', delivery_uncertain: true, outcome: 'unknown', retryable: false, failed_at: now, attempts: msg.attempt || 0 });
+            appendJsonl(path.join(sessionDir, 'state.jsonl'), { msg_id: msgId, state: 'dead_letter', ts: now, delivery_uncertain: true, outcome: 'unknown', retryable: false });
+          } else if (attempt >= this.config.maxRetries) {
             appendJsonl(path.join(sessionDir, 'dead-letter.jsonl'), {
               msg_id: msg.msg_id,
               from: msg.from,

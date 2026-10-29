@@ -35,7 +35,7 @@ function createSessionDeliveryContext({
   net = require('net'), fetch = globalThis.fetch, AbortSignal = globalThis.AbortSignal,
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
 }) {
-  async function writeDataToSession(id, session, data) {
+  async function writeDataToSession(id, session, data, { beforeWrite } = {}) {
     if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return denied;
@@ -51,20 +51,33 @@ function createSessionDeliveryContext({
         return new Promise((resolve) => {
           const payload = JSON.stringify({ action: "Inject", workspace: id, text: data }) + '\n';
           const response = createBoundedUdsResponse();
-          let settled = false;
+          let settled = false, attempted = false;
           const finish = result => { if (settled) return; settled = true; clearTimeout(timeout); resolve(result); };
           const timeout = setTimeout(() => {
+            finish(buildErrorBody('TIMEOUT', 'UDS delivery timed out.', { httpStatus: 504, delivery_uncertain: attempted, bytes_written: attempted ? null : 0 }));
             sock.destroy();
-            finish(buildErrorBody('TIMEOUT', 'UDS delivery timed out.', { httpStatus: 504, delivery_uncertain: true }));
           }, DELIVERY_TIMEOUT_MS);
           const sock = net.connect(session.delivery.address, () => {
+            if (settled) return;
             if (session.isClosing || sessions[id] !== session) {
               clearTimeout(timeout);
-              resolve({ success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 });
+              finish({ success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 });
               sock.destroy();
               return;
             }
-            sock.end(payload);
+            try {
+              if (beforeWrite && beforeWrite() !== true) {
+                finish(buildErrorBody('TRACKING_PERSISTENCE_FAILED', 'UDS attempt could not be durably fenced; nothing written.', { httpStatus: 503, bytes_written: 0 }));
+                sock.destroy(); return;
+              }
+              attempted = true;
+              sock.end(payload);
+            } catch {
+              finish(buildErrorBody(attempted ? 'DELIVERY_UNCERTAIN' : 'TRACKING_PERSISTENCE_FAILED',
+                attempted ? 'UDS write outcome unknown; do not retry blindly.' : 'UDS attempt could not be durably fenced; nothing written.',
+                { httpStatus: 503, delivery_uncertain: attempted, bytes_written: attempted ? null : 0 }));
+              sock.destroy();
+            }
           });
           sock.on('data', (chunk) => {
             if (settled) return;
@@ -84,7 +97,7 @@ function createSessionDeliveryContext({
                   console.log(`[UDS] Delivery rejected by ${id}: ${resp.error || resp.message || 'unknown'}`);
                   finish(buildErrorBody('DELIVERY_REJECTED', resp.error || resp.message || 'Target rejected the payload.', {
                     httpStatus: 502,
-                    detail: resp
+                    detail: resp, delivery_uncertain: attempted, bytes_written: attempted ? null : 0
                   }));
                   return;
                 }
@@ -100,9 +113,8 @@ function createSessionDeliveryContext({
             if (settled) return;
             console.log(`[UDS] Connection error for ${id} at ${session.delivery.address}: ${err.message}`);
             markSessionDisconnected(session);
-            finish(buildErrorBody('DISCONNECTED', 'UDS endpoint is unreachable.', {
-              httpStatus: 503,
-              detail: err.message
+            finish(buildErrorBody(attempted ? 'DELIVERY_UNCERTAIN' : 'DISCONNECTED', attempted ? 'UDS response failed after a write attempt; delivery outcome unknown.' : 'UDS endpoint is unreachable.', {
+              httpStatus: 503, delivery_uncertain: attempted, bytes_written: attempted ? null : 0, detail: err.message
             }));
           });
         });
@@ -190,6 +202,7 @@ function createSessionDeliveryContext({
   })();
   const MAILBOX_TEXT_WAIT_MS = 2 * DELIVERY_TIMEOUT_MS;
   const injectionTargets = new Map(); // pending text stays bound to its original instance
+  const immediateAttempts = new Map(); // only while the source is awaiting its immediate tick
   const mailboxTextWaiters = new Map(); // msg_id → { settle(ownerWs), lastFailure }
 
   function awaitMailboxText(msgId, timeoutMs) {
@@ -199,6 +212,12 @@ function createSessionDeliveryContext({
         mailboxTextWaiters.delete(msgId);
         resolve({ delivered: false, lastFailure: waiter.lastFailure });
       }, timeoutMs);
+      waiter.notWritten = result => {
+        clearTimeout(timer); mailboxTextWaiters.delete(msgId); resolve({ delivered: false, lastFailure: result, retryPending: true });
+      };
+      waiter.uncertain = result => {
+        clearTimeout(timer); mailboxTextWaiters.delete(msgId); resolve({ delivered: false, lastFailure: result });
+      };
       waiter.settle = (ownerWs) => {
         clearTimeout(timer);
         mailboxTextWaiters.delete(msgId);
@@ -444,6 +463,7 @@ function createSessionDeliveryContext({
       });
     }
 
+    let enqueueAttempted = false;
     try {
       if (session.sshRemote) {
         const failure = sshInputFailure(session, deliveredBody, sshGeneration);
@@ -461,7 +481,9 @@ function createSessionDeliveryContext({
         session.lastActivityAt = new Date().toISOString();
         return { ...text, submit: options.noEnter ? 'skipped' : 'written', queued: false, consumption: 'unknown' };
       }
-      const ack = getMailbox().enqueue({
+      const mailboxForEnqueue = getMailbox();
+      enqueueAttempted = true;
+      const ack = mailboxForEnqueue.enqueue({
         msg_id: msgId,
         from,
         to: id,
@@ -469,10 +491,12 @@ function createSessionDeliveryContext({
         created_at: Math.floor(now / 1000),
         attempt: 0,
       });
+      const immediate = { result: null }; immediateAttempts.set(msgId, immediate);
       injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs });
       // Registered synchronously after the enqueue: no tick can run in between.
       const owesSubmit = !options.noEnter && session.type !== 'aterm';
-      const textWait = owesSubmit ? awaitMailboxText(msgId, MAILBOX_TEXT_WAIT_MS) : null;
+      const waitsForText = owesSubmit || session.type === 'aterm';
+      const textWait = waitsForText ? awaitMailboxText(msgId, MAILBOX_TEXT_WAIT_MS) : null;
 
       // Notify aterm sessions immediately via UDS wake
       if (session.type === 'aterm') {
@@ -483,11 +507,24 @@ function createSessionDeliveryContext({
       try {
         await getMailboxDelivery().tick();
       } catch {}
+      immediateAttempts.delete(msgId);
+      if (immediate.result?.delivery_uncertain) {
+        injectionTargets.delete(msgId); releaseSubmit();
+        return { ...immediate.result, success: false, code: 'DELIVERY_UNCERTAIN', msg_id: msgId, retryable: false,
+          error: 'Delivery outcome unknown after an attempt; automatic retry disabled. Do not retry blindly.', submit: 'skipped' };
+      }
 
       // Send CR separately after delay (outside paste brackets)
-      if (owesSubmit) {
+      if (waitsForText) {
         const text = await textWait;
         if (!text.delivered) {
+          if (text.retryPending && session.type === 'aterm') return { success: true, queued: true, msg_id: msgId, pending: ack.pending,
+            strategy: 'mailbox', delivery_status: 'retry_pending', bytes_written: 0, submit: 'skipped' };
+          if (text.lastFailure?.delivery_uncertain) {
+            injectionTargets.delete(msgId); releaseSubmit();
+            return { ...text.lastFailure, success: false, code: 'DELIVERY_UNCERTAIN', msg_id: msgId, retryable: false, submit: 'skipped',
+              error: 'Delivery outcome unknown after an attempt; automatic retry disabled. Do not retry blindly.' };
+          }
           // Not written in time. Withdraw it if no deliverer holds it, so it can never land later
           // without its CR and a retry cannot duplicate it; if one does hold it, say so.
           let withdrawn = false;
@@ -498,35 +535,38 @@ function createSessionDeliveryContext({
           if (!withdrawn) { try { state = getMailbox().messageState(id, msgId); } catch {} }
           injectionTargets.delete(msgId);
           releaseSubmit();
-          if (!withdrawn && state === null) return { ...sessionGoneResult(), msg_id: msgId };
           const failure = text.lastFailure;
-          return withdrawn || state === 'dead_letter'
-            ? { success: false, httpStatus: (failure && failure.httpStatus) || 504, code: (failure && failure.code) || 'TIMEOUT',
-              error: `The text was not delivered within ${MAILBOX_TEXT_WAIT_MS} ms${failure && failure.error ? ` (${failure.error})` : ''}; it was ${withdrawn ? 'withdrawn' : 'dead-lettered'} and will not be written. Retry.`,
-              msg_id: msgId }
-            : { success: false, httpStatus: 504, code: 'DELIVERY_UNCERTAIN',
-              error: `The text was handed to delivery but not confirmed within ${MAILBOX_TEXT_WAIT_MS} ms; it may still arrive, without a CR. Do not retry blindly.`,
-              msg_id: msgId };
+          if (!withdrawn && !(state === 'dead_letter' && failure && (failure.bytes_written === 0 || failure.code === 'SESSION_GONE'))) {
+            try { getMailbox().withdraw(id, msgId, 'delivery_outcome_unknown_at_caller_timeout', { inFlight: true, deliveryUncertain: true }); } catch {}
+            return { success: false, httpStatus: state === null ? 410 : 504, code: state === null ? 'SESSION_GONE' : 'DELIVERY_UNCERTAIN',
+              delivery_uncertain: true, retryable: false, bytes_written: null, submit: 'skipped', msg_id: msgId,
+              error: 'Delivery was not confirmed before the caller deadline; outcome unknown and automatic retry disabled. Do not retry blindly.' };
+          }
+          return { success: false, httpStatus: (failure && failure.httpStatus) || 504, code: (failure && failure.code) || 'TIMEOUT',
+            error: withdrawn ? 'Pending text was withdrawn before delivery; nothing was written.' : 'Delivery was refused before text was written.',
+            msg_id: msgId, bytes_written: 0 };
         }
-        const submitDelay = session.type === 'wrapped' ? 500 : 300;
-        setTimeout(async () => {
-          let submitResult;
-          try {
-            // #109: never a bare CR into an instance that did not get this inject's text.
-            // PR #108 TP1: nor into an owner socket other than the one that got it.
-            submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === text.ownerWs
-              ? await writeDataToSession(id, session, '\r')
-              : sessionGoneResult();
-          } finally {
-            releaseSubmit();
-          }
-          if (!submitResult.success) {
-            emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
-              phase: 'submit',
-              source: options.source || 'inject'
-            }, session);
-          }
-        }, submitDelay);
+        if (owesSubmit) {
+          const submitDelay = session.type === 'wrapped' ? 500 : 300;
+          setTimeout(async () => {
+            let submitResult;
+            try {
+              // #109: never a bare CR into an instance that did not get this inject's text.
+              // PR #108 TP1: nor into an owner socket other than the one that got it.
+              submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === text.ownerWs
+                ? await writeDataToSession(id, session, '\r')
+                : sessionGoneResult();
+            } finally {
+              releaseSubmit();
+            }
+            if (!submitResult.success) {
+              emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
+                phase: 'submit',
+                source: options.source || 'inject'
+              }, session);
+            }
+          }, submitDelay);
+        }
       }
 
       session.lastActivityAt = new Date(now).toISOString();
@@ -544,8 +584,16 @@ function createSessionDeliveryContext({
         return { success: false, httpStatus: 504, code: 'SSH_WRITE_UNCONFIRMED',
           error: 'SSH delivery could not be confirmed; input may have been written. Do not retry blindly.' };
       }
-      console.error(`[MAILBOX] Enqueue failed for ${id}: ${err.message}`);
-      // Fallback: direct delivery (backward compat during migration)
+      console.error(`[MAILBOX] Enqueue/delivery path failed for ${id}; no blind retry will be attempted`);
+      // Once enqueue succeeded an exception cannot authorize a second physical attempt.
+      immediateAttempts.delete(msgId);
+      if (enqueueAttempted) {
+        try { getMailbox().withdraw(id, msgId, 'delivery_outcome_unknown', { inFlight: true, deliveryUncertain: true }); } catch {}
+        injectionTargets.delete(msgId); releaseSubmit();
+        return { success: false, code: 'DELIVERY_UNCERTAIN', httpStatus: 503, delivery_uncertain: true, retryable: false, bytes_written: null, msg_id: msgId,
+          error: 'Delivery outcome unknown after enqueue; no direct retry was attempted.', submit: 'skipped' };
+      }
+      // Fallback only when the mailbox could not even be obtained: enqueue was never called.
       injectionTargets.delete(msgId);
       if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) { releaseSubmit(); return sessionGoneResult(); }
       const textOwnerWs = session.ownerWs;
@@ -606,10 +654,15 @@ function createSessionDeliveryContext({
         return sessionGoneResult();
       }
       const ownerWs = session.ownerWs;
-      const result = await writeDataToSession(sessionId, session, msg.payload);
+      const beforeWrite = session.type === 'aterm' && session.delivery?.transport === 'unix_socket'
+        ? () => getMailbox().beginNonRetryableAttempt(sessionId, msg.msg_id) : undefined;
+      const result = await writeDataToSession(sessionId, session, msg.payload, { beforeWrite });
+      const immediate = immediateAttempts.get(msg.msg_id); if (immediate) immediate.result = result;
       const waiter = mailboxTextWaiters.get(msg.msg_id);
       if (waiter) {
         if (result.success) waiter.settle(ownerWs);
+        else if (result.delivery_uncertain) waiter.uncertain(result);
+        else if (session.type === 'aterm') waiter.notWritten(result);
         else waiter.lastFailure = result;
       }
       if (result.success) {
@@ -619,6 +672,10 @@ function createSessionDeliveryContext({
       return result;
     },
     onDelivery: (sessionId, msgId, result) => {
+      if (result.delivery_uncertain) {
+        const immediate = immediateAttempts.get(msgId); if (immediate) immediate.result = result;
+        const waiter = mailboxTextWaiters.get(msgId); if (waiter) waiter.uncertain(result);
+      }
       if (injectionTargets.has(msgId)) {
         const state = getMailbox().messageState(sessionId, msgId);
         if (state === null || state === 'dead_letter') injectionTargets.delete(msgId);
@@ -630,8 +687,8 @@ function createSessionDeliveryContext({
           extra: { msg_id: msgId }
         });
       } else {
-        broadcastSessionEvent('mailbox_delivery_failed', sessionId, session, {
-          extra: { msg_id: msgId, error: result.error }
+        broadcastSessionEvent(result.delivery_uncertain ? 'mailbox_delivery_unknown' : 'mailbox_delivery_failed', sessionId, session, {
+          extra: { msg_id: msgId, error: result.delivery_uncertain ? 'Delivery outcome unknown; automatic retry disabled.' : result.error, ...(result.delivery_uncertain ? { delivery_uncertain: true, outcome: 'unknown', retryable: false } : {}) }
         });
       }
     },
