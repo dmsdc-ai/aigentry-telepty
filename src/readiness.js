@@ -23,6 +23,20 @@ function outputTail(session) {
   return tail;
 }
 
+function currentOwnerEvidence(session) {
+  const seen=evidence.get(session);
+  return !!seen && !!seen.epoch && seen.epoch===session.sessionEpoch && seen.owner===session.ownerWs
+    && !!seen.generation && seen.generation===session.interactionOwnerGeneration
+    && seen.input===(session.interactionInputGeneration||0) && seen.geometry===(session.interactionGeometryGeneration||0)
+    && seen.sshGeneration===session.sshState?.generation;
+}
+function pendingWriteReady(session) {
+  if(!session || session.isClosing || !session.ownerWs || session.ownerWs.readyState!==1 || !currentOwnerEvidence(session))return false;
+  const command=remoteAgentCommand(session);
+  if(registry.commandKey(command))return readinessSnapshot(session).ready===true;
+  return evidence.get(session)?.kind==='prompt_suffix_observed' && !registry.detectSurfaceModal(command,outputTail(session)).blocked;
+}
+
 function readinessSnapshot(session, { nowMs = Date.now(), machineId = null } = {}) {
   const result = { schema: 'telepty.readiness/v1', session_id: session?.id || null,
     machine_id: machineId, session_epoch: session?.sessionEpoch || null,
@@ -125,4 +139,4 @@ function registerReadinessRoute(app, { sessions, machineId }) {
     }
   });
 }
-module.exports = { outputTail, MAX_WAIT_MS, recordReadyEvidence, readinessSnapshot, waitForReadiness, registerReadinessRoute };
+module.exports = { pendingWriteReady, outputTail, MAX_WAIT_MS, recordReadyEvidence, readinessSnapshot, waitForReadiness, registerReadinessRoute };

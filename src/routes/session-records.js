@@ -186,6 +186,8 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
         }
       }
       if (require('../principal/cooperative-handoff').activeHandoff(existing)) return res.status(409).json({code:'HANDOFF_FENCED'});
+      if((req.body.delivery_type!==undefined || req.body.delivery!==undefined || req.body.delivery_endpoint!==undefined || req.body.ssh_remote!==undefined || req.body.provenance_capable===true)
+        && require('../principal/pending-handoff').pendingNamespaceReserved(existing,getMailbox))return res.status(409).json({code:'HANDOFF_FENCED'});
       if (existing.type === 'mailbox' || mailboxRequest) {
         if (!credentialed) return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Current session credential is required.' });
         if (existing.type !== 'mailbox' || (req.body.delivery_type && !mailboxRequest)) {
@@ -231,6 +233,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       if (mayRedirectDelivery) applyProcessMetadata(existing, req.body);
       applyIdleTtlMetadata(existing, parsedIdleTtl);
       applyTimestampMetadata(existing, req.body);
+      if(existing.cooperativeHandoff?.pending_count>0 && credentialed && typeof req.body.command==='string' && req.body.command)existing.command=req.body.command;
       initializeBootstrapState(existing);
       // #47 P4 — provenance capability is opt-in (default-OFF). Only flip it ON; never silently OFF
       // on a metadata re-register, or a session's delivered bytes would change mid-flight.
@@ -366,7 +369,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
   });
 }
 
-function registerSessionRenameRoute(app, { context, sessionStateManager, busClients }) {
+function registerSessionRenameRoute(app, { context, sessionStateManager, busClients, getMailbox=()=>null }) {
   const { sessions, sessionCredentials, sidNonces, resolveSessionAlias, persistSessions } = context;
   app.patch('/api/sessions/:id', (req, res) => {
     const requestedId = req.params.id;
@@ -385,6 +388,7 @@ function registerSessionRenameRoute(app, { context, sessionStateManager, busClie
         return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Protected rename requires the current session credential.' });
       }
     }
+    if(require('../principal/pending-handoff').pendingNamespaceReserved(session,getMailbox))return res.status(409).json({code:'HANDOFF_FENCED'});
     const identity = readIdentity(req.body, 'new_id');
     if (identity.error) return res.status(400).json({ error: identity.error });
     const new_id = identity.value;

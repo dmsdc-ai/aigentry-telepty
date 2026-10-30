@@ -33,6 +33,7 @@ class DeliveryEngine {
   constructor(mailbox, options = {}) {
     this.mailbox = mailbox;
     this.deliverFn = options.deliverFn;
+    this.canProcess = options.canProcess || (()=>true);
     this.sessionResolver = options.sessionResolver || (() => this.mailbox.listSessions());
     this.pollMs = options.pollMs || mailbox.config.deliveryPollMs || 200;
     this.onDelivery = options.onDelivery || null;
@@ -85,6 +86,7 @@ class DeliveryEngine {
       const sessionIds = this.sessionResolver();
 
       for (const sessionId of sessionIds) {
+        if(!this.canProcess(sessionId))continue;
         // Fix 5: Skip sessions in backoff
         const skipUntil = this._skipUntil.get(sessionId) || 0;
         if (Date.now() < skipUntil) continue;
@@ -93,6 +95,7 @@ class DeliveryEngine {
 
         // 1. Recover in-flight timeouts
         try {
+          if(!this.canProcess(sessionId))continue;
           const recovered = this.mailbox.recoverInflight(sessionId);
           if (recovered > 0) {
             console.log(`[MAILBOX] Recovered ${recovered} in-flight message(s) for ${sessionId}`);
@@ -108,6 +111,7 @@ class DeliveryEngine {
         // 2. Expire stale messages
         if (!lockFailed) {
           try {
+            if(!this.canProcess(sessionId))continue;
             const expired = this.mailbox.expireStale(sessionId);
             if (expired > 0) {
               console.log(`[MAILBOX] Expired ${expired} stale message(s) for ${sessionId}`);
@@ -124,6 +128,7 @@ class DeliveryEngine {
         // 3. Dequeue and deliver
         if (!lockFailed) {
           try {
+            if(!this.canProcess(sessionId))continue;
             const msg = this.mailbox.dequeue(sessionId);
             if (!msg) {
               // Success path (no message but lock acquired OK)

@@ -2931,6 +2931,13 @@ async function main() {
       encode: readyRegistry.encodeInteraction,
       write: bytes => { if(handoffPending || !child)throw new Error('HANDOFF_FENCED');child.write(bytes); invalidateBridgeInteraction('interaction'); }
     });
+    const pendingReadyFields=()=>cooperativeEnabled && interactionBinding ? {pending_handoff_receipts:'v1',owner_generation:interactionBinding.owner_generation} : {};
+    const writePendingHandoff = require('./src/principal/pending-handoff').createPendingWriter({
+      binding:()=>handoffPending||!interactionBinding?null:{...interactionBinding,child_identity:child},
+      canWrite:()=>cooperativeEnabled && !!child && !handoffPending && isIdle() && allowSecurity.cooperativeQueueEmpty()
+        && !readyRegistry.detectSurfaceModal(command,outputTail).blocked,
+      write:data=>{if(handoffPending || !child)throw new Error('HANDOFF_FENCED');child.write(data);promptReady=false;readyNotified=false;invalidateBridgeInteraction('pending_handoff');}
+    });
     let lastInjectTextTime = 0;
     const MAX_RECONNECT_DELAY = 30000;
     // #732: bridge→daemon liveness interval. Must stay well under the daemon's
@@ -3066,7 +3073,7 @@ async function main() {
         // qualification the original detection produced — a reconnect measures nothing new, so it
         // must not present itself as a stronger (or weaker) observation than what was seen.
         if (!strictOwnerClient && readyNotified && promptReady) {
-          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}) }));
+          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}),...pendingReadyFields() }));
         }
       });
 
@@ -3082,9 +3089,7 @@ async function main() {
               console.error('Daemon owner channel does not support cooperative handoff. No child started.');
               closeAllowSession({destroySession:false});exitAllowSession(1);return;
             }
-            if (strictOwnerClient) { wsReady = true; flushPreConnectOutput();
-              if (readyNotified && promptReady) daemonWs.send(JSON.stringify({type:'ready',...(readyQualification || {})}));
-            }
+            if (strictOwnerClient) { wsReady = true; flushPreConnectOutput(); }
             if (credentialChannel) {
               try {
                 if (!credentialChannel.acknowledgeOwner({ attempt: credentialAttempt, bearer: ownerBearer, ownerToken: msg.token, binding: msg.interaction_binding })) {
@@ -3100,11 +3105,12 @@ async function main() {
             currentOwnerToken = msg.token || null;
             if (currentOwnerToken) acceptInitialOwner();
             interactionBinding = msg.interaction_binding || null;
+            if(strictOwnerClient && readyNotified && promptReady)daemonWs.send(JSON.stringify({type:'ready',...(readyQualification||{}),...pendingReadyFields()}));
             invalidateBridgeInteraction('owner_bound');
             if (sshInput && child) {
               const state = sshInput.snapshot();
               daemonWs.send(JSON.stringify({ type: 'ssh_state', ...state }));
-              if (state.phase === 'ready' && readyQualification) daemonWs.send(JSON.stringify({ type: 'ready', ...readyQualification }));
+              if (state.phase === 'ready' && readyQualification) daemonWs.send(JSON.stringify({ type: 'ready', ...readyQualification,...pendingReadyFields() }));
             }
             return;
           }
@@ -3122,6 +3128,7 @@ async function main() {
             return;
           }
           if(handoffPending)return;
+          if(strictOwnerClient && msg.type==='pending_handoff'){daemonWs.send(JSON.stringify(writePendingHandoff(msg)));return;}
           if (sshInput && msg.type === 'ssh_inject') {
             if (typeof msg.request_id !== 'string' || msg.request_id.length > 64 || typeof msg.data !== 'string') return;
             const result = msg.generation === sshInput.snapshot().generation
@@ -3407,7 +3414,7 @@ async function main() {
         if (!sshPlan) flushBridgeMailbox();
         if (!readyNotified && wsReady && daemonWs.readyState === 1) {
           readyNotified = true;
-          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}) }));
+          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}),...pendingReadyFields() }));
         }
       }
     });

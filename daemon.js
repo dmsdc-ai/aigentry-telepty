@@ -1239,6 +1239,7 @@ const sessionDeliveryContext = createSessionDeliveryContext({
   emitInjectFailureEvent,
   sessions,
   broadcastSessionEvent,
+  persistSessions,
   getMailbox: () => mailbox,
   getMailboxNotifier: () => mailboxNotifier,
   getMailboxDelivery: () => mailboxDelivery,
@@ -1934,7 +1935,7 @@ app.delete('/api/pendingReports/:id', (req, res) => {
 // GET /api/sessions/:id/screen — read current screen buffer
 app.get('/api/sessions/:id/screen', require('./src/routes/session-screen').createScreenHandler({ sessions, resolveSessionAlias }));
 
-registerSessionRenameRoute(app, { context: sessionRecordContext, sessionStateManager, busClients });
+registerSessionRenameRoute(app, { context: sessionRecordContext, sessionStateManager, busClients,getMailbox:()=>mailbox });
 
 sessionActions.registerKillRoute(app);
 
@@ -2198,7 +2199,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
     const healthStatus = getSessionHealthStatus(session, { nowMs: now });
     const healthReason = getSessionHealthReason(session, healthStatus);
-    if(require('./src/principal/cooperative-handoff').activeHandoff(session))continue;
+    if(require('./src/principal/cooperative-handoff').activeHandoff(session) || (session.cooperativeHandoff?.state==='committed' && session.cooperativeHandoff.pending_count>0))continue;
     const disconnectedSeconds = session.lastDisconnectedAt
       ? Math.floor((now - new Date(session.lastDisconnectedAt).getTime()) / 1000)
       : null;

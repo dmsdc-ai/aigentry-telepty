@@ -354,6 +354,7 @@ function installWebSocketTransport(deps) {
       activeSession.interactionProvider?.dispose();
       activeSession.interactionProvider = null;
       activeSession.interactionOwnerGeneration = crypto.randomUUID();
+      activeSession.pendingHandoffCapability=null;
       if (activeSession.sshRemote) activeSession.sshState = { phase: 'connecting', generation: 0, reason: 'owner_changed', owner_generation: activeSession.interactionOwnerGeneration };
       markSessionConnected(activeSession);
       initializeBootstrapState(activeSession);
@@ -495,6 +496,7 @@ function installWebSocketTransport(deps) {
         }
 
         if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+          if(type==='pending_handoff_receipt'){if(strictOwner)require('../principal/pending-handoff').acceptPendingReceipt(sessionId,activeSession,ws,msg);return;}
           if (type === 'handoff_ack') { if(strictOwner) deps.acceptHandoffAck?.(sessionId,activeSession,ws,msg);return; }
           if (type === 'ssh_state') { applySshState(activeSession, msg); return; }
           if (type === 'ssh_write_receipt') { acceptSshWriteReceipt(activeSession, ws, msg); return; }
@@ -555,6 +557,8 @@ function installWebSocketTransport(deps) {
             if (Number.isFinite(msg.pty_bytes)) activeSession.bridgePtyBytes = msg.pty_bytes;
             if (typeof msg.read_side === 'string') activeSession.bridgeReadSide = msg.read_side;
           } else if (type === 'ready') {
+            if(strictOwner && msg.pending_handoff_receipts==='v1' && msg.owner_generation===activeSession.interactionOwnerGeneration)
+              activeSession.pendingHandoffCapability={owner:ws,generation:activeSession.interactionOwnerGeneration};
             if (isBootstrapGatedSession(activeSession)) {
               markBootstrapReady(sessionId, activeSession, 'bridge_ready');
             } else {

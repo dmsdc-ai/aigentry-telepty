@@ -2,6 +2,7 @@
 const crypto = require('node:crypto');
 const { verifiedRequestPrincipal, storedOwningPrincipal } = require('./http');
 const { verifierFor } = require('../session-store/session-credentials');
+const pendingHandoff = require('./pending-handoff');
 const { mintSessionNonce } = require('../audit/provenance');
 
 function restoreHandoff(value, epoch, generation) {
@@ -9,10 +10,10 @@ function restoreHandoff(value, epoch, generation) {
   try {
     const committed = value?.state === 'committed';
     const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
-    const allowed=['schema','id','state','epoch','generation','owner_generation','actor','at','expires_at','next_epoch','exit_code','exit_signal','completed_at'];
+    const allowed=['schema','id','state','epoch','generation','owner_generation','actor','at','expires_at','next_epoch','exit_code','exit_signal','completed_at','pending_custody_schema','pending_policy','pending_count','pending_digest','pending_records','pending_dispatch_started','pending_write_invoked'];
     if (typeof value !== 'object' || Array.isArray(value) || JSON.stringify(value).length > 4096
         || value.schema!=='telepty.cooperative-handoff-intent/v1'
-        || Object.keys(value).some(key=>!allowed.includes(key))
+        || Object.keys(value).some(key=>!allowed.includes(key)) || !pendingHandoff.validPendingAudit(value)
         || !['awaiting_ack', 'refused', 'outcome_unknown', 'committed'].includes(value.state)
         || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.id || '') || !/^[a-f0-9-]{36}$/.test(value.owner_generation || '')
         || !/^[A-Za-z0-9_-]{22}$/.test(value.epoch || '')
@@ -56,6 +57,8 @@ function registerCooperativeHandoff(app, { context, getMailbox, hasUnsettled = (
       intent_id: session.cooperativeHandoff?.id, state: session.cooperativeHandoff?.state || 'absent',
       session_epoch: session.sessionEpoch, credential_generation: session.credentialGeneration,
       owner_generation: session.interactionOwnerGeneration || null,
+      ...(session.cooperativeHandoff?.pending_policy ? {pending_policy:session.cooperativeHandoff.pending_policy,pending_count:session.cooperativeHandoff.pending_count,pending_digest:session.cooperativeHandoff.pending_digest} : {}),
+      pending_transport:session.pendingHandoffCapability?.owner===session.ownerWs && session.pendingHandoffCapability?.generation===session.interactionOwnerGeneration?'available':'unavailable',
       child_exit: 'incumbent_report_only', process_tree: 'unknown', retryable: false
     };
   }
@@ -68,9 +71,12 @@ function registerCooperativeHandoff(app, { context, getMailbox, hasUnsettled = (
       ? { principal, session } : null;
   }
 
-  function emptyCustody(id, session) {
-    try { return !hasUnsettled(id, session) && getMailbox().snapshotCustody(id).length === 0; }
-    catch { return false; }
+  function captureCustody(id, session, policy) {
+    try {
+      if(hasUnsettled(id,session))return null;
+      if(policy==='empty')return getMailbox().snapshotCustody(id).length===0?[]:null;
+      return getMailbox().withNeverAttemptedCustody(id, rows => rows.every(row=>pendingHandoff.validConsent(row,session,session.sessionEpoch,session.interactionOwnerGeneration))?rows:null);
+    }catch{return null;}
   }
 
   app.get('/api/sessions/:id/handoff', (req, res) => {
@@ -93,11 +99,14 @@ function registerCooperativeHandoff(app, { context, getMailbox, hasUnsettled = (
       return deny('HANDOFF_BEARER_REQUIRED', 403);
     }
     if (!body || Array.isArray(body)
-        || Object.keys(body).some(key => !['intent_id', 'expected_epoch', 'credential_generation', 'owner_generation'].includes(key))
+        || Object.keys(body).some(key => !['intent_id', 'expected_epoch', 'credential_generation', 'owner_generation','pending_policy'].includes(key))
         || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(body.intent_id || '')) return deny('HANDOFF_INVALID_REQUEST', 400);
     if (session.cooperativeHandoff?.id === body.intent_id) {
       return res.status(409).json({ ...status(session), success: false, code: 'HANDOFF_ALREADY_RECORDED' });
     }
+    const policy=body.pending_policy===undefined?'empty':body.pending_policy;
+    if(!['empty','never-attempted'].includes(policy))return deny('HANDOFF_INVALID_REQUEST',400);
+    if(policy==='never-attempted' && (session.externalApprovalPolicy || session.provenanceCapable===true))return deny('HANDOFF_CONSENT_UNSUPPORTED');
     if (activeHandoff(session)) return deny('HANDOFF_FENCED');
     if (body.expected_epoch !== session.sessionEpoch || body.credential_generation !== session.credentialGeneration
         || body.owner_generation !== session.interactionOwnerGeneration) return deny('HANDOFF_INSTANCE_CHANGED');
@@ -108,13 +117,16 @@ function registerCooperativeHandoff(app, { context, getMailbox, hasUnsettled = (
     const ownerGeneration = session.interactionOwnerGeneration;
     if (ws?.readyState !== 1 || !session.strictOwnerConnected || !Number.isSafeInteger(generation)
         || generation < 1 || generation >= Number.MAX_SAFE_INTEGER) return deny('HANDOFF_INCUMBENT_UNAVAILABLE');
-    if (!emptyCustody(id, session)) return deny('HANDOFF_PENDING_OR_UNKNOWN');
+    const captured=captureCustody(id,session,policy);
+    if(captured===null)return deny('HANDOFF_PENDING_OR_UNKNOWN');
+    const custodyReceipt=pendingHandoff.snapshotReceipt(captured);
 
     const previous = session.cooperativeHandoff;
     const ownerSnapshot = JSON.stringify(storedOwningPrincipal(session.owningPrincipal));
     const intent = {
       schema:'telepty.cooperative-handoff-intent/v1',id: body.intent_id, state: 'awaiting_ack', epoch, generation, owner_generation: ownerGeneration,
       actor: { id: principal.id, key_id: principal.keyId, audience: principal.audience,source:'ed25519' },
+      pending_policy:policy,...custodyReceipt,
       at: Date.now(), expires_at: Date.now() + timeoutMs
     };
     session.cooperativeHandoff = intent;
@@ -143,7 +155,7 @@ function registerCooperativeHandoff(app, { context, getMailbox, hasUnsettled = (
     clearTimeout(timer);
     pending.delete(id);
     if (!current()) return deny('HANDOFF_INSTANCE_CHANGED');
-    if (!ack || Date.now() > intent.expires_at || ack.status !== 'exited' || !emptyCustody(id, session)) {
+    if (!ack || Date.now() > intent.expires_at || ack.status !== 'exited') {
       intent.state = ack?.status === 'refused' ? 'refused' : 'outcome_unknown';
       const result = context.persistSessions();
       if (!result?.ok) intent.state = 'outcome_unknown';
@@ -152,11 +164,12 @@ function registerCooperativeHandoff(app, { context, getMailbox, hasUnsettled = (
     }
 
     try {
-      return getMailbox().withCustodySnapshot(id, messages => {
-        if (messages.length || hasUnsettled(id, session) || !current()) {
+      return getMailbox()[policy==='never-attempted'?'withNeverAttemptedCustody':'withCustodySnapshot'](id, messages => {
+        const sameCustody=policy==='empty'?messages.length===0:messages.every(row=>pendingHandoff.validConsent(row,session,epoch,ownerGeneration)) && pendingHandoff.snapshotReceipt(messages).pending_digest===custodyReceipt.pending_digest;
+        if (!sameCustody || hasUnsettled(id, session) || !current()) {
           intent.state = 'outcome_unknown';
           context.persistSessions();
-          return deny('HANDOFF_PENDING_OR_UNKNOWN');
+          return res.status(409).json({...status(session),success:false,code:'HANDOFF_PENDING_OR_UNKNOWN',retryable:false});
         }
         // No await follows the final identity/custody check. The verifier and release audit
         // become visible together; neither a failed response nor late ACK repeats the effect.

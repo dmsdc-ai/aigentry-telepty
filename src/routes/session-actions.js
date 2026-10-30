@@ -596,7 +596,7 @@ function createSessionActions(shared, effects = {}) {
   }
 
   function beginDurableSessionClose(id, session) {
-    if(require('../principal/cooperative-handoff').activeHandoff(session))return {success:false,httpStatus:409,code:'HANDOFF_FENCED',error:'Cooperative handoff reserves this instance.'};
+    if(require('../principal/cooperative-handoff').activeHandoff(session) || require('../principal/pending-handoff').pendingNamespaceReserved(session,()=>shared.mailbox))return {success:false,httpStatus:409,code:'HANDOFF_FENCED',error:'Cooperative handoff reserves this instance.'};
     if (session.isClosing && !session.closeDurabilityPending) {
       return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing' };
     }
@@ -1328,6 +1328,18 @@ function createSessionActions(shared, effects = {}) {
       const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
       let { from, reply_to } = req.body;
       if (typeof prompt !== 'string') return (0, shared.respondWithError)(res, 400, 'INVALID_REQUEST', 'prompt is required');
+      let cooperativeConsent = null;
+      if(Object.hasOwn(req.body,'allow_cooperative_handoff') && typeof req.body.allow_cooperative_handoff!=='boolean')return res.status(400).json({code:'HANDOFF_CONSENT_INVALID'});
+      if(req.body.allow_cooperative_handoff===true){
+        const principal=require('../principal/http').verifiedRequestPrincipal(req,{action:'session.inject',target:id});
+        const recipient=require('../principal/http').storedOwningPrincipal(session.owningPrincipal);
+        if(!prompt.length || Buffer.from(prompt,'utf8').toString('utf8')!==prompt || Buffer.byteLength(prompt)>4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/u.test(prompt) || !principal || !recipient || !exactTarget || req.body.expected_epoch!==session.sessionEpoch || no_enter!==true
+          || !!from || auto_submit===true || session.type!=='wrapped' || session.sshRemote || session.externalApprovalPolicy || req.body.external_approval
+          || session.provenanceCapable===true || session.cooperativeHandoffCapable!==true || !session.interactionOwnerGeneration)return res.status(403).json({code:'HANDOFF_CONSENT_UNSUPPORTED'});
+        cooperativeConsent={schema:'telepty.pending-handoff-consent/v1',sid:id,origin_epoch:session.sessionEpoch,origin_owner_generation:session.interactionOwnerGeneration,
+          recipient:{id:recipient.id,audience:recipient.audience},sender:{id:principal.id,key_id:principal.keyId,audience:principal.audience,source:'ed25519'},
+          request_sha256:require('../principal/encoding').requestBodyDigest(req),proof_sha256:shared.crypto.createHash('sha256').update(req.headers['x-telepty-principal']).digest('hex')};
+      }
       // reply_to defaults to from when omitted
       if (from && !reply_to) reply_to = from;
       const claimedReturn = claimedReturnMetadata(reply_to, req.body.claimed_cross_host === true || !!req.body.forwarding);
@@ -1419,6 +1431,7 @@ function createSessionActions(shared, effects = {}) {
       try {
         const delivery = await (0, shared.deliverInjectionToSession)(id, session, finalPrompt, {
           noEnter: !!no_enter,
+          cooperativeHandoffConsent:cooperativeConsent,
           source: 'inject',
           externalApproval: req.body.external_approval || null,
           from: from || 'inject',

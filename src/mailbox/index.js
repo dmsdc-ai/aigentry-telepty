@@ -69,10 +69,12 @@ class FileMailbox {
         payload: msg.payload,
         created_at: msg.created_at,
         attempt: msg.attempt || 0,
+        ...(msg.cooperative_handoff ? {cooperative_handoff:msg.cooperative_handoff} : {}),
       });
 
       // Append state: pending
-      appendState(sessionDir, msg.msg_id, 'pending', now);
+      if(msg.cooperative_handoff && (msg.attempt||0)===0)appendJsonl(path.join(sessionDir,'state.jsonl'),{msg_id:msg.msg_id,state:'pending',ts:now,never_attempted:true});
+      else appendState(sessionDir,msg.msg_id,'pending',now);
 
       const pending = countPending(sessionDir, now);
       return { msg_id: msg.msg_id, queued: true, pending };
@@ -322,6 +324,27 @@ class FileMailbox {
 
   snapshotCustody(sessionId) {
     return this.withCustodySnapshot(sessionId, snapshot => snapshot);
+  }
+
+  withAcknowledgedCustody(sessionId,event,callback){
+    const sessionDir=this._sessionDir(sessionId),release=acquireLock(sessionDir);
+    try{
+      require('./custody').acknowledgedCustodySnapshot(sessionDir,sessionId,event);
+      for(const leaf of ['inbox.jsonl','state.jsonl']){const fd=openFile(path.join(sessionDir,leaf),fs.constants.O_RDONLY);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      if(process.platform!=='win32'){const fd=fs.openSync(sessionDir,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      return callback();
+    }finally{release();}
+  }
+
+  withNeverAttemptedCustody(sessionId,callback){
+    const sessionDir=this._sessionDir(sessionId),release=acquireLock(sessionDir);
+    try{
+      const rows=require('./custody').neverAttemptedCustodySnapshot(sessionDir,sessionId);
+      // Flush the immutable bytes before an authority record can claim durable custody.
+      for(const leaf of ['inbox.jsonl','state.jsonl']){const fd=openFile(path.join(sessionDir,leaf),fs.constants.O_RDONLY);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      if(process.platform!=='win32'){const fd=fs.openSync(sessionDir,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      const result=callback(rows);if(result&&typeof result.then==='function')throw new Error('Custody callback must be synchronous');return result;
+    }finally{release();}
   }
 
   withCustodySnapshot(sessionId, callback) {

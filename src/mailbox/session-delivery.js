@@ -32,6 +32,7 @@ function createSessionDeliveryContext({
   sessions,
   broadcastSessionEvent,
   getMailbox, getMailboxNotifier, getMailboxDelivery,
+  persistSessions = () => ({ok:false}),
   net = require('net'), fetch = globalThis.fetch, AbortSignal = globalThis.AbortSignal,
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
 }) {
@@ -483,14 +484,17 @@ function createSessionDeliveryContext({
       }
       const mailboxForEnqueue = getMailbox();
       enqueueAttempted = true;
-      const ack = mailboxForEnqueue.enqueue({
+      const queuedMessage = {
         msg_id: msgId,
         from,
         to: id,
         payload: deliveredBody,
         created_at: Math.floor(now / 1000),
         attempt: 0,
-      });
+      };
+      if(options.cooperativeHandoffConsent)queuedMessage.cooperative_handoff={...options.cooperativeHandoffConsent,inject_id:options.injectId || null,
+        message_sha256:require('../principal/pending-handoff').messageDigest(queuedMessage)};
+      const ack = mailboxForEnqueue.enqueue(queuedMessage);
       const immediate = { result: null }; immediateAttempts.set(msgId, immediate);
       injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs });
       // Registered synchronously after the enqueue: no tick can run in between.
@@ -641,9 +645,37 @@ function createSessionDeliveryContext({
   const mailboxDeliveryOptions = {
     pollMs: 200,
     sessionResolver: () => Object.keys(sessions).filter(id => !sessions[id].isClosing && sessions[id].type !== 'mailbox'),
+    canProcess: id => {const session=sessions[id];return !!session && !(session.cooperativeHandoff?.pending_count>0 && !require('../principal/pending-handoff').eligibleRecipient(session)) && !session.isClosing && !require('../principal/cooperative-handoff').activeHandoff(session)
+      && !(session.cooperativeHandoffCapable===true
+        && (!isOpenWebSocket(session.ownerWs) || session.sessionEpochProved!==session.sessionEpoch))
+      && !(session.cooperativeHandoff?.pending_count>(session.cooperativeHandoff?.pending_dispatch_started?.length||0)
+        && (!require('../readiness').pendingWriteReady(session) || session.pendingHandoffCapability?.owner!==session.ownerWs || session.pendingHandoffCapability?.generation!==session.interactionOwnerGeneration));},
     deliverFn: async (sessionId, msg) => {
       const session = sessions[sessionId];
       if (!session) return { success: false, error: 'Session not found' };
+      const consent=msg.cooperative_handoff;
+      if(consent && consent.origin_epoch!==session.sessionEpoch){
+        const helper=require('../principal/pending-handoff'),event=helper.transferredRecord(session,msg);
+        if(!event || event.pending_dispatch_started?.includes(msg.msg_id))return {success:false,delivery_uncertain:true,bytes_written:null,code:'HANDOFF_DISPATCH_UNKNOWN',retryable:false};
+        const oldTarget=injectionTargets.get(msg.msg_id);
+        if(oldTarget && (oldTarget.session!==session || oldTarget.sessionEpoch!==event.epoch))return {success:false,delivery_uncertain:true,bytes_written:null,code:'HANDOFF_BINDING_CHANGED',retryable:false};
+        const previous=event.pending_dispatch_started;
+        const audit=session.cooperativeHandoffAudit?.find(row=>row.id===event.id),previousAudit=audit?.pending_dispatch_started;
+        event.pending_dispatch_started=[...(previous||[]),msg.msg_id];if(audit && audit!==event)audit.pending_dispatch_started=event.pending_dispatch_started;
+        const committed=persistSessions();
+        if(!committed?.ok){if(!committed?.committed){event.pending_dispatch_started=previous;if(audit && audit!==event)audit.pending_dispatch_started=previousAudit;}return {success:false,delivery_uncertain:true,bytes_written:null,code:'HANDOFF_DISPATCH_STORE_UNAVAILABLE',retryable:false};}
+        injectionTargets.set(msg.msg_id,{session,sessionEpoch:session.sessionEpoch,ownerWs:session.ownerWs});
+        interaction.invalidateInteraction(session,'pending_handoff_dispatch');
+        const result=await helper.requestPendingWrite(session,msg);
+        if(result.success){
+          const priorInvoked=event.pending_write_invoked,priorAuditInvoked=audit?.pending_write_invoked;
+          event.pending_write_invoked=[...(priorInvoked||[]),msg.msg_id];if(audit && audit!==event)audit.pending_write_invoked=event.pending_write_invoked;
+          const acknowledged=persistSessions();
+          if(!acknowledged?.ok){if(!acknowledged?.committed){event.pending_write_invoked=priorInvoked;if(audit && audit!==event)audit.pending_write_invoked=priorAuditInvoked;}return {success:false,delivery_uncertain:true,bytes_written:null,code:'HANDOFF_RECEIPT_STORE_UNAVAILABLE',retryable:false};}
+          injectionTargets.delete(msg.msg_id);
+        }
+        return result;
+      }
       const target = injectionTargets.get(msg.msg_id);
       if (target && (!isSameSessionInstance(sessionId, target.session, target.sessionEpoch)
           || session.ownerWs !== target.ownerWs)) {

@@ -97,26 +97,25 @@ function countPending(sessionDir, nowSecs) {
  */
 function compact(sessionDir, threshold) {
   const states = loadStates(sessionDir);
+  const journal = readJsonl(path.join(sessionDir, 'state.jsonl'));
+  const unknown = new Set(journal.filter(row => row.delivery_uncertain === true || row.outcome === 'unknown' || row.retryable === false).map(row => row.msg_id));
   const terminalStates = new Set(['acked', 'expired', 'dead_letter']);
-  let terminalCount = 0;
-  for (const entry of states.values()) {
-    if (terminalStates.has(entry.state)) terminalCount++;
-  }
-
+  const terminalCount = [...states.values()].filter(row => terminalStates.has(row.state) && !unknown.has(row.msg_id)).length;
   if (terminalCount < threshold) return;
 
   const messages = loadMessages(sessionDir);
-  const activeMessages = messages.filter(m => {
-    const st = states.get(m.msg_id);
-    return !st || !terminalStates.has(st.state);
-  });
+  const activeMessages = messages.filter(message => unknown.has(message.msg_id) || !terminalStates.has(states.get(message.msg_id)?.state));
+  const pristine = require('./custody').pristinePendingIds(sessionDir, path.basename(sessionDir));
   writeJsonl(path.join(sessionDir, 'inbox.jsonl'), activeMessages);
 
-  const activeStates = [];
+  // Preserve explicit unknown history and payload independently of the optional DLQ.
+  // A generic later ACK cannot manufacture a settlement proof.
+  const activeStates = journal.filter(row => unknown.has(row.msg_id));
   for (const entry of states.values()) {
-    if (!terminalStates.has(entry.state)) {
-      activeStates.push(entry);
-    }
+    if (unknown.has(entry.msg_id) || terminalStates.has(entry.state)) continue;
+    if (entry.never_attempted === true && !pristine.has(entry.msg_id)) {
+      const safe = { ...entry }; delete safe.never_attempted; activeStates.push(safe);
+    } else activeStates.push(entry);
   }
   writeJsonl(path.join(sessionDir, 'state.jsonl'), activeStates);
 }
