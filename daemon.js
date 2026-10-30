@@ -2195,7 +2195,13 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
     if (quietObservation) broadcastSessionEvent(SUSTAINED_IDLE_KIND, id, session, { nowMs: now, includeTransport: false, includeSemantic: false,
       extra: { kind: SUSTAINED_IDLE_KIND, version: 1, message_id: crypto.randomUUID(), source: `telepty:${id}`,
         source_host: MACHINE_ID, target: null, ts: quietObservation.observed_at, observation: quietObservation, completion_fact: null, terminal: false } });
-    if (session.isClosing) continue; // A pending teardown owns this namespace until its process action settles.
+    if (session.isClosing) {
+      // Retrying an observed natural exit only commits metadata; its process
+      // handles/PIDs were retired at the exit callback, so no signal is sent.
+      const retry = Object.getOwnPropertyDescriptor(session, 'retryNaturalExitCleanup')?.value;
+      if (typeof retry === 'function') retry();
+      continue;
+    }
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
     const healthStatus = getSessionHealthStatus(session, { nowMs: now });
     const healthReason = getSessionHealthReason(session, healthStatus);

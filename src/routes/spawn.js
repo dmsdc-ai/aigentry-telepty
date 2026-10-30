@@ -176,16 +176,36 @@ function registerSpawnRoute(app, {
         const currentId = sessionRecord.id;
         console.log('[EXIT] Session %s exited with code %s', currentId, exitCode);
         if (sessions[currentId] !== sessionRecord) return;
-        sessionStateManager.markDead(currentId, exitCode, signal);
         sessionRecord.isClosing = true;
-        sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
-        if (sessions[currentId] === sessionRecord) {
+        sessionRecord.ready = false;
+        try { sessionStateManager.markDead(currentId, exitCode, signal); }
+        catch { console.error('[EXIT] Observed-exit publication failed:', currentId); }
+        // The child has actually exited. A later persistence/close retry must not
+        // signal its numeric PID after the operating system has reused it.
+        sessionRecord.ptyProcess = null;
+        for (const key of ['ptyPid', 'pty_pid', 'pid', 'ownerPid', 'owner_pid']) sessionRecord[key] = null;
+        sessionRecord.clients.forEach(ws => {
+          try { ws.close(1000, 'Session exited'); }
+          catch { console.error('[EXIT] Client close failed:', currentId); }
+        });
+        Object.defineProperty(sessionRecord, 'retryNaturalExitCleanup', { configurable: true, value: () => {
+          if (sessions[currentId] !== sessionRecord) return false;
+          let saved;
+          try { saved = persistSessions(); } catch { saved = null; }
+          if (!saved || !saved.ok) {
+            sessionRecord.closeDurabilityPending = true;
+            console.error('[EXIT] Session removal was not durably saved; namespace remains fenced:', currentId);
+            return false;
+          }
+          // Closing records are omitted by the serializer. Only a confirmed
+          // durable omission permits revocation, unregistration and SID reuse.
           delete sessions[currentId];
-          revokeSessionCredential(currentId);   // #815: PTY exit — the instance is gone
+          sessionRecord.closeDurabilityPending = false;
+          revokeSessionCredential(currentId);
           sessionStateManager.unregister(currentId);
-          const saved = persistSessions();
-          if (!saved || !saved.ok) console.error('[EXIT] Session removal was not durably saved:', currentId);
-        }
+          return true;
+        } });
+        sessionRecord.retryNaturalExitCleanup();
       });
 
       if (!saved.ok) return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
