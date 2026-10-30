@@ -8,6 +8,9 @@ The new strict owner transport removes the previously missing signed-connection
 prerequisite; it does not complete those other requirements. #133 stays Partial,
 and the overall55-issue disposition stays23 local /29 partial /3 remaining.
 No runtime, service, process or authority mutation was performed for this review.
+The later [cooperative handoff choices](2026-10-30-cooperative-handoff-choices.md)
+clarify that an authenticated voluntary release report need not claim independent
+kernel custody; independent enrollment is needed for autonomous/no-ACK recovery.
 
 ## Evidence in the current source
 
@@ -71,7 +74,8 @@ transaction, designed separately before changing the live lifecycle:
    child. Alternatively a kernel-authenticated local IPC enrollment adapter needs
    its own reviewed platform support; the current TCP WebSocket supplies no peer
    process identity. Same UID, a TTY and claimed PID ancestry are not enrollment.
-5. After both the ACK and required independent birth/custody checks, re-read the
+5. After the authenticated voluntary release ACK (or a separately authorized
+   recovery satisfying its independently enrolled birth/custody checks), re-read the
    exact original record and generations. Commit epoch, verifier, nonce, audit,
    delivery fences and the authorized custody disposition with compare-and-swap.
    Reuse the existing uncertain-commit discipline: a visible renamed generation
@@ -86,7 +90,8 @@ transaction, designed separately before changing the live lifecycle:
 These are proposed requirements, not implemented endpoints, enrollment or policy.
 Before execution, the handoff contract must settle pending versus uncertain-write
 custody, whether recovery without ACK is permitted under a dedicated exact grant,
-and which enrollment mechanism supplies independently observed process custody.
+and, for autonomous/no-ACK recovery, which enrollment mechanism supplies
+independently observed process custody.
 The existing configured-principal model is not a human-attestation mechanism;
 Linux process-birth checks do not establish Windows/Mac behavior or isolation from
 an unrestricted hostile same-UID process. No platform-native blocker is invented:
