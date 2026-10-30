@@ -1,6 +1,6 @@
 # Broker v1: exact inject over an outbound channel
 
-This opt-in Linux-tested slice supports an independently started hub, an outbound recipient SSE bridge, exact inject and receipt queries. It is a new versioned protocol; dormant `connectBroker`/HS256-JWT discovery helpers are not compatible and are not enabled. `--ref`, session discovery, automatic enrollment and installation as a service are unsupported. Normal daemon and peer discovery behavior does not change.
+This opt-in Linux-tested slice supports an independently started hub, an outbound recipient SSE bridge, exact inject and receipt queries. It is a new versioned protocol; dormant `connectBroker`/HS256-JWT discovery helpers are not compatible and are not enabled. `--ref`, automatic enrollment and installation as a service are unsupported. Explicitly scoped session discovery is described below. Normal daemon and peer discovery behavior does not change.
 
 No node must reach another node. A source signs an HTTP POST to the hub. The destination maintains an outbound SSE request to that hub; it verifies the pinned hub's signature on each delivery and submits the exact operation to its own literal loopback daemon. The final loopback request uses either the recipient's own existing daemon token or an explicitly configured local principal signature. The source, hub and stream never receive a local daemon/session token or local private signing key.
 
@@ -115,7 +115,7 @@ daemon, checks schema/audience/transport/source and signs the exact method, raw
 path, canonical body and epoch. Redirects and mixed token+principal configuration
 are refused. A failed challenge or signature never falls back to the token lane.
 The same local timeout bounds challenge and POST. Default legacy recipients keep
-their existing token behavior. Strict WebSocket support is still absent.
+their existing token behavior. Strict owner/input/bus WebSocket support remains absent; a separately granted read-only observer is available ([contract](../security/principal-http-132.md)).
 
 ## Explicit broadcast and reply
 
@@ -135,3 +135,46 @@ telepty broker-reply-v1 --config <source-config> <receipt-id> --request <private
 ```
 
 A mixed/failed/unknown CLI receipt exits nonzero without resending. Pending/accepted remains admission/endpoint receipt metadata, not consumption or completion proof.
+
+## Explicit scoped discovery
+
+A recipient opts in with `discovery: {sessions:["worker"], interval_ms:30000,
+ttl_ms:60000}`. Select at most 32 unique exact local SIDs; interval is 5000–120000 ms
+and TTL is at least the interval and at most120000 ms. Without this field, the
+recipient makes no discovery reads. A strict local signer needs an existing
+`session.inspect` grant and owner/operator inspection authority for each selected
+SID; an input grant never grants read access. Legacy recipients use only their
+existing loopback token. No other authority lane or automatic enrollment is used.
+
+Local sampling is bounded by the existing local timeout for the complete cycle.
+Only exact response ID and public epoch are copied; cwd, command, output, policy,
+credential, nonce, error text and unrelated JSON fields are discarded. Missing,
+refused, alias or invalid reads make the snapshot partial (`complete:false`), rather
+than a false complete empty inventory. No local read changes session state.
+
+The recipient posts `/v1/nodes/:node/advertise` with its separate
+`broker.advertise` grant targeting that same node. A live outbound stream and the
+exact current stream challenge are required. A stop/reconnect invalidates in-flight
+old sampling and publication. The hub keeps one bounded in-memory snapshot per
+configured node and clears it on disconnection. Session lists are capped 32; only
+SID/epoch pairs, completeness/count, bounded TTL and stream binding are admitted.
+There is no prompt, secret, arbitrary lookup URL or persisted enrollment record.
+
+`GET /v1/nodes/:caller/discovery/:node` requires `broker.discover` for that exact
+configured node; the signed principal must be the caller. Missing, expired,
+backward-clock or disconnected snapshots return `status:unavailable` with
+`sessions:null`. A current snapshot returns `status:observed`,
+`observation_scope:node-reported`, completeness, received-at/age/TTL and the
+whitelisted pairs. These are authenticated node claims, not proof of session
+identity, readiness, liveness, consumption or authority to inject. Injection still
+requires its own exact grant and destination epoch check. Snapshot freshness is
+measured from hub receipt, not a verified provider observation time.
+
+SDK: `client.discover(exactNode)`. CLI:
+
+```text
+telepty broker-discover-v1 --config <source-config> <exact-node>
+```
+
+The CLI prints JSON and exits nonzero on unavailable/denied discovery. It never
+chooses targets, enrolls nodes or injects discovered sessions.

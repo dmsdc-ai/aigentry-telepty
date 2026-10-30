@@ -176,9 +176,10 @@ HTTP adapter. Reserved static session path names cannot become exact-session
 grants, including encoded variants. Missing exact records never fall through to
 legacy alias resolution.
 
-Strict mode refuses **every WebSocket upgrade**, including ones carrying a shared
-daemon/JWT/session credential. Existing `allow`, attach and bus clients therefore
-need a future signed-handshake/per-frame adapter before working in this mode. The
+Strict mode refuses owner, input-capable attach and bus WebSocket upgrades,
+including ones carrying a shared daemon/JWT/session credential. Those clients
+need a future signed-handshake/per-frame authority adapter. A separate output-only
+observer is supported under its own exact grant as described below. The
 first slice is useful for independently signed HTTP/mailbox/control clients; it
 is not full acceptance of #132's wrapped-client, OS-account or external identity
 provider proposal. Default legacy clients retain their existing behavior.
@@ -196,3 +197,30 @@ The explicitly scoped forwarded-inject action also supports a broker recipient's
 separate local signer. It delegates input only, including configured cross-owner
 input, and does not grant session creation, destruction, listing, takeover or
 WebSocket access. See [broker local signer](../api/broker-v1.md).
+
+## Signed read-only observation
+
+`GET /api/observe/sessions/:exactId` upgrades only with a single header
+`x-telepty-principal` assertion for `session.observe`, `transport:websocket`, exact
+raw path, empty body and current session epoch. Obtain the existing startup
+challenge from `/api/auth/challenge` and create a fresh proof for each connection.
+A separate exact `session.observe` grant is required, including for an operator;
+wildcards are refused. The caller must own the session or be an explicitly granted
+operator observer. The existing origin/peer restrictions still apply. No query
+proof, token/JWT fallback, request body or automatic registration is accepted.
+
+This is a dedicated output-only transport. It emits an initial read-only identity
+envelope and bounded output frames only. Every client application frame, including
+input, resize or subscribe, closes the connection. Owner and bus routes remain
+unsupported. Verified proof expiry closes the connection within at most 60 seconds;
+capacity is 64 global and 8 per principal/session. Before each output and periodically,
+it rechecks the exact session object, closing state, owning principal, epoch,
+credential generation, owner socket and owner generation. Changed identity cannot
+reuse an old observation connection. Shutdown refuses new admission and terminates
+existing observers.
+
+Replay scans at most 1024 recent chunks and 64 KiB, frames are capped 64 KiB, and
+backpressure above 128 KiB closes the observer. No owner/session credentials, policy
+state, readiness inference or completion receipt is emitted. Output bytes prove no
+agent consumption or answer. This does not make legacy attach or allow clients
+strict-mode compatible; a signed owner/input protocol remains future work.

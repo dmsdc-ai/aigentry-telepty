@@ -801,10 +801,10 @@ function installWebSocketTransport(deps) {
     sessions, server, tailnetServer, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
   function handleUpgrade(req, socket, head) {
     if (observer.handle(req, socket, head)) return;
-    // HTTP-only strict mode has no per-frame authority adapter. Never let legacy upgrade
+    // Strict full-duplex routes have no per-frame authority adapter. Never let legacy upgrade
     // credentials turn it into a full-duplex bypass of action/target authorization.
     if (deps.principalAuthentication) {
-      return refuseUpgrade(socket, 401, 'Unauthorized', 'PRINCIPAL_WEBSOCKET_UNSUPPORTED', 'Strict principal mode currently supports HTTP only.');
+      return refuseUpgrade(socket, 401, 'Unauthorized', 'PRINCIPAL_WEBSOCKET_UNSUPPORTED', 'Full-duplex WebSocket routes are unsupported in strict principal mode.');
     }
     const url = new URL(req.url, 'http://' + req.headers.host);
     // #843 — TWO named carriers for the daemon token, matching the HTTP door exactly:
