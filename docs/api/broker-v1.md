@@ -1,6 +1,6 @@
 # Broker v1: exact inject over an outbound channel
 
-This opt-in Linux-tested slice supports an independently started hub, an outbound recipient SSE bridge, exact inject and receipt queries. It is a new versioned protocol; dormant `connectBroker`/HS256-JWT discovery helpers are not compatible and are not enabled. Broadcast, `--ref`, session discovery, broker-routed `reply`, automatic enrollment and installation as a service are unsupported. Normal daemon and peer discovery behavior does not change.
+This opt-in Linux-tested slice supports an independently started hub, an outbound recipient SSE bridge, exact inject and receipt queries. It is a new versioned protocol; dormant `connectBroker`/HS256-JWT discovery helpers are not compatible and are not enabled. `--ref`, session discovery, automatic enrollment and installation as a service are unsupported. Normal daemon and peer discovery behavior does not change.
 
 No node must reach another node. A source signs an HTTP POST to the hub. The destination maintains an outbound SSE request to that hub; it verifies the pinned hub's signature on each delivery and submits the exact operation to its own literal loopback daemon. The final loopback request uses either the recipient's own existing daemon token or an explicitly configured local principal signature. The source, hub and stream never receive a local daemon/session token or local private signing key.
 
@@ -116,3 +116,22 @@ path, canonical body and epoch. Redirects and mixed token+principal configuratio
 are refused. A failed challenge or signature never falls back to the token lane.
 The same local timeout bounds challenge and POST. Default legacy recipients keep
 their existing token behavior. Strict WebSocket support is still absent.
+
+## Explicit broadcast and reply
+
+`POST /v1/nodes/:source/broadcast` requires `broker.broadcast` for that source node and the **same verified signing key** must also grant `broker.inject` for every exact `node/session`. The body is `{idempotency_key,prompt,no_enter,targets:[{node,session,expected_epoch}]}` with 1–8 unique exact targets. All target checks and group/child durable reservations precede the first stream write. Group admission consumes one ledger/window record plus one per target, and each target consumes pending capacity. Existing payload, one-hop, epoch, backpressure, audit, deadline and unknown-outcome rules apply through the shared inject dispatcher.
+
+`GET /v1/nodes/:source/broadcast-receipts/:key` uses `broker.receipt` for that source node. A group reports individual receipt states, or `mixed` when they differ. An offline target may fail while another accepts; there is no physical all-or-none guarantee. Failed partial reservation leaves a consumed group intent. Missing child intents project `outcome_unknown`; group replay/query never repairs, dispatches or retries them. Prompts are absent from group and child records. Group/child/ordinary-inject key namespaces are distinct.
+
+`GET /v1/nodes/:responder/reply-context/:receiptId` requires `broker.reply_context` for the responder itself and returns only an original receipt targeted to that node. Context contains the original source node, receipt ID and original target SID/epoch, without prompt or credentials. It does not identify the original source session. `POST /v1/nodes/:responder/replies/:receiptId` requires `broker.reply` for the explicit `target_node/return_session`; the responder must be the original target node and `target_node` must equal the original source node. The body is `{target_node,return_session,expected_epoch,idempotency_key,prompt,no_enter}`. Return SID/epoch must be supplied explicitly; `from`/`reply_to` claims never select or authorize a return. Reply is a new one-hop operation, with `in_reply_to` and the original fingerprint bound into its durable idempotency fingerprint. It is not evidence of consumption, user identity or an agent answer.
+
+SDK methods are `broadcast(body)`, `broadcastReceipt(key)`, `replyContext(receiptId)` and `reply(receiptId,body)`. Replies are explicit; the SDK never selects a return session or automatically sends a reply. Versioned CLI commands read authority-checked private JSON request files (absolute Linux paths, mode0600 and checked ancestors):
+
+```text
+telepty broker-broadcast-v1 --config <source-config> --request <private-json>
+telepty broker-broadcast-receipt-v1 --config <source-config> <key>
+telepty broker-reply-context-v1 --config <source-config> <receipt-id>
+telepty broker-reply-v1 --config <source-config> <receipt-id> --request <private-json>
+```
+
+A mixed/failed/unknown CLI receipt exits nonzero without resending. Pending/accepted remains admission/endpoint receipt metadata, not consumption or completion proof.

@@ -2,6 +2,7 @@
 const { createPrincipalVerifier, validateTrustConfiguration } = require('../principal/proof');
 const { bodyDigest, parseUnambiguousJSON } = require('../principal/encoding');
 const { id, error, origin, readResponse, assertion, combineAbortSignals } = require('./http');
+const { createRoutingClient } = require('./routing-client');
 const { ACTIONS } = require('./hub');
 const { loadLocalPrincipal, createLocalPrincipalRequest } = require('./local-principal');
 const { validateForwardBody } = require('../peer-forwarding');
@@ -41,7 +42,7 @@ function createBrokerClient({ config, privateKey, fetch: send = globalThis.fetch
       return { status: response.status, body: await readResponse(response) };
     } finally { bounded.close(); }
   }
-  return { request,
+  return { request, ...createRoutingClient({ request, source: config.principal_id }),
     inject(node, sid, body) {
       if (!id(node)) throw error('BROKER_NODE_INVALID');
       return request('POST', `/v1/nodes/${config.principal_id}/to/${node}/sessions/${encodeURIComponent(sid)}/inject`,

@@ -5,11 +5,13 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const os = require('node:os');
 const { createBrokerAudit } = require('./audit');
-const { createPrincipalVerifier, validateTrustConfiguration, createSignedAssertion } = require('../principal/proof');
-const { createForwardLedger, validateForwardBody } = require('../peer-forwarding');
+const { createPrincipalVerifier, validateTrustConfiguration } = require('../principal/proof');
+const { createForwardLedger } = require('../peer-forwarding');
+const { createBrokerDispatch } = require('./dispatch');
+const { createBrokerRouting } = require('./routing');
 const { canonicalJSON } = require('../principal/encoding');
 const { id, error, readBody, json, verify } = require('./http');
-const ACTIONS = ['broker.stream', 'broker.inject', 'broker.receipt', 'broker.result', 'broker.envelope'];
+const ACTIONS = ['broker.stream', 'broker.inject', 'broker.receipt', 'broker.result', 'broker.envelope', 'broker.broadcast', 'broker.reply_context', 'broker.reply'];
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
@@ -44,7 +46,7 @@ function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
       session: record.session, expected_epoch: record.expected_epoch,
       state: record.state === 'pending' && !ledger.active.has(record.receipt_id) ? 'outcome_unknown' : record.state,
       code: record.code || null, remote_inject_id: record.remote_inject_id || null,
-      remote_queued: record.remote_queued === true, foreign_session_identity_verified: false };
+      remote_queued: record.remote_queued === true, ...(record.in_reply_to ? { in_reply_to: record.in_reply_to } : {}), foreign_session_identity_verified: false };
   }
   function finish(record, update) {
     const next = { ...record, ...update };
@@ -54,6 +56,8 @@ function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
     clearTimeout(timers.get(record.receipt_id)); timers.delete(record.receipt_id);
     return next;
   }
+  const dispatch = createBrokerDispatch({ config, signingKey, ledger, streams, timers, auditLog, finish, view });
+  const routing = createBrokerRouting({ config, trust, ledger, dispatch, view });
   async function handler(req, res) {
     const requestAudit = { event: 'request', requestTarget: req.url };
     let challengeRequest = false;
@@ -72,6 +76,8 @@ function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
       const injectMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/to\/([A-Za-z0-9._-]+)\/sessions\/([^/?]+)\/inject$/);
       const receiptMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/receipts\/([A-Za-z0-9_-]{16,128})$/);
       const resultMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/results\/([a-f0-9]{64})$/);
+      const routed = routing({ req, body, authenticate });
+      if (routed) return json(res, routed.status, routed.body);
       if (req.method === 'POST' && streamMatch) {
         const node = streamMatch[1];
         const principal = authenticate(body, 'broker.stream', node);
@@ -102,43 +108,8 @@ function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
         const sid = decodeURIComponent(encodedSid);
         const principal = authenticate(body, 'broker.inject', `${target}/${sid}`, body.expected_epoch);
         if (principal.id !== source || !own(config.nodes, source) || !own(config.nodes, target)) throw error('BROKER_NODE_DENIED', 403);
-        const payload = validateForwardBody(body);
-        const limit = config.limits[source];
-        if (Buffer.byteLength(payload.prompt) > limit.max_payload_bytes) throw error('BROKER_PAYLOAD_DENIED', 413);
-        const key = hash(`broker:${source}:${body.idempotency_key}`);
-        const fingerprint = hash(canonicalJSON({ source, target, sid, payload }));
-        const existing = ledger.read(key);
-        if (!existing) {
-          const records = ledger.all();
-          if (records.filter(record => record.source_node === source && record.created_at >= Date.now() - limit.window_ms).length >= limit.max_requests) throw error('BROKER_BUDGET_EXCEEDED', 429);
-          if (records.filter(record => record.source_node === source && ledger.active.has(record.receipt_id)).length >= limit.max_pending) throw error('BROKER_BACKPRESSURE', 429);
-        }
-        const reserved = ledger.reserve(key, fingerprint, { direction: 'broker', source_node: source, target_node: target,
-          session: sid, expected_epoch: payload.expected_epoch });
-        if (!reserved.fresh) {
-          auditLog.record({ event: 'idempotent_retry', principal, targetNode: target, targetSid: sid, receiptId: key, state: reserved.record.state });
-          return json(res, 200, view(reserved.record));
-        }
-        auditLog.record({ event: 'admitted', principal, targetNode: target, targetSid: sid, payload: payload.prompt, receiptId: key, state: 'pending' });
-        const stream = streams.get(target);
-        if (!stream || stream.response.destroyed) return json(res, 503, view(finish(reserved.record, { state: 'failed', code: 'BROKER_NODE_OFFLINE' })));
-        const envelope = { schema: 'telepty.broker-envelope/v1', receipt_id: key, source_node: source,
-          target_node: target, session: sid, payload, hop: 1, foreign_session_identity_verified: false };
-        const proof = createSignedAssertion({ privateKey: signingKey, keyId: config.key_id, principalId: config.principal_id,
-          audience: config.nodes[target].audience, challenge: stream.challenge, method: 'EVENT',
-          target: `/v1/envelopes/${key}`, body: envelope, action: 'broker.envelope', sessionEpoch: payload.expected_epoch });
-        const frame = `data: ${JSON.stringify({ envelope, assertion: proof })}\n\n`;
-        if (Buffer.byteLength(frame) > 128 * 1024 || stream.response.writableLength + Buffer.byteLength(frame) > 128 * 1024) {
-          return json(res, 429, view(finish(reserved.record, { state: 'failed', code: 'BROKER_BACKPRESSURE' })));
-        }
-        ledger.active.add(key);
-        try { stream.response.write(frame); auditLog.record({ event: 'envelope_forwarded', principal, targetNode: target, targetSid: sid, receiptId: key, state: 'pending' }); }
-        catch { return json(res, 202, view(finish(reserved.record, { state: 'outcome_unknown', code: 'BROKER_WRITE_UNKNOWN' }))); }
-        timers.set(key, setTimeout(() => {
-          try { const current = ledger.read(key); if (current && current.state === 'pending') finish(current, { state: 'outcome_unknown', code: 'BROKER_RESULT_TIMEOUT' }); }
-          catch { ledger.active.delete(key); }
-        }, limit.timeout_ms));
-        return json(res, 202, view(reserved.record));
+        const result = dispatch.inject(dispatch.plan(source, target, sid, body, principal));
+        return json(res, result.status, result.body);
       }
       if (req.method === 'GET' && receiptMatch) {
         const [, source, key] = receiptMatch;

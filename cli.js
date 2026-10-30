@@ -5053,6 +5053,17 @@ Discuss the following topic from your project's perspective. Engage with other s
   }
 
   // telepty peers [--remove <name>]
+  if (['broker-broadcast-v1', 'broker-broadcast-receipt-v1', 'broker-reply-context-v1', 'broker-reply-v1'].includes(cmd)) {
+    const mode = cmd.slice('broker-'.length, -'-v1'.length);
+    const parameters = mode === 'broadcast' ? '--request <private-file>' : mode === 'reply' ? '<receipt-id> --request <private-file>' : '<key-or-receipt-id>';
+    const usage = `telepty ${cmd} --config <file> ${parameters}`;
+    if (args[1] === '--help' || args[1] === '-h') { console.log(usage); return; }
+    if (args[1] !== '--config' || !args[2]) { console.error(usage); markCommandFailed(); return; }
+    try { await require('./src/broker/routing-cli').runBrokerRoutingRequest(mode, args[2], args.slice(3)); }
+    catch { console.error('BROKER_REQUEST_FAILED: query the same idempotency key before considering another send'); markCommandFailed(); }
+    return;
+  }
+
   if (cmd === 'broker-inject-v1' || cmd === 'broker-receipt-v1') {
     const usage = cmd === 'broker-inject-v1'
       ? 'telepty broker-inject-v1 --config <file> <node> <sid> <epoch> <idempotency-key> <prompt>'
@@ -5253,6 +5264,10 @@ function printGlobalHelp() {
   telepty relay-node-v1 --config <file>          Outbound recipient bridge, no auto-enrollment
   telepty broker-inject-v1 --config <file> <node> <sid> <epoch> <key> <prompt>
   telepty broker-receipt-v1 --config <file> <key> Query acceptance/uncertainty; no resend
+  telepty broker-broadcast-v1 --config <file> --request <private-file>
+  telepty broker-broadcast-receipt-v1 --config <file> <key>
+  telepty broker-reply-context-v1 --config <file> <receipt-id>
+  telepty broker-reply-v1 --config <file> <receipt-id> --request <private-file>
 
 \x1b[1mMonitoring:\x1b[0m
   telepty readiness <exact-id>[@host] [--json]     Inspect qualified composer evidence (read-only)
