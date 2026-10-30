@@ -1,5 +1,11 @@
 # Cooperative handoff: exact product choices
 
+Subsequent implementation: the limited empty-queue cooperative release described
+below is implemented and verified in [the continuation report](2026-10-30-lock-cooperative-continuation.md).
+The separate legacy ABA finding is repaired by [versioned mailbox locking](2026-10-30-mailbox-lock-v2.md).
+Earlier analysis below remains the decision record; its claims of missing source
+or an unrepaired lock describe the preceding checkpoint.
+
 Read-only reassessment at `fba220400895eeeb1985fe5f55bb83c565038a53`.
 Configured Ed25519 principals establish actors. A kernel PID/UID or child handle
 establishes different process facts and must not replace that actor identity.
