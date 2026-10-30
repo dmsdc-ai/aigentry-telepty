@@ -822,7 +822,10 @@ function installWebSocketTransport(deps) {
     sessions, server, tailnetServer, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
   const strictBus = require('./strict-bus').createStrictBusTransport({ authentication: deps.principalAuthentication,
     sessions, server, homeDir: deps.homeDir, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
+  const applicationEvents = require('./application-events').createApplicationEventTransport({ authentication: deps.principalAuthentication,
+    sessions, server, tailnetServer, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
   function handleUpgrade(req, socket, head) {
+    if (applicationEvents.handle(req, socket, head)) return;
     if (strictBus.handle(req, socket, head)) return;
     if (sessionEvents.handle(req, socket, head)) return;
     if (observer.handle(req, socket, head) || strictOwners.handle(req, socket, head) || strictInputs.handle(req, socket, head)) return;
@@ -886,7 +889,7 @@ function installWebSocketTransport(deps) {
     if (listener) listener.on('upgrade', handleUpgrade);
   }
 
-  return { wss, busWss, handleUpgrade, closeObservers: () => { observer.close(); sessionEvents.close(); strictOwners.close(); strictInputs.close(); strictBus.close(); } };
+  return { wss, busWss, handleUpgrade, closeObservers: () => { observer.close(); sessionEvents.close(); applicationEvents.close(); strictOwners.close(); strictInputs.close(); strictBus.close(); } };
 }
 
 module.exports = {

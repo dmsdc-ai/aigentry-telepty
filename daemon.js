@@ -1954,6 +1954,7 @@ sessionActions.registerDeleteRoute(app);
 // Shared auto-router: handles turn_request events from any source (WS or HTTP)
 
 sessionActions.registerBusPublishRoute(app);
+require('./src/routes/application-events').registerApplicationEventRoute(app,{sessions});
 
 registerHandoffRoutes(app, { handoffs, crypto, busClients });
 

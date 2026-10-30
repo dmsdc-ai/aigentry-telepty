@@ -1,6 +1,7 @@
 'use strict';
 const { createStrictEffectTransport } = require('./strict-effect');
 const { storedOwningPrincipal } = require('../principal/http');
+const {validApplicationBody,projectPublicationReceipt}=require('../application-publication');
 const { injectEffect } = require('./strict-input');
 function validStateBody(body) {
   return !!body && typeof body === 'object' && !Array.isArray(body)
@@ -24,7 +25,10 @@ function createStrictBusTransport(deps) {
   return createStrictEffectTransport(deps,{prefix:'/api/bus/',authorize:(auth,req)=>auth.authorizeBus(req),
     codePrefix:'BUS',refusalMessage:'Strict bus effects refused.',namespace:'strict-bus/v1',direction:'strict-bus',
     receiptSchema:'telepty.bus-effect-receipt/v1',streamSchema:'telepty.bus-effect-stream/v1',mode:'signed-http-session-effects',
-    effects:{state_report:{action:'session.state',suffix:'state',validate:validStateBody,project:projectStateReceipt,
+    effects:{app_publish:{action:'session.publish',suffix:'events',validate:validApplicationBody,project:projectPublicationReceipt,
+      preflight:(session,principal)=>{const owner=storedOwningPrincipal(session.owningPrincipal);
+        return owner && owner.id===principal.id && owner.audience===principal.audience ? null : 'PRINCIPAL_SESSION_OWNER_REQUIRED';}},
+      state_report:{action:'session.state',suffix:'state',validate:validStateBody,project:projectStateReceipt,
       preflight:(session,principal)=>{const owner=storedOwningPrincipal(session.owningPrincipal);
         return owner && owner.id===principal.id && owner.audience===principal.audience ? null : 'PRINCIPAL_SESSION_OWNER_REQUIRED';}},
       routed_turn:{...injectEffect,validate:(body,epoch)=>injectEffect.validate(body,epoch) && body.from===undefined && body.reply_to===undefined}}});

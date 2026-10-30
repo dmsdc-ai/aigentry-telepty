@@ -36,7 +36,7 @@ function resolveAction(req) {
     return sessionId(id) ? { action: 'session.forwarded_inject', target: id, explicitInject: true,
       epochRequired: true, forwarded: true } : null;
   }
-  const match = /^\/api\/sessions\/([^/]+)(?:\/(diagnostics|handshake|screen|inject|state|submit|kill|takeover|mailbox(?:\/ack)?|lease))?$/.exec(pathname);
+  const match = /^\/api\/sessions\/([^/]+)(?:\/(diagnostics|handshake|screen|inject|state|events|submit|kill|takeover|mailbox(?:\/ack)?|lease))?$/.exec(pathname);
   if (!match) return null;
   let id;
   try { id = decodeURIComponent(match[1]); } catch { return null; }
@@ -46,6 +46,7 @@ function resolveAction(req) {
   if (method === 'GET' && suffix === 'mailbox') return { action: 'mailbox.read', target: id, readOnly: true };
   if (method === 'POST' && suffix === 'takeover') return { action: 'session.takeover', target: id, epochRequired: true };
   if (method === 'POST' && suffix === 'inject') return { action: 'session.inject', target: id, explicitInject: true };
+  if (method === 'POST' && suffix === 'events') return { action: 'session.publish', target: id, epochRequired: true };
   if (method === 'POST' && suffix === 'state') return { action: 'session.state', target: id, epochRequired: true };
   if (method === 'POST' && suffix === 'submit') return { action: 'session.input', target: id, epochRequired: true };
   if (method === 'POST' && suffix === 'mailbox/ack') return { action: 'mailbox.ack', target: id, epochRequired: true };
@@ -110,6 +111,10 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
     authorizeInput(req) {
       const match = /^\/api\/input\/sessions\/([^/?]+)$/.exec(req.url || '');
       return authorizeSocket(req, match, 'session.input_stream', false, true);
+    },
+    authorizeApplicationEvents(req) {
+      const match = /^\/api\/application-events\/sessions\/([^/?]+)$/.exec(req.url || '');
+      return authorizeSocket(req, match, 'session.app_events', false);
     },
     authorizeEvents(req) {
       const match = /^\/api\/events\/sessions\/([^/?]+)$/.exec(req.url || '');
