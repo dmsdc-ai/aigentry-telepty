@@ -12,6 +12,7 @@ const COLOR_LINES = ['thought for 1s)', 'n65', '90', '─'.repeat(120),
 const providerObservations = new WeakMap();
 const SENSITIVE = /trust|permission|approv|update available|update now|resume|authenticat|sign.?in|sandbox|execute|auto.accept|proceed/i;
 function bindingForSession(s) {
+  if(require('../principal/cooperative-handoff').activeHandoff(s))return null;
   if (!s || s.sessionEpochProved !== s.sessionEpoch || !s.ownerWs || s.ownerWs.readyState !== 1) return null;
   return { sid: s.id, session_epoch: s.sessionEpoch, credential_generation: s.credentialGeneration || 1,
     owner_generation: s.interactionOwnerGeneration, input_generation: s.interactionInputGeneration || 0,

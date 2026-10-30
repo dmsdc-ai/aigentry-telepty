@@ -115,6 +115,9 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     const external = parseExternalApprovalPolicy(req.body.external_approval_policy);
     if (external.error) return res.status(400).json({ code: 'INVALID_APPROVAL_POLICY', error: external.error });
     const mailboxRequest = req.body.delivery_type === 'mailbox';
+    if(Object.hasOwn(req.body,'cooperative_handoff') && typeof req.body.cooperative_handoff!=='boolean')return res.status(400).json({code:'HANDOFF_INVALID_REQUEST'});
+    const cooperative = req.body.cooperative_handoff === true;
+    if (cooperative && !verifiedOwningPrincipal(req)) return res.status(403).json({code:'HANDOFF_PRINCIPAL_REQUIRED'});
     if (mailboxRequest) {
       try { validateMailboxId(session_id); }
       catch { return res.status(400).json({ code: 'INVALID_SESSION_ID', error: 'Invalid mailbox session identifier.' }); }
@@ -170,6 +173,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
           return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Current session credential is required.' });
         }
       }
+      if (require('../principal/cooperative-handoff').activeHandoff(existing)) return res.status(409).json({code:'HANDOFF_FENCED'});
       if (existing.type === 'mailbox' || mailboxRequest) {
         if (!credentialed) return res.status(403).json({ code: 'SESSION_CREDENTIAL_REQUIRED', error: 'Current session credential is required.' });
         if (existing.type !== 'mailbox' || (req.body.delivery_type && !mailboxRequest)) {
@@ -248,7 +252,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     // #815 — THE issuance point, and the only one. This branch runs exactly when the daemon does
     // not currently hold `session_id`, so every credential belongs to a fresh instance: a recreated
     // textual sid gets a new epoch and its predecessor's bearer can never resolve to it.
-    if (mailboxRequest) {
+    if (mailboxRequest || cooperative) {
       try { getMailbox().initializeCustody(session_id); }
       catch { return res.status(503).json({ code: 'MAILBOX_CUSTODY_UNAVAILABLE', error: 'Mailbox custody initialization failed.' }); }
     }
@@ -265,6 +269,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       command: command || 'wrapped',
       ...(sshRemote ? { sshRemote } : {}),
       cwd,
+      ...(cooperative ? {cooperativeHandoffCapable:true} : {}),
       backend: mailboxRequest ? 'mailbox' : backend || 'kitty',
       cmuxWorkspaceId: cmux_workspace_id || null,
       cmuxSurfaceId: cmux_surface_id || null,
@@ -357,6 +362,7 @@ function registerSessionRenameRoute(app, { context, sessionStateManager, busClie
     if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
     const session = ownRecord(sessions, resolvedId);
     if (!session) return res.status(409).json({ error: 'Invalid existing session record' });
+    if (require('../principal/cooperative-handoff').activeHandoff(session)) return res.status(409).json({code:'HANDOFF_FENCED'});
     if (session.isClosing) return res.status(409).json({ code: 'SESSION_CLOSING', error: 'Session is closing' });
     const id = resolvedId;
     if (session.requireOwnerProof === true) {

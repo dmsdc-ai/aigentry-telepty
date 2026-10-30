@@ -36,7 +36,7 @@ function createSessionDeliveryContext({
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
 }) {
   async function writeDataToSession(id, session, data, { beforeWrite } = {}) {
-    if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
+    if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return denied;
     const sshFailure = sshInputFailure(session, data);
@@ -59,7 +59,7 @@ function createSessionDeliveryContext({
           }, DELIVERY_TIMEOUT_MS);
           const sock = net.connect(session.delivery.address, () => {
             if (settled) return;
-            if (session.isClosing || sessions[id] !== session) {
+            if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session) || sessions[id] !== session) {
               finish({ success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 });
               sock.destroy();
               return;
@@ -175,14 +175,14 @@ function createSessionDeliveryContext({
   // pointing at a different object (or nothing); the epoch is compared as well so a future
   // in-place re-key cannot slip past.
   function isSameSessionInstance(id, session, sessionEpoch) {
-    return !session.isClosing && sessions[id] === session && (session.sessionEpoch || null) === sessionEpoch;
+    return !session.isClosing && !require('../principal/cooperative-handoff').activeHandoff(session) && sessions[id] === session && (session.sessionEpoch || null) === sessionEpoch;
   }
 
   // #109 review 1 B1: the deferred CR follows the INSTANCE, not the id. A rename moves the same
   // live record to `session.id` (same PTY, owner, epoch) — that record got the text, so it gets the
   // CR. Destroy/recreate leave the record unregistered; owner replacement changes the epoch.
   function isLiveSessionInstance(session, sessionEpoch) {
-    return !session.isClosing && sessions[session.id] === session && (session.sessionEpoch || null) === sessionEpoch;
+    return !session.isClosing && !require('../principal/cooperative-handoff').activeHandoff(session) && sessions[session.id] === session && (session.sessionEpoch || null) === sessionEpoch;
   }
 
   function sessionGoneResult() {
@@ -300,7 +300,7 @@ function createSessionDeliveryContext({
   }
 
   async function deliverInjectionToSession(id, session, prompt, options = {}) {
-    if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
+    if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     if (options.externalApproval && !session.externalApprovalPolicy) return { success: false, httpStatus: 403, code: 'APPROVAL_POLICY_REQUIRED', error: 'Signed inject requires the enrolled target policy.', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return options.externalApproval

@@ -305,6 +305,7 @@ function createAllowSecurityContext(shared, {
       if (shared.allowSessionClosed) closed = true;
       return closed;
     }
+    function canWrite(child) { return !shared.handoffPending && canDeliver(child); }
     function canDeliver(child) {
       return !isClosed() && child === shared.child;
     }
@@ -377,7 +378,7 @@ function createAllowSecurityContext(shared, {
     }
 
     function enqueueBridgeMessage(text) {
-      if (isClosed()) return;
+      if (isClosed() || shared.handoffPending) return;
       const child = shared.child;
       const msgId = `${shared.sessionId}:${now()}:${++shared.bridgeMsgSeq}`;
       try {
@@ -385,19 +386,20 @@ function createAllowSecurityContext(shared, {
           msg_id: msgId, from: 'daemon', to: shared.bridgeTarget,
           payload: text, created_at: Math.floor(now() / 1000), attempt: 0,
         });
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         shared.bridgePendingCount++;
       } catch (err) {
         // Fallback: write directly if mailbox fails
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         console.error(`[BRIDGE] Mailbox enqueue failed, writing directly: ${err.message}`);
         invalidateBridgeInteraction('automated_input');
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         child.write(text);
       }
     }
 
     function isIdle() {
+      if(shared.handoffPending)return false;
       return shared.promptReady && (now() - shared.lastUserInputTime > shared.IDLE_THRESHOLD);
     }
 
@@ -423,7 +425,7 @@ function createAllowSecurityContext(shared, {
     }
 
     function flushBridgeMailbox() {
-      if (isClosed()) return;
+      if (isClosed() || shared.handoffPending) return;
       const child = shared.child;
       if (shared.queueFlushTimer) { clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
       if (shared.idleCheckTimer) { clearInterval(shared.idleCheckTimer); shared.idleCheckTimer = null; }
@@ -432,9 +434,9 @@ function createAllowSecurityContext(shared, {
       const batch = [];
       // Dequeue all pending messages
       while (true) {
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         const msg = shared.bridgeMailbox.dequeue(shared.bridgeTarget);
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         if (!msg) break;
         batch.push(msg);
       }
@@ -447,34 +449,34 @@ function createAllowSecurityContext(shared, {
         ttlSecs: (0, shared.bridgeInjectTtlSecs)(process.env), nowSecs,
       });
       for (const { msg, reason } of dropped) {
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         // Ack so the dropped inject clears in_flight instead of lingering; never write it.
         try { shared.bridgeMailbox.ack(shared.bridgeTarget, msg.msg_id); } catch {}
         console.warn(`\x1b[33m[BRIDGE] dropped ${reason} inject ${msg.msg_id} (age=${nowSecs - msg.created_at}s)\x1b[0m`);
       }
       for (const msg of deliver) {
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         const text = msg.payload;
         const msgId = msg.msg_id;
         const timer = setTimeout(() => {
           deliveryTimers.delete(timer);
-          if (!canDeliver(child)) return;
+          if (!canWrite(child)) return;
           invalidateBridgeInteraction('automated_input');
-          if (!canDeliver(child)) return;
+          if (!canWrite(child)) return;
           child.write(text);
-          if (!canDeliver(child)) return;
+          if (!canWrite(child)) return;
           try { shared.bridgeMailbox.ack(shared.bridgeTarget, msgId); } catch {}
         }, delay);
         deliveryTimers.add(timer);
         delay += text === '\r' ? 0 : 100;
       }
-      if (!canDeliver(child)) return;
+      if (!canWrite(child)) return;
       shared.bridgePendingCount = Math.max(0, shared.bridgePendingCount - batch.length);
       shared.promptReady = false;
     }
 
     function scheduleIdleFlush() {
-      if (isClosed() || shared.idleCheckTimer) return;
+      if (isClosed() || shared.handoffPending || shared.idleCheckTimer) return;
       // Poll every 500ms for idle state
       shared.idleCheckTimer = setInterval(() => {
         if (isClosed()) return;
@@ -568,7 +570,11 @@ function createAllowSecurityContext(shared, {
     } catch {}
     }
 
-return { updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox };
+function cooperativeQueueEmpty(){
+      if(deliveryTimers.size || shared.bridgePendingCount || shared.queueFlushTimer)return false;
+      try{return shared.bridgeMailbox.snapshotCustody(shared.bridgeTarget).length===0;}catch{return false;}
+    }
+return { cooperativeQueueEmpty, updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox };
 }
 
 module.exports = { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken, credentialOrigin };

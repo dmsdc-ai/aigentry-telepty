@@ -44,6 +44,9 @@ function serializePersistedSessions(sessions) {
       stateReport: s.stateReport || null,
       idleTtl: s.idleTtl || null,
       idleTtlMs: s.idleTtlMs == null ? null : s.idleTtlMs,
+      ...(s.cooperativeHandoffCapable===true ? {cooperativeHandoffCapable:true} : {}),
+      ...(Object.hasOwn(s,'cooperativeHandoff') ? {cooperativeHandoff:s.cooperativeHandoff} : {}),
+      ...(s.cooperativeHandoffAudit ? {cooperativeHandoffAudit:s.cooperativeHandoffAudit} : {}),
       ownerPid: s.ownerPid || null,
       ptyPid: s.ptyPid || null,
       // #815: the VERIFIER for the active credential epoch — never the bearer itself. This is
@@ -223,6 +226,7 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
     stateReport: meta.stateReport || null,
     idleTtl: meta.idleTtl || null,
     idleTtlMs: meta.idleTtlMs == null ? null : meta.idleTtlMs,
+    ...require('../principal/cooperative-handoff').restoreHandoffRecord(meta),
     ownerPid: meta.ownerPid || null,
     ptyPid: meta.ptyPid || null,
     // #815: carry the credential epoch + verifier back onto the live record so the restored

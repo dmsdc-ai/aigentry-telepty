@@ -1630,6 +1630,9 @@ app.get('/api/meta', (req, res) => {
 // --- Mailbox API endpoints ---
 
 registerMailboxRoutes(app, { sessions, resolveSessionAlias, getMailbox: () => mailbox, sessionCredentials, persistSessions });
+const cooperativeHandoff = require('./src/principal/cooperative-handoff').registerCooperativeHandoff(app,{context:sessionRecordContext,getMailbox:()=>mailbox,
+  hasUnsettled:(id,s)=>!!pendingReports[id] || !!s.pendingSubmit || !!s.bootstrapDraining || hasBootstrapBacklog(s) || hasHeldInteraction(s)
+    || Object.values(trackedInjections.interactions?.actions || {}).some(r=>r.sid===id && ['dispatched','outcome_unknown'].includes(r.stage))});
 require('./src/principal/takeover').registerMailboxTakeoverRoute(app, { context: sessionRecordContext, getMailbox: () => mailbox, broadcastSessionEvent });
 registerSharedReferenceRoutes(app);
 
@@ -2195,6 +2198,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
     const healthStatus = getSessionHealthStatus(session, { nowMs: now });
     const healthReason = getSessionHealthReason(session, healthStatus);
+    if(require('./src/principal/cooperative-handoff').activeHandoff(session))continue;
     const disconnectedSeconds = session.lastDisconnectedAt
       ? Math.floor((now - new Date(session.lastDisconnectedAt).getTime()) / 1000)
       : null;
@@ -2463,7 +2467,8 @@ const websocketTransport = installWebSocketTransport({
   // #826 — the viewer write path gets the same policy verdict and the same audit line as
   // POST /api/sessions/:id/inject. See authorizeViewerInject.
   authorizeViewerInject,
-  acceptInteractionReceipt
+  acceptInteractionReceipt,
+  acceptHandoffAck:cooperativeHandoff.acceptAck
 });
 
 let shuttingDown = false;

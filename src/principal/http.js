@@ -36,7 +36,7 @@ function resolveAction(req) {
     return sessionId(id) ? { action: 'session.forwarded_inject', target: id, explicitInject: true,
       epochRequired: true, forwarded: true } : null;
   }
-  const match = /^\/api\/sessions\/([^/]+)(?:\/(diagnostics|handshake|screen|inject|state|events|submit|kill|takeover|mailbox(?:\/ack)?|lease))?$/.exec(pathname);
+  const match = /^\/api\/sessions\/([^/]+)(?:\/(diagnostics|handshake|screen|inject|state|events|submit|kill|takeover|handoff|mailbox(?:\/ack)?|lease))?$/.exec(pathname);
   if (!match) return null;
   let id;
   try { id = decodeURIComponent(match[1]); } catch { return null; }
@@ -44,6 +44,7 @@ function resolveAction(req) {
   const suffix = match[2];
   if (method === 'GET' && [undefined, 'diagnostics', 'handshake', 'screen'].includes(suffix)) return { action: 'session.inspect', target: id, readOnly: true };
   if (method === 'GET' && suffix === 'mailbox') return { action: 'mailbox.read', target: id, readOnly: true };
+  if (['GET','POST'].includes(method) && suffix === 'handoff') return { action:'session.takeover',target:id,epochRequired:true };
   if (method === 'POST' && suffix === 'takeover') return { action: 'session.takeover', target: id, epochRequired: true };
   if (method === 'POST' && suffix === 'inject') return { action: 'session.inject', target: id, explicitInject: true };
   if (method === 'POST' && suffix === 'events') return { action: 'session.publish', target: id, epochRequired: true };
@@ -86,7 +87,7 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
     const count = (req.rawHeaders || []).filter((name, index) => index % 2 === 0 && String(name).toLowerCase() === 'x-telepty-principal').length;
     if (count > 1 || req.headers?.['transfer-encoding'] || (req.headers?.['content-length'] && req.headers['content-length'] !== '0')) return denied('PRINCIPAL_HEADER_INVALID', 400);
     const session = ownSession(typeof sessions === 'function' ? sessions() : sessions, id);
-    if (!session || session.isClosing || typeof session.sessionEpoch !== 'string' || (ownerOnly && session.type !== 'wrapped')) return denied('PRINCIPAL_SESSION_NOT_FOUND', 404);
+    if (!session || session.isClosing || (ownerOnly && require('./cooperative-handoff').activeHandoff(session)) || typeof session.sessionEpoch !== 'string' || (ownerOnly && session.type !== 'wrapped')) return denied('PRINCIPAL_SESSION_NOT_FOUND', 404);
     const result = verifier.verify(req.headers?.['x-telepty-principal'], { method: 'GET', target: req.url,
       bodySha256: bodyDigest({}), action, grantTarget: id, transport: 'websocket', sessionEpoch: session.sessionEpoch });
     if (!result.ok) return result;

@@ -372,6 +372,7 @@ function installWebSocketTransport(deps) {
         try { ws.close(1011, 'Session store write failed'); } catch {}
         return;
       }
+      if (strictOwner) activeSession.strictOwnerConnected = true;
       if (strictOwner && !strictOwner.bind(ws)) { ws.terminate(); return; }
       if (isOwnerConnect && previousOwnerWs && previousOwnerWs !== ws) {
         // telepty#56 (durable last-writer-wins Replace): close the displaced owner with the
@@ -392,6 +393,7 @@ function installWebSocketTransport(deps) {
       }
       invalidateInteraction(activeSession, 'owner_replaced');
       try { ws.send(JSON.stringify({ type: 'owner_token', token: activeSession.ownerToken,
+        ...(activeSession.cooperativeHandoffCapable===true ? {cooperative_handoff:true} : {}),
         interaction_binding: { sid: sessionId, session_epoch: activeSession.sessionEpoch,
           credential_generation: activeSession.credentialGeneration || 1,
           owner_generation: activeSession.interactionOwnerGeneration,
@@ -493,6 +495,7 @@ function installWebSocketTransport(deps) {
         }
 
         if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+          if (type === 'handoff_ack') { if(strictOwner) deps.acceptHandoffAck?.(sessionId,activeSession,ws,msg);return; }
           if (type === 'ssh_state') { applySshState(activeSession, msg); return; }
           if (type === 'ssh_write_receipt') { acceptSshWriteReceipt(activeSession, ws, msg); return; }
           if (type === 'session_died' || type === 'session_restarted') {

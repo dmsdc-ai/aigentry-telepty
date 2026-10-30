@@ -3,7 +3,7 @@ const crypto = require('node:crypto');
 const { WebSocketServer } = require('ws');
 const { storedOwningPrincipal } = require('../principal/http');
 const OWNER_FRAMES = new Set(['output', 'heartbeat', 'ready', 'session_died', 'session_restarted',
-  'interaction_provider', 'interaction_receipt', 'interaction_invalidated', 'ssh_state', 'ssh_write_receipt']);
+  'handoff_ack', 'interaction_provider', 'interaction_receipt', 'interaction_invalidated', 'ssh_state', 'ssh_write_receipt']);
 const localSocket = socket => socket?.encrypted === true || ['127.0.0.1','::1','::ffff:127.0.0.1'].includes(socket?.remoteAddress);
 function createStrictOwnerTransport({ authentication, credentials, sessions, wss, refuse, forbiddenOrigin, allowedPeer }) {
   const ownerWss = new WebSocketServer({ noServer:true, maxPayload:131072, perMessageDeflate:false });
@@ -46,6 +46,7 @@ function createStrictOwnerTransport({ authentication, credentials, sessions, wss
           const done=typeof options==='function'?options:callback;if(typeof done==='function'){done(error);return;}throw error;};
         if(!current() || ws.bufferedAmount>262144 || typeof data!=='string' || Buffer.byteLength(data)>131072)return reject();
         let frame;try{frame=JSON.parse(data);}catch{return reject();}
+        if(require('../principal/cooperative-handoff').activeHandoff(session) && ['inject','resize','interaction','ssh_inject'].includes(frame.type))return reject();
         if(!bound && frame.type!=='owner_token')return reject();
         const encoded=JSON.stringify({...frame,connection_id:connectionId,sequence:outboundSequence+1,expires_at:expires});
         if(Buffer.byteLength(encoded)>131072)return reject();

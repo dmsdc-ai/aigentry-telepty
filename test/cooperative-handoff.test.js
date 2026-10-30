@@ -1,0 +1,103 @@
+'use strict';
+const {test}=require('node:test'),assert=require('node:assert/strict'),crypto=require('node:crypto'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const {startTestDaemon,waitFor}=require('../test-support/daemon-harness');
+const {createSignedAssertion}=require('../src/principal/proof');
+async function fixture(t,ignore=false){
+ const home=fs.mkdtempSync(path.join(os.tmpdir(),'cooperative-fixture-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));const pair=crypto.generateKeyPairSync('ed25519');const trust=path.join(home,'trust.json'),key=path.join(home,'key.pem');
+ fs.writeFileSync(key,pair.privateKey.export({type:'pkcs8',format:'pem'}),{mode:0o600});fs.writeFileSync(trust,JSON.stringify({schema:'telepty.principals/v1',audience:'fixture',keys:[{key_id:'owner',principal_id:'owner',authority:'operator',public_key_spki:pair.publicKey.export({type:'spki',format:'pem'}),grants:['session.register','session.owner','session.inspect','session.takeover','session.inject','session.rename','session.destroy'].map(action=>({action,targets:['fixture','moved']}))}]}),{mode:0o600});
+ const env={TELEPTY_PRINCIPAL_MODE:'strict',TELEPTY_PRINCIPAL_TRUST_FILE:trust,TELEPTY_MACHINE_ID:'fixture',TELEPTY_SESSION_STALE_SECONDS:'1',TELEPTY_SESSION_CLEANUP_SECONDS:'1',TELEPTY_HEALTH_POLL_MS:'100'};let daemon=await startTestDaemon({homeDir:home,env});t.after(()=>daemon.stop());
+ const config=path.join(home,'client.json');fs.writeFileSync(config,JSON.stringify({schema:'telepty.principal-client/v1',daemon_url:`http://${daemon.host}:${daemon.port}`,principal_id:'owner',key_id:'owner',audience:'fixture',private_key_path:key}),{mode:0o600});
+ const credential=path.join(home,'child-proof');const program=`const fs=require('fs');${ignore?"process.on('SIGTERM',()=>{});":''}fs.writeFileSync(${JSON.stringify(credential)},process.env.TELEPTY_SESSION_TOKEN,{mode:0o600});setInterval(()=>{},1000);`;
+ const child=require('child_process').spawn(process.execPath,['--require','./test-support/setup-env.js','cli.js','allow','--id','fixture',process.execPath,'-e',program],{cwd:path.resolve(__dirname,'..'),env:{...process.env,HOME:home,TELEPTY_HOST:daemon.host,TELEPTY_PORT:String(daemon.port),TELEPTY_PRINCIPAL_CLIENT_FILE:config,TELEPTY_COOPERATIVE_HANDOFF:'1'},stdio:['ignore','pipe','pipe']});let logs='';child.stdout.on('data',b=>logs+=b);child.stderr.on('data',b=>logs+=b);t.after(()=>{child.kill('SIGKILL');});
+ await waitFor(()=>{if(child.exitCode!==null)throw new Error(logs);return fs.existsSync(credential);});const bearer=fs.readFileSync(credential,'utf8');let epoch=bearer.split('.')[0];
+ async function request(method,target,body,extra={}){const challenge=(await daemon.request('/api/auth/challenge',{noAuth:true})).body.challenge;const proof=createSignedAssertion({privateKey:pair.privateKey,keyId:'owner',principalId:'owner',audience:'fixture',challenge,method,target,body,action:extra.action || (target.endsWith('/inject')?'session.inject':'session.takeover'),sessionEpoch:extra.epoch||epoch});return daemon.request(target,{method,...(body?{body}:{}),headers:{'x-telepty-principal':proof,'x-telepty-session-token':extra.bearer||bearer}});}
+ const target='/api/sessions/fixture/handoff';const status=()=>request('GET',target);const intent=async()=>{const response=await status();assert.equal(response.status,200,JSON.stringify(response.body));const s=response.body;return {intent_id:crypto.randomUUID(),expected_epoch:epoch,credential_generation:s.credential_generation,owner_generation:s.owner_generation};};
+ return {home,config,child,bearer,epoch,request,status,intent,target,origin:`http://${daemon.host}:${daemon.port}`,logs:()=>logs,restart:async()=>{const port=daemon.port;await daemon.kill();daemon=await startTestDaemon({homeDir:home,port,env});}};
+}
+test('actual cooperative handoff waits for owned child exit, atomically rotates, and never retries a recorded intent',{skip:process.platform!=='linux',timeout:15000},async t=>{
+ const f=await fixture(t),body=await f.intent();const result=await f.request('POST',f.target,body);assert.equal(result.status,200,JSON.stringify(result.body));assert.equal(result.body.state,'committed');assert.notEqual(result.body.session_epoch,f.epoch);assert.equal(result.body.credential_generation,2);assert.ok(result.body.session_token);await waitFor(()=>f.child.exitCode!==null);
+ assert.ok(!f.logs().includes(result.body.session_token));const stale=await f.status();assert.equal(stale.status,401);
+ const again=await f.request('POST',f.target,body,{epoch:result.body.session_epoch,bearer:result.body.session_token});assert.equal(again.body.code,'HANDOFF_ALREADY_RECORDED');assert.ok(!again.body.session_token);
+ const proofFile=path.join(f.home,'handoff-receipt.json');fs.writeFileSync(proofFile,JSON.stringify({schema:'telepty.handoff-credential/v1',session_id:'fixture',origin:f.origin,session_epoch:result.body.session_epoch,session_token:result.body.session_token,session_nonce:result.body.session_nonce,credential_generation:2}),{mode:0o600});
+ const goodProof=JSON.parse(fs.readFileSync(proofFile,'utf8'));
+ for(const [name,change,mode,envChange] of [
+  ['wrong-sid',{session_id:'other'},0o600,{}],['wrong-origin',{origin:'http://127.0.0.1:1'},0o600,{}],
+  ['stale-epoch',{session_epoch:f.epoch,session_token:f.bearer},0o600,{}],['public-file',{},0o644,{}],
+  ['no-cooperative',{},0o600,{TELEPTY_COOPERATIVE_HANDOFF:''}],['no-principal',{},0o600,{TELEPTY_PRINCIPAL_CLIENT_FILE:''}]
+ ]){
+  const invalidFile=path.join(f.home,'negative-'+name+'.json'),negativeMarker=path.join(f.home,'child-'+name);fs.writeFileSync(invalidFile,JSON.stringify({...goodProof,...change}),{mode});
+  const attempt=require('child_process').spawn(process.execPath,['--require','./test-support/setup-env.js','cli.js','allow','--id','fixture',process.execPath,'-e',`require('fs').writeFileSync(${JSON.stringify(negativeMarker)},'unsafe')`],{cwd:path.resolve(__dirname,'..'),env:{...process.env,HOME:f.home,TELEPTY_HOST:new URL(f.origin).hostname,TELEPTY_PORT:new URL(f.origin).port,TELEPTY_PRINCIPAL_CLIENT_FILE:f.config,TELEPTY_COOPERATIVE_HANDOFF:'1',TELEPTY_HANDOFF_CREDENTIAL_FILE:invalidFile,...envChange},stdio:['ignore','pipe','pipe']});
+  let diagnostic='';attempt.stdout.on('data',b=>diagnostic+=b);attempt.stderr.on('data',b=>diagnostic+=b);
+  const code=await new Promise((resolve,reject)=>{const timeout=setTimeout(()=>{attempt.kill('SIGKILL');reject(new Error('Negative launch timed out: '+name));},5000);attempt.once('error',reject);attempt.once('exit',code=>{clearTimeout(timeout);resolve(code);});});assert.notEqual(code,0,name);assert.equal(fs.existsSync(negativeMarker),false,name);assert.ok(!diagnostic.includes(result.body.session_token),name);
+ }
+ // An older owner ACK lacking the explicit feature must fail before child startup.
+ const http=require('node:http'),WebSocket=require('ws');const proxy=http.createServer((req,res)=>{const upstream=http.request(f.origin+req.url,{method:req.method,headers:req.headers},response=>{res.writeHead(response.statusCode,response.headers);response.pipe(res);});upstream.on('error',()=>res.destroy());req.pipe(upstream);});
+ const proxyWss=new WebSocket.WebSocketServer({noServer:true});const proxySockets=new Set();proxy.on('upgrade',(req,socket,head)=>proxyWss.handleUpgrade(req,socket,head,down=>{proxySockets.add(down);const up=new WebSocket(f.origin.replace(/^http/,'ws')+req.url,{headers:req.headers});proxySockets.add(up);up.on('message',bytes=>{const message=JSON.parse(bytes);delete message.cooperative_handoff;if(down.readyState===1)down.send(JSON.stringify(message));});down.on('message',bytes=>{if(up.readyState===1)up.send(bytes);});up.on('error',()=>down.terminate());down.on('error',()=>up.terminate());down.on('close',()=>up.terminate());up.on('close',()=>down.terminate());}));
+ await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));t.after(()=>{for(const socket of proxySockets)socket.terminate();proxy.close();});
+ const proxyOrigin=`http://127.0.0.1:${proxy.address().port}`,oldConfig=path.join(f.home,'old-daemon-client.json'),oldProof=path.join(f.home,'old-daemon-proof.json'),oldMarker=path.join(f.home,'old-daemon-child');const originalConfig=JSON.parse(fs.readFileSync(f.config));fs.writeFileSync(oldConfig,JSON.stringify({...originalConfig,daemon_url:proxyOrigin}),{mode:0o600});fs.writeFileSync(oldProof,JSON.stringify({...goodProof,origin:proxyOrigin}),{mode:0o600});
+ const unsupported=require('child_process').spawn(process.execPath,['--require','./test-support/setup-env.js','cli.js','allow','--id','fixture',process.execPath,'-e',`require('fs').writeFileSync(${JSON.stringify(oldMarker)},'unsafe')`],{cwd:path.resolve(__dirname,'..'),env:{...process.env,HOME:f.home,TELEPTY_HOST:'127.0.0.1',TELEPTY_PORT:String(proxy.address().port),TELEPTY_PRINCIPAL_CLIENT_FILE:oldConfig,TELEPTY_COOPERATIVE_HANDOFF:'1',TELEPTY_HANDOFF_CREDENTIAL_FILE:oldProof},stdio:['ignore','pipe','pipe']});unsupported.stdout.resume();unsupported.stderr.resume();t.after(()=>unsupported.kill('SIGKILL'));await waitFor(()=>unsupported.exitCode!==null);assert.notEqual(unsupported.exitCode,0);assert.equal(fs.existsSync(oldMarker),false);
+ const marker=path.join(f.home,'successor-started');const successor=require('child_process').spawn(process.execPath,['--require','./test-support/setup-env.js','cli.js','allow','--id','fixture',process.execPath,'-e',`require('fs').writeFileSync(${JSON.stringify(marker)},'started');setInterval(()=>{},1000)`],{cwd:path.resolve(__dirname,'..'),env:{...process.env,HOME:f.home,TELEPTY_HOST:new URL(f.origin).hostname,TELEPTY_PORT:new URL(f.origin).port,TELEPTY_PRINCIPAL_CLIENT_FILE:f.config,TELEPTY_COOPERATIVE_HANDOFF:'1',TELEPTY_HANDOFF_CREDENTIAL_FILE:proofFile},stdio:['ignore','pipe','pipe']});let successorLogs='';successor.stdout.on('data',b=>successorLogs+=b);successor.stderr.on('data',b=>successorLogs+=b);t.after(()=>successor.kill('SIGKILL'));
+ await waitFor(()=>{if(successor.exitCode!==null)throw new Error(successorLogs);return fs.existsSync(marker);});assert.ok(!successorLogs.includes(result.body.session_token));successor.kill('SIGKILL');await waitFor(()=>successor.signalCode!==null);
+
+ await f.restart();const restored=await f.request('GET',f.target,undefined,{epoch:result.body.session_epoch,bearer:result.body.session_token});assert.equal(restored.body.state,'committed');
+});
+test('missing child-exit ACK never rotates and durable uncertainty refuses writes/restart recovery',{skip:process.platform!=='linux',timeout:15000},async t=>{
+ const f=await fixture(t,true),body=await f.intent();const pending=f.request('POST',f.target,body);await waitFor(async()=> (await f.status()).body.state==='awaiting_ack');
+ for(const operation of [
+  ['PATCH','/api/sessions/fixture',{new_id:'moved'},'session.rename'],
+  ['DELETE','/api/sessions/fixture',undefined,'session.destroy'],
+  ['POST','/api/sessions/fixture/kill',{},'session.destroy'],
+  ['POST','/api/sessions/register',{session_id:'fixture',owner_pid:999999},'session.register']]) {
+   const denied=await f.request(operation[0],operation[1],operation[2],{action:operation[3]});assert.equal(denied.status,409,JSON.stringify(denied.body));assert.equal(denied.body.code,'HANDOFF_FENCED');
+ }
+ const inject=await f.request('POST','/api/sessions/fixture/inject',{prompt:'must-not-write',expected_epoch:f.epoch,exact_target:true,no_enter:true});assert.equal(inject.status,409);
+ const result=await pending;assert.equal(result.body.state,'outcome_unknown');assert.equal(result.body.session_epoch,f.epoch);assert.ok(!result.body.session_token);
+ await f.restart();await new Promise(resolve=>setTimeout(resolve,1300));assert.equal((await f.status()).body.state,'outcome_unknown');assert.equal(f.child.exitCode,null);assert.equal((await f.request('POST',f.target,{...body,intent_id:crypto.randomUUID()})).body.code,'HANDOFF_FENCED');
+});
+const {createCredentialStore}=require('../src/session-store/session-credentials');
+const {createSessionRecordContext}=require('../src/routes/session-records');
+const {validateTrustConfiguration}=require('../src/principal/proof');
+const {createPrincipalAuthentication}=require('../src/principal/http');
+const {registerCooperativeHandoff,activeHandoff}=require('../src/principal/cooperative-handoff');
+const persistence=require('../src/session-store/persistence');
+function unit(t,options={}) {
+ const home=fs.mkdtempSync(path.join(os.tmpdir(),'handoff-unit-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));const file=path.join(home,'sessions.json'),credentials=createCredentialStore(),issued=credentials.issue('fixture'),pair=crypto.generateKeyPairSync('ed25519');
+ const session={id:'fixture',type:'wrapped',cooperativeHandoffCapable:true,sessionEpoch:issued.epoch,credentialVerifier:issued.verifier,credentialGeneration:1,owningPrincipal:{id:'owner',source:'ed25519',audience:'fixture'},interactionOwnerGeneration:crypto.randomUUID(),strictOwnerConnected:true};
+ const sessions={fixture:session},context=createSessionRecordContext({sessions,sessionCredentials:credentials,sidNonces:new Map(),sessionPersistPath:file});context.persistSessions();const save=context.persistSessions;let saves=0;context.persistSessions=()=>{saves++;if(options.fault?.(saves)==='before')return{ok:false,committed:false};const result=save();return options.fault?.(saves)==='after'?{ok:false,committed:true}:result;};
+ let handler,api,stopped=0,late;let messages=[];
+ const ws={readyState:1,send:text=>{const request=JSON.parse(text);late={...request,type:'handoff_ack',status:options.refused?'refused':'exited',exit_code:0,exit_signal:null};options.beforeAck?.({session,sessions,messages,request});if(!options.noAck)setImmediate(()=>api.acceptAck('fixture',session,ws,late));},close:()=>stopped++};session.ownerWs=ws;
+ const trust=validateTrustConfiguration({schema:'telepty.principals/v1',audience:'fixture',keys:[{key_id:'owner',principal_id:'owner',public_key_spki:pair.publicKey.export({type:'spki',format:'pem'}),grants:[{action:'session.takeover',targets:['fixture']}]}]});const auth=createPrincipalAuthentication({trust,sessions});
+ api=registerCooperativeHandoff({get:()=>{},post:(_p,h)=>handler=h},{context,getMailbox:()=>({snapshotCustody:()=>messages,withCustodySnapshot:(_id,callback)=>callback(messages)}),hasUnsettled:()=>!!options.unsettled,timeoutMs:40});
+ const body={intent_id:crypto.randomUUID(),expected_epoch:issued.epoch,credential_generation:1,owner_generation:session.interactionOwnerGeneration};
+ async function run(){const req={method:'POST',originalUrl:'/api/sessions/fixture/handoff',params:{id:'fixture'},body,principalRawBody:Buffer.from(JSON.stringify(body)),headers:{'x-telepty-session-token':issued.bearer}};req.headers['x-telepty-principal']=createSignedAssertion({privateKey:pair.privateKey,keyId:'owner',principalId:'owner',audience:'fixture',challenge:auth.verifier.challenge,method:'POST',target:req.originalUrl,body,action:'session.takeover',sessionEpoch:issued.epoch});assert.equal(auth.authorize(req).ok,true);const response={statusCode:200,status(c){this.statusCode=c;return this;},json(b){this.body=b;return this;}};await handler(req,response);return response;}
+ return{run,session,sessions,credentials,issued,file,ws,late:()=>late,ack:()=>api.acceptAck('fixture',session,ws,late),stopped:()=>stopped};
+}
+test('handoff refuses unsettled work before requesting a stop',async t=>{const f=unit(t,{unsettled:true});const r=await f.run();assert.equal(r.body.code,'HANDOFF_PENDING_OR_UNKNOWN');assert.equal(f.late(),undefined);assert.equal(f.session.sessionEpoch,f.issued.epoch);});
+test('new pending work after child ACK prevents rotation and remains fenced',async t=>{const f=unit(t,{beforeAck:({messages})=>messages.push({msg_id:'late'})});const r=await f.run();assert.equal(r.body.state,'outcome_unknown');assert.ok(activeHandoff(f.session));assert.ok(f.credentials.verify(f.issued.bearer));});
+test('late ACK and ACK after generation change cannot rotate a successor',async t=>{const f=unit(t,{noAck:true});await f.run();assert.equal(f.ack(),false);assert.equal(f.session.sessionEpoch,f.issued.epoch);const g=unit(t,{beforeAck:({session})=>session.interactionOwnerGeneration=crypto.randomUUID()});const result=await g.run();assert.equal(result.body.code,'HANDOFF_INSTANCE_CHANGED');assert.ok(g.credentials.verify(g.issued.bearer));});
+for(const fault of ['before','after'])test(`authority commit ${fault} rename discloses no new bearer`,async t=>{const f=unit(t,{fault:n=>n===2?fault:null});const r=await f.run();assert.equal(r.statusCode,503);assert.ok(!r.body.session_token);assert.equal(!!f.credentials.verify(f.issued.bearer),fault==='before');if(fault==='after')assert.notEqual(persistence.loadPersistedSessions(f.file).fixture.sessionEpoch,f.issued.epoch);});
+test('intent save failure sends no stop, and explicit incumbent refusal does not rotate',async t=>{const f=unit(t,{fault:n=>n===1?'before':null});assert.equal((await f.run()).statusCode,503);assert.equal(f.late(),undefined);const g=unit(t,{refused:true});const r=await g.run();assert.equal(r.body.state,'refused');assert.equal(activeHandoff(g.session),false);assert.ok(g.credentials.verify(g.issued.bearer));});
+
+test('present corrupt handoff fields and malformed committed reports restore a durable unknown fence',()=>{
+ const base={type:'wrapped',command:'node',sessionEpoch:'a'.repeat(22),credentialGeneration:1};
+ for(const bad of [false,0,'',null,{}, {state:'committed',id:crypto.randomUUID(),next_epoch:base.sessionEpoch,generation:0}]){
+  const serialized=persistence.serializePersistedSessions({fixture:{id:'fixture',...base,cooperativeHandoff:bad}}).fixture;
+  const restored=persistence.buildRestoredWrappedSession('fixture',serialized);assert.equal(activeHandoff(restored),true);assert.equal(restored.cooperativeHandoff.invalid,true);
+  const again=persistence.serializePersistedSessions({fixture:restored}).fixture;assert.equal(activeHandoff(persistence.buildRestoredWrappedSession('fixture',again)),true);
+ }
+ const corruptAudit=persistence.buildRestoredWrappedSession('fixture',{...base,cooperativeHandoffAudit:[{state:'committed'}]});assert.equal(activeHandoff(corruptAudit),true);
+ assert.equal(activeHandoff(persistence.buildRestoredWrappedSession('fixture',base)),false);
+});
+test('custody transaction holds the mailbox lock through its synchronous commit callback',t=>{
+ const {FileMailbox}=require('../src/mailbox');const root=fs.mkdtempSync(path.join(os.tmpdir(),'handoff-lock-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));const mailbox=new FileMailbox({root});mailbox.initializeCustody('fixture');
+ mailbox.withCustodySnapshot('fixture',snapshot=>{assert.equal(snapshot.length,0);assert.throws(()=>mailbox.enqueue({msg_id:'blocked',from:'sender',to:'fixture',payload:'synthetic',created_at:1}),/lock timeout/i);});
+ const created=Math.floor(Date.now()/1000);mailbox.enqueue({msg_id:'after',from:'original-sender',to:'fixture',payload:'synthetic',created_at:created});const rows=mailbox.snapshotCustody('fixture');assert.equal(rows[0].from,'original-sender');assert.equal(rows[0].created_at,created);
+});
+test('pending handoff fences retained bridge write timers while child-exit callbacks remain active',()=>{
+ const {createAllowSecurityContext}=require('../src/cli/security-actions');let writes=0,acks=0,exits=0,exitCallback;const timers=[];
+ const child={write:()=>writes++,onData:()=>{},onExit:callback=>exitCallback=callback};let delivered=false;
+ const shared={child,handoffPending:null,allowSessionClosed:false,bridgePendingCount:1,bridgeTarget:'fixture',bridgeInjectTtlSecs:()=>300,
+  filterBridgeBatch:batch=>({deliver:batch,dropped:[]}),bridgeMailbox:{dequeue:()=>{if(delivered)return null;delivered=true;return{msg_id:'one',payload:'must-not-write',created_at:1};},ack:()=>acks++,snapshotCustody:()=>[]}};
+ const context=createAllowSecurityContext(shared,{setTimeout:callback=>{timers.push(callback);return callback;}});context.subscribeChild(child,()=>{},()=>exits++);
+ context.flushBridgeMailbox();assert.equal(timers.length,1);assert.equal(context.cooperativeQueueEmpty(),false);shared.handoffPending={child};timers[0]();assert.equal(writes,0);assert.equal(acks,0);exitCallback({exitCode:0});assert.equal(exits,1);
+});

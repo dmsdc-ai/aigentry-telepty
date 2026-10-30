@@ -16,6 +16,7 @@ function parseExternalApprovalPolicy(value) {
 }
 
 function protectedInputFailure(session) {
+  if (require('./principal/cooperative-handoff').activeHandoff(session)) return {success:false,httpStatus:409,code:'HANDOFF_FENCED',bytes_written:0,error:'Cooperative handoff fences terminal writes.'};
   return session?.externalApprovalPolicy ? { success: false, httpStatus: 403,
     code: 'EXTERNAL_APPROVAL_REQUIRED', bytes_written: 0,
     error: 'This protected session requires an external signature through the supported inject ingress.' } : null;

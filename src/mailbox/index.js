@@ -321,10 +321,19 @@ class FileMailbox {
   }
 
   snapshotCustody(sessionId) {
+    return this.withCustodySnapshot(sessionId, snapshot => snapshot);
+  }
+
+  withCustodySnapshot(sessionId, callback) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) throw Object.assign(new Error('Mailbox custody is unavailable'), { code: 'MAILBOX_CUSTODY_UNAVAILABLE' });
     const release = acquireLock(sessionDir);
-    try { return require('./custody').strictCustodySnapshot(sessionDir, sessionId); }
+    try {
+      const snapshot = require('./custody').strictCustodySnapshot(sessionDir, sessionId);
+      const result = callback(snapshot);
+      if(result && typeof result.then === 'function') throw new Error('Custody callback must be synchronous');
+      return result;
+    }
     finally { release(); }
   }
 

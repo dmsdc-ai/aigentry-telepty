@@ -596,6 +596,7 @@ function createSessionActions(shared, effects = {}) {
   }
 
   function beginDurableSessionClose(id, session) {
+    if(require('../principal/cooperative-handoff').activeHandoff(session))return {success:false,httpStatus:409,code:'HANDOFF_FENCED',error:'Cooperative handoff reserves this instance.'};
     if (session.isClosing && !session.closeDurabilityPending) {
       return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing' };
     }

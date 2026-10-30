@@ -2593,6 +2593,7 @@ async function main() {
 
     let strictOwnerClient = null;
     let strictOwnerEpoch = null;
+    const cooperativeEnabled = process.env.TELEPTY_COOPERATIVE_HANDOFF === '1';
     if (process.env.TELEPTY_PRINCIPAL_CLIENT_FILE) {
       try {
         const principalClient = require('./src/principal/client');
@@ -2603,6 +2604,18 @@ async function main() {
         process.exitCode = 1; return;
       }
     }
+    if(process.env.TELEPTY_HANDOFF_CREDENTIAL_FILE){
+      try{
+        if(!strictOwnerClient || !cooperativeEnabled)throw new Error();
+        const proof=require('./src/principal/encoding').parseUnambiguousJSON(require('./src/principal/authority-file').readAuthorityFile(process.env.TELEPTY_HANDOFF_CREDENTIAL_FILE,{privateFile:true,maximum:8192}));
+        if(!proof || proof.schema!=='telepty.handoff-credential/v1' || Object.keys(proof).some(k=>!['schema','session_id','origin','session_epoch','session_token','session_nonce','credential_generation'].includes(k))
+          || proof.session_id!==sessionId || proof.origin!==strictOwnerClient.daemonUrl || !/^[A-Za-z0-9_-]{22}$/.test(proof.session_epoch||'')
+          || typeof proof.session_token!=='string' || !proof.session_token.startsWith(proof.session_epoch+'.') || proof.session_token.length>256
+          || !Number.isSafeInteger(proof.credential_generation) || proof.credential_generation<2 || !/^[A-Za-z0-9_-]{24}$/.test(proof.session_nonce||''))throw new Error();
+        strictOwnerEpoch=proof.session_epoch;process.env.TELEPTY_SESSION_TOKEN=proof.session_token;process.env.TELEPTY_SESSION_ORIGIN=proof.origin;process.env.TELEPTY_SESSION_NONCE=proof.session_nonce;
+      }catch{console.error('Invalid or unsafe cooperative handoff credential file.');process.exitCode=1;return;}
+    }
+    if(cooperativeEnabled && !strictOwnerClient){console.error('Cooperative handoff requires an explicit strict principal client.');process.exitCode=1;return;}
     const allowFetchWithAuth = async (url, options = {}) => {
       if (!strictOwnerClient) return fetchWithAuth(url, options);
       const target = new URL(url);
@@ -2659,6 +2672,7 @@ async function main() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: sessionId,
+          ...(cooperativeEnabled ? {cooperative_handoff:true} : {}),
           command,
           ...(sshPlan ? { ssh_remote: sshPlan.metadata } : {}),
           cwd: process.cwd(),
@@ -2698,7 +2712,9 @@ async function main() {
     const sessionCwd = process.cwd();
     const sessionEnv = { ...process.env, ...(credentialChannel ? { TELEPTY_SESSION_CREDENTIAL_PATH: credentialChannel.credentialPath, TELEPTY_SESSION_CREDENTIAL_INSTANCE: credentialChannel.instance } : {}), TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true', ...(process.env.TELEPTY_SESSION_TOKEN ? { TELEPTY_SESSION_TOKEN: process.env.TELEPTY_SESSION_TOKEN } : {}), ...(process.env.TELEPTY_SESSION_NONCE ? { TELEPTY_SESSION_NONCE: process.env.TELEPTY_SESSION_NONCE } : {}) };
     if (strictOwnerClient) delete sessionEnv.TELEPTY_PRINCIPAL_CLIENT_FILE;
+    delete sessionEnv.TELEPTY_HANDOFF_CREDENTIAL_FILE;
     let child = null;
+    let handoffPending = null;
     const sshInput = sshPlan ? sshSupport.createSshInputState(sshPlan.metadata.agent, state => {
       if (wsReady && daemonWs?.readyState === 1) daemonWs.send(JSON.stringify({ type: 'ssh_state', ...state }));
     }) : null;
@@ -2720,6 +2736,7 @@ async function main() {
       get terminalProgram() { return terminalProgram; },
       get terminalType() { return terminalType; },
       get child() { return child; },
+      get handoffPending() { return handoffPending; },
       get idleTtl() { return idleTtl; },
       get DAEMON_URL() { return DAEMON_URL; },
       get fetchWithAuth() { return allowFetchWithAuth; },
@@ -2827,6 +2844,7 @@ async function main() {
     // Mailbox-backed inject queue (replaces in-memory array for crash resilience)
     const bridgeMailbox = allowSecurity.createBridgeMailbox();
     const bridgeTarget = sessionId;
+    if(cooperativeEnabled) bridgeMailbox.initializeCustody(bridgeTarget);
     let bridgeMsgSeq = 0;
     let bridgePendingCount = 0;
 
@@ -2901,9 +2919,9 @@ async function main() {
 
     const writeInteraction = interaction.createInteractionWriter({
       observe: () => interactionProvider?.observe() || interaction.unavailableObservation(),
-      binding: () => interactionBinding,
+      binding: () => handoffPending ? null : interactionBinding,
       encode: readyRegistry.encodeInteraction,
-      write: bytes => { child.write(bytes); invalidateBridgeInteraction('interaction'); }
+      write: bytes => { if(handoffPending || !child)throw new Error('HANDOFF_FENCED');child.write(bytes); invalidateBridgeInteraction('interaction'); }
     });
     let lastInjectTextTime = 0;
     const MAX_RECONNECT_DELAY = 30000;
@@ -3052,6 +3070,10 @@ async function main() {
           const msg = JSON.parse(message);
           if (strictOwnerWire && !alreadyVerified && !strictOwnerWire.accept(msg)) return;
           if (msg.type === 'owner_token') {
+            if(cooperativeEnabled && msg.cooperative_handoff!==true){
+              console.error('Daemon owner channel does not support cooperative handoff. No child started.');
+              closeAllowSession({destroySession:false});exitAllowSession(1);return;
+            }
             if (strictOwnerClient) { wsReady = true; flushPreConnectOutput();
               if (readyNotified && promptReady) daemonWs.send(JSON.stringify({type:'ready',...(readyQualification || {})}));
             }
@@ -3078,6 +3100,20 @@ async function main() {
             }
             return;
           }
+          if (strictOwnerClient && msg.type === 'handoff_stop') {
+            const bound = cooperativeEnabled && child && interactionBinding && !handoffPending
+              && msg.session_epoch === interactionBinding.session_epoch
+              && msg.credential_generation === interactionBinding.credential_generation
+              && msg.owner_generation === interactionBinding.owner_generation
+              && typeof msg.intent_id === 'string' && Number.isSafeInteger(msg.deadline) && msg.deadline > Date.now();
+            const ack = status => daemonWs.send(JSON.stringify({type:'handoff_ack',intent_id:msg.intent_id,
+              session_epoch:msg.session_epoch,credential_generation:msg.credential_generation,owner_generation:msg.owner_generation,status}));
+            if(!bound || !allowSecurity.cooperativeQueueEmpty() || pendingOwnerFrames.length) {ack('refused');return;}
+            handoffPending = {child,request:msg};
+            try { child.kill('SIGTERM'); } catch { handoffPending=null;ack('refused'); }
+            return;
+          }
+          if(handoffPending)return;
           if (sshInput && msg.type === 'ssh_inject') {
             if (typeof msg.request_id !== 'string' || msg.request_id.length > 64 || typeof msg.data !== 'string') return;
             const result = msg.generation === sshInput.snapshot().generation
@@ -3161,6 +3197,11 @@ async function main() {
 
       daemonWs.on('close', (code, reason) => {
         if (allowSessionClosed || daemonWs !== ownerSocket) return;
+        if(handoffPending){
+          wsReady=false;
+          if(child && handoffPending.child===child)return; // No exit ACK: retain the held child, never force recovery.
+          closeAllowSession({destroySession:false});exitAllowSession(0);return;
+        }
         interactionBinding = null;
         if (strictOwnerClient) pendingOwnerFrames.length = 0;
         wsReady = false;
@@ -3282,12 +3323,14 @@ async function main() {
 
     cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
       onData: (data) => {
+        if(handoffPending)return;
         lastUserInputTime = Date.now();
         invalidateBridgeInteraction('local_input');
         if (sshInput && !sshInput.localInput(child)) { console.error('[SSH] Input refused while reconnecting; nothing was buffered.'); return; }
         child.write(data.toString());
       },
       onResize: () => {
+        if(handoffPending)return;
         const size = getTerminalSize(process.stdout, { cols: 120, rows: 40 });
         invalidateBridgeInteraction('resize');
         if (child) child.resize(size.cols, size.rows);
@@ -3350,6 +3393,7 @@ async function main() {
         return true;
       },
       onReady: () => {
+        if(handoffPending)return;
         promptReady = true;
         firstReadyObserved = true;
         if (!sshPlan) flushBridgeMailbox();
@@ -3408,6 +3452,14 @@ async function main() {
     // Handle child exit with death tracking + auto-restart
     function attachChildExitHandler() {
       allowSecurity.subscribeChild(child, relayPtyOutput, ({ exitCode, signal }) => {
+        if(handoffPending && handoffPending.child===child){
+          const request=handoffPending.request;child=null;promptReady=false;readyNotified=false;
+          try{daemonWs.send(JSON.stringify({type:'handoff_ack',intent_id:request.intent_id,session_epoch:request.session_epoch,
+            credential_generation:request.credential_generation,owner_generation:request.owner_generation,status:'exited',
+            exit_code:Number.isInteger(exitCode)?exitCode:null,exit_signal:signal===undefined?null:String(signal)}));}catch{}
+          if(daemonWs.readyState!==1){closeAllowSession({destroySession:false});exitAllowSession(0);}
+          return;
+        }
         const duration = Date.now() - sessionStartTime;
         const isAbnormal = exitCode !== 0 || signal;
         const durationStr = duration > 60000 ? `${Math.round(duration / 60000)}m ${Math.round((duration % 60000) / 1000)}s` : `${Math.round(duration / 1000)}s`;
