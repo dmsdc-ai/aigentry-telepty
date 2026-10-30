@@ -1,6 +1,51 @@
 'use strict';
 const { test } = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { FileMailbox } = require('../src/mailbox');
+for (const compactionThreshold of [1, 100]) test(`TTL cannot erase an unresolved fenced write (compaction ${compactionThreshold})`, t => {
+    let clock = Date.now();
+    t.mock.method(Date, 'now', () => clock);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pending-ttl-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const options = { root, ttlSecs: 10, inflightTimeoutSecs: 60, compactionThreshold };
+    let mailbox = new FileMailbox(options);
+    mailbox.initializeCustody('fixture');
+    const message = { msg_id: 'uncertain', from: 'sender', to: 'fixture', payload: 'retain exact bytes 中', created_at: Math.floor(clock / 1000), attempt: 0 };
+    mailbox.enqueue(message);
+    mailbox.dequeue('fixture');
+    assert.equal(mailbox.beginNonRetryableAttempt('fixture', message.msg_id), true);
+    clock += 11000;
+    mailbox = new FileMailbox(options);
+    assert.equal(mailbox.recoverInflight('fixture'), 0);
+    assert.equal(mailbox.expireStale('fixture'), 0);
+    assert.equal(mailbox.messageState('fixture', message.msg_id), 'in_flight');
+    assert.throws(() => mailbox.withCustodySnapshot('fixture', () => true));
+    clock += 60000;
+    assert.equal(mailbox.recoverInflight('fixture'), 1);
+    assert.equal(mailbox.expireStale('fixture'), 0);
+    require('../src/mailbox/storage').compact(path.join(root, 'fixture'), 1);
+    mailbox = new FileMailbox(options);
+    const quarantined = mailbox.peekDeadLetter('fixture');
+    assert.equal(quarantined.length, 1);
+    assert.equal(quarantined[0].payload, message.payload);
+    assert.equal(quarantined[0].delivery_uncertain, true);
+    assert.equal(quarantined[0].retryable, false);
+    assert.equal(mailbox.messageState('fixture', message.msg_id), 'dead_letter');
+    assert.equal(mailbox.dequeue('fixture'), null);
+    assert.throws(() => mailbox.withCustodySnapshot('fixture', () => true));
+    assert.ok(fs.readFileSync(path.join(root, 'fixture', 'inbox.jsonl'), 'utf8').includes(message.payload));
+});
+test('TTL still expires untouched pending and unfenced in-flight messages', t => {
+    let clock = Date.now();
+    t.mock.method(Date, 'now', () => clock);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pending-ttl-control-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const mailbox = new FileMailbox({ root, ttlSecs: 10, compactionThreshold: 1 });
+    for (const msg_id of ['unfenced', 'untouched']) mailbox.enqueue({ msg_id, to: 'fixture', payload: msg_id, created_at: Math.floor(clock / 1000), attempt: 0 });
+    assert.equal(mailbox.dequeue('fixture').msg_id, 'unfenced');
+    clock += 11000;
+    assert.equal(mailbox.expireStale('fixture'), 2);
+    assert.equal(mailbox.dequeue('fixture'), null);
+});
 function fixture(t) { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pending-handoff-')); t.after(() => fs.rmSync(root, { recursive: true, force: true })); const mailbox = new FileMailbox({ root, compactionThreshold: 1 }); mailbox.initializeCustody('fixture'); const directory = path.join(root, 'fixture'); const msg = { msg_id: 'pending-one', from: 'original-claimed-sender', to: 'fixture', payload: 'literal\r\n中😀', created_at: Math.floor(Date.now() / 1000), attempt: 0, cooperative_handoff: { schema: 'synthetic-test-consent' } }; return { root, directory, mailbox, msg }; }
 test('producer-recorded pristine pending custody includes exact content without rewriting queue bytes', t => { const f = fixture(t); f.mailbox.enqueue(f.msg); const before = ['inbox.jsonl', 'state.jsonl'].map(p => fs.readFileSync(path.join(f.directory, p), 'utf8')); const rows = f.mailbox.withNeverAttemptedCustody('fixture', rows => rows); assert.deepEqual(rows, [f.msg]); assert.deepEqual(['inbox.jsonl', 'state.jsonl'].map(p => fs.readFileSync(path.join(f.directory, p), 'utf8')), before); });
 test('old unmarked or attempted pending rows cannot acquire never-attempted eligibility', t => { for (const mode of ['unmarked', 'retry', 'inflight', 'fenced', 'compact']) {

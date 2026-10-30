@@ -1,5 +1,9 @@
 # Residual decisions and external acceptance priorities
 
+Follow-up: [fenced-write TTL custody repair and verification](2026-10-30-fenced-ttl-custody.md).
+The decisions below remain unchanged; the following pass found and repaired an
+independent uncertainty-preservation bug. Latest integrated counts are in that report.
+
 Baseline: local commit 40f3eb99f04ded393d55e6ee8fb48e6bbeaaf10c. Read-only
 GitHub reconciliation still contains 55 open issues: 23 local implementations,
 29 partial and three remaining. The 32 residual rows are enumerated in the
@@ -51,7 +55,7 @@ The exact three full-suite skips are:
 
 | Test | Skip condition | Separate execution / remaining verification |
 |---|---|---|
-| `#732 levers (b)(c): an upstream TCP stall is reaped by the daemon heartbeat (not silent)` | `TELEPTY_732_SLOW !== '1'` on this Linux run; POSIX fixture also excludes Windows. It must outlast the owner WS heartbeat intervals. | Earlier opt-in checkpoint passed one selected test in 90.9s, `/tmp/telepty-tcp-stall-slow.log`; one unrelated test was excluded by name. Not rerun separately at the latest HEAD. This proves fixture heartbeat reaping, not the historical Mac incident's cause. |
+| `#732 levers (b)(c): an upstream TCP stall is reaped by the daemon heartbeat (not silent)` | `TELEPTY_732_SLOW !== '1'` on the full Linux run; POSIX fixture also excludes Windows. It must outlast the owner WS heartbeat intervals. | Explicit follow-up on dab2952 passed one selected test in 91.3s, `/tmp/telepty-tcp-stall-latest.log`; one unrelated test was excluded by name. This proves fixture heartbeat reaping, not the historical Mac incident's cause. |
 | `native Windows npm-style shim preserves literal argv` | `process.platform !== 'win32'` | Native Windows result unavailable; Linux argv fixtures do not replace it. Source: `test/win-spawn-target-115.test.js:62`. |
 | `native Windows update refuses before the explicit mock override` | `process.platform !== 'win32'` | Native Windows result unavailable. It asserts exit 1, `guard_blocks_update: true` and no mock npm sentinel; it does not test a successful upgrade/rollback. Source: `test/windows-update-plan-131.test.js:97`. |
 

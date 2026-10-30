@@ -1,6 +1,10 @@
 # Open Telepty issues: local delivery outcome — 2026-10-29
 
-Latest continuation: [residual audit, natural exit and durable ACK custody](2026-10-30-residual-custody-durability.md),
+Latest continuation: [fenced-write TTL custody](2026-10-30-fenced-ttl-custody.md),
+2,518 total / 2,515 pass / zero fail / three skip. The explicit long TCP test
+also passed separately at baseline dab2952; Windows acceptance remains open.
+
+Earlier continuation: [residual audit, natural exit and durable ACK custody](2026-10-30-residual-custody-durability.md),
 2,515 total / 2,512 pass / zero fail / three skip.
 
 Earlier continuation: [consented pending custody and migration preflight](2026-10-30-pending-migration-continuation.md),

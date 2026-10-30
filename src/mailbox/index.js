@@ -573,6 +573,9 @@ class FileMailbox {
       for (const msg of messages) {
         const st = states.get(msg.msg_id);
         if (!st) continue;
+        // TTL cannot settle a write whose physical outcome is unknown. Keep
+        // its attempt fence until recoverInflight quarantines it or ACK settles it.
+        if (st.non_retryable_attempt === true) continue;
         if ((st.state === 'pending' || st.state === 'in_flight') &&
             (msg.created_at + this.config.ttlSecs < now)) {
           appendState(sessionDir, msg.msg_id, 'expired', now);
