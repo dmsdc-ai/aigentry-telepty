@@ -51,7 +51,7 @@ test('signed hub/node topology reaches strict local mailbox without a daemon tok
   assert.equal(registration.status, 201, JSON.stringify(registration.body));
   const epoch = registration.body.session_epoch;
   const limits = { max_payload_bytes: 256, max_requests: 20, window_ms: 60000, timeout_ms: 2000, max_pending: 8 };
-  const hub = createBrokerHub({ privateKey: hubKey.privateKey, config: { schema: 'telepty.broker-hub/v1', audience: 'hub', principal_id: 'hub', key_id: 'hub', stream_ms: 60000,
+  const hub = createBrokerHub({ privateKey: hubKey.privateKey, homeDir: root, config: { schema: 'telepty.broker-hub/v1', audience: 'hub', principal_id: 'hub', key_id: 'hub', stream_ms: 60000,
     nodes: { source: { audience: 'source-audience' }, recipient: { audience: 'recipient-audience' } }, limits: { source: limits, recipient: limits },
     trust: trust('hub', [entry('source', source, [grant('broker.inject', ['recipient/worker']), grant('broker.receipt', ['source'])]),
       entry('recipient', nodeKey, [grant('broker.stream', ['recipient']), grant('broker.result', ['recipient'])])]) } });
@@ -59,11 +59,12 @@ test('signed hub/node topology reaches strict local mailbox without a daemon tok
   const hubOrigin = `http://127.0.0.1:${address.port}`;
   const config = { schema: 'telepty.broker-node/v1', principal_id: 'recipient', key_id: 'recipient', hub_url: hubOrigin,
     hub_audience: 'hub', hub_principal_id: 'hub', audience: 'recipient-audience', local_daemon_url: local, local_timeout_ms: 1000,
+    reconnect: { max_attempts: 2, initial_backoff_ms: 10, max_backoff_ms: 20 },
     hub_trust: trust('recipient-audience', [entry('hub', hubKey, [grant('broker.envelope', ['source/worker'])])]) };
   const client = createBrokerClient({ config: { principal_id: 'source', key_id: 'source', hub_url: hubOrigin, hub_audience: 'hub' }, privateKey: source.privateKey });
   let index = 0;
   for (const attack of ['valid', 'ordinary-grant', 'stale-epoch', 'forged-signature', 'refused-challenge']) {
-    const requests = [];
+    const requests = [], streamChallenges = [];
     const localPrincipal = { principal_id: attack === 'ordinary-grant' ? 'ordinary' : 'relay', key_id: attack === 'ordinary-grant' ? 'ordinary' : 'relay', audience: localAudience,
       privateKey: attack === 'ordinary-grant' || attack === 'forged-signature' ? wrong.privateKey : relay.privateKey };
     const node = createBrokerNode({ config, privateKey: nodeKey.privateKey, localPrincipal,
@@ -74,7 +75,9 @@ test('signed hub/node topology reaches strict local mailbox without a daemon tok
           if (attack === 'refused-challenge' && url.endsWith('/api/auth/challenge')) return new Response('{}', { status: 403 });
           if (options.headers?.['x-telepty-principal']) assert.equal(url, local + '/api/forwarded/sessions/worker/inject');
         }
-        return fetch(url, options);
+        const response = await fetch(url, options);
+        if (url === `${hubOrigin}/v1/nodes/recipient/stream` && response.ok) streamChallenges.push(JSON.parse(options.body).challenge);
+        return response;
       } });
     await node.start();
     const body = { prompt: `Synthetic ${attack}`, expected_epoch: attack === 'stale-epoch' ? 'stale-epoch' : epoch,
@@ -87,6 +90,16 @@ test('signed hub/node topology reaches strict local mailbox without a daemon tok
     assert.equal(receipt.state, attack === 'valid' ? 'accepted' : 'failed', JSON.stringify(receipt));
     assert.equal(requests.filter(request => request.options.headers?.['x-telepty-token']).length, 0);
     if (attack === 'refused-challenge') assert.equal(requests.length, 1, 'challenge refusal performs no local POST or fallback');
+    if (attack === 'valid') {
+      hub.server.closeAllConnections(); // Only this owned fixture's stream/keepalive sockets.
+      await waitFor(() => streamChallenges.length === 2, { description: 'strict recipient reconnect' });
+      assert.notEqual(streamChallenges[0], streamChallenges[1]);
+      const next = { ...body, prompt: 'Synthetic after reconnect', idempotency_key: 'strict-local-after-reconnect-0007' };
+      assert.equal((await client.inject('recipient', 'worker', next)).status, 202);
+      await waitFor(async () => (await client.receipt(next.idempotency_key)).body.state === 'accepted');
+      assert.equal((await client.receipt(body.idempotency_key)).body.state, 'accepted');
+      assert.ok(hub.auditStats().submitted > 0);
+    }
     await node.stop();
   }
   const protectedRegistration = await localSigned('POST', '/api/sessions/register', { session_id: 'protected', delivery_type: 'mailbox',
@@ -134,7 +147,7 @@ test('signed hub/node topology reaches strict local mailbox without a daemon tok
   } finally { child.kill(); await waitFor(() => exited, { description: 'owned strict broker recipient shutdown' }); }
   const messages = await localSigned('GET', '/api/sessions/worker/mailbox', {}, 'mailbox.read');
   assert.equal(messages.status, 200);
-  assert.deepEqual(messages.body.pending.map(message => message.payload), ['Synthetic valid', 'Synthetic configured key']);
+  assert.deepEqual(messages.body.pending.map(message => message.payload), ['Synthetic valid', 'Synthetic after reconnect', 'Synthetic configured key']);
   const duplicate = await client.inject('recipient', 'worker', { prompt: 'Synthetic valid', expected_epoch: epoch, idempotency_key: 'strict-local-key-0001', no_enter: true });
   assert.equal(duplicate.body.state, 'accepted');
   assert.equal(duplicate.body.foreign_session_identity_verified, false);

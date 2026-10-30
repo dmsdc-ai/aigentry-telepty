@@ -26,34 +26,34 @@ Local source only; no installation, live daemon/service, credentials, security/n
 
 Files: src/broker/node.js and narrow main wiring; new reconnect tests.
 
-- [ ] Prove current recipient completes on stream loss and lacks recovery with an owned hub fixture.
-- [ ] Add explicit bounded attempts/backoff, finite handshake and cancellation; transient transport only.
-- [ ] Test fresh signed stream, future operation, no old-operation replay, exhaustion and terminal auth refusal.
-- [ ] Commit and request independent review.
+- [x] Prove current recipient completes on stream loss and lacks recovery with an owned hub fixture.
+- [x] Add explicit bounded attempts/backoff, finite handshake and cancellation; transient transport only.
+- [x] Test fresh signed stream, future operation, no old-operation replay, exhaustion and terminal auth refusal.
+- [x] Commit and request independent review.
 
 ### Task2: Broker audit seams (#43/#47)
 
 Files: broker hub and a small adapter; existing audit schema builder if needed.
 
-- [ ] Test signed admission/refusal and terminal unknown records with hash-only payloads.
-- [ ] Reuse bounded async writer; keep node verification separate from null foreign session verification.
-- [ ] Test shutdown flush, overflow/error visibility, replay and no raw content under preview settings.
-- [ ] Commit and request independent review.
+- [x] Test signed admission/refusal and terminal unknown records with hash-only payloads.
+- [x] Reuse bounded async writer; keep node verification separate from null foreign session verification.
+- [x] Test shutdown flush, overflow/error visibility, replay and no raw content under preview settings.
+- [x] Commit and request independent review.
 
 ### Task3: Strict-local recipient signer (#42/#132)
 
 Files: principal exact-action resolver/proof actions, broker local request helper and main config loader.
 
-- [ ] Test strict daemon refusal of the existing recipient bearer path.
-- [ ] Add an explicit exact forwarded-inject grant with mandatory signed/current epoch and checked private signer path.
-- [ ] Test a signed broker delivery to a real strict mailbox, denied grant/stale epoch/forged challenge and zero token fallback.
-- [ ] Commit and request independent review.
+- [x] Test strict daemon refusal of the existing recipient bearer path.
+- [x] Add an explicit exact forwarded-inject grant with mandatory signed/current epoch and checked private signer path.
+- [x] Test a signed broker delivery to a real strict mailbox, denied grant/stale epoch/forged challenge and zero token fallback.
+- [x] Commit and request independent review.
 
 ### Task4: Preserve destination uncertainty (#111/#106)
 
 Files: src/peer-forwarding.js and destination receipt regression.
 
-- [ ] Reproduce a post-effect503 whose first response is unknown but whose persisted destination receipt says failed and loses null bytes/uncertainty on replay.
-- [ ] Persist unknown state and a bounded safe uncertainty projection without re-dispatch.
-- [ ] Verify repeated requests and a reconstructed receipt ledger preserve unknown and one physical request.
-- [ ] Compose all tasks; run focused and full setup-env suites, pinned typecheck and independent final review; record remaining platform/protocol scope.
+- [x] Reproduce a post-effect503 whose first response is unknown but whose persisted destination receipt says failed and loses null bytes/uncertainty on replay.
+- [x] Persist unknown state and a bounded safe uncertainty projection without re-dispatch.
+- [x] Verify repeated requests and a reconstructed receipt ledger preserve unknown and one physical request.
+- [x] Compose all tasks; run focused and full setup-env suites, pinned typecheck and independent final review; record remaining platform/protocol scope.

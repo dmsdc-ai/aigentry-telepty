@@ -2,7 +2,7 @@
 
 This opt-in Linux-tested slice supports an independently started hub, an outbound recipient SSE bridge, exact inject and receipt queries. It is a new versioned protocol; dormant `connectBroker`/HS256-JWT discovery helpers are not compatible and are not enabled. Broadcast, `--ref`, session discovery, broker-routed `reply`, automatic enrollment and installation as a service are unsupported. Normal daemon and peer discovery behavior does not change.
 
-No node must reach another node. A source signs an HTTP POST to the hub. The destination maintains an outbound SSE request to that hub; it verifies the pinned hub's signature on each delivery and submits the exact operation to its own literal loopback daemon. Only this last loopback request contains the recipient's own daemon token. The source, hub and stream never receive that token or a session bearer.
+No node must reach another node. A source signs an HTTP POST to the hub. The destination maintains an outbound SSE request to that hub; it verifies the pinned hub's signature on each delivery and submits the exact operation to its own literal loopback daemon. The final loopback request uses either the recipient's own existing daemon token or an explicitly configured local principal signature. The source, hub and stream never receive a local daemon/session token or local private signing key.
 
 ## Explicit enrollment and grants
 
@@ -15,9 +15,9 @@ The hub config schema is `telepty.broker-hub/v1`, with:
 - `trust` containing enrolled node public keys and exact grants. Node A needs `broker.inject` targets such as `node-b/worker` and `broker.receipt` target `node-a`. Node B needs `broker.stream` and `broker.result` targets `node-b`.
 - `nodes`, a map from enrolled node ID to `{audience: "that-recipient-audience"}`.
 - `limits`, a per-node map. Each entry requires `max_payload_bytes` (1–65536), `max_requests` (1–100), `window_ms` (1000–86400000), `timeout_ms` (100–10000) and `max_pending` (1–16).
-- `stream_ms` (1000–3600000), the maximum held-channel lifetime. The bridge exits on expiry/disconnect; an operator may establish a fresh stream. Operations are never resent automatically.
+- `stream_ms` (1000–3600000), the maximum held-channel lifetime. The default bridge exits on expiry/disconnect. Explicit bounded reconnect is described below; operations are never resent automatically.
 
-A recipient config schema is `telepty.broker-node/v1`: `principal_id`, `key_id`, `private_key_path`, `hub_url`, `hub_audience`, `hub_principal_id`, `audience`, `local_daemon_url`, `local_timeout_ms` (100–10000) and `hub_trust`. The last trust file contains only pinned hub keys with exact `broker.envelope` grants such as `node-a/worker`. `local_daemon_url` must use literal `127.0.0.1` or `[::1]`; redirects are denied. The bridge reads its own existing daemon token without creating or rotating credentials, with no environment-token override. Strict-principal local daemons that refuse that operator token fail closed; automatic enrollment of a local signer is not implemented.
+A recipient config schema is `telepty.broker-node/v1`: `principal_id`, `key_id`, `private_key_path`, `hub_url`, `hub_audience`, `hub_principal_id`, `audience`, `local_daemon_url`, `local_timeout_ms` (100–10000) and `hub_trust`. The last trust file contains only pinned hub keys with exact `broker.envelope` grants such as `node-a/worker`. `local_daemon_url` must use literal `127.0.0.1` or `[::1]`; redirects are denied. The bridge reads its own existing daemon token without creating or rotating credentials, with no environment-token override. An optional checked local signer supports strict-principal daemons as described below; automatic enrollment remains unsupported.
 
 A source config schema is `telepty.broker-source/v1`: `principal_id`, `key_id`, `private_key_path`, `hub_url` and `hub_audience`. `hub_url` must be HTTPS, or HTTP on literal loopback for local operation/tests. Credentials in URLs, non-root paths, fragments and query strings are rejected.
 
@@ -91,3 +91,28 @@ unsafe modes/owners and unsupported platforms discard the audit batch with an ob
 write-error count. Existing paths are never chmod'ed to make them pass. Rotation/pruning
 uses the same checked directory descriptor. These checks do not isolate hostile code
 already running under the same account, or establish native Windows/macOS ACL integrity.
+
+## Explicit signer for a strict local daemon (#42 / #132)
+
+A recipient may configure `local_principal` with exactly `principal_id`, `key_id`,
+`audience` and an absolute `private_key_path`. This is a separately provisioned
+Ed25519 local signer, read through the existing checked private authority-file
+adapter. Its local audience/grants are configured separately from hub authority
+and enrolled explicitly in the local daemon's startup trust. This implementation creates or enrolls no key.
+
+The local trust must explicitly grant `session.forwarded_inject` for the exact
+recipient SID. Ordinary `session.inject` is insufficient. Only
+`POST /api/forwarded/sessions/:id/inject` is enabled by this action. The signed
+epoch must match the existing target and `body.expected_epoch`; body CAS checks
+run after proof verification. Namespace aliases/reserved static names, extra hops,
+stale epochs and unsupported routes remain refused. Existing deduplication,
+closing and external-approval gates still run; this signer does not approve
+protected input or claim a foreign sender/session identity.
+
+In this explicit mode the recipient does not read or create a daemon token. It
+fetches a bounded anonymous startup challenge from its literal-loopback local
+daemon, checks schema/audience/transport/source and signs the exact method, raw
+path, canonical body and epoch. Redirects and mixed token+principal configuration
+are refused. A failed challenge or signature never falls back to the token lane.
+The same local timeout bounds challenge and POST. Default legacy recipients keep
+their existing token behavior. Strict WebSocket support is still absent.

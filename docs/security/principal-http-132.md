@@ -133,6 +133,7 @@ loopback, same UID, display names, daemon tokens, JWT `sub` or peer credentials.
 | `session.create` | `POST /api/sessions/spawn` | Explicit operator key and exact body session ID; authorizes process creation through the existing route |
 | `session.inspect` | `GET /api/sessions/:id`, `/diagnostics`, `/handshake`, `/screen` | Exact existing ID; owner or explicit operator inspection grant |
 | `session.inject` | `POST /api/sessions/:id/inject` | Explicit exact-target grant, including configured cross-session grants |
+| `session.forwarded_inject` | `POST /api/forwarded/sessions/:id/inject` | Separate explicit exact target grant; existing target, signed current epoch and matching body expected_epoch; one-hop/dedup/input policy retained |
 | `session.state` | `POST /api/sessions/:id/state` | Owner and exact signed current epoch |
 | `session.input` | `POST /api/sessions/:id/submit` | Owner and exact signed current epoch |
 | `session.rename` | `PATCH /api/sessions/:id` | Owner, current signed epoch, and explicit grants for both old and new IDs |
@@ -169,7 +170,7 @@ native-PTY creation also returns its instance epoch. Existing session-token,
 create-only, ownership-proof, external-approval, stale-owner and delivery-policy
 checks still run; a principal proof does not replace those proofs.
 
-Broadcast, multicast, submit-all, bus publication, forwarding, shared-reference
+Broadcast, multicast, submit-all, bus publication, outbound peer forwarding, shared-reference
 upload, configuration endpoints and unknown routes are not authorized by the first
 HTTP adapter. Reserved static session path names cannot become exact-session
 grants, including encoded variants. Missing exact records never fall through to
@@ -190,3 +191,8 @@ restarts. They cover signature/request mismatch, unknown principal/key, invalid
 configuration, unsupported platforms, replay/capacity/clock rollback, reserved
 routes, encoded aliases, historical ownership refusal and retention of session
 bearer checks. No production key, configuration, service or enrollment is touched.
+
+The explicitly scoped forwarded-inject action also supports a broker recipient's
+separate local signer. It delegates input only, including configured cross-owner
+input, and does not grant session creation, destruction, listing, takeover or
+WebSocket access. See [broker local signer](../api/broker-v1.md).
