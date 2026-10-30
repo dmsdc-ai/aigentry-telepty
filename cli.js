@@ -2930,30 +2930,21 @@ async function main() {
     // output is what still describes the screen. The unit is string length, the same measure
     // ptyBytesRead reports, so it equals bytes for ASCII and over-allocates by up to 3x for
     // CJK-heavy output — still a fixed ceiling, which is the property that matters here.
-    // ponytail: flat array + running counter; a ring buffer buys nothing at this size.
-    const PRECONNECT_MAX_CHARS = 256 * 1024;
-    let preConnectHeld = [];
-    let preConnectChars = 0;
-    function holdPreConnectOutput(data) {
-      preConnectHeld.push(data);
-      preConnectChars += data.length;
-      while (preConnectChars > PRECONNECT_MAX_CHARS && preConnectHeld.length > 1) {
-        preConnectChars -= preConnectHeld.shift().length;
-      }
-    }
+    // Empty callbacks are ignored; at most1024 chunks and256K UTF16 units survive,
+    // including a single oversized callback. Overflow retains complete Unicode pairs.
+    const preConnectOutput = require('./src/cli/output-hold').createOutputHold();
+    const holdPreConnectOutput = data => preConnectOutput.push(data);
     // Flushed as ONE 'output' frame: the daemon appends it to the ring and feeds the session
     // state machine exactly as it would the same bytes arriving in pieces.
     function flushPreConnectOutput() {
       if (!wsReady) return;
-      if (!preConnectHeld.length) return;
+      if (!preConnectOutput.length) return;
       try {
-        daemonWs.send(JSON.stringify({ type: 'output', data: preConnectHeld.join('') }));
-        preConnectHeld = [];
-        preConnectChars = 0;
+        daemonWs.send(JSON.stringify({ type: 'output', data: preConnectOutput.snapshot() }));
+        preConnectOutput.clear();
       } catch (error) {
         if (strictOwnerClient && Number.isSafeInteger(error.sentUnits) && error.sentUnits > 0) {
-          const remainder = preConnectHeld.join('').slice(error.sentUnits);
-          preConnectHeld = remainder ? [remainder] : []; preConnectChars = remainder.length;
+          preConnectOutput.consume(Math.min(error.sentUnits, preConnectOutput.length));
         }
         // Socket died mid-flush — keep the bytes for the next open rather than lose them.
       }
