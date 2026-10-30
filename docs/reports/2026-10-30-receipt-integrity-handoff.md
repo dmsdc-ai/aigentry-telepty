@@ -1,5 +1,9 @@
 # Receipt integrity and remaining live-handoff scope
 
+Subsequent continuation: the legacy ABA defect below is repaired by the
+[versioned mailbox lock](2026-10-30-mailbox-lock-v2.md). The earlier finding and
+verification checkpoint below are retained as historical evidence.
+
 Repository: dmsdc-ai/aigentry-telepty. Local branch fix/issues-128-135;
 implementation commits e2ab893 (receipt correlation/envelopes), 85fc4bb
 (persisted receipt reader) and 5d3c75a (handoff assessment correction).

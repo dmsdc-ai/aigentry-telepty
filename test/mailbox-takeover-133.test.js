@@ -288,7 +288,10 @@ for (const corruption of ['missing', 'corrupt']) test(`mailbox registration pres
 test('session-store precommit failure leaves initialized custody reusable without publishing authority', t => {
   const f = registrationCustodyFixture(t);
   const rename = fs.renameSync;
-  t.mock.method(fs, 'renameSync', () => { throw new Error('synthetic registry replacement failure'); });
+  t.mock.method(fs, 'renameSync', function(from, to) {
+    if (to === path.join(f.home, 'sessions.json')) throw new Error('synthetic registry replacement failure');
+    return rename.apply(fs, arguments);
+  });
   assert.equal(f.register().statusCode, 503);
   assert.deepEqual(Object.keys(f.sessions), []);
   assert.equal(f.credentials.size(), 0);

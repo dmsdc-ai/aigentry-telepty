@@ -1,7 +1,5 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
 
 /**
  * DeliveryEngine — polls mailbox for pending messages and delivers them.
@@ -76,7 +74,6 @@ class DeliveryEngine {
 
     try {
       const sessionIds = this.sessionResolver();
-      const lockBreakThreshold = this.mailbox.config.lockBreakAfterFailures || 3;
 
       for (const sessionId of sessionIds) {
         // Fix 5: Skip sessions in backoff
@@ -177,23 +174,13 @@ class DeliveryEngine {
           }
         }
 
-        // Fix 4 & 5: Handle lock failure — track, force-break, backoff
+        // Contention is not evidence that a writer has stopped. Keep backing
+        // off; dead v2 owners are reaped by acquisition/startup, never force-unlink.
         if (lockFailed) {
-          const failCount = (this._lockFailures.get(sessionId) || 0) + 1;
+          const failCount = Math.min((this._lockFailures.get(sessionId) || 0) + 1, 16);
           this._lockFailures.set(sessionId, failCount);
-
-          // Fix 4: Force-break after N consecutive failures
-          if (failCount >= lockBreakThreshold) {
-            const lockPath = path.join(this.mailbox._sessionDir(sessionId), '.lock');
-            try { fs.unlinkSync(lockPath); } catch {}
-            console.warn(`[MAILBOX] Force-broke stale lock for ${sessionId} after ${failCount} consecutive failures`);
-            this._lockFailures.delete(sessionId);
-            this._skipUntil.delete(sessionId);
-          } else {
-            // Fix 5: Exponential backoff — skip this session for increasing intervals
-            const backoffMs = Math.min(this.pollMs * (1 << failCount), 30000);
-            this._skipUntil.set(sessionId, Date.now() + backoffMs);
-          }
+          const backoffMs = Math.min(this.pollMs * (2 ** failCount), 30000);
+          this._skipUntil.set(sessionId, Date.now() + backoffMs);
         }
       }
     } finally {

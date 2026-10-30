@@ -26,8 +26,9 @@ function unixNow() {
 /**
  * FileMailbox — JSONL-backed mailbox implementing MailboxProtocol.
  *
- * Thread-safe via per-session advisory file locks.
- * Interoperable with Rust aigentry-mailbox crate (shared JSONL format).
+ * Per-session v2 advisory locks require cooperating writers on a local filesystem.
+ * JSONL format is shared with Rust aigentry-mailbox; lock protocols must also
+ * match before writers may concurrently share a root.
  */
 class FileMailbox {
   constructor(overrides = {}) {
@@ -400,8 +401,9 @@ class FileMailbox {
   purgeDeadLetter(sessionId) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) return;
-    const p = path.join(sessionDir, 'dead-letter.jsonl');
-    try { writeJsonl(p, []); } catch (err) { rethrowBoundary(err); }
+    const release = acquireLock(sessionDir);
+    try { writeJsonl(path.join(sessionDir, 'dead-letter.jsonl'), []); }
+    finally { release(); }
   }
 
   /**
