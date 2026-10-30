@@ -73,7 +73,7 @@ function createStrictInputTransport({ authentication, sessions, server, refuse, 
         const checked=authentication.verifier.inspect(message.assertion,{method:'POST',target,bodySha256:bodyDigest(body),
           action:'session.inject',grantTarget:sessionId,transport:'http',sessionEpoch:epoch});
         if(!checked.ok || checked.principal.keyId!==principal.keyId || checked.principal.id!==principal.id) {
-          return emit({schema:'telepty.input-receipt/v1',state:'refused',success:false,code:checked.ok?'INPUT_SIGNER_MISMATCH':checked.code,retryable:false,consumption:'unknown',reply:'unknown'});
+          return emit({schema:'telepty.input-receipt/v1',state:'refused',session_id:sessionId,session_epoch:epoch,success:false,code:checked.ok?'INPUT_SIGNER_MISMATCH':checked.code,retryable:false,consumption:'unknown',reply:'unknown'});
         }
         const fingerprint=bodyDigest(body);
         reserved=ledger.reserve(key,fingerprint,{direction:'strict-input',session:sessionId,expected_epoch:epoch,actor:{id:principal.id,key_id:principal.keyId,audience:principal.audience,source:'ed25519'}});
@@ -101,7 +101,7 @@ function createStrictInputTransport({ authentication, sessions, server, refuse, 
         } catch {result={...reserved.record,state:'outcome_unknown',remote_receipt:{success:false,code:'INPUT_OUTCOME_UNKNOWN',retryable:false,bytes_written:null,delivery_uncertain:true}};}
         ledger.write(result);emit(view(result));
       } catch(error) {
-        emit({schema:'telepty.input-receipt/v1',state:reserved?'outcome_unknown':'refused',success:false,
+        emit({schema:'telepty.input-receipt/v1',state:reserved?'outcome_unknown':'refused',session_id:sessionId,session_epoch:epoch,success:false,
           code:error.code==='IDEMPOTENCY_CONFLICT'?'IDEMPOTENCY_CONFLICT':'INPUT_STORAGE_UNAVAILABLE',retryable:false,consumption:'unknown',reply:'unknown'});
       } finally {if(reserved?.fresh)ledger.active.delete(reserved.record.receipt_id);busy=false;operation=undefined;}
     }
