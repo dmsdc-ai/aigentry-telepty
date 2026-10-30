@@ -5,6 +5,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const net = require('node:net');
+const { parseUnambiguousJSON } = require('./principal/encoding');
 
 const MAX_RECORDS = 512;
 const MAX_PAYLOAD = 64 * 1024;
@@ -40,20 +41,30 @@ function createForwardLedger(homeDir = os.homedir()) {
   function read(key) {
     prepare();
     const file = recordPath(key);
-    let fd;
+    let fd, observed = false;
     try {
       const stat = fs.lstatSync(file);
+      observed = true;
       if (!stat.isFile() || stat.nlink !== 1 || stat.size > 4096) throw failure('FORWARD_STORAGE_UNAVAILABLE', 503);
-      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== stat.dev || opened.ino !== stat.ino
+        || opened.size < 1 || opened.size > 4096) throw failure('FORWARD_STORAGE_UNAVAILABLE', 503);
       const bytes = Buffer.alloc(4097);
       const size = fs.readSync(fd, bytes, 0, bytes.length, 0);
-      if (size > 4096) throw failure('FORWARD_STORAGE_UNAVAILABLE', 503);
-      const record = JSON.parse(bytes.subarray(0, size));
+      const after = fs.fstatSync(fd);
+      if (size !== opened.size || after.nlink !== 1 || after.size !== opened.size
+        || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) throw failure('FORWARD_STORAGE_UNAVAILABLE', 503);
+      const record = parseUnambiguousJSON(bytes.subarray(0, size));
+      if (!record || typeof record !== 'object' || Array.isArray(record)) throw failure('FORWARD_STORAGE_UNAVAILABLE', 503);
       if (record.receipt_id !== key || !/^[a-f0-9]{64}$/.test(record.fingerprint)
         || !['pending', 'accepted', 'failed', 'outcome_unknown'].includes(record.state)
         || !Number.isFinite(record.created_at)) throw failure('FORWARD_STORAGE_UNAVAILABLE', 503);
       return record;
-    } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    } catch (error) {
+      if (error.code === 'ENOENT' && !observed) return null;
+      throw failure('FORWARD_STORAGE_UNAVAILABLE', 503);
+    }
     finally { if (fd !== undefined) fs.closeSync(fd); }
   }
   function all() {
