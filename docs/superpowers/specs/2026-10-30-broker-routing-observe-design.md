@@ -85,3 +85,33 @@ Test denied grants, stale epochs, duplicate keys, corrupt/failed reservation, of
 and lost responses, freshness/disconnect, cancellation, conflicting authority, and
 no raw secret output. Meaningful real topology tests precede full suite, pinned
 TypeScript and independent security review. Preserve all existing local commits.
+
+### Implemented observer transport
+
+Strict mode now admits only `GET /api/observe/sessions/:exactId` using a single
+`x-telepty-principal` header. Sign the raw path with `transport: websocket`,
+`action: session.observe`, body `{}` and the current session epoch, using the
+existing startup challenge and audience. Query strings and application request
+bodies are refused. A separate exact `session.observe` grant is required even for
+an owner; configured operators may read only explicitly granted exact sessions.
+The existing verifier and nonce cache are shared with HTTP. Trust enrollment and
+legacy owner/viewer/bus upgrade denial are unchanged.
+
+The first frame is `telepty.read-only-observer/v1` identity/expiry metadata. Later
+frames contain only `type: output` and terminal bytes, which can contain terminal
+secrets: an explicit observation grant is a read disclosure permission. There are
+no readiness, completion, delivery or owner credential envelopes. Replay is a
+bounded suffix of existing output, at most 64KiB, and may be incomplete. Each
+serialized output frame is at most 64KiB; oversized output closes the observer.
+Sockets with more than 128KiB queued output are terminated. At most64 observers
+and8 per principal/session are admitted, independent of key aliases. Application
+frames of any type close the socket. Control ping/pong carry no application
+command authority.
+
+Expiry is no later than the verified proof expiry or60s after admission. Every
+outbound output rechecks exact session object, owning principal, epoch, credential
+generation, owner generation/socket and closing state; a50ms timer also closes
+idle invalidated observers. Shutdown explicitly terminates this separate WSS.
+Fresh proof is necessary for reconnect; no token/JWT/query fallback is supported.
+Tests use synthetic configured keys, temporary HOME private daemons and an owned
+Node PTY fixture. No installed provider, trust store or service is changed.

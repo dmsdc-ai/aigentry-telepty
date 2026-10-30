@@ -797,7 +797,10 @@ function installWebSocketTransport(deps) {
   // true for every address (empty allowlist) and for every tailnet device (#672 auto-trust
   // populates the list, and a MATCH returns true just as completely as an empty list does), so
   // an uncredentialed handshake — viewer socket and `/api/bus` alike — upgraded with 101.
+  const observer = require('./observer').createObserverTransport({ authentication: deps.principalAuthentication,
+    sessions, server, tailnetServer, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
   function handleUpgrade(req, socket, head) {
+    if (observer.handle(req, socket, head)) return;
     // HTTP-only strict mode has no per-frame authority adapter. Never let legacy upgrade
     // credentials turn it into a full-duplex bypass of action/target authorization.
     if (deps.principalAuthentication) {
@@ -858,7 +861,7 @@ function installWebSocketTransport(deps) {
     if (listener) listener.on('upgrade', handleUpgrade);
   }
 
-  return { wss, busWss, handleUpgrade };
+  return { wss, busWss, handleUpgrade, closeObservers: observer.close };
 }
 
 module.exports = {

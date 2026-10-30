@@ -1,5 +1,5 @@
 'use strict';
-const { parseUnambiguousJSON, requestBodyDigest } = require('./encoding');
+const { bodyDigest, parseUnambiguousJSON, requestBodyDigest } = require('./encoding');
 const { validateTrustConfiguration, createPrincipalVerifier, validTarget } = require('./proof');
 const VERIFIED_REQUEST = Symbol('verified HTTP principal');
 const { readAuthorityFile } = require('./authority-file');
@@ -80,6 +80,24 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
   return Object.freeze({ verifier,
     challengeDocument: () => ({ schema: 'telepty.principal-challenge/v1', audience: verifier.audience,
       challenge: verifier.challenge, max_lifetime_seconds: 60, transport: 'http', identity_source: 'configured-ed25519-key' }),
+    authorizeObserver(req) {
+      const denied = (code, status = 403) => ({ ok: false, code, status });
+      const match = /^\/api\/observe\/sessions\/([^/?]+)$/.exec(req.url || '');
+      if (req.method !== 'GET' || !match || !validTarget(req.url)) return denied('PRINCIPAL_ACTION_DENIED');
+      let id;
+      try { id = decodeURIComponent(match[1]); } catch { return denied('PRINCIPAL_ACTION_DENIED'); }
+      if (!sessionId(id)) return denied('PRINCIPAL_ACTION_DENIED');
+      const count = (req.rawHeaders || []).filter((name, index) => index % 2 === 0 && String(name).toLowerCase() === 'x-telepty-principal').length;
+      if (count > 1 || req.headers?.['transfer-encoding'] || (req.headers?.['content-length'] && req.headers['content-length'] !== '0')) return denied('PRINCIPAL_HEADER_INVALID', 400);
+      const session = ownSession(typeof sessions === 'function' ? sessions() : sessions, id);
+      if (!session || session.isClosing || typeof session.sessionEpoch !== 'string') return denied('PRINCIPAL_SESSION_NOT_FOUND', 404);
+      const result = verifier.verify(req.headers?.['x-telepty-principal'], { method: 'GET', target: req.url,
+        bodySha256: bodyDigest({}), action: 'session.observe', grantTarget: id, transport: 'websocket', sessionEpoch: session.sessionEpoch });
+      if (!result.ok) return result;
+      const owner = storedOwningPrincipal(session.owningPrincipal);
+      if (result.principal.authority !== 'operator' && !(owner && owner.id === result.principal.id && owner.audience === result.principal.audience)) return denied('PRINCIPAL_SESSION_OWNER_REQUIRED');
+      return { ...result, session, sessionId: id };
+    },
     authorize(req) {
       delete req.authenticationPrincipal; delete req[VERIFIED_REQUEST];
       let digest;

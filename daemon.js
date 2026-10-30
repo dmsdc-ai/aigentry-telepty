@@ -1458,6 +1458,7 @@ const MODAL_PARK_POLL_MS = 500;
 
 
 function appendToOutputRing(session, data) {
+  require('./src/transport/observer').publishSessionOutput(session, data);
   if (!session.outputRing) session.outputRing = [];
   // #716: track bracketed-paste capability from the CLI's own mode-set output so
   // injects are wrapped (maybeBracketedPaste) only for paste-capable composers —
@@ -2454,7 +2455,7 @@ if (server) server.on('error', async (error) => {
 });
 
 
-installWebSocketTransport({
+const websocketTransport = installWebSocketTransport({
   principalAuthentication,
   server,
   tailnetServer,
@@ -2497,6 +2498,7 @@ installWebSocketTransport({
 
 let shuttingDown = false;
 async function shutdown(code) {
+  websocketTransport.closeObservers();
   if (shuttingDown) return;
   shuttingDown = true;
   eventLoopTelemetry.stop();
