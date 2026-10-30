@@ -1,6 +1,10 @@
 # Open Telepty issues: local delivery outcome — 2026-10-29
 
-Latest continuation: [fenced-write TTL custody](2026-10-30-fenced-ttl-custody.md),
+Latest continuation: [approved staged-auth preparation](2026-10-30-staged-auth-preparation.md),
+2,529 total / 2,526 pass / zero fail / three skip. Static inventory does not
+authorize enrollment or cutover; REPORT and foreign trust boundaries are retained.
+
+Earlier continuation: [fenced-write TTL custody](2026-10-30-fenced-ttl-custody.md),
 2,518 total / 2,515 pass / zero fail / three skip. The explicit long TCP test
 also passed separately at baseline dab2952; Windows acceptance remains open.
 

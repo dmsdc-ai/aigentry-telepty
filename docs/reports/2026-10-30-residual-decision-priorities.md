@@ -1,5 +1,11 @@
 # Residual decisions and external acceptance priorities
 
+The user subsequently approved the conservative directions in decisions 1–3:
+retain original REPORT authority, stage authenticated strict migration, and retain
+current foreign trust. See [local preparation](2026-10-30-staged-auth-preparation.md).
+These recommendations are no longer awaiting a direction choice; operational
+cutover, native acceptance and any later delegation/trust expansion remain separate.
+
 Follow-up: [fenced-write TTL custody repair and verification](2026-10-30-fenced-ttl-custody.md).
 The decisions below remain unchanged; the following pass found and repaired an
 independent uncertainty-preservation bug. Latest integrated counts are in that report.
