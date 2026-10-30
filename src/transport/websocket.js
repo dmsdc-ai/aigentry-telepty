@@ -63,7 +63,8 @@ function installWebSocketTransport(deps) {
     recordObservation,
     listTrackedInjectionsForSession,
     // #826 — policy + audit for the viewer write path, so it matches POST /inject. Returns
-    // whether the frame may be forwarded, and records the attempt either way. Optional, same
+    // an admission plus completion hook (or legacy boolean), recording dispatch after the
+    // writer callback. Optional, same
     // convention as above; the daemon always passes it.
     authorizeViewerInject,
     acceptInteractionReceipt
@@ -133,9 +134,9 @@ function installWebSocketTransport(deps) {
     if (session.type === 'wrapped') {
       const owner = session.ownerWs;
       if (!isOpenWebSocket(owner)) return null;
-      return (data) => owner.send(JSON.stringify({ type: 'inject', data }));
+      return (data, complete) => owner.send(JSON.stringify({ type: 'inject', data }), complete);
     }
-    if (session.ptyProcess) return (data) => session.ptyProcess.write(data);
+    if (session.ptyProcess) return (data, complete) => { session.ptyProcess.write(data); complete(); };
     return null;
   }
 
@@ -632,10 +633,12 @@ function installWebSocketTransport(deps) {
                   principal: presentedPrincipal
                 })
                 : true;
-              if (allowed) {
-                invalidateInteraction(activeSession, 'viewer_input');
-                deliver(data);
-              }
+              require('../audit/viewer-input').dispatchViewerInput({ authorization: allowed,
+                invalidate: () => invalidateInteraction(activeSession, 'viewer_input'),
+                deliver: complete => deliver(data, complete),
+                onFailure: () => { try { ws.send(JSON.stringify({ type:'input_refused', success:false,
+                  code:'INPUT_WRITE_OUTCOME_UNKNOWN', bytes_written:null, retryable:false, consumption:'unknown' })); } catch {} }
+              });
             }
           } else if (type === 'resize') {
             // RESIZE IS DELIBERATELY NOT BEHIND THE INJECT GATE.

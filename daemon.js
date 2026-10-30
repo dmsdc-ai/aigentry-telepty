@@ -1770,44 +1770,13 @@ sessionActions.registerInjectRoute(app);
 // boundary), while `verified_sender_*` comes from the #815 bearer presented on the handshake and
 // never from the frame — the same split as `body.from` vs `x-telepty-session-token`.
 //
-// Returns whether the frame may be forwarded. Records the attempt either way.
-function authorizeViewerInject({ sessionId, session, data, claimedFrom, principal }) {
-  const inject_id = crypto.randomUUID();
-  const payload = typeof data === 'string' ? data : '';
-  const verdict = classifyPeerLaneInject({
-    from: claimedFrom, to: sessionId, prompt: payload, orchestratorSids: ORCHESTRATOR_SIDS
-  });
-  const blocked = verdict.decision === 'block';
-
-  if (blocked) {
-    broadcastSessionEvent('peer_inject_blocked', sessionId, session, {
-      extra: {
-        target_agent: sessionId,
-        from: claimedFrom || null,
-        reason: verdict.reason,
-        attempted_kind: verdict.kind,
-        envelope_present: verdict.envelopePresent,
-        inject_id
-      }
-    });
-    console.warn(`[PEER-GUARD] blocked ws-viewer inject ${claimedFrom} → ${sessionId} (${verdict.reason})`);
-  }
-
-  auditAppend({
-    ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'ws-viewer',
-    claimed_from: claimedFrom || null, ...verifiedSenderFields(principal),
-    to: sessionId, to_alias: null,
-    origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: null,
-    payload,
-    // `forwarded`, not `success`. The HTTP route's `success` means its delivery machinery
-    // reported success; all this path can measure is that the frame was written to the owner
-    // socket. Two different measurements must not wear the same word — that substitution is the
-    // defect class this release exists to remove.
-    delivery_result: blocked ? `blocked:${verdict.reason}` : 'forwarded'
-  });
-
-  return !blocked;
-}
+// Records admission before the attempt, and returns a completion hook so transport
+// dispatch is recorded only after its callback (or native write return).
+const authorizeViewerInject = require('./src/audit/viewer-input').createViewerInputAuthorization({
+  classify: classifyPeerLaneInject, audit: auditAppend, broadcast: broadcastSessionEvent,
+  verifiedSenderFields, machineId: MACHINE_ID, orchestratorSids: ORCHESTRATOR_SIDS,
+  randomUUID: () => crypto.randomUUID()
+});
 
 // GET /api/inject-observations/:inject_id — #60 Stage A, the orchestrator's poll target.
 //
