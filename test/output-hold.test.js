@@ -23,3 +23,13 @@ test('overflow at a surrogate pair split across callbacks retains no dangling lo
  const held=createOutputHold({maxChars:3,maxChunks:4});held.push('ab\uD83D');held.push('\uDE00cd');assert.equal(held.snapshot(),'cd');
  assert.throws(()=>held.consume(3),/Invalid output hold prefix/);assert.equal(held.snapshot(),'cd');
 });
+for(const mode of ['oversized','borrowed','consume'])test(`retained ${mode} output owns bounded backing storage`,()=>{
+ const {spawnSync}=require('node:child_process'),path=require('node:path');
+ const result=spawnSync(process.execPath,['--require',path.resolve(__dirname,'../test-support/setup-env.js'),'--expose-gc',path.resolve(__dirname,'../test-support/output-hold-memory.js'),mode],{encoding:'utf8',timeout:10000});
+ assert.equal(result.status,0,result.stderr);const memory=JSON.parse(result.stdout.trim());assert.equal(memory.length,256*1024);
+ // A32MiB input must not survive behind a256Ki-unit suffix. Allow8MiB for V8/GC noise.
+ assert.ok(memory.retained<8*1024*1024,JSON.stringify(memory));
+});
+test('owned copies preserve exact UTF16 code units including lone surrogates',()=>{
+ const held=createOutputHold();const input='\uD800x\uDC00';held.push(input);assert.equal(held.snapshot(),input);held.consume(1);assert.equal(held.snapshot(),'x\uDC00');
+});
