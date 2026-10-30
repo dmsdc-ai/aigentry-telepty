@@ -38,7 +38,7 @@ async function daemonFixture(t){
  const sign=extra=>createSignedAssertion({privateKey:f.key.privateKey,keyId:'writer',principalId:'writer',audience:'fixture',challenge,method:'GET',target:'/api/input/sessions/mine',body:{},action:'session.input_stream',transport:'websocket',...extra});
  const ownerRequest=(method,target,body)=>daemon.request(target,{method,...(body?{body}:{}),headers:{'x-telepty-principal':sign({privateKey:owner.privateKey,keyId:'owner',principalId:'owner',method,target,body,action:method==='POST'?'session.register':'mailbox.read',transport:'http'})}});
  const registered=await ownerRequest('POST','/api/sessions/register',{session_id:'mine',delivery_type:'mailbox'});assert.equal(registered.status,201);
- return{...f,streamOnly,home,daemon,sign,ownerRequest,epoch:registered.body.session_epoch};
+ return{...f,owner,streamOnly,home,daemon,sign,ownerRequest,epoch:registered.body.session_epoch};
 }
 test('actual strict input goes through signed inject and exact durable dedup without token fallback', {timeout:15000},async t=>{
  const f=await daemonFixture(t),target='/api/sessions/mine/inject',c=await open(`ws://${f.daemon.host}:${f.daemon.port}/api/input/sessions/mine`,f.sign({sessionEpoch:f.epoch}));assert.ok(c.ws,JSON.stringify(c));t.after(()=>c.ws.terminate());await waitFor(()=>c.messages.length);
@@ -98,7 +98,16 @@ test('actual input CLI and receipt query preserve one write and never create or 
  const queried=await run('principal-input-receipt-v1',['--key',idempotency_key]);assert.ifError(queried.error);assert.equal(JSON.parse(queried.stdout).receipt_id,receipt.receipt_id);
  const repeated=await run('principal-input-v1',['--request',request]);assert.ifError(repeated.error);assert.equal(JSON.parse(repeated.stdout).receipt_id,receipt.receipt_id);
  assert.equal((await f.ownerRequest('GET','/api/sessions/mine/mailbox')).body.pending.length,1);assert.equal(fs.existsSync(path.join(clientHome,'.telepty','config.json')),false);
- fs.chmodSync(request,0o644);const unsafe=await run('principal-input-v1',['--request',request]);assert.equal(unsafe.error.code,1);assert.equal((await f.ownerRequest('GET','/api/sessions/mine/mailbox')).body.pending.length,1);
+ await f.daemon.stop();
+ const restarted=await startTestDaemon({homeDir:f.home,env:{TELEPTY_PRINCIPAL_MODE:'strict',TELEPTY_PRINCIPAL_TRUST_FILE:path.join(f.home,'trust'),TELEPTY_MACHINE_ID:'fixture'}});
+ try {
+  const updated=JSON.parse(fs.readFileSync(config));updated.daemon_url=`http://${restarted.host}:${restarted.port}`;fs.writeFileSync(config,JSON.stringify(updated));
+  const afterRestart=await run('principal-input-v1',['--request',request]);assert.ifError(afterRestart.error);assert.equal(JSON.parse(afterRestart.stdout).receipt_id,receipt.receipt_id);
+  const challenge=(await restarted.request('/api/auth/challenge',{noAuth:true})).body.challenge;
+  const target='/api/sessions/mine/mailbox';const proof=createSignedAssertion({privateKey:f.owner.privateKey,keyId:'owner',principalId:'owner',audience:'fixture',challenge,method:'GET',target,body:undefined,action:'mailbox.read'});
+  assert.equal((await restarted.request(target,{headers:{'x-telepty-principal':proof}})).body.pending.length,1);
+ } finally {await restarted.stop();}
+ fs.chmodSync(request,0o644);const unsafe=await run('principal-input-v1',['--request',request]);assert.equal(unsafe.error.code,1);assert.equal(unsafe.stdout,'');assert.match(unsafe.stderr,/AUTHORITY_FILE_UNAVAILABLE/);
 });
 test('input client treats channel loss after send as unknown and can query without a second write',async t=>{
  const f=await transportFixture(t,'close-channel'),key=path.join(f.home,'key'),config=path.join(f.home,'config'),file=path.join(f.home,'request');

@@ -35,10 +35,15 @@ before normal inject approval, audit, exact-target and delivery gates run. No
 caller Host, arbitrary URL/header, shared-token fallback, redirect or second
 forwarding hop can select a backend. A five-second finite deadline applies. A
 non-loopback-only primary listener is conservatively unavailable for this adapter.
+Connection fences stop new frames and check dispatch initiation; closing a socket
+cannot atomically cancel HTTP work already submitted. That operation retains the
+normal HTTP epoch, approval and delivery semantics and may already have queued or
+written bytes. Transport loss therefore remains unknown rather than a rollback.
 
 Durable keys are partitioned by protocol namespace, audience/principal/key,
-SID/epoch and caller idempotency key. Prompt and approval material are represented
-by body hash; raw payloads and assertions are not persisted. Reservations precede
+SID/epoch and caller idempotency key. The receipt ledger represents prompt and approval material by body hash; it does
+not store raw payloads or assertions. Normal mailbox/audit storage retains its
+existing configured behavior. Reservations precede
 HTTP attempts. Repeated keys never execute again; a changed body conflicts.
 Receipt states are accepted, failed, pending, outcome_unknown or not_found.
 5xx, response loss, invalid acceptance or storage uncertainty never implies zero

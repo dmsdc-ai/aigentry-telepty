@@ -293,3 +293,17 @@ The wire bounds frames and backpressure, splits large UTF16 output preserving
 surrogate pairs and stream offsets, retains unsent suffixes on reconnect, and
 propagates send refusals as errors. Owner dispatch still does not prove child
 write, consumption, response or completion.
+
+## Signed input and trusted session events
+
+Dedicated `/api/input/sessions/:exactId` requires session.input_stream admission
+and a separate exact session.inject proof for every operation. A non-consuming
+cryptographic precheck precedes durable reservation; real HTTP middleware still
+consumes the nonce and authorizes the effect. No legacy raw viewer input is opened.
+See [input and receipt protocol/CLI](../api/strict-input.md).
+
+Dedicated `/api/events/sessions/:exactId` requires its own exact session.events
+read grant. It projects only trusted daemon-produced per-session observations;
+client publishing/state/turn messages and the raw global bus remain refused.
+See [trusted session events](../api/strict-session-events.md). Neither new adapter
+grants takeover, process custody, OS-account identity or agent consumption proof.
