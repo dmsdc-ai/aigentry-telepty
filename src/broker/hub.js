@@ -2,6 +2,9 @@
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
+const path = require('node:path');
+const os = require('node:os');
+const { createBrokerAudit } = require('./audit');
 const { createPrincipalVerifier, validateTrustConfiguration, createSignedAssertion } = require('../principal/proof');
 const { createForwardLedger, validateForwardBody } = require('../peer-forwarding');
 const { canonicalJSON } = require('../principal/encoding');
@@ -9,7 +12,7 @@ const { id, error, readBody, json, verify } = require('./http');
 const ACTIONS = ['broker.stream', 'broker.inject', 'broker.receipt', 'broker.result', 'broker.envelope'];
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
-function createBrokerHub({ config, privateKey, homeDir, tls } = {}) {
+function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
   if (!config || config.schema !== 'telepty.broker-hub/v1' || !id(config.principal_id) || !id(config.key_id)
     || !config.nodes || typeof config.nodes !== 'object' || Array.isArray(config.nodes)
     || Object.keys(config.nodes).length < 1 || Object.keys(config.nodes).length > 64
@@ -35,6 +38,7 @@ function createBrokerHub({ config, privateKey, homeDir, tls } = {}) {
   }
   const ledger = createForwardLedger(homeDir);
   const streams = new Map(), timers = new Map();
+  const auditLog = audit || createBrokerAudit({ path: path.join(homeDir || os.homedir(), '.telepty', 'logs', 'broker.jsonl') });
   function view(record) {
     return { receipt_id: record.receipt_id, source_node: record.source_node, target_node: record.target_node,
       session: record.session, expected_epoch: record.expected_epoch,
@@ -45,22 +49,32 @@ function createBrokerHub({ config, privateKey, homeDir, tls } = {}) {
   function finish(record, update) {
     const next = { ...record, ...update };
     ledger.write(next);
+    auditLog.record({ event: 'receipt_outcome', receiptId: next.receipt_id, state: next.state });
     ledger.active.delete(record.receipt_id);
     clearTimeout(timers.get(record.receipt_id)); timers.delete(record.receipt_id);
     return next;
   }
   async function handler(req, res) {
+    const requestAudit = { event: 'request', requestTarget: req.url };
+    let challengeRequest = false;
+    res.once('finish', () => { if (!challengeRequest) auditLog.record({ ...requestAudit, status: res.statusCode }); });
+    function authenticate(body, action, target, epoch) {
+      const principal = verify(verifier, req, body, action, target, epoch);
+      requestAudit.principal = principal;
+      return principal;
+    }
     try {
-      if (req.method === 'GET' && req.url === '/v1/challenge') return json(res, 200, {
-        schema: 'telepty.broker-challenge/v1', audience: verifier.audience, challenge: verifier.challenge });
+      if (req.method === 'GET' && req.url === '/v1/challenge') { challengeRequest = true; return json(res, 200, {
+        schema: 'telepty.broker-challenge/v1', audience: verifier.audience, challenge: verifier.challenge }); }
       const body = await readBody(req);
+      requestAudit.payload = body && typeof body.prompt === 'string' ? body.prompt : undefined;
       const streamMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/stream$/);
       const injectMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/to\/([A-Za-z0-9._-]+)\/sessions\/([^/?]+)\/inject$/);
       const receiptMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/receipts\/([A-Za-z0-9_-]{16,128})$/);
       const resultMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/results\/([a-f0-9]{64})$/);
       if (req.method === 'POST' && streamMatch) {
         const node = streamMatch[1];
-        const principal = verify(verifier, req, body, 'broker.stream', node);
+        const principal = authenticate(body, 'broker.stream', node);
         if (principal.id !== node || !own(config.nodes, node) || !body || Object.keys(body).join() !== 'challenge'
           || !/^[A-Za-z0-9_-]{16,128}$/.test(body.challenge || '')) throw error('BROKER_NODE_DENIED', 403);
         if (streams.has(node)) throw error('BROKER_NODE_ALREADY_CONNECTED', 409);
@@ -86,7 +100,7 @@ function createBrokerHub({ config, privateKey, homeDir, tls } = {}) {
       if (req.method === 'POST' && injectMatch) {
         const [, source, target, encodedSid] = injectMatch;
         const sid = decodeURIComponent(encodedSid);
-        const principal = verify(verifier, req, body, 'broker.inject', `${target}/${sid}`, body.expected_epoch);
+        const principal = authenticate(body, 'broker.inject', `${target}/${sid}`, body.expected_epoch);
         if (principal.id !== source || !own(config.nodes, source) || !own(config.nodes, target)) throw error('BROKER_NODE_DENIED', 403);
         const payload = validateForwardBody(body);
         const limit = config.limits[source];
@@ -101,7 +115,11 @@ function createBrokerHub({ config, privateKey, homeDir, tls } = {}) {
         }
         const reserved = ledger.reserve(key, fingerprint, { direction: 'broker', source_node: source, target_node: target,
           session: sid, expected_epoch: payload.expected_epoch });
-        if (!reserved.fresh) return json(res, 200, view(reserved.record));
+        if (!reserved.fresh) {
+          auditLog.record({ event: 'idempotent_retry', principal, targetNode: target, targetSid: sid, receiptId: key, state: reserved.record.state });
+          return json(res, 200, view(reserved.record));
+        }
+        auditLog.record({ event: 'admitted', principal, targetNode: target, targetSid: sid, payload: payload.prompt, receiptId: key, state: 'pending' });
         const stream = streams.get(target);
         if (!stream || stream.response.destroyed) return json(res, 503, view(finish(reserved.record, { state: 'failed', code: 'BROKER_NODE_OFFLINE' })));
         const envelope = { schema: 'telepty.broker-envelope/v1', receipt_id: key, source_node: source,
@@ -114,7 +132,7 @@ function createBrokerHub({ config, privateKey, homeDir, tls } = {}) {
           return json(res, 429, view(finish(reserved.record, { state: 'failed', code: 'BROKER_BACKPRESSURE' })));
         }
         ledger.active.add(key);
-        try { stream.response.write(frame); }
+        try { stream.response.write(frame); auditLog.record({ event: 'envelope_forwarded', principal, targetNode: target, targetSid: sid, receiptId: key, state: 'pending' }); }
         catch { return json(res, 202, view(finish(reserved.record, { state: 'outcome_unknown', code: 'BROKER_WRITE_UNKNOWN' }))); }
         timers.set(key, setTimeout(() => {
           try { const current = ledger.read(key); if (current && current.state === 'pending') finish(current, { state: 'outcome_unknown', code: 'BROKER_RESULT_TIMEOUT' }); }
@@ -124,14 +142,14 @@ function createBrokerHub({ config, privateKey, homeDir, tls } = {}) {
       }
       if (req.method === 'GET' && receiptMatch) {
         const [, source, key] = receiptMatch;
-        if (verify(verifier, req, body, 'broker.receipt', source).id !== source) throw error('BROKER_NODE_DENIED', 403);
+        if (authenticate(body, 'broker.receipt', source).id !== source) throw error('BROKER_NODE_DENIED', 403);
         const record = ledger.read(hash(`broker:${source}:${key}`));
         if (!record || record.source_node !== source) throw error('BROKER_RECEIPT_NOT_FOUND', 404);
         return json(res, 200, view(record));
       }
       if (req.method === 'POST' && resultMatch) {
         const [, node, key] = resultMatch;
-        if (verify(verifier, req, body, 'broker.result', node).id !== node) throw error('BROKER_NODE_DENIED', 403);
+        if (authenticate(body, 'broker.result', node).id !== node) throw error('BROKER_NODE_DENIED', 403);
         const record = ledger.read(key);
         if (!record || record.target_node !== node) throw error('BROKER_RECEIPT_NOT_FOUND', 404);
         if (!body || Object.keys(body).some(field => !['state', 'inject_id', 'queued', 'code'].includes(field))
@@ -149,21 +167,27 @@ function createBrokerHub({ config, privateKey, homeDir, tls } = {}) {
       }
       throw error('BROKER_ROUTE_NOT_FOUND', 404);
     } catch (reason) {
+      requestAudit.code = reason.status ? reason.code : 'BROKER_STORAGE_UNAVAILABLE';
       if (!res.headersSent) return json(res, reason.status || 503, { success: false, code: reason.status ? reason.code : 'BROKER_STORAGE_UNAVAILABLE' });
       res.destroy();
     }
   }
   const server = tls ? https.createServer(tls, handler) : http.createServer(handler);
   server.requestTimeout = 10000; server.headersTimeout = 10000; server.maxHeadersCount = 32; server.maxConnections = 128;
-  return { server, challenge: verifier.challenge,
+  let closing;
+  return { server, challenge: verifier.challenge, auditStats: () => auditLog.stats(),
     listen({ host = '127.0.0.1', port = 0 } = {}) {
       if (!tls && !['127.0.0.1', '::1'].includes(host)) throw error('BROKER_TLS_REQUIRED');
       return new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address())); });
     },
-    async close() {
-      for (const stream of streams.values()) stream.response.end();
-      for (const timer of timers.values()) clearTimeout(timer);
-      await new Promise((resolve) => server.close(resolve));
+    close() {
+      if (!closing) closing = (async () => {
+        for (const stream of streams.values()) stream.response.end();
+        for (const timer of timers.values()) clearTimeout(timer);
+        await new Promise((resolve) => server.close(resolve));
+        await auditLog.close();
+      })();
+      return closing;
     }
   };
 }

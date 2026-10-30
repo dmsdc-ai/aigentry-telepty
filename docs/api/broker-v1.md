@@ -49,3 +49,45 @@ Request bodies are bounded to 100 KiB including JSON encoding, SSE frames and wr
 The acceptance test starts three owned child processes on loopback: hub, recipient daemon and recipient bridge. Source transport capture permits only the hub origin and rejects credential headers. It proves the application topology without changing network policy or requiring a live VPN/EDR deployment; real fleet/platform acceptance remains external evidence.
 
 Recipient connection recovery is opt-in with `reconnect: { "max_attempts": 3, "initial_backoff_ms": 250, "max_backoff_ms": 2000 }` in the node config. Without this field, EOF ends the node as before. `max_attempts` is a total reconnect budget per node process (1–10), not a budget reset by successful connections; delays double up to the configured cap (10–30000 ms). Initial startup refusal/failure still fails startup. Subsequent clean EOF or transient stream/network failure may establish a fresh stream with a new recipient challenge and fresh signed request. Challenge fetch/body and stream headers have 3-second deadlines. Stop cancels backoff, handshakes and the current reader. Authentication, signature, malformed/truncated protocol, configuration and result-POST failures terminate recovery. No accepted or uncertain envelope or result POST is replayed by reconnect; durable hub and destination deduplication remain authoritative. Recovery does not restore lost in-flight operations: query their receipts and treat unknown outcomes conservatively.
+
+## Hub audit observations (#43 / #47)
+
+The hub writes bounded async JSONL observations to `~/.telepty/logs/broker.jsonl`, using
+schema v1 from the existing inject audit writer. Events distinguish HTTP requests/refusals,
+fresh admission, idempotent retries, envelope forwarding, and recorded receipt outcomes.
+Granted inject admission/forwarding/retry events include the bounded exact requested SID
+in `to` and destination node in `broker_target_node`; these describe routing, not foreign
+session ownership. Unverified requests and denied grants expose no raw destination metadata.
+The public startup-challenge endpoint is excluded. Unknown request paths are hashed rather
+than logged. Selected internal refusal codes are allowlisted; arbitrary errors and
+recipient-supplied result codes are omitted.
+
+`authenticated_node_id` and `authenticated_node_key_id` identify only a successfully verified
+configured broker node/key at that request seam; `authenticated_identity_scope` is
+`broker-node`. They never establish a foreign user or session principal. In particular,
+`verified_sender_sid`/epoch/generation and `claimed_from` remain null,
+`foreign_session_identity_verified` remains false, and origin is `untrusted-remote`.
+Timer/stream-loss receipt updates have no authenticated request actor. Payloads are hashed
+before enqueueing; previews remain null even when `TELEPTY_AUDIT_PREVIEW=1`. Assertions,
+signatures, tokens, private keys, raw request paths and claimed sender labels are not logged.
+
+The default queue holds at most 10,000 metadata records, drops the oldest on overflow, and
+uses the existing size/age rotation (50 MiB active threshold, five rotated files, 30 days).
+`createBrokerHub().auditStats()` exposes saturating submitted, overflow-drop, write-error
+and append-error counters, without retaining error text. A failed append batch is lost,
+counted as a write error, and never retried as a delivery. Graceful hub close, including the
+standalone SIGTERM/SIGINT path, waits for pending audit writes. There is no per-record fsync
+or transactional audit/delivery guarantee; hard crashes and storage failures can lose rows.
+An `envelope_forwarded` observation records a hub stream write, not a physical terminal
+attempt, destination acceptance, or task completion. Idempotent operation retries add no
+new forwarding event.
+
+Broker audit storage uses an opt-in Linux descriptor-anchored backend to that writer.
+Ancestors must be root/current-user owned and not group/other writable, except root-owned
+sticky temporary directories. The final log directory must be current-user owned and
+private. Existing log and rotation leaves must be private, singly linked, current-user
+owned regular files; newly created leaves are exclusive and mode 0600. Symlinks, hardlinks,
+unsafe modes/owners and unsupported platforms discard the audit batch with an observable
+write-error count. Existing paths are never chmod'ed to make them pass. Rotation/pruning
+uses the same checked directory descriptor. These checks do not isolate hostile code
+already running under the same account, or establish native Windows/macOS ACL integrity.
