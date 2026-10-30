@@ -320,3 +320,14 @@ Legacy raw viewer input now rejects nonstrings and oversized UTF8 payloads befor
 policy/write. Admission and post-dispatch audit observations are distinct; no
 physical delivery is claimed before a writer callback. This opens no new strict
 raw authority. See [viewer audit contract](../api/viewer-input-audit.md).
+
+## Scoped application publication and effect CLI
+
+Owner-only session.publish writes bounded opaque application content to its exact
+authorized session.app_events readers. Both publication and reading require actual
+TLS or literal socket loopback, current epoch and separate grants. Server actor
+metadata is configured-principal identity, not foreign-session proof or trusted
+daemon fact; nested data never routes or writes terminals. Publication counts are
+not ACKs. See [application protocol](../api/application-events.md) and
+[explicit bus CLI](../api/principal-bus-cli.md). The CLI rejects inconsistent
+acceptance/identity/ACK claims and never replays unknown effects automatically.
