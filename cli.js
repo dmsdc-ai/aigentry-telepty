@@ -2589,9 +2589,44 @@ async function main() {
       }
     }
 
+    let strictOwnerClient = null;
+    let strictOwnerEpoch = null;
+    if (process.env.TELEPTY_PRINCIPAL_CLIENT_FILE) {
+      try {
+        const principalClient = require('./src/principal/client');
+        strictOwnerClient = principalClient.createPrincipalClient(principalClient.loadPrincipalClientConfiguration(process.env.TELEPTY_PRINCIPAL_CLIENT_FILE));
+        if (strictOwnerClient.daemonUrl !== new URL(DAEMON_URL).origin || sshPlan) throw new Error('PRINCIPAL_ALLOW_TARGET_UNSUPPORTED');
+      } catch {
+        console.error('Strict allow requires a checked principal client configuration for this local daemon and a local child.');
+        process.exitCode = 1; return;
+      }
+    }
+    const allowFetchWithAuth = async (url, options = {}) => {
+      if (!strictOwnerClient) return fetchWithAuth(url, options);
+      const target = new URL(url);
+      if (target.origin !== strictOwnerClient.daemonUrl) throw new Error('PRINCIPAL_ALLOW_TARGET_UNSUPPORTED');
+      const ownerToken = target.searchParams.get('owner_token');
+      if (ownerToken) target.searchParams.delete('owner_token');
+      const requestUrl = target.toString();
+      const method = options.method || 'GET';
+      const body = options.body ? JSON.parse(options.body) : undefined;
+      const pathname = target.pathname;
+      const action = pathname === '/api/sessions/register' ? 'session.register'
+        : method === 'DELETE' ? 'session.destroy' : pathname === '/api/meta' ? 'daemon.inspect' : null;
+      if (!action) throw new Error('PRINCIPAL_ALLOW_ACTION_UNSUPPORTED');
+      const deadline = AbortSignal.timeout(5000);
+      const signal = options.signal ? AbortSignal.any([options.signal,deadline]) : deadline;
+      const assertion = await strictOwnerClient.assertion({ method, target:target.pathname+target.search, body, action,
+        ...(strictOwnerEpoch ? {sessionEpoch:strictOwnerEpoch} : {}), signal });
+      const bearer = scopedSessionToken(url, {localOrigin:buildDaemonUrl('127.0.0.1',PORT)});
+      return fetch(requestUrl,{...options,method,signal,redirect:'error',headers:{'content-type':'application/json',
+        ...(ownerToken ? {'x-telepty-owner-token':ownerToken} : {}),
+        'x-telepty-principal':assertion,...(bearer ? {'x-telepty-session-token':bearer} : {})}});
+    };
+
     if (sshPlan) {
       try {
-        const response = await fetchWithAuth(`${DAEMON_URL}/api/meta`, { readOnlyAuth: true, signal: AbortSignal.timeout(2000) });
+        const response = await allowFetchWithAuth(`${DAEMON_URL}/api/meta`, { readOnlyAuth: true, signal: AbortSignal.timeout(2000) });
         const meta = response.ok ? await response.json() : null;
         if (!Array.isArray(meta?.capabilities) || !meta.capabilities.includes('ssh-child-write-receipts-v1')) {
           throw new Error('required SSH receipt capability unavailable');
@@ -2600,7 +2635,7 @@ async function main() {
         console.error('SSH requires a running daemon advertising ssh-child-write-receipts-v1. Start or upgrade it explicitly; no registration or command was started.');
         process.exitCode = 1; return;
       }
-    } else await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
+    } else if (!strictOwnerClient) await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
     // Detect terminal backend for session registration
     function findKittySocketCli() {
@@ -2617,7 +2652,7 @@ async function main() {
     const terminalProgram = detectTerminalProgram(process.env);
     const terminalType = process.env.TERM || null;
     try {
-      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
+      const res = await allowFetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2638,6 +2673,7 @@ async function main() {
         })
       });
       const data = await res.json();
+      if (res.ok && strictOwnerClient) strictOwnerEpoch = data.session_epoch;
       if (!res.ok) {
         console.error(`❌ Error: ${data.error}`);
         process.exit(1);
@@ -2659,6 +2695,7 @@ async function main() {
     const pty = require('node-pty');
     const sessionCwd = process.cwd();
     const sessionEnv = { ...process.env, ...(credentialChannel ? { TELEPTY_SESSION_CREDENTIAL_PATH: credentialChannel.credentialPath, TELEPTY_SESSION_CREDENTIAL_INSTANCE: credentialChannel.instance } : {}), TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true', ...(process.env.TELEPTY_SESSION_TOKEN ? { TELEPTY_SESSION_TOKEN: process.env.TELEPTY_SESSION_TOKEN } : {}), ...(process.env.TELEPTY_SESSION_NONCE ? { TELEPTY_SESSION_NONCE: process.env.TELEPTY_SESSION_NONCE } : {}) };
+    if (strictOwnerClient) delete sessionEnv.TELEPTY_PRINCIPAL_CLIENT_FILE;
     let child = null;
     const sshInput = sshPlan ? sshSupport.createSshInputState(sshPlan.metadata.agent, state => {
       if (wsReady && daemonWs?.readyState === 1) daemonWs.send(JSON.stringify({ type: 'ssh_state', ...state }));
@@ -2683,7 +2720,7 @@ async function main() {
       get child() { return child; },
       get idleTtl() { return idleTtl; },
       get DAEMON_URL() { return DAEMON_URL; },
-      get fetchWithAuth() { return fetchWithAuth; },
+      get fetchWithAuth() { return allowFetchWithAuth; },
       get resolveWindowsExecutable() { return resolveWindowsExecutable; },
       get cmdArgs() { return cmdArgs; },
       get sessionCwd() { return sessionCwd; },
@@ -2822,7 +2859,7 @@ async function main() {
     // of this session (a reconnect whose re-register POST below lost the race — that failure
     // is swallowed), its auto-register used to invent `command: 'wrapped'` and silently kill
     // every identity-gated feature. The bridge is the one process that always knows.
-    const wsOwnerBase = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}`;
+    const wsOwnerBase = `${daemonWsUrl(REMOTE_HOST)}/api/${strictOwnerClient ? 'owner/' : ''}sessions/${encodeURIComponent(sessionId)}`;
     // gh#82(D): the claim URL is BUILT PER ATTEMPT, not resolved once for the life of the bridge.
     // A daemon that came back holding a different secret (the reporter's environment B: "every
     // telepty CLI call → HTTP 401" with config.json untouched) is otherwise dialled forever with
@@ -2830,6 +2867,7 @@ async function main() {
     // long it runs. Called once here too, so a target this bridge cannot credential still fails
     // loudly at launch exactly as it did when this was a `const` (resolveTargetToken throws).
     function buildOwnerWsUrl() {
+      if (strictOwnerClient) return wsOwnerBase;
       return `${wsOwnerBase}?token=${encodeURIComponent(resolveTargetToken(wsOwnerBase))}&owner=1&owner_pid=${process.pid}&command=${encodeURIComponent(command)}`;
     }
     let wsUrl = buildOwnerWsUrl();
@@ -2904,12 +2942,17 @@ async function main() {
     // Flushed as ONE 'output' frame: the daemon appends it to the ring and feeds the session
     // state machine exactly as it would the same bytes arriving in pieces.
     function flushPreConnectOutput() {
+      if (!wsReady) return;
       if (!preConnectHeld.length) return;
       try {
         daemonWs.send(JSON.stringify({ type: 'output', data: preConnectHeld.join('') }));
         preConnectHeld = [];
         preConnectChars = 0;
-      } catch {
+      } catch (error) {
+        if (strictOwnerClient && Number.isSafeInteger(error.sentUnits) && error.sentUnits > 0) {
+          const remainder = preConnectHeld.join('').slice(error.sentUnits);
+          preConnectHeld = remainder ? [remainder] : []; preConnectChars = remainder.length;
+        }
         // Socket died mid-flush — keep the bytes for the next open rather than lose them.
       }
     }
@@ -2934,7 +2977,7 @@ async function main() {
         cachedAuthToken = null;
         try { wsUrl = buildOwnerWsUrl(); } catch { cachedAuthToken = priorAuthToken; }
         try {
-          const rereg = await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
+          const rereg = await allowFetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2962,6 +3005,7 @@ async function main() {
           // instance-bound channel described in docs/plans/credential-refresh-92.md.
           const reregData = await rereg.json().catch(() => null);
           if (allowSessionClosed) return;
+          if (rereg.ok && strictOwnerClient && reregData?.session_epoch) strictOwnerEpoch = reregData.session_epoch;
           credentialChannel?.stageRegistration(rereg, reregData);
           adoptRegistrationCredential(rereg, reregData, process.env, sessionEnv, DAEMON_URL);
         } catch (e) {
@@ -2977,14 +3021,21 @@ async function main() {
       const ownerCredential = scopedSessionToken(wsUrl, { localOrigin: buildDaemonUrl('127.0.0.1', PORT) });
       const ownerBearer = ownerCredential;
       const credentialAttempt = credentialChannel?.beginAttempt(ownerBearer);
-      const ownerSocket = new WebSocket(wsUrl, ownerBearer
-        ? { headers: { 'x-telepty-session-token': ownerBearer } }
-        : undefined);
+      let strictOwnerProof;
+      if (strictOwnerClient) {
+        try { strictOwnerProof = await strictOwnerClient.assertion({method:'GET',target:new URL(wsUrl).pathname,
+          body:{},action:'session.owner',sessionEpoch:strictOwnerEpoch,transport:'websocket'}); }
+        catch { scheduleReconnect(); return; }
+      }
+      if (allowSessionClosed) return;
+      const ownerSocket = new WebSocket(wsUrl, {headers:{...(ownerBearer ? {'x-telepty-session-token':ownerBearer} : {}),
+        ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
+      const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
       daemonWs = ownerSocket;
 
       daemonWs.on('open', () => {
         if (allowSessionClosed || daemonWs !== ownerSocket) return;
-        wsReady = true;
+        wsReady = !strictOwnerClient;
         // #768: before anything else this owner says, hand over what the PTY printed while the
         // socket was still coming up — so the ring's first content is the CLI's actual screen
         // and not whatever it happened to write next.
@@ -2995,18 +3046,22 @@ async function main() {
         // Re-send ready on reconnect so new daemon knows CLI is ready. Carries the SAME
         // qualification the original detection produced — a reconnect measures nothing new, so it
         // must not present itself as a stronger (or weaker) observation than what was seen.
-        if (readyNotified && promptReady) {
+        if (!strictOwnerClient && readyNotified && promptReady) {
           daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}) }));
         }
       });
 
       daemonWs.on('message', handleOwnerMessage);
 
-      function handleOwnerMessage(message) {
+      function handleOwnerMessage(message, alreadyVerified = false) {
         if (allowSessionClosed || daemonWs !== ownerSocket) return;
         try {
           const msg = JSON.parse(message);
+          if (strictOwnerWire && !alreadyVerified && !strictOwnerWire.accept(msg)) return;
           if (msg.type === 'owner_token') {
+            if (strictOwnerClient) { wsReady = true; flushPreConnectOutput();
+              if (readyNotified && promptReady) daemonWs.send(JSON.stringify({type:'ready',...(readyQualification || {})}));
+            }
             if (credentialChannel) {
               try {
                 if (!credentialChannel.acknowledgeOwner({ attempt: credentialAttempt, bearer: ownerBearer, ownerToken: msg.token, binding: msg.interaction_binding })) {
@@ -3108,12 +3163,13 @@ async function main() {
       }
       // Replay frames that arrived in the same packet as the initial owner token.
       replayPendingOwnerFrames = () => {
-        for (const frame of pendingOwnerFrames.splice(0)) handleOwnerMessage(frame);
+        for (const frame of pendingOwnerFrames.splice(0)) handleOwnerMessage(frame, true);
       };
 
       daemonWs.on('close', (code, reason) => {
         if (allowSessionClosed || daemonWs !== ownerSocket) return;
         interactionBinding = null;
+        if (strictOwnerClient) pendingOwnerFrames.length = 0;
         wsReady = false;
         // #17 (OQ-2): the daemon explicitly destroyed this session (manual kill or the
         // surface-gone GC) → close code 1000 'Session destroyed'. Terminate the bridge
@@ -3283,7 +3339,12 @@ async function main() {
         interactionProvider?.feed(data, stream);
         if (interactionStream) interactionStream.offset += data.length;
         if (wsReady && daemonWs.readyState === 1) {
-          daemonWs.send(JSON.stringify({ type: 'output', data, ...stream }));
+          try { daemonWs.send(JSON.stringify({ type: 'output', data, ...stream })); }
+          catch (error) {
+            if (!strictOwnerClient) throw error;
+            const remainder = data.slice(Number.isSafeInteger(error.sentUnits) ? error.sentUnits : 0);
+            if (remainder) holdPreConnectOutput(remainder);
+          }
         } else {
           holdPreConnectOutput(data);
         }

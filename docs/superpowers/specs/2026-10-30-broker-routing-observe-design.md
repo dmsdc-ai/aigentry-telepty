@@ -115,3 +115,50 @@ idle invalidated observers. Shutdown explicitly terminates this separate WSS.
 Fresh proof is necessary for reconnect; no token/JWT/query fallback is supported.
 Tests use synthetic configured keys, temporary HOME private daemons and an owned
 Node PTY fixture. No installed provider, trust store or service is changed.
+
+## Strict owner WebSocket continuation
+
+`GET /api/owner/sessions/:exactId` is a distinct wrapped-owner endpoint. It requires
+an exact `session.owner` grant, the stored owning principal (including for configured
+operators), the current signed epoch and the current session bearer header. There
+is no auto-registration, operator cross-owner override, query proof, or URL PID or
+command claim. The actual socket must be literal loopback or encrypted TLS; proxy
+headers confer no transport security. Admission retains existing origin/peer
+narrowing, and existing legacy owner/viewer/bus routes remain denied in strict mode.
+
+The current wrapped-owner protocol is connection bound: a random connection ID,
+monotonic sequences in both directions, proof expiry at most60s, exact record,
+epoch, credential generation, owner socket/generation and stored principal checks
+before processing or emitting each application frame. Idle changes are checked
+within50ms. Reconnect requires fresh signed proof and bearer. No swapped record
+can implicitly re-adopt an old socket. At most64 owner sockets are admitted;
+inbound messages and serialized outbound envelopes are bounded128KiB, with262144byte
+backpressure cutoff. Only existing owner output, heartbeat, qualified-ready,
+child lifecycle, interaction observation/receipt and SSH state/receipt frame types
+are accepted. Viewer input/resize/subscribe and bus state-report frames close the
+owner connection. These telemetry frames create no approval or completion authority.
+
+For a local synthetic or operator-selected child, `telepty allow` can opt in using
+`TELEPTY_PRINCIPAL_CLIENT_FILE`, the checked private `telepty.principal-client/v1`
+configuration. Its fixed daemon origin must match the command's configured daemon.
+This path never starts or upgrades a daemon, and presently refuses SSH child mode.
+Wrapped HTTP registration requires the existing explicit operator registration
+policy; the exact owner grant alone does not permit creation. Reconnect registration
+and teardown use signed HTTP requests plus the current scoped bearer. Teardown
+moves its stale-owner token into `x-telepty-owner-token`, retaining the existing
+comparison and refusing duplicate/conflicting carriers. Child startup still waits
+for the actual owner ACK; the signing configuration path is not inherited by the
+child. Configuration possession and same-user file access remain existing trust
+boundaries, not proof of descendant identity or process custody. No installed
+provider, key enrollment, service or native terminal automation is exercised.
+
+Strict allow splits live and buffered output into at most8,192 UTF16 units per
+frame, preserving surrogate pairs, stream offsets and sequence order. On partial
+backpressure failure it retains only the unsent suffix for reconnect. This is
+bounded output observation, not lossless scrollback: the existing256KiB-character
+holding limit and replay ring bounds still apply. Failed server sends raise an
+error or invoke the caller error callback. The client freezes its first owner
+expiry (at most60s locally), rejects expiry extension and independently terminates
+at the deadline. Signed allow HTTP operations compose caller cancellation with a
+finite5s deadline. Hermetic tests cover actual CLI startup and a private-daemon
+restart with90,000 buffered CJK characters; native provider behavior is unverified.

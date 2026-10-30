@@ -1660,7 +1660,11 @@ function createSessionActions(shared, effects = {}) {
       // Detach-only (no-op): leave the record and every client untouched. Tokenless callers
       // (operator `telepty delete`, ghost clean) and matching-token current-owner exits are
       // unaffected. Forceful kills go through POST /:id/kill (teardownSessionById), not here.
-      const ownerToken = req.query.owner_token;
+      const ownerHeaderCount = (req.rawHeaders || []).filter((name, index) => index % 2 === 0 && String(name).toLowerCase() === 'x-telepty-owner-token').length;
+      const ownerHeader = req.headers?.['x-telepty-owner-token'];
+      if (ownerHeaderCount > 1 || (ownerHeader !== undefined && (typeof ownerHeader !== 'string' || !ownerHeader || ownerHeader.length > 128))
+          || (ownerHeader && req.query.owner_token)) return res.status(400).json({code:'OWNER_TOKEN_HEADER_INVALID',error:'Invalid owner token carrier.'});
+      const ownerToken = ownerHeader || req.query.owner_token;
       if (session.type === 'wrapped'
           && ownerToken && session.ownerToken && ownerToken !== session.ownerToken
           && (0, shared.isOpenWebSocket)(session.ownerWs)) {

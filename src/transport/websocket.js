@@ -161,10 +161,11 @@ function installWebSocketTransport(deps) {
 
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url, 'http://' + req.headers.host);
-    const sessionId = url.pathname.split('/').pop();
+    const strictOwner = strictOwners.context(req);
+    const sessionId = strictOwner ? strictOwner.sessionId : url.pathname.split('/').pop();
     const session = sessions[sessionId];
     // ?owner=1 indicates the allow bridge (PTY owner), not an attach viewer
-    const isOwnerConnect = url.searchParams.get('owner') === '1';
+    const isOwnerConnect = !!strictOwner || url.searchParams.get('owner') === '1';
 
     // Ping/pong heartbeat — detect and terminate stale TCP half-open connections (30s interval)
     let isAlive = true;
@@ -179,6 +180,7 @@ function installWebSocketTransport(deps) {
       ws.ping();
     }, 30000);
 
+    if (strictOwner && (session !== strictOwner.session || !strictOwner.current())) { ws.terminate(); return; }
     if (!session) {
       const connectedAt = new Date().toISOString();
       // Auto-register wrapped session on WS connect (supports reconnect after daemon restart)
@@ -338,7 +340,7 @@ function installWebSocketTransport(deps) {
       // only carries owner_pid on reconnect, so a first-connect owner would otherwise have a null
       // ownerPid and `kill --force` could not SIGKILL the owning process. The bridge passes its pid
       // on the ?owner=1 URL; record it so the kill path always has a process to signal.
-      const claimOwnerPid = Number(url.searchParams.get('owner_pid'));
+      const claimOwnerPid = strictOwner ? NaN : Number(url.searchParams.get('owner_pid'));
       if (Number.isInteger(claimOwnerPid) && claimOwnerPid > 0) {
         activeSession.ownerPid = claimOwnerPid;
       }
@@ -369,6 +371,7 @@ function installWebSocketTransport(deps) {
         try { ws.close(1011, 'Session store write failed'); } catch {}
         return;
       }
+      if (strictOwner && !strictOwner.bind(ws)) { ws.terminate(); return; }
       if (isOwnerConnect && previousOwnerWs && previousOwnerWs !== ws) {
         // telepty#56 (durable last-writer-wins Replace): close the displaced owner with the
         // dedicated terminal code 4001 'Owner replaced' instead of a bare terminate(). A
@@ -455,6 +458,7 @@ function installWebSocketTransport(deps) {
     ws.on('message', (message) => {
       try {
         const msg = JSON.parse(message);
+        if (strictOwner && !strictOwner.accept(msg)) return;
         const { type, data, cols, rows } = msg;
 
         // #732 (H5 guard): `activeSession` above is a snapshot taken once, at connect time.
@@ -472,7 +476,7 @@ function installWebSocketTransport(deps) {
         // degrading into a viewer (the viewer branch drops 'output' entirely). Same
         // last-writer-wins rule as the connect-time claim: only an explicit ?owner=1 bridge,
         // and only when no other owner socket is open, so a live owner is never displaced.
-        if (activeSession.type === 'wrapped' && isOwnerConnect
+        if (!strictOwner && activeSession.type === 'wrapped' && isOwnerConnect
             && activeSession.ownerWs !== ws && !isOpenWebSocket(activeSession.ownerWs)) {
           activeSession.ownerWs = ws;
           activeSession.clients.add(ws);
@@ -656,6 +660,7 @@ function installWebSocketTransport(deps) {
           }
         }
       } catch (e) {
+        if (strictOwner) { ws.terminate(); return; }
         console.error('[WS] Invalid message format', e);
       }
     });
@@ -797,10 +802,12 @@ function installWebSocketTransport(deps) {
   // true for every address (empty allowlist) and for every tailnet device (#672 auto-trust
   // populates the list, and a MATCH returns true just as completely as an empty list does), so
   // an uncredentialed handshake — viewer socket and `/api/bus` alike — upgraded with 101.
+  const strictOwners = require('./strict-owner').createStrictOwnerTransport({ authentication: deps.principalAuthentication, credentials,
+    sessions, wss, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
   const observer = require('./observer').createObserverTransport({ authentication: deps.principalAuthentication,
     sessions, server, tailnetServer, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
   function handleUpgrade(req, socket, head) {
-    if (observer.handle(req, socket, head)) return;
+    if (observer.handle(req, socket, head) || strictOwners.handle(req, socket, head)) return;
     // Strict full-duplex routes have no per-frame authority adapter. Never let legacy upgrade
     // credentials turn it into a full-duplex bypass of action/target authorization.
     if (deps.principalAuthentication) {
@@ -861,7 +868,7 @@ function installWebSocketTransport(deps) {
     if (listener) listener.on('upgrade', handleUpgrade);
   }
 
-  return { wss, busWss, handleUpgrade, closeObservers: observer.close };
+  return { wss, busWss, handleUpgrade, closeObservers: () => { observer.close(); strictOwners.close(); } };
 }
 
 module.exports = {
