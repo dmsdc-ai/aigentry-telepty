@@ -123,11 +123,16 @@ test('TP2: with a tick in flight on a slow unrelated session, the text still pre
 });
 
 test('TP2: text not delivered within the bound is withdrawn — typed failure, and it never lands later', async (t) => {
-  // DELIVERY_TIMEOUT_MS=200 → the pairing wait is 400 ms, while six slow unrelated sessions hold the
-  // delivery tick for up to 200 ms each. Our message is still pending when the wait ends.
-  const short = await startTestDaemon({ env: { TELEPTY_DELIVERY_TIMEOUT_MS: '200' } });
-  t.after(() => short.stop());
-  const slowServer = http.createServer((req, res) => { req.resume(); setTimeout(() => res.end('{}'), 1500); });
+  // Seed the owned mailbox directly: separate HTTP inject callers would withdraw
+  // their pending rows after their own400ms waits, making the supposed backlog
+  // disappear before this target's deadline. These six fixture rows remain queued.
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const { FileMailbox } = require('../src/mailbox/index');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pr108-withdraw-backlog-'));
+  const short = await startTestDaemon({ env: { TELEPTY_DELIVERY_TIMEOUT_MS: '200', AIGENTRY_MAILBOX_DIR: root } });
+  t.after(async () => { await short.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  let receivedSlow = 0;
+  const slowServer = http.createServer((req, res) => { receivedSlow++; req.resume(); setTimeout(() => res.end('{}'), 1500); });
   await new Promise((resolve) => slowServer.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise((resolve) => slowServer.close(resolve)));
 
@@ -150,10 +155,13 @@ test('TP2: text not delivered within the bound is withdrawn — typed failure, a
   await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
   t.after(() => { try { ws.close(); } catch {} });
 
-  const slowInjects = slowIds.map((s) => short.request(`/api/sessions/${encodeURIComponent(s)}/inject`, { method: 'POST', body: { prompt: 'x' } }));
-  await sleep(100);
+  const mailbox = new FileMailbox({ root });
+  for (const [index, to] of slowIds.entries()) mailbox.enqueue({ msg_id: `fixture-backlog-${index}`, from: 'fixture', to,
+    payload: 'x', created_at: Math.floor(Date.now() / 1000) - 1, attempt: 0 });
+  const kick = short.request(`/api/sessions/${encodeURIComponent(slowIds[0])}/inject`, { method: 'POST', body: { prompt: 'kick' } });
+  await waitFor(() => receivedSlow > 0, { description: 'owned backlog actually entering delivery' });
   const res = await short.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, { method: 'POST', body: { prompt: 'late' } });
-  await Promise.all(slowInjects);
+  await kick;
   await sleep(2500); // past the slow tick and a retry backoff
 
   assert.equal(res.status, 504, JSON.stringify(res.body));
