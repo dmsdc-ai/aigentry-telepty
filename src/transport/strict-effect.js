@@ -1,12 +1,12 @@
 'use strict';
 const crypto = require('node:crypto');
+const {effectReceiptId}=require('../principal/receipt-key');
 const { WebSocketServer } = require('ws');
-const { parseUnambiguousJSON, canonicalJSON, bodyDigest } = require('../principal/encoding');
+const { parseUnambiguousJSON, bodyDigest } = require('../principal/encoding');
 const { storedOwningPrincipal } = require('../principal/http');
 const { createForwardLedger } = require('../peer-forwarding');
 const { localSocket } = require('./strict-owner');
 const { readResponse } = require('../broker/http');
-const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const validKey = value => typeof value === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(value);
 function backendOrigin(server) {
   const address = server?.address();
@@ -49,12 +49,34 @@ function createStrictEffectTransport({ authentication, sessions, server, refuse,
       const count=counts.get(countKey)-1;if(count)counts.set(countKey,count);else counts.delete(countKey);};
     const close=()=>{release();ws?.terminate();};
     const emit=body=>{if(!current() || ws.bufferedAmount>65536)return close();try{ws.send(JSON.stringify(body));}catch{close();}};
-    const receiptKey=(key,effect)=>hash(canonicalJSON([adapter.namespace,...(adapter.defaultEffect ? [] : [effect]),principal.audience,principal.id,principal.keyId,sessionId,epoch,key]));
-    const view=record=>({schema:adapter.receiptSchema,receipt_id:record.receipt_id,state:ledger.view(record).state,
-      ...(adapter.defaultEffect ? {} : { effect:record.effect }),
-      session_id:sessionId,session_epoch:epoch,...(record.remote_receipt || {}),consumption:'unknown',reply:'unknown'});
+    const receiptKey=(key,effect)=>effectReceiptId(adapter.namespace,adapter.defaultEffect?undefined:effect,principal,sessionId,epoch,key);
+    const storageFailure=()=>{throw Object.assign(new Error('Stored effect receipt is inconsistent'),{code:'FORWARD_STORAGE_UNAVAILABLE'});};
+    function view(record,effectName) {
+      if(record.direction!==adapter.direction || record.session!==sessionId || record.expected_epoch!==epoch
+        || (!adapter.defaultEffect && record.effect!==effectName))storageFailure();
+      if(Object.hasOwn(record,'actor') && (!record.actor || typeof record.actor!=='object' || Array.isArray(record.actor) || record.actor.id!==principal.id || record.actor.key_id!==principal.keyId
+        || record.actor.audience!==principal.audience || record.actor.source!=='ed25519'))storageFailure();
+      const state=ledger.view(record).state,effect=adapter.effects[effectName],raw=record.remote_receipt;
+      if(raw!==undefined && (!raw || typeof raw!=='object' || Array.isArray(raw)))storageFailure();
+      const safe={};
+      // Re-project only bounded result fields; persisted metadata cannot overwrite
+      // the envelope, authoritative state, actor partition, or consumption facts.
+      for(const field of ['success','queued','bootstrap_queued','delivered','retryable','delivery_uncertain','delivery_ack'])if(typeof raw?.[field]==='boolean')safe[field]=raw[field];
+      if(typeof raw?.inject_id==='string' && /^[A-Za-z0-9_-]{1,128}$/.test(raw.inject_id))safe.inject_id=raw.inject_id;
+      if(typeof raw?.code==='string' && /^[A-Z][A-Z0-9_]{0,95}$/.test(raw.code))safe.code=raw.code;
+      if(raw?.bytes_written===null || (Number.isSafeInteger(raw?.bytes_written) && raw.bytes_written>=0))safe.bytes_written=raw.bytes_written;
+      if(typeof raw?.publication_id==='string' && raw.publication_id.length<=128)safe.publication_id=raw.publication_id;
+      if(Number.isSafeInteger(raw?.matched_socket_count) && raw.matched_socket_count>=0 && raw.matched_socket_count<=64)safe.matched_socket_count=raw.matched_socket_count;
+      if(Number.isSafeInteger(raw?.seq) && raw.seq>=0)safe.seq=raw.seq;
+      const projected=effect.project({ok:state==='accepted',status:state==='accepted'?200:['pending','outcome_unknown'].includes(state)?503:409},
+        {...safe,session_id:sessionId,exact_target:true,semantic:{seq:safe.seq}},sessionId);
+      if(state==='accepted' && (!projected.accepted || projected.uncertain))storageFailure();
+      if(['pending','outcome_unknown'].includes(state)){projected.safe.success=false;projected.safe.retryable=false;delete projected.safe.delivered;delete projected.safe.queued;delete projected.safe.bootstrap_queued;}
+      return {...projected.safe,schema:adapter.receiptSchema,receipt_id:record.receipt_id,state,
+        ...(adapter.defaultEffect?{}:{effect:effectName}),session_id:sessionId,session_epoch:epoch,consumption:'unknown',reply:'unknown'};
+    }
     async function processFrame(message) {
-      let reserved;
+      let reserved,cacheSeen=false;
       try {
         const effectName = message?.type === 'receipt' ? (adapter.defaultEffect || message.effect) : message?.type;
         const effect = adapter.effects[effectName];
@@ -65,7 +87,7 @@ function createStrictEffectTransport({ authentication, sessions, server, refuse,
         const key=receiptKey(message.idempotency_key,effectName);
         if(message.type==='receipt') {
           if(Object.keys(message).some(k=>!['type','connection_id','sequence','idempotency_key',...(adapter.defaultEffect ? [] : ['effect'])].includes(k)))return close();
-          const found=ledger.read(key);return emit(found?view(found):{schema:adapter.receiptSchema,state:'not_found',session_id:sessionId,session_epoch:epoch});
+          const found=ledger.read(key);cacheSeen=!!found;return emit(found?view(found,effectName):{schema:adapter.receiptSchema,state:'not_found',session_id:sessionId,session_epoch:epoch});
         }
         if(Object.keys(message).some(k=>!['type','connection_id','sequence','idempotency_key','body','assertion'].includes(k)))return close();
         const body=message.body;
@@ -83,7 +105,7 @@ function createStrictEffectTransport({ authentication, sessions, server, refuse,
           success:false,code:policyCode,retryable:false,consumption:'unknown',reply:'unknown'});
         const fingerprint=adapter.defaultEffect ? bodyDigest(body) : bodyDigest({effect:effectName,target,body});
         reserved=ledger.reserve(key,fingerprint,{direction:adapter.direction,...(adapter.defaultEffect ? {} : { effect:effectName }),session:sessionId,expected_epoch:epoch,actor:{id:principal.id,key_id:principal.keyId,audience:principal.audience,source:'ed25519'}});
-        if(!reserved.fresh)return emit(view(reserved.record));
+        if(!reserved.fresh){cacheSeen=true;return emit(view(reserved.record,effectName));}
         busy=true;ledger.active.add(key);operation=new AbortController();
         let result;
         try {
@@ -94,9 +116,9 @@ function createStrictEffectTransport({ authentication, sessions, server, refuse,
           const { accepted, uncertain, safe } = effect.project(response,remote,sessionId);
           result={...reserved.record,state:uncertain?'outcome_unknown':accepted?'accepted':'failed',remote_status:response.status,remote_receipt:safe};
         } catch {result={...reserved.record,state:'outcome_unknown',remote_receipt:{success:false,code:code('OUTCOME_UNKNOWN'),retryable:false,bytes_written:null,delivery_uncertain:true}};}
-        ledger.write(result);emit(view(result));
+        ledger.write(result);emit(view(result,effectName));
       } catch(error) {
-        emit({schema:adapter.receiptSchema,state:reserved?'outcome_unknown':'refused',session_id:sessionId,session_epoch:epoch,success:false,
+        emit({schema:adapter.receiptSchema,state:(reserved || cacheSeen)?'outcome_unknown':'refused',session_id:sessionId,session_epoch:epoch,success:false,...((reserved || cacheSeen)?{bytes_written:null,delivery_uncertain:true}:{}),
           code:error.code==='IDEMPOTENCY_CONFLICT'?'IDEMPOTENCY_CONFLICT':code('STORAGE_UNAVAILABLE'),retryable:false,consumption:'unknown',reply:'unknown'});
       } finally {if(reserved?.fresh)ledger.active.delete(reserved.record.receipt_id);busy=false;operation=undefined;}
     }

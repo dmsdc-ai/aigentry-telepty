@@ -126,3 +126,19 @@ test('strict input preserves external approval refusal without inserting mailbox
  c.ws.send(JSON.stringify({type:'inject',connection_id:c.messages[0].connection_id,sequence:1,idempotency_key:'input-protected-deny-0001',body,assertion:f.sign({method:'POST',target:'/api/sessions/protected/inject',body,action:'session.inject',transport:'http',sessionEpoch:epoch})}));await waitFor(()=>c.messages.length===2);
  assert.equal(c.messages[1].state,'failed');assert.equal(c.messages[1].code,'EXTERNAL_APPROVAL_REQUIRED');assert.equal((await f.ownerRequest('GET','/api/sessions/protected/mailbox')).body.pending.length,0);
 });
+test('cached receipt metadata cannot override the authoritative operation identity or unknown state',async t=>{
+ const f=await transportFixture(t,'lost');let c=await f.connect();const key='input-cache-envelope-0001';c.ws.send(JSON.stringify(f.frame(c,1,key)));await waitFor(()=>c.messages.length===2);const original=c.messages[1];assert.equal(original.state,'outcome_unknown');
+ const directory=path.join(f.home,'.telepty','forward-receipts'),file=path.join(directory,fs.readdirSync(directory)[0]),record=JSON.parse(fs.readFileSync(file));
+ record.remote_receipt={...record.remote_receipt,state:'accepted',receipt_id:'0'.repeat(64),session_id:'foreign',session_epoch:'foreign',effect:'app_publish',consumption:'confirmed',data:'PRIVATE_DAMAGED_METADATA'};fs.writeFileSync(file,JSON.stringify(record));
+ f.restart();c=await f.connect();c.ws.send(JSON.stringify({type:'receipt',sequence:1,connection_id:c.messages[0].connection_id,idempotency_key:key}));await waitFor(()=>c.messages.length===2);
+ assert.equal(c.messages[1].state,'outcome_unknown');assert.equal(c.messages[1].receipt_id,original.receipt_id);assert.equal(c.messages[1].session_id,'mine');assert.equal(c.messages[1].session_epoch,'epoch');assert.equal(c.messages[1].consumption,'unknown');assert.ok(!JSON.stringify(c.messages[1]).includes('PRIVATE_DAMAGED_METADATA'));assert.equal(f.effects(),1);
+ record.direction='wrong-namespace';fs.writeFileSync(file,JSON.stringify(record));f.restart();c=await f.connect();
+ c.ws.send(JSON.stringify({type:'receipt',sequence:1,connection_id:c.messages[0].connection_id,idempotency_key:key}));await waitFor(()=>c.messages.length===2);assert.equal(c.messages[1].state,'outcome_unknown');assert.equal(c.messages[1].bytes_written,null);assert.equal(c.messages[1].code,'INPUT_STORAGE_UNAVAILABLE');
+ c.ws.send(JSON.stringify(f.frame(c,2,key)));await waitFor(()=>c.messages.length===3);assert.equal(c.messages[2].state,'outcome_unknown');assert.equal(f.effects(),1);
+});
+
+test('inconsistent accepted cache is unknown rather than a success or a new write',async t=>{
+ const f=await transportFixture(t,'ok');let c=await f.connect();const key='input-cache-inconsistent-0001';c.ws.send(JSON.stringify(f.frame(c,1,key)));await waitFor(()=>c.messages.length===2);assert.equal(c.messages[1].state,'accepted');
+ const dir=path.join(f.home,'.telepty','forward-receipts'),file=path.join(dir,fs.readdirSync(dir)[0]),record=JSON.parse(fs.readFileSync(file));record.remote_receipt.success=false;fs.writeFileSync(file,JSON.stringify(record));
+ f.restart();c=await f.connect();c.ws.send(JSON.stringify({type:'receipt',sequence:1,connection_id:c.messages[0].connection_id,idempotency_key:key}));await waitFor(()=>c.messages.length===2);assert.equal(c.messages[1].state,'outcome_unknown');assert.equal(c.messages[1].bytes_written,null);assert.equal(f.effects(),1);
+});

@@ -1,5 +1,6 @@
 'use strict';
 const WebSocket = require('ws');
+const {effectReceiptId}=require('./receipt-key');
 const { createPrincipalClient, loadPrincipalClientConfiguration } = require('./client');
 const { readAuthorityFile } = require('./authority-file');
 const { parseUnambiguousJSON } = require('./encoding');
@@ -14,12 +15,15 @@ async function runPrincipalEffect(profile,mode,parameters) {
   const [,file,,id,,epoch]=parameters, argument=parameters[busReceipt?9:7];
   if(!id || Buffer.byteLength(id)>128 || /[\/\\\x00-\x1f\x7f]/.test(id) || ['.','..'].includes(id)
     || !epoch || epoch.length>128)throw failure(code('TARGET_INVALID'));
-  const client=createPrincipalClient(loadPrincipalClientConfiguration(file));
+  const configuration=loadPrincipalClientConfiguration(file);
+  const client=createPrincipalClient(configuration);
   const request=mode==='inject'?parseUnambiguousJSON(readAuthorityFile(argument,{maximum:16384,privateFile:true})):{idempotency_key:argument,...(busReceipt?{effect:parameters[7]}:{})};
   if(!request || Array.isArray(request) || Object.keys(request).some(k=>!['idempotency_key','body',...(profile.defaultEffect?[]:['effect'])].includes(k))
     || typeof request.idempotency_key!=='string' || !/^[A-Za-z0-9_-]{16,128}$/.test(request.idempotency_key)
     || !Object.hasOwn(profile.effects,profile.defaultEffect || request.effect))throw failure(code('REQUEST_INVALID'));
   const effectName=profile.defaultEffect || request.effect, effect=profile.effects[effectName];
+  const expectedReceipt=effectReceiptId(profile.namespace,profile.defaultEffect?undefined:effectName,
+    {audience:configuration.principal.audience,id:configuration.principal.principal_id,keyId:configuration.principal.key_id},id,epoch,request.idempotency_key);
   if(mode==='inject' && (!request.body || typeof request.body!=='object' || Array.isArray(request.body)
     || (effect.kind==='inject' && request.body.exact_target!==true)
     || (effect.kind!=='state' && request.body.expected_epoch!==epoch)))throw failure(code('REQUEST_INVALID'));
@@ -54,7 +58,7 @@ async function runPrincipalEffect(profile,mode,parameters) {
         } else {
           if(!sent || frame.schema!==profile.receiptSchema || frame.session_id!==id || frame.session_epoch!==epoch
             || !['accepted','failed','outcome_unknown','pending','refused','not_found'].includes(frame.state))throw failure(code('FRAME_INVALID'));
-          if((frame.success===true && frame.state!=='accepted') || (frame.effect!==undefined && frame.effect!==effectName)
+          if((frame.receipt_id!==undefined && frame.receipt_id!==expectedReceipt) || (frame.success===true && frame.state!=='accepted') || (frame.effect!==undefined && frame.effect!==effectName)
             || (frame.state==='accepted' && (frame.success!==true || frame.delivery_uncertain===true || !/^[a-f0-9]{64}$/.test(frame.receipt_id || '')
               || (!profile.defaultEffect && frame.effect!==effectName)
               || (effect.kind==='inject' && !/^[A-Za-z0-9_-]{1,128}$/.test(frame.inject_id || ''))

@@ -102,7 +102,7 @@ async function wireFixture(t, mode = 'lost') {
       if (mode === 'lost') return req.socket.destroy();
       if (mode === 'malformed') return res.end('null');
       if (mode === 'server-error') { res.writeHead(503); return res.end(JSON.stringify({ success: false, code: 'STORAGE_FAILED' })); }
-      res.end(JSON.stringify({ success: true, session_id: 'mine', exact_target: true, inject_id: crypto.randomUUID(), semantic: { seq: 1, current_task: 'MUST_NOT_LEAK' } }));
+      res.end(JSON.stringify({ success: true, ...(mode==='contradictory'?{delivery_uncertain:true}:{}), session_id: 'mine', exact_target: true, inject_id: crypto.randomUUID(), semantic: { seq: 1, current_task: 'MUST_NOT_LEAK' } }));
     });
   });
   const install = () => { transport = createStrictBusTransport({ authentication, sessions, server, homeDir: home,
@@ -112,7 +112,7 @@ async function wireFixture(t, mode = 'lost') {
   const connect = async extra => { const c = await open(`ws://127.0.0.1:${server.address().port}/api/bus/sessions/mine`, sign(extra)); assert.ok(c.ws); t.after(() => c.ws.terminate()); await waitFor(() => c.messages.length); return c; };
   return { home, sign, session, sessions, authentication, server, connect, effects: () => effects, restart() { transport.close(); install(); } };
 }
-for (const mode of ['lost','malformed','server-error']) test(`bus ${mode} remains uncertain across adapter restart for both effects`, async t => {
+for (const mode of ['lost','malformed','server-error','contradictory']) test(`bus ${mode} remains uncertain across adapter restart for both effects`, async t => {
   const f = await wireFixture(t, mode); let c = await f.connect();
   for (const [index, type] of ['state_report','routed_turn'].entries()) {
     const body = type === 'state_report' ? { phase: 'PRIVATE_BUS_BODY', seq: 1 } : { prompt: 'PRIVATE_BUS_BODY', expected_epoch: 'epoch', exact_target: true, no_enter: true };

@@ -13,8 +13,8 @@ function validStateBody(body) {
 }
 function projectStateReceipt(response,remote,sessionId) {
   const valid=remote && typeof remote==='object' && !Array.isArray(remote);
-  const accepted=response.ok && valid && remote.success===true && remote.session_id===sessionId;
-  const uncertain=response.status>=500 || !valid || (response.ok && !accepted);
+  const accepted=response.ok && valid && remote.success===true && remote.delivery_uncertain!==true && remote.session_id===sessionId;
+  const uncertain=response.status>=500 || !valid || remote.delivery_uncertain===true || (response.ok && !accepted);
   const safe={success:accepted,retryable:false};
   if(accepted && Number.isSafeInteger(remote.semantic?.seq) && remote.semantic.seq>=0)safe.seq=remote.semantic.seq;
   if(valid && /^[A-Z][A-Z0-9_]{0,95}$/.test(remote.code || ''))safe.code=remote.code;

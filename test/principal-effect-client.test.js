@@ -7,6 +7,8 @@ async function fixture(t,receipt,effect='inject') {
  const home=fs.mkdtempSync(path.join(os.tmpdir(),'principal-effect-client-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
  const pair=crypto.generateKeyPairSync('ed25519'),challenge=crypto.randomBytes(32).toString('base64url');
  const server=http.createServer((_req,res)=>res.end(JSON.stringify({schema:'telepty.principal-challenge/v1',audience:'fixture',challenge,max_lifetime_seconds:60,transport:'http',identity_source:'configured-ed25519-key'})));
+ const tuple=bus?['strict-bus/v1',effect,'fixture','writer','writer','mine','epoch','input-client-contract-0001']:['strict-input/v1','fixture','writer','writer','mine','epoch','input-client-contract-0001'];
+ if(receipt.receipt_id==='fixture-key')receipt={...receipt,receipt_id:crypto.createHash('sha256').update(JSON.stringify(tuple)).digest('hex')};
  const wss=new WebSocketServer({server});wss.on('connection',ws=>{ws.send(JSON.stringify({schema:bus?'telepty.bus-effect-stream/v1':'telepty.input-stream/v1',connection_id:crypto.randomUUID(),session_id:'mine',session_epoch:'epoch',expires_at:Date.now()+59000,mode:bus?'signed-http-session-effects':'signed-http-inject',max_frames:64}));ws.on('message',()=>ws.send(JSON.stringify(receipt)));});
  await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>{for(const ws of wss.clients)ws.terminate();wss.close();server.closeAllConnections();server.close();});
  const key=path.join(home,'key'),config=path.join(home,'config'),request=path.join(home,'request');fs.writeFileSync(key,pair.privateKey.export({type:'pkcs8',format:'pem'}),{mode:0o600});
@@ -29,7 +31,7 @@ test('bus receipt cannot acknowledge a different effect',async t=>{
  assert.equal((await runPrincipalBus('inject',args)).state,'outcome_unknown');
 });
 test('application publication never promotes an ACK claim or raw response payload',async t=>{
- const base={schema:'telepty.bus-effect-receipt/v1',effect:'app_publish',session_id:'mine',session_epoch:'epoch',state:'accepted',success:true,receipt_id:'a'.repeat(64),publication_id:crypto.randomUUID(),matched_socket_count:1,delivery_ack:false,data:'PRIVATE_SERVER_DATA',consumption:'confirmed',reply:'answer'};
+ const base={schema:'telepty.bus-effect-receipt/v1',effect:'app_publish',session_id:'mine',session_epoch:'epoch',state:'accepted',success:true,receipt_id:'fixture-key',publication_id:crypto.randomUUID(),matched_socket_count:1,delivery_ack:false,data:'PRIVATE_SERVER_DATA',consumption:'confirmed',reply:'answer'};
  const bad=await fixture(t,{...base,delivery_ack:true},'app_publish');assert.equal((await runPrincipalBus('inject',bad)).state,'outcome_unknown');
  const malformed=await fixture(t,{...base,publication_id:'-'.repeat(36)},'app_publish');assert.equal((await runPrincipalBus('inject',malformed)).state,'outcome_unknown');
  const good=await fixture(t,base,'app_publish'),receipt=await runPrincipalBus('inject',good);assert.equal(receipt.state,'accepted');assert.equal(receipt.delivery_ack,false);assert.equal(receipt.consumption,'unknown');assert.equal(receipt.reply,'unknown');assert.ok(!JSON.stringify(receipt).includes('PRIVATE_SERVER_DATA'));
@@ -61,4 +63,9 @@ test('actual bus CLI state, turn and application publication preserve authority 
  await waitFor(()=>apps.messages.length===2);assert.equal(apps.messages[1].data.text,'PRIVATE_APP');assert.equal(apps.messages[1].trusted_daemon_event,false);assert.equal(apps.messages[1].actor.id,'owner');assert.ok(!JSON.stringify(trusted.messages).includes('PRIVATE_APP'));
  const mailbox=await client.request({method:'GET',target:'/api/sessions/mine/mailbox',body:undefined,action:'mailbox.read'});assert.equal((await mailbox.json()).pending.length,1);
  assert.equal(fs.existsSync(path.join(clientHome,'.telepty','config.json')),false);
+});
+
+test('a well-formed receipt for another operation key never confirms this input',async t=>{
+ const args=await fixture(t,{schema:'telepty.input-receipt/v1',session_id:'mine',session_epoch:'epoch',state:'accepted',success:true,receipt_id:'b'.repeat(64),inject_id:'inject-id'});
+ const result=await runPrincipalInput('inject',args);assert.equal(result.state,'outcome_unknown');assert.equal(result.success,false);assert.equal(result.retryable,false);
 });

@@ -162,3 +162,8 @@ test('publication receipt projection refuses inconsistent delivery ACK claims an
     assert.equal(invalid.safe.publication_id, undefined); assert.equal(invalid.safe.delivery_ack, false);
   }
 });
+test('a successful-looking publication response cannot erase explicit uncertainty',()=>{
+ const {projectPublicationReceipt}=require('../src/application-publication');
+ const receipt=projectPublicationReceipt({ok:true,status:200},{success:true,session_id:'mine',publication_id:crypto.randomUUID(),matched_socket_count:1,delivery_ack:false,delivery_uncertain:true},'mine');
+ assert.equal(receipt.accepted,false);assert.equal(receipt.uncertain,true);assert.equal(receipt.safe.success,false);assert.equal(receipt.safe.publication_id,undefined);
+});
