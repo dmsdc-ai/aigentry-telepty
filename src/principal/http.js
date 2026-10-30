@@ -107,6 +107,10 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
       const match = /^\/api\/input\/sessions\/([^/?]+)$/.exec(req.url || '');
       return authorizeSocket(req, match, 'session.input_stream', false, true);
     },
+    authorizeEvents(req) {
+      const match = /^\/api\/events\/sessions\/([^/?]+)$/.exec(req.url || '');
+      return authorizeSocket(req, match, 'session.events', false);
+    },
     authorizeObserver(req) {
       const match = /^\/api\/observe\/sessions\/([^/?]+)$/.exec(req.url || '');
       return authorizeSocket(req, match, 'session.observe', false);

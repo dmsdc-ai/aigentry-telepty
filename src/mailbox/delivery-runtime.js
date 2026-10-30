@@ -1007,6 +1007,7 @@ function createDeliveryRuntime(shared, {
 
   function broadcastSessionEvent(eventType, sessionId, session, options = {}) {
     const event = buildSessionEvent(eventType, sessionId, session, options);
+    require('../transport/session-events').publishTrustedSessionEvent(session, sessionId, eventType, event);
     broadcastBusEvent(event);
     return event;
   }
