@@ -9,7 +9,10 @@ function fixture(root, endpoint, extra = {}) {
   const mailbox = new FileMailbox({ root, retryBackoffSecs: 0, inflightTimeoutSecs: 0, maxRetries: 10 });
   const session = { id: 'fixture', sessionEpoch: 'fixture-epoch', type: 'aterm', deliveryEndpoint: endpoint };
   const events = []; let engine;
-  const context = createSessionDeliveryContext({ ...extra, sessions: { fixture: session }, DELIVERY_TIMEOUT_MS: 60,
+  const context = createSessionDeliveryContext({ ...extra, sessions: { fixture: session },
+    // Allow initial loopback connection setup under full-suite concurrency; the
+    // timeout case still waits past this finite budget after the body is received.
+    DELIVERY_TIMEOUT_MS: 1000,
     isOpenWebSocket: ws => ws?.readyState === 1, armUpstreamProbe() {},
     hasHeldInteraction: () => false, interaction: { invalidateInteraction() {} },
     buildErrorBody: (code, error, extra) => ({ success: false, code, error, ...extra }), markSessionDisconnected() {},

@@ -2615,7 +2615,7 @@ async function main() {
         : method === 'DELETE' ? 'session.destroy' : pathname === '/api/meta' ? 'daemon.inspect' : null;
       if (!action) throw new Error('PRINCIPAL_ALLOW_ACTION_UNSUPPORTED');
       const deadline = AbortSignal.timeout(5000);
-      const signal = options.signal ? AbortSignal.any([options.signal,deadline]) : deadline;
+      const signal = options.signal ? require('./src/broker/http').combineAbortSignals([options.signal,deadline]) : deadline;
       const assertion = await strictOwnerClient.assertion({ method, target:target.pathname+target.search, body, action,
         ...(strictOwnerEpoch ? {sessionEpoch:strictOwnerEpoch} : {}), signal });
       const bearer = scopedSessionToken(url, {localOrigin:buildDaemonUrl('127.0.0.1',PORT)});

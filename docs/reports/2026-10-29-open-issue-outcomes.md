@@ -1,6 +1,6 @@
 # Open Telepty issues: local delivery outcome — 2026-10-29
 
-Latest continuation: [scoped broker routing and strict observation](2026-10-30-broker-routing-observe.md),
+Latest continuation: [strict owner and explicit signer CLI](2026-10-30-strict-owner-cli.md),
 2,379 total / 2,376 pass / zero fail / three skip; affected WS hint follow-up 19/19.
 The 23 local / 29 partial / 3 remaining disposition is unchanged.
 
@@ -35,7 +35,7 @@ Current source disposition: **23 local implementations, 29 partial items, 3 rema
 | [#135](https://github.com/dmsdc-ai/aigentry-telepty/issues/135) | Local implementation | Child startup, mailbox recovery and success wait for WS owner token after HTTP registration; refused challenger leaves incumbent untouched. |
 | [#134](https://github.com/dmsdc-ai/aigentry-telepty/issues/134) | Partial | Exact owned kill and immutable protected-instance policy now require current sid/epoch/generation credential. Opt-in strict asymmetric principal authorization adds owner/operator grants separately; default legacy operator bearer remains explicitly privileged. |
 | [#133](https://github.com/dmsdc-ai/aigentry-telepty/issues/133) | Partial | Explicit strict-HTTP takeover of an expired poll-only mailbox requires the same configured owner principal, exact grant and signed/body epoch CAS. New credential/nonce plus bounded authority audit commit atomically; strict locked custody preserves original sender/time or refuses corrupt/unknown storage. Wrapped/live takeover awaits a signed WS adapter, graceful incumbent ACK and process-custody proof. |
-| [#132](https://github.com/dmsdc-ai/aigentry-telepty/issues/132) | Partial | Checked Linux Ed25519 HTTP principals now support separately granted output-only WS observation with exact epoch, TTL/caps and identity fences. Owner/input/bus WS, native OS-account identity and hostile same-UID isolation remain unsupported; signer mode never falls back to a daemon token. |
+| [#132](https://github.com/dmsdc-ai/aigentry-telepty/issues/132) | Partial | Checked Linux Ed25519 HTTP principals now support exact output-only observation and a same-principal/current-bearer strict owner WS with explicit local allow signer, epoch/sequence/TTL/instance fences and bounded reconnect output. Legacy viewer input/bus WS, native OS-account identity and hostile same-UID isolation remain unsupported; signer mode never falls back to a daemon token. |
 | [#131](https://github.com/dmsdc-ai/aigentry-telepty/issues/131) | Partial | Windows self-update now refuses before npm/repair, including interactive/override paths; bounded read-only --plan --json documents exact holder/install/service/rollback blockers. Direct npm upgrade and native transaction/holder verification remain unimplemented. |
 | [#130](https://github.com/dmsdc-ai/aigentry-telepty/issues/130) | Partial | Independent incumbent-PID overwrite defect reproduced/fixed. Original Windows owner-refusal then not-found sequence remains unreproduced. |
 | [#129](https://github.com/dmsdc-ai/aigentry-telepty/issues/129) | Local implementation | Kill errors use natural exitCode/return for transport teardown. Actual Windows UV assertion acceptance remains native-only. |

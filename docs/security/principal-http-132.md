@@ -176,10 +176,10 @@ HTTP adapter. Reserved static session path names cannot become exact-session
 grants, including encoded variants. Missing exact records never fall through to
 legacy alias resolution.
 
-Strict mode refuses owner, input-capable attach and bus WebSocket upgrades,
+Strict mode refuses legacy input-capable attach and bus WebSocket upgrades,
 including ones carrying a shared daemon/JWT/session credential. Those clients
-need a future signed-handshake/per-frame authority adapter. A separate output-only
-observer is supported under its own exact grant as described below. The
+need action-specific adapters. A separate output-only observer and a dedicated
+signed owner route are supported under their own exact grants as described below. The
 first slice is useful for independently signed HTTP/mailbox/control clients; it
 is not full acceptance of #132's wrapped-client, OS-account or external identity
 provider proposal. Default legacy clients retain their existing behavior.
@@ -211,8 +211,8 @@ proof, token/JWT fallback, request body or automatic registration is accepted.
 
 This is a dedicated output-only transport. It emits an initial read-only identity
 envelope and bounded output frames only. Every client application frame, including
-input, resize or subscribe, closes the connection. Owner and bus routes remain
-unsupported. Verified proof expiry closes the connection within at most 60 seconds;
+input, resize or subscribe, closes the connection. Legacy attach and bus routes remain
+unsupported; the owner route uses its separate protocol below. Verified proof expiry closes the connection within at most 60 seconds;
 capacity is 64 global and 8 per principal/session. Before each output and periodically,
 it rechecks the exact session object, closing state, owning principal, epoch,
 credential generation, owner socket and owner generation. Changed identity cannot
@@ -222,8 +222,8 @@ existing observers.
 Replay scans at most 1024 recent chunks and 64 KiB, frames are capped 64 KiB, and
 backpressure above 128 KiB closes the observer. No owner/session credentials, policy
 state, readiness inference or completion receipt is emitted. Output bytes prove no
-agent consumption or answer. This does not make legacy attach or allow clients
-strict-mode compatible; a signed owner/input protocol remains future work.
+agent consumption or answer. Legacy attach remains unsupported. Local allow can explicitly select the signed
+owner protocol below; it never silently changes authentication mode.
 
 ## Explicit signer client and observation CLI
 
@@ -259,3 +259,37 @@ registers a session or creates a shared token file. A live stream is bounded by
 60 seconds; output is observation rather than proof of consumption or completion.
 The SDK `createPrincipalClient` also sends explicitly selected signed HTTP requests
 with a mandatory five-second deadline and without retrying uncertain mutations.
+
+## Signed owner connection and local allow
+
+`GET /api/owner/sessions/:exactId` requires a fresh header assertion for
+`session.owner`, transport websocket, body {}, exact raw path and current epoch,
+plus the current `x-telepty-session-token`. The configured signer must match the
+stored owning principal; operator status has no cross-owner exception. Existing
+wrapped records only are accepted. There is no auto-register, missing-record
+adoption, query PID/command custody or lost-bearer takeover.
+
+The owner adapter requires actual TLS or a literal loopback socket. It allows up
+to 64 connections, each with a random connection ID, strictly ordered application
+sequence, at most 60-second expiry and exact record/epoch/credential/owner-generation
+fences. Only owner output, heartbeat, readiness and existing receipt/lifecycle
+frames are accepted; viewer input/resize and bus messages are refused. Each
+application frame is connection-bound over the protected transport, rather than
+a standalone signed artifact. The proof grants no independent OS-account identity.
+
+Set `TELEPTY_PRINCIPAL_CLIENT_FILE` to the checked client file when invoking local
+`telepty allow`. The daemon must already be running. Registration additionally
+requires operator authority with an exact session.register grant; reconnection
+and teardown require their respective grants/current instance proofs. The child
+starts after owner ACK, and the signer configuration environment variable is
+removed from its environment. No daemon repair, enrollment or token fallback
+is attempted. SSH and native platforms without the Linux authority adapter are
+unsupported by this selection.
+
+The existing owner lifecycle, persisted claim rollback, approval/delivery gates
+and stale-owner teardown guard remain. Signed teardown carries owner token in
+`x-telepty-owner-token`; duplicate or conflicting query/header carriers refuse.
+The wire bounds frames and backpressure, splits large UTF16 output preserving
+surrogate pairs and stream offsets, retains unsent suffixes on reconnect, and
+propagates send refusals as errors. Owner dispatch still does not prove child
+write, consumption, response or completion.
