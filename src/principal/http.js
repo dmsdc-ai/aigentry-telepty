@@ -77,7 +77,7 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
   if (!sessions || !['object', 'function'].includes(typeof sessions)) unavailable();
   const verifier = createPrincipalVerifier({ trust, now, replayCapacity, challenge });
   const denied = (code, status = 403) => ({ ok: false, code, status });
-  function authorizeSocket(req, match, action, ownerOnly) {
+  function authorizeSocket(req, match, action, ownerOnly, delegatedInput = false) {
     if (req.method !== 'GET' || !match || !validTarget(req.url)) return denied('PRINCIPAL_ACTION_DENIED');
     let id;
     try { id = decodeURIComponent(match[1]); } catch { return denied('PRINCIPAL_ACTION_DENIED'); }
@@ -90,7 +90,7 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
       bodySha256: bodyDigest({}), action, grantTarget: id, transport: 'websocket', sessionEpoch: session.sessionEpoch });
     if (!result.ok) return result;
     const owner = storedOwningPrincipal(session.owningPrincipal);
-    if (!(owner && owner.id === result.principal.id && owner.audience === result.principal.audience)
+    if (!delegatedInput && !(owner && owner.id === result.principal.id && owner.audience === result.principal.audience)
         && (ownerOnly || result.principal.authority !== 'operator')) return denied('PRINCIPAL_SESSION_OWNER_REQUIRED');
     return { ...result, session, sessionId: id };
   }
@@ -102,6 +102,10 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
       if (!match) return denied('PRINCIPAL_ACTION_DENIED');
       // Share the header/body/path validation and verifier cache without translating the signed target.
       return authorizeSocket(req, match, 'session.owner', true);
+    },
+    authorizeInput(req) {
+      const match = /^\/api\/input\/sessions\/([^/?]+)$/.exec(req.url || '');
+      return authorizeSocket(req, match, 'session.input_stream', false, true);
     },
     authorizeObserver(req) {
       const match = /^\/api\/observe\/sessions\/([^/?]+)$/.exec(req.url || '');

@@ -806,8 +806,10 @@ function installWebSocketTransport(deps) {
     sessions, wss, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
   const observer = require('./observer').createObserverTransport({ authentication: deps.principalAuthentication,
     sessions, server, tailnetServer, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
+  const strictInputs = require('./strict-input').createStrictInputTransport({ authentication: deps.principalAuthentication,
+    sessions, server, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
   function handleUpgrade(req, socket, head) {
-    if (observer.handle(req, socket, head) || strictOwners.handle(req, socket, head)) return;
+    if (observer.handle(req, socket, head) || strictOwners.handle(req, socket, head) || strictInputs.handle(req, socket, head)) return;
     // Strict full-duplex routes have no per-frame authority adapter. Never let legacy upgrade
     // credentials turn it into a full-duplex bypass of action/target authorization.
     if (deps.principalAuthentication) {
@@ -868,7 +870,7 @@ function installWebSocketTransport(deps) {
     if (listener) listener.on('upgrade', handleUpgrade);
   }
 
-  return { wss, busWss, handleUpgrade, closeObservers: () => { observer.close(); strictOwners.close(); } };
+  return { wss, busWss, handleUpgrade, closeObservers: () => { observer.close(); strictOwners.close(); strictInputs.close(); } };
 }
 
 module.exports = {

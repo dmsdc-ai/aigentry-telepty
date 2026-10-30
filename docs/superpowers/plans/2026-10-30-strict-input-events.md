@@ -1,0 +1,9 @@
+# Strict input and trusted session event continuation
+
+Baseline eba1f74. Read-only GitHub reconciliation:55 open issues,11 open PRs; no remote mutation. Issue132 remains partial;133 has strict owner reconnect but lacks lost-bearer/live-handoff custody.
+
+1. Add exact signed input-stream admission under a separate session.input_stream grant and current epoch. Dedicated protected-transport WS, not legacy viewer membership. Keep exact instance/principal/owner-generation fences, short expiry and bounded concurrency/backpressure.
+2. Each input carries a fresh normal HTTP session.inject assertion from the SAME configured key/principal, binding exact fixed inject route/body/current epoch. Never infer inject authority from stream/observe grants. Forward only to this process's known loopback listener; actual HTTP middleware verifies signature, nonce, approval and delivery gates. Caller Host/URLs/headers cannot route it.
+3. Before the attempt, durably reserve an input namespace key scoped to principal/key/session/epoch/idempotency. Store hashes and projected receipts only. Lost/5xx/invalid receipts become unknown and are never retried automatically, even after restart. Expose own scoped receipt query. Endpoint acceptance/dispatch do not imply child write/consumption/reply.
+4. Add separate exact signed read-only session event transport. Publish only trusted daemon-produced, allowlisted projections with captured session identity; never global raw busClients or busAutoRoute. Mutating/state/turn bus frames remain refused.
+5. Add SDK/explicit CLI only where safe; tests with synthetic keys/private daemon/temp HOME. Independently review then full suite, syntax/typecheck. Record handoff requirements rather than weakening incumbent authority. No live services, installations, actual credentials, network/security settings or remote repository mutations.
