@@ -1,5 +1,14 @@
 'use strict';
 
+function lockRefused(error, sessionId) {
+  const refused = ['MAILBOX_LOCK_TIMEOUT', 'MAILBOX_LOCK_LEGACY', 'MAILBOX_LOCK_STORAGE'].includes(error.code)
+    || error.message.includes('lock timeout');
+  if (refused && ['MAILBOX_LOCK_LEGACY', 'MAILBOX_LOCK_STORAGE'].includes(error.code)) {
+    console.error(`[MAILBOX] Delivery paused for ${sessionId}: ${error.message}`);
+  }
+  return refused;
+}
+
 
 /**
  * DeliveryEngine — polls mailbox for pending messages and delivers them.
@@ -89,7 +98,7 @@ class DeliveryEngine {
             console.log(`[MAILBOX] Recovered ${recovered} in-flight message(s) for ${sessionId}`);
           }
         } catch (err) {
-          if (err.message.includes('lock timeout')) {
+          if (lockRefused(err, sessionId)) {
             lockFailed = true;
           } else {
             console.error(`[MAILBOX] recoverInflight error for ${sessionId}: ${err.message}`);
@@ -104,7 +113,7 @@ class DeliveryEngine {
               console.log(`[MAILBOX] Expired ${expired} stale message(s) for ${sessionId}`);
             }
           } catch (err) {
-            if (err.message.includes('lock timeout')) {
+            if (lockRefused(err, sessionId)) {
               lockFailed = true;
             } else {
               console.error(`[MAILBOX] expireStale error for ${sessionId}: ${err.message}`);
@@ -166,7 +175,7 @@ class DeliveryEngine {
             this._lockFailures.delete(sessionId);
             this._skipUntil.delete(sessionId);
           } catch (err) {
-            if (err.message.includes('lock timeout')) {
+            if (lockRefused(err, sessionId)) {
               lockFailed = true;
             } else {
               console.error(`[MAILBOX] Delivery loop error for ${sessionId}: ${err.message}`);

@@ -63,3 +63,19 @@ test('compatibility config fields remain readable but are not eviction authority
   const custom = new FileMailbox({root, staleLockAgeSecs: 30, lockBreakAfterFailures: 5});
   assert.equal(custom.config.staleLockAgeSecs, 30); assert.equal(custom.config.lockBreakAfterFailures, 5);
 });
+test('legacy migration refusal backs off without trying further mailbox mutations', async t => {
+  const {root, dir} = fixture(t), mailbox = new FileMailbox({root});
+  mailbox.enqueue({msg_id:'retained',from:'origin',to:'s',payload:'keep',created_at:Math.floor(Date.now()/1000),attempt:0});
+  fs.rmdirSync(path.join(dir,'.lock')); // Only an idle, private fixture is converted to legacy form.
+  fs.writeFileSync(path.join(dir,'.lock'),String(process.pid));
+  const errors=[];t.mock.method(console,'error',message=>errors.push(message));
+  let delivered=0;
+  const engine=new DeliveryEngine(mailbox,{sessionResolver:()=>['s'],pollMs:50,deliverFn:async()=>{delivered++;return true;}});
+  await engine.tick();
+  assert.equal(engine._lockFailures.get('s'),1);
+  assert.ok(engine._skipUntil.get('s')>Date.now());
+  assert.equal(errors.length,1);assert.match(errors[0],/quiesced migration/);
+  await engine.tick();assert.equal(errors.length,1);assert.equal(delivered,0);
+  assert.equal(fs.readFileSync(path.join(dir,'.lock'),'utf8'),String(process.pid));
+  assert.equal(mailbox.listSessions().length,1);
+});
