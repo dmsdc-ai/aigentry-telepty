@@ -91,7 +91,12 @@ Linux private authority-file checks, with exact SID/origin/epoch binding; both
 file handles' environment paths are removed from the child. The product does not
 write this credential file or infer authority from inherited ambient session
 tokens. The signed registration and owner handshake still verify the configured
-actor and current bearer. The successor's child starts only after its owner ACK.
+actor and current bearer. The private-file path also sends both
+`expected_epoch` and `expected_credential_generation` registration preconditions.
+The server refuses a missing/mismatched instance before issuing any credential;
+the CLI requires `registration_instance_matched: true`, a re-registration and
+matching epoch/generation. Older responses lacking this evidence refuse before
+an owner socket or successor child starts. The successor's child starts only after its owner ACK.
 
 ## Refusal, uncertainty and restart
 
