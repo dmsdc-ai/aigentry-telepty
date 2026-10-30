@@ -31,8 +31,8 @@ function createLocalPrincipalRequest({ localDaemonUrl, principal, timeoutMs, fet
   const local = origin(localDaemonUrl, true);
   const signer = validateProgrammaticPrincipal(principal);
   if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10000) throw error('BROKER_CONFIG_INVALID');
-  return async (sid, body, signal) => {
-    const target = `/api/forwarded/sessions/${encodeURIComponent(sid)}/inject`;
+  const request = async (sid, body, signal, inspect = false) => {
+    const target = inspect ? `/api/sessions/${encodeURIComponent(sid)}` : `/api/forwarded/sessions/${encodeURIComponent(sid)}/inject`;
     const deadline = combineAbortSignals([...(signal ? [signal] : []), AbortSignal.timeout(timeoutMs)]);
     let response;
     try { response = await send(`${local}/api/auth/challenge`, { redirect: 'error', signal: deadline }); }
@@ -44,12 +44,16 @@ function createLocalPrincipalRequest({ localDaemonUrl, principal, timeoutMs, fet
         || typeof challenge.challenge !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(challenge.challenge)
         || challenge.max_lifetime_seconds !== 60 || challenge.transport !== 'http'
         || challenge.identity_source !== 'configured-ed25519-key') throw error('BROKER_LOCAL_CHALLENGE_INVALID');
-    if (body.exact_target !== true || typeof body.expected_epoch !== 'string' || !body.expected_epoch) throw error('BROKER_LOCAL_BODY_INVALID');
+    if (!inspect && (body.exact_target !== true || typeof body.expected_epoch !== 'string' || !body.expected_epoch)) throw error('BROKER_LOCAL_BODY_INVALID');
     const assertion = createSignedAssertion({ privateKey: signer.privateKey, keyId: signer.key_id, principalId: signer.principal_id,
-      audience: signer.audience, challenge: challenge.challenge, method: 'POST', target, body,
-      action: 'session.forwarded_inject', sessionEpoch: body.expected_epoch });
-    return send(local + target, { method: 'POST', redirect: 'error', signal: deadline,
-      headers: { 'content-type': 'application/json', 'x-telepty-principal': assertion }, body: JSON.stringify(body) });
+      audience: signer.audience, challenge: challenge.challenge, method: inspect ? 'GET' : 'POST', target, body,
+      action: inspect ? 'session.inspect' : 'session.forwarded_inject', sessionEpoch: inspect ? undefined : body.expected_epoch });
+    return send(local + target, { method: inspect ? 'GET' : 'POST', redirect: 'error', signal: deadline,
+      headers: { 'content-type': 'application/json', 'x-telepty-principal': assertion },
+      ...(inspect ? {} : { body: JSON.stringify(body) }) });
   };
+  const inject = (sid, body, signal) => request(sid, body, signal);
+  inject.inspect = (sid, signal) => request(sid, undefined, signal, true);
+  return inject;
 }
 module.exports = { loadLocalPrincipal, validateProgrammaticPrincipal, createLocalPrincipalRequest };

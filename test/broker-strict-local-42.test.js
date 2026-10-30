@@ -31,7 +31,7 @@ test('signed hub/node topology reaches strict local mailbox without a daemon tok
   const localTrust = path.join(root, 'local-trust.json');
   fs.writeFileSync(localTrust, JSON.stringify(trust(localAudience, [
     entry('operator', operator, [grant('session.register', ['worker', 'protected']), grant('mailbox.read', ['worker', 'protected'])], 'operator'),
-    entry('relay', relay, [grant('session.forwarded_inject', ['worker', 'protected'])]),
+    entry('relay', relay, [grant('session.forwarded_inject', ['worker', 'protected']), grant('session.inspect', ['worker'])], 'operator'),
     entry('ordinary', wrong, [grant('session.inject', ['worker'])])
   ])), { mode: 0o600 });
   const home = path.join(root, 'receiver'); fs.mkdirSync(home, { mode: 0o700 });
@@ -53,13 +53,14 @@ test('signed hub/node topology reaches strict local mailbox without a daemon tok
   const limits = { max_payload_bytes: 256, max_requests: 20, window_ms: 60000, timeout_ms: 2000, max_pending: 8 };
   const hub = createBrokerHub({ privateKey: hubKey.privateKey, homeDir: root, config: { schema: 'telepty.broker-hub/v1', audience: 'hub', principal_id: 'hub', key_id: 'hub', stream_ms: 60000,
     nodes: { source: { audience: 'source-audience' }, recipient: { audience: 'recipient-audience' } }, limits: { source: limits, recipient: limits },
-    trust: trust('hub', [entry('source', source, [grant('broker.inject', ['recipient/worker']), grant('broker.receipt', ['source'])]),
-      entry('recipient', nodeKey, [grant('broker.stream', ['recipient']), grant('broker.result', ['recipient'])])]) } });
+    trust: trust('hub', [entry('source', source, [grant('broker.inject', ['recipient/worker']), grant('broker.receipt', ['source']), grant('broker.discover', ['recipient'])]),
+      entry('recipient', nodeKey, [grant('broker.stream', ['recipient']), grant('broker.result', ['recipient']), grant('broker.advertise', ['recipient'])])]) } });
   const address = await hub.listen({ host: '127.0.0.1', port: 0 }); t.after(() => hub.close());
   const hubOrigin = `http://127.0.0.1:${address.port}`;
   const config = { schema: 'telepty.broker-node/v1', principal_id: 'recipient', key_id: 'recipient', hub_url: hubOrigin,
     hub_audience: 'hub', hub_principal_id: 'hub', audience: 'recipient-audience', local_daemon_url: local, local_timeout_ms: 1000,
     reconnect: { max_attempts: 2, initial_backoff_ms: 10, max_backoff_ms: 20 },
+    discovery: { sessions: ['worker'], interval_ms: 5000, ttl_ms: 10000 },
     hub_trust: trust('recipient-audience', [entry('hub', hubKey, [grant('broker.envelope', ['source/worker'])])]) };
   const client = createBrokerClient({ config: { principal_id: 'source', key_id: 'source', hub_url: hubOrigin, hub_audience: 'hub' }, privateKey: source.privateKey });
   let index = 0;
@@ -73,13 +74,18 @@ test('signed hub/node topology reaches strict local mailbox without a daemon tok
         if (new URL(url).origin === local) {
           requests.push({ url, options });
           if (attack === 'refused-challenge' && url.endsWith('/api/auth/challenge')) return new Response('{}', { status: 403 });
-          if (options.headers?.['x-telepty-principal']) assert.equal(url, local + '/api/forwarded/sessions/worker/inject');
+          if (options.headers?.['x-telepty-principal']) assert.ok([local + '/api/forwarded/sessions/worker/inject', local + '/api/sessions/worker'].includes(url));
         }
         const response = await fetch(url, options);
         if (url === `${hubOrigin}/v1/nodes/recipient/stream` && response.ok) streamChallenges.push(JSON.parse(options.body).challenge);
         return response;
       } });
     await node.start();
+    if (attack === 'valid') {
+      const found = await waitFor(async () => { const result = await client.discover('recipient'); return result.body.status === 'observed' && result.body; });
+      assert.deepEqual(found.sessions, [{ session_id: 'worker', session_epoch: epoch }]);
+      assert.equal(found.foreign_session_identity_verified, false);
+    }
     const body = { prompt: `Synthetic ${attack}`, expected_epoch: attack === 'stale-epoch' ? 'stale-epoch' : epoch,
       idempotency_key: `strict-local-key-${String(++index).padStart(4, '0')}`, no_enter: true };
     assert.equal((await client.inject('recipient', 'worker', body)).status, 202);
@@ -89,7 +95,7 @@ test('signed hub/node topology reaches strict local mailbox without a daemon tok
     }, { description: 'strict local broker receipt' });
     assert.equal(receipt.state, attack === 'valid' ? 'accepted' : 'failed', JSON.stringify(receipt));
     assert.equal(requests.filter(request => request.options.headers?.['x-telepty-token']).length, 0);
-    if (attack === 'refused-challenge') assert.equal(requests.length, 1, 'challenge refusal performs no local POST or fallback');
+    if (attack === 'refused-challenge') assert.ok(requests.every(request => request.url.endsWith('/api/auth/challenge')), 'challenge refusal performs no local POST or fallback');
     if (attack === 'valid') {
       hub.server.closeAllConnections(); // Only this owned fixture's stream/keepalive sockets.
       await waitFor(() => streamChallenges.length === 2, { description: 'strict recipient reconnect' });

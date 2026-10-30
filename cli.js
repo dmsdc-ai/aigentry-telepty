@@ -5064,6 +5064,14 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
+  if (cmd === 'broker-discover-v1') {
+    if (args[1] === '--help' || args[1] === '-h') { console.log('Usage: telepty broker-discover-v1 --config <file> <exact-node>'); return; }
+    if (args[1] !== '--config' || args.length !== 4) { console.error('Usage: telepty broker-discover-v1 --config <file> <exact-node>'); markCommandFailed(); return; }
+    try { await require('./src/broker/main').runBrokerRequest('discover', args[2], args.slice(3)); }
+    catch { console.error('BROKER_DISCOVERY_UNAVAILABLE'); markCommandFailed(); }
+    return;
+  }
+
   if (cmd === 'broker-inject-v1' || cmd === 'broker-receipt-v1') {
     const usage = cmd === 'broker-inject-v1'
       ? 'telepty broker-inject-v1 --config <file> <node> <sid> <epoch> <idempotency-key> <prompt>'
@@ -5268,6 +5276,7 @@ function printGlobalHelp() {
   telepty broker-broadcast-receipt-v1 --config <file> <key>
   telepty broker-reply-context-v1 --config <file> <receipt-id>
   telepty broker-reply-v1 --config <file> <receipt-id> --request <private-file>
+  telepty broker-discover-v1 --config <file> <exact-node> Read scoped node-reported metadata
 
 \x1b[1mMonitoring:\x1b[0m
   telepty readiness <exact-id>[@host] [--json]     Inspect qualified composer evidence (read-only)

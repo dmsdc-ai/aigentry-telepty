@@ -5,13 +5,14 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const os = require('node:os');
 const { createBrokerAudit } = require('./audit');
+const { createDiscoveryRegistry } = require('./discovery');
 const { createPrincipalVerifier, validateTrustConfiguration } = require('../principal/proof');
 const { createForwardLedger } = require('../peer-forwarding');
 const { createBrokerDispatch } = require('./dispatch');
 const { createBrokerRouting } = require('./routing');
 const { canonicalJSON } = require('../principal/encoding');
 const { id, error, readBody, json, verify } = require('./http');
-const ACTIONS = ['broker.stream', 'broker.inject', 'broker.receipt', 'broker.result', 'broker.envelope', 'broker.broadcast', 'broker.reply_context', 'broker.reply'];
+const ACTIONS = ['broker.stream', 'broker.inject', 'broker.receipt', 'broker.result', 'broker.envelope', 'broker.broadcast', 'broker.reply_context', 'broker.reply', 'broker.advertise', 'broker.discover'];
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
@@ -40,6 +41,7 @@ function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
   }
   const ledger = createForwardLedger(homeDir);
   const streams = new Map(), timers = new Map();
+  const discovery = createDiscoveryRegistry({ nodes: config.nodes, streams });
   const auditLog = audit || createBrokerAudit({ path: path.join(homeDir || os.homedir(), '.telepty', 'logs', 'broker.jsonl') });
   function view(record) {
     return { receipt_id: record.receipt_id, source_node: record.source_node, target_node: record.target_node,
@@ -72,6 +74,7 @@ function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
         schema: 'telepty.broker-challenge/v1', audience: verifier.audience, challenge: verifier.challenge }); }
       const body = await readBody(req);
       requestAudit.payload = body && typeof body.prompt === 'string' ? body.prompt : undefined;
+      if (discovery.handle(req, res, body, authenticate)) return;
       const streamMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/stream$/);
       const injectMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/to\/([A-Za-z0-9._-]+)\/sessions\/([^/?]+)\/inject$/);
       const receiptMatch = req.url.match(/^\/v1\/nodes\/([A-Za-z0-9._-]+)\/receipts\/([A-Za-z0-9_-]{16,128})$/);
@@ -93,6 +96,7 @@ function createBrokerHub({ config, privateKey, homeDir, tls, audit } = {}) {
         res.on('close', () => {
           clearInterval(heartbeat); clearTimeout(lifetime);
           if (streams.get(node) === entry) streams.delete(node);
+          discovery.remove(node, entry);
           let records;
           try { records = ledger.all(); } catch { return; }
           for (const record of records) {

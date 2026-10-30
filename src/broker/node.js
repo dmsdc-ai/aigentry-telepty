@@ -4,6 +4,7 @@ const { bodyDigest, parseUnambiguousJSON } = require('../principal/encoding');
 const { id, error, origin, readResponse, assertion, combineAbortSignals } = require('./http');
 const { createRoutingClient } = require('./routing-client');
 const { ACTIONS } = require('./hub');
+const { createDiscoveryAgent } = require('./discovery');
 const { loadLocalPrincipal, createLocalPrincipalRequest } = require('./local-principal');
 const { validateForwardBody } = require('../peer-forwarding');
 
@@ -43,6 +44,10 @@ function createBrokerClient({ config, privateKey, fetch: send = globalThis.fetch
     } finally { bounded.close(); }
   }
   return { request, ...createRoutingClient({ request, source: config.principal_id }),
+    discover(node) {
+      if (!id(node)) throw error('BROKER_NODE_INVALID');
+      return request('GET', `/v1/nodes/${config.principal_id}/discovery/${node}`, {}, 'broker.discover');
+    },
     inject(node, sid, body) {
       if (!id(node)) throw error('BROKER_NODE_INVALID');
       return request('POST', `/v1/nodes/${config.principal_id}/to/${node}/sessions/${encodeURIComponent(sid)}/inject`,
@@ -78,6 +83,11 @@ function createBrokerNode({ config, privateKey, localToken, localPrincipal, fetc
     || reconnect.max_backoff_ms > 30000)) throw error('BROKER_CONFIG_INVALID');
   const client = createBrokerClient({ config, privateKey, fetch: send });
   const stop = new AbortController();
+  const discovery = createDiscoveryAgent({ configuration: config.discovery, node: config.principal_id, client,
+    timeoutMs: config.local_timeout_ms, signal: stop.signal, inspect: (sid, signal) => localRequest
+      ? localRequest.inspect(sid, signal)
+      : send(`${local}/api/sessions/${encodeURIComponent(sid)}`, { redirect: 'error', signal,
+        headers: { 'x-telepty-token': localToken } }) });
   let completion, starting = false;
   function transient(reason) {
     return reason && (reason.code === 'BROKER_TRANSPORT_LOST' || reason.code === 'BROKER_HEADER_TIMEOUT'
@@ -133,6 +143,7 @@ function createBrokerNode({ config, privateKey, localToken, localPrincipal, fetc
     if (posted.status >= 400) throw error('BROKER_RESULT_REFUSED', posted.status);
   }
   async function consume(response) {
+    const streamChallenge = verifier.challenge;
     const reader = response.body.getReader();
     let pending = Buffer.alloc(0);
     const cancel = () => { reader.cancel().catch(() => {}); };
@@ -156,12 +167,14 @@ function createBrokerNode({ config, privateKey, localToken, localPrincipal, fetc
         }
       }
       if (pending.length) throw error('BROKER_FRAME_TRUNCATED');
-    } finally { stop.signal.removeEventListener('abort', cancel); await reader.cancel().catch(() => {}); }
+    } finally { discovery?.end(streamChallenge); stop.signal.removeEventListener('abort', cancel); await reader.cancel().catch(() => {}); }
   }
   async function connect() {
     verifier = createPrincipalVerifier({ trust });
-    return client.request('POST', `/v1/nodes/${config.principal_id}/stream`, { challenge: verifier.challenge },
+    const response = await client.request('POST', `/v1/nodes/${config.principal_id}/stream`, { challenge: verifier.challenge },
       'broker.stream', { signal: stop.signal, stream: true });
+    discovery?.begin(verifier.challenge);
+    return response;
   }
   async function run(response) {
     let retries = 0;
@@ -192,6 +205,7 @@ function createBrokerNode({ config, privateKey, localToken, localPrincipal, fetc
       completion.catch(() => {});
     },
     get completion() { return completion; },
+    discoveryStats: () => discovery?.stats() || null,
     async stop() { stop.abort(); if (completion) await completion.catch(() => {}); }
   };
 }

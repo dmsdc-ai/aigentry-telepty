@@ -26,9 +26,10 @@ async function runBrokerRequest(mode, configFile, parameters) {
     const [node, sid, epoch, key, prompt] = parameters;
     result = await client.inject(node, sid, { prompt, expected_epoch: epoch, idempotency_key: key, no_enter: true });
   } else if (mode === 'receipt' && parameters.length === 1) result = await client.receipt(parameters[0]);
+  else if (mode === 'discover' && parameters.length === 1) result = await client.discover(parameters[0]);
   else throw error('BROKER_REQUEST_INVALID');
   console.log(JSON.stringify(result.body));
-  if (result.status >= 400 || ['failed', 'outcome_unknown'].includes(result.body.state)) process.exitCode = 1;
+  if (result.status >= 400 || ['failed', 'outcome_unknown'].includes(result.body.state) || result.body.status === 'unavailable') process.exitCode = 1;
   return result;
 }
 async function runBrokerCommand(mode, configFile) {
