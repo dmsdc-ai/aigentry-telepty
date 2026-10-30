@@ -224,3 +224,38 @@ backpressure above 128 KiB closes the observer. No owner/session credentials, po
 state, readiness inference or completion receipt is emitted. Output bytes prove no
 agent consumption or answer. This does not make legacy attach or allow clients
 strict-mode compatible; a signed owner/input protocol remains future work.
+
+## Explicit signer client and observation CLI
+
+Linux clients may select an existing checked private configuration. Creation,
+enrollment and permission repair are never automatic. The exact v1 fields are:
+
+```json
+{
+  "schema": "telepty.principal-client/v1",
+  "daemon_url": "http://127.0.0.1:3848",
+  "principal_id": "observer",
+  "key_id": "observer-key",
+  "audience": "configured-machine-audience",
+  "private_key_path": "/absolute/private/path/observer.pem"
+}
+```
+
+Both configuration and Ed25519 key use the Linux descriptor-relative authority
+file checks, including trusted ancestors, no symlinks/hard links, and private leaf
+permissions. The URL is a bare origin: cleartext HTTP accepts literal 127.0.0.1 or
+::1 only; other hosts require HTTPS with normal certificate verification. No custom
+CA, TLS bypass, redirects or daemon-token fallback is introduced.
+
+```
+telepty principal-observe-v1 --config /absolute/private/config.json --session exact-id --epoch current-epoch
+```
+
+Each connection fetches a fresh bounded startup challenge and signs its exact raw
+path and epoch. The CLI prints JSON Lines only, validates the first read-only
+identity, enforces advertised expiry locally, and refuses binary/unknown frames
+or stdout backpressure. It never reconnects automatically, starts a daemon,
+registers a session or creates a shared token file. A live stream is bounded by
+60 seconds; output is observation rather than proof of consumption or completion.
+The SDK `createPrincipalClient` also sends explicitly selected signed HTTP requests
+with a mandatory five-second deadline and without retrying uncertain mutations.

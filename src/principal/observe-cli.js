@@ -32,7 +32,7 @@ async function runPrincipalObserver(parameters,{stdout=process.stdout,signal}={}
         if(!identity) {
           if(frame.type!=='observer' || frame.schema!=='telepty.read-only-observer/v1' || frame.session_id!==id || frame.session_epoch!==epoch || frame.read_only!==true
             || !Number.isFinite(frame.expires_at) || frame.expires_at<=Date.now() || frame.expires_at>Date.now()+61000) throw failure('PRINCIPAL_OBSERVER_IDENTITY_INVALID');
-          identity=true;expires=frame.expires_at;clearTimeout(timer);timer=setTimeout(()=>finish(failure('PRINCIPAL_OBSERVER_EXPIRED')),Math.max(1,expires-Date.now()));
+          identity=true;expires=Math.min(expires,frame.expires_at);clearTimeout(timer);timer=setTimeout(()=>finish(failure('PRINCIPAL_OBSERVER_EXPIRED')),Math.max(1,expires-Date.now()));
         } else if(frame.type!=='output' || typeof frame.data!=='string' || Object.keys(frame).some(k=>!['type','data'].includes(k))) throw failure('PRINCIPAL_OBSERVER_FRAME_INVALID');
         if(!stdout.write(JSON.stringify(frame)+'\n'))throw failure('PRINCIPAL_OBSERVER_OUTPUT_BACKPRESSURE');
       } catch(error) {finish(error.code?error:failure('PRINCIPAL_OBSERVER_FRAME_INVALID'));}
