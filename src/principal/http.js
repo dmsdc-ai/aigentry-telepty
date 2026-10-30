@@ -103,6 +103,10 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
       // Share the header/body/path validation and verifier cache without translating the signed target.
       return authorizeSocket(req, match, 'session.owner', true);
     },
+    authorizeBus(req) {
+      const match = /^\/api\/bus\/sessions\/([^/?]+)$/.exec(req.url || '');
+      return authorizeSocket(req, match, 'session.bus', false, true);
+    },
     authorizeInput(req) {
       const match = /^\/api\/input\/sessions\/([^/?]+)$/.exec(req.url || '');
       return authorizeSocket(req, match, 'session.input_stream', false, true);
