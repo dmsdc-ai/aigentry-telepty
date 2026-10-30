@@ -101,7 +101,7 @@ The first frame is `telepty.read-only-observer/v1` identity/expiry metadata. Lat
 frames contain only `type: output` and terminal bytes, which can contain terminal
 secrets: an explicit observation grant is a read disclosure permission. There are
 no readiness, completion, delivery or owner credential envelopes. Replay is a
-bounded suffix of existing output, at most 64KiB, and may be incomplete. Each
+bounded suffix of existing output, at most 64KiB and1,024 scanned chunks, and may be incomplete. Each
 serialized output frame is at most 64KiB; oversized output closes the observer.
 Sockets with more than 128KiB queued output are terminated. At most64 observers
 and8 per principal/session are admitted, independent of key aliases. Application

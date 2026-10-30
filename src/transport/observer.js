@@ -49,7 +49,7 @@ function createObserverTransport({ authentication, sessions, server, tailnetServ
       expiry = setTimeout(close, Math.max(1, expires - Date.now())); expiry.unref();
       ws.send(JSON.stringify({ type:'observer', schema:'telepty.read-only-observer/v1', session_id:sessionId, session_epoch:epoch, read_only:true, expires_at:expires }));
       let replay = '', bytes = 0;
-      for (let i=(session.outputRing?.length || 0)-1;i>=0;i--) {
+      for (let i=(session.outputRing?.length || 0)-1, scanned=0;i>=0 && scanned<1024;i--,scanned++) {
         const chunk=session.outputRing[i]; if(typeof chunk !== 'string' || (bytes += Buffer.byteLength(chunk)) > 65536) break;
         replay=chunk+replay;
       }

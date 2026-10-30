@@ -117,3 +117,18 @@ test('global64 admission budget releases sockets after shutdown and error closes
   clients[0].ws.terminate();await pause(30);const freed=await connect('s8');assert.ok(freed.ws);transport.close();await pause(30);assert.equal(freed.ws.readyState,3);
   assert.equal((await connect('s8')).status,503);
 });
+
+test('observer replay scans at most1024 recent chunks even with an unbounded empty ring', async t => {
+  const f=fixture(), sessions={mine:f.session};let reads=0;
+  f.session.outputRing=new Proxy({length:10000000}, {get(target,key) {
+    if(key==='length')return target.length;
+    if(/^[0-9]+$/.test(String(key))){reads++;return Number(key)===target.length-1?'recent-output':'';}
+    return target[key];
+  }});
+  const server=http.createServer();const transport=createObserverTransport({authentication:f.auth,sessions,server,
+    refuse:(s,status)=>s.end(`HTTP/1.1 ${status} Refused\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`),forbiddenOrigin:()=>false,allowedPeer:()=>true});
+  server.on('upgrade',(r,s,h)=>transport.handle(r,s,h));await new Promise(r=>server.listen(0,'127.0.0.1',r));
+  t.after(()=>{transport.close();server.close();});
+  const c=await open(`ws://127.0.0.1:${server.address().port}/api/observe/sessions/mine`,f.sign());
+  await pause(20);assert.equal(reads,1024);assert.equal(c.messages.find(m=>m.type==='output').data,'recent-output');
+});
