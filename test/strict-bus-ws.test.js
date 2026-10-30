@@ -133,7 +133,10 @@ for (const mode of ['lost','malformed','server-error']) test(`bus ${mode} remain
 test('bus refuses bad crypto and failed durable reservation before HTTP effects', async t => {
   const f = await wireFixture(t, 'ok'), c = await f.connect(), body = { phase: 'working', seq: 1 };
   const forged = frame(f.sign, c, 'state_report', 1, 'bus-forged-proof-0001', body);
-  forged.assertion = forged.assertion.slice(0, -2) + 'AA'; c.ws.send(JSON.stringify(forged)); await waitFor(() => c.messages.length === 2);
+  const original = forged.assertion, parts = original.split('.'), signature = Buffer.from(parts[2], 'base64url');
+  signature[0] ^= 1; parts[2] = signature.toString('base64url'); forged.assertion = parts.join('.');
+  assert.notEqual(forged.assertion, original, 'the corruption must actually change the signed bytes');
+  c.ws.send(JSON.stringify(forged)); await waitFor(() => c.messages.length === 2);
   assert.equal(c.messages[1].state, 'refused'); assert.equal(f.effects(), 0);
   assert.equal(fs.existsSync(path.join(f.home, '.telepty', 'forward-receipts')), false);
   fs.mkdirSync(path.join(f.home, '.telepty')); fs.writeFileSync(path.join(f.home, '.telepty', 'forward-receipts'), 'blocked');
