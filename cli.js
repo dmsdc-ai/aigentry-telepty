@@ -1705,6 +1705,8 @@ async function manageInteractiveAttach(sessionId, targetHost) {
     ws.on('message', m => {
       const msg = JSON.parse(m);
       if (msg.type === 'output') process.stdout.write(msg.data);
+      const refusal = require('./src/cli/viewer-input').viewerInputRefusal(msg);
+      if (refusal) process.stderr.write(`\n${refusal}\n`);
     });
     ws.on('close', async () => {
       process.stdout.write(`\x1b]0;\x07`); // Restore default terminal title
@@ -3569,10 +3571,12 @@ async function main() {
     });
 
     ws.on('message', (message) => {
-      const { type, data } = JSON.parse(message);
-      if (type === 'output') {
-        process.stdout.write(data);
+      const frame = JSON.parse(message);
+      if (frame.type === 'output') {
+        process.stdout.write(frame.data);
       }
+      const refusal = require('./src/cli/viewer-input').viewerInputRefusal(frame);
+      if (refusal) process.stderr.write(`\n${refusal}\n`);
     });
 
     ws.on('close', async (code, reason) => {

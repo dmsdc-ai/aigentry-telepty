@@ -20,3 +20,11 @@ test('synchronous writer failure remains unknown; blocked authorization never at
  const f=fixture();dispatchViewerInput({authorization:f.authorization,invalidate:()=>{},deliver:()=>{throw Error('writer failed after possible effect');}});assert.equal(f.rows[1].delivery_result,'outcome_unknown');
  const denied=fixture(true);let writes=0;assert.equal(dispatchViewerInput({authorization:denied.authorization,invalidate:()=>writes++,deliver:()=>writes++}),false);assert.equal(writes,0);assert.equal(denied.rows.length,1);assert.equal(denied.rows[0].delivery_result,'blocked:fixture');
 });
+test('attach refusal messages expose byte limits and uncertainty without printing server payload or claiming safe retry',()=>{
+ const {viewerInputRefusal}=require('../src/cli/viewer-input');
+ assert.equal(viewerInputRefusal({type:'input_refused',code:'INPUT_FRAME_TOO_LARGE',bytes_written:0}),'Input was refused: text exceeds 64 KiB.');
+ assert.equal(viewerInputRefusal({type:'input_refused',code:'INPUT_WRITE_OUTCOME_UNKNOWN',bytes_written:null}),'Input outcome is unknown. Check the receiver before retrying.');
+ assert.equal(viewerInputRefusal({type:'input_refused',code:'EXTERNAL_APPROVAL_REQUIRED'}),'Input was refused: external approval is required.');
+ assert.equal(viewerInputRefusal({type:'input_refused',error:'PRIVATE\x1b[2J',code:'PRIVATE'}),'Input was refused.');
+ assert.equal(viewerInputRefusal({type:'output',data:'terminal output'}),'');
+});
