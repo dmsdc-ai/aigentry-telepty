@@ -152,3 +152,13 @@ test('publication handler requires private verified request context and real sec
   handler(req, res); assert.equal(response.code, 'APPLICATION_PUBLICATION_DENIED');
   req.socket.encrypted = true; handler(req, res); assert.equal(response.success, true); assert.equal(response.matched_socket_count, 0);
 });
+
+test('publication receipt projection refuses inconsistent delivery ACK claims and strips data', () => {
+  const { projectPublicationReceipt } = require('../src/application-publication');
+  const response = { ok: true, status: 200 }, remote = { success: true, session_id: 'mine', publication_id: crypto.randomUUID(), matched_socket_count: 1, delivery_ack: false, data: 'PRIVATE_RESPONSE_DATA' };
+  const projected = projectPublicationReceipt(response, remote, 'mine'); assert.equal(projected.accepted, true); assert.equal(projected.safe.data, undefined);
+  for (const delivery_ack of [true, undefined]) {
+    const invalid = projectPublicationReceipt(response, { ...remote, delivery_ack }, 'mine'); assert.equal(invalid.accepted, false); assert.equal(invalid.uncertain, true);
+    assert.equal(invalid.safe.publication_id, undefined); assert.equal(invalid.safe.delivery_ack, false);
+  }
+});

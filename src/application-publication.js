@@ -24,7 +24,7 @@ function projectPublicationReceipt(response, remote, sessionId) {
   const valid = remote && typeof remote === 'object' && !Array.isArray(remote);
   const accepted = response.ok && valid && remote.success === true && remote.session_id === sessionId
     && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(remote.publication_id || '')
-    && Number.isInteger(remote.matched_socket_count) && remote.matched_socket_count >= 0 && remote.matched_socket_count <= 64;
+    && Number.isInteger(remote.matched_socket_count) && remote.matched_socket_count >= 0 && remote.matched_socket_count <= 64 && remote.delivery_ack === false;
   const uncertain = response.status >= 500 || !valid || (response.ok && !accepted);
   const safe = { success: accepted, retryable: false, delivery_ack: false };
   if (accepted) { safe.publication_id = remote.publication_id; safe.matched_socket_count = remote.matched_socket_count; }
