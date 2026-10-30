@@ -2,8 +2,9 @@
 
 This is a restricted recovery operation for expired poll-only mailbox sessions.
 It does not implement `allow --takeover`, wrapped-process replacement, graceful
-incumbent termination, TTY verification or signed WebSocket ownership transfer.
-Those paths remain refusals until their custody and handshake protocols exist.
+incumbent termination or TTY verification. A signed current-bearer owner
+connection now exists; it is not a lost-bearer recovery or epoch-rotating handoff.
+Those takeover paths remain refusals until their custody and handshake protocols exist.
 
 ## Admission
 
@@ -91,10 +92,13 @@ invalid audit restoration, strict custody corruption refusal and an owned real
 HTTP daemon restart retaining pending rows while rejecting the old bearer.
 No production key, mailbox, service or configuration is touched.
 
-Full wrapped takeover still needs a signed ownership transport, an authenticated
-graceful-stop acknowledgment, process-birth/custody evidence and a defined handoff
-for in-flight PTY writes. A disconnected socket or a reported PID alone does not
-supply those facts, so this slice does not claim full acceptance of #133.
+The [strict owner transport](principal-http-132.md#signed-owner-connection-and-local-allow)
+now supplies signed, current-bearer, epoch-bound connections. Full wrapped takeover
+still needs an authenticated graceful-stop acknowledgment, process-birth/custody
+evidence and a defined handoff for in-flight PTY writes. A disconnected socket or a reported PID alone does not
+supply those facts, so this slice does not claim full acceptance of #133. The
+[Linux reassessment](../reports/2026-10-30-wrapped-takeover-assessment.md) separates
+existing reconnect authority from the remaining recovery protocol.
 
 New poll-mailbox registration initializes custody before issuing or persisting its session
 credential. A newly created queue receives exclusive, private `inbox.jsonl` and `state.jsonl`
