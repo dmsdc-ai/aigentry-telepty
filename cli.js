@@ -5052,6 +5052,12 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
+  if (cmd === 'principal-observe-v1') {
+    try { await require('./src/principal/observe-cli').runPrincipalObserver(args.slice(1)); }
+    catch (error) { console.error(error.code || 'PRINCIPAL_OBSERVER_FAILED'); markCommandFailed(); }
+    return;
+  }
+
   // telepty peers [--remove <name>]
   if (['broker-broadcast-v1', 'broker-broadcast-receipt-v1', 'broker-reply-context-v1', 'broker-reply-v1'].includes(cmd)) {
     const mode = cmd.slice('broker-'.length, -'-v1'.length);
@@ -5268,7 +5274,7 @@ function printGlobalHelp() {
   telepty disconnect <name> | --all              Disconnect remote host
   telepty peers [--remove <name>]                List connected peers
   telepty discover [--json] [--refresh]           Read-only local tailnet candidates; never enroll or authorize
-  telepty broker-v1 --config <file>              Opt-in signed SSE hub (exact inject only)
+  telepty principal-observe-v1 --config <private-file> --session <exact-id> --epoch <epoch>\n  telepty broker-v1 --config <file>              Opt-in signed SSE hub (exact inject only)
   telepty relay-node-v1 --config <file>          Outbound recipient bridge, no auto-enrollment
   telepty broker-inject-v1 --config <file> <node> <sid> <epoch> <key> <prompt>
   telepty broker-receipt-v1 --config <file> <key> Query acceptance/uncertainty; no resend
