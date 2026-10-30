@@ -121,3 +121,18 @@ test('lock symlinks never modify the external target', {skip: process.platform =
   assert.throws(() => breakStaleLocks(root), {code: 'MAILBOX_UNSAFE_PATH'});
   assert.equal(fs.readFileSync(target, 'utf8'), 'keep');
 });
+test('an unlinked inode observed by lstat during normal release is a departed ticket', t => {
+  const {dir} = fixture(t), release = acquireLock(dir), original = fs.lstatSync;
+  const number = path.join(dir, '.lock', fs.readdirSync(path.join(dir, '.lock'))[0], 'number');
+  let observed = false;
+  t.mock.method(fs, 'lstatSync', function(file, ...args) {
+    if (!observed && file === number) {
+      observed = true; const fd = fs.openSync(file, 'r');
+      try { release(); return fs.fstatSync(fd); } finally { fs.closeSync(fd); }
+    }
+    return original.call(fs, file, ...args);
+  });
+  const successor = acquireLock(dir);
+  try { assert.equal(observed, true); release(); assert.throws(() => acquireLock(dir), /lock timeout/i); }
+  finally { successor(); }
+});

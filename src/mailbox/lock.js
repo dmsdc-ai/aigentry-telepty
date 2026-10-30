@@ -43,7 +43,9 @@ function checkTicketFiles(dir) {
   try { names = fs.readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
   for (const name of names) {
     if (name !== 'draft' && name !== 'number') throw failure();
-    const st = statOptional(path.join(dir, name));
+    const file = path.join(dir, name), st = statOptional(file);
+    // A concurrent owner can unlink after lookup but before stat captures nlink.
+    if (st?.isFile() && st.nlink === 0 && !statOptional(file)) continue;
     if (st && (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1 || st.size > 32)) throw failure('MAILBOX_UNSAFE_PATH');
   }
   return names;
