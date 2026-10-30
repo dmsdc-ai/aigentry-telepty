@@ -347,12 +347,22 @@ class FileMailbox {
     }finally{release();}
   }
 
-  withCustodySnapshot(sessionId, callback) {
+  withCustodySnapshot(sessionId, callback, {durable = false} = {}) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) throw Object.assign(new Error('Mailbox custody is unavailable'), { code: 'MAILBOX_CUSTODY_UNAVAILABLE' });
     const release = acquireLock(sessionDir);
     try {
       const snapshot = require('./custody').strictCustodySnapshot(sessionDir, sessionId);
+      if (durable) {
+        for (const leaf of ['inbox.jsonl', 'state.jsonl']) {
+          const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_RDONLY);
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        }
+        if (process.platform !== 'win32') {
+          const fd = fs.openSync(sessionDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        }
+      }
       const result = callback(snapshot);
       if(result && typeof result.then === 'function') throw new Error('Custody callback must be synchronous');
       return result;

@@ -13,7 +13,7 @@ const { createPrincipalAuthentication } = require('../src/principal/http');
 const { registerMailboxTakeoverRoute } = require('../src/principal/takeover');
 const NOW = 1700000000000;
 
-function fixture(t) {
+function fixture(t, {withMessage = false, beforeLocked} = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-takeover-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const file = path.join(home, 'sessions.json'), credentials = createCredentialStore(), issued = credentials.issue('mail');
@@ -27,11 +27,11 @@ function fixture(t) {
     principal_id: 'alice', public_key_spki: pair.publicKey.export({ type: 'spki', format: 'pem' }),
     grants: [{ action: 'session.takeover', targets: ['mail'] }] }] }, { audience: 'fixture-node' });
   const authentication = createPrincipalAuthentication({ trust, sessions, now: () => NOW });
-  const messages = [{ msg_id: 'message-1', from: 'original-unverified-sender', created_at: 1699999000,
-    state: 'pending', payload: 'original synthetic text' }];
+  const messages = withMessage ? [{ msg_id: 'message-1', from: 'original-unverified-sender', created_at: 1699999000,
+    state: 'pending', payload: 'original synthetic text' }] : [];
   const beforeMessages = structuredClone(messages), events = [];
   let handler;
-  registerMailboxTakeoverRoute({ post: (_path, route) => { handler = route; } }, { context, getMailbox: () => ({ snapshotCustody: () => messages }),
+  registerMailboxTakeoverRoute({ post: (_path, route) => { handler = route; } }, { context, getMailbox: () => ({ withCustodySnapshot: (_id, callback) => { if (beforeLocked) beforeLocked(sessions.mail); return callback(messages); } }),
     now: () => NOW, broadcastSessionEvent: (...args) => events.push(args) });
   function request({ expectedEpoch = sessions.mail.sessionEpoch, body = {}, authenticate = true, beforeHandle } = {}) {
     const payload = { expected_epoch: expectedEpoch, ...body };
@@ -52,7 +52,7 @@ function fixture(t) {
   return { sessions, context, credentials, issued, request, file, messages, beforeMessages, events };
 }
 
-test('expired same-principal mailbox takeover rotates authority with a durable audit and unchanged pending custody', t => {
+test('expired same-principal empty-mailbox takeover rotates authority with a durable audit', t => {
   const f = fixture(t), oldEpoch = f.issued.epoch;
   const result = f.request();
   assert.equal(result.statusCode, 200);
@@ -67,7 +67,7 @@ test('expired same-principal mailbox takeover rotates authority with a durable a
   assert.equal(disk.authorityAudit.at(-1).actor.id, 'alice');
   assert.equal(disk.authorityAudit.at(-1).previous_epoch, oldEpoch);
   assert.equal(disk.authorityAudit.at(-1).previous_owner_state, 'mailbox_lease_expired');
-  assert.equal(disk.authorityAudit.at(-1).pending_count, 1);
+  assert.equal(disk.authorityAudit.at(-1).pending_count, 0);
   assert.equal(JSON.stringify(disk).includes(result.body.session_token), false);
   assert.equal(persistence.buildRestoredWrappedSession('mail', disk).authorityAudit.at(-1).next_epoch, result.body.session_epoch);
   assert.equal(f.events.length, 1);
@@ -142,7 +142,7 @@ test('historical owner-unknown or another principal never receives takeover auth
   }
 });
 
-for (const withMessage of [false, true]) test(`real HTTP expired-mailbox transfer preserves ${withMessage ? 'pending messages' : 'initialized empty custody'} and audit across restart`, { skip: process.platform !== 'linux', timeout: 15000 }, async t => {
+for (const withMessage of [false, true]) test(`real HTTP expired-mailbox ${withMessage ? 'refuses exposed pending bytes' : 'transfers empty custody'} across restart`, { skip: process.platform !== 'linux', timeout: 15000 }, async t => {
   const { startTestDaemon } = require('../test-support/daemon-harness');
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-takeover-http-'));
   const pair = crypto.generateKeyPairSync('ed25519');
@@ -172,6 +172,14 @@ for (const withMessage of [false, true]) test(`real HTTP expired-mailbox transfe
   await new Promise(resolve => setTimeout(resolve, 1050));
   const transferred = await request('/api/sessions/mail/takeover', 'session.takeover', { expected_epoch: registered.body.session_epoch },
     { method: 'POST', epoch: registered.body.session_epoch });
+  if (withMessage) {
+    assert.equal(transferred.status, 409);assert.equal(transferred.body.code, 'TAKEOVER_PENDING_UNPROVEN');assert.equal(transferred.body.session_token, undefined);
+    assert.deepEqual((await request('/api/sessions/mail/mailbox', 'mailbox.read')).body.pending, original);
+    assert.equal((await request('/api/sessions/mail/lease', 'mailbox.renew', {lease_seconds:60}, {method:'POST',epoch:registered.body.session_epoch,bearer:registered.body.session_token})).status, 200);
+    await daemon.kill();daemon=await startTestDaemon({homeDir:home,env});challenge=(await daemon.request('/api/auth/challenge')).body.challenge;
+    const retained=await request('/api/sessions/mail','session.inspect');assert.equal(retained.body.handshake.session_epoch,registered.body.session_epoch);
+    assert.deepEqual((await request('/api/sessions/mail/mailbox','mailbox.read')).body.pending,original);return;
+  }
   assert.equal(transferred.status, 200);
   const nextEpoch = transferred.body.session_epoch;
   assert.notEqual(nextEpoch, registered.body.session_epoch);
@@ -308,4 +316,19 @@ test('initializing existing valid custody preserves pending message bytes and jo
   assert.equal(f.register().statusCode, 201);
   assert.deepEqual(['inbox.jsonl', 'state.jsonl'].map(leaf => fs.readFileSync(path.join(dir, leaf), 'utf8')), before);
   assert.equal(f.mailbox.snapshotCustody('unused')[0].msg_id, 'retained');
+});
+for(const state of ['pending','in_flight'])test(`lease expiry does not prove that ${state} poll bytes can transfer to another epoch`,t=>{
+ const f=fixture(t,{withMessage:true});f.messages[0].state=state;const before=fs.readFileSync(f.file,'utf8'),records=structuredClone(f.messages);
+ const result=f.request();assert.equal(result.statusCode,409);assert.equal(result.body.code,'TAKEOVER_PENDING_UNPROVEN');
+ assert.equal(f.sessions.mail.sessionEpoch,f.issued.epoch);assert.ok(f.credentials.verify(f.issued.bearer));assert.equal(f.sessions.mail.credentialGeneration,1);assert.deepEqual(f.messages,records);assert.deepEqual(f.events,[]);assert.equal(fs.readFileSync(f.file,'utf8'),before);
+});
+test('durable custody mode refuses a flush failure before invoking an authority callback',t=>{
+ const {FileMailbox}=require('../src/mailbox');const root=fs.mkdtempSync(path.join(os.tmpdir(),'durable-custody-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));const mailbox=new FileMailbox({root});mailbox.initializeCustody('fixture');
+ const sync=fs.fsyncSync,inbox=fs.statSync(path.join(root,'fixture','inbox.jsonl'));t.mock.method(fs,'fsyncSync',fd=>{const st=fs.fstatSync(fd);if(st.dev===inbox.dev&&st.ino===inbox.ino)throw Error('synthetic custody flush failure');return sync(fd);});let callbacks=0;
+ assert.throws(()=>mailbox.withCustodySnapshot('fixture',()=>callbacks++,{durable:true}),/custody flush failure/);assert.equal(callbacks,0);assert.deepEqual(mailbox.snapshotCustody('fixture'),[]);
+});
+
+test('locked takeover rechecks the configured owner before changing authority',t=>{
+ const f=fixture(t,{beforeLocked:session=>{session.owningPrincipal={id:'different',source:'ed25519',audience:'fixture-node'};}}),before=fs.readFileSync(f.file,'utf8');
+ const result=f.request();assert.equal(result.statusCode,403);assert.equal(result.body.code,'TAKEOVER_OWNER_REQUIRED');assert.equal(f.sessions.mail.sessionEpoch,f.issued.epoch);assert.ok(f.credentials.verify(f.issued.bearer));assert.deepEqual(f.events,[]);assert.equal(fs.readFileSync(f.file,'utf8'),before);
 });
