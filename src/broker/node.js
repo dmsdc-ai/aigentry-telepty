@@ -8,23 +8,37 @@ const { validateForwardBody } = require('../peer-forwarding');
 function createBrokerClient({ config, privateKey, fetch: send = globalThis.fetch } = {}) {
   if (!config || !id(config.principal_id) || !id(config.key_id) || typeof config.hub_audience !== 'string') throw error('BROKER_CONFIG_INVALID');
   const hub = origin(config.hub_url);
-  async function challenge() {
-    const response = await send(`${hub}/v1/challenge`, { redirect: 'error', signal: AbortSignal.timeout(3000) });
-    if (!response.ok) throw error('BROKER_CHALLENGE_FAILED', 502);
-    const value = await readResponse(response);
-    if (value.schema !== 'telepty.broker-challenge/v1' || value.audience !== config.hub_audience
-      || !/^[A-Za-z0-9_-]{16,128}$/.test(value.challenge || '')) throw error('BROKER_CHALLENGE_INVALID', 502);
-    return value.challenge;
+  function deadline(signal, milliseconds) {
+    const controller = new AbortController();
+    const cancel = () => controller.abort(signal.reason);
+    if (signal) { if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true }); }
+    const timer = setTimeout(() => controller.abort(error('BROKER_HEADER_TIMEOUT')), milliseconds);
+    return { signal: controller.signal, close() { clearTimeout(timer); if (signal) signal.removeEventListener('abort', cancel); } };
+  }
+  async function challenge(signal) {
+    const bounded = deadline(signal, 3000);
+    try {
+      const response = await send(`${hub}/v1/challenge`, { redirect: 'error', signal: bounded.signal });
+      if (!response.ok) throw error('BROKER_CHALLENGE_FAILED', response.status);
+      if (!response.body) throw error('BROKER_CHALLENGE_INVALID', 502);
+      const value = await readResponse(response);
+      if (value.schema !== 'telepty.broker-challenge/v1' || value.audience !== config.hub_audience
+        || !/^[A-Za-z0-9_-]{16,128}$/.test(value.challenge || '')) throw error('BROKER_CHALLENGE_INVALID', 502);
+      return value.challenge;
+    } finally { bounded.close(); }
   }
   async function request(method, target, body, action, { sessionEpoch, signal, stream = false } = {}) {
-    const current = await challenge();
+    const current = await challenge(signal);
     const proof = assertion(config, privateKey, current, method, target, body, action, sessionEpoch);
-    const response = await send(`${hub}${target}`, { method, redirect: 'error',
-      signal: stream ? (signal || AbortSignal.timeout(10000))
-        : combineAbortSignals([...(signal ? [signal] : []), AbortSignal.timeout(10000)]), headers: { 'content-type': 'application/json', 'x-telepty-assertion': proof },
-      ...(method === 'GET' ? {} : { body: JSON.stringify(body) }) });
-    if (stream) { if (!response.ok) throw error('BROKER_STREAM_REFUSED', response.status); return response; }
-    return { status: response.status, body: await readResponse(response) };
+    const bounded = deadline(signal, stream ? 3000 : 10000);
+    try {
+      const response = await send(`${hub}${target}`, { method, redirect: 'error', signal: bounded.signal,
+        headers: { 'content-type': 'application/json', 'x-telepty-assertion': proof },
+        ...(method === 'GET' ? {} : { body: JSON.stringify(body) }) });
+      // Stream reads are owned and cancelled by consume(); this deadline bounds headers only.
+      if (stream) { if (!response.ok) { await response.body?.cancel().catch(() => {}); throw error('BROKER_STREAM_REFUSED', response.status); } return response; }
+      return { status: response.status, body: await readResponse(response) };
+    } finally { bounded.close(); }
   }
   return { request,
     inject(node, sid, body) {
@@ -47,10 +61,30 @@ function createBrokerNode({ config, privateKey, localToken, fetch: send = global
   const trust = validateTrustConfiguration(config.hub_trust, { audience: config.audience, allowedActions: ACTIONS });
   // This trust file pins only the hub's key(s), with exact source-node/session grants.
   for (const key of trust.keys.values()) if (key.id !== config.hub_principal_id) throw error('BROKER_HUB_PIN_INVALID');
-  const verifier = createPrincipalVerifier({ trust });
+  let verifier = createPrincipalVerifier({ trust });
+  const reconnect = config.reconnect;
+  if (reconnect !== undefined && (!reconnect || typeof reconnect !== 'object' || Array.isArray(reconnect)
+    || Object.keys(reconnect).some(key => !['max_attempts', 'initial_backoff_ms', 'max_backoff_ms'].includes(key))
+    || !Number.isInteger(reconnect.max_attempts) || reconnect.max_attempts < 1 || reconnect.max_attempts > 10
+    || !Number.isInteger(reconnect.initial_backoff_ms) || reconnect.initial_backoff_ms < 10
+    || !Number.isInteger(reconnect.max_backoff_ms) || reconnect.max_backoff_ms < reconnect.initial_backoff_ms
+    || reconnect.max_backoff_ms > 30000)) throw error('BROKER_CONFIG_INVALID');
   const client = createBrokerClient({ config, privateKey, fetch: send });
   const stop = new AbortController();
-  let completion;
+  let completion, starting = false;
+  function transient(reason) {
+    return reason && (reason.code === 'BROKER_TRANSPORT_LOST' || reason.code === 'BROKER_HEADER_TIMEOUT'
+      || reason.name === 'TimeoutError'
+      || (reason instanceof TypeError && (!reason.cause || ['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET'].includes(reason.cause.code))));
+  }
+  async function backoff(attempt) {
+    await new Promise(resolve => {
+      if (stop.signal.aborted) return resolve();
+      const finish = () => { clearTimeout(timer); stop.signal.removeEventListener('abort', finish); resolve(); };
+      const timer = setTimeout(finish, Math.min(reconnect.max_backoff_ms, reconnect.initial_backoff_ms * 2 ** (attempt - 1)));
+      stop.signal.addEventListener('abort', finish, { once: true });
+    });
+  }
   async function handle(frame) {
     const value = parseUnambiguousJSON(frame);
     const envelope = value.envelope;
@@ -88,9 +122,16 @@ function createBrokerNode({ config, privateKey, localToken, fetch: send = global
   async function consume(response) {
     const reader = response.body.getReader();
     let pending = Buffer.alloc(0);
+    const cancel = () => { reader.cancel().catch(() => {}); };
+    stop.signal.addEventListener('abort', cancel, { once: true });
     try {
       while (!stop.signal.aborted) {
-        const { value, done } = await reader.read(); if (done) break;
+        let chunk;
+        try { chunk = await reader.read(); } catch (reason) {
+          if (transient(reason)) throw error('BROKER_TRANSPORT_LOST');
+          throw reason;
+        }
+        const { value, done } = chunk; if (done) break;
         if (pending.length + value.length > 128 * 1024) throw error('BROKER_FRAME_TOO_LARGE');
         pending = Buffer.concat([pending, Buffer.from(value)]);
         let end;
@@ -102,16 +143,39 @@ function createBrokerNode({ config, privateKey, localToken, fetch: send = global
         }
       }
       if (pending.length) throw error('BROKER_FRAME_TRUNCATED');
-    } finally { await reader.cancel().catch(() => {}); }
+    } finally { stop.signal.removeEventListener('abort', cancel); await reader.cancel().catch(() => {}); }
+  }
+  async function connect() {
+    verifier = createPrincipalVerifier({ trust });
+    return client.request('POST', `/v1/nodes/${config.principal_id}/stream`, { challenge: verifier.challenge },
+      'broker.stream', { signal: stop.signal, stream: true });
+  }
+  async function run(response) {
+    let retries = 0;
+    while (!stop.signal.aborted) {
+      try {
+        await consume(response);
+        if (!reconnect || stop.signal.aborted) return;
+      } catch (reason) {
+        if (stop.signal.aborted) return;
+        // Only stream transport failures may reconnect. Never retry handle() or result POST.
+        if (!reconnect || reason.code !== 'BROKER_TRANSPORT_LOST') throw reason;
+      }
+      while (!stop.signal.aborted) {
+        if (retries >= reconnect.max_attempts) throw error('BROKER_RECONNECT_EXHAUSTED');
+        await backoff(++retries);
+        if (stop.signal.aborted) return;
+        try { response = await connect(); break; }
+        catch (reason) { if (stop.signal.aborted) return; if (!transient(reason)) throw reason; }
+      }
+    }
   }
   return {
     async start() {
-      if (completion) throw error('BROKER_NODE_ALREADY_STARTED');
-      const response = await client.request('POST', `/v1/nodes/${config.principal_id}/stream`, { challenge: verifier.challenge },
-        'broker.stream', { signal: stop.signal, stream: true });
-      completion = consume(response);
-      // The caller can observe .completion; mark handled immediately to avoid an
-      // unhandled rejection while an operator is querying another receipt.
+      if (starting || completion || stop.signal.aborted) throw error('BROKER_NODE_ALREADY_STARTED');
+      starting = true;
+      const response = await connect();
+      completion = run(response);
       completion.catch(() => {});
     },
     get completion() { return completion; },
