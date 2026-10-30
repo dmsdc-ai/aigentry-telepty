@@ -22,7 +22,7 @@ function createBrokerClient({ config, privateKey, fetch: send = globalThis.fetch
       if (!response.ok) throw error('BROKER_CHALLENGE_FAILED', response.status);
       if (!response.body) throw error('BROKER_CHALLENGE_INVALID', 502);
       const value = await readResponse(response);
-      if (value.schema !== 'telepty.broker-challenge/v1' || value.audience !== config.hub_audience
+      if (!value || typeof value !== 'object' || Array.isArray(value) || value.schema !== 'telepty.broker-challenge/v1' || value.audience !== config.hub_audience
         || !/^[A-Za-z0-9_-]{16,128}$/.test(value.challenge || '')) throw error('BROKER_CHALLENGE_INVALID', 502);
       return value.challenge;
     } finally { bounded.close(); }

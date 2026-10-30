@@ -11,8 +11,12 @@ function fixture(options = {}) {
     reconnect: { max_attempts: 2, initial_backoff_ms: 10, max_backoff_ms: 20 },
     hub_trust: { schema: 'telepty.principals/v1', audience: 'b', keys: [{ key_id: 'hub-key', principal_id: 'hub',
       public_key_spki: hub.publicKey.export({ type: 'spki', format: 'pem' }), grants: [{ action: 'broker.envelope', targets: ['a/worker'] }] }] }, ...options.config };
-  let streams = 0, posts = 0, delivered = 0; const challenges = []; let previousFrame;
+  let streams = 0, posts = 0, delivered = 0, challengeRequests = 0; const challenges = []; let previousFrame;
   const node = createBrokerNode({ config, privateKey: nodeKey.privateKey, localToken: 'synthetic', fetch: async (url, init) => {
+    if (url.endsWith('/v1/challenge')) {
+      challengeRequests++;
+      if (options.nullChallengeAfterFirst && challengeRequests > 1) return new Response('null');
+    }
     if (url.endsWith('/v1/challenge') && options.challengeHangs) return new Promise((resolve, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true }));
     if (url.endsWith('/v1/challenge')) return new Response(JSON.stringify({ schema: 'telepty.broker-challenge/v1', audience: 'hub', challenge: 'h'.repeat(32) }));
     if (url.includes('/results/')) { posts++; if (options.resultFailure) throw new TypeError('network'); return new Response('{}'); }
@@ -37,7 +41,7 @@ function fixture(options = {}) {
     } }), { headers: { 'content-type': 'text/event-stream' } });
     return response;
   } });
-  return { node, challenges, counts: () => ({ streams, posts, delivered }) };
+  return { node, challenges, challengeCount: () => challengeRequests, counts: () => ({ streams, posts, delivered }) };
 }
 test('opt-in reconnect uses fresh challenges, bounds attempts, and never replays uncertain delivery', async () => {
   const f = fixture({ messages: true }); await f.node.start();
@@ -105,4 +109,11 @@ test('stop cancels a blocked reader and auth refusal after disconnect is termina
   const refused = fixture({ refusedAfterFirst: true }); await refused.node.start();
   await assert.rejects(refused.node.completion, { code: 'BROKER_STREAM_REFUSED' });
   assert.equal(refused.counts().streams, 2); await refused.node.stop();
+});
+
+test('JSON null challenge after disconnect is terminal protocol failure', async () => {
+  const f = fixture({ nullChallengeAfterFirst: true }); await f.node.start();
+  await assert.rejects(f.node.completion, { code: 'BROKER_CHALLENGE_INVALID' });
+  assert.equal(f.challengeCount(), 2);
+  assert.equal(f.counts().streams, 1); await f.node.stop();
 });
