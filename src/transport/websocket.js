@@ -461,6 +461,13 @@ function installWebSocketTransport(deps) {
         const msg = JSON.parse(message);
         if (strictOwner && !strictOwner.accept(msg)) return;
         const { type, data, cols, rows } = msg;
+        // Raw viewer bytes must be the exact string classified and audited below.
+        // Bound each raw write to64KiB UTF8; owner wire framing remains independently bounded.
+        if (type === 'input' && (typeof data !== 'string' || Buffer.byteLength(data) > 65536)) {
+          ws.send(JSON.stringify({type:'input_refused',success:false,bytes_written:0,
+            code:typeof data === 'string' ? 'INPUT_FRAME_TOO_LARGE' : 'INVALID_INPUT_FRAME'}));
+          return;
+        }
 
         // #732 (H5 guard): `activeSession` above is a snapshot taken once, at connect time.
         // If sessions[id] is ever replaced under a live owner — a delete+recreate through
