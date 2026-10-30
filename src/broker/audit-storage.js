@@ -68,8 +68,8 @@ function createPrivateAuditStorage(file) {
         if (existing && (opened.dev !== existing.dev || opened.ino !== existing.ino)) unsafe();
         await handle.writeFile(data);
       } finally {
-        if (handle) await handle.close();
-        fs.closeSync(dir);
+        try { if (handle) await handle.close(); }
+        finally { fs.closeSync(dir); }
       }
     }
   };

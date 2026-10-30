@@ -176,3 +176,23 @@ test('private audit rotation remains bounded and refuses unsafe rotated leaves',
   assert.equal(fs.readFileSync(outside, 'utf8'), 'KEEP');
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 });
+
+test('private audit closes its directory descriptor when file-handle close rejects', { skip: process.platform !== 'linux' }, async t => {
+  const { createPrivateAuditStorage } = require('../src/broker/audit-storage');
+  const file = path.join(temp(t), 'logs', 'audit.jsonl');
+  const open = fs.promises.open, close = fs.closeSync;
+  let directoryDescriptor, directoryCloseCalls = 0;
+  t.mock.method(fs.promises, 'open', async (...args) => {
+    directoryDescriptor = Number(args[0].match(/^\/proc\/self\/fd\/(\d+)\//)[1]);
+    const handle = await open(...args), closeHandle = handle.close.bind(handle);
+    handle.close = async () => { await closeHandle(); throw new Error('synthetic close failure after real close'); };
+    return handle;
+  });
+  t.mock.method(fs, 'closeSync', fd => {
+    if (fd === directoryDescriptor) directoryCloseCalls++;
+    return close(fd);
+  });
+  await assert.rejects(createPrivateAuditStorage(file).writeBatch('synthetic audit row\n', { maxBytes: 1000, maxFiles: 2, maxAgeDays: 30 }), /synthetic close failure/);
+  assert.equal(directoryCloseCalls, 1);
+  assert.throws(() => fs.fstatSync(directoryDescriptor), { code: 'EBADF' });
+});
