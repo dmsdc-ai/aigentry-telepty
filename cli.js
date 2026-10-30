@@ -2593,6 +2593,7 @@ async function main() {
 
     let strictOwnerClient = null;
     let strictOwnerEpoch = null;
+    let handoffAdoption = null;
     const cooperativeEnabled = process.env.TELEPTY_COOPERATIVE_HANDOFF === '1';
     if (process.env.TELEPTY_PRINCIPAL_CLIENT_FILE) {
       try {
@@ -2612,6 +2613,7 @@ async function main() {
           || proof.session_id!==sessionId || proof.origin!==strictOwnerClient.daemonUrl || !/^[A-Za-z0-9_-]{22}$/.test(proof.session_epoch||'')
           || typeof proof.session_token!=='string' || !proof.session_token.startsWith(proof.session_epoch+'.') || proof.session_token.length>256
           || !Number.isSafeInteger(proof.credential_generation) || proof.credential_generation<2 || !/^[A-Za-z0-9_-]{24}$/.test(proof.session_nonce||''))throw new Error();
+        handoffAdoption={expected_epoch:proof.session_epoch,expected_credential_generation:proof.credential_generation};
         strictOwnerEpoch=proof.session_epoch;process.env.TELEPTY_SESSION_TOKEN=proof.session_token;process.env.TELEPTY_SESSION_ORIGIN=proof.origin;process.env.TELEPTY_SESSION_NONCE=proof.session_nonce;
       }catch{console.error('Invalid or unsafe cooperative handoff credential file.');process.exitCode=1;return;}
     }
@@ -2673,6 +2675,7 @@ async function main() {
         body: JSON.stringify({
           session_id: sessionId,
           ...(cooperativeEnabled ? {cooperative_handoff:true} : {}),
+          ...(handoffAdoption || {}),
           command,
           ...(sshPlan ? { ssh_remote: sshPlan.metadata } : {}),
           cwd: process.cwd(),
@@ -2689,6 +2692,11 @@ async function main() {
         })
       });
       const data = await res.json();
+      if (res.ok && handoffAdoption && (data.registration_instance_matched !== true || data.reregistered !== true
+          || data.session_epoch !== handoffAdoption.expected_epoch || data.credential_generation !== handoffAdoption.expected_credential_generation)) {
+        console.error('Daemon did not confirm the exact handoff instance; successor child was not started.');
+        process.exitCode = 1; return;
+      }
       if (res.ok && strictOwnerClient) strictOwnerEpoch = data.session_epoch;
       if (!res.ok) {
         console.error(`❌ Error: ${data.error}`);

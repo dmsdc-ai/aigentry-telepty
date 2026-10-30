@@ -109,6 +109,18 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     const identity = readIdentity(req.body, 'session_id');
     if (identity.error) return res.status(400).json({ error: identity.error });
     const session_id = identity.value;
+    const conditionalInstance = Object.hasOwn(req.body, 'expected_epoch') || Object.hasOwn(req.body, 'expected_credential_generation');
+    if (conditionalInstance) {
+      if (!/^[A-Za-z0-9_-]{22}$/.test(req.body.expected_epoch || '')
+          || !Number.isSafeInteger(req.body.expected_credential_generation) || req.body.expected_credential_generation < 1) {
+        return res.status(400).json({ code: 'REGISTRATION_PRECONDITION_INVALID', error: 'Both valid instance preconditions are required.' });
+      }
+      const expected = ownRecord(sessions, session_id);
+      if (!expected || expected.sessionEpoch !== req.body.expected_epoch
+          || expected.credentialGeneration !== req.body.expected_credential_generation) {
+        return res.status(409).json({ code: 'REGISTRATION_INSTANCE_CHANGED', error: 'Expected session instance differs or is unavailable.' });
+      }
+    }
     if (Object.prototype.hasOwnProperty.call(req.body, 'require_owner_proof') && typeof req.body.require_owner_proof !== 'boolean') {
       return res.status(400).json({ code: 'INVALID_OWNER_POLICY', error: 'require_owner_proof must be boolean.' });
     }
@@ -244,7 +256,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       // The legitimate holder does not need a copy back: the bridge carries the bearer in its env
       // (cli.js) and the child got its copy at spawn. `session_epoch` is a non-secret instance
       // discriminator — it identifies WHICH instance answered, and proves nothing on its own.
-      return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_epoch: existing.sessionEpoch || null, provenance_capable: !!existing.provenanceCapable });
+      return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_epoch: existing.sessionEpoch || null, ...(conditionalInstance ? { registration_instance_matched: true, credential_generation: existing.credentialGeneration } : {}), provenance_capable: !!existing.provenanceCapable });
     }
 
     const { delivery_type, delivery_endpoint, delivery } = req.body;
