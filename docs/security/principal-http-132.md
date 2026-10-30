@@ -307,3 +307,16 @@ read grant. It projects only trusted daemon-produced per-session observations;
 client publishing/state/turn messages and the raw global bus remain refused.
 See [trusted session events](../api/strict-session-events.md). Neither new adapter
 grants takeover, process custody, OS-account identity or agent consumption proof.
+
+## Exact bus effects and legacy viewer correction
+
+The separate session.bus channel admits only signed exact state_report/routed_turn
+effects through normal HTTP policy. Admission is not state/inject authority;
+pre-reservation owner policy and real HTTP ownership checks both protect state.
+See [bus effect contract](../api/strict-bus-effects.md). Legacy arbitrary publication
+and alias routing remain refused.
+
+Legacy raw viewer input now rejects nonstrings and oversized UTF8 payloads before
+policy/write. Admission and post-dispatch audit observations are distinct; no
+physical delivery is claimed before a writer callback. This opens no new strict
+raw authority. See [viewer audit contract](../api/viewer-input-audit.md).
