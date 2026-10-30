@@ -70,7 +70,7 @@ function createDiscoveryRegistry({ nodes, streams, now = Date.now }) {
     }
   };
 }
-function createDiscoveryAgent({ configuration, node, client, inspect, timeoutMs, signal }) {
+function createDiscoveryAgent({ configuration, node, client, inspect, timeoutMs, signal, setTimer = setTimeout, clearTimer = clearTimeout }) {
   const config = validateDiscovery(configuration);
   if (!config) return null;
   if (!id(node) || !Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 10000) throw error('BROKER_DISCOVERY_CONFIG_INVALID');
@@ -80,7 +80,7 @@ function createDiscoveryAgent({ configuration, node, client, inspect, timeoutMs,
   function end(challenge) {
     const job = current;
     if (!job || (challenge !== undefined && job.challenge !== challenge)) return;
-    current = null; job.stop.abort(); clearTimeout(job.timer);
+    current = null; job.stop.abort(); clearTimer(job.timer);
   }
   function begin(challenge) {
     end();
@@ -88,7 +88,7 @@ function createDiscoveryAgent({ configuration, node, client, inspect, timeoutMs,
     const job = { challenge, stop: new AbortController(), timer: null }; current = job;
     async function sample() {
       const sessions = [];
-      const bounded = combineAbortSignals([signal, job.stop.signal, AbortSignal.timeout(timeoutMs)]);
+      const bounded = config.sessions.length ? combineAbortSignals([job.stop.signal, AbortSignal.timeout(timeoutMs)]) : job.stop.signal;
       try {
         for (const sid of config.sessions) {
           if (bounded.aborted || current !== job) break;
@@ -104,14 +104,14 @@ function createDiscoveryAgent({ configuration, node, client, inspect, timeoutMs,
           ttl_ms: config.ttl_ms, stream_challenge: challenge };
         // Local sampling has its own finite budget; publishing is separately bounded by client.
         const result = await client.request('POST', `/v1/nodes/${node}/advertise`, body, 'broker.advertise',
-          { signal: combineAbortSignals([signal, job.stop.signal]) });
+          { signal: job.stop.signal });
         if (current !== job || signal.aborted || job.stop.signal.aborted) return;
         if (result.status >= 400 || result.body?.success !== true) throw error('BROKER_DISCOVERY_REFUSED');
         bump('posted'); if (!body.complete) bump('partial');
       } catch { if (current === job && !signal.aborted && !job.stop.signal.aborted) bump('errors'); }
       finally {
         if (current === job && !signal.aborted && !job.stop.signal.aborted) {
-          job.timer = setTimeout(sample, config.interval_ms); job.timer.unref?.();
+          job.timer = setTimer(sample, config.interval_ms); job.timer.unref?.();
         }
       }
     }

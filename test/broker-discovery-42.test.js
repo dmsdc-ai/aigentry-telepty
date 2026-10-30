@@ -118,3 +118,21 @@ test('discovery treats a backwards clock as unavailable rather than extending sn
   now = 11000; const result = res(); registry.handle({ method: 'GET', url: '/v1/nodes/source/discovery/node' }, result, {}, auth);
   assert.equal(result.body.reason, 'clock_unsafe'); assert.equal(result.body.sessions, null);
 });
+
+test('successful discovery refreshes do not retain global stop listeners', async () => {
+  const { getEventListeners, setMaxListeners } = require('node:events');
+  const stop = new AbortController(); setMaxListeners(0, stop.signal);
+  const refresh = []; let posted = 0;
+  const agent = createDiscoveryAgent({ configuration: { sessions: [], interval_ms: 5000, ttl_ms: 10000 }, node: 'node',
+    signal: stop.signal, timeoutMs: 100, inspect: async () => { throw Error('empty configuration must not inspect'); },
+    setTimer: callback => { refresh.push(callback); return { unref() {} }; }, clearTimer() {},
+    client: { request: async () => { posted++; return { status: 200, body: { success: true } }; } } });
+  agent.begin('h'.repeat(43));
+  for (let i = 0; i < 13; i++) {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(refresh.length, 1); refresh.shift()();
+  }
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.equal(posted, 14); assert.equal(getEventListeners(stop.signal, 'abort').length, 1);
+  stop.abort(); assert.equal(getEventListeners(stop.signal, 'abort').length, 0);
+});
