@@ -263,6 +263,7 @@ kill, automatic cleanup and unsafe delivery/provenance reconfiguration until
 settlement is provable. Legitimate checked successor registration remains
 available. Explicit unknown journal history and payload survive compaction and
 DLQ purge; generic later ACKs cannot erase them. Malformed evidence is not repaired
-away. If normal compaction prunes the ACK rows needed for settlement, the
-reservation remains rather than manufacturing a proof from absence. This
-conservative limitation and unresolved fences have no automatic recovery API.
+away. A [new private transport-ACK proof](pending-transport-ack.md) can preserve exact
+settlement before normal compaction. Legacy/generic ACK rows pruned without that
+proof remain reserved rather than manufacturing settlement from absence.
+Unresolved fences still have no automatic recovery API.
