@@ -244,10 +244,15 @@ function registerPeerForwardRoutes(app, { sessions, loadPeers, homeDir = os.home
       const originalJson = res.json.bind(res);
       res.json = (body) => {
         const safe = {};
-        for (const field of ['success', 'inject_id', 'session_id', 'exact_target', 'queued', 'bootstrap_queued', 'delivered', 'bytes_written', 'code']) {
+        for (const field of ['success', 'inject_id', 'session_id', 'exact_target', 'queued', 'bootstrap_queued', 'delivered', 'code', 'delivery_uncertain', 'retryable']) {
           if (['string', 'boolean', 'number'].includes(typeof body[field])) safe[field] = body[field];
         }
-        try { ledger.write({ ...reserved.record, state: body.success === true ? 'accepted' : 'failed',
+        if (body.bytes_written === null || (Number.isFinite(body.bytes_written) && body.bytes_written >= 0)) {
+          safe.bytes_written = body.bytes_written;
+        }
+        if (body.submit === 'skipped') safe.submit = 'skipped';
+        const uncertain = body.delivery_uncertain === true || body.code === 'DELIVERY_UNCERTAIN' || res.statusCode >= 500;
+        try { ledger.write({ ...reserved.record, state: uncertain ? 'outcome_unknown' : body.success === true ? 'accepted' : 'failed',
           remote_status: res.statusCode, remote_receipt: safe }); }
         catch { res.status(503); return originalJson({ success: false, code: 'FORWARD_STORAGE_UNAVAILABLE' }); }
         return originalJson(body);
