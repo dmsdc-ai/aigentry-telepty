@@ -72,6 +72,7 @@ function transferredRecord(session, message) {
 // One connection/child attempt only. A transport receipt measures the bridge's
 // child.write invocation, never PTY consumption or application completion.
 const deliveries = new WeakMap();
+const verifiedWrites = new WeakMap();
 function requestPendingWrite(session, message, { timeoutMs = 3000 } = {}) {
     const ws = session.ownerWs, epoch = session.sessionEpoch, owner = session.interactionOwnerGeneration;
     const event = transferredRecord(session, message);
@@ -109,7 +110,9 @@ function acceptPendingReceipt(id, session, ws, message) {
         return false;
     }
     if (message.stage === 'child_write_invoked' && message.bytes_written === null && message.submitted_bytes === Buffer.byteLength(attempt.request.data)) {
-        attempt.finish({ success: true, bytes_written: null, submitted_bytes: message.submitted_bytes, measurement: 'bridge_child_write_invoked', consumption: 'unknown', reply: 'unknown' });
+        const result = { success: true, bytes_written: null, submitted_bytes: message.submitted_bytes, measurement: 'bridge_child_write_invoked', consumption: 'unknown', reply: 'unknown' };
+        verifiedWrites.set(result, {session, epoch:attempt.epoch, intent:attempt.request.intent_id, msgId:attempt.request.msg_id, digest:attempt.request.content_digest});
+        attempt.finish(result);
     }
     else
         attempt.finish({ success: false, delivery_uncertain: true, bytes_written: null, code: 'HANDOFF_WRITE_UNKNOWN' });
@@ -160,6 +163,12 @@ function createPendingWriter({ binding, canWrite, write, now = Date.now }) {
         return result;
     };
 }
+function consumeVerifiedPendingWrite(result, session, message) {
+    const proof = verifiedWrites.get(result);
+    verifiedWrites.delete(result);
+    return !!proof && proof.session === session && proof.epoch === session.sessionEpoch
+      && proof.intent === session.cooperativeHandoff?.id && proof.msgId === message.msg_id && proof.digest === bodyDigest(message);
+}
 function eligibleRecipient(session) {
     return session?.type === 'wrapped' && session.cooperativeHandoffCapable === true
         && !session.sshRemote && !session.externalApprovalPolicy && session.provenanceCapable !== true;
@@ -168,7 +177,7 @@ function pendingNamespaceReserved(session, mailboxSource) {
     const event = session?.cooperativeHandoff;
     if (event?.state !== 'committed' || !(event.pending_count > 0))
         return false;
-    if (!validPendingAudit(event) || !event.pending_records.every(row => event.pending_write_invoked?.includes(row.id)))
+    if (event.next_epoch !== session.sessionEpoch || !validPendingAudit(event) || !event.pending_records.every(row => event.pending_write_invoked?.includes(row.id)))
         return true;
     try {
         const mailbox = typeof mailboxSource === 'function' ? mailboxSource() : mailboxSource;
@@ -179,4 +188,4 @@ function pendingNamespaceReserved(session, mailboxSource) {
     }
 }
 module.exports = { MAX_PENDING, messageDigest, validConsent, snapshotReceipt, validPendingAudit, transferredRecord,
-    requestPendingWrite, acceptPendingReceipt, createPendingWriter, eligibleRecipient, pendingNamespaceReserved };
+    requestPendingWrite, acceptPendingReceipt, createPendingWriter, eligibleRecipient, pendingNamespaceReserved, consumeVerifiedPendingWrite };

@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const LEAVES = ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl', '.lock'];
+const LEAVES = ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl', 'handoff-settlements.jsonl', '.lock'];
 
 function unsafePath() {
   return Object.assign(new Error('Unsafe mailbox storage path'), { code: 'MAILBOX_UNSAFE_PATH' });

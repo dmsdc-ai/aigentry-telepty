@@ -157,7 +157,14 @@ class DeliveryEngine {
             }
 
             if (result && result.success) {
-              this.mailbox.ack(sessionId, msg.msg_id);
+              try { this.mailbox.ack(sessionId, msg.msg_id, result); }
+              catch {
+                // Physical invocation is not a durable transport-ACK receipt. Its
+                // attempt fence remains authoritative; never invoke the deliverer again.
+                if (this.onDelivery) this.onDelivery(sessionId, msg.msg_id, {success:false,delivery_uncertain:true,
+                  outcome:'unknown',retryable:false,bytes_written:null,code:'MAILBOX_ACK_STORE_UNAVAILABLE'});
+                continue;
+              }
               if (this.onDelivery) {
                 this.onDelivery(sessionId, msg.msg_id, { success: true });
               }

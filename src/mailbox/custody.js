@@ -127,13 +127,20 @@ function pristinePendingIds(directory, sessionId) {
 }
 function acknowledgedCustodySnapshot(directory, sessionId, event) {
     const { messages, states, unsettled } = readCustody(directory, sessionId);
-    if (unsettled)
-        invalid();
+    if (unsettled) invalid();
     const digest = require('../principal/encoding').bodyDigest;
+    const missing = [];
     for (const record of event.pending_records) {
-        if (states.get(record.id)?.state !== 'acked' || !messages.has(record.id) || digest(messages.get(record.id)) !== record.digest)
-            invalid();
+        const present = messages.has(record.id) || states.has(record.id);
+        if (present) {
+            if (states.get(record.id)?.state !== 'acked' || !messages.has(record.id) || digest(messages.get(record.id)) !== record.digest) invalid();
+        } else missing.push(record);
+    }
+    if (missing.length) {
+        const settlement = require('./handoff-settlement');
+        const confirmed = settlement.readSettlements(directory, {sync:true});
+        if (!missing.every(record => settlement.confirmed(confirmed, sessionId, event, record))) invalid();
     }
     return true;
 }
-module.exports = { acknowledgedCustodySnapshot, strictCustodySnapshot, neverAttemptedCustodySnapshot, pristinePendingIds, MAX_FILE_BYTES, MAX_ROWS };
+module.exports = { readCustody, acknowledgedCustodySnapshot, strictCustodySnapshot, neverAttemptedCustodySnapshot, pristinePendingIds, MAX_FILE_BYTES, MAX_ROWS };

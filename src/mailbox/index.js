@@ -131,7 +131,7 @@ class FileMailbox {
   /**
    * Acknowledge successful delivery of a message.
    */
-  ack(sessionId, msgId) {
+  ack(sessionId, msgId, result = undefined) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) return;
 
@@ -142,7 +142,32 @@ class FileMailbox {
       // Idempotent: already acked → no-op
       if (st && (st.state === 'acked' || st.state === 'dead_letter')) return;
 
+      const settlement = require('./handoff-settlement');
+      if (settlement.usedProof(result)) return;
+      const trusted = settlement.hasProof(result);
+      let message;
+      if (trusted) {
+        const custody = require('./custody').readCustody(sessionDir, sessionId);
+        message = custody.messages.get(msgId);
+        if (custody.journal.some(row => row.delivery_uncertain === true || row.outcome === 'unknown' || row.retryable === false) || custody.states.get(msgId)?.state !== 'in_flight'
+          || !custody.histories.get(msgId)?.some(row => row.non_retryable_attempt === true)) throw new Error('HANDOFF_ACK_EVIDENCE_REQUIRED');
+      }
       appendState(sessionDir, msgId, 'acked', unixNow());
+      if (trusted) {
+        try {
+          if (require('./custody').readCustody(sessionDir, sessionId).unsettled) throw new Error('HANDOFF_ACK_UNKNOWN_HISTORY');
+          const fd = openFile(path.join(sessionDir, 'state.jsonl'), fs.constants.O_RDWR);
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+          settlement.commitSettlement(sessionDir, sessionId, message, result);
+        } catch (error) {
+          // Visible ACK or proof publication is not a successful durability receipt.
+          // Preserve original payload and unknown history; compaction must not erase it.
+          appendJsonl(path.join(sessionDir, 'state.jsonl'), {msg_id:msgId,state:'dead_letter',ts:unixNow(),delivery_uncertain:true,outcome:'unknown',retryable:false});
+          const fd = openFile(path.join(sessionDir, 'state.jsonl'), fs.constants.O_RDWR);
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+          throw error;
+        }
+      }
       compact(sessionDir, this.config.compactionThreshold);
     } finally {
       release();

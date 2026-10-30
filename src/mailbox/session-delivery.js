@@ -672,6 +672,7 @@ function createSessionDeliveryContext({
           event.pending_write_invoked=[...(priorInvoked||[]),msg.msg_id];if(audit && audit!==event)audit.pending_write_invoked=event.pending_write_invoked;
           const acknowledged=persistSessions();
           if(!acknowledged?.ok){if(!acknowledged?.committed){event.pending_write_invoked=priorInvoked;if(audit && audit!==event)audit.pending_write_invoked=priorAuditInvoked;}return {success:false,delivery_uncertain:true,bytes_written:null,code:'HANDOFF_RECEIPT_STORE_UNAVAILABLE',retryable:false};}
+          require('./handoff-settlement').captureSettlement(result,session,msg);
           injectionTargets.delete(msg.msg_id);
         }
         return result;
