@@ -5,6 +5,7 @@ const { createBrokerHub } = require('./hub');
 const { createBrokerNode, createBrokerClient } = require('./node');
 const { error } = require('./http');
 const { readAuthorityFile } = require('../principal/authority-file');
+const { loadLocalPrincipal } = require('./local-principal');
 function readFile(file, maximum, privateFile = false) {
   try { return readAuthorityFile(file, { maximum, privateFile }); }
   catch { throw error('BROKER_FILE_UNSAFE'); }
@@ -43,8 +44,9 @@ async function runBrokerCommand(mode, configFile) {
     console.log(`Broker v1 listening on ${tls ? 'https' : 'http'}://${address.address}:${address.port}`);
   } else if (mode === 'node') {
     // Only this node's own local credential is read. It never leaves loopback.
-    const localToken = require('../../auth').getConfig({ create: false }).authToken;
-    running = createBrokerNode({ config, privateKey, localToken });
+    const localPrincipal = config.local_principal === undefined ? undefined : loadLocalPrincipal(config.local_principal);
+    const localToken = localPrincipal ? undefined : require('../../auth').getConfig({ create: false }).authToken;
+    running = createBrokerNode({ config, privateKey, localToken, localPrincipal });
     await running.start();
     console.log('Broker v1 node connected (foreign session identity unverified)');
   } else throw error('BROKER_MODE_INVALID');

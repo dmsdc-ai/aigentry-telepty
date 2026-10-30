@@ -4,7 +4,7 @@ const { canonicalJSON, bodyDigest, parseUnambiguousJSON } = require('./encoding'
 const SCHEMA = 'telepty.principals/v1';
 const DOMAIN = 'telepty.principal-assertion/v1\n';
 const HTTP_ACTIONS = Object.freeze(['daemon.inspect', 'session.list', 'session.inspect', 'session.register',
-  'session.create', 'session.takeover', 'session.inject', 'session.state', 'session.input', 'session.rename', 'session.destroy', 'mailbox.read', 'mailbox.ack', 'mailbox.renew']);
+  'session.create', 'session.takeover', 'session.inject', 'session.forwarded_inject', 'session.state', 'session.input', 'session.rename', 'session.destroy', 'mailbox.read', 'mailbox.ack', 'mailbox.renew']);
 const VALIDATED = Symbol('validated public principal trust');
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 const opaque = value => typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 256 && !/[\x00-\x20\x7f]/.test(value);

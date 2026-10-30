@@ -3,6 +3,7 @@ const { createPrincipalVerifier, validateTrustConfiguration } = require('../prin
 const { bodyDigest, parseUnambiguousJSON } = require('../principal/encoding');
 const { id, error, origin, readResponse, assertion, combineAbortSignals } = require('./http');
 const { ACTIONS } = require('./hub');
+const { loadLocalPrincipal, createLocalPrincipalRequest } = require('./local-principal');
 const { validateForwardBody } = require('../peer-forwarding');
 
 function createBrokerClient({ config, privateKey, fetch: send = globalThis.fetch } = {}) {
@@ -53,11 +54,16 @@ function createBrokerClient({ config, privateKey, fetch: send = globalThis.fetch
   };
 }
 
-function createBrokerNode({ config, privateKey, localToken, fetch: send = globalThis.fetch } = {}) {
+function createBrokerNode({ config, privateKey, localToken, localPrincipal, fetch: send = globalThis.fetch } = {}) {
+  const strictLocal = localPrincipal !== undefined || config?.local_principal !== undefined;
   if (!config || config.schema !== 'telepty.broker-node/v1' || !id(config.principal_id)
-    || !id(config.hub_principal_id) || typeof localToken !== 'string' || !localToken
+    || !id(config.hub_principal_id) || (!strictLocal && (typeof localToken !== 'string' || !localToken))
     || !Number.isInteger(config.local_timeout_ms) || config.local_timeout_ms < 100 || config.local_timeout_ms > 10000) throw error('BROKER_CONFIG_INVALID');
   const local = origin(config.local_daemon_url, true);
+  if (strictLocal && localToken !== undefined) throw error('BROKER_LOCAL_AUTH_AMBIGUOUS');
+  const localRequest = strictLocal ? createLocalPrincipalRequest({ localDaemonUrl: local,
+    principal: localPrincipal === undefined ? loadLocalPrincipal(config.local_principal) : localPrincipal,
+    timeoutMs: config.local_timeout_ms, fetch: send }) : null;
   const trust = validateTrustConfiguration(config.hub_trust, { audience: config.audience, allowedActions: ACTIONS });
   // This trust file pins only the hub's key(s), with exact source-node/session grants.
   for (const key of trust.keys.values()) if (key.id !== config.hub_principal_id) throw error('BROKER_HUB_PIN_INVALID');
@@ -99,11 +105,13 @@ function createBrokerNode({ config, privateKey, localToken, fetch: send = global
     if (!proof.ok) throw error(proof.code, proof.status);
     let result;
     try {
-      const response = await send(`${local}/api/forwarded/sessions/${encodeURIComponent(envelope.session)}/inject`, {
+      const localBody = { ...payload, exact_target: true, claimed_cross_host: true,
+        forwarding: { hop: 1, key: envelope.receipt_id } };
+      const response = localRequest ? await localRequest(envelope.session, localBody, stop.signal)
+        : await send(`${local}/api/forwarded/sessions/${encodeURIComponent(envelope.session)}/inject`, {
         method: 'POST', redirect: 'error', signal: combineAbortSignals([stop.signal, AbortSignal.timeout(config.local_timeout_ms)]),
         headers: { 'content-type': 'application/json', 'x-telepty-token': localToken },
-        body: JSON.stringify({ ...payload, exact_target: true, claimed_cross_host: true,
-          forwarding: { hop: 1, key: envelope.receipt_id } })
+        body: JSON.stringify(localBody)
       });
       const receipt = await readResponse(response);
       if (response.ok && receipt.success === true && typeof receipt.inject_id === 'string'
@@ -112,7 +120,11 @@ function createBrokerNode({ config, privateKey, localToken, fetch: send = global
       } else result = { state: response.ok || response.status >= 500
         || ['FORWARD_OUTCOME_UNKNOWN', 'FORWARD_STORAGE_UNAVAILABLE'].includes(receipt.code) ? 'outcome_unknown' : 'failed',
         code: 'BROKER_LOCAL_INJECT_REFUSED' };
-    } catch { result = { state: 'outcome_unknown', code: 'BROKER_LOCAL_OUTCOME_UNKNOWN' }; }
+    } catch (failure) {
+      result = failure.code?.startsWith('BROKER_LOCAL_CHALLENGE')
+        ? { state: 'failed', code: 'BROKER_LOCAL_CHALLENGE_REFUSED' }
+        : { state: 'outcome_unknown', code: 'BROKER_LOCAL_OUTCOME_UNKNOWN' };
+    }
     // A failed/uncertain result POST is never retried automatically. Hub polling can
     // still reveal a committed receipt if the response alone was lost.
     const posted = await client.request('POST', `/v1/nodes/${config.principal_id}/results/${envelope.receipt_id}`,

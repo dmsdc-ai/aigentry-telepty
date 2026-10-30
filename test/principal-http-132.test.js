@@ -164,10 +164,18 @@ test('static fanout paths and encoded aliases cannot turn an exact inject grant 
     assert.equal((await f.request(target, { method: 'POST', body,
       proof: f.sign(target, 'session.inject', body, { method: 'POST' }) })).status, 404);
   }
-  for (const target of ['/api/sessions/submit-all', '/api/bus/publish', '/api/forwarded/sessions/legacy/inject']) {
+  for (const target of ['/api/sessions/submit-all', '/api/bus/publish']) {
     assert.equal((await f.request(target, { method: 'POST', body,
       proof: f.sign(target, 'session.inject', body, { method: 'POST' }) })).status, 403);
   }
+  // The newly recognized forwarded path still refuses an ordinary inject assertion;
+  // a correctly bound forwarded assertion separately requires its explicit grant.
+  const forwarded = '/api/forwarded/sessions/legacy/inject';
+  assert.equal((await f.request(forwarded, { method: 'POST', body,
+    proof: f.sign(forwarded, 'session.inject', body, { method: 'POST' }) })).status, 401);
+  const exactBody = { ...body, expected_epoch: 'legacy-epoch' };
+  assert.equal((await f.request(forwarded, { method: 'POST', body: exactBody,
+    proof: f.sign(forwarded, 'session.forwarded_inject', exactBody, { method: 'POST', sessionEpoch: 'legacy-epoch' }) })).status, 403);
   assert.deepEqual(f.writes, []);
 });
 

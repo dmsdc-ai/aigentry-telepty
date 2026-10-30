@@ -29,6 +29,13 @@ function resolveAction(req) {
     return { action: pathname.endsWith('/register') ? 'session.register' : 'session.create', target: id.value, creation: true,
       operatorOnly: pathname.endsWith('/spawn') };
   }
+  const forwarded = /^\/api\/forwarded\/sessions\/([^/]+)\/inject$/.exec(pathname);
+  if (method === 'POST' && forwarded) {
+    let id;
+    try { id = decodeURIComponent(forwarded[1]); } catch { return null; }
+    return sessionId(id) ? { action: 'session.forwarded_inject', target: id, explicitInject: true,
+      epochRequired: true, forwarded: true } : null;
+  }
   const match = /^\/api\/sessions\/([^/]+)(?:\/(diagnostics|handshake|screen|inject|state|submit|kill|takeover|mailbox(?:\/ack)?|lease))?$/.exec(pathname);
   if (!match) return null;
   let id;
@@ -89,6 +96,9 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
         target: req.originalUrl || req.url, bodySha256: digest, action: action.action,
         grantTarget: action.target, transport: 'http', ...(epochRequired ? { sessionEpoch: session.sessionEpoch } : {}) });
       if (!result.ok) return result;
+      if (action.forwarded && (typeof req.body?.expected_epoch !== 'string' || req.body.expected_epoch !== session.sessionEpoch)) {
+        return denied('PRINCIPAL_SESSION_EPOCH_MISMATCH', 409);
+      }
       const principal = result.principal, owner = storedOwningPrincipal(session?.owningPrincipal);
       const owns = owner && owner.id === principal.id && owner.audience === principal.audience;
       const operatorOnly = action.operatorOnly || (action.action === 'session.register'
