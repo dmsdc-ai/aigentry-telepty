@@ -62,6 +62,10 @@ client labels and fixed reason codes, not keys, signatures, tokens or input path
 
 ## 2. Prove authenticated registration separately
 
+An existing configured client can inspect exact composer evidence with the
+[signed readiness CLI](principal-readiness.md). A signed read-only HTTP response
+is still not proof of registration; it does not replace this stage's acceptance.
+
 Use disposable fixture daemons and synthetic keys for compatibility acceptance.
 Verify an exact signed registration, persisted principal/epoch, owner handshake,
 stale/wrong key refusal, restart challenge and no shared-token fallback. Existing

@@ -5193,6 +5193,12 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
+  if (cmd === 'principal-readiness-v1') {
+    try { console.log(JSON.stringify(await require('./src/principal/readiness-cli').runPrincipalReadiness(args.slice(1)))); }
+    catch (error) { console.error(error.code || 'PRINCIPAL_READINESS_FAILED'); markCommandFailed(); }
+    return;
+  }
+
   if (cmd === 'principal-observe-v1') {
     try { await require('./src/principal/observe-cli').runPrincipalObserver(args.slice(1)); }
     catch (error) { console.error(error.code || 'PRINCIPAL_OBSERVER_FAILED'); markCommandFailed(); }
@@ -5415,7 +5421,7 @@ function printGlobalHelp() {
   telepty disconnect <name> | --all              Disconnect remote host
   telepty peers [--remove <name>]                List connected peers
   telepty discover [--json] [--refresh]           Read-only local tailnet candidates; never enroll or authorize
-  telepty principal-bus-v1 --config <private-file> --session <id> --epoch <epoch> --request <private-file>\n  telepty principal-bus-receipt-v1 --config <private-file> --session <id> --epoch <epoch> --effect <effect> --key <key>\n  telepty principal-input-v1 --config <private-file> --session <id> --epoch <epoch> --request <private-file>\n  telepty principal-input-receipt-v1 --config <private-file> --session <id> --epoch <epoch> --key <key>\n  telepty principal-observe-v1 --config <private-file> --session <exact-id> --epoch <epoch>\n  telepty broker-v1 --config <file>              Opt-in signed SSE hub (exact inject only)
+  telepty principal-bus-v1 --config <private-file> --session <id> --epoch <epoch> --request <private-file>\n  telepty principal-bus-receipt-v1 --config <private-file> --session <id> --epoch <epoch> --effect <effect> --key <key>\n  telepty principal-input-v1 --config <private-file> --session <id> --epoch <epoch> --request <private-file>\n  telepty principal-input-receipt-v1 --config <private-file> --session <id> --epoch <epoch> --key <key>\n  telepty principal-readiness-v1 --config <private-file> --session <exact-id> --epoch <epoch>\n  telepty principal-observe-v1 --config <private-file> --session <exact-id> --epoch <epoch>\n  telepty broker-v1 --config <file>              Opt-in signed SSE hub (exact inject only)
   telepty relay-node-v1 --config <file>          Outbound recipient bridge, no auto-enrollment
   telepty broker-inject-v1 --config <file> <node> <sid> <epoch> <key> <prompt>
   telepty broker-receipt-v1 --config <file> <key> Query acceptance/uncertainty; no resend

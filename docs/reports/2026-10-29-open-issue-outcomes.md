@@ -1,6 +1,10 @@
 # Open Telepty issues: local delivery outcome — 2026-10-29
 
-Latest continuation: [approved staged-auth preparation](2026-10-30-staged-auth-preparation.md),
+Latest continuation: [signed strict readiness inspection](2026-10-30-signed-readiness-continuation.md),
+2,535 total / 2,532 pass / zero fail / three skip. Signed inspection acceptance
+remains separate from real client enrollment, consumption and reply.
+
+Earlier continuation: [approved staged-auth preparation](2026-10-30-staged-auth-preparation.md),
 2,529 total / 2,526 pass / zero fail / three skip. Static inventory does not
 authorize enrollment or cutover; REPORT and foreign trust boundaries are retained.
 
