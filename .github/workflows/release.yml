@@ -26,7 +26,7 @@ on:
   push:
     tags: [ 'v*' ]
   # #917: re-run an EXISTING tag without retagging. v0.8.1 published nothing because the
-  # windows leg timed out (see the `test-windows` job), and a tag-triggered re-run would have
+  # windows leg timed out (see the `test` job's #917 note), and a tag-triggered re-run would have
   # re-executed the release.yml AT THAT TAG — the broken one — because a push-tag run resolves
   # its workflow file from the tag's tree. Dispatching from the default branch runs the FIXED
   # file while every checkout below pins the tag's tree, so the bytes published are still the
@@ -60,9 +60,12 @@ jobs:
     outputs:
       package: ${{ steps.identity.outputs.package }}
       version: ${{ steps.identity.outputs.version }}
-      # #917: the resolved tag, so every downstream job checks out the same tree this Gate
-      # validated — whether the run came from a tag push or a dispatch.
+      # #917: the resolved tag — kept for naming and release metadata (TAG env, gh release).
       tag: ${{ steps.identity.outputs.tag }}
+      # Task 1215 R1: the exact commit this Gate checked out and validated. Every downstream job
+      # checks out THIS sha, never the tag name, so a tag moved or re-pushed mid-run cannot hand
+      # test/pack/consumer/publish a tree the Gate never validated.
+      commit: ${{ steps.commit.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -97,6 +100,17 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "tag ${TAG} agrees with package.json: ${PACKAGE}@${VERSION}"
 
+      # Task 1215 R1: export the validated checkout's commit (the tree the identity check above
+      # just read). A full 40-hex sha or the Gate fails; downstream checkouts pin to it.
+      - name: Export the validated commit
+        id: commit
+        run: |
+          set -euo pipefail
+          COMMIT="$(git rev-parse HEAD)"
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve the validated checkout commit (got '${COMMIT}')"; exit 1; }
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "validated commit ${COMMIT}"
+
       # A workflow that silently no-ops when the secret is absent is green-without-publishing,
       # i.e. the bug this file exists to prevent. The token's value is never printed, only its
       # emptiness is tested.
@@ -112,35 +126,34 @@ jobs:
           echo "NPM_TOKEN is present"
 
   # Gate 3: the whole suite, not a subset. Job shape is deliberately the same as
-  # .github/workflows/test-install.yml (matrix, 20min cap, windows quarantine, the four steps)
-  # so the release gate and the PR gate cannot drift into measuring different things. Kept as a
-  # copy rather than a workflow_call refactor because test-install.yml is out of scope for #874.
-  # #917: THE BLOCKING GATE — ubuntu + macOS only.
+  # .github/workflows/test-install.yml (matrix, 20min cap, the four steps) so the release gate and
+  # the PR gate cannot drift into measuring different things. Kept as a copy rather than a
+  # workflow_call refactor because test-install.yml is out of scope for #874.
   #
-  # windows-latest used to be a third leg of this matrix under
-  # `continue-on-error: ${{ matrix.os == 'windows-latest' }}`, with a comment saying
-  # "ubuntu+macOS are the blocking gate". The YAML did not implement that sentence.
-  # `continue-on-error` excuses a job that FAILS; it does not excuse one that is CANCELLED, and
-  # a job killed by `timeout-minutes` is cancelled. Measured on run 31921029756 (v0.8.1): Gate
-  # green, ubuntu green 1m56, macOS green 2m44, windows cancelled at 20m06 — and `publish` was
-  # SKIPPED. The tag was pushed, the run went through, and npm still served 0.8.0.
+  # #917 history: windows-latest used to be a third leg of this matrix under
+  # `continue-on-error: ${{ matrix.os == 'windows-latest' }}`. `continue-on-error` excuses a job that
+  # FAILS; it does not excuse one that is CANCELLED, and a job killed by `timeout-minutes` is
+  # cancelled. Measured on run 31921029756 (v0.8.1): windows cancelled at 20m06 and `publish` was
+  # SKIPPED while npm still served 0.8.0. It was then measured in a separate non-gating job.
   #
-  # A quarantined leg must never be in the publish `needs` graph. Windows is measured in its own
-  # job below, where its outcome cannot reach this one.
+  # Task 1215 G2: test-install.yml already gates windows-latest with these SAME unchanged commands
+  # (npm ci, typecheck, test:ci, test:ci:pty) and no continue-on-error, and Windows is a supported
+  # platform of this release. So the release gate measures the same three platforms, and no leg is
+  # quarantined: a failed or cancelled leg blocks `publish` (red, never a silent skip into green).
   test:
     name: Full suite
     needs: guard
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node: [20]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.guard.outputs.tag }}
+          ref: ${{ needs.guard.outputs.commit }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -164,38 +177,13 @@ jobs:
       - name: Run PTY-serialized regression tests
         run: npm run test:ci:pty
 
-  # #879: MEASURED, NOT GATING. Same steps as the gate above, deliberately outside it and
-  # outside `publish`'s needs graph — windows-latest has never completed this suite inside the
-  # 20-minute cap, so anything downstream of it is hostage to that. Its result is still recorded
-  # (that is the point of running it at all); it simply cannot decide whether a release ships.
-  # Fold it back into `test` when #879 lands and windows completes.
-  test-windows:
-    name: Full suite (windows — measured, not gating, #879)
-    needs: guard
-    runs-on: windows-latest
-    timeout-minutes: 20
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.guard.outputs.tag }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Run typecheck
-        run: npm run typecheck
-      - name: Run regression suite
-        run: npm run test:ci
-      - name: Run PTY-serialized regression tests
-        run: npm run test:ci:pty
+  # (#879's former `test-windows` job — measured, not gating, continue-on-error — is folded into the
+  # `test` matrix above, as its own comment prescribed once windows completes the unchanged suite.)
 
   # Task 1215: THE binary that ships. Built once on macOS from the tag's first-party source with the
   # runner's Apple toolchain and Node-API headers (explicit inputs, no download), verified universal
-  # (arm64 + x86_64), exercised by the native tests with zero skips, and handed to `publish` with its
-  # sha256. `publish` packs exactly these bytes and fails unless the tarball contains them.
+  # (arm64 + x86_64), exercised by the native tests with zero skips, and handed to `pack` with its
+  # sha256. `pack` packs exactly these bytes and fails unless the tarball contains them.
   authority-darwin:
     name: Build and verify the Darwin authority reader
     needs: guard
@@ -206,7 +194,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.guard.outputs.tag }}
+          ref: ${{ needs.guard.outputs.commit }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -238,29 +226,30 @@ jobs:
             src/principal/native/prebuilt/darwin/authority-darwin.node.provenance.json
           if-no-files-found: error
 
-  publish:
-    name: Publish and verify from the registry
-    needs: [guard, test, authority-darwin]
+  # Task 1215 G2: ONE canonical archive, packed once from the tag's tree AFTER the reviewed Darwin
+  # reader is downloaded and verified. check-package --pack-only writes the archive and a manifest
+  # read back out of the tarball itself: archive sha256/sha1/integrity, every packed file's
+  # path/size/sha256 (npm additions and the release-built reader included) and the reader's exact
+  # identity (sha256, bytes, provenance, fat-slice hashes). Every consumer leg AND publish consume
+  # this same file. No secret or registry credential is present in this job.
+  pack:
+    name: Pack the canonical archive
+    needs: [guard, authority-darwin]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # gh release create
-    env:
-      PACKAGE: ${{ needs.guard.outputs.package }}
-      VERSION: ${{ needs.guard.outputs.version }}
-      # #917: the tag the Gate resolved and validated, not github.ref_name — on a dispatched
-      # re-run the ref is the default branch and the tag is the input.
-      TAG: ${{ needs.guard.outputs.tag }}
+    timeout-minutes: 15
+    outputs:
+      filename: ${{ steps.pack.outputs.filename }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+      shasum: ${{ steps.pack.outputs.shasum }}
+      integrity: ${{ steps.pack.outputs.integrity }}
+      manifest_sha256: ${{ steps.pack.outputs.manifest_sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.guard.outputs.tag }}
+          ref: ${{ needs.guard.outputs.commit }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
-          registry-url: 'https://registry.npmjs.org'
-      - name: Install dependencies
-        run: npm ci
       - uses: actions/download-artifact@v4
         with:
           name: authority-darwin
@@ -275,25 +264,126 @@ jobs:
           ACTUAL="$(sha256sum "$BIN" | cut -d' ' -f1)"
           test -n "$EXPECTED" && test "$ACTUAL" = "$EXPECTED" || { echo "::error::Darwin reader sha256 $ACTUAL != built $EXPECTED"; exit 1; }
 
-      # `npm pack` does NOT run prepublishOnly (only prepack/prepare), but `npm publish` does —
-      # so packing first and publishing from the directory would shasum one tarball and ship
-      # another whenever gen-readme.mjs changes README.md. Run the hook explicitly, pack, then
-      # publish THAT tarball. gen-readme is idempotent, so a second run inside npm publish
-      # cannot change the bytes we measured.
-      - name: Build the exact tarball this run will publish
+      # `npm pack` does NOT run prepublishOnly (only prepack/prepare), but `npm publish` of a folder
+      # does — so the hook runs explicitly here, before the one pack, and publish ships THIS tarball
+      # file (a tarball argument is not rebuilt). gen-readme is idempotent.
+      - name: Pack once and record the archive manifest
         id: pack
+        env:
+          EXPECTED: ${{ needs.authority-darwin.outputs.sha256 }}
+          OUT: ${{ runner.temp }}/package
         run: |
           set -euo pipefail
           npm run prepublishOnly
-          npm pack --json > "${RUNNER_TEMP}/pack.json"
-          TARBALL="$(node -p "require(process.env.RUNNER_TEMP + '/pack.json')[0].filename")"
-          SHASUM="$(node -p "require(process.env.RUNNER_TEMP + '/pack.json')[0].shasum")"
+          node scripts/check-package.mjs --pack-only --out "$OUT"
+          node -e '
+            const fs = require("fs"), crypto = require("crypto"), path = require("path"), out = process.env.OUT;
+            const m = JSON.parse(fs.readFileSync(path.join(out, "package-manifest.json"), "utf8"));
+            // Task 1215: the tarball must carry THE built reader, or Mac strict mode cannot read authority files.
+            if (m.darwin.sha256 !== process.env.EXPECTED) { console.error("::error::packed Darwin reader " + m.darwin.sha256 + " != built " + process.env.EXPECTED); process.exit(1); }
+            const sha = (f) => crypto.createHash("sha256").update(fs.readFileSync(path.join(out, f))).digest("hex");
+            if (sha(m.filename) !== m.sha256) { console.error("::error::archive sha256 differs from its manifest"); process.exit(1); }
+            const lines = ["filename=" + m.filename, "sha256=" + m.sha256, "shasum=" + m.shasum, "integrity=" + m.integrity, "manifest_sha256=" + sha("package-manifest.json")];
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.join("\n") + "\n");
+            console.log("packed " + m.filename + " sha256=" + m.sha256 + " sha1=" + m.shasum + " files=" + m.files.length);'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: |
+            ${{ runner.temp }}/package/${{ steps.pack.outputs.filename }}
+            ${{ runner.temp }}/package/package-manifest.json
+          if-no-files-found: error
+
+  # Task 1215 G2: the SAME archive installed as a private non-global consumer on every supported OS
+  # BEFORE anything is published: manifest and membership checked before install, npm ls identity,
+  # bins, --version/--help/init, the macOS installed native authority read, and an installed daemon +
+  # PTY smoke. No secret or registry credential is present in this job.
+  consumer:
+    name: Installed consumer (${{ matrix.os }})
+    needs: [guard, pack]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: ${{ runner.temp }}/package
+      - name: The downloaded archive and manifest must be the pack job's bytes
+        shell: bash
+        env:
+          DIR: ${{ runner.temp }}/package
+          FILENAME: ${{ needs.pack.outputs.filename }}
+          SHA256: ${{ needs.pack.outputs.sha256 }}
+          MANIFEST_SHA256: ${{ needs.pack.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs"), crypto = require("crypto"), path = require("path"), e = process.env;
+            const sha = (f) => crypto.createHash("sha256").update(fs.readFileSync(path.join(e.DIR, f))).digest("hex");
+            if (sha(e.FILENAME) !== e.SHA256 || sha("package-manifest.json") !== e.MANIFEST_SHA256) { console.error("::error::downloaded package bytes differ from the pack job"); process.exit(1); }
+            console.log("archive " + e.FILENAME + " sha256=" + e.SHA256);'
+      - name: Validate the installed consumer of that archive
+        shell: bash
+        env:
+          DIR: ${{ runner.temp }}/package
+          FILENAME: ${{ needs.pack.outputs.filename }}
+        run: node scripts/check-package.mjs --tarball "$DIR/$FILENAME" --manifest "$DIR/package-manifest.json"
+
+  publish:
+    name: Publish and verify from the registry
+    needs: [guard, test, authority-darwin, pack, consumer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh release create
+    env:
+      PACKAGE: ${{ needs.guard.outputs.package }}
+      VERSION: ${{ needs.guard.outputs.version }}
+      # #917: the tag the Gate resolved and validated, not github.ref_name — on a dispatched
+      # re-run the ref is the default branch and the tag is the input.
+      TAG: ${{ needs.guard.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: ${{ runner.temp }}/package
+
+      # Task 1215 G2: publish the pack job's archive — the bytes every consumer leg installed — and
+      # never repack. Re-hashed here (sha256 and the sha1 the registry readback compares);
+      # `steps.pack.outputs.tarball/shasum` keep the names the steps below already use.
+      - name: The archive to publish must be the pack job's bytes
+        id: pack
+        env:
+          DIR: ${{ runner.temp }}/package
+          FILENAME: ${{ needs.pack.outputs.filename }}
+          SHA256: ${{ needs.pack.outputs.sha256 }}
+          SHASUM: ${{ needs.pack.outputs.shasum }}
+        run: |
+          set -euo pipefail
+          TARBALL="${DIR}/${FILENAME}"
+          test -n "$FILENAME" && test -f "$TARBALL" || { echo "::error::the pack artifact lacks ${FILENAME}"; exit 1; }
+          test "$(sha256sum "$TARBALL" | cut -d' ' -f1)" = "$SHA256" || { echo "::error::archive sha256 differs from the pack job"; exit 1; }
+          test "$(sha1sum "$TARBALL" | cut -d' ' -f1)" = "$SHASUM" || { echo "::error::archive sha1 differs from the pack job"; exit 1; }
           echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
           echo "shasum=${SHASUM}" >> "$GITHUB_OUTPUT"
-          echo "packed ${TARBALL} sha1=${SHASUM}"
-          # Task 1215: the tarball must carry the Darwin reader and its provenance, or Mac strict mode
-          # cannot read authority files after install.
-          node -e 'const f=new Set(require(process.env.RUNNER_TEMP+"/pack.json")[0].files.map(x=>x.path));for(const p of ["src/principal/native/prebuilt/darwin/authority-darwin.node","src/principal/native/prebuilt/darwin/authority-darwin.node.provenance.json","src/principal/authority-file-darwin.js"]){if(!f.has(p)){console.error("::error::tarball lacks "+p);process.exit(1)}}console.log("tarball carries the Darwin authority reader")'
+          echo "publishing the pack job archive ${FILENAME} sha256=${SHA256} sha1=${SHASUM}"
 
       # Idempotence. npm versions are immutable, so a re-run or a twice-pushed tag must not try
       # to publish again. It must also not shrug and go green: "already there" is only

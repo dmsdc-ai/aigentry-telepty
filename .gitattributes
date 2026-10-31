@@ -9,3 +9,7 @@ tests/snippet-protocol/v1/** text eol=lf
 # comparisons (measured, run 40500878932). The byte contract of `telepty init --print-snippet`
 # is LF-only on every platform, so the source files are pinned the same way as the fixtures.
 src/init/snippets/** text eol=lf
+# Task 1215 W1: gen-readme --check (check-package self-pack, now also on Windows) compares README.md to
+# README.tmpl.md + LF-joined generated content byte-for-byte, so both are pinned to LF the same way.
+README.md text eol=lf
+README.tmpl.md text eol=lf

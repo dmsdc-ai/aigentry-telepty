@@ -17,6 +17,8 @@ const os = require('os');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 const { randomUUID } = require('crypto');
+const { EventEmitter, once } = require('events');
+const { PassThrough } = require('stream');
 const { assertOwnerOnlyMode } = require('../test-support/platform-contract');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -72,6 +74,25 @@ async function killExitedThenRemove(d, home, bodyError) {
 
 function seed(cfg, bytes) {
   fs.writeFileSync(cfg, bytes, { mode: 0o600 });
+}
+
+// Task 1215 token15 — every collector whose RESULT is the child's output settles on 'close', not
+// 'exit'. Node may emit 'exit' before the stdout/stderr pipes are drained, so an exit-time read can
+// see '' from a child that wrote its token and exited 0 (measured, Linux CI on aec1bc3: 8 exits 0,
+// 7 identical tokens + 1 '' — an output impossible for auth.js, whose getConfig() either returns a
+// non-empty token or throws). 'close' follows the end of every stdio stream, so `out`/`err` are
+// complete there; 'error' rejects. The accumulators stay readable while the child runs (the #839
+// writer is admitted on its live stderr). Exit-only helpers (waitForExit) prove termination and
+// are unchanged.
+function collectChild(child) {
+  const io = { out: '', err: '' };
+  if (child.stdout) child.stdout.on('data', (c) => { io.out += c; });
+  if (child.stderr) child.stderr.on('data', (c) => { io.err += c; });
+  io.done = new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code, signal) => resolve({ code, signal, out: io.out, err: io.err }));
+  });
+  return io;
 }
 
 // Run getConfig() in a child process with HOME pointed at the fixture. Returns the parsed
@@ -174,21 +195,61 @@ test('concurrent first-run mints converge on one token — no process loses its 
     // secret-destroying rotation by another door, and it desyncs whichever process already
     // froze the loser's value. This is a race DETECTOR, not a proof: it only goes red when a
     // clobber actually happened, so it never produces a false failure.
-    const tokens = await Promise.all(Array.from({ length: 8 }, () => new Promise((resolve, reject) => {
+    // All eight are spawned before any is awaited (still concurrent); each result is taken at 'close'.
+    const tokens = await Promise.all(Array.from({ length: 8 }, () => {
       const p = spawn(process.execPath, ['-e', script], {
         env: { ...process.env, HOME: home, USERPROFILE: home },
         stdio: ['ignore', 'pipe', 'inherit']
       });
-      let out = '';
-      p.stdout.on('data', (c) => { out += c; });
-      p.on('error', reject);
-      p.on('exit', (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(`exit ${code}`))));
-    })));
+      return collectChild(p).done.then(({ code, signal, out }) => {
+        if (code === 0 && signal === null) return out.trim();
+        throw new Error(`exit ${code}${signal ? ` signal ${signal}` : ''}`);
+      });
+    }));
     assert.equal(new Set(tokens).size, 1, `all 8 must agree, got ${JSON.stringify(tokens)}`);
     assert.equal(JSON.parse(fs.readFileSync(cfg, 'utf8')).authToken, tokens[0]);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+// Task 1215 token15 — the collector contract, deterministically. A child may emit 'exit' BEFORE its
+// stdout data is read, and 'close' only after every stdio stream has ended. The ADOPTED helper above
+// must return the whole output; the pre-token15 exit-time read (kept here only as the negative
+// control that names the cause) returns '' for the same order. Synthetic ordering pins the helper's
+// contract; it does not claim to reproduce the native CI schedule (the measured Linux run is that).
+test('collectChild settles on close: exit before data still yields the whole output (the old exit-time read yields "")', async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const io = collectChild(child);
+  let oldOut = '';
+  child.stdout.on('data', (c) => { oldOut += c; });
+  const oldRead = new Promise((resolve) => child.once('exit', (code) => resolve(code === 0 ? oldOut.trim() : null)));
+
+  child.emit('exit', 0, null);
+  assert.equal(await oldRead, '', 'negative control: an exit-time read sees no output yet — the measured failure shape');
+  child.stdout.end('TOKEN-T');
+  child.stderr.end();
+  await Promise.all([once(child.stdout, 'end'), once(child.stderr, 'end')]);
+  child.emit('close', 0, null);
+  assert.deepEqual(await io.done, { code: 0, signal: null, out: 'TOKEN-T', err: '' });
+});
+
+test('collectChild reports a signal outcome explicitly and rejects on a spawn error', async () => {
+  const killed = new EventEmitter();
+  killed.stdout = new PassThrough();
+  const io = collectChild(killed);
+  killed.stdout.end();
+  await once(killed.stdout, 'end');
+  killed.emit('close', null, 'SIGKILL');
+  assert.deepEqual(await io.done, { code: null, signal: 'SIGKILL', out: '', err: '' });
+
+  const broken = new EventEmitter();
+  const failed = collectChild(broken).done;
+  const boom = new Error('spawn ENOENT');
+  broken.emit('error', boom);
+  await assert.rejects(failed, (e) => e === boom);
 });
 
 // #839 — the first-run write must be ATOMIC, not merely exclusive.
@@ -245,18 +306,12 @@ function spawnReader(home) {
     const { getConfig } = require(${JSON.stringify(AUTH)});
     process.stdout.write(getConfig().authToken);
   `;
-  return new Promise((resolve, reject) => {
-    const p = spawn(process.execPath, ['-e', script], {
-      env: { ...process.env, HOME: home, USERPROFILE: home },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    let out = '';
-    let err = '';
-    p.stdout.on('data', (c) => { out += c; });
-    p.stderr.on('data', (c) => { err += c; });
-    p.on('error', reject);
-    p.on('exit', (code) => resolve({ code, out: out.trim(), err: err.trim() }));
+  const p = spawn(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+    stdio: ['ignore', 'pipe', 'pipe']
   });
+  // Settles at 'close' (complete output); a signal leaves code null, which the caller counts as a failure.
+  return collectChild(p).done.then(({ code, signal, out, err }) => ({ code, signal, out: out.trim(), err: err.trim() }));
 }
 
 test('a reader that arrives mid-mint never sees a partial config — the write is atomic', { timeout: 30000 }, async (t) => {
@@ -267,22 +322,18 @@ test('a reader that arrives mid-mint never sees a partial config — the write i
       env: { ...process.env, HOME: home, USERPROFILE: home },
       stdio: ['ignore', 'pipe', 'pipe']
     });
-    let wOut = '';
-    let wErr = '';
-    writer.stdout.on('data', (c) => { wOut += c; });
-    writer.stderr.on('data', (c) => { wErr += c; });
-    const writerExit = new Promise((resolve, reject) => {
-      writer.on('error', reject);
-      writer.on('exit', (code) => resolve(code));
-    });
+    // Live accumulators (the readers are admitted on the writer's stderr marker); the writer's
+    // completion is its 'close', so `w.out` is the whole token by the time it is compared below.
+    const w = collectChild(writer);
+    const writerExit = w.done.then(({ code }) => code);
 
     await new Promise((resolve, reject) => {
       const deadline = setTimeout(() => {
         clearInterval(poll);
-        reject(new Error(`the writer never announced its exclusive create: ${wErr}`));
+        reject(new Error(`the writer never announced its exclusive create: ${w.err}`));
       }, 15000);
       const poll = setInterval(() => {
-        if (!wErr.includes('CREATED')) return;
+        if (!w.err.includes('CREATED')) return;
         clearInterval(poll);
         clearTimeout(deadline);
         resolve();
@@ -297,9 +348,9 @@ test('a reader that arrives mid-mint never sees a partial config — the write i
       [],
       'a reader admitted while a mint is in flight must never see a file it cannot read'
     );
-    assert.equal(writerCode, 0, `the minting process itself must exit 0: ${wErr}`);
+    assert.equal(writerCode, 0, `the minting process itself must exit 0: ${w.err}`);
 
-    const tokens = [wOut.trim(), ...readers.map((r) => r.out)];
+    const tokens = [w.out.trim(), ...readers.map((r) => r.out)];
     assert.equal(new Set(tokens).size, 1, `all 5 must agree, got ${JSON.stringify(tokens)}`);
     assert.equal(JSON.parse(fs.readFileSync(cfg, 'utf8')).authToken, tokens[0]);
     await assertOwnerOnlyMode(t, cfg, 'the atomically placed config stays 0600'); // #879: named subtest, skipped on win32
@@ -328,13 +379,13 @@ test('the daemon refuses to boot on an unreadable config, loudly, without rewrit
       env: { ...process.env, HOME: home, USERPROFILE: home, PORT: '0', TELEPTY_NO_TAILNET_AUTO: '1' },
       stdio: ['ignore', 'pipe', 'pipe']
     });
-    let stderr = '';
-    let stdout = '';
-    d.stderr.on('data', (c) => { stderr += c; });
-    d.stdout.on('data', (c) => { stdout += c; });
-    const code = await new Promise((resolve, reject) => {
+    // Task 1215 token15: the refusal is asserted on its OUTPUT, so it is read at 'close' (complete);
+    // the existing 20 s SIGKILL deadline and its message are unchanged.
+    const io = collectChild(d);
+    const { code, stderr, stdout } = await new Promise((resolve, reject) => {
       const t = setTimeout(() => { d.kill('SIGKILL'); reject(new Error('daemon did not exit')); }, 20000);
-      d.on('exit', (c) => { clearTimeout(t); resolve(c); });
+      io.done.then((r) => { clearTimeout(t); resolve({ code: r.code, stderr: r.err, stdout: r.out }); },
+        (e) => { clearTimeout(t); reject(e); });
     });
 
     assert.notEqual(code, 0, 'a daemon that cannot read the shared secret must not exit 0');
@@ -433,13 +484,13 @@ test('without the env token nothing changes: a corrupt config is still a refusal
       },
       stdio: ['ignore', 'pipe', 'pipe']
     });
-    let stderr = '';
-    let stdout = '';
-    d.stderr.on('data', (c) => { stderr += c; });
-    d.stdout.on('data', (c) => { stdout += c; });
-    const code = await new Promise((resolve, reject) => {
+    // Task 1215 token15: the refusal is asserted on its OUTPUT, so it is read at 'close' (complete);
+    // the existing 20 s SIGKILL deadline and its message are unchanged.
+    const io = collectChild(d);
+    const { code, stderr, stdout } = await new Promise((resolve, reject) => {
       const t = setTimeout(() => { d.kill('SIGKILL'); reject(new Error('daemon did not exit')); }, 20000);
-      d.on('exit', (c) => { clearTimeout(t); resolve(c); });
+      io.done.then((r) => { clearTimeout(t); resolve({ code: r.code, stderr: r.err, stdout: r.out }); },
+        (e) => { clearTimeout(t); reject(e); });
     });
 
     assert.notEqual(code, 0, 'an empty TELEPTY_AUTH_TOKEN supplies no secret and must not open the recovery path');
