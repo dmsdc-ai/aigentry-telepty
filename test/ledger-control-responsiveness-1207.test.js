@@ -53,6 +53,36 @@ const CHUNKS = Object.freeze({ busy: '\x1b[2K\r✻ Thinking… (esc to interrupt
 const f2ByTier = new Map();
 const r1ByTier = new Map();
 
+// Task 1215 W5 — DIAGNOSTIC same-process controls (no assertion consumes them). Each control is a SEPARATE
+// instance of the exact harness sampler (H.startHeartbeat, 1 ms), run sequentially and never concurrently with
+// the F2 sampler, so the measured window, its CPU/IO/latency and every existing assertion are untouched.
+// idle_pre / idle_post bracket the workload (1500 ms total idle per tier ≤ 2000 ms); `block` is a deliberate
+// ≤ 100 ms busy-wait confined to this test process, labelled separately, proving the sampler can see a stall.
+const CONTROLS = Object.freeze({ idlePreMs: 750, idlePostMs: 750, blockLeadMs: 100, blockMs: 100, blockRecoveryMs: 300 });
+async function heartbeatControl(label, { idleMs = 0, blockMs = 0 } = {}) {
+  const hb = H.startHeartbeat({ periodMs: 1 });
+  hb.mark('measured');
+  const t0 = process.hrtime.bigint();
+  let blockActualMs = null;
+  if (blockMs > 0) {
+    await H.sleep(CONTROLS.blockLeadMs);
+    const b0 = process.hrtime.bigint(), end = b0 + BigInt(blockMs) * 1000000n;
+    while (process.hrtime.bigint() < end) { /* deliberate main-thread stall (control only) */ }
+    blockActualMs = H.ms(b0, process.hrtime.bigint());
+    await H.sleep(CONTROLS.blockRecoveryMs);
+  } else {
+    await H.sleep(idleMs);
+  }
+  const wallMs = H.ms(t0, process.hrtime.bigint());
+  const s = hb.stop();
+  const m = s.measured;
+  return { label, kind: blockMs > 0 ? 'deliberate_block' : 'idle', wall_ms: wallMs, period_ms: s.period_ms, n: m.n,
+    mean_ms: m.n ? m.sum_ms / m.n : null, p50_ms: m.p50_ms, p90_ms: m.p90_ms, p99_ms: m.p99_ms, max_ms: m.max_ms,
+    over_10ms: m.over_10ms, over_50ms: m.over_50ms, dropped: s.dropped, n_vs_half_wall: m.n >= Math.floor(wallMs / 2),
+    ...(blockMs > 0 ? { block_requested_ms: blockMs, block_actual_ms: blockActualMs, stall_visible: m.max_ms != null && m.max_ms >= blockMs * 0.9 } : {}) };
+}
+const runtimeIdentity = () => ({ platform: process.platform, arch: process.arch, node: process.version, runtime: process.release && process.release.name });
+
 // ------------------------------------------------------------------------------------------------
 // F2 — main-thread blocking during sustained observation traffic, one tier at a time
 // ------------------------------------------------------------------------------------------------
@@ -63,9 +93,11 @@ for (const tier of TIERS) {
     const R = H.recorders();
     const messages = { inbound: [], outbound: [] };
     const { shared, runtime, actions, injectHandler, ledgerClient, sessionStateManager } = H.buildShared(store, R, { messages });
+    const controlPre = await heartbeatControl('idle_pre', { idleMs: CONTROLS.idlePreMs });   // W5 diagnostic, before the F2 sampler starts
     const hb = H.startHeartbeat({ periodMs: 1 });
     let failed = true;
     const evidence = { case: 'F2', tier_mib: tier, seeded: { records: seeded.count, bytes: seeded.bytes, sha256: seeded.sha256 }, counts: F2, started_at: new Date().toISOString(), node: process.version, platform: process.platform };
+    evidence.heartbeat_controls = { identity: runtimeIdentity(), limits: CONTROLS, idle_pre: controlPre, idle_post: null, block: null };
     // main-thread instrumentation: installed AFTER open (the one legitimate main-thread write is the O_EXCL lock)
     const realWrite = fs.writeSync; const realWriteFile = fs.writeFileSync; let mainWrites = 0;
     try {
@@ -124,6 +156,12 @@ for (const tier of TIERS) {
       const ioEnd = (await ledgerClient.ownerStatus()).io;
       evidence.owner_io_total = { writes: ioEnd.writes - io0.writes, bytes: ioEnd.bytes - io0.bytes, fsyncs: ioEnd.fsyncs - io0.fsyncs, renames: ioEnd.renames - io0.renames };
       evidence.messages = H.messageSizeReport(messages);
+      // W5 diagnostic controls AFTER every workload metric above is captured and BEFORE any assertion, so they are
+      // retained in the evidence file even when an assertion below fails. Not consumed by any assertion.
+      evidence.heartbeat_controls.idle_post = await heartbeatControl('idle_post', { idleMs: CONTROLS.idlePostMs });
+      evidence.heartbeat_controls.block = await heartbeatControl('block', { blockMs: CONTROLS.blockMs });
+      evidence.heartbeat_controls.measured_reference = { n: heartbeat.measured.n, wall_ms: measuredWall, mean_ms: heartbeat.measured.n ? heartbeat.measured.sum_ms / heartbeat.measured.n : null,
+        p50_ms: heartbeat.measured.p50_ms, p90_ms: heartbeat.measured.p90_ms, p99_ms: heartbeat.measured.p99_ms, max_ms: heartbeat.measured.max_ms, n_vs_half_wall: heartbeat.measured.n >= Math.floor(measuredWall / 2) };
 
       // ---- structural assertions (not baselines) --------------------------------------------
       const measured = flips.filter((f) => f.phase === 'measured');
@@ -156,6 +194,8 @@ for (const tier of TIERS) {
       evidence.finished_at = new Date().toISOString(); evidence.failed = failed;
       const file = H.writeEvidence(EVIDENCE, `F2-${tier}MiB.json`, evidence);
       console.log(`[ledger-1207 F2 ${tier} MiB] evidence=${file} heartbeat.measured=${JSON.stringify(evidence.heartbeat && evidence.heartbeat.measured)} process_cpu=${JSON.stringify(evidence.process_cpu_measured)} mainWrites=${evidence.main_thread_store_writes}`);
+      // W5: raw control summaries on every outcome (identity, phases, counts, gap stats only — no paths or payloads).
+      console.log(`[ledger-1207 F2 ${tier} MiB] heartbeat_controls=${JSON.stringify(evidence.heartbeat_controls)}`);
       if (failed) console.log(`[ledger-1207 F2 ${tier} MiB] FAILED — private HOME preserved for diagnosis: ${store.home}`);
       else fs.rmSync(store.home, { recursive: true, force: true });
     }

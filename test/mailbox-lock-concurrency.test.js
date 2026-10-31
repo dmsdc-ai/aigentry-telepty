@@ -136,3 +136,47 @@ test('an unlinked inode observed by lstat during normal release is a departed ti
   try { assert.equal(observed, true); release(); assert.throws(() => acquireLock(dir), /lock timeout/i); }
   finally { successor(); }
 });
+test('#879: a release overlapped by a real open reader handle departs without blocking or breaking exclusion', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock'), release = acquireLock(dir);
+  const number = path.join(lock, fs.readdirSync(lock)[0], 'number');
+  const reader = fs.openSync(number, 'r'); // On win32 this real handle leaves the unlinked number delete-pending.
+  let successor;
+  try {
+    release(); // Must neither throw (ENOTEMPTY) nor leave a ticket that reads as choosing.
+    successor = acquireLock(dir); // Liveness: no EPERM and no wait on the departed ticket.
+    assert.throws(() => acquireLock(dir), /lock timeout/i); // Safety: the successor stays exclusive.
+  } finally { fs.closeSync(reader); }
+  successor(); release();
+  acquireLock(dir)(); // The owner finishes its leftover departed ticket on a later scan.
+  assert.deepEqual(fs.readdirSync(lock), []);
+});
+test('#879: EPERM on a delete-pending number of a departing peer is a departure', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock'), release = acquireLock(dir);
+  const number = path.join(lock, fs.readdirSync(lock)[0], 'number'), original = fs.openSync;
+  let departing = false;
+  t.mock.method(fs, 'openSync', function(file, ...args) {
+    if (!departing && file === number) {
+      departing = true; release(); // win32 open of a delete-pending name reports EPERM, not ENOENT.
+      throw Object.assign(new Error(`EPERM: operation not permitted, open '${file}'`), {code: 'EPERM', syscall: 'open', path: file});
+    }
+    return original.call(fs, file, ...args);
+  });
+  const successor = acquireLock(dir);
+  try { assert.equal(departing, true); assert.throws(() => acquireLock(dir), /lock timeout/i); }
+  finally { successor(); }
+  assert.deepEqual(fs.readdirSync(lock), []);
+});
+test('#879: EPERM on a live ticket without a departure marker still fails closed', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock'), release = acquireLock(dir);
+  const name = fs.readdirSync(lock)[0], number = path.join(lock, name, 'number'), original = fs.openSync;
+  const mock = t.mock.method(fs, 'openSync', function(file, ...args) {
+    if (file === number) throw Object.assign(new Error(`EPERM: operation not permitted, open '${file}'`), {code: 'EPERM', syscall: 'open', path: file});
+    return original.call(fs, file, ...args);
+  });
+  try {
+    assert.throws(() => acquireLock(dir), {code: 'EPERM'});
+    assert.deepEqual(fs.readdirSync(lock), [name]); // The live holder's ticket is neither evicted nor marked departed.
+    assert.deepEqual(fs.readdirSync(path.join(lock, name)), ['number']);
+  } finally { mock.mock.restore(); release(); }
+  assert.deepEqual(fs.readdirSync(lock), []);
+});
