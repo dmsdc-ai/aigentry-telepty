@@ -40,7 +40,7 @@ function createLedgerClient(options = {}) {
   const freeSpaceHintBytes = options.freeSpaceHintBytes == null ? F.FREE_SPACE_HINT_BYTES : options.freeSpaceHintBytes;
 
   const C = {
-    pid: process.pid, token: null, lockHeld: false, lockInfo: null,
+    pid: process.pid, token: null, lockHeld: false, lockInfo: null, lockDurable: null, closeInFlight: false,
     worker: null, workerGen: 0, state: 'not_opened', reason: null, reasonDetail: null, epoch: 0, counts: null, resident: null, recovery: null,
     openedOnce: false, opening: null, closing: false, pendingAvailable: false,
     readModel: emptyModel(), nextModel: null,
@@ -69,15 +69,53 @@ function createLedgerClient(options = {}) {
   function isAvailable() { return C.state === 'available' && !C.closing; }
 
   // ---- lock ------------------------------------------------------------------------------------
+  // #1215 native51 (review D1) — the PUBLIC acquireLock() keeps its original synchronous contract
+  // (lock.acquire: create + write + fsync + close before it returns). daemon.js:719 calls it at module load
+  // and daemon.js:1136-1137 may call releaseLock(); process.exit(1) in that same turn, so a lock must be
+  // releasable synchronously the moment acquireLock() answers held. The only exception is a call made while
+  // open()'s own durable acquisition is pending: it answers `held: true, durable: false` and never creates
+  // again (an O_EXCL retry would read our own file as lock_present).
   function acquireLock() {
     if (C.lockHeld) return { held: true, lockPath, token: C.token };
+    if (C.lockDurable) return { held: true, durable: false, lockPath, pid: C.pid, token: C.token };
     C.token = crypto.randomBytes(16).toString('hex');
     const result = lock.acquire(lockPath, { pid: C.pid, token: C.token }, fs);
     C.lockInfo = result;
     if (result.held) { C.lockHeld = true; return result; }
+    return lockRefused(result);
+  }
+  function lockRefused(result) {
     C.state = result.reason === 'lock_present' ? 'lock_present' : 'unavailable';
     C.reason = result.reason; C.reasonDetail = { lockPath, contents: result.contents || null, code: result.code || null };
     return result;
+  }
+  // #1215 native44 — used ONLY by open(), in the same synchronous run that assigns C.opening (no yield in
+  // between, so a concurrent open() always joins it): the exclusive create stays synchronous on
+  // this thread (its refusals keep their synchronous shapes; a second acquirer can never also create); the
+  // lock record's write + fsync + close run on the libuv threadpool (lock.acquireDurable). While pending,
+  // C.lockHeld stays false and open() waits for the durable outcome before any owner exists, so nothing is
+  // served or reported available earlier. A durable-step failure is the existing `lock_error` (step write)
+  // and the created file stays in place. native51: an injected fs without the callback API takes the
+  // explicit synchronous acquire() instead of an async-labelled synchronous fallback.
+  function acquireLockForOpen() {
+    if (!['write', 'fsync', 'close'].every((name) => typeof fs[name] === 'function')) return acquireLock();
+    C.token = crypto.randomBytes(16).toString('hex');
+    const result = lock.acquireDurable(lockPath, { pid: C.pid, token: C.token }, fs);
+    C.lockInfo = result;
+    if (result.created) {
+      const pending = result.durable.then((settled) => {
+        if (C.lockDurable === pending) C.lockDurable = null;
+        C.lockInfo = settled;
+        if (settled.held) { C.lockHeld = true; return settled; }
+        if (!C.closing && C.state !== 'closed') {
+          C.state = 'unavailable'; C.reason = settled.reason; C.reasonDetail = { lockPath, contents: null, code: settled.code || null };
+        }
+        return settled;
+      });
+      C.lockDurable = pending;
+      return { held: true, durable: false, lockPath, pid: C.pid, token: C.token };
+    }
+    return lockRefused(result);
   }
   function releaseLock() {
     if (!C.lockHeld) return { released: false, reason: 'not_held' };
@@ -118,13 +156,25 @@ function createLedgerClient(options = {}) {
 
   function open(opts = {}) {
     if (C.opening) return C.opening;
-    if (!C.lockHeld) {
-      const r = acquireLock();
+    // #1215 native44: a close in flight may be waiting on the lock's durability; an open now would
+    // clear `closing` and let that wait resurrect an owner. Refused by name instead (nothing changes).
+    if (C.closeInFlight) return Promise.resolve({ ok: false, state: C.state, reason: 'shutting_down' });
+    if (!C.lockHeld && !C.lockDurable) {
+      const r = acquireLockForOpen();   // native51: the asynchronous durable acquisition exists only on this path
       if (!r.held) return Promise.resolve({ ok: false, state: C.state, reason: C.reason, lock: r });
     }
     if (Array.isArray(opts.liveSids)) for (const s of opts.liveSids) C.liveSids.add(s);
     C.closing = false;
+    if (!C.lockHeld) { C.state = 'recovering'; C.reason = null; C.pendingAvailable = false; }   // in flight from here, as before
     C.opening = (async () => {
+      // #1215 native44: no owner, read, submit or `available` before the lock record is durable. The
+      // wait is on the threadpool fsync, not on this thread; C.opening is already set, so a concurrent
+      // open() joins this one. The durable promise never rejects.
+      if (!C.lockHeld) {
+        const durable = C.lockDurable ? await C.lockDurable : { held: false, reason: C.reason };
+        if (C.closing) return { ok: false, state: 'closed', reason: 'closed', lock: durable };   // close() raced the wait: never resurrect
+        if (!durable.held) return { ok: false, state: C.state, reason: C.reason, lock: durable };
+      }
       // An explicit re-open (e.g. after an unreadable store was repaired from outside) must never
       // leave two owners alive: the inert previous worker is terminated first, its handlers
       // detached by the generation bump so its exit is not mistaken for a failure.
@@ -437,7 +487,7 @@ function createLedgerClient(options = {}) {
   // ---- status / close ------------------------------------------------------------------------------------
   function status() {
     const acct = accounting.status();
-    return { store: C.state, reason: C.reason, detail: C.reasonDetail, epoch: C.epoch, healthy: isHealthy(), lock: { path: lockPath, held: C.lockHeld, pid: C.pid, contents: C.lockInfo && C.lockInfo.contents ? C.lockInfo.contents : null },
+    return { store: C.state, reason: C.reason, detail: C.reasonDetail, epoch: C.epoch, healthy: isHealthy(), lock: { path: lockPath, held: C.lockHeld, durability_pending: !!C.lockDurable, pid: C.pid, contents: C.lockInfo && C.lockInfo.contents ? C.lockInfo.contents : null },
       counts: C.counts, resident: C.resident, recovery: C.recovery, read_model: { records: C.readModel.records.size, actions: C.readModel.actions.size, pending: C.readModel.pending.size },
       inflight: C.inflight.size, accounting: acct, over_cap: acct.admitted_jobs > F.R_MAX_JOBS, unresolved: [...C.unresolved.entries()].slice(0, 64).map(([txn, u]) => ({ txn, ...u })), unresolved_count: C.unresolved.size,
       resolved_count: C.resolved.size, last_indeterminate: C.lastIndeterminate, respawns: C.respawns.length, dir, legacyPath };
@@ -445,7 +495,13 @@ function createLedgerClient(options = {}) {
   function close(deadlineMs = 2000) {
     if (C.closing && C.closePromise) return C.closePromise;
     C.closing = true;
+    C.closeInFlight = true;
     C.closePromise = (async () => {
+      // #1215 native44: a close during acquisition waits for the lock's durable outcome (never rejects;
+      // threadpool, not this thread) so a lock this client created is released once it is durable and
+      // ours — never leaked, never unlinked while undetermined — and a failed-durability lock stays put
+      // (releaseLock answers not_held). An open waiting on the same outcome sees `closing` and stops.
+      if (C.lockDurable) await C.lockDurable;
       let closed = null;
       if (C.worker) {
         closed = await new Promise((resolve) => {
@@ -465,7 +521,7 @@ function createLedgerClient(options = {}) {
       const released = releaseLock();
       notify('closed');
       return { closed: closed || { clean: false, unresolved: C.unresolved.size, deadline: true }, lock: released };
-    })();
+    })().finally(() => { C.closeInFlight = false; });
     return C.closePromise;
   }
 

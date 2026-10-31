@@ -24,6 +24,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto'); // Task 1215 native39: readiness-token nonce only
 const WebSocket = require('ws');
 
 const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
@@ -226,10 +227,10 @@ test('the orchestrator lane is untouched — the guardrail did not become a tigh
 // comment one branch up calls the wrapped path "the one write path with no accountability"; the
 // spawned path still was exactly that, and the six #826 cases all build wrapped fixtures, so
 // nothing ever went through this door.
-async function spawned(prefix) {
+async function spawned(prefix, overrides) { // Task 1215 native39: optional spawn overrides (undefined = unchanged default shell)
   const sid = createSessionId(prefix);
   const origin = performance.now(); // Task 1215 diagnostics12: timing origin for the failure-only timeline (no behaviour)
-  const res = await daemon.spawnSession(sid);
+  const res = await daemon.spawnSession(sid, overrides);
   const spawnResponseMs = Math.round(performance.now() - origin);
   assert.ok([200, 201].includes(res.status), `spawn: ${res.status} ${JSON.stringify(res.body)}`);
   const viewer = await open(`/api/sessions/${encodeURIComponent(sid)}?token=${encodeURIComponent(TOKEN)}`);
@@ -394,16 +395,51 @@ async function postVerdictObservation(sid, timeline, output, origin) {
   return { window_ms: POST_VERDICT_WINDOW_MS, probe_timeout_ms: UPSTREAM_PROBE_TIMEOUT_MS, failure, window_end: windowEnd };
 }
 
+// Task 1215 native39 — HERMETIC TEST PROTOCOL ONLY (never a production screen gate). Measured on native Windows (diagnostic
+// run, df4cb86): the single write was sent at 58 ms, the 5000 ms wait failed at 5092 ms with 115 control-only bytes, and the
+// UNCHANGED write's echo then arrived at 6013 ms, after the first prompt at 5518 ms — the 5000 ms bound was spent on PowerShell
+// startup, not on delivery. On win32 the REAL spawned PowerShell (same executable, -NoLogo -NoProfile kept) defines its own
+// prompt function through -NoExit -Command, so the shell itself prints a per-test token at its first prompt, i.e. when its
+// console host starts reading input. The shell builds the token by concatenation, so the literal never appears in argv or a
+// title; no argv element contains whitespace, a double quote or a backslash, so the CreateProcess command-line quoting layer
+// leaves each one verbatim (single quotes are PowerShell string delimiters, not argv quoting; PowerShell joins the words
+// after -Command with spaces). Off win32 this returns null and the POSIX path is unchanged.
+//
+// Task 1215 native44 — DETERMINISTIC RELEASE (replaces native39's "token absent before the write" check, which was a
+// scheduling race on a fast shell). Before it defines that prompt, the -Command script waits — bounded by
+// STARTUP_BOUND_MS on the shell's own clock — for a PRIVATE gate file that only the test creates: <USERPROFILE>/
+// tp1215-gate-<nonce>. USERPROFILE is the daemon's test HOME on win32 (daemon-harness homeEnv) and a spawned session
+// inherits the daemon's environment (src/routes/spawn.js buildSessionEnv), so no path travels in argv. The test creates
+// the gate only after the daemon has recorded the frame (the spawned door appends its `ws-viewer` audit line right after
+// ptyProcess.write: src/transport/websocket.js viewerInputDeliverer + src/audit/viewer-input.js), so the ONE write is in
+// the PTY before the shell can become ready — by construction, not by timing. No second send, no production gate.
+const STARTUP_BOUND_MS = 20000; // <= 30000 (dispatch bound); chosen so the failure path incl. the unchanged 20 s pty33 window stays under the 60000 ms diagnostic per-file timeout
+function powershellReadiness() {
+  if (process.platform !== 'win32') return null;
+  const nonce = crypto.randomBytes(6).toString('hex');
+  const gatePath = path.join(daemon.homeDir, `tp1215-gate-${nonce}`);
+  // Single-space separated; split into argv words below (none contains whitespace, `"` or `\`).
+  const script = `$g=Join-Path $env:USERPROFILE 'tp1215-gate-${nonce}'; $d=[DateTime]::UtcNow.AddMilliseconds(${STARTUP_BOUND_MS}); `
+    + `while(-not(Test-Path -LiteralPath $g) -and [DateTime]::UtcNow -lt $d){Start-Sleep -Milliseconds 20}; `
+    + `function prompt { 'TP1215READY'+'${nonce}>' }`;
+  return { token: `TP1215READY${nonce}`, gatePath,
+    release: () => { fs.writeFileSync(gatePath, '', { flag: 'wx', mode: 0o600 }); },
+    overrides: { args: ['-NoLogo', '-NoProfile', '-NoExit', '-Command', ...script.split(' ')] } };
+}
+const hasReadiness = (raw, token) => raw.includes(token) || plainText(raw).includes(token);
+
 test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly like a wrapped one', async (t) => {
-  const { sid, viewer, timing } = await spawned('spawnaudit');
+  const readiness = powershellReadiness(); // Task 1215 native39: null off win32
+  const { sid, viewer, timing } = await spawned('spawnaudit', readiness ? readiness.overrides : undefined);
   const output = collectOutput(viewer);
   const timeline = frameTimeline(viewer, timing.origin); // Task 1215 diagnostics12: observe-only
 
   const writeSentMs = Math.round(performance.now() - timing.origin);
+  // Task 1215 native44: the ONE write below precedes the release by construction (see powershellReadiness); there is no
+  // second send, retry or retype at any stage.
+  const startup = { bound_ms: readiness ? STARTUP_BOUND_MS : null, recorded_ms: null, ready_at_release: null, released_ms: null, ready_observed_ms: null };
   viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_OK\r', from: 'orchestrator' }));
-  await daemon.waitFor(() => (output().includes('SPAWNMARKER_OK') ? true : null),
-    { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' })
-    .catch(async (error) => {
+  const onFailure = async (error) => {
       // Task 1215 pty17 (windows42 NA-4): V8 formats `stack` lazily — read it BEFORE `message` changes (reading it after
       // already contained the note, which then appeared twice). Both notes are appended once, below.
       const stack = error.stack; const first = `${error.name}: ${error.message}`;
@@ -422,8 +458,8 @@ test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly
       const { stdout, stderr } = daemon.getLogs();
       const log = `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid)).slice(-8).map((l) => l.slice(0, 300));
       const tdiag = JSON.stringify({ spawn_response_ms: timing.spawn_response_ms, viewer_open_ms: timing.viewer_open_ms, write_sent_ms: writeSentMs,
-        failed_at_ms: Math.round(performance.now() - timing.origin), ...timeline, control: timeline.control(), byte_classes: byteClasses(raw), log,
-        observation_limit: 'this timeline is the existing 5000 ms wait; post_verdict adds one fixed observe-only window after the verdict' });
+        failed_at_ms: Math.round(performance.now() - timing.origin), startup, ...timeline, control: timeline.control(), byte_classes: byteClasses(raw), log,
+        observation_limit: 'this timeline is the win32-only bounded startup stage (startup.bound_ms, null off win32) then the existing 5000 ms wait; post_verdict adds one fixed observe-only window after the verdict' });
       t.diagnostic(`#879 diag spawned_timeline ${tdiag}`);
       // Task 1215 pty33: the verdict and the original error (stack/first above) are already fixed; the window below can only
       // add evidence. An observer fault is kept as a typed label and never replaces the original error, which is rethrown.
@@ -437,7 +473,25 @@ test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly
       error.message += note;
       if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
       throw error;
-    });
+  };
+  // Task 1215 native39/native44: stage 1 (win32 only) — the daemon has recorded the frame (existing audit wait), the test
+  // releases the shell's private gate, then a bounded startup ends with the shell's own readiness token.
+  if (readiness) {
+    await waitForAudit((l) => l.to === sid && l.source === 'ws-viewer').catch(onFailure);
+    startup.recorded_ms = Math.round(performance.now() - timing.origin);
+    startup.ready_at_release = hasReadiness(output(), readiness.token);
+    assert.equal(startup.ready_at_release, false, 'protocol: the shell cannot print its readiness token before the test releases it');
+    readiness.release();
+    startup.released_ms = Math.round(performance.now() - timing.origin);
+    await daemon.waitFor(() => (hasReadiness(output(), readiness.token) ? true : null),
+      { timeoutMs: STARTUP_BOUND_MS, description: 'the spawned PowerShell to print its test readiness prompt (bounded startup stage)' })
+      .catch(onFailure);
+    startup.ready_observed_ms = Math.round(performance.now() - timing.origin);
+  }
+  // Stage 2 — the ORIGINAL 5000 ms delivery bound and marker, now starting once readiness is observed (win32) / at once (POSIX).
+  await daemon.waitFor(() => (output().includes('SPAWNMARKER_OK') ? true : null),
+    { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' })
+    .catch(onFailure);
 
   const lines = await waitForAudit((l) => l.to === sid && l.source === 'ws-viewer');
   assert.equal(lines.length, 1, 'one line per viewer write, same as the wrapped door');
@@ -450,10 +504,31 @@ test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly
 });
 
 test('#843: #533 applies at the spawned door too — the block is not one `else` away', async () => {
-  const { sid, viewer } = await spawned('spawnpeer');
+  const readiness = powershellReadiness(); // Task 1215 native44: null off win32 (POSIX path unchanged)
+  const { sid, viewer } = await spawned('spawnpeer', readiness ? readiness.overrides : undefined);
   const output = collectOutput(viewer);
 
   viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_LEAK\r', from: 'peer-alpha' }));
+  // Task 1215 native44 (win32): measured, PowerShell can print nothing for > 5 s after spawn, so a window that starts at the
+  // write proves nothing there. Readiness/control phase: once the daemon has decided this frame (its audit line), the test
+  // releases the shell and waits for the shell's own readiness token — proof the real shell is now reading input and
+  // rendering, so anything queued in its PTY would be echoed within the unchanged window below.
+  if (readiness) {
+    await waitForAudit((l) => l.to === sid && l.source === 'ws-viewer');
+    readiness.release();
+    await daemon.waitFor(() => (hasReadiness(output(), readiness.token) ? true : null),
+      { timeoutMs: STARTUP_BOUND_MS, description: 'the spawned PowerShell to print its test readiness prompt (control phase before the no-leak window)' });
+    // Task 1215 native51 (review F1): a rendered prompt does not prove that input queued before the release was
+    // already consumed (measured: queued typeahead echoed ~495 ms after the first prompt). ONE permitted
+    // orchestrator-lane frame with a distinct marker is sent now and its echo awaited within the original 5000 ms
+    // delivery bound. PTY input is FIFO, so its echo proves that anything queued ahead of it — a leaked
+    // SPAWNMARKER_LEAK included — has already been read and rendered before the unchanged window below starts.
+    // Its forwarded audit line comes AFTER the blocked one (that line was awaited above), so lines[0] below is
+    // still the peer-alpha refusal.
+    viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_CTRL\r', from: 'orchestrator' }));
+    await daemon.waitFor(() => (output().includes('SPAWNMARKER_CTRL') ? true : null),
+      { timeoutMs: 5000, description: 'the orchestrator-lane control marker to echo (FIFO drain before the no-leak window)' });
+  }
   // A shell echoes what is typed into it, so if these bytes reached the PTY the marker comes back
   // within milliseconds. Give it a full second before concluding it did not.
   await new Promise((r) => setTimeout(r, 1000));

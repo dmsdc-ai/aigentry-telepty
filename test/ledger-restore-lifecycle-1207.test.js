@@ -344,3 +344,218 @@ test('restore lifecycle 3c (boundary): no ledger client on the runtime — resto
     else fs.rmSync(store.home, { recursive: true, force: true });
   }
 });
+
+// ------------------------------------------------------------------------------------------------
+// 4 — #1215 native44: lock-record DURABILITY delayed or failing, through the REAL client/runtime/inject
+// handler. Measured on native Windows (df4cb86): the lock fsync took 258 ms ON the main thread inside
+// the open. The fault model is storage that takes DURABILITY.delayMs to make the lock durable, applied to
+// BOTH APIs of the client's own injected `fs` for the lock fd only: fsyncSync blocks the caller for the
+// delay (Atomics.wait — what slow storage does to a synchronous fsync) and the callback fsync completes
+// only when the test releases its gate. Everything else is real fs. RED/GREEN expectations are written
+// against the original product (sync lock fsync) and the native44 candidate (lock.acquireDurable).
+// ------------------------------------------------------------------------------------------------
+const DURABILITY = Object.freeze({ delayMs: 300, enterMs: 2000, stallBoundMs: 50 });   // stallBoundMs = the existing #1207 heartbeat contract bound
+
+function slowLockFs(lockPath, { failDurable = false } = {}) {
+  const lockFds = new Set();
+  const gate = { creates: 0, entered: 0, syncCalls: 0, released: false };
+  let releaseGate; let released;
+  gate.rearm = () => { gate.released = false; released = new Promise((resolve) => { releaseGate = resolve; }); };
+  gate.release = () => { gate.released = true; releaseGate(); };
+  gate.rearm();
+  const eio = () => Object.assign(new Error('EIO: injected lock durability fault (test)'), { code: 'EIO' });
+  const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  gate.fs = new Proxy(fs, { get(target, key) {
+    const real = target[key];
+    if (key === 'openSync') return (p, ...rest) => { const fd = real.call(target, p, ...rest); if (p === lockPath) { gate.creates++; lockFds.add(fd); } return fd; };
+    if (key === 'fsyncSync') return (fd, ...rest) => {
+      if (!lockFds.has(fd)) return real.call(target, fd, ...rest);
+      gate.syncCalls++; sleepSync(DURABILITY.delayMs);
+      if (failDurable) throw eio();
+      return real.call(target, fd, ...rest);
+    };
+    if (key === 'fsync') return (fd, cb) => {
+      if (!lockFds.has(fd)) return real.call(target, fd, cb);
+      gate.entered++;
+      released.then(() => (failDurable ? cb(eio()) : real.call(target, fd, cb)));   // the gate armed at call time
+      return undefined;
+    };
+    if (key === 'closeSync' || key === 'close') return (fd, ...rest) => { lockFds.delete(fd); return real.call(target, fd, ...rest); };
+    return real;
+  } });
+  return gate;
+}
+function loopGapMeter() {
+  let last = performance.now(); let max = 0; let ticks = 0;
+  const timer = setInterval(() => { const t = performance.now(); max = Math.max(max, t - last); last = t; ticks++; }, 1);
+  return { stop() { clearInterval(timer); const t = performance.now(); max = Math.max(max, t - last); return { max_gap_ms: Math.round(max * 1000) / 1000, ticks }; } };
+}
+const lockFile = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
+const openMessages = (messages) => messages.outbound.filter((m) => m.type === 'open').length;
+
+async function withDurabilityStore(name, { failDurable = false } = {}, fn) {
+  const store = H.privateStore(`telepty-1207-durability-${name}-`);
+  const gate = slowLockFs(store.lockPath, { failDurable });
+  const counter = { constructed: 0 };
+  const build = (messages, R) => {
+    const Observed = H.makeObservedWorker(messages);
+    class CountingWorker extends Observed { constructor(...args) { super(...args); counter.constructed++; } }
+    return H.buildShared(store, R, { messages, clientOptions: { fs: gate.fs, Worker: CountingWorker } });
+  };
+  const R = H.recorders(); const messages = { inbound: [], outbound: [] };
+  const built = build(messages, R);
+  const extra = [];
+  const evidence = { case: `durability-${name}`, started_at: nowIso(), node: process.version, platform: process.platform, limits: DURABILITY,
+    labels: { fault: 'client-injected fs: lock fd only; fsyncSync blocks delayMs, callback fsync completes at gate release', inject: 'REAL captured inject handler (in-process call)' } };
+  let failed = true;
+  try { await fn({ store, gate, counter, R, messages, evidence, build, extra, ...built }); failed = false; } finally {
+    gate.release();
+    evidence.closed = await H.closeBounded(built.ledgerClient, LIMITS.closeMs);
+    for (const c of extra) await H.closeBounded(c, LIMITS.closeMs);
+    evidence.gate = { creates: gate.creates, entered: gate.entered, sync_calls: gate.syncCalls }; evidence.workers_constructed = counter.constructed;
+    evidence.failed = failed; evidence.finished_at = nowIso();
+    const file = H.writeEvidence(EVIDENCE, `durability-${name}.json`, evidence);
+    console.log(`[ledger-1207 durability ${name}] evidence=${file}`);
+    if (failed) console.log(`[ledger-1207 durability ${name}] FAILED — private HOME preserved: ${store.home}`);
+    else fs.rmSync(store.home, { recursive: true, force: true });
+  }
+}
+
+test('restore lifecycle 4a (native44 regression): lock durability DELAYED — the main loop stays responsive (no gap >= 50 ms) while the lock record is not durable; until it is: no owner Worker, no open message, not available, lock not held, the captured inject handler refuses 503 recovering with no delivery; after durability: one owner, available, lock names this client (expected RED on the original: its fsyncSync blocks the restore call for the whole delay; GREEN on native44)', () => withDurabilityStore('delayed', {}, async ({ store, gate, counter, R, messages, evidence, shared, runtime, injectHandler, ledgerClient }) => {
+  const meter = loopGapMeter();
+  const restoring = runtime.restoreTrackedInjections();
+  let settled = null; restoring.then((v) => { settled = v; });
+  const entered = await waitFor(() => gate.entered === 1, DURABILITY.enterMs);
+  await H.sleep(DURABILITY.delayMs);   // durability is still pending: the gate is held for at least the fault delay
+  const loop = meter.stop();
+  const status = ledgerClient.status();
+  evidence.pending = { loop, entered, sync_calls: gate.syncCalls, settled, state: ledgerClient.state, available: ledgerClient.isAvailable(), lock: status.lock, workers: counter.constructed, open_messages: openMessages(messages), shared: snap(shared) };
+  assert.ok(loop.max_gap_ms < DURABILITY.stallBoundMs, `the main loop never stalls >= ${DURABILITY.stallBoundMs} ms while the lock is made durable (observed max gap ${loop.max_gap_ms} ms over ${loop.ticks} ticks; original: the synchronous fsync blocks ~${DURABILITY.delayMs} ms)`);
+  assert.equal(gate.syncCalls, 0, 'the lock durability step never ran as fsyncSync on the calling thread');
+  assert.equal(entered, true, 'the lock durability step reached the callback fsync (off-thread) and is held there');
+  assert.equal(settled, null, 'the restore has not settled while the lock is not durable');
+  assert.equal(ledgerClient.state, 'recovering'); assert.equal(ledgerClient.isAvailable(), false);
+  assert.equal(status.lock.held, false, 'a lock whose record is not durable is not reported held');
+  assert.equal(counter.constructed, 0, 'no owner Worker exists before the lock is durable');
+  assert.equal(openMessages(messages), 0, 'no open message reached any owner before the lock is durable');
+  assert.equal(gate.creates, 1, 'exactly one exclusive create');
+  const res = H.makeRes();
+  await injectHandler(H.makeReq('while the lock is not yet durable', 'orch', 'w1'), res);
+  evidence.inject_pending = { status: res.statusCode, body: res.body, deliveries: R.delivery.length };
+  assert.equal(res.statusCode, 503, `refused while recovering (observed ${res.statusCode} ${res.body && res.body.code} ${res.body && res.body.reason})`);
+  assert.equal(res.body.code, 'TRACKING_CAPACITY'); assert.equal(res.body.reason, 'recovering');
+  assert.equal(R.delivery.length, 0, 'no delivery before the store is usable');
+
+  gate.release();
+  const opened = await restoring;
+  evidence.opened = { ok: opened.ok, reason: opened.reason || null, workers: counter.constructed, open_messages: openMessages(messages), shared: snap(shared) };
+  assert.equal(opened.ok, true, JSON.stringify(opened));
+  assert.equal(ledgerClient.isAvailable(), true); assert.equal(shared.trackedLedgerHealthy, true);
+  assert.equal(counter.constructed, 1, 'exactly one owner Worker after durability'); assert.equal(openMessages(messages), 1);
+  assert.equal(ledgerClient.status().lock.held, true);
+  const contents = lockFile(store.lockPath);
+  assert.ok(contents && Number(contents.pid) === process.pid && contents.token === ledgerClient._internal.token, `the durable lock names this client (${JSON.stringify(contents)})`);
+}));
+
+test('restore lifecycle 4b (native44 control, semantics preserved): lock durability FAILS (EIO) — restore refuses by name lock_error (step write), no owner Worker and no open message, the captured inject handler delivers nothing, the created lock is LEFT in place (uncertain lock retained), a re-open fails closed as lock_present (no automatic break) and close() never unlinks it (expected GREEN on the original and on native44)', () => withDurabilityStore('failed', { failDurable: true }, async ({ store, gate, counter, R, messages, evidence, shared, runtime, injectHandler, ledgerClient }) => {
+  const restoring = runtime.restoreTrackedInjections();
+  await waitFor(() => gate.entered + gate.syncCalls >= 1, DURABILITY.enterMs);
+  gate.release();
+  const opened = await restoring;
+  evidence.opened = { result: { ok: opened.ok, state: opened.state || null, reason: opened.reason || null, lock: opened.lock ? { held: opened.lock.held, reason: opened.lock.reason, step: opened.lock.step, code: opened.lock.code } : null }, shared: snap(shared) };
+  assert.equal(opened.ok, false, JSON.stringify(opened));
+  assert.equal(opened.reason, 'lock_error');
+  assert.ok(opened.lock && opened.lock.step === 'write' && opened.lock.code === 'EIO', `the durable-step failure keeps its classification (${JSON.stringify(opened.lock)})`);
+  assert.equal(ledgerClient.state, 'unavailable'); assert.equal(ledgerClient.reason, 'lock_error');
+  assert.equal(shared.trackedLedgerHealthy, false); assert.equal(shared.trackedLedgerUnavailableReason, 'lock_error');
+  assert.equal(counter.constructed, 0, 'no owner behind a lock that is not durable'); assert.equal(openMessages(messages), 0);
+  assert.equal(ledgerClient.status().lock.held, false);
+  const res = H.makeRes();
+  await injectHandler(H.makeReq('behind a lock that never became durable', 'orch', 'w1'), res);
+  evidence.inject = { status: res.statusCode, body: res.body, deliveries: R.delivery.length };
+  assert.notEqual(res.statusCode, 200); assert.equal(R.delivery.length, 0, 'no delivery');
+  assert.equal(fs.existsSync(store.lockPath), true, 'the lock this client created is left in place, never unlinked');
+  const bytes = fs.readFileSync(store.lockPath);
+  const again = await ledgerClient.open();
+  evidence.reopen = { ok: again.ok, state: again.state || null, reason: again.reason || null };
+  assert.equal(again.ok, false); assert.equal(again.reason, 'lock_present', 'the uncertain lock fails a re-open closed (no stale break)');
+  assert.equal(gate.creates, 1, 'the re-open created nothing');
+  const closed = await ledgerClient.close(LIMITS.closeMs);
+  evidence.close = closed;
+  assert.equal(closed.lock.released, false, 'close() never releases a lock whose durability failed');
+  assert.ok(fs.readFileSync(store.lockPath).equals(bytes), 'the uncertain lock bytes are untouched');
+  assert.equal(counter.constructed, 0);
+}));
+
+test('restore lifecycle 4c (native44 regression): concurrent open/close/reopen while lock durability is pending — (1) a second open and an open issued during close JOIN the one in-flight open (one create) and it settles closed: no owner is constructed and the client\'s own lock is released once durable, never leaked; (2) an open() during an in-flight close of an OPENED client (owner present) is refused by name (shutting_down) instead of replacing the owner, and the close releases the lock; (3) a fresh client then acquires, opens with exactly one owner and releases (expected RED on the original: no off-thread durability, owners are spawned and the open during close is not refused; GREEN on native51)', () => withDurabilityStore('concurrent', {}, async ({ store, gate, counter, messages, evidence, build, extra, runtime, ledgerClient }) => {
+  // (1) restore + concurrent open + close, all while the first acquisition's durability is pending
+  const restoring = runtime.restoreTrackedInjections();
+  const opening1 = ledgerClient._internal.opening;
+  const joined = ledgerClient.open();
+  assert.ok(opening1 && joined === opening1, 'a concurrent open joins the in-flight open (same promise) before anything yields');
+  assert.equal(await waitFor(() => gate.entered === 1, DURABILITY.enterMs), true, 'durability is pending off-thread');
+  const closing = ledgerClient.close(LIMITS.closeMs);
+  const during = ledgerClient.open();
+  assert.equal(during, opening1, 'an open during close joins the in-flight open — it cannot start a second acquisition');
+  assert.equal(gate.creates, 1, 'one exclusive create for every open of this acquisition');
+  gate.release();
+  const [restored, closed] = await Promise.all([restoring, closing]);
+  evidence.part1 = { restored: { ok: restored.ok, reason: restored.reason || null }, closed, workers: counter.constructed, open_messages: openMessages(messages), state: ledgerClient.state, lock_exists: fs.existsSync(store.lockPath) };
+  assert.equal(restored.ok, false, 'the open that close() overtook does not succeed'); assert.equal(restored.reason, 'closed');
+  assert.equal(counter.constructed, 0, 'no owner was resurrected after close'); assert.equal(openMessages(messages), 0);
+  assert.equal(ledgerClient.state, 'closed'); assert.equal(ledgerClient.isAvailable(), false);
+  assert.equal(closed.lock.released, true, `the client's own durable lock is released by close (${JSON.stringify(closed.lock)})`);
+  assert.equal(fs.existsSync(store.lockPath), false, 'no leaked lock file');
+
+  // (2) native51 (review D1): an open() during an in-flight close of an OPENED client (owner present) is refused by
+  // name instead of clearing `closing` and replacing the owner; the close then completes and releases the lock.
+  // (The daemon's load-time synchronous acquireLock()/releaseLock() shape is test 4d.)
+  const R2 = H.recorders(); const messages2 = { inbound: [], outbound: [] };
+  const second = build(messages2, R2); extra.push(second.ledgerClient);
+  const opened2 = await second.runtime.restoreTrackedInjections();
+  assert.equal(opened2.ok, true, JSON.stringify(opened2));
+  assert.equal(counter.constructed, 1, 'one owner for the opened client');
+  const creates2 = gate.creates;
+  const closing2 = second.ledgerClient.close(LIMITS.closeMs);
+  const refused = await second.ledgerClient.open();
+  evidence.part2 = { opened: opened2.ok, refused, workers_during_close: counter.constructed };
+  assert.equal(refused.ok, false); assert.equal(refused.reason, 'shutting_down', `an open during an in-flight close is refused by name (${JSON.stringify(refused)})`);
+  assert.equal(gate.creates, creates2, 'the refused open created nothing');
+  assert.equal(counter.constructed, 1, 'the refused open constructed no replacement owner');
+  const closed2 = await closing2;
+  assert.equal(closed2.lock.released, true, 'the close completes and releases the lock'); assert.equal(fs.existsSync(store.lockPath), false);
+  assert.equal(second.ledgerClient.state, 'closed'); assert.equal(openMessages(messages2), 1);
+
+  // (3) reopen: a fresh client on the same store takes the lock, opens with exactly one owner, and releases it
+  const R3 = H.recorders(); const messages3 = { inbound: [], outbound: [] };
+  const third = build(messages3, R3); extra.push(third.ledgerClient);
+  const reopened = await third.runtime.restoreTrackedInjections();
+  evidence.part3 = { ok: reopened.ok, reason: reopened.reason || null, workers: counter.constructed, open_messages: openMessages(messages3) };
+  assert.equal(reopened.ok, true, JSON.stringify(reopened));
+  assert.equal(counter.constructed, 2, 'exactly one owner per opened client (parts 2 and 3); none for part 1'); assert.equal(openMessages(messages3), 1);
+  const contents = lockFile(store.lockPath);
+  assert.ok(contents && contents.token === third.ledgerClient._internal.token, 'the lock names the new client');
+  const closed3 = await third.ledgerClient.close(LIMITS.closeMs);
+  assert.equal(closed3.lock.released, true); assert.equal(fs.existsSync(store.lockPath), false);
+}));
+
+test('restore lifecycle 4d (native51 regression, review D1): the daemon.js load-time shape — acquireLock() and then, in the SAME synchronous turn, releaseLock() (daemon.js:719 and :1136-1137 before process.exit(1)) — the public acquire answers held and durable, the release removes the lock, no lock file remains, and the next client for this store opens available, not lock_present (expected GREEN on the original, RED on native44 as submitted: its acquireLock left durability pending so releaseLock answered not_held; GREEN on native51). In-process, all platforms; test/integration/ledger-early-exit-lock-1207.test.js EX2 stays the real-daemon POSIX gate', () => withDurabilityStore('daemon-load-exit', {}, async ({ store, gate, counter, evidence, build, extra, ledgerClient }) => {
+  // one synchronous turn with no await between the calls — exactly the daemon's config-failure exit path
+  const claimed = ledgerClient.acquireLock();
+  const released = ledgerClient.releaseLock();
+  const lockLeft = fs.existsSync(store.lockPath);
+  evidence.load_exit = { claimed: { held: claimed.held, durable: claimed.durable === undefined ? 'unset' : claimed.durable }, released, lock_left: lockLeft, sync_calls: gate.syncCalls, entered: gate.entered };
+  assert.equal(claimed.held, true, JSON.stringify(claimed));
+  assert.notEqual(claimed.durable, false, 'the public acquire answers only once the lock is durable (synchronous contract)');
+  assert.equal(released.released, true, `the same-turn release succeeds (${JSON.stringify(released)})`);
+  assert.equal(lockLeft, false, 'no lock outlives the early exit');
+  assert.equal(gate.entered, 0, 'the public acquire never took the off-thread durability path');
+  assert.equal(counter.constructed, 0, 'no owner');
+  // the next daemon for this store: a fresh client opens available (not lock_present). Its open() takes the
+  // off-thread path, so the durability gate is released first.
+  gate.release();
+  const next = build({ inbound: [], outbound: [] }, H.recorders()); extra.push(next.ledgerClient);
+  const opened = await next.runtime.restoreTrackedInjections();
+  evidence.next_open = { ok: opened.ok, reason: opened.reason || null, state: next.ledgerClient.state };
+  assert.equal(opened.ok, true, JSON.stringify(opened)); assert.equal(next.ledgerClient.state, 'available');
+}));

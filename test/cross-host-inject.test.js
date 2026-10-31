@@ -4,12 +4,43 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('node:crypto'); // Task 1215 native49: startup-barrier nonce only
 const WebSocket = require('ws');
 
 const { startTestDaemon, createSessionId, stripAnsi, waitFor } = require('../test-support/daemon-harness');
 
 let daemonA = null; // Local-side CLI's daemon (also serves as origin)
 let daemonB = null; // Remote-side daemon hosting the target session
+
+// Task 1215 native49 — HERMETIC TEST PROTOCOL ONLY (never a production screen gate); the native44 pattern of
+// test/ws-viewer-inject-audit-826.test.js, copied because a test file may not import another. Measured on native Windows
+// (cc7f251 main job 124665248797): the CLI exited 0 in 601 ms and daemonB logged `[INJECT] Wrote to session`, the 8000 ms
+// window failed with 115 control-only bytes, and the UNCHANGED single write then produced the real PowerShell prompt at
+// 8205 ms and its token at 9864 ms after viewer open (no close, no exit, no second send) — the bound was spent on shell
+// startup, not on routing or delivery. On win32 the REAL target PowerShell (-NoLogo -NoProfile kept) runs a -NoExit
+// -Command script that waits — bounded by STARTUP_BOUND_MS on its own clock — for a PRIVATE gate file only the test
+// creates, <USERPROFILE>/tp1215-gate-<nonce> (USERPROFILE = daemonB's test HOME on win32: daemon-harness homeEnv; a spawned
+// session inherits daemonB's environment: src/routes/spawn.js buildSessionEnv), and only then defines a prompt that prints
+// a concatenated readiness token. No argv word contains whitespace, `"` or `\`. Off win32 this returns null and the POSIX
+// path is unchanged.
+const STARTUP_BOUND_MS = 20000; // <= 30000 (dispatch bound); same bound as the native44 #843 fixture
+function powershellStartupBarrier(daemon) {
+  if (process.platform !== 'win32') return null;
+  const nonce = crypto.randomBytes(6).toString('hex');
+  const token = `TP1215READY${nonce}`;
+  const gatePath = path.join(daemon.homeDir, `tp1215-gate-${nonce}`);
+  const script = `$g=Join-Path $env:USERPROFILE 'tp1215-gate-${nonce}'; $d=[DateTime]::UtcNow.AddMilliseconds(${STARTUP_BOUND_MS}); `
+    + `while(-not(Test-Path -LiteralPath $g) -and [DateTime]::UtcNow -lt $d){Start-Sleep -Milliseconds 20}; `
+    + `function prompt { 'TP1215READY'+'${nonce}>' }`;
+  const plain = (raw) => raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').replace(/\u001b\].*?(\u0007|\u001b\\)/g, '');
+  let raw = '';
+  return { token,
+    overrides: { args: ['-NoLogo', '-NoProfile', '-NoExit', '-Command', ...script.split(' ')] },
+    observe(ws) { ws.on('message', (buffer) => { let msg = null; try { msg = JSON.parse(buffer.toString()); } catch { return; }
+      if (msg.type === 'output' && typeof msg.data === 'string' && raw.length < 65536) raw += msg.data; }); },
+    ready: () => raw.includes(token) || plain(raw).includes(token),
+    release: () => { fs.writeFileSync(gatePath, '', { flag: 'wx', mode: 0o600 }); } };
+}
 
 function collectMessages(ws, predicate, options = {}) {
   return new Promise((resolve, reject) => {
@@ -68,7 +99,8 @@ after(async () => {
 
 test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async () => {
   const sessionId = createSessionId('cross-host-target');
-  const spawn = await daemonB.spawnSession(sessionId);
+  const barrier = powershellStartupBarrier(daemonB); // Task 1215 native49: null off win32
+  const spawn = await daemonB.spawnSession(sessionId, barrier ? barrier.overrides : undefined);
   assert.ok([200, 201].includes(spawn.status), `spawnSession status=${spawn.status}: ${JSON.stringify(spawn.body)}`);
 
   const targetWs = new WebSocket(
@@ -82,13 +114,19 @@ test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async 
   const token = createSessionId('cross-host-token');
   // Task 1215 G-SHELL step 1 (K1) diagnostics only: payload-free counts of everything daemonB's viewer received.
   const viewer = viewerSummary(targetWs, token);
-  const seenToken = collectMessages(
+  if (barrier) barrier.observe(targetWs);
+  // Task 1215 native49: the ORIGINAL 8000 ms delivery window (same predicate, description and bound). Off win32 it starts
+  // here, exactly as before; on win32 it starts once the released shell is ready (stage 2 below).
+  const deliveryWindow = () => collectMessages(
     targetWs,
     (msg) => msg.type === 'output' && String(msg.data || '').includes(token),
     { description: 'cross-host inject delivery', timeoutMs: 8000 }
   );
   // Settled at creation: the delivery deadline can never surface as an unhandled rejection ahead of the CLI result.
-  const seen = seenToken.then(() => null, (error) => error);
+  let seen = barrier ? null : deliveryWindow().then(() => null, (error) => error);
+  const startup = barrier ? { bound_ms: STARTUP_BOUND_MS, written_ms: null, ready_at_release: null, released_ms: null, ready_ms: null,
+    note: 'win32: viewer counters at failure span the startup stage plus the 8000 ms window' } : null;
+  const startupOrigin = performance.now();
 
   try {
     // Run the CLI from daemonA's HOME but target daemonB explicitly via @host:port. The token for
@@ -103,6 +141,29 @@ test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async 
     const cliElapsedMs = Math.round(performance.now() - cliStarted);
 
     assert.equal(result.code, 0, `CLI failed:\nstderr: ${result.stderr}\nstdout: ${result.stdout}`);
+    if (barrier) {
+      // Task 1215 native49 stage 1 (win32): daemonB has written the ONE CLI inject to the target PTY — it logs `Wrote to`
+      // only after its delivery reported a non-queued write (src/routes/session-actions.js `[INJECT] ... session`) — and
+      // only then does the test release the shell; a bounded startup ends with the shell's own readiness token.
+      const at = () => Math.round(performance.now() - startupOrigin);
+      const wrote = `[INJECT] Wrote to session ${sessionId} `;
+      try {
+        await waitFor(() => daemonB.getLogs().stdout.split(/\r?\n/).some((line) => line.startsWith(wrote)),
+          { timeoutMs: 5000, description: 'daemonB to log the CLI inject as written to the target PTY' });
+        startup.written_ms = at();
+        startup.ready_at_release = barrier.ready();
+        assert.equal(startup.ready_at_release, false, 'protocol: the shell cannot print its readiness token before the test releases it');
+        barrier.release(); startup.released_ms = at();
+        await waitFor(() => barrier.ready(), { timeoutMs: STARTUP_BOUND_MS, description: 'the target PowerShell to print its test readiness prompt (bounded startup stage)' });
+        startup.ready_ms = at();
+      } catch (error) {
+        appendEvidence(error, ` | startup ${JSON.stringify({ ...startup, viewer: viewer() })}`);
+        throw error;
+      }
+      // Stage 2 — the original 8000 ms window from readiness. Check-then-subscribe runs synchronously in one tick, so an
+      // echo that already arrived counts and none can fall between the check and the listener.
+      seen = viewer().token_in_concatenated_output ? Promise.resolve(null) : deliveryWindow().then(() => null, (error) => error);
+    }
     const missed = await seen;
     if (missed) {
       // The K1 evidence is fixed (stringified) at failure time, exactly as before; post_verdict below can only add to it.
@@ -122,7 +183,7 @@ test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async 
         window_end: { ...viewer(), observation_limit: 'viewer counters at the end of the post-verdict window (timing ms after viewer open)' },
         target_ws_ready_state: targetWs.readyState,
         target_exit_log_lines: `${bOut}\n${bErr}`.split(/\r?\n/).filter((line) => line.includes(sessionId) && line.includes('[EXIT]')).length });
-      appendEvidence(missed, ` | K1 evidence ${k1} | post_verdict ${post}`);
+      appendEvidence(missed, ` | K1 evidence ${k1} | post_verdict ${post}${startup ? ` | startup ${JSON.stringify(startup)}` : ''}`);
       throw missed;
     }
   } finally {
