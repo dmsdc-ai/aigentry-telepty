@@ -103,7 +103,7 @@ function registerFanoutRoutes(app, {
             continue;
           }
 
-          results.successful.push({ id, strategy: delivery.strategy });
+          results.successful.push({ id, strategy: delivery.strategy, ...(delivery.poll_only ? { queued: true, delivered: false, msg_id: delivery.msg_id } : {}) });
           // #860 F2 — a fan-out target that parked the op wrote nothing; same three-value rule as
           // the single-target route.
           auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, deliveryAuditResult(delivery));
@@ -181,7 +181,7 @@ function registerFanoutRoutes(app, {
           continue;
         }
 
-        results.successful.push({ id, strategy: delivery.strategy });
+        results.successful.push({ id, strategy: delivery.strategy, ...(delivery.poll_only ? { queued: true, delivered: false, msg_id: delivery.msg_id } : {}) });
         auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, deliveryAuditResult(delivery));  // #860 F2
       } catch (err) {
         results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });

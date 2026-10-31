@@ -1,4 +1,6 @@
 'use strict';
+const { protectedInputFailure } = require('../external-approval');
+const { mailboxLeaseAlive } = require('./poll-session');
 
 // Accessors retain the daemon's shared instances and original first-use timing.
 // Construction only creates functions; effect boundaries run when those functions do.
@@ -6,6 +8,7 @@ function createDeliveryRuntime(shared, {
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
 } = {}) {
   function auditAppend(record) {
+    if (shared.sessions?.[record.to]?.externalApprovalPolicy) record = { ...record, preview: false };
     try { shared.auditWriter.append(record); } catch { /* audit must never throw into a handler */ }
   }
 
@@ -79,6 +82,7 @@ function createDeliveryRuntime(shared, {
     const sid = frame.request.identity.sid;
     const s = shared.sessions[sid];
     if (!s) return Promise.resolve(shared.interaction.refusal('wrong_owner'));
+    if (protectedInputFailure(s)) return Promise.resolve(shared.interaction.refusal('unsupported_capability'));
     if (s.type !== 'wrapped' || !shared.isOpenWebSocket(s.ownerWs)) {
       return Promise.resolve(shared.interaction.refusal('unsupported_capability'));
     }
@@ -258,6 +262,7 @@ function createDeliveryRuntime(shared, {
       // with a reason rather than inventing availability from a bare SID or an open socket.
       session_epoch: (session && session.sessionEpoch) || null,
       session_epoch_reason: (session && session.sessionEpoch) ? null : 'no_815_epoch_fact',
+      owner_generation: (session && session.interactionOwnerGeneration) || null,
       transport_source: source || null,
       created_at: nowIso,
       observation_seq: 0,
@@ -369,7 +374,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function deliveryAuditResult(delivery) {
-    return delivery && delivery.queued === true && delivery.strategy === 'bootstrap_queue' ? 'queued' : 'success';
+    return delivery && delivery.queued === true && (delivery.strategy === 'bootstrap_queue' || delivery.poll_only === true || delivery.delivery_status === 'retry_pending') ? 'queued' : 'success';
   }
 
   function getPendingReport(sessionId, registry = shared.pendingReports) {
@@ -520,6 +525,8 @@ function createDeliveryRuntime(shared, {
     const staleMs = (options.staleSeconds ?? shared.SESSION_STALE_SECONDS) * 1000;
     const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
 
+    if (session.type === 'mailbox') return mailboxLeaseAlive(session, nowMs) ? 'CONNECTED' : 'DISCONNECTED';
+
     if (session.type === 'wrapped') {
       if (shared.isOpenWebSocket(session.ownerWs)) {
         // #732: an open owner socket is necessary, not sufficient. A session that has
@@ -556,6 +563,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function getSessionHealthReason(session, healthStatus) {
+    if (session.type === 'mailbox') return healthStatus === 'CONNECTED' ? 'MAILBOX_LEASE_VALID' : 'MAILBOX_LEASE_EXPIRED';
     if (session.type === 'wrapped') {
       if (healthStatus === 'CONNECTED') return 'OWNER_CONNECTED';
       // #732: the owner socket is open and answering pings; the output pipe behind it is not.
@@ -852,7 +860,9 @@ function createDeliveryRuntime(shared, {
               // persistence outcome it is based on.
               const tracking = await settleTerminalOutcome(op, sessionId, result.code || 'DELIVERY_FAILED', result.error, {
                 trigger: 'bootstrap_queue_failed',
-                bytesWritten: result.bytes_written,
+                // Linux: a delivery whose outcome is unknown is recorded as such, never as zero bytes.
+                ...(result.delivery_uncertain ? { kind: 'inject_delivery_unknown' } : {}),
+                bytesWritten: result.delivery_uncertain ? null : result.bytes_written,
               });
               emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
                 op_id: op.op_id,
@@ -1076,6 +1086,7 @@ function createDeliveryRuntime(shared, {
       health_status: healthStatus,
       health_reason: healthReason,
       type: session.type || 'spawned',
+      ...(session.type === 'mailbox' ? { lease_expires_at: session.leaseExpiresAt || null } : {}),
       backend: session.backend || 'kitty',
       terminal: getSessionTerminalLabel(session),
       active_clients: session.clients ? session.clients.size : 0,
@@ -1138,11 +1149,13 @@ function createDeliveryRuntime(shared, {
 
   function broadcastSessionEvent(eventType, sessionId, session, options = {}) {
     const event = buildSessionEvent(eventType, sessionId, session, options);
+    require('../transport/session-events').publishTrustedSessionEvent(session, sessionId, eventType, event);
     broadcastBusEvent(event);
     return event;
   }
 
   function getInjectFailure(session, options = {}) {
+    if (session.isClosing) return { httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing' };
     const healthStatus = getSessionHealthStatus(session, options);
     if (healthStatus === 'STALE') {
       return { httpStatus: 410, code: 'STALE', error: 'Session is stale and awaiting cleanup.' };
@@ -1180,6 +1193,9 @@ function createDeliveryRuntime(shared, {
   }
 
   function terminalLevelSubmit(id, session) {
+    if (session.isClosing) return null;
+    if (protectedInputFailure(session)) return null;
+    if (session.sshRemote) return null;
     if (hasHeldInteraction(session)) return null;
     if (submitViaPty(session)) return 'pty_cr';
     return null;
@@ -1400,6 +1416,7 @@ function createDeliveryRuntime(shared, {
     if (term.includes('ghostty')) return 'ghostty';
     if (term.includes('tmux')) return 'tmux';
 
+    if (session.type === 'mailbox') return 'mailbox';
     if (session.type === 'aterm') return 'aterm';
     if (session.backend === 'cmux') return 'cmux';
     if (session.backend === 'kitty') return 'kitty';
@@ -1409,6 +1426,8 @@ function createDeliveryRuntime(shared, {
   }
 
   function submitViaPty(session) {
+    if (protectedInputFailure(session)) return false;
+    if (session.sshRemote) return false; // SSH submit is admitted by the receipt protocol only.
     if (hasHeldInteraction(session)) return false;
     shared.interaction.invalidateInteraction(session, 'submit');
     if (session.type === 'wrapped') {

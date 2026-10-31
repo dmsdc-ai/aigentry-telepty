@@ -94,14 +94,27 @@ function createLedgerClient(options = {}) {
         group: options.group || null, compactFrames: options.compactFrames || null, hotMaxRecords: options.hotMaxRecords || null, hotMaxBytes: options.hotMaxBytes || null, coldIndexMaxBytes: options.coldIndexMaxBytes || null },
       resourceLimits,
     });
-    worker.on('message', (m) => { if (gen === C.workerGen) onMessage(m); });
+    worker.on('message', (m) => { if (gen === C.workerGen) { onMessage(m); syncLoopRef(); } });
     worker.on('error', (error) => { if (gen === C.workerGen) onWorkerFailure('error', error); });
     worker.on('exit', (code) => { if (gen === C.workerGen) onWorkerExit(code); });
     if (options.unrefWorker === true && typeof worker.unref === 'function') worker.unref();
-    C.worker = worker;
+    C.worker = worker; C.loopRef = false;
     return worker;
   }
   function postToOwner(m) { if (C.worker) C.worker.postMessage(m); }
+  // #1207 — `unrefWorker` lets a process that only `require`s daemon.js exit while the store is IDLE.
+  // It must not let the event loop drain while a caller awaits the owner: an unref'd Worker also
+  // unrefs its message port, so the owner's reply could never arrive (measured on Windows CI run
+  // 41169574692: `await ledgerReady` → "Promise resolution is still pending but the event loop has
+  // already resolved" at +0.2 s). The worker is ref'd while an open, a submission, a read or a close
+  // is outstanding and unref'd again when none is. Without `unrefWorker` nothing changes.
+  function syncLoopRef() {
+    if (options.unrefWorker !== true || !C.worker) return;
+    const busy = !!C.openResolve || C.inflight.size > 0 || C.reads.size > 0 || !!C.closedResolve;
+    if (busy === C.loopRef) return;
+    C.loopRef = busy;
+    if (busy) { if (typeof C.worker.ref === 'function') C.worker.ref(); } else if (typeof C.worker.unref === 'function') C.worker.unref();
+  }
 
   function open(opts = {}) {
     if (C.opening) return C.opening;
@@ -128,6 +141,7 @@ function createLedgerClient(options = {}) {
         C.state = 'recovering'; C.reason = null; C.pendingAvailable = false;
         spawnWorker();
         postToOwner({ type: 'open', dir, lockPath, token: C.token, live_sids: [...C.liveSids], req: 'snapshot' });
+        syncLoopRef();
         notify('recovering');
       });
     })().finally(() => { C.opening = null; });
@@ -340,6 +354,7 @@ function createLedgerClient(options = {}) {
     return new Promise((resolve) => {
       C.inflight.set(txn, { kind, class: admitted.class || cls, bytes: admitted.bytes || bytes, jobId, reserved: admitted.reserved === true, resolve, id: delta.id || null, startedAt: now(), delta });
       postToOwner({ type: 'submit', txn, class: admitted.class || cls, kind, delta, bytes });
+      syncLoopRef();
     });
   }
   function reserveJob(id) {
@@ -374,7 +389,7 @@ function createLedgerClient(options = {}) {
   function readRequest(message) {
     if (!C.worker || C.state === 'not_opened' || C.state === 'lock_present' || C.state === 'closed') return Promise.resolve({ items: [], reason: unavailableOutcome(null).reason });
     const req = crypto.randomUUID();
-    return new Promise((resolve) => { C.reads.set(req, { items: [], resolve }); postToOwner({ ...message, req }); });
+    return new Promise((resolve) => { C.reads.set(req, { items: [], resolve }); postToOwner({ ...message, req }); syncLoopRef(); });
   }
   async function fetchTrackedInjection(id) {
     const r = await readRequest({ type: 'read', op: 'get', id });
@@ -438,6 +453,7 @@ function createLedgerClient(options = {}) {
           C.closedResolve = (m) => { if (timer) clearTimer(timer); resolve(m); };
           timer = setTimer(() => { C.closedResolve = null; resolve(null); }, deadlineMs);
           postToOwner({ type: 'close', deadline_ms: deadlineMs });
+          syncLoopRef();
         });
         const worker = C.worker; C.worker = null; C.workerGen++;
         for (const [txn, inflight] of C.inflight) resolveIndeterminate(txn, inflight, 'shutting_down');

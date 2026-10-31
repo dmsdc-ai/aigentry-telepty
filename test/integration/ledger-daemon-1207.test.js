@@ -41,7 +41,7 @@ test('M1 / D2: a 0.9.1 legacy file is migrated by the daemon at start while /api
   const legacy = writeLegacyLedger(legacyPath, { targetBytes: 8 * 1048576, obsPerRecord: 12 });
   let d = null;
   try {
-    d = await startTestDaemon({ homeDir });
+    d = await startTestDaemon({ homeDir, awaitLedger: false });
     // the control plane is up during the migration (readiness waited on /api/health, not the ledger)
     const meta = await d.request('/api/meta');
     assert.equal(meta.status, 200);

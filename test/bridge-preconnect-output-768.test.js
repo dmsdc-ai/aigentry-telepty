@@ -1,30 +1,9 @@
 'use strict';
 
-// #768 — the bridge's UPSTREAM leg has a blind spot at BOOTSTRAP, not only mid-session.
-//
-// relayPtyOutput (cli.js) forwards PTY bytes to the daemon only while the owner WS is open.
-// It used to hold nothing back, so every byte the wrapped CLI printed before that handshake
-// completed was dropped — permanently, because an idle CLI never reprints. The daemon's ring
-// therefore stayed EMPTY for the life of the session, and so did `telepty read-screen` and
-// every predicate that reads the ring (#737/#760 modal detection, #801 idle classification).
-//
-// Live signature (CI, ubuntu-latest, run 30200189371): bridge_pty_bytes=23 while
-// upstream_bytes=0, bridge_read_side=ok, session CONNECTED, ring empty. It is the #732
-// asymmetry — upstream dead, downstream alive, nothing noticing — arrived at through
-// bootstrap timing instead of a fault. Linux loses this race almost always (bash prints its
-// prompt in ~200ms; a WS handshake to a just-booted daemon takes longer), macOS usually wins
-// it, which is why it only ever surfaced as a "flaky" test rather than as the product bug.
-//
-// The lever is deterministic on every platform: a TCP proxy postpones the bridge's WebSocket
-// UPGRADE by 2.5s while forwarding plain HTTP untouched, so the PTY has certainly booted and
-// printed before the owner WS can possibly open. The proxy QUEUES the upgrade rather than
-// dropping it, HTTP health/version probes still answer instantly (a fully held leg makes the
-// CLI decide the daemon is broken and restart it), and the test proves the ordering it depends
-// on rather than assuming it — so a failure here is the bridge's own loss, not the harness's.
-//
-// #524 guard: isolated HOME + ephemeral ports, every process owned and killed here. The
-// production daemon on 3848 is never contacted — the daemon binds its own port under its
-// own HOME.
+// #135 supersedes the old bootstrap sequence: a wrapped command must wait for
+// the owner token. Hold the WS upgrade explicitly while HTTP registration proceeds,
+// verify no child output/success, then release it and verify initial and live output.
+// All resources use temporary HOME, ephemeral ports and test-owned processes.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -34,15 +13,9 @@ const H = require('../test-support/bridge-pipe-harness');
 
 const SKIP = process.platform === 'win32' ? 'POSIX-only (node-pty master fd semantics)' : false;
 
-// Long enough that the shell's prompt is unambiguously history by the time the owner WS can
-// open, short enough to keep the file a few seconds long.
-const WS_UPGRADE_HOLD_MS = 2500;
-// A prompt nothing else in the suite emits, so finding it in the ring cannot be a false
-// positive from another session's bytes. startBridge sets PS1 before spreading `env`, so
-// this wins.
 const MARKER = 'C768BOOT';
 
-test('#768 RED: PTY output printed before the owner WS opens still reaches the daemon ring',
+test('#135/#768: delayed owner claim gates startup and preserves initial PTY output',
   { skip: SKIP }, async (t) => {
     const home = H.makeHome();
     const sid = `c768-preconnect-${process.pid}`;
@@ -60,26 +33,22 @@ test('#768 RED: PTY output printed before the owner WS opens still reaches the d
     // The test talks to the daemon directly; only the BRIDGE goes through the held proxy, so
     // these assertions are never themselves delayed by the lever.
     const A = H.api(port, home);
-    proxy = H.startProxy({ targetPort: port, holdWsUpgradeMs: WS_UPGRADE_HOLD_MS });
+    proxy = H.startProxy({ targetPort: port, manualHoldWsUpgrade: true });
     const proxyPort = await proxy.listen();
 
     bridge = H.startBridge({ home, port: proxyPort, sid, env: { PS1: `${MARKER}$ ` } });
 
-    // The shell prints its prompt into the PTY within a few hundred ms — inside the hold.
-    await H.waitFor(() => bridge.out.includes(MARKER), {
-      timeoutMs: 15000,
-      description: 'the shell to print its prompt into the PTY'
+    await H.waitFor(async () => (await A.session(sid)).id === sid, {
+      timeoutMs: 5000, description: 'HTTP registration while WS upgrade is held'
     });
-
-    // Prove the ordering this test rests on instead of trusting the timing: the session is
-    // registered (HTTP is not delayed) but its owner is NOT connected yet, so the owner WS
-    // provably was not open when those bytes were printed.
     const early = await A.session(sid);
-    assert.notEqual(early.healthStatus, 'CONNECTED',
-      `the owner WS was already connected — the upgrade hold did not take, so this run ` +
-      `proves nothing about pre-connect output\n${JSON.stringify(early)}`);
+    assert.notEqual(early.healthStatus, 'CONNECTED');
+    assert.doesNotMatch(bridge.out, /C768BOOT|Inject allowed/);
+    assert.equal(early.ptyPid, null, 'no PTY starts before ownership is accepted');
     assert.equal(early.transport.upstream_bytes, 0,
       `the daemon already had upstream bytes before the owner connected\n${JSON.stringify(early.transport)}`);
+
+    proxy.releaseUpgrades();
 
     // Now let the handshake through and wait for the owner to actually be connected.
     await H.waitFor(async () => (await A.session(sid)).healthStatus === 'CONNECTED', {
@@ -87,10 +56,10 @@ test('#768 RED: PTY output printed before the owner WS opens still reaches the d
       description: 'the owner WS to connect once the proxy releases the held bytes'
     });
 
-    // --- was RED: upstream_bytes stayed 0 and the ring stayed empty for the whole session ---
+    // Initial output must still reach the ring after the delayed claim.
     await H.waitFor(async () => (await A.screen(sid)).screen.includes(MARKER), {
       timeoutMs: 10000, intervalMs: 100,
-      description: 'the pre-connect PTY output to reach the daemon ring',
+      description: 'initial PTY output to reach the daemon ring',
       context: async () => {
         const s = await A.session(sid).catch((e) => ({ error: e.message }));
         return `[diag] transport=${JSON.stringify(s.transport)}\n` +
@@ -110,8 +79,8 @@ test('#768 RED: PTY output printed before the owner WS opens still reaches the d
     await A.inject(sid, 'echo C768_LIVE\n');
     await H.waitFor(async () => (await A.screen(sid)).screen.includes('C768_LIVE'), {
       timeoutMs: 15000, intervalMs: 100,
-      description: 'post-connect output to keep flowing after the pre-connect flush'
+      description: 'post-claim output to keep flowing'
     });
     assert.match((await A.screen(sid)).screen, new RegExp(`${MARKER}[\\s\\S]*C768_LIVE`),
-      'the flushed pre-connect bytes must land BEFORE the bytes that came after them');
+      'initial prompt bytes must precede subsequent live output');
   });

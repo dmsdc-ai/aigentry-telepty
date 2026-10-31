@@ -18,6 +18,34 @@ function parseSessionReference(sessionRef) {
   };
 }
 
+// Resolve only identities explicitly recorded by connect/connect-http. Never infer trust
+// from DNS, a session advertisement, or a partial hostname match.
+function resolveRegisteredPeerTarget(sessionRef, peers = {}) {
+  const parsed = parseSessionReference(sessionRef);
+  if (!parsed.id || !parsed.host) return null;
+  const matches = Object.entries(peers).filter(([name, peer]) => {
+    if (!peer || typeof peer !== 'object') return false;
+    const host = typeof peer.host === 'string' && peer.host.includes(':') && !peer.host.startsWith('[') ? `[${peer.host}]` : peer.host;
+    const endpoint = host && peer.port ? `${host}:${peer.port}` : null;
+    return [name, peer.machineId, peer.host, endpoint, peer.target,
+      peer.dnsName, peer.magicDnsName].some((alias) => typeof alias === 'string' && alias === parsed.host);
+  });
+  if (matches.length > 1) {
+    throw new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(([name]) => name).sort().join(', ')}. Use a registered address:port.`);
+  }
+  if (matches.length === 0) return null;
+  const [name, peer] = matches[0];
+  if (peer.transport === 'http') {
+    if (!peer.host || !peer.port) throw new Error(`Peer '${name}' has no registered HTTP endpoint.`);
+    const host = peer.host.includes(':') && !peer.host.startsWith('[') ? `[${peer.host}]` : peer.host;
+    return { id: parsed.id, host: `${host}:${peer.port}`, peerName: name, peerPort: peer.port };
+  }
+  if (!peer.transport || peer.transport === 'ssh') {
+    return { id: parsed.id, host: peer.target, peerName: name, remote: true };
+  }
+  return null;
+}
+
 function groupSessionsByHost(sessions) {
   const grouped = new Map();
 
@@ -84,5 +112,6 @@ module.exports = {
   formatHostLabel,
   groupSessionsByHost,
   parseSessionReference,
-  pickSessionTarget
+  pickSessionTarget,
+  resolveRegisteredPeerTarget
 };

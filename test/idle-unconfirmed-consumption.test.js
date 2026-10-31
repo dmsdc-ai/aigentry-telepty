@@ -37,10 +37,12 @@ process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = '1';
 // Unit tests drive fireAutoReport() via its deps DI seam (same pattern as
 // test/idle-unconfirmed-settle.test.js).
 
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const daemon = require('../daemon');
+const { trackedInjectId, beginTrackedEager, settleTracked, fireAndSettle } = require('../test-support/tracked-observation');
+after(async () => { await daemon.ledgerClient.close(2000); });
 const { fireAutoReport } = daemon;
 
 const T0 = 1_700_000_000_000; // fixed clock origin
@@ -81,7 +83,7 @@ function makeGate({
   };
   ctx.pendingReport = {
     source: 'orch',
-    injectId: 'inj-52',
+    injectId: trackedInjectId('inj-52'),   // #1207: fresh durably begun id per fixture
     injectedAt: new Date(T0 - elapsedSec * 1000).toISOString(),
     injectedBodyPreview: BODY,
     ringBytesAtInject: preBytes,
@@ -99,11 +101,18 @@ function makeGate({
   };
   if (sampleChildCpu) ctx.deps.sampleChildCpu = sampleChildCpu;
   if (idleEvidenceReliable !== undefined) ctx.deps.idleEvidenceReliable = idleEvidenceReliable;
-  ctx.fire = (trigger = 'ready-signal') =>
-    fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps);
-  ctx.flushTimers = () => {
+  // #1207: the source is told only after the observation is durable on a durably begun record —
+  // begun here, awaited by the first fire; each step then awaits the async emit (settle).
+  ctx.ready = beginTrackedEager(daemon, { injectId: ctx.pendingReport.injectId, sessionId: 'worker-1', source: ctx.pendingReport.source, session: ctx.session });
+  const progress = () => `${ctx.delivered.length}:${ctx.broadcasts.length}`;
+  ctx.fire = async (trigger = 'ready-signal') => {
+    await ctx.ready;
+    return fireAndSettle(daemon, () => fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps), progress);
+  };
+  ctx.flushTimers = async () => {
     const due = ctx.timers.splice(0);
     for (const { fn, ms } of due) { ctx.nowMs += ms; fn(); }
+    await settleTracked(daemon, progress);
   };
   return ctx;
 }
@@ -134,7 +143,7 @@ function cpuScript(values) {
 // echo and a body-removal confirm are screen facts, not proof a turn started.
 function stateOnce(ctx) {
   assert.equal(ctx.delivered.length, 1, 'exactly one observation is stated — never silence');
-  assert.match(ctx.delivered[0].msg, /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-52 /);
+  assert.match(ctx.delivered[0].msg, /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-52-\d+-\d+ /);
   assert.doesNotMatch(ctx.delivered[0].msg, /TASK_COMPLETE:|TASK_IDLE_UNCONFIRMED:/);
   assert.equal(ctx.delivered[0].srcId, 'orch');
   const ev = ctx.broadcasts.find((b) => b.type === 'task_completion_unknown');
@@ -150,13 +159,13 @@ function stateOnce(ctx) {
 // (a) quiet-thinking: no output, no spinner — but the inject echo IS in the ring
 // ---------------------------------------------------------------------------
 
-test('#52 (a): quiet-thinking — body echoed in post-inject frames → recorded as inject_echo_observed', () => {
+test('#52 (a): quiet-thinking — body echoed in post-inject frames → recorded as inject_echo_observed', async () => {
   const ctx = makeGate({
     preFrames: ['codex 0.99 — workspace ready\n› \n'],
     postFrames: [`│ › ${BODY} │\n`], // composer redraw with the injected text
   });
-  ctx.fire();
-  ctx.flushTimers(); // settle elapses: still idle-classified, output stalled (quiet thinking)
+  await ctx.fire();
+  await ctx.flushTimers(); // settle elapses: still idle-classified, output stalled (quiet thinking)
   // OLD: asserted SILENCE — the gate returned without emitting. The echo detection itself is
   // unchanged and still fires; what changed is that it now NAMES itself instead of muting the
   // statement, so a consumer reading this observation learns strictly more than it used to.
@@ -166,10 +175,10 @@ test('#52 (a): quiet-thinking — body echoed in post-inject frames → recorded
     'echo proves bytes reached the screen, never that a turn started — it was never consumption');
 });
 
-test('#52 (a): an echoed inject still never yields a completion claim (never-false-complete)', () => {
+test('#52 (a): an echoed inject still never yields a completion claim (never-false-complete)', async () => {
   const ctx = makeGate({ postFrames: [`› ${BODY}\n`] });
-  ctx.fire();
-  ctx.flushTimers();
+  await ctx.fire();
+  await ctx.flushTimers();
   const consumption = stateOnce(ctx);
   assert.equal(consumption.basis, 'inject_echo_observed');
   // The original point of this test — the strongest available evidence must not manufacture a
@@ -178,18 +187,18 @@ test('#52 (a): an echoed inject still never yields a completion claim (never-fal
   assert.equal(ev.opts.extra.capability.outcome_protocol, 'unavailable');
 });
 
-test('#52 (a): echo survives composer line-wrapping and box borders', () => {
+test('#52 (a): echo survives composer line-wrapping and box borders', async () => {
   // The TUI wraps the body across bordered composer lines — contiguous full-body
   // matching would fail; conservative window sampling must still observe the echo.
   const wrapAt = 60;
   const wrapped = `│ ${BODY.slice(0, wrapAt)}\n│ ${BODY.slice(wrapAt)}\n`;
   const ctx = makeGate({ postFrames: [wrapped] });
-  ctx.fire();
-  ctx.flushTimers();
+  await ctx.fire();
+  await ctx.flushTimers();
   assert.equal(stateOnce(ctx).basis, 'inject_echo_observed', 'wrapped echo is still observed');
 });
 
-test('#52 (a): screen-verified submit confirm (body_consumed) is named, and names its shortfall', () => {
+test('#52 (a): screen-verified submit confirm (body_consumed) is named, and names its shortfall', async () => {
   // Live #52 shape: submit screen-verified as consumed, codex quiet-thinks, the
   // classifier flips real-idle with unreliable evidence. Pre-fix this notified
   // UNCONFIRMED; #52 then suppressed it entirely.
@@ -203,8 +212,8 @@ test('#52 (a): screen-verified submit confirm (body_consumed) is named, and name
     },
     idleEvidenceReliable: false,
   });
-  ctx.fire('real-idle');
-  ctx.flushTimers();
+  await ctx.fire('real-idle');
+  await ctx.flushTimers();
   const consumption = stateOnce(ctx);
   assert.equal(consumption.basis, 'submit_body_removed_observed');
   assert.equal(consumption.submit_confirm_reason, 'body_consumed');
@@ -219,34 +228,34 @@ test('#52 (a): screen-verified submit confirm (body_consumed) is named, and name
 // (b) genuinely unconsumed: no echo + no CPU advance → the signal is preserved
 // ---------------------------------------------------------------------------
 
-test('#52 (b): no echo + no CPU advance → no_consumption_evidence (format intact)', () => {
+test('#52 (b): no echo + no CPU advance → no_consumption_evidence (format intact)', async () => {
   const ctx = makeGate({
     preFrames: ['some unrelated screen content\n'],
     postFrames: [], // the inject never echoed — nothing reached the TUI
     sampleChildCpu: cpuScript([42.0]), // CPU flat across arm/recheck
   });
-  ctx.fire();
-  ctx.flushTimers();
+  await ctx.fire();
+  await ctx.flushTimers();
   // The signal is preserved, and it is now the literal absence statement rather than a claim
   // that "the inject may NOT have been processed" — which was never measured either.
   const consumption = stateOnce(ctx);
   assert.equal(consumption.basis, 'no_consumption_evidence');
   assert.match(ctx.delivered[0].msg,
-    /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-52 — no completion fact observed; legacy_ready_observed(?:; elapsed_since_inject=\d+\.\ds)?; consumption=not_established; outcome protocol unavailable$/);
+    /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-52-\d+-\d+ — no completion fact observed; legacy_ready_observed(?:; elapsed_since_inject=\d+\.\ds)?; consumption=not_established; outcome protocol unavailable$/);
 });
 
-test('#52 (b): body below the conservative length floor never claims echo', () => {
+test('#52 (b): body below the conservative length floor never claims echo', async () => {
   const ctx = makeGate({
     pendingReportOverrides: { injectedBodyPreview: 'ACK status please' }, // < 24 normalized chars
     postFrames: ['› ACK status please\n'],
   });
-  ctx.fire();
-  ctx.flushTimers();
+  await ctx.fire();
+  await ctx.flushTimers();
   assert.equal(stateOnce(ctx).basis, 'no_consumption_evidence',
     'short bodies are too weak for echo evidence — the conservative floor still holds');
 });
 
-test('#52 (b): identical re-inject — body already in PRE-inject frames, only redrawn after', () => {
+test('#52 (b): identical re-inject — body already in PRE-inject frames, only redrawn after', async () => {
   // An alt-screen redraw of an EARLIER identical message lands in the post-inject
   // suffix; windows that pre-exist before the watermark are not fresh echo.
   const oldEcho = `│ › ${BODY} │\n`;
@@ -254,13 +263,13 @@ test('#52 (b): identical re-inject — body already in PRE-inject frames, only r
     preFrames: ['boot\n', oldEcho],
     postFrames: [oldEcho], // full-screen redraw of the OLD content after the new inject
   });
-  ctx.fire();
-  ctx.flushTimers();
+  await ctx.fire();
+  await ctx.flushTimers();
   assert.equal(stateOnce(ctx).basis, 'no_consumption_evidence',
     'a redraw of pre-existing identical text is not fresh echo');
 });
 
-test('#52 (b): definitively failed submit (body stuck in composer) can never be echo-overridden', () => {
+test('#52 (b): definitively failed submit (body stuck in composer) can never be echo-overridden', async () => {
   const ctx = makeGate({
     pendingReportOverrides: {
       submitExpected: true,
@@ -268,8 +277,8 @@ test('#52 (b): definitively failed submit (body stuck in composer) can never be 
     },
     postFrames: [`│ › ${BODY} │\n`], // echoed, but the CR never landed
   });
-  ctx.fire('real-idle');
-  ctx.flushTimers();
+  await ctx.fire('real-idle');
+  await ctx.flushTimers();
   const consumption = stateOnce(ctx);
   // Rejection PRECEDENCE, which is the load-bearing half of this test: the body IS echoed, so
   // the echo branch would have matched, but a positive submit rejection is evaluated first and
@@ -279,7 +288,7 @@ test('#52 (b): definitively failed submit (body stuck in composer) can never be 
   assert.equal(consumption.submit_confirm_reason, 'body_still_visible');
 });
 
-test("#52 (b): a 'force' submit confirm is not screen-verified consumption", () => {
+test("#52 (b): a 'force' submit confirm is not screen-verified consumption", async () => {
   const ctx = makeGate({
     elapsedSec: 20,
     pendingReportOverrides: {
@@ -290,8 +299,8 @@ test("#52 (b): a 'force' submit confirm is not screen-verified consumption", () 
     },
     idleEvidenceReliable: false,
   });
-  ctx.fire('real-idle');
-  ctx.flushTimers();
+  await ctx.fire('real-idle');
+  await ctx.flushTimers();
   const consumption = stateOnce(ctx);
   // `accepted: true` is NOT sufficient — the whitelist is narrower than acceptance, and `force`
   // measured no screen at all. The recorded reason proves the confirm was seen and rejected as
@@ -304,30 +313,30 @@ test("#52 (b): a 'force' submit confirm is not screen-verified consumption", () 
 // (c) CPU-advance heuristic at settle-recheck: quiet thinking re-settles
 // ---------------------------------------------------------------------------
 
-test('#52 (c): screen idle + child CPU advancing at recheck → re-settles instead of notifying', () => {
+test('#52 (c): screen idle + child CPU advancing at recheck → re-settles instead of notifying', async () => {
   const ctx = makeGate({
     postFrames: [], // no echo observable (non-echoing TUI)
     sampleChildCpu: cpuScript([100.0, 100.5, 100.5, 100.5]), // arm, recheck(+0.5), re-arm, recheck(flat)
   });
-  ctx.fire();
-  ctx.flushTimers(); // recheck 1: CPU advanced → quiet thinking, re-settle
+  await ctx.fire();
+  await ctx.flushTimers(); // recheck 1: CPU advanced → quiet thinking, re-settle
   assert.equal(ctx.delivered.length, 0, 'CPU-active session is working — the follow-up debounces');
   assert.equal(ctx.timers.length, 1, 'a fresh settle window is open');
-  ctx.flushTimers(); // recheck 2: CPU flat → genuinely stalled → state it
+  await ctx.flushTimers(); // recheck 2: CPU flat → genuinely stalled → state it
   assert.equal(stateOnce(ctx).basis, 'no_consumption_evidence');
 });
 
-test('#52 (c): CPU re-settles are bounded — a perpetually-busy child cannot starve the signal forever', () => {
+test('#52 (c): CPU re-settles are bounded — a perpetually-busy child cannot starve the signal forever', async () => {
   let v = 0;
   const ctx = makeGate({
     postFrames: [],
     sampleChildCpu: () => { v += 1; return v; }, // always advancing
   });
-  ctx.fire();
+  await ctx.fire();
   let flushes = 0;
   while (ctx.delivered.length === 0 && flushes < 100) {
     assert.ok(ctx.timers.length > 0, `settle chain must stay alive or notify (flush ${flushes})`);
-    ctx.flushTimers();
+    await ctx.flushTimers();
     flushes++;
   }
   assert.equal(ctx.delivered.length, 1, 'bounded: eventually states it even with CPU always advancing');
@@ -335,13 +344,13 @@ test('#52 (c): CPU re-settles are bounded — a perpetually-busy child cannot st
   assert.ok(flushes >= 5, 'the CPU bound is meaningfully larger than a single settle');
 });
 
-test('#52 (c): no PID / sampler unavailable → CPU heuristic silently skips (prior behavior)', () => {
+test('#52 (c): no PID / sampler unavailable → CPU heuristic silently skips (prior behavior)', async () => {
   const ctx = makeGate({
     postFrames: [],
     sampleChildCpu: () => null,
   });
-  ctx.fire();
-  ctx.flushTimers();
+  await ctx.fire();
+  await ctx.flushTimers();
   assert.equal(ctx.delivered.length, 1, 'falls back to the #48 behavior when CPU is unobservable');
 });
 

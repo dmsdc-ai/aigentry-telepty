@@ -185,6 +185,12 @@ function createAuthMiddleware(options) {
       return res.status(403).json(PEER_DENIED);
     }
 
+    if (options.principalAuthentication) {
+      const result = options.principalAuthentication.authorize(req);
+      if (result.ok) return next();
+      return res.status(result.status || 401).json({ error: 'Principal request refused', code: result.code });
+    }
+
     // ...and now the credential, for EVERY address including loopback. There is no branch above
     // this that reaches a route.
     const token = req.headers['x-telepty-token'] || req.query.token;
@@ -195,6 +201,11 @@ function createAuthMiddleware(options) {
     // JWT Bearer token
     const authHeader = req.headers['authorization'] || '';
     if (authHeader.startsWith('Bearer ') && verifyJwt(authHeader.slice(7))) {
+      return next();
+    }
+
+    if (options.authorizeSessionRequest && options.authorizeSessionRequest(req)) {
+      req.sessionCredentialOnly = true;
       return next();
     }
 

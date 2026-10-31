@@ -157,9 +157,15 @@ function request(app,row){
   const context=await direct('s03',()=>records.createSessionRecordContext({sessions,sessionCredentials:credentials,
     sidNonces:nonces,sessionPersistPath:path.join(fixtureRoot,'sessions.json')}));
   const ledger=await direct('s04',()=>persistence.emptyTrackedInjections());
+  // #1207: the product no longer reads an in-memory `trackedInjections` mirror; held/busy interaction
+  // state comes from the ledger client's committed read model. The same explicit INPUT reaches that
+  // seam: a real, never-opened client (no worker, no files) whose read model mirrors `ledger`.
+  const {createLedgerClient}=local('src/session-store/ledger-client.js');
+  const ledgerClient=createLedgerClient({dir:path.join(fixtureRoot,'ledger-store'),lockPath:path.join(fixtureRoot,'ledger.lock')});
+  const mirrorLedger=()=>{const m=ledgerClient._internal.readModel;m.actions=new Map(Object.entries(ledger.interactions.actions));m.pending=new Map(Object.entries(ledger.interactions.pending));};
   const mailbox=await direct('s05',()=>new FileMailbox({root:path.join(fixtureRoot,'mailbox'),maxRetries:1}));
   const busClients=new Set([{readyState:1,send(text){assert.ok(bus.length<256);bus.push(JSON.parse(text));}}]);
-  const shared={sessions,sessionStateManager:state,sessionPersistence:persistence,trackedInjections:ledger,
+  const shared={sessions,sessionStateManager:state,sessionPersistence:persistence,trackedInjections:ledger,ledgerClient,
     trackedLedgerHealthy:true,trackedLedgerUnavailableReason:null,TRACKED_INJECTIONS_PATH:path.join(fixtureRoot,'ledger.json'),
     interaction,readyRegistry,isOpenWebSocket,fs,isBootstrapGatedSession:metadata.isBootstrapGatedSession,interactionWaiters:new Map(),
     UPSTREAM_STALL_SECONDS:30,SESSION_STALE_SECONDS:300};
@@ -312,7 +318,7 @@ function request(app,row){
     const rateObservation={elapsedNs:String(intervalNs),accepted:1,refused:2,constructorClockSeconds:0,assessment:'SELECTED_ORACLES_MATCH'};
     await direct('s35',()=>{ // Explicit trusted ledger INPUT; real core/held checks, not remote valid-frame reproduction.
       ledger.interactions.actions.fixture={sid:'alpha-1',stage:'dispatched'};
-      ledger.interactions.pending.fixture={sid:'alpha-2',state:'held'};
+      ledger.interactions.pending.fixture={sid:'alpha-2',state:'held'};mirrorLedger();
     });
     const heldGen=[first.interactionInputGeneration,second.interactionInputGeneration],heldWrites=effects.length;
     await direct('a-clock-4',()=>{originalNow=1;});
@@ -323,7 +329,7 @@ function request(app,row){
     });
     const refundBefore4=snapshot();
     await runHttp('a-no-refund-4',(body,wire)=>{assert.equal(body.code,'RATE_LIMITED');assert.match(wire.raw,/\r\nRetry-After: 1\r\n/i);assert.deepEqual(snapshot(),refundBefore4);});
-    await direct('s36',()=>{ledger.interactions.actions={};ledger.interactions.pending={};first.ownerWs.readyState=3;});
+    await direct('s36',()=>{ledger.interactions.actions={};ledger.interactions.pending={};mirrorLedger();first.ownerWs.readyState=3;});
     await direct('a-clock-5',()=>{originalNow=2;});
     await runHttp('t05',body=>{
       assert.deepEqual(body.results.successful.map(x=>x.id),['alpha-2']);
@@ -348,7 +354,7 @@ const defaultA={},defaultB={},fraction={},invalid={},authCase={},emptyCase={};le
 const selectedClock=()=>{clockCalls++;if(clockValue==='THROW')throw Error('private constructor clock failure');return clockValue;};
 let fractionBucket,invalidBucket,authBucket,emptyBucket,defaultStart,defaultElapsed;
 
-await direct('x-restore-terminal',()=>{ledger.interactions.actions={};ledger.interactions.pending={};first.type='wrapped';first.ownerWs={readyState:1,send:terminal(first,'owner')};second.type='spawned';second.ptyProcess={pid:null,killed:false,write:terminal(second,'pty')};});
+await direct('x-restore-terminal',()=>{ledger.interactions.actions={};ledger.interactions.pending={};mirrorLedger();first.type='wrapped';first.ownerWs={readyState:1,send:terminal(first,'owner')};second.type='spawned';second.ptyProcess={pid:null,killed:false,write:terminal(second,'pty')};});
 await direct('default-a-context',()=>{defaultA.context=createSessionInspectionContext(inspectionShared,{});});
 await direct('default-a-app',()=>{defaultA.app=httpApp.createHttpApp({express,cors});});
 await direct('default-a-auth',()=>{httpApp.registerHealthAndAuth(defaultA.app,{pkg:local('package.json'),createAuthMiddleware:auth.createAuthMiddleware,EXPECTED_TOKEN:hostToken,verifyJwt,isAllowedPeer,isForbiddenOrigin});});

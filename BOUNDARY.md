@@ -454,6 +454,18 @@ What holds:
   described as success or failure; settled only by receipts/unapplied lists at the next recovery),
   or `rejected_admission` (a reservation failed; nothing queued, nothing persisted). Accepted means
   capacity admitted, not durable.
+- **What "durable" means per OS (WIN-1, measured on Windows CI run 41169574692).** On every platform
+  the ACK follows a successful `fsync` of the FILE that holds the commit frame (segments, checkpoint
+  members, MANIFEST temporaries and the migration copy are file-fsynced before use); any file-fsync
+  error is `indeterminate`, never an ACK. On macOS/Linux the owner also fsyncs the DIRECTORY after
+  creating or renaming an entry, and any error there fails the operation closed. On Windows a
+  directory handle cannot be flushed (`FlushFileBuffers` → `EPERM`), so the owner records
+  `durability.dir_flush: "unsupported"` (`telepty ledger status`, owner `io.dir_flush_unsupported`) and
+  continues. Only that shape is tolerated: the directory opened, its flush refused with `EPERM`, on
+  win32. A directory that cannot be opened, any other errno, and every file-fsync error still fail
+  closed. **Windows limit:** a newly created segment's directory entry, or a rename, is not explicitly
+  flushed. Whether it survives power loss is up to the file system (NTFS journals metadata), and this
+  owner does not promise it.
 - **Exclusion by a filesystem fact.** The unguarded 0.9.1 `saveTrackedInjections` renames a temp
   file over the path; a directory there makes the rename fail and the load fail, so 0.9.1 begins
   refuse before delivery (`X1–X4`). Expected errno `EISDIR` on macOS/Linux; **Windows errno is

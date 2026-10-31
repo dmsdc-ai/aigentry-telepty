@@ -17,7 +17,7 @@ const {
   listSessionDirs,
 } = require('./storage');
 const { createConfig } = require('./config');
-const { canonicalRoot, resolveSessionDir, rethrowBoundary } = require('./path-boundary');
+const { canonicalRoot, resolveSessionDir, rethrowBoundary, openFile } = require('./path-boundary');
 
 function unixNow() {
   return Math.floor(Date.now() / 1000);
@@ -26,8 +26,9 @@ function unixNow() {
 /**
  * FileMailbox — JSONL-backed mailbox implementing MailboxProtocol.
  *
- * Thread-safe via per-session advisory file locks.
- * Interoperable with Rust aigentry-mailbox crate (shared JSONL format).
+ * Per-session v2 advisory locks require cooperating writers on a local filesystem.
+ * JSONL format is shared with Rust aigentry-mailbox; lock protocols must also
+ * match before writers may concurrently share a root.
  */
 class FileMailbox {
   constructor(overrides = {}) {
@@ -68,10 +69,12 @@ class FileMailbox {
         payload: msg.payload,
         created_at: msg.created_at,
         attempt: msg.attempt || 0,
+        ...(msg.cooperative_handoff ? {cooperative_handoff:msg.cooperative_handoff} : {}),
       });
 
       // Append state: pending
-      appendState(sessionDir, msg.msg_id, 'pending', now);
+      if(msg.cooperative_handoff && (msg.attempt||0)===0)appendJsonl(path.join(sessionDir,'state.jsonl'),{msg_id:msg.msg_id,state:'pending',ts:now,never_attempted:true});
+      else appendState(sessionDir,msg.msg_id,'pending',now);
 
       const pending = countPending(sessionDir, now);
       return { msg_id: msg.msg_id, queued: true, pending };
@@ -128,7 +131,7 @@ class FileMailbox {
   /**
    * Acknowledge successful delivery of a message.
    */
-  ack(sessionId, msgId) {
+  ack(sessionId, msgId, result = undefined) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) return;
 
@@ -137,9 +140,34 @@ class FileMailbox {
       const states = loadStates(sessionDir);
       const st = states.get(msgId);
       // Idempotent: already acked → no-op
-      if (st && st.state === 'acked') return;
+      if (st && (st.state === 'acked' || st.state === 'dead_letter')) return;
 
+      const settlement = require('./handoff-settlement');
+      if (settlement.usedProof(result)) return;
+      const trusted = settlement.hasProof(result);
+      let message;
+      if (trusted) {
+        const custody = require('./custody').readCustody(sessionDir, sessionId);
+        message = custody.messages.get(msgId);
+        if (custody.journal.some(row => row.delivery_uncertain === true || row.outcome === 'unknown' || row.retryable === false) || custody.states.get(msgId)?.state !== 'in_flight'
+          || !custody.histories.get(msgId)?.some(row => row.non_retryable_attempt === true)) throw new Error('HANDOFF_ACK_EVIDENCE_REQUIRED');
+      }
       appendState(sessionDir, msgId, 'acked', unixNow());
+      if (trusted) {
+        try {
+          if (require('./custody').readCustody(sessionDir, sessionId).unsettled) throw new Error('HANDOFF_ACK_UNKNOWN_HISTORY');
+          const fd = openFile(path.join(sessionDir, 'state.jsonl'), fs.constants.O_RDWR);
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+          settlement.commitSettlement(sessionDir, sessionId, message, result);
+        } catch (error) {
+          // Visible ACK or proof publication is not a successful durability receipt.
+          // Preserve original payload and unknown history; compaction must not erase it.
+          appendJsonl(path.join(sessionDir, 'state.jsonl'), {msg_id:msgId,state:'dead_letter',ts:unixNow(),delivery_uncertain:true,outcome:'unknown',retryable:false});
+          const fd = openFile(path.join(sessionDir, 'state.jsonl'), fs.constants.O_RDWR);
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+          throw error;
+        }
+      }
       compact(sessionDir, this.config.compactionThreshold);
     } finally {
       release();
@@ -206,9 +234,171 @@ class FileMailbox {
   }
 
   /**
+   * Withdraw a message that has not been handed to a deliverer: only a `pending` message moves to
+   * dead letter (with `reason`), so it can never be delivered afterwards. Returns true if it did;
+   * false if the message is in flight, already delivered or already gone. The active
+   * deliverer may opt into `inFlight` to reject text bound to a displaced session.
+   */
+  // Durably fence a non-idempotent write BEFORE crossing its effect boundary. A daemon
+  // interruption after this point is unknown, never evidence that retry is safe.
+  beginNonRetryableAttempt(sessionId, msgId) {
+    const sessionDir = this._sessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) return false;
+    const release = acquireLock(sessionDir);
+    try {
+      const st = loadStates(sessionDir).get(msgId);
+      if (!st || st.state !== 'in_flight') return false;
+      if (st.non_retryable_attempt === true) return true;
+      const fd = openFile(path.join(sessionDir, 'state.jsonl'), fs.constants.O_WRONLY | fs.constants.O_APPEND);
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ msg_id: msgId, state: 'in_flight', ts: unixNow(), non_retryable_attempt: true }) + '\n');
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      return true;
+    } finally { release(); }
+  }
+
+  withdraw(sessionId, msgId, reason, { inFlight = false, deliveryUncertain = false } = {}) {
+    const sessionDir = this._sessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) return false;
+
+    const release = acquireLock(sessionDir);
+    try {
+      const st = loadStates(sessionDir).get(msgId);
+      if (!st || (st.state !== 'pending' && !(inFlight && st.state === 'in_flight'))) return false;
+
+      const msg = loadMessages(sessionDir)
+        .filter(m => m.msg_id === msgId)
+        .reduce((latest, m) => (!latest || (m.attempt || 0) > (latest.attempt || 0) ? m : latest), null);
+      if (!msg) return false;
+
+      const now = unixNow();
+      appendJsonl(path.join(sessionDir, 'dead-letter.jsonl'), {
+        msg_id: msg.msg_id,
+        from: msg.from,
+        to: msg.to,
+        payload: msg.payload,
+        reason: reason || 'withdrawn',
+        ...(deliveryUncertain ? { delivery_uncertain: true, outcome: 'unknown', retryable: false } : {}),
+        failed_at: now,
+        attempts: msg.attempt || 0,
+      });
+      if (deliveryUncertain) {
+        const fd = openFile(path.join(sessionDir, 'dead-letter.jsonl'), fs.constants.O_WRONLY);
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        appendJsonl(path.join(sessionDir, 'state.jsonl'), { msg_id: msgId, state: 'dead_letter', ts: now, delivery_uncertain: true, outcome: 'unknown', retryable: false });
+        const stateFd = openFile(path.join(sessionDir, 'state.jsonl'), fs.constants.O_WRONLY);
+        try { fs.fsyncSync(stateFd); } finally { fs.closeSync(stateFd); }
+      } else appendState(sessionDir, msgId, 'dead_letter', now);
+      return true;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Latest state of one message (`pending`, `in_flight`, `dead_letter`, …), or null when the
+   * mailbox has no record of it (never enqueued, or purged with its session).
+   */
+  messageState(sessionId, msgId) {
+    const sessionDir = this._sessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) return null;
+
+    const release = acquireLock(sessionDir);
+    try {
+      const st = loadStates(sessionDir).get(msgId);
+      return st ? st.state : null;
+    } finally {
+      release();
+    }
+  }
+
+  // Registration prepares custody before publishing its verifier. Never repair an existing
+  // partial queue: missing files may represent lost messages rather than an unused mailbox.
+  initializeCustody(sessionId) {
+    const sessionDir = this._sessionDir(sessionId);
+    let created = false;
+    try { fs.mkdirSync(sessionDir, { mode: 0o700 }); created = true; }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const release = acquireLock(sessionDir);
+    try {
+      if (created) {
+        for (const leaf of ['inbox.jsonl', 'state.jsonl']) {
+          const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+          try { fs.writeFileSync(fd, ''); fs.fsyncSync(fd); }
+          finally { fs.closeSync(fd); }
+        }
+      }
+      require('./custody').strictCustodySnapshot(sessionDir, sessionId);
+      // Flush existing valid custody too: a retry after an uncertain flush must establish
+      // durability itself. No successful session ACK depends on a prior failed attempt.
+      for (const leaf of ['inbox.jsonl', 'state.jsonl']) {
+        const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_RDONLY);
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      }
+      if (process.platform !== 'win32') {
+        // Include newly created root ancestors, not merely the queue's own entries.
+        for (let directory = sessionDir; ; directory = path.dirname(directory)) {
+          const fd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0));
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+          if (path.dirname(directory) === directory) break;
+        }
+      }
+    } finally { release(); }
+  }
+
+  snapshotCustody(sessionId) {
+    return this.withCustodySnapshot(sessionId, snapshot => snapshot);
+  }
+
+  withAcknowledgedCustody(sessionId,event,callback){
+    const sessionDir=this._sessionDir(sessionId),release=acquireLock(sessionDir);
+    try{
+      require('./custody').acknowledgedCustodySnapshot(sessionDir,sessionId,event);
+      for(const leaf of ['inbox.jsonl','state.jsonl']){const fd=openFile(path.join(sessionDir,leaf),fs.constants.O_RDONLY);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      if(process.platform!=='win32'){const fd=fs.openSync(sessionDir,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      return callback();
+    }finally{release();}
+  }
+
+  withNeverAttemptedCustody(sessionId,callback){
+    const sessionDir=this._sessionDir(sessionId),release=acquireLock(sessionDir);
+    try{
+      const rows=require('./custody').neverAttemptedCustodySnapshot(sessionDir,sessionId);
+      // Flush the immutable bytes before an authority record can claim durable custody.
+      for(const leaf of ['inbox.jsonl','state.jsonl']){const fd=openFile(path.join(sessionDir,leaf),fs.constants.O_RDONLY);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      if(process.platform!=='win32'){const fd=fs.openSync(sessionDir,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      const result=callback(rows);if(result&&typeof result.then==='function')throw new Error('Custody callback must be synchronous');return result;
+    }finally{release();}
+  }
+
+  withCustodySnapshot(sessionId, callback, {durable = false} = {}) {
+    const sessionDir = this._sessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) throw Object.assign(new Error('Mailbox custody is unavailable'), { code: 'MAILBOX_CUSTODY_UNAVAILABLE' });
+    const release = acquireLock(sessionDir);
+    try {
+      const snapshot = require('./custody').strictCustodySnapshot(sessionDir, sessionId);
+      if (durable) {
+        for (const leaf of ['inbox.jsonl', 'state.jsonl']) {
+          const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_RDONLY);
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        }
+        if (process.platform !== 'win32') {
+          const fd = fs.openSync(sessionDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        }
+      }
+      const result = callback(snapshot);
+      if(result && typeof result.then === 'function') throw new Error('Custody callback must be synchronous');
+      return result;
+    }
+    finally { release(); }
+  }
+
+  /**
    * Peek at pending messages without dequeueing.
    */
-  peek(sessionId) {
+  peek(sessionId, { includePayload = false } = {}) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) return [];
 
@@ -227,6 +417,7 @@ class FileMailbox {
           created_at: msg.created_at,
           attempt: msg.attempt || 0,
           state: st.state,
+          ...(includePayload ? { payload: msg.payload, to: msg.to } : {}),
         });
       }
 
@@ -277,8 +468,9 @@ class FileMailbox {
   purgeDeadLetter(sessionId) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) return;
-    const p = path.join(sessionDir, 'dead-letter.jsonl');
-    try { writeJsonl(p, []); } catch (err) { rethrowBoundary(err); }
+    const release = acquireLock(sessionDir);
+    try { writeJsonl(path.join(sessionDir, 'dead-letter.jsonl'), []); }
+    finally { release(); }
   }
 
   /**
@@ -299,7 +491,7 @@ class FileMailbox {
   }
 
   /**
-   * Recover in-flight messages that timed out → auto-nack.
+   * Recover timed-out in-flight messages: quarantine fenced attempts; retry legacy untouched entries.
    * Called by DeliveryEngine.
    */
   recoverInflight(sessionId) {
@@ -326,7 +518,11 @@ class FileMailbox {
           if (!msg) continue;
 
           const attempt = (msg.attempt || 0) + 1;
-          if (attempt >= this.config.maxRetries) {
+          if (entry.non_retryable_attempt) {
+            appendJsonl(path.join(sessionDir, 'dead-letter.jsonl'), { msg_id: msg.msg_id, from: msg.from, to: msg.to, payload: msg.payload,
+              reason: 'delivery_outcome_unknown_after_interruption', delivery_uncertain: true, outcome: 'unknown', retryable: false, failed_at: now, attempts: msg.attempt || 0 });
+            appendJsonl(path.join(sessionDir, 'state.jsonl'), { msg_id: msgId, state: 'dead_letter', ts: now, delivery_uncertain: true, outcome: 'unknown', retryable: false });
+          } else if (attempt >= this.config.maxRetries) {
             appendJsonl(path.join(sessionDir, 'dead-letter.jsonl'), {
               msg_id: msg.msg_id,
               from: msg.from,
@@ -377,6 +573,9 @@ class FileMailbox {
       for (const msg of messages) {
         const st = states.get(msg.msg_id);
         if (!st) continue;
+        // TTL cannot settle a write whose physical outcome is unknown. Keep
+        // its attempt fence until recoverInflight quarantines it or ACK settles it.
+        if (st.non_retryable_attempt === true) continue;
         if ((st.state === 'pending' || st.state === 'in_flight') &&
             (msg.created_at + this.config.ttlSecs < now)) {
           appendState(sessionDir, msg.msg_id, 'expired', now);

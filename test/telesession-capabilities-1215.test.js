@@ -145,7 +145,7 @@ async function assertStillDeliverable(sid, marker) {
 
 // --- capability advertisement -------------------------------------------------------------------
 
-test('1215: /api/meta advertises exactly the three consumer-required capabilities', async () => {
+test('1215: /api/meta retains each consumer-required capability alongside SSH receipt support', async () => {
   const meta = await daemon.request('/api/meta');
   assert.equal(meta.status, 200);
   const caps = meta.body.capabilities;
@@ -157,7 +157,8 @@ test('1215: /api/meta advertises exactly the three consumer-required capabilitie
   for (const cap of BASELINE) {
     assert.ok(caps.includes(cap), `baseline capability ${cap} must be retained`);
   }
-  assert.equal(caps.length, BASELINE.length + REQUIRED.length, 'no other capability was added');
+  assert.ok(caps.includes('ssh-child-write-receipts-v1'));
+  assert.equal(caps.length, BASELINE.length + REQUIRED.length + 1, 'only the explicit SSH receipt capability was added');
 });
 
 // --- inject-exact-target ------------------------------------------------------------------------

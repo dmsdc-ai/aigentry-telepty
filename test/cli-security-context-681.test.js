@@ -140,7 +140,7 @@ await op('import-providers',async()=>{assert.equal(require.cache[require.resolve
 await op('config-mint',async()=>{const value=providers.auth.getConfig();assert.equal(typeof value.authToken,'string');assert.ok(value.authToken);assert.equal(JSON.parse(fs.readFileSync(path.join(process.env.HOME,'.telepty/config.json'))).authToken,value.authToken);top={cachedAuthToken:null,cachedPeerTokens:null,getConfig:providers.auth.getConfig,path,lifecycle:providers.lifecycle,PORT:3848,isMainModule:false};return value;});
 await op('peer-factory',async()=>{top.crossMachine=providers.cross.createPeerContext({PEERS_PATH:path.join(fixture,'peers.json'),CONTROL_DIR:path.join(fixture,'ssh'),getUsername:()=> 'finite-user',execFileSync(){throw Error('SSH not selected in CLI');},spawnSync(){throw Error('SSH not selected');},spawn(){throw Error('SSH not selected');}});});
 await op('peer-file-input',async()=>{fs.writeFileSync(path.join(fixture,'peers.json'),JSON.stringify({peers:{private:{transport:'http',host:'peer.invalid',port:3848,token:'synthetic-peer-token'}}}),{flag:'wx',mode:0o600});});
-await op('cli-factory',async()=>{cli=providers.security.createCliSecurityActions(top,{
+await op('cli-factory',async()=>{cli=providers.security.createCliSecurityActions(top,{platform:'linux',
  execSync(...a){capture('execSync',a);},execFileSync(...a){capture('execFileSync',a);},
  exit(code){const e=Error('captured exit');e.name='CapturedExit';e.code=code;throw e;},
  fetch(url,options){

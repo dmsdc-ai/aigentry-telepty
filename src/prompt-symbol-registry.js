@@ -16,11 +16,14 @@
 // Interaction observations intentionally do not reuse detectOutput or strip an output ring.
 // No measured current-frame provider is staged. This module is the future adapter boundary,
 // not a request-controlled capability toggle. Legacy readiness predicates stay unchanged.
-function observeInteraction() {
-  return require('./interaction').unavailableObservation();
+function observeInteraction(session) {
+  if (!session || session.externalApprovalPolicy || !session.interactionProvider) return require('./interaction').unavailableObservation();
+  return session.interactionProvider.observe();
 }
 
-function encodeInteraction() { return null; }
+function encodeInteraction(request, observation) {
+  return require('./vt/captured-selector').encodeCapturedSelector(request, observation);
+}
 
 
 // #737: the pre-prompt UIs codex's detect() step 1 rejects, hoisted so the delivery-path

@@ -83,7 +83,7 @@ function buildDeps(server, sessions, credentials) {
     markSessionConnected: () => {},
     scheduleBootstrapPromptPoll: () => {},
     emitSessionLifecycleEvent: () => {},
-    persistSessions: () => {},
+    persistSessions: () => ({ ok: true, committed: true }),
     appendToOutputRing: () => {},
     sessionStateManager: {
       feed: () => {},

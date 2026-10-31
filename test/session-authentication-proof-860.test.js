@@ -46,7 +46,7 @@ before(async () => {
     sink = net.createServer((sock) => {
       sock.on('data', (chunk) => {
         sinkDeliveries.push(chunk.toString());
-        sock.end();
+        sock.end(JSON.stringify({ success: true }));
       });
     });
     await new Promise((resolve) => sink.listen(sinkPath, resolve));

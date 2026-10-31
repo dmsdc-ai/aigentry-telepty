@@ -52,7 +52,7 @@ function buildDeps(server, sessions) {
     markSessionConnected: () => {},
     scheduleBootstrapPromptPoll: () => {},
     emitSessionLifecycleEvent: () => {},
-    persistSessions: () => {},
+    persistSessions: () => ({ ok: true, committed: true }),
     // Mirrors the real appendToOutputRing closely enough to prove WHICH record was fed.
     appendToOutputRing: (session, data) => {
       session.outputRing.push(data);

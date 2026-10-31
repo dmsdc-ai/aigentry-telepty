@@ -1,3 +1,5 @@
+const { protectedInputFailure } = require('../external-approval');
+const { claimedReturnMetadata } = require('../claimed-return');
 // Production session actions. Keep non-strict semantics of the original daemon bodies.
 // shared supplies lazy access to the daemon's actual stores and producers.
 // effects is constructor-only: timer scheduling, lifecycle signal/sleep/liveness options,
@@ -613,15 +615,26 @@ function createSessionActions(shared, effects = {}) {
   }
 
   function applySessionStateReport(sessionId, session, payload = {}) {
+    if (session.isClosing) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing' };
     const parsed = parseSessionStateReport(session, payload);
     if (!parsed.success) {
       return parsed;
     }
 
+    const previous = Object.getOwnPropertyDescriptors(session);
     session.stateReport = parsed.report;
     session.lastStateReportAt = parsed.report.timestamp;
     if (parsed.report.thread_id) {
       session.lastThreadId = parsed.report.thread_id;
+    }
+
+    const saved = (0, shared.persistSessions)();
+    if (!saved || !saved.ok) {
+      if (!saved || !saved.committed) {
+        for (const key of Object.keys(session)) delete session[key];
+        Object.defineProperties(session, previous);
+      }
+      return { success: false, httpStatus: 503, code: 'SESSION_STORE_WRITE_FAILED', error: 'Session store write failed' };
     }
 
     const event = (0, shared.broadcastSessionEvent)('session_state_report', sessionId, session, {
@@ -671,59 +684,69 @@ function createSessionActions(shared, effects = {}) {
     return Number.isFinite(configured) && configured >= 0 ? configured : shared.FORCE_CR_GAP_DEFAULT_MS;
   }
 
+  function beginDurableSessionClose(id, session) {
+    if(require('../principal/cooperative-handoff').activeHandoff(session) || require('../principal/pending-handoff').pendingNamespaceReserved(session,()=>shared.mailbox))return {success:false,httpStatus:409,code:'HANDOFF_FENCED',error:'Cooperative handoff reserves this instance.'};
+    if (session.isClosing && !session.closeDurabilityPending) {
+      return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing' };
+    }
+    const previous = Object.getOwnPropertyDescriptor(session, 'isClosing');
+    session.isClosing = true;
+    const saved = (0, shared.persistSessions)();
+    if (!saved || !saved.ok) {
+      if ((!saved || !saved.committed) && !session.closeDurabilityPending) {
+        if (previous) Object.defineProperty(session, 'isClosing', previous);
+        else delete session.isClosing;
+      } else {
+        // Rename reached disk, but its fsync failed. Keep the namespace reserved and permit
+        // only a close retry, never process actions or reuse before a successful durable save.
+        session.closeDurabilityPending = true;
+      }
+      return { success: false, httpStatus: 503, code: 'SESSION_STORE_WRITE_FAILED',
+        error: 'Session removal was not durably saved; no process action was attempted',
+        process_action_attempted: false, removal_visible: !!saved?.committed };
+    }
+    session.closeDurabilityPending = false;
+    (0, shared.revokeSessionCredential)(id);
+    return { success: true };
+  }
+
   async function teardownSessionById(id, options = {}) {
     const session = shared.sessions[id];
-    if (!session) {
-      return { success: false, httpStatus: 404, error: 'Session not found' };
-    }
+    if (!session) return { success: false, httpStatus: 404, error: 'Session not found' };
+    const prepared = beginDurableSessionClose(id, session);
+    if (!prepared.success) return prepared;
 
     const timeoutMs = Math.max(0, Number(options.timeoutMs ?? 5000));
     const force = options.force === true;
     const reason = options.reason || (force ? 'manual_force' : 'manual');
-    session.isClosing = true;
+    let kill = null, killError = null;
+    try {
+      kill = await shared.lifecycle.killSessionProcess(session, { ...effects.lifecycle, timeoutMs, force });
+      if (kill?.reason === 'ESCALATION_FAILED') killError = new Error('Process escalation was not confirmed');
+    } catch (error) { killError = error; }
 
-    const kill = await shared.lifecycle.killSessionProcess(session, { ...effects.lifecycle, timeoutMs, force });
-    emitSessionLifecycleEvent('session_closed', id, session, {
-      reason,
-      force,
-      pid: kill.pid,
-      signal: kill.signal || null,
-      escalated: kill.escalated === true,
+    // A process exit can remove the old record while killSessionProcess awaits. Never let its
+    // delayed cleanup unregister, revoke, purge or delete a successor with the same textual id.
+    const current = shared.sessions[id] === session;
+    if (current) emitSessionLifecycleEvent('session_closed', id, session, {
+      reason, force, pid: kill?.pid || null, signal: kill?.signal || null,
+      escalated: kill?.escalated === true, process_action_error: killError?.message || null,
       source: options.source || 'daemon'
     });
-
-    if (session.clients) {
-      session.clients.forEach(ws => {
-        try { ws.close(1000, 'Session destroyed'); } catch {}
-      });
+    (0, shared.cancelModalParkPoll)(session);
+    if (current) {
+      if (session.clients) session.clients.forEach(ws => { try { ws.close(1000, 'Session destroyed'); } catch {} });
+      if (session.ownerWs) { try { session.ownerWs.close(1000, 'Session destroyed'); } catch {} }
+      try { shared.terminalBackend.closeSurface(session); } catch {}
+      delete shared.sessions[id];
+      shared.sessionStateManager.unregister(id);
+      try { shared.mailbox.purge(id); } catch {}
+      shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
     }
-    if (session.ownerWs) {
-      try { session.ownerWs.close(1000, 'Session destroyed'); } catch {}
-    }
-
-    // Surface close is the orchestrator's job (Workspace Host adapter), per the 2026-05-30
-    // verdict — this call is a NO-OP on the managed path. It actuates only for a standalone
-    // telepty that opted in via AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
-    try { shared.terminalBackend.closeSurface(session); } catch {}
-
-    (0, shared.cancelModalParkPoll)(session);   // #760: a destroyed session must not keep polling its surface
-
-    delete shared.sessions[id];
-    (0, shared.revokeSessionCredential)(id);    // #815: kill path — the epoch dies with the instance
-    shared.sessionStateManager.unregister(id);
-    try { shared.mailbox.purge(id); } catch {}
-    shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
-    (0, shared.persistSessions)();
-
-    return {
-      success: true,
-      session_id: id,
-      status: 'closed',
-      reason,
-      force,
-      timeout_ms: timeoutMs,
-      kill
-    };
+    if (killError) return { success: false, httpStatus: 500, code: 'KILL_FAILED',
+      status: 'registry-removed-kill-unconfirmed', registry_removed: true, kill,
+      error: `Session was durably removed, but process teardown was not confirmed: ${killError.message}` };
+    return { success: true, session_id: id, status: 'closed', reason, force, timeout_ms: timeoutMs, kill };
   }
 
   function describeSessionTeardown(killError) {
@@ -886,7 +909,6 @@ function createSessionActions(shared, effects = {}) {
         return (0, shared.respondWithError)(res, applied.httpStatus || 400, applied.code || 'INVALID_REQUEST', applied.error);
       }
 
-      (0, shared.persistSessions)();
       res.json({
         success: true,
         session_id: resolvedId,
@@ -903,7 +925,14 @@ function createSessionActions(shared, effects = {}) {
       if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
       const session = shared.sessions[resolvedId];
       const id = resolvedId;
+      if (session.isClosing) return res.status(409).json({ success: false, code: 'SESSION_CLOSING', error: 'Session is closing' });
 
+      const denied = protectedInputFailure(session);
+      if (denied) return res.status(denied.httpStatus).json(denied);
+      if (session.sshRemote) {
+        const result = await require('../ssh-session').requestSshWrite(session, '\r');
+        return res.status(result.success ? 200 : result.httpStatus || 409).json(result);
+      }
       const preDelayMs = Math.min(Math.max(Number(req.body?.pre_delay_ms) || 0, 0), 1000);
       // Default raised 5000 → 10000 (0.3.1) to cover empirical claude REPL
       // ready window (3-6s on fresh spawn) with margin. Upper clamp raised
@@ -1366,8 +1395,8 @@ function createSessionActions(shared, effects = {}) {
     return value !== null && typeof value === 'object' && !Array.isArray(value) ? requestedId : null;
   }
 
-  function registerInjectRoute(app) {
-    app.post('/api/sessions/:id/inject', async (req, res) => {
+  function registerInjectRoute(app, routePath = '/api/sessions/:id/inject') {
+    app.post(routePath, async (req, res) => {
       const requestedId = req.params.id;
       // #1215 inject-exact-target — opt-in exact routing. With boolean `exact_target:true` the
       // target is the exact own record or nothing: a bare alias or a `-N` sibling name is 404 here
@@ -1379,11 +1408,31 @@ function createSessionActions(shared, effects = {}) {
       if (!resolvedId) return (0, shared.respondWithError)(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId, ...(exactTarget ? { exact_target: true } : {}) });
       const session = shared.sessions[resolvedId];
       const id = resolvedId;
+      if (req.body.expected_epoch !== undefined && req.body.expected_epoch !== session.sessionEpoch) {
+        return (0, shared.respondWithError)(res, 409, 'TARGET_EPOCH_MISMATCH', 'Target session epoch differs');
+      }
+      if (req.body.external_approval && !session.externalApprovalPolicy) {
+        return (0, shared.respondWithError)(res, 403, 'APPROVAL_POLICY_REQUIRED', 'Signed inject requires the enrolled target policy.');
+      }
       const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
       let { from, reply_to } = req.body;
       if (typeof prompt !== 'string') return (0, shared.respondWithError)(res, 400, 'INVALID_REQUEST', 'prompt is required');
+      let cooperativeConsent = null;
+      if(Object.hasOwn(req.body,'allow_cooperative_handoff') && typeof req.body.allow_cooperative_handoff!=='boolean')return res.status(400).json({code:'HANDOFF_CONSENT_INVALID'});
+      if(req.body.allow_cooperative_handoff===true){
+        const principal=require('../principal/http').verifiedRequestPrincipal(req,{action:'session.inject',target:id});
+        const recipient=require('../principal/http').storedOwningPrincipal(session.owningPrincipal);
+        if(!prompt.length || Buffer.from(prompt,'utf8').toString('utf8')!==prompt || Buffer.byteLength(prompt)>4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/u.test(prompt) || !principal || !recipient || !exactTarget || req.body.expected_epoch!==session.sessionEpoch || no_enter!==true
+          || !!from || auto_submit===true || session.type!=='wrapped' || session.sshRemote || session.externalApprovalPolicy || req.body.external_approval
+          || session.provenanceCapable===true || session.cooperativeHandoffCapable!==true || !session.interactionOwnerGeneration)return res.status(403).json({code:'HANDOFF_CONSENT_UNSUPPORTED'});
+        cooperativeConsent={schema:'telepty.pending-handoff-consent/v1',sid:id,origin_epoch:session.sessionEpoch,origin_owner_generation:session.interactionOwnerGeneration,
+          recipient:{id:recipient.id,audience:recipient.audience},sender:{id:principal.id,key_id:principal.keyId,audience:principal.audience,source:'ed25519'},
+          request_sha256:require('../principal/encoding').requestBodyDigest(req),proof_sha256:shared.crypto.createHash('sha256').update(req.headers['x-telepty-principal']).digest('hex')};
+      }
       // reply_to defaults to from when omitted
       if (from && !reply_to) reply_to = from;
+      const claimedReturn = claimedReturnMetadata(reply_to, req.body.claimed_cross_host === true || !!req.body.forwarding);
+      if (reply_to && !claimedReturn) return (0, shared.respondWithError)(res, 400, 'INVALID_RETURN_LOCATOR', 'Invalid claimed return locator');
 
       // Routing metadata stays in session/bus state, not in the visible prompt text.
       const finalPrompt = prompt;
@@ -1391,7 +1440,7 @@ function createSessionActions(shared, effects = {}) {
       // #43 P2 / #815 — daemon-verified sender identity (from the presented bearer, never body.from).
       // The full principal (sid, epoch, generation) so a consumer can tell WHICH INSTANCE of a sid
       // sent this; `verifiedSender` spreads the epoch/generation onto every audit line below.
-      const verifiedPrincipal = (0, shared.verifiedPrincipalFromReq)(req);
+      const verifiedPrincipal = req.body.forwarding ? null : (0, shared.verifiedPrincipalFromReq)(req);
       const verifiedSenderSid = verifiedPrincipal ? verifiedPrincipal.sid : null;
       const verifiedSender = (0, shared.verifiedSenderFields)(verifiedPrincipal);
 
@@ -1417,9 +1466,10 @@ function createSessionActions(shared, effects = {}) {
         // itself is unchanged; this only records the attempt.
         (0, shared.auditAppend)({
           ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
-          claimed_from: from || null, ...verifiedSender,
+          claimed_from: from || null, ...verifiedSender, claimed_return: claimedReturn,
           to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
-          origin: 'trusted-local', origin_host: shared.MACHINE_ID, ref_path: req.body.ref_path || null,
+          origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
+          origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
           payload: finalPrompt, delivery_result: `blocked:${peerVerdict.reason}`
         });
         return (0, shared.respondWithError)(res, 403, 'PEER_INJECT_BLOCKED',
@@ -1481,7 +1531,9 @@ function createSessionActions(shared, effects = {}) {
       try {
         const delivery = await (0, shared.deliverInjectionToSession)(id, session, finalPrompt, {
           noEnter: !!no_enter,
+          cooperativeHandoffConsent:cooperativeConsent,
           source: 'inject',
+          externalApproval: req.body.external_approval || null,
           from: from || 'inject',
           // #860 F2 — carried so that a park keeps its link to the write-ahead record. Null for an
           // untracked operator inject (no `from`), and every consumer of it no-ops on null.
@@ -1497,9 +1549,10 @@ function createSessionActions(shared, effects = {}) {
           }, session);
           (0, shared.auditAppend)({
             ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'inject',
-            claimed_from: from || null, ...verifiedSender,
+            claimed_from: from || null, ...verifiedSender, claimed_return: claimedReturn,
             to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
-            origin: 'trusted-local', origin_host: shared.MACHINE_ID, ref_path: req.body.ref_path || null,
+            origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
+            origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
             payload: finalPrompt, delivery_result: `failed:${delivery.code || 'DELIVERY_FAILED'}`
           });
           // #843 — close the write-ahead record. Without this the refusal is recorded in the AUDIT log
@@ -1508,14 +1561,23 @@ function createSessionActions(shared, effects = {}) {
           // body for the same reason: a caller told its dispatch was refused must be able to poll the
           // record that says so.
           const aborted = trackedRecord
-            ? await (0, shared.abortTrackedInjection)(inject_id, id, delivery.code, delivery.error)
+            ? await (0, shared.abortTrackedInjection)(inject_id, id, delivery.code, delivery.error, delivery.delivery_uncertain
+              ? { kind: 'inject_delivery_unknown', trigger: 'delivery_outcome_unknown', bytesWritten: null } : {})
             : 'no_tracked_inject';
           return (0, shared.respondWithError)(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error,
-            { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable' });
+            { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable',
+              ...(session.sshRemote ? { text_written: delivery.text_written === true,
+                text_bytes_written: delivery.text_bytes_written ?? null, bytes_written: delivery.bytes_written ?? null,
+                retry_safe: delivery.bytes_written === 0 && delivery.text_written !== true } : {}),
+
+              ...(delivery.delivery_uncertain ? { delivery_uncertain: true, retryable: false, bytes_written: null, submit: 'skipped' } : {}) });
         }
 
         if (from) session.lastInjectFrom = from;
-        if (reply_to) session.lastInjectReplyTo = reply_to;
+        if (reply_to) {
+          session.lastInjectReplyTo = reply_to;
+          session.lastInjectReturn = claimedReturn;
+        }
         if (thread_id) session.lastThreadId = thread_id;
 
         // #860 F2 — the service log gets the same distinction the audit line does. "Wrote" was printed
@@ -1527,14 +1589,15 @@ function createSessionActions(shared, effects = {}) {
         // #43 P1/P2 — one audit line per delivery (claimed + daemon-verified sender, hash-only).
         (0, shared.auditAppend)({
           ts: injectTimestamp, inject_id, kind: 'inject', source: 'inject',
-          claimed_from: from || null, ...verifiedSender,
+          claimed_from: from || null, ...verifiedSender, claimed_return: claimedReturn,
           to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
-          origin: 'trusted-local', origin_host: shared.MACHINE_ID, ref_path: req.body.ref_path || null,
+          origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
+          origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
           // #860 F2 — `queued` when the delivery was parked on the bootstrap / modal queue with zero
           // bytes written, `success` only for a delivery the machinery reported as written.
           payload: finalPrompt, delivery_result: (0, shared.deliveryAuditResult)(delivery)
         });
-        (0, shared.broadcastSessionEvent)('inject_written', id, session, {
+        (0, shared.broadcastSessionEvent)((0, shared.deliveryAuditResult)(delivery) === 'queued' ? 'inject_queued' : 'inject_written', id, session, {
           timestamp: injectTimestamp,
           extra: {
             inject_id,
@@ -1621,6 +1684,8 @@ function createSessionActions(shared, effects = {}) {
           inject_id,
           strategy: delivery.strategy,
           submit: delivery.submit,
+          ...(delivery.poll_only ? { queued: true, delivered: false, bytes_written: 0,
+            msg_id: delivery.msg_id, pending: delivery.pending, poll_only: true } : {}),
           ...(exactTarget ? { exact_target: true, session_id: id } : {}),
           ...(delivery.bootstrap_queued ? {
             bootstrap_queued: true,
@@ -1639,8 +1704,18 @@ function createSessionActions(shared, effects = {}) {
     app.post('/api/sessions/:id/kill', async (req, res) => {
       const requestedId = req.params.id;
       // #548: destructive op — must not cascade across alias-sharing siblings.
-      const resolvedId = (0, shared.resolveSessionForDestroy)(requestedId);
+      const ownedKill = req.query?.owned === 'true';
+      const resolvedId = ownedKill ? exactOwnSessionId(requestedId) : (0, shared.resolveSessionForDestroy)(requestedId);
       if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
+      const session = shared.sessions[resolvedId];
+      if (ownedKill || session.requireOwnerProof === true) {
+        if (exactOwnSessionId(requestedId) !== resolvedId) return res.status(404).json({ error: 'Exact session id required.' });
+        const principal = (0, shared.verifiedPrincipalFromReq)(req);
+        if (!principal || principal.sid !== resolvedId || !session.sessionEpoch
+            || principal.epoch !== session.sessionEpoch || principal.generation !== (Number(session.credentialGeneration) || 1)) {
+          return (0, shared.respondWithError)(res, 403, 'OWNED_KILL_FORBIDDEN', 'Kill requires the current session credential.');
+        }
+      }
 
       try {
         const timeoutSeconds = req.body && req.body.timeout != null
@@ -1657,7 +1732,7 @@ function createSessionActions(shared, effects = {}) {
           source: req.body && req.body.source ? String(req.body.source) : 'api'
         });
         if (!result.success) {
-          return res.status(result.httpStatus || 500).json({ error: result.error || 'Failed to kill session' });
+          return res.status(result.httpStatus || 500).json({ ...result, error: result.error || 'Failed to kill session' });
         }
         console.log(`[KILL] Session ${resolvedId} closed (reason=${result.reason}, force=${result.force}, pid=${result.kill.pid || 'none'})`);
         res.json(result);
@@ -1682,7 +1757,8 @@ function createSessionActions(shared, effects = {}) {
       // principal's sid, epoch and generation all matching the record. Checked before isClosing and
       // every side effect below (kill, unregister, revoke, purge, persist); a missing, foreign or
       // stale bearer is a 403 with no mutation. Requests without `owned=true` are untouched.
-      if (ownedDelete) {
+      if (ownedDelete || session.requireOwnerProof === true) {
+        if (exactOwnSessionId(requestedId) !== resolvedId) return res.status(404).json({ error: 'Exact session id required.' });
         const principal = (0, shared.verifiedPrincipalFromReq)(req);
         const generation = Number(session.credentialGeneration) || 1;
         if (!principal || principal.sid !== id || !session.sessionEpoch
@@ -1691,14 +1767,18 @@ function createSessionActions(shared, effects = {}) {
             'Owned delete requires the current session credential.', { requested: requestedId });
         }
       }
-      if (session.isClosing) return res.json({ success: true, status: 'closing' });
+      if (session.isClosing && !session.closeDurabilityPending) return res.status(409).json({ success: false, code: 'SESSION_CLOSING', error: 'Session is closing' });
       // BUG-C (shared-fate): a wrapped session can be co-bound by a stale/displaced owner bridge
       // (duplicate --id). A DELETE carrying a token that is NOT the current owner's, while a live
       // owner ws is still open, is that stale bridge exiting — it must NOT tear down the live owner.
       // Detach-only (no-op): leave the record and every client untouched. Tokenless callers
       // (operator `telepty delete`, ghost clean) and matching-token current-owner exits are
       // unaffected. Forceful kills go through POST /:id/kill (teardownSessionById), not here.
-      const ownerToken = req.query.owner_token;
+      const ownerHeaderCount = (req.rawHeaders || []).filter((name, index) => index % 2 === 0 && String(name).toLowerCase() === 'x-telepty-owner-token').length;
+      const ownerHeader = req.headers?.['x-telepty-owner-token'];
+      if (ownerHeaderCount > 1 || (ownerHeader !== undefined && (typeof ownerHeader !== 'string' || !ownerHeader || ownerHeader.length > 128))
+          || (ownerHeader && req.query.owner_token)) return res.status(400).json({code:'OWNER_TOKEN_HEADER_INVALID',error:'Invalid owner token carrier.'});
+      const ownerToken = ownerHeader || req.query.owner_token;
       if (session.type === 'wrapped'
           && ownerToken && session.ownerToken && ownerToken !== session.ownerToken
           && (0, shared.isOpenWebSocket)(session.ownerWs)) {
@@ -1711,9 +1791,10 @@ function createSessionActions(shared, effects = {}) {
       // `bin/session-cleanup.sh`, the operator entrance here, read that success as "the worker is
       // gone". Capturing the error as a value collapses the duplicated teardown into one path and
       // makes "a failed kill does not report success" structural rather than a thing to remember.
+      const prepared = beginDurableSessionClose(id, session);
+      if (!prepared.success) return res.status(prepared.httpStatus).json(prepared);
       let killError = null;
       try {
-        session.isClosing = true;
         if (session.type === 'wrapped') {
           if (session.clients) session.clients.forEach(ws => ws.close(1000, 'Session destroyed'));
         } else if (session.ptyProcess) {
@@ -1726,7 +1807,7 @@ function createSessionActions(shared, effects = {}) {
       // verdict — NO-OP on the managed path. The orchestrator's session-cleanup.sh closes the
       // surface on this normal CLI-exit (CLEANUP_REQUEST→wh_close). Actuates only for a standalone
       // telepty with AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE=1 (gate lives in closeSurface).
-      try { shared.terminalBackend.closeSurface(session); } catch {}
+      if (shared.sessions[id] === session) { try { shared.terminalBackend.closeSurface(session); } catch {} }
       // #60 Stage A §A2 (F1) — OBSERVE THE END BEFORE THE RECORD DISAPPEARS.
       //
       // This used to `delete sessions[id]` first and mark nothing at all. The PTY kill's onExit fires
@@ -1742,13 +1823,13 @@ function createSessionActions(shared, effects = {}) {
       // them. The mark runs synchronously, so the observation is emitted while `sessions[id]` is still
       // live; unregister then destroys the machine, which also makes the later onExit markDead a no-op
       // (its `if (sm)` guard) rather than a second, differently-named statement about one ending.
-      shared.sessionStateManager.markTerminationRequested(id, 'operator_delete', killError && killError.message);
-      shared.sessionStateManager.unregister(id);
-      delete shared.sessions[id];
-      (0, shared.revokeSessionCredential)(id);    // #815: DELETE — revoke before the id can be reused
-      try { shared.mailbox.purge(id); } catch {}
-      shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
-      (0, shared.persistSessions)();
+      if (shared.sessions[id] === session) {
+        shared.sessionStateManager.markTerminationRequested(id, 'operator_delete', killError && killError.message);
+        shared.sessionStateManager.unregister(id);
+        delete shared.sessions[id];
+        try { shared.mailbox.purge(id); } catch {}
+        shared.lifecycle.cleanupSessionArtifacts(id, effects.cleanup);
+      }
       const teardown = describeSessionTeardown(killError);
       console.log(killError
         ? `[KILL] Session ${id} registry-removed but the kill was NOT confirmed: ${killError.message}`
@@ -1776,7 +1857,6 @@ function createSessionActions(shared, effects = {}) {
           return (0, shared.respondWithError)(res, applied.httpStatus || 400, applied.code || 'INVALID_REQUEST', applied.error);
         }
 
-        (0, shared.persistSessions)();
         return res.json({ success: true, delivered: shared.busClients.size, event: applied.event });
       }
 

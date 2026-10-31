@@ -62,6 +62,38 @@ function buildAuditLine(record = {}) {
     payload_preview: previewOn ? truncatePreview(payload, previewBytes) : null,
     delivery_result: record.delivery_result || 'success'
   };
+  if (record.claimed_return && typeof record.claimed_return.locator === 'string') {
+    line.claimed_return_locator = record.claimed_return.locator;
+    line.return_locator_verification = 'unverified';
+    line.claimed_cross_host = record.claimed_return.claimed_cross_host === true;
+  }
+  // Broker adapters prehash before enqueueing so even an enabled preview setting cannot
+  // retain remote payloads. Node authentication never becomes a foreign session identity.
+  if (record.kind === 'broker' && record.broker) {
+    const broker = record.broker;
+    line.payload_sha256 = broker.payload_sha256;
+    line.payload_bytes = broker.payload_bytes;
+    line.payload_preview = null;
+    line.claimed_from = null;
+    line.verified_sender_sid = null;
+    line.verified_sender_epoch = null;
+    line.verified_sender_generation = null;
+    line.spoof_suspected = false;
+    line.origin = 'untrusted-remote';
+    line.broker_event = broker.event;
+    line.to = broker.target_sid;
+    line.broker_target_node = broker.target_node;
+    line.authenticated_node_id = broker.node;
+    line.authenticated_node_key_id = broker.key;
+    line.authenticated_identity_scope = 'broker-node';
+    line.foreign_session_identity_verified = false;
+    line.broker_request_sha256 = broker.request_sha256;
+    line.broker_receipt_id = broker.receipt_id;
+    line.broker_state = broker.state;
+    line.broker_http_status = broker.status;
+    line.broker_code = broker.code;
+    line.delivery_result = 'not-a-physical-delivery-receipt';
+  }
   return JSON.stringify(line);
 }
 
@@ -90,13 +122,14 @@ function createAuditWriter(options = {}) {
   const emitter = new EventEmitter();
   let queue = [];
   let timer = null;
-  let writing = false;
+  let writing = null;
   let closed = false;
   let droppedTotal = 0;
 
   ensureDir();
 
   function ensureDir() {
+    if (options.storage) return;
     const dir = path.dirname(filePath);
     try {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -121,19 +154,28 @@ function createAuditWriter(options = {}) {
   }
 
   function scheduleFlush() {
-    if (timer || writing || queue.length === 0) return;
+    if (closed || timer || writing || queue.length === 0) return;
     timer = setTimeout(() => { timer = null; flush().catch(() => {}); }, flushMs);
     if (timer && typeof timer.unref === 'function') timer.unref();
   }
 
   async function flush() {
-    if (writing || queue.length === 0) return;
-    writing = true;
+    if (writing) await writing;
+    if (queue.length === 0) return;
+    writing = writeBatch();
+    await writing;
+  }
+
+  async function writeBatch() {
     const batch = queue;
     queue = [];
     try {
-      await rotateIfNeeded();
       const data = batch.map((r) => buildAuditLine(r)).join('\n') + '\n';
+      if (options.storage) {
+        await options.storage.writeBatch(data, { maxBytes, maxFiles, maxAgeDays });
+        return;
+      }
+      await rotateIfNeeded();
       await fs.promises.appendFile(filePath, data, { mode: 0o600 });
       // appendFile's mode only applies on create — chmod each flush so a pre-existing file
       // (or umask-loosened create) is forced to 0600 (the file may carry preview content).
@@ -141,7 +183,7 @@ function createAuditWriter(options = {}) {
     } catch (err) {
       emitter.emit('audit_error', err);
     } finally {
-      writing = false;
+      writing = null;
       if (queue.length > 0) scheduleFlush();
     }
   }
@@ -175,7 +217,7 @@ function createAuditWriter(options = {}) {
   async function close() {
     closed = true;
     if (timer) { clearTimeout(timer); timer = null; }
-    await flush();
+    do { await flush(); } while (writing || queue.length > 0);
   }
 
   return {

@@ -226,9 +226,25 @@ test('daemon stop: with NO daemon running does NOT start one (the #55 ignore-arg
   // The old behavior printed "Starting telepty daemon..." and started a daemon.
   assert.doesNotMatch(res.stdout, /Starting telepty daemon/i, 'stop must never START a daemon');
 
-  // Give any (erroneously) spawned daemon a moment, then assert nothing is listening.
-  await new Promise((r) => setTimeout(r, 600));
-  assert.equal(await health(port), null, 'stop on an idle port must leave nothing listening');
+  // #121: the released ephemeral port may now belong to another parallel test.
+  // Only a state claim under this invocation's unique HOME is attributable to it.
+  assert.equal(fs.existsSync(path.join(home, '.telepty', 'daemon-state.json')), false,
+    'stop without a recorded daemon must not create a daemon state claim');
+});
+
+test('#121: stopping an unrecorded daemon leaves an independently owned listener intact', async t => {
+  const home = makeTempHome();
+  const server = net.createServer(socket => socket.end());
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const port = server.address().port;
+  const result = await runCli(['daemon', 'stop'], home, port);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(server.listening, true, 'a port listener is not evidence of a daemon owned by this invocation');
+  assert.equal(fs.existsSync(path.join(home, '.telepty', 'daemon-state.json')), false);
 });
 
 test('daemon restart: cycles the daemon (stop + start) and leaves it reachable', async () => {

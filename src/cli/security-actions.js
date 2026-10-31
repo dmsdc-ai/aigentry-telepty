@@ -1,10 +1,39 @@
+const { buildPtySpawnTarget } = require('../win-spawn-target');
 // Actual CLI security producers; retain the original non-strict semantics.
 // Construction does not read shared getters or start CLI/native/network work.
+// A registration error body is not credential issuance. Keep the wrapper and
+// its future child-spawn environment consistent only after successful issuance.
+function credentialOrigin(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'ws:') url.protocol = 'http:';
+    if (url.protocol === 'wss:') url.protocol = 'https:';
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
+    return url.origin;
+  } catch { return null; }
+}
+function scopedSessionToken(url, { env = process.env, localOrigin = 'http://127.0.0.1:3848' } = {}) {
+  const destination = credentialOrigin(url);
+  const boundOrigin = credentialOrigin(env.TELEPTY_SESSION_ORIGIN || localOrigin);
+  return destination && destination === boundOrigin ? env.TELEPTY_SESSION_TOKEN || null : null;
+}
+function adoptRegistrationCredential(response, data, env, childEnv = env, origin) {
+  if (!response?.ok || typeof data?.session_token !== 'string' || !data.session_token) return false;
+  const boundOrigin = origin === undefined ? null : credentialOrigin(origin);
+  if (origin !== undefined && !boundOrigin) return false;
+  if (boundOrigin) { env.TELEPTY_SESSION_ORIGIN = boundOrigin; childEnv.TELEPTY_SESSION_ORIGIN = boundOrigin; }
+  env.TELEPTY_SESSION_TOKEN = data.session_token;
+  childEnv.TELEPTY_SESSION_TOKEN = data.session_token;
+  return true;
+}
+
 function createCliSecurityActions(shared, {
   execSync = (...args) => (0, shared.execSync)(...args),
   execFileSync = (...args) => (0, shared.execFileSync)(...args),
   fetch = (...args) => (0, globalThis.fetch)(...args),
-  exit = code => process.exit(code)
+  exit = code => process.exit(code),
+  platform = process.platform,
+  guardUpdate = options => require('../update-plan').assertUpdateCanRun(options)
 } = {}) {
 function getAuthToken() {
   if (shared.cachedAuthToken == null) {
@@ -31,7 +60,7 @@ function isLocalHostname(host) {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
 }
 
-function resolveTargetToken(url) {
+function resolveTargetToken(url, { readOnly = false } = {}) {
   if (process.env.TELEPTY_AUTH_TOKEN) return process.env.TELEPTY_AUTH_TOKEN;
   let host = null;
   try {
@@ -45,7 +74,7 @@ function resolveTargetToken(url) {
     if (peerToken) return peerToken;
   } catch { /* not a URL we can read — see below: no host, so nothing is dialled from here */ }
   if (host && !isLocalHostname(host)) throw credentialRefusalError(host);
-  return getAuthToken();
+  return readOnly ? (0, shared.getConfig)({ create: false }).authToken : getAuthToken();
 }
 
 function credentialRefusalError(host) {
@@ -96,6 +125,8 @@ function classifyBackend(env, findKitty) {
 }
 
 function runUpdateInstall() {
+  // Applies to explicit and interactive update entry points before any command or repair.
+  try { guardUpdate({ platform }); } catch (error) { markCommandFailed(); throw error; }
   if (process.env.TELEPTY_SKIP_PACKAGE_UPDATE === '1') {
     return;
   }
@@ -160,16 +191,19 @@ function interceptSubcommandHelp(cmd, argv) {
 }
 
 const fetchWithAuth = (url, options = {}) => {
-  const headers = { ...options.headers, 'x-telepty-token': resolveTargetToken(url) };
+  const { readOnlyAuth = false, ...requestOptions } = options;
+  const headers = Object.fromEntries(new Headers(requestOptions.headers).entries());
+  headers['x-telepty-token'] = resolveTargetToken(url, { readOnly: readOnlyAuth });
+  delete headers['x-telepty-session-token'];
   // #43 P2 — present the per-session verified-sender token (minted at register, carried in the
   // parent-hijack-protected env beside TELEPTY_SESSION_ID) so the daemon can map token→sid and
   // record verified_sender_sid. Header only, never the body. Absent for operator/human shells.
-  const sessionToken = process.env.TELEPTY_SESSION_TOKEN;
+  const sessionToken = scopedSessionToken(url, { localOrigin: shared.localOrigin || `http://127.0.0.1:${shared.PORT || 3848}` });
   if (sessionToken) headers['x-telepty-session-token'] = sessionToken;
   // Wrapped here rather than at the 45 call sites: every one of them either prints `e.message`
   // or swallows the throw, so this is the single place the origin can be attached without
   // changing what any caller does with the error.
-  return fetch(url, { ...options, headers }).catch((error) => { throw namedTransportError(url, error); });
+  return fetch(url, { ...requestOptions, headers, redirect: 'error' }).catch((error) => { throw namedTransportError(url, error); });
 };
 
 function parseAllowInvocation(cmd, args) {
@@ -240,7 +274,10 @@ function parseAllowInvocation(cmd, args) {
     // #43 P2 — drop any inherited verified-sender token so a parent process cannot smuggle one
     // in; the daemon mints the real one at register (below) and we set it into the same
     // protected env.
+    delete process.env.TELEPTY_SESSION_CREDENTIAL_PATH;
+    delete process.env.TELEPTY_SESSION_CREDENTIAL_INSTANCE;
     delete process.env.TELEPTY_SESSION_TOKEN;
+    delete process.env.TELEPTY_SESSION_ORIGIN;
     // #47 P4 — same parent-hijack defense for the per-session provenance nonce: drop any inherited
     // value so a parent cannot pre-seed a known nonce, then carry the daemon-minted one (below).
     delete process.env.TELEPTY_SESSION_NONCE;
@@ -268,6 +305,7 @@ function createAllowSecurityContext(shared, {
       if (shared.allowSessionClosed) closed = true;
       return closed;
     }
+    function canWrite(child) { return !shared.handoffPending && canDeliver(child); }
     function canDeliver(child) {
       return !isClosed() && child === shared.child;
     }
@@ -276,6 +314,7 @@ function createAllowSecurityContext(shared, {
       const body = {
         session_id: shared.sessionId,
         command: shared.command,
+        ...(shared.sshPlan ? { ssh_remote: shared.sshPlan.metadata } : {}),
         cwd: process.cwd(),
         backend: shared.detectedBackend,
         cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
@@ -293,28 +332,53 @@ function createAllowSecurityContext(shared, {
       }).catch(() => {});
     }
 
+    function createOutputRelay({ onInteraction, onBytes, rewrite, write, sendOutput, observeReady, onReady }) {
+      return data => {
+        onInteraction();
+        onBytes(data.length);
+        write(rewrite(data));
+        sendOutput(data);
+        if (observeReady(data)) onReady();
+      };
+    }
+
+    // Fence retained callbacks before they can touch any shared successor state.
+    function subscribeChild(child, onData, onExit) {
+      let exited = false;
+      const current = () => !exited && canDeliver(child);
+      child.onData(data => { if (current()) onData(data); });
+      child.onExit(event => {
+        if (!current()) return;
+        exited = true;
+        onExit(event);
+      });
+    }
+
     function spawnChild() {
+      if (isClosed()) return null;
       // Windows: walk %PATHEXT% so bare names (`claude`, `codex`, `gemini`)
       // resolve to their npm-global `.cmd`/`.ps1` shims. POSIX: no-op. (#25)
-      const resolvedCommand = (0, shared.resolveWindowsExecutable)(shared.command, process.env);
+      const target = buildPtySpawnTarget(shared.command, shared.cmdArgs, shared.sessionEnv);
       // #26 (Snyk waiver, accepted-by-design): spawning the operator/user-chosen CLI IS the
       // `telepty allow` feature — `command` comes from the local CLI invocation, not an
       // untrusted boundary, so this is not an exploitable injection. Pre-existing baseline
       // finding; not fixable without removing `telepty allow`.
-      shared.child = spawnPty(resolvedCommand, shared.cmdArgs, {
+      shared.child = spawnPty(target.file, target.args, {
         name: 'xterm-256color',
         cols: getStdout().columns || 80,
         rows: getStdout().rows || 30,
         cwd: shared.sessionCwd,
-        env: shared.sessionEnv
+        env: shared.sshPlan ? require('../ssh-session').sshChildEnvironment(shared.sessionEnv) : shared.sessionEnv
       });
+      if (shared.onChildSpawn) (0, shared.onChildSpawn)(shared.child);
+      shared.resetInteractionProvider?.(shared.child);
       shared.sessionStartTime = now();
       updateDaemonProcessMetadata();
       return shared.child;
     }
 
     function enqueueBridgeMessage(text) {
-      if (isClosed()) return;
+      if (isClosed() || shared.handoffPending) return;
       const child = shared.child;
       const msgId = `${shared.sessionId}:${now()}:${++shared.bridgeMsgSeq}`;
       try {
@@ -322,19 +386,20 @@ function createAllowSecurityContext(shared, {
           msg_id: msgId, from: 'daemon', to: shared.bridgeTarget,
           payload: text, created_at: Math.floor(now() / 1000), attempt: 0,
         });
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         shared.bridgePendingCount++;
       } catch (err) {
         // Fallback: write directly if mailbox fails
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         console.error(`[BRIDGE] Mailbox enqueue failed, writing directly: ${err.message}`);
         invalidateBridgeInteraction('automated_input');
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         child.write(text);
       }
     }
 
     function isIdle() {
+      if(shared.handoffPending)return false;
       return shared.promptReady && (now() - shared.lastUserInputTime > shared.IDLE_THRESHOLD);
     }
 
@@ -360,7 +425,7 @@ function createAllowSecurityContext(shared, {
     }
 
     function flushBridgeMailbox() {
-      if (isClosed()) return;
+      if (isClosed() || shared.handoffPending) return;
       const child = shared.child;
       if (shared.queueFlushTimer) { clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
       if (shared.idleCheckTimer) { clearInterval(shared.idleCheckTimer); shared.idleCheckTimer = null; }
@@ -369,9 +434,9 @@ function createAllowSecurityContext(shared, {
       const batch = [];
       // Dequeue all pending messages
       while (true) {
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         const msg = shared.bridgeMailbox.dequeue(shared.bridgeTarget);
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         if (!msg) break;
         batch.push(msg);
       }
@@ -384,34 +449,34 @@ function createAllowSecurityContext(shared, {
         ttlSecs: (0, shared.bridgeInjectTtlSecs)(process.env), nowSecs,
       });
       for (const { msg, reason } of dropped) {
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         // Ack so the dropped inject clears in_flight instead of lingering; never write it.
         try { shared.bridgeMailbox.ack(shared.bridgeTarget, msg.msg_id); } catch {}
         console.warn(`\x1b[33m[BRIDGE] dropped ${reason} inject ${msg.msg_id} (age=${nowSecs - msg.created_at}s)\x1b[0m`);
       }
       for (const msg of deliver) {
-        if (!canDeliver(child)) return;
+        if (!canWrite(child)) return;
         const text = msg.payload;
         const msgId = msg.msg_id;
         const timer = setTimeout(() => {
           deliveryTimers.delete(timer);
-          if (!canDeliver(child)) return;
+          if (!canWrite(child)) return;
           invalidateBridgeInteraction('automated_input');
-          if (!canDeliver(child)) return;
+          if (!canWrite(child)) return;
           child.write(text);
-          if (!canDeliver(child)) return;
+          if (!canWrite(child)) return;
           try { shared.bridgeMailbox.ack(shared.bridgeTarget, msgId); } catch {}
         }, delay);
         deliveryTimers.add(timer);
         delay += text === '\r' ? 0 : 100;
       }
-      if (!canDeliver(child)) return;
+      if (!canWrite(child)) return;
       shared.bridgePendingCount = Math.max(0, shared.bridgePendingCount - batch.length);
       shared.promptReady = false;
     }
 
     function scheduleIdleFlush() {
-      if (isClosed() || shared.idleCheckTimer) return;
+      if (isClosed() || shared.handoffPending || shared.idleCheckTimer) return;
       // Poll every 500ms for idle state
       shared.idleCheckTimer = setInterval(() => {
         if (isClosed()) return;
@@ -453,6 +518,8 @@ function createAllowSecurityContext(shared, {
       if (closed) return false;
       closed = true;
       shared.allowSessionClosed = true;
+      shared.credentialChannel?.close();
+      shared.disposeInteractionProvider?.();
       for (const timer of deliveryTimers) clearTimeout(timer);
       deliveryTimers.clear();
       if (shared.queueFlushTimer != null) clearTimeout(shared.queueFlushTimer);
@@ -503,7 +570,11 @@ function createAllowSecurityContext(shared, {
     } catch {}
     }
 
-return { updateDaemonProcessMetadata, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox };
+function cooperativeQueueEmpty(){
+      if(deliveryTimers.size || shared.bridgePendingCount || shared.queueFlushTimer)return false;
+      try{return shared.bridgeMailbox.snapshotCustody(shared.bridgeTarget).length===0;}catch{return false;}
+    }
+return { cooperativeQueueEmpty, updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox };
 }
 
-module.exports = { createCliSecurityActions, createAllowSecurityContext };
+module.exports = { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken, credentialOrigin };

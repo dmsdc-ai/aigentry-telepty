@@ -2,7 +2,7 @@
 
 **Connect any terminal to any terminal, any machine.**
 
-telepty is an **agent session control plane**: the CLIs keep doing the work (data plane), telepty addresses their sessions by name and guarantees delivery. Concretely, a background daemon plus a session bridge — it lets you spawn, attach to, and inject commands into terminal sessions, locally or across machines via Tailscale.
+telepty is an **agent session control plane**: the CLIs keep doing the work (data plane), telepty addresses their sessions by name and records delivery observations. Acceptance, writes, consumption and replies remain distinct. Concretely, a background daemon plus a session bridge — it lets you spawn, attach to, and inject commands into terminal sessions, locally or across machines via Tailscale.
 
 Built for AI CLI workflows (Claude Code, Codex, Gemini CLI), but works with any interactive terminal program.
 
@@ -23,12 +23,59 @@ iwr -useb https://raw.githubusercontent.com/dmsdc-ai/aigentry-telepty/main/insta
 npm install -g @dmsdc-ai/aigentry-telepty
 ```
 
-The installer sets up telepty as a background service (`launchd` on macOS, `systemd` on Linux, detached process on Windows).
+### Will the daemon come back after a reboot?
+
+`npm install -g` installs the package, not a service: it never creates one, and it prints a
+one-line hint when nothing supervises the daemon. Ask and decide explicitly:
+
+```bash
+telepty service status            # what supervises the daemon, and does it survive a reboot?
+telepty service install           # consented; prints the plan first, needs no admin
+telepty service start|stop|restart
+telepty service uninstall         # back to no service (config and sessions are kept)
+```
+
+| Platform | Mechanism (user scope) | Starts at login | Starts at boot without login |
+| --- | --- | --- | --- |
+| macOS | LaunchAgent `com.aigentry.telepty` in `~/Library/LaunchAgents` | yes | **no** — that needs a root LaunchDaemon (reported, not attempted) |
+| Linux | `systemd --user` unit `~/.config/systemd/user/telepty.service` | yes | only with linger: `loginctl enable-linger $USER`. `service status` reports the current state; telepty never runs that command for you |
+| Windows | Task Scheduler logon task `telepty-daemon` (`/sc onlogon /rl LIMITED`) | yes | **no** — a boot/SYSTEM task needs admin (reported, not attempted) |
+
+`install.sh` and a root `install.js` still write the system-scope Linux unit; `telepty service`
+surfaces it read-only and prints the exact `sudo systemctl …` command rather than competing with
+it. `install.ps1` creates no task (it starts a detached process), so on Windows the logon task
+comes from `telepty service install`.
+
+Explicit uninstall preserves descriptors whose ownership cannot be established, including
+legacy broker or bin-only plists. Inspect those descriptors before removing them manually.
+
+### Migrating from the unscoped `aigentry-telepty`
+
+The legacy package `aigentry-telepty` declares the same `telepty` command as this scoped one. npm
+keeps one link per command name, so removing the legacy package can take the shared `telepty` link
+with it (`telepty: command not found`). `telepty service status` and `npm i -g` both report which
+package currently owns the command. To migrate:
+
+```bash
+telepty service stop                                  # only if a service is installed
+npm rm -g aigentry-telepty
+npm i -g @dmsdc-ai/aigentry-telepty@{{version}} --force   # --force relinks the shared command
+telepty --version                                     # must print {{version}}
+```
 
 **Windows is BETA.** It installs and the cross-machine demo below is a real Windows box, but
 `windows-latest` CI is quarantined as non-blocking (Windows-specific failures tracked in #577),
 the UDS delivery path is POSIX-only, and the inbound tailnet firewall rule only auto-installs
 when the daemon runs elevated — otherwise you run one `netsh` command it prints for you.
+
+## Optional signed HTTP principals
+
+Legacy authentication remains the default. Linux operators can explicitly configure
+public Ed25519 keys and exact action/target grants for an HTTP-only strict mode.
+Missing/unsafe trust configuration refuses startup; shared-token/JWT/session-token
+fallback and all WebSocket upgrades are refused in that mode. Existing session
+credential and approval checks still apply. See the [implemented contract and
+limits](docs/security/principal-http-132.md); no OS-account or OIDC identity is claimed.
 
 ## Quick Start
 
@@ -173,9 +220,10 @@ readiness-aware inject/submit, event streams, cross-machine session control.
   The full steps are in CHANGELOG.md under 0.10.0.
 - If a daemon crashes or is SIGKILLed, the ledger lock stays behind. Tracked injects are then
   refused until you run `telepty ledger unlock --confirm`.
-- **Windows:** the new store is expected not to open, because directory fsync is unavailable
-  there. In that case tracked injects (those with `from`) are refused and untracked injects keep
-  working. This is not yet measured.
+- **Durability:** on every OS, a tracked inject is acknowledged only after its record is fsynced
+  to disk. Windows cannot flush directories, so there the store reports
+  `dir_flush: unsupported` in `telepty ledger status`. It still fsyncs every file. New file names
+  and renames are left to the file system across a power loss.
 
 ## Core Commands
 
@@ -184,7 +232,7 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | `telepty daemon start\|stop\|restart` | Manage the background daemon (port 3848); `start` is detached and returns immediately |
 | `telepty daemon` | Run the daemon in the **foreground** — this is what launchd/systemd invoke; it blocks your shell |
 | `telepty allow --id <name> <cmd>` | Wrap a CLI for inject control (survives a daemon restart) |
-| `telepty spawn --id <name> <cmd>` | Spawn a new background session (dies with the daemon) |
+| `telepty spawn --id <name> [--background] [--] <cmd>` | Spawn and enter a daemon-owned session; `--background` returns immediately (session dies with daemon) |
 | `telepty list [--json]` | List sessions on this daemon + registered peers |
 | `telepty attach [id[@host]]` | Attach to a session (interactive picker if no ID) |
 | `telepty inject <id[@host]> "text"` | Inject text and submit it. The Enter rides along as a deferred PTY write and is **not** gated — there is no no-submit mode |
@@ -202,7 +250,7 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | `telepty disconnect <name>\|--all` | Remove a registered peer |
 | `telepty reply "text"` | Reply to the last injector |
 | `telepty monitor` | Real-time event billboard |
-| `telepty listen` | Stream event bus as JSON |
+| `telepty listen --json` | Stream event bus as JSON lines without a startup banner |
 | `telepty update` | Update to latest version |
 
 ## Environment variables
@@ -255,45 +303,40 @@ delivered in order once the surface clears. A parked inject reports
 
 ## Cross-Machine Sessions
 
-Two different things are at play here, and only one of them is zero-config:
+Reachability, discovery, and authorization are separate.
 
-- **Reachability is zero-config on a tailnet.** The daemon binds and trusts tailnet peers by
-  itself (below), and `<id>@<host>` targeting works right away against any reachable daemon —
-  no registration step. `inject`, `attach`, `read-screen`, `enter`, `multicast` and `rename`
-  all accept `@<host>`.
-- **Discovery is not.** `telepty list` enumerates this daemon's sessions plus the peers
-  recorded in `~/.telepty/peers.json` — it does **not** scan the tailnet. Two fresh tailnet
-  machines each see only their own sessions until you register one with the other:
+- The daemon can bind loopback and a detected tailnet interface automatically.
+- `telepty discover --json` enumerates online IPv4 candidates reported by the local
+  `tailscale status --json` client. It performs no peer requests, writes no configuration,
+  enrolls no keys, and sends no credentials. Advertised names and IPs are observations,
+  **not authentication**. Candidate output is capped at 256 and the provider call at
+  1.5 seconds / 1 MiB. Status is cached for 15 seconds within one process.
+- `telepty list` continues to query only enrolled peers in `~/.telepty/peers.json`.
+  Discovery does not turn a new device into an authorized controller or copy a secret.
+- HTTP peers, including tailnet peers, must present the destination daemon's credential
+  (or a separately configured supported verifier). Loopback also requires authentication.
+  `TELEPTY_AUTH_TOKEN` is the explicit operator override; otherwise the destination's
+  enrolled `host:port` token is used, never the local daemon token as a foreign fallback.
 
-  ```bash
-  telepty connect-http <host>        # HTTP only — no sshd on either side
-  telepty connect <user@host>        # over SSH (ControlMaster)
-  telepty peers                      # what is registered
-  telepty disconnect <name>           # unregister
-  ```
+```bash
+telepty discover --json
+telepty connect-http <host> --token <destination-daemon-token>
+telepty connect <user@host>       # SSH transport, with normal SSH authentication
+telepty peers
+```
 
-  After that, `list` / `broadcast` / `multicast` see the peer's sessions too.
+### Tailscale auto-bind is reachability, not identity
 
-### Zero-config on Tailscale (auto bind + auto trust)
+A detected tailnet interface can make the daemon reachable without setting manual bind
+variables. `TELEPTY_PEER_ALLOWLIST` narrows network admission and
+`TELEPTY_NO_TAILNET_AUTO=1` disables automatic tailnet binding. These controls do not
+replace API authentication. A shared `100.64.0.0/10` address alone does not prove a
+user, agent, or Tailscale identity, and discovery never establishes trust.
 
-On a host that is on a **Tailscale tailnet**, a fresh install is cross-machine-*reachable* with
-**no manual env**. At startup the daemon detects its tailnet interface (a `100.64.0.0/10`
-address) and:
-
-- **binds :3848 to the tailnet IP only** (plus loopback) — LAN/public interfaces stay
-  closed, so the control API is reachable **only from your Tailnet**, never the flat LAN;
-- **trusts tailnet peers automatically** — Tailscale's own ACLs already gate who is on the
-  tailnet, so a tailnet peer needs no token or manual allowlist.
-
-> **Trust boundary:** on a Tailscale host, telepty auto-exposes :3848 to your **entire
-> tailnet** (every peer Tailscale's ACLs let onto it). If you share your tailnet with
-> machines you don't fully trust, set `TELEPTY_PEER_ALLOWLIST` to restrict to specific
-> peers/CIDRs, or `TELEPTY_NO_TAILNET_AUTO=1` to stay loopback-only.
-
-**Zero-config cross-machine is Tailscale-specific.** On a non-Tailscale host (plain LAN,
-other mesh VPNs) the daemon stays **loopback-only** (the safe default) — set `TELEPTY_BIND`
-+ `TELEPTY_PEER_ALLOWLIST` manually to expose it. Manual `TELEPTY_BIND` / `HOST` /
-`TELEPTY_PEER_ALLOWLIST` always win over auto-detect.
+On other networks the daemon stays loopback-only unless explicit bind/allowlist
+configuration is supplied. Manual `TELEPTY_BIND` / `HOST` /
+`TELEPTY_PEER_ALLOWLIST` overrides auto-detection. No such live settings are changed by
+`discover`.
 
 **Windows:** Defender Firewall blocks inbound on the tailnet interface by default. On the
 auto path the daemon adds the inbound allow-rule automatically when run elevated, otherwise
@@ -464,3 +507,52 @@ telepty runs **standalone** — it needs none of the other aigentry modules and 
 ## License
 
 MIT
+
+
+### Machine-readable event stream
+
+`telepty listen --json` writes one JSON object per nonempty stdout line, including
+startup: no human banner is emitted in this mode. Each bus payload is preserved and
+includes the source `host`. Diagnostics go to stderr. Plain `listen` keeps its banner;
+`monitor` keeps its human billboard.
+
+A session reconnect is the daemon's event, for example
+`{"type":"session_reconnect","host":"127.0.0.1","session_id":"worker","transport":{"health_status":"CONNECTED"}}`.
+Additional event fields may be present. This describes a session transport
+reconnecting; it is not delivery, consumption or task-completion confirmation.
+If the listener's bus socket disconnects, the current CLI reports that on stderr
+and exits nonzero; it does not promise automatic stream reconnection or replay.
+### Poll-only mailbox sessions
+
+A turn-based agent can register with `delivery_type: "mailbox"` and an integer
+`lease_seconds` from 1 to 3600 (default 300). Registration requires the daemon
+credential and returns a new session credential once. A mailbox session needs no
+PTY, owner WebSocket, HTTP listener, or Unix socket. Its transport status is
+`CONNECTED` only while its lease is valid; the list response includes
+`lease_expires_at` as Unix milliseconds.
+
+Injects return `strategy: "mailbox"`, `queued: true`, `delivered: false`, and
+`bytes_written: 0`. Text remains pending until explicitly acknowledged; the push
+delivery engine does not dequeue or retry mailbox sessions. An acknowledgement
+records receipt only and does not assert that the task was consumed or completed.
+
+A poller provisioned with its session bearer in `TELEPTY_SESSION_TOKEN` can run:
+
+```sh
+telepty mailbox my-agent --json
+telepty mailbox my-agent --since last-message-id --json
+telepty mailbox ack my-agent message-id
+```
+
+These commands target the configured local daemon. With a session bearer they do
+not load or send the shared daemon credential. Otherwise they use the normal
+configured daemon credential. Neither command prints credentials.
+
+Renew with `POST /api/sessions/:id/lease` and `{ "lease_seconds": 300 }`, or
+re-register the same id. Renewal requires the current
+`x-telepty-session-token`, including when the caller also holds the daemon
+credential. A session bearer grants only that exact mailbox's read, ack, and
+renewal operations; it grants no listing, inject, deletion, or other-session
+access. Expiry stops new injects but preserves pending messages and permits the
+owner to read, acknowledge, and renew. Mailbox type and lease survive a daemon
+restart with the same credential verifier; no bearer is saved to disk.

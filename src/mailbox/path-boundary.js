@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const LEAVES = ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl', '.lock'];
+const LEAVES = ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl', 'handoff-settlements.jsonl', '.lock'];
 
 function unsafePath() {
   return Object.assign(new Error('Unsafe mailbox storage path'), { code: 'MAILBOX_UNSAFE_PATH' });
@@ -55,7 +55,11 @@ function resolveSessionDir(root, id) {
   if (st) {
     if (!st.isDirectory() || st.isSymbolicLink()) throw unsafePath();
     // Inspect links without following their targets; preflight before any effects.
-    for (const leaf of LEAVES) checkLeaf(path.join(dir, leaf));
+    for (const leaf of LEAVES) {
+      const file = path.join(dir, leaf), lock = leaf === '.lock' && lstatOptional(file);
+      if (lock && lock.isDirectory() && !lock.isSymbolicLink()) continue;
+      checkLeaf(file);
+    }
   }
   return dir;
 }
@@ -112,4 +116,4 @@ function rethrowBoundary(err) {
   if (err.code === 'MAILBOX_INVALID_SESSION_ID' || err.code === 'MAILBOX_UNSAFE_PATH') throw err;
 }
 
-module.exports = { canonicalRoot, resolveSessionDir, checkRoot, checkFile, openFile, readFile, writeFile, unlinkFile, rethrowBoundary };
+module.exports = { validateSessionId, canonicalRoot, resolveSessionDir, checkRoot, checkFile, openFile, readFile, writeFile, unlinkFile, rethrowBoundary };

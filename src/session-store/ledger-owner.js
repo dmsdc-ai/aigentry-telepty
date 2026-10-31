@@ -56,6 +56,7 @@ function createStore(options) {
   const hotMaxRecords = options.hotMaxRecords || F.HOT_MAX_RECORDS;
   const hotMaxBytes = options.hotMaxBytes || F.HOT_MAX_ENCODED_BYTES;
   const coldIndexMaxBytes = options.coldIndexMaxBytes || F.COLD_INDEX_MAX_BYTES;
+  const platform = options.platform || process.platform;   // #1207 WIN-1: injectable for the in-process regression only
 
   // ---- state -------------------------------------------------------------------------------
   const S = {
@@ -79,13 +80,34 @@ function createStore(options) {
     legacy: null, recovery: null, migration: null,
     closing: false, possiblyDurable: null,
     chunkQueues: new Map(),         // req -> [chunks]
-    io: { writes: 0, bytes: 0, fsyncs: 0, renames: 0 },
+    io: { writes: 0, bytes: 0, fsyncs: 0, renames: 0, dir_flush_unsupported: 0 },
+    // #1207 WIN-1 — what this owner can actually promise: file data is fsynced before every ACK on
+    // every platform; directory entries are explicitly flushed where the OS supports it.
+    durability: { platform, file_flush: 'fsync', dir_flush: 'not_attempted', dir_flush_code: null },
   };
 
   // ---- fs helpers --------------------------------------------------------------------------
+  // #1207 WIN-1 — a DIRECTORY flush is a platform capability, not an I/O result. On win32 libuv
+  // opens the directory (FILE_FLAG_BACKUP_SEMANTICS) but FlushFileBuffers on that read-only handle
+  // fails ERROR_ACCESS_DENIED → EPERM (measured, Windows CI run 41169574692: every store open failed
+  // `open_failed` EPERM fsync). That one shape — the directory opened, its flush refused with EPERM,
+  // on win32 — is recorded as `dir_flush: unsupported` and the operation continues. Everything else
+  // still throws and fails closed: a directory that cannot be OPENED, any other errno, every errno on
+  // other platforms, and every FILE fsync (segments, checkpoint members, MANIFEST temporaries, the
+  // migration copy), which is what the ACK depends on. Rename atomicity is unchanged. What is LOST on
+  // win32 is only the explicit flush of directory entries (a newly created segment's name, a rename):
+  // their persistence across power loss is left to the file system's own metadata handling and is
+  // not promised by this owner. status().durability names that mode instead of hiding it.
   function fsyncDir(p) {
     let fd = null;
-    try { fd = fs.openSync(p, 'r'); fs.fsyncSync(fd); S.io.fsyncs++; } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } } }
+    try {
+      fd = fs.openSync(p, 'r');
+      try { fs.fsyncSync(fd); S.io.fsyncs++; if (S.durability.dir_flush !== 'unsupported') S.durability.dir_flush = 'flushed'; }
+      catch (error) {
+        if (!(platform === 'win32' && error && error.code === 'EPERM')) throw error;
+        S.durability.dir_flush = 'unsupported'; S.durability.dir_flush_code = error.code; S.io.dir_flush_unsupported++;
+      }
+    } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } } }
   }
   function writeFileDurable(file, buf, mode = 0o600, flags = 'w') {
     const fd = fs.openSync(file, flags, mode);
@@ -963,7 +985,7 @@ function createStore(options) {
     return { store: S.state, reason: S.reason, epoch: S.epoch, seq_committed: S.seqCommitted, seq_next: S.seqNext, counts: counts(), resident: resident(),
       recovery: S.recovery, unapplied: S.unapplied.slice(0, MAX_EXAMPLES), possibly_durable: S.possiblyDurable ? S.possiblyDurable.group : null,
       legacy: S.legacy, segments: S.segments.map((s) => ({ name: s.name, closed: s.closed, bytes: s.bytes })), frames_since_checkpoint: S.framesSinceCheckpoint,
-      checkpoint: { n: S.checkpointN, pos: S.checkpointPos }, cold_index_bytes: S.coldIndexBytes, io: { ...S.io }, live_sids: S.liveSids.size, dir, lockPath };
+      checkpoint: { n: S.checkpointN, pos: S.checkpointPos }, cold_index_bytes: S.coldIndexBytes, io: { ...S.io }, durability: { ...S.durability }, live_sids: S.liveSids.size, dir, lockPath };
   }
   function exportV3(out) {
     if (typeof out !== 'string' || !path.isAbsolute(out)) return { ok: false, reason: 'export_path_invalid' };

@@ -53,7 +53,9 @@ function readConfig() {
   return parsed;
 }
 
-function getConfig() {
+function getConfig(options = {}) {
+  // Read-only diagnostics must never create directories or mint a first-run credential.
+  if (options.create === false) return readConfig();
   if (!fs.existsSync(CONFIG_DIR)) {
     fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 }); // Restrict permissions
   }

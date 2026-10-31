@@ -269,6 +269,27 @@ async function startTestDaemon(options = {}) {
     }
   }, { timeoutMs: 7000, description: 'daemon start' });
 
+  // #1207 — the tracked-injection store opens asynchronously, AFTER the listener is up, and a tracked
+  // inject (`from` set) is refused `503 recovering` until it has. Tests written against the old
+  // synchronous ledger send one right after start, so by default readiness also waits (bounded) until
+  // the store has SETTLED — any state but `not_opened` / `recovering`; `lock_present` and the
+  // unavailable states count as settled and are left for the test to assert. A status this harness
+  // cannot read (non-200) is not waited on, and a timeout proceeds unchanged rather than adding a
+  // failure. `awaitLedger: false` keeps the old readiness for tests that observe the recovery itself.
+  if (options.awaitLedger !== false) {
+    const deadline = Date.now() + (options.ledgerTimeoutMs ?? 10000);
+    while (Date.now() < deadline && !exitState.exited) {
+      let store = null;
+      try {
+        const status = await request('/api/ledger/status');
+        if (status.status !== 200 || !status.body || !status.body.client) break;
+        store = status.body.client.store;
+      } catch { break; }
+      if (store !== 'not_opened' && store !== 'recovering') break;
+      await delay(25);
+    }
+  }
+
   async function cleanupSessions() {
     const list = await request('/api/sessions');
     if (list.status !== 200 || !Array.isArray(list.body)) {
