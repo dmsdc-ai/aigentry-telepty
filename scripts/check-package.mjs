@@ -47,6 +47,27 @@ const hash = (bytes, algorithm = 'sha256', encoding = 'hex') =>
 const pkg = json(path.join(checkout, 'package.json'));
 const WIN = process.platform === 'win32';
 assert.ok(['linux', 'darwin', 'win32'].includes(process.platform), 'Linux/macOS/Windows only');
+
+// Task 1215 consumer84 (failure-only, read-only; POSIX callers only): after the unchanged 15 s "PTY exit after delete"
+// deadline has ALREADY failed, ONE bounded `ps` read of the exact PTY child the daemon itself listed (ptyPid of the
+// already-fetched session) — state/PID/PPID columns only, never command or environment; nothing is signalled and no
+// other pid is looked up. Labels: live | zombie | absent | unknown (no listed pid, ps unavailable/timed out/unparsable).
+// The caller appends the label to the ORIGINAL error and rethrows it: no label is ever a pass.
+function ptyProcessState(sessions, sid, daemonPid) {
+  const entry = Array.isArray(sessions) ? sessions.find((s) => s && s.id === sid) : null;
+  const pid = entry ? entry.ptyPid : null;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { state: 'unknown', reason: 'no_listed_pty_pid' };
+  const r = spawnSync('ps', ['-o', 'stat=', '-o', 'pid=', '-o', 'ppid=', '-p', String(pid)],
+    { shell: false, timeout: 1000, maxBuffer: 8192, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const base = { pid, ps_status: r.status, ps_signal: r.signal || null, ps_stderr_bytes: Buffer.byteLength(r.stderr || '') };
+  if (r.error) return { ...base, state: 'unknown', reason: typeof r.error.code === 'string' ? r.error.code.slice(0, 32) : 'ps_error' };
+  const out = String(r.stdout || '').trim();
+  if (r.status === 1 && out === '') return { ...base, state: 'absent' };
+  const m = /^([A-Za-z<>+]{1,8})\s+(\d+)\s+(\d+)$/.exec(out);
+  if (r.status !== 0 || !m || Number(m[2]) !== pid) return { ...base, state: 'unknown', reason: 'ps_unparsable' };
+  const ppid = Number(m[3]);
+  return { ...base, state: m[1].startsWith('Z') ? 'zombie' : 'live', stat: m[1], ppid, ppid_is_daemon: Number.isSafeInteger(daemonPid) ? ppid === daemonPid : null };
+}
 assert.equal(pkg.name, '@dmsdc-ai/aigentry-telepty');
 assert.equal(pkg.version, '0.10.0');
 const DARWIN_READER = 'src/principal/native/prebuilt/darwin/authority-darwin.node';
@@ -467,7 +488,16 @@ try {
         ptyExit.catch(() => {}); // observed below through within(); never an unhandled rejection meanwhile
         const removed = await call('/api/sessions/' + encodeURIComponent(sid), { method: 'DELETE' });
         assert.equal(removed.status, 200, 'PTY delete'); assert.equal(removed.body && removed.body.success, true);
-        await within(ptyExit, 15000, 'PTY exit after delete'); // the daemon's own onExit record for the owned PTY
+        await within(ptyExit, 15000, 'PTY exit after delete') // the daemon's own onExit record for the owned PTY
+          .catch((error) => { // Task 1215 consumer84: failure-only, after the unchanged deadline; the same error is rethrown
+            if (!WIN) {
+              let observed;
+              try { observed = ptyProcessState(listed.body, sid, meta && meta.body ? meta.body.pid : null); }
+              catch { observed = { state: 'unknown', reason: 'observer_error' }; }
+              error.message += ' | pty_process ' + JSON.stringify(observed);
+            }
+            throw error;
+          });
         if (WIN) {
           const stop = await call('/api/daemon/stop', { method: 'POST', body: JSON.stringify({ pid: meta.body.pid, instance_id: meta.body.instance_id }) });
           assert.equal(stop.status, 202, 'graceful stop accepted');

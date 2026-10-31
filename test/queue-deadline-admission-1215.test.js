@@ -133,13 +133,20 @@ test('P1 control C3: SESSION_GONE keeps precedence over the expired deadline and
   await turn();
   assert.ok(BOUND_MS > SUBMIT_DELAY_MS + (bCalled - aReturned), 'PRECONDITION: the holder CR is due before the waiter deadline');
   delete fixture.sessions['p1-c3']; // the instance is gone while the waiter is queued (as test/session-delivery-identity-unit)
-  const blockStart = performance.now();
-  blockLoop(BOUND_MS + 400);
-  assert.ok(performance.now() - blockStart > BOUND_MS + 100, 'PRECONDITION: both timers are overdue');
-  const b = await waiter;
-  await sleep(SUBMIT_DELAY_MS + 300);
-  assert.equal(b.code, 'SESSION_GONE', `a gone instance answers SESSION_GONE, not QUEUE_TIMEOUT: ${JSON.stringify({ code: b.code ?? null })}`);
-  assert.equal(b.httpStatus, 410);
-  assert.equal(bText(session), 0, 'no write into a gone instance');
-  assert.deepEqual(session.written.map(unwrap), ['HOLDER-A'], 'the holder CR is withheld from a gone instance, too');
+  try {
+    const blockStart = performance.now();
+    blockLoop(BOUND_MS + 400);
+    assert.ok(performance.now() - blockStart > BOUND_MS + 100, 'PRECONDITION: both timers are overdue');
+    const b = await waiter;
+    await sleep(SUBMIT_DELAY_MS + 300);
+    assert.equal(b.code, 'SESSION_GONE', `a gone instance answers SESSION_GONE, not QUEUE_TIMEOUT: ${JSON.stringify({ code: b.code ?? null })}`);
+    assert.equal(b.httpStatus, 410);
+    assert.equal(bText(session), 0, 'no write into a gone instance');
+    assert.deepEqual(session.written.map(unwrap), ['HOLDER-A'], 'the holder CR is withheld from a gone instance, too');
+  } finally {
+    // Task 1215 queue80 (teardown only, after every assertion): the fixture registered this record's SessionStateMachine
+    // (a referenced setInterval, session-state.js) and dispose() unregisters only ids still in `sessions`. Re-listing the
+    // record lets the unchanged dispose() release it — the one Timeout that kept run 41252716256 alive to its 60 s bound.
+    fixture.sessions['p1-c3'] = session;
+  }
 });

@@ -548,6 +548,12 @@ function createSessionDeliveryContext({
     const queueEnteredAt = Date.now();
     const queueDeadline = queueEnteredAt + SUBMIT_QUEUE_TIMEOUT_MS;
     let waitRounds = 0; // #1215 G5 diagnostics only: holders this caller waited behind
+    const queueTimeoutRefusal = () => {
+      emitQueueTimeoutDiag(session, { bound_ms: SUBMIT_QUEUE_TIMEOUT_MS, queue_wait_ms: Date.now() - queueEnteredAt,
+        pre_barrier_in_delivery_ms: queueEnteredAt - now, wait_rounds: waitRounds });
+      return { success: false, httpStatus: 503, code: 'QUEUE_TIMEOUT', queue_wait_ms: Date.now() - queueEnteredAt,
+        error: `Earlier submits on this session did not clear within ${SUBMIT_QUEUE_TIMEOUT_MS} ms; nothing was written. Retry.` };
+    };
     while (session.pendingSubmit) {
       waitRounds++;
       const remaining = queueDeadline - Date.now();
@@ -557,16 +563,14 @@ function createSessionDeliveryContext({
         new Promise((resolve) => { timer = setTimeout(resolve, remaining, true); })
       ]);
       clearTimeout(timer);
-      if (timedOut) {
-        emitQueueTimeoutDiag(session, { bound_ms: SUBMIT_QUEUE_TIMEOUT_MS, queue_wait_ms: Date.now() - queueEnteredAt,
-          pre_barrier_in_delivery_ms: queueEnteredAt - now, wait_rounds: waitRounds });
-        return { success: false, httpStatus: 503, code: 'QUEUE_TIMEOUT', queue_wait_ms: Date.now() - queueEnteredAt,
-          error: `Earlier submits on this session did not clear within ${SUBMIT_QUEUE_TIMEOUT_MS} ms; nothing was written. Retry.` };
-      }
+      if (timedOut) return queueTimeoutRefusal();
     }
     if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
     const liveFailure = getInjectFailure(session, { nowMs: Date.now() });
     if (liveFailure) return { success: false, ...liveFailure };
+    // Task 1215 queue80 (P1, reproduced on win32 run 41252716256): the bound is enforced AT ADMISSION too, not only by
+    // timer order — a holder release that settles the race after this caller's deadline (both timers overdue) admits nothing.
+    if (waitRounds > 0 && Date.now() >= queueDeadline) return queueTimeoutRefusal();
     let releaseSubmit = () => {};
     let barrier = null; // #1215 G5 diagnostics only
     if (!options.noEnter && session.type !== 'aterm') {
