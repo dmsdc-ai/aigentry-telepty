@@ -136,6 +136,14 @@ test('R5 (real transport): an authenticated owner displacement through installWe
     while (Date.now() < deadline && countFrames(store.dir).fact === framesBefore.fact) await H.sleep(25);
     await H.sleep(200);
     const framesAfter = countFrames(store.dir);
+    // Task 1215 G7 — FAILURE-ONLY diagnostic: fixed stage name, allowlisted fact kinds in append order,
+    // per-type frame deltas and the displaced socket's numeric readyState. No payloads, ids or paths.
+    if (framesAfter.fact - framesBefore.fact !== 1) {
+      console.log(`[ledger-1207 R5-transport DIAG] ${JSON.stringify({ stage: 'fact_frames_after_displacement',
+        added: framesAfter.fact - framesBefore.fact, kinds: factKindsInOrder(store.dir).slice(framesBefore.fact),
+        frame_delta: Object.fromEntries(Object.keys(framesAfter).map((k) => [k, framesAfter[k] - framesBefore[k]])),
+        displaced_socket_ready_state: sockets[0] ? sockets[0].readyState : null })}`);
+    }
     assert.equal(framesAfter.fact - framesBefore.fact, 1, 'the real transport wrote exactly one fact frame for 2001 records');
     const busEvents = R.bus.slice(busBefore).filter((b) => b.type === 'task_completion_unknown' && b.kind === 'owner_replaced_observed');
     assert.equal(busEvents.length, R5.cold + 1, 'per-record bus events retained');
@@ -147,6 +155,22 @@ test('R5 (real transport): an authenticated owner displacement through installWe
   }
 }));
 
+// Task 1215 G7 diagnostic helper: fact frames in append order (segments sorted by epoch, then n), reduced to
+// a fixed scope label and an allowlisted observation kind ('other' for anything else). Read-only.
+const FACT_KIND_ALLOW = new Set(['owner_replaced_observed', 'owner_transport_detached', 'daemon_restart_observed', 'unmapped_transition_cause']);
+function factKindsInOrder(dir) {
+  const { readFrames } = require('./fixtures/ledger-1207/owner-harness');
+  const d = path.join(dir, 'segments');
+  const names = (fs.existsSync(d) ? fs.readdirSync(d) : []).filter((n) => /^\d+-\d+\.jsonl$/.test(n))
+    .sort((a, b) => { const [ea, na] = a.split(/[-.]/).map(Number), [eb, nb] = b.split(/[-.]/).map(Number); return ea - eb || na - nb; });
+  const out = [];
+  for (const n of names) for (const f of readFrames(path.join(d, n)).frames) {
+    if (f.obj.t !== 'fact') continue;
+    const kind = f.obj.observation && f.obj.observation.kind;
+    out.push(`${f.obj.scope === 'session' ? 'session' : 'global'}:${FACT_KIND_ALLOW.has(kind) ? kind : 'other'}`);
+  }
+  return out;
+}
 function countFrames(dir) {
   const { readFrames } = require('./fixtures/ledger-1207/owner-harness');
   const out = { fact: 0, obs: 0, begin: 0, state: 0 };

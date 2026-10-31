@@ -21,12 +21,22 @@ nodeTest('session-inspection-security-681',{concurrency:false},async t=>{
   if(id!=='f01')assert.equal(plan.operations[opCount].id,id,'planned chronology');
   assert.ok(++opCount<=256);active.status='RUNNING';
  }
+ // Task 1215 G4 — failure-only diagnostics that stay inside the suppression boundary: ONLY a stage name from
+ // this frozen allowlist and a witness of fixed keys whose values are booleans. Never an actual/expected
+ // value, error message/stack, payload, token, environment value or path.
+ const G4_STAGES=Object.freeze(new Set(['http.status','http.finished_disposed','http.listeners','http.no_x_powered_by',
+  'http.cors','http.json_body','http.check','http.prototype_intact']));
+ const G4_WITNESS_KEYS=Object.freeze(['successful_ids_match','failed_empty','effects_two','first_generation_advanced',
+  'second_generation_advanced','invalidation_submit','upstream_probe_armed']);
+ let g4Stage=null,g4Witness=null;
  async function group(id,fn){
-  enter(id);let value,failed=false;
+  enter(id);let value,failed=false;g4Stage=null;g4Witness=null;
   await t.test(id,{concurrency:false},async sub=>{
    try{value=await fn(sub);if(active.status==='RUNNING')active.status='MATCH';}
    catch(error){failed=true;active.status='MISMATCH';
     const identity=['AssertionError','TypeError','RangeError'].includes(error?.name)?error.name:'Error';
+    if(G4_STAGES.has(g4Stage))sub.diagnostic('G4 stage='+g4Stage);
+    if(g4Witness)sub.diagnostic('G4 witness='+JSON.stringify(Object.fromEntries(G4_WITNESS_KEYS.map(k=>[k,g4Witness[k]===true]))));
     throw new Error(identity+' in '+id+'; private diagnostic values suppressed');
    }
   });
@@ -213,14 +223,15 @@ function request(app,row){
       const requestRow={...row};
       if(row.registerId)requestRow.body={session_id:row.registerId,command:'generic-tool',cwd:fixtureRoot};
       wire=await request(selectedApp,requestRow);
+      g4Stage='http.status';
       if(row.allowTimingInconclusive)assert.ok([200,429].includes(wire.status));else assert.equal(wire.status,row.status);
-      assert.ok(wire.finished&&wire.disposed);assert.equal(wire.listeners,0);
+      g4Stage='http.finished_disposed';assert.ok(wire.finished&&wire.disposed);g4Stage='http.listeners';assert.equal(wire.listeners,0);
       const header=/\r\nx-powered-by: ([^\r]+)/i.exec(wire.raw);
-      assert.equal(header,null,'X-Powered-By must be absent');
-      assert.match(wire.raw,/\r\nAccess-Control-Allow-Origin: \*\r\n/i,'original CORS header retained');
-      let body;if(![400,500].includes(wire.status))body=JSON.parse(wire.body);
-      const observation=check?check(body,wire):null;
-      assert.deepEqual(Object.getOwnPropertyDescriptors(Object.prototype),globalBefore);
+      g4Stage='http.no_x_powered_by';assert.equal(header,null,'X-Powered-By must be absent');
+      g4Stage='http.cors';assert.match(wire.raw,/\r\nAccess-Control-Allow-Origin: \*\r\n/i,'original CORS header retained');
+      g4Stage='http.json_body';let body;if(![400,500].includes(wire.status))body=JSON.parse(wire.body);
+      g4Stage='http.check';const observation=check?check(body,wire):null;
+      g4Stage='http.prototype_intact';assert.deepEqual(Object.getOwnPropertyDescriptors(Object.prototype),globalBefore);
       active.status=observation?.assessment==='INCONCLUSIVE'?'INCONCLUSIVE':'MATCH';
       measurements.push({id,before,after:snapshot(),effects:effects.slice(before.effects),
         bus:bus.slice(before.bus),elapsedNs:String(process.hrtime.bigint()-start),observation});
@@ -309,6 +320,11 @@ function request(app,row){
       const admissionBefore=snapshot();
       batch.push(await runHttp(id,(body,wire)=>{
         if(id!=='t01'){assert.equal(body.code,'RATE_LIMITED');assert.match(wire.raw,/\r\nRetry-After: 1\r\n/i);assert.deepEqual(snapshot(),admissionBefore);return;}
+        // G4: boolean-only witness of the t01 checks below (computed without throwing; emitted on failure only).
+        g4Witness={successful_ids_match:JSON.stringify((body?.results?.successful||[]).map(x=>x&&x.id))===JSON.stringify(['alpha-1','alpha-2']),
+          failed_empty:Array.isArray(body?.results?.failed)&&body.results.failed.length===0,effects_two:effects.length-startEffects===2,
+          first_generation_advanced:first.interactionInputGeneration===gen1+1,second_generation_advanced:second.interactionInputGeneration===gen2+1,
+          invalidation_submit:first.interactionInvalidation==='submit',upstream_probe_armed:first.upstreamProbeAt!=null};
         assert.deepEqual(body.results.successful.map(x=>x.id),['alpha-1','alpha-2']);
         assert.deepEqual(body.results.failed,[]);assert.equal(effects.length-startEffects,2);
         assert.equal(first.interactionInputGeneration,gen1+1);assert.equal(second.interactionInputGeneration,gen2+1);

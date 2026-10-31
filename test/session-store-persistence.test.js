@@ -147,7 +147,14 @@ test('persisted wrapped-session restore keeps awaiting-reconnect shape', () => {
     idleTtlMs: 1800000,
     ownerPid: 1234,
     ptyPid: 5678,
+    // Task 1215 G6: memory-only "rebuilt from disk in this daemon lifetime" (persistence.js builder).
+    // This old-format meta carries no supervisionRestorable, so none is restored.
+    restoredFromPersistence: true,
     clients: new Set(), isClosing: false, outputRing: [], ready: true,     });
+  // …and the marker never reaches disk: the serializer's whitelist excludes it.
+  const reserialized = persistence.serializePersistedSessions({ alpha: restored });
+  assert.equal(Object.hasOwn(reserialized.alpha, 'restoredFromPersistence'), false);
+  assert.equal(JSON.stringify(reserialized).includes('restoredFromPersistence'), false);
   assert.equal(persistence.buildRestoredWrappedSession('beta', { type: 'spawned' }), null);
 });
 
