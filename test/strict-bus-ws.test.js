@@ -112,7 +112,8 @@ async function wireFixture(t, mode = 'lost') {
     refuse: (socket, status) => socket.end(`HTTP/1.1 ${status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`), forbiddenOrigin: () => false, allowedPeer: () => true }); };
   install(); server.on('upgrade', (req, socket, head) => transport.handle(req, socket, head)); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => { transport.close(); server.closeAllConnections(); server.close(); fs.rmSync(home, { recursive: true, force: true }); });
-  const connect = async extra => { const c = await open(`ws://127.0.0.1:${server.address().port}/api/bus/sessions/mine`, sign(extra)); assert.ok(c.ws); t.after(() => c.ws.terminate()); await waitFor(() => c.messages.length); return c; };
+  // Diagnostic: a refused upgrade resolves { status } only; name that status (no proof, URL or payload).
+  const connect = async extra => { const c = await open(`ws://127.0.0.1:${server.address().port}/api/bus/sessions/mine`, sign(extra)); assert.ok(c.ws, `strict bus connection refused before establishment: status=${c.status === undefined ? 'none' : c.status}`); t.after(() => c.ws.terminate()); await waitFor(() => c.messages.length); return c; };
   return { home, sign, session, sessions, authentication, server, connect, effects: () => effects, restart() { transport.close(); install(); } };
 }
 for (const mode of ['lost','malformed','server-error','contradictory']) test(`bus ${mode} remains uncertain across adapter restart for both effects`, async t => {

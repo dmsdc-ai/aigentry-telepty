@@ -53,7 +53,7 @@ const CHUNKS = Object.freeze({ busy: '\x1b[2K\r✻ Thinking… (esc to interrupt
 const f2ByTier = new Map();
 const r1ByTier = new Map();
 
-// Task 1215 W5 — DIAGNOSTIC same-process controls (no assertion consumes them). Each control is a SEPARATE
+// Task 1215 W5 — same-process controls, consumed ONLY by heartbeatAcceptance (below) to validate the measurement. Each control is a SEPARATE
 // instance of the exact harness sampler (H.startHeartbeat, 1 ms), run sequentially and never concurrently with
 // the F2 sampler, so the measured window, its CPU/IO/latency and every existing assertion are untouched.
 // idle_pre / idle_post bracket the workload (1500 ms total idle per tier ≤ 2000 ms); `block` is a deliberate
@@ -77,11 +77,53 @@ async function heartbeatControl(label, { idleMs = 0, blockMs = 0 } = {}) {
   const s = hb.stop();
   const m = s.measured;
   return { label, kind: blockMs > 0 ? 'deliberate_block' : 'idle', wall_ms: wallMs, period_ms: s.period_ms, n: m.n,
-    mean_ms: m.n ? m.sum_ms / m.n : null, p50_ms: m.p50_ms, p90_ms: m.p90_ms, p99_ms: m.p99_ms, max_ms: m.max_ms,
+    mean_ms: m.n ? m.sum_ms / m.n : null, sum_ms: m.sum_ms, p50_ms: m.p50_ms, p90_ms: m.p90_ms, p99_ms: m.p99_ms, max_ms: m.max_ms,
     over_10ms: m.over_10ms, over_50ms: m.over_50ms, dropped: s.dropped, n_vs_half_wall: m.n >= Math.floor(wallMs / 2),
     ...(blockMs > 0 ? { block_requested_ms: blockMs, block_actual_ms: blockActualMs, stall_visible: m.max_ms != null && m.max_ms >= blockMs * 0.9 } : {}) };
 }
 const runtimeIdentity = () => ({ platform: process.platform, arch: process.arch, node: process.version, runtime: process.release && process.release.name });
+
+// Task 1215 W5 — heartbeat ACCEPTANCE contract. It replaces the fixed-rate `n >= floor(wall / 2)` count. Measured fact:
+// on the Windows runner the same-process IDLE controls themselves fail that count (CI 5971070 job 124536950446: idle
+// n=73/751.8 ms and n=57/758.8 ms; workload n=247/2041.1 ms with max gap 27.3 ms; R1 n=252/open 529 ms with max gap
+// 18.1 ms), which invalidates the fixed sampling-rate assumption. Host timer resolution and runner load are possible
+// contributors to the low sample rate; neither was independently isolated as the cause.
+// A heartbeat sample is the gap between two main-loop ticks, so the user-visible property ("bookkeeping must not
+// block control work") is the LONGEST gap, plus proof that the sampler really covered the window.
+// The bounds are FIXED here, identical on every platform, and evaluated before the workload result is consulted:
+//   stallBoundMs 50 — a NEW explicit acceptance bound (a design decision for CI review, not a measured production
+//     performance figure or a recovered original requirement): a main-loop gap >= 50 ms is a blocking regression. That is half of the 100 ms deliberate stall
+//     the block control must show, and well above the worst idle gap measured on the runners (19.3 ms win32).
+//     It is the same figure as the existing over_50ms heartbeat counter and the R1 50 ms poll-answer proposal.
+//   coverage — the unsampled part of the window must stay below the stall bound (wall - sum < stallBoundMs), the same
+//     >= 50 ms rule as a sampled gap. Otherwise sampling stopped or started late, and an unsampled stall at the end would be hidden.
+//   minSamples 1 — zero or disabled sampling is never a pass.
+// Controls first: both idle controls must be valid windows whose max gap stays below the bound, and the deliberate
+// block must appear as a gap >= max(bound, 0.9 x requested). If not, the verdict is INCONCLUSIVE (asserted as a
+// failure, never a pass, never a workload-derived baseline). Only then is the workload window judged.
+const HEARTBEAT_CONTRACT = Object.freeze({ stallBoundMs: 50, minSamples: 1, blockDetectRatio: 0.9, sumOverWallToleranceMs: 1 });
+function heartbeatAcceptance(workload, controls, contract = HEARTBEAT_CONTRACT) {
+  const windowProblem = (label, w) => {
+    if (!w || !Number.isFinite(w.wall_ms) || !(w.n >= contract.minSamples)) return `${label}: no heartbeat samples (zero or disabled sampling)`;
+    if (!Number.isFinite(w.sum_ms) || w.wall_ms - w.sum_ms >= contract.stallBoundMs) return `${label}: samples cover ${w.sum_ms} of ${w.wall_ms} ms (uncovered >= ${contract.stallBoundMs} ms: incomplete phase coverage)`;
+    if (w.sum_ms - w.wall_ms > contract.sumOverWallToleranceMs) return `${label}: sample sum ${w.sum_ms} ms exceeds its window ${w.wall_ms} ms (mis-measured window)`;
+    return null;
+  };
+  const reasons = [];
+  for (const label of ['idle_pre', 'idle_post']) {
+    const c = controls && controls[label];
+    const bad = windowProblem(label, c) || (!(c.max_ms < contract.stallBoundMs) ? `${label}: idle max gap ${c.max_ms} ms >= ${contract.stallBoundMs} ms (overloaded or invalid baseline)` : null);
+    if (bad) reasons.push(bad);
+  }
+  const b = controls && controls.block;
+  const blockBad = windowProblem('block', b)
+    || (!(b.max_ms >= Math.max(contract.stallBoundMs, contract.blockDetectRatio * b.block_requested_ms)) ? `block: the deliberate ${b.block_requested_ms} ms stall is not visible (max gap ${b.max_ms} ms)` : null);
+  if (blockBad) reasons.push(blockBad);
+  if (reasons.length) return { verdict: 'inconclusive', reasons, contract };
+  const workloadBad = windowProblem('workload', workload)
+    || (!(workload.max_ms < contract.stallBoundMs) ? `workload: max main-loop gap ${workload.max_ms} ms >= ${contract.stallBoundMs} ms (blocking)` : null);
+  return workloadBad ? { verdict: 'fail', reasons: [workloadBad], contract } : { verdict: 'pass', reasons: [], contract };
+}
 
 // ------------------------------------------------------------------------------------------------
 // F2 — main-thread blocking during sustained observation traffic, one tier at a time
@@ -162,6 +204,8 @@ for (const tier of TIERS) {
       evidence.heartbeat_controls.block = await heartbeatControl('block', { blockMs: CONTROLS.blockMs });
       evidence.heartbeat_controls.measured_reference = { n: heartbeat.measured.n, wall_ms: measuredWall, mean_ms: heartbeat.measured.n ? heartbeat.measured.sum_ms / heartbeat.measured.n : null,
         p50_ms: heartbeat.measured.p50_ms, p90_ms: heartbeat.measured.p90_ms, p99_ms: heartbeat.measured.p99_ms, max_ms: heartbeat.measured.max_ms, n_vs_half_wall: heartbeat.measured.n >= Math.floor(measuredWall / 2) };
+      // W5 acceptance (contract above), recorded in the evidence BEFORE any assertion so it survives a failure.
+      evidence.heartbeat_acceptance = heartbeatAcceptance({ wall_ms: measuredWall, n: heartbeat.measured.n, sum_ms: heartbeat.measured.sum_ms, max_ms: heartbeat.measured.max_ms }, evidence.heartbeat_controls);
 
       // ---- structural assertions (not baselines) --------------------------------------------
       const measured = flips.filter((f) => f.phase === 'measured');
@@ -175,7 +219,7 @@ for (const tier of TIERS) {
         for (const r of f.bus_results) assert.ok(['observation_emitted', 'observation_duplicate'].includes(r), `every bus result during traffic is a durable outcome or a named duplicate, got ${r}`);
       }
       assert.equal(mainWrites, 0, 'the main thread never writes to the store during observation traffic');
-      assert.ok(heartbeat.measured.n >= Math.floor(measuredWall / 2), `the heartbeat must have sampled through the measured interval (n=${heartbeat.measured.n}, wall=${measuredWall.toFixed(0)} ms)`);
+      assert.equal(evidence.heartbeat_acceptance.verdict, 'pass', `heartbeat acceptance (sampled the whole measured interval, no main-loop gap >= ${HEARTBEAT_CONTRACT.stallBoundMs} ms, valid same-process controls): ${JSON.stringify(evidence.heartbeat_acceptance)}`);
       assert.deepEqual(evidence.messages.over_64KiB_outside_exceptions, [], 'no main-thread message above 64 KiB outside ack.entry/submit.delta');
       assert.deepEqual(evidence.messages.over_frame_cap, [], 'no message above the largest frame cap');
       const rec = await ledgerClient.fetchTrackedInjection(injectId);
@@ -196,6 +240,7 @@ for (const tier of TIERS) {
       console.log(`[ledger-1207 F2 ${tier} MiB] evidence=${file} heartbeat.measured=${JSON.stringify(evidence.heartbeat && evidence.heartbeat.measured)} process_cpu=${JSON.stringify(evidence.process_cpu_measured)} mainWrites=${evidence.main_thread_store_writes}`);
       // W5: raw control summaries on every outcome (identity, phases, counts, gap stats only — no paths or payloads).
       console.log(`[ledger-1207 F2 ${tier} MiB] heartbeat_controls=${JSON.stringify(evidence.heartbeat_controls)}`);
+      console.log(`[ledger-1207 F2 ${tier} MiB] heartbeat_acceptance=${JSON.stringify(evidence.heartbeat_acceptance || null)}`);
       if (failed) console.log(`[ledger-1207 F2 ${tier} MiB] FAILED — private HOME preserved for diagnosis: ${store.home}`);
       else fs.rmSync(store.home, { recursive: true, force: true });
     }
@@ -213,14 +258,19 @@ for (const tier of TIERS) {
     const R = H.recorders();
     const messages = { inbound: [], outbound: [] };
     const { shared, runtime, injectHandler, ledgerClient } = H.buildShared(store, R, { messages });
+    // W5: R1's OWN same-process controls (never borrowed from F2). idle_pre runs before the R1 sampler and before the
+    // open; idle_post + block run after every workload metric is captured. Same budget as F2: 1500 ms idle + 100 ms block.
+    const controlPre = await heartbeatControl('idle_pre', { idleMs: CONTROLS.idlePreMs });
     const hb = H.startHeartbeat({ periodMs: 1 });
     let failed = true; let pollTimer = null;
     const evidence = { case: 'R1', tier_mib: tier, seeded: { records: seeded.count, bytes: seeded.bytes, sha256: seeded.sha256 }, counts: R1, started_at: new Date().toISOString(), node: process.version, platform: process.platform,
       handler_reach: 'poll handler BODY not reachable in-process (inline on the express app); its data path is driven as daemon.js evaluates it; the inject handler is the real one' };
+    evidence.heartbeat_controls = { identity: runtimeIdentity(), limits: CONTROLS, idle_pre: controlPre, idle_post: null, block: null };
     const polls = [];
     const begins = [];
     try {
       hb.mark('measured');
+      const tPhase0 = process.hrtime.bigint();   // W5: the sampled window is the whole measured phase (open ⊂ phase)
       const cpu0 = H.cpuMark(); const tOpen0 = process.hrtime.bigint();
       const sampleIds = seeded.ids.slice(0, 5);
       let pollIndex = 0;
@@ -248,8 +298,10 @@ for (const tier of TIERS) {
       clearInterval(pollTimer); pollTimer = null;
       await H.sleep(100);
       hb.mark('tail');
+      const phaseWall = H.ms(tPhase0, process.hrtime.bigint());
       const heartbeat = hb.stop();
       evidence.heartbeat = heartbeat;
+      evidence.measured_phase_wall_ms = phaseWall;
       evidence.messages = H.messageSizeReport(messages);
       const during = polls.filter((p) => p.during === 'recovering');
       const after = polls.filter((p) => p.during === 'available');
@@ -261,6 +313,10 @@ for (const tier of TIERS) {
         poll_answer_within_50ms: { proposed_bound_ms: 50, observed_max_during_recovery_ms: evidence.polls.during_latency.max_ms, note: 'contract proposal (ACCEPTANCE R1), recorded not asserted' },
         heartbeat_max_vs_F2_1MiB: { proposed: 'heartbeat max <= F2 1 MiB bound', observed_heartbeat_max_ms: heartbeat.measured.max_ms, f2_1mib_measured_max_ms: f2ByTier.has(1) ? f2ByTier.get(1).heartbeat.measured.max_ms : null, status: f2ByTier.has(1) ? 'comparison_recorded' : 'incomplete (F2 1 MiB not in this run)' },
       };
+      // W5: R1's own post-workload controls, after every workload metric above and before any assertion.
+      evidence.heartbeat_controls.idle_post = await heartbeatControl('idle_post', { idleMs: CONTROLS.idlePostMs });
+      evidence.heartbeat_controls.block = await heartbeatControl('block', { blockMs: CONTROLS.blockMs });
+      evidence.heartbeat_acceptance = heartbeatAcceptance({ wall_ms: phaseWall, n: heartbeat.measured.n, sum_ms: heartbeat.measured.sum_ms, max_ms: heartbeat.measured.max_ms }, evidence.heartbeat_controls);
 
       // ---- structural assertions ---------------------------------------------------------------
       assert.ok(polls.length >= R1.postOpenPolls, `the poll driver must have run (${polls.length} polls)`);
@@ -277,7 +333,7 @@ for (const tier of TIERS) {
       }
       assert.equal(R.delivery.length, 0, 'no begin issued during recovery delivered anything');
       assert.deepEqual(evidence.messages.over_64KiB_outside_exceptions, [], 'no main-thread message above 64 KiB outside ack.entry/submit.delta (snapshot/read chunks are bounded)');
-      assert.ok(heartbeat.measured.n >= Math.floor(openWall / 2), `the heartbeat must have sampled through the open (n=${heartbeat.measured.n}, open wall=${openWall.toFixed(0)} ms)`);
+      assert.equal(evidence.heartbeat_acceptance.verdict, 'pass', `heartbeat acceptance (sampled the whole measured phase incl. the ${openWall.toFixed(0)} ms open, no main-loop gap >= ${HEARTBEAT_CONTRACT.stallBoundMs} ms, valid same-process controls): ${JSON.stringify(evidence.heartbeat_acceptance)}`);
       failed = false;
       r1ByTier.set(tier, evidence);
     } finally {
@@ -287,6 +343,7 @@ for (const tier of TIERS) {
       evidence.finished_at = new Date().toISOString(); evidence.failed = failed;
       const file = H.writeEvidence(EVIDENCE, `R1-${tier}MiB.json`, evidence);
       console.log(`[ledger-1207 R1 ${tier} MiB] evidence=${file} open_ms=${evidence.open && evidence.open.wall_ms} polls=${JSON.stringify(evidence.polls && { total: evidence.polls.total, during: evidence.polls.during_recovery })} heartbeat.measured=${JSON.stringify(evidence.heartbeat && evidence.heartbeat.measured)}`);
+      console.log(`[ledger-1207 R1 ${tier} MiB] heartbeat_controls=${JSON.stringify(evidence.heartbeat_controls)} heartbeat_acceptance=${JSON.stringify(evidence.heartbeat_acceptance || null)}`);
       if (failed) console.log(`[ledger-1207 R1 ${tier} MiB] FAILED — private HOME preserved for diagnosis: ${store.home}`);
       else fs.rmSync(store.home, { recursive: true, force: true });
     }
@@ -319,4 +376,50 @@ test('F2/R1 cross-tier comparison (same run): ratios recorded against the propos
   const file = H.writeEvidence(EVIDENCE, 'CROSS-TIER.json', summary);
   console.log(`[ledger-1207 cross-tier] ${file} ${summary.cross_tier_gate}`);
   assert.ok(fs.existsSync(file), 'the comparison evidence file is written');
+});
+
+// ------------------------------------------------------------------------------------------------
+// W5 — deterministic negative controls for the heartbeat acceptance predicate (pure; no I/O, no timing).
+// The "measured" windows are the exact Windows CI 5971070 / job 124536950446 values (sum_ms = mean_ms × n where the
+// log only printed the mean); every other window is a synthetic counterexample.
+// ------------------------------------------------------------------------------------------------
+test('W5 heartbeat acceptance predicate: rejects zero sampling, stalls, incomplete coverage and invalid baselines; accepts the measured win32 idle-timer windows', () => {
+  const ciControls = Object.freeze({
+    idle_pre: { n: 73, wall_ms: 751.822, sum_ms: 73 * 10.295071232876714, max_ms: 19.2604 },
+    idle_post: { n: 57, wall_ms: 758.8164, sum_ms: 57 * 13.311759649122807, max_ms: 16.0523 },
+    block: { n: 33, wall_ms: 521.8245, sum_ms: 33 * 15.809027272727272, max_ms: 100.2268, block_requested_ms: 100 },
+  });
+  const ciF2 = Object.freeze({ n: 247, wall_ms: 2041.1315, sum_ms: 2041.079399999999, max_ms: 27.3317 });
+  const ciR1 = Object.freeze({ n: 252, wall_ms: 2192.4456, sum_ms: 2192.4456000000005, max_ms: 18.1287 });  // R1 phase wall not logged by the old file: sum used as wall
+  const with_ = (base, patch) => ({ ...base, ...patch });
+  const verdictOf = (w, c = ciControls) => heartbeatAcceptance(w, c).verdict;
+  const oldRule = (w) => w.n >= Math.floor(w.wall_ms / 2);
+  const observed = {
+    // the false positive removed: the old count rejects even IDLE on win32; the new contract accepts these windows
+    old_rule_on_ci: { idle_pre: oldRule(ciControls.idle_pre), idle_post: oldRule(ciControls.idle_post), f2: oldRule(ciF2), r1_open: 252 >= Math.floor(529.345 / 2) },
+    ci_f2: verdictOf(ciF2),
+    ci_r1: verdictOf(ciR1),
+    // workload rejections (controls valid)
+    zero_samples: verdictOf({ n: 0, wall_ms: 2041.1315, sum_ms: 0, max_ms: null }),
+    disabled_sampler: verdictOf(null),
+    large_stall: verdictOf(with_(ciF2, { max_ms: 100.2268 })),
+    stall_at_bound: verdictOf(with_(ciF2, { max_ms: 50 })),
+    unsampled_tail_stall: verdictOf(with_(ciF2, { sum_ms: ciF2.wall_ms - 120 })),
+    unsampled_tail_at_bound: verdictOf({ n: 247, wall_ms: 2048, sum_ms: 1998, max_ms: 27.3317 }),  // exactly 50 ms unsampled (integers: exact in binary)
+    incomplete_phase_coverage: verdictOf({ n: 40, wall_ms: 2041.1315, sum_ms: 640, max_ms: 16.2 }),
+    sum_exceeds_window: verdictOf(with_(ciF2, { sum_ms: ciF2.wall_ms + 25 })),
+    // invalid baselines: never a pass, even with a perfect workload window
+    idle_overloaded: verdictOf(ciF2, with_(ciControls, { idle_pre: with_(ciControls.idle_pre, { max_ms: 60 }) })),
+    idle_zero_samples: verdictOf(ciF2, with_(ciControls, { idle_post: { n: 0, wall_ms: 758.8164, sum_ms: 0, max_ms: null } })),
+    idle_missing: verdictOf(ciF2, with_(ciControls, { idle_pre: null })),
+    block_not_visible: verdictOf(ciF2, with_(ciControls, { block: with_(ciControls.block, { max_ms: 16.2 }) })),
+    block_missing_request: verdictOf(ciF2, with_(ciControls, { block: with_(ciControls.block, { block_requested_ms: undefined }) })),
+  };
+  assert.deepEqual(observed, {
+    old_rule_on_ci: { idle_pre: false, idle_post: false, f2: false, r1_open: false },
+    ci_f2: 'pass', ci_r1: 'pass',
+    zero_samples: 'fail', disabled_sampler: 'fail', large_stall: 'fail', stall_at_bound: 'fail', unsampled_tail_stall: 'fail', unsampled_tail_at_bound: 'fail',
+    incomplete_phase_coverage: 'fail', sum_exceeds_window: 'fail',
+    idle_overloaded: 'inconclusive', idle_zero_samples: 'inconclusive', idle_missing: 'inconclusive', block_not_visible: 'inconclusive', block_missing_request: 'inconclusive',
+  }, JSON.stringify(observed));
 });

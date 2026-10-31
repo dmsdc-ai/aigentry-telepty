@@ -182,7 +182,7 @@ function request(app,row){
   const busClients=new Set([{readyState:1,send(text){assert.ok(bus.length<256);bus.push(JSON.parse(text));}}]);
   const shared={sessions,sessionStateManager:state,sessionPersistence:persistence,trackedInjections:ledger,ledgerClient,
     trackedLedgerHealthy:true,trackedLedgerUnavailableReason:null,TRACKED_INJECTIONS_PATH:path.join(fixtureRoot,'ledger.json'),
-    interaction,readyRegistry,isOpenWebSocket,fs,isBootstrapGatedSession:metadata.isBootstrapGatedSession,interactionWaiters:new Map(),
+    interaction,readyRegistry,isOpenWebSocket,fs,crypto,isBootstrapGatedSession:metadata.isBootstrapGatedSession,interactionWaiters:new Map(),
     UPSTREAM_STALL_SECONDS:30,SESSION_STALE_SECONDS:300};
   const timers={setTimeout(fn,ms){assert.ok(++timeoutSeq<=128);const h={unref(){return this;}};
     timeouts.set(h,{fn,ms});return h;},clearTimeout(h){timeouts.delete(h);}};
