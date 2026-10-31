@@ -19,6 +19,17 @@
 // Blind spots: no per-thread CPU in Node 20 (main-thread descheduling vs busy JS cannot be separated per gap);
 // worker-isolate GC and worker CPU are invisible per gap; labels are the last label set, not an exact call site.
 // Disable with TELEPTY_LEDGER_1207_HB_DIAG=off (instrumentation-disabled comparison run).
+//
+// Task 1215 native55 — OPT-IN attribution fields for the diagnostic-only paired probe (scripts/heartbeat-attribution-1207.mjs).
+// Enabled ONLY by TELEPTY_LEDGER_1207_HB_ATTRIB=on; when absent every code path, field and value below is exactly as before.
+// When on, each top-K gap additionally carries:
+//   abs_start_ms / abs_end_ms        performance.timeOrigin + the gap bounds (epoch ms) — cross-process alignment with the
+//                                    probe's idle sibling sampler (both use the same wall-clock origin rule; ~ms accuracy)
+//   process_cpu_user_ms / _system_ms process.cpuUsage() delta across the SAME gap — WHOLE PROCESS (main + owner worker +
+//                                    threadpool), never main-thread CPU; on win32 the OS counters are coarse (~15.6 ms)
+// and the report gains `attribution` (field list, limits). Cost when on: one process.cpuUsage() call per heartbeat tick.
+// Owner-worker ELU is NOT observable here (this module has no handle to the owner Worker; obtaining one needs the frozen
+// test or control-harness.js, both outside this unit) and is reported as unavailable — never estimated.
 
 const { performance, PerformanceObserver } = require('node:perf_hooks');
 
@@ -28,6 +39,10 @@ const KINDS = { 1: 'minor', 2: 'major', 4: 'incremental', 8: 'weakcb' };
 
 function enabled(env = process.env) {
   return String(env.TELEPTY_LEDGER_1207_HB_DIAG || 'on').toLowerCase() !== 'off';
+}
+// native55: strictly opt-in (absent / anything but "on" ⇒ off).
+function attributionEnabled(env = process.env) {
+  return String(env.TELEPTY_LEDGER_1207_HB_ATTRIB || '').toLowerCase() === 'on';
 }
 
 function snapshotAggregate() {
@@ -46,6 +61,10 @@ function createGapDiagnostics({ topK = DEFAULT_TOP_K, messages = null } = {}) {
   const phaseAt = new Array(K).fill(null), labelStart = new Array(K).fill(null), labelEnd = new Array(K).fill(null), maxType = new Array(K).fill(null);
   let minIdx = 0, ticks = 0, label = null, lastLabel = null;
   let prevNow = t0, prevIdle = performance.nodeTiming.idleTime, prevMsg = messages ? messages.inbound.length : 0;
+  // native55 opt-in attribution state (inert unless TELEPTY_LEDGER_1207_HB_ATTRIB=on)
+  const attrib = attributionEnabled();
+  const cpuUser = attrib ? new Float64Array(K) : null, cpuSystem = attrib ? new Float64Array(K) : null;
+  let prevCpu = attrib ? process.cpuUsage() : null;
   // main-isolate GC ring
   const gcStart = new Float64Array(GC_CAP), gcDur = new Float64Array(GC_CAP), gcKind = new Int8Array(GC_CAP);
   let gcN = 0, gcDropped = 0, gcTotalMs = 0, gcTotal = 0;
@@ -61,9 +80,11 @@ function createGapDiagnostics({ topK = DEFAULT_TOP_K, messages = null } = {}) {
 
   function tick(phase) {
     const now = performance.now(), idleNow = performance.nodeTiming.idleTime;
+    const cpuNow = attrib ? process.cpuUsage() : null;   // native55 opt-in only
     const g = now - prevNow;
     ticks++;
     if (g > gap[minIdx]) {
+      if (attrib) { cpuUser[minIdx] = cpuNow.user - prevCpu.user; cpuSystem[minIdx] = cpuNow.system - prevCpu.system; }
       // worker messages handled inside this gap (only scanned for a top-K candidate; usually 0-2 entries)
       let n = 0, bytes = 0, mBytes = 0, mType = null;
       if (messages) {
@@ -76,10 +97,12 @@ function createGapDiagnostics({ topK = DEFAULT_TOP_K, messages = null } = {}) {
       minIdx = 0; for (let i = 1; i < K; i++) if (gap[i] < gap[minIdx]) minIdx = i;
     }
     prevNow = now; prevIdle = idleNow; prevMsg = messages ? messages.inbound.length : 0; lastLabel = label;
+    if (attrib) prevCpu = cpuNow;
   }
   function mark(phase) {
     // a phase boundary resets the gap origin exactly like the harness does for its own samples
     prevNow = performance.now(); prevIdle = performance.nodeTiming.idleTime; prevMsg = messages ? messages.inbound.length : 0;
+    if (attrib) prevCpu = process.cpuUsage();
     aggregates.phases[phase] = snapshotAggregate();
   }
   function setLabel(next) { label = next; }
@@ -99,9 +122,14 @@ function createGapDiagnostics({ topK = DEFAULT_TOP_K, messages = null } = {}) {
         const overlap = Math.min(e, ge) - Math.max(s, gs);
         if (overlap > 0) { gcMs += overlap; gcCount++; const k = KINDS[gcKind[j]] || 'other'; kinds[k] = (kinds[k] || 0) + 1; }
       }
-      gaps.push({ gap_ms: gap[i], start_ms: start[i], end_ms: end[i], phase: phaseAt[i], label_start: labelStart[i], label_end: labelEnd[i],
+      const entry = { gap_ms: gap[i], start_ms: start[i], end_ms: end[i], phase: phaseAt[i], label_start: labelStart[i], label_end: labelEnd[i],
         idle_ms: idle[i], busy_or_descheduled_ms: Math.max(0, gap[i] - idle[i]), gc_ms: gcMs, gc_count: gcCount, gc_kinds: kinds,
-        msgs: msgs[i], msg_bytes: msgBytes[i], max_msg_type: maxType[i], max_msg_bytes: maxBytes[i] });
+        msgs: msgs[i], msg_bytes: msgBytes[i], max_msg_type: maxType[i], max_msg_bytes: maxBytes[i] };
+      if (attrib) {   // native55 opt-in only: appended after every existing field
+        entry.abs_start_ms = performance.timeOrigin + s; entry.abs_end_ms = performance.timeOrigin + e;
+        entry.process_cpu_user_ms = cpuUser[i] / 1000; entry.process_cpu_system_ms = cpuSystem[i] / 1000;
+      }
+      gaps.push(entry);
     }
     gaps.sort((a, b) => b.gap_ms - a.gap_ms);
     const phaseAgg = (from, to) => (from && to ? {
@@ -120,9 +148,20 @@ function createGapDiagnostics({ topK = DEFAULT_TOP_K, messages = null } = {}) {
         'worker-isolate GC/CPU not attributable per gap', 'labels are the last test-set label, not exact call sites',
         'message bytes are the harness JSON-size proxy (computed on the main thread)'],
     };
+    if (attrib) {   // native55 opt-in only
+      reported.attribution = {
+        schema: 'telepty.ledger-1207.heartbeat-attribution-fields/v1', enabled_by: 'TELEPTY_LEDGER_1207_HB_ATTRIB=on',
+        time_origin_ms: performance.timeOrigin,
+        per_gap_fields: ['abs_start_ms', 'abs_end_ms', 'process_cpu_user_ms', 'process_cpu_system_ms'],
+        owner_worker_elu: 'unavailable: no owner-Worker handle in this module; obtaining one needs the frozen test or control-harness.js (outside this unit)',
+        limits: ['process CPU is WHOLE-process (main + owner worker + threadpool), never main-thread CPU',
+          'win32 process CPU counters are coarse (~15.6 ms quanta)', 'abs_* align with other processes only to wall-clock accuracy (~ms)',
+          'instrumentation cost: one process.cpuUsage() per heartbeat tick while enabled'],
+      };
+    }
     return reported;
   }
   return { tick, mark, setLabel, report };
 }
 
-module.exports = { createGapDiagnostics, enabled, DEFAULT_TOP_K };
+module.exports = { createGapDiagnostics, enabled, attributionEnabled, DEFAULT_TOP_K };

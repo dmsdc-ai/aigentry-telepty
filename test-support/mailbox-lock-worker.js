@@ -29,7 +29,12 @@ process.once('message', () => {
   const begun = performance.now(), bootMs = Math.round(begun);
   if (mode === 'sweep') {
     let removed = 0;
-    for (let i = 0; i < Number(count); i++) { removed += breakStaleLocks(path.dirname(dir)); wait(1); }
+    for (let i = 0; i < Number(count); i++) {
+      removed += breakStaleLocks(path.dirname(dir)); wait(1);
+      // Task 1215 native65 OBS-M1 (diagnostics only): after iterations 49, 99, …, 349 (≤ 7 lines through the existing
+      // emitDiag cap) — the actual sweep rate. kind 'sweep' is not a progress milestone: the parent guard ignores it.
+      if ((i + 1) % 50 === 0) emitDiag('sweep', {iteration: i, since_start_ms: Math.round(performance.now() - begun), removed});
+    }
     process.send({removed, stats: {bootMs, ms: Math.round(performance.now() - begun), ...cpu(), lock: lockDiagnostics()}}, () => process.disconnect()); return;
   }
   if (mode !== 'contend') {
