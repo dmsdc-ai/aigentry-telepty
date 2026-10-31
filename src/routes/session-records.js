@@ -227,7 +227,10 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
           && typeof existing.sessionEpoch === 'string' && binding.sessionEpoch === existing.sessionEpoch
           && !!presentedCredential && presentedCredential.sid === existing.id && presentedCredential.epoch === existing.sessionEpoch
           && presentedCredential.generation === (Number(existing.credentialGeneration) || 1)
-          && !inputPolicies.hasInputPolicyGrant(existing);
+          && !inputPolicies.hasInputPolicyGrant(existing)
+          // Task 1215 G6: only a genuine restore of a granted, never-revoked instance; an explicit
+          // downgrade (live or before a restart) stays revoked.
+          && inputPolicies.restorableAfterRestart(existing);
         policyGrant = inputPolicies.authorizeInputPolicy({ policy: inputPolicy.policy, ...policyAuthority, sessionId: existing.id, existing,
           credentialed, hasCredential: sessionCredentials.hasCredential(existing.id), external: !!existing.externalApprovalPolicy,
           capabilityProved: !!inputPolicies.verifyInputPolicyCapability(existing, presentedPolicyCapability), ownerReissue,

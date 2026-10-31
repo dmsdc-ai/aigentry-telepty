@@ -72,7 +72,10 @@ function serializePersistedSessions(sessions) {
       // advertise it once at startup and never again. Emitted ONLY when actually
       // observed, so a session that never saw the mode-set serializes byte-identically
       // to the pre-#730 format.
-      ...(s.bracketedPasteCapable === undefined ? {} : { bracketedPasteCapable: s.bracketedPasteCapable })
+      ...(s.bracketedPasteCapable === undefined ? {} : { bracketedPasteCapable: s.bracketedPasteCapable }),
+      // Task 1215 G6: "supervision granted and not explicitly revoked" (non-secret; no capability).
+      // Emitted only when true, so other sessions serialize byte-identically.
+      ...(s.supervisionRestorable === true ? { supervisionRestorable: true } : {})
     } });
   }
   return data;
@@ -245,6 +248,9 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
     ...(meta.bracketedPasteCapable === true || meta.bracketedPasteCapable === false
       ? { bracketedPasteCapable: meta.bracketedPasteCapable }
       : {}),
+    ...(meta.supervisionRestorable === true ? { supervisionRestorable: true } : {}),
+    // Task 1215 G6: memory-only "rebuilt from disk in this daemon lifetime"; never serialized.
+    restoredFromPersistence: true,
     clients: new Set(), isClosing: false, outputRing: [], ready: true,     };
 }
 

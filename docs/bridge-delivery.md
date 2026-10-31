@@ -170,8 +170,15 @@ Fail-closed configuration:
    is verified for `session.register` on that session id and bound to the record's current epoch; the
    principal equals the persisted `owningPrincipal` (id, source, audience); the presented session
    bearer verifies to that session id, epoch and current credential generation; and no live grant
-   exists. The old capability is never accepted again. Other operators, workers, stale epochs, and
-   missing or failed bearers are refused and stay guarded.
+   exists, and the record was restored from disk with supervision still granted. The old capability is
+   never accepted again. Other operators, workers, stale epochs, and missing or failed bearers are
+   refused and stay guarded.
+   *Restart versus revocation.* An explicit downgrade (`input_policy: "guarded"`) revokes supervision
+   durably: the daemon records only the non-secret fact "supervision granted and not revoked", removes
+   it on downgrade, and a re-request carrying the old capability is refused
+   (`INPUT_POLICY_CAPABILITY_REQUIRED`) whether or not the daemon restarted in between. A lost grant
+   without a restart (for example after credential rotation) is not a restore either. Returning to
+   supervision after a downgrade needs a fresh launch.
 5. *Not promoted (migration limitation).* A record registered without an operator owner (no
    `owningPrincipal`, e.g. a legacy token registration), or a bridge relaunched without the
    instance's bearer, cannot become supervised. There is no automatic takeover and no credential

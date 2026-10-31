@@ -92,11 +92,21 @@ function verifyInputPolicyCapability(session, presented) {
 function revokeInputPolicyCapability(session) { if (session) grants.delete(session); }
 function hasInputPolicyGrant(session) { return !!currentGrant(session); }
 
+// Task 1215 G6: `supervisionRestorable` is the durable, non-secret fact "user-supervised was granted to
+// this instance and not explicitly revoked". It is persisted (session-store/persistence.js) so a daemon
+// restore can be told apart from a deliberate downgrade; it carries no capability or proof material.
 function requestInputPolicy(record, policy, source, now = new Date(), { origin = 'reregistration' } = {}) {
   if (policy === 'user-supervised') {
     const grant = currentGrant(record);
     record.inputPolicyPending = { policy, source, requested_at: now.toISOString(), origin, grant_attempt: grant ? grant.attempt : null };
-  } else { delete record.inputPolicyPending; record.inputPolicy = null; revokeInputPolicyCapability(record); }
+    record.supervisionRestorable = true;
+  } else { delete record.inputPolicyPending; record.inputPolicy = null; revokeInputPolicyCapability(record); delete record.supervisionRestorable; }
+}
+// Restore-only reissue eligibility: the record was rebuilt from disk in THIS daemon lifetime
+// (memory-only marker set by buildRestoredWrappedSession, never serialized) AND its persisted state says
+// supervision was granted and never explicitly revoked. "No live grant" alone never qualifies.
+function restorableAfterRestart(session) {
+  return !!session && session.restoredFromPersistence === true && session.supervisionRestorable === true;
 }
 
 // Called once per owner claim, immediately after the new interactionOwnerGeneration is minted.
@@ -134,4 +144,4 @@ function userSupervised(session) {
 function effectiveInputPolicy(session) { return userSupervised(session) ? 'user-supervised' : 'guarded'; }
 
 module.exports = { POLICIES, CAPABILITY_HEADER, parseInputPolicy, authorizeInputPolicy, requestInputPolicy, bindInputPolicy, userSupervised, effectiveInputPolicy,
-  mintInputPolicyCapability, verifyInputPolicyCapability, revokeInputPolicyCapability, hasInputPolicyGrant };
+  mintInputPolicyCapability, verifyInputPolicyCapability, revokeInputPolicyCapability, hasInputPolicyGrant, restorableAfterRestart };
