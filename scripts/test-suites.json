@@ -256,6 +256,7 @@
         "test/supervision-readiness-1215.test.js",
         "test/operator-supervision-1215.test.js",
         "test/authority-file-darwin-1215.test.js",
+        "test/integration/supervision-daemon-cli-1215.test.js",
         "test/test-runner-manifest.test.js"
       ]
     },
@@ -715,6 +716,7 @@
         "test/supervision-readiness-1215.test.js",
         "test/operator-supervision-1215.test.js",
         "test/authority-file-darwin-1215.test.js",
+        "test/integration/supervision-daemon-cli-1215.test.js",
         "test/test-runner-manifest.test.js"
       ]
     },

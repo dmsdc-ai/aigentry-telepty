@@ -194,8 +194,14 @@ app.get('/api/sessions/:id', (req, res) => {
   const resolvedId = (0, shared.resolveSessionAlias)(requestedId);
   if (!resolvedId) return res.status(404).json({ error: 'Session not found' });
   const session = shared.sessions[resolvedId];
+  const view = serializeSession(resolvedId, session);
   res.json({
-    ...serializeSession(resolvedId, session),
+    ...view,
+    // #137 single-session contract: the current owner's bridge stage support and queue summary at the
+    // top level — the SAME values as transport.bridge_receipts / transport.bridge_queue (current owner
+    // generation only, from bridge-stage.js; never inferred). The list route is unchanged.
+    bridge_receipts: view.transport ? view.transport.bridge_receipts : null,
+    bridge_queue: view.transport ? view.transport.bridge_queue : null,
     alias: requestedId !== resolvedId ? requestedId : null,
     lastInjectFrom: session.lastInjectFrom || null,
     lastInjectReplyTo: session.lastInjectReplyTo || null
