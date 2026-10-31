@@ -334,3 +334,66 @@ test('#879: EPERM on a live ticket without a departure marker still fails closed
   } finally { mock.mock.restore(); release(); }
   assert.deepEqual(fs.readdirSync(lock), []);
 });
+// #1215 lock10 — measured on win32 (8a0219b diagnostic job, mailbox-lock-concurrency contend worker): a reader validated a
+// peer's published `number`, then its `before` lstat (lock.js readTicket) raised EPERM and the re-list showed no departure
+// marker, so the reader threw (eperm_read_throw) and the worker exited 1. Source-reachable state: removeTicket creates the
+// marker, unlinks `number`, unlinks the marker once it is the last entry, THEN removes the directory — so a departing
+// ticket is an EMPTY directory between its marker unlink and its rmdir. Below, the real owner release runs inside the
+// reader's EPERM window with its rmdir deferred until just after the reader's re-list. Platform-independent: only the
+// EPERM itself and the rmdir timing are injected; every file operation of the release is real.
+const lockCounter = key => require('../src/mailbox/lock').lockDiagnostics()[key];
+test('#1215: EPERM on a published peer number whose departure has removed its marker (empty ticket before rmdir) is a departure; the successor acquires and stays exclusive', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock'), release = acquireLock(dir);
+  const name = fs.readdirSync(lock)[0], ticket = path.join(lock, name), number = path.join(ticket, 'number');
+  const lstat = fs.lstatSync, readdir = fs.readdirSync, rmdir = fs.rmdirSync;
+  let stage = 'armed';
+  t.mock.method(fs, 'rmdirSync', function(p, ...args) {
+    if (p === ticket && stage === 'releasing') { stage = 'rmdir_deferred'; return undefined; } // the owner's rmdir, later
+    return rmdir.call(fs, p, ...args);
+  });
+  t.mock.method(fs, 'lstatSync', function(file, ...args) {
+    if (file === number && stage === 'armed') { stage = 'validated'; return lstat.call(fs, file, ...args); } // checkTicketFiles
+    if (file === number && stage === 'validated') { // readTicket's `before`: the owner departs during this lstat
+      stage = 'releasing'; release();
+      assert.equal(stage, 'rmdir_deferred', 'the real release reached its rmdir');
+      assert.deepEqual(readdir.call(fs, ticket), [], 'number and marker are both gone; only the rmdir is outstanding');
+      stage = 'emptied'; throw epermLstat(file);
+    }
+    return lstat.call(fs, file, ...args);
+  });
+  t.mock.method(fs, 'readdirSync', function(p, ...args) {
+    const listed = readdir.call(fs, p, ...args);
+    if (p === ticket && stage === 'emptied') { stage = 'relisted'; rmdir.call(fs, ticket); } // the owner's rmdir lands after the re-list
+    return listed;
+  });
+  const gone0 = lockCounter('eperm_read_number_gone'), throws0 = lockCounter('eperm_read_throw');
+  const successor = acquireLock(dir); // ORIGINAL (8a0219b): throws this EPERM. CANDIDATE: the departure is recognised.
+  try {
+    assert.equal(stage, 'relisted', 'the EPERM read and the re-list of the emptied ticket both happened');
+    assert.equal(lockCounter('eperm_read_number_gone') - gone0, 1);
+    assert.equal(lockCounter('eperm_read_throw') - throws0, 0);
+    assert.equal(fs.readdirSync(lock).length, 1, 'only the successor ticket remains');
+    release(); // the old release is a no-op
+    assert.throws(() => acquireLock(dir), /lock timeout/i); // Safety: the successor stays exclusive.
+  } finally { successor(); }
+  assert.deepEqual(fs.readdirSync(lock), []);
+});
+test('#1215 control: EPERM on a published live peer number that the re-list still shows, with no marker, still fails closed and the ticket is retained', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock'), release = acquireLock(dir);
+  const name = fs.readdirSync(lock)[0], number = path.join(lock, name, 'number'), body = fs.readFileSync(number, 'utf8');
+  const lstat = fs.lstatSync;
+  let reads = 0;
+  const mock = t.mock.method(fs, 'lstatSync', function(file, ...args) {
+    if (file === number && ++reads % 2 === 0) throw epermLstat(file); // every readTicket's `before` lstat, never its validation stat
+    return lstat.call(fs, file, ...args);
+  });
+  try {
+    let refused;
+    assert.throws(() => acquireLock(dir), error => { refused = error; return error.code === 'EPERM'; });
+    assert.equal(refused.syscall, 'lstat', 'the refusal is the original read-site EPERM, not a substituted error');
+    assert.deepEqual(fs.readdirSync(lock), [name]); // The live holder's ticket is neither evicted nor marked departed.
+    assert.deepEqual(fs.readdirSync(path.join(lock, name)), ['number']);
+    assert.equal(fs.readFileSync(number, 'utf8'), body);
+  } finally { mock.mock.restore(); release(); }
+  assert.deepEqual(fs.readdirSync(lock), []);
+});

@@ -614,6 +614,99 @@ test('#1215 R2 neighbours: only the refused submit\'s own body is withdrawn; an 
   });
 });
 
+// --- 2e. task 1215 O1/O2: nothing overtakes a write already scheduled; a refused legacy body's CR is never a lone submit --
+// O1 uses a generic prompt CLI (not a known AI CLI), so the relay's prompt detector calls onReady -> flush synchronously and
+// the body's delivery timer is still pending on the fake clock when the CR frame is handled.
+const promptOnlyRegistry = { ...registry, isKnownAiCli: () => false };
+
+test('#1215 O1 in-flight order: a CR arriving while its flushed body is still on a delivery timer is chained after it, never written first', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-o1-inflight', readyRegistry: promptOnlyRegistry });
+  const { injectId, body, submit } = b.daemonInject('O1-BODY');
+  b.injectFrame(body);
+  assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: no prompt yet, so the body is queued');
+  b.feed('fixture $ '); // the prompt: onReady flushes the body onto a delivery timer that has not fired yet
+  assert.deepEqual({ pending: b.shared.bridgePendingCount, inFlight: b.allow.bridgeQueueSummary().in_flight, writes: b.writes.length },
+    { pending: 0, inFlight: 1, writes: 0 }, 'PRECONDITION: the body is in flight and the pending count is already 0');
+  b.injectFrame(submit);
+  const beforeAdvance = b.writes.slice();
+  await b.clock.advance(1000);
+  assert.deepEqual({ beforeAdvance, writes: b.writes,
+    submitStages: b.receipts(injectId).filter(r => r.msg.part === 'submit').map(r => r.msg.stage),
+    bodyWritten: b.receipts(injectId, 'pty_written').filter(r => r.msg.part === 'body').length },
+  { beforeAdvance: [], writes: ['O1-BODY', '\r'], submitStages: ['queued', 'pty_written'], bodyWritten: 1 });
+});
+
+test('#1215 O1 neighbours: with an earlier pair and the next body in one flushed batch, the next CR is chained after every in-flight write', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-o1-neighbours', readyRegistry: promptOnlyRegistry });
+  const a = b.daemonInject('O1-PAIR-A');
+  const c = b.daemonInject('O1-PAIR-B');
+  b.injectFrame(a.body);
+  b.injectFrame(a.submit);
+  b.injectFrame(c.body);
+  assert.equal(b.shared.bridgePendingCount, 3, 'PRECONDITION: pair A and body B are queued');
+  b.feed('fixture $ '); // one flush: A, CR A and B are on delivery timers
+  assert.deepEqual({ pending: b.shared.bridgePendingCount, inFlight: b.allow.bridgeQueueSummary().in_flight, writes: b.writes.length },
+    { pending: 0, inFlight: 3, writes: 0 }, 'PRECONDITION: the whole batch is in flight');
+  b.injectFrame(c.submit);
+  await b.clock.advance(1000);
+  assert.deepEqual({ writes: b.writes, a: b.receipts(a.injectId, 'pty_written').map(r => r.msg.part),
+    b: b.receipts(c.injectId, 'pty_written').map(r => r.msg.part) },
+  { writes: ['O1-PAIR-A', '\r', 'O1-PAIR-B', '\r'], a: ['body', 'submit'], b: ['body', 'submit'] });
+});
+
+test('#1215 O1 control: with nothing pending or in flight, an ordinary pair is still written at once (no enqueue; a CR is never idle-gated)', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-o1-direct', readyRegistry: promptOnlyRegistry });
+  b.feed('fixture $ '); // the prompt first: the gate is open and nothing is queued
+  const { injectId, body, submit } = b.daemonInject('O1-DIRECT');
+  const realEnqueue = b.shared.bridgeMailbox.enqueue.bind(b.shared.bridgeMailbox);
+  let enqueues = 0;
+  b.shared.bridgeMailbox.enqueue = message => { enqueues++; return realEnqueue(message); };
+  b.injectFrame(body);
+  b.injectFrame(submit);
+  assert.deepEqual({ writes: b.writes, enqueues, written: b.receipts(injectId, 'pty_written').map(r => r.msg.part) },
+    { writes: ['O1-DIRECT', '\r'], enqueues: 0, written: ['body', 'submit'] });
+});
+
+test('#1215 O2 legacy: an id-less CR whose id-less body was refused while other records were pending is refused, not written as a lone submit', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-o2-legacy' });
+  for (const data of ['O2-LEGACY-A', '\r']) b.injectFrame({ type: 'inject', data }); // an old daemon sends no ids
+  assert.equal(b.shared.bridgePendingCount, 2, 'PRECONDITION: legacy pair A is queued');
+  const realEnqueue = b.shared.bridgeMailbox.enqueue;
+  const calls = failEnqueue(b);
+  b.injectFrame({ type: 'inject', data: 'O2-LEGACY-B' });
+  b.shared.bridgeMailbox.enqueue = realEnqueue;
+  b.injectFrame({ type: 'inject', data: '\r' }); // B's CR; pending > 0, so it takes the queued branch
+  for (const data of ['O2-LEGACY-C', '\r']) b.injectFrame({ type: 'inject', data }); // the next legacy pair, queued normally
+  const pending = b.shared.bridgePendingCount;
+  b.feed(IDLE);
+  await settleVt();
+  await b.clock.advance(3000);
+  assert.deepEqual({ enqueueFailures: calls.enqueue, pending, writes: b.writes,
+    refused: b.framesOf('bridge_receipt').filter(r => r.msg.stage === 'refused').map(r => r.msg.reason) },
+  { enqueueFailures: 1, pending: 4, writes: ['O2-LEGACY-A', '\r', 'O2-LEGACY-C', '\r'], refused: ['mailbox_unavailable', 'pair_unwritten'] });
+});
+
+test('#1215 O2 control (current ids): a refused body\'s CR with ids is queued and quarantined pair_unwritten at flush; the neighbour pair is delivered', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-o2-ids' });
+  const a = b.daemonInject('O2-IDS-A');
+  const c = b.daemonInject('O2-IDS-B');
+  b.injectFrame(a.body);
+  b.injectFrame(a.submit);
+  const realEnqueue = b.shared.bridgeMailbox.enqueue;
+  failEnqueue(b);
+  b.injectFrame(c.body);
+  b.shared.bridgeMailbox.enqueue = realEnqueue;
+  b.injectFrame(c.submit);
+  const pending = b.shared.bridgePendingCount;
+  b.feed(IDLE);
+  await settleVt();
+  await b.clock.advance(3000);
+  assert.deepEqual({ pending, writes: b.writes, a: b.receipts(a.injectId, 'pty_written').map(r => r.msg.part),
+    bRefused: refusedParts(b, c.injectId), bQuarantined: b.receipts(c.injectId, 'quarantined').map(r => [r.msg.part, r.msg.reason]) },
+  { pending: 3, writes: ['O2-IDS-A', '\r'], a: ['body', 'submit'], bRefused: [['body', 'mailbox_unavailable', 'not_written']],
+    bQuarantined: [['submit', 'pair_unwritten']] });
+});
+
 test('#1215 positive control: a trusted supervised orchestrator still receives body then CR directly while the mailbox is failing', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1215-mailbox-fail-supervised-direct', inputPolicy: 'user-supervised' });
   b.feed(MODAL);
