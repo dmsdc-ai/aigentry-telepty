@@ -23,6 +23,8 @@ const lock = require('./ledger-lock');
 const LEGACY_FILE_NAME = 'tracked-injections.v3.json';
 const MIGRATING_PREFIX = 'tracked-injections.json.migrating.';
 const ASIDE_PREFIX = 'tracked-injections.json.pre-0.10.';
+// #1215 F-A — the staging children moved into a claimed L, in this order (MANIFEST.json last).
+const PUBLICATION_CHILDREN = ['legacy', 'cold', 'hot', 'facts', 'segments', 'MIGRATION.json', 'MANIFEST.json'];
 const COPY_CHUNK = 1048576;
 const MAX_EXAMPLES = 16;
 const UNAVAILABLE_READ = 'unavailable_read';
@@ -274,6 +276,8 @@ function createStore(options) {
     if (st && st.isDirectory()) {
       let manifest = null;
       try { manifest = readJson(path.join(dir, 'MANIFEST.json')); } catch (error) {
+        const interrupted = error && error.code === 'ENOENT' ? interruptedPublication(staging, asides) : null;
+        if (interrupted) return interrupted;
         return { kind: 'unavailable_read', reason: 'manifest_unreadable', detail: error && error.code };
       }
       if (!isObject(manifest) || Number(manifest.format) !== F.STORE_FORMAT_VERSION) return { kind: 'unavailable_read', reason: 'manifest_format', detail: String(manifest && manifest.format) };
@@ -323,6 +327,27 @@ function createStore(options) {
     if (!st) return { kind: 'fresh' };
     return { kind: 'migrate', staging, asides };
   }
+  // #1215 F-A crash recovery: L is a claimed directory without MANIFEST.json. It is resumed only as
+  // this owner's unambiguous interrupted fill; anything else stays fail-closed (null ⇒ manifest_unreadable).
+  function interruptedPublication(staging, asides) {
+    let present;
+    try { present = fs.readdirSync(dir); } catch { return null; }
+    if (!present.every((n) => PUBLICATION_CHILDREN.includes(n))) return null;
+    const candidates = staging.map((n) => {
+      const s = path.join(parent, n); let man = null;
+      try { man = readJson(path.join(s, 'MANIFEST.json')); } catch { man = null; }
+      return { s, tok: n.slice(MIGRATING_PREFIX.length), man };
+    }).filter((c) => isObject(c.man) && c.man.published === false && c.man.token === c.tok && Number(c.man.format) === F.STORE_FORMAT_VERSION);
+    if (!candidates.length) return null;
+    if (candidates.length > 1) return { kind: 'conflict', reason: 'migration_conflict', detail: 'pending_identity_ambiguous', staging, asides };
+    const c = candidates[0];
+    if (present.some((n) => statOrNull(path.join(c.s, n)))) return { kind: 'conflict', reason: 'migration_conflict', detail: 'publication_overlap', staging, asides };
+    if (!c.man.legacy) return { kind: 'resume_publish', staging: c.s, manifest: c.man };
+    const aside = path.join(parent, ASIDE_PREFIX + c.tok);
+    if (!statOrNull(aside)) return { kind: 'conflict', reason: 'migration_conflict', detail: 'aside_missing', staging, asides };
+    if (hashFileStreamed(aside).sha256 !== c.man.legacy.sha256) return { kind: 'conflict', reason: 'migration_conflict', detail: 'original_modified', staging, asides, aside };
+    return { kind: 'resume_publish', staging: c.s, manifest: c.man, aside };
+  }
 
   // ---- migration (CUTOVER §4 M1–M7, errata C2, binding correction 2) -----------------------
   function migrationRecord(s, data) {
@@ -369,6 +394,30 @@ function createStore(options) {
     for (const sub of ['legacy', 'cold', 'hot', 'facts', 'segments']) { if (statOrNull(path.join(s, sub))) fsyncDir(path.join(s, sub)); }
     fsyncDir(s);
   }
+  // #1215 F-A — non-destructive publication of a staging directory S at L. A replacement-capable
+  // rename (Node/libuv on win32 replaces an existing FILE target) is never aimed at L, where an old
+  // writer may recreate the legacy file at any time. L is CLAIMED with an exclusive, non-recursive
+  // mkdir — the portable no-replace creation of a directory name: any occupant ⇒ EEXIST, left
+  // untouched — and S's children are then moved INTO the claimed directory, MANIFEST.json
+  // (published:false) last, so an interrupted fill is classified `resume_publish`. This is not an
+  // atomic publication (Node exposes no no-replace directory rename); after the claim an old writer's
+  // write/rename to L targets a directory and fails, so its bytes stay in its own file.
+  function claimStorePath() {
+    fs.mkdirSync(dir, { mode: 0o700 });
+    fsyncDir(parent);
+  }
+  function fillClaimedStore(s) {
+    for (const name of PUBLICATION_CHILDREN) {
+      const from = path.join(s, name);
+      try { fs.lstatSync(from); } catch (error) { if (error && error.code === 'ENOENT') continue; throw error; } // not produced, or moved by an interrupted fill
+      fs.renameSync(from, path.join(dir, name)); S.io.renames++;
+    }
+    fsyncDir(dir);
+    // rmdir removes only an EMPTY directory; on any failure the emptied S is retained, and no
+    // classification treats it as pending once L holds a MANIFEST.
+    try { fs.rmdirSync(s); } catch { /* retained */ }
+    fsyncDir(parent);
+  }
   function migrateFromFile(info) {
     const tok = randomToken();
     const s = path.join(parent, MIGRATING_PREFIX + tok);
@@ -411,14 +460,14 @@ function createStore(options) {
       e.retained = { aside, staging: s, legacy_reappeared: !!statOrNull(dir) }; throw e;
     }
     // M6b — publish the directory at L; a reappeared file ⇒ legacy_recreated, all three retained.
-    try { fs.renameSync(s, dir); S.io.renames++; } catch (error) {
+    try { claimStorePath(); } catch (error) {
       if (error && ['ENOTDIR', 'EEXIST', 'ENOTEMPTY', 'EISDIR'].includes(error.code)) {
         const e = new Error('migration_conflict:legacy_recreated'); e.code = 'MIGRATION_CONFLICT'; e.detail = 'legacy_recreated'; e.errno_code = error.code;
         e.retained = { aside, staging: s, legacy_reappeared: true }; throw e;
       }
       throw error;
     }
-    fsyncDir(parent); step('M6b');
+    fillClaimedStore(s); step('M6b');
     publishM7(manifest); step('M7');
     return manifest;
   }
@@ -442,13 +491,13 @@ function createStore(options) {
     durablePublicationOrder(s);
     writeAtomic(path.join(s, 'MANIFEST.json'), Buffer.from(JSON.stringify(manifest, null, 2) + '\n'));
     fsyncDir(s);
-    try { fs.renameSync(s, dir); S.io.renames++; } catch (error) {
+    try { claimStorePath(); } catch (error) {
       if (error && ['ENOTDIR', 'EEXIST', 'ENOTEMPTY', 'EISDIR'].includes(error.code)) {
         const e = new Error('migration_conflict:legacy_recreated'); e.code = 'MIGRATION_CONFLICT'; e.detail = 'legacy_recreated'; e.retained = { staging: s }; throw e;
       }
       throw error;
     }
-    fsyncDir(parent);
+    fillClaimedStore(s);
     return publishM7(manifest);
   }
 
@@ -677,12 +726,13 @@ function createStore(options) {
         case 'published': manifest = info.manifest; break;
         case 'resume_m7': manifest = publishM7(info.manifest); break;
         case 'resume_m6b': {
-          try { fs.renameSync(info.staging, dir); S.io.renames++; } catch (error) {
+          try { claimStorePath(); } catch (error) {
             if (error && ['ENOTDIR', 'EEXIST', 'ENOTEMPTY', 'EISDIR'].includes(error.code)) { postState('unavailable', 'migration_conflict', { detail: 'legacy_recreated', staging: info.staging, aside: info.aside }); return; }
             throw error;
           }
-          fsyncDir(parent); manifest = publishM7(info.manifest); break;
+          fillClaimedStore(info.staging); manifest = publishM7(info.manifest); break;
         }
+        case 'resume_publish': fillClaimedStore(info.staging); manifest = publishM7(info.manifest); break;
         case 'fresh': manifest = createFresh(); break;
         case 'migrate': manifest = migrateFromFile(info); break;
         default: postState('unavailable', 'classify_failed'); return;

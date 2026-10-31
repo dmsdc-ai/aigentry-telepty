@@ -86,7 +86,10 @@ function resolve(deps = {}) {
     probe: deps.probe !== false,
     sleep: deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms))),
     waitMs: deps.waitMs != null ? deps.waitMs : DEFAULT_WAIT_MS,
-    now: deps.now || Date.now
+    now: deps.now || Date.now,
+    // Task 1215 W3 (R1): async graceful stop of the running daemon (cli.js serviceDeps); absent ⇒ a scheduled-task
+    // uninstall refuses rather than ending the task's daemon.
+    gracefulStop: typeof deps.gracefulStop === 'function' ? deps.gracefulStop : null
   };
 }
 
@@ -708,9 +711,12 @@ function planUninstall(deps = {}, opts = {}) {
     return base;
   }
 
-  base.commands.push(['schtasks', '/end', '/tn', target.taskName]);
+  // Task 1215 W3 (R1): `schtasks /end` terminates the daemon without its shutdown() (the ledger lock is left), so an
+  // ordinary uninstall never issues it. The running daemon must first be stopped through the graceful gate; both
+  // execution doors refuse without a confirmed outcome. Only the task definition is then deleted (nothing tolerated).
+  base.gracefulStop = 'required';
   base.commands.push(['schtasks', '/delete', '/tn', target.taskName, '/f']);
-  base.tolerate = [0];
+  base.tolerate = [];
   return base;
 }
 
@@ -845,6 +851,13 @@ function executePlan(ctx, plan, verb) {
   return { steps, exitCode, reason };
 }
 
+// Task 1215 W3 (R1): a decideStopOutcome result that confirms the daemon is gone with its cleanup done (or that
+// none was running). Anything else — refused, timeout, unknown, lock retained, missing — is not a confirmation.
+const GRACEFUL_STOP_STEP = 'graceful stop of the running daemon (POST /api/daemon/stop, wait for its exit; never schtasks /end)';
+function confirmedStop(outcome) {
+  return Boolean(outcome && outcome.ok === true && outcome.startReplacement === true);
+}
+
 function consentGate(verb, opts) {
   if (verb !== 'install' && verb !== 'uninstall') return null;
   if (opts.yes || opts.dryRun) return null;
@@ -920,7 +933,21 @@ async function runServiceVerb(verb, opts = {}, deps = {}) {
     plan = freshPlan;
   }
 
+  // Task 1215 W3 (R1): after consent, before any command — the scheduled-task uninstall's graceful gate.
+  let gracefulStep = null;
+  if (plan.gracefulStop === 'required') {
+    let outcome = null;
+    try { outcome = ctx.gracefulStop ? await ctx.gracefulStop() : null; } catch { outcome = null; }
+    const confirmed = confirmedStop(outcome);
+    gracefulStep = { command: GRACEFUL_STOP_STEP, ok: confirmed,
+      stderr: confirmed ? '' : String((outcome && outcome.message) || 'no graceful stop is available to this caller; nothing was stopped or removed') };
+    if (!confirmed) {
+      return { ok: false, verb, exitCode: SERVICE_EXIT.FAILED, reason: outcome ? 'graceful-stop-unconfirmed' : 'graceful-stop-unavailable',
+        verified: null, steps: [gracefulStep], status: await getServiceStatus(scoped), plan, manualCommands: plan.manualCommands || [] };
+    }
+  }
   const executed = executePlan(ctx, plan, verb);
+  if (gracefulStep) executed.steps.unshift(gracefulStep);
   let status = null;
   let exitCode = executed.exitCode;
   // The command result and the post-state measurement stay SEPARATE (R-5):
@@ -974,6 +1001,12 @@ function runServiceVerbSync(verb, opts = {}, deps = {}) {
   if (opts.dryRun) {
     return { ok: true, verb, exitCode: SERVICE_EXIT.OK, reason: 'dry-run', steps: [], plan, manualCommands: plan.manualCommands || [] };
   }
+  // Task 1215 W3 (R1): this door cannot await a graceful stop (and must not block), so a scheduled-task uninstall
+  // proceeds only with the caller's precomputed confirmed outcome (`opts.daemonStop`); otherwise nothing is issued.
+  if (plan.gracefulStop === 'required' && !confirmedStop(opts.daemonStop)) {
+    return { ok: false, verb, exitCode: SERVICE_EXIT.FAILED, reason: opts.daemonStop ? 'graceful-stop-unconfirmed' : 'graceful-stop-required',
+      steps: [], plan, manualCommands: plan.manualCommands || [] };
+  }
   const executed = executePlan(ctx, plan, verb);
   return {
     ok: executed.exitCode === SERVICE_EXIT.OK,
@@ -998,6 +1031,7 @@ function formatPlan(plan, { dryRun = false, startup = true } = {}) {
   for (const write of plan.writes || []) lines.push(`${would}write ${write.path} (mode ${write.mode.toString(8)})`);
   for (const removal of plan.removals || []) lines.push(`${would}remove ${removal}`);
   if (plan.shell) lines.push(`${would}run ${plan.shell}`);
+  if (plan.gracefulStop === 'required') lines.push(`${would}first stop the running daemon gracefully (refused unless confirmed)`);
   for (const argv of [...(plan.commands || []), ...(plan.post || [])]) lines.push(`${would}run ${argv.join(' ')}`);
   for (const manual of plan.manualCommands || []) lines.push(`manual step (needs admin): ${manual}`);
   if (startup && plan.startup) {

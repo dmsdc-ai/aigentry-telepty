@@ -26,8 +26,24 @@ function inspectMailboxCompatibility(root, {entryBudget = 1000} = {}) {
     } finally { stream.closeSync(); }
     return names.sort();
   }
+  // #1215 F-B: root metadata can stay unchanged across a membership change (NTFS-like directory
+  // size/nlink/timestamps), so the observed membership is re-enumerated after the scan, bounded by
+  // the observed count + 1. This detects a difference inside this scan window only: no atomic
+  // snapshot, and an add+remove completed between the two enumerations (ABA) is not detected.
+  function membershipChanged(observed) {
+    const stream = fs.opendirSync(root), names = [];
+    try {
+      for (let entry; (entry = stream.readSync());) {
+        if (names.length === observed.length) return true;
+        names.push(entry.name);
+      }
+    } finally { stream.closeSync(); }
+    names.sort();
+    return names.some((name, i) => name !== observed[i]) || names.length !== observed.length;
+  }
   try {
-    for (const id of boundedNames(root)) {
+    const observed = boundedNames(root);
+    for (const id of observed) {
       const row = {session_id:id,lock_format:'unknown',holder_state:'unknown',acquisition_entries:null};
       try {
         validateSessionId(id);
@@ -61,7 +77,7 @@ function inspectMailboxCompatibility(root, {entryBudget = 1000} = {}) {
       }
     }
     checkRoot(root);
-    if (!same(before,optionalStat(root))) { report.complete=false;report.reason='changed_during_inspection'; }
+    if (!same(before,optionalStat(root)) || membershipChanged(observed)) { report.complete=false;report.reason='changed_during_inspection'; }
   } catch (error) {
     report.complete=false;
     report.reason=error.code === 'INSPECTION_BUDGET' ? 'entry_budget' : 'unavailable_or_changed';

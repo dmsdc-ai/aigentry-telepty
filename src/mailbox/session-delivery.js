@@ -460,7 +460,10 @@ function createSessionDeliveryContext({
     // instead of the caller's own client timeout; nothing is enqueued for a timed-out caller.
     // After the wait (and resolveModalGate above) the id must still name THIS instance — a session
     // destroyed, renamed or recreated meanwhile gets SESSION_GONE, never the text.
-    const queueDeadline = Date.now() + SUBMIT_QUEUE_TIMEOUT_MS;
+    // Task 1215 (#879 discriminator): the refusal carries the MEASURED barrier wait, so a caller can tell the
+    // cumulative wait behind earlier submits (bounded here) from the work done before reaching the barrier.
+    const queueEnteredAt = Date.now();
+    const queueDeadline = queueEnteredAt + SUBMIT_QUEUE_TIMEOUT_MS;
     while (session.pendingSubmit) {
       const remaining = queueDeadline - Date.now();
       let timer;
@@ -470,7 +473,7 @@ function createSessionDeliveryContext({
       ]);
       clearTimeout(timer);
       if (timedOut) {
-        return { success: false, httpStatus: 503, code: 'QUEUE_TIMEOUT',
+        return { success: false, httpStatus: 503, code: 'QUEUE_TIMEOUT', queue_wait_ms: Date.now() - queueEnteredAt,
           error: `Earlier submits on this session did not clear within ${SUBMIT_QUEUE_TIMEOUT_MS} ms; nothing was written. Retry.` };
       }
     }

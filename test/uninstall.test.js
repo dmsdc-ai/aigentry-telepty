@@ -133,6 +133,57 @@ test('runUninstall: missing plist → no unload attempt; launchctl failure toler
   assert.equal(result.plists[0].removed, true, 'owned plist file still removed after a failed unload');
 });
 
+// ── Task 1215 W3 (R1): Windows uninstall is graceful-first; the sync API never blocks or forces ──────────────
+
+function winCensus(targets = []) {
+  const calls = [];
+  const fn = (o) => { calls.push(o || {}); return o && o.dryRun === true ? { stopped: [], failed: [], targets } : { stopped: [{ pid: 9 }], failed: [] }; };
+  fn.calls = calls;
+  return fn;
+}
+// `schtasks /query` is the planner's read-only observation; everything else would be an effect.
+const effects = (execFile) => execFile.filter((c) => !c.includes('/query'));
+const CONFIRMED_STOP = { ok: true, startReplacement: true, stopped: [4242], exitCode: 0, message: 'Stopped telepty daemon (pid 4242).' };
+
+test('win32 runUninstall: no confirmed graceful outcome ⇒ refused; nothing stopped, run, removed or purged (even with --purge)', () => {
+  for (const windowsStop of [undefined, { ok: false, startReplacement: false, exitCode: 1, message: 'Graceful stop of pid 4242 was not confirmed (timeout).' }]) {
+    const census = winCensus();
+    const { deps, calls } = fakeDeps({ platform: 'win32', cleanupDaemonProcesses: census });
+    const result = runUninstall({ ...deps, purge: true, ...(windowsStop ? { windowsStop } : {}) });
+    assert.deepEqual({ reason: result.refused && result.refused.reason, cleanups: census.calls.length, execFile: effects(calls.execFile), rm: calls.rm, services: result.services },
+      { reason: windowsStop ? 'graceful-stop-unconfirmed' : 'graceful-stop-required', cleanups: 0, execFile: [], rm: [], services: null });
+  }
+});
+
+test('win32 runUninstall: a confirmed stop still refuses while the census finds another telepty daemon — named, never killed', () => {
+  const census = winCensus([{ pid: 5151, source: 'process-scan' }]);
+  const { deps, calls } = fakeDeps({ platform: 'win32', cleanupDaemonProcesses: census });
+  const result = runUninstall({ ...deps, purge: true, windowsStop: CONFIRMED_STOP });
+  assert.deepEqual({ reason: result.refused.reason, pids: result.refused.pids, census: census.calls.map((o) => o.dryRun === true), execFile: effects(calls.execFile), rm: calls.rm },
+    { reason: 'other-daemons-running', pids: [5151], census: [true], execFile: [], rm: [] });
+});
+
+test('win32 runUninstall: confirmed stop + empty census ⇒ proceeds without any forced sweep; the stop is reported as graceful', () => {
+  const census = winCensus();
+  const { deps, calls } = fakeDeps({ platform: 'win32', cleanupDaemonProcesses: census });
+  const result = runUninstall({ ...deps, windowsStop: CONFIRMED_STOP });
+  assert.deepEqual({ refused: result.refused || null, stopped: result.stopped, census: census.calls.map((o) => o.dryRun === true),
+    endIssued: calls.execFile.some((c) => c.includes('/end')), purged: calls.rm.length },
+    { refused: null, stopped: [{ pid: 4242, source: 'graceful' }], census: [true], endIssued: false, purged: 0 });
+});
+
+test('win32 runPreuninstall (npm hook): without a confirmed outcome it leaves the daemon running and never throws; with one it only takes the census', () => {
+  const unconfirmed = winCensus();
+  const a = fakeDeps({ platform: 'win32', cleanupDaemonProcesses: unconfirmed });
+  const left = runPreuninstall(a.deps);
+  const confirmed = winCensus();
+  const b = fakeDeps({ platform: 'win32', cleanupDaemonProcesses: confirmed });
+  const done = runPreuninstall({ ...b.deps, windowsStop: CONFIRMED_STOP });
+  assert.deepEqual({ left: left.refused.reason, leftCalls: unconfirmed.calls.length, doneRefused: done.refused || null, doneCalls: confirmed.calls.map((o) => o.dryRun === true),
+    execFile: effects([...a.calls.execFile, ...b.calls.execFile]), rm: [...a.calls.rm, ...b.calls.rm] },
+    { left: 'graceful-stop-required', leftCalls: 0, doneRefused: null, doneCalls: [true], execFile: [], rm: [] });
+});
+
 // ── runPreuninstall: npm hook — quiet, partial, unbreakable ─────────────────────
 
 test('runPreuninstall: stops daemon + unloads plists but does NOT remove files or dirs', () => {

@@ -146,6 +146,13 @@ async function diagSession(sessionId) {
     return { status: res.status, healthStatus: b.healthStatus ?? null, type: b.type ?? null, input_policy: t.input_policy ?? null,
       bootstrap_gated: t.bootstrap ? t.bootstrap.gated ?? null : null, readiness_capability: r.capability ?? null,
       input_transport_ready: r.input_transport_ready ? r.input_transport_ready.status ?? null : null,
+      // Task 1215 (#879 discriminators): which handshake half is missing, any refused frame (fixed reason code) and the
+      // daemon-side bootstrap queue (counts only).
+      process_started: r.process_started ? r.process_started.status ?? null : null,
+      input_transport_ready_reason: r.input_transport_ready ? r.input_transport_ready.reason ?? null : null,
+      refused_frames: r.refused_frames ? { count: r.refused_frames.count ?? null, milestone: r.refused_frames.last ? r.refused_frames.last.milestone ?? null : null,
+        reason: r.refused_frames.last ? r.refused_frames.last.reason ?? null : null } : null,
+      bootstrap: t.bootstrap ? { ready: t.bootstrap.ready ?? null, queued: t.bootstrap.queued ?? null, draining: t.bootstrap.draining ?? null } : null,
       instruction_received: t.instruction_received ? t.instruction_received.status ?? null : null, bridge_receipts: t.bridge_receipts ?? null,
       bridge_queue: q ? { source: q.source ?? null, phase: q.phase ?? null, pending: q.pending ?? null, reason: q.reason ?? null } : null };
   } catch (error) { return { error: (error && error.code) || 'request_failed' }; }
@@ -201,7 +208,12 @@ test('#752 RED: an ad-hoc `telepty allow claude` session actually receives the i
   let bridgeBytes = 0, bridgeTail = '', bridgeExit = null;
   bridge.onData((d) => { bridgeBytes += Buffer.byteLength(d, 'utf8'); bridgeTail = (bridgeTail + d).slice(-65536); });
   bridge.onExit(({ exitCode }) => { bridgeExit = exitCode; });
-  const BRIDGE_MARKERS = { inject_allowed: 'Inject allowed', stub_banner: 'ClaudeCodev2.1.220', owner_claim_refused: 'Owner claim refused' };
+  const BRIDGE_MARKERS = { inject_allowed: 'Inject allowed', stub_banner: 'ClaudeCodev2.1.220', owner_claim_refused: 'Owner claim refused',
+    // Task 1215 (#879 discriminators): the fixed exit-1 messages of `telepty allow` and the win32 spawn-target throws
+    // (booleans only), so the bridge's actual failure class is named without recording its output.
+    claim_timeout: 'Timed out waiting for owner claim', credential_refused: 'Credential refresh refused',
+    exe_not_found: 'cannot find executable', exe_unsupported: 'unsupported Windows executable type',
+    batch_args_refused: 'Windows batch arguments', uncaught_error: 'Error:', announce_unsent: 'transport readiness not announced', announce_pid_unavailable: 'pid=unavailable' };
 
   await waitFor(async () => {
     const list = await harness.request('/api/sessions');

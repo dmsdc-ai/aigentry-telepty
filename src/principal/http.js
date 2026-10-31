@@ -23,6 +23,10 @@ function resolveAction(req) {
   const pathname = target.split('?')[0], method = req.method;
   if (method === 'GET' && pathname === '/api/meta') return { action: 'daemon.inspect', target: 'daemon' };
   if (method === 'GET' && pathname === '/api/sessions') return { action: 'session.list', target: '*', operatorOnly: true };
+  // Task 1215 W3 (F4): the normal lifecycle stop — operator only, explicit `daemon.stop` grant on target `daemon`
+  // (proof.js admits no `*` for it). The route handler still requires loopback, no Origin, the local header token
+  // and the exact pid/instance (src/daemon-shutdown.js).
+  if (method === 'POST' && pathname === '/api/daemon/stop') return { action: 'daemon.stop', target: 'daemon', operatorOnly: true };
   if (method === 'POST' && ['/api/sessions/register', '/api/sessions/spawn'].includes(pathname)) {
     const id = req.body && Object.getOwnPropertyDescriptor(req.body, 'session_id');
     if (!id || !Object.hasOwn(id, 'value') || !sessionId(id.value)) return null;
@@ -145,7 +149,7 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
       const count = (req.rawHeaders || []).filter((name, index) => index % 2 === 0 && String(name).toLowerCase() === 'x-telepty-principal').length;
       if (count > 1) return denied('PRINCIPAL_HEADER_INVALID', 400);
       const store = typeof sessions === 'function' ? sessions() : sessions;
-      const session = ['daemon.inspect', 'session.list'].includes(action.action) ? null : ownSession(store, action.target);
+      const session = ['daemon.inspect', 'session.list', 'daemon.stop'].includes(action.action) ? null : ownSession(store, action.target);
       const epochRequired = action.epochRequired || (action.creation && !!session);
       if (epochRequired && typeof session?.sessionEpoch !== 'string') return denied('PRINCIPAL_SESSION_IDENTITY_UNAVAILABLE');
       const result = verifier.verify(req.headers?.['x-telepty-principal'], { method: req.method,
@@ -162,7 +166,7 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
       if (operatorOnly && principal.authority !== 'operator') return denied('PRINCIPAL_OPERATOR_REQUIRED');
       if (session && !action.explicitInject) {
         if (!owns && !(action.readOnly && principal.authority === 'operator')) return denied('PRINCIPAL_SESSION_OWNER_REQUIRED');
-      } else if (!session && !action.creation && !['daemon.inspect', 'session.list'].includes(action.action)) {
+      } else if (!session && !action.creation && !['daemon.inspect', 'session.list', 'daemon.stop'].includes(action.action)) {
         return denied('PRINCIPAL_SESSION_NOT_FOUND', 404);
       }
       if (session?.isClosing && !action.readOnly) return denied('SESSION_CLOSING', 409);

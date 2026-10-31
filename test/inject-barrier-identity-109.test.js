@@ -158,7 +158,9 @@ test('#109(b): queued callers are delivered in arrival order, each text followed
   for (const p of ['f1', 'f2', 'f3']) {
     const issued = Date.now() - t0;
     pending.push(inject(sid, p).then((r) => {
-      callers.push({ p, issued_ms: issued, answered_ms: Date.now() - t0, status: r.status, code: (r.body && r.body.code) || null });
+      callers.push({ p, issued_ms: issued, answered_ms: Date.now() - t0, status: r.status, code: (r.body && r.body.code) || null,
+        // Task 1215 (#879 discriminator): the daemon-measured barrier wait of a refusal (pre-barrier = answered - issued - this).
+        queue_wait_ms: r.body && Number.isSafeInteger(r.body.queue_wait_ms) ? r.body.queue_wait_ms : null });
       return r;
     }));
     await sleep(30);

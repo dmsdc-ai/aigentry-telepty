@@ -128,6 +128,7 @@ loopback, same UID, display names, daemon tokens, JWT `sub` or peer credentials.
 | Action | Supported route | Grant target / extra check |
 | --- | --- | --- |
 | `daemon.inspect` | `GET /api/meta` | `daemon` |
+| `daemon.stop` | `POST /api/daemon/stop` | `daemon`, explicit operator key and explicit grant (no `*`); the route also requires a loopback socket, no `Origin`, the local `x-telepty-token` header and the exact `{pid, instance_id}` of the running daemon (task 1215) |
 | `session.list` | `GET /api/sessions` | `*`, explicit operator key required |
 | `session.register` | `POST /api/sessions/register` | Exact body session ID; ordinary keys may create/renew mailbox sessions only; other transport types require operator authority; existing records also require owner and current signed epoch |
 | `session.create` | `POST /api/sessions/spawn` | Explicit operator key and exact body session ID; authorizes process creation through the existing route |
@@ -150,6 +151,19 @@ are available only to explicitly configured operator **read** grants for
 are always exact. Operator status does not permit cross-owner destruction or
 adoption of historical records. A future operator recovery adapter would need a
 separate explicit grant and current-epoch contract.
+
+`daemon.stop` (task 1215) is the normal lifecycle stop used by `telepty daemon stop|restart`, `telepty service
+stop|restart` and automatic client restarts on hosts where no signal runs the daemon shutdown. Denials, all
+before any effect: no proof or the shared token alone → 401; a principal (non-operator) key →
+`PRINCIPAL_OPERATOR_REQUIRED`; an operator key without the exact `daemon.stop`/`daemon` grant →
+`PRINCIPAL_GRANT_DENIED`; a reused nonce → `PRINCIPAL_REPLAY`; a proof for another method, target, action or
+body → `PRINCIPAL_PROOF_INVALID`; a verified operator without the local header token, from a non-loopback
+socket, with an `Origin`, or for another pid/instance → refused by the route (`STOP_*`). The signing client is
+the existing `TELEPTY_PRINCIPAL_CLIENT_FILE` principal client; it also signs the `daemon.inspect` identity read.
+An unloadable client configuration, or one naming another daemon origin, is an explicit refusal — the stop is
+never sent unsigned and is never forced. No key is generated, granted or migrated automatically. Because the
+integrity adapters above are unavailable on Windows, strict mode (and so this signed stop) cannot be configured
+there until a Windows adapter exists; that is a separate trust decision, not relaxed by this route.
 
 An ordinary key cannot establish OS process custody merely by naming an `owner_pid`
 or `pty_pid`, or choose arbitrary external delivery endpoints. Its new registrations

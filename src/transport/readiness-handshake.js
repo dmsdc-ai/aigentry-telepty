@@ -98,6 +98,19 @@ function acceptMilestone(sessionId, session, msg) {
   return { ok: true, milestone: 'input_transport_ready' };
 }
 
+// Task 1215 (#879 discriminator): the CURRENT owner generation's refused milestone frames, bounded — a count
+// and the last refusal (milestone + the fixed reason code above + time). Diagnostic only: it gates nothing and
+// releases nothing. It appears in view() only once a frame was actually refused, so `not_observed` with no
+// `refused_frames` means no milestone frame of this generation was accepted OR refused (never sent / never
+// arrived), while `refused_frames` names why the daemon dropped one.
+function noteRefusedMilestone(session, type, reason) {
+  const state = current(session);
+  if (!state || !MILESTONES.includes(type)) return false;
+  const count = Math.min((state.refused_frames ? state.refused_frames.count : 0) + 1, 1000000);
+  state.refused_frames = { count, last: { milestone: type, reason: typeof reason === 'string' ? reason.slice(0, 32) : 'unknown', at: new Date().toISOString() } };
+  return true;
+}
+
 // Daemon gating. `negotiated` = the current owner generation speaks the handshake.
 function negotiated(session) { const state = current(session); return !!(state && state.capable); }
 function inputTransportReady(session) {
@@ -126,6 +139,7 @@ function view(session) {
     owner_connected: isOpen(session.ownerWs),
     process_started: milestone(state.process_started, 'awaiting_process_started'),
     input_transport_ready: milestone(state.input_transport_ready, 'awaiting_input_transport_ready'),
+    ...(state.refused_frames ? { refused_frames: { count: state.refused_frames.count, last: { ...state.refused_frames.last } } } : {}),
     meaning: 'transport_only_not_instruction_receipt' };
 }
 
@@ -142,4 +156,4 @@ function milestoneFrame(type, { sessionId, binding, nonce, childSeq, pid }) {
 }
 
 module.exports = { CAPABILITY, CAPABILITY_HEADER, SCHEMA, MILESTONES, declaresCapability, beginOwnerGeneration, clearReadiness,
-  acceptMilestone, negotiated, inputTransportReady, awaitingInputTransport, view, milestoneFrame };
+  acceptMilestone, noteRefusedMilestone, negotiated, inputTransportReady, awaitingInputTransport, view, milestoneFrame };

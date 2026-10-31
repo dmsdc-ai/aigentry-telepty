@@ -97,9 +97,44 @@ function runUninstall(opts = {}) {
     services: null
   };
 
+  // Task 1215 W3 (R1): on Windows every signal stop is a forced termination that never runs the daemon's
+  // shutdown(), so an ordinary uninstall is GRACEFUL-FIRST. This function stays synchronous: the caller (cli.js
+  // runUninstallCommand / scripts/preuninstall.js) awaits the exact-instance graceful gate and passes its outcome as
+  // `windowsStop`. Without a confirmed outcome, or while ANY telepty daemon is still found by the same discovery
+  // chain (dry-run census: nothing signalled), the uninstall is refused: nothing stopped, removed or purged.
+  if (plan.platform === 'win32' && !dryRun) {
+    const stop = opts.windowsStop;
+    const confirmed = Boolean(stop && stop.ok === true && stop.startReplacement === true);
+    let refused = null;
+    if (!confirmed) {
+      refused = { reason: stop ? 'graceful-stop-unconfirmed' : 'graceful-stop-required',
+        message: stop && stop.message ? String(stop.message) : 'a confirmed graceful stop of the running daemon is required first (run `telepty uninstall`); nothing was stopped or removed.' };
+    } else {
+      let census = null;
+      try { census = cleanup({ port: daemonControl.DEFAULT_PORT, dryRun: true }); } catch { census = null; }
+      if (!census || !Array.isArray(census.targets)) {
+        refused = { reason: 'daemon-census-unavailable', message: 'could not establish that no telepty daemon is still running; nothing was removed.' };
+      } else if (census.targets.length > 0) {
+        const pids = census.targets.map((t) => t.pid);
+        refused = { reason: 'other-daemons-running', pids,
+          message: `telepty daemon(s) still running (pid ${pids.join(', ')}); stop them first (\`telepty daemon stop\` with their TELEPTY_PORT), or force with \`telepty cleanup-daemons\`. Nothing was removed.` };
+      }
+    }
+    if (refused) {
+      result.refused = refused;
+      for (const dirPath of plan.stateDirs) {
+        let exists = false;
+        try { exists = fsx.existsSync(dirPath); } catch { exists = false; }
+        result.stateDirs.push({ path: dirPath, exists, purged: false });
+      }
+      return result;
+    }
+    result.stopped = (stop.stopped || []).map((pid) => ({ pid, source: 'graceful' }));
+  }
+
   // (1) Stop running daemons via the full discovery chain (state file →
   // process-title scan → port owner; daemon-control, telepty#15/#44).
-  if (!dryRun) {
+  if (!dryRun && plan.platform !== 'win32') {
     try {
       // #902: uninstall is machine-wide by contract; it names the default port explicitly now
       // that the sweep no longer assumes one.
@@ -167,7 +202,9 @@ function runUninstall(opts = {}) {
   if (plan.services && removePlists) {
     try {
       const { runServiceVerbSync } = require('./service');
-      result.services = runServiceVerbSync('uninstall', { yes: true, dryRun }, serviceDepsFrom(opts, !dryRun));
+      // Task 1215 W3 (R1): the confirmed graceful outcome lets the scheduled-task plan run (no schtasks /end).
+      result.services = runServiceVerbSync('uninstall', { yes: true, dryRun, ...(opts.windowsStop ? { daemonStop: opts.windowsStop } : {}) },
+        serviceDepsFrom(opts, !dryRun));
     } catch (err) {
       result.services = { ok: false, reason: err.message };
     }

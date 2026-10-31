@@ -421,6 +421,10 @@ function cleanupDaemonProcesses(opts) {
     }
   }
 
+  // Task 1215 W3B: a dry run reports the surgical targets without signalling or clearing anything, so a
+  // caller can tell "no daemon" from "a daemon that did not accept a graceful stop" without forcing.
+  if (o.dryRun === true) return { stopped: [], failed: [], targets: [...targets.values()] };
+
   const stopped = [];
   const failed = [];
 

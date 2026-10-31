@@ -25,6 +25,13 @@ async function diagSession(sessionId) {
     return { status: res.status, healthStatus: b.healthStatus ?? null, type: b.type ?? null, input_policy: t.input_policy ?? null,
       bootstrap_gated: t.bootstrap ? t.bootstrap.gated ?? null : null, readiness_capability: r.capability ?? null,
       input_transport_ready: r.input_transport_ready ? r.input_transport_ready.status ?? null : null,
+      // Task 1215 (#879 discriminators): which handshake half is missing, any refused frame (fixed reason code) and the
+      // daemon-side bootstrap queue (counts only).
+      process_started: r.process_started ? r.process_started.status ?? null : null,
+      input_transport_ready_reason: r.input_transport_ready ? r.input_transport_ready.reason ?? null : null,
+      refused_frames: r.refused_frames ? { count: r.refused_frames.count ?? null, milestone: r.refused_frames.last ? r.refused_frames.last.milestone ?? null : null,
+        reason: r.refused_frames.last ? r.refused_frames.last.reason ?? null : null } : null,
+      bootstrap: t.bootstrap ? { ready: t.bootstrap.ready ?? null, queued: t.bootstrap.queued ?? null, draining: t.bootstrap.draining ?? null } : null,
       instruction_received: t.instruction_received ? t.instruction_received.status ?? null : null, bridge_receipts: t.bridge_receipts ?? null,
       bridge_queue: q ? { source: q.source ?? null, phase: q.phase ?? null, pending: q.pending ?? null, reason: q.reason ?? null } : null };
   } catch (error) { return { error: (error && error.code) || 'request_failed' }; }
@@ -805,7 +812,7 @@ test('telepty allow inject submits once without exposing routing metadata', asyn
   let cliExit = null;
   cli.onExit(({ exitCode }) => { cliExit = exitCode; });
   let inject = null;
-  const DIAG_MARKERS = { inject_allowed: 'Inject allowed.', child_prompt: '> ', payload_echo: 'hello-once', submit_line: 'SUBMIT:' };
+  const DIAG_MARKERS = { inject_allowed: 'Inject allowed.', child_prompt: '> ', payload_echo: 'hello-once', submit_line: 'SUBMIT:', announce_unsent: 'transport readiness not announced', announce_pid_unavailable: 'pid=unavailable' };
   const diagnose = (stage) => async (error) => {
     t.diagnostic(`#879 diag ${stage} ${JSON.stringify({ bridge: diagPty(output, cliExit, DIAG_MARKERS), inject: diagInject(inject), session: await diagSession(sessionId) })}`);
     throw error;

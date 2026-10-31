@@ -465,10 +465,12 @@ test('M2 conflicts: legacy_modified (write to L between capture and aside) and l
   ownedTeardown(s, owned, null); const s2 = tmpStore(); const owned2 = [];
   await inStore(s2, owned2, () => {
     const leg2 = writeLegacyLedger(s2.dir, { count: 4 });
-    const f2 = createFaultFs({ faults: { renameSync: { code: null, times: 1, when: (args) => String(args[0]).includes('.migrating.') && args[1] === s2.dir, before: () => fs.writeFileSync(s2.dir, 'recreated-by-old-writer') } } });
+    // #1215: M6b publishes by an exclusive mkdirSync(L) claim (no rename onto L); the old writer recreates L just before it.
+    const f2 = createFaultFs({ faults: { mkdirSync: { code: null, times: 1, when: (args) => args[0] === s2.dir, before: () => fs.writeFileSync(s2.dir, 'recreated-by-old-writer') } } });
     const crashed2 = trackOwnerFds(f2);
     h = createOwnerHarness({ dir: s2.dir, fsImpl: crashed2.fs }); owned2.push({ h, tracked: crashed2 });
     const o2 = h.open();
+    assert.deepEqual(f2._state.fired.map((f) => [f.name, f.path, f.hook]), [['mkdirSync', s2.dir, true]], 'exactly one injection fired, at the mkdirSync(L) publication boundary');
     assert.equal(o2.reason, 'migration_conflict'); assert.equal(o2.stateMessage.detail, 'legacy_recreated');
     const names = fs.readdirSync(s2.parent);
     assert.ok(names.some((n) => n.startsWith('tracked-injections.json.pre-0.10.')) && names.some((n) => n.startsWith('tracked-injections.json.migrating.')) && names.includes('tracked-injections.json'));

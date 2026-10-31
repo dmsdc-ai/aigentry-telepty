@@ -664,14 +664,86 @@ test('win32 verbs use argv for run/end/delete and build no shell string', async 
     ['start', ['schtasks /run /tn telepty-daemon']],
     ['stop', ['schtasks /end /tn telepty-daemon']],
     ['restart', ['schtasks /end /tn telepty-daemon', 'schtasks /run /tn telepty-daemon']],
-    ['uninstall', ['schtasks /end /tn telepty-daemon', 'schtasks /delete /tn telepty-daemon /f']]
+    // Task 1215 W3 (R1): uninstall deletes the task only after a confirmed graceful stop — never `schtasks /end`.
+    ['uninstall', ['schtasks /delete /tn telepty-daemon /f']]
   ]) {
-    const world = winWorld({});
+    const world = winWorld({ deps: { gracefulStop: async () => ({ ok: true, startReplacement: true, stopped: [4242], exitCode: 0, message: 'Stopped telepty daemon (pid 4242).' }) } });
     const result = await runServiceVerb(verb, CONSENTED, world.deps);
     assert.equal(result.exitCode, SERVICE_EXIT.OK, `${verb}: ${JSON.stringify(result.steps)}`);
     const issued = world.calls.exec.filter(([, flag]) => flag !== '/query').map((c) => c.join(' '));
     assert.deepEqual(issued, expected, verb);
     assert.deepEqual(world.calls.shell, [], `${verb} must not build a shell string`);
+  }
+});
+
+// ── Task 1215 W3 (R1): a scheduled-task uninstall is graceful-first, at both service doors ──
+
+const { decideStopOutcome } = require('../src/daemon-shutdown');
+const UNCONFIRMED_STOPS = [
+  decideStopOutcome({ status: 'timeout', pid: 4242, exited: false }),
+  decideStopOutcome({ status: 'refused', pid: 4242, code: 'STOP_AUTH_REQUIRED', httpStatus: 401 }),
+  decideStopOutcome({ status: 'unknown', pid: 4242, reason: 'stop_request_failed' }),
+  decideStopOutcome({ status: 'stopped', pid: 4242, lockRetained: true }),
+  decideStopOutcome({ status: 'no_answer' }, [{ pid: 4242 }])
+];
+const mutating = (world) => world.calls.exec.filter(([, flag]) => flag !== '/query').map((c) => c.join(' '));
+
+test('R1: async service uninstall on a scheduled task: unconfirmed / unavailable graceful stop ⇒ FAILED with nothing issued', async () => {
+  for (const outcome of UNCONFIRMED_STOPS) {
+    const world = winWorld({ deps: { gracefulStop: async () => outcome } });
+    const result = await runServiceVerb('uninstall', CONSENTED, world.deps);
+    assert.deepEqual({ exit: result.exitCode, reason: result.reason, issued: mutating(world), stepOk: result.steps[0].ok, stderr: result.steps[0].stderr },
+      { exit: SERVICE_EXIT.FAILED, reason: 'graceful-stop-unconfirmed', issued: [], stepOk: false, stderr: outcome.message });
+  }
+  const none = winWorld({});
+  const unavailable = await runServiceVerb('uninstall', CONSENTED, none.deps);
+  assert.deepEqual({ exit: unavailable.exitCode, reason: unavailable.reason, issued: mutating(none) },
+    { exit: SERVICE_EXIT.FAILED, reason: 'graceful-stop-unavailable', issued: [] });
+});
+
+test('R1: consent comes before the graceful stop — a declined or unconsented uninstall never asks the daemon to stop', async () => {
+  let asked = 0;
+  const world = winWorld({ deps: { gracefulStop: async () => { asked++; return { ok: true, startReplacement: true, stopped: [4242], exitCode: 0, message: 'Stopped telepty daemon (pid 4242).' }; } } });
+  const unconsented = await runServiceVerb('uninstall', { isTTY: false }, world.deps);
+  const declined = await runServiceVerb('uninstall', { isTTY: true, confirm: async () => false }, world.deps);
+  assert.deepEqual({ unconsented: unconsented.reason, declined: declined.reason, asked, issued: mutating(world) },
+    { unconsented: 'consent-required', declined: 'declined', asked: 0, issued: [] });
+});
+
+test('R1: the synchronous door never blocks: without a precomputed confirmed outcome it issues nothing; with one it only deletes the task', () => {
+  const { runServiceVerbSync, formatPlan } = require('../src/service');
+  const bare = winWorld({});
+  const refused = runServiceVerbSync('uninstall', { yes: true }, bare.deps);
+  const unconfirmedWorld = winWorld({});
+  const unconfirmed = runServiceVerbSync('uninstall', { yes: true, daemonStop: UNCONFIRMED_STOPS[0] }, unconfirmedWorld.deps);
+  const okWorld = winWorld({});
+  const ok = runServiceVerbSync('uninstall', { yes: true, daemonStop: { ok: true, startReplacement: true, stopped: [4242], exitCode: 0, message: 'Stopped telepty daemon (pid 4242).' } }, okWorld.deps);
+  const dry = runServiceVerbSync('uninstall', { yes: true, dryRun: true }, winWorld({}).deps);
+  assert.deepEqual({ refused: [refused.reason, mutating(bare)], unconfirmed: [unconfirmed.reason, mutating(unconfirmedWorld)], ok: [ok.exitCode, mutating(okWorld)],
+    dryPlan: formatPlan(dry.plan, { dryRun: true, startup: false }) }, {
+    refused: ['graceful-stop-required', []], unconfirmed: ['graceful-stop-unconfirmed', []], ok: [SERVICE_EXIT.OK, ['schtasks /delete /tn telepty-daemon /f']],
+    dryPlan: ['Would first stop the running daemon gracefully (refused unless confirmed)', 'Would run schtasks /delete /tn telepty-daemon /f'] });
+});
+
+test('R1: `telepty uninstall` on Windows (src/uninstall runUninstall): graceful outcome + empty census ⇒ task deleted, no /end; otherwise refused with nothing touched', () => {
+  const { runUninstall } = require('../src/uninstall');
+  const run = ({ windowsStop, census = [], purge = true } = {}) => {
+    const world = winWorld({});
+    const cleanups = [];
+    const result = runUninstall({ platform: 'win32', homedir: 'C:\\Users\\tester', purge, fs: world.deps.fs, execFileSync: world.deps.execFileSync,
+      cleanupDaemonProcesses: (o) => { cleanups.push(o); return o && o.dryRun === true ? { stopped: [], failed: [], targets: census.map((pid) => ({ pid })) } : { stopped: [{ pid: 1 }], failed: [] }; },
+      serviceDeps: world.deps, ...(windowsStop ? { windowsStop } : {}) });
+    return { result, world, cleanups };
+  };
+  const ok = run({ windowsStop: { ok: true, startReplacement: true, stopped: [4242], exitCode: 0, message: 'Stopped telepty daemon (pid 4242).' } });
+  assert.deepEqual({ refused: ok.result.refused || null, issued: mutating(ok.world), cleanups: ok.cleanups.map((o) => o.dryRun === true), services: ok.result.services.exitCode },
+    { refused: null, issued: ['schtasks /delete /tn telepty-daemon /f'], cleanups: [true], services: SERVICE_EXIT.OK });
+  for (const [label, args, reason] of [['no outcome', {}, 'graceful-stop-required'], ['unconfirmed', { windowsStop: UNCONFIRMED_STOPS[0] }, 'graceful-stop-unconfirmed'],
+    ['other daemon', { windowsStop: { ok: true, startReplacement: true, stopped: [4242], exitCode: 0, message: 'Stopped telepty daemon (pid 4242).' }, census: [5151] }, 'other-daemons-running']]) {
+    const r = run(args);
+    assert.deepEqual({ label, reason: r.result.refused && r.result.refused.reason, issued: mutating(r.world), forced: r.cleanups.filter((o) => !o || o.dryRun !== true).length,
+      removals: r.world.calls.removals, services: r.result.services, purged: r.result.stateDirs.some((d) => d.purged) },
+      { label, reason, issued: [], forced: 0, removals: [], services: null, purged: false });
   }
 });
 

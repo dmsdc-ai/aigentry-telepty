@@ -247,13 +247,21 @@ function collectOutput(ws) {
   return () => chunks.join('');
 }
 
-test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly like a wrapped one', async () => {
+test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly like a wrapped one', async (t) => {
   const { sid, viewer } = await spawned('spawnaudit');
   const output = collectOutput(viewer);
 
   viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_OK\r', from: 'orchestrator' }));
   await daemon.waitFor(() => (output().includes('SPAWNMARKER_OK') ? true : null),
-    { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' });
+    { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' })
+    .catch((error) => {
+      // Task 1215 (#879 discriminator, diagnostics only; no bytes): did anything come back, and is the marker present
+      // once terminal escape sequences are removed (split echo) vs absent altogether (write never reached the PTY)?
+      const raw = output(); const plain = raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').replace(/\u001b\].*?(\u0007|\u001b\\)/g, '');
+      t.diagnostic(`#879 diag spawned_echo ${JSON.stringify({ output_bytes: Buffer.byteLength(raw, 'utf8'), any_output: raw.length > 0,
+        marker_raw: raw.includes('SPAWNMARKER_OK'), marker_plain: plain.includes('SPAWNMARKER_OK'), command_plain: plain.includes('echo SPAWNMARKER') })}`);
+      throw error;
+    });
 
   const lines = await waitForAudit((l) => l.to === sid && l.source === 'ws-viewer');
   assert.equal(lines.length, 1, 'one line per viewer write, same as the wrapped door');

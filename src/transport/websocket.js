@@ -105,7 +105,8 @@ function installWebSocketTransport(deps) {
   // bootstrap gate of a negotiated owner, for every role.
   function acceptReadinessMilestone(sessionId, session, msg) {
     const accepted = readinessHandshake.acceptMilestone(sessionId, session, msg);
-    if (!accepted.ok) return false;
+    // Task 1215 (#879 discriminator): still no effect, but the refusal reason is now observable (bounded).
+    if (!accepted.ok) { readinessHandshake.noteRefusedMilestone(session, msg && msg.type, accepted.reason); return false; }
     const event = JSON.stringify({ type: accepted.milestone === 'input_transport_ready' ? 'session_input_transport_ready' : 'session_process_started',
       session_id: sessionId, owner_generation: session.interactionOwnerGeneration, child_seq: msg.child_seq,
       meaning: 'transport_only_not_instruction_receipt', timestamp: new Date().toISOString() });

@@ -52,6 +52,13 @@ async function diagSession(sessionId) {
     return { status: res.status, healthStatus: b.healthStatus ?? null, type: b.type ?? null, input_policy: t.input_policy ?? null,
       bootstrap_gated: t.bootstrap ? t.bootstrap.gated ?? null : null, readiness_capability: r.capability ?? null,
       input_transport_ready: r.input_transport_ready ? r.input_transport_ready.status ?? null : null,
+      // Task 1215 (#879 discriminators): which handshake half is missing, any refused frame (fixed reason code) and the
+      // daemon-side bootstrap queue (counts only).
+      process_started: r.process_started ? r.process_started.status ?? null : null,
+      input_transport_ready_reason: r.input_transport_ready ? r.input_transport_ready.reason ?? null : null,
+      refused_frames: r.refused_frames ? { count: r.refused_frames.count ?? null, milestone: r.refused_frames.last ? r.refused_frames.last.milestone ?? null : null,
+        reason: r.refused_frames.last ? r.refused_frames.last.reason ?? null : null } : null,
+      bootstrap: t.bootstrap ? { ready: t.bootstrap.ready ?? null, queued: t.bootstrap.queued ?? null, draining: t.bootstrap.draining ?? null } : null,
       instruction_received: t.instruction_received ? t.instruction_received.status ?? null : null, bridge_receipts: t.bridge_receipts ?? null,
       bridge_queue: q ? { source: q.source ?? null, phase: q.phase ?? null, pending: q.pending ?? null, reason: q.reason ?? null } : null };
   } catch (error) { return { error: (error && error.code) || 'request_failed' }; }
@@ -190,7 +197,7 @@ test('the incumbent still accepts an inject after the refused claim — it was n
     { timeoutMs: 10000, description: 'incumbent PTY received the inject' }).catch(async (error) => {
     // #879 diagnostics only (allowlisted; MARK is test-owned): where did the accepted inject stop?
     t.diagnostic(`#879 diag incumbent_delivery ${JSON.stringify({ inject: diagInject(injected), session: await diagSession(sessionId),
-      incumbent: diagPty(a.output.text, a.output.exit, { inject_allowed: 'Inject allowed', repl_prompt: '> ', mark_echo: MARK }),
+      incumbent: diagPty(a.output.text, a.output.exit, { inject_allowed: 'Inject allowed', repl_prompt: '> ', mark_echo: MARK, announce_unsent: 'transport readiness not announced', announce_pid_unavailable: 'pid=unavailable' }),
       challenger: diagPty(b.output.text, b.output.exit, { owner_claim_refused: 'Owner claim refused' }) })}`);
     throw error;
   });

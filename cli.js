@@ -532,6 +532,86 @@ function resolveTeleptyEntryPoint(deps = {}) {
   return ownCli;
 }
 
+// Task 1215 W3B: Windows `daemon stop|restart`. Every Windows signal stop is a forced termination that never
+// runs the daemon's shutdown() (ledger lock left ⇒ next daemon lock_present), so a NORMAL stop asks the
+// identified daemon instance to shut itself down and waits, bounded, for its actual exit. It never forces.
+// Task 1215 W3 (F4): with TELEPTY_PRINCIPAL_CLIENT_FILE set (strict principal mode) the identity read and the
+// stop are additionally signed by that existing principal client (`daemon.inspect`, `daemon.stop`); a client
+// configuration that cannot be loaded or names another daemon is an explicit refusal, never an unsigned stop.
+async function gracefulWindowsStop(port) {
+  const shutdownClient = require('./src/daemon-shutdown');
+  const { pidMatchesTeleptyCmdline } = require('./daemon-control');
+  const persistence = require('./src/session-store/persistence');
+  let signRequest = null;
+  if (process.env.TELEPTY_PRINCIPAL_CLIENT_FILE) {
+    try {
+      const principalClient = require('./src/principal/client');
+      const client = principalClient.createPrincipalClient(principalClient.loadPrincipalClientConfiguration(process.env.TELEPTY_PRINCIPAL_CLIENT_FILE));
+      if (client.daemonUrl !== new URL(`http://127.0.0.1:${port}`).origin) throw new Error('PRINCIPAL_CLIENT_TARGET_MISMATCH');
+      signRequest = (binding) => client.assertion(binding);
+    } catch {
+      return shutdownClient.decideStopOutcome({ status: 'unidentified', reason: 'principal_client_unavailable' });
+    }
+  }
+  const lockPath = persistence.defaultTrackedInjectionsLockPath(process.env.TELEPTY_TRACKED_INJECTIONS_PATH || persistence.defaultTrackedInjectionsPath());
+  const result = await shutdownClient.requestGracefulStop({
+    port, token: existingAuthToken(), fetchImpl: (url, options) => fetch(url, { ...options, redirect: 'error' }),
+    isProcessRunning, confirmCmdline: pidMatchesTeleptyCmdline,
+    probeHealth: () => probeDaemonHealth(port, 1000),
+    readLockPid: () => { try { const pid = JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid; return Number.isSafeInteger(pid) ? pid : null; } catch { return null; } },
+    signRequest
+  });
+  const dryRun = result.status === 'no_answer' ? (stopDaemon({ port, dryRun: true }).targets || []) : [];
+  return shutdownClient.decideStopOutcome(result, dryRun);
+}
+
+// Task 1215 W3 (F1/F2): which stop step a NORMAL (non-force) stop uses on this platform. Windows has no signal
+// that runs the daemon's shutdown(), so every ordinary Windows caller uses the graceful gate above; POSIX keeps
+// its signal stop (SIGTERM runs shutdown()). Explicit force (`telepty cleanup-daemons`) is not a normal stop.
+function normalStopMode(platform = process.platform) {
+  return platform === 'win32' ? 'graceful' : 'signal';
+}
+
+// Task 1215 W3 (R2): THE stop-step selector of every normal caller. 'seam' only when a caller injected one of the
+// pre-existing whole-stop-step seams (frozen tests); otherwise the platform decides. The graceful / signal
+// IMPLEMENTATIONS are injectable separately (`_gracefulStop`, `_signalStop`) and never change the selected mode.
+function selectNormalStop({ platform = process.platform, legacyStopSeam = false } = {}) {
+  if (legacyStopSeam) return 'seam';
+  return normalStopMode(platform) === 'graceful' ? 'graceful' : 'signal';
+}
+
+// Task 1215 W3 (F1): `daemon stop|restart` routed to an installed Windows scheduled task, and `service
+// stop|restart`. `schtasks /end` terminates the daemon without its shutdown() (the ledger lock is left), so a
+// NORMAL stop asks the identified daemon to stop itself through the graceful gate and never issues /end. A
+// restart runs the task (service verb `start` = `schtasks /run`) only after a confirmed clean stop or when no
+// daemon was running; refused / timeout / uncertain ⇒ failure with nothing forced and nothing started. The
+// service's own refusals (not installed, foreign descriptor, …) are returned unchanged. The task's daemon is
+// the default-port daemon (a task descriptor names no port — the same rule as supervisorFor).
+// → null when the service is not a scheduled task (the caller keeps its own path).
+const GRACEFUL_SERVICE_STEP = 'graceful stop: POST /api/daemon/stop to the identified daemon and wait for its exit (never schtasks /end)';
+async function scheduledTaskGracefulVerb(sub, deps, { dryRun = false, _runServiceVerb, _gracefulStop } = {}) {
+  if (sub !== 'stop' && sub !== 'restart') return null;
+  const service = require('./src/service');
+  const runVerb = _runServiceVerb || service.runServiceVerb;
+  const gracefulStop = _gracefulStop || gracefulWindowsStop;
+  const preview = await runVerb(sub, { yes: true, isTTY: false, dryRun: true }, deps);
+  if (!preview || !preview.plan || preview.plan.kind !== 'schtasks') return null;
+  const plan = { ...preview.plan, commands: [[GRACEFUL_SERVICE_STEP],
+    ...(preview.plan.commands || []).filter((argv) => !(argv[0] === 'schtasks' && argv[1] === '/end'))] };
+  if (preview.exitCode !== service.SERVICE_EXIT.OK || dryRun) return { ...preview, plan };
+  const outcome = await gracefulStop(DEFAULT_PORT);
+  const confirmed = Boolean(outcome && outcome.ok === true && outcome.startReplacement === true);
+  const step = { command: GRACEFUL_SERVICE_STEP, ok: confirmed, stderr: confirmed ? '' : String((outcome && outcome.message) || 'graceful stop not confirmed') };
+  if (!confirmed) {
+    return { ok: false, verb: sub, exitCode: service.SERVICE_EXIT.FAILED, reason: 'graceful-stop-unconfirmed', verified: null, steps: [step], status: null, plan, manualCommands: [] };
+  }
+  if (sub === 'stop') {
+    return { ok: true, verb: sub, exitCode: service.SERVICE_EXIT.OK, reason: null, verified: null, steps: [step], status: null, plan, manualCommands: [] };
+  }
+  const started = await runVerb('start', { yes: true, isTTY: false }, deps);
+  return { ...started, verb: sub, steps: [step, ...((started && started.steps) || [])], plan };
+}
+
 function startDetachedDaemon() {
   const entryPoint = resolveTeleptyEntryPoint();
   const cp = spawn(process.argv[0], [entryPoint, 'daemon'], {
@@ -764,7 +844,15 @@ async function restartDaemonUnderLease(options = {}) {
   // #902: SURGICAL by default — stopDaemon targets only the state-file pid and the addressed
   // port's owner, never a system-wide `ps` scan (daemon-control.js:438, telepty#55 wrote it for
   // exactly this property; the repair path just never adopted it).
-  const cleanup = options._cleanupDaemonProcesses || stopDaemon;
+  // Task 1215 W3 (F2): this automatic (default `clientRestart=auto`) restart is a NORMAL stop, so on Windows its
+  // stop step is the graceful gate: a replacement is started (or kickstarted) only after a confirmed clean stop
+  // or when no daemon was running; anything else returns a failure with nothing forced and nothing started.
+  // An injected stop seam keeps replacing the stop step exactly as before (frozen tests); production passes none.
+  // Task 1215 W3 (R2): the mode comes from selectNormalStop alone; `_gracefulStop`/`_signalStop` only replace the
+  // implementation of the SELECTED mode, so a test injecting them still exercises the production selection.
+  const stopMode = selectNormalStop({ platform: options._platform || process.platform, legacyStopSeam: typeof options._cleanupDaemonProcesses === 'function' });
+  const cleanup = stopMode === 'seam' ? options._cleanupDaemonProcesses : (options._signalStop || stopDaemon);
+  const gracefulStop = stopMode === 'graceful' ? (options._gracefulStop || gracefulWindowsStop) : null;
   const startDaemon = options._startDetachedDaemon || startDetachedDaemon;
   const detect = options._detectSupervisor || detectSupervisor;
   const restartSupervisor = options._restartSupervisorDaemon || restartSupervisorDaemon;
@@ -835,7 +923,19 @@ async function restartDaemonUnderLease(options = {}) {
     }
     // (a) Stop the daemon we are addressing (#902: the sweep is told which one)
     logRestartInitiated(writeLog, 'stop-initiated', { verdict: options.verdict, port: addressedPort });
-    const results = cleanup({ port: addressedPort });
+    let results;
+    if (gracefulStop) {
+      const outcome = await gracefulStop(addressedPort);
+      if (!outcome || outcome.startReplacement !== true) {
+        const diagnostic = (outcome && outcome.message) || 'graceful stop not confirmed';
+        console.error(`\x1b[31m❌ Daemon restart blocked: ${diagnostic}\x1b[0m`);
+        writeLog({ event: 'attempt-failed', attempt: `${attempt}/${maxAttempts}`, port: addressedPort, reason: 'graceful-stop-unconfirmed' });
+        return { success: false, meta: null, attempt, gracefulStopUnconfirmed: true, diagnostic };
+      }
+      results = { stopped: (outcome.stopped || []).map((pid) => ({ pid })), failed: [] };
+    } else {
+      results = cleanup({ port: addressedPort });
+    }
 
     // (b) Wait up to 3s for old processes to fully exit
     if (results.stopped.length > 0) {
@@ -1060,7 +1160,11 @@ async function repairLocalDaemon(options = {}) {
 
   const restart = options.restart !== false;
   // Injectable seams (default to the real implementations), as in restartDaemonGraceful.
-  const stop = options._stopDaemon || stopDaemon;
+  // Task 1215 W3: repair/update is a NORMAL stop — on Windows the graceful gate, never a forced kill (the injected
+  // `_stopDaemon` seam keeps replacing the stop step exactly as before). R2: the mode is selectNormalStop's alone.
+  const stopMode = selectNormalStop({ platform: options._platform || process.platform, legacyStopSeam: typeof options._stopDaemon === 'function' });
+  const stop = stopMode === 'seam' ? options._stopDaemon : (options._signalStop || stopDaemon);
+  const gracefulStop = stopMode === 'graceful' ? (options._gracefulStop || gracefulWindowsStop) : null;
   const doRestart = options._restartDaemonGraceful || restartDaemonGraceful;
   // gh#82 round 2 (c): repair stops the daemon too, so it obeys the same gate as every other caller.
   const refusal = clientRestartRefusal('repair', Number(PORT), options);
@@ -1070,7 +1174,18 @@ async function repairLocalDaemon(options = {}) {
   }
   // #902: "repair MY daemon" — the one this CLI addresses, not every daemon on the machine.
   logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
-  const results = stop({ port: Number(PORT) });
+  let results;
+  if (gracefulStop) {
+    const outcome = await gracefulStop(Number(PORT));
+    if (!outcome || outcome.ok !== true) {
+      const diagnostic = (outcome && outcome.message) || 'graceful stop not confirmed';
+      console.error(`\x1b[31m❌ ${diagnostic}\x1b[0m`);
+      return { stopped: 0, failed: 1, meta: null, versionMatch: false, gracefulStopUnconfirmed: true, diagnostic };
+    }
+    results = { stopped: (outcome.stopped || []).map((pid) => ({ pid })), failed: [] };
+  } else {
+    results = stop({ port: Number(PORT) });
+  }
 
   if (!restart) {
     return { stopped: results.stopped.length, failed: results.failed.length, meta: null };
@@ -1787,9 +1902,7 @@ async function manageInteractive() {
 
     if (response.action === 'daemon') {
       console.log('\n\x1b[33mStarting daemon in background...\x1b[0m');
-      logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: null });
-      cleanupDaemonProcesses();
-      startDetachedDaemon();
+      if (!(await interactiveDaemonStart())) continue;   // Task 1215 W3 (R2): the same body, via the shared selector
       console.log('✅ Daemon started.\n');
       continue;
     }
@@ -2027,6 +2140,8 @@ function serviceDeps(extra = {}) {
     port: Number(PORT),
     getDaemonMeta: (host) => getDaemonMetaWithoutMinting(host || '127.0.0.1'),
     readDaemonState,
+    // Task 1215 W3 (R1): the graceful gate a Windows scheduled-task uninstall must pass first (src/service.js).
+    gracefulStop: () => gracefulWindowsStop(DEFAULT_PORT),
     ...extra
   };
 }
@@ -2041,7 +2156,7 @@ function printServiceSteps(result) {
   }
 }
 
-async function runSupervisedDaemonVerb(route, sub) {
+async function runSupervisedDaemonVerb(route, sub, deps = {}) {
   if (route.route === 'manual') {
     // A root-owned unit is surfaced, never driven: no sudo from product code.
     console.error(`❌ A system-scope systemd unit owns this daemon — run: ${route.command}`);
@@ -2049,16 +2164,124 @@ async function runSupervisedDaemonVerb(route, sub) {
     return;
   }
 
-  const { runServiceVerb, SERVICE_EXIT } = require('./src/service');
-  const result = await runServiceVerb(sub, { yes: true, isTTY: false }, serviceDeps());
+  const { runServiceVerb: realRunServiceVerb, SERVICE_EXIT } = require('./src/service');
+  // Task 1215 W3 (R2): injectable service runner / graceful stop so the routing is testable; production passes none.
+  const runServiceVerb = deps.runServiceVerb || realRunServiceVerb;
+  const sdeps = deps.serviceDeps || serviceDeps();
+  const result = (route.kind === 'schtasks' && await scheduledTaskGracefulVerb(sub, sdeps, { _runServiceVerb: deps.runServiceVerb, _gracefulStop: deps.gracefulStop }))
+    || await runServiceVerb(sub, { yes: true, isTTY: false }, sdeps);
   console.log(`→ managed by ${route.kind}`);
   if (result.exitCode === SERVICE_EXIT.OK) {
     console.log(`\x1b[32m✅ Telepty daemon ${sub === 'stop' ? 'stopped' : `${sub}ed`} through ${route.kind}.\x1b[0m`);
-    return;
+    return result;
   }
   console.error(`\x1b[31m❌ ${route.kind} could not ${sub} the daemon (${result.reason || 'failed'}).\x1b[0m`);
   printServiceSteps(result);
   process.exitCode = result.exitCode;
+  return result;
+}
+
+// Task 1215 W3 (R2): `telepty daemon stop|restart` exactly as main() dispatches it (main calls this; nothing else
+// does), with seams so a test reaches the REAL routing and stop selection: a supervised daemon goes to the service
+// route; a local one uses selectNormalStop — graceful (win32) or the signal stop (POSIX). The bodies below are
+// main()'s former inline branches, unchanged except that the platform check is the shared selector.
+async function runDaemonStopRestart(sub, deps = {}) {
+  const port = Number.isInteger(deps.port) && deps.port > 0 ? deps.port : Number(PORT);
+  const detect = deps.detectSupervisor || detectSupervisor;
+  const route = decideDaemonVerbRoute(supervisorFor(detect(), port, deps.supervisorOptions || {}), sub);
+  if (route.route !== 'local') return (deps.runSupervisedDaemonVerb || runSupervisedDaemonVerb)(route, sub, deps);
+  const mode = selectNormalStop({ platform: deps.platform || process.platform });
+  const gracefulStop = deps.gracefulStop || gracefulWindowsStop;
+  const signalStop = deps.signalStop || stopDaemon;
+  const startDaemon = deps.startDetachedDaemon || startDetachedDaemon;
+  const writeLog = deps.logDaemonRestartEvent || logDaemonRestartEvent;
+
+  if (sub === 'stop') {
+    // Terminate the running daemon (state-file pid + configured-port owner),
+    // graceful SIGTERM→SIGKILL. Surgical: never a system-wide process sweep
+    // (that's `cleanup-daemons`). Internal auto-restart is untouched.
+    logRestartInitiated(writeLog, 'stop-initiated', { verdict: 'explicit', port });
+    if (mode === 'graceful') {
+      const outcome = await gracefulStop(port);
+      if (outcome.ok) console.log(outcome.stopped.length ? `\x1b[32m✅ ${outcome.message}\x1b[0m` : outcome.message);
+      else { console.error(`\x1b[31m❌ ${outcome.message}\x1b[0m`); process.exitCode = outcome.exitCode; }
+      return outcome;
+    }
+    const results = signalStop({ port });
+    if (results.stopped.length === 0 && results.failed.length === 0) {
+      console.log('No telepty daemon running.');
+    } else {
+      if (results.stopped.length > 0) {
+        console.log(`\x1b[32m✅ Stopped telepty daemon (${results.stopped.map((d) => `pid ${d.pid}`).join(', ')}).\x1b[0m`);
+      }
+      if (results.failed.length > 0) {
+        console.error(`\x1b[31m❌ Failed to stop ${results.failed.length} daemon process(es): ${results.failed.map((d) => `pid ${d.pid}`).join(', ')}.\x1b[0m`);
+        process.exitCode = 1;
+      }
+    }
+    return results;
+  }
+
+  // Clean cross-platform restart = surgical stop + detached start. Replaces
+  // the mac-only `launchctl kickstart` and gives Windows a restart it never
+  // had. Internal auto-restart (ensureDaemonRunning) is NOT touched.
+  logRestartInitiated(writeLog, 'stop-initiated', { verdict: 'explicit', port });
+  if (mode === 'graceful') {
+    // Never start a replacement while the old owned daemon is alive or its safe shutdown is unestablished.
+    const outcome = await gracefulStop(port);
+    if (!outcome.startReplacement) { console.error(`\x1b[31m❌ ${outcome.message}\x1b[0m`); process.exitCode = outcome.exitCode; return outcome; }
+  } else {
+    signalStop({ port });
+  }
+  const cp = startDaemon();
+  console.log(`\x1b[32m✅ Telepty daemon restarted (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
+  return { restarted: true, pid: cp.pid };
+}
+
+// Task 1215 W3 (R2): `telepty service <verb>` result as main() computes it (main calls this). A scheduled task's
+// stop|restart goes through the graceful-first helper; everything else (including uninstall, whose graceful gate
+// is inside src/service.js and receives `serviceDeps().gracefulStop`) goes to the service verb unchanged.
+async function runServiceCommandVerb(sub, flags = {}, deps = {}) {
+  const service = require('./src/service');
+  const runVerb = deps.runServiceVerb || service.runServiceVerb;
+  const sdeps = deps.serviceDeps || serviceDeps();
+  const scheduledTask = selectNormalStop({ platform: deps.platform || process.platform }) === 'graceful'
+    ? await scheduledTaskGracefulVerb(sub, sdeps, { dryRun: flags.dryRun, _runServiceVerb: deps.runServiceVerb, _gracefulStop: deps.gracefulStop })
+    : null;
+  return scheduledTask || await runVerb(sub, { yes: flags.yes, dryRun: flags.dryRun, replace: flags.replace, isTTY: flags.isTTY, confirm: flags.confirm }, sdeps);
+}
+
+// Task 1215 W3 (R1): `telepty uninstall` as main() runs it (main calls this). On Windows the default-port daemon is
+// first asked to stop itself through the exact-instance graceful gate (async here); src/uninstall.js runUninstall
+// stays synchronous and proceeds only with that confirmed outcome — otherwise it refuses and removes nothing.
+// A dry run asks nothing. POSIX is unchanged (no outcome is passed; runUninstall keeps its own stop step).
+async function runUninstallCommand({ purge = false, dryRun = false } = {}, deps = {}) {
+  const run = deps.runUninstall || require('./src/uninstall').runUninstall;
+  const opts = { purge, dryRun, ...(deps.uninstallOptions || {}) };
+  if (!dryRun && selectNormalStop({ platform: deps.platform || process.platform }) === 'graceful') {
+    let windowsStop = null;
+    try { windowsStop = await (deps.gracefulStop || gracefulWindowsStop)(DEFAULT_PORT); } catch { windowsStop = null; }
+    if (windowsStop) opts.windowsStop = windowsStop;
+  }
+  return run(opts);
+}
+
+// Task 1215 W3 (R2): the interactive menu's `daemon` action (the menu calls this). Graceful stop of the addressed
+// daemon and a start only on a confirmed outcome (win32); POSIX keeps its sweep + start. → true when started.
+async function interactiveDaemonStart(deps = {}) {
+  const port = Number(PORT);
+  const writeLog = deps.logDaemonRestartEvent || logDaemonRestartEvent;
+  if (selectNormalStop({ platform: deps.platform || process.platform }) === 'graceful') {
+    // Task 1215 W3: the addressed daemon is asked to stop itself; no machine-wide forced sweep, no overlap.
+    logRestartInitiated(writeLog, 'stop-initiated', { verdict: 'explicit', port });
+    const outcome = await (deps.gracefulStop || gracefulWindowsStop)(port);
+    if (!outcome.startReplacement) { console.error(`❌ ${outcome.message}\n`); return false; }
+  } else {
+    logRestartInitiated(writeLog, 'stop-initiated', { verdict: 'explicit', port: null });
+    (deps.cleanupDaemonProcesses || cleanupDaemonProcesses)();
+  }
+  (deps.startDetachedDaemon || startDetachedDaemon)();
+  return true;
 }
 
 
@@ -2166,8 +2389,12 @@ async function main() {
     // --purge. --dry-run prints what would happen without touching anything.
     const purge = args.includes('--purge');
     const dryRun = args.includes('--dry-run');
-    const { runUninstall } = require('./src/uninstall');
-    const result = runUninstall({ purge, dryRun });
+    const result = await runUninstallCommand({ purge, dryRun });   // Task 1215 W3 (R1): graceful-first on Windows
+    if (result.refused) {
+      console.error(`\x1b[31m❌ Uninstall refused (${result.refused.reason}): ${result.refused.message}\x1b[0m`);
+      process.exitCode = 1;
+      return;
+    }
     const would = dryRun ? 'Would ' : '';
 
     if (dryRun) {
@@ -2287,13 +2514,14 @@ async function main() {
       return answer.ok === true;
     };
 
-    const result = await runServiceVerb(sub, {
+    // Task 1215 W3 (R2): the same computation, through the exported dispatcher (graceful-first scheduled task).
+    const result = await runServiceCommandVerb(sub, {
       yes,
       dryRun,
       replace,
       isTTY: Boolean(process.stdin.isTTY && process.stdout.isTTY),
       confirm
-    }, serviceDeps());
+    });
 
     if (dryRun && result.plan) {
       console.log(`🔎 Dry run — nothing was written, loaded, removed or started.`);
@@ -2332,6 +2560,7 @@ async function main() {
     // #902: the one command whose contract IS machine-wide — it names the default port
     // explicitly now that the sweep no longer assumes one.
     logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: DEFAULT_PORT });
+    if (normalStopMode() === 'graceful') console.error('⚠️ cleanup-daemons is a FORCED stop (crash semantics): no daemon shutdown runs, so a ledger lock may be left for `telepty ledger unlock --confirm`. Use `telepty daemon stop` for a normal stop.');
     const results = cleanupDaemonProcesses({ port: DEFAULT_PORT });
     console.log(`Stopped ${results.stopped.length} telepty daemon(s).`);
     if (results.failed.length > 0) {
@@ -2348,7 +2577,9 @@ async function main() {
     // didn't exist. We now parse the subcommand; bare `telepty daemon` keeps the
     // foreground behavior for back-compat (install/launchd flows depend on it).
     const sub = args[1];
-    if (['start', 'stop', 'restart'].includes(sub)) {
+    // Task 1215 W3 (R2): stop|restart (supervised route or local) run through the exported dispatcher.
+    if (sub === 'stop' || sub === 'restart') return runDaemonStopRestart(sub);
+    if (sub === 'start') {
       const route = decideDaemonVerbRoute(supervisorFor(detectSupervisor(), Number(PORT)), sub);
       if (route.route !== 'local') return runSupervisedDaemonVerb(route, sub);
     }
@@ -2359,37 +2590,6 @@ async function main() {
       // IS the daemon process, so cp.pid is the daemon's pid.
       const cp = startDetachedDaemon();
       console.log(`\x1b[32m✅ Telepty daemon started (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
-      return;
-    }
-
-    if (sub === 'stop') {
-      // Terminate the running daemon (state-file pid + configured-port owner),
-      // graceful SIGTERM→SIGKILL. Surgical: never a system-wide process sweep
-      // (that's `cleanup-daemons`). Internal auto-restart is untouched.
-      logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
-      const results = stopDaemon({ port: Number(PORT) });
-      if (results.stopped.length === 0 && results.failed.length === 0) {
-        console.log('No telepty daemon running.');
-      } else {
-        if (results.stopped.length > 0) {
-          console.log(`\x1b[32m✅ Stopped telepty daemon (${results.stopped.map((d) => `pid ${d.pid}`).join(', ')}).\x1b[0m`);
-        }
-        if (results.failed.length > 0) {
-          console.error(`\x1b[31m❌ Failed to stop ${results.failed.length} daemon process(es): ${results.failed.map((d) => `pid ${d.pid}`).join(', ')}.\x1b[0m`);
-          process.exitCode = 1;
-        }
-      }
-      return;
-    }
-
-    if (sub === 'restart') {
-      // Clean cross-platform restart = surgical stop + detached start. Replaces
-      // the mac-only `launchctl kickstart` and gives Windows a restart it never
-      // had. Internal auto-restart (ensureDaemonRunning) is NOT touched.
-      logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
-      stopDaemon({ port: Number(PORT) });
-      const cp = startDetachedDaemon();
-      console.log(`\x1b[32m✅ Telepty daemon restarted (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
       return;
     }
 
@@ -3602,7 +3802,15 @@ async function main() {
 
     replayPendingOwnerFrames();
     // Task 1215 F2: child created, output/exit subscription attached, owner inject loop live.
-    allowSecurity.announceTransportReady();
+    // Task 1215 (#879 discriminator): a negotiated owner whose announce was NOT sent never releases its queued
+    // deliveries, and nothing said so. Name which precondition failed — one bounded line; no payload, token, id or
+    // path. Behavior is unchanged: nothing is retried, forced or written to the child.
+    if (!allowSecurity.announceTransportReady() && readinessNonce) {
+      console.error(`[allow] transport readiness not announced: pid=${child && Number.isSafeInteger(child.pid) && child.pid > 0 ? 'ok' : 'unavailable'}`
+        + ` socket=${wsReady && daemonWs && daemonWs.readyState === 1 ? 'open' : 'not_open'}`
+        + ` binding=${interactionBinding && typeof interactionBinding.owner_generation === 'string' ? 'ok' : 'missing'}`
+        + ` handoff=${handoffPending ? 'pending' : 'none'}`);
+    }
 
     // Graceful shutdown on SIGINT (let child handle it via PTY)
     process.on('SIGINT', () => {});
@@ -5620,6 +5828,14 @@ module.exports = {
   updateRestartSucceeded, // gh#61: did `update` leave a running daemon — skip is not a failure
   formatDaemonStopDiagnostic, // telepty#15: actionable can't-stop-daemon diagnostic (pure)
   restartDaemonGraceful,  // telepty#15: injectable seams for the blocked-restart fail-fast path
+  normalStopMode,         // Task 1215 W3: graceful (win32) vs signal stop for NORMAL callers (pure)
+  selectNormalStop,       // Task 1215 W3 (R2): the stop-step selector every normal caller uses (pure)
+  gracefulWindowsStop,    // Task 1215 W3 (R1): the exact-instance graceful gate (npm preuninstall awaits it)
+  runDaemonStopRestart,   // Task 1215 W3 (R2): main()'s `daemon stop|restart` dispatch (injectable seams)
+  runServiceCommandVerb,  // Task 1215 W3 (R2): main()'s `service <verb>` dispatch (injectable seams)
+  runUninstallCommand,    // Task 1215 W3 (R1): main()'s `uninstall` (graceful-first on Windows)
+  interactiveDaemonStart, // Task 1215 W3 (R2): the interactive menu `daemon` action
+  scheduledTaskGracefulVerb, // Task 1215 W3 (F1): graceful-first scheduled-task stop|restart (injectable seams)
   probeTimeoutMs,         // gh#82 (C): the one probe deadline, TELEPTY_PROBE_TIMEOUT_MS-overridable
   probeDaemonHealth,      // gh#82 (A/B): unauthenticated /api/health liveness re-confirmation
   resolveTargetToken,     // #844 F1: which credential belongs to THIS address — refuses, never assumes

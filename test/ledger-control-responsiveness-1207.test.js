@@ -41,6 +41,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const H = require('./fixtures/ledger-1207/control-harness');
+// Task 1215 / #1207: bounded gap diagnostics on the F2/R1 WORKLOAD samplers only (controls stay uninstrumented, so they
+// remain an uninstrumented same-process reference). Diagnostic evidence only; no assertion consumes it.
+const GapDiag = require('./fixtures/ledger-1207/heartbeat-gap-diagnostics');
+const gapDiagOptions = (messages) => (GapDiag.enabled() ? { diag: GapDiag.createGapDiagnostics({ messages }) } : {});
+const compactGapDiag = (d) => (d ? { top_gaps: d.top_gaps, main_isolate_gc: d.main_isolate_gc, measured_phase_aggregate: d.measured_phase_aggregate } : null);
 
 const TIERS = H.selectedTiers();
 const EVIDENCE = H.evidenceDir();
@@ -136,7 +141,7 @@ for (const tier of TIERS) {
     const messages = { inbound: [], outbound: [] };
     const { shared, runtime, actions, injectHandler, ledgerClient, sessionStateManager } = H.buildShared(store, R, { messages });
     const controlPre = await heartbeatControl('idle_pre', { idleMs: CONTROLS.idlePreMs });   // W5 diagnostic, before the F2 sampler starts
-    const hb = H.startHeartbeat({ periodMs: 1 });
+    const hb = H.startHeartbeat({ periodMs: 1, ...gapDiagOptions(messages) });
     let failed = true;
     const evidence = { case: 'F2', tier_mib: tier, seeded: { records: seeded.count, bytes: seeded.bytes, sha256: seeded.sha256 }, counts: F2, started_at: new Date().toISOString(), node: process.version, platform: process.platform };
     evidence.heartbeat_controls = { identity: runtimeIdentity(), limits: CONTROLS, idle_pre: controlPre, idle_post: null, block: null };
@@ -170,12 +175,16 @@ for (const tier of TIERS) {
       const flips = [];
       let k = 0;
       async function flip(phase) {
+        hb.label('flip-status-before');
         const before = (await ledgerClient.ownerStatus()).io;
         const busBefore = R.bus.length;
         const t0 = process.hrtime.bigint();
+        hb.label('flip-feed');
         sessionStateManager.feed('w1', k % 2 === 0 ? CHUNKS.busy : CHUNKS.plain(k));
         k++;
+        hb.label('flip-wait');
         await H.sleep(F2.spacingMs);
+        hb.label('flip-status-after');
         const after = (await ledgerClient.ownerStatus()).io;
         const events = R.bus.slice(busBefore).filter((b) => b.type === 'task_completion_unknown');
         flips.push({ phase, k, writes: after.writes - before.writes, bytes: after.bytes - before.bytes, fsyncs: after.fsyncs - before.fsyncs, renames: after.renames - before.renames,
@@ -186,6 +195,7 @@ for (const tier of TIERS) {
       const cpuM = H.cpuMark(); const tM0 = process.hrtime.bigint();
       hb.mark('measured');
       for (let i = 0; i < F2.measuredFlips; i++) await flip('measured');
+      hb.label('settle');
       await H.sleep(F2.settleMs);
       hb.mark('tail');
       const measuredWall = H.ms(tM0, process.hrtime.bigint());
@@ -233,13 +243,14 @@ for (const tier of TIERS) {
       f2ByTier.set(tier, evidence);
     } finally {
       fs.writeSync = realWrite; fs.writeFileSync = realWriteFile;
-      try { hb.stop(); } catch { /* already stopped */ }
+      try { const late = hb.stop(); if (!evidence.heartbeat) evidence.heartbeat_on_early_failure = late; } catch { /* already stopped */ }
       evidence.closed = await H.closeBounded(ledgerClient, 2000);
       evidence.finished_at = new Date().toISOString(); evidence.failed = failed;
       const file = H.writeEvidence(EVIDENCE, `F2-${tier}MiB.json`, evidence);
       console.log(`[ledger-1207 F2 ${tier} MiB] evidence=${file} heartbeat.measured=${JSON.stringify(evidence.heartbeat && evidence.heartbeat.measured)} process_cpu=${JSON.stringify(evidence.process_cpu_measured)} mainWrites=${evidence.main_thread_store_writes}`);
       // W5: raw control summaries on every outcome (identity, phases, counts, gap stats only — no paths or payloads).
       console.log(`[ledger-1207 F2 ${tier} MiB] heartbeat_controls=${JSON.stringify(evidence.heartbeat_controls)}`);
+      console.log(`[ledger-1207 F2 ${tier} MiB] heartbeat_gap_diagnostics=${JSON.stringify(compactGapDiag((evidence.heartbeat || evidence.heartbeat_on_early_failure || {}).diagnostics))}`);
       console.log(`[ledger-1207 F2 ${tier} MiB] heartbeat_acceptance=${JSON.stringify(evidence.heartbeat_acceptance || null)}`);
       if (failed) console.log(`[ledger-1207 F2 ${tier} MiB] FAILED — private HOME preserved for diagnosis: ${store.home}`);
       else fs.rmSync(store.home, { recursive: true, force: true });
@@ -261,7 +272,7 @@ for (const tier of TIERS) {
     // W5: R1's OWN same-process controls (never borrowed from F2). idle_pre runs before the R1 sampler and before the
     // open; idle_post + block run after every workload metric is captured. Same budget as F2: 1500 ms idle + 100 ms block.
     const controlPre = await heartbeatControl('idle_pre', { idleMs: CONTROLS.idlePreMs });
-    const hb = H.startHeartbeat({ periodMs: 1 });
+    const hb = H.startHeartbeat({ periodMs: 1, ...gapDiagOptions(messages) });
     let failed = true; let pollTimer = null;
     const evidence = { case: 'R1', tier_mib: tier, seeded: { records: seeded.count, bytes: seeded.bytes, sha256: seeded.sha256 }, counts: R1, started_at: new Date().toISOString(), node: process.version, platform: process.platform,
       handler_reach: 'poll handler BODY not reachable in-process (inline on the express app); its data path is driven as daemon.js evaluates it; the inject handler is the real one' };
@@ -281,13 +292,17 @@ for (const tier of TIERS) {
           .catch((error) => polls.push({ arm: 'threw', error: error && error.message, issued_ms_after_open_start: H.ms(tOpen0, issued) }));
       }, R1.pollIntervalMs);
       // begins issued while the store is recovering (the open is in flight on the owner thread)
+      hb.label('open-inflight');
       const openPromise = runtime.restoreTrackedInjections();
       for (let i = 0; i < R1.beginDuringRecovery; i++) {
+        hb.label('begin-during-open');
         const res = H.makeRes(); const t0 = process.hrtime.bigint();
         await injectHandler(H.makeReq(`begin while recovering ${i}`), res);
         begins.push({ status: res.statusCode, code: res.body && res.body.code, reason: res.body && res.body.reason, wall_ms: H.ms(t0, process.hrtime.bigint()), store: ledgerClient.state, healthy: shared.trackedLedgerHealthy });
       }
+      hb.label('open-await');
       const opened = await openPromise;
+      hb.label('post-open-polls');
       const openWall = H.ms(tOpen0, process.hrtime.bigint());
       evidence.open = { ok: opened.ok, state: opened.state || null, reason: opened.reason || null, wall_ms: openWall, counts: opened.counts || null, process_cpu: H.cpuDelta(cpu0) };
       assert.equal(opened.ok, true, JSON.stringify(opened));
@@ -296,6 +311,7 @@ for (const tier of TIERS) {
       const deadline = Date.now() + 15000;
       while (polls.length < target && Date.now() < deadline) await H.sleep(R1.pollIntervalMs);
       clearInterval(pollTimer); pollTimer = null;
+      hb.label('drain');
       await H.sleep(100);
       hb.mark('tail');
       const phaseWall = H.ms(tPhase0, process.hrtime.bigint());
@@ -338,12 +354,13 @@ for (const tier of TIERS) {
       r1ByTier.set(tier, evidence);
     } finally {
       if (pollTimer) clearInterval(pollTimer);
-      try { hb.stop(); } catch { /* already stopped */ }
+      try { const late = hb.stop(); if (!evidence.heartbeat) evidence.heartbeat_on_early_failure = late; } catch { /* already stopped */ }
       evidence.closed = await H.closeBounded(ledgerClient, 2000);
       evidence.finished_at = new Date().toISOString(); evidence.failed = failed;
       const file = H.writeEvidence(EVIDENCE, `R1-${tier}MiB.json`, evidence);
       console.log(`[ledger-1207 R1 ${tier} MiB] evidence=${file} open_ms=${evidence.open && evidence.open.wall_ms} polls=${JSON.stringify(evidence.polls && { total: evidence.polls.total, during: evidence.polls.during_recovery })} heartbeat.measured=${JSON.stringify(evidence.heartbeat && evidence.heartbeat.measured)}`);
       console.log(`[ledger-1207 R1 ${tier} MiB] heartbeat_controls=${JSON.stringify(evidence.heartbeat_controls)} heartbeat_acceptance=${JSON.stringify(evidence.heartbeat_acceptance || null)}`);
+      console.log(`[ledger-1207 R1 ${tier} MiB] heartbeat_gap_diagnostics=${JSON.stringify(compactGapDiag((evidence.heartbeat || evidence.heartbeat_on_early_failure || {}).diagnostics))}`);
       if (failed) console.log(`[ledger-1207 R1 ${tier} MiB] FAILED — private HOME preserved for diagnosis: ${store.home}`);
       else fs.rmSync(store.home, { recursive: true, force: true });
     }

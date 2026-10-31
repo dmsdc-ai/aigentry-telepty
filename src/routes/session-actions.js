@@ -1566,6 +1566,8 @@ function createSessionActions(shared, effects = {}) {
             : 'no_tracked_inject';
           return (0, shared.respondWithError)(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error,
             { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable',
+              // Task 1215 (#879 discriminator): the measured barrier wait of a QUEUE_TIMEOUT refusal (nothing was written).
+              ...(delivery.code === 'QUEUE_TIMEOUT' && Number.isSafeInteger(delivery.queue_wait_ms) ? { queue_wait_ms: delivery.queue_wait_ms } : {}),
               ...(session.sshRemote ? { text_written: delivery.text_written === true,
                 text_bytes_written: delivery.text_bytes_written ?? null, bytes_written: delivery.bytes_written ?? null,
                 retry_safe: delivery.bytes_written === 0 && delivery.text_written !== true } : {}),

@@ -333,6 +333,9 @@ if (!ENV_AUTH_TOKEN) {
 }
 const EXPECTED_TOKEN = ENV_AUTH_TOKEN || config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
+// Task 1215 W3B: identifies THIS daemon process for a bound graceful stop (exposed only through the
+// authenticated /api/meta). An identity, not a credential: the stop also requires the local admin token.
+const DAEMON_INSTANCE_ID = require('./src/daemon-shutdown').newInstanceId();
 const principalAuthentication = require('./src/principal/http').createPrincipalAuthenticationFromEnvironment({ machineId: MACHINE_ID, sessions: () => sessions });
 // Task 1215 combined mode: ordinary transport auth plus a separately configured operator verifier for
 // user-supervised registrations. Configured-but-invalid trust (or a strict-mode conflict) throws here,
@@ -1713,6 +1716,7 @@ app.get('/api/meta', (req, res) => {
     name: pkg.name,
     version: pkg.version,
     pid: process.pid,
+    instance_id: DAEMON_INSTANCE_ID,
     host: HOST,
     port: boundPort,
     machine_id: MACHINE_ID,
@@ -1720,9 +1724,19 @@ app.get('/api/meta', (req, res) => {
     terminal: DETECTED_TERMINAL,
     // #137: bridge-stage-receipts-v1 = this daemon accepts owner-bound bridge_receipt/bridge_queue
     // frames and threads inject ids to the bridge. It says nothing about any one bridge's support.
-    capabilities: ['ssh-child-write-receipts-v1', 'bridge-stage-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session']
+    capabilities: ['ssh-child-write-receipts-v1', 'bridge-stage-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session', 'daemon-graceful-stop-v1']
   });
 });
+
+// Task 1215 W3B: authenticated LOCAL graceful stop (Windows has no signal that runs shutdown()). Behind the
+// existing auth middleware AND its own checks in src/daemon-shutdown.js: loopback socket peer, no Origin,
+// x-telepty-token header (timing-safe), exact bounded {pid, instance_id} body for THIS process. Accepted ⇒
+// the same idempotent shutdown() the SIGINT/SIGTERM handlers call, only when running as the daemon main.
+{
+  const { STOP_PATH, createGracefulStopHandler } = require('./src/daemon-shutdown');
+  app.post(STOP_PATH, createGracefulStopHandler({ expectedToken: EXPECTED_TOKEN, pid: process.pid, instanceId: DAEMON_INSTANCE_ID,
+    isDaemonMain: require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1', shutdown: (code) => shutdown(code) }));
+}
 
 // --- Mailbox API endpoints ---
 

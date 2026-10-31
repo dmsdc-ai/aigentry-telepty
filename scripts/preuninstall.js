@@ -14,10 +14,20 @@
 // HARD RULE: this script must never fail — a broken preuninstall would break
 // `npm rm` itself, which is strictly worse than leaving a daemon running.
 
-try {
-  const { runPreuninstall } = require('../src/uninstall');
-  runPreuninstall();
-} catch {
-  // Swallow everything — see HARD RULE above.
-}
-process.exit(0);
+// Task 1215 W3 (R1): on Windows the daemon is first asked to stop itself through the same exact-instance graceful
+// gate as `telepty daemon stop` (bounded; it never kills). The synchronous pass below proceeds only with a
+// confirmed outcome and otherwise leaves the daemon running — never a forced kill. POSIX is unchanged. The HARD
+// RULE still holds: every path, including a rejected or thrown gate, exits 0.
+(async () => {
+  try {
+    const { runPreuninstall } = require('../src/uninstall');
+    let windowsStop = null;
+    if (process.platform === 'win32') {
+      try { windowsStop = await require('../cli').gracefulWindowsStop(require('../daemon-control').DEFAULT_PORT); } catch { windowsStop = null; }
+    }
+    runPreuninstall(windowsStop ? { windowsStop } : {});
+  } catch {
+    // Swallow everything — see HARD RULE above.
+  }
+  process.exit(0);
+})();

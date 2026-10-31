@@ -58,7 +58,9 @@ function seedTier(store, tierMiB, obsPerRecord = 12) {
 // ---- heartbeat sampler (1 ms main-loop timer) ------------------------------------------------------
 // Gap = time between consecutive timer callbacks minus the 1 ms period; a blocked main loop shows up
 // as large gaps. Samples are split at `mark()` boundaries so warm-up and measurement are separate.
-function startHeartbeat({ periodMs = 1, cap = 100000 } = {}) {
+// Task 1215 / #1207: `diag` (optional) is a heartbeat-gap-diagnostics tracker. Without it the sampler is exactly as
+// before. With it, each tick also calls diag.tick(phase) AFTER the unchanged gap sample; stop() adds `diagnostics`.
+function startHeartbeat({ periodMs = 1, cap = 100000, diag = null } = {}) {
   const phases = { warmup: [], measured: [], tail: [] };
   let phase = 'warmup';
   let last = process.hrtime.bigint();
@@ -69,10 +71,12 @@ function startHeartbeat({ periodMs = 1, cap = 100000 } = {}) {
     last = now;
     const arr = phases[phase];
     if (arr.length < cap) arr.push(gapMs); else dropped++;
+    if (diag) diag.tick(phase);
   }, periodMs);
   return {
-    mark(next) { phase = next; last = process.hrtime.bigint(); },
-    stop() { clearInterval(timer); return { ...summarizeAll(phases), dropped, period_ms: periodMs }; },
+    mark(next) { phase = next; last = process.hrtime.bigint(); if (diag) diag.mark(next); },
+    label(next) { if (diag) diag.setLabel(next); },
+    stop() { clearInterval(timer); return { ...summarizeAll(phases), dropped, period_ms: periodMs, ...(diag ? { diagnostics: diag.report() } : {}) }; },
   };
 }
 function percentile(sorted, p) { if (!sorted.length) return null; const i = Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1)); return sorted[i]; }
