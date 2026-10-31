@@ -84,3 +84,33 @@ trust/staged-auth directions. No repeated preparation tool is proposed here.
 There is no further independently reproduced Telepty product defect in this pass.
 User-requested install/startup usability work continues in the isolated consumer
 clone; it must not be misreported as deployment or a recovered gateway.
+
+## Install-flow completion follow-up
+
+The isolated consumer advanced to91b8c9b69cc7648def83f9c951b5d3a9975dbdda.
+Actual help/version/unknown-argument and missing-tarball-document defects were
+reproduced and fixed. Its full suite now passes190/193, zero failed, three
+native/platform skips; exact CI unit passes103/105, zero failed, two skips.
+Independent entrypoint/pack3/3 and real installed-MCP acceptance passed.
+
+A clean local archive was actually installed offline into a new private npm prefix,
+with lifecycle scripts disabled and a separate sanitized public dependency cache.
+The installed package/SDK/zod are real directories, not source symlinks. Installed
+npm shim, five MCP tools, durable send, stable request-ID dedupe, credential-bound
+reply and owned close/target preservation all pass. The reusable runner's timeout
+and realpath truthfulness issues were corrected before final artifact acceptance.
+
+Artifact: sibling workspace folder `telesession-artifacts-20261031`, containing
+`dmsdc-ai-telesession-0.1.0.tgz`, manifest.json and SHA256SUMS. Archive size59,909
+bytes; SHA256 b3b4d63ad61c263cef9951e194354968b7c79ab482c2daf110408bcca62dc732.
+Manifest captures exact source, Node20.20.0/npm10.8.2 and installed SDK1.32.2/zod3.25.76.
+Final installed acceptance: `/tmp/telesession-final-artifact-acceptance-20261031.log`.
+Source core and installation reports are in the sibling consumer's docs directory.
+
+No external publish or operating change occurred. Source target is
+dmsdc-ai/aigentry-telesession; current package remains @dmsdc-ai/telesession@0.1.0,
+private:true. Final registry version/dist-tag/access and posting authorization
+remain unresolved. Compatible operating Telepty activation, gateway429, actual
+Mac/provider and native cross-OS acceptance remain separate gates. The55-row
+disposition and32 residual conditions above are unchanged; Linux local repair and
+isolated installation completion must not be described as all issues closed.
