@@ -5,7 +5,7 @@ const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypt
 const http=require('node:http'),{Duplex}=require('node:stream');
 const assert=require('node:assert/strict');
 nodeTest('session-inspection-security-681',{concurrency:false},async t=>{
- const root=fs.mkdtempSync(path.join(os.tmpdir(),'telepty-inspection-681-'));
+ const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'telepty-inspection-681-')));
  const fixtureRoot=path.join(root,'fixture');
  const privateEnv={HOME:path.join(root,'private','home'),USERPROFILE:path.join(root,'private','home'),
   XDG_CONFIG_HOME:path.join(root,'private','config'),XDG_DATA_HOME:path.join(root,'private','data'),TMPDIR:path.join(root,'private','tmp')};

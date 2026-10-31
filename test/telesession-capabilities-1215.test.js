@@ -158,7 +158,9 @@ test('1215: /api/meta retains each consumer-required capability alongside SSH re
     assert.ok(caps.includes(cap), `baseline capability ${cap} must be retained`);
   }
   assert.ok(caps.includes('ssh-child-write-receipts-v1'));
-  assert.equal(caps.length, BASELINE.length + REQUIRED.length + 1, 'only the explicit SSH receipt capability was added');
+  // #137 (accepted; asserted by bridge-stage-receipts-137 S3): the daemon also advertises bridge-stage receipts.
+  assert.equal(caps.filter((c) => c === 'bridge-stage-receipts-v1').length, 1, 'bridge-stage-receipts-v1 advertised exactly once');
+  assert.equal(caps.length, BASELINE.length + REQUIRED.length + 2, 'only the explicit SSH receipt and #137 bridge-stage receipt capabilities were added');
 });
 
 // --- inject-exact-target ------------------------------------------------------------------------

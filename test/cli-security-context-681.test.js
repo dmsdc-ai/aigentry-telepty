@@ -5,7 +5,7 @@ const {test:nodeTest}=require('node:test');
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),os=require('node:os');
 const assert=require('node:assert/strict');
 nodeTest('cli security regression 681', {concurrency:false}, async t=>{
- const root=fs.mkdtempSync(path.join(os.tmpdir(),'telepty-cli-681-'));
+ const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'telepty-cli-681-')));
  const fixture=path.join(root,'fixture');
  // #879: spawnChild always runs the production buildPtySpawnTarget, whose win32 PATH x PATHEXT walk cannot
  // resolve the synthetic bare name. On win32 the tool is an absolute .exe path (never executed: spawnPty is

@@ -118,7 +118,7 @@ test('#12 remote POSIX quoting preserves cwd and literal argv without shell eval
 }, t => {
   const fs = require('node:fs'); const os = require('node:os'); const path = require('node:path');
   const { spawnSync } = require('node:child_process');
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-ssh-quote-'));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-ssh-quote-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const cwd = path.join(root, "directory's $() space"); fs.mkdirSync(cwd);
   const script = path.join(root, 'record.js');

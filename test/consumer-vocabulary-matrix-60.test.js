@@ -30,7 +30,8 @@
 // (mcp-server/index.mjs) are base-commit "NOT DONE" items 4 and 5, owned by the sibling doing the
 // consumer-facing work. Their rows belong in the change that lands them.
 //
-// Pure: session-state.js + a source read. No daemon spawn, no PTY, no HTTP.
+// Pure: session-state.js + a source read, plus one in-memory execution of the real single-session route
+// handler (no daemon spawn, no PTY, no HTTP, no filesystem).
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -193,6 +194,74 @@ test('consumer_vocabulary_matrix_is_total: a deleted or unknown name degrades to
   }
 });
 
+// Runs the REAL single-session route (src/routes/session-inspection.js registerGetRoute) over an in-memory
+// session that carries internal FSM state plus planted internal-only values. Real: the inspection context,
+// serializeSession, readinessSnapshot, session-state mapObservationCause/OBSERVATION_DISPLAY,
+// completion-observation CAPABILITY_STAGE_A, lifecycle.effectiveIdleTtlMs. Stand-ins (boundaries only):
+// the app router, health/terminal/transport/semantic block builders, the state manager, the mailbox.
+// No daemon, PTY, socket, filesystem or network.
+function assertSingleSessionRouteServesConsumerVocabulary() {
+  const { createSessionInspectionContext } = require('../src/routes/session-inspection');
+  const { CAPABILITY_STAGE_A } = require('../src/completion-observation');
+  const SECRET = {
+    verifier: 'SECRET-credential-verifier-60', ring: 'SECRET-output-ring-60', nonce: 'SECRET-readiness-nonce-60',
+    capability: 'SECRET-policy-capability-60', ownerToken: 'SECRET-owner-token-60', bearer: 'SECRET-bearer-60',
+  };
+  const session = {
+    id: 'vocab-60', type: 'wrapped', command: 'codex', cwd: '/fixture/vocab-60', createdAt: '2026-07-29T00:00:00.000Z',
+    lastActivityAt: '2026-07-29T00:00:00.000Z', clients: new Set(), ready: true,
+    // Internal-only state a consumer must never receive (the route returns a serialized VIEW, not the record).
+    credentialVerifier: SECRET.verifier, outputRing: [SECRET.ring], transportReadiness: { nonce: SECRET.nonce },
+    inputPolicyPending: { capability: SECRET.capability }, ownerToken: SECRET.ownerToken, sessionToken: SECRET.bearer,
+    ownerWs: { readyState: 1, secret: SECRET.ownerToken }, ptyProcess: { pid: 4242, secret: SECRET.ring },
+  };
+  const internalState = { state: 'idle', detail: { trigger: 'silence_timeout', silence_ms: 6000 }, confidence: 0.6, since: '2026-07-29T00:00:06.000Z' };
+  const shared = {
+    sessions: { 'vocab-60': session }, resolveSessionAlias: id => (id === 'vocab-60' ? id : null), MACHINE_ID: 'fixture-machine',
+    getSessionHealthStatus: () => 'CONNECTED', getSessionHealthReason: () => null, getSessionDisconnectedMs: () => null,
+    getSessionTerminalLabel: () => 'fixture', buildSessionTransportBlock: () => ({ marker: 'transport-block' }),
+    buildSessionSemanticBlock: () => ({ marker: 'semantic-block' }), sessionStateManager: { getState: () => internalState },
+    lifecycle: require('../src/lifecycle'), teleptyConfig: {}, mapObservationCause, OBSERVATION_DISPLAY, CAPABILITY_STAGE_A,
+    mailbox: { peek: () => [], peekDeadLetter: () => [] }, SUBMIT_STRATEGIES: {}, submitViaPty: () => false,
+  };
+  const inspection = createSessionInspectionContext(shared);
+  const routes = {};
+  inspection.registerGetRoute({ get: (p, h) => { routes[p] = h; } });
+  assert.equal(typeof routes['/api/sessions/:id'], 'function', 'the real registerGetRoute registers the single-session route');
+  let body = null, status = 200;
+  routes['/api/sessions/:id']({ params: { id: 'vocab-60' } }, { status(c) { status = c; return this; }, json(b) { body = b; return this; } });
+  assert.equal(status, 200);
+  // 1. The consumer serializer is applied: every serializer field is served unchanged, plus only the
+  //    documented single-session additions (#137 bridge fields, alias, last-inject routing).
+  const expected = inspection.serializeSession('vocab-60', session);
+  const extras = Object.keys(body).filter(k => !Object.hasOwn(expected, k)).sort();
+  assert.deepEqual(extras, ['alias', 'bridge_queue', 'bridge_receipts', 'lastInjectFrom', 'lastInjectReplyTo'],
+    'single-session route = serializer view + documented additions only');
+  for (const key of Object.keys(expected)) {
+    if (key === 'handshake' || key === 'idleSeconds') continue;  // clock-derived (sampled_at / now)
+    assert.deepEqual(body[key], expected[key], `single-session route serves serializer field ${key} unchanged`);
+  }
+  // 2. The public vocabulary: observation by cause (neutral, never green/done), and a separate permanently
+  //    unknown completion block carrying the explicit capability gaps.
+  assert.equal(body.activityObservation.kind, 'pty_quiet');
+  assert.equal(body.activityObservation.tone, 'neutral');
+  assert.equal(OUTCOME_TONES.has(body.activityObservation.tone), false);
+  assert.deepEqual(body.completion, { completion_fact: null, terminal: false, capability: { ...CAPABILITY_STAGE_A } });
+  // 3. Leakage control: no internal FSM value and none of the planted internal-only values reach the consumer.
+  const leaks = served => {
+    const raw = JSON.stringify(served, (k, v) => (v instanceof Set ? [...v] : v));
+    return { autoState: Object.hasOwn(served, 'autoState'), internalFsmValue: /"(state|status)":"idle"/.test(raw),
+      planted: Object.values(SECRET).filter(s => raw.includes(s)) };
+  };
+  assert.deepEqual(leaks(body), { autoState: false, internalFsmValue: false, planted: [] },
+    'the single-session route must not expose internal state or internal-only record fields');
+  // The control is sensitive: the same detector flags a raw record that carries the internal state.
+  const rawControl = leaks({ ...session, autoState: internalState });
+  assert.equal(rawControl.autoState, true, 'CONTROL: the detector sees an exported autoState');
+  assert.equal(rawControl.internalFsmValue, true, 'CONTROL: the detector sees the internal FSM value');
+  assert.ok(rawControl.planted.length === Object.keys(SECRET).length, 'CONTROL: the detector sees every planted internal value');
+}
+
 test('consumer_vocabulary_matrix_is_total: telepty list --json exposes no internal state value', () => {
   // §8.5.1: "no external autoState.state:'idle'; completion capability and last observation are
   // present." `telepty list --json` prints the daemon's session payload verbatim
@@ -229,7 +298,10 @@ test('consumer_vocabulary_matrix_is_total: telepty list --json exposes no intern
   assert.ok(inspectionSrc.includes("app.get('/api/sessions', (req, res) => {"));
   assert.ok(inspectionSrc.includes('Object.entries(shared.sessions).map(([id, session]) => serializeSession(id, session, { nowMs: now }))'));
   assert.ok(inspectionSrc.includes("app.get('/api/sessions/:id', (req, res) => {"));
-  assert.ok(inspectionSrc.includes('...serializeSession(resolvedId, session),'));
+  // The single-session route is verified by EXECUTING it (below), not by matching how it spells the
+  // serializer call: #137 changed the spelling (`const view = serializeSession(…)` + `...view`) without
+  // changing the contract.
+  assertSingleSessionRouteServesConsumerVocabulary();
 
   // The removed field, in the shape a consumer would read: `autoState: {` inside the serialized
   // payload. Its absence is what makes `activityObservation` load-bearing rather than additive.

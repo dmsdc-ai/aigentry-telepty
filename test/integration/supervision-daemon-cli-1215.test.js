@@ -98,6 +98,25 @@ async function stopBridge(bridge) {
   await waitFor(() => bridge.exit !== null, { timeoutMs: 3000, description: 'owned bridge termination' });
 }
 const witnessText = file => { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } };
+// The child's OWN startup record (written by the child process itself, first thing it does), or null.
+// Only this file proves the child executed; daemon supervision and bridge readiness do not (cli.js binds
+// the owner and receives input_policy BEFORE it spawns the child: initialOwnerAccepted → spawnChild()).
+function childStart(witness) {
+  try {
+    const start = JSON.parse(fs.readFileSync(witness + '.start', 'utf8'));
+    return Number.isSafeInteger(start.pid) && start.pid > 0 && Array.isArray(start.env) ? start : null;
+  } catch { return null; }
+}
+// Bounded wait that, on timeout, reports diagnostics read AT THE FAILURE (not when the wait began).
+async function boundedWait(check, { deadline, label, diagnose }) {
+  try {
+    return await waitFor(check, { timeoutMs: Math.max(0, deadline - Date.now()), description: label });
+  } catch (error) {
+    let detail = '';
+    try { detail = JSON.stringify(await diagnose()); } catch (e) { detail = `diagnostics unavailable: ${e && e.message}`; }
+    throw new Error(`${error.message}\nDIAGNOSTICS ${detail}`);
+  }
+}
 async function transportOf(daemon, sid) {
   const r = await daemon.request(`/api/sessions/${encodeURIComponent(sid)}`);
   return r.status === 200 && r.body ? r.body.transport : null;
@@ -159,13 +178,24 @@ test('#1215 real daemon + real CLI: file-backed operator supervision, child-inpu
   const forgedClient = clientFile(root, 'forged', unenrolled, { port, principalId: 'operator', keyId: 'operator-key' });
   const witness = path.join(root, 'witness', 'child-stdin.bin');
   bridge = spawnBridge({ root, daemon, sid, token, supervisionClient: operatorClient, witness });
-  await waitFor(async () => { const tr = await transportOf(daemon, sid); return tr && tr.input_policy === 'user-supervised'; },
-    { timeoutMs: 20000, description: `effective user-supervised for ${sid}; bridge output:\n${bridge.output.slice(-2000)}` });
-  const start = JSON.parse(fs.readFileSync(witness + '.start', 'utf8'));
+  // Fresh failure-time evidence for every bounded wait below (raw, unfiltered tails).
+  const diagnose = async () => {
+    let transport = null;
+    try { transport = await transportOf(daemon, sid); } catch (e) { transport = `unreadable: ${e && e.message}`; }
+    return { bridgeExit: bridge.exit, bridgeOutputTail: bridge.output.slice(-2000), daemonAlive: daemon.isAlive(),
+      daemonLogTail: (({ stdout, stderr }) => ({ stdout: stdout.slice(-1500), stderr: stderr.slice(-1500) }))(daemon.getLogs()),
+      transport, childStartPresent: fs.existsSync(witness + '.start'), childStart: childStart(witness), stdinWitnessBytes: witnessText(witness).length };
+  };
+  // ONE existing 20 s budget covers both facts: the daemon's effective supervision (owner bound) AND the child's own
+  // startup record. The bridge spawns the child only after the owner is accepted, so the second can lag the first.
+  const startDeadline = Date.now() + 20000;
+  await boundedWait(async () => { const tr = await transportOf(daemon, sid); return tr && tr.input_policy === 'user-supervised'; },
+    { deadline: startDeadline, label: `effective user-supervised for ${sid}`, diagnose });
+  const start = await boundedWait(() => childStart(witness), { deadline: startDeadline, label: 'child-owned startup record (witness .start)', diagnose });
   const before = await transportOf(daemon, sid);
   const nonce1 = `N1215A-${crypto.randomBytes(12).toString('hex')}`;
   const inject1 = await cliInject(daemon, token, sid, nonce1);
-  await waitFor(() => witnessText(witness).includes(nonce1), { timeoutMs: 15000, description: 'nonce 1 in the child stdin witness' });
+  await boundedWait(() => witnessText(witness).includes(nonce1), { deadline: Date.now() + 15000, label: 'nonce 1 in the child stdin witness', diagnose });
   const persisted = JSON.parse(fs.readFileSync(require('../../src/session-store/persistence').defaultSessionPersistPath(homeDir), 'utf8'))[sid] || null;
   const positive = { inputPolicy: before.input_policy, source: before.input_policy_source, inject1Code: inject1.code,
     nonce1InChildInput: witnessText(witness).includes(nonce1), childSupervisionEnv: start.env,
@@ -200,11 +230,11 @@ test('#1215 real daemon + real CLI: file-backed operator supervision, child-inpu
   const bridgePidBefore = bridge.pid;
   await daemon.kill();                                            // harness: SIGTERM/SIGKILL of its own child only
   daemon = await startTestDaemon({ homeDir, port, env: daemonEnv });
-  await waitFor(async () => { const tr = await transportOf(daemon, sid); return tr && tr.input_policy === 'user-supervised'; },
-    { timeoutMs: 30000, description: `re-supervised after restore; bridge output:\n${bridge.output.slice(-2000)}` });
+  await boundedWait(async () => { const tr = await transportOf(daemon, sid); return tr && tr.input_policy === 'user-supervised'; },
+    { deadline: Date.now() + 30000, label: 're-supervised after restore', diagnose });
   const nonce2 = `N1215B-${crypto.randomBytes(12).toString('hex')}`;
   const inject2 = await cliInject(daemon, token, sid, nonce2);
-  await waitFor(() => witnessText(witness).includes(nonce2), { timeoutMs: 15000, description: 'nonce 2 in the child stdin witness' });
+  await boundedWait(() => witnessText(witness).includes(nonce2), { deadline: Date.now() + 15000, label: 'nonce 2 in the child stdin witness', diagnose });
   const after = await transportOf(daemon, sid);
   const restored = { bridgeAlive: bridge.exit === null, samePid: bridge.pid === bridgePidBefore, inputPolicy: after.input_policy,
     source: after.input_policy_source, inject2Code: inject2.code, nonce2InChildInput: witnessText(witness).includes(nonce2),
