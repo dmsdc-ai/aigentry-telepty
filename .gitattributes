@@ -13,3 +13,9 @@ src/init/snippets/** text eol=lf
 # README.tmpl.md + LF-joined generated content byte-for-byte, so both are pinned to LF the same way.
 README.md text eol=lf
 README.tmpl.md text eol=lf
+# Task 1215 / #879: npm rewrites the shebang line ending of each package.json `bin` target when it links bins (measured,
+# Windows d66f095: installed cli.js = the CRLF checkout bytes with only the first newline LF), so a CRLF checkout made the
+# installed bytes differ from the packed ones. Exactly the bin targets are pinned to LF, so packed == installed on every OS.
+/cli.js text eol=lf
+/install.js text eol=lf
+/mcp-server/index.mjs text eol=lf
