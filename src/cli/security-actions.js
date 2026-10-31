@@ -351,6 +351,9 @@ function createAllowSecurityContext(shared, {
     // bridge write to the child. A local keystroke after it also breaks adjacency (user input is
     // never routed through here, so ordinary terminal typing is never blocked).
     let unwrittenBodyAdjacentAt = null;
+    // Task 1215 R2: legacy (id-less) pairing for a refused CR — the msg_id of the most recent successfully queued
+    // id-less body, only while nothing else was enqueued, refused or written since.
+    let adjacentQueuedBody = null;
     // Task 1215 F2: child sequence for spawn-readiness milestones; the subscribed child is the one
     // whose output/exit handlers are attached.
     let childSeq = 0;
@@ -503,6 +506,7 @@ function createAllowSecurityContext(shared, {
           continue;
         }
         if (age >= STALL_MS) {
+          if (record.pairRefused) continue; // keeps its withheld pair_refused receipt; never relabelled
           reason = reason || withholdReason();
           if (record.withheld !== reason) { record.withheld = reason; sendReceipt(msgId, record.meta, 'withheld', 'not_written', reason); }
         }
@@ -521,6 +525,23 @@ function createAllowSecurityContext(shared, {
         }
         if (!bodyId) break;
       }
+    }
+    // Task 1215 R2 — the reverse direction: a submit refused unwritten (mailbox_unavailable) takes its still-unwritten
+    // body with it, so the body can never be typed alone and later submitted glued to the next one. Dead-lettered
+    // now; if the mailbox still fails, held (`pairRefused`): never written, only quarantined by flush, the delivery
+    // timer, TTL or exit custody. Written (deleted) or write-threw (`unknown`) records are never touched.
+    function withdrawPairedBody(ids) {
+      let bodyId = ids.pair ? null : adjacentQueuedBody;
+      if (ids.pair) for (const [id, record] of bridgeRecords) if (record.meta.daemon_msg_id === ids.pair) { bodyId = id; break; }
+      const body = bodyId ? bridgeRecords.get(bodyId) : null;
+      if (!body || body.isCr || (body.state !== 'pending' && body.state !== 'in_flight')) return;
+      if (body.state === 'pending') {
+        const moved = quarantine(bodyId, 'pair_refused', 'not_written');
+        if (moved === true) { shared.bridgePendingCount = Math.max(0, shared.bridgePendingCount - 1); return; }
+        if (moved === false) return;
+      }
+      body.pairRefused = true;
+      if (body.state === 'pending') { body.withheld = 'pair_refused'; sendReceipt(bodyId, body.meta, 'withheld', 'not_written', 'pair_refused'); }
     }
     function vtLabel() {
       if (supervised() || !shared.knownAiCli || shared.sshPlan) return 'not_applicable';
@@ -597,6 +618,7 @@ function createAllowSecurityContext(shared, {
       }
       child.write(text);
       unwrittenBodyAdjacentAt = null;
+      adjacentQueuedBody = null;
       sendReceipt(null, ids, 'pty_written', 'written');
       return true;
     }
@@ -750,24 +772,21 @@ function createAllowSecurityContext(shared, {
           payload: text, created_at: Math.floor(now() / 1000), attempt: 0,
         });
       } catch (err) {
-        // Fallback: write directly if mailbox fails
         if (!canWrite(child)) return;
-        // Task 1215 CI18 (measured: Windows MAILBOX_LOCK_TIMEOUT wrote a lone CR under the kill switch). A CR is
-        // queued only behind pending records; written now it would submit ahead of its own unwritten body.
-        if (text === '\r' && shared.bridgePendingCount > 0) {
-          console.error(`[BRIDGE] Mailbox enqueue failed, submit not written: ${err.message}`);
-          sendReceipt(msgId, ids, 'refused', 'not_written', 'mailbox_unavailable');
-          return;
-        }
-        console.error(`[BRIDGE] Mailbox enqueue failed, writing directly: ${err.message}`);
-        invalidateBridgeInteraction('automated_input');
-        if (!canWrite(child)) return;
-        child.write(text);
-        unwrittenBodyAdjacentAt = null;
-        sendReceipt(msgId, ids, 'pty_written', 'written', 'mailbox_unavailable');
+        // Task 1215 C1/C2 (measured: Windows MAILBOX_LOCK_TIMEOUT wrote a lone CR under the kill switch, and body+CR
+        // on a guarded MODAL frame). Every caller enqueues only because a direct write is not permitted now (gate
+        // closed, or a CR behind pending records), so a failed enqueue is refused unwritten, never written directly.
+        // A refused body is recorded unwritten like a quarantined one: its submit is then never written alone.
+        const diagnostic = err && err.lock_diagnostic ? ` ${JSON.stringify(err.lock_diagnostic)}` : '';
+        console.error(`[BRIDGE] Mailbox enqueue failed, not written: ${err && err.message}${diagnostic}`);
+        if (text !== '\r') { rememberUnwritten(ids.daemon_msg_id); unwrittenBodyAdjacentAt = now(); }
+        sendReceipt(msgId, ids, 'refused', 'not_written', 'mailbox_unavailable');
+        if (text === '\r') withdrawPairedBody(ids); // Task 1215 R2: its body never goes out alone
+        adjacentQueuedBody = null;
         return;
       }
       rememberRecord(msgId, ids, text === '\r');
+      adjacentQueuedBody = text !== '\r' && !ids.daemon_msg_id ? msgId : null;
       if (!canWrite(child)) return;
       shared.bridgePendingCount++;
       sendReceipt(msgId, ids, 'queued', 'not_written');
@@ -854,9 +873,15 @@ function createAllowSecurityContext(shared, {
           quarantine(msgId, 'pair_unwritten', 'not_written', { inFlight: true });
           continue;
         }
+        // Task 1215 R2: a body whose submit was refused unwritten is held; it is quarantined, never written alone.
+        if (bridgeRecords.get(msgId)?.pairRefused) {
+          quarantine(msgId, 'pair_refused', 'not_written', { inFlight: true });
+          continue;
+        }
         const timer = setTimeout(() => {
           deliveryTimers.delete(timer);
           if (!canWrite(child)) return;
+          if (bridgeRecords.get(msgId)?.pairRefused) { quarantine(msgId, 'pair_refused', 'not_written', { inFlight: true }); return; }
           invalidateBridgeInteraction('automated_input');
           if (!canWrite(child)) return;
           try { child.write(text); }

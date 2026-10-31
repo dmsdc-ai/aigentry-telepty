@@ -337,6 +337,10 @@ test('#136 kill switch under mailbox failure: a CR that cannot be queued behind 
     inbox: b.leaf('inbox.jsonl').map(r => r.payload),
   }, { writes: [], vt: 'disabled', blindFlushTimers: 0, refused: [['submit', 'mailbox_unavailable', 'not_written']], written: 0,
     inbox: ['KILL-SWITCH-MAILBOX-BODY'] });
+  // Task 1215 R2: the refused submit takes its queued body with it (dead-lettered with its payload, not pending).
+  assert.deepEqual({ dead: b.leaf('dead-letter.jsonl').map(d => [d.payload, d.reason]), pending: b.allow.bridgeQueueSummary().pending,
+    quarantined: b.receipts(injectId, 'quarantined').map(r => [r.msg.part, r.msg.reason, r.msg.certainty]) },
+  { dead: [['KILL-SWITCH-MAILBOX-BODY', 'pair_refused']], pending: 0, quarantined: [['body', 'pair_refused', 'not_written']] });
 });
 
 test('#136 lone submit: a CR whose body was quarantined unwritten is refused, not written alone', { timeout: 60000 }, async t => {
@@ -444,6 +448,182 @@ test('#1215 guarded: workers, unknown and spoofed policies keep the modal gate (
   for (const [policy, verdict] of Object.entries(verdicts)) {
     assert.deepEqual(verdict, { writes: 0, withheld: ['modal_ui'] }, `policy ${policy}`);
   }
+});
+
+// --- 2c. task 1215 C1/C2: a failed durable enqueue is refused unwritten, never written directly --------------
+// Measured on Windows (MAILBOX_LOCK_TIMEOUT): C1 lone CR under the kill switch; C2 body+CR on a guarded MODAL frame
+// (policy "USER-SUPERVISED"). Forced here on every OS by a throwing enqueue on this bridge's mailbox instance.
+function failEnqueue(b) {
+  const calls = { enqueue: 0 };
+  b.shared.bridgeMailbox.enqueue = () => {
+    calls.enqueue++;
+    throw Object.assign(new Error('synthetic lock timeout'), { code: 'MAILBOX_LOCK_TIMEOUT' });
+  };
+  return calls;
+}
+const refusedParts = (b, injectId) => b.receipts(injectId, 'refused').map(r => [r.msg.part, r.msg.reason, r.msg.certainty]);
+
+test('#1215 C1 kill switch: a BODY whose enqueue fails is refused unwritten and its submit is refused, never written', { timeout: 30000 }, async t => {
+  const saved = process.env.TELEPTY_BRIDGE_VT_READY;
+  process.env.TELEPTY_BRIDGE_VT_READY = '0';
+  t.after(() => { if (saved === undefined) delete process.env.TELEPTY_BRIDGE_VT_READY; else process.env.TELEPTY_BRIDGE_VT_READY = saved; });
+  const b = createBridge(t, { sid: 'b1215-mailbox-fail-kill-body' });
+  b.feed(IDLE);
+  await settleVt();
+  const { injectId, body, submit } = b.daemonInject('KILL-SWITCH-BODY-FAIL');
+  const calls = failEnqueue(b);
+  b.injectFrame(body);
+  assert.equal(calls.enqueue, 1, 'PRECONDITION: the gate is closed, so the body reached the enqueue');
+  assert.equal(b.shared.bridgePendingCount, 0, 'PRECONDITION: the failed body is not counted, so the CR takes the direct path');
+  b.injectFrame(submit);
+  await b.clock.advance(20000);
+  assert.deepEqual({ writes: b.writes, vt: b.allow.bridgeQueueSummary().vt, blindFlushTimers: b.clock.calls.timeouts.filter(ms => ms === 5000).length,
+    refused: refusedParts(b, injectId), written: b.receipts(injectId, 'pty_written').length, pending: b.allow.bridgeQueueSummary().pending },
+  { writes: [], vt: 'disabled', blindFlushTimers: 0,
+    refused: [['body', 'mailbox_unavailable', 'not_written'], ['submit', 'pair_unwritten', 'not_written']], written: 0, pending: 0 });
+});
+
+test('#1215 C2 guarded MODAL: a BODY whose enqueue fails is refused unwritten for workers, unknown and spoofed policies; its submit is refused', { timeout: 60000 }, async t => {
+  const verdicts = {};
+  for (const policy of [undefined, 'guarded', 'USER-SUPERVISED']) {
+    const b = createBridge(t, { sid: `b1215-mailbox-fail-guarded-${Object.keys(verdicts).length}`, inputPolicy: policy });
+    b.feed(MODAL);
+    await settleVt();
+    const { injectId, body, submit } = b.daemonInject('GUARDED-BODY-FAIL');
+    const calls = failEnqueue(b);
+    b.injectFrame(body);
+    b.injectFrame(submit);
+    await b.clock.advance(16000);
+    verdicts[JSON.stringify(policy) ?? 'undefined'] = { writes: b.writes.length, enqueue: calls.enqueue, refused: refusedParts(b, injectId),
+      written: b.receipts(injectId, 'pty_written').length, pending: b.shared.bridgePendingCount };
+  }
+  for (const [policy, verdict] of Object.entries(verdicts)) {
+    assert.deepEqual(verdict, { writes: 0, enqueue: 1,
+      refused: [['body', 'mailbox_unavailable', 'not_written'], ['submit', 'pair_unwritten', 'not_written']], written: 0, pending: 0 }, `policy ${policy}`);
+  }
+});
+
+test('#1215 C2 guarded MODAL: a SUBMIT whose enqueue fails behind its queued body is refused; the body is dead-lettered pair_refused, unwritten', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-mailbox-fail-guarded-submit', inputPolicy: 'USER-SUPERVISED' });
+  b.feed(MODAL);
+  await settleVt();
+  const { injectId, body, submit } = b.daemonInject('GUARDED-SUBMIT-FAIL');
+  b.injectFrame(body);
+  assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: the body is queued on the modal frame');
+  failEnqueue(b);
+  b.injectFrame(submit);
+  await b.clock.advance(16000);
+  assert.deepEqual({ writes: b.writes, withheld: b.receipts(injectId, 'withheld').filter(r => r.msg.part === 'body').map(r => r.msg.reason),
+    refused: refusedParts(b, injectId), written: b.receipts(injectId, 'pty_written').length,
+    quarantined: b.receipts(injectId, 'quarantined').map(r => [r.msg.part, r.msg.reason]), dead: b.leaf('dead-letter.jsonl').map(d => [d.payload, d.reason]) },
+  { writes: [], withheld: [], refused: [['submit', 'mailbox_unavailable', 'not_written']], written: 0,
+    quarantined: [['body', 'pair_refused']], dead: [['GUARDED-SUBMIT-FAIL', 'pair_refused']] });
+});
+
+// --- 2d. task 1215 R2: a refused submit never leaves its body to be typed alone (glued to the next inject) ------
+test('#1215 R2 pair integrity: queued body, refused submit, gate reopens, second inject — the next submit carries only its own body', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-r2-glue' });
+  const first = b.daemonInject('R2-BODY-ONE');
+  b.injectFrame(first.body);
+  assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: no ready yet, so body one is queued');
+  const realEnqueue = b.shared.bridgeMailbox.enqueue;
+  const calls = failEnqueue(b);
+  b.injectFrame(first.submit);
+  b.shared.bridgeMailbox.enqueue = realEnqueue; // the mailbox recovers; the refusal stands
+  b.feed(IDLE);
+  await settleVt();
+  await b.clock.advance(3000); // the gate reopens: the prior candidate drained body one alone here
+  const second = b.daemonInject('R2-BODY-TWO');
+  b.injectFrame(second.body);
+  b.injectFrame(second.submit);
+  await b.clock.advance(3000);
+  assert.deepEqual({
+    writes: b.writes, enqueueFailures: calls.enqueue,
+    first: { refused: refusedParts(b, first.injectId), quarantined: b.receipts(first.injectId, 'quarantined').map(r => [r.msg.part, r.msg.reason, r.msg.certainty]),
+      written: b.receipts(first.injectId, 'pty_written').length },
+    second: b.receipts(second.injectId, 'pty_written').map(r => r.msg.part),
+    dead: b.leaf('dead-letter.jsonl').map(d => [d.payload, d.reason]),
+  }, {
+    writes: ['R2-BODY-TWO', '\r'], enqueueFailures: 1,
+    first: { refused: [['submit', 'mailbox_unavailable', 'not_written']], quarantined: [['body', 'pair_refused', 'not_written']], written: 0 },
+    second: ['body', 'submit'], dead: [['R2-BODY-ONE', 'pair_refused']],
+  });
+});
+
+test('#1215 R2 hold: while the mailbox keeps failing, the body of a refused submit is held across ticks and a reopened gate, never written', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-r2-held' });
+  const { injectId, body, submit } = b.daemonInject('R2-HELD-BODY');
+  b.injectFrame(body);
+  assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: no ready yet, so the body is queued');
+  const mailbox = b.shared.bridgeMailbox;
+  const realWithdraw = mailbox.withdraw;
+  failEnqueue(b);
+  mailbox.withdraw = () => { throw Object.assign(new Error('synthetic lock timeout'), { code: 'MAILBOX_LOCK_TIMEOUT' }); };
+  b.injectFrame(submit);
+  const held = { pending: b.allow.bridgeQueueSummary().pending, withheld: b.receipts(injectId, 'withheld').map(r => [r.msg.part, r.msg.reason, r.msg.certainty]) };
+  b.feed(IDLE);
+  await settleVt();
+  await b.clock.advance(20000); // repeated ticks, the gate reopens and the stall threshold passes
+  assert.equal(b.leaf('state.jsonl').filter(s => s.state === 'in_flight').length, 1, 'PRECONDITION: the gate reopened and flush dequeued the held body');
+  const whileFailing = { writes: b.writes.slice(), written: b.receipts(injectId, 'pty_written').length,
+    withheld: b.receipts(injectId, 'withheld').map(r => r.msg.reason), dead: b.leaf('dead-letter.jsonl').length };
+  mailbox.withdraw = realWithdraw; // custody completes at exit once the mailbox can move it
+  assert.equal(b.allow.closeAllowSession({ destroySession: true }), true);
+  assert.deepEqual({ held, whileFailing, writes: b.writes, dead: b.leaf('dead-letter.jsonl').map(d => [d.payload, d.reason]) }, {
+    held: { pending: 1, withheld: [['body', 'pair_refused', 'not_written']] },
+    whileFailing: { writes: [], written: 0, withheld: ['pair_refused'], dead: 0 },
+    writes: [], dead: [['R2-HELD-BODY', 'bridge_exit_unwritten']],
+  });
+});
+
+test('#1215 R2 neighbours: only the refused submit\'s own body is withdrawn; an earlier complete pair (ids and legacy id-less) is delivered intact', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-r2-neighbour' });
+  const a = b.daemonInject('R2-PAIR-A');
+  const c = b.daemonInject('R2-PAIR-B');
+  b.injectFrame(a.body);
+  b.injectFrame(a.submit);
+  b.injectFrame(c.body);
+  assert.equal(b.shared.bridgePendingCount, 3, 'PRECONDITION: pair A and body B are queued');
+  const realEnqueue = b.shared.bridgeMailbox.enqueue;
+  failEnqueue(b);
+  b.injectFrame(c.submit);
+  b.shared.bridgeMailbox.enqueue = realEnqueue;
+  b.feed(IDLE);
+  await settleVt();
+  await b.clock.advance(3000);
+  const legacy = createBridge(t, { sid: 'b1215-r2-neighbour-legacy' });
+  for (const data of ['LEGACY-A', '\r', 'LEGACY-B']) legacy.injectFrame({ type: 'inject', data }); // an old daemon sends no ids
+  assert.equal(legacy.shared.bridgePendingCount, 3, 'PRECONDITION: legacy pair A and body B are queued');
+  const legacyEnqueue = legacy.shared.bridgeMailbox.enqueue;
+  failEnqueue(legacy);
+  legacy.injectFrame({ type: 'inject', data: '\r' });
+  legacy.shared.bridgeMailbox.enqueue = legacyEnqueue;
+  legacy.feed(IDLE);
+  await settleVt();
+  await legacy.clock.advance(3000);
+  assert.deepEqual({
+    writes: b.writes, a: b.receipts(a.injectId, 'pty_written').map(r => r.msg.part),
+    bQuarantined: b.receipts(c.injectId, 'quarantined').map(r => [r.msg.part, r.msg.reason]), bRefused: refusedParts(b, c.injectId),
+    dead: b.leaf('dead-letter.jsonl').map(d => [d.payload, d.reason]),
+    legacyWrites: legacy.writes, legacyDead: legacy.leaf('dead-letter.jsonl').map(d => [d.payload, d.reason]),
+  }, {
+    writes: ['R2-PAIR-A', '\r'], a: ['body', 'submit'],
+    bQuarantined: [['body', 'pair_refused']], bRefused: [['submit', 'mailbox_unavailable', 'not_written']],
+    dead: [['R2-PAIR-B', 'pair_refused']],
+    legacyWrites: ['LEGACY-A', '\r'], legacyDead: [['LEGACY-B', 'pair_refused']],
+  });
+});
+
+test('#1215 positive control: a trusted supervised orchestrator still receives body then CR directly while the mailbox is failing', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1215-mailbox-fail-supervised-direct', inputPolicy: 'user-supervised' });
+  b.feed(MODAL);
+  const { injectId, body, submit } = b.daemonInject('SUPERVISED-MAILBOX-DOWN');
+  const calls = failEnqueue(b);
+  b.injectFrame(body);
+  b.injectFrame(submit);
+  await b.clock.advance(1000);
+  assert.deepEqual({ writes: b.writes, written: b.receipts(injectId, 'pty_written').map(r => r.msg.part), refused: refusedParts(b, injectId),
+    enqueue: calls.enqueue }, { writes: ['SUPERVISED-MAILBOX-DOWN', '\r'], written: ['body', 'submit'], refused: [], enqueue: 0 });
 });
 
 test('#1215 supervised keeps recovery quarantine: previous-bridge records are dead-lettered, never replayed', { timeout: 30000 }, async t => {
