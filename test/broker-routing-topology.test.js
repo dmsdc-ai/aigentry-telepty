@@ -104,7 +104,26 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
     assert.equal(answer.foreign_session_identity_verified, false);
     const staleBody = { ...responseBody, idempotency_key: 'routing-stale-key-0001', expected_epoch: 'stale-epoch' };
     assert.equal((await responder.reply(receipt, staleBody)).status, 202);
-    await waitFor(async () => (await responder.receipt(staleBody.idempotency_key)).body.state === 'failed');
+    let staleAnswer; const staleAdmitted = performance.now(); // Task 1215 lifecycle56: diagnostics only
+    await waitFor(async () => { staleAnswer = (await responder.receipt(staleBody.idempotency_key)).body; return staleAnswer.state === 'failed'; })
+      .catch((error) => {
+        // Task 1215 lifecycle56 (failure-only; the unchanged poll and bound have ALREADY failed and the same error is
+        // rethrown; nothing is sent or retried). The last receipt the poll saw separates: node local timeout
+        // (outcome_unknown / BROKER_LOCAL_OUTCOME_UNKNOWN), local 5xx (outcome_unknown / BROKER_LOCAL_INJECT_REFUSED),
+        // node never reported (BROKER_RESULT_TIMEOUT), stream loss (BROKER_STREAM_LOST), still in flight (pending), and
+        // a stale epoch that was ADMITTED (accepted; a second return-worker frame). Fixed fields only — never a prompt.
+        const stack = error.stack; const first = `${error.name}: ${error.message}`;
+        const count = (sid) => frames.filter((f) => f.sid === sid).length;
+        const note = ` | #1215 lifecycle56 evidence ${JSON.stringify({ waited_ms: Math.round(performance.now() - staleAdmitted),
+          last_receipt: staleAnswer ? { state: staleAnswer.state ?? null, code: staleAnswer.code ?? null, remote_queued: staleAnswer.remote_queued ?? null,
+            has_remote_inject_id: Boolean(staleAnswer.remote_inject_id), in_reply_to_matches: staleAnswer.in_reply_to === receipt,
+            expected_epoch_is_stale: staleAnswer.expected_epoch === 'stale-epoch' } : null,
+          first_reply: answer ? { state: answer.state ?? null, has_remote_inject_id: Boolean(answer.remote_inject_id) } : null,
+          frames: { worker: count('worker'), other: count('other'), 'return-worker': count('return-worker') }, nodes: { ...nodeRuns } })}`;
+        error.message += note;
+        if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
+        throw error;
+      });
 
     await waitFor(() => frames.some(frame => frame.sid === 'return-worker'));
     assert.equal((await responder.reply(receipt, responseBody)).status, 200);
