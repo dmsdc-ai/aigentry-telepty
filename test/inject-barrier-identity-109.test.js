@@ -137,14 +137,37 @@ test('#109(b): queued callers are delivered in arrival order, each text followed
   const { ws, frames } = await wrappedOwner(sid);
   t.after(() => { try { ws.close(); } catch {} });
 
+  // #879 diagnostics only: per-caller timing and owner-frame arrival times. Frame labels are restricted to the exact
+  // test-owned prompts f1/f2/f3 and CR; anything else is recorded as 'other' with its numeric length only (never its body).
+  // The recorded list is bounded; frames beyond the cap are counted in frames_omitted.
+  const t0 = Date.now(), callers = [], frameTimes = [], FRAME_CAP = 16, OWNED = new Set(['f1', 'f2', 'f3']);
+  let framesOmitted = 0;
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+      if (msg.type !== 'inject') return;
+      if (frameTimes.length >= FRAME_CAP) { framesOmitted++; return; }
+      const label = msg.data === '\r' ? 'CR' : (typeof msg.data === 'string' && OWNED.has(msg.data) ? msg.data : 'other');
+      frameTimes.push(label === 'other'
+        ? { at_ms: Date.now() - t0, label, utf16_length: typeof msg.data === 'string' ? msg.data.length : null }
+        : { at_ms: Date.now() - t0, label });
+    } catch { /* not a frame */ }
+  });
+  const diagnose = (stage) => t.diagnostic(`#879 diag ${stage} ${JSON.stringify({ queue_bound_ms: QUEUE_BOUND_MS, callers, frames: frameTimes, frames_omitted: framesOmitted })}`);
   const pending = [];
   for (const p of ['f1', 'f2', 'f3']) {
-    pending.push(inject(sid, p));
+    const issued = Date.now() - t0;
+    pending.push(inject(sid, p).then((r) => {
+      callers.push({ p, issued_ms: issued, answered_ms: Date.now() - t0, status: r.status, code: (r.body && r.body.code) || null });
+      return r;
+    }));
     await sleep(30);
   }
   const results = await Promise.all(pending);
+  if (results.some((r) => r.status !== 200)) diagnose('fifo_results');
   for (const r of results) assert.equal(r.status, 200, JSON.stringify(r.body));
-  await waitFor(() => frames.length >= 6, { timeoutMs: 3000, description: 'three texts and three CRs' });
+  await waitFor(() => frames.length >= 6, { timeoutMs: 3000, description: 'three texts and three CRs' })
+    .catch((error) => { diagnose('fifo_frames'); throw error; });
 
   assert.deepEqual(frames, ['f1', '\r', 'f2', '\r', 'f3', '\r'], JSON.stringify(frames));
 });

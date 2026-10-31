@@ -12,12 +12,34 @@ function fixture(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return { root, dir: ensureSessionDir(root, 's') };
 }
-function worker(t, dir, mode, iterations = 1) {
+// Timeout-path-only, read-only diagnostics (#1215 mac a41): ticket pid/state and counter, never ticket
+// suffixes or payload. Nothing here runs unless a worker timeout has already failed the test.
+function lockSnapshot(dir) {
+  const lock = path.join(dir, '.lock'), tickets = [];
+  let counter; try { counter = Number(fs.readFileSync(path.join(dir, 'counter'), 'utf8')); } catch (e) { counter = e.code; }
+  let names; try { names = fs.readdirSync(lock).slice(0, 64); } catch (e) { return {counter, lock: e.code}; }
+  for (const name of names) {
+    let state;
+    try {
+      const files = fs.readdirSync(path.join(lock, name));
+      state = files.includes('departed') ? 'departed' : files.includes('number') ? Number(fs.readFileSync(path.join(lock, name, 'number'), 'utf8')) : 'choosing';
+    } catch (e) { state = e.code; }
+    tickets.push({pid: Number(name.split('-')[0]), state});
+  }
+  return {counter, tickets};
+}
+function diagnostic(probe, self) {
+  let extra; try { extra = probe(); } catch (e) { extra = {probe: e.code || 'error'}; }
+  return ` | diag ${JSON.stringify({self, ...extra})}`;
+}
+function worker(t, dir, mode, iterations = 1, probe = () => ({})) {
+  const forked = performance.now();
   const child = fork(path.join(__dirname, '../test-support/mailbox-lock-worker.js'), [dir, mode, String(iterations)], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   let output = ''; child.stderr.on('data', b => { output += b; });
   t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
   const next = () => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { clean(); reject(Error(`worker timeout: ${output}`)); }, 10000);
+    const timer = setTimeout(() => { clean(); reject(Error(`worker timeout: ${output}${diagnostic(probe, {mode, pid: child.pid,
+      exitCode: child.exitCode, signalCode: child.signalCode, connected: child.connected, sinceForkMs: Math.round(performance.now() - forked)})}`)); }, 10000);
     const fail = code => { clean(); reject(Error(`worker exited ${code}: ${output}`)); };
     const message = value => { clean(); resolve(value); };
     function clean() { clearTimeout(timer); child.off('message', message); child.off('exit', fail); }
@@ -49,10 +71,13 @@ test('legacy PID files fail closed without deleting even invalid or dead owners'
 });
 test('multiple processes never overlap mailbox mutation or lose increments', async t => {
   const {dir} = fixture(t); fs.writeFileSync(path.join(dir, 'counter'), '0');
-  const workers = Array.from({length: 5}, () => worker(t, dir, 'contend', 40));
-  const sweeper = worker(t, dir, 'sweep', 350);
-  const swept = sweeper.next(); sweeper.child.send('start');
-  const done = workers.map(w => w.next());
+  const started = performance.now(), progress = []; // Resolution timeline; read only by the timeout diagnostic.
+  const probe = () => ({...lockSnapshot(dir), pids: [...workers, sweeper].map(w => w.child.pid), progress});
+  const workers = Array.from({length: 5}, () => worker(t, dir, 'contend', 40, probe));
+  const sweeper = worker(t, dir, 'sweep', 350, probe);
+  const mark = (i, p) => p.then(r => { progress.push({i, ms: Math.round(performance.now() - started), stats: r.stats}); return r; });
+  const swept = mark(5, sweeper.next()); sweeper.child.send('start');
+  const done = workers.map((w, i) => mark(i, w.next()));
   for (const w of workers) w.child.send('start');
   const results = await Promise.all([...done, swept]);
   assert.ok(results.slice(0, -1).every(r => r.done === 40));

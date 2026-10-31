@@ -39,6 +39,35 @@ const projectRoot = path.resolve(__dirname, '..');
 
 let harness;
 
+// Task 1215 / #879 — ALLOWLISTED failure-boundary diagnostics for the win32 delivery failures. Emitted only when a
+// delivery wait fails; never payload bytes (only booleans for test-owned markers), tokens, env, URLs or credentials.
+// They do not change any assertion, wait, timeout or the test sequence; the original error is rethrown unchanged.
+async function diagSession(sessionId) {
+  try {
+    const res = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    const b = res.body && typeof res.body === 'object' ? res.body : {};
+    const t = b.transport && typeof b.transport === 'object' ? b.transport : {};
+    const r = t.readiness && typeof t.readiness === 'object' ? t.readiness : {};
+    const q = t.bridge_queue && typeof t.bridge_queue === 'object' ? t.bridge_queue : null;
+    return { status: res.status, healthStatus: b.healthStatus ?? null, type: b.type ?? null, input_policy: t.input_policy ?? null,
+      bootstrap_gated: t.bootstrap ? t.bootstrap.gated ?? null : null, readiness_capability: r.capability ?? null,
+      input_transport_ready: r.input_transport_ready ? r.input_transport_ready.status ?? null : null,
+      instruction_received: t.instruction_received ? t.instruction_received.status ?? null : null, bridge_receipts: t.bridge_receipts ?? null,
+      bridge_queue: q ? { source: q.source ?? null, phase: q.phase ?? null, pending: q.pending ?? null, reason: q.reason ?? null } : null };
+  } catch (error) { return { error: (error && error.code) || 'request_failed' }; }
+}
+function diagInject(res) {
+  if (!res) return null;
+  const b = res.body && typeof res.body === 'object' ? res.body : {};
+  return { status: res.status, success: b.success ?? null, code: b.code ?? null, queued: b.queued ?? null,
+    bootstrap_queued: b.bootstrap_queued ?? null, strategy: b.strategy ?? null, tracking_state: b.tracking_state ?? null };
+}
+function diagPty(text, exit, markers) {
+  const plain = stripAnsi(String(text || ''));
+  return { exit: exit === undefined ? null : exit, bytes: Buffer.byteLength(String(text || ''), 'utf8'),
+    markers: Object.fromEntries(Object.entries(markers).map(([name, needle]) => [name, plain.includes(needle)])) };
+}
+
 before(async () => { harness = await startTestDaemon(); });
 after(async () => { if (harness) await harness.stop(); });
 
@@ -158,7 +187,13 @@ test('the incumbent still accepts an inject after the refused claim — it was n
     `the incumbent must still accept injects; got ${injected.status} ${JSON.stringify(injected.body)}`);
 
   await waitFor(async () => stripAnsi(a.output.text).includes(MARK),
-    { timeoutMs: 10000, description: 'incumbent PTY received the inject' });
+    { timeoutMs: 10000, description: 'incumbent PTY received the inject' }).catch(async (error) => {
+    // #879 diagnostics only (allowlisted; MARK is test-owned): where did the accepted inject stop?
+    t.diagnostic(`#879 diag incumbent_delivery ${JSON.stringify({ inject: diagInject(injected), session: await diagSession(sessionId),
+      incumbent: diagPty(a.output.text, a.output.exit, { inject_allowed: 'Inject allowed', repl_prompt: '> ', mark_echo: MARK }),
+      challenger: diagPty(b.output.text, b.output.exit, { owner_claim_refused: 'Owner claim refused' }) })}`);
+    throw error;
+  });
 });
 
 

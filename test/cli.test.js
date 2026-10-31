@@ -11,6 +11,35 @@ const { createSessionId, startTestDaemon, stripAnsi, waitFor } = require('../tes
 const { writeFakeCli } = require('../test-support/platform-contract');
 
 let harness;
+
+// Task 1215 / #879 — ALLOWLISTED failure-boundary diagnostics for the win32 delivery failures. Emitted only when a
+// delivery wait fails; never payload bytes (only booleans for test-owned markers), tokens, env, URLs or credentials.
+// They do not change any assertion, wait, timeout or the test sequence; the original error is rethrown unchanged.
+async function diagSession(sessionId) {
+  try {
+    const res = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    const b = res.body && typeof res.body === 'object' ? res.body : {};
+    const t = b.transport && typeof b.transport === 'object' ? b.transport : {};
+    const r = t.readiness && typeof t.readiness === 'object' ? t.readiness : {};
+    const q = t.bridge_queue && typeof t.bridge_queue === 'object' ? t.bridge_queue : null;
+    return { status: res.status, healthStatus: b.healthStatus ?? null, type: b.type ?? null, input_policy: t.input_policy ?? null,
+      bootstrap_gated: t.bootstrap ? t.bootstrap.gated ?? null : null, readiness_capability: r.capability ?? null,
+      input_transport_ready: r.input_transport_ready ? r.input_transport_ready.status ?? null : null,
+      instruction_received: t.instruction_received ? t.instruction_received.status ?? null : null, bridge_receipts: t.bridge_receipts ?? null,
+      bridge_queue: q ? { source: q.source ?? null, phase: q.phase ?? null, pending: q.pending ?? null, reason: q.reason ?? null } : null };
+  } catch (error) { return { error: (error && error.code) || 'request_failed' }; }
+}
+function diagInject(res) {
+  if (!res) return null;
+  const b = res.body && typeof res.body === 'object' ? res.body : {};
+  return { status: res.status, success: b.success ?? null, code: b.code ?? null, queued: b.queued ?? null,
+    bootstrap_queued: b.bootstrap_queued ?? null, strategy: b.strategy ?? null, tracking_state: b.tracking_state ?? null };
+}
+function diagPty(text, exit, markers) {
+  const plain = stripAnsi(String(text || ''));
+  return { exit: exit === undefined ? null : exit, bytes: Buffer.byteLength(String(text || ''), 'utf8'),
+    markers: Object.fromEntries(Object.entries(markers).map(([name, needle]) => [name, plain.includes(needle)])) };
+}
 const projectRoot = path.resolve(__dirname, '..');
 const TERMINAL_CLEANUP_SEQUENCE = '\x1b[<u\x1b[>4;0m\x1b[?2004l';
 
@@ -740,7 +769,7 @@ test('telepty allow rejects malformed --idle-ttl before spawning', async () => {
   assert.doesNotMatch(output, /should-not-run/);
 });
 
-test('telepty allow inject submits once without exposing routing metadata', async () => {
+test('telepty allow inject submits once without exposing routing metadata', async (t) => {
   const sessionId = createSessionId('cli-allow-inject');
   const childScript = createSubmitCaptureScript();
 
@@ -772,12 +801,21 @@ test('telepty allow inject submits once without exposing routing metadata', asyn
   cli.onData((chunk) => {
     output += chunk;
   });
+  // #879 diagnostics only: exit code, plus booleans for test-owned markers (prompt, payload echo, submit line).
+  let cliExit = null;
+  cli.onExit(({ exitCode }) => { cliExit = exitCode; });
+  let inject = null;
+  const DIAG_MARKERS = { inject_allowed: 'Inject allowed.', child_prompt: '> ', payload_echo: 'hello-once', submit_line: 'SUBMIT:' };
+  const diagnose = (stage) => async (error) => {
+    t.diagnostic(`#879 diag ${stage} ${JSON.stringify({ bridge: diagPty(output, cliExit, DIAG_MARKERS), inject: diagInject(inject), session: await diagSession(sessionId) })}`);
+    throw error;
+  };
 
   try {
     await waitFor(() => stripAnsi(output).includes('Inject allowed.'), {
       timeoutMs: 7000,
       description: 'allow bridge ready'
-    });
+    }).catch(diagnose('bridge_ready'));
 
     // #577 CI-flake fix: the local "Inject allowed." banner does not guarantee the daemon-side
     // owner WebSocket is connected yet. Injecting immediately raced ahead of it and returned 503
@@ -791,9 +829,9 @@ test('telepty allow inject submits once without exposing routing metadata', asyn
     }, {
       timeoutMs: 7000,
       description: 'allow session owner connected on daemon'
-    });
+    }).catch(diagnose('owner_connected'));
 
-    const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+    inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
       method: 'POST',
       body: { prompt: 'hello-once', from: 'orch', reply_to: 'orch' }
     });
@@ -802,7 +840,7 @@ test('telepty allow inject submits once without exposing routing metadata', asyn
     await waitFor(() => stripAnsi(output).includes('SUBMIT:hello-once'), {
       timeoutMs: 7000,
       description: 'single submitted inject payload'
-    });
+    }).catch(diagnose('submitted_payload'));
 
     const normalized = stripAnsi(output);
     assert.equal(countOccurrences(normalized, 'SUBMIT:'), 1);
