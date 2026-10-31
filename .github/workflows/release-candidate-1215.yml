@@ -1,0 +1,314 @@
+name: Release candidate archive (task 1215, prepublication only)
+
+# Task 1215 / release1238 — a canonical PREPUBLICATION archive for real Mac/Linux activation.
+#
+# WHAT THIS IS. The same three release.yml stages that produce and prove the bytes npm would receive — the macOS-built
+# universal Darwin authority reader (`authority-darwin`), ONE pack of that tree through the current prepublishOnly +
+# `scripts/check-package.mjs --pack-only` contract (`pack`), and the installed private consumer of THAT archive on all
+# three supported OSes through the existing `--tarball --manifest` contract (`consumer`) — run on the EXACT selected
+# source (a pull request's head commit, or a dispatched ref) instead of a tag. The step bodies are copied unchanged from
+# release.yml; only the source pin (`needs.source.outputs.commit` instead of the tag Gate's commit) and the artifact names
+# differ, plus one build-identity record that travels with the archive.
+#
+# WHAT THIS IS NOT. It never publishes, tags, creates a release, reads a secret or writes to the repository
+# (`contents: read`, no job-level permission, no registry URL, no NPM_TOKEN). It does not replace release.yml, which
+# stays the only path to npm and starts only from a tag. A green run here is NOT proof of publication: a later tag
+# release.yml run checks out and REBUILDS the tag's tree (its own Darwin build and its own pack), so the archive it
+# publishes is a different build that needs its own canonical-artifact validation, even when the source commit is the
+# same. The full regression suite is NOT repeated here: the pull request's own CI (test-install.yml) owns it.
+#
+# FAILS CLOSED on: a checkout that is not the selected head; a Darwin reader that is absent, not universal, skipped by
+# its native tests, or not the built bytes; a packed reader or archive that differs from its manifest/build; a
+# downloaded archive, manifest or identity that differs from the pack job's; and any consumer failure.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release-candidate-1215.yml'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.npmignore'
+      - 'README.tmpl.md'
+      - 'ecosystem.json'
+      - 'scripts/check-package.mjs'
+      - 'scripts/build-authority-darwin.mjs'
+      - 'scripts/gen-readme.mjs'
+      - 'scripts/postinstall.js'
+      - 'scripts/preuninstall.js'
+      - 'scripts/mailbox-preflight.js'
+      - 'src/**'
+      - 'mcp-server/**'
+      - 'skills/**'
+      - 'third-party-notices/**'
+      - '*.js'
+      - 'install.sh'
+      - 'install.ps1'
+      - 'CHANGELOG.md'
+      - 'test/authority-file-darwin-1215.test.js'
+      - 'test/operator-supervision-1215.test.js'
+      - 'test-support/setup-env.js'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or full 40-hex commit to build the prepublication archive from (nothing is published).'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# One candidate build per PR (or dispatched ref) at a time; queued, not cancelled, so every started run either finishes
+# with its artifacts or fails visibly.
+concurrency:
+  group: release-candidate-1215-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Replaces release.yml's tag Gate: no tag and no credential exist here. It pins the EXACT selected head — for a pull
+  # request the head commit (NOT actions/checkout's default refs/pull/N/merge commit), for a dispatch the given ref —
+  # and every later job checks out THIS commit, never a moving ref.
+  source:
+    name: Source identity (exact selected head)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      package: ${{ steps.identity.outputs.package }}
+      version: ${{ steps.identity.outputs.version }}
+      commit: ${{ steps.commit.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Package identity of the selected tree
+        id: identity
+        run: |
+          set -euo pipefail
+          PACKAGE="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "package=${PACKAGE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "selected tree is ${PACKAGE}@${VERSION} (prepublication candidate; nothing is published)"
+      - name: Export the selected commit
+        id: commit
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          REQUESTED: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          COMMIT="$(git rev-parse HEAD)"
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve the selected checkout commit (got '${COMMIT}')"; exit 1; }
+          if [ -n "${PR_HEAD}" ] && [ "$COMMIT" != "${PR_HEAD}" ]; then echo "::error::checkout ${COMMIT} is not the pull request head ${PR_HEAD}"; exit 1; fi
+          if [[ "${REQUESTED}" =~ ^[0-9a-f]{40}$ ]] && [ "$COMMIT" != "${REQUESTED}" ]; then echo "::error::checkout ${COMMIT} is not the requested commit ${REQUESTED}"; exit 1; fi
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "selected commit ${COMMIT}"
+
+  # Unchanged from release.yml `authority-darwin` (steps verbatim; only the checkout pin differs).
+  authority-darwin:
+    name: Build and verify the Darwin authority reader
+    needs: source
+    runs-on: macos-latest
+    timeout-minutes: 15
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build (universal, macOS >= 11, N-API 8)
+        id: build
+        run: |
+          set -euo pipefail
+          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
+          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
+          BIN=src/principal/native/prebuilt/darwin/authority-darwin.node
+          ARCHS="$(lipo -archs "$BIN" | tr ' ' '\n' | sort | tr '\n' ' ')"
+          test "$ARCHS" = "arm64 x86_64 " || { echo "::error::unexpected architectures: $ARCHS"; exit 1; }
+          echo "sha256=$(shasum -a 256 "$BIN" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Native reader tests must run and pass with zero skips
+        run: |
+          set -euo pipefail
+          node --require ./test-support/setup-env.js --test --test-reporter=tap \
+            test/authority-file-darwin-1215.test.js test/operator-supervision-1215.test.js | tee "$RUNNER_TEMP/native.tap"
+          grep -qx '# fail 0' "$RUNNER_TEMP/native.tap"
+          grep -qx '# skip 0' "$RUNNER_TEMP/native.tap" || { echo "::error::a native check was skipped; skipped is not green"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-1215-authority-darwin
+          path: |
+            src/principal/native/prebuilt/darwin/authority-darwin.node
+            src/principal/native/prebuilt/darwin/authority-darwin.node.provenance.json
+          if-no-files-found: error
+
+  # Unchanged from release.yml `pack` (steps verbatim; checkout pin and artifact names differ), plus ONE identity record
+  # written next to the archive after the unchanged manifest checks, and its sha256 exported for the consumers.
+  pack:
+    name: Pack the canonical archive
+    needs: [source, authority-darwin]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      filename: ${{ steps.pack.outputs.filename }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+      shasum: ${{ steps.pack.outputs.shasum }}
+      integrity: ${{ steps.pack.outputs.integrity }}
+      manifest_sha256: ${{ steps.pack.outputs.manifest_sha256 }}
+      identity_sha256: ${{ steps.identity.outputs.identity_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-1215-authority-darwin
+          path: src/principal/native/prebuilt/darwin
+      - name: The bundled Darwin reader must be the bytes the macOS job built
+        env:
+          EXPECTED: ${{ needs.authority-darwin.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          BIN=src/principal/native/prebuilt/darwin/authority-darwin.node
+          chmod 0644 "$BIN" "$BIN.provenance.json"
+          ACTUAL="$(sha256sum "$BIN" | cut -d' ' -f1)"
+          test -n "$EXPECTED" && test "$ACTUAL" = "$EXPECTED" || { echo "::error::Darwin reader sha256 $ACTUAL != built $EXPECTED"; exit 1; }
+
+      # `npm pack` does NOT run prepublishOnly (only prepack/prepare), but `npm publish` of a folder
+      # does — so the hook runs explicitly here, before the one pack (the release.yml contract; there, publish ships that
+      # tarball file). NOTHING is published by this workflow. gen-readme is idempotent.
+      - name: Pack once and record the archive manifest
+        id: pack
+        env:
+          EXPECTED: ${{ needs.authority-darwin.outputs.sha256 }}
+          OUT: ${{ runner.temp }}/package
+        run: |
+          set -euo pipefail
+          npm run prepublishOnly
+          node scripts/check-package.mjs --pack-only --out "$OUT"
+          node -e '
+            const fs = require("fs"), crypto = require("crypto"), path = require("path"), out = process.env.OUT;
+            const m = JSON.parse(fs.readFileSync(path.join(out, "package-manifest.json"), "utf8"));
+            // Task 1215: the tarball must carry THE built reader, or Mac strict mode cannot read authority files.
+            if (m.darwin.sha256 !== process.env.EXPECTED) { console.error("::error::packed Darwin reader " + m.darwin.sha256 + " != built " + process.env.EXPECTED); process.exit(1); }
+            const sha = (f) => crypto.createHash("sha256").update(fs.readFileSync(path.join(out, f))).digest("hex");
+            if (sha(m.filename) !== m.sha256) { console.error("::error::archive sha256 differs from its manifest"); process.exit(1); }
+            const lines = ["filename=" + m.filename, "sha256=" + m.sha256, "shasum=" + m.shasum, "integrity=" + m.integrity, "manifest_sha256=" + sha("package-manifest.json")];
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.join("\n") + "\n");
+            console.log("packed " + m.filename + " sha256=" + m.sha256 + " sha1=" + m.shasum + " files=" + m.files.length);'
+
+      # Task 1215 package70: the source/build identity of THIS archive (values only from the job context and the
+      # manifest; no environment dump, no secret). It states in-band that it is a prepublication candidate.
+      - name: Record the source and build identity of this archive
+        id: identity
+        env:
+          OUT: ${{ runner.temp }}/package
+          COMMIT: ${{ needs.source.outputs.commit }}
+          PACKAGE: ${{ needs.source.outputs.package }}
+          VERSION: ${{ needs.source.outputs.version }}
+          DARWIN_SHA256: ${{ needs.authority-darwin.outputs.sha256 }}
+          FILENAME: ${{ steps.pack.outputs.filename }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+          SHASUM: ${{ steps.pack.outputs.shasum }}
+          INTEGRITY: ${{ steps.pack.outputs.integrity }}
+          MANIFEST_SHA256: ${{ steps.pack.outputs.manifest_sha256 }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REQUESTED: ${{ inputs.ref }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs"), crypto = require("crypto"), path = require("path"), e = process.env;
+            const m = JSON.parse(fs.readFileSync(path.join(e.OUT, "package-manifest.json"), "utf8"));
+            if (!m.darwin || m.darwin.sha256 !== e.DARWIN_SHA256) { console.error("::error::identity: manifest Darwin reader differs from the build"); process.exit(1); }
+            const identity = {
+              schema: "telepty.release-candidate-identity/v1",
+              status: "PREPUBLICATION CANDIDATE: not published, not a release, not proof of publication; a later tag release.yml run rebuilds and needs its own canonical-artifact validation",
+              source: { repository: e.REPOSITORY, commit: e.COMMIT, event: e.EVENT, pull_request: e.PR_NUMBER || null, requested_ref: e.REQUESTED || null },
+              package: { name: e.PACKAGE, version: e.VERSION },
+              archive: { filename: e.FILENAME, sha256: e.SHA256, sha1: e.SHASUM, integrity: e.INTEGRITY, manifest_sha256: e.MANIFEST_SHA256, files: m.files.length },
+              darwin_reader: m.darwin,
+              build: { workflow_ref: e.WORKFLOW_REF, run_id: e.RUN_ID, run_attempt: e.RUN_ATTEMPT },
+            };
+            const file = path.join(e.OUT, "release-candidate-identity.json");
+            fs.writeFileSync(file, JSON.stringify(identity, null, 2) + "\n");
+            const digest = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+            fs.appendFileSync(e.GITHUB_OUTPUT, "identity_sha256=" + digest + "\n");
+            console.log("identity " + digest + " for " + e.FILENAME + " sha256=" + e.SHA256 + " commit=" + e.COMMIT);'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-1215-package
+          path: |
+            ${{ runner.temp }}/package/${{ steps.pack.outputs.filename }}
+            ${{ runner.temp }}/package/package-manifest.json
+            ${{ runner.temp }}/package/release-candidate-identity.json
+          if-no-files-found: error
+
+  # Unchanged from release.yml `consumer` (steps verbatim; checkout pin and artifact name differ), plus the identity record
+  # included in the same byte check.
+  consumer:
+    name: Installed consumer (${{ matrix.os }})
+    needs: [source, pack]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-1215-package
+          path: ${{ runner.temp }}/package
+      - name: The downloaded archive and manifest must be the pack job's bytes
+        shell: bash
+        env:
+          DIR: ${{ runner.temp }}/package
+          FILENAME: ${{ needs.pack.outputs.filename }}
+          SHA256: ${{ needs.pack.outputs.sha256 }}
+          MANIFEST_SHA256: ${{ needs.pack.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs"), crypto = require("crypto"), path = require("path"), e = process.env;
+            const sha = (f) => crypto.createHash("sha256").update(fs.readFileSync(path.join(e.DIR, f))).digest("hex");
+            if (sha(e.FILENAME) !== e.SHA256 || sha("package-manifest.json") !== e.MANIFEST_SHA256) { console.error("::error::downloaded package bytes differ from the pack job"); process.exit(1); }
+            console.log("archive " + e.FILENAME + " sha256=" + e.SHA256);'
+      # Task 1215 package70 (added): the identity record that travels with the archive must also be the pack job's bytes.
+      - name: The downloaded identity record must be the pack job's bytes
+        shell: bash
+        env:
+          DIR: ${{ runner.temp }}/package
+          IDENTITY_SHA256: ${{ needs.pack.outputs.identity_sha256 }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs"), crypto = require("crypto"), path = require("path"), e = process.env;
+            const got = crypto.createHash("sha256").update(fs.readFileSync(path.join(e.DIR, "release-candidate-identity.json"))).digest("hex");
+            if (!e.IDENTITY_SHA256 || got !== e.IDENTITY_SHA256) { console.error("::error::downloaded identity record differs from the pack job"); process.exit(1); }
+            console.log("identity sha256=" + got);'
+      - name: Validate the installed consumer of that archive
+        shell: bash
+        env:
+          DIR: ${{ runner.temp }}/package
+          FILENAME: ${{ needs.pack.outputs.filename }}
+        run: node scripts/check-package.mjs --tarball "$DIR/$FILENAME" --manifest "$DIR/package-manifest.json"
