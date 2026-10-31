@@ -94,21 +94,35 @@ test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async 
     // Run the CLI from daemonA's HOME but target daemonB explicitly via @host:port. The token for
     // daemonB is resolved from its peers.json entry BY ADDRESS — the dial site here has only a host
     // string, never a peer name, which is why name-keyed resolution never fired for this path.
+    const cliStarted = performance.now(); // Task 1215 native39: diagnostics only (CLI wall time, which bounds when the write happened)
     const result = await daemonA.runCli([
       'inject',
       `${sessionId}@${daemonB.host}:${daemonB.port}`,
       `echo ${token}`
     ], { timeoutMs: 8000 });
+    const cliElapsedMs = Math.round(performance.now() - cliStarted);
 
     assert.equal(result.code, 0, `CLI failed:\nstderr: ${result.stderr}\nstdout: ${result.stdout}`);
     const missed = await seen;
     if (missed) {
-      appendEvidence(missed, ` | K1 evidence ${JSON.stringify({
+      // The K1 evidence is fixed (stringified) at failure time, exactly as before; post_verdict below can only add to it.
+      const k1 = JSON.stringify({
         cli: { code: result.code, signal: result.signal ?? null, stdout_tail: tail(result.stdout), stderr_tail: tail(result.stderr) },
         target_inject_log: daemonB.getLogs().stdout.split(/\r?\n/).filter((line) => line.startsWith('[INJECT]') && line.includes(sessionId))
           .slice(-4).map((line) => line.slice(0, 240)),
         viewer: viewer(),
-      })}`);
+      });
+      // Task 1215 native39 (failure-only, observe-only; the 8000 ms verdict is ALREADY failed and `missed` is always rethrown):
+      // one fixed window keeps the EXISTING viewerSummary listener recording, so a late prompt then late token (queued input
+      // behind a slow shell start), a prompt with no token (input lost), no prompt at all (startup still stalled) and a shell
+      // exit can be told apart. No write, resend, retry or polling; counts, times and fixed labels only.
+      await new Promise((resolve) => setTimeout(resolve, POST_VERDICT_WINDOW_MS));
+      const { stdout: bOut, stderr: bErr } = daemonB.getLogs();
+      const post = JSON.stringify({ window_ms: POST_VERDICT_WINDOW_MS, cli_elapsed_ms: cliElapsedMs,
+        window_end: { ...viewer(), observation_limit: 'viewer counters at the end of the post-verdict window (timing ms after viewer open)' },
+        target_ws_ready_state: targetWs.readyState,
+        target_exit_log_lines: `${bOut}\n${bErr}`.split(/\r?\n/).filter((line) => line.includes(sessionId) && line.includes('[EXIT]')).length });
+      appendEvidence(missed, ` | K1 evidence ${k1} | post_verdict ${post}`);
       throw missed;
     }
   } finally {
@@ -118,6 +132,8 @@ test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async 
 
 // Task 1215 G-SHELL step 1 (K1): bounded, payload-free evidence only (counts and booleans; tails capped).
 function tail(text) { return String(text ?? '').slice(-600); }
+// Task 1215 native39: the fixed post-verdict observation window (same length as the #843 pty33 window).
+const POST_VERDICT_WINDOW_MS = 20000;
 // The same error object is rethrown (identity, stack frames); only its message and first stack line gain the evidence.
 // Task 1215 pty17 (windows42 NA-4): V8 formats `stack` lazily, so it is read BEFORE `message` changes — reading it after
 // already contained the note and the evidence appeared twice.

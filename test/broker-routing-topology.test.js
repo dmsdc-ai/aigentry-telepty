@@ -33,6 +33,7 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
       entry('c', 'c', c, [grant('broker.reply_context', ['c']), grant('broker.reply', ['a/return-worker'])])
     ]) } });
   const bridges = [], owners = []; let origin, dropResults = false;
+  const nodeRuns = {}; // Task 1215 native39: diagnostics only — how each bridge's run loop settled (fixed labels / code tokens)
   const client = (principal, key, privateKey) => createBrokerClient({ config: { principal_id: principal, key_id: key, hub_audience: 'hub', hub_url: origin }, privateKey });
   try {
     const address = await hub.listen(); origin = `http://127.0.0.1:${address.port}`;
@@ -51,6 +52,9 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
         hub_principal_id: 'hub', audience: node, local_daemon_url: `http://127.0.0.1:${daemon.port}`, local_timeout_ms: 500,
         hub_trust: trust(node, [entry('h', 'hub', h, [grant('broker.envelope', targets)])]) } });
       bridges.push(bridge); await bridge.start();
+      nodeRuns[node] = 'running'; // observe-only: the node's own completion promise is never awaited or altered here
+      bridge.completion.then(() => { nodeRuns[node] = 'ended'; },
+        (reason) => { const code = reason && reason.code; nodeRuns[node] = `rejected:${typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(code) ? code : 'other'}`; });
     }
     const source = client('a', 'a', a.privateKey), responder = client('b', 'b', b.privateKey), foreign = client('c', 'c', c.privateKey);
     const body = { idempotency_key: 'routing-group-key-0001', prompt: 'Synthetic broadcast', no_enter: true,
@@ -80,7 +84,23 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
     const reply = await responder.reply(receipt, responseBody); assert.equal(reply.status, 202);
     assert.equal(reply.body.in_reply_to, receipt);
     let answer;
-    await waitFor(async () => { answer = (await responder.receipt(responseBody.idempotency_key)).body; return answer.state === 'accepted'; });
+    const replyAdmitted = performance.now(); // Task 1215 native39: diagnostics only
+    await waitFor(async () => { answer = (await responder.receipt(responseBody.idempotency_key)).body; return answer.state === 'accepted'; })
+      .catch((error) => {
+        // Task 1215 native39 (failure-only; the wait has ALREADY failed and the same error is rethrown): the last receipt the
+        // unchanged poll saw (fixed fields only — never a prompt), owner frames per sid (counts) and each bridge's run state.
+        // Discriminates node-side local timeout (BROKER_LOCAL_OUTCOME_UNKNOWN), hub result timer (BROKER_RESULT_TIMEOUT),
+        // stream loss, a stopped bridge loop, and a delivered-but-unreported frame. V8 formats `stack` lazily: read it first.
+        const stack = error.stack; const first = `${error.name}: ${error.message}`;
+        const count = (sid) => frames.filter((f) => f.sid === sid).length;
+        const note = ` | #1215 native39 evidence ${JSON.stringify({ waited_ms: Math.round(performance.now() - replyAdmitted),
+          last_receipt: answer ? { state: answer.state ?? null, code: answer.code ?? null, remote_queued: answer.remote_queued ?? null,
+            has_remote_inject_id: Boolean(answer.remote_inject_id), in_reply_to_matches: answer.in_reply_to === receipt } : null,
+          frames: { worker: count('worker'), other: count('other'), 'return-worker': count('return-worker') }, nodes: { ...nodeRuns } })}`;
+        error.message += note;
+        if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
+        throw error;
+      });
     assert.equal(answer.foreign_session_identity_verified, false);
     const staleBody = { ...responseBody, idempotency_key: 'routing-stale-key-0001', expected_epoch: 'stale-epoch' };
     assert.equal((await responder.reply(receipt, staleBody)).status, 202);

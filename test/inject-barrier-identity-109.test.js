@@ -105,11 +105,13 @@ test('#109(b): the barrier wait is bounded — late callers get QUEUE_TIMEOUT, a
   const { ws, frames } = await wrappedOwner(sid);
   t.after(() => { try { ws.close(); } catch {} });
 
+  // Task 1215 native39 (failure-only evidence): the daemon's own payload-free submit_barrier records emitted after this point.
+  const DIAG_PREFIX = '[telepty-diag] submit_barrier ', diagFrom = harness.getLogs().stderr.length, t0 = Date.now();
   const prompts = ['q1', 'q2', 'q3', 'q4', 'q5', 'q6'];
   const timed = await Promise.all(prompts.map(async (p) => {
     const started = Date.now();
     const res = await inject(sid, p);
-    return { p, res, elapsed: Date.now() - started };
+    return { p, res, elapsed: Date.now() - started, issued_ms: started - t0 };
   }));
   const slowest = Math.max(...timed.map((r) => r.elapsed));
   const delivered = timed.filter((r) => r.res.status === 200).map((r) => r.p);
@@ -120,8 +122,17 @@ test('#109(b): the barrier wait is bounded — late callers get QUEUE_TIMEOUT, a
     { timeoutMs: 5000, description: 'a CR for every accepted inject' });
   await sleep(700);
 
-  assert.ok(slowest < QUEUE_BOUND_MS + 800,
-    `slowest caller waited ${slowest} ms with a ${QUEUE_BOUND_MS} ms bound: ${JSON.stringify(timed.map((r) => [r.p, r.res.status, r.elapsed]))}`);
+  // Task 1215 native39: the SAME predicate and bound; on failure only, the message also carries each caller's issue offset,
+  // code and daemon-measured barrier wait (queue_wait_ms) plus the daemon's submit_barrier lines (pre_barrier_in_delivery_ms,
+  // wait_rounds, holder phase marks), so pre-barrier work, barrier wait and a late timer can be told apart.
+  const withinBound = slowest < QUEUE_BOUND_MS + 800;
+  const boundEvidence = withinBound ? '' : ` | #1215 native39 evidence ${JSON.stringify({
+    callers: timed.map((r) => ({ p: r.p, issued_ms: r.issued_ms, elapsed_ms: r.elapsed, status: r.res.status, code: (r.res.body && r.res.body.code) || null,
+      queue_wait_ms: r.res.body && Number.isSafeInteger(r.res.body.queue_wait_ms) ? r.res.body.queue_wait_ms : null })),
+    daemon: harness.getLogs().stderr.slice(diagFrom).split(/\r?\n/).filter((line) => line.startsWith(DIAG_PREFIX)).slice(-6)
+      .map((line) => { try { return JSON.parse(line.slice(DIAG_PREFIX.length)); } catch { return 'unparsed'; } }) })}`;
+  assert.ok(withinBound,
+    `slowest caller waited ${slowest} ms with a ${QUEUE_BOUND_MS} ms bound: ${JSON.stringify(timed.map((r) => [r.p, r.res.status, r.elapsed]))}${boundEvidence}`);
   assert.ok(refused.length > 0, 'six back-to-back injects all fit inside the bound — the test proves nothing');
   for (const r of refused) {
     assert.equal(r.res.status, 503, JSON.stringify(r.res.body));
