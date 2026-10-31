@@ -98,11 +98,14 @@ test('S1 (discriminating): with the owner held before the park group\'s segment 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const barrierHome = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-s1-barrier-'));
   const barrier = createBarrier(barrierHome);
-  // The owner worker reads the barrier config at spawn, which the fixture's restore performs synchronously.
+  // The owner worker copies process.env when it is constructed (the barrier config is read once at its module load). Since the
+  // durable open-time lock acquisition (#1215 native44/51) the fixture's restore constructs it only AFTER an awaited lock
+  // durability step, i.e. after createSessionDeliveryFixture() returns — so the variable stays set until the open has settled.
+  // Settlement only: a failed open is still surfaced by the awaited begin below, inside the try whose finally disposes.
   const prev = process.env.LEDGER_1207_BARRIER;
   process.env.LEDGER_1207_BARRIER = barrier.env({ maxWaitMs: 10000 });
   let fixture;
-  try { fixture = createSessionDeliveryFixture({ ledgerOptions: { fsImplPath: path.join(__dirname, 'fixtures', 'ledger-1207', 'paused-owner-fs.js') } }); }
+  try { fixture = createSessionDeliveryFixture({ ledgerOptions: { fsImplPath: path.join(__dirname, 'fixtures', 'ledger-1207', 'paused-owner-fs.js') } }); await fixture.ledgerReady.catch(() => {}); }
   finally { if (prev === undefined) delete process.env.LEDGER_1207_BARRIER; else process.env.LEDGER_1207_BARRIER = prev; }
   const written = [];
   // Bootstrap-gated (`claude`) and not ready: the inject parks on the bootstrap queue (session-delivery.js).
