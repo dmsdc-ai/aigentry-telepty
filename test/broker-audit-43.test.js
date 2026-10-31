@@ -8,6 +8,7 @@ const crypto = require('node:crypto');
 const { createBrokerAudit } = require('../src/broker/audit');
 const { createBrokerHub } = require('../src/broker/hub');
 const { createSignedAssertion } = require('../src/principal/proof');
+const { linuxOnly, nonLinuxOnly } = require('../test-support/windows-879/linux-authority');
 function temp(t) { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-broker-audit-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true })); return dir; }
 function pair() { return crypto.generateKeyPairSync('ed25519'); }
 
@@ -23,7 +24,9 @@ test('broker audit bounds overflow and exposes sanitized writer failures without
   assert.equal(JSON.stringify(audit.stats()).includes('secret'), false);
 });
 
-test('signed hub audits admission, refusal, replay and receipt outcomes hash-only and flushes on close', async t => {
+// #879: the private audit writer is Linux-only (src/broker/audit-storage.js:8); off Linux the batch is
+// discarded observably, asserted by the refusal case below.
+test('signed hub audits admission, refusal, replay and receipt outcomes hash-only and flushes on close', { skip: linuxOnly }, async t => {
   const home = temp(t), source = pair(), receiver = pair(), hubKey = pair();
   const key = (name, owner, p, grants) => ({ key_id: name, principal_id: owner,
     public_key_spki: p.publicKey.export({ type: 'spki', format: 'pem' }), grants });
@@ -102,7 +105,8 @@ test('signed hub audits admission, refusal, replay and receipt outcomes hash-onl
   }
 });
 
-test('owned hub SIGTERM awaits its final audit batch', { timeout: 10000 }, async t => {
+// #879: the hub child reads its config/key through readAuthorityFile — Linux-only.
+test('owned hub SIGTERM awaits its final audit batch', { timeout: 10000, skip: linuxOnly }, async t => {
   const { spawn } = require('node:child_process');
   const { waitFor } = require('../test-support/daemon-harness');
   const home = temp(t), hubKey = pair(), source = pair();
@@ -132,6 +136,17 @@ test('owned hub SIGTERM awaits its final audit batch', { timeout: 10000 }, async
   assert.equal(JSON.parse(raw.trim()).broker_http_status, 404);
   assert.equal(stdout.includes('SYNTHETIC_SECRET_PATH_43'), false);
   assert.equal(stderr, '');
+});
+
+test('off Linux the private audit discards its batch observably and creates no file', { skip: nonLinuxOnly }, async t => {
+  const file = path.join(temp(t), 'audit.jsonl');
+  const audit = createBrokerAudit({ path: file, flushMs: 60000 });
+  audit.record({ event: 'request', payload: 'secret-refused-43', principal: { id: 'node-a', keyId: 'a-key' }, status: 404 });
+  await audit.close();
+  assert.equal(audit.stats().submitted, 1);
+  assert.ok(audit.stats().write_errors >= 1, 'an unsupported audit store must be visible as a write error');
+  assert.equal(fs.existsSync(file), false, 'no audit file may be created without the Linux integrity checks');
+  assert.equal(JSON.stringify(audit.stats()).includes('secret'), false);
 });
 
 for (const unsafe of ['leaf-symlink', 'hardlink', 'writable-leaf', 'ancestor-symlink', 'writable-ancestor', 'foreign-owner']) test(`broker audit refuses ${unsafe} without modifying existing paths`, { skip: process.platform !== 'linux' }, async t => {

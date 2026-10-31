@@ -9,6 +9,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const { createBrokerClient, createBrokerNode } = require('../src/broker/node');
 const { createSignedAssertion } = require('../src/principal/proof');
 const { startTestDaemon, waitFor } = require('../test-support/daemon-harness');
+const { linuxOnly, nonLinuxOnly } = require('../test-support/windows-879/linux-authority');
 
 function keyPair() {
   const pair = crypto.generateKeyPairSync('ed25519');
@@ -38,7 +39,8 @@ async function child(mode, configFile, home, banner) {
   };
 }
 
-test('three-process outbound-only broker topology uses enrolled keys and exact idempotent local ingress', async () => {
+// #879: the hub/node children load their config and keys through readAuthorityFile — Linux-only.
+test('three-process outbound-only broker topology uses enrolled keys and exact idempotent local ingress', { skip: linuxOnly }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-broker-42-'));
   const hubHome = path.join(root, 'hub'); fs.mkdirSync(hubHome, { mode: 0o700 });
   const receiver = await startTestDaemon({ env: { TELEPTY_AUTH_TOKEN: '', TELEPTY_MACHINE_ID: 'node-b' } });
@@ -192,6 +194,25 @@ test('three-process outbound-only broker topology uses enrolled keys and exact i
   }
 });
 
+
+test('off Linux a broker hub child refuses its private config and key before listening', { skip: nonLinuxOnly }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-broker-42-refusal-'));
+  try {
+    const h = keyPair(), a = keyPair();
+    const hubKey = path.join(root, 'hub-key.pem'); write(hubKey, h.private);
+    const hubFile = path.join(root, 'hub.json');
+    write(hubFile, { schema: 'telepty.broker-hub/v1', audience: 'synthetic-hub', principal_id: 'hub', key_id: 'hub-key',
+      private_key_path: hubKey, listen: { host: '127.0.0.1', port: 0 }, stream_ms: 60000,
+      nodes: { 'node-a': { audience: 'synthetic-node-a' } },
+      limits: { 'node-a': { max_payload_bytes: 256, max_requests: 10, window_ms: 60000, timeout_ms: 1500, max_pending: 4 } },
+      trust: trust('synthetic-hub', [entry('a-key', 'node-a', a, [grant('broker.receipt', ['node-a'])])]) });
+    await assert.rejects(child('hub', hubFile, root, /Broker v1 listening/), (reason) => {
+      assert.match(reason.message, /Synthetic broker child exited: BROKER_START_OR_CHANNEL_FAILED/);
+      assert.equal(reason.message.includes(h.private), false, 'the refusal never echoes key material');
+      return true;
+    });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test('recipient rejects unpinned or oversized SSE envelopes before any local credential request', async () => {
   const b = keyPair(), h = keyPair(), foreign = keyPair();

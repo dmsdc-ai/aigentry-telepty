@@ -140,9 +140,11 @@ test('G-REPLY: a hostile OSC payload never appears in the frame as text or as a 
 test('G-REPLY/source: the module wires no reply sink and logs nothing (contract §9)', () => {
   const src = fs.readFileSync(H.VT_MODULE_PATH, 'utf8');
   // Strip block and line comments so the prose ABOUT these APIs cannot mask a real call.
+  // #879: split on CRLF too — a Windows autocrlf checkout leaves '\r' on every line, and `.` does not
+  // match it, so the line-comment strip below silently kept every comment.
   const code = src
     .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
+    .split(/\r?\n/)
     .map((line) => line.replace(/^\s*\/\/.*$/, ''))
     .join('\n');
 

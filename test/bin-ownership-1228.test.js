@@ -148,7 +148,8 @@ test('locatePrefix: a non-global checkout is reported unscoped, never guessed at
 
 test('detectLegacyPackage: reports presence, version and the bin map (resolves F-1 on a real host)', () => {
   const fs = posixTree({ linkTarget: '../lib/node_modules/aigentry-telepty/cli.js' });
-  const legacy = detectLegacyPackage({ globalRoot: POSIX_GLOBAL_ROOT, fs });
+  // #879: platform is named because detectLegacyPackage otherwise joins with the HOST path flavor.
+  const legacy = detectLegacyPackage({ globalRoot: POSIX_GLOBAL_ROOT, fs, platform: 'linux' });
 
   assert.equal(legacy.present, true);
   assert.equal(legacy.version, '0.0.4');
@@ -160,7 +161,7 @@ test('detectLegacyPackage: a same-named directory with a different package name 
   const fs = fakeFs({
     [`${POSIX_GLOBAL_ROOT}/aigentry-telepty/package.json`]: packageJson('something-else', '9.9.9', {})
   });
-  assert.equal(detectLegacyPackage({ globalRoot: POSIX_GLOBAL_ROOT, fs }).present, false);
+  assert.equal(detectLegacyPackage({ globalRoot: POSIX_GLOBAL_ROOT, fs, platform: 'linux' }).present, false);
 });
 
 test('detectLegacyPackage: unreadable or malformed package.json is absent, never a throw', () => {
@@ -425,7 +426,9 @@ test('B-U6: resolveTeleptyEntryPoint refuses a PATH-resolved legacy cli.js', () 
   const legacyCli = `${POSIX_GLOBAL_ROOT}/aigentry-telepty/cli.js`;
   const legacyFs = fakeFs({
     [legacyCli]: { content: '// legacy' },
-    [`${POSIX_GLOBAL_ROOT}/aigentry-telepty/package.json`]: packageJson('aigentry-telepty', '0.0.4', { telepty: 'cli.js' })
+    // #879: keyed with the host path API — resolveTeleptyEntryPoint derives the sibling manifest
+    // with path.join, which is backslash-separated on a win32 host (identical bytes on POSIX).
+    [path.join(POSIX_GLOBAL_ROOT, 'aigentry-telepty', 'package.json')]: packageJson('aigentry-telepty', '0.0.4', { telepty: 'cli.js' })
   });
   assert.equal(
     resolveTeleptyEntryPoint({
@@ -462,7 +465,8 @@ test('B-U6: a scoped cli.js on PATH is still accepted (the in-place upgrade case
   const scopedCli = `${POSIX_PKG_ROOT}/cli.js`;
   const tree = fakeFs({
     [scopedCli]: { content: '// scoped' },
-    [`${POSIX_PKG_ROOT}/package.json`]: packageJson('@dmsdc-ai/aigentry-telepty', pkg.version, { telepty: 'cli.js' })
+    // #879: host path API, as above.
+    [path.join(POSIX_PKG_ROOT, 'package.json')]: packageJson('@dmsdc-ai/aigentry-telepty', pkg.version, { telepty: 'cli.js' })
   });
 
   assert.equal(

@@ -73,11 +73,18 @@ test('native Windows npm-style shim preserves literal argv', { skip: process.pla
     fs.writeFileSync(shim, `@"${process.execPath}" "${helper}" %*\r\n`);
     const args = ['a&b', 'a|b', '>out', '^', '" & echo X', '!x!', '', 'trail\\'];
     const target = buildPtySpawnTarget(shim, args, process.env);
-    await new Promise((resolve, reject) => {
-      const child = pty.spawn(target.file, target.args, { env: process.env, cwd: root, cols: 80, rows: 24 });
-      child.onData(() => {});
-      child.onExit(({ exitCode }) => exitCode === 0 ? resolve() : reject(new Error(`shim exited ${exitCode}`)));
-    });
+    let child;
+    try {
+      await new Promise((resolve, reject) => {
+        child = pty.spawn(target.file, target.args, { env: process.env, cwd: root, cols: 80, rows: 24 });
+        child.onData(() => {});
+        child.onExit(({ exitCode }) => exitCode === 0 ? resolve() : reject(new Error(`shim exited ${exitCode}`)));
+      });
+    } finally {
+      // #879: ConPTY keeps its conout worker and pipe server alive after the child exits until the
+      // pty is killed (measured: file timed out with them still open), as test/cli.test.js does.
+      try { if (child) child.kill(); } catch { /* already gone */ }
+    }
     assert.deepEqual(JSON.parse(fs.readFileSync(output, 'utf8')), args);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

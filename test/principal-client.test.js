@@ -8,6 +8,7 @@ const path = require('node:path');
 const { createPrincipalClient, loadPrincipalClientConfiguration } = require('../src/principal/client');
 const { validateTrustConfiguration, createPrincipalVerifier } = require('../src/principal/proof');
 const { bodyDigest } = require('../src/principal/encoding');
+const { linuxOnly, nonLinuxOnly } = require('../test-support/windows-879/linux-authority');
 function fixture() {
   const pair=crypto.generateKeyPairSync('ed25519');
   const principal={principal_id:'reader',key_id:'reader',audience:'fixture',privateKey:pair.privateKey};
@@ -33,7 +34,8 @@ test('client refuses insecure origins and mismatched challenge; never sends sign
     await assert.rejects(client.assertion({method:'GET',target:'/api/meta',body:{},action:'daemon.inspect'}),{code:'PRINCIPAL_CHALLENGE_INVALID'});assert.equal(calls,1);
   }
 });
-test('checked client configuration rejects unknown fields, weak key files and symlinks',t=>{
+// #879: client config and key files are read through readAuthorityFile — Linux-only; refusal case at the end.
+test('checked client configuration rejects unknown fields, weak key files and symlinks',{skip:linuxOnly},t=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'telepty-principal-client-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const f=fixture(),key=path.join(dir,'key.pem'),file=path.join(dir,'config.json');
   fs.writeFileSync(key,f.principal.privateKey.export({type:'pkcs8',format:'pem'}),{mode:0o600});
@@ -48,7 +50,7 @@ const { PassThrough }=require('node:stream');
 const { createObserverTransport,publishSessionOutput }=require('../src/transport/observer');
 const { createPrincipalAuthentication }=require('../src/principal/http');
 const { runPrincipalObserver }=require('../src/principal/observe-cli');
-test('observer CLI uses checked config, proves exact epoch, emits JSON and closes without a token file',async t=>{
+test('observer CLI uses checked config, proves exact epoch, emits JSON and closes without a token file',{skip:linuxOnly},async t=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'telepty-observe-client-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const pair=crypto.generateKeyPairSync('ed25519');
   const trust=validateTrustConfiguration({schema:'telepty.principals/v1',audience:'fixture',keys:[{key_id:'reader',principal_id:'reader',public_key_spki:pair.publicKey.export({type:'spki',format:'pem'}),grants:[{action:'session.observe',targets:['mine']}]}]});
@@ -80,7 +82,7 @@ test('caller cancellation never replaces the finite request deadline',async t=>{
 test('already cancelled observer refuses before opening a WebSocket',async()=>{
   const signal=AbortSignal.abort();await assert.rejects(runPrincipalObserver(['--config','/unused','--session','mine','--epoch','epoch'],{signal}),{code:'PRINCIPAL_OBSERVER_CANCELLED'});
 });
-test('observer enforces advertised expiry even if a server keeps the socket open',async t=>{
+test('observer enforces advertised expiry even if a server keeps the socket open',{skip:linuxOnly},async t=>{
   const f=fixture(),dir=fs.mkdtempSync(path.join(os.tmpdir(),'telepty-expiry-client-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const server=http.createServer((_req,res)=>res.end(JSON.stringify(f.document)));
   const {WebSocketServer}=require('ws');const wss=new WebSocketServer({server});
@@ -94,4 +96,19 @@ test('observer enforces advertised expiry even if a server keeps the socket open
   const stdout=new PassThrough();let output='';stdout.on('data',data=>{output+=data;});
   await assert.rejects(runPrincipalObserver(['--config',config,'--session','mine','--epoch','epoch'],{stdout}),{code:'PRINCIPAL_OBSERVER_EXPIRED'});
   assert.ok(!output.includes('too late'));
+});
+test('off Linux checked client configuration, observer and observer CLI refuse before any request',{skip:nonLinuxOnly},async t=>{
+  const f=fixture(),dir=fs.mkdtempSync(path.join(os.tmpdir(),'telepty-principal-refusal-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const key=path.join(dir,'key.pem'),config=path.join(dir,'config.json');let requests=0;
+  const server=http.createServer((_req,res)=>{requests++;res.end(JSON.stringify(f.document));});
+  await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>{server.close();server.closeAllConnections();});
+  fs.writeFileSync(key,f.principal.privateKey.export({type:'pkcs8',format:'pem'}),{mode:0o600});
+  fs.writeFileSync(config,JSON.stringify({schema:'telepty.principal-client/v1',daemon_url:`http://127.0.0.1:${server.address().port}`,principal_id:'reader',key_id:'reader',audience:'fixture',private_key_path:key}),{mode:0o600});
+  assert.throws(()=>loadPrincipalClientConfiguration(config),{code:'AUTHORITY_FILE_UNAVAILABLE'});
+  await assert.rejects(runPrincipalObserver(['--config',config,'--session','mine','--epoch','epoch'],{stdout:new PassThrough()}),{code:'AUTHORITY_FILE_UNAVAILABLE'});
+  const {execFile}=require('node:child_process');
+  const refused=await new Promise(resolve=>execFile(process.execPath,[path.join(__dirname,'../cli.js'),'principal-observe-v1','--config',config,'--session','mine','--epoch','epoch'],{env:{...process.env,HOME:dir,USERPROFILE:dir,TELEPTY_AUTH_TOKEN:'unused-legacy'},timeout:10000},(error,stdout,stderr)=>resolve({error,stdout,stderr})));
+  assert.equal(refused.error?.code,1);assert.equal(refused.stdout,'');assert.match(refused.stderr,/AUTHORITY_FILE_UNAVAILABLE/);
+  assert.equal(fs.existsSync(path.join(dir,'.telepty','config.json')),false);
+  assert.equal(requests,0,'no challenge may be requested without a checked configuration');
 });

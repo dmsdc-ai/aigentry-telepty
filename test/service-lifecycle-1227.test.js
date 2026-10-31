@@ -31,6 +31,9 @@ const path = require('path');
 // override would measure a different directory than the product would mint into.
 const PROBE_HOME = fsReal.mkdtempSync(path.join(process.env.HOME, 'probe-home-'));
 process.env.HOME = PROBE_HOME;
+// #879: os.homedir() reads USERPROFILE on win32 (as test-support/setup-env.js notes), so HOME
+// alone left auth.js measuring a different directory than PROBE_HOME.
+if (process.platform === 'win32') process.env.USERPROFILE = PROBE_HOME;
 
 const {
   SERVICE_EXIT,
@@ -323,9 +326,12 @@ test('A-U2: classifyDescriptor separates managed, drifted (nodeBin / install.sh 
 <key>ProgramArguments</key><array><string>/usr/bin/sleep</string><string>99</string></array></dict></plist>`;
   assert.equal(classifyDescriptor(foreign, 'launchd', expected), 'foreign');
 
-  const unitExpected = { nodeBin: NODE_BIN, cliJs: CLI_JS, text: expectedUnit() };
-  assert.equal(classifyDescriptor(expectedUnit(), 'systemd-user', unitExpected), 'managed');
-  assert.equal(classifyDescriptor(expectedUnit({ nodeBin: '/usr/bin/node' }), 'systemd-user', unitExpected), 'drifted');
+  // #879: a systemd unit always names POSIX paths; host path.join made CLI_JS a backslash path on
+  // win32, which the unit builder escapes. path.posix keeps the same bytes on POSIX hosts.
+  const unitCliJs = path.posix.join(PKG_ROOT, 'cli.js');
+  const unitExpected = { nodeBin: NODE_BIN, cliJs: unitCliJs, text: expectedUnit({ cliJs: unitCliJs }) };
+  assert.equal(classifyDescriptor(expectedUnit({ cliJs: unitCliJs }), 'systemd-user', unitExpected), 'managed');
+  assert.equal(classifyDescriptor(expectedUnit({ nodeBin: '/usr/bin/node', cliJs: unitCliJs }), 'systemd-user', unitExpected), 'drifted');
   assert.equal(classifyDescriptor('[Service]\nExecStart=/usr/bin/redis-server\n', 'systemd-user', unitExpected), 'foreign');
 });
 

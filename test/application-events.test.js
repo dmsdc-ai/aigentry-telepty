@@ -15,12 +15,15 @@ const WebSocket = require('ws');
 const { createSignedAssertion, validateTrustConfiguration } = require('../src/principal/proof');
 const { createPrincipalAuthentication } = require('../src/principal/http');
 const { startTestDaemon, waitFor } = require('../test-support/daemon-harness');
+const { linuxOnly, nonLinuxOnly, assertStrictDaemonRefused } = require('../test-support/windows-879/linux-authority');
 function open(url, proof) { return new Promise(resolve => {
   const ws = new WebSocket(url, { headers: { 'x-telepty-principal': proof } }), frames = [];
   ws.on('message', bytes => frames.push(JSON.parse(bytes))); ws.on('error', () => {}); ws.once('open', () => resolve({ ws, frames }));
   ws.once('unexpected-response', (_r, res) => { res.resume(); ws.terminate(); resolve({ status: res.statusCode }); });
 }); }
-test('actual private daemon isolates opaque application events from trusted events, routing and caller authority', { timeout: 15000 }, async t => {
+// #879: the strict daemon loads TELEPTY_PRINCIPAL_TRUST_FILE through readAuthorityFile — Linux-only
+// (src/principal/authority-file.js:15); the off-Linux refusal is asserted at the end of this file.
+test('actual private daemon isolates opaque application events from trusted events, routing and caller authority', { timeout: 15000, skip: linuxOnly }, async t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'application-events-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const pairs = Object.fromEntries(['owner','outsider','reader','weak'].map(id => [id, crypto.generateKeyPairSync('ed25519')]));
   const entry = (key, principal, authority, actions) => ({ key_id: key, principal_id: principal, ...(authority ? { authority } : {}),
@@ -166,4 +169,11 @@ test('a successful-looking publication response cannot erase explicit uncertaint
  const {projectPublicationReceipt}=require('../src/application-publication');
  const receipt=projectPublicationReceipt({ok:true,status:200},{success:true,session_id:'mine',publication_id:crypto.randomUUID(),matched_socket_count:1,delivery_ack:false,delivery_uncertain:true},'mine');
  assert.equal(receipt.accepted,false);assert.equal(receipt.uncertain,true);assert.equal(receipt.safe.success,false);assert.equal(receipt.safe.publication_id,undefined);
+});
+
+test('off Linux the strict daemon refuses to start rather than run without its trust file', { timeout: 15000, skip: nonLinuxOnly }, async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'application-events-refusal-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const trust = path.join(home, 'trust'); fs.writeFileSync(trust, JSON.stringify({ schema: 'telepty.principals/v1', audience: 'fixture', keys: [{ key_id: 'owner', principal_id: 'owner', authority: 'operator',
+    public_key_spki: crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }), grants: [{ action: 'session.register', targets: ['mine'] }] }] }), { mode: 0o600 });
+  await assertStrictDaemonRefused(startTestDaemon, { homeDir: home, env: { TELEPTY_PRINCIPAL_MODE: 'strict', TELEPTY_PRINCIPAL_TRUST_FILE: trust, TELEPTY_MACHINE_ID: 'fixture' } });
 });

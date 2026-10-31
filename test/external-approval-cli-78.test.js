@@ -13,6 +13,13 @@ const publicKey = keys.publicKey.export({ type: 'spki', format: 'pem' }).toStrin
 let daemon;
 before(async () => { daemon = await startTestDaemon(); });
 after(async () => { if (daemon) await daemon.stop(); });
+// #879: readApprovalFile refuses every approval file on win32 before any filesystem access
+// (src/cli/external-approval.js:63, APPROVAL_FILE_PLATFORM_UNSUPPORTED — no O_NOFOLLOW/POSIX-mode
+// private-file contract there). Cases that need an ACCEPTED or inspected approval file are POSIX-only;
+// the Windows refusal is asserted by the win32 cases below and inside the signed-submit case.
+const APPROVAL_FILE_POSIX_ONLY = process.platform === 'win32'
+  ? 'win32: approval files are refused before reading (src/cli/external-approval.js:63); refusal covered below'
+  : false;
 function proof(document) { return { document, signature: crypto.sign(null, Buffer.from(JSON.stringify(document)), keys.privateKey).toString('base64url') }; }
 async function owner(t, protectedSession = true) {
   const sid = createSessionId('approvalcli');
@@ -27,7 +34,7 @@ async function owner(t, protectedSession = true) {
   return { sid, frames, token: reg.body.session_token };
 }
 
-test('CLI digest-only handoff then private approval file accepts once without printing payload or credentials', async t => {
+test('CLI digest-only handoff then private approval file accepts once without printing payload or credentials', { skip: APPROVAL_FILE_POSIX_ONLY }, async t => {
   const target = await owner(t);
   const payload = 'unique private prompt → --help --approval-file literal';
   const handoff = await daemon.runCli(['approval-challenge', '--no-enter', target.sid, '--', payload]);
@@ -67,9 +74,17 @@ test('CLI defaults to signed text plus Enter; ordinary inject and literal approv
   const file = path.join(daemon.homeDir, 'approval-submit.json');
   fs.writeFileSync(file, JSON.stringify(proof(document)), { mode: 0o600 });
   const sent = await daemon.runCli(['inject', '--approval-file', file, target.sid, '--', 'submit this']);
-  assert.equal(sent.code, 0, sent.stderr);
-  await daemon.waitFor(() => target.frames.length === 2);
-  assert.deepEqual(target.frames, ['submit this', '\r']);
+  if (process.platform === 'win32') {
+    // #879: the supported win32 contract is refusal before any request (src/cli/external-approval.js:63).
+    assert.equal(sent.code, 1);
+    assert.equal(JSON.parse(sent.stderr).code, 'APPROVAL_FILE_PLATFORM_UNSUPPORTED');
+    assert.equal(sent.stdout.includes('submit this') || sent.stderr.includes('submit this'), false);
+    assert.deepEqual(target.frames, []);
+  } else {
+    assert.equal(sent.code, 0, sent.stderr);
+    await daemon.waitFor(() => target.frames.length === 2);
+    assert.deepEqual(target.frames, ['submit this', '\r']);
+  }
   const normal = await owner(t, false);
   const legacy = await daemon.runCli(['inject', normal.sid, '--', 'literal --approval-file value']);
   assert.equal(legacy.code, 0, legacy.stderr);
@@ -110,7 +125,7 @@ test('parser keeps literal words, rejects unsupported flags, and never selects a
   assert.throws(() => parseApprovalArgs('inject', ['--approval-file', 'proof', '--submit', 'target', 'payload']), { code: 'UNSUPPORTED_APPROVAL_OPTION' });
 });
 
-test('approval file loader refuses symlinks, public modes, oversized files and private key material before a request', async () => {
+test('approval file loader refuses symlinks, public modes, oversized files and private key material before a request', { skip: APPROVAL_FILE_POSIX_ONLY }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'approvalcli-files-'));
   const input = parseApprovalArgs('inject', ['--approval-file', 'x', 'target', 'payload']);
   try {
@@ -143,7 +158,7 @@ test('approval file loader refuses symlinks, public modes, oversized files and p
 });
 
 
-test('old approval cannot fall back to unsigned injection after target id is recreated without protection', async t => {
+test('old approval cannot fall back to unsigned injection after target id is recreated without protection', { skip: APPROVAL_FILE_POSIX_ONLY }, async t => {
   const target = await owner(t);
   const challenge = await daemon.runCli(['approval-challenge', '--no-enter', target.sid, '--', 'old signed text']);
   assert.equal(challenge.code, 0, challenge.stderr);
@@ -157,4 +172,35 @@ test('old approval cannot fall back to unsigned injection after target id is rec
   assert.equal(JSON.parse(result.stderr).code, 'APPROVAL_POLICY_REQUIRED');
   const mailbox = await daemon.request(`/api/sessions/${target.sid}/mailbox`);
   assert.equal(mailbox.body.pending.length, 0, 'old proof must never enter a replacement mailbox');
+});
+
+// #879: the win32 refusal contract. The loader case runs on every platform through the injectable
+// platform seam; the CLI case is the real Windows command against a protected live session.
+test('approval file loader refuses win32 before touching the file', () => {
+  const input = parseApprovalArgs('inject', ['--approval-file', 'x', 'target', 'payload']);
+  const touched = [];
+  const observedFs = Object.create(fs);
+  for (const name of ['lstatSync', 'openSync', 'fstatSync', 'readSync']) observedFs[name] = (...args) => { touched.push(name); return fs[name](...args); };
+  assert.throws(() => readApprovalFile(path.join(os.tmpdir(), 'approval-879-never-read.json'), input, { filesystem: observedFs, platform: 'win32' }),
+    { code: 'APPROVAL_FILE_PLATFORM_UNSUPPORTED' });
+  assert.deepEqual(touched, [], 'the refusal precedes every filesystem call');
+});
+
+test('win32 CLI refuses an approval file before any request and delivers nothing', { skip: process.platform !== 'win32' }, async t => {
+  const target = await owner(t);
+  const challenge = await daemon.runCli(['approval-challenge', '--no-enter', target.sid, '--', 'win32 refused text']);
+  assert.equal(challenge.code, 0, challenge.stderr);
+  const document = JSON.parse(challenge.stdout);
+  const file = path.join(daemon.homeDir, 'approval-win32.json');
+  fs.writeFileSync(file, JSON.stringify(proof(document)), { mode: 0o600 });
+  const result = await daemon.runCli(['inject', '--approval-file', file, '--no-enter', target.sid, '--', 'win32 refused text']);
+  assert.equal(result.code, 1);
+  assert.equal(JSON.parse(result.stderr).code, 'APPROVAL_FILE_PLATFORM_UNSUPPORTED');
+  for (const output of [result.stdout, result.stderr]) {
+    assert.equal(output.includes('win32 refused text'), false);
+    assert.equal(output.includes(target.token), false);
+    assert.equal(output.includes(daemon.authToken()), false);
+  }
+  assert.deepEqual(target.frames, [], 'a refused approval must deliver nothing');
+  assert.equal(fs.existsSync(file), true, 'client never deletes proof files');
 });

@@ -21,7 +21,9 @@ const WebSocket = require('ws');
 
 const { startTestDaemon, createSessionId, delay } = require('../test-support/daemon-harness');
 
-const posixOnly = (t) => (process.platform === 'win32' ? t.skip('POSIX shell sinks') : false);
+// #879: t.skip() returns undefined, so the old guard never returned and the body still ran /bin/sh
+// (measured ENOENT, reported as `not ok # SKIP`). The sinks are POSIX /bin/sh and kitty paths.
+const posixOnly = (t) => (process.platform === 'win32' ? (t.skip('POSIX shell sinks'), true) : false);
 
 let daemon;
 before(async () => { daemon = await startTestDaemon(); });

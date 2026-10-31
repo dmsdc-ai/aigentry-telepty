@@ -10,6 +10,7 @@ const { createBrokerHub } = require('../src/broker/hub');
 const { createBrokerClient, createBrokerNode } = require('../src/broker/node');
 const { hash } = require('../src/broker/dispatch');
 const { startTestDaemon, waitFor } = require('../test-support/daemon-harness');
+const { IS_LINUX } = require('../test-support/windows-879/linux-authority');
 const pair = () => crypto.generateKeyPairSync('ed25519');
 const grant = (action, targets) => ({ action, targets });
 const entry = (key, principal, pair, grants) => ({ key_id: key, principal_id: principal,
@@ -113,15 +114,26 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
     const cli = await new Promise((resolve, reject) => {
       const child = spawn(process.execPath, ['--require', './test-support/setup-env.js', 'cli.js', 'broker-broadcast-v1', '--config', cliConfig, '--request', cliRequest],
         { cwd: path.resolve(__dirname, '..'), env: { ...process.env, HOME: root, USERPROFILE: root }, stdio: ['ignore', 'pipe', 'pipe'] });
-      let output = ''; child.stdout.on('data', data => { output += data; }); child.on('error', reject);
+      let output = '', errors = ''; child.stdout.on('data', data => { output += data; }); child.stderr.on('data', data => { errors += data; }); child.on('error', reject);
       const timeout = setTimeout(() => { child.kill(); reject(new Error('Owned CLI deadline')); }, 5000);
-      child.on('exit', code => { clearTimeout(timeout); resolve({ code, body: JSON.parse(output.trim()) }); });
+      child.on('exit', code => { clearTimeout(timeout); resolve({ code, output, errors }); });
     });
-    assert.equal(cli.code, 1); assert.equal(cli.body.state, 'failed');
-    assert.equal(cli.body.children[0].code, 'BROKER_NODE_OFFLINE');
-    fs.chmodSync(cliRequest, 0o644);
-    await assert.rejects(require('../src/broker/routing-cli').runBrokerRoutingRequest('broadcast', cliConfig, ['--request', cliRequest]),
-      { code: 'AUTHORITY_FILE_UNAVAILABLE' }, 'request files containing prompts must be private');
+    // #879: the CLI's private config/key/request files go through readAuthorityFile — Linux-only
+    // (src/principal/authority-file.js:15). Off Linux the same CLI and loader must refuse before any send.
+    if (IS_LINUX) {
+      cli.body = JSON.parse(cli.output.trim());
+      assert.equal(cli.code, 1); assert.equal(cli.body.state, 'failed');
+      assert.equal(cli.body.children[0].code, 'BROKER_NODE_OFFLINE');
+      fs.chmodSync(cliRequest, 0o644);
+      await assert.rejects(require('../src/broker/routing-cli').runBrokerRoutingRequest('broadcast', cliConfig, ['--request', cliRequest]),
+        { code: 'AUTHORITY_FILE_UNAVAILABLE' }, 'request files containing prompts must be private');
+    } else {
+      assert.equal(cli.code, 1); assert.equal(cli.output, '', 'a refused CLI prints no result');
+      assert.match(cli.errors, /BROKER_REQUEST_FAILED/);
+      assert.equal(cli.errors.includes('Synthetic broadcast'), false);
+      await assert.rejects(require('../src/broker/routing-cli').runBrokerRoutingRequest('broadcast', cliConfig, ['--request', cliRequest]),
+        { code: 'BROKER_FILE_UNSAFE' }, 'an unsupported platform refuses even a private config');
+    }
 
     const contents = fs.readdirSync(path.join(root, '.telepty', 'forward-receipts')).map(name => fs.readFileSync(path.join(root, '.telepty', 'forward-receipts', name), 'utf8')).join('');
     assert.equal(contents.includes('Synthetic broadcast'), false); assert.equal(contents.includes('Synthetic reply'), false);

@@ -12,6 +12,7 @@ const WebSocket = require('ws');
 const { createSignedAssertion, validateTrustConfiguration } = require('../src/principal/proof');
 const { createPrincipalAuthentication } = require('../src/principal/http');
 const { startTestDaemon, waitFor } = require('../test-support/daemon-harness');
+const { linuxOnly, nonLinuxOnly, assertStrictDaemonRefused } = require('../test-support/windows-879/linux-authority');
 function open(url, proof) { return new Promise(resolve => {
   const ws = new WebSocket(url, { headers: { 'x-telepty-principal': proof } }), messages = [];
   ws.on('message', bytes => messages.push(JSON.parse(bytes))); ws.on('error', () => {});
@@ -32,7 +33,9 @@ function frame(sign, c, type, sequence, key, body, id = 'owner') {
   return { type, connection_id: c.messages[0].connection_id, sequence, idempotency_key: key, body,
     assertion: sign({ method: 'POST', target, body, action: type === 'state_report' ? 'session.state' : 'session.inject', transport: 'http' }, id) };
 }
-test('actual strict bus effects preserve HTTP owner, inject, approval, signer and pre-reservation authority', { timeout: 15000 }, async t => {
+// #879: the strict daemon loads TELEPTY_PRINCIPAL_TRUST_FILE through readAuthorityFile — Linux-only
+// (src/principal/authority-file.js:15); the off-Linux refusal is asserted at the end of this file.
+test('actual strict bus effects preserve HTTP owner, inject, approval, signer and pre-reservation authority', { timeout: 15000, skip: linuxOnly }, async t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'strict-bus-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const pairs = keys(), trust = path.join(home, 'trust'); fs.writeFileSync(trust, JSON.stringify(trustDocument(pairs)), { mode: 0o600 });
   const daemon = await startTestDaemon({ homeDir: home, env: { TELEPTY_PRINCIPAL_MODE: 'strict', TELEPTY_PRINCIPAL_TRUST_FILE: trust, TELEPTY_MACHINE_ID: 'fixture' } }); t.after(() => daemon.stop());
@@ -172,4 +175,10 @@ test('common transport reuses pre-existing strict input key and body fingerprint
     assertion: f.sign({ method: 'POST', target: '/api/sessions/mine/inject', action: 'session.inject', transport: 'http', body }) })); await waitFor(() => c.messages.length === 2);
   assert.equal(c.messages[1].receipt_id, receiptId); assert.equal(c.messages[1].inject_id, 'legacy-inject-id'); assert.equal(c.messages[1].state, 'accepted');
   assert.equal(c.messages[1].schema, 'telepty.input-receipt/v1'); assert.equal(f.effects(), 0);
+});
+
+test('off Linux the strict daemon refuses to start rather than run without its trust file', { timeout: 15000, skip: nonLinuxOnly }, async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'strict-bus-refusal-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const trust = path.join(home, 'trust'); fs.writeFileSync(trust, JSON.stringify(trustDocument(keys())), { mode: 0o600 });
+  await assertStrictDaemonRefused(startTestDaemon, { homeDir: home, env: { TELEPTY_PRINCIPAL_MODE: 'strict', TELEPTY_PRINCIPAL_TRUST_FILE: trust, TELEPTY_MACHINE_ID: 'fixture' } });
 });

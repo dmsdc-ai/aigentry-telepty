@@ -2,6 +2,9 @@
 const {test}=require('node:test');const assert=require('node:assert/strict');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),http=require('node:http'),crypto=require('node:crypto');
 const {WebSocketServer}=require('ws');const {runPrincipalInput}=require('../src/principal/input-client');
+// #879: every client case reads its config/key/request through readAuthorityFile — a Linux-only contract
+// (src/principal/authority-file.js:15). Off Linux the refusal case at the end runs the same clients instead.
+const {linuxOnly,nonLinuxOnly,assertStrictDaemonRefused}=require('../test-support/windows-879/linux-authority');
 async function fixture(t,receipt,effect='inject') {
  const bus=effect!=='inject';
  const home=fs.mkdtempSync(path.join(os.tmpdir(),'principal-effect-client-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
@@ -17,20 +20,20 @@ async function fixture(t,receipt,effect='inject') {
  fs.writeFileSync(request,JSON.stringify({idempotency_key:'input-client-contract-0001',...(bus?{effect}:{}),body}),{mode:0o600});
  return['--config',config,'--session','mine','--epoch','epoch','--request',request];
 }
-test('an internally inconsistent accepted receipt never becomes client success',async t=>{
+test('an internally inconsistent accepted receipt never becomes client success',{skip:linuxOnly},async t=>{
  const args=await fixture(t,{schema:'telepty.input-receipt/v1',session_id:'mine',session_epoch:'epoch',state:'accepted',success:false,receipt_id:'a'.repeat(64),inject_id:'inject-id'});
  const result=await runPrincipalInput('inject',args);assert.equal(result.state,'outcome_unknown');assert.equal(result.success,false);assert.equal(result.bytes_written,null);assert.equal(result.retryable,false);
 });
-test('accepted input without durable receipt identity remains unknown',async t=>{
+test('accepted input without durable receipt identity remains unknown',{skip:linuxOnly},async t=>{
  const args=await fixture(t,{schema:'telepty.input-receipt/v1',session_id:'mine',session_epoch:'epoch',state:'accepted',success:true,inject_id:'inject-id'});
  assert.equal((await runPrincipalInput('inject',args)).state,'outcome_unknown');
 });
 const {runPrincipalBus}=require('../src/principal/bus-client');
-test('bus receipt cannot acknowledge a different effect',async t=>{
+test('bus receipt cannot acknowledge a different effect',{skip:linuxOnly},async t=>{
  const args=await fixture(t,{schema:'telepty.bus-effect-receipt/v1',effect:'routed_turn',session_id:'mine',session_epoch:'epoch',state:'accepted',success:true,receipt_id:'a'.repeat(64),inject_id:'inject-id'},'state_report');
  assert.equal((await runPrincipalBus('inject',args)).state,'outcome_unknown');
 });
-test('application publication never promotes an ACK claim or raw response payload',async t=>{
+test('application publication never promotes an ACK claim or raw response payload',{skip:linuxOnly},async t=>{
  const base={schema:'telepty.bus-effect-receipt/v1',effect:'app_publish',session_id:'mine',session_epoch:'epoch',state:'accepted',success:true,receipt_id:'fixture-key',publication_id:crypto.randomUUID(),matched_socket_count:1,delivery_ack:false,data:'PRIVATE_SERVER_DATA',consumption:'confirmed',reply:'answer'};
  const bad=await fixture(t,{...base,delivery_ack:true},'app_publish');assert.equal((await runPrincipalBus('inject',bad)).state,'outcome_unknown');
  const malformed=await fixture(t,{...base,publication_id:'-'.repeat(36)},'app_publish');assert.equal((await runPrincipalBus('inject',malformed)).state,'outcome_unknown');
@@ -38,7 +41,7 @@ test('application publication never promotes an ACK claim or raw response payloa
 });
 const {startTestDaemon,waitFor}=require('../test-support/daemon-harness');const WebSocket=require('ws');
 const {createPrincipalClient}=require('../src/principal/client');
-test('actual bus CLI state, turn and application publication preserve authority and one-effect receipts', {timeout:20000},async t=>{
+test('actual bus CLI state, turn and application publication preserve authority and one-effect receipts', {timeout:20000,skip:linuxOnly},async t=>{
  const home=fs.mkdtempSync(path.join(os.tmpdir(),'bus-cli-daemon-')),clientHome=fs.mkdtempSync(path.join(os.tmpdir(),'bus-cli-client-'));t.after(()=>{fs.rmSync(home,{recursive:true,force:true});fs.rmSync(clientHome,{recursive:true,force:true});});
  const pair=crypto.generateKeyPairSync('ed25519'),trust=path.join(home,'trust');fs.writeFileSync(trust,JSON.stringify({schema:'telepty.principals/v1',audience:'fixture',keys:[{key_id:'owner',principal_id:'owner',authority:'operator',public_key_spki:pair.publicKey.export({type:'spki',format:'pem'}),grants:['session.register','session.bus','session.state','session.inject','session.inspect','mailbox.read','session.publish','session.app_events','session.events'].map(action=>({action,targets:['mine']}))}]}),{mode:0o600});
  const daemon=await startTestDaemon({homeDir:home,env:{TELEPTY_PRINCIPAL_MODE:'strict',TELEPTY_PRINCIPAL_TRUST_FILE:trust,TELEPTY_MACHINE_ID:'fixture'}});t.after(()=>daemon.stop());
@@ -65,7 +68,16 @@ test('actual bus CLI state, turn and application publication preserve authority 
  assert.equal(fs.existsSync(path.join(clientHome,'.telepty','config.json')),false);
 });
 
-test('a well-formed receipt for another operation key never confirms this input',async t=>{
+test('a well-formed receipt for another operation key never confirms this input',{skip:linuxOnly},async t=>{
  const args=await fixture(t,{schema:'telepty.input-receipt/v1',session_id:'mine',session_epoch:'epoch',state:'accepted',success:true,receipt_id:'b'.repeat(64),inject_id:'inject-id'});
  const result=await runPrincipalInput('inject',args);assert.equal(result.state,'outcome_unknown');assert.equal(result.success,false);assert.equal(result.retryable,false);
+});
+test('off Linux the input and bus clients and the strict daemon refuse their authority files',{skip:nonLinuxOnly,timeout:15000},async t=>{
+ const receipt={schema:'telepty.input-receipt/v1',session_id:'mine',session_epoch:'epoch',state:'accepted',success:true,receipt_id:'fixture-key',inject_id:'inject-id'};
+ await assert.rejects(runPrincipalInput('inject',await fixture(t,receipt)),{code:'AUTHORITY_FILE_UNAVAILABLE'});
+ await assert.rejects(runPrincipalBus('inject',await fixture(t,{...receipt,schema:'telepty.bus-effect-receipt/v1',effect:'state_report'},'state_report')),{code:'AUTHORITY_FILE_UNAVAILABLE'});
+ const home=fs.mkdtempSync(path.join(os.tmpdir(),'principal-effect-refusal-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
+ const pair=crypto.generateKeyPairSync('ed25519'),trust=path.join(home,'trust');
+ fs.writeFileSync(trust,JSON.stringify({schema:'telepty.principals/v1',audience:'fixture',keys:[{key_id:'owner',principal_id:'owner',authority:'operator',public_key_spki:pair.publicKey.export({type:'spki',format:'pem'}),grants:[{action:'session.register',targets:['mine']}]}]}),{mode:0o600});
+ await assertStrictDaemonRefused(startTestDaemon,{homeDir:home,env:{TELEPTY_PRINCIPAL_MODE:'strict',TELEPTY_PRINCIPAL_TRUST_FILE:trust,TELEPTY_MACHINE_ID:'fixture'}});
 });

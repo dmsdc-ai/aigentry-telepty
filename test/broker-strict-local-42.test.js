@@ -11,6 +11,7 @@ const { createSignedAssertion } = require('../src/principal/proof');
 const { createBrokerHub } = require('../src/broker/hub');
 const { createBrokerClient, createBrokerNode } = require('../src/broker/node');
 const { startTestDaemon, waitFor } = require('../test-support/daemon-harness');
+const { linuxOnly, nonLinuxOnly, assertStrictDaemonRefused } = require('../test-support/windows-879/linux-authority');
 const pair = () => crypto.generateKeyPairSync('ed25519');
 const grant = (action, targets) => ({ action, targets });
 const entry = (id, key, grants, authority = 'principal') => ({ key_id: id, principal_id: id, authority,
@@ -24,7 +25,8 @@ test('forwarded ingress requires a separate exact action and mandatory epoch', (
   assert.equal(resolveAction({ method: 'POST', originalUrl: '/api/forwarded/sessions/broadcast/inject', body: {} }), null);
 });
 
-test('signed hub/node topology reaches strict local mailbox without a daemon token; no grant/epoch/signature/challenge fallback', async t => {
+// #879: the strict receiver daemon loads TELEPTY_PRINCIPAL_TRUST_FILE through readAuthorityFile — Linux-only.
+test('signed hub/node topology reaches strict local mailbox without a daemon token; no grant/epoch/signature/challenge fallback', { skip: linuxOnly }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-strict-local-')); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const operator = pair(), relay = pair(), source = pair(), hubKey = pair(), nodeKey = pair(), wrong = pair();
   const localAudience = 'strict-local-fixture';
@@ -180,7 +182,7 @@ test('strict local challenge validation rejects null/schema/audience and redirec
   await assert.rejects(redirected('worker', { exact_target: true, expected_epoch: 'epoch' }), { code: 'BROKER_LOCAL_CHALLENGE_REFUSED' });
 });
 
-test('configured local signer uses existing Linux private authority reader and rejects unsafe or ambiguous selection', t => {
+test('configured local signer uses existing Linux private authority reader and rejects unsafe or ambiguous selection', { skip: linuxOnly }, t => {
   const { loadLocalPrincipal, createLocalPrincipalRequest } = require('../src/broker/local-principal');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'strict-local-authority-')); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const key = pair(), file = path.join(root, 'synthetic-key.pem');
@@ -193,6 +195,21 @@ test('configured local signer uses existing Linux private authority reader and r
   assert.throws(() => loadLocalPrincipal({ ...config, local_token: 'not-accepted' }), { code: 'BROKER_LOCAL_PRINCIPAL_INVALID' });
   assert.throws(() => createLocalPrincipalRequest({ localDaemonUrl: 'http://localhost:39001', timeoutMs: 200,
     principal: { principal_id: 'relay', key_id: 'relay', audience: 'local', privateKey: key.privateKey } }), { code: 'BROKER_ORIGIN_INVALID' });
+});
+
+test('off Linux the strict receiver and the configured local signer fail closed', { skip: nonLinuxOnly }, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-strict-local-refusal-')); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const operator = pair(), key = pair();
+  const localTrust = path.join(root, 'local-trust.json');
+  fs.writeFileSync(localTrust, JSON.stringify(trust('strict-local-fixture', [entry('operator', operator, [grant('session.register', ['worker'])], 'operator')])), { mode: 0o600 });
+  const home = path.join(root, 'receiver'); fs.mkdirSync(home, { mode: 0o700 });
+  await assertStrictDaemonRefused(startTestDaemon, { homeDir: home, env: { TELEPTY_MACHINE_ID: 'strict-local-fixture',
+    TELEPTY_PRINCIPAL_MODE: 'strict', TELEPTY_PRINCIPAL_TRUST_FILE: localTrust, TELEPTY_AUTH_TOKEN: 'synthetic-unused-daemon-token' } });
+  const { loadLocalPrincipal } = require('../src/broker/local-principal');
+  const file = path.join(root, 'synthetic-key.pem');
+  fs.writeFileSync(file, key.privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+  assert.throws(() => loadLocalPrincipal({ principal_id: 'relay', key_id: 'relay', audience: 'local', private_key_path: file }),
+    { code: 'BROKER_LOCAL_KEY_UNAVAILABLE' });
 });
 
 test('strict forwarded authorization refuses a closing target before the HTTP handler', async t => {

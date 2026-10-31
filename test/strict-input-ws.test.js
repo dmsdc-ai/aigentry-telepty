@@ -23,6 +23,9 @@ test('input stream has exact independent grant and epoch, without inheriting obs
 });
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),WebSocket=require('ws');
 const {startTestDaemon,waitFor}=require('../test-support/daemon-harness');
+// #879: the strict daemon trust file and the client config/key/request files are read through readAuthorityFile —
+// a Linux-only contract (src/principal/authority-file.js:15). Off Linux the refusal case at the end runs instead.
+const {linuxOnly,nonLinuxOnly,assertStrictDaemonRefused}=require('../test-support/windows-879/linux-authority');
 function open(url,proof){return new Promise(resolve=>{const ws=new WebSocket(url,{headers:{'x-telepty-principal':proof}}),messages=[];ws.on('message',b=>messages.push(JSON.parse(b)));ws.on('error',()=>{});ws.on('open',()=>resolve({ws,messages}));ws.on('unexpected-response',(_r,res)=>{res.resume();ws.terminate();resolve({status:res.statusCode});});});}
 async function daemonFixture(t){
  const home=fs.mkdtempSync(path.join(os.tmpdir(),'strict-input-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
@@ -40,7 +43,7 @@ async function daemonFixture(t){
  const registered=await ownerRequest('POST','/api/sessions/register',{session_id:'mine',delivery_type:'mailbox'});assert.equal(registered.status,201);
  return{...f,owner,streamOnly,home,daemon,sign,ownerRequest,epoch:registered.body.session_epoch};
 }
-test('actual strict input goes through signed inject and exact durable dedup without token fallback', {timeout:15000},async t=>{
+test('actual strict input goes through signed inject and exact durable dedup without token fallback', {timeout:15000,skip:linuxOnly},async t=>{
  const f=await daemonFixture(t),target='/api/sessions/mine/inject',c=await open(`ws://${f.daemon.host}:${f.daemon.port}/api/input/sessions/mine`,f.sign({sessionEpoch:f.epoch}));assert.ok(c.ws,JSON.stringify(c));t.after(()=>c.ws.terminate());await waitFor(()=>c.messages.length);
  const identity=c.messages[0],body={prompt:'SYNTHETIC_INPUT',expected_epoch:f.epoch,exact_target:true,no_enter:true};
  const frame=(sequence,key,bodyArg=body,extra={})=>({type:'inject',connection_id:identity.connection_id,sequence,idempotency_key:key,body:bodyArg,assertion:f.sign({method:'POST',target,body:bodyArg,action:'session.inject',transport:'http',sessionEpoch:f.epoch,...extra})});
@@ -86,7 +89,7 @@ test('input rejects stale identity, protocol frames and caller-selected backend 
  const d=await f.connect();d.ws.send(JSON.stringify({type:'input',data:'raw bypass',sequence:1,connection_id:d.messages[0].connection_id,idempotency_key:'input-raw-bypass-00001'}));await waitFor(()=>d.ws.readyState===3);assert.equal(f.effects(),0);
  for(const address of [null,'/tmp/foreign.sock',{address:'192.0.2.1',port:1234}])assert.throws(()=>backendOrigin({address:()=>address}),/INPUT_BACKEND_UNAVAILABLE/);
 });
-test('actual input CLI and receipt query preserve one write and never create or use a shared client token', {timeout:15000},async t=>{
+test('actual input CLI and receipt query preserve one write and never create or use a shared client token', {timeout:15000,skip:linuxOnly},async t=>{
  const f=await daemonFixture(t),clientHome=fs.mkdtempSync(path.join(os.tmpdir(),'strict-input-cli-'));t.after(()=>fs.rmSync(clientHome,{recursive:true,force:true}));
  const key=path.join(clientHome,'key'),config=path.join(clientHome,'config'),request=path.join(clientHome,'request');
  fs.writeFileSync(key,f.key.privateKey.export({type:'pkcs8',format:'pem'}),{mode:0o600});
@@ -109,7 +112,7 @@ test('actual input CLI and receipt query preserve one write and never create or 
  } finally {await restarted.stop();}
  fs.chmodSync(request,0o644);const unsafe=await run('principal-input-v1',['--request',request]);assert.equal(unsafe.error.code,1);assert.equal(unsafe.stdout,'');assert.match(unsafe.stderr,/AUTHORITY_FILE_UNAVAILABLE/);
 });
-test('input client treats channel loss after send as unknown and can query without a second write',async t=>{
+test('input client treats channel loss after send as unknown and can query without a second write',{skip:linuxOnly},async t=>{
  const f=await transportFixture(t,'close-channel'),key=path.join(f.home,'key'),config=path.join(f.home,'config'),file=path.join(f.home,'request');
  fs.writeFileSync(key,f.key.privateKey.export({type:'pkcs8',format:'pem'}),{mode:0o600});fs.writeFileSync(config,JSON.stringify({schema:'telepty.principal-client/v1',daemon_url:`http://127.0.0.1:${f.server.address().port}`,principal_id:'writer',key_id:'writer',audience:'fixture',private_key_path:key}),{mode:0o600});
  const idempotency_key='input-client-lost-channel-0001';fs.writeFileSync(file,JSON.stringify({idempotency_key,body:{prompt:'CLIENT_PRIVATE_BODY',expected_epoch:'epoch',exact_target:true,no_enter:true}}),{mode:0o600});
@@ -118,7 +121,7 @@ test('input client treats channel loss after send as unknown and can query witho
  await waitFor(()=>fs.readdirSync(path.join(f.home,'.telepty','forward-receipts')).some(name=>JSON.parse(fs.readFileSync(path.join(f.home,'.telepty','forward-receipts',name))).state==='outcome_unknown'));
  f.restart();const queried=await runPrincipalInput('receipt',[...base,'--key',idempotency_key]);assert.equal(queried.state,'outcome_unknown');assert.equal(f.effects(),1);assert.ok(!JSON.stringify(queried).includes('CLIENT_PRIVATE_BODY'));
 });
-test('strict input preserves external approval refusal without inserting mailbox bytes',async t=>{
+test('strict input preserves external approval refusal without inserting mailbox bytes',{skip:linuxOnly},async t=>{
  const f=await daemonFixture(t);
  const registered=await f.ownerRequest('POST','/api/sessions/register',{session_id:'protected',delivery_type:'mailbox',external_approval_policy:{public_key_spki:f.key.publicKey.export({type:'spki',format:'pem'})}});assert.equal(registered.status,201);
  const epoch=registered.body.session_epoch,c=await open(`ws://${f.daemon.host}:${f.daemon.port}/api/input/sessions/protected`,f.sign({target:'/api/input/sessions/protected',sessionEpoch:epoch}));assert.ok(c.ws);t.after(()=>c.ws.terminate());await waitFor(()=>c.messages.length);
@@ -141,4 +144,19 @@ test('inconsistent accepted cache is unknown rather than a success or a new writ
  const f=await transportFixture(t,'ok');let c=await f.connect();const key='input-cache-inconsistent-0001';c.ws.send(JSON.stringify(f.frame(c,1,key)));await waitFor(()=>c.messages.length===2);assert.equal(c.messages[1].state,'accepted');
  const dir=path.join(f.home,'.telepty','forward-receipts'),file=path.join(dir,fs.readdirSync(dir)[0]),record=JSON.parse(fs.readFileSync(file));record.remote_receipt.success=false;fs.writeFileSync(file,JSON.stringify(record));
  f.restart();c=await f.connect();c.ws.send(JSON.stringify({type:'receipt',sequence:1,connection_id:c.messages[0].connection_id,idempotency_key:key}));await waitFor(()=>c.messages.length===2);assert.equal(c.messages[1].state,'outcome_unknown');assert.equal(c.messages[1].bytes_written,null);assert.equal(f.effects(),1);
+});
+test('off Linux the strict daemon and the input client refuse their authority files before any write',{skip:nonLinuxOnly,timeout:15000},async t=>{
+ const home=fs.mkdtempSync(path.join(os.tmpdir(),'strict-input-refusal-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
+ const f=fixture(),trustFile=path.join(home,'trust');
+ fs.writeFileSync(trustFile,JSON.stringify({schema:'telepty.principals/v1',audience:'fixture',keys:[{key_id:'writer',principal_id:'writer',public_key_spki:f.key.publicKey.export({type:'spki',format:'pem'}),grants:[{action:'session.inject',targets:['mine']}]}]}),{mode:0o600});
+ await assertStrictDaemonRefused(startTestDaemon,{homeDir:home,env:{TELEPTY_PRINCIPAL_MODE:'strict',TELEPTY_PRINCIPAL_TRUST_FILE:trustFile,TELEPTY_MACHINE_ID:'fixture'}});
+ let requests=0;const server=require('node:http').createServer((_req,res)=>{requests++;res.end('{}');});
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>{server.close();server.closeAllConnections();});
+ const key=path.join(home,'key'),config=path.join(home,'config'),file=path.join(home,'request');
+ fs.writeFileSync(key,f.key.privateKey.export({type:'pkcs8',format:'pem'}),{mode:0o600});
+ fs.writeFileSync(config,JSON.stringify({schema:'telepty.principal-client/v1',daemon_url:`http://127.0.0.1:${server.address().port}`,principal_id:'writer',key_id:'writer',audience:'fixture',private_key_path:key}),{mode:0o600});
+ fs.writeFileSync(file,JSON.stringify({idempotency_key:'input-refusal-879-0001',body:{prompt:'REFUSED_PRIVATE_BODY',expected_epoch:'epoch',exact_target:true,no_enter:true}}),{mode:0o600});
+ const {runPrincipalInput}=require('../src/principal/input-client');
+ await assert.rejects(runPrincipalInput('inject',['--config',config,'--session','mine','--epoch','epoch','--request',file]),{code:'AUTHORITY_FILE_UNAVAILABLE'});
+ assert.equal(requests,0,'a refused client configuration never reaches the daemon');
 });

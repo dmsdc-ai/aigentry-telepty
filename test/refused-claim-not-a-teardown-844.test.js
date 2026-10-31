@@ -42,7 +42,12 @@ let harness;
 before(async () => { harness = await startTestDaemon(); });
 after(async () => { if (harness) await harness.stop(); });
 
-function spawnBridge(sessionId, commandArgs = ['bash']) {
+// #879: `bash` is not a Windows primitive (it may resolve to the WSL launcher, or not at all). The
+// incumbent only needs a long-lived interactive child that echoes what it is given, so win32 uses
+// this suite's own node by absolute path in REPL mode. POSIX keeps `bash` unchanged.
+const INCUMBENT_COMMAND = process.platform === 'win32' ? [process.execPath, '-i'] : ['bash'];
+
+function spawnBridge(sessionId, commandArgs = INCUMBENT_COMMAND) {
   const env = {
     ...process.env,
     HOME: harness.homeDir,
