@@ -255,9 +255,56 @@ function collectOutput(ws) {
 // text vs the write. prompt_first_seen_ms is an ordering observation of rendered text, never a readiness claim. Bounded:
 // first 16 output chunks (ms + byte length only), fixed type counters, <= 8 other type names, 64 KiB of prompt scan.
 const plainText = (raw) => raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').replace(/\u001b\].*?(\u0007|\u001b\\)/g, '');
+// Task 1215 pty17 (windows42 NA-1) — payload-free control-sequence IDENTITIES of the viewer output for the failure-only
+// timeline (byte-identical copy of the parser in test/cross-host-inject.test.js; a test file may not import another).
+// CSI parameter/intermediate bytes + final byte, OSC command number only, never text/title/payload; split-safe bounded
+// state; <= 32 distinct identities; 262144-code-point parse bound. Observation only: nothing is answered or written.
+function controlSequenceIdentities() {
+  const ids = new Map();
+  let state = 'text'; let params = ''; let osc = ''; let fed = 0; let overflow = 0; let truncated = false; let printable = 0;
+  const CODE_POINT_BOUND = 262144; // pty18: `fed` counts for-of CODE POINTS (not UTF-8 bytes); the bound and the report say so
+  const add = (id) => { if (ids.has(id)) ids.set(id, ids.get(id) + 1); else if (ids.size < 32) ids.set(id, 1); else overflow++; };
+  function step(ch) {
+    const code = ch.codePointAt(0);
+    if (state === 'text') {
+      if (code === 0x1b) state = 'esc';
+      else if (code >= 0x20 && code !== 0x7f && !(code >= 0x80 && code < 0xa0)) { printable++; return true; }
+    } else if (state === 'esc') {
+      if (ch === '[') { state = 'csi'; params = ''; } else if (ch === ']') { state = 'osc'; osc = ''; }
+      else if (code === 0x1b) add('ESC ?');
+      else { add(code >= 0x20 && code < 0x7f ? `ESC ${ch}` : 'ESC ?'); state = 'text'; }
+    } else if (state === 'csi') {
+      if (code >= 0x40 && code <= 0x7e) { add(`CSI ${params}${ch}`); state = 'text'; }
+      else if (code >= 0x20 && code <= 0x3f) { if (params.length < 32) params += ch; else { add('CSI overlong'); state = 'csi_skip'; } }
+      else { add('CSI malformed'); state = code === 0x1b ? 'esc' : 'text'; }
+    } else if (state === 'csi_skip') {
+      if (code >= 0x40 && code <= 0x7e) state = 'text'; else if (!(code >= 0x20 && code <= 0x3f)) state = code === 0x1b ? 'esc' : 'text';
+    } else if (state === 'osc') {
+      if (code >= 0x30 && code <= 0x39 && osc.length < 5) osc += ch;
+      else { add(`OSC ${osc || '-'}`); state = code === 0x07 ? 'text' : code === 0x1b ? 'osc_esc' : 'osc_body'; }
+    } else if (state === 'osc_body') {
+      if (code === 0x07) state = 'text'; else if (code === 0x1b) state = 'osc_esc';
+    } else if (state === 'osc_esc') {
+      if (ch === '\\') state = 'text'; else { state = 'esc'; return step(ch); } // not ST: a new sequence began
+    }
+    return false;
+  }
+  return {
+    feed(chunk) {
+      let sawPrintable = false;
+      for (const ch of chunk) { if (fed >= CODE_POINT_BOUND) { truncated = true; break; } fed++; if (step(ch)) sawPrintable = true; }
+      return sawPrintable;
+    },
+    report: () => ({ identities: Object.fromEntries(ids), distinct_overflow: overflow, printable, parser_state: state, truncated,
+      code_point_bound: CODE_POINT_BOUND, fed_code_points: fed }),
+  };
+}
 function frameTimeline(ws, origin) {
   const ms = () => Math.round(performance.now() - origin);
-  const tl = { first_output_ms: null, prompt_first_seen_ms: null, chunks: [], types: { output: 0, input_refused: 0, other: 0 }, other_types: [], close: null };
+  const tl = { first_output_ms: null, prompt_first_seen_ms: null, chunks: [], types: { output: 0, input_refused: 0, other: 0 }, other_types: [], close: null,
+    first_printable_ms: null, marker_ms: null }; // pty17: + first printable / marker times (same listener, existing window)
+  const control = controlSequenceIdentities();
+  tl.control = control.report; // read at failure time
   let scanned = '';
   ws.on('message', (buf) => {
     let msg = null;
@@ -267,7 +314,14 @@ function frameTimeline(ws, origin) {
       const at = ms(); tl.types.output++;
       if (tl.first_output_ms === null) tl.first_output_ms = at;
       if (tl.chunks.length < 16) tl.chunks.push({ ms: at, bytes: Buffer.byteLength(msg.data, 'utf8') });
-      if (tl.prompt_first_seen_ms === null && scanned.length < 65536) { scanned += msg.data; if (plainText(scanned).includes('PS ')) tl.prompt_first_seen_ms = at; }
+      if (control.feed(msg.data) && tl.first_printable_ms === null) tl.first_printable_ms = at;
+      // pty18: `scanned` grows under its unchanged 64 KiB cap whether or not a prompt was already seen (before, it stopped growing at
+      // the first prompt, so a later marker could never be found); both checks run on each growth, including the cap-crossing chunk.
+      if (scanned.length < 65536) {
+        scanned += msg.data;
+        if (tl.prompt_first_seen_ms === null && plainText(scanned).includes('PS ')) tl.prompt_first_seen_ms = at;
+        if (tl.marker_ms === null && (scanned.includes('SPAWNMARKER_OK') || plainText(scanned).includes('SPAWNMARKER_OK'))) tl.marker_ms = at;
+      }
     } else if (type === 'input_refused') tl.types.input_refused++;
     else {
       tl.types.other++;
@@ -293,6 +347,9 @@ test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly
   await daemon.waitFor(() => (output().includes('SPAWNMARKER_OK') ? true : null),
     { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' })
     .catch((error) => {
+      // Task 1215 pty17 (windows42 NA-4): V8 formats `stack` lazily — read it BEFORE `message` changes (reading it after
+      // already contained the note, which then appeared twice). Both notes are appended once, below.
+      const stack = error.stack; const first = `${error.name}: ${error.message}`;
       // Task 1215 (#879 discriminator, diagnostics only; no bytes): did anything come back, and is the marker present
       // once terminal escape sequences are removed (split echo) vs absent altogether (write never reached the PTY)?
       const raw = output(); const plain = raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').replace(/\u001b\].*?(\u0007|\u001b\\)/g, '');
@@ -304,16 +361,16 @@ test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly
         printable: [...plain].filter((ch) => ch >= ' ' && ch !== '\u007f').length, prompt_ps: plain.includes('PS '),
         audit_lines: audit.length, delivery_results: audit.slice(-4).map((l) => String(l.delivery_result).slice(0, 64)) });
       t.diagnostic(`#879 diag spawned_echo ${diag}`);
-      const first = `${error.name}: ${error.message}`;
-      error.message += ` | K4 evidence ${diag}`;
-      if (typeof error.stack === 'string' && error.stack.startsWith(first)) error.stack = first + ` | K4 evidence ${diag}` + error.stack.slice(first.length);
       // Task 1215 diagnostics12: the bounded timeline (no raw output), plus <= 8 daemon log lines naming this sid (<= 300 chars).
       const { stdout, stderr } = daemon.getLogs();
       const log = `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid)).slice(-8).map((l) => l.slice(0, 300));
       const tdiag = JSON.stringify({ spawn_response_ms: timing.spawn_response_ms, viewer_open_ms: timing.viewer_open_ms, write_sent_ms: writeSentMs,
-        failed_at_ms: Math.round(performance.now() - timing.origin), ...timeline, byte_classes: byteClasses(raw), log });
+        failed_at_ms: Math.round(performance.now() - timing.origin), ...timeline, control: timeline.control(), byte_classes: byteClasses(raw), log,
+        observation_limit: 'the existing 5000 ms wait only: this test has no outer test deadline, so nothing is observed after it' });
       t.diagnostic(`#879 diag spawned_timeline ${tdiag}`);
-      error.message += ` | timeline ${tdiag}`;
+      const note = ` | K4 evidence ${diag} | timeline ${tdiag}`;
+      error.message += note;
+      if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
       throw error;
     });
 

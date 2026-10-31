@@ -35,6 +35,11 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const crypto = require('node:crypto');
 const { startTestDaemon, createSessionId, delay } = require('../test-support/daemon-harness');
+const { beginAuditCompletion } = require('../test-support/audit-completion');
+// #1215 audit44 (root disposition D1): ONLY the consumer-shape case waits for an audit row; it declares { timeout: 60000 } and
+// its t.signal bounds that wait. The former fixed 4000 ms visibility poll is replaced by a completion fact
+// (test-support/audit-completion.js). Every other case and wait in this file is unchanged.
+const AUDIT_CASE = { timeout: 60000 };
 
 const REQUIRED = ['inject-exact-target', 'register-create-only', 'delete-owned-session'];
 const BASELINE = ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon',
@@ -472,13 +477,14 @@ test('1215 control: an ordinary tokenless DELETE of an exact id still works', as
 // attribution is read from the audit surface the consumer itself reads (GET /api/injects,
 // `verified_sender_sid`), which the daemon derives from the presented bearer and never from the
 // unverified `from` field.
-test('1215 consumer shape: inbox bearer + plain first line + exact_target to the orchestrator sid is delivered and attributed', async () => {
+test('1215 consumer shape: inbox bearer + plain first line + exact_target to the orchestrator sid is delivered and attributed', AUDIT_CASE, async (t) => {
   const target = 'orchestrator'; // the sid pinned via AIGENTRY_ORCHESTRATOR_SIDS in before()
   const inbox = createSessionId('t1215-consumer-inbox');
   const inboxReg = await registerAterm(inbox);
   await registerAterm(target);
 
   const prompt = '[telesession nonce=fedcba9876543210fedcba9876543210 reply-to=' + inbox + ']\nconsumer hello orchestrator';
+  const audit = await beginAuditCompletion(daemon, t.signal);
   const res = await inject(target, {
     prompt, from: inbox, reply_to: inbox, exact_target: true,
   }, { 'x-telepty-session-token': inboxReg.session_token });
@@ -501,13 +507,27 @@ test('1215 consumer shape: inbox bearer + plain first line + exact_target to the
   // answer and the daemon's own [INJECT]/[AUDIT] lines are appended to the already-failing error.
   const auditWaitStart = Date.now();
   let lastAudit = null;
-  const row = await daemon.waitFor(async () => {
-    const audit = await daemon.request(`/api/injects?to=${enc(target)}&limit=200`);
-    lastAudit = { status: audit.status, code: audit.body && audit.body.code, reason: audit.body && audit.body.reason,
-      rows: audit.body && Array.isArray(audit.body.injects) ? audit.body.injects.length : null, at_ms: Date.now() - auditWaitStart };
-    if (audit.status !== 200 || !Array.isArray(audit.body.injects)) return null;
-    return audit.body.injects.find((r) => r && r.inject_id === res.body.inject_id) || null;
-  }, { timeoutMs: 4000, description: `audit row for ${res.body.inject_id}` }).catch((error) => {
+  // #1215 audit44: completion of this request's audit line first, then ONE query; a completed write whose row is absent fails.
+  const matchRow = (r) => r && r.inject_id === res.body.inject_id;
+  const row = await audit.settledRows({
+    read: async (signal) => {
+      // #1215 audit45: the ONE final query is bound to the case signal. harness.request (test-support/daemon-harness.js:241-259)
+      // forwards no signal, so this sends the same GET it would (same endpoint and query, same x-telepty-token header) with the
+      // signal, and parses the body as its parseResponse does (:84-101). No second query, retry or timeout.
+      const token = daemon.authToken();
+      const response = await fetch(`http://${daemon.host}:${daemon.port}/api/injects?to=${enc(target)}&limit=200`,
+        { method: 'GET', headers: token ? { 'x-telepty-token': token } : {}, signal });
+      const text = await response.text();
+      let body = null;
+      if (text) { try { body = JSON.parse(text); } catch { body = text; } }
+      const answer = { status: response.status, body };
+      lastAudit = { status: answer.status, code: answer.body && answer.body.code, reason: answer.body && answer.body.reason,
+        rows: answer.body && Array.isArray(answer.body.injects) ? answer.body.injects.length : null, at_ms: Date.now() - auditWaitStart };
+      if (answer.status !== 200 || !Array.isArray(answer.body.injects)) throw new Error(`audit query for ${res.body.inject_id} failed after completion`);
+      return answer.body.injects;
+    },
+    match: matchRow,
+  }).then((rows) => rows.find(matchRow)).catch((error) => {
     const { stdout, stderr } = daemon.getLogs();
     const tail = (text, prefix) => text.split(/\r?\n/).filter((l) => l.startsWith(prefix)).slice(-4);
     error.message += ` | [telepty-diag] audit_query ${JSON.stringify({ waited_ms: Date.now() - auditWaitStart, last: lastAudit,

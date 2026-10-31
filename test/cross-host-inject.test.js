@@ -119,24 +119,86 @@ test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async 
 // Task 1215 G-SHELL step 1 (K1): bounded, payload-free evidence only (counts and booleans; tails capped).
 function tail(text) { return String(text ?? '').slice(-600); }
 // The same error object is rethrown (identity, stack frames); only its message and first stack line gain the evidence.
+// Task 1215 pty17 (windows42 NA-4): V8 formats `stack` lazily, so it is read BEFORE `message` changes — reading it after
+// already contained the note and the evidence appeared twice.
 function appendEvidence(error, note) {
+  const stack = error.stack;
   const first = `${error.name}: ${error.message}`;
   error.message += note;
-  if (typeof error.stack === 'string' && error.stack.startsWith(first)) error.stack = first + note + error.stack.slice(first.length);
+  if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
+}
+// Task 1215 pty17 (windows42 NA-1) — payload-free terminal control-sequence IDENTITIES of the viewer output, reported only
+// in the failure evidence. CSI: its parameter/intermediate bytes (digits, `; : < = > ?`, 0x20-0x2F — never letters, so never
+// text) plus the final byte, e.g. `CSI ?9001h` or `CSI 6n` (a DSR query); OSC: the command NUMBER only (`OSC 0`), never its
+// title/text; other ESC sequences by their single final byte. A sequence split across frames is completed by the bounded
+// state (<= 32 parameter bytes, <= 5 OSC digits). <= 32 distinct identities (the rest counted); input beyond 262144 code points is not
+// parsed (marked). Characters outside sequences count as printable. Observation only: nothing is answered or written.
+function controlSequenceIdentities() {
+  const ids = new Map();
+  let state = 'text'; let params = ''; let osc = ''; let fed = 0; let overflow = 0; let truncated = false; let printable = 0;
+  const CODE_POINT_BOUND = 262144; // pty18: `fed` counts for-of CODE POINTS (not UTF-8 bytes); the bound and the report say so
+  const add = (id) => { if (ids.has(id)) ids.set(id, ids.get(id) + 1); else if (ids.size < 32) ids.set(id, 1); else overflow++; };
+  function step(ch) {
+    const code = ch.codePointAt(0);
+    if (state === 'text') {
+      if (code === 0x1b) state = 'esc';
+      else if (code >= 0x20 && code !== 0x7f && !(code >= 0x80 && code < 0xa0)) { printable++; return true; }
+    } else if (state === 'esc') {
+      if (ch === '[') { state = 'csi'; params = ''; } else if (ch === ']') { state = 'osc'; osc = ''; }
+      else if (code === 0x1b) add('ESC ?');
+      else { add(code >= 0x20 && code < 0x7f ? `ESC ${ch}` : 'ESC ?'); state = 'text'; }
+    } else if (state === 'csi') {
+      if (code >= 0x40 && code <= 0x7e) { add(`CSI ${params}${ch}`); state = 'text'; }
+      else if (code >= 0x20 && code <= 0x3f) { if (params.length < 32) params += ch; else { add('CSI overlong'); state = 'csi_skip'; } }
+      else { add('CSI malformed'); state = code === 0x1b ? 'esc' : 'text'; }
+    } else if (state === 'csi_skip') {
+      if (code >= 0x40 && code <= 0x7e) state = 'text'; else if (!(code >= 0x20 && code <= 0x3f)) state = code === 0x1b ? 'esc' : 'text';
+    } else if (state === 'osc') {
+      if (code >= 0x30 && code <= 0x39 && osc.length < 5) osc += ch;
+      else { add(`OSC ${osc || '-'}`); state = code === 0x07 ? 'text' : code === 0x1b ? 'osc_esc' : 'osc_body'; }
+    } else if (state === 'osc_body') {
+      if (code === 0x07) state = 'text'; else if (code === 0x1b) state = 'osc_esc';
+    } else if (state === 'osc_esc') {
+      if (ch === '\\') state = 'text'; else { state = 'esc'; return step(ch); } // not ST: a new sequence began
+    }
+    return false;
+  }
+  return {
+    feed(chunk) {
+      let sawPrintable = false;
+      for (const ch of chunk) { if (fed >= CODE_POINT_BOUND) { truncated = true; break; } fed++; if (step(ch)) sawPrintable = true; }
+      return sawPrintable;
+    },
+    report: () => ({ identities: Object.fromEntries(ids), distinct_overflow: overflow, printable, parser_state: state, truncated,
+      code_point_bound: CODE_POINT_BOUND, fed_code_points: fed }),
+  };
 }
 function viewerSummary(ws, token) {
   let frames = 0; let bytes = 0; let raw = '';
+  // Task 1215 pty17: first output/printable/prompt/marker times (ms after this summary started, i.e. after viewer open),
+  // observed by this same listener within the test's EXISTING windows only (no extension, no new timer).
+  const origin = performance.now(); const ms = () => Math.round(performance.now() - origin);
+  const timing = { first_output_ms: null, first_printable_ms: null, prompt_ms: null, marker_ms: null };
+  const control = controlSequenceIdentities();
+  const plainOf = (text) => stripAnsi(text).replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\u001b[@-Z\\-_]/g, '');
   ws.on('message', (buffer) => {
     let msg = null;
     try { msg = JSON.parse(buffer.toString()); } catch { return; }
     if (msg.type !== 'output' || typeof msg.data !== 'string') return;
     frames++; bytes += Buffer.byteLength(msg.data, 'utf8');
     if (raw.length < 65536) raw += msg.data;
+    const at = ms();
+    if (timing.first_output_ms === null) timing.first_output_ms = at;
+    if (control.feed(msg.data) && timing.first_printable_ms === null) timing.first_printable_ms = at;
+    if (timing.prompt_ms === null && raw.length < 65536 && plainOf(raw).includes('PS ')) timing.prompt_ms = at;
+    if (timing.marker_ms === null && (raw.includes(token) || plainOf(raw).includes(token))) timing.marker_ms = at;
   });
   return () => {
-    const plain = stripAnsi(raw).replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\u001b[@-Z\\-_]/g, '');
+    const plain = plainOf(raw);
     return { frames, bytes, printable: [...plain].filter((ch) => ch >= ' ' && ch !== '\u007f').length,
-      prompt_ps: plain.includes('PS '), token_in_concatenated_output: raw.includes(token) || plain.includes(token) };
+      prompt_ps: plain.includes('PS '), token_in_concatenated_output: raw.includes(token) || plain.includes(token),
+      timing, control: control.report(),
+      observation_limit: 'the existing 8000 ms delivery window only: this test has no outer test deadline, so nothing is observed after it' };
   };
 }
 
