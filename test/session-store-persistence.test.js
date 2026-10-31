@@ -506,3 +506,69 @@ test('#1207 a failed healthy write is not an unavailable store: one fsync fault 
   delete process.env.LEDGER_1207_FAULTS;
 }));
 
+// ---------------------------------------------------------------------------
+// #1215 — causal order of the restart fact against a poll (CI 5914cc3: mac + win
+// `tracking_unknown_survives_restart` saw [tracking_started] only). The client reports `available` at
+// the snapshot swap; finishRecovery then submits daemon_restart_observed, and the owner holds that frame
+// in its open group (GROUP.ms) before the fsync while serving reads from committed facts only. A poll in
+// that window was read before the fact existed. Fixed order: the restoration's own fact submission
+// settles, THEN the read is issued. Health is unchanged: still true from the swap, as before.
+// The client below is a recorder with the ledger-client surface performRestore/finishRecovery/fetch use;
+// the fact's ack is released by the test, so the order is deterministic, not timing-dependent.
+// ---------------------------------------------------------------------------
+function orderRecordingClient(counts) {
+  const order = [];
+  const pending = [];
+  const client = {
+    state: 'not_opened', reason: null,
+    open() { order.push('open'); return Promise.resolve({ ok: true, state: 'available', counts }); },
+    submit(kind, delta) {
+      order.push(`submit:${kind}:${delta && delta.observation ? delta.observation.kind : ''}`);
+      return new Promise((resolve) => { pending.push(() => { order.push(`ack:${kind}`); resolve({ outcome: 'ack', seq: 2 }); }); });
+    },
+    async fetchTrackedInjection(id) { order.push(`read:${id}`); return { record: { inject_id: id }, reason: null, tier: 'hot' }; },
+  };
+  return { client, order, pending };
+}
+const macrotask = () => new Promise((resolve) => setImmediate(resolve));
+
+test('#1215 restart fact: a poll during the restoration\'s in-flight daemon_restart_observed submission is read only after that submission settles', async () => {
+  const { client, order, pending } = orderRecordingClient({ hot: 1, cold: 0 });
+  const shared = { sessions: {}, ledgerClient: client, trackedLedgerHealthy: false, trackedLedgerUnavailableReason: 'not_opened' };
+  const runtime = createDeliveryRuntime(shared);
+  const restoring = runtime.restoreTrackedInjections();
+  await macrotask();
+  assert.deepEqual(order, ['open', 'submit:fact:daemon_restart_observed'], 'precondition: the restoration submitted its restart fact');
+  assert.equal(pending.length, 1);
+  assert.equal(shared.trackedLedgerHealthy, true, 'health still follows the swap (unchanged contract)');
+
+  const polling = runtime.fetchTrackedInjection('restored-1');
+  await macrotask();
+  assert.deepEqual(order, ['open', 'submit:fact:daemon_restart_observed'],
+    `FIXED EXPECTED: no read is issued while the restart fact is in flight (observed ${JSON.stringify(order)})`);
+
+  pending[0]();
+  const polled = await polling;
+  const restored = await restoring;
+  assert.deepEqual(order, ['open', 'submit:fact:daemon_restart_observed', 'ack:fact', 'read:restored-1'],
+    'the read follows the restart fact\'s settlement');
+  assert.equal(polled.record.inject_id, 'restored-1');
+  assert.equal(restored.ok, true);
+  assert.equal(restored.restartFact.outcome, 'ack');
+
+  await runtime.fetchTrackedInjection('restored-2');
+  assert.equal(order[order.length - 1], 'read:restored-2', 'after settlement a read is issued directly');
+  assert.equal(pending.length, 1, 'exactly one fact per recovery; nothing retried or added');
+});
+
+test('#1215 restart fact control: an empty store writes no restart fact and a poll is never deferred', async () => {
+  const { client, order, pending } = orderRecordingClient({ hot: 0, cold: 0 });
+  const shared = { sessions: {}, ledgerClient: client, trackedLedgerHealthy: false, trackedLedgerUnavailableReason: 'not_opened' };
+  const runtime = createDeliveryRuntime(shared);
+  const restored = await runtime.restoreTrackedInjections();
+  assert.equal(restored.restartFact, null);
+  await runtime.fetchTrackedInjection('fresh-1');
+  assert.deepEqual(order, ['open', 'read:fresh-1']);
+  assert.equal(pending.length, 0);
+});
+

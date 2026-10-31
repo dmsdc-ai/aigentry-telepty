@@ -30,12 +30,29 @@ after(async () => { if (daemon) await daemon.stop(); });
 // Wait until at least one audit line matches `predicate`, then return ALL parsed lines.
 // Predicate-gated so a test never races the 10ms flush against lines from earlier tests.
 async function waitForAudit(predicate) {
-  return daemon.waitFor(() => {
-    let raw = '';
-    try { raw = fs.readFileSync(logPath, 'utf8'); } catch { return null; }
-    const lines = raw.split('\n').filter(Boolean).map((l) => JSON.parse(l));
-    return lines.some(predicate) ? lines : null;
-  }, { timeoutMs: 4000, description: 'audit lines' });
+  const t0 = Date.now();
+  try {
+    return await daemon.waitFor(() => {
+      let raw = '';
+      try { raw = fs.readFileSync(logPath, 'utf8'); } catch { return null; }
+      const lines = raw.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      return lines.some(predicate) ? lines : null;
+    }, { timeoutMs: 4000, description: 'audit lines' });
+  } catch (error) {
+    // #1215 diagnostics only (CI 5914cc3 win32: three audit waits timed out with no daemon evidence):
+    // appended to the already-failing error, never consulted by an assertion. Separates "never queued"
+    // ([INJECT] line absent) from a writer error ([AUDIT] write error) from a writer that did not
+    // complete a write in the window (file unchanged since before the wait).
+    error.message += ` | [telepty-diag] audit_wait ${JSON.stringify(auditDiag(t0))}`;
+    throw error;
+  }
+}
+function auditDiag(t0) {
+  let file = null;
+  try { const st = fs.statSync(logPath); file = { bytes: st.size, mtime_ms_after_wait_start: Math.round(st.mtimeMs - t0) }; } catch (e) { file = { error: e.code || 'stat_failed' }; }
+  const { stdout, stderr } = daemon.getLogs();
+  const tail = (text, prefix) => text.split(/\r?\n/).filter((l) => l.startsWith(prefix)).slice(-4);
+  return { waited_ms: Date.now() - t0, file, inject_log: tail(stdout, '[INJECT]'), audit_log: tail(stderr, '[AUDIT]') };
 }
 
 test('P1: inject appends an audit line (schema v1, claimed_from, hash-only)', async () => {

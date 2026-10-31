@@ -752,6 +752,13 @@ function createAllowSecurityContext(shared, {
       } catch (err) {
         // Fallback: write directly if mailbox fails
         if (!canWrite(child)) return;
+        // Task 1215 CI18 (measured: Windows MAILBOX_LOCK_TIMEOUT wrote a lone CR under the kill switch). A CR is
+        // queued only behind pending records; written now it would submit ahead of its own unwritten body.
+        if (text === '\r' && shared.bridgePendingCount > 0) {
+          console.error(`[BRIDGE] Mailbox enqueue failed, submit not written: ${err.message}`);
+          sendReceipt(msgId, ids, 'refused', 'not_written', 'mailbox_unavailable');
+          return;
+        }
         console.error(`[BRIDGE] Mailbox enqueue failed, writing directly: ${err.message}`);
         invalidateBridgeInteraction('automated_input');
         if (!canWrite(child)) return;

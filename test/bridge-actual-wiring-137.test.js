@@ -315,6 +315,30 @@ test('#136 kill switch: TELEPTY_BRIDGE_VT_READY=0 never weakens the gate (a know
     { writes: [], vt: 'disabled', blindFlushTimers: 0 });
 });
 
+// Task 1215 CI18 (Windows job 124591988699 @5914cc3): the submit's enqueue hit MAILBOX_LOCK_TIMEOUT and the
+// enqueue-failure fallback wrote '\r' ahead of its queued body. Forced here on every OS, without lock timing.
+test('#136 kill switch under mailbox failure: a CR that cannot be queued behind its pending body is refused, never written directly', { timeout: 30000 }, async t => {
+  const saved = process.env.TELEPTY_BRIDGE_VT_READY;
+  process.env.TELEPTY_BRIDGE_VT_READY = '0';
+  t.after(() => { if (saved === undefined) delete process.env.TELEPTY_BRIDGE_VT_READY; else process.env.TELEPTY_BRIDGE_VT_READY = saved; });
+  const b = createBridge(t, { sid: 'b137w-kill-switch-mailbox-fail' });
+  b.feed(IDLE);
+  await settleVt();
+  const { injectId, body, submit } = b.daemonInject('KILL-SWITCH-MAILBOX-BODY');
+  b.injectFrame(body);
+  assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: the body is queued, so the CR takes the queued branch');
+  b.shared.bridgeMailbox.enqueue = () => { throw Object.assign(new Error('synthetic lock timeout'), { code: 'MAILBOX_LOCK_TIMEOUT' }); };
+  b.injectFrame(submit);
+  await b.clock.advance(20000);
+  assert.deepEqual({
+    writes: b.writes, vt: b.allow.bridgeQueueSummary().vt, blindFlushTimers: b.clock.calls.timeouts.filter(ms => ms === 5000).length,
+    refused: b.receipts(injectId, 'refused').map(r => [r.msg.part, r.msg.reason, r.msg.certainty]),
+    written: b.receipts(injectId, 'pty_written').length,
+    inbox: b.leaf('inbox.jsonl').map(r => r.payload),
+  }, { writes: [], vt: 'disabled', blindFlushTimers: 0, refused: [['submit', 'mailbox_unavailable', 'not_written']], written: 0,
+    inbox: ['KILL-SWITCH-MAILBOX-BODY'] });
+});
+
 test('#136 lone submit: a CR whose body was quarantined unwritten is refused, not written alone', { timeout: 60000 }, async t => {
   const b = createBridge(t, { sid: 'b137w-lone-submit' });
   b.feed(LOADING);

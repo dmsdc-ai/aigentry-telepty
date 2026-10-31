@@ -114,6 +114,12 @@ function createDeliveryRuntime(shared, {
   let restoreInFlight = null;
   // One-shot watch that completes a first-open recovery across the client boundary (armRecoveryWatch).
   let recoveryWatch = null;
+  // #1215 — this recovery's daemon_restart_observed submission while it is in flight (settles, never
+  // rejects). The owner serves reads from COMMITTED facts only and holds a submitted fact in its open
+  // group for up to GROUP.ms before the fsync, so a poll that arrived in that window was answered
+  // without the fact (measured: CI 5914cc3 mac+win, [tracking_started] only). fetchTrackedInjection
+  // orders itself after this one submission; nothing is written, retried or synthesized for it.
+  let restartFactSettling = null;
 
   function restoreTrackedInjections() {
     if (restoreInFlight) return restoreInFlight;
@@ -172,7 +178,10 @@ function createDeliveryRuntime(shared, {
     const hadRecords = (counts.hot || 0) + (counts.cold || 0) > 0;
     let restartFact = null;
     if (hadRecords) {
-      restartFact = await client.submit('fact', { scope: 'global', observation: { kind: 'daemon_restart_observed', trigger: 'daemon_restart', at: new Date().toISOString() } }, { class: 'L' });
+      const submitted = client.submit('fact', { scope: 'global', observation: { kind: 'daemon_restart_observed', trigger: 'daemon_restart', at: new Date().toISOString() } }, { class: 'L' });
+      const settling = submitted.then(() => undefined, () => undefined);
+      restartFactSettling = settling;
+      try { restartFact = await submitted; } finally { if (restartFactSettling === settling) restartFactSettling = null; }
       if (restartFact.outcome !== 'ack') {
         console.warn(`[OBSERVE] daemon_restart_observed fact not durable (${restartFact.outcome}: ${restartFact.reason || ''}) — recorded in ledger status, not retried`);
       }
@@ -221,6 +230,7 @@ function createDeliveryRuntime(shared, {
   async function fetchTrackedInjection(injectId) {
     if (typeof injectId !== 'string' || !injectId) return { record: null, reason: 'invalid_id' };
     if (!shared.ledgerClient) return { record: null, reason: 'observation_store_unavailable' };
+    if (restartFactSettling) await restartFactSettling;
     return shared.ledgerClient.fetchTrackedInjection(injectId);
   }
 

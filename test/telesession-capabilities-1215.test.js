@@ -486,11 +486,23 @@ test('1215 consumer shape: inbox bearer + plain first line + exact_target to the
 
   // Attributed: the audit row for this inject_id names the inbox as the daemon-VERIFIED sender
   // (bearer-derived), with the inbox's own epoch, and nothing about it reads as a spoof.
+  // #1215 diagnostics only (CI 5914cc3 win32 timed out here with no daemon evidence): the last query
+  // answer and the daemon's own [INJECT]/[AUDIT] lines are appended to the already-failing error.
+  const auditWaitStart = Date.now();
+  let lastAudit = null;
   const row = await daemon.waitFor(async () => {
     const audit = await daemon.request(`/api/injects?to=${enc(target)}&limit=200`);
+    lastAudit = { status: audit.status, code: audit.body && audit.body.code, reason: audit.body && audit.body.reason,
+      rows: audit.body && Array.isArray(audit.body.injects) ? audit.body.injects.length : null, at_ms: Date.now() - auditWaitStart };
     if (audit.status !== 200 || !Array.isArray(audit.body.injects)) return null;
     return audit.body.injects.find((r) => r && r.inject_id === res.body.inject_id) || null;
-  }, { timeoutMs: 4000, description: `audit row for ${res.body.inject_id}` });
+  }, { timeoutMs: 4000, description: `audit row for ${res.body.inject_id}` }).catch((error) => {
+    const { stdout, stderr } = daemon.getLogs();
+    const tail = (text, prefix) => text.split(/\r?\n/).filter((l) => l.startsWith(prefix)).slice(-4);
+    error.message += ` | [telepty-diag] audit_query ${JSON.stringify({ waited_ms: Date.now() - auditWaitStart, last: lastAudit,
+      inject_log: tail(stdout, '[INJECT]'), audit_log: tail(stderr, '[AUDIT]') })}`;
+    throw error;
+  });
   assert.equal(row.to, target);
   assert.equal(row.to_alias, null, 'exact routing: no alias was resolved');
   assert.equal(row.delivery_result, 'success');
