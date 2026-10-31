@@ -57,10 +57,11 @@ after(async () => {
 });
 
 // #1207 — the three queue-flush paths (`flushModalParkQueue`, `failBootstrapQueueOnTimeout`,
-// `drainBootstrapQueue`'s failure arms) call the now-async `abortTrackedInjection` without
-// awaiting it (src/mailbox/delivery-runtime.js: four call sites), so the durable terminal
-// transition lands shortly AFTER the flush returns. The assertion is on the durable state; this
-// waits for it with a failsafe deadline and never relaxes what is asserted.
+// `drainBootstrapQueue`'s failure arms) AWAIT the terminal outcome (`settleTerminalOutcome` at all
+// four call sites in src/mailbox/delivery-runtime.js) before they notify or settle. Some cases here
+// do not hold the flush's promise (it is fired, or entered from a timer), so the durable terminal
+// transition is polled. The assertion is on the durable state, with a failsafe deadline, and nothing
+// asserted is relaxed.
 // The tracked records of these cases live in the queue fixture's own ledger (the store they were
 // begun in), so that is the read model polled here.
 async function abortedRecord(injectId, timeoutMs = 3000) {

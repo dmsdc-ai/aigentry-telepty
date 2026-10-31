@@ -44,6 +44,21 @@ test('exact API correlation rejects mismatches before inspecting/mutating sessio
   assert.equal(call({ machine_id: 'machine', inject_id: ID }).body.messaging.request_accepted.status, 'observed');
   assert.equal(session.sessionEpoch, 'epoch'); assert.equal(reads, 2);
 });
+test('#1207 an unavailable authoritative read is 503 CORRELATION_UNAVAILABLE and an unhealthy ledger is 503 OBSERVATION_LEDGER_UNAVAILABLE — never a 404 or a correlation', async () => {
+  const session = Object.freeze({ sessionEpoch: 'epoch', interactionOwnerGeneration: 'owner' });
+  const run = async (opts) => { let reads = 0, inspected = 0, status = 200, body;
+    const handler = createDiagnosticsHandler({ machineId: 'machine', sessions: { exact: session }, inspect: () => { inspected++; return {}; },
+      ...opts, readTracked: id => { reads++; return opts.readTracked(id); } });
+    await handler({ params: { id: 'exact' }, query: { machine_id: 'machine', inject_id: ID } }, { status(value) { status = value; return this; }, json(value) { body = value; } });
+    return { status, body, reads, inspected }; };
+  // the shape daemon.js readTracked rejects with for every non-miss reason (recovering, cold_offline, a failed read)
+  const named = await run({ readTracked: async () => { throw Object.assign(new Error('tracked-injection read unavailable'), { status: 503, code: 'CORRELATION_UNAVAILABLE' }); } });
+  assert.deepEqual([named.status, named.body, named.reads, named.inspected], [503, { code: 'CORRELATION_UNAVAILABLE' }, 1, 0]);
+  const plain = await run({ readTracked: async () => { throw new Error('owner_failed'); } });
+  assert.deepEqual([plain.status, plain.body, plain.inspected], [503, { code: 'CORRELATION_UNAVAILABLE' }, 0]);
+  const unhealthy = await run({ ledgerAvailable: () => false, readTracked: () => { throw new Error('must not be read'); } });
+  assert.deepEqual([unhealthy.status, unhealthy.body, unhealthy.reads, unhealthy.inspected], [503, { code: 'OBSERVATION_LEDGER_UNAVAILABLE' }, 0, 0]);
+});
 test('bounded Linux process state supports stopped/zombie and permission/unsupported limits without responsiveness claims', () => {
   for (const [state, expected] of [['R','running'],['S','sleeping'],['T','stopped'],['Z','zombie']]) {
     const result = processState(42, { platform: 'linux', read: path => { assert.equal(path, '/proc/42/stat'); return `42 (private ) name) ${state} 1 2 3`; }, now: () => at });
@@ -88,8 +103,11 @@ test('real HTTP/CLI/MCP correlate same request without replaying input; TCP prob
     assert.equal(injected.status, 200, JSON.stringify(injected.body));
     const injectId = injected.body.inject_id; assert.ok(injectId);
     await harness.waitFor(() => inputFrames > 0);
+    // #1207 — the ledger path is the directory store: snapshot every file of it (MANIFEST, segments, tiers).
+    const { shaTree } = require('./fixtures/ledger-1207/owner-harness');
     const ledgerPath = require('../src/session-store/persistence').defaultTrackedInjectionsPath(harness.homeDir);
-    const ledgerBefore = require('node:fs').readFileSync(ledgerPath);
+    const ledgerBefore = shaTree(ledgerPath);
+    assert.ok('MANIFEST.json' in ledgerBefore && Object.keys(ledgerBefore).some(k => k.startsWith('segments/')), JSON.stringify(Object.keys(ledgerBefore)));
     const initialFrames = inputFrames, meta = (await harness.request('/api/meta')).body;
     const query = new URLSearchParams({ machine_id: meta.machine_id, inject_id: injectId, session_epoch: created.body.session_epoch, process_state: '1' });
     const first = await harness.request('/api/sessions/diagnostic-correlation/diagnostics?' + query);
@@ -113,7 +131,7 @@ test('real HTTP/CLI/MCP correlate same request without replaying input; TCP prob
     } finally { await client.close(); }
     const again = await harness.request('/api/sessions/diagnostic-correlation/diagnostics?' + query);
     assert.equal(again.body.messaging.inject_id, injectId); assert.equal(inputFrames, initialFrames);
-    assert.deepEqual(require('node:fs').readFileSync(ledgerPath), ledgerBefore);
+    assert.deepEqual(shaTree(ledgerPath), ledgerBefore);
     await harness.registerSession('other-diagnostic-correlation', { command: 'fixture' });
     assert.equal((await harness.request('/api/sessions/other-diagnostic-correlation/diagnostics?' + query)).status, 409);
   } finally { owner?.close(); await harness.stop(); }

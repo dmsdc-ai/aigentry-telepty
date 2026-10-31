@@ -25,10 +25,11 @@ const { createLedgerClient } = require('../src/session-store/ledger-client');
 // in-memory `trackedInjections` mirror no longer exists in the runtime, so a fixture that only
 // supplied it would make every begin/park/abort answer `tracking_unavailable`. A tracked begin
 // awaits the open; dispose() closes the owner (lock released) before the root is removed.
-function createSessionDeliveryFixture() {
+// `ledgerOptions` (optional) reaches createLedgerClient — e.g. a test-only `fsImplPath` barrier.
+function createSessionDeliveryFixture({ ledgerOptions = {} } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-delivery-fixture-'));
   const ledgerDir = path.join(root, 'tracked-injections.json');
-  const ledgerClient = createLedgerClient({ dir: ledgerDir, lockPath: path.join(root, 'tracked-injections.lock'), legacyPath: ledgerDir });
+  const ledgerClient = createLedgerClient({ dir: ledgerDir, lockPath: path.join(root, 'tracked-injections.lock'), legacyPath: ledgerDir, ...ledgerOptions });
   const sessions = Object.create(null);
   const events = [];
   const shared = {

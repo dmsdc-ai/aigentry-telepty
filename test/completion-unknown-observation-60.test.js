@@ -368,18 +368,19 @@ test('duplicate_idle_transition_is_total: a repeat of the same observation is na
 
 // --- #843 failed_commit_is_not_silence --------------------------------------------------
 
-// #1207 RETARGET STOPPED FOR THIS ARM — reported, not weakened, not skipped. The fault this test
-// induces (chmod 0500 on the ledger's parent directory between two observations) made the 0.9.1
-// whole-file rewrite fail at its temp-file create. Under the directory store the owner appends to
-// a segment fd it already holds open inside `tracked-injections.json/segments/`, so a parent-dir
-// permission change no longer produces a write failure, and the admitted contract for a write
-// failure is no longer "named result + in-memory rollback + retry emitted": it is one retry in a
-// new segment file (ack) or `indeterminate` + `unavailable_write` (DECISION §7), never a rollback
-// and never an automatic retry. Inducing that failure through the daemon's real client requires a
-// product-owned fault seam (daemon.js passes no `fsImplPath`), which this continuation may not add.
-// The body below is therefore only async-retargeted; its assertions describe the 0.9.1 mechanism
-// and are expected NOT to hold against the directory store until the controller dispositions a
-// seam. Runtime outcome: UNMEASURED.
+// #1207 — retargeted to the directory store's real write boundary. The 0.9.1 fault (chmod 0500 on the
+// ledger's parent directory) no longer produces a write failure: the owner appends to a segment fd it
+// already holds open, so that arm measured a write that SUCCEEDED (`observation_emitted`, correctly).
+// The fault now lands where a write can actually fail — the segment FILE fsync, through the test-only
+// fault facade the owner worker accepts as `fsImplPath` (test/fixtures/ledger-1207/fault-fs.js; the
+// daemon passes none) — on a private store driven by the REAL session actions, runtime and client
+// (test/fixtures/ledger-1207/control-harness.js). The contract under test is the admitted one for a
+// failed write (DECISION §7): one retry in a NEW segment file, then `indeterminate` + `unavailable_write`
+// — never a rollback, never an automatic retry, never success and never a durable failure. §A2 is
+// unchanged: the absence is still emitted, by name. What the 0.9.1 body also asserted — that the
+// source is pushed an envelope about an observation that is not durable — is the inverse of #1207's
+// durable-before-delivery rule (session-actions.js recordObservation: the source is notified only after
+// the fsynced ACK), so that half now asserts the source is NOT told; the bus still hears it.
 test('failed_commit_is_not_silence: a ledger write failure is still emitted, and does not poison the retry', async () => {
   // §A2 inside the emitter written to enforce §A2. `recordObservation` returned
   // `tracking_persistence_failed` BEFORE the broadcast, so a store that could not be written
@@ -387,81 +388,84 @@ test('failed_commit_is_not_silence: a ledger write failure is still emitted, and
   // Stage A forbids. And because `appendLedgerObservation` had already mutated
   // `record.last_observation`, the identity dedup then suppressed every RETRY of that same
   // measurement as a duplicate: the first attempt was silent and the first silenced the rest.
-  //
-  // Drive the real failure, not a stub: make the ledger directory unwritable, which is exactly
-  // how this reproduces in the field (a HOME whose .config is read-only).
-  const ledgerDir = path.join(TMP_HOME, '.config', 'aigentry-telepty');
-  fs.mkdirSync(ledgerDir, { recursive: true });
-
-  const session = { id: 'ledger-1', type: 'spawned' };
-  const pendingReport = { source: 'orch', injectId: 'inj-ledger', unconfirmedSettleDone: true };
-  const busEvents = [];
-  const delivered = [];
-  const deps = {
-    broadcastSessionEvent: (type, sid, _s, payload) => busEvents.push({ type, sid, payload }),
-    resolveSessionAlias: (s) => s,
-    sessions: { orch: { id: 'orch' }, 'ledger-1': session },
-    deliverInjectionToSession: (srcId, _s, msg) => delivered.push({ srcId, msg }),
-  };
-  const measurement = () => ({
-    sessionId: 'ledger-1', session, pendingReport,
-    destination: 'idle', cause: 'silence_timeout', evidence: { silence_ms: 6000 },
-    deliverToSource: true, trigger: 'transition', deps,
-  });
-
-  const begun = await daemon.beginTrackedInjection({
-    injectId: pendingReport.injectId, sessionId: 'ledger-1', source: 'orch', session,
-  });
-  assert.equal(begun.ok, true, 'the write-ahead record must commit while the store is still writable');
-  const seqBefore = daemon.getTrackedInjection(pendingReport.injectId).observation_seq;
-
-  // #879: chmod 0o500 on a DIRECTORY denies nothing on win32 (chmod only toggles a file's
-  // read-only attribute there), so the write succeeded and the product correctly reported
-  // observation_emitted — the failure under test was never produced. On win32 the directory is
-  // moved aside and a FILE is put in its place (the same "parent is not a directory" shape
-  // test/observation-tracking-endpoint-60.test.js uses), which the atomic write cannot traverse
-  // on any platform. POSIX keeps the chmod exactly as before.
-  const blockWin32 = process.platform === 'win32';
-  if (blockWin32) { fs.renameSync(ledgerDir, `${ledgerDir}.aside`); fs.writeFileSync(ledgerDir, 'not a directory'); }
-  else fs.chmodSync(ledgerDir, 0o500);
-  let first;
+  const H = require('./fixtures/ledger-1207/control-harness');
+  const { segmentFiles } = require('./fixtures/ledger-1207/owner-harness');
+  const FAULT_FS = path.join(__dirname, 'fixtures', 'ledger-1207', 'fault-fs.js');
+  const store = H.privateStore('telepty60-obs-fault-');
+  // The worker reads its faults at spawn (the open below). FRESH store: no recovery re-fsync, no restart
+  // fact, so `skip: 1` passes exactly the begin's group; the observation's group and its retry in a new
+  // segment file are the two faulted segment-FILE fsyncs (the trailing separator never matches a
+  // directory flush). EIO is injected identically on every platform — no chmod, no win32 special case.
+  const prevFaults = process.env.LEDGER_1207_FAULTS;
+  process.env.LEDGER_1207_FAULTS = JSON.stringify({ fsyncSync: { code: 'EIO', times: 2, skip: 1, pathIncludes: `${path.sep}segments${path.sep}` } });
+  const { runtime, actions, ledgerClient } = H.buildShared(store, H.recorders(), { clientOptions: { fsImplPath: FAULT_FS } });
   try {
-    first = await recordObservation(measurement());
+    const restored = await runtime.restoreTrackedInjections();
+    if (prevFaults === undefined) delete process.env.LEDGER_1207_FAULTS; else process.env.LEDGER_1207_FAULTS = prevFaults;
+    assert.equal(restored.ok, true, JSON.stringify(restored));
+    assert.equal(restored.restartFact, null, 'precondition: an empty store writes no restart fact');
+
+    const session = { id: 'ledger-1', type: 'spawned' };
+    const pendingReport = { source: 'orch', injectId: 'inj-ledger', unconfirmedSettleDone: true };
+    const busEvents = [];
+    const delivered = [];
+    const deps = {
+      broadcastSessionEvent: (type, sid, _s, payload) => busEvents.push({ type, sid, payload }),
+      resolveSessionAlias: (s) => s,
+      sessions: { orch: { id: 'orch' }, 'ledger-1': session },
+      deliverInjectionToSession: (srcId, _s, msg) => delivered.push({ srcId, msg }),
+    };
+    const measurement = () => ({
+      sessionId: 'ledger-1', session, pendingReport,
+      destination: 'idle', cause: 'silence_timeout', evidence: { silence_ms: 6000 },
+      deliverToSource: true, trigger: 'transition', deps,
+    });
+
+    const begun = await runtime.beginTrackedInjection({
+      injectId: pendingReport.injectId, sessionId: 'ledger-1', source: 'orch', session,
+    });
+    assert.equal(begun.ok, true, 'the write-ahead record must commit while the store is still writable');
+    const seqBefore = runtime.getTrackedInjection(pendingReport.injectId).observation_seq;
+
+    const first = await actions.recordObservation(measurement());
+    assert.equal(first, 'tracking_outcome_indeterminate',
+      'a write whose durability is unknown is named as such — never success, never a durable failure');
+    assert.equal(segmentFiles(store.dir).length, 2, 'the fault reached the segment write: the retry went to a NEW segment file');
+    assert.equal(ledgerClient.state, 'unavailable_write');
+    assert.equal(ledgerClient.status().unresolved_count, 1, 'the txn is held for resolution, never retried');
+    assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 1,
+      'a store that cannot be written is a condition to REPORT: the bus must still hear the absence');
+    const body = busEvents[0].payload.extra;
+    assert.equal(body.tracking_result, 'tracking_outcome_indeterminate',
+      'the envelope must NAME the durability gap rather than presenting a normal observation');
+    assert.equal(body.completion_fact, null);
+    assert.equal(body.terminal, false);
+    assert.equal(delivered.length, 0, 'the source is told only after a durable ACK; an indeterminate write is never pushed as recorded');
+
+    // The committed read model never describes the possibly-durable append: no advanced sequence and no
+    // un-acked `last_observation` — the state that used to turn the retry into a phantom duplicate.
+    const committed = runtime.getTrackedInjection(pendingReport.injectId);
+    assert.equal(committed.observation_seq, seqBefore,
+      'a failed commit must not advance the durable sequence it failed to write');
+    assert.notEqual(committed.last_observation && committed.last_observation.kind, 'pty_quiet',
+      'the un-persisted observation must not be left standing as the record\'s last one');
+
+    // The same measurement again: the write side is out (`unavailable_write`), so it is named and heard —
+    // never deduplicated against the attempt that may not have landed, and never pushed.
+    const second = await actions.recordObservation(measurement());
+    assert.equal(second, 'tracking_unavailable',
+      `the retry of an observation that never landed must be named, got ${JSON.stringify(second)}`);
+    assert.notEqual(second, 'observation_duplicate');
+    assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 2);
+    assert.equal(busEvents[1].payload.extra.tracking_result, 'tracking_unavailable');
+    assert.equal(delivered.length, 0);
+    for (const e of busEvents) {
+      assert.ok(!TERMINAL_EVENT_RE.test(e.type), `terminal event emitted: ${e.type}`);
+    }
   } finally {
-    if (blockWin32) { fs.rmSync(ledgerDir); fs.renameSync(`${ledgerDir}.aside`, ledgerDir); }
-    fs.chmodSync(ledgerDir, 0o700);
-  }
-
-  assert.equal(first, 'tracking_persistence_failed',
-    'the named result is right — it is the silence around it that is the defect');
-  assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 1,
-    'a store that cannot be written is a condition to REPORT: the bus must still hear the absence');
-  assert.equal(delivered.length, 1,
-    'and the source waiting on this inject must still be told, not left inferring from silence');
-  const body = busEvents[0].payload.extra;
-  assert.equal(body.tracking_result, 'tracking_persistence_failed',
-    'the envelope must NAME the durability gap rather than presenting a normal observation');
-  assert.equal(body.completion_fact, null);
-  assert.equal(body.terminal, false);
-
-  // The in-memory record must be rolled back to exactly what is on disk. A `last_observation`
-  // describing an append that never reached the ledger is a claim about durable state that was
-  // not measured — and it is what turns the retry into a phantom duplicate.
-  const rolledBack = daemon.getTrackedInjection(pendingReport.injectId);
-  assert.equal(rolledBack.observation_seq, seqBefore,
-    'a failed commit must not advance the durable sequence it failed to write');
-  assert.notEqual(rolledBack.last_observation && rolledBack.last_observation.kind, 'pty_quiet',
-    'the un-persisted observation must not be left standing as the record\'s last one');
-
-  // The retry, once the store is writable again, is the FIRST successful statement of this
-  // measurement — never a duplicate of one that only ever existed in memory.
-  const second = await recordObservation(measurement());
-  assert.equal(second, 'observation_emitted',
-    `the retry of an observation that never landed must be emitted, got ${JSON.stringify(second)}`);
-  assert.equal(daemon.getTrackedInjection(pendingReport.injectId).last_observation.kind, 'pty_quiet');
-  assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 2);
-  for (const d of delivered) {
-    assert.ok(!TERMINAL_TEXT_RE.test(d.msg), `terminal outcome emitted: ${d.msg}`);
+    if (prevFaults === undefined) delete process.env.LEDGER_1207_FAULTS; else process.env.LEDGER_1207_FAULTS = prevFaults;
+    await H.closeBounded(ledgerClient, 2000);
+    fs.rmSync(store.home, { recursive: true, force: true });
   }
 });
 

@@ -96,9 +96,9 @@ The [strict owner transport](principal-http-132.md#signed-owner-connection-and-l
 now supplies signed, current-bearer, epoch-bound connections. Full wrapped takeover
 still needs an authenticated graceful-stop acknowledgment, process-birth/custody
 evidence and a defined handoff for in-flight PTY writes. A disconnected socket or a reported PID alone does not
-supply those facts, so this slice does not claim full acceptance of #133. The
-[Linux reassessment](../reports/2026-10-30-wrapped-takeover-assessment.md) separates
-existing reconnect authority from the remaining recovery protocol.
+supply those facts, so this slice does not claim full acceptance of #133. Existing
+reconnect authority (the signed, current-bearer owner connection) is separate from that
+remaining recovery protocol, and wrapped takeover stays refused until the protocol exists.
 
 New poll-mailbox registration initializes custody before issuing or persisting its session
 credential. A newly created queue receives exclusive, private `inbox.jsonl` and `state.jsonl`

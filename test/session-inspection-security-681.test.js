@@ -203,7 +203,8 @@ function request(app,row){
       ownerReady:s.ownerWs?s.ownerWs.readyState:null,ptyKilled:s.ptyProcess?s.ptyProcess.killed:null,
       inputGeneration:s.interactionInputGeneration||0,invalidation:s.interactionInvalidation||null,
       probeAt:s.upstreamProbeAt??null,probeWatermark:s.upstreamProbeWatermark??null})),
-    interactionLedger:JSON.parse(JSON.stringify(shared.trackedInjections.interactions))});
+    // #1207: the authoritative interaction view the product reads (committed read model), not the unread mirror.
+    interactionLedger:JSON.parse(JSON.stringify(ledgerClient.readModel.interactionsView()))});
 
   async function runHttp(id,check,selectedApp=app){
     const row=all.find(r=>r.id===id);assert.ok(row);

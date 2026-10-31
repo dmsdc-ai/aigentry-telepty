@@ -35,7 +35,7 @@ async function waitForLedger(d, states = ['available'], timeoutMs = 20000) {
   }, { timeoutMs, description: `ledger ${states.join('|')}` });
 }
 
-test('M1 / D2: a 0.9.1 legacy file is migrated by the daemon at start while /api/health answers; aside sha == legacy sha == MANIFEST.legacy; historical ids poll deepEqual (+ the restart fact at the NEXT open only)', async () => {
+test('M1 / D2: a 0.9.1 legacy file is migrated by the daemon at start while /api/health answers; aside sha == legacy sha == MANIFEST.legacy; historical ids poll deepEqual (+ exactly one restart fact per open, the migrating open included)', async () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-ledger-m1-'));
   const legacyPath = ledgerDir(homeDir);
   const legacy = writeLegacyLedger(legacyPath, { targetBytes: 8 * 1048576, obsPerRecord: 12 });
@@ -54,20 +54,27 @@ test('M1 / D2: a 0.9.1 legacy file is migrated by the daemon at start while /api
     assert.equal(sha256(fs.readFileSync(path.join(legacyPath, 'legacy', 'tracked-injections.v3.json'))), legacy.sha256);
     const aside = fs.readdirSync(path.dirname(legacyPath)).find((n) => n.startsWith('tracked-injections.json.pre-0.10.'));
     assert.ok(aside); assert.equal(sha256(fs.readFileSync(path.join(path.dirname(legacyPath), aside))), legacy.sha256);
-    // historical polls: the record as it was (the first open after a migration appends NO restart fact)
+    // historical polls: the record as it was, plus the ONE restart fact of this open. The upgrade
+    // start is a restart of a store with records, so it gains `daemon_restart_observed` exactly as the
+    // 0.9.1 restore did (finishRecovery; only an empty store is exempt) — the same contract
+    // ledger-restore-lifecycle-1207 (case 2) and ledger-cold-fanout-1207 (R5) assert on a migrating open.
     const id = legacy.ids[3];
     const poll = await d.request(`/api/inject-observations/${encodeURIComponent(id)}`);
     assert.equal(poll.status, 200); assert.equal(poll.body.tracking_state, 'tracked');
-    assert.deepEqual(poll.body.observations, legacy.ledger.injections[id].observations);
-    assert.equal(poll.body.observation_seq, 12);
+    assert.deepEqual(poll.body.observations.slice(0, 12), legacy.ledger.injections[id].observations, 'the migrated history is unchanged');
+    assert.equal(poll.body.observations.length, 13);
+    assert.equal(poll.body.observations[12].kind, 'daemon_restart_observed');
+    assert.equal(poll.body.observations[12].seq, 13);
+    assert.equal(poll.body.observation_seq, 13);
     await d.kill(); d = null;
-    // next open: the restart fact overlays every record lazily
+    // next open: one more restart fact, overlaid lazily in log order — never a replay of the first
     d = await startTestDaemon({ homeDir });
     await waitForLedger(d);
     const again = await d.request(`/api/inject-observations/${encodeURIComponent(id)}`);
-    assert.equal(again.body.observation_seq, 13);
-    assert.equal(again.body.observations[12].kind, 'daemon_restart_observed');
-    assert.equal(again.body.observations[12].seq, 13);
+    assert.deepEqual(again.body.observations.slice(0, 13), poll.body.observations, 'the first open\'s history is unchanged');
+    assert.equal(again.body.observation_seq, 14);
+    assert.equal(again.body.observations[13].kind, 'daemon_restart_observed');
+    assert.equal(again.body.observations[13].seq, 14);
   } finally {
     if (d) await d.stop();
     fs.rmSync(homeDir, { recursive: true, force: true });

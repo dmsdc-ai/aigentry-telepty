@@ -25,26 +25,39 @@ function readLock(lockPath, fsImpl = fs) {
 
 /**
  * Acquire with O_CREAT|O_EXCL|O_WRONLY 0600, writing `{pid, token, started_at}` and fsyncing.
- * Returns `{held:true, lockPath}` or `{held:false, reason:'lock_present'|'lock_error', contents, lockPath}`.
+ * Returns `{held:true, lockPath}`, `{held:false, reason:'lock_present', step:'create', contents, lockPath}`
+ * or `{held:false, reason:'lock_error', step:'lock_dir'|'create'|'write', code, message, lockPath}`.
+ *
+ * Each syscall step is classified where it is observed. ONLY an O_EXCL create answering EEXIST means
+ * something already occupies the lock path (`lock_present`). A failure to make the lock's directory is
+ * a `lock_error` whatever its errno: a recursive mkdir throws EEXIST when that path exists as a
+ * NON-directory (measured, Linux CI job 124456824562), and no lock can exist beneath it.
  */
 function acquire(lockPath, { pid = process.pid, token, startedAt = new Date().toISOString() } = {}, fsImpl = fs) {
   if (typeof token !== 'string' || !token) throw new TypeError('ledger-lock: token required');
-  let fd = null;
-  try {
-    fsImpl.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-    fd = fsImpl.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-    fsImpl.writeSync(fd, JSON.stringify({ pid, token, started_at: startedAt }) + '\n');
-    fsImpl.fsyncSync(fd);
-    fsImpl.closeSync(fd); fd = null;
-    return { held: true, lockPath, pid, token };
-  } catch (error) {
-    if (fd !== null) { try { fsImpl.closeSync(fd); } catch { /* best effort */ } }
+  const failed = (step, error, extra = {}) => ({ held: false, reason: 'lock_error', step, lockPath, code: error && error.code, message: error && error.message, ...extra });
+  try { fsImpl.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 }); } catch (error) {
+    return failed('lock_dir', error, error && error.code === 'EEXIST' ? { detail: 'lock_dir_not_directory' } : {});
+  }
+  let fd;
+  try { fd = fsImpl.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600); } catch (error) {
     if (error && error.code === 'EEXIST') {
       const current = readLock(lockPath, fsImpl);
-      return { held: false, reason: 'lock_present', lockPath, contents: current.readable ? current.contents : 'unreadable' };
+      return { held: false, reason: 'lock_present', step: 'create', lockPath, contents: current.readable ? current.contents : 'unreadable' };
     }
-    return { held: false, reason: 'lock_error', lockPath, code: error && error.code, message: error && error.message };
+    return failed('create', error);
   }
+  try {
+    fsImpl.writeSync(fd, JSON.stringify({ pid, token, started_at: startedAt }) + '\n');
+    fsImpl.fsyncSync(fd);
+  } catch (error) {
+    // The file was created by this call but its contents are not durable. It is left in place (never
+    // unlinked here), so the next acquisition fails closed as `lock_present` until an operator unlock.
+    try { fsImpl.closeSync(fd); } catch { /* best effort */ }
+    return failed('write', error);
+  }
+  try { fsImpl.closeSync(fd); } catch (error) { return failed('write', error); }
+  return { held: true, lockPath, pid, token };
 }
 
 /** True iff the lock exists, is readable and names exactly this `{pid, token}`. */

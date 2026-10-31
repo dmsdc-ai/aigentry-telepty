@@ -450,13 +450,16 @@ test('#1207 explicit valid re-open re-establishes health; refused work then proc
 
 test('#1207 a failed healthy write is not an unavailable store: one fsync fault is retried in a new segment (200, health untouched); two faults leave the inject INDETERMINATE (500, no delivery, never described as persisted) and the store unavailable_write, still readable', () => withLedgerDir(async (store, clients) => {
   // (1) one injected EIO on a segment fsync → retry file → ack, retried:true
-  // `skip: 1` lets recovery's own re-fsync of the last group (one segment fsync at every open of a
-  // store with history) through; the fault lands on the first group written by the handler.
-  process.env.LEDGER_1207_FAULTS = JSON.stringify({ fsyncSync: { code: 'EIO', times: 1, skip: 1, pathIncludes: `${path.sep}segments${path.sep}` } });
+  // `skip: 0`: this store is FRESH — no history, so recovery re-fsyncs no last group, and no records,
+  // so no restart fact is written. The first segment-FILE fsync is the handler's begin group. (The
+  // pattern's trailing separator never matches a directory flush of `segments` itself.)
+  process.env.LEDGER_1207_FAULTS = JSON.stringify({ fsyncSync: { code: 'EIO', times: 1, skip: 0, pathIncludes: `${path.sep}segments${path.sep}` } });
   let recorders = makeRecorders();
   let built = buildShared(store, recorders, { fsImplPath: FAULT_FS });
   clients.push(built.ledgerClient);
-  assert.equal((await built.runtime.restoreTrackedInjections()).ok, true);
+  let restored = await built.runtime.restoreTrackedInjections();
+  assert.equal(restored.ok, true);
+  assert.equal(restored.restartFact, null, 'precondition: an empty store writes no restart fact, so the fault is the handler\'s');
   let res = makeRes(); await built.handler(makeReq('one fault'), res);
   assert.equal(res.statusCode, 200, JSON.stringify(res.body));
   assert.equal(built.shared.trackedLedgerHealthy, true, 'a retried write on a healthy store does not mark it unavailable');
@@ -464,11 +467,15 @@ test('#1207 a failed healthy write is not an unavailable store: one fsync fault 
   assert.equal(recorders.delivery.length, 1); assert.equal(recorders.delivery[0].commitCoversAtCall, true);
   await built.ledgerClient.close(2000); clients.pop();
   // (2) two injected EIOs → indeterminate: a third outcome, never success, never failure
-  process.env.LEDGER_1207_FAULTS = JSON.stringify({ fsyncSync: { code: 'EIO', times: 2, skip: 1, pathIncludes: `${path.sep}segments${path.sep}` } });
+  // `skip: 2`: the store now HAS history and records, so the open fsyncs two segment groups before the
+  // handler runs — recovery's re-fsync of the last group, then the daemon_restart_observed fact.
+  process.env.LEDGER_1207_FAULTS = JSON.stringify({ fsyncSync: { code: 'EIO', times: 2, skip: 2, pathIncludes: `${path.sep}segments${path.sep}` } });
   recorders = makeRecorders();
   built = buildShared(store, recorders, { fsImplPath: FAULT_FS });
   clients.push(built.ledgerClient);
-  assert.equal((await built.runtime.restoreTrackedInjections()).ok, true);
+  restored = await built.runtime.restoreTrackedInjections();
+  assert.equal(restored.ok, true);
+  assert.equal(restored.restartFact && restored.restartFact.outcome, 'ack', 'precondition: the restart fact is durable, so both faults are the handler\'s');
   const treeBefore = shaTree(store.dir);
   res = makeRes(); await built.handler(makeReq('two faults'), res);
   assert.equal(res.statusCode, 500);
