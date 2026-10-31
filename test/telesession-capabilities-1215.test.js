@@ -142,10 +142,21 @@ async function waitForDelivery(sink, sid, count) {
 }
 
 // Proves a record is still live AND still routed to its original endpoint after a refusal.
+// #1215 G-HTTP (K2) diagnostics only: on a failing control inject, one bounded non-asserting wait shows whether the text
+// reached the sink late (after the daemon's fetch gave up) or never, next to the daemon's own http_delivery record(s).
+const LATE_ARRIVAL_WAIT_MS = 1000;
 async function assertStillDeliverable(sid, marker) {
   const before = primarySink.textsFor(sid).length;
+  const diagFrom = daemon.getLogs().stderr.length;
   const ok = await inject(sid, { prompt: marker });
-  assert.equal(ok.status, 200, `control inject to ${sid} failed: ${JSON.stringify(ok.body)}`);
+  let evidence = '';
+  if (ok.status !== 200) {
+    await delay(LATE_ARRIVAL_WAIT_MS);
+    const late = primarySink.textsFor(sid).slice(before);
+    evidence = ` | K2 evidence ${JSON.stringify({ http_delivery: daemonHttpDiag(diagFrom), late_wait_ms: LATE_ARRIVAL_WAIT_MS,
+      late_arrivals: late.length, marker_arrived: late.some((text) => text.includes(marker)) })}`;
+  }
+  assert.equal(ok.status, 200, `control inject to ${sid} failed: ${JSON.stringify(ok.body)}${evidence}`);
   const texts = await waitForDelivery(primarySink, sid, before + 1);
   assert.ok(texts[texts.length - 1].includes(marker), 'control inject reached the original endpoint');
 }

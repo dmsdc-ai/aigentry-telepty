@@ -80,25 +80,65 @@ test('cross-host: <id>@<host>:<port> routes inject to the remote daemon', async 
   });
 
   const token = createSessionId('cross-host-token');
+  // Task 1215 G-SHELL step 1 (K1) diagnostics only: payload-free counts of everything daemonB's viewer received.
+  const viewer = viewerSummary(targetWs, token);
   const seenToken = collectMessages(
     targetWs,
     (msg) => msg.type === 'output' && String(msg.data || '').includes(token),
     { description: 'cross-host inject delivery', timeoutMs: 8000 }
   );
+  // Settled at creation: the delivery deadline can never surface as an unhandled rejection ahead of the CLI result.
+  const seen = seenToken.then(() => null, (error) => error);
 
-  // Run the CLI from daemonA's HOME but target daemonB explicitly via @host:port. The token for
-  // daemonB is resolved from its peers.json entry BY ADDRESS — the dial site here has only a host
-  // string, never a peer name, which is why name-keyed resolution never fired for this path.
-  const result = await daemonA.runCli([
-    'inject',
-    `${sessionId}@${daemonB.host}:${daemonB.port}`,
-    `echo ${token}`
-  ], { timeoutMs: 8000 });
+  try {
+    // Run the CLI from daemonA's HOME but target daemonB explicitly via @host:port. The token for
+    // daemonB is resolved from its peers.json entry BY ADDRESS — the dial site here has only a host
+    // string, never a peer name, which is why name-keyed resolution never fired for this path.
+    const result = await daemonA.runCli([
+      'inject',
+      `${sessionId}@${daemonB.host}:${daemonB.port}`,
+      `echo ${token}`
+    ], { timeoutMs: 8000 });
 
-  assert.equal(result.code, 0, `CLI failed:\nstderr: ${result.stderr}\nstdout: ${result.stdout}`);
-  await seenToken;
-  targetWs.close();
+    assert.equal(result.code, 0, `CLI failed:\nstderr: ${result.stderr}\nstdout: ${result.stdout}`);
+    const missed = await seen;
+    if (missed) {
+      appendEvidence(missed, ` | K1 evidence ${JSON.stringify({
+        cli: { code: result.code, signal: result.signal ?? null, stdout_tail: tail(result.stdout), stderr_tail: tail(result.stderr) },
+        target_inject_log: daemonB.getLogs().stdout.split(/\r?\n/).filter((line) => line.startsWith('[INJECT]') && line.includes(sessionId))
+          .slice(-4).map((line) => line.slice(0, 240)),
+        viewer: viewer(),
+      })}`);
+      throw missed;
+    }
+  } finally {
+    targetWs.close();
+  }
 });
+
+// Task 1215 G-SHELL step 1 (K1): bounded, payload-free evidence only (counts and booleans; tails capped).
+function tail(text) { return String(text ?? '').slice(-600); }
+// The same error object is rethrown (identity, stack frames); only its message and first stack line gain the evidence.
+function appendEvidence(error, note) {
+  const first = `${error.name}: ${error.message}`;
+  error.message += note;
+  if (typeof error.stack === 'string' && error.stack.startsWith(first)) error.stack = first + note + error.stack.slice(first.length);
+}
+function viewerSummary(ws, token) {
+  let frames = 0; let bytes = 0; let raw = '';
+  ws.on('message', (buffer) => {
+    let msg = null;
+    try { msg = JSON.parse(buffer.toString()); } catch { return; }
+    if (msg.type !== 'output' || typeof msg.data !== 'string') return;
+    frames++; bytes += Buffer.byteLength(msg.data, 'utf8');
+    if (raw.length < 65536) raw += msg.data;
+  });
+  return () => {
+    const plain = stripAnsi(raw).replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\u001b[@-Z\\-_]/g, '');
+    return { frames, bytes, printable: [...plain].filter((ch) => ch >= ' ' && ch !== '\u007f').length,
+      prompt_ps: plain.includes('PS '), token_in_concatenated_output: raw.includes(token) || plain.includes(token) };
+  };
+}
 
 test('cross-host: TELEPTY_HOST=host:port produces a clean http URL (no double-port)', async () => {
   // Regression for #13c. Previously TELEPTY_HOST=host:port concatenated :PORT

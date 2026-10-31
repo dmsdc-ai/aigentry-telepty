@@ -228,10 +228,12 @@ test('the orchestrator lane is untouched — the guardrail did not become a tigh
 // nothing ever went through this door.
 async function spawned(prefix) {
   const sid = createSessionId(prefix);
+  const origin = performance.now(); // Task 1215 diagnostics12: timing origin for the failure-only timeline (no behaviour)
   const res = await daemon.spawnSession(sid);
+  const spawnResponseMs = Math.round(performance.now() - origin);
   assert.ok([200, 201].includes(res.status), `spawn: ${res.status} ${JSON.stringify(res.body)}`);
   const viewer = await open(`/api/sessions/${encodeURIComponent(sid)}?token=${encodeURIComponent(TOKEN)}`);
-  return { sid, viewer };
+  return { sid, viewer, timing: { origin, spawn_response_ms: spawnResponseMs, viewer_open_ms: Math.round(performance.now() - origin) } };
 }
 
 // Everything the PTY has echoed back to this socket. For a spawned session the shell echoes what
@@ -247,10 +249,46 @@ function collectOutput(ws) {
   return () => chunks.join('');
 }
 
-test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly like a wrapped one', async (t) => {
-  const { sid, viewer } = await spawned('spawnaudit');
-  const output = collectOutput(viewer);
+// Task 1215 diagnostics12 (diagnostics only; observes frames, never acts on them, and is read only after the existing
+// 5000 ms wait has already failed). Native Windows diagnostic runs 41226376589 / 41229418760 measured 115 output bytes and
+// no echo; this separates refusal (input_refused), shell exit (socket close), and the ORDER of first output / first prompt
+// text vs the write. prompt_first_seen_ms is an ordering observation of rendered text, never a readiness claim. Bounded:
+// first 16 output chunks (ms + byte length only), fixed type counters, <= 8 other type names, 64 KiB of prompt scan.
+const plainText = (raw) => raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').replace(/\u001b\].*?(\u0007|\u001b\\)/g, '');
+function frameTimeline(ws, origin) {
+  const ms = () => Math.round(performance.now() - origin);
+  const tl = { first_output_ms: null, prompt_first_seen_ms: null, chunks: [], types: { output: 0, input_refused: 0, other: 0 }, other_types: [], close: null };
+  let scanned = '';
+  ws.on('message', (buf) => {
+    let msg = null;
+    try { msg = JSON.parse(buf.toString()); } catch { tl.types.other++; return; }
+    const type = msg && typeof msg.type === 'string' ? msg.type : null;
+    if (type === 'output' && typeof msg.data === 'string') {
+      const at = ms(); tl.types.output++;
+      if (tl.first_output_ms === null) tl.first_output_ms = at;
+      if (tl.chunks.length < 16) tl.chunks.push({ ms: at, bytes: Buffer.byteLength(msg.data, 'utf8') });
+      if (tl.prompt_first_seen_ms === null && scanned.length < 65536) { scanned += msg.data; if (plainText(scanned).includes('PS ')) tl.prompt_first_seen_ms = at; }
+    } else if (type === 'input_refused') tl.types.input_refused++;
+    else {
+      tl.types.other++;
+      if (type && /^[a-z_]{1,32}$/.test(type) && tl.other_types.length < 8 && !tl.other_types.includes(type)) tl.other_types.push(type);
+    }
+  });
+  ws.on('close', (code) => { if (!tl.close) tl.close = { code, ms: ms() }; });
+  return tl;
+}
+function byteClasses(raw) {
+  const count = (re) => (raw.match(re) || []).length;
+  return { esc: count(/\u001b/g), csi: count(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g), osc: count(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g),
+    cr: count(/\r/g), lf: count(/\n/g), printable: [...plainText(raw)].filter((ch) => ch >= ' ' && ch !== '\u007f').length };
+}
 
+test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly like a wrapped one', async (t) => {
+  const { sid, viewer, timing } = await spawned('spawnaudit');
+  const output = collectOutput(viewer);
+  const timeline = frameTimeline(viewer, timing.origin); // Task 1215 diagnostics12: observe-only
+
+  const writeSentMs = Math.round(performance.now() - timing.origin);
   viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_OK\r', from: 'orchestrator' }));
   await daemon.waitFor(() => (output().includes('SPAWNMARKER_OK') ? true : null),
     { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' })
@@ -258,8 +296,24 @@ test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly
       // Task 1215 (#879 discriminator, diagnostics only; no bytes): did anything come back, and is the marker present
       // once terminal escape sequences are removed (split echo) vs absent altogether (write never reached the PTY)?
       const raw = output(); const plain = raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').replace(/\u001b\].*?(\u0007|\u001b\\)/g, '');
-      t.diagnostic(`#879 diag spawned_echo ${JSON.stringify({ output_bytes: Buffer.byteLength(raw, 'utf8'), any_output: raw.length > 0,
-        marker_raw: raw.includes('SPAWNMARKER_OK'), marker_plain: plain.includes('SPAWNMARKER_OK'), command_plain: plain.includes('echo SPAWNMARKER') })}`);
+      // Task 1215 G-SHELL step 1 (K4), still diagnostics only: printable/prompt summary and a NON-asserting audit look-up,
+      // separating "forwarded but the shell never rendered/echoed" from "never forwarded". Counts and fixed labels only.
+      const audit = auditLines().filter((l) => l.to === sid && l.source === 'ws-viewer');
+      const diag = JSON.stringify({ output_bytes: Buffer.byteLength(raw, 'utf8'), any_output: raw.length > 0,
+        marker_raw: raw.includes('SPAWNMARKER_OK'), marker_plain: plain.includes('SPAWNMARKER_OK'), command_plain: plain.includes('echo SPAWNMARKER'),
+        printable: [...plain].filter((ch) => ch >= ' ' && ch !== '\u007f').length, prompt_ps: plain.includes('PS '),
+        audit_lines: audit.length, delivery_results: audit.slice(-4).map((l) => String(l.delivery_result).slice(0, 64)) });
+      t.diagnostic(`#879 diag spawned_echo ${diag}`);
+      const first = `${error.name}: ${error.message}`;
+      error.message += ` | K4 evidence ${diag}`;
+      if (typeof error.stack === 'string' && error.stack.startsWith(first)) error.stack = first + ` | K4 evidence ${diag}` + error.stack.slice(first.length);
+      // Task 1215 diagnostics12: the bounded timeline (no raw output), plus <= 8 daemon log lines naming this sid (<= 300 chars).
+      const { stdout, stderr } = daemon.getLogs();
+      const log = `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid)).slice(-8).map((l) => l.slice(0, 300));
+      const tdiag = JSON.stringify({ spawn_response_ms: timing.spawn_response_ms, viewer_open_ms: timing.viewer_open_ms, write_sent_ms: writeSentMs,
+        failed_at_ms: Math.round(performance.now() - timing.origin), ...timeline, byte_classes: byteClasses(raw), log });
+      t.diagnostic(`#879 diag spawned_timeline ${tdiag}`);
+      error.message += ` | timeline ${tdiag}`;
       throw error;
     });
 

@@ -1721,6 +1721,8 @@ app.get('/api/meta', (req, res) => {
     port: boundPort,
     machine_id: MACHINE_ID,
     event_loop: eventLoopTelemetry.snapshot(),
+    // #1215 diagnostics: payload-free audit-writer counters/stage beside the event-loop telemetry.
+    audit_writer: auditWriter.status(),
     terminal: DETECTED_TERMINAL,
     // #137: bridge-stage-receipts-v1 = this daemon accepts owner-bound bridge_receipt/bridge_queue
     // frames and threads inject ids to the bridge. It says nothing about any one bridge's support.

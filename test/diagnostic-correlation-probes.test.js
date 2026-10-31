@@ -88,6 +88,94 @@ test('CLI/MCP shared client passes exact correlation/probe options with bounded 
   assert.ok(calls.every(call => call.options.readOnlyAuth)); assert.match(calls[1].url, /inject_id=.*&process_state=1/);
   assert.equal(report.network_probe.status, 'timeout'); assert.equal(report.messaging.reply.status, 'unknown');
 });
+// #1215 diagnostics12 (diagnostics only; built ONLY when the :103 inject assertion is already failing, appended to its
+// message). Windows diagnostic run 41229418760 answered 503 DELIVERY_UNCERTAIN "after enqueue" here with no daemon output.
+// Bounded: <=8 daemon log lines naming this sid (<=300 chars each); this fixture's mailbox evidence only — the resolved
+// root must lie inside THIS harness's owned HOME, otherwise a fixed outside_fixture marker and nothing is read. Inbox:
+// a newline COUNT over raw bytes (never decoded, parsed or serialized). State: whitelisted fields of the last 8 rows
+// (no msg_id). Lock: entry counts and known ticket-entry names only. Override/private-root are booleans; no path or value.
+function correlationInjectDiag(harness, sid, inputFrames) {
+  const fsx = require('node:fs'), pathx = require('node:path');
+  const cap = (l) => String(l).slice(0, 300);
+  const { stdout, stderr } = harness.getLogs();
+  const log = `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid)).slice(-8).map(cap);
+  const override = typeof process.env.AIGENTRY_MAILBOX_DIR === 'string' && process.env.AIGENTRY_MAILBOX_DIR !== '';
+  let mailbox;
+  try {
+    const home = fsx.realpathSync(harness.homeDir);
+    const configured = pathx.resolve(override ? process.env.AIGENTRY_MAILBOX_DIR : pathx.join(harness.homeDir, '.aigentry', 'mailbox'));
+    let root = configured; try { root = fsx.realpathSync(configured); } catch { /* absent root: compared as resolved */ }
+    const rel = pathx.relative(home, root);
+    const privateRoot = rel !== '' && !rel.startsWith('..') && !pathx.isAbsolute(rel);
+    if (!privateRoot) mailbox = { override, private_root: false, outside_fixture: true };
+    else {
+      const dirOf = (p) => { try { const st = fsx.lstatSync(p); return st.isDirectory() && !st.isSymbolicLink(); } catch { return false; } };
+      const sessionDir = pathx.join(root, sid);
+      mailbox = { override, private_root: true, session_dir: dirOf(sessionDir) };
+      if (mailbox.session_dir) {
+        // #1215 correction41 (review25): every file read goes through one owned-file gate. lstat must be a regular non-symlink
+        // file; it is opened read-only with O_NOFOLLOW (and O_NONBLOCK) where fs.constants defines them; fstat must be the same
+        // regular file (dev/ino) or nothing is read; the descriptor is closed on every path. Where O_NOFOLLOW is undefined
+        // (win32) the open itself may traverse a link swapped in after the lstat; the identity check then refuses to read it.
+        // This is detection at this boundary, not race-free OS confinement; there is no path-based fallback read.
+        const OPEN_FLAGS = fsx.constants.O_RDONLY | (fsx.constants.O_NOFOLLOW || 0) | (fsx.constants.O_NONBLOCK || 0);
+        const withOwnedFile = (file, use) => {
+          const st = fsx.lstatSync(file);
+          if (!st.isFile() || st.isSymbolicLink()) return { file: false };
+          const fd = fsx.openSync(file, OPEN_FLAGS);
+          try {
+            const opened = fsx.fstatSync(fd);
+            if (!opened.isFile() || opened.dev !== st.dev || opened.ino !== st.ino) return { identity_changed: true };
+            return use(fd, opened);
+          } finally { fsx.closeSync(fd); }
+        };
+        let inbox;
+        try {
+          inbox = withOwnedFile(pathx.join(sessionDir, 'inbox.jsonl'), (fd, opened) => {
+            const buf = Buffer.alloc(65536); let rows = 0, seen = 0, n;
+            while (seen < 1048576 && (n = fsx.readSync(fd, buf, 0, buf.length, seen)) > 0) { for (let i = 0; i < n; i++) if (buf[i] === 10) rows++; seen += n; }
+            return { rows, bytes: opened.size, partial: opened.size > seen };
+          });
+        } catch (e) { inbox = { error: e.code || 'read_failed' }; }
+        let state;
+        try {
+          const keep = ['state', 'non_retryable_attempt', 'delivery_uncertain', 'outcome', 'retryable', 'never_attempted'];
+          state = withOwnedFile(pathx.join(sessionDir, 'state.jsonl'), (fd, opened) => {
+            // Bounded tail: only the last <=65536 bytes are read, positionally through the fd.
+            const start = Math.max(0, opened.size - 65536), buf = Buffer.alloc(opened.size - start); let got = 0, n;
+            while (got < buf.length && (n = fsx.readSync(fd, buf, got, buf.length - got, start + got)) > 0) got += n;
+            let text = buf.subarray(0, got).toString('utf8');
+            // A tail that does not start at byte 0 begins mid-row: that partial first line is omitted, never parsed as a row.
+            if (start > 0) { const nl = text.indexOf('\n'); text = nl < 0 ? '' : text.slice(nl + 1); }
+            return text.split('\n').filter(Boolean).slice(-8).map((l) => {
+              try { const r = JSON.parse(l), out = {}; for (const k of keep) if (typeof r[k] === 'string' || typeof r[k] === 'boolean') out[k] = typeof r[k] === 'string' ? r[k].slice(0, 40) : r[k]; return out; }
+              catch { return { unparsed: true }; }
+            });
+          });
+        } catch (e) { state = { error: e.code || 'read_failed' }; }
+        let lock;
+        try {
+          const lockDir = pathx.join(sessionDir, '.lock');
+          if (!dirOf(lockDir)) lock = { dir: false };
+          else {
+            const names = fsx.readdirSync(lockDir);
+            lock = { entries: names.length, tickets: names.slice(0, 16).map((name) => {
+              try {
+                // lstat before listing: a non-directory or symlinked ticket entry is reported, never listed or followed.
+                const entry = fsx.lstatSync(pathx.join(lockDir, name)); // an lstat error is reported by the catch below
+                if (!entry.isDirectory() || entry.isSymbolicLink()) return { not_directory: true };
+                const inner = fsx.readdirSync(pathx.join(lockDir, name));
+                return { known: inner.filter((x) => ['draft', 'number', 'departed'].includes(x)).sort(), unknown: inner.filter((x) => !['draft', 'number', 'departed'].includes(x)).length };
+              } catch (e) { return { error: e.code || 'readdir_failed' }; }
+            }) };
+          }
+        } catch (e) { lock = { error: e.code || 'readdir_failed' }; }
+        Object.assign(mailbox, { inbox, state, lock });
+      }
+    }
+  } catch (e) { mailbox = { override, error: e.code || 'inspect_failed' }; }
+  return ` | [telepty-diag] correlation_inject ${JSON.stringify({ log, mailbox, owner_input_frames: inputFrames })}`;
+}
 test('real HTTP/CLI/MCP correlate same request without replaying input; TCP probe sends no session data', { timeout: 15000 }, async () => {
   const { startTestDaemon } = require('../test-support/daemon-harness');
   const harness = await startTestDaemon(); let owner;
@@ -100,7 +188,7 @@ test('real HTTP/CLI/MCP correlate same request without replaying input; TCP prob
     owner.send(JSON.stringify({ type: 'ready' }));
     const injected = await harness.request('/api/sessions/diagnostic-correlation/inject', { method: 'POST', body: {
       from: 'orchestrator', prompt: 'PRIVATE_FIXTURE_INPUT', no_enter: true, exact_target: true } });
-    assert.equal(injected.status, 200, JSON.stringify(injected.body));
+    assert.equal(injected.status, 200, injected.status === 200 ? '' : `${JSON.stringify(injected.body)}${correlationInjectDiag(harness, 'diagnostic-correlation', inputFrames)}`);
     const injectId = injected.body.inject_id; assert.ok(injectId);
     await harness.waitFor(() => inputFrames > 0);
     // #1207 — the ledger path is the directory store: snapshot every file of it (MANIFEST, segments, tiers).

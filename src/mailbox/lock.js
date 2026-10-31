@@ -21,7 +21,10 @@ const COUNTERS = ['doorway_rescans', 'admission_polls', 'pauses', 'pause_request
   'eperm_read_throw', 'dir_unresolved',
   // #1215 correction5: the nlink0 re-stat site (original :82) — re-stats taken and their EPERM outcomes.
   'restat_nlink0', 'eperm_restat_marked_entry', 'eperm_restat_relist_departed', 'eperm_restat_relist_unresolved',
-  'eperm_restat_relist_dir_gone', 'eperm_restat_unmarked_throw_entry_listed', 'eperm_restat_unmarked_throw_entry_absent'];
+  'eperm_restat_relist_dir_gone', 'eperm_restat_unmarked_throw_entry_listed', 'eperm_restat_unmarked_throw_entry_absent',
+  // #1215 lock10: the read-site EPERM whose re-list shows the published `number` gone (departure final stage), and a
+  // diagnostic split of the remaining throws (not `eperm_`-prefixed, so eperm_total is not double counted).
+  'eperm_read_number_gone', 'read_throw_number_listed'];
 const MAXIMA = ['pause_actual_max_ms', 'peers_seen_max'];
 const counters = () => Object.fromEntries([...COUNTERS, ...MAXIMA].map(key => [key, 0]));
 const totals = {acquired: 0, timeouts: 0, errors: 0, wait_ms_total: 0, wait_ms_max: 0, ...counters()};
@@ -195,6 +198,7 @@ function readTicket(parent, name, reap) {
     return null;
   }
   if (reap && !isProcessAlive(pid)) { removeTicket(dir); return {removed: true}; }
+  const published = names.includes('number'); // #1215 lock10: this read listed (and stat-validated) a published number
   let fd;
   try {
     const file = path.join(dir, 'number'), before = statOptional(file);
@@ -217,9 +221,16 @@ function readTicket(parent, name, reap) {
   } catch (e) {
     if (e.code === 'ENOENT') return null; // This unique participant has left.
     if (e.code === 'EPERM') { // Windows delete-pending number of a departure; an unmarked EPERM still throws.
-      const gone = dirState(() => departed(dir));
-      if (gone === UNRESOLVED) { note('eperm_read_unresolved'); return unresolved; }
-      if (gone) { note('eperm_read_departed'); return null; }
+      const again = dirState(() => ticketNames(dir)); // departed(dir), with the listing kept for the rule below
+      if (again === UNRESOLVED) { note('eperm_read_unresolved'); return unresolved; }
+      if (again === null || again.includes(DEPARTED)) { note('eperm_read_departed'); return null; }
+      // #1215 lock10 (win32 8a0219b diagnostic job, lock.js:200 `before` lstat → eperm_read_throw): `number` is created
+      // only by the publication rename and unlinked only by removeTicket AFTER its O_EXCL marker; the marker is
+      // unlinked only once it is the last entry, then the directory is removed. A number this read saw published that
+      // is now unlisted, with no marker, is therefore that departure between its marker unlink and its rmdir. A
+      // choosing ticket never lists `number` (published is false), and a still-listed unmarked number keeps throwing.
+      if (published && !again.includes('number')) { note('eperm_read_number_gone'); return null; }
+      if (again.includes('number')) note('read_throw_number_listed');
       note('eperm_read_throw');
     }
     throw e;

@@ -5,6 +5,19 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { FileMailbox } = require('../src/mailbox');
 const { DeliveryEngine } = require('../src/mailbox/delivery');
 const { createSessionDeliveryContext } = require('../src/mailbox/session-delivery');
+// Task 1215 G-LOCK (K3) diagnostics only: process-wide lock totals (fixed counters; no pid, path or payload) and their
+// change across one call, carried in an assertion message so a lock refusal is told apart from an effectful throw.
+const { lockDiagnostics } = require('../src/mailbox/lock');
+function lockDelta(before) {
+  const after = lockDiagnostics(), delta = {};
+  for (const [key, value] of Object.entries(after)) if (typeof value === 'number' && value !== before[key]) delta[key] = Math.round((value - (before[key] || 0)) * 10) / 10;
+  return delta;
+}
+function deliveryEvidence(result, frames, before) {
+  return JSON.stringify({ code: result?.code ?? null, error: String(result?.error ?? '').slice(0, 240),
+    bytes_written: result && 'bytes_written' in result ? result.bytes_written : 'absent',
+    frames: { count: frames.length, body_only: frames.length === 1 && frames[0] === 'PRIVATE_BODY' }, lock_delta: lockDelta(before) });
+}
 function fixture(root, address) {
   const mailbox = new FileMailbox({ root, retryBackoffSecs: 0, inflightTimeoutSecs: 0, maxRetries: 10 });
   const session = { id: 'fixture', sessionEpoch: 'fixture-epoch', type: 'aterm', delivery: { transport: 'unix_socket', address } };
@@ -76,12 +89,37 @@ test('effectful callback throw is quarantined and source never emits CR or blind
   try {
     const f = fixture(root, '/unused'); f.session.type = 'wrapped';
     f.session.ownerWs = { readyState: 1, send(raw) { frames.push(JSON.parse(raw).data); throw Error('unmeasured post-write failure'); } };
+    const lockBefore = lockDiagnostics();
     const result = await f.context.deliverInjectionToSession('fixture', f.session, 'PRIVATE_BODY', { from: 'source' });
-    assert.equal(result.success, false); assert.equal(result.code, 'DELIVERY_UNCERTAIN'); assert.equal(result.delivery_uncertain, true);
-    assert.equal(result.submit, 'skipped'); assert.deepEqual(frames, ['PRIVATE_BODY']);
+    assert.equal(result.success, false); assert.equal(result.code, 'DELIVERY_UNCERTAIN', `K3 evidence ${deliveryEvidence(result, frames, lockBefore)}`); assert.equal(result.delivery_uncertain, true);
+    assert.equal(result.submit, 'skipped'); assert.deepEqual(frames, ['PRIVATE_BODY'], `K3 evidence ${deliveryEvidence(result, frames, lockBefore)}`);
     for (let i = 0; i < 3; i++) await f.engine.tick();
     const restarted = fixture(root, '/unused'); for (let i = 0; i < 3; i++) await restarted.engine.tick();
     assert.deepEqual(frames, ['PRIVATE_BODY']); assert.equal(restarted.mailbox.peekDeadLetter('fixture')[0].outcome, 'unknown');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+// Task 1215 G-LOCK (K3) characterization: a lock refusal BEFORE any write is a truthful zero-write TIMEOUT, never
+// DELIVERY_UNCERTAIN, never a frame, and the message is withdrawn (not left in flight to be written later).
+test('pre-write lock refusal on dequeue is a truthful zero-write TIMEOUT: no frame, withdrawn, never written later', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 't-delivery-lock-refused-')); const frames = [];
+  try {
+    const f = fixture(root, '/unused'); f.session.type = 'wrapped';
+    f.session.ownerWs = { readyState: 1, send(raw) { frames.push(JSON.parse(raw).data); } };
+    const dequeue = f.mailbox.dequeue.bind(f.mailbox); let refusals = 0;
+    f.mailbox.dequeue = sessionId => {
+      f.mailbox.dequeue = dequeue; refusals++;
+      throw Object.assign(new Error(`Mailbox lock timeout for ${sessionId}`), { code: 'MAILBOX_LOCK_TIMEOUT' });
+    };
+    const lockBefore = lockDiagnostics();
+    const result = await f.context.deliverInjectionToSession('fixture', f.session, 'PRIVATE_BODY', { from: 'source' });
+    const evidence = `characterization evidence ${deliveryEvidence(result, frames, lockBefore)} refusals=${refusals}`;
+    assert.equal(result.success, false, evidence); assert.equal(result.code, 'TIMEOUT', evidence);
+    assert.equal(result.bytes_written, 0, evidence); assert.equal(result.delivery_uncertain, undefined, evidence);
+    assert.deepEqual(frames, [], evidence);
+    assert.equal(f.mailbox.messageState('fixture', result.msg_id), 'dead_letter', evidence);
+    for (let i = 0; i < 3; i++) await f.engine.tick();
+    const restarted = fixture(root, '/unused'); for (let i = 0; i < 3; i++) await restarted.engine.tick();
+    assert.deepEqual(frames, [], evidence); assert.equal(restarted.mailbox.messageState('fixture', result.msg_id), 'dead_letter', evidence);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 test('real API and tracked ledger preserve uncertain UDS attempt rather than false zero-write refusal', { skip: process.platform === 'win32', timeout: 15000 }, async () => {

@@ -125,6 +125,10 @@ function createAuditWriter(options = {}) {
   let writing = null;
   let closed = false;
   let droppedTotal = 0;
+  // #1215 diagnostics: O(1) counters and the in-flight stage, read by status(). No I/O, no payload,
+  // no behaviour change: a stalled stage, an armed timer that never fired and a dropped batch differ here.
+  const stat = { appended: 0, written_lines: 0, batches: 0, errors: 0, last_error_code: null, stage: null,
+    timer_armed_at: null, writing_started_at: null, last_write_ms: null, max_write_ms: 0, last_write_end_at: null };
 
   ensureDir();
 
@@ -145,6 +149,7 @@ function createAuditWriter(options = {}) {
       droppedTotal += 1;
       emitter.emit('audit_overflow', { dropped: droppedTotal, queueMax });
     }
+    stat.appended += 1;
     queue.push({
       ...record,
       preview: record.preview != null ? record.preview : preview,
@@ -156,6 +161,7 @@ function createAuditWriter(options = {}) {
   function scheduleFlush() {
     if (closed || timer || writing || queue.length === 0) return;
     timer = setTimeout(() => { timer = null; flush().catch(() => {}); }, flushMs);
+    stat.timer_armed_at = Date.now();
     if (timer && typeof timer.unref === 'function') timer.unref();
   }
 
@@ -169,20 +175,32 @@ function createAuditWriter(options = {}) {
   async function writeBatch() {
     const batch = queue;
     queue = [];
+    stat.writing_started_at = Date.now(); stat.timer_armed_at = null; stat.stage = 'build';
     try {
       const data = batch.map((r) => buildAuditLine(r)).join('\n') + '\n';
       if (options.storage) {
+        stat.stage = 'storage';
         await options.storage.writeBatch(data, { maxBytes, maxFiles, maxAgeDays });
+        stat.written_lines += batch.length;
         return;
       }
+      stat.stage = 'rotate';
       await rotateIfNeeded();
+      stat.stage = 'append';
       await fs.promises.appendFile(filePath, data, { mode: 0o600 });
+      stat.written_lines += batch.length;
+      stat.stage = 'chmod';
       // appendFile's mode only applies on create — chmod each flush so a pre-existing file
       // (or umask-loosened create) is forced to 0600 (the file may carry preview content).
       try { await fs.promises.chmod(filePath, 0o600); } catch { /* best-effort */ }
     } catch (err) {
+      stat.errors += 1; stat.last_error_code = (err && err.code) || 'error';
       emitter.emit('audit_error', err);
     } finally {
+      const end = Date.now();
+      stat.batches += 1; stat.stage = null; stat.last_write_end_at = end;
+      stat.last_write_ms = end - stat.writing_started_at; stat.max_write_ms = Math.max(stat.max_write_ms, stat.last_write_ms);
+      stat.writing_started_at = null;
       writing = null;
       if (queue.length > 0) scheduleFlush();
     }
@@ -199,6 +217,7 @@ function createAuditWriter(options = {}) {
       }
       try { await fs.promises.rename(filePath, `${filePath}.1`); } catch { /* nothing to rotate */ }
     }
+    stat.stage = 'prune';
     await pruneByAge();
   }
 
@@ -220,10 +239,22 @@ function createAuditWriter(options = {}) {
     do { await flush(); } while (writing || queue.length > 0);
   }
 
+  // #1215 diagnostics: a bounded, payload-free snapshot (counts, booleans, ms, an errno code).
+  function status() {
+    const now = Date.now();
+    const ago = (t) => (t === null ? null : now - t);
+    return { queued: queue.length, appended: stat.appended, written_lines: stat.written_lines, batches: stat.batches,
+      dropped: droppedTotal, errors: stat.errors, last_error_code: stat.last_error_code, closed, flush_ms: flushMs,
+      timer_armed: !!timer, timer_armed_ms_ago: timer ? ago(stat.timer_armed_at) : null,
+      writing: !!writing, writing_stage: stat.stage, writing_for_ms: ago(stat.writing_started_at),
+      last_write_ms: stat.last_write_ms, max_write_ms: stat.max_write_ms, last_write_end_ms_ago: ago(stat.last_write_end_at) };
+  }
+
   return {
     append,
     flush,
     close,
+    status,
     on: emitter.on.bind(emitter),
     off: emitter.off.bind(emitter)
   };

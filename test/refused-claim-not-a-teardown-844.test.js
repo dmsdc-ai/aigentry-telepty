@@ -31,6 +31,7 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fsDiag = require('node:fs'); // #879 N2 failure-only cleanup evidence (homeResidual)
 const pty = require('node-pty');
 
 const { startTestDaemon, createSessionId, stripAnsi, waitFor, delay } = require('../test-support/daemon-harness');
@@ -75,8 +76,49 @@ function diagPty(text, exit, markers) {
     markers: Object.fromEntries(Object.entries(markers).map(([name, needle]) => [name, plain.includes(needle)])) };
 }
 
+// Task 1215 / #879 (windows40 N2) — FAILURE-ONLY cleanup evidence. Windows main job 124625652428: this file's after hook
+// failed with ENOTEMPTY removing the harness HOME after all three tests passed; which entry remained, and whether the bridges
+// this file spawned with that HOME had exited, was not recorded. Only when the existing harness.stop() throws ENOTEMPTY,
+// the SAME error is rethrown with bounded metadata appended: residual names relative to the owned HOME (lstat walk, never
+// following a symlink, depth <= 4, <= 32 entries, no contents or absolute paths) and each spawned bridge's observed exit.
+// No cleanup, wait, kill, retry or ordering change: this gathers evidence; it does not fix the cleanup failure.
+const spawnedBridges = [];
+function homeResidual(root) {
+  const entries = []; let truncated = false;
+  const walk = (dir, rel, depth) => {
+    let names;
+    try { names = fsDiag.readdirSync(dir).sort(); } catch (e) { entries.push({ name: rel || '.', error: e.code || 'readdir_failed' }); return; }
+    for (const name of names) {
+      if (entries.length >= 32) { truncated = true; return; }
+      const relName = rel ? `${rel}/${name}` : name;
+      let st;
+      try { st = fsDiag.lstatSync(path.join(dir, name)); } catch (e) { entries.push({ name: relName, error: e.code || 'lstat_failed' }); continue; }
+      const type = st.isSymbolicLink() ? 'symlink' : st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other';
+      entries.push({ name: relName, type });
+      if (type === 'dir') { if (depth < 4) walk(path.join(dir, name), relName, depth + 1); else truncated = true; }
+    }
+  };
+  walk(root, '', 1);
+  return { entries, truncated };
+}
+function bridgeExits(failedAt) {
+  return spawnedBridges.slice(0, 16).map((b) => ({ kind: b.kind, exit_code: b.exitCode ?? null, signal: b.signal ?? null,
+    exited_before_failure_ms: b.exitedAt === undefined ? null : failedAt - b.exitedAt }));
+}
+
 before(async () => { harness = await startTestDaemon(); });
-after(async () => { if (harness) await harness.stop(); });
+after(async () => {
+  if (!harness) return;
+  try { await harness.stop(); } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOTEMPTY' && typeof error.message === 'string') {
+      const failedAt = Date.now(), first = `${error.name}: ${error.message}`;
+      const note = ` | [telepty-diag] home_residual ${JSON.stringify({ residual: homeResidual(harness.homeDir), bridges: bridgeExits(failedAt) })}`;
+      error.message += note;
+      if (typeof error.stack === 'string' && error.stack.startsWith(first)) error.stack = first + note + error.stack.slice(first.length);
+    }
+    throw error;
+  }
+});
 
 // #879: `bash` is not a Windows primitive (it may resolve to the WSL launcher, or not at all). The
 // incumbent only needs a long-lived interactive child that echoes what it is given, so win32 uses
@@ -108,6 +150,10 @@ function spawnBridge(sessionId, commandArgs = INCUMBENT_COMMAND) {
   const output = { text: '', exit: null };
   proc.onData((d) => { output.text += d; });
   proc.onExit(({ exitCode }) => { output.exit = exitCode; });
+  // Task 1215 / #879 N2: observe-only exit facts for the failure-only cleanup evidence above (no behaviour change).
+  const observed = { kind: commandArgs === INCUMBENT_COMMAND ? 'bridge_incumbent_command' : 'bridge_custom_command' };
+  spawnedBridges.push(observed);
+  proc.onExit(({ exitCode, signal }) => { observed.exitCode = exitCode; observed.signal = signal ?? null; observed.exitedAt = Date.now(); });
   return { proc, output };
 }
 

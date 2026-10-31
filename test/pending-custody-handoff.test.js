@@ -69,24 +69,40 @@ test('old unmarked or attempted pending rows cannot acquire never-attempted elig
     }
     assert.throws(() => f.mailbox.withNeverAttemptedCustody('fixture', rows => rows), undefined, mode);
 } });
+// Task 1215 G-LOCK (K5) diagnostics only: TAP drops custom error properties, so a lock refusal in this setup is rethrown
+// as the SAME error with its bounded lock_diagnostic (fixed counters; no pid, path or payload) appended to the message.
+function withLockDiagnostic(label, fn) {
+    try {
+        return fn();
+    }
+    catch (err) {
+        if (err && typeof err === 'object' && err.lock_diagnostic && typeof err.message === 'string') {
+            const note = ` | ${label} lock_diagnostic ${JSON.stringify(err.lock_diagnostic).slice(0, 2048)}`, first = `${err.name}: ${err.message}`;
+            err.message += note;
+            if (typeof err.stack === 'string' && err.stack.startsWith(first))
+                err.stack = first + note + err.stack.slice(first.length);
+        }
+        throw err;
+    }
+}
 test('unknown attempt history or DLQ never becomes empty or transferable custody', t => {
     for (const mode of ['dead-letter', 'later-acked', 'compacted', 'purged-dlq', 'purged']) {
         const f = fixture(t);
         f.mailbox.enqueue(f.msg);
         f.mailbox.dequeue('fixture');
         f.mailbox.beginNonRetryableAttempt('fixture', f.msg.msg_id);
-        f.mailbox.withdraw('fixture', f.msg.msg_id, 'delivery_outcome_unknown', { inFlight: true, deliveryUncertain: true });
+        withLockDiagnostic(`${mode} withdraw`, () => f.mailbox.withdraw('fixture', f.msg.msg_id, 'delivery_outcome_unknown', { inFlight: true, deliveryUncertain: true }));
         if (mode === 'later-acked')
             fs.appendFileSync(path.join(f.directory, 'state.jsonl'), JSON.stringify({ msg_id: f.msg.msg_id, state: 'acked', ts: Math.floor(Date.now() / 1000) }) + '\n');
         if (['compacted', 'purged-dlq'].includes(mode)) {
             f.mailbox.enqueue({ ...f.msg, msg_id: 'known-terminal' });
             f.mailbox.ack('fixture', 'known-terminal');
-            require('../src/mailbox/storage').compact(f.directory, 1);
+            withLockDiagnostic(`${mode} compact`, () => require('../src/mailbox/storage').compact(f.directory, 1));
         }
         if (mode === 'purged-dlq')
-            f.mailbox.purgeDeadLetter('fixture');
+            withLockDiagnostic(`${mode} purgeDeadLetter`, () => f.mailbox.purgeDeadLetter('fixture'));
         if (mode === 'purged')
-            f.mailbox.purge('fixture');
+            withLockDiagnostic(`${mode} purge`, () => f.mailbox.purge('fixture'));
         assert.throws(() => f.mailbox.snapshotCustody('fixture'), undefined, mode);
         assert.throws(() => f.mailbox.withNeverAttemptedCustody('fixture', rows => rows), undefined, mode);
     }

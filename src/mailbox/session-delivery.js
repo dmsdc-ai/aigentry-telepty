@@ -271,6 +271,23 @@ function createSessionDeliveryContext({
     const code = error && error.code;
     return typeof code === 'string' && DIAG_CODE.test(code) ? `threw_${code}` : 'threw_other';
   }
+  // #1215 diagnostics12 (diagnostics only): fixed keys for the enqueue/delivery catch log. Shape-checked tokens
+  // only — code, syscall, the mailbox step (FileMailbox.enqueue) and the lock diagnostic's outcome/phase/EPERM
+  // count. Never a message, path, payload, token, bearer or stack. Reading an exotic thrown value cannot throw out.
+  const DIAG_SYSCALL = /^[a-z][a-z0-9_]{1,31}$/;
+  const DIAG_STEP = /^(session_dir|acquire|body|release)$/;
+  const DIAG_LOCK_OUTCOME = /^(acquired|timeout|error)$/;
+  const DIAG_LOCK_PHASE = /^(doorway|admission)$/;
+  function enqueueFailureDiag(error) {
+    const token = (value, pattern) => (value === undefined || value === null ? null : typeof value === 'string' && pattern.test(value) ? value : 'other');
+    try {
+      if (error === null || (typeof error !== 'object' && typeof error !== 'function')) return { kind: 'non_object' };
+      const lock = error.lock_diagnostic;
+      return { code: token(error.code, DIAG_CODE), syscall: token(error.syscall, DIAG_SYSCALL), step: token(error.mailbox_step, DIAG_STEP),
+        lock: lock && typeof lock === 'object' ? { outcome: token(lock.outcome, DIAG_LOCK_OUTCOME), phase: token(lock.last_block_phase, DIAG_LOCK_PHASE),
+          eperm_total: Number.isSafeInteger(lock.eperm_total) ? lock.eperm_total : null } : null };
+    } catch { return { kind: 'unreadable' }; }
+  }
   function httpFailureCategory(error) {
     if (error && error.name === 'TimeoutError') return 'timeout';
     if (error && error.name === 'AbortError') return 'aborted';
@@ -688,7 +705,7 @@ function createSessionDeliveryContext({
         return { success: false, httpStatus: 504, code: 'SSH_WRITE_UNCONFIRMED',
           error: 'SSH delivery could not be confirmed; input may have been written. Do not retry blindly.' };
       }
-      console.error(`[MAILBOX] Enqueue/delivery path failed for ${id}; no blind retry will be attempted`);
+      console.error(`[MAILBOX] Enqueue/delivery path failed for ${id}; no blind retry will be attempted diag=${JSON.stringify(enqueueFailureDiag(err))}`);
       // Once enqueue succeeded an exception cannot authorize a second physical attempt.
       immediateAttempts.delete(msgId);
       if (enqueueAttempted) {

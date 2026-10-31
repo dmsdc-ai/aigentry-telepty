@@ -29,8 +29,9 @@ after(async () => { if (daemon) await daemon.stop(); });
 
 // Wait until at least one audit line matches `predicate`, then return ALL parsed lines.
 // Predicate-gated so a test never races the 10ms flush against lines from earlier tests.
-async function waitForAudit(predicate) {
+async function waitForAudit(predicate, diagKeys = null) {
   const t0 = Date.now();
+  const atStart = auditFileIdentity();   // #1215 diagnostics baseline only (one stat); never asserted
   try {
     return await daemon.waitFor(() => {
       let raw = '';
@@ -43,16 +44,45 @@ async function waitForAudit(predicate) {
     // appended to the already-failing error, never consulted by an assertion. Separates "never queued"
     // ([INJECT] line absent) from a writer error ([AUDIT] write error) from a writer that did not
     // complete a write in the window (file unchanged since before the wait).
-    error.message += ` | [telepty-diag] audit_wait ${JSON.stringify(auditDiag(t0))}`;
+    // #1215 (a01 win32 multicast): also the same-file identity across the wait, one final re-read, and the
+    // daemon's own audit-writer counters/stage + event-loop telemetry from /api/meta (bounded 2 s), so a
+    // dropped append, a writer exception, an armed-but-unfired flush timer and a stalled fs stage differ.
+    error.message += ` | [telepty-diag] audit_wait ${JSON.stringify(await auditDiag(t0, atStart, predicate, diagKeys))}`;
     throw error;
   }
 }
-function auditDiag(t0) {
-  let file = null;
-  try { const st = fs.statSync(logPath); file = { bytes: st.size, mtime_ms_after_wait_start: Math.round(st.mtimeMs - t0) }; } catch (e) { file = { error: e.code || 'stat_failed' }; }
+function auditFileIdentity() {
+  try { const st = fs.statSync(logPath); return { bytes: st.size, mtime_ms: st.mtimeMs, ino: st.ino, birthtime_ms: st.birthtimeMs }; }
+  catch (e) { return { error: e.code || 'stat_failed' }; }
+}
+async function auditDiag(t0, atStart, predicate, diagKeys) {
+  const rel = (f) => (f.error ? f : { bytes: f.bytes, mtime_ms_after_wait_start: Math.round(f.mtime_ms - t0) });
+  const atCatch = auditFileIdentity();
+  let reread = null;
+  try {
+    const lines = fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean);
+    let matching = 0; let unparsed = 0;
+    for (const l of lines) { try { if (predicate(JSON.parse(l))) matching++; } catch { unparsed++; } }
+    reread = { lines: lines.length, matching, unparsed };
+  } catch (e) { reread = { error: e.code || 'read_failed' }; }
   const { stdout, stderr } = daemon.getLogs();
-  const tail = (text, prefix) => text.split(/\r?\n/).filter((l) => l.startsWith(prefix)).slice(-4);
-  return { waited_ms: Date.now() - t0, file, inject_log: tail(stdout, '[INJECT]'), audit_log: tail(stderr, '[AUDIT]') };
+  const keep = (l) => !Array.isArray(diagKeys) || diagKeys.some((k) => l.includes(k));
+  // The target filter applies to [INJECT] lines only: '[AUDIT] write error' lines carry no sid (daemon.js:486), so
+  // filtering them by target would always hide writer errors. Both tails stay the last 4 lines, each capped at 300 chars.
+  const tail = (text, prefix, filtered) => text.split(/\r?\n/).filter((l) => l.startsWith(prefix) && (!filtered || keep(l))).slice(-4).map((l) => l.slice(0, 300));
+  let meta = null; let timer = null;
+  const tm = Date.now();
+  try {
+    const r = await Promise.race([daemon.request('/api/meta'),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), 2000); })]);
+    meta = r ? { request_ms: Date.now() - tm, status: r.status, audit_writer: r.body && r.body.audit_writer,
+      event_loop: r.body && r.body.event_loop ? { latest: r.body.event_loop.latest, last_stall: r.body.event_loop.last_stall, freshness_ms: r.body.event_loop.freshness_ms } : null }
+      : { timed_out_ms: 2000 };
+  } catch (e) { meta = { error: (e && e.message ? e.message : String(e)).slice(0, 200) }; } finally { clearTimeout(timer); }
+  return { waited_ms: Date.now() - t0, file_at_start: rel(atStart), file_at_catch: rel(atCatch),
+    same_file: !atStart.error && !atCatch.error && atStart.ino === atCatch.ino && atStart.birthtime_ms === atCatch.birthtime_ms,
+    rotated_1_present: fs.existsSync(`${logPath}.1`), final_reread: reread,
+    log_filter: Array.isArray(diagKeys) ? { inject_log: diagKeys, audit_log: 'none' } : 'none', inject_log: tail(stdout, '[INJECT]', true), audit_log: tail(stderr, '[AUDIT]', false), meta };
 }
 
 test('P1: inject appends an audit line (schema v1, claimed_from, hash-only)', async () => {
@@ -192,7 +222,9 @@ test('P1: multicast appends one audit line per target sharing an inject_id', asy
   });
   assert.equal(res.status, 200);
 
-  const lines = await waitForAudit((l) => l.kind === 'multicast' && l.to === b);
+  // fanout logs no [INJECT] line: the diagnostic [INJECT] tail is filtered to these targets so an earlier
+  // test's line is never read as this multicast's evidence ([AUDIT] lines carry no sid and stay unfiltered).
+  const lines = await waitForAudit((l) => l.kind === 'multicast' && l.to === b, [a, b]);
   const mcLines = lines.filter((l) => l.kind === 'multicast' && (l.to === a || l.to === b));
   assert.equal(mcLines.length >= 2, true);
   const forA = mcLines.find((l) => l.to === a);

@@ -105,13 +105,46 @@ test('missing_tracking_is_explicit: malformed and hostile inject_ids are unavail
 
 // --- §8.1 pending_overwrite_emits_superseded -------------------------------------------------
 
+// #1215 lock10 diagnostics only (win32 8a0219b diagnostic job: the FIRST inject answered 500 DELIVERY_UNCERTAIN,
+// tracking_state aborted, bytes_written null, before any supersession step). The route overwrites the underlying
+// code, and no daemon output reached the job log. Built ONLY when that assertion is already failing, and appended to
+// its message: the spawn answer (status/success/code only), the daemon log lines naming this sid, and this sid's
+// mailbox state.jsonl trail (whitelisted state fields, never payload). Separates a deliver callback that threw or
+// returned an uncertain write ([MAILBOX] Delivery outcome unknown + dead_letter row) from an ACK-store failure (fenced
+// in_flight row, no dead_letter, no such line) and from a session that never spawned. Bounded: 8 lines × 300 chars.
+function firstInjectDiag(sid, spawned) {
+  const cap = (l) => String(l).slice(0, 300);
+  const { stdout, stderr } = daemon.getLogs();
+  const log = `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid)).slice(-8).map(cap);
+  const root = process.env.AIGENTRY_MAILBOX_DIR || path.join(daemon.homeDir, '.aigentry', 'mailbox');
+  const dir = path.join(root, sid);
+  let mailbox;
+  try {
+    const names = fs.readdirSync(dir).slice(0, 16);
+    let trail = null;
+    try {
+      trail = fs.readFileSync(path.join(dir, 'state.jsonl'), 'utf8').split('\n').filter(Boolean).slice(-8).map((l) => {
+        try {
+          const r = JSON.parse(l); const keep = {};
+          for (const k of ['state', 'non_retryable_attempt', 'delivery_uncertain', 'outcome', 'retryable', 'reason', 'attempt']) if (r[k] !== undefined) keep[k] = typeof r[k] === 'string' ? cap(r[k]) : r[k];
+          return keep;
+        } catch { return { unparsed: true }; }
+      });
+    } catch (e) { trail = { error: e.code || 'read_failed' }; }
+    let lockEntries = null; try { lockEntries = fs.readdirSync(path.join(dir, '.lock')).length; } catch (e) { lockEntries = e.code || 'error'; }
+    mailbox = { names, state_trail: trail, lock_entries: lockEntries };
+  } catch (e) { mailbox = { error: e.code || 'readdir_failed' }; }
+  const spawn = spawned ? { status: spawned.status, success: spawned.body && spawned.body.success, code: spawned.body && spawned.body.code } : null;
+  return ` | [telepty-diag] first_inject ${JSON.stringify({ spawn, log, mailbox })}`;
+}
+
 test('pending_overwrite_emits_superseded: a second dispatch retains the first inject_id and names the supersession', () => {
   return (async () => {
     const sid = createSessionId('supersede');
-    await daemon.spawnSession(sid);
+    const spawned = await daemon.spawnSession(sid);
 
     const first = await dispatch(sid, 'first task');
-    assert.equal(first.status, 200, `first inject failed: ${JSON.stringify(first.body)}`);
+    assert.equal(first.status, 200, first.status === 200 ? '' : `first inject failed: ${JSON.stringify(first.body)}${firstInjectDiag(sid, spawned)}`);
     const firstId = first.body.inject_id;
     assert.equal(typeof firstId, 'string');
 

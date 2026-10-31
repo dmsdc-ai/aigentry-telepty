@@ -23,6 +23,19 @@ function unixNow() {
   return Math.floor(Date.now() / 1000);
 }
 
+// #1215 diagnostics12 (diagnostics only): name which enqueue step a thrown value came from. Best-effort and
+// non-enumerable; the caller rethrows the SAME value either way. A primitive, frozen/non-extensible, already
+// annotated or exotic value (e.g. a Proxy whose traps throw) is left exactly as it was — annotation never
+// replaces, wraps or masks the original error.
+const MAILBOX_STEPS = new Set(['session_dir', 'acquire', 'body', 'release']);
+function annotateMailboxStep(error, step) {
+  if (!MAILBOX_STEPS.has(step) || error === null || (typeof error !== 'object' && typeof error !== 'function')) return;
+  try {
+    if (!Object.isExtensible(error) || Object.prototype.hasOwnProperty.call(error, 'mailbox_step')) return;
+    Object.defineProperty(error, 'mailbox_step', { value: step, enumerable: false, writable: false, configurable: true });
+  } catch { /* exotic value: leave it untouched */ }
+}
+
 /**
  * FileMailbox — JSONL-backed mailbox implementing MailboxProtocol.
  *
@@ -45,8 +58,14 @@ class FileMailbox {
    * Idempotent: re-enqueueing the same msg_id is a no-op (returns queued: false).
    */
   enqueue(msg) {
+    // #1215 diagnostics12: `step` only labels a thrown value (annotateMailboxStep); control flow, I/O, the
+    // release and its cleanup are unchanged and the same value is rethrown.
+    let step = 'session_dir';
+    try {
     const sessionDir = ensureSessionDir(this.config.root, msg.to);
+    step = 'acquire';
     const release = acquireLock(sessionDir);
+    step = 'body';
     try {
       // Idempotency check
       const states = loadStates(sessionDir);
@@ -79,8 +98,11 @@ class FileMailbox {
       const pending = countPending(sessionDir, now);
       return { msg_id: msg.msg_id, queued: true, pending };
     } finally {
+      const during = step; step = 'release';
       release();
+      step = during; // release returned: any value still propagating came from `during` (body), not from release
     }
+    } catch (error) { annotateMailboxStep(error, step); throw error; }
   }
 
   /**

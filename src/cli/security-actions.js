@@ -354,6 +354,12 @@ function createAllowSecurityContext(shared, {
     // Task 1215 R2: legacy (id-less) pairing for a refused CR — the msg_id of the most recent successfully queued
     // id-less body, only while nothing else was enqueued, refused or written since.
     let adjacentQueuedBody = null;
+    // Task 1215 O2: when the latest inject frame was an id-less body refused at enqueue (mailbox_unavailable), the time of
+    // that refusal; cleared by every other enqueue outcome, every direct bridge write and its own use. Arrival order, so
+    // a later legitimately queued body (or an older record's TTL quarantine) never makes a CR look adjacent to it.
+    let refusedIdlessBodyAt = null;
+    // Task 1215 O1: due time of the latest scheduled delivery timer; a new flush batch starts after it (FIFO).
+    let deliveryTailAt = -Infinity;
     // Task 1215 F2: child sequence for spawn-readiness milestones; the subscribed child is the one
     // whose output/exit handlers are attached.
     let childSeq = 0;
@@ -619,6 +625,7 @@ function createAllowSecurityContext(shared, {
       child.write(text);
       unwrittenBodyAdjacentAt = null;
       adjacentQueuedBody = null;
+      refusedIdlessBodyAt = null;
       sendReceipt(null, ids, 'pty_written', 'written');
       return true;
     }
@@ -637,10 +644,20 @@ function createAllowSecurityContext(shared, {
       let textWritten = false;
       if (!rawData) return { rawData, textWritten };
       const isCr = rawData === '\r';
-      if (isCr && shared.bridgePendingCount > 0) {
+      // Task 1215 O1: flush lowers the pending count while its writes still wait on delivery timers. A CR with only
+      // in-flight writes ahead is queued and flushed at once (a CR is never idle-gated) behind them, never written first.
+      const inFlightAhead = isCr && shared.bridgePendingCount === 0 && deliveryTimers.size > 0;
+      if (isCr && (shared.bridgePendingCount > 0 || inFlightAhead)) {
         // CR with pending queued text — queue CR too and wait for the same gate as the text.
+        // Task 1215 O2: an id-less CR right after its id-less body was refused unwritten is refused too (the direct
+        // path's adjacency and typing rule, in arrival order); a CR with ids is paired at flush by unwrittenBodies.
+        if (!bridgeStage.frameMeta(meta).pair && refusedIdlessBodyAt !== null && !(shared.lastUserInputTime > refusedIdlessBodyAt)) {
+          refusedIdlessBodyAt = null;
+          sendReceipt(null, bridgeStage.frameMeta(meta), 'refused', 'not_written', 'pair_unwritten');
+          return { rawData, textWritten };
+        }
         enqueueBridgeMessage(rawData, meta);
-        if (isIdle()) {
+        if (inFlightAhead || isIdle()) {
           if (shared.queueFlushTimer) { clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
           flushBridgeMailbox();
         } else {
@@ -649,7 +666,9 @@ function createAllowSecurityContext(shared, {
       } else if (isCr) {
         // CR is never idle-gated, but never for a body that was quarantined unwritten (#136, F5).
         writeDirectInject(rawData, meta);
-      } else if (isIdle()) {
+      } else if (isIdle() && shared.bridgePendingCount === 0 && deliveryTimers.size === 0) {
+        // Task 1215 O5: a body is written directly only when nothing earlier is queued or still on a delivery timer
+        // (supervised isIdle() is typing quiet only); otherwise it queues behind that work and drains in order.
         if (writeDirectInject(rawData, meta)) { shared.promptReady = false; textWritten = true; }
       } else {
         enqueueBridgeMessage(rawData, meta);
@@ -783,10 +802,12 @@ function createAllowSecurityContext(shared, {
         sendReceipt(msgId, ids, 'refused', 'not_written', 'mailbox_unavailable');
         if (text === '\r') withdrawPairedBody(ids); // Task 1215 R2: its body never goes out alone
         adjacentQueuedBody = null;
+        refusedIdlessBodyAt = text !== '\r' && !ids.daemon_msg_id ? now() : null; // Task 1215 O2
         return;
       }
       rememberRecord(msgId, ids, text === '\r');
       adjacentQueuedBody = text !== '\r' && !ids.daemon_msg_id ? msgId : null;
+      refusedIdlessBodyAt = null;
       if (!canWrite(child)) return;
       shared.bridgePendingCount++;
       sendReceipt(msgId, ids, 'queued', 'not_written');
@@ -829,7 +850,8 @@ function createAllowSecurityContext(shared, {
       if (shared.queueFlushTimer) { clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
       if (shared.idleCheckTimer) { clearInterval(shared.idleCheckTimer); shared.idleCheckTimer = null; }
       if (shared.bridgePendingCount === 0) return;
-      let delay = 0;
+      // Task 1215 O1: a batch flushed while earlier writes still wait on delivery timers starts after the latest of them.
+      let delay = deliveryTimers.size > 0 ? Math.max(0, deliveryTailAt - now()) + 1 : 0;
       const batch = [];
       // Dequeue all pending messages
       while (true) {
@@ -899,6 +921,7 @@ function createAllowSecurityContext(shared, {
           try { shared.bridgeMailbox.ack(shared.bridgeTarget, msgId); } catch {}
         }, delay);
         deliveryTimers.add(timer);
+        deliveryTailAt = Math.max(deliveryTailAt, now() + delay);
         delay += text === '\r' ? 0 : 100;
       }
       if (!canWrite(child)) return;

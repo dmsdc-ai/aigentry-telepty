@@ -46,6 +46,22 @@ const H = require('./fixtures/ledger-1207/control-harness');
 const GapDiag = require('./fixtures/ledger-1207/heartbeat-gap-diagnostics');
 const gapDiagOptions = (messages) => (GapDiag.enabled() ? { diag: GapDiag.createGapDiagnostics({ messages }) } : {});
 const compactGapDiag = (d) => (d ? { top_gaps: d.top_gaps, main_isolate_gc: d.main_isolate_gc, measured_phase_aggregate: d.measured_phase_aggregate } : null);
+// Task 1215 (a01 win32 R1: one 455 ms busy gap from the measured mark to `open-await` at ~140 ms whole-process CPU):
+// timing of the SYNCHRONOUS main-thread steps of that window only. The client is handed this pass-through fs
+// (its existing `fs` option); only the lock syscalls it performs inside restoreTrackedInjections() are timed
+// (≤ 16 entries). Printed on failure only; no assertion consumes it and no step is moved, skipped or retried.
+const SYNC_FS_TIMED = new Set(['mkdirSync', 'openSync', 'writeSync', 'fsyncSync', 'closeSync', 'readFileSync']);
+function timedSyncFs(log) {
+  return new Proxy(fs, { get(target, key) {
+    const value = target[key];
+    if (typeof value !== 'function' || !SYNC_FS_TIMED.has(key)) return value;
+    return function timed(...args) {
+      if (!log.active) return value.apply(target, args);
+      const t0 = process.hrtime.bigint();
+      try { return value.apply(target, args); } finally { if (log.steps.length < 16) log.steps.push({ op: key, ms: H.ms(t0, process.hrtime.bigint()) }); }
+    };
+  } });
+}
 
 const TIERS = H.selectedTiers();
 const EVIDENCE = H.evidenceDir();
@@ -268,7 +284,8 @@ for (const tier of TIERS) {
     const seeded = H.seedTier(store, tier);
     const R = H.recorders();
     const messages = { inbound: [], outbound: [] };
-    const { shared, runtime, injectHandler, ledgerClient } = H.buildShared(store, R, { messages });
+    const openSync = { active: false, steps: [] };   // Task 1215 failure-only diagnostics (see timedSyncFs)
+    const { shared, runtime, injectHandler, ledgerClient } = H.buildShared(store, R, { messages, clientOptions: { fs: timedSyncFs(openSync) } });
     // W5: R1's OWN same-process controls (never borrowed from F2). idle_pre runs before the R1 sampler and before the
     // open; idle_post + block run after every workload metric is captured. Same budget as F2: 1500 ms idle + 100 ms block.
     const controlPre = await heartbeatControl('idle_pre', { idleMs: CONTROLS.idlePreMs });
@@ -293,13 +310,18 @@ for (const tier of TIERS) {
       }, R1.pollIntervalMs);
       // begins issued while the store is recovering (the open is in flight on the owner thread)
       hb.label('open-inflight');
+      const tCall0 = process.hrtime.bigint(); const cpuCall0 = process.cpuUsage(); openSync.active = true;
       const openPromise = runtime.restoreTrackedInjections();
+      openSync.active = false; const cpuCall = process.cpuUsage(cpuCall0);
+      openSync.restore_call_ms = H.ms(tCall0, process.hrtime.bigint());
+      openSync.restore_call_cpu_ms = { user: Math.round(cpuCall.user / 1000), system: Math.round(cpuCall.system / 1000), scope: 'whole process incl. worker threads' };
       for (let i = 0; i < R1.beginDuringRecovery; i++) {
         hb.label('begin-during-open');
         const res = H.makeRes(); const t0 = process.hrtime.bigint();
         await injectHandler(H.makeReq(`begin while recovering ${i}`), res);
         begins.push({ status: res.statusCode, code: res.body && res.body.code, reason: res.body && res.body.reason, wall_ms: H.ms(t0, process.hrtime.bigint()), store: ledgerClient.state, healthy: shared.trackedLedgerHealthy });
       }
+      openSync.to_open_await_ms = H.ms(tCall0, process.hrtime.bigint());
       hb.label('open-await');
       const opened = await openPromise;
       hb.label('post-open-polls');
@@ -361,6 +383,7 @@ for (const tier of TIERS) {
       console.log(`[ledger-1207 R1 ${tier} MiB] evidence=${file} open_ms=${evidence.open && evidence.open.wall_ms} polls=${JSON.stringify(evidence.polls && { total: evidence.polls.total, during: evidence.polls.during_recovery })} heartbeat.measured=${JSON.stringify(evidence.heartbeat && evidence.heartbeat.measured)}`);
       console.log(`[ledger-1207 R1 ${tier} MiB] heartbeat_controls=${JSON.stringify(evidence.heartbeat_controls)} heartbeat_acceptance=${JSON.stringify(evidence.heartbeat_acceptance || null)}`);
       console.log(`[ledger-1207 R1 ${tier} MiB] heartbeat_gap_diagnostics=${JSON.stringify(compactGapDiag((evidence.heartbeat || evidence.heartbeat_on_early_failure || {}).diagnostics))}`);
+      if (failed) console.log(`[ledger-1207 R1 ${tier} MiB] open_sync_diagnostics=${JSON.stringify({ restore_call_ms: openSync.restore_call_ms, restore_call_cpu_ms: openSync.restore_call_cpu_ms, fs_steps: openSync.steps, fs_steps_ms: openSync.steps.reduce((n, x) => n + x.ms, 0), begins_wall_ms: begins.map((b) => b.wall_ms), to_open_await_ms: openSync.to_open_await_ms })}`);
       if (failed) console.log(`[ledger-1207 R1 ${tier} MiB] FAILED — private HOME preserved for diagnosis: ${store.home}`);
       else fs.rmSync(store.home, { recursive: true, force: true });
     }
