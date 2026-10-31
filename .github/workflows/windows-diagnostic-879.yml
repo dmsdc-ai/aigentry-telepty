@@ -1,0 +1,134 @@
+name: Windows CI diagnostic (#879)
+
+# Opt-in, bounded, per-file diagnostic of the Windows regression job (telepty #879).
+# Does NOT replace test-install.yml. It runs the SAME inventory (derived at runtime from
+# package.json test:ci / test:ci:pty) one process per file with a per-file deadline, records
+# exit-vs-stream-close timing and the descendant process tree on any deadline, and always
+# uploads the per-file logs + summary. A timeout, a lost process or a stream that never closes
+# is a job failure — it is never reported as green.
+#
+# Triggers: manual dispatch, and pull_request filtered to this workflow's own files so the
+# workflow can run on the PR that introduces it. Nothing here runs on push to main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      concurrency:
+        description: 'Files run in parallel in the main phase (1-4). 3 matches node --test on the 4-vCPU runner.'
+        required: false
+        default: '3'
+      file_timeout_ms:
+        description: 'Per-file deadline in ms (1000-120000). Evidence-based exceptions for cli.test.js and daemon.test.js are fixed at 120000 in the runner.'
+        required: false
+        default: '60000'
+      filter:
+        description: 'Substring of a test path to run only matching files (empty = whole inventory).'
+        required: false
+        default: ''
+      git_autocrlf:
+        description: 'runner-default reproduces the regression job; "false" disables CRLF conversion at checkout to falsify the CRLF hypotheses (init.test.js, consumer-vocabulary-matrix-60).'
+        required: false
+        type: choice
+        options:
+          - runner-default
+          - 'false'
+        default: runner-default
+  pull_request:
+    paths:
+      - '.github/workflows/windows-diagnostic-879.yml'
+      - 'scripts/windows-ci-diagnostic.mjs'
+      - 'docs/reports/windows-ci-879.md'
+      # #879 phase 2: the harness/fixture candidate lives in these paths; a change there must
+      # trigger the next Windows per-file run (and the non-main regression job below).
+      - 'test/**'
+      - 'test-support/**'
+      - 'tests/snippet-protocol/**'
+      - '.gitattributes'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: per-file diagnostic (windows-latest, node 20)
+    runs-on: windows-latest
+    # Hard cap for the whole job. The runner's own budget is 10 minutes; the remaining 5 cover
+    # npm ci, the bounded kill/verify steps and the artifact upload. Deliberately BELOW the
+    # 20-minute cap of test-install.yml, which is left unchanged.
+    timeout-minutes: 15
+    env:
+      # Inputs are empty on pull_request; the runner receives the dispatch defaults instead.
+      DIAG_CONCURRENCY: ${{ inputs.concurrency || '3' }}
+      DIAG_FILE_TIMEOUT_MS: ${{ inputs.file_timeout_ms || '60000' }}
+      DIAG_FILTER: ${{ inputs.filter || '' }}
+    steps:
+      - name: Disable git CRLF conversion (only when requested)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.git_autocrlf == 'false' }}
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Record checkout line-ending state
+        shell: pwsh
+        run: |
+          git config --get core.autocrlf
+          git ls-files --eol src/init/snippets src/routes/session-inspection.js tests/snippet-protocol/v1
+
+      - name: Print derived inventory
+        run: node scripts/windows-ci-diagnostic.mjs --list
+
+      - name: Per-file diagnostic (main phase, then serialized PTY phase)
+        shell: pwsh
+        run: >-
+          node scripts/windows-ci-diagnostic.mjs
+          --phase all
+          --out diag-879
+          --concurrency "$env:DIAG_CONCURRENCY"
+          --timeout-ms "$env:DIAG_FILE_TIMEOUT_MS"
+          --budget-ms 600000
+          --filter "$env:DIAG_FILTER"
+
+      - name: Upload per-file logs and summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-diagnostic-879-${{ github.run_id }}-${{ github.run_attempt }}
+          path: diag-879
+          if-no-files-found: warn
+          retention-days: 14
+
+  # #879 phase 2 — independent Linux/macOS regression of the SAME candidate, so a harness change
+  # made for Windows is never merged on Windows evidence alone. Runs the real package commands
+  # (test:ci, then the serialized PTY file, with test:ci's trailing fixture diff gate intact).
+  # Gated to pull requests whose base is NOT main (the diagnostic branch stack) and to manual
+  # dispatch: a PR against main already gets this matrix from test-install.yml, and running it
+  # twice there would only duplicate the trustworthy gate. Windows stays with `diagnose` above.
+  regression-posix:
+    name: regression (${{ matrix.os }}, node 20) — non-main PR base only
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref != 'main') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run regression suite (includes the snippet fixture diff gate)
+        run: npm run test:ci
+      - name: Run PTY-serialized regression tests
+        run: npm run test:ci:pty

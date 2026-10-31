@@ -32,7 +32,18 @@ const { startTestDaemon, createSessionId } = require('../test-support/daemon-har
 
 let daemon;
 
-before(async () => { daemon = await startTestDaemon(); });
+// #1207 — the daemon answers /api/health (the harness's readiness) while its ledger owner may still
+// be opening the directory store under the harness HOME; a tracked inject that lands in that window
+// is refused `503 recovering` by design. Wait for the ledger to reach the state the test needs, so
+// each arm asserts on the store it means to.
+async function awaitLedger(d, states = ['available'], timeoutMs = 20000) {
+  return d.waitFor(async () => {
+    const r = await d.request('/api/ledger/status');
+    return r.status === 200 && r.body && r.body.client && states.includes(r.body.client.store) ? r.body : null;
+  }, { timeoutMs, description: `ledger store in [${states.join('|')}]` });
+}
+
+before(async () => { daemon = await startTestDaemon(); await awaitLedger(daemon); });
 after(async () => { if (daemon) await daemon.stop(); });
 
 // A tracked dispatch: `from` present is what makes the daemon open a durable record.
@@ -139,6 +150,7 @@ test('tracking_unknown_survives_restart: a record survives a daemon restart and 
     // out, which would destroy the very state the restart is supposed to carry across.
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty60-restart-'));
     const first = await startTestDaemon({ homeDir });
+    await awaitLedger(first);
     let second = null;
     try {
       const sid = createSessionId('restart');
@@ -156,6 +168,9 @@ test('tracking_unknown_survives_restart: a record survives a daemon restart and 
 
       await first.kill();
       second = await startTestDaemon({ homeDir });
+      // #1207: recovery (segment replay + snapshot) runs off the main thread; a poll during it is
+      // `unavailable: recovering`, which is correct and not the arm under test.
+      await awaitLedger(second);
 
       const after = await second.request(`/api/inject-observations/${encodeURIComponent(injectId)}`);
       const body = assertDiscriminatedUnknown(after, 'after restart');
@@ -185,7 +200,11 @@ test('tracking_unknown_survives_restart: a record survives a daemon restart and 
 test('tracking_persist_failure_prevents_delivery: an unwritable ledger aborts the delivery, and no bytes reach the target', () => {
   return (async () => {
     // Make the ledger path unwritable in the one way that cannot be mistaken for anything else: its
-    // parent directory is a FILE, so mkdirSync throws and the atomic write returns {ok:false}.
+    // parent directory is a FILE. #1207: the ledger is a directory store beside an O_EXCL lock in
+    // that same parent, so the daemon's main-thread lock acquisition fails (ENOTDIR), no store is
+    // ever opened, and begin refuses before any mutation. The observed contract is unchanged —
+    // 500 TRACKING_PERSISTENCE_FAILED, tracking_state unavailable, reason tracking_persistence_failed,
+    // zero bytes delivered — and remains UNMEASURED until the frozen suites are executed.
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty60-nowrite-'));
     const blocker = path.join(home, 'blocked');
     fs.writeFileSync(blocker, 'not a directory');
@@ -193,6 +212,8 @@ test('tracking_persist_failure_prevents_delivery: an unwritable ledger aborts th
 
     const d = await startTestDaemon({ env: { TELEPTY_TRACKED_INJECTIONS_PATH: ledgerPath } });
     try {
+      // The store never becomes available here; wait until the client has left `recovering`.
+      await awaitLedger(d, ['unavailable', 'lock_present', 'unavailable_read'], 20000);
       const sid = createSessionId('nowrite');
       await d.spawnSession(sid);
       // A marker that could only appear on the target's screen if the bytes were delivered.

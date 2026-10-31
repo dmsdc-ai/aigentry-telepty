@@ -21,7 +21,7 @@
 // redirected and PORT pinned BEFORE requiring the daemon, so it cannot read or restore live
 // production session state into this test process.
 
-const { test, after } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -42,6 +42,17 @@ const { createCredentialStore } = require('../src/session-store/session-credenti
 const TOKEN = 'owner-displaced-60-token';
 const SID = 'displaced-60';
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// #1207 — the ledger under TMP_HOME is a worker-owned directory store. Owner-lifecycle facts are
+// stored ONCE as a session-scoped fact frame and overlaid onto every tracked inject of the session
+// in durable log order; the hot read model therefore does not carry them inline, and the records
+// are read the way the poll endpoint reads them (fetchTrackedInjection: owner + overlay). The two
+// facts keep their meaning and their fields; only where they live changed.
+before(async () => {
+  const opened = await daemon.ledgerReady;
+  assert.equal(opened.ok, true, `the private ledger must open first: ${JSON.stringify(opened)}`);
+});
+after(async () => { await daemon.ledgerClient.close(2000); });
 
 function newRecord() {
   return {
@@ -90,7 +101,11 @@ function buildDeps(server, sessions, credentials) {
     busAutoRoute: () => {},
     credentials,
     // The real seams. This is the point of the test: the ledger append has to actually happen.
+    // #1207: `listTrackedInjectionsForSession` is async (hot + cold) and the transport writes ONE
+    // durable session fact per lifecycle event through `recordSessionFact` — the daemon's real
+    // wiring, passed here exactly as daemon.js passes it.
     recordObservation: daemon.recordObservation,
+    recordSessionFact: daemon.recordSessionFact,
     listTrackedInjectionsForSession: daemon.listTrackedInjectionsForSession,
   };
 }
@@ -106,8 +121,13 @@ function connect(port, bearer) {
   });
 }
 
-const kindsOf = (injectId) =>
-  (daemon.getTrackedInjection(injectId).observations || []).map((o) => o.kind);
+// The record as a poll would see it: owner-served, lazy facts overlaid in log order (#1207).
+async function recordOf(injectId) {
+  const fetched = await daemon.fetchTrackedInjection(injectId);
+  assert.ok(fetched.record, `${injectId} must be readable from the ledger (reason: ${fetched.reason})`);
+  return fetched.record;
+}
+const kindsOf = async (injectId) => ((await recordOf(injectId)).observations || []).map((o) => o.kind);
 
 test('owner_displaced_without_markdead_reports_absence: both facts reach every tracked inject', async () => {
   const app = express();
@@ -124,9 +144,9 @@ test('owner_displaced_without_markdead_reports_absence: both facts reach every t
   // Two tracked injects for this session. The second SUPERSEDES the first, and the first is
   // retained deliberately — an owner replacement is exactly the kind of fact its reader still
   // needs, so "every tracked inject" has to mean every one, not just the active pointer.
-  const first = daemon.beginTrackedInjection({ injectId: 'inj-old', sessionId: SID, source: 'orch', session });
+  const first = await daemon.beginTrackedInjection({ injectId: 'inj-old', sessionId: SID, source: 'orch', session });
   assert.equal(first.ok, true);
-  const second = daemon.beginTrackedInjection({ injectId: 'inj-new', sessionId: SID, source: 'orch', session });
+  const second = await daemon.beginTrackedInjection({ injectId: 'inj-new', sessionId: SID, source: 'orch', session });
   assert.equal(second.ok, true);
 
   // The incumbent proves the credential, so the daemon knows the exact epoch its work is filed
@@ -142,9 +162,10 @@ test('owner_displaced_without_markdead_reports_absence: both facts reach every t
   await delay(250);
 
   for (const injectId of ['inj-old', 'inj-new']) {
-    assert.ok(kindsOf(injectId).includes('owner_replaced_observed'),
-      `expected owner_replaced_observed durably appended to ${injectId}, got ${JSON.stringify(kindsOf(injectId))}`);
-    const record = daemon.getTrackedInjection(injectId);
+    const kinds = await kindsOf(injectId);
+    assert.ok(kinds.includes('owner_replaced_observed'),
+      `expected owner_replaced_observed durably appended to ${injectId}, got ${JSON.stringify(kinds)}`);
+    const record = await recordOf(injectId);
     const observed = record.observations.find((o) => o.kind === 'owner_replaced_observed');
     assert.equal(observed.displaced_session_epoch, issued.epoch,
       'the fact must NAME the displaced instance, not merely report that something changed');
@@ -161,16 +182,17 @@ test('owner_displaced_without_markdead_reports_absence: both facts reach every t
     // lines up, with code 4001. Calling a close the daemon sent `session_process_exited` asserted
     // a child exit nobody observed — and BUS_EVENT_SCHEMA.md:153-156 already said, correctly, that
     // this path implies no process-exit observation. The code contradicted the repo's own doc.
-    assert.ok(kindsOf(injectId).includes('owner_transport_detached'),
-      `expected owner_transport_detached for ${injectId} without markDead, got ${JSON.stringify(kindsOf(injectId))}`);
-    assert.equal(kindsOf(injectId).includes('session_process_exited'), false,
+    const kinds = await kindsOf(injectId);
+    assert.ok(kinds.includes('owner_transport_detached'),
+      `expected owner_transport_detached for ${injectId} without markDead, got ${JSON.stringify(kinds)}`);
+    assert.equal(kinds.includes('session_process_exited'), false,
       'transport detachment is not process death: the displaced bridge may still be running');
   }
 
   // Neither fact is an outcome. Owner replacement is not task failure and death is not task
   // completion — the record stays unknown through both.
   for (const injectId of ['inj-old', 'inj-new']) {
-    const record = daemon.getTrackedInjection(injectId);
+    const record = await recordOf(injectId);
     assert.equal(record.capability.outcome_protocol, 'unavailable');
     for (const observation of record.observations) {
       assert.notEqual(observation.terminal, true, 'no owner-lifecycle observation may be terminal');

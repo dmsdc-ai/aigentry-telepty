@@ -11,6 +11,7 @@ const path = require('node:path');
 const I = require('../src/interaction');
 const P = require('../src/session-store/persistence');
 const R = require('../src/prompt-symbol-registry');
+const { assertOwnerOnlyMode } = require('../test-support/platform-contract');
 
 nodeTest('interaction-core-681 / baseline', { concurrency: false }, async t => {
   const output = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-interaction-681-baseline-'));
@@ -52,7 +53,7 @@ test('C7-v2-migration',()=>{const old={schema_version:2,generation:8,injections:
 test('C7-recovery-stages',()=>{const l=P.emptyTrackedInjections();for(const [id,stage,bytes] of [['p','prepared',0],['d','dispatched',null],['w','written',3]])l.interactions.actions[id]=record(request(id),stage,bytes);const result=loadCase('recovery',l);assert.equal(result.ok,true);assert.equal(result.ledger.interactions.actions.p.stage,'refused');assert.equal(result.ledger.interactions.actions.p.bytes_written,0);assert.equal(result.ledger.interactions.actions.d.stage,'outcome_unknown');assert.equal(result.ledger.interactions.actions.d.bytes_written,null);assert.equal(result.ledger.interactions.actions.w.stage,'written');});
 for(const kind of ['action-id','request-null-shape','unknown-bytes','written-terminal','request-expiry'])test(`C7-malformed-${kind}`,()=>{const r=request(), rec=record(r);if(kind==='action-id'){rec.request.action_id='other';rec.request_digest=I.digest(rec.request);}if(kind==='request-null-shape'){rec.request={identity:{sid:'s1'}};rec.request_digest=I.digest(rec.request);}if(kind==='unknown-bytes'){rec.stage='outcome_unknown';rec.bytes_written=-7;}if(kind==='written-terminal')rec.terminal=true;if(kind==='request-expiry'){rec.request.expires_at='bad';rec.request_digest=I.digest(rec.request);}const l=P.emptyTrackedInjections();l.interactions.actions.a1=rec;const result=loadCase(`malformed-${kind}`,l);assert.equal(result.ok,false,JSON.stringify(result));});
 test('C7-corrupt-future-maps',()=>{for(const [i,l] of [null,[],{schema_version:99,injections:{}},{schema_version:3,injections:{},interactions:{actions:[],pending:{}}}].entries())assert.equal(loadCase(`invalid-${i}`,l).ok,false);const f=path.join(output,'corrupt.json');fs.writeFileSync(f,'{bad');assert.equal(P.loadTrackedInjections(f).ok,false);assert.equal(fs.readFileSync(f,'utf8'),'{bad');});
-test('C7-atomic-save-private-mode',()=>{const s=store();assert.equal(s.commit(P.emptyTrackedInjections()),true);assert.equal(fs.statSync(s.file).mode&0o777,0o600);assert.equal(P.loadTrackedInjections(s.file).ok,true);});
+test('C7-atomic-save-private-mode',async(t)=>{const s=store();assert.equal(s.commit(P.emptyTrackedInjections()),true);await assertOwnerOnlyMode(t,s.file,'private mode');/* #879: named subtest, skipped on win32; the mode line only */assert.equal(P.loadTrackedInjections(s.file).ok,true);});
 test('C8-provider-disabled',()=>{for(const screen of ['', '› ', 'Press enter to continue','quoted historic prompt']){const result=R.observeInteraction({command:'codex',outputRing:[screen]});assert.equal(result.available,false);assert.deepEqual(result.supported_operations,[]);assert.equal(R.encodeInteraction(request(),result),null);}});
 
     for (const { id, fn } of tests) {
@@ -100,6 +101,68 @@ test('dispatch-valid-refused',async()=>{const x=makeCore(()=>({stage:'refused',b
   } finally {
     fs.rmSync(output, { recursive: true, force: true });
   }
+});
+
+// #1207 — the core's commit is ASYNC and persists one interaction delta per stage through the
+// ledger owner; a per-act reservation (class I) is taken BEFORE the first saveRecord. These cases
+// pin the seams a synthetic commit can prove: reservation refusal is `busy` with no commit, an
+// `'indeterminate'` commit is a refusal that NAMES the unknown storage outcome and never dispatches,
+// and a promise-returning commit drives prepared → dispatched → written exactly once each.
+nodeTest('interaction-core-681 / 1207-async-commit', { concurrency: false }, async t => {
+  const NOW = 100000;
+  function req(id = 'a1') { return { schema_version: 1, action_id: id, interaction_request_id: 'ir1', identity: { kind: 'manual', sid: 's1' }, expected: { sid: 's1', session_epoch: 'e1', credential_generation: 1, owner_generation: 'o1', input_generation: 1, geometry_generation: 1, prompt_revision: 'r1', frame_digest: 'a'.repeat(64), surface_id: 'surface1', cols: 80, rows: 24, question_id: 'q1' }, operation: 'key', value: 'down', authority: { provenance: 'controller-policy', reference: 'p1' }, expires_at: NOW + 10000 }; }
+  function observation(r = req()) { return { ...r.expected, available: true, current_frame: true, provenance: 'measured-provider', expires_at: NOW + 20000, mode: 'single_choice', routine: true, supported_operations: ['key'] }; }
+  function makeCore(commit, extra = {}) {
+    let ledger = P.emptyTrackedInjections(); const commits = []; const dispatches = []; const acts = [];
+    const core = I.createInteractionCore({
+      readLedger: () => ledger,
+      commitLedger: async (next, change) => { commits.push({ stage: change.record.stage, pending: change.pending }); const r = await commit(next, change, commits.length); if (r === true) ledger = next; return r; },
+      observe: () => observation(), binding: () => ({ ...req().expected }), authorize: (p) => p === 'ctl', pendingTask: () => null,
+      dispatch: async (f) => { dispatches.push(f); return { stage: 'written', bytes_written: 3, reason: null }; }, now: () => NOW,
+      reserveAct: (sid) => { acts.push(['reserve', sid]); return extra.reserve === undefined ? true : extra.reserve; },
+      releaseAct: (sid) => { acts.push(['release', sid]); },
+      ...extra.deps,
+    });
+    return { core, commits, dispatches, acts, get ledger() { return ledger; } };
+  }
+  await t.test('async promise commit drives the three stages once each; reservation held for the act and released in finally', async () => {
+    const x = makeCore(async () => true);
+    const receipt = await x.core.act(req(), 'ctl');
+    assert.equal(receipt.stage, 'written');
+    assert.deepEqual(x.commits.map((c) => c.stage), ['prepared', 'dispatched', 'written']);
+    assert.equal(x.dispatches.length, 1);
+    assert.deepEqual(x.acts, [['reserve', 's1'], ['release', 's1']]);
+    assert.equal(x.core.lookup('a1').stage, 'written');
+  });
+  await t.test('reservation refused ⇒ busy, before any commit or dispatch', async () => {
+    const x = makeCore(async () => true, { reserve: false });
+    const receipt = await x.core.act(req(), 'ctl');
+    assert.equal(receipt.reason, 'busy');
+    assert.deepEqual(x.commits, []); assert.deepEqual(x.dispatches, []);
+    assert.deepEqual(x.acts, [['reserve', 's1']], 'nothing to release: the act never started');
+  });
+  await t.test('an indeterminate commit at prepared is a NAMED unknown storage outcome: refused, storage_outcome:indeterminate, no dispatch, not reported as persisted', async () => {
+    const x = makeCore(async () => 'indeterminate');
+    const receipt = await x.core.act(req(), 'ctl');
+    assert.equal(receipt.stage, 'refused'); assert.equal(receipt.reason, 'storage_unavailable'); assert.equal(receipt.storage_outcome, 'indeterminate');
+    assert.deepEqual(x.dispatches, []);
+    assert.equal(x.core.lookup('a1'), null, 'the read model was never advanced on an unknown outcome');
+    assert.deepEqual(x.acts, [['reserve', 's1'], ['release', 's1']]);
+  });
+  await t.test('an indeterminate FINAL commit after a dispatch keeps outcome_unknown and names the storage outcome; a false commit before dispatch refuses without dispatching', async () => {
+    const x = makeCore(async (next, change, n) => (n === 3 ? 'indeterminate' : true));
+    const receipt = await x.core.act(req(), 'ctl');
+    assert.equal(receipt.stage, 'outcome_unknown'); assert.equal(receipt.bytes_written, null); assert.equal(receipt.storage_outcome, 'indeterminate'); assert.equal(receipt.action_id, 'a1');
+    assert.equal(x.dispatches.length, 1);
+    const y = makeCore(async (next, change, n) => n !== 2);
+    const r2 = await y.core.act(req('a2'), 'ctl');
+    assert.equal(r2.reason, 'storage_unavailable'); assert.equal(r2.storage_outcome, undefined); assert.deepEqual(y.dispatches, []);
+  });
+  await t.test('a construction site without reserve/release keeps the pre-#1207 behaviour (always admitted)', async () => {
+    let ledger = P.emptyTrackedInjections();
+    const core = I.createInteractionCore({ readLedger: () => ledger, commitLedger: (next) => { ledger = next; return true; }, observe: () => observation(), binding: () => ({ ...req().expected }), authorize: () => true, pendingTask: () => null, dispatch: async () => ({ stage: 'written', bytes_written: 3, reason: null }), now: () => NOW });
+    assert.equal((await core.act(req(), 'x')).stage, 'written');
+  });
 });
 
 nodeTest('interaction-core-681 / link-controls', { concurrency: false }, async t => {

@@ -156,6 +156,12 @@ function defaultTrackedInjectionsPath(homeDir = os.homedir()) {
   return path.join(homeDir, '.config', 'aigentry-telepty', 'tracked-injections.json');
 }
 
+// #1207 — the ledger lock lives BESIDE the store, never inside it: the store path is a directory
+// only after migration, and the lock must exist before the first legacy read (CUTOVER §4 L0).
+function defaultTrackedInjectionsLockPath(trackedPath = defaultTrackedInjectionsPath()) {
+  return path.join(path.dirname(trackedPath), 'tracked-injections.lock');
+}
+
 function emptyTrackedInjections() {
   return { schema_version: TRACKED_INJECTIONS_SCHEMA_VERSION, generation: 0, injections: {},
     interactions: { actions: {}, pending: {} } };
@@ -313,6 +319,7 @@ module.exports = {
   TRACKED_INJECTIONS_SCHEMA_VERSION,
   MAX_OBSERVATIONS_PER_RECORD,
   defaultTrackedInjectionsPath,
+  defaultTrackedInjectionsLockPath,
   emptyTrackedInjections,
   saveTrackedInjections,
   loadTrackedInjections,

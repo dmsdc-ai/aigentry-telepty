@@ -58,6 +58,12 @@ function installWebSocketTransport(deps) {
     // omits them gets the bus-only behaviour instead of a throw.
     recordObservation,
     listTrackedInjectionsForSession,
+    // #1207 — one durable session-scoped FACT per lifecycle event (overlaid onto every tracked
+    // inject of the session in log order) replaces one whole-ledger rewrite per record. Optional:
+    // a harness that passes only `recordObservation` keeps the per-record path. `ledgerLive`
+    // tells the owner which sessions are live (resident-tier hint; correctness never depends on it).
+    recordSessionFact,
+    ledgerLive,
     // #826 — policy + audit for the viewer write path, so it matches POST /inject. Returns
     // whether the frame may be forwarded, and records the attempt either way. Optional, same
     // convention as above; the daemon always passes it.
@@ -73,23 +79,29 @@ function installWebSocketTransport(deps) {
    *
    * Returns the named results, one per record — never undefined, never a bare return.
    */
-  function recordOwnerLifecycle(sessionId, session, cause, evidence) {
-    if (typeof recordObservation !== 'function' || typeof listTrackedInjectionsForSession !== 'function') {
+  async function recordOwnerLifecycle(sessionId, session, cause, evidence) {
+    if ((typeof recordSessionFact !== 'function' && typeof recordObservation !== 'function') || typeof listTrackedInjectionsForSession !== 'function') {
       // Named, not silent: a construction site without the ledger seam still emitted the bus
       // lifecycle event above, and this says exactly what did not happen.
       return ['observation_ledger_unavailable'];
     }
-    const records = listTrackedInjectionsForSession(sessionId);
-    if (records.length === 0) return ['no_tracked_inject'];
+    // #1207 — hot AND cold records of the session (the owner answers in ≤ 64 KiB chunks).
+    const records = await listTrackedInjectionsForSession(sessionId);
+    if (!Array.isArray(records) || records.length === 0) return ['no_tracked_inject'];
+    if (typeof recordSessionFact === 'function') {
+      // One fact frame for the whole session; one bus event per record; results one per record.
+      return recordSessionFact({ sessionId, session, cause, evidence, records, trigger: 'owner_lifecycle' });
+    }
     const active = pendingReports[sessionId] || null;
-    return records.map((record) => {
+    const results = [];
+    for (const record of records) {
       // Reuse the LIVE pending report when this is the session's active inject, so its consumption
       // provenance survives; a superseded record gets a minimal stub, which classifies as
       // `no_consumption_evidence` — accurate, because nothing about consumption was measured here.
       const pendingReport = active && active.injectId === record.inject_id
         ? active
         : { injectId: record.inject_id, source: record.transport_source };
-      return recordObservation({
+      results.push(await recordObservation({
         sessionId,
         session,
         pendingReport,
@@ -101,8 +113,9 @@ function installWebSocketTransport(deps) {
         evidence,
         deliverToSource: true,
         trigger: 'owner_lifecycle',
-      });
-    });
+      }));
+    }
+    return results;
   }
 
   // #843 B — the delivery adapters behind the ONE viewer-write gate.
@@ -203,6 +216,7 @@ function installWebSocketTransport(deps) {
             };
       initializeBootstrapState(autoSession);
       sessions[sessionId] = autoSession;
+      if (typeof ledgerLive === 'function') ledgerLive(sessionId, true);   // #1207 resident-tier hint
       console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect (command: ${autoSession.command})`);
       // Set tab title via kitty (no \x0c redraw — it causes flickering on multi-session reconnect)
       setTimeout(() => {
@@ -386,11 +400,12 @@ function installWebSocketTransport(deps) {
         // the mapper fails CLOSED to `unmapped_transition_cause` (missing required evidence). That
         // is the correct outcome and it is left to happen: the honest statement is "an owner was
         // replaced and we cannot bind it to an instance", never a synthesized epoch.
-        const results = recordOwnerLifecycle(sessionId, activeSession, 'owner_epoch_replaced', {
+        recordOwnerLifecycle(sessionId, activeSession, 'owner_epoch_replaced', {
           displaced_session_epoch: displacedSessionEpoch,
           displaced_owner_pid: displacedOwnerPid,
-        });
-        console.log(`[OBSERVE] ${sessionId} owner replaced — ${results.length} tracked inject(s): ${results.join(', ')}`);
+        }).then((results) => {
+          console.log(`[OBSERVE] ${sessionId} owner replaced — ${results.length} tracked inject(s): ${results.join(', ')}`);
+        }).catch((error) => console.error(`[OBSERVE] ${sessionId} owner replaced — lifecycle fact failed: ${error && error.message}`));
         // #60 Stage A §3 item 3 — mark the displaced socket so its own close handler can report
         // the death. Once `ownerWs` moved, that handler takes the "client detached" branch and the
         // displaced bridge's exit becomes invisible; the bridge reads close 4001 as terminal and
@@ -626,11 +641,12 @@ function installWebSocketTransport(deps) {
       // rule correctly ("no process-exit observation is implied") while the code beside it
       // implied exactly that.
       if (ws.__teleptyDisplaced) {
-        const results = recordOwnerLifecycle(sessionId, activeSession, 'owner_transport_detached', {
+        recordOwnerLifecycle(sessionId, activeSession, 'owner_transport_detached', {
           detached_at: new Date().toISOString(),
           displaced_session_epoch: ws.__teleptyDisplacedEpoch || null,
-        });
-        console.log(`[OBSERVE] ${sessionId} displaced owner socket detached — ${results.length} tracked inject(s): ${results.join(', ')}`);
+        }).then((results) => {
+          console.log(`[OBSERVE] ${sessionId} displaced owner socket detached — ${results.length} tracked inject(s): ${results.join(', ')}`);
+        }).catch((error) => console.error(`[OBSERVE] ${sessionId} displaced owner socket detached — lifecycle fact failed: ${error && error.message}`));
       }
 
       if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {

@@ -337,6 +337,45 @@ recorded. That is a measurement, not a proven ceiling, and a door found later is
 rather than a nuisance. No quantifier ("both", "all", "every") should replace this list: the
 previous wording said "both write paths" because two had been looked at, not because two existed.
 
+### Bootstrap / modal queue terminal notifications (#1207 candidate — acceptance pending)
+
+These describe the **candidate** delivery runtime under independent measurement for #1207; they are not
+an installed update. All three are session events (envelope as above, `sender: "daemon"`,
+`session_id`, `timestamp`, `transport`, `semantic`, plus a `bootstrap` block) emitted when an
+operation that was accepted into the per-session bootstrap/modal queue can no longer be delivered.
+
+```json
+{ "type": "bootstrap_ready_timeout", "session_id": "string", "reason": "string", "actionable": true, "queued_dropped": "number", "hint": "string", "bootstrap": { "...": "..." }, "timestamp": "ISO 8601" }
+```
+- Session-level **cause** notification, emitted first and unchanged. It states how many queued ops are
+  being dropped; it makes no claim about any dispatch's durable state.
+
+```json
+{ "type": "bootstrap_queue_failed", "session_id": "string", "op_id": "UUID", "operation": "inject|submit", "code": "string", "error": "string", "tracking": "tracking_aborted|tracking_outcome_indeterminate|tracking_persistence_failed|tracking_unavailable|no_tracked_inject", "bootstrap": { "...": "..." }, "timestamp": "ISO 8601" }
+```
+- Per-operation **terminal** notification (drain refusal, drain throw, bootstrap-ready timeout).
+  `tracking` is additive and states the persistence outcome the notification is based on; the event
+  is emitted **only after the terminal persistence attempt has settled**, never while it is in flight.
+- `tracking_aborted`: the dispatch's terminal `aborted` state is durable (fsynced commit ACK) and the
+  ledger reads `aborted`. Every other value is **not** a durably aborted dispatch:
+  `tracking_outcome_indeterminate` (a write/fsync attempt happened, durability unknown, the ledger
+  still reads `tracked`, the transaction is held unresolved and never retried automatically),
+  `tracking_persistence_failed` (refused or failed before durability), `tracking_unavailable` (the
+  store refused by name; the record may be unknown to it). `no_tracked_inject` means the op carried no
+  `injectId` (an untracked boot-time op) — it is not an owner persistence outcome and no record exists.
+- Ordering: the session-level `bootstrap_ready_timeout` cause **may precede** the per-operation
+  `bootstrap_queue_failed` notifications, which follow in queue (FIFO) order, each after its own
+  outcome.
+
+```json
+{ "type": "modal_park_timeout", "session_id": "string", "actionable": true, "queued_dropped": "number", "waited_ms": "number", "tracking": [ { "op_id": "UUID", "inject_id": "UUID|null", "outcome": "tracking_aborted|tracking_outcome_indeterminate|tracking_persistence_failed|tracking_unavailable|no_tracked_inject" } ], "hint": "string", "bootstrap": { "...": "..." }, "timestamp": "ISO 8601" }
+```
+- Emitted once per flush, **after every dropped op's terminal attempt has settled**; `tracking` lists
+  the outcome per op with the same vocabulary. The awaitable form `awaitModalParkDrain()` still
+  resolves `{ cleared, waited_ms, flushed }` with `flushed` a **number** (ops flushed), unchanged.
+- A consumer must not read any of these notifications as "delivered" or, unless `tracking` says
+  `tracking_aborted`, as "durably aborted". Poll the record for its committed state.
+
 ### `message_routed`
 ```json
 { "type": "message_routed", "message_id": "UUID", "from": "string", "to": "string", "reply_to": "string", "inject_id": "UUID", "deliberation_session_id": "string|null", "thread_id": "string|null", "timestamp": "ISO 8601" }

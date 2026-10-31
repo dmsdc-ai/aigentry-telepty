@@ -20,17 +20,48 @@ function createSessionActions(shared, effects = {}) {
   }
 
   function markAbsenceDeliveredToSource(record, identity) {
-    let delivered = shared.deliveredAbsenceIdentities.get(record);
+    // #1207 — read-model records are immutable copies replaced on every ack, so the per-inject key
+    // is the client's stable identity object for that inject (same lifetime as its residency); a
+    // record that did not come from the read model keys on itself, exactly as before.
+    const key = (shared.ledgerClient && record && shared.ledgerClient.readModel.identityOf(record.inject_id)) || record;
+    let delivered = shared.deliveredAbsenceIdentities.get(key);
     if (!delivered) {
       delivered = new Set();
-      shared.deliveredAbsenceIdentities.set(record, delivered);
+      shared.deliveredAbsenceIdentities.set(key, delivered);
     }
     if (delivered.has(identity)) return true;
     delivered.add(identity);
     return false;
   }
 
-  function recordObservation({
+  // #1207 — which ledger class a measured observation belongs to. Result-class (R) observations are
+  // the ones a dispatch's source is waiting for (idle auto-report, death, park); everything a screen
+  // transition produced is class O. The class decides which reservation admits the write — it never
+  // changes the observation's name or fields.
+  function observationClass(mapped, destination, trigger) {
+    if (trigger && trigger !== 'transition' && trigger !== 'owner_lifecycle') return 'R';   // ready-signal / real-idle / silence-timeout
+    if (destination === 'dead' || destination === 'idle') return 'R';
+    if (trigger === 'owner_lifecycle') return 'L';
+    return 'O';
+  }
+
+  // Maps one ledger outcome onto the named `tracking_result` vocabulary the bus and the source hear.
+  function trackingResultFor(outcome) {
+    switch (outcome.outcome) {
+      case 'ack': return outcome.result === 'observation_duplicate' ? 'observation_duplicate'
+        : outcome.result === 'already_terminal' ? 'already_terminal'
+          : outcome.record_state === 'superseded' ? 'tracking_superseded' : 'observation_emitted';
+      case 'rejected_admission': return outcome.reason === 'tracking_capacity_result' ? 'tracking_capacity_result'
+        : outcome.reason === 'tracking_capacity_exhausted' ? 'tracking_capacity_exhausted' : 'tracking_backpressure';
+      case 'indeterminate': return 'tracking_outcome_indeterminate';
+      case 'nack': return ['record_missing', 'not_observed_by_daemon_epoch', 'cold_offline'].includes(outcome.reason) ? 'tracking_unavailable'
+        : ['recovering', 'owner_failed', 'unavailable_write', 'unavailable_read', 'lock_present', 'shutting_down', 'unavailable'].includes(outcome.reason) ? 'tracking_unavailable'
+          : 'tracking_persistence_failed';
+      default: return 'tracking_persistence_failed';
+    }
+  }
+
+  async function recordObservation({
     sessionId,
     session,
     pendingReport,
@@ -74,7 +105,7 @@ function createSessionActions(shared, effects = {}) {
     }
 
     const injectId = pendingReport ? pendingReport.injectId : null;
-    const record = injectId ? (0, shared.getTrackedInjection)(injectId) : null;
+    let record = injectId ? (0, shared.getTrackedInjection)(injectId) : null;
 
     const consumption = pendingReport
       ? (0, shared.classifyConsumption)(pendingReport, {
@@ -83,49 +114,50 @@ function createSessionActions(shared, effects = {}) {
       })
       : { status: 'not_established', basis: 'no_tracked_inject' };
 
-    // Duplicate suppression by observation identity. It suppresses the repeat NOTIFICATION; it is
-    // not an authority gate, and it can never prevent a future genuine observation of a different
-    // kind from being recorded.
+    // #1207 — no speculative in-memory append, no rollback, and NO client-side dedup shortcut
+    // (errata C3): the owner alone decides `observation_duplicate` against its ORDERED overlay
+    // (committed frames + pending frames of the open group, in log position), so a committed A,
+    // pending B, incoming A is written rather than dropped. Admission is reserve-before-accept
+    // (errata C5): the write is either persisted (ack / nack-invalid / indeterminate) or rejected
+    // before anything is queued, with a named result either way. The bus hears every outcome.
     let result = 'observation_emitted';
-    if (record) {
-      const identity = observationIdentity(mapped.kind, mapped.cause);
-      if (record.last_observation && observationIdentity(record.last_observation.kind, record.last_observation.trigger) === identity) {
-        result = 'observation_duplicate';
+    let outcome = null;
+    if (injectId) {
+      const client = shared.ledgerClient;
+      const unavailable = client && typeof shared.ledgerUnavailable === 'function' ? (0, shared.ledgerUnavailable)() : { reason: 'observation_store_unavailable' };
+      if (unavailable) {
+        // Unavailable authorizes nothing. Explicit, named, never silence.
+        result = 'tracking_unavailable';
       } else {
-        // #843 — snapshot BEFORE the in-memory append, because the append is speculative until the
-        // commit lands. Two defects rode on its absence, and they compounded:
-        //   1. the failed-commit branch below used to `return` HERE, ahead of the broadcast, so a
-        //      store that could not be written emitted NOTHING — no bus event, no source delivery.
-        //      That is §A2 ("absence is emitted, never silence") violated inside the emitter written
-        //      to enforce §A2, on the one condition an operator most needs to hear about;
-        //   2. `appendLedgerObservation` had already moved `last_observation`, so the identity dedup
-        //      then suppressed every RETRY of that same measurement as a duplicate of an append that
-        //      never reached disk. The first attempt was silent and it silenced all the rest.
-        // The rollback is what makes the retry meaningful; falling through to the broadcast is what
-        // makes the failure audible. Neither alone is enough.
-        const priorSeq = record.observation_seq;
-        const priorLast = record.last_observation;
-        const priorObservations = Array.isArray(record.observations) ? record.observations.slice() : [];
-        const priorCapability = record.capability;
-        shared.sessionPersistence.appendLedgerObservation(record, { ...observation, consumption_status: consumption.status }, nowIso);
-        record.capability = { ...shared.CAPABILITY_STAGE_A, ...(record.capability || {}) };
-        const committed = (0, shared.commitTrackedInjections)();
-        if (!committed.ok) {
-          record.observation_seq = priorSeq;
-          record.last_observation = priorLast;
-          record.observations = priorObservations;
-          record.capability = priorCapability;
+        try {
+          if (!record) {
+            // A record this daemon epoch has not got hot (cold tier, or never tracked here). Reads
+            // never reheat; a WRITE does, under resident admission and the job reservation.
+            const hot = await client.ensureHot(injectId);
+            if (hot.ok) record = (0, shared.getTrackedInjection)(injectId);
+            else if (hot.outcome && hot.outcome.outcome === 'rejected_admission') result = hot.reason === 'hot_capacity' ? 'tracking_backpressure' : 'tracking_capacity_exhausted';
+            else if (hot.outcome && hot.outcome.outcome === 'indeterminate') result = 'tracking_outcome_indeterminate';
+            else result = 'tracking_unavailable';
+          }
+          if (record) {
+            const cls = observationClass(mapped, destination, trigger);
+            outcome = await client.submit('obs', {
+              id: injectId,
+              observation: { ...observation, consumption_status: consumption.status, at: nowIso },
+            }, { class: cls, jobId: injectId, result: cls === 'R' });
+            result = trackingResultFor(outcome);
+            if (outcome.outcome === 'ack') record = (0, shared.getTrackedInjection)(injectId) || record;
+            if (outcome.outcome !== 'ack') {
+              console.error(`[OBSERVE] ledger write for ${injectId} → ${outcome.outcome} (${outcome.reason || outcome.result || ''}) — `
+                + `${observation.kind} is emitted on the bus and is NOT described as durable`);
+            }
+          }
+        } catch (error) {
+          // The emitter never throws into a listener; the bus still hears a named absence.
           result = 'tracking_persistence_failed';
-          console.error(`[OBSERVE] ledger commit FAILED for ${injectId} (${committed.reason}) — `
-            + `${observation.kind} was emitted on the bus but is NOT durable`);
-        } else if (record.tracking_state === 'superseded') {
-          result = 'tracking_superseded';
+          console.error(`[OBSERVE] ledger write threw for ${injectId}: ${error && error.message}`);
         }
       }
-    } else if (injectId) {
-      // A tracked inject whose record we cannot find (pre-v2, another daemon epoch, corrupt store).
-      // Explicit, named, never silence.
-      result = 'tracking_unavailable';
     }
 
     if (mapped.kind === 'unmapped_transition_cause') result = 'unmapped_transition_cause';
@@ -146,7 +178,11 @@ function createSessionActions(shared, effects = {}) {
       extra: { ...envelope, tracking_result: result, source: pendingReport ? pendingReport.source : null },
     });
 
-    if (deliverToSource && pendingReport && result !== 'observation_duplicate') {
+    // #1207 — the source is notified only AFTER the fsynced ACK (durable before delivery). A
+    // duplicate, a pre-admission rejection, an invalid nack or an indeterminate outcome is on the
+    // bus with its name and is never pushed as if it had been recorded.
+    const durable = outcome ? outcome.outcome === 'ack' && outcome.basis === 'written' : !injectId;
+    if (deliverToSource && pendingReport && result !== 'observation_duplicate' && durable) {
       // gh#82(F): while there is no outcome protocol, only absences made of a daemon-measured
       // process/transport fact are PUSHED to the source; the screen-derived rows (pty_quiet, a
       // repeated-error pattern matched on spinner frames, …) fired on essentially every inject to a
@@ -175,6 +211,59 @@ function createSessionActions(shared, effects = {}) {
       }
     }
     return result;
+  }
+
+  /**
+   * #1207 — an owner-lifecycle FACT about a session (owner replaced, displaced transport detached):
+   * stored ONCE as a session-scoped fact frame and overlaid lazily, in log order, onto every tracked
+   * inject assigned to that session (hot and cold alike) — instead of one whole-ledger rewrite per
+   * record. The bus hears one `task_completion_unknown` per record, as today, with the ONE durable
+   * outcome as its `tracking_result`; the source is notified per record only after the ACK.
+   * Returns the named results, one per record — never undefined, never a bare return.
+   */
+  async function recordSessionFact({ sessionId, session, cause, evidence, records, trigger = 'owner_lifecycle', deps = {} }) {
+    const _broadcast = deps.broadcastSessionEvent || shared.broadcastSessionEvent;
+    const _sessions = deps.sessions || shared.sessions;
+    const _resolveAlias = deps.resolveSessionAlias || shared.resolveSessionAlias;
+    const _deliver = deps.deliverInjectionToSession || shared.deliverInjectionToSession;
+    const nowIso = new Date().toISOString();
+    const mapped = (0, shared.mapObservationCause)({ destination: null, cause, evidence });
+    const observation = { kind: mapped.kind, trigger: mapped.cause, ...mapped.fields, emitted_via: trigger };
+    if (!Array.isArray(records) || records.length === 0) return ['no_tracked_inject'];
+    const client = shared.ledgerClient;
+    const unavailable = client && typeof shared.ledgerUnavailable === 'function' ? (0, shared.ledgerUnavailable)() : { reason: 'observation_store_unavailable' };
+    let result = 'observation_emitted';
+    let outcome = null;
+    if (unavailable) result = 'tracking_unavailable';
+    else {
+      try {
+        outcome = await client.submit('fact', { scope: 'session', sid: sessionId, observation: { ...observation, at: nowIso } }, { class: 'L' });
+        result = trackingResultFor(outcome);
+      } catch (error) { result = 'tracking_persistence_failed'; console.error(`[OBSERVE] session fact threw for ${sessionId}: ${error && error.message}`); }
+    }
+    if (mapped.kind === 'unmapped_transition_cause') result = 'unmapped_transition_cause';
+    const durable = outcome && outcome.outcome === 'ack' && outcome.basis === 'written';
+    const active = (0, shared.getPendingReport)(sessionId);
+    return records.map((rec) => {
+      const pendingReport = active && active.injectId === rec.inject_id ? active : { injectId: rec.inject_id, source: rec.transport_source };
+      const live = (0, shared.getTrackedInjection)(rec.inject_id);
+      const consumption = active && active.injectId === rec.inject_id ? (0, shared.classifyConsumption)(pendingReport, {}) : { status: 'not_established', basis: 'no_tracked_inject' };
+      const seq = (Number(rec.observation_seq) || 0) + (durable ? 1 : 0);
+      const envelope = (0, shared.buildCompletionUnknown)({
+        sessionId, injectId: rec.inject_id, observation: { ...observation, seq, at: nowIso }, consumption,
+        capability: (live && live.capability) || rec.capability || shared.CAPABILITY_STAGE_A, observationSeq: seq,
+      });
+      _broadcast('task_completion_unknown', sessionId, session, { timestamp: nowIso, extra: { ...envelope, tracking_result: result, source: pendingReport.source || null } });
+      if (durable && pendingReport.source && (0, shared.shouldPushCompletionUnknown)(envelope)) {
+        const key = observationIdentity(mapped.kind, mapped.cause) + '|' + rec.inject_id;
+        if (!(live && markAbsenceDeliveredToSource(live, key))) {
+          const srcId = _resolveAlias(pendingReport.source) || pendingReport.source;
+          const srcSession = _sessions[srcId];
+          if (srcSession) _deliver(srcId, srcSession, (0, shared.formatCompletionUnknownText)(envelope), { noEnter: false, source: 'auto_report' });
+        }
+      }
+      return result;
+    });
   }
 
   function pendingReportHasSubmitEvidence(pendingReport) {
@@ -1267,11 +1356,27 @@ function createSessionActions(shared, effects = {}) {
     });
   }
 
+  // #1215 — the exact own-record lookup the opt-in exact-target inject and owned delete share: an
+  // own, object-valued property of `sessions` and nothing else (mirrors ownRecord in
+  // session-records.js). No alias/sibling resolution, no prototype adoption.
+  function exactOwnSessionId(requestedId) {
+    if (typeof requestedId !== 'string') return null;
+    const descriptor = Object.getOwnPropertyDescriptor(shared.sessions, requestedId);
+    const value = descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value') ? descriptor.value : null;
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? requestedId : null;
+  }
+
   function registerInjectRoute(app) {
     app.post('/api/sessions/:id/inject', async (req, res) => {
       const requestedId = req.params.id;
-      const resolvedId = (0, shared.resolveSessionAlias)(requestedId);
-      if (!resolvedId) return (0, shared.respondWithError)(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId });
+      // #1215 inject-exact-target — opt-in exact routing. With boolean `exact_target:true` the
+      // target is the exact own record or nothing: a bare alias or a `-N` sibling name is 404 here
+      // and never reaches resolveSessionAlias' most-recent-sibling fallback, so no bytes, audit line
+      // or tracking record exist for it. For an exact id every guard below runs unchanged, and only
+      // the success body additionally confirms `exact_target` and the actual `session_id`.
+      const exactTarget = !!(req.body && req.body.exact_target === true);
+      const resolvedId = exactTarget ? exactOwnSessionId(requestedId) : (0, shared.resolveSessionAlias)(requestedId);
+      if (!resolvedId) return (0, shared.respondWithError)(res, 404, 'SESSION_NOT_FOUND', 'Session not found', { requested: requestedId, ...(exactTarget ? { exact_target: true } : {}) });
       const session = shared.sessions[resolvedId];
       const id = resolvedId;
       const { prompt, no_enter, auto_submit, thread_id, reply_expected } = req.body;
@@ -1337,14 +1442,25 @@ function createSessionActions(shared, effects = {}) {
       // Scoped to tracked injects (`from` present) — an untracked operator inject is unaffected.
       let trackedRecord = null;
       if (from) {
-        const begun = (0, shared.beginTrackedInjection)({ injectId: inject_id, sessionId: id, source: from, session });
+        // #1207 — the begin is durable (fsynced commit ACK) before this await returns; capacity and
+        // availability refusals are 503 TRACKING_CAPACITY with the named reason, an unreadable
+        // store or an indeterminate outcome stays the existing 500 branch with its reason.
+        const begun = await (0, shared.beginTrackedInjection)({ injectId: inject_id, sessionId: id, source: from, session });
         if (!begun.ok) {
+          if (begun.capacity) {
+            (0, shared.emitInjectFailureEvent)(id, 'TRACKING_CAPACITY',
+              'Observation tracking capacity is not available; no task bytes were delivered.',
+              { inject_id, from: from || null, reason: begun.reason }, session);
+            return (0, shared.respondWithError)(res, 503, 'TRACKING_CAPACITY',
+              'Observation tracking capacity is not available; no task bytes were delivered.',
+              { inject_id, tracking_state: 'unavailable', reason: begun.reason });
+          }
           (0, shared.emitInjectFailureEvent)(id, 'TRACKING_PERSISTENCE_FAILED',
             'Observation tracking could not be persisted; no task bytes were delivered.',
-            { inject_id, from: from || null }, session);
+            { inject_id, from: from || null, reason: begun.reason }, session);
           return (0, shared.respondWithError)(res, 500, 'TRACKING_PERSISTENCE_FAILED',
             'Observation tracking could not be persisted; no task bytes were delivered.',
-            { inject_id, tracking_state: 'unavailable', reason: 'tracking_persistence_failed' });
+            { inject_id, tracking_state: 'unavailable', reason: begun.reason === 'tracking_outcome_indeterminate' ? 'tracking_outcome_indeterminate' : 'tracking_persistence_failed' });
         }
         trackedRecord = begun.record;
         shared.pendingReports[id] = {
@@ -1392,7 +1508,7 @@ function createSessionActions(shared, effects = {}) {
           // body for the same reason: a caller told its dispatch was refused must be able to poll the
           // record that says so.
           const aborted = trackedRecord
-            ? (0, shared.abortTrackedInjection)(inject_id, id, delivery.code, delivery.error)
+            ? await (0, shared.abortTrackedInjection)(inject_id, id, delivery.code, delivery.error)
             : 'no_tracked_inject';
           return (0, shared.respondWithError)(res, delivery.httpStatus || 500, delivery.code || 'DELIVERY_FAILED', delivery.error,
             { inject_id, tracking_state: aborted === 'tracking_aborted' ? 'aborted' : 'unavailable' });
@@ -1505,6 +1621,7 @@ function createSessionActions(shared, effects = {}) {
           inject_id,
           strategy: delivery.strategy,
           submit: delivery.submit,
+          ...(exactTarget ? { exact_target: true, session_id: id } : {}),
           ...(delivery.bootstrap_queued ? {
             bootstrap_queued: true,
             bootstrap_op_id: delivery.bootstrap_op_id || delivery.msg_id,
@@ -1553,11 +1670,27 @@ function createSessionActions(shared, effects = {}) {
   function registerDeleteRoute(app) {
     app.delete('/api/sessions/:id', (req, res) => {
       const requestedId = req.params.id;
+      // #1215 delete-owned-session — opt-in owned delete. `?owned=true` names the exact own record
+      // only (no resolveSessionForDestroy fallback: a bare alias is 404 even with one live sibling).
+      const ownedDelete = req.query.owned === 'true';
       // #548: destructive op — must not cascade across alias-sharing siblings.
-      const resolvedId = (0, shared.resolveSessionForDestroy)(requestedId);
+      const resolvedId = ownedDelete ? exactOwnSessionId(requestedId) : (0, shared.resolveSessionForDestroy)(requestedId);
       if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
       const session = shared.sessions[resolvedId];
       const id = resolvedId;
+      // #1215 — an owned delete must present THIS instance's current credential: the verified
+      // principal's sid, epoch and generation all matching the record. Checked before isClosing and
+      // every side effect below (kill, unregister, revoke, purge, persist); a missing, foreign or
+      // stale bearer is a 403 with no mutation. Requests without `owned=true` are untouched.
+      if (ownedDelete) {
+        const principal = (0, shared.verifiedPrincipalFromReq)(req);
+        const generation = Number(session.credentialGeneration) || 1;
+        if (!principal || principal.sid !== id || !session.sessionEpoch
+            || principal.epoch !== session.sessionEpoch || principal.generation !== generation) {
+          return (0, shared.respondWithError)(res, 403, 'OWNED_DELETE_FORBIDDEN',
+            'Owned delete requires the current session credential.', { requested: requestedId });
+        }
+      }
       if (session.isClosing) return res.json({ success: true, status: 'closing' });
       // BUG-C (shared-fate): a wrapped session can be co-bound by a stale/displaced owner bridge
       // (duplicate --id). A DELETE carrying a token that is NOT the current owner's, while a live
@@ -1756,6 +1889,9 @@ function createSessionActions(shared, effects = {}) {
     observationIdentity,
     markAbsenceDeliveredToSource,
     recordObservation,
+    recordSessionFact,
+    observationClass,
+    trackingResultFor,
     pendingReportHasSubmitEvidence,
     maybeRecordInjectConsumption,
     maybeRecordLauncherConsumption,

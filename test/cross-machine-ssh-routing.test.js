@@ -17,6 +17,7 @@ const path = require('path');
 
 let tmpHome;
 let originalHome;
+let originalUserProfile;
 let crossMachine;
 
 function writePeers(peers) {
@@ -28,7 +29,11 @@ function writePeers(peers) {
 before(() => {
   tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-xmachine-test-'));
   originalHome = process.env.HOME;
+  originalUserProfile = process.env.USERPROFILE;
   process.env.HOME = tmpHome;
+  // #879: PEERS_PATH resolves through os.homedir(), which reads USERPROFILE on win32 — HOME alone
+  // left the product reading the runner's real profile (measured: 0 peers on Windows).
+  if (process.platform === 'win32') process.env.USERPROFILE = tmpHome;
   // Force a fresh require so PEERS_PATH binds to the test HOME.
   delete require.cache[require.resolve('../cross-machine')];
   crossMachine = require('../cross-machine');
@@ -37,6 +42,10 @@ before(() => {
 after(() => {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  if (process.platform === 'win32') {
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
+  }
   try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch {}
   delete require.cache[require.resolve('../cross-machine')];
 });

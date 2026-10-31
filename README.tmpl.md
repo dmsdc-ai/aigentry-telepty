@@ -163,6 +163,20 @@ readiness-aware inject/submit, event streams, cross-machine session control.
   outlive the daemon, wrap it with `allow`.
 - Requires a background daemon and a network port (:3848, auth-gated).
 
+## Tracked-injection ledger (0.10.0)
+- Since 0.10.0 the tracked-injection ledger (`~/.config/aigentry-telepty/tracked-injections.json`)
+  is a **directory store**, and one worker thread is its only writer. The daemon's first start
+  on 0.10.0 migrates a 0.9.x file offline and keeps the original as
+  `tracked-injections.json.pre-0.10.*`. Check the result with `telepty ledger status`.
+- **Rollback** to 0.9.x takes three steps: export with `telepty ledger export-v3 --out <file>`,
+  stop the daemon, then put the export (or the retained aside) back at `tracked-injections.json`.
+  The full steps are in CHANGELOG.md under 0.10.0.
+- If a daemon crashes or is SIGKILLed, the ledger lock stays behind. Tracked injects are then
+  refused until you run `telepty ledger unlock --confirm`.
+- **Windows:** the new store is expected not to open, because directory fsync is unavailable
+  there. In that case tracked injects (those with `from`) are refused and untracked injects keep
+  working. This is not yet measured.
+
 ## Core Commands
 
 | Command | Description |

@@ -199,8 +199,10 @@ test('consumer_vocabulary_matrix_is_total: telepty list --json exposes no intern
   // (cli.js:1334-1337), so the daemon's serializer is the contract. Asserted against the SOURCE
   // because the shape is what consumers bind to, and a re-added field would not fail any behaviour
   // test until a consumer read it again.
-  const daemonSrc = fs.readFileSync(path.join(__dirname, '..', 'daemon.js'), 'utf8');
-  const inspectionSrc = fs.readFileSync(path.join(__dirname, '..', 'src/routes/session-inspection.js'), 'utf8');
+  // #879: the '\n'-anchored substrings below are a SOURCE-TEXT contract, not a line-ending one —
+  // normalise a CRLF checkout (actions/checkout on Windows) before matching.
+  const daemonSrc = fs.readFileSync(path.join(__dirname, '..', 'daemon.js'), 'utf8').replace(/\r\n/g, '\n');
+  const inspectionSrc = fs.readFileSync(path.join(__dirname, '..', 'src/routes/session-inspection.js'), 'utf8').replace(/\r\n/g, '\n');
   const serializeStart = inspectionSrc.indexOf('function serializeSession(');
   const serializeEnd = inspectionSrc.indexOf('\nfunction getSubmitStrategy(', serializeStart);
   assert.ok(serializeStart >= 0 && serializeEnd > serializeStart, 'inspect the actual serializeSession body');

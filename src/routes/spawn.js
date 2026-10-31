@@ -29,7 +29,8 @@ function buildSessionEnv(sessionId) {
 
 function registerSpawnRoute(app, {
   sessions, sessionStateManager, pty, persistSessions, appendToOutputRing,
-  revokeSessionCredential, busClients, os, buildSessionEnv, admission = defaultSpawnAdmission
+  revokeSessionCredential, busClients, os, buildSessionEnv, admission = defaultSpawnAdmission,
+  ledgerLive = null   // #1207 — optional: tells the ledger owner which sessions are live
 }) {
   app.post('/api/sessions/spawn', (req, res) => {
     const invalid = field => res.status(400).json({ error: `Invalid ${field}.` });
@@ -139,6 +140,7 @@ function registerSpawnRoute(app, {
         ready: true,
             };
       sessions[session_id] = sessionRecord;
+      if (typeof ledgerLive === 'function') ledgerLive(session_id, true);   // #1207 resident-tier hint
 
       // Broadcast session creation to bus
       const spawnMsg = JSON.stringify({
@@ -179,6 +181,7 @@ function registerSpawnRoute(app, {
         sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
         if (sessions[currentId] === sessionRecord) {
           delete sessions[currentId];
+          if (typeof ledgerLive === 'function') ledgerLive(currentId, false);   // #1207
           revokeSessionCredential(currentId);   // #815: PTY exit — the instance is gone
           sessionStateManager.unregister(currentId);
         }

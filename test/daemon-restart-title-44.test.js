@@ -61,8 +61,10 @@ function waitMs(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-test('pidMatchesTeleptyCmdline confirms a process whose real title is telepty-daemon', async () => {
-  if (process.platform === 'win32') return; // title-replacement bug is Unix-only
+// #879: announced skip instead of a silent `return` (a silently returned test counts as a pass).
+const TITLE_WIN32_SKIP = process.platform === 'win32' ? 'win32: process-title replacement and the ps title scan are Unix-only' : false;
+
+test('pidMatchesTeleptyCmdline confirms a process whose real title is telepty-daemon', { skip: TITLE_WIN32_SKIP }, async () => {
   const child = spawnTitledChild();
   try {
     await waitMs(700); // let ps observe the renamed title
@@ -76,8 +78,7 @@ test('pidMatchesTeleptyCmdline confirms a process whose real title is telepty-da
   }
 });
 
-test('listDaemonProcesses includes a process whose real title is telepty-daemon', async () => {
-  if (process.platform === 'win32') return;
+test('listDaemonProcesses includes a process whose real title is telepty-daemon', { skip: TITLE_WIN32_SKIP }, async () => {
   const child = spawnTitledChild();
   try {
     await waitMs(700);
@@ -97,8 +98,7 @@ test('listDaemonProcesses includes a process whose real title is telepty-daemon'
 // throwaway child — but the confirmation runs through the REAL pidMatchesTeleptyCmdline
 // against the REAL 'telepty-daemon' title. state-file / process-scan sources are stubbed
 // empty so only the port-owner+title path is exercised.
-test('cleanupDaemonProcesses selects a real telepty-daemon-titled port owner for stop', async () => {
-  if (process.platform === 'win32') return;
+test('cleanupDaemonProcesses selects a real telepty-daemon-titled port owner for stop', { skip: TITLE_WIN32_SKIP }, async () => {
   const child = spawnTitledChild();
   try {
     await waitMs(700);

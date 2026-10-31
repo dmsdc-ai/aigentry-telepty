@@ -83,7 +83,6 @@ const sessionActions = createSessionActions({
   get cancelModalParkPoll() { return cancelModalParkPoll; },
   get classifyConsumption() { return classifyConsumption; },
   get classifyPeerLaneInject() { return classifyPeerLaneInject; },
-  get commitTrackedInjections() { return commitTrackedInjections; },
   get completionObservation() { return completionObservation; },
   get confirmSubmitAfterDispatch() { return confirmSubmitAfterDispatch; },
   get crypto() { return crypto; },
@@ -104,6 +103,8 @@ const sessionActions = createSessionActions({
   get isBootstrapReady() { return isBootstrapReady; },
   get isOpenWebSocket() { return isOpenWebSocket; },
   get isSurfaceBlockedByModal() { return isSurfaceBlockedByModal; },
+  get ledgerClient() { return ledgerClient; },             // #1207 — the one storage owner's client
+  get ledgerUnavailable() { return ledgerUnavailable; },   // #1207 — guard: unavailable authorizes nothing
   get lifecycle() { return lifecycle; },
   get mailbox() { return mailbox; },
   get mapObservationCause() { return mapObservationCause; },
@@ -142,6 +143,7 @@ const {
   observationIdentity,
   markAbsenceDeliveredToSource,
   recordObservation,
+  recordSessionFact,
   pendingReportHasSubmitEvidence,
   maybeRecordInjectConsumption,
   maybeRecordLauncherConsumption,
@@ -166,7 +168,7 @@ const deliveryRuntime = createDeliveryRuntime({
   get auditWriter() { return auditWriter; },
   get sessionCredentials() { return sessionCredentials; },
   get sessionPersistence() { return sessionPersistence; },
-  get trackedInjections() { return trackedInjections; },
+  get ledgerClient() { return ledgerClient; },          // #1207 — replaces the in-memory mirror
   get TRACKED_INJECTIONS_PATH() { return TRACKED_INJECTIONS_PATH; },
   get interactionCore() { return interactionCore; },
   get pendingReports() { return pendingReports; },
@@ -203,7 +205,6 @@ const deliveryRuntime = createDeliveryRuntime({
   get trackedLedgerHealthy() { return trackedLedgerHealthy; },
   get trackedLedgerUnavailableReason() { return trackedLedgerUnavailableReason; },
   get CAPABILITY_STAGE_A() { return CAPABILITY_STAGE_A; },
-  set trackedInjections(value) { trackedInjections = value; },
   set trackedLedgerHealthy(value) { trackedLedgerHealthy = value; },
   set trackedLedgerUnavailableReason(value) { trackedLedgerUnavailableReason = value; },
 });
@@ -211,12 +212,13 @@ const {
   auditAppend,
   verifiedPrincipalFromReq,
   verifiedSenderFields,
-  commitTrackedInjections,
+  ledgerUnavailable,
   interactionBinding,
   hasHeldInteraction,
   dispatchInteraction,
   restoreTrackedInjections,
   getTrackedInjection,
+  fetchTrackedInjection,
   sessionAuthenticationCapability,
   beginTrackedInjection,
   abortTrackedInjection,
@@ -667,13 +669,36 @@ const LAUNCHER_CONSUMPTION_MIN_SECONDS = Number(process.env.TELEPTY_LAUNCHER_CON
 
 const TRACKED_INJECTIONS_PATH = process.env.TELEPTY_TRACKED_INJECTIONS_PATH
   || sessionPersistence.defaultTrackedInjectionsPath();
+const TRACKED_INJECTIONS_LOCK_PATH = sessionPersistence.defaultTrackedInjectionsLockPath(TRACKED_INJECTIONS_PATH);
 
-// In-memory mirror of the durable ledger. `trackedLedgerHealthy` is false when the store could
-// not be read: the endpoint then answers `tracking_state:"unavailable"` with a named reason
-// instead of pretending nothing was ever tracked.
-let trackedInjections = sessionPersistence.emptyTrackedInjections();
-let trackedLedgerHealthy = true;
-let trackedLedgerUnavailableReason = null;
+// #1207 — the ledger is a DIRECTORY STORE at the legacy path, owned by one long-lived worker
+// thread; this process holds a committed-only read model and submits small durable deltas. The
+// in-memory mirror is gone. `trackedLedgerHealthy` is false until the owner's open succeeds and
+// whenever the store is unreadable: the endpoint then answers `tracking_state:"unavailable"` with a
+// NAMED reason instead of pretending nothing was ever tracked.
+//
+// The O_EXCL lock is taken on the main thread here, immediately after the daemon singleton claim
+// above (errata C1). EEXIST fails closed: the store stays `unavailable: lock_present`, the lock
+// file is untouched, the control plane stays up, and `telepty ledger unlock --confirm` is the
+// operator's recovery. No automatic stale-lock breaking exists.
+const { createLedgerClient } = require('./src/session-store/ledger-client');
+const ledgerClient = createLedgerClient({
+  dir: TRACKED_INJECTIONS_PATH,
+  lockPath: TRACKED_INJECTIONS_LOCK_PATH,
+  legacyPath: TRACKED_INJECTIONS_PATH,
+  // The listener keeps a real daemon alive; a test that merely `require`s this file for its pure
+  // seams must still be able to exit, so the worker does not pin the event loop by itself.
+  unrefWorker: true,
+});
+let trackedLedgerHealthy = false;
+let trackedLedgerUnavailableReason = 'not_opened';
+{
+  const acquired = ledgerClient.acquireLock();
+  if (!acquired.held) {
+    trackedLedgerUnavailableReason = acquired.reason === 'lock_present' ? 'lock_present' : 'observation_store_unavailable';
+    console.warn(`[LEDGER] ${acquired.reason} at ${TRACKED_INJECTIONS_LOCK_PATH}${acquired.contents ? ` (${JSON.stringify(acquired.contents)})` : ''} — tracked-injection store unavailable; control plane continues; recover with: telepty ledger unlock --confirm`);
+  }
+}
 
 
 
@@ -711,8 +736,33 @@ app.get('/api/sessions/:id/interaction', requireInteractionController, (req, res
   if (!s) return res.status(404).json(interaction.refusal('wrong_owner'));
   res.json({ ...readyRegistry.observeInteraction(s), identity: interactionBinding(req.params.id),
     protocol_version: 1, live_adapter: false, task_binding_available: false,
-    retained_pending: Object.values(trackedInjections.interactions?.pending || {})
-      .filter(p => p.sid === req.params.id).map(p => ({ inject_id: p.inject_id, payload_digest: p.payload_digest, state: p.state })) });
+    retained_pending: ledgerClient.readModel.retainedPending(req.params.id)   // #1207 — committed-only read model
+      .map(p => ({ inject_id: p.inject_id, payload_digest: p.payload_digest, state: p.state })) });
+});
+
+// #1207 — ledger status and downgrade export, behind the SAME host-token guard as the interaction
+// routes (an opt-in controller surface, never the general middleware alone). The export writes
+// only to a path under this daemon's HOME; no arbitrary remote write target is accepted.
+app.get('/api/ledger/status', requireInteractionController, async (req, res) => {
+  const txn = typeof req.query.txn === 'string' && req.query.txn.length <= 128 ? req.query.txn : null;
+  const status = ledgerClient.status();
+  let owner = null;
+  try { owner = ledgerClient.isHealthy() ? await ledgerClient.ownerStatus() : null; } catch { owner = null; }
+  let resolved = null;
+  if (txn && ledgerClient.isHealthy()) { try { resolved = (await ledgerClient.resolve([txn]))[0] || null; } catch { resolved = null; } }
+  res.json({ schema_version: 1, healthy: trackedLedgerHealthy, unavailable_reason: trackedLedgerUnavailableReason, client: status, owner, txn: resolved });
+});
+app.post('/api/ledger/export', requireInteractionController, async (req, res) => {
+  const out = req.body && typeof req.body.out === 'string' ? req.body.out : null;
+  const exportsRoot = path.join(os.homedir(), '.config', 'aigentry-telepty', 'exports');
+  const resolvedOut = out && path.isAbsolute(out) ? path.resolve(out) : (out && !out.includes('..') && !out.includes('/') && !out.includes('\\') ? path.join(exportsRoot, out) : null);
+  if (!resolvedOut || !resolvedOut.startsWith(exportsRoot + path.sep) || !/^[A-Za-z0-9._-]{1,128}$/.test(path.basename(resolvedOut))) {
+    return res.status(400).json({ success: false, code: 'EXPORT_PATH_REFUSED', error: `out must name a file under ${exportsRoot}`, exports_root: exportsRoot });
+  }
+  if (!ledgerClient.isHealthy()) return res.status(503).json({ success: false, code: 'LEDGER_UNAVAILABLE', reason: trackedLedgerUnavailableReason });
+  try { fs.mkdirSync(exportsRoot, { recursive: true, mode: 0o700 }); } catch { /* reported by the export result */ }
+  const result = await ledgerClient.exportV3(resolvedOut);
+  res.status(result.ok ? 200 : 500).json({ success: result.ok === true, ...result });
 });
 app.get('/api/sessions/:id/interaction/receipts/:action', requireInteractionController, (req, res) => {
   const receipt = interactionCore.lookup(req.params.action);
@@ -744,11 +794,12 @@ app.post('/api/sessions/:id/interaction', requireInteractionController, async (r
  * is exactly the kind of fact their reader still needs. Ordered by creation so the caller emits
  * oldest-first.
  */
-function listTrackedInjectionsForSession(sessionId) {
+async function listTrackedInjectionsForSession(sessionId) {
   if (typeof sessionId !== 'string' || !sessionId) return [];
-  return Object.values(trackedInjections.injections)
-    .filter((record) => record && record.session_id === sessionId)
-    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  // #1207 — hot AND cold records, answered by the owner in ≤ 64 KiB chunks; already sorted by
+  // creation. Minimal fields only (inject_id, session_id, transport_source, tracking_state, …).
+  if (!trackedLedgerHealthy) return [];
+  try { return await ledgerClient.listForSession(sessionId); } catch { return []; }
 }
 
 /**
@@ -1058,6 +1109,7 @@ try {
   // condition the daemon must not boot through.
   if (!ENV_AUTH_TOKEN) {
     console.error(`[CONFIG] Failed to load telepty config: ${err.message}`);
+    ledgerClient.releaseLock();   // #1207 — taken above; no owner open yet. Else the next daemon is lock_present.
     process.exit(1);
   }
   console.error(`[CONFIG] ${err.message}`);
@@ -1501,7 +1553,19 @@ console.log(`[DAEMON] Terminal backend: ${DETECTED_TERMINAL}`);
 // #60 Stage A: restore the observation ledger BEFORE HTTP/WS readiness, so the first poll after
 // a restart is answered from durable state rather than from an empty map. A restored record
 // gains `daemon_restart_observed` and stays completion-unknown; it can never settle a dispatch.
-restoreTrackedInjections();
+//
+// #1207 — the restore is the owner's open (lock re-check, offline migration of a legacy file if
+// one is at the path, segment recovery, chunked snapshot) and runs OFF the main thread: the daemon
+// listens while the store is `recovering`; polls answer `unavailable: recovering` and begins are
+// refused 503 until `available`. `ledgerReady` settles either way and never rejects.
+const ledgerReady = ledgerClient.state === 'lock_present'
+  ? Promise.resolve({ ok: false, reason: 'lock_present' })
+  : restoreTrackedInjections().catch((error) => {
+    trackedLedgerHealthy = false;
+    trackedLedgerUnavailableReason = 'observation_store_unavailable';
+    console.error(`[LEDGER] open threw: ${error && error.message}`);
+    return { ok: false, reason: 'open_threw' };
+  });
 
 // Restore persisted session metadata (wrapped sessions await reconnect)
 const _persisted = loadPersistedSessions();
@@ -1509,6 +1573,7 @@ for (const [id, meta] of Object.entries(_persisted)) {
   const restored = sessionPersistence.buildRestoredWrappedSession(id, meta, { cwd: process.cwd() });
   if (!restored) continue;
   sessions[id] = restored;
+  ledgerClient.live(id, true);   // #1207 resident-tier hint (correctness never depends on it)
   // #815: re-index the persisted VERIFIER so the bearer the wrapped child already carries in its
   // spawn-time environment keeps verifying across this restart, with nothing reissued. Without
   // this, every restored session silently becomes an unauthenticated sender — the child's env
@@ -1528,7 +1593,8 @@ for (const [id, meta] of Object.entries(_persisted)) {
 
 registerSpawnRoute(app, {
   sessions, sessionStateManager, pty, persistSessions, appendToOutputRing,
-  revokeSessionCredential, busClients, os, buildSessionEnv
+  revokeSessionCredential, busClients, os, buildSessionEnv,
+  ledgerLive: (sid, on) => ledgerClient.live(sid, on)   // #1207
 });
 
 registerSessionRegisterRoute(app, { context: sessionRecordContext, sessionStateManager, busClients });
@@ -1615,7 +1681,7 @@ app.get('/api/meta', (req, res) => {
     port: boundPort,
     machine_id: MACHINE_ID,
     terminal: DETECTED_TERMINAL,
-    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox']
+    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session']
   });
 });
 
@@ -1812,7 +1878,7 @@ function authorizeViewerInject({ sessionId, session, data, claimedFrom, principa
 //     NOT "this endpoint is absent" and NOT "nothing is tracked" — a consumer that folds it into
 //     an absence reason is making exactly the overclaim this release removes. Send the daemon
 //     token (`x-telepty-token`).
-app.get('/api/inject-observations/:inject_id', (req, res) => {
+app.get('/api/inject-observations/:inject_id', async (req, res) => {
   const injectId = req.params.inject_id;
 
   const unavailable = (reason, extra = {}) => res.status(200).json({
@@ -1829,14 +1895,19 @@ app.get('/api/inject-observations/:inject_id', (req, res) => {
     ...extra,
   });
 
+  // #1207 — `recovering` (owner still opening/migrating), `lock_present`, `unavailable_read` and a
+  // write-side outage are all NAMED here; the daemon keeps listening throughout.
   if (!trackedLedgerHealthy) {
-    return unavailable(trackedLedgerUnavailableReason || 'observation_store_unavailable');
+    return unavailable(trackedLedgerUnavailableReason || (ledgerClient.state === 'recovering' ? 'recovering' : 'observation_store_unavailable'));
   }
-  const record = getTrackedInjection(injectId);
+  // Hot (committed-only read model) or cold (owner, via index) with the lazy-fact overlay applied in
+  // log order — identical to what the per-record append used to produce. Reads never reheat.
+  const fetched = await fetchTrackedInjection(injectId);
+  const record = fetched.record;
   if (!record) {
-    // Either it was never tracked here, or it predates this daemon's schema-v2 store. Both are
-    // "this daemon epoch did not observe it" — explicitly, not by omission.
-    return unavailable('not_observed_by_daemon_epoch');
+    // Either it was never tracked here, or it predates this daemon's schema-v2 store, or its cold
+    // file is beyond the resident index cap (`cold_offline`). All explicit, never by omission.
+    return unavailable(fetched.reason || 'not_observed_by_daemon_epoch');
   }
 
   // #843 — the consumption block must be measured FOR THE INJECT BEING POLLED. This read
@@ -2424,6 +2495,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
         disconnectedSeconds
       });
       delete sessions[id];
+      ledgerClient.live(id, false);   // #1207 — the session's records become demotion-eligible
       revokeSessionCredential(id);  // #815: TTL/GC is the routine reuse path — revoke here too
       sessionStateManager.unregister(id);
       console.log(`[CLEANUP] Removed stale session ${id} after ${disconnectedSeconds}s disconnected`);
@@ -2437,6 +2509,8 @@ if (server) server.on('error', async (error) => {
   clearDaemonState(process.pid);
 
   if (error && error.code === 'EADDRINUSE') {
+    // #1207 — both exits below: drain the owner and release the lock, as shutdown() does.
+    try { await ledgerClient.close(2000); } catch (closeError) { console.error(`[LEDGER] close failed: ${closeError && closeError.message}`); }
     // Probe health to determine if it's a telepty daemon on this port
     try {
       const probe = await fetch(`http://127.0.0.1:${PORT}/api/health`);
@@ -2488,17 +2562,30 @@ installWebSocketTransport({
   // replacement is a hard fact the daemon knows with certainty.
   recordObservation,
   listTrackedInjectionsForSession,
+  // #1207 — one durable session fact per owner-lifecycle event, plus the live-session hint.
+  recordSessionFact,
+  ledgerLive: (sid, on) => ledgerClient.live(sid, on),
   // #826 — the viewer write path gets the same policy verdict and the same audit line as
   // POST /api/sessions/:id/inject. See authorizeViewerInject.
   authorizeViewerInject,
   acceptInteractionReceipt
 });
 
+// #1207 — shutdown drains the ledger owner first (flush the open group under the ack /
+// indeterminate rules, checkpoint, MANIFEST clean_close:true, release the lock only with matching
+// contents) within a 2000 ms deadline; past it, remaining inflight work is `indeterminate
+// (shutting_down)`, the worker is terminated and the next open recovers from segments.
+let shuttingDown = null;
 function shutdown(code) {
-  mailboxDelivery.stop();
-  mailboxNotifier.cancelAll();
-  clearDaemonState(process.pid);
-  process.exit(code);
+  if (shuttingDown) return shuttingDown;
+  shuttingDown = (async () => {
+    mailboxDelivery.stop();
+    mailboxNotifier.cancelAll();
+    try { await ledgerClient.close(2000); } catch (error) { console.error(`[LEDGER] close failed: ${error && error.message}`); }
+    clearDaemonState(process.pid);
+    process.exit(code);
+  })();
+  return shuttingDown;
 }
 
 // Daemon-lifecycle signal/exit handlers — only when run as the daemon, so a test require does
@@ -2537,9 +2624,13 @@ module.exports = {
   beginTrackedInjection,          // #60 Stage A: durable write-before-delivery tracking record
   sessionAuthenticationCapability, // #860 F1: "observed" requires a bearer that was PRESENTED and verified
   deliveryAuditResult,            // #860 F2: audit `delivery_result` — `queued` is not `success`
-  getTrackedInjection,            // #60 Stage A: ledger read by inject_id
-  listTrackedInjectionsForSession, // #60 Stage A: ledger read by session (owner-lifecycle fan-out)
-  restoreTrackedInjections,       // #60 Stage A: restore + daemon_restart_observed, before readiness
+  getTrackedInjection,            // #60 Stage A: ledger read by inject_id (hot, committed-only read model)
+  fetchTrackedInjection,          // #1207: async ledger read by inject_id (hot or cold + lazy-fact overlay)
+  listTrackedInjectionsForSession, // #60 Stage A: ledger read by session (owner-lifecycle fan-out; async since #1207)
+  restoreTrackedInjections,       // #60 Stage A: restore + daemon_restart_observed, before readiness (async open since #1207)
+  recordSessionFact,              // #1207: one durable session-scoped fact per owner-lifecycle event
+  ledgerClient,                   // #1207: the storage owner's client (lock, read model, status, close)
+  ledgerReady,                    // #1207: settles when the owner's open finished (ok:true|false); never rejects
   observeInjectEchoEvidence,      // #60 Stage A: ring-scoped echo evidence (a field, no longer a gate)
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
   isTerminalGateFailure,          // #678: submit-gate disposition — no_state is best-effort dispatch, not hard-fail

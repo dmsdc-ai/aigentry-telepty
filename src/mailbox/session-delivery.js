@@ -154,7 +154,8 @@ function createSessionDeliveryContext({
           from: options.from || 'daemon'
         }
       });
-      parkTrackedInjection(options.injectId, 'bootstrap_queue', 'bootstrap_not_ready');
+      // #1207 — the park observation is durable (fsynced ACK) before the queued response returns.
+      await parkTrackedInjection(options.injectId, 'bootstrap_queue', 'bootstrap_not_ready');
       session.lastActivityAt = new Date(now).toISOString();
       return bootstrapQueuedResponse(op, {
         msg_id: op.op_id,
@@ -198,7 +199,7 @@ function createSessionDeliveryContext({
           injectId: options.injectId || null,     // #860 F2 — see the bootstrap-queue push above
           options: { source: options.source || 'inject', from: options.from || 'daemon' },
         }, injectParkDecision);
-        parkTrackedInjection(options.injectId, 'bootstrap_queue', injectParkDecision.reason);
+        await parkTrackedInjection(options.injectId, 'bootstrap_queue', injectParkDecision.reason);   // #1207 durable before ack
         session.lastActivityAt = new Date(now).toISOString();
         return modalParkResponse(op, injectParkDecision, {
           msg_id: op.op_id,

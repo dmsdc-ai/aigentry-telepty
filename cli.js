@@ -16,6 +16,7 @@ const {
   clearRestartFailureMarker,
   findParentProcessInfo,
   findPortOwnerPid,
+  isProcessRunning,
   readDaemonState,
   readRestartFailureMarker,
   stopDaemon,
@@ -3472,6 +3473,63 @@ async function main() {
     return;
   }
 
+  if (cmd === 'ledger') {
+    // #1207 — operator surface for the directory store: status (owner + client, optional txn
+    // resolution from receipts), the schema-3 downgrade export (daemon writes only under its own
+    // HOME exports directory), and the operator unlock. `unlock` is LOCAL and deliberate: it
+    // prints the lock contents, refuses while daemon-state.json names a live pid or the configured
+    // port answers /api/health, and otherwise unlinks the lock on the operator's authority. The
+    // daemon never does this by itself (no automatic stale-lock breaking).
+    const sub = args[1];
+    const usage = 'Usage: telepty ledger status [--txn <id>] | export-v3 --out <file> | unlock --confirm';
+    try {
+      if (sub === 'status') {
+        const txnIndex = args.indexOf('--txn');
+        const txn = txnIndex !== -1 ? args[txnIndex + 1] : null;
+        if (txnIndex !== -1 && (!txn || txn.startsWith('--'))) throw new Error(usage);
+        const res = await fetchWithAuth(`${DAEMON_URL}/api/ledger/status${txn ? `?txn=${encodeURIComponent(txn)}` : ''}`);
+        const data = await res.json();
+        console.log(JSON.stringify(data, null, 2));
+        if (!res.ok) process.exitCode = 1;
+        return;
+      }
+      if (sub === 'export-v3') {
+        const outIndex = args.indexOf('--out');
+        const out = outIndex !== -1 ? args[outIndex + 1] : null;
+        if (!out || out.startsWith('--')) throw new Error(usage);
+        const res = await fetchWithAuth(`${DAEMON_URL}/api/ledger/export`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ out })
+        });
+        const data = await res.json();
+        console.log(JSON.stringify(data, null, 2));
+        if (!res.ok || data.success !== true) process.exitCode = 1;
+        return;
+      }
+      if (sub === 'unlock') {
+        const persistence = require('./src/session-store/persistence');
+        const { operatorUnlock } = require('./src/session-store/ledger-lock');
+        const lockPath = persistence.defaultTrackedInjectionsLockPath(process.env.TELEPTY_TRACKED_INJECTIONS_PATH || persistence.defaultTrackedInjectionsPath());
+        const result = await operatorUnlock(lockPath, {
+          confirm: args.includes('--confirm'),
+          daemonState: readDaemonState(),
+          isProcessRunning,
+          probeHealth: async () => (await probeDaemonHealth(Number(PORT), 0)) === true,
+        });
+        console.log(JSON.stringify(result, null, 2));
+        if (!result.unlocked) {
+          if (result.reason === 'confirm_required') console.error('❌ Refusing without --confirm. This removes the ledger lock; run it only when no telepty daemon is running for this HOME.');
+          process.exitCode = 1;
+        }
+        return;
+      }
+      throw new Error(usage);
+    } catch (error) {
+      console.error(`❌ ${error.message || 'ledger command failed'}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   if (cmd === 'send-key') {
     const sessionId = args[1];
     const key = (args[2] || '').toLowerCase();
@@ -4755,6 +4813,9 @@ function printGlobalHelp() {
   telepty update                                 Update to latest version
   telepty uninstall [--purge] [--dry-run]        Stop daemon + unload service; keep user data unless --purge
   telepty status-report --phase <p> [options]    Emit structured status event
+  telepty ledger status [--txn <id>]             Tracked-injection ledger status (owner/client; txn receipt lookup)
+  telepty ledger export-v3 --out <file>          Write a schema-3 ledger export under ~/.config/aigentry-telepty/exports
+  telepty ledger unlock --confirm                Remove a stale ledger lock (refuses while a daemon is alive)
 
 \x1b[1mExamples:\x1b[0m
   \x1b[2m# Wrap Claude Code for remote control\x1b[0m
