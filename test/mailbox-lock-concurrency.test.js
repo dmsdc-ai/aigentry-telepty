@@ -32,17 +32,53 @@ function diagnostic(probe, self) {
   let extra; try { extra = probe(); } catch (e) { extra = {probe: e.code || 'error'}; }
   return ` | diag ${JSON.stringify({self, ...extra})}`;
 }
-function worker(t, dir, mode, iterations = 1, probe = () => ({})) {
+// #1215 correction7 (test-only): the per-worker timer is a NO-PROGRESS guard, not a whole-work budget. macOS 3b2c44a
+// measured 197/200 ordered increments, zero lock errors/timeouts and every acquisition under the 500 ms product bound,
+// while each requested 10 ms pause averaged 42-46 ms: a 10 s total for 40 contended iterations asserted throughput,
+// not exclusion or progress. The guard is re-armed ONLY by a valid, strictly advancing milestone record from this
+// child's own stderr (the existing `lock-diag` progress line written after iterations 9/19/29/39). Split, multiple,
+// duplicate, malformed, out-of-range or non-milestone records never re-arm it. Bound: at most floor(iterations / 10)
+// re-arms, so a worker is given at most (floor(iterations / 10) + 1) × stallMs in total — 50 s for 40 iterations.
+const PROGRESS_PREFIX = 'lock-diag ', PROGRESS_EVERY = 10;
+function progressGuard(iterations) {
+  let pending = '', last = -1;
+  const milestones = Math.floor(iterations / PROGRESS_EVERY);
+  return {
+    milestones,
+    get last() { return last; },
+    feed(chunk) { // → number of strictly advancing milestones accepted from this chunk
+      pending += chunk; let advanced = 0;
+      const lines = pending.split('\n'); pending = lines.pop();
+      for (const raw of lines) {
+        const line = raw.replace(/\r$/, '');
+        if (!line.startsWith(PROGRESS_PREFIX)) continue;
+        let record; try { record = JSON.parse(line.slice(PROGRESS_PREFIX.length)); } catch { continue; }
+        const i = record && record.kind === 'progress' ? record.iteration : undefined;
+        if (!Number.isSafeInteger(i) || i < 0 || i >= iterations || (i + 1) % PROGRESS_EVERY !== 0 || i <= last) continue;
+        last = i; advanced++;
+      }
+      return advanced;
+    },
+  };
+}
+function worker(t, dir, mode, iterations = 1, probe = () => ({}), { stallMs = 10000 } = {}) {
   const forked = performance.now();
   const child = fork(path.join(__dirname, '../test-support/mailbox-lock-worker.js'), [dir, mode, String(iterations)], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
-  let output = ''; child.stderr.on('data', b => { output += b; });
+  const guard = progressGuard(mode === 'contend' ? iterations : 0);
+  let output = '', onProgress = null;
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', b => { output += b; if (guard.feed(b) > 0 && onProgress) onProgress(); });
   t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
   const next = () => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { clean(); reject(Error(`worker timeout: ${output}${diagnostic(probe, {mode, pid: child.pid,
-      exitCode: child.exitCode, signalCode: child.signalCode, connected: child.connected, sinceForkMs: Math.round(performance.now() - forked)})}`)); }, 10000);
+    const armed = performance.now(), maxMs = (guard.milestones + 1) * stallMs;
+    let timer;
+    const expire = () => { clean(); reject(Error(`worker timeout: no progress for ${stallMs} ms (last milestone ${guard.last}): ${output}${diagnostic(probe, {mode, pid: child.pid,
+      exitCode: child.exitCode, signalCode: child.signalCode, connected: child.connected, sinceForkMs: Math.round(performance.now() - forked)})}`)); };
+    const arm = () => { clearTimeout(timer); timer = setTimeout(expire, Math.min(stallMs, Math.max(0, armed + maxMs - performance.now()))); };
     const fail = code => { clean(); reject(Error(`worker exited ${code}: ${output}`)); };
     const message = value => { clean(); resolve(value); };
-    function clean() { clearTimeout(timer); child.off('message', message); child.off('exit', fail); }
+    function clean() { clearTimeout(timer); onProgress = null; child.off('message', message); child.off('exit', fail); }
+    onProgress = arm; arm();
     child.once('message', message); child.once('exit', fail);
   });
   return { child, next };
@@ -90,6 +126,39 @@ test('multiple processes never overlap mailbox mutation or lose increments', asy
     assert.equal(r.stats.lock.pause_requested_ms, r.stats.lock.pauses * 10, `diag ${JSON.stringify(r.stats)}`);
     assert.ok(Number.isSafeInteger(r.stats.cpu_user_ms) && Number.isSafeInteger(r.stats.cpu_system_ms), `diag ${JSON.stringify(r.stats)}`);
   }
+});
+test('#1215 guard control: only valid, strictly advancing milestone records count as progress', () => {
+  const g = progressGuard(40), rec = value => `${PROGRESS_PREFIX}${JSON.stringify(value)}\n`;
+  assert.equal(g.milestones, 4);
+  assert.equal(g.feed(`${PROGRESS_PREFIX}{"kind":"progress","iter`), 0, 'a split record waits for its line end');
+  assert.equal(g.feed('ation":9,"acquire_ms":3}\r\n'), 1, 'the completed split (CRLF) record counts once');
+  assert.equal(g.feed(rec({kind: 'progress', iteration: 9})), 0, 'a duplicate never re-arms');
+  assert.equal(g.feed(`${PROGRESS_PREFIX}{not json\n`), 0, 'malformed');
+  assert.equal(g.feed(rec({kind: 'progress', iteration: 12})), 0, 'a slow-acquire record is not a milestone');
+  assert.equal(g.feed(rec({kind: 'error', iteration: 19})), 0, 'an error record is not progress');
+  assert.equal(g.feed(rec({kind: 'progress', iteration: 49})), 0, 'out of range for 40 iterations');
+  assert.equal(g.feed(rec({kind: 'progress', iteration: '19'})), 0, 'non-integer iteration');
+  assert.equal(g.feed(`other text\n${rec({kind: 'progress', iteration: 19})}${rec({kind: 'progress', iteration: 29})}`), 2, 'multiple records in one chunk');
+  assert.equal(g.feed(rec({kind: 'progress', iteration: 19})), 0, 'going backwards never re-arms');
+  assert.equal(g.feed(rec({kind: 'progress', iteration: 39})), 1);
+  assert.equal(g.last, 39);
+  assert.equal(g.feed(rec({kind: 'progress', iteration: 39})), 0, 'no record re-arms after the last milestone');
+  assert.equal(progressGuard(1).milestones, 0, 'non-contend workers get exactly one stall window');
+});
+test('#1215 guard negative control: a real worker that stops making progress is rejected within its own stall window', async t => {
+  const {root, dir} = fixture(t), stallMs = 500;
+  const w = worker(t, dir, 'choose', 1, () => ({}), {stallMs});
+  const choosing = w.next(); w.child.send('start');
+  assert.equal((await choosing).choosing, true); // The child now blocks for 30 s inside its publication rename: no progress.
+  const began = performance.now();
+  await assert.rejects(w.next(), /worker timeout: no progress for 500 ms/);
+  const waited = performance.now() - began;
+  assert.ok(waited >= stallMs - 50 && waited < 5000, `rejected after ${Math.round(waited)} ms, not after the child's own 30 s stall`);
+  assert.equal(w.child.exitCode, null, 'the guard rejects; it does not itself kill the child');
+  const exited = once(w.child, 'exit'); w.child.kill('SIGKILL'); await exited; // This test's own child only.
+  assert.equal(breakStaleLocks(root), 1, 'exactly its own choosing ticket is reaped');
+  acquireLock(dir)();
+  assert.deepEqual(fs.readdirSync(path.join(dir, '.lock')), []);
 });
 test('crashed owner is reaped without deleting a successor and old clients refuse v2 directory', async t => {
   const {root, dir} = fixture(t), w = worker(t, dir, 'hold'), held = w.next(); w.child.send('start');

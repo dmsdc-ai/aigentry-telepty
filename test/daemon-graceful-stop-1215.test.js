@@ -161,12 +161,30 @@ test('W3B client: refused, unidentified and unsupported targets are failures wit
   });
 });
 
-// Task 1215 G2 (review26 REWORK). Health is tri-state in the caller (cli.js probeDaemonHealth): true = a daemon
-// answered; false = refused / not a daemon answer (absent as a daemon); null = timeout or reset — presence UNKNOWN,
-// "never not there". Without a token nothing is requested (no /api/meta, no stop). The census (state-file pid + port
-// owner, command-line confirmed) still decides an owned target, but an UNKNOWN presence never authorizes a replacement:
-// a plain stop is benign (ok, nothing acted on), while every caller that needs a replacement refuses (exit 1).
-function noTokenDeps(probeHealth) { const c = clientDeps({ probeHealth }); c.deps.token = null; return c; }
+// Task 1215 G2 (correction31, review30 G2-R1). Without a local token no daemon can be identified, so nothing
+// authenticated is requested (no /api/meta, no stop). The gate issues ONE unauthenticated GET /api/health through
+// fetchImpl and classifies the transport itself — the old boolean probeHealth seam merged an HTTP 404 with a refused
+// connection and is NOT consulted (it throws here, so a regression to it cannot pass). Only a REFUSED connection is
+// absence; a 2xx health answer is an unidentified daemon (refused); any other HTTP status, a timeout or a reset is an
+// UNKNOWN presence, which never authorizes a replacement. `health`: 'refused' | 'reset' | 'timeout' | an HTTP status.
+function noTokenDeps(health) {
+  const c = clientDeps({ probeHealth: async () => { throw new Error('PRECONDITION: the no-token gate must not use the boolean health seam'); } });
+  c.deps.token = null;
+  const inner = c.deps.fetchImpl;
+  c.deps.fetchImpl = async (url, options = {}) => {
+    if (url.endsWith('/api/health')) {
+      c.sent.push({ url, method: options.method || 'GET', headers: options.headers || {}, body: options.body || null });
+      if (health === 'refused') throw refusedConnection();
+      if (health === 'reset') throw resetConnection();
+      if (health === 'timeout') throw timedOut();
+      return { status: health, ok: health >= 200 && health < 300, json: async () => ({ status: 'ok' }) };
+    }
+    return inner(url, options);
+  };
+  return c;
+}
+const noTokenCounts = (c) => ({ health: c.sent.filter((s) => s.url.endsWith('/api/health')).length, meta: c.sent.filter((s) => s.url.endsWith('/api/meta')).length,
+  stop: c.sent.filter((s) => s.method === 'POST').length, tokenSent: c.sent.some((s) => s.headers && s.headers['x-telepty-token'] !== undefined) });
 // The exact composition cli.js gracefulWindowsStop performs: requestGracefulStop, then the census only on no_answer.
 function gateOver(c, census) {
   return async () => { const r = await requestGracefulStop(c.deps); return decideStopOutcome(r, r.status === 'no_answer' ? census : []); };
@@ -177,44 +195,51 @@ async function quietCli(fn) {
   try { const value = await fn(); return { value, exitCode: process.exitCode }; } finally { console.log = log; console.error = error; process.exitCode = exitCode; }
 }
 
-test('W3 G2: without a local token — unknown presence never authorizes a replacement; genuine absence still does; nothing is ever requested', async () => {
-  const cases = { unknownEmpty: [async () => null, []], unknownOwned: [async () => null, [{ pid: PID, source: 'port-owner' }]],
-    answering: [async () => true, []], absentEmpty: [async () => false, []], absentOwned: [async () => false, [{ pid: PID, source: 'state-file' }]] };
+test('W3 G2 no-token: only a refused connection is absence; a foreign 404/503, a timeout or a reset is unknown (no replacement); a 2xx is unidentified; one health GET, never meta/stop or a token', async () => {
+  const owned = [{ pid: PID, source: 'port-owner' }];
+  const cases = { http404: ['404', []], http503: ['503', []], timeout: ['timeout', []], reset: ['reset', []], timeoutOwned: ['timeout', owned],
+    http200: ['200', []], refusedAbsent: ['refused', []], refusedOwned: ['refused', owned] };
   const observed = {};
-  for (const [label, [probeHealth, census]] of Object.entries(cases)) {
-    const c = noTokenDeps(probeHealth);
+  for (const [label, [health, census]] of Object.entries(cases)) {
+    const c = noTokenDeps(/^\d+$/.test(health) ? Number(health) : health);
     const outcome = await gateOver(c, census)();
-    observed[label] = { requests: c.sent.length, ok: outcome.ok, startReplacement: outcome.startReplacement, exitCode: outcome.exitCode, stopped: outcome.stopped };
+    observed[label] = { ...noTokenCounts(c), ok: outcome.ok, startReplacement: outcome.startReplacement, exitCode: outcome.exitCode, stopped: outcome.stopped };
   }
+  const req = { health: 1, meta: 0, stop: 0, tokenSent: false };
   assert.deepEqual(observed, {
-    unknownEmpty: { requests: 0, ok: true, startReplacement: false, exitCode: 1, stopped: [] },   // benign stop; never a replacement
-    unknownOwned: { requests: 0, ok: false, startReplacement: false, exitCode: 1, stopped: [] },  // an owned target: unconfirmed, never forced
-    answering: { requests: 0, ok: false, startReplacement: false, exitCode: 1, stopped: [] },     // a daemon answered: unidentified, refused
-    absentEmpty: { requests: 0, ok: true, startReplacement: true, exitCode: 0, stopped: [] },     // genuine absence: unchanged
-    absentOwned: { requests: 0, ok: false, startReplacement: false, exitCode: 1, stopped: [] },
+    http404: { ...req, ok: true, startReplacement: false, exitCode: 1, stopped: [] },          // review30 G2-R1: a foreign HTTP answer is NOT absence
+    http503: { ...req, ok: true, startReplacement: false, exitCode: 1, stopped: [] },
+    timeout: { ...req, ok: true, startReplacement: false, exitCode: 1, stopped: [] },          // benign stop; never a replacement
+    reset: { ...req, ok: true, startReplacement: false, exitCode: 1, stopped: [] },
+    timeoutOwned: { ...req, ok: false, startReplacement: false, exitCode: 1, stopped: [] },    // an owned target: unconfirmed, never forced
+    http200: { ...req, ok: false, startReplacement: false, exitCode: 1, stopped: [] },         // a daemon answered: unidentified, refused
+    refusedAbsent: { ...req, ok: true, startReplacement: true, exitCode: 0, stopped: [] },     // genuine absence: unchanged (positive control)
+    refusedOwned: { ...req, ok: false, startReplacement: false, exitCode: 1, stopped: [] },
   });
-  assert.deepEqual(await requestGracefulStop(noTokenDeps(async () => null).deps), { status: 'no_answer', reason: 'no_local_token', presence: 'unknown' });
-  assert.deepEqual(await requestGracefulStop(noTokenDeps(async () => false).deps), { status: 'no_answer', reason: 'no_local_token' });
+  assert.deepEqual(await requestGracefulStop(noTokenDeps(404).deps), { status: 'no_answer', reason: 'no_local_token', presence: 'unknown' });
+  assert.deepEqual(await requestGracefulStop(noTokenDeps('refused').deps), { status: 'no_answer', reason: 'no_local_token' });
+  assert.deepEqual(await requestGracefulStop(noTokenDeps(200).deps), { status: 'unidentified', reason: 'no_local_token' });
 });
 
-test('W3 G2 callers: with unknown presence, restart / menu / uninstall start nothing while a plain stop exits 0; genuine absence still restarts once', async () => {
+test('W3 G2 no-token callers: a foreign 404 listener or unknown presence starts nothing (restart/menu/uninstall) while a plain stop exits 0; a refused connection restarts exactly once', async () => {
   const cli = require('../cli');
   const recorder = () => { const calls = []; const fn = (name, ret) => (...a) => { calls.push(name); return ret; }; return { calls, fn }; };
-  const deps = (r, probeHealth) => ({ platform: 'win32', port: 39003, detectSupervisor: () => ({ present: false }), logDaemonRestartEvent: () => {},
-    gracefulStop: gateOver(noTokenDeps(probeHealth), []), signalStop: r.fn('signal-stop', { stopped: [], failed: [] }),
+  const deps = (r, health) => ({ platform: 'win32', port: 39003, detectSupervisor: () => ({ present: false }), logDaemonRestartEvent: () => {},
+    gracefulStop: gateOver(noTokenDeps(health), []), signalStop: r.fn('signal-stop', { stopped: [], failed: [] }),
     startDetachedDaemon: r.fn('start', { pid: 777 }), cleanupDaemonProcesses: r.fn('sweep', { stopped: [], failed: [] }) });
-  const restart = recorder(); const re = await quietCli(() => cli.runDaemonStopRestart('restart', deps(restart, async () => null)));
-  const stop = recorder(); const st = await quietCli(() => cli.runDaemonStopRestart('stop', deps(stop, async () => null)));
-  const menu = recorder(); const me = await quietCli(() => cli.interactiveDaemonStart(deps(menu, async () => null)));
+  const foreign = recorder(); const fo = await quietCli(() => cli.runDaemonStopRestart('restart', deps(foreign, 404)));
+  const restart = recorder(); const re = await quietCli(() => cli.runDaemonStopRestart('restart', deps(restart, 'timeout')));
+  const stop = recorder(); const st = await quietCli(() => cli.runDaemonStopRestart('stop', deps(stop, 404)));
+  const menu = recorder(); const me = await quietCli(() => cli.interactiveDaemonStart(deps(menu, 'reset')));
   const uninstalled = [];
-  await cli.runUninstallCommand({ purge: false, dryRun: false }, { platform: 'win32', gracefulStop: gateOver(noTokenDeps(async () => null), []),
+  await cli.runUninstallCommand({ purge: false, dryRun: false }, { platform: 'win32', gracefulStop: gateOver(noTokenDeps(404), []),
     runUninstall: (opts) => { uninstalled.push(opts.windowsStop); return {}; } });
-  const absent = recorder(); const ab = await quietCli(() => cli.runDaemonStopRestart('restart', deps(absent, async () => false)));
+  const absent = recorder(); const ab = await quietCli(() => cli.runDaemonStopRestart('restart', deps(absent, 'refused')));
   assert.deepEqual({
-    restart: [restart.calls, re.exitCode], stop: [stop.calls, st.exitCode], menu: [menu.calls, me.value],
+    foreignRestart: [foreign.calls, fo.exitCode], restart: [restart.calls, re.exitCode], stop: [stop.calls, st.exitCode], menu: [menu.calls, me.value],
     uninstallGate: uninstalled.map((w) => [w.ok, w.startReplacement]), absentRestart: [absent.calls, ab.exitCode],
   }, {
-    restart: [[], 1], stop: [[], undefined], menu: [[], false],
+    foreignRestart: [[], 1], restart: [[], 1], stop: [[], undefined], menu: [[], false],
     uninstallGate: [[true, false]], absentRestart: [['start'], undefined],
   });
 });

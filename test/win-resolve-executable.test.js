@@ -191,3 +191,99 @@ test('Windows: PATHEXT entries with whitespace are trimmed', () => {
   });
   assert.equal(result, expected);
 });
+
+// ── #1215 G6 (#752, native 3b2c44a): Windows environment keys are case-insensitive ────────────────────────────
+// The bridge hands the resolver a plain-object copy of process.env (cli.js sessionEnv), which keeps the OS key spelling
+// (`Path`, `PathExt`); the native diagnostic measured path_key_other_case:true and resolver_walk_finds:false for an
+// existing stub. Cross-host cases below run everywhere with win32 path semantics; the real-fixture cases need a
+// native win32 host (the resolver is a POSIX no-op by design, and win32 path joins are not POSIX paths).
+const fs = require('fs');
+const os = require('os');
+
+for (const key of ['PATH', 'Path', 'path']) {
+  test(`Windows #1215: bare name resolves through a ${key} key with PathExt spelling`, () => {
+    const dir = 'C:\\npm';
+    const expected = winPath.join(dir, 'claude.CMD');
+    const env = Object.freeze({ [key]: `C:\\Windows\\System32;${dir}`, PathExt: '.COM;.EXE;.BAT;.CMD' });
+    const result = resolveWindowsExecutable('claude', env, { platform: 'win32', existsSync: makeExistsSync(new Set([expected])) });
+    assert.equal(result, expected);
+  });
+}
+
+test('Windows #1215: duplicate case-variant keys resolve by lexicographic key order, not insertion order', () => {
+  const dirA = 'C:\\binA';
+  const dirB = 'C:\\binB';
+  const present = new Set([winPath.join(dirA, 'tool.EXE'), winPath.join(dirB, 'tool.EXE')]);
+  const opts = { platform: 'win32', existsSync: makeExistsSync(present) };
+  // Exact upper-case PATH keeps its precedence over another spelling, whichever was inserted first.
+  assert.equal(resolveWindowsExecutable('tool', { Path: dirB, PATH: dirA, PATHEXT: '.EXE' }, opts), winPath.join(dirA, 'tool.EXE'));
+  assert.equal(resolveWindowsExecutable('tool', { PATH: dirA, Path: dirB, PATHEXT: '.EXE' }, opts), winPath.join(dirA, 'tool.EXE'));
+  // Without an exact key: 'Path' sorts before 'path'.
+  assert.equal(resolveWindowsExecutable('tool', { path: dirA, Path: dirB, PATHEXT: '.EXE' }, opts), winPath.join(dirB, 'tool.EXE'));
+  // PATHEXT spellings follow the same rule: 'PATHEXT' (.EXE) wins over 'PathExt' (.CMD).
+  const both = new Set([winPath.join(dirA, 'tool.EXE'), winPath.join(dirA, 'tool.CMD')]);
+  assert.equal(resolveWindowsExecutable('tool', { PATH: dirA, PathExt: '.CMD', PATHEXT: '.EXE' },
+    { platform: 'win32', existsSync: makeExistsSync(both) }), winPath.join(dirA, 'tool.EXE'));
+});
+
+test('Windows #1215: an absolute path without extension honours a PathExt key spelling', () => {
+  const base = 'C:\\tools\\my';
+  const expected = `${base}.CMD`;
+  const result = resolveWindowsExecutable(base, Object.freeze({ Path: '', PathExt: '.EXE;.CMD' }), {
+    platform: 'win32', existsSync: makeExistsSync(new Set([expected])),
+  });
+  assert.equal(result, expected);
+});
+
+test('Windows #1215: a case-variant PATH never hides a genuinely missing executable', () => {
+  for (const env of [{ Path: 'C:\\bin', PathExt: '.EXE;.CMD' }, { path: '' }, { PathExt: '.CMD' }]) {
+    assert.throws(() => resolveWindowsExecutable('does-not-exist', Object.freeze(env), { platform: 'win32', existsSync: () => false }),
+      /cannot find executable "does-not-exist" on PATH/);
+  }
+  assert.throws(() => resolveWindowsExecutable('', Object.freeze({ Path: 'C:\\bin' }), { platform: 'win32', existsSync: () => true }),
+    /requires a non-empty command/);
+});
+
+test('Windows #1215: the env object and process.env are never modified', () => {
+  const before = JSON.stringify(process.env);
+  const env = Object.freeze({ Path: 'C:\\bin', PathExt: '.CMD' });
+  resolveWindowsExecutable('tool', env, { platform: 'win32', existsSync: makeExistsSync(new Set([winPath.join('C:\\bin', 'tool.CMD')])) });
+  assert.deepEqual(env, { Path: 'C:\\bin', PathExt: '.CMD' });
+  assert.equal(JSON.stringify(process.env), before);
+});
+
+// Real temp executable fixtures on a native win32 host: the real filesystem and platform, no existsSync or platform
+// override. The resolved path must be the fixture file itself (same bytes), and a fixture absent from PATH still throws.
+const NATIVE = process.platform === 'win32' ? false : 'native win32 host only: the resolver is a POSIX no-op by design';
+function nativeFixture(t) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'win-resolve-1215-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'fixture1215.cmd'), body = '@echo off\r\nrem #1215 fixture\r\n';
+  fs.writeFileSync(file, body);
+  return { dir, file, body };
+}
+for (const [pathKey, extKey] of [['PATH', 'PATHEXT'], ['Path', 'PathExt'], ['path', 'pathext']]) {
+  test(`native win32 #1215: a real .cmd fixture resolves through ${pathKey}/${extKey} keys`, { skip: NATIVE }, (t) => {
+    const fx = nativeFixture(t);
+    const env = Object.freeze({ [pathKey]: `${process.env.SystemRoot || 'C:\\Windows'}\\System32;${fx.dir}`, [extKey]: '.COM;.EXE;.BAT;.CMD' });
+    const result = resolveWindowsExecutable('fixture1215', env);
+    assert.equal(path.resolve(result).toLowerCase(), path.resolve(fx.file).toLowerCase(), result);
+    assert.equal(fs.readFileSync(result, 'utf8'), fx.body, 'the resolved executable is the real fixture file');
+  });
+}
+test('native win32 #1215: a sessionEnv-shaped copy of process.env finds a real fixture added to its own PATH spelling', { skip: NATIVE }, (t) => {
+  const fx = nativeFixture(t);
+  const copy = { ...process.env };                      // the bridge's shape: OS key spelling preserved
+  const pathKey = Object.keys(copy).find((key) => key.toUpperCase() === 'PATH') || 'Path';
+  copy[pathKey] = `${fx.dir};${copy[pathKey] || ''}`;
+  const result = resolveWindowsExecutable('fixture1215', Object.freeze(copy));
+  assert.equal(fs.readFileSync(result, 'utf8'), fx.body);
+});
+test('native win32 #1215: a real fixture outside every PATH spelling is still not found', { skip: NATIVE }, (t) => {
+  const fx = nativeFixture(t);
+  const other = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'win-resolve-1215-empty-')));
+  t.after(() => fs.rmSync(other, { recursive: true, force: true }));
+  assert.ok(fs.existsSync(fx.file));
+  assert.throws(() => resolveWindowsExecutable('fixture1215', Object.freeze({ Path: other, PathExt: '.CMD' })),
+    /cannot find executable "fixture1215" on PATH/);
+});

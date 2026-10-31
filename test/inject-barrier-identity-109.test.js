@@ -25,12 +25,14 @@ before(async () => {
 });
 after(async () => { if (harness) await harness.stop(); });
 
-async function ownerSocket(sid) {
+// #1215 correction7: helpers take the daemon fixture explicitly (default: the shared bounded-wait fixture), so one
+// test can use its own daemon without swapping shared mutable state.
+async function ownerSocket(sid, h = harness) {
   const frames = [];
   const ws = new WebSocket(
-    `ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sid)}`
-    + `?owner=1&owner_pid=${process.pid}&command=test-wrap&token=${encodeURIComponent(harness.authToken())}`,
-    harness.ownerAuth(sid));
+    `ws://${h.host}:${h.port}/api/sessions/${encodeURIComponent(sid)}`
+    + `?owner=1&owner_pid=${process.pid}&command=test-wrap&token=${encodeURIComponent(h.authToken())}`,
+    h.ownerAuth(sid));
   ws.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw);
@@ -41,13 +43,13 @@ async function ownerSocket(sid) {
   return { ws, frames };
 }
 
-async function wrappedOwner(sid) {
-  const reg = await harness.registerSession(sid, { command: 'test-wrap' });
+async function wrappedOwner(sid, h = harness) {
+  const reg = await h.registerSession(sid, { command: 'test-wrap' });
   assert.ok([200, 201].includes(reg.status), `register -> ${reg.status}`);
-  return ownerSocket(sid);
+  return ownerSocket(sid, h);
 }
 
-const inject = (sid, prompt) => harness.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, {
+const inject = (sid, prompt, h = harness) => h.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, {
   method: 'POST', body: { prompt }
 });
 const destroy = (sid) => harness.request(`/api/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE' });
@@ -130,11 +132,19 @@ test('#109(b): the barrier wait is bounded — late callers get QUEUE_TIMEOUT, a
   for (let i = 0; i < frames.length; i += 2) assert.equal(frames[i + 1], '\r', JSON.stringify(frames));
 });
 
-// N5: accepted callers are served in arrival order. Staggered starts make arrival order known;
-// three injects fit inside the bound (2 × 500 ms wrapped submit delay < QUEUE_BOUND_MS).
+// N5: accepted callers are served in arrival order. Staggered starts make arrival order known.
+// #1215 correction7 timing: f3 waits behind TWO barrier holders. Each holder spans its text delivery, the 500 ms wrapped
+// submit delay and its CR write, so f3's wait is >= 2 × 500 ms + the holders' text/timer overhead (measured on win32
+// 3b2c44a: CR at 1072 ms, f2 text at 1305 ms, f3 refused after 1203 ms against 1200). Three serialized callers therefore
+// cannot be asserted against the shared 1200 ms bound. That bound is covered by the bounded-wait test above, which keeps
+// the shared fixture; this case uses its own daemon at the product default bound (session-delivery.js, 10000 ms).
+const PRODUCT_QUEUE_BOUND_MS = 10000;
 test('#109(b): queued callers are delivered in arrival order, each text followed by its own CR', async (t) => {
+  // Own fixture: no queue-bound override (an inherited one is removed: spawn drops undefined values). Stopped on any outcome.
+  const own = await startTestDaemon({ env: { TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS: undefined } });
+  t.after(async () => { await own.stop(); });
   const sid = createSessionId('i109-fifo');
-  const { ws, frames } = await wrappedOwner(sid);
+  const { ws, frames } = await wrappedOwner(sid, own);
   t.after(() => { try { ws.close(); } catch {} });
 
   // #879 diagnostics only: per-caller timing and owner-frame arrival times. Frame labels are restricted to the exact
@@ -154,14 +164,14 @@ test('#109(b): queued callers are delivered in arrival order, each text followed
     } catch { /* not a frame */ }
   });
   // #1215 G5: the daemon's own bounded barrier record(s) for a refusal (fixed fields only), last DAEMON_DIAG_CAP lines emitted after this test began.
-  const DAEMON_DIAG_CAP = 4, DAEMON_DIAG = '[telepty-diag] submit_barrier ', daemonDiagFrom = harness.getLogs().stderr.length;
-  const daemonDiag = () => harness.getLogs().stderr.slice(daemonDiagFrom).split(/\r?\n/).filter((line) => line.startsWith(DAEMON_DIAG)).slice(-DAEMON_DIAG_CAP)
+  const DAEMON_DIAG_CAP = 4, DAEMON_DIAG = '[telepty-diag] submit_barrier ', daemonDiagFrom = own.getLogs().stderr.length;
+  const daemonDiag = () => own.getLogs().stderr.slice(daemonDiagFrom).split(/\r?\n/).filter((line) => line.startsWith(DAEMON_DIAG)).slice(-DAEMON_DIAG_CAP)
     .map((line) => { try { return JSON.parse(line.slice(DAEMON_DIAG.length)); } catch { return 'unparsed'; } });
-  const diagnose = (stage) => t.diagnostic(`#879 diag ${stage} ${JSON.stringify({ queue_bound_ms: QUEUE_BOUND_MS, callers, frames: frameTimes, frames_omitted: framesOmitted, daemon: daemonDiag() })}`);
+  const diagnose = (stage) => t.diagnostic(`#879 diag ${stage} ${JSON.stringify({ queue_bound_ms: PRODUCT_QUEUE_BOUND_MS, callers, frames: frameTimes, frames_omitted: framesOmitted, daemon: daemonDiag() })}`);
   const pending = [];
   for (const p of ['f1', 'f2', 'f3']) {
     const issued = Date.now() - t0;
-    pending.push(inject(sid, p).then((r) => {
+    pending.push(inject(sid, p, own).then((r) => {
       callers.push({ p, issued_ms: issued, answered_ms: Date.now() - t0, status: r.status, code: (r.body && r.body.code) || null,
         // Task 1215 (#879 discriminator): the daemon-measured barrier wait of a refusal (pre-barrier = answered - issued - this).
         queue_wait_ms: r.body && Number.isSafeInteger(r.body.queue_wait_ms) ? r.body.queue_wait_ms : null });
@@ -176,6 +186,15 @@ test('#109(b): queued callers are delivered in arrival order, each text followed
     .catch((error) => { diagnose('fifo_frames'); throw error; });
 
   assert.deepEqual(frames, ['f1', '\r', 'f2', '\r', 'f3', '\r'], JSON.stringify(frames));
+  // Non-vacuity on ONE clock (t0: caller issue times and owner-frame arrival times): f2 and f3 were issued before f1's
+  // CR, so both had to wait behind the barrier, and f3's text arrived only after f2's CR. A sequence that never queued
+  // (each caller arriving after the previous CR) cannot satisfy this.
+  const issued = Object.fromEntries(callers.map((c) => [c.p, c.issued_ms]));
+  const frameAt = (label, nth = 0) => (frameTimes.filter((f) => f.label === label)[nth] || {}).at_ms;
+  const proof = JSON.stringify({ issued, frames: frameTimes });
+  assert.ok(Number.isSafeInteger(issued.f2) && Number.isSafeInteger(issued.f3) && Number.isSafeInteger(frameAt('CR', 0)), proof);
+  assert.ok(issued.f2 < frameAt('CR', 0) && issued.f3 < frameAt('CR', 0), `f2 and f3 must be issued before f1's CR: ${proof}`);
+  assert.ok(frameAt('f3') > frameAt('CR', 1), `f3's text must follow f2's CR: ${proof}`);
 });
 
 // Review 1 B1, measured on aeb436b: a rename inside the submit delay left the owner with

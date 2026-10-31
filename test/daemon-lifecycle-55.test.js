@@ -491,3 +491,69 @@ test('#W3 genuine crash control: a forced kill keeps lock_present, untouched, un
     unlockNeedsConfirm: true, unlocked: true, thirdStore: 'available',
   }, `unlockWhileUp:\n${unlockWhileUp.stdout}\nunlock:\n${unlock.stdout}${unlock.stderr}`);
 });
+
+// ── Task 1215 G2-N1 (review30): native restart from NO daemon, with and without a local token ──────────────────
+// The Windows normal stop gate classifies a closed port by its transport outcome: only a refused connection is absence.
+// Whether a Windows loopback refusal arrives inside the gate's existing bounds (1 s unauthenticated health / 2 s
+// identity read) is UNMEASURED; these cases measure it on CI. The refusal latency observed by the test itself is
+// reported as a diagnostic, never asserted. The contract asserted is the ordinary lifecycle: a restart from nothing
+// exits 0 and leaves a reachable daemon. Isolated temp HOME + free port; every daemon started is tracked and killed in
+// after(). No deadline was raised to make this pass.
+function refusalProbe(port) {
+  return new Promise((resolve) => {
+    const t0 = Date.now(); let done = false;
+    const finish = (code) => { if (done) return; done = true; clearTimeout(timer); try { socket.destroy(); } catch {} resolve({ code, ms: Date.now() - t0 }); };
+    const socket = net.connect(port, '127.0.0.1');
+    const timer = setTimeout(() => finish('NO_RESULT_5000MS'), 5000);
+    socket.once('error', (e) => finish(e.code || 'ERROR'));
+    socket.once('connect', () => finish('CONNECTED'));
+  });
+}
+
+test('#1215 G2-N1 native: `daemon restart` with NO daemon and NO local token restarts one (refused connection = absence)', async (t) => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  t.diagnostic(`#1215 G2-N1 no_token refusal ${JSON.stringify({ platform: process.platform, ...(await refusalProbe(port)) })}`);
+  const res = await runCli(['daemon', 'restart'], home, port);
+  assert.equal(res.code, 0, `restart from nothing should exit 0\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+  assert.match(res.stdout, /restarted/i);
+  await waitFor(async () => (await health(port)) ? true : null, { desc: 'restarted daemon reachable' });
+});
+
+test('#1215 G2-N1 native: `daemon restart` with NO daemon but WITH a local token restarts one (refused connection = absence)', async (t) => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  // A real local token: a real daemon start writes it under this HOME; the real stop then leaves nothing running.
+  await runCli(['daemon', 'start'], home, port);
+  await waitFor(() => meta(port, home), { desc: 'PRECONDITION: seeding daemon up (writes the local token)' });
+  const stopped = await runCli(['daemon', 'stop'], home, port);
+  assert.equal(stopped.code, 0, `PRECONDITION: seeding daemon stopped\nstderr:\n${stopped.stderr}`);
+  await waitFor(async () => (await health(port)) === null, { desc: 'PRECONDITION: nothing answers on the port' });
+  t.diagnostic(`#1215 G2-N1 with_token refusal ${JSON.stringify({ platform: process.platform, ...(await refusalProbe(port)) })}`);
+  const res = await runCli(['daemon', 'restart'], home, port);
+  assert.equal(res.code, 0, `restart from nothing should exit 0\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+  assert.match(res.stdout, /restarted/i);
+  await waitFor(async () => (await meta(port, home)) ? true : null, { desc: 'restarted daemon reachable with the local token' });
+});
+
+// A foreign HTTP listener (answers 404 to everything) is NOT absence: with no local token the Windows gate must not
+// start a replacement on it, must not claim success, and must send it no identification or stop request. Windows-only:
+// the gate is the win32 normal stop path; the unit tests pin the same decision on every platform.
+test('#1215 G2-R1 native: a foreign HTTP 404 listener on the port is never treated as absence — no replacement, no success claim, no meta/stop', { skip: process.platform === 'win32' ? false : 'win32 graceful-stop gate only (unit tests pin the decision on all platforms)' }, async (t) => {
+  const home = makeTempHome();
+  const received = [];
+  const server = require('node:http').createServer((req, res) => { received.push(`${req.method} ${req.url}`); res.statusCode = 404; res.end('not found'); });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  t.after(() => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve); }));
+  const port = server.address().port;
+  // Positive capture control: this listener's capture observes a known harmless request before relying on absences.
+  const control = await fetch(`http://127.0.0.1:${port}/telepty-1215-capture-control`, { signal: AbortSignal.timeout(5000) });
+  assert.equal(control.status, 404, 'PRECONDITION: the foreign listener answers 404');
+  assert.deepEqual(received, ['GET /telepty-1215-capture-control'], 'PRECONDITION: the capture observes requests');
+  const res = await runCli(['daemon', 'restart'], home, port);
+  assert.equal(res.code, 1, `restart must refuse on an unidentified listener\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+  assert.doesNotMatch(res.stdout, /restarted/i);
+  assert.equal(server.listening, true, 'the foreign listener is untouched');
+  assert.deepEqual(received.slice(1).filter((r) => /\/api\/meta|\/api\/daemon\/stop/.test(r)), [], 'no identification or stop request reached it');
+  assert.equal(fs.existsSync(path.join(home, '.telepty', 'daemon-state.json')), false, 'no daemon state was created');
+});

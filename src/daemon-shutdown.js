@@ -105,13 +105,20 @@ async function requestGracefulStop({ port, token, fetchImpl, isProcessRunning, c
     // /api/meta, no stop. Only the unauthenticated health probe is consulted: `true` (a daemon answered) ⇒ refused as
     // unidentified; otherwise `no_answer`, which the caller's dry-run census (state-file pid + port owner, command-line
     // confirmed) resolves. A foreign listener is never a target. Grants nothing.
-    // Review26 (REWORK): only `false` is absence-as-a-daemon (refused / not a daemon answer). `null` — a timeout or a
-    // reset, which the caller defines as "never not there" — is an UNKNOWN presence: tagged, so that it can never
-    // authorize a replacement (decideStopOutcome) even when the census finds nothing to act on.
-    let answering = null;
-    try { answering = await probeHealth(); } catch { answering = null; }
-    if (answering === true) return { status: 'unidentified', reason: 'no_local_token' };
-    return answering === false ? { status: 'no_answer', reason: 'no_local_token' } : { status: 'no_answer', reason: 'no_local_token', presence: 'unknown' };
+    // Correction31 (review30 G2-R1): the boolean health probe merged an HTTP 404 (some foreign listener answered) with a
+    // refused connection. This branch therefore issues ONE unauthenticated GET /api/health through fetchImpl (no token,
+    // no meta, no stop; the same 1 s bound the probe had) and classifies the transport itself, with the same rule as the
+    // token path: only a REFUSED connection is absence; a 2xx answer is an unidentified daemon (refused); any other HTTP
+    // status, a timeout, a reset or any other failure is an UNKNOWN presence, which never authorizes a replacement.
+    let health;
+    try {
+      health = await fetchImpl(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1000) });
+    } catch (error) {
+      return connectionRefused(error) ? { status: 'no_answer', reason: 'no_local_token' } : { status: 'no_answer', reason: 'no_local_token', presence: 'unknown' };
+    }
+    try { if (health && health.body && typeof health.body.cancel === 'function') Promise.resolve(health.body.cancel()).catch(() => {}); } catch { /* body is never read */ }
+    if (health && Number.isInteger(health.status) && health.status >= 200 && health.status < 300) return { status: 'unidentified', reason: 'no_local_token' };
+    return { status: 'no_answer', reason: 'no_local_token', presence: 'unknown' };
   }
   const base = `http://127.0.0.1:${port}`;
   const proof = async (binding) => (signRequest ? { 'x-telepty-principal': await signRequest(binding) } : {});
