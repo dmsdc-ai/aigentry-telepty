@@ -108,7 +108,7 @@ header, SID/role text or a client-side environment check does not qualify.
 
 | | Combined mode (ordinary transport + scoped operator proof) | Explicit strict mode |
 |---|---|---|
-| Daemon | `TELEPTY_SUPERVISION_TRUST_FILE=<trust file>` | `TELEPTY_PRINCIPAL_MODE=strict` + `TELEPTY_PRINCIPAL_TRUST_FILE=<trust file>` |
+| Daemon | `TELEPTY_SUPERVISION_TRUST_FILE=<trust file>`, or persistently `"supervisionTrustFile": "<absolute trust file path>"` in `~/.telepty/config.json` (a non-empty env value wins) | `TELEPTY_PRINCIPAL_MODE=strict` + `TELEPTY_PRINCIPAL_TRUST_FILE=<trust file>` |
 | Bridge | `TELEPTY_SUPERVISION_CLIENT_FILE=<operator client config>` | `TELEPTY_PRINCIPAL_CLIENT_FILE=<operator client config>` |
 | Ordinary requests | Daemon token / session bearer / JWT peers exactly as without supervision | Every request must carry a principal assertion; no token fallback |
 | Operator proof | Only on `POST /api/sessions/register` asking for `user-supervised` (and its reconnect re-registration) | On every request |
@@ -125,6 +125,70 @@ Fail-closed configuration:
 - Trust file set but unreadable or invalid ⇒ the daemon does not start (verification is never
   silently disabled). Set together with strict mode ⇒ `SUPERVISION_MODE_CONFLICT`, the daemon does
   not start.
+
+Persistent setting (`supervisionTrustFile`):
+- A service manager (launchd, systemd `--user`), a detached `telepty daemon start`, the CLI's automatic
+  restart and the npm-upgrade respawn do not inherit your shell, and service descriptors carry a fixed
+  environment that every install regenerates. Put the path in `~/.telepty/config.json` instead; every
+  daemon boot path reads it. Only the path is stored — never trust or key bytes. Service descriptors are
+  unchanged.
+- Precedence: a non-empty `TELEPTY_SUPERVISION_TRUST_FILE` wins; otherwise the config key; neither ⇒ off
+  (guarded, exactly as before). A missing config file is "not set".
+- The value must be a non-empty, absolute, normalized path of at most 4096 bytes with no control
+  characters. Anything else is `SUPERVISION_CONFIG_INVALID` and the daemon does not start. An existing
+  config that cannot be read or parsed is not "not set": lifecycle commands refuse with
+  `SUPERVISION_CONFIG_UNREADABLE`. The daemon itself only boots through it when `TELEPTY_AUTH_TOKEN` supplied
+  the secret (the recovery path), and then boots guarded and logs `[SUPERVISION] … UNAVAILABLE`.
+- Preflight: `telepty service install|start|restart`, `telepty daemon start|restart`, the menu's daemon
+  start, `telepty update`/repair, the CLI's automatic upgrade restart, the npm postinstall upgrade and
+  `install.js` check the setting BEFORE stopping, unloading or replacing anything, using the same trust
+  loader the daemon uses. A refusal prints only its code (`SUPERVISION_CONFIG_INVALID`,
+  `SUPERVISION_CONFIG_UNREADABLE`, `SUPERVISION_MODE_CONFLICT`, `SUPERVISION_UNSUPPORTED_PLATFORM`,
+  `PRINCIPAL_TRUST_UNAVAILABLE`), and the running daemon keeps running.
+- Preflight checks two local views, at that moment:
+  - **this process:** its environment first, then the config, with its `TELEPTY_MACHINE_ID`/hostname
+    audience. This is what a detached or inherited start receives.
+  - **the persistent setting a service-managed replacement reads:** launchd, systemd `--user` and schtasks
+    descriptors carry no `TELEPTY_*` variable, so that daemon resolves the config key alone, with the hostname
+    audience.
+
+  A `TELEPTY_SUPERVISION_TRUST_FILE` exported in your shell therefore decides only the first view. Whenever
+  it does, the persistent key is checked too, with the same rules. A valid override plus an invalid or
+  unreadable persistent setting is refused before anything is stopped. A valid override with NO persistent
+  key proceeds, and a service-managed replacement then runs guarded. The daemon's own rule (env wins) is
+  unchanged. Refusal lines still print only the code. Which view failed (`calling_process` or
+  `service_persistence`) is reported as `failed_scope` by `telepty service status --json`.
+- Preflight is not the running daemon's effective policy. `telepty service status` reports
+  `supervision: {configured, source, preflight}` (`--json` adds `failed_scope` and `service_persistence`) and
+  marks the daemon's effective policy as unmeasured. Only `GET /api/auth/challenge` (200 = supervision on) on that daemon shows
+  the effective policy.
+- Windows: the trust-file reader has no Windows backend, so a configured setting is refused
+  (`SUPERVISION_UNSUPPORTED_PLATFORM` in preflight; the daemon does not start).
+- `telepty uninstall` keeps `~/.telepty` and the key; `--purge` deletes `~/.telepty`, so keep the trust file
+  itself outside it. Remove the key and restart to return to guarded.
+
+Local admission check (`telepty allow-check --input-policy user-supervised`):
+- Runs the SAME parse and the same admission as `telepty allow --input-policy user-supervised`
+  (`src/cli/allow-admission.js`). That covers the nested-session refusal, the strict, handoff and
+  cooperative rules, and the operator client checks: loading `TELEPTY_SUPERVISION_CLIENT_FILE` and its
+  key through the private-file reader, and the local origin. Then it stops.
+- It is local and non-mutating. It creates no credential channel, starts or ensures no daemon, makes no
+  network request, does no registration, opens no listener, and writes no config or file. The client and key
+  are only read into memory.
+- Exit `0` comes only with exactly one JSON line (at most 1 KiB):
+  `{"schema":"telepty.allow-admission/v1","ok":true,"telepty_version":…,"input_policy":"user-supervised","supervision_client":"loaded","daemon_origin":…}`.
+- Exit `1` means refused. An admission refusal prints a code-only line
+  `{"schema":"telepty.allow-admission/v1","ok":false,"code":…}`; a parse refusal (nested session) keeps its
+  stderr text. Checker-only codes: `ALLOW_CHECK_CREDENTIAL_REFRESH_UNSUPPORTED` (the check never creates the
+  refresh channel) and `ALLOW_CHECK_SUPERVISION_CLIENT_REQUIRED` (no operator client configured).
+- Exit `2` means any other argv, including `--help`, and prints usage.
+- No path, key material or stack is printed.
+- An older telepty answers this unknown command with help and exit 0, so a caller must accept ONLY the
+  schema-valid success line.
+- It proves admission in THIS environment at THIS moment. It says nothing about a running daemon, its trust or
+  challenge audience, the network, or whether a later registration will be granted.
+- A real `telepty allow` now runs the same admission BEFORE creating the credential-refresh channel, so a
+  refused allow creates no channel. Its refusal texts are unchanged.
 - Combined mode: a presented operator proof that fails verification ⇒ the request is refused
   (`SUPERVISION_PROOF_INVALID`, `detail` = verifier code); no proof ⇒ registered guarded with the
   explicit refusal. Any other request ignores the header.

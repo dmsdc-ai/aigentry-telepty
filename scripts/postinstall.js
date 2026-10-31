@@ -129,6 +129,23 @@ async function main(options = {}) {
 
   logger.log(`[telepty postinstall] Detected stale daemon ${state.version || 'unknown'} (pid ${state.pid}); upgrading in-place to ${pkg.version}.`);
 
+  // Task 1215 service36: a replacement daemon that would refuse its supervision setting must not replace a running
+  // one. Preflight BEFORE the stop; on a refusal skip both stop and restart, so the old daemon keeps running, and
+  // name the code only (no path, no config content). Lazy require, as for daemon-control below.
+  try {
+    const supervision = require('../src/principal/supervision-config');
+    try {
+      supervision.preflightSupervision({ env, platform, configPath: supervision.defaultConfigPath(options.homeDir || os.homedir()) });
+    } catch (err) {
+      logger.warn(`[telepty postinstall] Supervision preflight refused (${supervision.refusalCode(err)}); the running `
+        + `${state.version || 'unknown'} daemon was NOT stopped or restarted. Fix the supervisionTrustFile setting, then run: telepty daemon restart`);
+      return;
+    }
+  } catch {
+    logger.warn('[telepty postinstall] Supervision preflight unavailable (SUPERVISION_PREFLIGHT_FAILED); the running daemon was NOT stopped or restarted.');
+    return;
+  }
+
   let stopped = 0;
   try {
     // Lazy require so a malformed install of daemon-control.js doesn't abort

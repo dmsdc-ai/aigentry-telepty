@@ -1172,6 +1172,11 @@ async function repairLocalDaemon(options = {}) {
     console.error(`\x1b[31m❌ ${refusal.diagnostic}\x1b[0m`);
     return { stopped: 0, failed: 0, meta: null, versionMatch: false, clientRestartRefused: refusal.mode, diagnostic: refusal.diagnostic };
   }
+  // Task 1215 service36: update/repair replaces the daemon, so it is preflighted before the stop.
+  if (restart) {
+    const refusedSupervision = supervisionPreflightRefusal({ supervision: options._supervision });
+    if (refusedSupervision) return { stopped: 0, failed: 0, meta: null, versionMatch: false, supervisionRefused: refusedSupervision.code, diagnostic: refusedSupervision.diagnostic };
+  }
   // #902: "repair MY daemon" — the one this CLI addresses, not every daemon on the machine.
   logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
   let results;
@@ -1755,6 +1760,14 @@ async function ensureDaemonRunning(options = {}) {
     }
   }
 
+  // Task 1215 service36: replacing an ANSWERING daemon (upgrade / legacy / capability restart) is preflighted first;
+  // a refusal leaves the running daemon untouched and reports the code. A `start` (nothing answered) has no daemon
+  // to preserve and keeps relying on the daemon's own boot check.
+  if (decision.action === 'restart') {
+    const refusedSupervision = supervisionPreflightRefusal({ supervision: options._supervision });
+    if (refusedSupervision) return { success: false, meta: null, supervisionRefused: refusedSupervision.code, diagnostic: refusedSupervision.diagnostic };
+  }
+
   // stderr (not stdout): banner must not contaminate `telepty list --json` (task #400, telepty#15)
   if (decision.action === 'restart' && decision.reason.startsWith('version-')) {
     process.stderr.write(`\x1b[33m⚙️ Daemon version mismatch (running v${meta.version}, installed v${pkg.version}). Restarting...\x1b[0m\n`);
@@ -2146,6 +2159,24 @@ function serviceDeps(extra = {}) {
   };
 }
 
+// Task 1215 service36: the supervision preflight (src/principal/supervision-config.js) every lifecycle mutation runs
+// FIRST. A refusal prints one fixed line with its code — never a path, config content or trust bytes — and nothing is
+// stopped, unloaded, cleaned up or restarted, so a running daemon keeps running. `deps.supervision` is the test seam
+// ({ env, configPath, machineId, platform }); production passes none (process env + the operator config).
+function supervisionPreflightRefusal(deps = {}) {
+  const supervision = require('./src/principal/supervision-config');
+  try {
+    supervision.preflightSupervision(deps.supervision || {});
+    return null;
+  } catch (error) {
+    const code = supervision.refusalCode(error);
+    const diagnostic = `Supervision preflight refused (${code}): nothing was stopped, unloaded or restarted. Fix the `
+      + 'supervisionTrustFile setting in the telepty config (or TELEPTY_SUPERVISION_TRUST_FILE) and retry.';
+    console.error(`\x1b[31m❌ ${diagnostic}\x1b[0m`);
+    return { code, diagnostic };
+  }
+}
+
 function printServiceSteps(result) {
   for (const step of result.steps || []) {
     if (step.ok) continue;
@@ -2186,6 +2217,11 @@ async function runSupervisedDaemonVerb(route, sub, deps = {}) {
 // route; a local one uses selectNormalStop — graceful (win32) or the signal stop (POSIX). The bodies below are
 // main()'s former inline branches, unchanged except that the platform check is the shared selector.
 async function runDaemonStopRestart(sub, deps = {}) {
+  if (sub === 'restart') {
+    // Task 1215 service36: preflight before the route, the stop and the replacement start.
+    const refusedSupervision = supervisionPreflightRefusal(deps);
+    if (refusedSupervision) { process.exitCode = 1; return { refused: true, supervisionRefused: refusedSupervision.code }; }
+  }
   const port = Number.isInteger(deps.port) && deps.port > 0 ? deps.port : Number(PORT);
   const detect = deps.detectSupervisor || detectSupervisor;
   const route = decideDaemonVerbRoute(supervisorFor(detect(), port, deps.supervisorOptions || {}), sub);
@@ -2243,6 +2279,14 @@ async function runDaemonStopRestart(sub, deps = {}) {
 // is inside src/service.js and receives `serviceDeps().gracefulStop`) goes to the service verb unchanged.
 async function runServiceCommandVerb(sub, flags = {}, deps = {}) {
   const service = require('./src/service');
+  // Task 1215 service36: install|start|restart are preflighted before any plan, write, load or graceful stop
+  // (a dry run changes nothing and is not refused).
+  if (['install', 'start', 'restart'].includes(sub) && !flags.dryRun) {
+    const refusedSupervision = supervisionPreflightRefusal(deps);
+    if (refusedSupervision) {
+      return { exitCode: service.SERVICE_EXIT.FAILED, reason: `supervision-preflight ${refusedSupervision.code}`, supervisionRefused: refusedSupervision.code };
+    }
+  }
   const runVerb = deps.runServiceVerb || service.runServiceVerb;
   const sdeps = deps.serviceDeps || serviceDeps();
   const scheduledTask = selectNormalStop({ platform: deps.platform || process.platform }) === 'graceful'
@@ -2266,9 +2310,54 @@ async function runUninstallCommand({ purge = false, dryRun = false } = {}, deps 
   return run(opts);
 }
 
+// Task 1215 service36: `telepty daemon start` exactly as main() dispatches it (main calls this; it holds main()'s
+// former inline start branches, unchanged), preflighted first, with seams so a test reaches the real routing
+// without detecting a real supervisor or spawning a daemon.
+async function runDaemonStart(deps = {}) {
+  const refusedSupervision = supervisionPreflightRefusal(deps);
+  if (refusedSupervision) { process.exitCode = 1; return { refused: true, supervisionRefused: refusedSupervision.code }; }
+  const route = decideDaemonVerbRoute(supervisorFor((deps.detectSupervisor || detectSupervisor)(), Number(PORT)), 'start');
+  if (route.route !== 'local') return (deps.runSupervisedDaemonVerb || runSupervisedDaemonVerb)(route, 'start');
+  // Detached/background start: return control to the shell immediately
+  // (cross-platform spawn with detached + stdio:'ignore' + unref). The child
+  // IS the daemon process, so cp.pid is the daemon's pid.
+  const cp = (deps.startDetachedDaemon || startDetachedDaemon)();
+  console.log(`\x1b[32m✅ Telepty daemon started (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
+  return { started: true, pid: cp.pid };
+}
+
+// Task 1215 service41: `telepty allow-check --input-policy user-supervised` exactly as main() dispatches it (main calls
+// this) → the exit code. A LOCAL, NON-MUTATING admission check: the same parseAllowInvocation and the same shared
+// admitAllowInvocation (src/cli/allow-admission.js) the real allow runs, then it stops — no credential channel, no
+// ensureDaemonRunning, fetch, registration, listener, config read/mint or file write. Success prints exactly one
+// whitelisted JSON line (≤1 KiB); an admission refusal prints a code-only JSON line, exit 1; a parse refusal keeps its
+// existing stderr text, exit 1; any other argv is usage, exit 2. It says nothing about a running daemon, its trust,
+// the network or whether a later registration will be granted.
+function runAllowCheck(argv, { env = process.env } = {}) {
+  const allowAdmission = require('./src/cli/allow-admission');
+  if (argv.length !== 3 || argv[0] !== 'allow-check' || argv[1] !== '--input-policy' || argv[2] !== 'user-supervised') {
+    console.error('Usage: telepty allow-check --input-policy user-supervised');
+    return 2;
+  }
+  const invocation = parseAllowInvocation('allow', ['allow', '--id', 'telepty-allow-check', '--input-policy', 'user-supervised', 'telepty-allow-check']);
+  if (!invocation) return 1;
+  if (env.TELEPTY_SESSION_CREDENTIAL_REFRESH === '1') {
+    console.log(allowAdmission.allowCheckRefusalLine('ALLOW_CHECK_CREDENTIAL_REFRESH_UNSUPPORTED'));
+    return 1;
+  }
+  const admission = allowAdmission.admitAllowInvocation(invocation, { env, daemonUrl: DAEMON_URL, sshPlan: null });
+  if (!admission.ok) { console.log(allowAdmission.allowCheckRefusalLine(admission.code)); return 1; }
+  if (!admission.supervisionClient) { console.log(allowAdmission.allowCheckRefusalLine('ALLOW_CHECK_SUPERVISION_CLIENT_REQUIRED')); return 1; }
+  const line = allowAdmission.allowCheckSuccessLine({ version: pkg.version, daemonOrigin: new URL(DAEMON_URL).origin });
+  if (Buffer.byteLength(line) > 1024) { console.log(allowAdmission.allowCheckRefusalLine('ALLOW_CHECK_OUTPUT_UNBOUNDED')); return 1; }
+  console.log(line);
+  return 0;
+}
+
 // Task 1215 W3 (R2): the interactive menu's `daemon` action (the menu calls this). Graceful stop of the addressed
 // daemon and a start only on a confirmed outcome (win32); POSIX keeps its sweep + start. → true when started.
 async function interactiveDaemonStart(deps = {}) {
+  if (supervisionPreflightRefusal(deps)) return false;   // Task 1215 service36: before the stop and the start
   const port = Number(PORT);
   const writeLog = deps.logDaemonRestartEvent || logDaemonRestartEvent;
   if (selectNormalStop({ platform: deps.platform || process.platform }) === 'graceful') {
@@ -2313,6 +2402,10 @@ async function main() {
     console.log(pkg.version);
     return;
   }
+
+  // Task 1215 service41: ahead of Guard A on purpose — allow-check accepts exactly one argv shape and answers every
+  // other one (including --help) with usage and exit 2, so it never acts on its way to usage either.
+  if (cmd === 'allow-check') { process.exitCode = runAllowCheck(args); return; }
 
   // tp941 Guard A: before ANY command branch, so no subcommand can execute on its way to
   // printing its own usage. Deliberately below the version check, which takes no argv.
@@ -2365,7 +2458,7 @@ async function main() {
       // are gone until a daemon is back. restartDaemonGraceful has already printed WHY.
       if (!updateRestartSucceeded(repair)) {
         // gh#82 round 2 (c): this client did not touch the daemon — say that, not "did not come back".
-        if (repair && repair.clientRestartRefused) {
+        if (repair && (repair.clientRestartRefused || repair.supervisionRefused)) {   // Task 1215 service36: + preflight refusal
           console.error('\n\x1b[31m❌ Update installed, but this client did not restart the daemon (see above).\x1b[0m');
           process.exitCode = 1;
           return;
@@ -2481,6 +2574,9 @@ async function main() {
       let binOwnership = null;
       try { binOwnership = diagnoseBinOwnership(); } catch { /* diagnosis is additive */ }
       const status = await getServiceStatus(serviceDeps({ binOwnership }));
+      // Task 1215 service36: read-only supervision view — THIS process's preflight of the configured setting, not the
+      // running daemon's effective policy (that is only GET /api/auth/challenge on the daemon). No path is shown.
+      status.supervision = require('./src/principal/supervision-config').describeSupervision();
       if (asJson) {
         console.log(JSON.stringify(status, null, 2));
       } else {
@@ -2495,6 +2591,8 @@ async function main() {
         console.log(`  startup: at login = ${status.startup.atLogin}, boot without login = ${status.startup.bootWithoutLogin}, linger = ${status.startup.linger}`);
         if (status.startup.reason) console.log(`  reason: ${status.startup.reason}`);
         if (status.startup.hint) console.log(`  note: ${status.startup.hint}`);
+        console.log(`  supervision: configured = ${status.supervision.configured}, source = ${status.supervision.source}, `
+          + `preflight = ${status.supervision.preflight} (daemon effective policy: unmeasured here)`);
         for (const conflict of status.conflicts) console.log(`  conflict: ${conflict.kind} at ${conflict.path}`);
         if (binOwnership && binOwnership.bins && binOwnership.bins.telepty) {
           console.log(`  telepty command owned by: ${binOwnership.bins.telepty.owner}`);
@@ -2579,19 +2677,8 @@ async function main() {
     const sub = args[1];
     // Task 1215 W3 (R2): stop|restart (supervised route or local) run through the exported dispatcher.
     if (sub === 'stop' || sub === 'restart') return runDaemonStopRestart(sub);
-    if (sub === 'start') {
-      const route = decideDaemonVerbRoute(supervisorFor(detectSupervisor(), Number(PORT)), sub);
-      if (route.route !== 'local') return runSupervisedDaemonVerb(route, sub);
-    }
-
-    if (sub === 'start') {
-      // Detached/background start: return control to the shell immediately
-      // (cross-platform spawn with detached + stdio:'ignore' + unref). The child
-      // IS the daemon process, so cp.pid is the daemon's pid.
-      const cp = startDetachedDaemon();
-      console.log(`\x1b[32m✅ Telepty daemon started (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
-      return;
-    }
+    // Task 1215 service36: start (supervised route or detached) runs through the exported, preflighted dispatcher.
+    if (sub === 'start') { await runDaemonStart(); return; }
 
     if (sub) {
       console.error('❌ Usage: telepty daemon [start|stop|restart]');
@@ -2786,6 +2873,10 @@ async function main() {
     let readinessNonce = null;
     const policyCapabilityHeaders = () => requestedInputPolicy === 'user-supervised' && inputPolicyCapability
       ? { 'x-telepty-input-policy-capability': inputPolicyCapability } : {};
+    // Task 1215 service41: the shared admission (src/cli/allow-admission.js) — the same body `telepty allow-check` runs —
+    // now precedes the credential channel, so a refused allow creates nothing. Refusal texts and success are unchanged.
+    const admission = require('./src/cli/allow-admission').admitAllowInvocation(allowInvocation, { env: process.env, daemonUrl: DAEMON_URL, sshPlan });
+    if (!admission.ok) { console.error(admission.message); process.exitCode = 1; return; }
     let credentialChannel = null;
     if (process.env.TELEPTY_SESSION_CREDENTIAL_REFRESH === '1') {
       try {
@@ -2798,56 +2889,12 @@ async function main() {
       }
     }
 
-    let strictOwnerClient = null;
-    let strictOwnerEpoch = null;
-    let handoffAdoption = null;
+    let strictOwnerClient = admission.strictOwnerClient;
+    let strictOwnerEpoch = admission.strictOwnerEpoch;
+    let handoffAdoption = admission.handoffAdoption;
     const cooperativeEnabled = process.env.TELEPTY_COOPERATIVE_HANDOFF === '1';
-    if (process.env.TELEPTY_PRINCIPAL_CLIENT_FILE) {
-      try {
-        const principalClient = require('./src/principal/client');
-        strictOwnerClient = principalClient.createPrincipalClient(principalClient.loadPrincipalClientConfiguration(process.env.TELEPTY_PRINCIPAL_CLIENT_FILE));
-        if (strictOwnerClient.daemonUrl !== new URL(DAEMON_URL).origin || sshPlan) throw new Error('PRINCIPAL_ALLOW_TARGET_UNSUPPORTED');
-      } catch {
-        console.error('Strict allow requires a checked principal client configuration for this local daemon and a local child.');
-        process.exitCode = 1; return;
-      }
-    }
-    if(process.env.TELEPTY_HANDOFF_CREDENTIAL_FILE){
-      try{
-        if(!strictOwnerClient || !cooperativeEnabled)throw new Error();
-        const proof=require('./src/principal/encoding').parseUnambiguousJSON(require('./src/principal/authority-file').readAuthorityFile(process.env.TELEPTY_HANDOFF_CREDENTIAL_FILE,{privateFile:true,maximum:8192}));
-        if(!proof || proof.schema!=='telepty.handoff-credential/v1' || Object.keys(proof).some(k=>!['schema','session_id','origin','session_epoch','session_token','session_nonce','credential_generation'].includes(k))
-          || proof.session_id!==sessionId || proof.origin!==strictOwnerClient.daemonUrl || !/^[A-Za-z0-9_-]{22}$/.test(proof.session_epoch||'')
-          || typeof proof.session_token!=='string' || !proof.session_token.startsWith(proof.session_epoch+'.') || proof.session_token.length>256
-          || !Number.isSafeInteger(proof.credential_generation) || proof.credential_generation<2 || !/^[A-Za-z0-9_-]{24}$/.test(proof.session_nonce||''))throw new Error();
-        handoffAdoption={expected_epoch:proof.session_epoch,expected_credential_generation:proof.credential_generation};
-        strictOwnerEpoch=proof.session_epoch;process.env.TELEPTY_SESSION_TOKEN=proof.session_token;process.env.TELEPTY_SESSION_ORIGIN=proof.origin;process.env.TELEPTY_SESSION_NONCE=proof.session_nonce;
-      }catch{console.error('Invalid or unsafe cooperative handoff credential file.');process.exitCode=1;return;}
-    }
-    if(cooperativeEnabled && !strictOwnerClient){console.error('Cooperative handoff requires an explicit strict principal client.');process.exitCode=1;return;}
-    // Task 1215 combined mode: ordinary transport credentials stay in force; a SEPARATE operator client
-    // (TELEPTY_SUPERVISION_CLIENT_FILE) signs only the user-supervised registration. It never selects
-    // strict owner transport or cooperative handoff; conflicting or unused configuration is refused.
-    let supervisionClient = null;
+    let supervisionClient = admission.supervisionClient;
     let supervisionEpoch = null;
-    if (process.env.TELEPTY_SUPERVISION_CLIENT_FILE) {
-      if (strictOwnerClient) {
-        console.error('TELEPTY_SUPERVISION_CLIENT_FILE cannot be combined with TELEPTY_PRINCIPAL_CLIENT_FILE (strict mode signs every request itself). Nothing was started.');
-        process.exitCode = 1; return;
-      }
-      if (requestedInputPolicy !== 'user-supervised') {
-        console.error('TELEPTY_SUPERVISION_CLIENT_FILE is used only with --input-policy user-supervised. Nothing was started.');
-        process.exitCode = 1; return;
-      }
-      try {
-        const principalClient = require('./src/principal/client');
-        supervisionClient = principalClient.createPrincipalClient(principalClient.loadPrincipalClientConfiguration(process.env.TELEPTY_SUPERVISION_CLIENT_FILE));
-        if (supervisionClient.daemonUrl !== new URL(DAEMON_URL).origin || sshPlan) throw new Error('SUPERVISION_TARGET_UNSUPPORTED');
-      } catch {
-        console.error('Supervision requires a checked operator client configuration (TELEPTY_SUPERVISION_CLIENT_FILE) for this local daemon and a local child. Nothing was started.');
-        process.exitCode = 1; return;
-      }
-    }
     // Adds the operator assertion to exactly one request shape: POST /api/sessions/register with
     // input_policy user-supervised, signed over the JSON-roundtripped body that is sent. Anything else
     // is passed through untouched. The assertion is never logged or stored.
@@ -5703,6 +5750,7 @@ function printGlobalHelp() {
   telepty daemon start|stop|restart              Start (detached) / stop / restart the background daemon
   telepty spawn --id <id> [--background] [--] <command> [args...]  Spawn and enter; --background returns
   telepty allow [--id <id>] [--idle-ttl 1h|off] [--auto-restart] <command> [args...]  Wrap a CLI for remote control
+  telepty allow-check --input-policy user-supervised  Local, non-mutating check of the user-supervised allow admission
   telepty list [--json]                          List sessions (local + Tailnet)
   telepty attach [id[@host]]                     Attach interactively (picker if no ID)
   telepty rename <old_id[@host]> <new_id>        Rename a session
@@ -5832,6 +5880,8 @@ module.exports = {
   selectNormalStop,       // Task 1215 W3 (R2): the stop-step selector every normal caller uses (pure)
   gracefulWindowsStop,    // Task 1215 W3 (R1): the exact-instance graceful gate (npm preuninstall awaits it)
   runDaemonStopRestart,   // Task 1215 W3 (R2): main()'s `daemon stop|restart` dispatch (injectable seams)
+  runDaemonStart,         // Task 1215 service36: main()'s `daemon start` dispatch, supervision-preflighted (injectable seams)
+  runAllowCheck,          // Task 1215 service41: main()'s `allow-check` dispatch (local, non-mutating admission check)
   runServiceCommandVerb,  // Task 1215 W3 (R2): main()'s `service <verb>` dispatch (injectable seams)
   runUninstallCommand,    // Task 1215 W3 (R1): main()'s `uninstall` (graceful-first on Windows)
   interactiveDaemonStart, // Task 1215 W3 (R2): the interactive menu `daemon` action

@@ -340,7 +340,25 @@ const principalAuthentication = require('./src/principal/http').createPrincipalA
 // Task 1215 combined mode: ordinary transport auth plus a separately configured operator verifier for
 // user-supervised registrations. Configured-but-invalid trust (or a strict-mode conflict) throws here,
 // so the daemon does not start without the verification it was told to perform.
-const supervisionAuthentication = require('./src/principal/http').createSupervisionAuthenticationFromEnvironment({ machineId: MACHINE_ID, sessions: () => sessions });
+// Task 1215 service36: the trust file is a non-empty TELEPTY_SUPERVISION_TRUST_FILE, else the persistent
+// `supervisionTrustFile` key of the config read above (src/principal/supervision-config.js) — so every boot path
+// (service manager, detached start, auto-restart, postinstall respawn) resolves the same setting. A present
+// invalid key throws here, like an invalid env value. Only when TELEPTY_AUTH_TOKEN skipped the config read and the
+// file then cannot be read does the daemon start guarded, saying so (the #843 C recovery shape below).
+const supervisionConfig = require('./src/principal/supervision-config');
+let supervisionSelection;
+try {
+  supervisionSelection = supervisionConfig.resolveSupervisionTrustFile({ env: process.env, config: config === null ? undefined : config });
+} catch (err) {
+  if (err.code !== 'SUPERVISION_CONFIG_UNREADABLE') throw err;
+  console.error(`[SUPERVISION] ${err.message}. TELEPTY_AUTH_TOKEN supplied the secret, so the daemon is starting `
+    + 'GUARDED: the supervisionTrustFile setting is UNAVAILABLE, not absent.');
+  supervisionSelection = { file: null, source: null };
+}
+const supervisionEnv = supervisionSelection.source === 'config'
+  ? { ...process.env, TELEPTY_SUPERVISION_TRUST_FILE: supervisionSelection.file }
+  : process.env;
+const supervisionAuthentication = require('./src/principal/http').createSupervisionAuthenticationFromEnvironment({ env: supervisionEnv, machineId: MACHINE_ID, sessions: () => sessions });
 // Neither supervision variable may reach a spawned session (src/routes/spawn.js copies process.env).
 delete process.env.TELEPTY_SUPERVISION_TRUST_FILE;
 delete process.env.TELEPTY_SUPERVISION_CLIENT_FILE;

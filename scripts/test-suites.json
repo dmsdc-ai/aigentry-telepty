@@ -264,7 +264,10 @@
         "test/integration/supervision-daemon-cli-1215.test.js",
         "test/test-runner-manifest.test.js",
         "test/ledger-publication-1215.test.js",
-        "test/mailbox-compatibility-membership-1215.test.js"
+        "test/mailbox-compatibility-membership-1215.test.js",
+        "test/supervision-config-persistence-1215.test.js",
+        "test/supervision-preflight-lifecycle-1215.test.js",
+        "test/allow-admission-1215.test.js"
       ]
     },
     "test:watch": {
@@ -473,7 +476,10 @@
         "test/operator-supervision-1215.test.js",
         "test/authority-file-darwin-1215.test.js",
         "test/test-runner-manifest.test.js",
-        "test/ledger-publication-1215.test.js"
+        "test/ledger-publication-1215.test.js",
+        "test/supervision-config-persistence-1215.test.js",
+        "test/supervision-preflight-lifecycle-1215.test.js",
+        "test/allow-admission-1215.test.js"
       ]
     },
     "test:ci": {
@@ -736,7 +742,10 @@
         "test/integration/supervision-daemon-cli-1215.test.js",
         "test/test-runner-manifest.test.js",
         "test/ledger-publication-1215.test.js",
-        "test/mailbox-compatibility-membership-1215.test.js"
+        "test/mailbox-compatibility-membership-1215.test.js",
+        "test/supervision-config-persistence-1215.test.js",
+        "test/supervision-preflight-lifecycle-1215.test.js",
+        "test/allow-admission-1215.test.js"
       ]
     },
     "test:ci:pty": {
