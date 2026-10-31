@@ -1,0 +1,22 @@
+{
+  "schema": "telepty-test-suites/v1",
+  "preload": ["./test/fixtures/test-runner/record-direct-child.cjs"],
+  "modes": {
+    "pass": {
+      "flags": ["--test", "--test-reporter=tap"],
+      "files": ["test/fixtures/test-runner/pass-a.fixture.cjs", "test/fixtures/test-runner/pass-b.fixture.cjs"]
+    },
+    "fail": {
+      "flags": ["--test"],
+      "files": ["test/fixtures/test-runner/fail.fixture.cjs"]
+    },
+    "duplicate": {
+      "flags": ["--test"],
+      "files": ["test/fixtures/test-runner/pass-a.fixture.cjs", "test/fixtures/test-runner/pass-a.fixture.cjs"]
+    },
+    "missing": {
+      "flags": ["--test"],
+      "files": ["test/fixtures/test-runner/absent.fixture.cjs"]
+    }
+  }
+}

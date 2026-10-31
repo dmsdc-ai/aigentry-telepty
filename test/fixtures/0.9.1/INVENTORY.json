@@ -1,0 +1,54 @@
+{
+  "purpose": "frozen 0.9.1 bodies for ACCEPTANCE X1–X3 (exact supplied baseline bytes; never edited)",
+  "head": "67463584ee03ffd0337e94818d712804509294a3",
+  "files": [
+    {
+      "path": "src/mailbox/delivery-runtime.js",
+      "sha256": "2657ac73900b4ab8a238742f4b1e48401b14e2f532743cd5b3c637bb25321ee0",
+      "bytes": 59463,
+      "provenance": "installed 0.9.1 (unguarded) — original-changed baseline",
+      "expected": "2657ac73900b4ab8a238742f4b1e48401b14e2f532743cd5b3c637bb25321ee0",
+      "gitBlob": "84444060c40a0f96708a55e9cae77bd84faf28dd"
+    },
+    {
+      "path": "guard/src/mailbox/delivery-runtime.js",
+      "sha256": "d7789bd11fbce179f60c0d0acf65ff86031ebd810bdeee32eadee742cea36468",
+      "bytes": 61117,
+      "provenance": "guard candidate overlay (accepted) — INPUT/source",
+      "expected": "d7789bd11fbce179f60c0d0acf65ff86031ebd810bdeee32eadee742cea36468",
+      "gitBlob": "84444060c40a0f96708a55e9cae77bd84faf28dd"
+    },
+    {
+      "path": "src/session-store/persistence.js",
+      "sha256": "ccdb1878266ba85fc55acc6af28c6a298ccafdae7aaa20bfe460a03a52fa9800",
+      "bytes": 16757,
+      "provenance": "installed == guard (unchanged) — INPUT/source",
+      "expected": "ccdb1878266ba85fc55acc6af28c6a298ccafdae7aaa20bfe460a03a52fa9800",
+      "gitBlob": "dac190d49c115d03534a3b40db54855ec1a9d97e"
+    },
+    {
+      "path": "src/interaction.js",
+      "sha256": "e5e6fe04a34b03f6eafdaabd251f02d99e94fd0df9693ae368235cd657e01b00",
+      "bytes": 17398,
+      "provenance": "installed == guard (unchanged) — INPUT/source",
+      "expected": "e5e6fe04a34b03f6eafdaabd251f02d99e94fd0df9693ae368235cd657e01b00",
+      "gitBlob": "c1a2f1f3c4389e1373ba0b6c5d51affc644ad578"
+    },
+    {
+      "path": "src/routes/session-actions.js",
+      "sha256": "3784ef5bcdcb6c2e75521c34bade51e8ea136320c1d28668e76e98b03c99ffa4",
+      "bytes": 93248,
+      "provenance": "installed == guard (unchanged) — INPUT/source",
+      "expected": "3784ef5bcdcb6c2e75521c34bade51e8ea136320c1d28668e76e98b03c99ffa4",
+      "gitBlob": "6c21406a122c66662f2a4b64d18c3a0d9f6fbea3"
+    },
+    {
+      "path": "src/completion-observation.js",
+      "sha256": "82819954e9007d4d2b4aabd6cb28d69e6d927c77eb3c0aa070b964b3f3f317aa",
+      "bytes": 14085,
+      "provenance": "installed == guard (unchanged) — INPUT/source",
+      "expected": "82819954e9007d4d2b4aabd6cb28d69e6d927c77eb3c0aa070b964b3f3f317aa",
+      "gitBlob": "ad48ad85e5a1f34171ce9989228bfcf1662e2ebf"
+    }
+  ]
+}

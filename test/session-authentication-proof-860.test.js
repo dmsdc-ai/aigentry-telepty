@@ -34,15 +34,23 @@ let sink;             // the aterm delivery endpoint — the UDS transport write
 let sinkPath;
 const sinkDeliveries = [];
 
+// #879: the aterm sink is a unix domain socket; `listen()` on a file path is EACCES on win32 and
+// it killed the WHOLE file in the before() hook (exit 7, 0 of 4 tests run). The sink is created
+// only where it can exist; the one test that needs it is skipped on win32 with the same reason
+// test/daemon.test.js already states for its aterm cases. The other three tests stay live.
+const UDS_WIN32_SKIP = process.platform === 'win32' ? 'unix domain sockets unavailable on Windows' : false;
+
 before(async () => {
-  sinkPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tp860-')), 's.sock');
-  sink = net.createServer((sock) => {
-    sock.on('data', (chunk) => {
-      sinkDeliveries.push(chunk.toString());
-      sock.end();
+  if (!UDS_WIN32_SKIP) {
+    sinkPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tp860-')), 's.sock');
+    sink = net.createServer((sock) => {
+      sock.on('data', (chunk) => {
+        sinkDeliveries.push(chunk.toString());
+        sock.end(JSON.stringify({ success: true }));
+      });
     });
-  });
-  await new Promise((resolve) => sink.listen(sinkPath, resolve));
+    await new Promise((resolve) => sink.listen(sinkPath, resolve));
+  }
   daemon = await startTestDaemon();
 });
 
@@ -57,7 +65,7 @@ function observations(injectId) {
 
 // --- the epoch a session never proved -------------------------------------------------------
 
-test('#860 F1: an epoch MINTED at register is not an authentication — nothing presented a bearer', async () => {
+test('#860 F1: an epoch MINTED at register is not an authentication — nothing presented a bearer', { skip: UDS_WIN32_SKIP }, async () => {
   const sid = createSessionId('f1-aterm');
   const reg = await daemon.registerSession(sid, {
     delivery_type: 'aterm',

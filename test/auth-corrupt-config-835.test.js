@@ -17,6 +17,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 const { randomUUID } = require('crypto');
+const { assertOwnerOnlyMode } = require('../test-support/platform-contract');
 
 const ROOT = path.resolve(__dirname, '..');
 const AUTH = path.join(ROOT, 'auth.js');
@@ -27,6 +28,46 @@ function withHome() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-835-'));
   fs.mkdirSync(path.join(home, '.telepty'), { recursive: true, mode: 0o700 });
   return { home, cfg: path.join(home, '.telepty', 'config.json') };
+}
+
+// Task 1215 — a daemon that reached `listening` has a ledger owner (a worker thread IN the daemon process)
+// holding .config/aigentry-telepty/tracked-injections.json/segments/* open. ChildProcess.kill() only
+// REQUESTS termination; removing the home before the process has exited raced those handles (Windows:
+// ENOTEMPTY on segments). Kill stays SIGKILL (no graceful path is simulated); teardown now waits,
+// bounded, for the actual 'exit', keeps the home and fails hard if it never comes, and reports a cleanup
+// failure together with — never instead of — the body's own failure. No retry, no sleep.
+const DAEMON_EXIT_BOUND_MS = 5000;
+function waitForExit(child, ms) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), ms);
+    child.once('exit', () => { clearTimeout(t); resolve(true); });
+  });
+}
+function remainingEntries(root, max = 40) {
+  const out = [];
+  (function walk(d, rel) {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) { if (out.length >= max) return; const r = rel ? `${rel}/${e.name}` : e.name; out.push(e.isDirectory() ? `${r}/` : r); if (e.isDirectory()) walk(path.join(d, e.name), r); }
+  })(root, '');
+  return out;
+}
+async function killExitedThenRemove(d, home, bodyError) {
+  const failures = [];
+  if (d) {
+    const exited = waitForExit(d, DAEMON_EXIT_BOUND_MS);
+    try { d.kill('SIGKILL'); } catch { /* already gone */ }
+    if (!(await exited)) failures.push(new Error(`daemon pid ${d.pid} did not exit within ${DAEMON_EXIT_BOUND_MS}ms of SIGKILL; owned home retained: ${home}`));
+  }
+  if (!failures.length) {
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch (error) {
+      failures.push(new Error(`owned home cleanup failed after daemon exit (exit=${d ? d.exitCode : 'n/a'} signal=${d ? d.signalCode : 'n/a'}): ${error.code} ${error.path || ''}; body_failed=${!!bodyError}; remaining=${JSON.stringify(remainingEntries(home))}`, { cause: error }));
+    }
+  }
+  if (!failures.length) return;
+  if (bodyError) throw new AggregateError([bodyError, ...failures], `test body failed (${bodyError.message}) and owned teardown failed`);
+  throw failures[0];
 }
 
 function seed(cfg, bytes) {
@@ -105,14 +146,14 @@ test('a valid config is returned intact — every key preserved, file never rewr
   }
 });
 
-test('no config at all still mints one — first run is the only place a token is created', () => {
+test('no config at all still mints one — first run is the only place a token is created', async (t) => {
   const { home, cfg } = withHome();
   try {
     assert.equal(fs.existsSync(cfg), false);
     const first = runGetConfig(home);
     assert.equal(first.ok, true);
     assert.match(first.token, /^[0-9a-f-]{36}$/i);
-    assert.equal((fs.statSync(cfg).mode & 0o777), 0o600, 'minted config stays 0600');
+    await assertOwnerOnlyMode(t, cfg, 'minted config stays 0600'); // #879: named subtest, skipped on win32
 
     const second = runGetConfig(home);
     assert.equal(second.token, first.token, 'a second call must not re-mint');
@@ -218,7 +259,7 @@ function spawnReader(home) {
   });
 }
 
-test('a reader that arrives mid-mint never sees a partial config — the write is atomic', { timeout: 30000 }, async () => {
+test('a reader that arrives mid-mint never sees a partial config — the write is atomic', { timeout: 30000 }, async (t) => {
   const { home, cfg } = withHome();
   const WINDOW_MS = 1500; // wide enough that four child-process startups fit inside it under load
   try {
@@ -261,7 +302,7 @@ test('a reader that arrives mid-mint never sees a partial config — the write i
     const tokens = [wOut.trim(), ...readers.map((r) => r.out)];
     assert.equal(new Set(tokens).size, 1, `all 5 must agree, got ${JSON.stringify(tokens)}`);
     assert.equal(JSON.parse(fs.readFileSync(cfg, 'utf8')).authToken, tokens[0]);
-    assert.equal((fs.statSync(cfg).mode & 0o777), 0o600, 'the atomically placed config stays 0600');
+    await assertOwnerOnlyMode(t, cfg, 'the atomically placed config stays 0600'); // #879: named subtest, skipped on win32
     assert.deepEqual(
       fs.readdirSync(path.dirname(cfg)),
       ['config.json'],
@@ -326,7 +367,7 @@ test('the daemon refuses to boot on an unreadable config, loudly, without rewrit
 test('the daemon boots on a corrupt config when TELEPTY_AUTH_TOKEN supplies the secret', { timeout: 30000 }, async () => {
   const { home, cfg } = withHome();
   const ENV_TOKEN = `env-supplied-${randomUUID()}`;
-  let d = null;
+  let d = null; let bodyError = null;
   try {
     seed(cfg, '{"authToken":"REAL-SECR');
     const before = fs.readFileSync(cfg);
@@ -370,9 +411,8 @@ test('the daemon boots on a corrupt config when TELEPTY_AUTH_TOKEN supplies the 
     assert.equal(ok.status, 200, 'the env-supplied token must be the one the daemon actually enforces');
     const denied = await fetch(`http://127.0.0.1:${port}/api/sessions`, { headers: { 'x-telepty-token': 'REAL-SECR' } });
     assert.notEqual(denied.status, 200, 'and the unreadable file must not have supplied a working one');
-  } finally {
-    if (d) { try { d.kill('SIGKILL'); } catch { /* already gone */ } }
-    fs.rmSync(home, { recursive: true, force: true });
+  } catch (error) { bodyError = error; throw error; } finally {
+    await killExitedThenRemove(d, home, bodyError);
   }
 });
 

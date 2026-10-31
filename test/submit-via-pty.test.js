@@ -20,13 +20,15 @@ process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = '1';
 // docs/adr/2026-06-07-submit-via-pty-context-layer.md and
 // docs/superpowers/specs/2026-06-07-submit-via-pty-context-layer.md.
 
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const child_process = require('node:child_process');
 
 const daemon = require('../daemon');
 const { terminalLevelSubmit, submitViaPty, forceSubmitDeliveredToSurface, fireAutoReport, runSubmitAll } = daemon;
 const { confirmSubmitAccepted, observeBodyVisibility } = require('../src/submit-gate');
+const { trackedInjectId, beginTracked, settleTracked } = require('../test-support/tracked-observation');
+after(async () => { await daemon.ledgerClient.close(2000); });
 
 // ---------------------------------------------------------------------------
 // 1) pty-only submit: single 0x0D, separate write, no surface shell-out
@@ -192,13 +194,16 @@ const NOW = 1_700_000_000_000;
 // choice between two message labels.
 const broadcasts = [];
 
-function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4.5, idleEvidenceReliable } = {}) {
+// #1207: the source is told only after the observation is durable on a durably begun tracked
+// record, so the record is begun first (fresh id per call — see test-support/tracked-observation)
+// and the settle chain is awaited.
+async function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4.5, idleEvidenceReliable } = {}) {
   const captured = [];
   const timers = []; // #48: settle-and-recheck defers the follow-up — capture and flush below
   broadcasts.length = 0;
   const pendingReport = {
     source: 'orch',
-    injectId: 'inj-1',
+    injectId: trackedInjectId('inj-1'),
     injectedAt: new Date(NOW - elapsedSec * 1000).toISOString(),
     ...pendingReportOverrides,
   };
@@ -213,12 +218,18 @@ function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4
     idleEvidenceReliable, // #545: now recorded as EVIDENCE, no longer a promotion input
     getAutoState: () => 'idle', // #48: still idle at recheck → the observation fires
   };
-  fireAutoReport('worker-1', { id: 'worker-1' }, pendingReport, trigger, deps);
-  while (timers.length) timers.shift()(); // #48: run the settle recheck
+  await beginTracked(daemon, { injectId: pendingReport.injectId, sessionId: 'worker-1', source: 'orch' });
+  const decision = fireAutoReport('worker-1', { id: 'worker-1' }, pendingReport, trigger, deps);
+  if (decision && typeof decision.then === 'function') await decision;
+  for (let guard = 0; guard < 50; guard++) { // #48: run the settle recheck (and any re-arm), then await its async emit
+    while (timers.length) timers.shift()();
+    await settleTracked(daemon, () => captured.length + broadcasts.length);
+    if (!timers.length) break;
+  }
   return captured.length ? captured[0].msg : null;
 }
 
-const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1 — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
+const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1-\d+-\d+ — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
 // The whole of section 4/4b used to turn on a two-way verdict: UNCONFIRMED for a never-started
 // worker, TASK_COMPLETE for a real one. Both are deleted, so every case below states the same
@@ -237,11 +248,11 @@ function statedAbsence(msg) {
   return ev.opts.extra.consumption;
 }
 
-test('BUG B: never-started worker (submit failed, only a startup spinner) is never a completion [real-idle]', () => {
+test('BUG B: never-started worker (submit failed, only a startup spinner) is never a completion [real-idle]', async () => {
   // Submit was expected but never strong-confirmed (no submitConfirmedAt, accepted:false).
   // The ONLY positive signal is sawWorkingAfterInject — a startup-spinner-polluted transition,
   // which Stage A does not admit as an input to consumption at all.
-  const consumption = statedAbsence(runGate({
+  const consumption = statedAbsence(await runGate({
     submitExpected: true,
     sawWorkingAfterInject: true,
     submitConfirm: { accepted: false, reason: 'strategy_failed' },
@@ -250,19 +261,19 @@ test('BUG B: never-started worker (submit failed, only a startup spinner) is nev
   assert.equal(consumption.submit_confirm_reason, 'strategy_failed');
 });
 
-test('BUG B: never-started worker is not a completion on the silence-timeout trigger either', () => {
+test('BUG B: never-started worker is not a completion on the silence-timeout trigger either', async () => {
   const consumption = statedAbsence(
-    runGate({ submitExpected: true, sawWorkingAfterInject: true }, { trigger: 'silence-timeout', elapsedSec: 12 })
+    await runGate({ submitExpected: true, sawWorkingAfterInject: true }, { trigger: 'silence-timeout', elapsedSec: 12 })
   );
   assert.equal(consumption.basis, 'no_consumption_evidence',
     'sawWorkingAfterInject on its own is not evidence of anything');
 });
 
-test('a force-accepted pty_cr submit (post-#544) is delivery, not completion', () => {
+test('a force-accepted pty_cr submit (post-#544) is delivery, not completion', async () => {
   // Change 2a: a delivered pty_cr sets submitConfirmedAt at submit time. That is a TRANSPORT
   // fact — the CR reached the PTY — and the old gate promoted it to a completion claim. The two
   // are different domains, which is the separation Stage A exists to draw.
-  const consumption = statedAbsence(runGate({
+  const consumption = statedAbsence(await runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
@@ -285,8 +296,8 @@ test('a force-accepted pty_cr submit (post-#544) is delivery, not completion', (
 // three cases below assert the property that replaces the old gate: the reliability of the idle
 // evidence CANNOT change what is claimed, in either direction, on any trigger.
 
-test('#545: unreliable idle evidence with a confirmed submit claims nothing', () => {
-  const consumption = statedAbsence(runGate({
+test('#545: unreliable idle evidence with a confirmed submit claims nothing', async () => {
+  const consumption = statedAbsence(await runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
@@ -294,12 +305,12 @@ test('#545: unreliable idle evidence with a confirmed submit claims nothing', ()
   assert.equal(consumption.basis, 'no_consumption_evidence');
 });
 
-test('#545: RELIABLE idle evidence (OSC133 + body consumed) still claims nothing', () => {
+test('#545: RELIABLE idle evidence (OSC133 + body consumed) still claims nothing', async () => {
   // The load-bearing half. This is the strongest idle evidence the daemon can have, and it was
   // the exact input that produced TASK_COMPLETE. It now produces the same sentence as the
   // unreliable case above — a reliable idle flip measures the SCREEN settling, never a turn
   // ending, so it never had the standing to conclude the task was done.
-  const consumption = statedAbsence(runGate({
+  const consumption = statedAbsence(await runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
@@ -307,8 +318,8 @@ test('#545: RELIABLE idle evidence (OSC133 + body consumed) still claims nothing
   assert.equal(consumption.basis, 'no_consumption_evidence');
 });
 
-test('#545: the reliability flag changes nothing on a silence-timeout trigger either', () => {
-  const consumption = statedAbsence(runGate({
+test('#545: the reliability flag changes nothing on a silence-timeout trigger either', async () => {
+  const consumption = statedAbsence(await runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 30_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },

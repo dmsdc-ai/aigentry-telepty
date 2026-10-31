@@ -1,5 +1,9 @@
+const { buildPtySpawnTarget } = require('../win-spawn-target');
 const os = require('os');
+const crypto = require('node:crypto');
+const { verifiedOwningPrincipal } = require('../principal/http');
 const { defaultSpawnAdmission } = require('../spawn-admission');
+const { isValidSessionId } = require('../session-id');
 
 const STRIPPED_SESSION_ENV_KEYS = [
   'CLAUDECODE',
@@ -29,13 +33,15 @@ function buildSessionEnv(sessionId) {
 
 function registerSpawnRoute(app, {
   sessions, sessionStateManager, pty, persistSessions, appendToOutputRing,
-  revokeSessionCredential, busClients, os, buildSessionEnv, admission = defaultSpawnAdmission
+  revokeSessionCredential, busClients, os, buildSessionEnv, admission = defaultSpawnAdmission,
+  ledgerLive = null   // #1207 — optional: tells the ledger owner which sessions are live
 }) {
   app.post('/api/sessions/spawn', (req, res) => {
-    const invalid = field => res.status(400).json({ error: `Invalid ${field}.` });
+    const invalid = (field, code) => res.status(400).json({ error: `Invalid ${field}.`, ...(code ? { code } : {}) });
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)
         || ![Object.prototype, null].includes(Object.getPrototypeOf(body))) return invalid('body');
+    if ('external_approval_policy' in body || 'require_owner_proof' in body) return invalid('unsupported protected spawn policy; use register');
     const values = Object.create(null);
     for (const field of ['session_id', 'command', 'args', 'cwd', 'cols', 'rows', 'type']) {
       const descriptor = Object.getOwnPropertyDescriptor(body, field);
@@ -48,11 +54,11 @@ function registerSpawnRoute(app, {
     }
     const { session_id, command } = values;
     if (typeof session_id !== 'string' || !session_id || Buffer.byteLength(session_id, 'utf8') > 128
-        || /[\x00-\x1f\x7f-\x9f]/.test(session_id)) return invalid('session_id');
+        || /[\x00-\x1f\x7f-\x9f]/.test(session_id)) return invalid('session_id', 'INVALID_SESSION_ID');
     if (typeof command !== 'string' || !command || command.includes('\0')) return invalid('command');
     for (const field of ['cwd', 'type']) {
       if (field in values && (typeof values[field] !== 'string' || !values[field]
-          || values[field].includes('\0'))) return invalid(field);
+          || values[field].includes('\0'))) return invalid(field, field === 'type' ? 'INVALID_SESSION_TYPE' : undefined);
     }
     const args = [];
     if ('args' in values) {
@@ -74,6 +80,11 @@ function registerSpawnRoute(app, {
     const { cols, rows } = values;
     const cwd = 'cwd' in values ? values.cwd : process.cwd();
     const type = 'type' in values ? values.type : 'AGENT';
+    // PR #108 C1/C2 — both become the PS1/PROMPT text below, which the shell expands on every prompt:
+    // the label must be USER or AGENT (case-insensitive, as before); the id is an allowlist with no shell,
+    // prompt or quote character, no space or control character, no prototype name and not dots only.
+    if (!['USER', 'AGENT'].includes(type.toUpperCase())) return invalid('type', 'INVALID_SESSION_TYPE');
+    if (!isValidSessionId(session_id)) return invalid('session_id', 'INVALID_SESSION_ID');
     if (Object.prototype.hasOwnProperty.call(sessions, session_id)) {
       return res.status(409).json({ error: `Session ID '${session_id}' is already active.` });
     }
@@ -91,10 +102,9 @@ function registerSpawnRoute(app, {
     }
 
     const isWin = os.platform() === 'win32';
-    const shell = isWin ? (command === 'powershell' ? 'powershell.exe' : 'cmd.exe') : command;
-    const shellArgs = isWin ? (command === 'powershell' || command === 'cmd' ? args : ['/c', command, ...args]) : args;
 
     try {
+      const { file: shell, args: shellArgs } = buildPtySpawnTarget(command, args, process.env, { platform: isWin ? 'win32' : process.platform });
       console.log('[SPAWN] Spawning %s with args: %o in cwd: %s', shell, shellArgs, cwd);
 
       const customEnv = buildSessionEnv(session_id);
@@ -120,8 +130,10 @@ function registerSpawnRoute(app, {
         env: customEnv
       });
 
+      const owningPrincipal = verifiedOwningPrincipal(req);
       const sessionRecord = {
         id: session_id,
+        ...(owningPrincipal ? { owningPrincipal, sessionEpoch: crypto.randomBytes(16).toString('base64url') } : {}),
         type: 'spawned',
         ptyProcess,
         ptyPid: ptyProcess.pid || null,
@@ -139,23 +151,21 @@ function registerSpawnRoute(app, {
         ready: true,
             };
       sessions[session_id] = sessionRecord;
-
-      // Broadcast session creation to bus
-      const spawnMsg = JSON.stringify({
-        type: 'session_spawn',
-        sender: 'daemon',
-        session_id,
-        command,
-        cwd,
-        timestamp: new Date().toISOString()
-      });
-      busClients.forEach(client => {
-        if (client.readyState === 1) client.send(spawnMsg);
-      });
+      const saved = persistSessions();
+      if (!saved || !saved.ok) {
+        if (!saved || !saved.committed) {
+          delete sessions[session_id];
+          // This process was created by this request and has not been published to clients.
+          try { ptyProcess.kill(); } catch (error) { console.error('[SPAWN] Rollback kill failed:', error.message); }
+        }
+        if (!saved || !saved.committed) return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
+      }
+      // #1207 resident-tier hint, only once the record is committed (the rollback arm returned above).
+      if (typeof ledgerLive === 'function') ledgerLive(session_id, true);
 
       ptyProcess.onData((data) => {
         const currentSession = sessions[sessionRecord.id];
-        if (!currentSession || currentSession !== sessionRecord) {
+        if (!currentSession || currentSession.isClosing || currentSession !== sessionRecord) {
           return;
         }
 
@@ -174,19 +184,56 @@ function registerSpawnRoute(app, {
       ptyProcess.onExit(({ exitCode, signal }) => {
         const currentId = sessionRecord.id;
         console.log('[EXIT] Session %s exited with code %s', currentId, exitCode);
-        sessionStateManager.markDead(currentId, exitCode, signal);
+        if (sessions[currentId] !== sessionRecord) return;
         sessionRecord.isClosing = true;
-        sessionRecord.clients.forEach(ws => ws.close(1000, 'Session exited'));
-        if (sessions[currentId] === sessionRecord) {
+        sessionRecord.ready = false;
+        try { sessionStateManager.markDead(currentId, exitCode, signal); }
+        catch { console.error('[EXIT] Observed-exit publication failed:', currentId); }
+        // The child has actually exited. A later persistence/close retry must not
+        // signal its numeric PID after the operating system has reused it.
+        sessionRecord.ptyProcess = null;
+        for (const key of ['ptyPid', 'pty_pid', 'pid', 'ownerPid', 'owner_pid']) sessionRecord[key] = null;
+        sessionRecord.clients.forEach(ws => {
+          try { ws.close(1000, 'Session exited'); }
+          catch { console.error('[EXIT] Client close failed:', currentId); }
+        });
+        Object.defineProperty(sessionRecord, 'retryNaturalExitCleanup', { configurable: true, value: () => {
+          if (sessions[currentId] !== sessionRecord) return false;
+          let saved;
+          try { saved = persistSessions(); } catch { saved = null; }
+          if (!saved || !saved.ok) {
+            sessionRecord.closeDurabilityPending = true;
+            console.error('[EXIT] Session removal was not durably saved; namespace remains fenced:', currentId);
+            return false;
+          }
+          // Closing records are omitted by the serializer. Only a confirmed
+          // durable omission permits revocation, unregistration and SID reuse.
           delete sessions[currentId];
+          sessionRecord.closeDurabilityPending = false;
+          if (typeof ledgerLive === 'function') ledgerLive(currentId, false);   // #1207
           revokeSessionCredential(currentId);   // #815: PTY exit — the instance is gone
           sessionStateManager.unregister(currentId);
-        }
+          return true;
+        } });
+        sessionRecord.retryNaturalExitCleanup();
       });
 
+      if (!saved.ok) return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
       console.log('[SPAWN] Created session %s (%s)', session_id, command);
-      persistSessions();
-      res.status(201).json({ session_id, command, cwd });
+      // Broadcast session creation to bus
+      const spawnMsg = JSON.stringify({
+        type: 'session_spawn',
+        sender: 'daemon',
+        session_id,
+        command,
+        cwd,
+        timestamp: new Date().toISOString()
+      });
+      busClients.forEach(client => {
+        if (client.readyState === 1) client.send(spawnMsg);
+      });
+
+      res.status(201).json({ session_id, command, cwd, ...(owningPrincipal ? { session_epoch: sessionRecord.sessionEpoch, owningPrincipal } : {}) });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

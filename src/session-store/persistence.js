@@ -3,6 +3,9 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
+const { storedOwningPrincipal } = require('../principal/http');
+const { normalizeAuthorityAudit } = require('../principal/authority-audit');
 
 function defaultSessionPersistPath(homeDir = os.homedir()) {
   return path.join(homeDir, '.config', 'aigentry-telepty', 'sessions.json');
@@ -11,10 +14,19 @@ function defaultSessionPersistPath(homeDir = os.homedir()) {
 function serializePersistedSessions(sessions) {
   const data = {};
   for (const [id, s] of Object.entries(sessions)) {
+    // Closing instances reserve their names in memory while process teardown awaits. Once the
+    // removal is committed, unrelated saves must never reintroduce their credential verifiers.
+    if (s.isClosing) continue;
     Object.defineProperty(data, id, { enumerable: true, writable: true, configurable: true, value: {
       id,
+      ...(storedOwningPrincipal(s.owningPrincipal) ? { owningPrincipal: storedOwningPrincipal(s.owningPrincipal) } : {}),
+      ...((s.authorityAuditInvalid === true || normalizeAuthorityAudit(s.authorityAudit) === null) ? { authorityAuditInvalid: true } : {}),
+      ...(normalizeAuthorityAudit(s.authorityAudit)?.length ? { authorityAudit: normalizeAuthorityAudit(s.authorityAudit) } : {}),
       type: s.type,
+      ...(s.externalApprovalPolicy ? { externalApprovalPolicy: s.externalApprovalPolicy } : {}),
+      ...(s.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
       command: s.command,
+      ...(s.sshRemote ? { sshRemote: require('../ssh-session').validateSshMetadata(s.sshRemote) } : {}),
       cwd: s.cwd,
       backend: s.backend || null,
       cmuxWorkspaceId: s.cmuxWorkspaceId || null,
@@ -23,6 +35,7 @@ function serializePersistedSessions(sessions) {
       term: s.term || null,
       delivery: s.delivery || null,
       deliveryEndpoint: s.deliveryEndpoint || null,
+      ...(s.type === 'mailbox' ? { leaseExpiresAt: s.leaseExpiresAt || null } : {}),
       createdAt: s.createdAt,
       lastActivityAt: s.lastActivityAt || null,
       lastConnectedAt: s.lastConnectedAt || null,
@@ -31,6 +44,9 @@ function serializePersistedSessions(sessions) {
       stateReport: s.stateReport || null,
       idleTtl: s.idleTtl || null,
       idleTtlMs: s.idleTtlMs == null ? null : s.idleTtlMs,
+      ...(s.cooperativeHandoffCapable===true ? {cooperativeHandoffCapable:true} : {}),
+      ...(Object.hasOwn(s,'cooperativeHandoff') ? {cooperativeHandoff:s.cooperativeHandoff} : {}),
+      ...(s.cooperativeHandoffAudit ? {cooperativeHandoffAudit:s.cooperativeHandoffAudit} : {}),
       ownerPid: s.ownerPid || null,
       ptyPid: s.ptyPid || null,
       // #815: the VERIFIER for the active credential epoch — never the bearer itself. This is
@@ -56,45 +72,150 @@ function serializePersistedSessions(sessions) {
       // advertise it once at startup and never again. Emitted ONLY when actually
       // observed, so a session that never saw the mode-set serializes byte-identically
       // to the pre-#730 format.
-      ...(s.bracketedPasteCapable === undefined ? {} : { bracketedPasteCapable: s.bracketedPasteCapable })
+      ...(s.bracketedPasteCapable === undefined ? {} : { bracketedPasteCapable: s.bracketedPasteCapable }),
+      // Task 1215 G6: "supervision granted and not explicitly revoked" (non-secret; no capability).
+      // Emitted only when true, so other sessions serialize byte-identically.
+      ...(s.supervisionRestorable === true ? { supervisionRestorable: true } : {})
     } });
   }
   return data;
 }
 
-// #815: this file now carries credential verifiers, so it is owner-only (0600). The mode is
-// passed to writeFileSync for the create case AND chmod'ed explicitly, because writeFileSync's
-// mode applies only when it creates the file — an existing 0644 sessions.json written by an
-// older daemon would otherwise keep its permissions forever.
+// #815: credential verifiers require owner-only files. Each replacement is created private;
+// legacy generations are tightened through their checked descriptor when loaded.
 const SESSION_FILE_MODE = 0o600;
 
-function savePersistedSessions(sessions, persistPath = defaultSessionPersistPath()) {
+function unsafeSessionPath() {
+  return Object.assign(new Error('Unsafe session storage path'), { code: 'SESSION_STORE_UNSAFE_PATH' });
+}
+
+// Reject link/reparse ancestors before mkdir or chmod can follow them. The final directory is
+// daemon-private; ancestors may be shared (e.g. /tmp) and must never be chmod'ed here.
+function checkSessionDirectory(dir, create) {
+  const resolved = path.resolve(dir);
+  let current = path.parse(resolved).root;
+  for (const part of resolved.slice(current.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    let st;
+    try { st = fs.lstatSync(current); } catch (error) {
+      if (!create || error.code !== 'ENOENT') throw error;
+      try { fs.mkdirSync(current, { mode: 0o700 }); } catch (mkdirError) {
+        if (mkdirError.code !== 'EEXIST') throw mkdirError;
+      }
+      st = fs.lstatSync(current);
+    }
+    if (!st.isDirectory() || st.isSymbolicLink()) throw unsafeSessionPath();
+  }
+  const st = fs.lstatSync(resolved);
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw unsafeSessionPath();
+  return resolved;
+}
+
+// macOS exposes /tmp and /var through system aliases. Resolve only the environment's
+// trusted HOME/temp base, then reject any link beneath that base as usual.
+function sessionStoragePath(persistPath) {
+  const file = path.resolve(persistPath);
+  for (const base of [os.homedir(), os.tmpdir()]) {
+    const root = path.resolve(base);
+    const relative = path.relative(root, file);
+    if (relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)) {
+      try { return path.join(fs.realpathSync(root), relative); } catch { /* mkdir handles a missing home */ }
+    }
+  }
+  return file;
+}
+
+function checkSessionLeaf(file) {
   try {
-    const data = serializePersistedSessions(sessions);
-    fs.mkdirSync(path.dirname(persistPath), { recursive: true });
-    fs.writeFileSync(persistPath, JSON.stringify(data, null, 2), { mode: SESSION_FILE_MODE });
-    try { fs.chmodSync(persistPath, SESSION_FILE_MODE); } catch {}
-  } catch {}
+    const st = fs.lstatSync(file);
+    if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1
+        || (typeof process.getuid === 'function' && st.uid !== process.getuid())) throw unsafeSessionPath();
+    return st;
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+// A failure before rename leaves the previous generation untouched. Once rename succeeds,
+// committed:true identifies the new visible generation even if directory fsync then fails;
+// callers must not roll memory back to a generation the disk no longer contains.
+function savePersistedSessions(sessions, persistPath = defaultSessionPersistPath()) {
+  let fd = null, dirFd = null, tmp = null, committed = false;
+  try {
+    const body = JSON.stringify(serializePersistedSessions(sessions), null, 2);
+    const file = sessionStoragePath(persistPath);
+    const dir = checkSessionDirectory(path.dirname(file), true);
+    checkSessionLeaf(file);
+    // Do not tighten arbitrary caller-supplied shared directories.
+    if (process.platform !== 'win32' && (fs.statSync(dir).mode & 0o077) !== 0
+        && dir === path.dirname(sessionStoragePath(defaultSessionPersistPath()))) {
+      fs.chmodSync(dir, 0o700);
+    }
+    // Windows chmod does not express DACL privacy; retain its existing mode request without
+    // interpreting synthetic POSIX permission bits as a reason to reject every NTFS directory.
+    if (process.platform !== 'win32' && (fs.statSync(dir).mode & 0o077) !== 0) {
+      throw Object.assign(new Error('Session storage directory must be owner-private'), { code: 'SESSION_STORE_UNSAFE_PATH' });
+    }
+    tmp = path.join(dir, `.sessions.${process.pid}.${crypto.randomBytes(12).toString('hex')}.tmp`);
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+      | (fs.constants.O_NOFOLLOW || 0), SESSION_FILE_MODE);
+    fs.fchmodSync(fd, SESSION_FILE_MODE);
+    fs.writeFileSync(fd, body);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = null;
+    // Windows does not support opening/fsync'ing a directory. File fsync + rename still
+    // provide complete generations there; native NTFS/DACL crash guarantees need platform QA.
+    if (process.platform !== 'win32') dirFd = fs.openSync(dir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0));
+    checkSessionDirectory(dir, false);
+    checkSessionLeaf(file);
+    fs.renameSync(tmp, file); committed = true; tmp = null;
+    if (dirFd !== null) fs.fsyncSync(dirFd);
+    return { ok: true, committed: true };
+  } catch (error) {
+    return { ok: false, committed, reason: 'session_store_write_failed', error };
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+    if (dirFd !== null) { try { fs.closeSync(dirFd); } catch {} }
+    if (tmp !== null) { try { fs.unlinkSync(tmp); } catch {} }
+  }
 }
 
 function loadPersistedSessions(persistPath = defaultSessionPersistPath()) {
+  let fd = null;
   try {
-    if (!fs.existsSync(persistPath)) return {};
-    // Tighten on the way in too: a file left world-readable by a pre-#815 daemon must not stay
-    // that way until the next write happens to land.
-    try { fs.chmodSync(persistPath, SESSION_FILE_MODE); } catch {}
-    return JSON.parse(fs.readFileSync(persistPath, 'utf8'));
+    const file = sessionStoragePath(persistPath);
+    checkSessionDirectory(path.dirname(file), false);
+    const st = checkSessionLeaf(file);
+    if (!st) return {};
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== st.dev || opened.ino !== st.ino) throw unsafeSessionPath();
+    fs.fchmodSync(fd, SESSION_FILE_MODE);
+    return JSON.parse(fs.readFileSync(fd, 'utf8'));
   } catch { return {}; }
+  finally { if (fd !== null) { try { fs.closeSync(fd); } catch {} } }
 }
 
 function buildRestoredWrappedSession(id, meta, options = {}) {
-  if (meta.type !== 'wrapped') return null;
+  if (!['wrapped', 'mailbox'].includes(meta.type)) return null;
 
+  let sshRemote;
+  try { sshRemote = require('../ssh-session').validateSshMetadata(meta.sshRemote); }
+  catch { return null; }
   const cwd = options.cwd || process.cwd();
   const nowIso = options.nowIso || (() => new Date().toISOString());
   return {
-    id, type: 'wrapped', ptyProcess: null, ownerWs: null,
+    id, type: meta.type,
+    ...(meta.externalApprovalPolicy ? { externalApprovalPolicy: meta.externalApprovalPolicy, requireOwnerProof: true } : {}),
+    ...(meta.requireOwnerProof === true ? { requireOwnerProof: true } : {}),
+    ptyProcess: null, ownerWs: null,
+    ...(storedOwningPrincipal(meta.owningPrincipal) ? { owningPrincipal: storedOwningPrincipal(meta.owningPrincipal) } : {}),
+    ...((meta.authorityAuditInvalid === true || normalizeAuthorityAudit(meta.authorityAudit) === null) ? { authorityAuditInvalid: true } : {}),
+    ...(normalizeAuthorityAudit(meta.authorityAudit)?.length ? { authorityAudit: normalizeAuthorityAudit(meta.authorityAudit) } : {}),
+    ...(meta.type === 'mailbox' ? { leaseExpiresAt: Number.isFinite(meta.leaseExpiresAt) ? meta.leaseExpiresAt : null } : {}),
     command: meta.command || 'wrapped', cwd: meta.cwd || cwd,
+    ...(sshRemote ? { sshRemote } : {}),
     backend: meta.backend || 'kitty',
     cmuxWorkspaceId: meta.cmuxWorkspaceId || null,
     cmuxSurfaceId: meta.cmuxSurfaceId || null,
@@ -108,6 +229,7 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
     stateReport: meta.stateReport || null,
     idleTtl: meta.idleTtl || null,
     idleTtlMs: meta.idleTtlMs == null ? null : meta.idleTtlMs,
+    ...require('../principal/cooperative-handoff').restoreHandoffRecord(meta),
     ownerPid: meta.ownerPid || null,
     ptyPid: meta.ptyPid || null,
     // #815: carry the credential epoch + verifier back onto the live record so the restored
@@ -126,6 +248,9 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
     ...(meta.bracketedPasteCapable === true || meta.bracketedPasteCapable === false
       ? { bracketedPasteCapable: meta.bracketedPasteCapable }
       : {}),
+    ...(meta.supervisionRestorable === true ? { supervisionRestorable: true } : {}),
+    // Task 1215 G6: memory-only "rebuilt from disk in this daemon lifetime"; never serialized.
+    restoredFromPersistence: true,
     clients: new Set(), isClosing: false, outputRing: [], ready: true,     };
 }
 
@@ -140,7 +265,7 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
 // no outcome field, by construction, so there is nothing in it for a future reader to mistake
 // for one.
 //
-// The write is transactional, unlike savePersistedSessions above: same-directory temp file →
+// Like the session store, the ledger uses: same-directory temp file →
 // fsync the file → atomic rename → fsync the directory. A crash therefore leaves either the
 // complete old generation or the complete new one, never an empty or half-written file. That
 // matters because this write is the thing that has to happen BEFORE bytes reach the target.
@@ -154,6 +279,12 @@ const MAX_OBSERVATIONS_PER_RECORD = 50;
 
 function defaultTrackedInjectionsPath(homeDir = os.homedir()) {
   return path.join(homeDir, '.config', 'aigentry-telepty', 'tracked-injections.json');
+}
+
+// #1207 — the ledger lock lives BESIDE the store, never inside it: the store path is a directory
+// only after migration, and the lock must exist before the first legacy read (CUTOVER §4 L0).
+function defaultTrackedInjectionsLockPath(trackedPath = defaultTrackedInjectionsPath()) {
+  return path.join(path.dirname(trackedPath), 'tracked-injections.lock');
 }
 
 function emptyTrackedInjections() {
@@ -313,6 +444,7 @@ module.exports = {
   TRACKED_INJECTIONS_SCHEMA_VERSION,
   MAX_OBSERVATIONS_PER_RECORD,
   defaultTrackedInjectionsPath,
+  defaultTrackedInjectionsLockPath,
   emptyTrackedInjections,
   saveTrackedInjections,
   loadTrackedInjections,

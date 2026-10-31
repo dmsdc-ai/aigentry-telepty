@@ -5,7 +5,7 @@ const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypt
 const http=require('node:http'),{Duplex}=require('node:stream');
 const assert=require('node:assert/strict');
 nodeTest('session-inspection-security-681',{concurrency:false},async t=>{
- const root=fs.mkdtempSync(path.join(os.tmpdir(),'telepty-inspection-681-'));
+ const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'telepty-inspection-681-')));
  const fixtureRoot=path.join(root,'fixture');
  const privateEnv={HOME:path.join(root,'private','home'),USERPROFILE:path.join(root,'private','home'),
   XDG_CONFIG_HOME:path.join(root,'private','config'),XDG_DATA_HOME:path.join(root,'private','data'),TMPDIR:path.join(root,'private','tmp')};
@@ -21,12 +21,27 @@ nodeTest('session-inspection-security-681',{concurrency:false},async t=>{
   if(id!=='f01')assert.equal(plan.operations[opCount].id,id,'planned chronology');
   assert.ok(++opCount<=256);active.status='RUNNING';
  }
+ // Task 1215 G4 — failure-only diagnostics that stay inside the suppression boundary: ONLY a stage name from
+ // this frozen allowlist and a witness of fixed keys whose values are booleans. Never an actual/expected
+ // value, error message/stack, payload, token, environment value or path.
+ const G4_STAGES=Object.freeze(new Set(['http.status','http.finished_disposed','http.listeners','http.no_x_powered_by',
+  'http.cors','http.json_body','http.check','http.prototype_intact']));
+ const G4_WITNESS_KEYS=Object.freeze(['successful_ids_match','failed_empty','effects_two','first_generation_advanced',
+  'second_generation_advanced','invalidation_submit','upstream_probe_armed']);
+ let g4Stage=null,g4Witness=null,g4Http=null;
+ // G4 HTTP status diagnostic: fixed recognized response codes only; anything else is 'other'.
+ const G4_CODES=Object.freeze(new Set(['PERMISSION_DENIED','ORIGIN_NOT_ALLOWED','PEER_NOT_ALLOWED','RATE_LIMITED',
+  'SUBMIT_ADMISSION_UNAVAILABLE']));
  async function group(id,fn){
-  enter(id);let value,failed=false;
+  enter(id);let value,failed=false;g4Stage=null;g4Witness=null;g4Http=null;
   await t.test(id,{concurrency:false},async sub=>{
    try{value=await fn(sub);if(active.status==='RUNNING')active.status='MATCH';}
    catch(error){failed=true;active.status='MISMATCH';
     const identity=['AssertionError','TypeError','RangeError'].includes(error?.name)?error.name:'Error';
+    if(G4_STAGES.has(g4Stage))sub.diagnostic('G4 stage='+g4Stage);
+    if(g4Http)sub.diagnostic('G4 http='+JSON.stringify({status:g4Http.status,expected_status:g4Http.expected_status,
+      status_equal:g4Http.status_equal===true,code_category:g4Http.code_category}));
+    if(g4Witness)sub.diagnostic('G4 witness='+JSON.stringify(Object.fromEntries(G4_WITNESS_KEYS.map(k=>[k,g4Witness[k]===true]))));
     throw new Error(identity+' in '+id+'; private diagnostic values suppressed');
    }
   });
@@ -157,11 +172,17 @@ function request(app,row){
   const context=await direct('s03',()=>records.createSessionRecordContext({sessions,sessionCredentials:credentials,
     sidNonces:nonces,sessionPersistPath:path.join(fixtureRoot,'sessions.json')}));
   const ledger=await direct('s04',()=>persistence.emptyTrackedInjections());
+  // #1207: the product no longer reads an in-memory `trackedInjections` mirror; held/busy interaction
+  // state comes from the ledger client's committed read model. The same explicit INPUT reaches that
+  // seam: a real, never-opened client (no worker, no files) whose read model mirrors `ledger`.
+  const {createLedgerClient}=local('src/session-store/ledger-client.js');
+  const ledgerClient=createLedgerClient({dir:path.join(fixtureRoot,'ledger-store'),lockPath:path.join(fixtureRoot,'ledger.lock')});
+  const mirrorLedger=()=>{const m=ledgerClient._internal.readModel;m.actions=new Map(Object.entries(ledger.interactions.actions));m.pending=new Map(Object.entries(ledger.interactions.pending));};
   const mailbox=await direct('s05',()=>new FileMailbox({root:path.join(fixtureRoot,'mailbox'),maxRetries:1}));
   const busClients=new Set([{readyState:1,send(text){assert.ok(bus.length<256);bus.push(JSON.parse(text));}}]);
-  const shared={sessions,sessionStateManager:state,sessionPersistence:persistence,trackedInjections:ledger,
+  const shared={sessions,sessionStateManager:state,sessionPersistence:persistence,trackedInjections:ledger,ledgerClient,
     trackedLedgerHealthy:true,trackedLedgerUnavailableReason:null,TRACKED_INJECTIONS_PATH:path.join(fixtureRoot,'ledger.json'),
-    interaction,readyRegistry,isOpenWebSocket,fs,isBootstrapGatedSession:metadata.isBootstrapGatedSession,interactionWaiters:new Map(),
+    interaction,readyRegistry,isOpenWebSocket,fs,crypto,isBootstrapGatedSession:metadata.isBootstrapGatedSession,interactionWaiters:new Map(),
     UPSTREAM_STALL_SECONDS:30,SESSION_STALE_SECONDS:300};
   const timers={setTimeout(fn,ms){assert.ok(++timeoutSeq<=128);const h={unref(){return this;}};
     timeouts.set(h,{fn,ms});return h;},clearTimeout(h){timeouts.delete(h);}};
@@ -197,7 +218,8 @@ function request(app,row){
       ownerReady:s.ownerWs?s.ownerWs.readyState:null,ptyKilled:s.ptyProcess?s.ptyProcess.killed:null,
       inputGeneration:s.interactionInputGeneration||0,invalidation:s.interactionInvalidation||null,
       probeAt:s.upstreamProbeAt??null,probeWatermark:s.upstreamProbeWatermark??null})),
-    interactionLedger:JSON.parse(JSON.stringify(shared.trackedInjections.interactions))});
+    // #1207: the authoritative interaction view the product reads (committed read model), not the unread mirror.
+    interactionLedger:JSON.parse(JSON.stringify(ledgerClient.readModel.interactionsView()))});
 
   async function runHttp(id,check,selectedApp=app){
     const row=all.find(r=>r.id===id);assert.ok(row);
@@ -206,14 +228,18 @@ function request(app,row){
       const requestRow={...row};
       if(row.registerId)requestRow.body={session_id:row.registerId,command:'generic-tool',cwd:fixtureRoot};
       wire=await request(selectedApp,requestRow);
+      g4Stage='http.status';
+      {const statusNum=Number.isInteger(wire.status)&&wire.status>=100&&wire.status<=599?wire.status:null;let codeCategory='other';
+       try{const parsed=JSON.parse(wire.body);if(parsed&&typeof parsed.code==='string'&&G4_CODES.has(parsed.code))codeCategory=parsed.code;}catch{codeCategory='other';}
+       g4Http={status:statusNum,expected_status:Number.isInteger(row.status)?row.status:null,status_equal:statusNum===row.status,code_category:codeCategory};}
       if(row.allowTimingInconclusive)assert.ok([200,429].includes(wire.status));else assert.equal(wire.status,row.status);
-      assert.ok(wire.finished&&wire.disposed);assert.equal(wire.listeners,0);
+      g4Stage='http.finished_disposed';assert.ok(wire.finished&&wire.disposed);g4Stage='http.listeners';assert.equal(wire.listeners,0);
       const header=/\r\nx-powered-by: ([^\r]+)/i.exec(wire.raw);
-      assert.equal(header,null,'X-Powered-By must be absent');
-      assert.match(wire.raw,/\r\nAccess-Control-Allow-Origin: \*\r\n/i,'original CORS header retained');
-      let body;if(![400,500].includes(wire.status))body=JSON.parse(wire.body);
-      const observation=check?check(body,wire):null;
-      assert.deepEqual(Object.getOwnPropertyDescriptors(Object.prototype),globalBefore);
+      g4Stage='http.no_x_powered_by';assert.equal(header,null,'X-Powered-By must be absent');
+      g4Stage='http.cors';assert.match(wire.raw,/\r\nAccess-Control-Allow-Origin: \*\r\n/i,'original CORS header retained');
+      g4Stage='http.json_body';let body;if(![400,500].includes(wire.status))body=JSON.parse(wire.body);
+      g4Stage='http.check';const observation=check?check(body,wire):null;
+      g4Stage='http.prototype_intact';assert.deepEqual(Object.getOwnPropertyDescriptors(Object.prototype),globalBefore);
       active.status=observation?.assessment==='INCONCLUSIVE'?'INCONCLUSIVE':'MATCH';
       measurements.push({id,before,after:snapshot(),effects:effects.slice(before.effects),
         bus:bus.slice(before.bus),elapsedNs:String(process.hrtime.bigint()-start),observation});
@@ -302,6 +328,11 @@ function request(app,row){
       const admissionBefore=snapshot();
       batch.push(await runHttp(id,(body,wire)=>{
         if(id!=='t01'){assert.equal(body.code,'RATE_LIMITED');assert.match(wire.raw,/\r\nRetry-After: 1\r\n/i);assert.deepEqual(snapshot(),admissionBefore);return;}
+        // G4: boolean-only witness of the t01 checks below (computed without throwing; emitted on failure only).
+        g4Witness={successful_ids_match:JSON.stringify((body?.results?.successful||[]).map(x=>x&&x.id))===JSON.stringify(['alpha-1','alpha-2']),
+          failed_empty:Array.isArray(body?.results?.failed)&&body.results.failed.length===0,effects_two:effects.length-startEffects===2,
+          first_generation_advanced:first.interactionInputGeneration===gen1+1,second_generation_advanced:second.interactionInputGeneration===gen2+1,
+          invalidation_submit:first.interactionInvalidation==='submit',upstream_probe_armed:first.upstreamProbeAt!=null};
         assert.deepEqual(body.results.successful.map(x=>x.id),['alpha-1','alpha-2']);
         assert.deepEqual(body.results.failed,[]);assert.equal(effects.length-startEffects,2);
         assert.equal(first.interactionInputGeneration,gen1+1);assert.equal(second.interactionInputGeneration,gen2+1);
@@ -312,7 +343,7 @@ function request(app,row){
     const rateObservation={elapsedNs:String(intervalNs),accepted:1,refused:2,constructorClockSeconds:0,assessment:'SELECTED_ORACLES_MATCH'};
     await direct('s35',()=>{ // Explicit trusted ledger INPUT; real core/held checks, not remote valid-frame reproduction.
       ledger.interactions.actions.fixture={sid:'alpha-1',stage:'dispatched'};
-      ledger.interactions.pending.fixture={sid:'alpha-2',state:'held'};
+      ledger.interactions.pending.fixture={sid:'alpha-2',state:'held'};mirrorLedger();
     });
     const heldGen=[first.interactionInputGeneration,second.interactionInputGeneration],heldWrites=effects.length;
     await direct('a-clock-4',()=>{originalNow=1;});
@@ -323,7 +354,7 @@ function request(app,row){
     });
     const refundBefore4=snapshot();
     await runHttp('a-no-refund-4',(body,wire)=>{assert.equal(body.code,'RATE_LIMITED');assert.match(wire.raw,/\r\nRetry-After: 1\r\n/i);assert.deepEqual(snapshot(),refundBefore4);});
-    await direct('s36',()=>{ledger.interactions.actions={};ledger.interactions.pending={};first.ownerWs.readyState=3;});
+    await direct('s36',()=>{ledger.interactions.actions={};ledger.interactions.pending={};mirrorLedger();first.ownerWs.readyState=3;});
     await direct('a-clock-5',()=>{originalNow=2;});
     await runHttp('t05',body=>{
       assert.deepEqual(body.results.successful.map(x=>x.id),['alpha-2']);
@@ -348,7 +379,7 @@ const defaultA={},defaultB={},fraction={},invalid={},authCase={},emptyCase={};le
 const selectedClock=()=>{clockCalls++;if(clockValue==='THROW')throw Error('private constructor clock failure');return clockValue;};
 let fractionBucket,invalidBucket,authBucket,emptyBucket,defaultStart,defaultElapsed;
 
-await direct('x-restore-terminal',()=>{ledger.interactions.actions={};ledger.interactions.pending={};first.type='wrapped';first.ownerWs={readyState:1,send:terminal(first,'owner')};second.type='spawned';second.ptyProcess={pid:null,killed:false,write:terminal(second,'pty')};});
+await direct('x-restore-terminal',()=>{ledger.interactions.actions={};ledger.interactions.pending={};mirrorLedger();first.type='wrapped';first.ownerWs={readyState:1,send:terminal(first,'owner')};second.type='spawned';second.ptyProcess={pid:null,killed:false,write:terminal(second,'pty')};});
 await direct('default-a-context',()=>{defaultA.context=createSessionInspectionContext(inspectionShared,{});});
 await direct('default-a-app',()=>{defaultA.app=httpApp.createHttpApp({express,cors});});
 await direct('default-a-auth',()=>{httpApp.registerHealthAndAuth(defaultA.app,{pkg:local('package.json'),createAuthMiddleware:auth.createAuthMiddleware,EXPECTED_TOKEN:hostToken,verifyJwt,isAllowedPeer,isForbiddenOrigin});});

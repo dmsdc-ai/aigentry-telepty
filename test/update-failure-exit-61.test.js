@@ -121,7 +121,7 @@ test('updateRestartSucceeded: an unknown or absent verdict fails closed', () => 
 
 // ── end to end ────────────────────────────────────────────────────────────────
 
-test('control: an update whose daemon repair is SKIPPED still reports success and exits 0', async () => {
+test('control: an update whose daemon repair is SKIPPED still reports success and exits 0', { skip: process.platform === 'win32' ? 'Windows now refuses before npm; covered by windows-update-plan-131' : false }, async () => {
   // Proves the success path is reachable in this fixture. Without it, the failure assertions
   // below could pass because `telepty update` never succeeds here for some unrelated reason.
   const { sentinel, command } = makeUpdateSentinel('control-skip');
@@ -137,7 +137,7 @@ test('control: an update whose daemon repair is SKIPPED still reports success an
   assert.match(result.stdout, /You are now using the latest version/);
 });
 
-test('update whose daemon restart FAILS exits non-zero and does not claim success (gh#61)', async () => {
+test('update whose daemon restart FAILS exits non-zero and does not claim success (gh#61)', { skip: process.platform === 'win32' ? 'Windows now refuses before npm; covered by windows-update-plan-131' : false }, async () => {
   const holder = await startPortHolder();
   try {
     const { sentinel, command } = makeUpdateSentinel('blocked-restart');
@@ -163,7 +163,7 @@ test('update whose daemon restart FAILS exits non-zero and does not claim succes
   }
 });
 
-test('a failed restart says the daemon is down and what to do about it', async () => {
+test('a failed restart says the daemon is down and what to do about it', { skip: process.platform === 'win32' ? 'Windows now refuses before npm; covered by windows-update-plan-131' : false }, async () => {
   // The report asked for this explicitly: the consequence users care about is that existing
   // sessions are now disconnected, and the original output never said so.
   const holder = await startPortHolder();

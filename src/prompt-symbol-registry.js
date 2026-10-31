@@ -16,11 +16,14 @@
 // Interaction observations intentionally do not reuse detectOutput or strip an output ring.
 // No measured current-frame provider is staged. This module is the future adapter boundary,
 // not a request-controlled capability toggle. Legacy readiness predicates stay unchanged.
-function observeInteraction() {
-  return require('./interaction').unavailableObservation();
+function observeInteraction(session) {
+  if (!session || session.externalApprovalPolicy || !session.interactionProvider) return require('./interaction').unavailableObservation();
+  return session.interactionProvider.observe();
 }
 
-function encodeInteraction() { return null; }
+function encodeInteraction(request, observation) {
+  return require('./vt/captured-selector').encodeCapturedSelector(request, observation);
+}
 
 
 // #737: the pre-prompt UIs codex's detect() step 1 rejects, hoisted so the delivery-path
@@ -38,7 +41,7 @@ const CODEX_MODAL_PATTERNS = [
 // ("gpt-5.5 xhigh fast" / "gpt-5.5 default · /path"). It repaints on every composer frame
 // and is absent while a modal owns the screen, so its LAST position is reliable evidence
 // that the composer was alive after that point in the stream.
-const CODEX_COMPOSER_FOOTER = /gpt-\S+\s+\S+(\s+fast|\s*·)/;
+const CODEX_COMPOSER_FOOTER = /gpt-\S+\s+\S+(\s+fast|\s*·)/i;
 
 // #760 — the same two lists for Claude Code, measured against real 2.1.220 surfaces
 // (scratchpad/capture-760-claude-modals.js, scratchpad/EVIDENCE-760.md).
@@ -235,7 +238,7 @@ const ENTRIES = {
       // names ("gpt-5.6-sol"), where `[0-9.]+` stopped at "5.6" and the `\s`
       // never reached past the "-sol". `\S+` cannot cross whitespace, so the
       // trailing `\s+\S+(\s+fast|\s*·)` profile/tail signal is preserved.
-      if (/OpenAI Codex \(v/.test(text) && /gpt-\S+\s+\S+(\s+fast|\s*·)/.test(text)) {
+      if (/OpenAI Codex \(v/.test(text) && /gpt-\S+\s+\S+(\s+fast|\s*·)/i.test(text)) {
         return { found: true, reason: 'codex_multi_signal' };
       }
 
@@ -248,7 +251,7 @@ const ENTRIES = {
         // captures kept one leading space — accept both.
         if (!/^ ?› /.test(line)) continue;
         const footer = (lines[i + 1] || '') + '\n' + (lines[i + 2] || '');
-        if (/gpt-\d/.test(footer)) {
+        if (/gpt-\d/i.test(footer)) {
           return { found: true, line_index: i, col: 2, reason: 'codex_strict_line' };
         }
       }
@@ -414,6 +417,27 @@ function detectOutput(command, output) {
   return entry.detect(screenLike);
 }
 
+// #136 (task 1215) — readiness from a RENDERED frame (src/vt/session-screen.js readFrame*), which
+// is what detect() was written for. Only a complete, current vt_grid qualifies; anything else is
+// `frame_incomplete` and never ready. Busy markers in the bottom 6 rows veto first (the same
+// expressions session-state.js uses), then detect() runs on the real rows, so its modal step 1
+// sees a screen instead of an append-only stream. Pure: no I/O, no timers.
+const FRAME_BUSY_MARKERS = [/\besc to interrupt\b/i, /\bstarting mcp servers?\b/i, /\bbooting mcp server\b/i];
+
+function detectFrame(command, frame) {
+  const entry = lookup(command);
+  if (!entry) return { found: false, reason: 'unknown_cli' };
+  if (!frame || frame.observation_basis !== 'vt_grid' || frame.snapshot_truncated !== false
+    || frame.lag_units !== 0 || !Array.isArray(frame.rows_text)) {
+    return { found: false, reason: 'frame_incomplete' };
+  }
+  const bottom = frame.rows_text.slice(-6).join('\n');
+  if (FRAME_BUSY_MARKERS.some((re) => re.test(bottom))) return { found: false, reason: 'busy_indicator' };
+  const hit = entry.detect(frame.rows_text.join('\n'));
+  if (!hit.found && /_modal_ui$/.test(hit.reason || '')) return { found: false, reason: 'modal_ui' };
+  return hit;
+}
+
 module.exports = {
   observeInteraction,
   encodeInteraction,
@@ -424,6 +448,7 @@ module.exports = {
   detectSurfaceModal,  // #737: positional modal check for the byte-stream delivery path
   detectSurfaceError,  // #801: per-CLI terminal-turn-failure markers (error-death vs completion)
   detectOutput,
+  detectFrame,         // #136: rendered-frame readiness for the bridge VT probe
   normalizeOutputForDetection,
   ENTRIES,
 };

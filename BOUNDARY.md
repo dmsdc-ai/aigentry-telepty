@@ -391,6 +391,123 @@ Accepted for 0.8.0. The rule for the follow-up is age-based eviction — records
 and whose last observation predates a named retention window — and the whole-file rewrite is a
 separate storage axis.
 
+## An unavailable tracked-injection ledger refuses new tracked work (candidate, #1207 on the 0.9.1 tree)
+
+`restoreTrackedInjections` is fail-closed and named: a file that is unparseable, not an object, or
+carries a `schema_version` this daemon does not understand leaves the bytes untouched and marks the
+store unavailable (`trackedLedgerHealthy = false`, reason `observation_store_unavailable`). Measured
+against the unchanged 0.9.1 tree (task 1207, private synthetic ledgers; not a live incident): that
+was where the refusal ended. The in-memory mirror the daemon starts with (`daemon.js`, an empty
+healthy ledger created before restore) is **not** the file, and `beginTrackedInjection` inserted
+into it, committed it over the preserved bytes as a fresh `generation: 1` file, flipped the store
+back to healthy, and let `POST /api/sessions/:id/inject` deliver with `200 success:true`. Two
+historical records and an unsupported-schema marker were gone after one inject.
+
+What holds now (`src/mailbox/delivery-runtime.js`):
+
+- **Unavailable authorizes nothing.** `beginTrackedInjection` refuses before any in-memory
+  mutation while the store is unavailable, returning the failure result the inject route already
+  handles: `500 TRACKING_PERSISTENCE_FAILED`, `tracking_state: "unavailable"`, no pending report,
+  no delivery, no audit `success` line. The unavailable reason stays on shared state, so
+  `GET /api/inject-observations/:id` keeps answering `tracking_state: "unavailable"` with it.
+- **One save boundary.** `commitTrackedInjections` — the save behind begin, abort, park, restore
+  and `recordObservation` — returns `{ ok: false, reason: <retained reason> }` while the store is
+  unavailable, so no writer can replace the preserved bytes. The interaction core already refused
+  `storage_unavailable` through its null ledger reader; that is unchanged.
+- **Health is re-established only by a valid explicit restore.** A later successful save no longer
+  marks the store healthy (that assignment is gone from the begin path): a writable filesystem is
+  not a readable ledger. `restoreTrackedInjections` sets healthy on a successful load, and still
+  marks `observation_store_write_failed` if its own restart commit fails.
+- **A failed healthy save is a distinct observation.** A commit that fails while the store is
+  healthy still refuses that one inject and rolls back, as before; it does not mark the store
+  unavailable, and the next inject may try again.
+
+Not done here, deliberately: no repair, quarantine, migration or deletion of the unreadable file;
+no operator recovery command; no retry loop. Putting a known-valid ledger back and running the
+existing restore (a daemon restart) is the only way back. The whole-file rewrite cost above, and
+the observation that the in-memory `generation` never advances inside one process lifetime (every
+commit writes `generation: <loaded> + 1`), are recorded for a separate disposition under the #1251
+successor architecture; this refusal does not address them.
+
+## The tracked-injection ledger is a directory store owned by one worker thread (unreleased current-task correction, #1207 under release-1238)
+
+**Status: private implementation candidate. Not activated, not measured, not released.** Every
+number below is proposed until the acceptance runs measure it; the package version is assigned by
+the release controller and is not changed by this correction.
+
+What changed. `~/.config/aigentry-telepty/tracked-injections.json` is a **directory** after a
+one-time offline migration: `MANIFEST.json`, `legacy/tracked-injections.v3.json` (the 0.9.1 file,
+byte-identical, mode 0400), `segments/<epoch>-<n>.jsonl` (hash-framed JSONL deltas, append-only,
+grouped by commit frames, one fsync per group), `hot/<n>.jsonl` (the working set + interaction
+receipts), `cold/<n>.jsonl` + 32-byte indexes (immutable history), `facts/<n>.jsonl` (restart and
+owner-lifecycle facts, stored once and overlaid in durable log order). One long-lived
+`worker_threads` owner (`src/session-store/ledger-owner.js`) is the only opener of any file under
+it; the main thread (`ledger-client.js`) submits small deltas and serves a committed-only read
+model. No observation rewrites history; retained cold data is never rewritten or deleted.
+
+What holds:
+
+- **Durable before delivery; four outcomes.** HTTP 200, `deliverInjectionToSession`,
+  `inject_written`, audit `success|queued` and the source notification happen only after the owner's
+  fsynced commit ACK. A write is `ack`, `nack` (invalidity established before any persistence
+  attempt), `indeterminate` (a write or fsync was attempted and its durability is unknown; never
+  described as success or failure; settled only by receipts/unapplied lists at the next recovery),
+  or `rejected_admission` (a reservation failed; nothing queued, nothing persisted). Accepted means
+  capacity admitted, not durable.
+- **What "durable" means per OS (WIN-1, measured on Windows CI run 41169574692).** On every platform
+  the ACK follows a successful `fsync` of the FILE that holds the commit frame (segments, checkpoint
+  members, MANIFEST temporaries and the migration copy are file-fsynced before use); any file-fsync
+  error is `indeterminate`, never an ACK. On macOS/Linux the owner also fsyncs the DIRECTORY after
+  creating or renaming an entry, and any error there fails the operation closed. On Windows a
+  directory handle cannot be flushed (`FlushFileBuffers` → `EPERM`), so the owner records
+  `durability.dir_flush: "unsupported"` (`telepty ledger status`, owner `io.dir_flush_unsupported`) and
+  continues. Only that shape is tolerated: the directory opened, its flush refused with `EPERM`, on
+  win32. A directory that cannot be opened, any other errno, and every file-fsync error still fail
+  closed. **Windows limit:** a newly created segment's directory entry, or a rename, is not explicitly
+  flushed. Whether it survives power loss is up to the file system (NTFS journals metadata), and this
+  owner does not promise it.
+- **Exclusion by a filesystem fact.** The unguarded 0.9.1 `saveTrackedInjections` renames a temp
+  file over the path; a directory there makes the rename fail and the load fail, so 0.9.1 begins
+  refuse before delivery (`X1–X4`). Expected errno `EISDIR` on macOS/Linux; **Windows errno is
+  recorded, not asserted, and Windows is not a supported cutover platform until those gates pass
+  there.** Existing Windows support of the rest of the daemon is unchanged.
+- **Lock fails closed.** `tracked-injections.lock` is created once with `O_EXCL` by the daemon
+  main thread; `EEXIST` ⇒ `unavailable: lock_present`, lock untouched, control plane up. The worker
+  re-reads the lock (pid + token) before opening any file. **Named availability limitation:** after
+  a crash the lock persists until an operator runs `telepty ledger unlock --confirm`, which refuses
+  while `daemon-state.json` names a live pid or the port answers `/api/health`. No automatic
+  stale-lock breaking exists and none is fabricated.
+- **Migration retains everything.** Under the lock: unique staging directory, streamed hash and copy
+  of the legacy file, parse of the COPY with the 0.9.1 loader rules, publication order with
+  per-file and per-directory fsyncs, rename aside, **hash of the aside artifact itself**, rename of
+  the staging directory into place. Every conflict (`legacy_modified`,
+  `original_modified_after_capture`, `legacy_recreated`, `original_modified`, `abandoned_staging`)
+  stops with every file in place and a named reason — the aside is **never renamed back** after a
+  conflict (that check would race an old writer). A published directory store is recognised
+  **before** any pending-migration scan, so a retained aside from a completed migration never blocks
+  a restart; only unknown or ambiguous pending identities fail closed. Live migration of a running
+  0.9.x daemon is not authorized; a daemon already running keeps serving its in-memory mirror until
+  it is restarted (operator prerequisite P1).
+- **Guard semantics preserved.** An unreadable store (`unavailable_read`: bad manifest format, a
+  corrupted committed frame, a conflicting duplicate frame) authorizes nothing: begin refuses
+  before any in-memory mutation, polls answer `tracking_state:"unavailable"` with the reason, and
+  only a successful owner open re-establishes health. A single failed write is distinct: retried
+  once in a new segment file, then `indeterminate` + `unavailable_write`, health untouched.
+- **Capacity is visible and reserved.** Each admitted job reserves one terminal unit and two result
+  units; class O (screen-transition) observations draw on their own pool and are rejected
+  pre-admission with `tracking_backpressure` when it is full; sustained exhaustion refuses new
+  begins with `503 TRACKING_CAPACITY sustained_exhaustion`. There is no lossy coalescing, no
+  suppression record, and no unbounded main-thread retry queue. Encoded-byte caps bound resident
+  encoded state only; heap and RSS are measured, not implied.
+
+Named deltas and limits: the hot/cold tier means a new tracked begin supersedes only the session's
+**hot** `tracked` records (cold ones remain `tracked`, completion unknown, exactly as a poll answered
+before); facts are resident in memory (they are O(restarts + lifecycle events), not O(records));
+cold index memory is capped at 64 MiB after which the oldest cold files answer `cold_offline`
+(demotion to on-disk search is successor #1251 work); `exportV3` materializes the whole history in
+memory (operator command, not on the observation path). Not done: archival/eviction, cold-index
+demotion, task/attempt bundles, automatic replay of indeterminate work.
+
 ## Design principle
 
 > **telepty = stateless dumb pipe**

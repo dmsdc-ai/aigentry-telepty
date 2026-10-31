@@ -80,12 +80,32 @@ function makeUpdateSentinel(name) {
 
 // ── gh#61: `update --help` must not update ────────────────────────────────────
 
-test('control: plain `update` DOES run the configured update command', async () => {
+// #879: on win32 plain `update` never runs any update command — cli.js answers with the read-only
+// blocked plan and exit 1 before runUpdateInstall (src/update-plan.js assertUpdateCanRun, gh#131),
+// so this sentinel control cannot fire there by contract. The win32 control below proves instead
+// that plain `update` reaches the update branch while `update --help` does not.
+const UPDATE_RUNS_SKIP = process.platform === 'win32'
+  ? 'win32: in-place self-update is blocked before any update command (src/update-plan.js); covered by the win32 control below'
+  : false;
+
+test('control: plain `update` DOES run the configured update command', { skip: UPDATE_RUNS_SKIP }, async () => {
   // Without this, the assertion below could pass because the sentinel is unwritable rather than
   // because the guard held. Fully sandboxed — TELEPTY_UPDATE_COMMAND replaces the real npm call.
   const { sentinel, command } = makeUpdateSentinel('control-update');
   await runCliSandboxed(['update'], { TELEPTY_UPDATE_COMMAND: command });
   assert.equal(fs.existsSync(sentinel), true, 'sentinel never fires — the guard test would be vacuous');
+});
+
+test('win32 control: plain `update` reaches the blocked update plan; `update --help` prints help instead', { skip: process.platform !== 'win32' }, async () => {
+  const { sentinel, command } = makeUpdateSentinel('win32-control-update');
+  const plain = await runCliSandboxed(['update'], { TELEPTY_UPDATE_COMMAND: command });
+  assert.equal(plain.code, 1, 'the Windows update refusal is a failure exit');
+  assert.match(stripAnsi(plain.stdout), /Update plan: blocked/, 'plain `update` must reach the update branch');
+  assert.equal(fs.existsSync(sentinel), false, 'the Windows guard must refuse before the update command');
+  const help = await runCliSandboxed(['update', '--help'], { TELEPTY_UPDATE_COMMAND: command });
+  assert.match(stripAnsi(help.stdout), GLOBAL_HELP_UPDATE);
+  assert.doesNotMatch(stripAnsi(help.stdout), /Update plan:/, '`update --help` entered the update branch (gh#61)');
+  assert.equal(fs.existsSync(sentinel), false);
 });
 
 test('update --help prints usage and does NOT perform the update', async () => {

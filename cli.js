@@ -16,6 +16,7 @@ const {
   clearRestartFailureMarker,
   findParentProcessInfo,
   findPortOwnerPid,
+  isProcessRunning,
   readDaemonState,
   readRestartFailureMarker,
   stopDaemon,
@@ -23,8 +24,9 @@ const {
 } = require('./daemon-control');
 const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = require('./interactive-terminal');
 const interaction = require('./src/interaction');
+const { formatTerminalTitle } = require('./src/session-id');   // PR #108 C7: controls stripped from OSC titles
 const { getRuntimeInfo } = require('./runtime-info');
-const { formatHostLabel, groupSessionsByHost, parseSessionReference, pickSessionTarget } = require('./session-routing');
+const { formatHostLabel, groupSessionsByHost, parseSessionReference, pickSessionTarget, resolveRegisteredPeerTarget } = require('./session-routing');
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const {
@@ -55,6 +57,7 @@ const { parseHostSpec, buildDaemonUrl, buildDaemonWsUrl } = require('./host-spec
 const { FileMailbox } = require('./src/mailbox/index');
 const { filterBridgeBatch, bridgeInjectTtlSecs } = require('./src/mailbox/bridge-flush-filter');
 const readyRegistry = require('./src/prompt-symbol-registry');
+const capturedSelector = require('./src/vt/captured-selector');
 const lifecycle = require('./src/lifecycle');
 const args = process.argv.slice(2);
 let pendingTerminalInputError = null;
@@ -176,7 +179,7 @@ let cachedAuthToken = null;
 // TELEPTY_AUTH_TOKEN for a client but not for the daemon produces a 401 that looks like a
 // credential bug; the variable is therefore documented (BOUNDARY.md) as something you set for
 // BOTH ends or neither, and never silently preferred at one end only.
-const { createCliSecurityActions, createAllowSecurityContext } = require('./src/cli/security-actions');
+const { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken } = require('./src/cli/security-actions');
 const cliSecurity = createCliSecurityActions({
   get cachedAuthToken() { return cachedAuthToken; },
   get cachedPeerTokens() { return cachedPeerTokens; },
@@ -488,17 +491,125 @@ function ensureRemoteSharedReference(peerName, descriptor, message = '') {
   };
 }
 
-function resolveTeleptyEntryPoint() {
-  // After npm upgrade, process.argv[1] still points to the OLD version's cli.js.
-  // Resolve the current telepty binary from PATH, which npm updates on install.
+async function ensureHttpSharedReference(host, descriptor, message = '') {
+  const { MAX_SHARED_REFERENCE_BYTES } = require('./src/shared-reference-transfer');
+  const bytes = Buffer.from(descriptor.content, 'utf8');
+  if (bytes.length > MAX_SHARED_REFERENCE_BYTES) throw new Error('Shared reference exceeds the HTTP transfer size limit.');
+  const response = await fetchWithAuth(`${daemonUrl(host)}/api/shared`, {
+    method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content_base64: bytes.toString('base64'), hash: descriptor.hash, fileName: descriptor.fileName })
+  });
+  if (!response.ok) throw new Error(`Shared reference upload failed (HTTP ${response.status}); nothing injected.`);
+  const receipt = await response.json();
+  if (receipt.success !== true || receipt.hash !== descriptor.hash || receipt.fileName !== descriptor.fileName
+    || receipt.promptPath !== descriptor.promptPath) throw new Error('Shared reference upload returned an invalid commit receipt; nothing injected.');
+  return { descriptor, referencePath: descriptor.promptPath,
+    prompt: buildSharedReferenceInjectPrompt(descriptor.promptPath, message) };
+}
+
+
+function resolveTeleptyEntryPoint(deps = {}) {
+  const ownCli = path.join(__dirname, 'cli.js');
+  const platform = deps.platform || process.platform;
+  const exec = deps.execSync || execSync;
+  const fsx = deps.fs || fs;
+
   try {
-    const cmd = process.platform === 'win32' ? 'where telepty' : 'which telepty';
-    const binPath = execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n')[0];
-    if (binPath && fs.existsSync(binPath)) {
-      return fs.realpathSync(binPath);
+    const cmd = platform === 'win32' ? 'where telepty' : 'which telepty';
+    const output = exec(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    for (const line of String(output).split(/\r?\n/)) {
+      const candidate = line.trim();
+      if (!candidate || !fsx.existsSync(candidate)) continue;
+      const real = fsx.realpathSync(candidate);
+      if (path.basename(real) !== 'cli.js') continue; // a shim, not an entry point
+      try {
+        const manifest = JSON.parse(String(fsx.readFileSync(path.join(path.dirname(real), 'package.json'), 'utf8')));
+        if (manifest && manifest.name === '@dmsdc-ai/aigentry-telepty') return real;
+      } catch { /* unreadable sibling manifest ⇒ not provably ours */ }
     }
   } catch {}
-  return process.argv[1];
+  return ownCli;
+}
+
+// Task 1215 W3B: Windows `daemon stop|restart`. Every Windows signal stop is a forced termination that never
+// runs the daemon's shutdown() (ledger lock left ⇒ next daemon lock_present), so a NORMAL stop asks the
+// identified daemon instance to shut itself down and waits, bounded, for its actual exit. It never forces.
+// Task 1215 W3 (F4): with TELEPTY_PRINCIPAL_CLIENT_FILE set (strict principal mode) the identity read and the
+// stop are additionally signed by that existing principal client (`daemon.inspect`, `daemon.stop`); a client
+// configuration that cannot be loaded or names another daemon is an explicit refusal, never an unsigned stop.
+async function gracefulWindowsStop(port) {
+  const shutdownClient = require('./src/daemon-shutdown');
+  const { pidMatchesTeleptyCmdline } = require('./daemon-control');
+  const persistence = require('./src/session-store/persistence');
+  let signRequest = null;
+  if (process.env.TELEPTY_PRINCIPAL_CLIENT_FILE) {
+    try {
+      const principalClient = require('./src/principal/client');
+      const client = principalClient.createPrincipalClient(principalClient.loadPrincipalClientConfiguration(process.env.TELEPTY_PRINCIPAL_CLIENT_FILE));
+      if (client.daemonUrl !== new URL(`http://127.0.0.1:${port}`).origin) throw new Error('PRINCIPAL_CLIENT_TARGET_MISMATCH');
+      signRequest = (binding) => client.assertion(binding);
+    } catch {
+      return shutdownClient.decideStopOutcome({ status: 'unidentified', reason: 'principal_client_unavailable' });
+    }
+  }
+  const lockPath = persistence.defaultTrackedInjectionsLockPath(process.env.TELEPTY_TRACKED_INJECTIONS_PATH || persistence.defaultTrackedInjectionsPath());
+  const result = await shutdownClient.requestGracefulStop({
+    port, token: existingAuthToken(), fetchImpl: (url, options) => fetch(url, { ...options, redirect: 'error' }),
+    isProcessRunning, confirmCmdline: pidMatchesTeleptyCmdline,
+    probeHealth: () => probeDaemonHealth(port, 1000),
+    readLockPid: () => { try { const pid = JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid; return Number.isSafeInteger(pid) ? pid : null; } catch { return null; } },
+    signRequest
+  });
+  const dryRun = result.status === 'no_answer' ? (stopDaemon({ port, dryRun: true }).targets || []) : [];
+  return shutdownClient.decideStopOutcome(result, dryRun);
+}
+
+// Task 1215 W3 (F1/F2): which stop step a NORMAL (non-force) stop uses on this platform. Windows has no signal
+// that runs the daemon's shutdown(), so every ordinary Windows caller uses the graceful gate above; POSIX keeps
+// its signal stop (SIGTERM runs shutdown()). Explicit force (`telepty cleanup-daemons`) is not a normal stop.
+function normalStopMode(platform = process.platform) {
+  return platform === 'win32' ? 'graceful' : 'signal';
+}
+
+// Task 1215 W3 (R2): THE stop-step selector of every normal caller. 'seam' only when a caller injected one of the
+// pre-existing whole-stop-step seams (frozen tests); otherwise the platform decides. The graceful / signal
+// IMPLEMENTATIONS are injectable separately (`_gracefulStop`, `_signalStop`) and never change the selected mode.
+function selectNormalStop({ platform = process.platform, legacyStopSeam = false } = {}) {
+  if (legacyStopSeam) return 'seam';
+  return normalStopMode(platform) === 'graceful' ? 'graceful' : 'signal';
+}
+
+// Task 1215 W3 (F1): `daemon stop|restart` routed to an installed Windows scheduled task, and `service
+// stop|restart`. `schtasks /end` terminates the daemon without its shutdown() (the ledger lock is left), so a
+// NORMAL stop asks the identified daemon to stop itself through the graceful gate and never issues /end. A
+// restart runs the task (service verb `start` = `schtasks /run`) only after a confirmed clean stop or when no
+// daemon was running; refused / timeout / uncertain ⇒ failure with nothing forced and nothing started. The
+// service's own refusals (not installed, foreign descriptor, …) are returned unchanged. The task's daemon is
+// the default-port daemon (a task descriptor names no port — the same rule as supervisorFor).
+// → null when the service is not a scheduled task (the caller keeps its own path).
+const GRACEFUL_SERVICE_STEP = 'graceful stop: POST /api/daemon/stop to the identified daemon and wait for its exit (never schtasks /end)';
+async function scheduledTaskGracefulVerb(sub, deps, { dryRun = false, _runServiceVerb, _gracefulStop } = {}) {
+  if (sub !== 'stop' && sub !== 'restart') return null;
+  const service = require('./src/service');
+  const runVerb = _runServiceVerb || service.runServiceVerb;
+  const gracefulStop = _gracefulStop || gracefulWindowsStop;
+  const preview = await runVerb(sub, { yes: true, isTTY: false, dryRun: true }, deps);
+  if (!preview || !preview.plan || preview.plan.kind !== 'schtasks') return null;
+  const plan = { ...preview.plan, commands: [[GRACEFUL_SERVICE_STEP],
+    ...(preview.plan.commands || []).filter((argv) => !(argv[0] === 'schtasks' && argv[1] === '/end'))] };
+  if (preview.exitCode !== service.SERVICE_EXIT.OK || dryRun) return { ...preview, plan };
+  const outcome = await gracefulStop(DEFAULT_PORT);
+  const confirmed = Boolean(outcome && outcome.ok === true && outcome.startReplacement === true);
+  const step = { command: GRACEFUL_SERVICE_STEP, ok: confirmed, stderr: confirmed ? '' : String((outcome && outcome.message) || 'graceful stop not confirmed') };
+  if (!confirmed) {
+    return { ok: false, verb: sub, exitCode: service.SERVICE_EXIT.FAILED, reason: 'graceful-stop-unconfirmed', verified: null, steps: [step], status: null, plan, manualCommands: [] };
+  }
+  if (sub === 'stop') {
+    return { ok: true, verb: sub, exitCode: service.SERVICE_EXIT.OK, reason: null, verified: null, steps: [step], status: null, plan, manualCommands: [] };
+  }
+  const started = await runVerb('start', { yes: true, isTTY: false }, deps);
+  return { ...started, verb: sub, steps: [step, ...((started && started.steps) || [])], plan };
 }
 
 function startDetachedDaemon() {
@@ -733,7 +844,15 @@ async function restartDaemonUnderLease(options = {}) {
   // #902: SURGICAL by default — stopDaemon targets only the state-file pid and the addressed
   // port's owner, never a system-wide `ps` scan (daemon-control.js:438, telepty#55 wrote it for
   // exactly this property; the repair path just never adopted it).
-  const cleanup = options._cleanupDaemonProcesses || stopDaemon;
+  // Task 1215 W3 (F2): this automatic (default `clientRestart=auto`) restart is a NORMAL stop, so on Windows its
+  // stop step is the graceful gate: a replacement is started (or kickstarted) only after a confirmed clean stop
+  // or when no daemon was running; anything else returns a failure with nothing forced and nothing started.
+  // An injected stop seam keeps replacing the stop step exactly as before (frozen tests); production passes none.
+  // Task 1215 W3 (R2): the mode comes from selectNormalStop alone; `_gracefulStop`/`_signalStop` only replace the
+  // implementation of the SELECTED mode, so a test injecting them still exercises the production selection.
+  const stopMode = selectNormalStop({ platform: options._platform || process.platform, legacyStopSeam: typeof options._cleanupDaemonProcesses === 'function' });
+  const cleanup = stopMode === 'seam' ? options._cleanupDaemonProcesses : (options._signalStop || stopDaemon);
+  const gracefulStop = stopMode === 'graceful' ? (options._gracefulStop || gracefulWindowsStop) : null;
   const startDaemon = options._startDetachedDaemon || startDetachedDaemon;
   const detect = options._detectSupervisor || detectSupervisor;
   const restartSupervisor = options._restartSupervisorDaemon || restartSupervisorDaemon;
@@ -804,7 +923,19 @@ async function restartDaemonUnderLease(options = {}) {
     }
     // (a) Stop the daemon we are addressing (#902: the sweep is told which one)
     logRestartInitiated(writeLog, 'stop-initiated', { verdict: options.verdict, port: addressedPort });
-    const results = cleanup({ port: addressedPort });
+    let results;
+    if (gracefulStop) {
+      const outcome = await gracefulStop(addressedPort);
+      if (!outcome || outcome.startReplacement !== true) {
+        const diagnostic = (outcome && outcome.message) || 'graceful stop not confirmed';
+        console.error(`\x1b[31m❌ Daemon restart blocked: ${diagnostic}\x1b[0m`);
+        writeLog({ event: 'attempt-failed', attempt: `${attempt}/${maxAttempts}`, port: addressedPort, reason: 'graceful-stop-unconfirmed' });
+        return { success: false, meta: null, attempt, gracefulStopUnconfirmed: true, diagnostic };
+      }
+      results = { stopped: (outcome.stopped || []).map((pid) => ({ pid })), failed: [] };
+    } else {
+      results = cleanup({ port: addressedPort });
+    }
 
     // (b) Wait up to 3s for old processes to fully exit
     if (results.stopped.length > 0) {
@@ -1029,7 +1160,11 @@ async function repairLocalDaemon(options = {}) {
 
   const restart = options.restart !== false;
   // Injectable seams (default to the real implementations), as in restartDaemonGraceful.
-  const stop = options._stopDaemon || stopDaemon;
+  // Task 1215 W3: repair/update is a NORMAL stop — on Windows the graceful gate, never a forced kill (the injected
+  // `_stopDaemon` seam keeps replacing the stop step exactly as before). R2: the mode is selectNormalStop's alone.
+  const stopMode = selectNormalStop({ platform: options._platform || process.platform, legacyStopSeam: typeof options._stopDaemon === 'function' });
+  const stop = stopMode === 'seam' ? options._stopDaemon : (options._signalStop || stopDaemon);
+  const gracefulStop = stopMode === 'graceful' ? (options._gracefulStop || gracefulWindowsStop) : null;
   const doRestart = options._restartDaemonGraceful || restartDaemonGraceful;
   // gh#82 round 2 (c): repair stops the daemon too, so it obeys the same gate as every other caller.
   const refusal = clientRestartRefusal('repair', Number(PORT), options);
@@ -1039,7 +1174,18 @@ async function repairLocalDaemon(options = {}) {
   }
   // #902: "repair MY daemon" — the one this CLI addresses, not every daemon on the machine.
   logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
-  const results = stop({ port: Number(PORT) });
+  let results;
+  if (gracefulStop) {
+    const outcome = await gracefulStop(Number(PORT));
+    if (!outcome || outcome.ok !== true) {
+      const diagnostic = (outcome && outcome.message) || 'graceful stop not confirmed';
+      console.error(`\x1b[31m❌ ${diagnostic}\x1b[0m`);
+      return { stopped: 0, failed: 1, meta: null, versionMatch: false, gracefulStopUnconfirmed: true, diagnostic };
+    }
+    results = { stopped: (outcome.stopped || []).map((pid) => ({ pid })), failed: [] };
+  } else {
+    results = stop({ port: Number(PORT) });
+  }
 
   if (!restart) {
     return { stopped: results.stopped.length, failed: results.failed.length, meta: null };
@@ -1197,6 +1343,23 @@ async function resolveLocalSessionTarget(sessionRef) {
 }
 
 async function resolveSessionTarget(sessionRef, options = {}) {
+  // Qualified registered identities retain the peer's endpoint and credential lane,
+  // even when discovery cannot list the session. Never shorten the requested id.
+  const registeredPeers = crossMachine.loadPeers().peers || {};
+  let registered;
+  try { registered = resolveRegisteredPeerTarget(sessionRef, registeredPeers); }
+  catch (error) { markCommandFailed(); throw error; }
+  if (registered) {
+    const discovered = (options.sessions || []).find((session) =>
+      session.id === registered.id && session.peerName === registered.peerName);
+    return { ...discovered, ...registered };
+  }
+  const qualified = parseSessionReference(sessionRef);
+  if (qualified.host && !isLocalHostname(qualified.host) && !process.env.TELEPTY_AUTH_TOKEN) {
+    markCommandFailed();
+    const known = Object.entries(registeredPeers).map(([name, peer]) => (peer && peer.machineId) || name).sort();
+    throw new Error(`No peer registered with machine id or address '${qualified.host}'; known: ${known.join(', ') || '(none)'}. Use telepty connect-http or telepty connect to register it.`);
+  }
   if (!options.sessions) {
     // #837: a hit here means no peer was consulted. A caller that already did its own discovery
     // (and paid for the fan-out) passes `sessions` and keeps its list as the authority.
@@ -1646,7 +1809,7 @@ async function manageInteractiveAttach(sessionId, targetHost) {
     });
     ws.on('open', () => {
       // Set Ghostty tab title to show session ID
-      process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
+      process.stdout.write(formatTerminalTitle(sessionId));
       console.log(`\n\x1b[32mEntered room '${sessionId}'.\x1b[0m\n`);
       cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
         onData: (d) => ws.send(JSON.stringify({ type: 'input', data: d.toString() })),
@@ -1659,6 +1822,8 @@ async function manageInteractiveAttach(sessionId, targetHost) {
     ws.on('message', m => {
       const msg = JSON.parse(m);
       if (msg.type === 'output') process.stdout.write(msg.data);
+      const refusal = require('./src/cli/viewer-input').viewerInputRefusal(msg);
+      if (refusal) process.stderr.write(`\n${refusal}\n`);
     });
     ws.on('close', async () => {
       process.stdout.write(`\x1b]0;\x07`); // Restore default terminal title
@@ -1737,9 +1902,7 @@ async function manageInteractive() {
 
     if (response.action === 'daemon') {
       console.log('\n\x1b[33mStarting daemon in background...\x1b[0m');
-      logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: null });
-      cleanupDaemonProcesses();
-      startDetachedDaemon();
+      if (!(await interactiveDaemonStart())) continue;   // Task 1215 W3 (R2): the same body, via the shared selector
       console.log('✅ Daemon started.\n');
       continue;
     }
@@ -1941,6 +2104,204 @@ function interceptHelp(cmd, argv) {
   return true;
 }
 
+function existingAuthToken() {
+  if (process.env.TELEPTY_AUTH_TOKEN) return process.env.TELEPTY_AUTH_TOKEN;
+  try {
+    const { authToken } = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.telepty', 'config.json'), 'utf8'));
+    return typeof authToken === 'string' && authToken !== '' ? authToken : null;
+  } catch {
+    return null; // no config, unreadable, or no token — ask without one, create nothing
+  }
+}
+
+// A credential-less probe still answers the only question `service status` asks. #835/#844: an
+// answer that DECLINES is an answer, so a 401/403 is evidence of a daemon that is there and
+// reachable — `probeDaemon` counts it as `answering: true`. Nothing is inferred beyond that:
+// a refusal carries no version, so `version`/`matchesPackage` stay null rather than fabricated.
+async function getDaemonMetaWithoutMinting(host = '127.0.0.1') {
+  const token = existingAuthToken();
+  try {
+    const res = await fetch(`${daemonUrl(host)}/api/meta`, {
+      headers: token ? { 'x-telepty-token': token } : {},
+      signal: AbortSignal.timeout(probeTimeoutMs())
+    });
+    if (!res.ok) return daemonAnswer(res.status, '/api/meta');
+    return await res.json();
+  } catch {
+    return null; // connect error / timeout: genuinely nothing answered
+  }
+}
+
+// #1227: the seams `telepty service` and the supervised `telepty daemon` verbs share. Lazy
+// require keeps cli.js startup cost unchanged (the same idiom as ./src/uninstall below), and the
+// daemon probe is passed IN so src/service.js stays free of auth.js and fetch.
+function serviceDeps(extra = {}) {
+  return {
+    port: Number(PORT),
+    getDaemonMeta: (host) => getDaemonMetaWithoutMinting(host || '127.0.0.1'),
+    readDaemonState,
+    // Task 1215 W3 (R1): the graceful gate a Windows scheduled-task uninstall must pass first (src/service.js).
+    gracefulStop: () => gracefulWindowsStop(DEFAULT_PORT),
+    ...extra
+  };
+}
+
+function printServiceSteps(result) {
+  for (const step of result.steps || []) {
+    if (step.ok) continue;
+    console.error(`   ${step.command}${step.stderr ? `: ${step.stderr}` : ''}`);
+  }
+  for (const manual of result.manualCommands || []) {
+    console.error(`   needs admin: ${manual}`);
+  }
+}
+
+async function runSupervisedDaemonVerb(route, sub, deps = {}) {
+  if (route.route === 'manual') {
+    // A root-owned unit is surfaced, never driven: no sudo from product code.
+    console.error(`❌ A system-scope systemd unit owns this daemon — run: ${route.command}`);
+    process.exitCode = route.exitCode;
+    return;
+  }
+
+  const { runServiceVerb: realRunServiceVerb, SERVICE_EXIT } = require('./src/service');
+  // Task 1215 W3 (R2): injectable service runner / graceful stop so the routing is testable; production passes none.
+  const runServiceVerb = deps.runServiceVerb || realRunServiceVerb;
+  const sdeps = deps.serviceDeps || serviceDeps();
+  const result = (route.kind === 'schtasks' && await scheduledTaskGracefulVerb(sub, sdeps, { _runServiceVerb: deps.runServiceVerb, _gracefulStop: deps.gracefulStop }))
+    || await runServiceVerb(sub, { yes: true, isTTY: false }, sdeps);
+  console.log(`→ managed by ${route.kind}`);
+  if (result.exitCode === SERVICE_EXIT.OK) {
+    console.log(`\x1b[32m✅ Telepty daemon ${sub === 'stop' ? 'stopped' : `${sub}ed`} through ${route.kind}.\x1b[0m`);
+    return result;
+  }
+  console.error(`\x1b[31m❌ ${route.kind} could not ${sub} the daemon (${result.reason || 'failed'}).\x1b[0m`);
+  printServiceSteps(result);
+  process.exitCode = result.exitCode;
+  return result;
+}
+
+// Task 1215 W3 (R2): `telepty daemon stop|restart` exactly as main() dispatches it (main calls this; nothing else
+// does), with seams so a test reaches the REAL routing and stop selection: a supervised daemon goes to the service
+// route; a local one uses selectNormalStop — graceful (win32) or the signal stop (POSIX). The bodies below are
+// main()'s former inline branches, unchanged except that the platform check is the shared selector.
+async function runDaemonStopRestart(sub, deps = {}) {
+  const port = Number.isInteger(deps.port) && deps.port > 0 ? deps.port : Number(PORT);
+  const detect = deps.detectSupervisor || detectSupervisor;
+  const route = decideDaemonVerbRoute(supervisorFor(detect(), port, deps.supervisorOptions || {}), sub);
+  if (route.route !== 'local') return (deps.runSupervisedDaemonVerb || runSupervisedDaemonVerb)(route, sub, deps);
+  const mode = selectNormalStop({ platform: deps.platform || process.platform });
+  const gracefulStop = deps.gracefulStop || gracefulWindowsStop;
+  const signalStop = deps.signalStop || stopDaemon;
+  const startDaemon = deps.startDetachedDaemon || startDetachedDaemon;
+  const writeLog = deps.logDaemonRestartEvent || logDaemonRestartEvent;
+
+  if (sub === 'stop') {
+    // Terminate the running daemon (state-file pid + configured-port owner),
+    // graceful SIGTERM→SIGKILL. Surgical: never a system-wide process sweep
+    // (that's `cleanup-daemons`). Internal auto-restart is untouched.
+    logRestartInitiated(writeLog, 'stop-initiated', { verdict: 'explicit', port });
+    if (mode === 'graceful') {
+      const outcome = await gracefulStop(port);
+      if (outcome.ok) console.log(outcome.stopped.length ? `\x1b[32m✅ ${outcome.message}\x1b[0m` : outcome.message);
+      else { console.error(`\x1b[31m❌ ${outcome.message}\x1b[0m`); process.exitCode = outcome.exitCode; }
+      return outcome;
+    }
+    const results = signalStop({ port });
+    if (results.stopped.length === 0 && results.failed.length === 0) {
+      console.log('No telepty daemon running.');
+    } else {
+      if (results.stopped.length > 0) {
+        console.log(`\x1b[32m✅ Stopped telepty daemon (${results.stopped.map((d) => `pid ${d.pid}`).join(', ')}).\x1b[0m`);
+      }
+      if (results.failed.length > 0) {
+        console.error(`\x1b[31m❌ Failed to stop ${results.failed.length} daemon process(es): ${results.failed.map((d) => `pid ${d.pid}`).join(', ')}.\x1b[0m`);
+        process.exitCode = 1;
+      }
+    }
+    return results;
+  }
+
+  // Clean cross-platform restart = surgical stop + detached start. Replaces
+  // the mac-only `launchctl kickstart` and gives Windows a restart it never
+  // had. Internal auto-restart (ensureDaemonRunning) is NOT touched.
+  logRestartInitiated(writeLog, 'stop-initiated', { verdict: 'explicit', port });
+  if (mode === 'graceful') {
+    // Never start a replacement while the old owned daemon is alive or its safe shutdown is unestablished.
+    const outcome = await gracefulStop(port);
+    if (!outcome.startReplacement) { console.error(`\x1b[31m❌ ${outcome.message}\x1b[0m`); process.exitCode = outcome.exitCode; return outcome; }
+  } else {
+    signalStop({ port });
+  }
+  const cp = startDaemon();
+  console.log(`\x1b[32m✅ Telepty daemon restarted (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
+  return { restarted: true, pid: cp.pid };
+}
+
+// Task 1215 W3 (R2): `telepty service <verb>` result as main() computes it (main calls this). A scheduled task's
+// stop|restart goes through the graceful-first helper; everything else (including uninstall, whose graceful gate
+// is inside src/service.js and receives `serviceDeps().gracefulStop`) goes to the service verb unchanged.
+async function runServiceCommandVerb(sub, flags = {}, deps = {}) {
+  const service = require('./src/service');
+  const runVerb = deps.runServiceVerb || service.runServiceVerb;
+  const sdeps = deps.serviceDeps || serviceDeps();
+  const scheduledTask = selectNormalStop({ platform: deps.platform || process.platform }) === 'graceful'
+    ? await scheduledTaskGracefulVerb(sub, sdeps, { dryRun: flags.dryRun, _runServiceVerb: deps.runServiceVerb, _gracefulStop: deps.gracefulStop })
+    : null;
+  return scheduledTask || await runVerb(sub, { yes: flags.yes, dryRun: flags.dryRun, replace: flags.replace, isTTY: flags.isTTY, confirm: flags.confirm }, sdeps);
+}
+
+// Task 1215 W3 (R1): `telepty uninstall` as main() runs it (main calls this). On Windows the default-port daemon is
+// first asked to stop itself through the exact-instance graceful gate (async here); src/uninstall.js runUninstall
+// stays synchronous and proceeds only with that confirmed outcome — otherwise it refuses and removes nothing.
+// A dry run asks nothing. POSIX is unchanged (no outcome is passed; runUninstall keeps its own stop step).
+async function runUninstallCommand({ purge = false, dryRun = false } = {}, deps = {}) {
+  const run = deps.runUninstall || require('./src/uninstall').runUninstall;
+  const opts = { purge, dryRun, ...(deps.uninstallOptions || {}) };
+  if (!dryRun && selectNormalStop({ platform: deps.platform || process.platform }) === 'graceful') {
+    let windowsStop = null;
+    try { windowsStop = await (deps.gracefulStop || gracefulWindowsStop)(DEFAULT_PORT); } catch { windowsStop = null; }
+    if (windowsStop) opts.windowsStop = windowsStop;
+  }
+  return run(opts);
+}
+
+// Task 1215 W3 (R2): the interactive menu's `daemon` action (the menu calls this). Graceful stop of the addressed
+// daemon and a start only on a confirmed outcome (win32); POSIX keeps its sweep + start. → true when started.
+async function interactiveDaemonStart(deps = {}) {
+  const port = Number(PORT);
+  const writeLog = deps.logDaemonRestartEvent || logDaemonRestartEvent;
+  if (selectNormalStop({ platform: deps.platform || process.platform }) === 'graceful') {
+    // Task 1215 W3: the addressed daemon is asked to stop itself; no machine-wide forced sweep, no overlap.
+    logRestartInitiated(writeLog, 'stop-initiated', { verdict: 'explicit', port });
+    const outcome = await (deps.gracefulStop || gracefulWindowsStop)(port);
+    if (!outcome.startReplacement) { console.error(`❌ ${outcome.message}\n`); return false; }
+  } else {
+    logRestartInitiated(writeLog, 'stop-initiated', { verdict: 'explicit', port: null });
+    (deps.cleanupDaemonProcesses || cleanupDaemonProcesses)();
+  }
+  (deps.startDetachedDaemon || startDetachedDaemon)();
+  return true;
+}
+
+
+function decideDaemonVerbRoute(supervisor, sub) {
+  if (!supervisor || !supervisor.present) return { route: 'local', kind: null };
+  if (supervisor.kind === 'systemd') {
+    return {
+      route: 'manual',
+      kind: 'systemd',
+      exitCode: 5,
+      command: `sudo systemctl ${sub} ${SYSTEMD_SERVICE_NAME}`
+    };
+  }
+  if (['launchd', 'systemd-user', 'schtasks'].includes(supervisor.kind)) {
+    return { route: 'service', kind: supervisor.kind };
+  }
+  return { route: 'local', kind: supervisor.kind || null };
+}
+
+
 async function main() {
   const cmd = args[0];
 
@@ -1957,6 +2318,25 @@ async function main() {
   // printing its own usage. Deliberately below the version check, which takes no argv.
   if (interceptHelp(cmd, args.slice(1))) return;
 
+  if (cmd === 'approval-challenge' || (cmd === 'inject' && require('./src/cli/external-approval').approvalOptionRequested(args.slice(1)))) {
+    process.exitCode = await require('./src/cli/external-approval').runApprovalCommand(cmd, args.slice(1), {
+      daemonUrl, remoteHost: REMOTE_HOST, fetchWithAuth
+    });
+    return;
+  }
+  if (['multicast', 'broadcast'].includes(cmd) && require('./src/cli/external-approval').approvalOptionRequested(args.slice(1), ['--approval-file', '--approval-map'])) {
+    console.error(JSON.stringify({ success: false, code: 'APPROVAL_FANOUT_UNSUPPORTED' }));
+    process.exitCode = 1;
+    return;
+  }
+
+  if (cmd === 'readiness' || cmd === 'wait-ready') {
+    process.exitCode = await require('./src/cli/readiness').runReadinessCommand(cmd, args.slice(1), {
+      remoteHost: REMOTE_HOST, daemonUrl, fetchWithAuth
+    });
+    return;
+  }
+
   if (cmd === 'init') {
     const { main: runInit } = require('./src/init/print-snippet');
     const exitCode = runInit(args.slice(1));
@@ -1967,6 +2347,13 @@ async function main() {
   }
 
   if (cmd === 'update') {
+    const updatePlanning = require('./src/update-plan');
+    if (args.includes('--plan') || process.platform === 'win32') {
+      const plan = updatePlanning.createUpdatePlan();
+      console.log(args.includes('--json') ? JSON.stringify(plan) : updatePlanning.formatUpdatePlan(plan));
+      if (!args.includes('--plan')) markCommandFailed();
+      return;
+    }
     console.log('\x1b[36m🔄 Updating telepty to the latest version...\x1b[0m');
     try {
       runUpdateInstall();
@@ -2002,8 +2389,12 @@ async function main() {
     // --purge. --dry-run prints what would happen without touching anything.
     const purge = args.includes('--purge');
     const dryRun = args.includes('--dry-run');
-    const { runUninstall } = require('./src/uninstall');
-    const result = runUninstall({ purge, dryRun });
+    const result = await runUninstallCommand({ purge, dryRun });   // Task 1215 W3 (R1): graceful-first on Windows
+    if (result.refused) {
+      console.error(`\x1b[31m❌ Uninstall refused (${result.refused.reason}): ${result.refused.message}\x1b[0m`);
+      process.exitCode = 1;
+      return;
+    }
     const would = dryRun ? 'Would ' : '';
 
     if (dryRun) {
@@ -2018,10 +2409,29 @@ async function main() {
 
     for (const plist of result.plists) {
       if (!plist.existed) continue;
+      if (plist.refused) {
+        console.log(`Kept launchd descriptor with unverified ownership: ${plist.path}`);
+        process.exitCode = 1;
+        continue;
+      }
       if (dryRun) {
         console.log(`${would}unload and remove launchd service: ${plist.path}`);
       } else {
         console.log(`Launchd service ${plist.removed ? 'unloaded and removed' : (plist.unloaded ? 'unloaded (file not removed)' : 'removal attempted')}: ${plist.path}`);
+      }
+    }
+
+    const service = result.services;
+    if (service && service.plan && service.plan.kind !== 'none') {
+      if (service.manualCommands && service.manualCommands.length > 0) {
+        console.log(`A system-scope ${service.plan.kind} service owns this daemon — remove it manually:`);
+        for (const manual of service.manualCommands) console.log(`  ${manual}`);
+      } else {
+        const { formatPlan } = require('./src/service');
+        for (const line of formatPlan(service.plan, { dryRun, startup: false })) console.log(line);
+        if (!dryRun && !service.ok) {
+          console.log(`⚠️ Service uninstall incomplete (${service.reason || 'unknown'}) — see "telepty service status".`);
+        }
       }
     }
 
@@ -2043,10 +2453,114 @@ async function main() {
     return;
   }
 
+  if (cmd === 'service') {
+    // #1227: the consented OS-service lifecycle. Named `service`, never `install` — a
+    // receiver-side `telepty install` is rejected by ADR 2026-05-05-telepty-devkit-boundary
+    // (README "Integration scope"). `service --help` never reaches here: interceptHelp above
+    // answers it first (tp941).
+    const { SERVICE_EXIT, formatPlan, getServiceStatus, runServiceVerb } = require('./src/service');
+    const { diagnoseBinOwnership } = require('./src/bin-ownership');
+    const sub = args[1];
+    const asJson = args.includes('--json');
+    const yes = args.includes('--yes');
+    const dryRun = args.includes('--dry-run');
+    const replace = args.includes('--replace');
+    if (args.includes('--system')) {
+      console.error('❌ System-scope service changes require administrator-managed installation; this command supports --user only.');
+      process.exitCode = SERVICE_EXIT.NEEDS_ADMIN;
+      return;
+    }
+
+    if (!['status', 'install', 'uninstall', 'start', 'stop', 'restart'].includes(sub)) {
+      console.error('❌ Usage: telepty service status [--json] | install [--yes] [--dry-run] [--replace] | uninstall [--yes] [--dry-run] | start | stop | restart');
+      process.exitCode = SERVICE_EXIT.CONSENT;
+      return;
+    }
+
+    if (sub === 'status') {
+      let binOwnership = null;
+      try { binOwnership = diagnoseBinOwnership(); } catch { /* diagnosis is additive */ }
+      const status = await getServiceStatus(serviceDeps({ binOwnership }));
+      if (asJson) {
+        console.log(JSON.stringify(status, null, 2));
+      } else {
+        console.log(`Service: ${status.kind}${status.installed ? '' : ' (not installed)'}`);
+        console.log(`  descriptor: ${status.descriptor.path} (${status.descriptor.ownership}${status.descriptor.drift.length ? `: ${status.descriptor.drift.join(', ')}` : ''})`);
+        console.log(`  loaded: ${status.loaded}   active: ${status.active}   daemon answering: ${status.daemon.answering}`);
+        // #1227 R-5: null is UNMEASURED, so say which answers are missing instead of
+        // letting a degraded exit code imply something was found to be wrong.
+        if (status.inconclusive && status.inconclusive.length > 0) {
+          console.log(`  not measured: ${status.inconclusive.join(', ')}`);
+        }
+        console.log(`  startup: at login = ${status.startup.atLogin}, boot without login = ${status.startup.bootWithoutLogin}, linger = ${status.startup.linger}`);
+        if (status.startup.reason) console.log(`  reason: ${status.startup.reason}`);
+        if (status.startup.hint) console.log(`  note: ${status.startup.hint}`);
+        for (const conflict of status.conflicts) console.log(`  conflict: ${conflict.kind} at ${conflict.path}`);
+        if (binOwnership && binOwnership.bins && binOwnership.bins.telepty) {
+          console.log(`  telepty command owned by: ${binOwnership.bins.telepty.owner}`);
+        }
+        for (const remedy of status.remedies) console.log(`  remedy: ${remedy}`);
+      }
+      process.exitCode = status.exitCode;
+      return;
+    }
+
+    // Consent is explicit: the plan is printed, then a TTY y/N (default No). A non-TTY
+    // without --yes exits 2 before anything is planned, probed or executed.
+    const confirm = async (plan) => {
+      console.log(`telepty service ${sub} would:`);
+      for (const line of formatPlan(plan)) console.log(`  ${line}`);
+      const answer = await prompts({ type: 'confirm', name: 'ok', message: 'Proceed?', initial: false });
+      return answer.ok === true;
+    };
+
+    // Task 1215 W3 (R2): the same computation, through the exported dispatcher (graceful-first scheduled task).
+    const result = await runServiceCommandVerb(sub, {
+      yes,
+      dryRun,
+      replace,
+      isTTY: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+      confirm
+    });
+
+    if (dryRun && result.plan) {
+      console.log(`🔎 Dry run — nothing was written, loaded, removed or started.`);
+      for (const line of formatPlan(result.plan, { dryRun: true })) console.log(`  ${line}`);
+    } else if (result.exitCode === SERVICE_EXIT.OK) {
+      const kind = result.plan ? result.plan.kind : 'service';
+      // #1227 R-5: the commands succeeding and the service being OBSERVED up are two
+      // different claims. Only the second one is a verified success.
+      if (result.verified === false) {
+        const unmeasured = (result.status && result.status.inconclusive) || [];
+        console.log(`\x1b[33m✅ telepty service ${sub} commands completed (${kind}), but the result could not be verified`
+          + `${unmeasured.length ? ` — not measured: ${unmeasured.join(', ')}` : ''}. Check: telepty service status\x1b[0m`);
+      } else {
+        console.log(`\x1b[32m✅ telepty service ${sub} completed (${kind}).\x1b[0m`);
+      }
+    } else if (result.reason === 'consent-required') {
+      console.error('❌ Consent required: re-run with --yes (or from a terminal) — nothing was changed.');
+    } else if (result.reason === 'declined') {
+      console.error('Cancelled — nothing was changed.');
+    } else if (result.reason === 'foreign-descriptor') {
+      // #1227 R-3: `--replace` is install-time replacement, NOT permission to drive a job
+      // this package does not own — so it is only offered where it actually applies.
+      console.error(`❌ ${result.plan.descriptorPath} exists but is not a telepty descriptor — nothing was changed.`);
+      console.error(sub === 'install'
+        ? '   Re-run with --replace to overwrite it.'
+        : `   telepty will not ${sub} a service it does not own; remove or rename that descriptor first.`);
+    } else {
+      console.error(`\x1b[31m❌ telepty service ${sub} failed (${result.reason || 'unknown'}).\x1b[0m`);
+      printServiceSteps(result);
+    }
+    process.exitCode = result.exitCode;
+    return;
+  }
+
   if (cmd === 'cleanup-daemons') {
     // #902: the one command whose contract IS machine-wide — it names the default port
     // explicitly now that the sweep no longer assumes one.
     logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: DEFAULT_PORT });
+    if (normalStopMode() === 'graceful') console.error('⚠️ cleanup-daemons is a FORCED stop (crash semantics): no daemon shutdown runs, so a ledger lock may be left for `telepty ledger unlock --confirm`. Use `telepty daemon stop` for a normal stop.');
     const results = cleanupDaemonProcesses({ port: DEFAULT_PORT });
     console.log(`Stopped ${results.stopped.length} telepty daemon(s).`);
     if (results.failed.length > 0) {
@@ -2063,6 +2577,12 @@ async function main() {
     // didn't exist. We now parse the subcommand; bare `telepty daemon` keeps the
     // foreground behavior for back-compat (install/launchd flows depend on it).
     const sub = args[1];
+    // Task 1215 W3 (R2): stop|restart (supervised route or local) run through the exported dispatcher.
+    if (sub === 'stop' || sub === 'restart') return runDaemonStopRestart(sub);
+    if (sub === 'start') {
+      const route = decideDaemonVerbRoute(supervisorFor(detectSupervisor(), Number(PORT)), sub);
+      if (route.route !== 'local') return runSupervisedDaemonVerb(route, sub);
+    }
 
     if (sub === 'start') {
       // Detached/background start: return control to the shell immediately
@@ -2070,37 +2590,6 @@ async function main() {
       // IS the daemon process, so cp.pid is the daemon's pid.
       const cp = startDetachedDaemon();
       console.log(`\x1b[32m✅ Telepty daemon started (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
-      return;
-    }
-
-    if (sub === 'stop') {
-      // Terminate the running daemon (state-file pid + configured-port owner),
-      // graceful SIGTERM→SIGKILL. Surgical: never a system-wide process sweep
-      // (that's `cleanup-daemons`). Internal auto-restart is untouched.
-      logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
-      const results = stopDaemon({ port: Number(PORT) });
-      if (results.stopped.length === 0 && results.failed.length === 0) {
-        console.log('No telepty daemon running.');
-      } else {
-        if (results.stopped.length > 0) {
-          console.log(`\x1b[32m✅ Stopped telepty daemon (${results.stopped.map((d) => `pid ${d.pid}`).join(', ')}).\x1b[0m`);
-        }
-        if (results.failed.length > 0) {
-          console.error(`\x1b[31m❌ Failed to stop ${results.failed.length} daemon process(es): ${results.failed.map((d) => `pid ${d.pid}`).join(', ')}.\x1b[0m`);
-          process.exitCode = 1;
-        }
-      }
-      return;
-    }
-
-    if (sub === 'restart') {
-      // Clean cross-platform restart = surgical stop + detached start. Replaces
-      // the mac-only `launchctl kickstart` and gives Windows a restart it never
-      // had. Internal auto-restart (ensureDaemonRunning) is NOT touched.
-      logRestartInitiated(logDaemonRestartEvent, 'stop-initiated', { verdict: 'explicit', port: Number(PORT) });
-      stopDaemon({ port: Number(PORT) });
-      const cp = startDetachedDaemon();
-      console.log(`\x1b[32m✅ Telepty daemon restarted (pid ${cp.pid}) → ${DAEMON_URL}\x1b[0m`);
       return;
     }
 
@@ -2135,6 +2624,7 @@ async function main() {
         console.log(`  - ID: \x1b[36m${s.id}\x1b[0m`);
         console.log(`    Host: ${formatHostLabel(s.host)}`);
         console.log(`    Command: ${s.command}`);
+        if (s.type === 'mailbox') console.log(`    Mailbox lease expires: ${new Date(s.lease_expires_at).toISOString()}`);
         console.log(`    Status: ${formatSessionStatusWithIdle(s)}`);
         // #60 Stage A: separate lines, because they are separate domains. Status is transport
         // connectivity; the activity observation is what the PTY was measured doing. Collapsing
@@ -2149,6 +2639,11 @@ async function main() {
     } catch (e) {
       console.error(`❌ ${e.message || 'Failed to discover sessions.'}`);
     }
+    return;
+  }
+
+  if (cmd === 'mailbox') {
+    await require('./src/cli/mailbox').runMailboxCommand(args.slice(1), { daemonUrl: DAEMON_URL, fetchWithAuth });
     return;
   }
 
@@ -2193,18 +2688,27 @@ async function main() {
       return `  ${l.ts}  \x1b[36m${l.claimed_from || '-'}\x1b[0m→${l.to}  verified=${verified}  ${l.kind}/${l.delivery_result}${spoofTag}`;
     }
 
+    async function fetchAuditPage() {
+      const res = await fetchWithAuth(buildQuery(), { readOnlyAuth: true, signal: AbortSignal.timeout(12000) });
+      const data = await res.json();
+      if (!res.ok || !Array.isArray(data.injects)) {
+        const error = new Error(res.status === 401 || res.status === 403
+          ? `Inject audit query refused (HTTP ${res.status}).` : 'Inject audit query unavailable.');
+        error.code = res.status === 401 || res.status === 403 ? 'DAEMON_REFUSED'
+          : typeof data.code === 'string' && /^AUDIT_QUERY_[A-Z_]+$/.test(data.code) ? data.code : 'AUDIT_QUERY_FAILED';
+        throw error;
+      }
+      return data;
+    }
+
     try {
       if (tail) {
         // Poll newest lines and print rows as they appear (dedup by inject_id+to).
         const seen = new Set();
         let firstPass = true;
-        console.log('\x1b[1mTailing inject audit log (Ctrl-C to stop)...\x1b[0m');
+        if (!asJson) console.log('\x1b[1mTailing inject audit log (Ctrl-C to stop)...\x1b[0m');
         for (;;) {
-          const res = await fetchWithAuth(buildQuery());
-          // #835: without this, a refusal makes the tail poll forever printing nothing — an
-          // audit log that looks quiet is exactly what an audit log must never fake.
-          if (!res.ok) throw daemonAnswerError(daemonAnswer(res.status, '/api/injects'));
-          const data = await res.json();
+          const data = await fetchAuditPage();
           const fresh = (data.injects || []).slice().reverse(); // oldest→newest for display
           for (const l of fresh) {
             const key = `${l.inject_id}|${l.to}`;
@@ -2221,9 +2725,7 @@ async function main() {
         }
       }
 
-      const res = await fetchWithAuth(buildQuery());
-      const data = await res.json();
-      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); process.exit(1); }
+      const data = await fetchAuditPage();
       if (asJson) { console.log(JSON.stringify(data, null, 2)); return; }
       const injects = data.injects || [];
       if (injects.length === 0) { console.log('No inject audit records found.'); return; }
@@ -2231,20 +2733,25 @@ async function main() {
       injects.forEach((l) => console.log(formatRow(l)));
       if (data.next_cursor != null) console.log(`  … more (--limit/cursor ${data.next_cursor})`);
     } catch (e) {
-      console.error(`❌ ${e.message || 'Failed to query inject audit log.'}`);
-      process.exit(1);
+      const code = typeof e.code === 'string' && /^(AUDIT_QUERY_[A-Z_]+|DAEMON_REFUSED)$/.test(e.code) ? e.code : 'AUDIT_QUERY_FAILED';
+      if (asJson) console.log(JSON.stringify({ success: false, code, error: 'Inject audit query failed; no empty result was substituted.' }));
+      else console.error(`❌ Inject audit query failed (${code}); no empty result was substituted.`);
+      process.exitCode = 1;
     }
     return;
   }
 
   if (cmd === 'spawn') {
-    const idIndex = args.indexOf('--id');
-    if (idIndex === -1 || !args[idIndex + 1]) { console.error('❌ Usage: telepty spawn --id <session_id> <command> [args...]'); process.exit(1); }
-    const sessionId = args[idIndex + 1];
-    const spawnArgs = args.filter((a, i) => a !== 'spawn' && i !== idIndex && i !== idIndex + 1);
-    if (spawnArgs.length === 0) { console.error('❌ Missing command. Example: telepty spawn --id "test" bash'); process.exit(1); }
-    const command = spawnArgs[0]; const cmdArgs = spawnArgs.slice(1);
-    
+    let invocation;
+    try {
+      invocation = require('./src/cli/spawn-invocation').parseSpawnInvocation(args.slice(1));
+    } catch (error) {
+      console.error(`❌ ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const { sessionId, background, command, cmdArgs } = invocation;
+
     const cols = process.stdout.columns || 80;
     const rows = process.stdout.rows || 30;
 
@@ -2254,19 +2761,143 @@ async function main() {
         body: JSON.stringify({ session_id: sessionId, command: command, args: cmdArgs, cwd: process.cwd(), cols, rows, type: 'USER' })
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      if (!res.ok) { console.error(`❌ Error: ${data.error}`); process.exitCode = 1; return; }
+      if (background) { console.log(`✅ Session '${data.session_id}' spawned in background.`); return; }
       console.log(`✅ Session '\x1b[36m${data.session_id}\x1b[0m' spawned. Entering room automatically...`);
       return manageInteractiveAttach(data.session_id, '127.0.0.1');
-    } catch (e) { console.error('❌ Failed to connect to daemon. Is it running?'); }
+    } catch (e) { console.error(`❌ Failed to spawn session: ${e.message}`); process.exitCode = 1; }
     return;
   }
 
-  if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap') {
-    const allowInvocation = parseAllowInvocation(cmd, args);
+  if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap' || cmd === 'ssh') {
+    const sshSupport = require('./src/ssh-session');
+    let sshPlan = null;
+    if (cmd === 'ssh') {
+      try { sshPlan = sshSupport.buildSshPlan(args.slice(1)); }
+      catch (error) { console.error(error.message); process.exitCode = 1; return; }
+    }
+    const allowInvocation = sshPlan
+      ? parseAllowInvocation('allow', ['allow', '--id', sshPlan.id, 'ssh', ...sshPlan.args])
+      : parseAllowInvocation(cmd, args);
     if (!allowInvocation) return;
-    const { sessionId, command, cmdArgs, idleTtl, autoRestart } = allowInvocation;
+    const { sessionId, command, cmdArgs, idleTtl, autoRestart, inputPolicy: requestedInputPolicy = null } = allowInvocation;
+    // Task 1215: bridge-memory-only authority/readiness material (see readiness-handshake.js).
+    let inputPolicyCapability = null;
+    let readinessNonce = null;
+    const policyCapabilityHeaders = () => requestedInputPolicy === 'user-supervised' && inputPolicyCapability
+      ? { 'x-telepty-input-policy-capability': inputPolicyCapability } : {};
+    let credentialChannel = null;
+    if (process.env.TELEPTY_SESSION_CREDENTIAL_REFRESH === '1') {
+      try {
+        credentialChannel = require('./src/session-credential-channel').createSessionCredentialChannel({ sessionId });
+        process.once('exit', () => credentialChannel.close());
+      } catch (error) {
+        console.error(`❌ ${error.message}`);
+        process.exitCode = 1;
+        return;
+      }
+    }
 
-    await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
+    let strictOwnerClient = null;
+    let strictOwnerEpoch = null;
+    let handoffAdoption = null;
+    const cooperativeEnabled = process.env.TELEPTY_COOPERATIVE_HANDOFF === '1';
+    if (process.env.TELEPTY_PRINCIPAL_CLIENT_FILE) {
+      try {
+        const principalClient = require('./src/principal/client');
+        strictOwnerClient = principalClient.createPrincipalClient(principalClient.loadPrincipalClientConfiguration(process.env.TELEPTY_PRINCIPAL_CLIENT_FILE));
+        if (strictOwnerClient.daemonUrl !== new URL(DAEMON_URL).origin || sshPlan) throw new Error('PRINCIPAL_ALLOW_TARGET_UNSUPPORTED');
+      } catch {
+        console.error('Strict allow requires a checked principal client configuration for this local daemon and a local child.');
+        process.exitCode = 1; return;
+      }
+    }
+    if(process.env.TELEPTY_HANDOFF_CREDENTIAL_FILE){
+      try{
+        if(!strictOwnerClient || !cooperativeEnabled)throw new Error();
+        const proof=require('./src/principal/encoding').parseUnambiguousJSON(require('./src/principal/authority-file').readAuthorityFile(process.env.TELEPTY_HANDOFF_CREDENTIAL_FILE,{privateFile:true,maximum:8192}));
+        if(!proof || proof.schema!=='telepty.handoff-credential/v1' || Object.keys(proof).some(k=>!['schema','session_id','origin','session_epoch','session_token','session_nonce','credential_generation'].includes(k))
+          || proof.session_id!==sessionId || proof.origin!==strictOwnerClient.daemonUrl || !/^[A-Za-z0-9_-]{22}$/.test(proof.session_epoch||'')
+          || typeof proof.session_token!=='string' || !proof.session_token.startsWith(proof.session_epoch+'.') || proof.session_token.length>256
+          || !Number.isSafeInteger(proof.credential_generation) || proof.credential_generation<2 || !/^[A-Za-z0-9_-]{24}$/.test(proof.session_nonce||''))throw new Error();
+        handoffAdoption={expected_epoch:proof.session_epoch,expected_credential_generation:proof.credential_generation};
+        strictOwnerEpoch=proof.session_epoch;process.env.TELEPTY_SESSION_TOKEN=proof.session_token;process.env.TELEPTY_SESSION_ORIGIN=proof.origin;process.env.TELEPTY_SESSION_NONCE=proof.session_nonce;
+      }catch{console.error('Invalid or unsafe cooperative handoff credential file.');process.exitCode=1;return;}
+    }
+    if(cooperativeEnabled && !strictOwnerClient){console.error('Cooperative handoff requires an explicit strict principal client.');process.exitCode=1;return;}
+    // Task 1215 combined mode: ordinary transport credentials stay in force; a SEPARATE operator client
+    // (TELEPTY_SUPERVISION_CLIENT_FILE) signs only the user-supervised registration. It never selects
+    // strict owner transport or cooperative handoff; conflicting or unused configuration is refused.
+    let supervisionClient = null;
+    let supervisionEpoch = null;
+    if (process.env.TELEPTY_SUPERVISION_CLIENT_FILE) {
+      if (strictOwnerClient) {
+        console.error('TELEPTY_SUPERVISION_CLIENT_FILE cannot be combined with TELEPTY_PRINCIPAL_CLIENT_FILE (strict mode signs every request itself). Nothing was started.');
+        process.exitCode = 1; return;
+      }
+      if (requestedInputPolicy !== 'user-supervised') {
+        console.error('TELEPTY_SUPERVISION_CLIENT_FILE is used only with --input-policy user-supervised. Nothing was started.');
+        process.exitCode = 1; return;
+      }
+      try {
+        const principalClient = require('./src/principal/client');
+        supervisionClient = principalClient.createPrincipalClient(principalClient.loadPrincipalClientConfiguration(process.env.TELEPTY_SUPERVISION_CLIENT_FILE));
+        if (supervisionClient.daemonUrl !== new URL(DAEMON_URL).origin || sshPlan) throw new Error('SUPERVISION_TARGET_UNSUPPORTED');
+      } catch {
+        console.error('Supervision requires a checked operator client configuration (TELEPTY_SUPERVISION_CLIENT_FILE) for this local daemon and a local child. Nothing was started.');
+        process.exitCode = 1; return;
+      }
+    }
+    // Adds the operator assertion to exactly one request shape: POST /api/sessions/register with
+    // input_policy user-supervised, signed over the JSON-roundtripped body that is sent. Anything else
+    // is passed through untouched. The assertion is never logged or stored.
+    async function withSupervisionProof(url, options) {
+      const target = new URL(url);
+      if (target.pathname !== '/api/sessions/register' || (options.method || 'GET') !== 'POST' || typeof options.body !== 'string') return options;
+      const body = JSON.parse(options.body);
+      if (!body || body.input_policy !== 'user-supervised') return options;
+      if (target.origin !== supervisionClient.daemonUrl) throw new Error('SUPERVISION_TARGET_UNSUPPORTED');
+      const assertion = await supervisionClient.assertion({ method: 'POST', target: target.pathname + target.search, body,
+        action: 'session.register', ...(supervisionEpoch ? { sessionEpoch: supervisionEpoch } : {}), signal: AbortSignal.timeout(5000) });
+      return { ...options, headers: { ...Object.fromEntries(new Headers(options.headers).entries()), 'x-telepty-principal': assertion } };
+    }
+    const allowFetchWithAuth = async (url, options = {}) => {
+      if (!strictOwnerClient) return fetchWithAuth(url, supervisionClient ? await withSupervisionProof(url, options) : options);
+      const target = new URL(url);
+      if (target.origin !== strictOwnerClient.daemonUrl) throw new Error('PRINCIPAL_ALLOW_TARGET_UNSUPPORTED');
+      const ownerToken = target.searchParams.get('owner_token');
+      if (ownerToken) target.searchParams.delete('owner_token');
+      const requestUrl = target.toString();
+      const method = options.method || 'GET';
+      const body = options.body ? JSON.parse(options.body) : undefined;
+      const pathname = target.pathname;
+      const action = pathname === '/api/sessions/register' ? 'session.register'
+        : method === 'DELETE' ? 'session.destroy' : pathname === '/api/meta' ? 'daemon.inspect' : null;
+      if (!action) throw new Error('PRINCIPAL_ALLOW_ACTION_UNSUPPORTED');
+      const deadline = AbortSignal.timeout(5000);
+      const signal = options.signal ? require('./src/broker/http').combineAbortSignals([options.signal,deadline]) : deadline;
+      const assertion = await strictOwnerClient.assertion({ method, target:target.pathname+target.search, body, action,
+        ...(strictOwnerEpoch ? {sessionEpoch:strictOwnerEpoch} : {}), signal });
+      const bearer = scopedSessionToken(url, {localOrigin:buildDaemonUrl('127.0.0.1',PORT)});
+      const policyCapabilityHeader = new Headers(options.headers).get('x-telepty-input-policy-capability');
+      return fetch(requestUrl,{...options,method,signal,redirect:'error',headers:{'content-type':'application/json',
+        ...(ownerToken ? {'x-telepty-owner-token':ownerToken} : {}),
+        ...(policyCapabilityHeader ? {'x-telepty-input-policy-capability':policyCapabilityHeader} : {}),
+        'x-telepty-principal':assertion,...(bearer ? {'x-telepty-session-token':bearer} : {})}});
+    };
+
+    if (sshPlan) {
+      try {
+        const response = await allowFetchWithAuth(`${DAEMON_URL}/api/meta`, { readOnlyAuth: true, signal: AbortSignal.timeout(2000) });
+        const meta = response.ok ? await response.json() : null;
+        if (!Array.isArray(meta?.capabilities) || !meta.capabilities.includes('ssh-child-write-receipts-v1')) {
+          throw new Error('required SSH receipt capability unavailable');
+        }
+      } catch {
+        console.error('SSH requires a running daemon advertising ssh-child-write-receipts-v1. Start or upgrade it explicitly; no registration or command was started.');
+        process.exitCode = 1; return;
+      }
+    } else if (!strictOwnerClient) await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
     // Detect terminal backend for session registration
     function findKittySocketCli() {
@@ -2283,12 +2914,15 @@ async function main() {
     const terminalProgram = detectTerminalProgram(process.env);
     const terminalType = process.env.TERM || null;
     try {
-      const res = await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
+      const res = await allowFetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: sessionId,
+          ...(cooperativeEnabled ? {cooperative_handoff:true} : {}),
+          ...(handoffAdoption || {}),
           command,
+          ...(sshPlan ? { ssh_remote: sshPlan.metadata } : {}),
           cwd: process.cwd(),
           backend: detectedBackend,
           cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
@@ -2299,17 +2933,33 @@ async function main() {
           // #47 P4 — provenance banner is opt-in per session (default-OFF). Operators flip it ON
           // for sessions whose onboarding understands the fence via TELEPTY_PROVENANCE=1.
           ...(process.env.TELEPTY_PROVENANCE === '1' ? { provenance_capable: true } : {}),
+          ...(requestedInputPolicy ? { input_policy: requestedInputPolicy } : {}),
           ...(idleTtl !== null ? { idle_ttl: idleTtl } : {})
         })
       });
       const data = await res.json();
+      // Task 1215 F1: the input-policy capability lives in this bridge's memory only — never in
+      // process.env/sessionEnv (the child), never printed. Removed from `data` before anyone else reads it.
+      if (res.ok && data && typeof data.input_policy_capability === 'string') inputPolicyCapability = data.input_policy_capability;
+      if (data) delete data.input_policy_capability;
+      if (res.ok && requestedInputPolicy === 'user-supervised' && !data.input_policy_pending) {
+        console.error(`⚠️  [allow] input_policy user-supervised was not granted (${data.input_policy_refused || 'unsupported by daemon'}); this session runs GUARDED.`);
+      }
+      if (res.ok && handoffAdoption && (data.registration_instance_matched !== true || data.reregistered !== true
+          || data.session_epoch !== handoffAdoption.expected_epoch || data.credential_generation !== handoffAdoption.expected_credential_generation)) {
+        console.error('Daemon did not confirm the exact handoff instance; successor child was not started.');
+        process.exitCode = 1; return;
+      }
+      if (res.ok && strictOwnerClient) strictOwnerEpoch = data.session_epoch;
+      if (res.ok && supervisionClient && typeof data.session_epoch === 'string') supervisionEpoch = data.session_epoch;
       if (!res.ok) {
         console.error(`❌ Error: ${data.error}`);
         process.exit(1);
       }
       // #43 P2 — store the daemon-minted verified-sender token beside TELEPTY_SESSION_ID so the
       // wrapped CLI (and any `telepty inject` it spawns) inherits it via sessionEnv below.
-      if (data.session_token) process.env.TELEPTY_SESSION_TOKEN = data.session_token;
+      credentialChannel?.stageRegistration(res, data);
+      adoptRegistrationCredential(res, data, process.env, process.env, DAEMON_URL);
       // #47 P4 — carry the per-session provenance nonce in the same protected env. This is the
       // agent's trusted bootstrap copy of the nonce: a delivery's origin banner is authoritative
       // ONLY if its nonce matches this value. Treat it as secret; never echo it (onboarding §6).
@@ -2322,28 +2972,51 @@ async function main() {
     // Spawn local PTY (preserves isTTY, env, shell config)
     const pty = require('node-pty');
     const sessionCwd = process.cwd();
-    const sessionEnv = { ...process.env, TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true', ...(process.env.TELEPTY_SESSION_TOKEN ? { TELEPTY_SESSION_TOKEN: process.env.TELEPTY_SESSION_TOKEN } : {}), ...(process.env.TELEPTY_SESSION_NONCE ? { TELEPTY_SESSION_NONCE: process.env.TELEPTY_SESSION_NONCE } : {}) };
+    const sessionEnv = { ...process.env, ...(credentialChannel ? { TELEPTY_SESSION_CREDENTIAL_PATH: credentialChannel.credentialPath, TELEPTY_SESSION_CREDENTIAL_INSTANCE: credentialChannel.instance } : {}), TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true', ...(process.env.TELEPTY_SESSION_TOKEN ? { TELEPTY_SESSION_TOKEN: process.env.TELEPTY_SESSION_TOKEN } : {}), ...(process.env.TELEPTY_SESSION_NONCE ? { TELEPTY_SESSION_NONCE: process.env.TELEPTY_SESSION_NONCE } : {}) };
+    if (strictOwnerClient) delete sessionEnv.TELEPTY_PRINCIPAL_CLIENT_FILE;
+    // Task 1215: no supervision configuration reaches the child (proof/capability stay in this bridge).
+    delete sessionEnv.TELEPTY_SUPERVISION_CLIENT_FILE;
+    delete sessionEnv.TELEPTY_SUPERVISION_TRUST_FILE;
+    delete sessionEnv.TELEPTY_HANDOFF_CREDENTIAL_FILE;
     let child = null;
+    let handoffPending = null;
+    const sshInput = sshPlan ? sshSupport.createSshInputState(sshPlan.metadata.agent, state => {
+      if (wsReady && daemonWs?.readyState === 1) daemonWs.send(JSON.stringify({ type: 'ssh_state', ...state }));
+    }) : null;
     let sessionStartTime = Date.now();
     let crashCount = 0;
     const MAX_CRASHES = 3;
     const DEATH_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'session-deaths.log');
 
+    let readyNotified = false;
+    // Task 1215: effective policy = requested at launch AND confirmed by the daemon for the
+    // current owner generation (owner_token). Anything else, including a disconnect, is guarded.
+    let inputPolicy = 'guarded';
     let allowSessionClosed = false;
+    let cleanupTerminal = () => {};
+    const allowSignalHandlers = new Map();
+    // #137: identity of the code this bridge actually loaded — read once, at bridge start.
+    const bridgeIdentity = require('./src/mailbox/bridge-stage').bridgeIdentity(__dirname, pkg.version);
     const allowSecurity = createAllowSecurityContext({
       get sessionId() { return sessionId; },
       get command() { return command; },
+      get sshPlan() { return sshPlan; },
+      get onChildSpawn() { return current => { if (sshInput) sshInput.start(current); }; },
       get detectedBackend() { return detectedBackend; },
       get terminalProgram() { return terminalProgram; },
       get terminalType() { return terminalType; },
       get child() { return child; },
+      get handoffPending() { return handoffPending; },
       get idleTtl() { return idleTtl; },
       get DAEMON_URL() { return DAEMON_URL; },
-      get fetchWithAuth() { return fetchWithAuth; },
+      get fetchWithAuth() { return allowFetchWithAuth; },
       get resolveWindowsExecutable() { return resolveWindowsExecutable; },
       get cmdArgs() { return cmdArgs; },
       get sessionCwd() { return sessionCwd; },
       get sessionEnv() { return sessionEnv; },
+      get resetInteractionProvider() { return resetInteractionProvider; },
+      get disposeInteractionProvider() { return () => interactionProvider?.dispose(); },
+      get credentialChannel() { return credentialChannel; },
       get sessionStartTime() { return sessionStartTime; },
       get bridgeMailbox() { return bridgeMailbox; },
       get bridgeTarget() { return bridgeTarget; },
@@ -2372,6 +3045,9 @@ async function main() {
       get reconnectTimer() { return reconnectTimer; },
       get heartbeatTimer() { return heartbeatTimer; },
       get allowSignalHandlers() { return allowSignalHandlers; },
+      get bridgeIdentity() { return bridgeIdentity; },
+      get inputPolicy() { return inputPolicy; },
+      get readinessNonce() { return readinessNonce; },
       get FileMailbox() { return FileMailbox; },
       get path() { return path; },
       get os() { return os; },
@@ -2398,6 +3074,7 @@ async function main() {
     }
 
     function emitDeathEvent(exitCode, signal, willRestart) {
+      if (interactionBinding) interactionBinding.input_generation++;
       if (wsReady && daemonWs && daemonWs.readyState === 1) {
         daemonWs.send(JSON.stringify({
           type: 'session_died',
@@ -2412,6 +3089,7 @@ async function main() {
     }
 
     function emitRestartEvent(attempt) {
+      if (interactionBinding) interactionBinding.input_generation++;
       if (wsReady && daemonWs && daemonWs.readyState === 1) {
         daemonWs.send(JSON.stringify({
           type: 'session_restarted',
@@ -2424,12 +3102,11 @@ async function main() {
 
 
 
-    spawnChild();
-
     // Prompt-ready detection for safe inject delivery.
     // Known AI CLIs use the centralized geometry-aware registry; generic
     // commands keep the permissive legacy prompt regex for compatibility.
-    const knownAiCli = readyRegistry.isKnownAiCli(command);
+    const readyCommand = sshPlan ? sshPlan.metadata.agent || '' : command;
+    const knownAiCli = readyRegistry.isKnownAiCli(readyCommand);
     const promptPattern = /[❯>$#%]\s*$/;
     let promptReady = false;  // wait for CLI prompt before accepting inject
     let firstReadyObserved = false;
@@ -2440,11 +3117,11 @@ async function main() {
     // Mailbox-backed inject queue (replaces in-memory array for crash resilience)
     const bridgeMailbox = allowSecurity.createBridgeMailbox();
     const bridgeTarget = sessionId;
+    if(cooperativeEnabled) bridgeMailbox.initializeCustody(bridgeTarget);
     let bridgeMsgSeq = 0;
     let bridgePendingCount = 0;
 
-    // Recover undelivered messages from a previous crash
-    allowSecurity.recoverBridgeMailbox();
+    // Recover only after the daemon accepts this bridge as owner (#135).
 
 
 
@@ -2475,7 +3152,7 @@ async function main() {
     // of this session (a reconnect whose re-register POST below lost the race — that failure
     // is swallowed), its auto-register used to invent `command: 'wrapped'` and silently kill
     // every identity-gated feature. The bridge is the one process that always knows.
-    const wsOwnerBase = `${daemonWsUrl(REMOTE_HOST)}/api/sessions/${encodeURIComponent(sessionId)}`;
+    const wsOwnerBase = `${daemonWsUrl(REMOTE_HOST)}/api/${strictOwnerClient ? 'owner/' : ''}sessions/${encodeURIComponent(sessionId)}`;
     // gh#82(D): the claim URL is BUILT PER ATTEMPT, not resolved once for the life of the bridge.
     // A daemon that came back holding a different secret (the reporter's environment B: "every
     // telepty CLI call → HTTP 401" with config.json untouched) is otherwise dialled forever with
@@ -2483,6 +3160,7 @@ async function main() {
     // long it runs. Called once here too, so a target this bridge cannot credential still fails
     // loudly at launch exactly as it did when this was a `const` (resolveTargetToken throws).
     function buildOwnerWsUrl() {
+      if (strictOwnerClient) return wsOwnerBase;
       return `${wsOwnerBase}?token=${encodeURIComponent(resolveTargetToken(wsOwnerBase))}&owner=1&owner_pid=${process.pid}&command=${encodeURIComponent(command)}`;
     }
     let wsUrl = buildOwnerWsUrl();
@@ -2496,12 +3174,34 @@ async function main() {
     // from a stale/displaced owner's exit and avoid the shared-fate teardown.
     let currentOwnerToken = null;
     let interactionBinding = null;
+    let interactionProvider = null;
+    let interactionStream = null;
+    const interactionProfile = process.env.TELEPTY_INTERACTION_PROFILE;
+    function resetInteractionProvider(currentChild) {
+      interactionProvider?.dispose(); interactionProvider = null; interactionStream = null;
+      if (!capturedSelector.supportedProfile(interactionProfile) || !interactionBinding) return;
+      const size = { cols: currentChild.cols, rows: currentChild.rows };
+      Object.assign(interactionBinding, size);
+      interactionStream = { id: require('node:crypto').randomUUID(), offset: 0 };
+      interactionProvider = capturedSelector.createCapturedSelector({ profile: interactionProfile,
+        binding: () => interactionBinding, ...size, sessionId, streamId: interactionStream.id });
+      if (wsReady && daemonWs.readyState === 1) daemonWs.send(JSON.stringify({ type: 'interaction_provider',
+        profile: interactionProfile, stream_id: interactionStream.id,
+        owner_generation: interactionBinding.owner_generation, ...size }));
+    }
 
     const writeInteraction = interaction.createInteractionWriter({
-      observe: () => readyRegistry.observeInteraction({ command }),
-      binding: () => interactionBinding,
+      observe: () => interactionProvider?.observe() || interaction.unavailableObservation(),
+      binding: () => handoffPending ? null : interactionBinding,
       encode: readyRegistry.encodeInteraction,
-      write: bytes => { child.write(bytes); invalidateBridgeInteraction('interaction'); }
+      write: bytes => { if(handoffPending || !child)throw new Error('HANDOFF_FENCED');child.write(bytes); invalidateBridgeInteraction('interaction'); }
+    });
+    const pendingReadyFields=()=>cooperativeEnabled && interactionBinding ? {pending_handoff_receipts:'v1',owner_generation:interactionBinding.owner_generation} : {};
+    const writePendingHandoff = require('./src/principal/pending-handoff').createPendingWriter({
+      binding:()=>handoffPending||!interactionBinding?null:{...interactionBinding,child_identity:child},
+      canWrite:()=>cooperativeEnabled && !!child && !handoffPending && isIdle() && allowSecurity.cooperativeQueueEmpty()
+        && !readyRegistry.detectSurfaceModal(command,outputTail).blocked,
+      write:data=>{if(handoffPending || !child)throw new Error('HANDOFF_FENCED');child.write(data);promptReady=false;readyNotified=false;invalidateBridgeInteraction('pending_handoff');}
     });
     let lastInjectTextTime = 0;
     const MAX_RECONNECT_DELAY = 30000;
@@ -2528,31 +3228,33 @@ async function main() {
     // output is what still describes the screen. The unit is string length, the same measure
     // ptyBytesRead reports, so it equals bytes for ASCII and over-allocates by up to 3x for
     // CJK-heavy output — still a fixed ceiling, which is the property that matters here.
-    // ponytail: flat array + running counter; a ring buffer buys nothing at this size.
-    const PRECONNECT_MAX_CHARS = 256 * 1024;
-    let preConnectHeld = [];
-    let preConnectChars = 0;
-    function holdPreConnectOutput(data) {
-      preConnectHeld.push(data);
-      preConnectChars += data.length;
-      while (preConnectChars > PRECONNECT_MAX_CHARS && preConnectHeld.length > 1) {
-        preConnectChars -= preConnectHeld.shift().length;
-      }
-    }
+    // Empty callbacks are ignored; at most1024 chunks and256K UTF16 units survive,
+    // including a single oversized callback. Overflow retains complete Unicode pairs.
+    const preConnectOutput = require('./src/cli/output-hold').createOutputHold();
+    const holdPreConnectOutput = data => preConnectOutput.push(data);
     // Flushed as ONE 'output' frame: the daemon appends it to the ring and feeds the session
     // state machine exactly as it would the same bytes arriving in pieces.
     function flushPreConnectOutput() {
-      if (!preConnectHeld.length) return;
+      if (!wsReady) return;
+      if (!preConnectOutput.length) return;
       try {
-        daemonWs.send(JSON.stringify({ type: 'output', data: preConnectHeld.join('') }));
-        preConnectHeld = [];
-        preConnectChars = 0;
-      } catch {
+        daemonWs.send(JSON.stringify({ type: 'output', data: preConnectOutput.snapshot() }));
+        preConnectOutput.clear();
+      } catch (error) {
+        if (strictOwnerClient && Number.isSafeInteger(error.sentUnits) && error.sentUnits > 0) {
+          preConnectOutput.consume(Math.min(error.sentUnits, preConnectOutput.length));
+        }
         // Socket died mid-flush — keep the bytes for the next open rather than lose them.
       }
     }
 
+    let acceptInitialOwner;
+    const initialOwnerAccepted = new Promise(resolve => { acceptInitialOwner = resolve; });
+    const pendingOwnerFrames = [];
+    let replayPendingOwnerFrames = () => {};
+
     async function connectDaemonWs() {
+      if (allowSessionClosed) return;
       // Re-register session BEFORE WebSocket connect (daemon rejects WS if session unknown)
       if (reconnectAttempts > 0) {
         // gh#82(D): forget the daemon token this process resolved at launch, so BOTH the
@@ -2566,12 +3268,13 @@ async function main() {
         cachedAuthToken = null;
         try { wsUrl = buildOwnerWsUrl(); } catch { cachedAuthToken = priorAuthToken; }
         try {
-          const rereg = await fetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
+          const rereg = await allowFetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...policyCapabilityHeaders() },
             body: JSON.stringify({
               session_id: sessionId,
               command,
+              ...(sshPlan ? { ssh_remote: sshPlan.metadata } : {}),
               cwd: process.cwd(),
               backend: detectedBackend,
               cmux_workspace_id: process.env.CMUX_WORKSPACE_ID || null,
@@ -2580,6 +3283,7 @@ async function main() {
               term: terminalType,
               owner_pid: process.pid,
               ...(child && child.pid ? { pty_pid: child.pid } : {}),
+              ...(requestedInputPolicy ? { input_policy: requestedInputPolicy } : {}),
               ...(idleTtl !== null ? { idle_ttl: idleTtl } : {})
             })
           });
@@ -2588,13 +3292,21 @@ async function main() {
           // the POST above was a FIRST registration of a fresh instance — a new epoch, a new
           // bearer, and our env copy is now stale. Without adopting it here the owner claim below
           // would be refused (4003) and the session could never reconnect. The child keeps the
-          // old bearer either way: its environment cannot be updated from outside, so it becomes
-          // an unauthenticated sender against the new instance — which is correct, it IS a
-          // different instance now.
+          // old bearer: an already-running process environment cannot be rewritten. Keep
+          // sessionEnv current for future respawns; opt-in Linux running-child refresh uses the
+          // instance-bound channel described in docs/plans/credential-refresh-92.md.
           const reregData = await rereg.json().catch(() => null);
-          if (reregData && reregData.session_token) {
-            process.env.TELEPTY_SESSION_TOKEN = reregData.session_token;
+          // A first registration of a fresh instance (daemon GC'd us) mints a fresh capability.
+          if (rereg.ok && reregData && typeof reregData.input_policy_capability === 'string') inputPolicyCapability = reregData.input_policy_capability;
+          if (reregData) delete reregData.input_policy_capability;
+          if (rereg.ok && requestedInputPolicy === 'user-supervised' && reregData && reregData.input_policy_pending === false) {
+            console.error(`⚠️  [allow] input_policy user-supervised was not re-granted (${reregData.input_policy_refused || 'unsupported by daemon'}); this session runs GUARDED.`);
           }
+          if (allowSessionClosed) return;
+          if (rereg.ok && strictOwnerClient && reregData?.session_epoch) strictOwnerEpoch = reregData.session_epoch;
+          if (rereg.ok && supervisionClient && typeof reregData?.session_epoch === 'string') supervisionEpoch = reregData.session_epoch;
+          credentialChannel?.stageRegistration(rereg, reregData);
+          adoptRegistrationCredential(rereg, reregData, process.env, sessionEnv, DAEMON_URL);
         } catch (e) {
           // Registration may fail if session already exists or daemon not ready
         }
@@ -2604,12 +3316,26 @@ async function main() {
       // already holds a credential unless the matching bearer arrives here — that is what stops
       // any local process from taking over a live PTY byte stream. Sent as a HANDSHAKE HEADER,
       // never on the URL: a query string lands in logs and error reports, a header does not.
-      daemonWs = new WebSocket(wsUrl, process.env.TELEPTY_SESSION_TOKEN
-        ? { headers: { 'x-telepty-session-token': process.env.TELEPTY_SESSION_TOKEN } }
-        : undefined);
+      if (allowSessionClosed) return;
+      const ownerCredential = scopedSessionToken(wsUrl, { localOrigin: buildDaemonUrl('127.0.0.1', PORT) });
+      const ownerBearer = ownerCredential;
+      const credentialAttempt = credentialChannel?.beginAttempt(ownerBearer);
+      let strictOwnerProof;
+      if (strictOwnerClient) {
+        try { strictOwnerProof = await strictOwnerClient.assertion({method:'GET',target:new URL(wsUrl).pathname,
+          body:{},action:'session.owner',sessionEpoch:strictOwnerEpoch,transport:'websocket'}); }
+        catch { scheduleReconnect(); return; }
+      }
+      if (allowSessionClosed) return;
+      const ownerSocket = new WebSocket(wsUrl, {headers:{...(ownerBearer ? {'x-telepty-session-token':ownerBearer} : {}),
+        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY, ...policyCapabilityHeaders(),
+        ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
+      const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
+      daemonWs = ownerSocket;
 
       daemonWs.on('open', () => {
-        wsReady = true;
+        if (allowSessionClosed || daemonWs !== ownerSocket) return;
+        wsReady = !strictOwnerClient;
         // #768: before anything else this owner says, hand over what the PTY printed while the
         // socket was still coming up — so the ring's first content is the CLI's actual screen
         // and not whatever it happened to write next.
@@ -2620,18 +3346,83 @@ async function main() {
         // Re-send ready on reconnect so new daemon knows CLI is ready. Carries the SAME
         // qualification the original detection produced — a reconnect measures nothing new, so it
         // must not present itself as a stronger (or weaker) observation than what was seen.
-        if (readyNotified && promptReady) {
-          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}) }));
+        if (!strictOwnerClient && readyNotified && promptReady) {
+          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}),...pendingReadyFields() }));
         }
       });
 
-      daemonWs.on('message', (message) => {
+      daemonWs.on('message', handleOwnerMessage);
+
+      function handleOwnerMessage(message, alreadyVerified = false) {
+        if (allowSessionClosed || daemonWs !== ownerSocket) return;
         try {
           const msg = JSON.parse(message);
+          if (strictOwnerWire && !alreadyVerified && !strictOwnerWire.accept(msg)) return;
           if (msg.type === 'owner_token') {
+            if(cooperativeEnabled && msg.cooperative_handoff!==true){
+              console.error('Daemon owner channel does not support cooperative handoff. No child started.');
+              closeAllowSession({destroySession:false});exitAllowSession(1);return;
+            }
+            if (strictOwnerClient) { wsReady = true; flushPreConnectOutput(); }
+            if (credentialChannel) {
+              try {
+                if (!credentialChannel.acknowledgeOwner({ attempt: credentialAttempt, bearer: ownerBearer, ownerToken: msg.token, binding: msg.interaction_binding })) {
+                  throw new Error('Credential refresh refused (OWNER_BINDING).');
+                }
+              } catch {
+                console.error('❌ Credential refresh refused (PUBLICATION).');
+                closeAllowSession({ destroySession: false });
+                exitAllowSession(1);
+                return;
+              }
+            }
             currentOwnerToken = msg.token || null;
+            if (currentOwnerToken) acceptInitialOwner();
             interactionBinding = msg.interaction_binding || null;
+            readinessNonce = typeof msg.readiness_nonce === 'string' ? msg.readiness_nonce : null;
+            inputPolicy = requestedInputPolicy === 'user-supervised' && msg.input_policy === 'user-supervised' ? 'user-supervised' : 'guarded';
+            if(strictOwnerClient && readyNotified && promptReady)daemonWs.send(JSON.stringify({type:'ready',...(readyQualification||{}),...pendingReadyFields()}));
             invalidateBridgeInteraction('owner_bound');
+            if (!sshPlan) allowSecurity.reportBridgeQueue(true); // #137: announces bridge-stage-receipts-v1 to this owner generation
+            allowSecurity.announceTransportReady(); // Task 1215 F2: a live child re-announces to this owner generation
+            if (sshInput && child) {
+              const state = sshInput.snapshot();
+              daemonWs.send(JSON.stringify({ type: 'ssh_state', ...state }));
+              if (state.phase === 'ready' && readyQualification) daemonWs.send(JSON.stringify({ type: 'ready', ...readyQualification,...pendingReadyFields() }));
+            }
+            return;
+          }
+          if (strictOwnerClient && msg.type === 'handoff_stop') {
+            const bound = cooperativeEnabled && child && interactionBinding && !handoffPending
+              && msg.session_epoch === interactionBinding.session_epoch
+              && msg.credential_generation === interactionBinding.credential_generation
+              && msg.owner_generation === interactionBinding.owner_generation
+              && typeof msg.intent_id === 'string' && Number.isSafeInteger(msg.deadline) && msg.deadline > Date.now();
+            const ack = status => daemonWs.send(JSON.stringify({type:'handoff_ack',intent_id:msg.intent_id,
+              session_epoch:msg.session_epoch,credential_generation:msg.credential_generation,owner_generation:msg.owner_generation,status}));
+            if(!bound || !allowSecurity.cooperativeQueueEmpty() || pendingOwnerFrames.length) {ack('refused');return;}
+            handoffPending = {child,request:msg};
+            try { child.kill('SIGTERM'); } catch { handoffPending=null;ack('refused'); }
+            return;
+          }
+          if(handoffPending)return;
+          if(strictOwnerClient && msg.type==='pending_handoff'){daemonWs.send(JSON.stringify(writePendingHandoff(msg)));return;}
+          if (sshInput && msg.type === 'ssh_inject') {
+            if (typeof msg.request_id !== 'string' || msg.request_id.length > 64 || typeof msg.data !== 'string') return;
+            const result = msg.generation === sshInput.snapshot().generation
+              ? sshInput.write(child, msg.data, bytes => child.write(bytes))
+              : { stage: 'refused', reason: 'ssh_generation_changed' };
+            invalidateBridgeInteraction('automated_input');
+            daemonWs.send(JSON.stringify({ type: 'ssh_write_receipt', request_id: msg.request_id, generation: msg.generation, ...result }));
+            return;
+          }
+          if (sshInput && msg.type === 'inject') {
+            console.error('[SSH] Refused unbound legacy input; use the current SSH write protocol.');
+            return;
+          }
+          if (sshInput && !child) return;
+          if (!child) {
+            pendingOwnerFrames.push(message);
             return;
           }
           if (msg.type === 'interaction') {
@@ -2643,58 +3434,38 @@ async function main() {
             return;
           }
           if (msg.type === 'inject') {
-            invalidateBridgeInteraction('automated_input');
-            const chunks = [];
-            const rawData = typeof msg.data === 'string' ? msg.data : String(msg.data ?? '');
-            // Keep text+CR combined — do NOT split them.
-            chunks.push(rawData);
-
-            for (const chunk of chunks) {
-              if (!chunk) {
-                continue;
-              }
-
-              const isCr = chunk === '\r';
-              if (isCr && bridgePendingCount > 0) {
-                // CR with pending queued text — queue CR too and wait for the
-                // same readiness gate as the text. This preserves order during
-                // bootstrap and busy-session delivery.
-                enqueueBridgeMessage(chunk);
-                if (isIdle()) {
-                  if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
-                  flushBridgeMailbox();
-                } else {
-                  scheduleIdleFlush();
-                }
-              } else if (isCr) {
-                // CR always written immediately — never idle-gated.
-                child.write(chunk);
-              } else if (isIdle()) {
-                // Text when idle — write immediately.
-                child.write(chunk);
-                promptReady = false;
-                lastInjectTextTime = Date.now();
-              } else {
-                // Text when not idle — queue for safe delivery.
-                enqueueBridgeMessage(chunk);
-                scheduleIdleFlush();
-              }
-            }
+            // Task 1215 F4: the shared production handler (src/cli/security-actions.js).
+            const handled = allowSecurity.handleOwnerInject(msg);
+            if (handled.textWritten) lastInjectTextTime = Date.now();
             // Reset readyNotified so next prompt detection re-notifies daemon (auto-report)
-            if (rawData && rawData !== '\r') {
+            if (handled.rawData && handled.rawData !== '\r') {
               readyNotified = false;
             }
           } else if (msg.type === 'resize') {
             invalidateBridgeInteraction('resize');
             child.resize(msg.cols, msg.rows);
+            allowSecurity.noteBridgeGeometry(msg.cols, msg.rows);
           }
         } catch (e) {
           // ignore malformed messages
         }
-      });
+      }
+      // Replay frames that arrived in the same packet as the initial owner token.
+      replayPendingOwnerFrames = () => {
+        for (const frame of pendingOwnerFrames.splice(0)) handleOwnerMessage(frame, true);
+      };
 
       daemonWs.on('close', (code, reason) => {
+        if (allowSessionClosed || daemonWs !== ownerSocket) return;
+        if(handoffPending){
+          wsReady=false;
+          if(child && handoffPending.child===child)return; // No exit ACK: retain the held child, never force recovery.
+          closeAllowSession({destroySession:false});exitAllowSession(0);return;
+        }
         interactionBinding = null;
+        readinessNonce = null;
+        inputPolicy = 'guarded';
+        if (strictOwnerClient) pendingOwnerFrames.length = 0;
         wsReady = false;
         // #17 (OQ-2): the daemon explicitly destroyed this session (manual kill or the
         // surface-gone GC) → close code 1000 'Session destroyed'. Terminate the bridge
@@ -2749,6 +3520,11 @@ async function main() {
       // Keep reconnecting (this process owns a live PTY; exiting would kill the user's CLI), but
       // say it once: a credential mismatch does not fix itself with backoff.
       daemonWs.on('unexpected-response', (_req, res) => {
+        if (allowSessionClosed || daemonWs !== ownerSocket) {
+          res.resume();
+          try { ownerSocket.terminate(); } catch {}
+          return;
+        }
         if (!wsRefusalReported && (res.statusCode === 401 || res.statusCode === 403)) {
           wsRefusalReported = true;
           process.stderr.write(
@@ -2773,7 +3549,7 @@ async function main() {
         // daemon and this bridge agree again. The #17 rows are untouched — a daemon-issued 1000
         // 'Session destroyed', a 4001 replacement and a 4003 refused claim all still return from
         // the close handler before scheduleReconnect().
-        try { daemonWs.terminate(); } catch { /* already gone — the close is on its way */ }
+        try { ownerSocket.terminate(); } catch { /* already gone — the close is on its way */ }
       });
     }
 
@@ -2790,26 +3566,38 @@ async function main() {
       }, delay);
     }
 
+    // HTTP registration precedes this handshake; only owner_token proves the WS claim.
+    const claimTimeout = setTimeout(() => {
+      console.error(`❌ [allow] Timed out waiting for owner claim for '${sessionId}'. No command started; retry or choose another --id.`);
+      closeAllowSession({ destroySession: false });
+      exitAllowSession(1);
+    }, 10000);
     connectDaemonWs();
+    await initialOwnerAccepted;
+    clearTimeout(claimTimeout);
+    spawnChild();
+    if (!sshPlan) allowSecurity.recoverBridgeMailbox();
 
     // Set terminal title
-    process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}\x07`);
-    console.log(`\x1b[32m⚡ '${command}' is now session '\x1b[36m${sessionId}\x1b[32m'. Inject allowed.\x1b[0m\n`);
+    process.stdout.write(formatTerminalTitle(sessionId));
+    if (sshPlan) console.log(`[SSH] '${sessionId}' transport registered. Automated input waits for a qualified remote composer.`);
+    else console.log(`\x1b[32m⚡ '${command}' is now session '\x1b[36m${sessionId}\x1b[32m'. Inject allowed.\x1b[0m\n`);
 
-    const cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
+    cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
       onData: (data) => {
+        if(handoffPending)return;
         lastUserInputTime = Date.now();
         invalidateBridgeInteraction('local_input');
+        if (sshInput && !sshInput.localInput(child)) { console.error('[SSH] Input refused while reconnecting; nothing was buffered.'); return; }
         child.write(data.toString());
       },
       onResize: () => {
+        if(handoffPending)return;
         const size = getTerminalSize(process.stdout, { cols: 120, rows: 40 });
         invalidateBridgeInteraction('resize');
-        child.resize(size.cols, size.rows);
+        if (child) { child.resize(size.cols, size.rows); allowSecurity.noteBridgeGeometry(size.cols, size.rows); }
       }
     });
-    const allowSignalHandlers = new Map();
-
     // #844: `destroySession: false` closes THIS bridge's own resources and nothing else — no
     // teardown DELETE, no mailbox purge. It is for the one caller that has been told, by the
     // daemon, that it does not own this id (close 4003): the session and its queued deliveries
@@ -2833,37 +3621,50 @@ async function main() {
     }
 
     // Relay PTY output to current terminal + send to daemon for attach clients
-    let readyNotified = false;
     // #732: monotonic count of bytes this bridge has actually READ from the PTY. Reported on
     // the heartbeat below; it is what lets the daemon tell "the CLI is quiet" (counter also
     // quiet) from "the PTY read side died inside the bridge" (counter frozen while the
     // heartbeat keeps arriving). Single definition of the relay so the auto-restart path
     // below cannot drift from it.
     let ptyBytesRead = 0;
-    function relayPtyOutput(data) {
-      // No additional output frame: the daemon sees this same output and invalidates there.
-      if (interactionBinding) interactionBinding.input_generation++;
-      ptyBytesRead += data.length;
-      const rewritten = rewriteTitleSequences(data);
-      process.stdout.write(rewritten);
-      if (wsReady && daemonWs.readyState === 1) {
-        daemonWs.send(JSON.stringify({ type: 'output', data }));
-      } else {
-        holdPreConnectOutput(data);
-      }
-      // Detect prompt in output to enable inject delivery
-      if (observePromptReady(data)) {
+    const relayPtyOutput = allowSecurity.createOutputRelay({
+      onInteraction: () => { if (interactionBinding) interactionBinding.input_generation++; },
+      onBytes: bytes => { ptyBytesRead += bytes; },
+      rewrite: rewriteTitleSequences,
+      write: data => process.stdout.write(data),
+      sendOutput: data => {
+        const stream = interactionStream ? { stream_id: interactionStream.id, stream_offset: interactionStream.offset } : {};
+        interactionProvider?.feed(data, stream);
+        if (interactionStream) interactionStream.offset += data.length;
+        if (wsReady && daemonWs.readyState === 1) {
+          try { daemonWs.send(JSON.stringify({ type: 'output', data, ...stream })); }
+          catch (error) {
+            if (!strictOwnerClient) throw error;
+            const remainder = data.slice(Number.isSafeInteger(error.sentUnits) ? error.sentUnits : 0);
+            if (remainder) holdPreConnectOutput(remainder);
+          }
+        } else {
+          holdPreConnectOutput(data);
+        }
+      },
+      observeReady: data => {
+        if (!sshInput) return observePromptReady(data);
+        promptReady = false; readyNotified = false;
+        if (!sshInput.output(child, data)) return false;
+        readyQualification = { ready_kind: 'composer_surface_observed', detector: 'ssh_remote_registry', cli_key: sshPlan.metadata.agent };
+        return true;
+      },
+      onReady: () => {
+        if(handoffPending)return;
         promptReady = true;
         firstReadyObserved = true;
-        flushBridgeMailbox();
-        // Notify daemon that CLI is ready for inject
+        if (!sshPlan) flushBridgeMailbox();
         if (!readyNotified && wsReady && daemonWs.readyState === 1) {
           readyNotified = true;
-          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}) }));
+          daemonWs.send(JSON.stringify({ type: 'ready', ...(readyQualification || {}),...pendingReadyFields() }));
         }
       }
-    }
-    child.onData(relayPtyOutput);
+    });
 
     // #732: PTY read-side self-defense. node-pty gives us two independent halves over one
     // master fd — the read side (`_socket`, a tty.ReadStream) feeding onData, and a separate
@@ -2904,7 +3705,9 @@ async function main() {
         daemonWs.send(JSON.stringify({
           type: 'heartbeat',
           pty_bytes: ptyBytesRead,
-          read_side: ptyReadSide
+          read_side: ptyReadSide,
+          // #137: the same bounded queue summary as bridge_queue (in-memory, no history read).
+          ...(sshPlan ? {} : { bridge_queue: allowSecurity.bridgeQueueSummary() })
         }));
       }
     }, BRIDGE_HEARTBEAT_MS);
@@ -2912,31 +3715,44 @@ async function main() {
 
     // Handle child exit with death tracking + auto-restart
     function attachChildExitHandler() {
-      child.onExit(({ exitCode, signal }) => {
+      allowSecurity.subscribeChild(child, relayPtyOutput, ({ exitCode, signal }) => {
+        if(handoffPending && handoffPending.child===child){
+          const request=handoffPending.request;child=null;promptReady=false;readyNotified=false;
+          try{daemonWs.send(JSON.stringify({type:'handoff_ack',intent_id:request.intent_id,session_epoch:request.session_epoch,
+            credential_generation:request.credential_generation,owner_generation:request.owner_generation,status:'exited',
+            exit_code:Number.isInteger(exitCode)?exitCode:null,exit_signal:signal===undefined?null:String(signal)}));}catch{}
+          if(daemonWs.readyState!==1){closeAllowSession({destroySession:false});exitAllowSession(0);}
+          return;
+        }
         const duration = Date.now() - sessionStartTime;
         const isAbnormal = exitCode !== 0 || signal;
         const durationStr = duration > 60000 ? `${Math.round(duration / 60000)}m ${Math.round((duration % 60000) / 1000)}s` : `${Math.round(duration / 1000)}s`;
 
         logSessionDeath(exitCode, signal, duration);
+        if (sshInput) { sshInput.exit(child); child = null; promptReady = false; readyNotified = false; }
 
-        if (isAbnormal && autoRestart && crashCount < MAX_CRASHES) {
+        const persistentSsh = sshPlan && sshPlan.persistent;
+        if (persistentSsh || (isAbnormal && autoRestart && crashCount < MAX_CRASHES)) {
           crashCount++;
-          const backoffMs = Math.min(1000 * Math.pow(2, crashCount - 1), 8000);
+          const backoffMs = persistentSsh
+            ? Math.min(sshPlan.backoffMs * Math.pow(2, Math.min(crashCount - 1, 16)), sshPlan.backoffMaxMs)
+            : Math.min(1000 * Math.pow(2, crashCount - 1), 8000);
           const willRestart = true;
           emitDeathEvent(exitCode, signal, willRestart);
-          console.log(`\n\x1b[33m⚠️ Session '${sessionId}' died (code ${exitCode}, signal ${signal || 'none'}, ${durationStr}). Restarting in ${backoffMs}ms (attempt ${crashCount}/${MAX_CRASHES})...\x1b[0m`);
+          console.log(`\n\x1b[33m⚠️ Session '${sessionId}' died (code ${exitCode}, signal ${signal || 'none'}, ${durationStr}). Restarting in ${backoffMs}ms (attempt ${crashCount}${persistentSsh ? ', persistent SSH' : `/${MAX_CRASHES}`})...\x1b[0m`);
 
           setTimeout(() => {
+            if (allowSessionClosed) return;
             try {
-              spawnChild();
+              if (!spawnChild()) return;
               promptReady = false;
               firstReadyObserved = false;
               readyNotified = false;
               outputTail = '';
               // Re-attach output relay, prompt detection, and exit handler
-              child.onData(relayPtyOutput);
               attachChildExitHandler();
               emitRestartEvent(crashCount);
+              allowSecurity.announceTransportReady(); // Task 1215 F2: the new child, after the daemon cleared the old one
               console.log(`\x1b[32m✅ Session '${sessionId}' restarted (attempt ${crashCount}).\x1b[0m\n`);
               // Reset crash counter if session survives 30s
               setTimeout(() => { if (crashCount > 0) crashCount = 0; }, 30000);
@@ -2982,6 +3798,18 @@ async function main() {
       };
       allowSignalHandlers.set(signalName, handler);
       process.on(signalName, handler);
+    }
+
+    replayPendingOwnerFrames();
+    // Task 1215 F2: child created, output/exit subscription attached, owner inject loop live.
+    // Task 1215 (#879 discriminator): a negotiated owner whose announce was NOT sent never releases its queued
+    // deliveries, and nothing said so. Name which precondition failed — one bounded line; no payload, token, id or
+    // path. Behavior is unchanged: nothing is retried, forced or written to the child.
+    if (!allowSecurity.announceTransportReady() && readinessNonce) {
+      console.error(`[allow] transport readiness not announced: pid=${child && Number.isSafeInteger(child.pid) && child.pid > 0 ? 'ok' : 'unavailable'}`
+        + ` socket=${wsReady && daemonWs && daemonWs.readyState === 1 ? 'open' : 'not_open'}`
+        + ` binding=${interactionBinding && typeof interactionBinding.owner_generation === 'string' ? 'ok' : 'missing'}`
+        + ` handoff=${handoffPending ? 'pending' : 'none'}`);
     }
 
     // Graceful shutdown on SIGINT (let child handle it via PTY)
@@ -3042,7 +3870,7 @@ async function main() {
     ws.on('open', () => {
       // Set Ghostty tab title to show session ID
       const hostSuffix = targetHost === '127.0.0.1' ? '' : ` @ ${targetHost}`;
-      process.stdout.write(`\x1b]0;⚡ telepty :: ${sessionId}${hostSuffix}\x07`);
+      process.stdout.write(formatTerminalTitle(sessionId, hostSuffix));
       console.log(`\x1b[32mEntered room '${sessionId}'${hostSuffix ? ` (${targetHost})` : ''}.\x1b[0m\n`);
 
       cleanupTerminal = attachInteractiveTerminal(process.stdin, process.stdout, {
@@ -3061,10 +3889,12 @@ async function main() {
     });
 
     ws.on('message', (message) => {
-      const { type, data } = JSON.parse(message);
-      if (type === 'output') {
-        process.stdout.write(data);
+      const frame = JSON.parse(message);
+      if (frame.type === 'output') {
+        process.stdout.write(frame.data);
       }
+      const refusal = require('./src/cli/viewer-input').viewerInputRefusal(frame);
+      if (refusal) process.stderr.write(`\n${refusal}\n`);
     });
 
     ws.on('close', async (code, reason) => {
@@ -3108,31 +3938,28 @@ async function main() {
     return;
   }
 
+  if (cmd === 'diagnose') {
+    try {
+      const { diagnoseTarget, formatDiagnostics } = require('./src/diagnostics/client');
+      const option = (name) => { const i = args.indexOf(name); if (i < 0) return undefined; if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error(name + ' requires a value'); return args[i + 1]; };
+      const report = await diagnoseTarget(args[1], { fetchWithAuth, daemonUrl,
+        machineId: option('--machine-id'), sessionEpoch: option('--epoch'), injectId: option('--inject-id'),
+        includeTcp: args.includes('--tcp'), includeProcessState: args.includes('--process-state') });
+      console.log(args.includes('--json') ? JSON.stringify(report) : formatDiagnostics(report));
+      if (!report.identity) process.exitCode = 1;
+    } catch (error) { console.error(error.message); process.exitCode = 1; }
+    return;
+  }
+
   if (cmd === 'read-screen') {
     const sessionId = args[1];
-    if (!sessionId) { console.error('❌ Usage: telepty read-screen <session_id> [--lines N] [--raw]'); process.exit(1); }
-
-    const linesIndex = args.indexOf('--lines');
-    const lines = (linesIndex !== -1 && args[linesIndex + 1]) ? args[linesIndex + 1] : '50';
-    const raw = args.includes('--raw');
+    if (!sessionId) { console.error('❌ Usage: telepty read-screen <session_id> [--lines N] [--raw] [--json --max-bytes N --since CURSOR]'); process.exit(1); }
 
     try {
-      const target = await resolveSessionTarget(sessionId);
-      if (!target) {
-        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
-        process.exit(1);
-      }
-
-      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/screen?lines=${lines}${raw ? '&raw=1' : ''}`);
-      const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); process.exit(1); }
-
-      if (!data.screen) {
-        console.log('(empty screen)');
-      } else {
-        console.log(data.screen);
-      }
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+      await require('./src/cli/read-screen').readScreen(args, {
+        resolveTarget: resolveSessionTarget, daemonUrl, fetchWithAuth
+      });
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); process.exitCode = 1; }
     return;
   }
 
@@ -3267,7 +4094,9 @@ async function main() {
       }
 
       if (useRef) {
-        const reference = ensureLocalSharedReference(refDescriptor, refFilePath ? prompt : '');
+        const reference = target.host === '127.0.0.1'
+          ? ensureLocalSharedReference(refDescriptor, refFilePath ? prompt : '')
+          : await ensureHttpSharedReference(target.host, refDescriptor, refFilePath ? prompt : '');
         injectPrompt = reference.prompt;
         referencePath = reference.referencePath;
       }
@@ -3278,6 +4107,7 @@ async function main() {
         replyExpected,
         noEnter: useSubmit
       });
+      if (target.host !== '127.0.0.1') body.claimed_cross_host = true;
 
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
@@ -3366,7 +4196,9 @@ async function main() {
           } else if (consumption === 'unknown') {
             console.log(`✅ Submitted via ${submitData.strategy}${tail} (consumption=unknown — delivered to PTY; turn-consumption not observable).`);
           } else {
-            console.log(`✅ Submitted via ${submitData.strategy}${tail}.`);
+            // Task 1215: a submit handed to a wrapped session's owner bridge is not a PTY write
+            // and not consumption; the bridge may still hold its body. Receipts tell (inject_id).
+            console.log(`✅ Submitted via ${submitData.strategy}${tail} (handed to the session transport; PTY write and consumption unconfirmed by this response).`);
           }
         } else if (submitRes && submitRes.status === 504) {
           // Soft failure: REPL never readied. Orchestrator scripts depend on
@@ -3472,6 +4304,63 @@ async function main() {
     return;
   }
 
+  if (cmd === 'ledger') {
+    // #1207 — operator surface for the directory store: status (owner + client, optional txn
+    // resolution from receipts), the schema-3 downgrade export (daemon writes only under its own
+    // HOME exports directory), and the operator unlock. `unlock` is LOCAL and deliberate: it
+    // prints the lock contents, refuses while daemon-state.json names a live pid or the configured
+    // port answers /api/health, and otherwise unlinks the lock on the operator's authority. The
+    // daemon never does this by itself (no automatic stale-lock breaking).
+    const sub = args[1];
+    const usage = 'Usage: telepty ledger status [--txn <id>] | export-v3 --out <file> | unlock --confirm';
+    try {
+      if (sub === 'status') {
+        const txnIndex = args.indexOf('--txn');
+        const txn = txnIndex !== -1 ? args[txnIndex + 1] : null;
+        if (txnIndex !== -1 && (!txn || txn.startsWith('--'))) throw new Error(usage);
+        const res = await fetchWithAuth(`${DAEMON_URL}/api/ledger/status${txn ? `?txn=${encodeURIComponent(txn)}` : ''}`);
+        const data = await res.json();
+        console.log(JSON.stringify(data, null, 2));
+        if (!res.ok) process.exitCode = 1;
+        return;
+      }
+      if (sub === 'export-v3') {
+        const outIndex = args.indexOf('--out');
+        const out = outIndex !== -1 ? args[outIndex + 1] : null;
+        if (!out || out.startsWith('--')) throw new Error(usage);
+        const res = await fetchWithAuth(`${DAEMON_URL}/api/ledger/export`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ out })
+        });
+        const data = await res.json();
+        console.log(JSON.stringify(data, null, 2));
+        if (!res.ok || data.success !== true) process.exitCode = 1;
+        return;
+      }
+      if (sub === 'unlock') {
+        const persistence = require('./src/session-store/persistence');
+        const { operatorUnlock } = require('./src/session-store/ledger-lock');
+        const lockPath = persistence.defaultTrackedInjectionsLockPath(process.env.TELEPTY_TRACKED_INJECTIONS_PATH || persistence.defaultTrackedInjectionsPath());
+        const result = await operatorUnlock(lockPath, {
+          confirm: args.includes('--confirm'),
+          daemonState: readDaemonState(),
+          isProcessRunning,
+          probeHealth: async () => (await probeDaemonHealth(Number(PORT), 0)) === true,
+        });
+        console.log(JSON.stringify(result, null, 2));
+        if (!result.unlocked) {
+          if (result.reason === 'confirm_required') console.error('❌ Refusing without --confirm. This removes the ledger lock; run it only when no telepty daemon is running for this HOME.');
+          process.exitCode = 1;
+        }
+        return;
+      }
+      throw new Error(usage);
+    } catch (error) {
+      console.error(`❌ ${error.message || 'ledger command failed'}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   if (cmd === 'send-key') {
     const sessionId = args[1];
     const key = (args[2] || '').toLowerCase();
@@ -3515,16 +4404,27 @@ async function main() {
       const meta = await metaRes.json();
       const replyTo = meta.lastInjectReplyTo;
       if (!replyTo) { console.error(`❌ No pending reply-to found for session '${mySessionId}'`); process.exit(1); }
+      const claimedReturn = meta.lastInjectReturn;
+      const parsedReturn = parseSessionReference(replyTo);
+      if (claimedReturn && claimedReturn.claimed_cross_host === true) {
+        if (!parsedReturn.host) {
+          throw new Error('REPLY_AMBIGUOUS_SENDER: cross-host return has no host-qualified locator. Supply an explicit registered peer return locator.');
+        }
+        if (!resolveRegisteredPeerTarget(replyTo, crossMachine.loadPeers().peers || {})) {
+          throw new Error('REPLY_UNKNOWN_CLAIMED_PEER: the unverified return locator does not name a registered peer.');
+        }
+      }
       const target = await resolveSessionTarget(replyTo);
       if (!target) { console.error(`❌ Session '${replyTo}' was not found on any discovered host.`); process.exit(1); }
-      const body = { prompt: replyText, from: mySessionId, reply_to: mySessionId };
+      const body = { prompt: replyText, from: mySessionId, reply_to: mySessionId, exact_target: true,
+        ...(target.host !== '127.0.0.1' ? { claimed_cross_host: true } : {}) };
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
-      console.log(`✅ Reply sent to '\x1b[36m${replyTo}\x1b[0m'.`);
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); markCommandFailed(); return; }
+      console.log(`✅ Reply sent to claimed return locator '\x1b[36m${replyTo}\x1b[0m' (unverified).`);
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); markCommandFailed(); }
     return;
   }
 
@@ -3775,10 +4675,13 @@ async function main() {
         }
 
         for (const host of groupSessionsByHost(local).keys()) {
+          const hostPrompt = useRef && host !== '127.0.0.1'
+            ? (await ensureHttpSharedReference(host, descriptor, refFilePath ? prompt : '')).prompt
+            : localPrompt;
           const res = await fetchWithAuth(`${daemonUrl(host)}/api/sessions/broadcast/inject`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: localPrompt })
+            body: JSON.stringify({ prompt: hostPrompt })
           });
           const data = await res.json();
           if (!res.ok) {
@@ -3819,7 +4722,7 @@ async function main() {
       if (aggregate.failed.length > 0) {
         console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host} [${item.code || 'UNKNOWN'}] ${item.error || ''}`.trim()).join(', '));
       }
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); markCommandFailed(); }
     return;
   }
 
@@ -3845,23 +4748,23 @@ async function main() {
     if (timeoutIndex !== -1) {
       if (!killArgs[timeoutIndex + 1]) {
         console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]');
-        process.exit(1);
+        process.exitCode = 1; return;
       }
       timeout = Number(killArgs[timeoutIndex + 1]);
       if (!Number.isFinite(timeout) || timeout < 0) {
         console.error('❌ --timeout must be a non-negative number of seconds.');
-        process.exit(1);
+        process.exitCode = 1; return;
       }
       killArgs.splice(timeoutIndex, 2);
     }
     const filtered = killArgs.filter((item) => item !== '--force');
     const sessionRef = filtered[0];
-    if (!sessionRef) { console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]'); process.exit(1); }
+    if (!sessionRef) { console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]'); process.exitCode = 1; return; }
 
     try {
       const target = await resolveSessionTarget(sessionRef);
-      if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exit(1); }
-      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/kill`, {
+      if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exitCode = 1; return; }
+      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/kill${args.includes('--owned') ? '?owned=true' : ''}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force, timeout, source: 'cli' })
@@ -3869,12 +4772,12 @@ async function main() {
       const data = await res.json();
       if (!res.ok) {
         console.error(`❌ Error: ${data.error || 'Failed to kill session.'}`);
-        process.exit(1);
+        process.exitCode = 1; return;
       }
       console.log(`✅ Session '\x1b[36m${target.id}\x1b[0m' killed${data.kill && data.kill.escalated ? ' (escalated)' : ''}.`);
     } catch (e) {
       console.error(`❌ ${e.message || 'Failed to kill session.'}`);
-      process.exit(1);
+      process.exitCode = 1; return;
     }
     return;
   }
@@ -4578,7 +5481,95 @@ Discuss the following topic from your project's perspective. Engage with other s
     return;
   }
 
+  if (cmd === 'discover') {
+    const result = await require('./src/peer-discovery').createPeerDiscovery({
+      loadRegistered: () => crossMachine.loadPeers().peers || {}
+    })({ refresh: args.includes('--refresh') });
+    if (args.includes('--json')) console.log(JSON.stringify(result));
+    else if (result.status !== 'ok') console.error(`Discovery unavailable: ${result.reason}`);
+    else for (const peer of result.candidates) {
+      console.log(`${peer.address}:${peer.port} ${peer.machine_id || '(unnamed)'} [${peer.enrollment}; not authenticated]`);
+    }
+    if (result.status !== 'ok') process.exitCode = 1;
+    return;
+  }
+
+  if (cmd === 'principal-bus-v1' || cmd === 'principal-bus-receipt-v1') {
+    try {
+      const receipt = await require('./src/principal/bus-client').runPrincipalBus(cmd === 'principal-bus-v1' ? 'inject' : 'receipt', args.slice(1));
+      console.log(JSON.stringify(receipt));
+      if (receipt.state !== 'accepted') markCommandFailed();
+    } catch (error) { console.error(error.code || 'PRINCIPAL_BUS_FAILED'); markCommandFailed(); }
+    return;
+  }
+
+  if (cmd === 'principal-input-v1' || cmd === 'principal-input-receipt-v1') {
+    try {
+      const receipt = await require('./src/principal/input-client').runPrincipalInput(cmd === 'principal-input-v1' ? 'inject' : 'receipt', args.slice(1));
+      console.log(JSON.stringify(receipt));
+      if (receipt.state !== 'accepted') markCommandFailed();
+    } catch (error) { console.error(error.code || 'PRINCIPAL_INPUT_FAILED'); markCommandFailed(); }
+    return;
+  }
+
+  if (cmd === 'principal-readiness-v1') {
+    try { console.log(JSON.stringify(await require('./src/principal/readiness-cli').runPrincipalReadiness(args.slice(1)))); }
+    catch (error) { console.error(error.code || 'PRINCIPAL_READINESS_FAILED'); markCommandFailed(); }
+    return;
+  }
+
+  if (cmd === 'principal-observe-v1') {
+    try { await require('./src/principal/observe-cli').runPrincipalObserver(args.slice(1)); }
+    catch (error) { console.error(error.code || 'PRINCIPAL_OBSERVER_FAILED'); markCommandFailed(); }
+    return;
+  }
+
   // telepty peers [--remove <name>]
+  if (['broker-broadcast-v1', 'broker-broadcast-receipt-v1', 'broker-reply-context-v1', 'broker-reply-v1'].includes(cmd)) {
+    const mode = cmd.slice('broker-'.length, -'-v1'.length);
+    const parameters = mode === 'broadcast' ? '--request <private-file>' : mode === 'reply' ? '<receipt-id> --request <private-file>' : '<key-or-receipt-id>';
+    const usage = `telepty ${cmd} --config <file> ${parameters}`;
+    if (args[1] === '--help' || args[1] === '-h') { console.log(usage); return; }
+    if (args[1] !== '--config' || !args[2]) { console.error(usage); markCommandFailed(); return; }
+    try { await require('./src/broker/routing-cli').runBrokerRoutingRequest(mode, args[2], args.slice(3)); }
+    catch { console.error('BROKER_REQUEST_FAILED: query the same idempotency key before considering another send'); markCommandFailed(); }
+    return;
+  }
+
+  if (cmd === 'broker-discover-v1') {
+    if (args[1] === '--help' || args[1] === '-h') { console.log('Usage: telepty broker-discover-v1 --config <file> <exact-node>'); return; }
+    if (args[1] !== '--config' || args.length !== 4) { console.error('Usage: telepty broker-discover-v1 --config <file> <exact-node>'); markCommandFailed(); return; }
+    try { await require('./src/broker/main').runBrokerRequest('discover', args[2], args.slice(3)); }
+    catch { console.error('BROKER_DISCOVERY_UNAVAILABLE'); markCommandFailed(); }
+    return;
+  }
+
+  if (cmd === 'broker-inject-v1' || cmd === 'broker-receipt-v1') {
+    const usage = cmd === 'broker-inject-v1'
+      ? 'telepty broker-inject-v1 --config <file> <node> <sid> <epoch> <idempotency-key> <prompt>'
+      : 'telepty broker-receipt-v1 --config <file> <idempotency-key>';
+    if (args[1] === '--help' || args[1] === '-h') { console.log(usage); return; }
+    if (args[1] !== '--config' || args.length !== (cmd === 'broker-inject-v1' ? 8 : 4)) {
+      console.error(usage); markCommandFailed(); return;
+    }
+    try { await require('./src/broker/main').runBrokerRequest(cmd === 'broker-inject-v1' ? 'inject' : 'receipt', args[2], args.slice(3)); }
+    catch { console.error('BROKER_REQUEST_FAILED: query the same idempotency key before considering another send'); markCommandFailed(); }
+    return;
+  }
+
+  if (cmd === 'broker-v1' || cmd === 'relay-node-v1') {
+    if (args[1] === '--help' || args[1] === '-h') {
+      console.log(`Usage: telepty ${cmd} --config <explicit local config file>`);
+      return;
+    }
+    if (args.length !== 3 || args[1] !== '--config') {
+      console.error(`Usage: telepty ${cmd} --config <explicit local config file>`); markCommandFailed(); return;
+    }
+    try { await require('./src/broker/main').runBrokerCommand(cmd === 'broker-v1' ? 'hub' : 'node', args[2]); }
+    catch { console.error('BROKER_START_OR_CHANNEL_FAILED'); markCommandFailed(); }
+    return;
+  }
+
   if (cmd === 'peers') {
     if (args[1] === '--remove' && args[2]) {
       crossMachine.removePeer(args[2]);
@@ -4626,7 +5617,7 @@ Discuss the following topic from your project's perspective. Engage with other s
     if (cmd === 'monitor') {
       console.log('\x1b[36m\x1b[1m📺 Telepty Event Billboard\x1b[0m');
       console.log('Listening for background agent communications...\n');
-    } else {
+    } else if (!args.includes('--json')) {
       console.log('\x1b[36m👂 Listening to the telepty event bus...\x1b[0m');
     }
 
@@ -4710,12 +5701,12 @@ function printGlobalHelp() {
 \x1b[1mSession Management:\x1b[0m
   telepty daemon                                 Start the daemon in the foreground (port 3848)
   telepty daemon start|stop|restart              Start (detached) / stop / restart the background daemon
-  telepty spawn --id <id> <command> [args...]    Spawn a new background session
+  telepty spawn --id <id> [--background] [--] <command> [args...]  Spawn and enter; --background returns
   telepty allow [--id <id>] [--idle-ttl 1h|off] [--auto-restart] <command> [args...]  Wrap a CLI for remote control
   telepty list [--json]                          List sessions (local + Tailnet)
   telepty attach [id[@host]]                     Attach interactively (picker if no ID)
   telepty rename <old_id[@host]> <new_id>        Rename a session
-  telepty kill <id[@host]> [--force] [--timeout N]  Gracefully terminate a session
+  telepty kill <id[@host]> [--owned] [--force] [--timeout N]  Gracefully terminate a session
   telepty clean [--older-than 7d] [--idle] [--dry-run]  Clean ghost or old sessions
   telepty session info <id[@host]> [--json]      Show session metadata
   telepty session interaction <sid> observe     Typed capabilities (live adapter unavailable)
@@ -4724,19 +5715,44 @@ function printGlobalHelp() {
 
 \x1b[1mInject & Communicate:\x1b[0m
   telepty inject [--ref [file]] [--from <id>] <id[@host]> "<prompt>"  Inject text
+  telepty approval-challenge [--no-enter] <exact-id[@host]> -- "<prompt>"  Digest-only signing document
+  telepty inject --approval-file <private-file> [--no-enter] <exact-id[@host]> -- "<prompt>"  Signed direct inject
   telepty enter <id[@host]>                      Send Enter/Return
   telepty reply "<text>"                         Reply to last injector
   telepty multicast <id1,id2> "<prompt>"         Inject into multiple sessions
   telepty broadcast [--ref [file]] "<prompt>"    Inject into ALL sessions
+  telepty diagnose <exact-id@host> [--json] [--machine-id ID] [--epoch EPOCH]
+    --inject-id UUID correlates ledger facts; --tcp adds one bounded connection probe
+    --process-state reads bounded Linux /proc scheduler state (no responsiveness claim)
+    Read-only, two bounded authenticated probes; no discovery or automatic repair
   telepty read-screen <id[@host]> [--lines N]    Read session screen buffer
+    --json [--max-bytes N] [--since CURSOR]      Bounded snapshots/deltas (default 4096 content bytes; max 262144)
+    --lines N selects last N lines before byte limiting; --raw preserves ANSI
+    Cursors are scoped to session instance and raw/lines mode; reset requires refresh
+    Delta splice indices use Unicode code points; truncated snapshots are partial
+  telepty mailbox <id> [--json] [--since msg_id] Read a local mailbox
+  telepty mailbox ack <id> <msg_id>            Acknowledge one local mailbox message
 
 \x1b[1mCross-Machine:\x1b[0m
+  telepty ssh <user@host> --id <id> [--persistent] [--remote-command <agent>] [--cwd <path>] [--resume <id>]
   telepty connect <user@host> [--name N] [--port P]      SSH tunnel to remote host
   telepty connect-http <host>[:port] [--name N] [--token T]  Register remote daemon via HTTP (no SSH)
   telepty disconnect <name> | --all              Disconnect remote host
   telepty peers [--remove <name>]                List connected peers
+  telepty discover [--json] [--refresh]           Read-only local tailnet candidates; never enroll or authorize
+  telepty principal-bus-v1 --config <private-file> --session <id> --epoch <epoch> --request <private-file>\n  telepty principal-bus-receipt-v1 --config <private-file> --session <id> --epoch <epoch> --effect <effect> --key <key>\n  telepty principal-input-v1 --config <private-file> --session <id> --epoch <epoch> --request <private-file>\n  telepty principal-input-receipt-v1 --config <private-file> --session <id> --epoch <epoch> --key <key>\n  telepty principal-readiness-v1 --config <private-file> --session <exact-id> --epoch <epoch>\n  telepty principal-observe-v1 --config <private-file> --session <exact-id> --epoch <epoch>\n  telepty broker-v1 --config <file>              Opt-in signed SSE hub (exact inject only)
+  telepty relay-node-v1 --config <file>          Outbound recipient bridge, no auto-enrollment
+  telepty broker-inject-v1 --config <file> <node> <sid> <epoch> <key> <prompt>
+  telepty broker-receipt-v1 --config <file> <key> Query acceptance/uncertainty; no resend
+  telepty broker-broadcast-v1 --config <file> --request <private-file>
+  telepty broker-broadcast-receipt-v1 --config <file> <key>
+  telepty broker-reply-context-v1 --config <file> <receipt-id>
+  telepty broker-reply-v1 --config <file> <receipt-id> --request <private-file>
+  telepty broker-discover-v1 --config <file> <exact-node> Read scoped node-reported metadata
 
 \x1b[1mMonitoring:\x1b[0m
+  telepty readiness <exact-id>[@host] [--json]     Inspect qualified composer evidence (read-only)
+  telepty wait-ready <exact-id>[@host] [--timeout-ms N] [--json]  Bounded composer wait
   telepty monitor                                Real-time event billboard
   telepty listen                                 Stream event bus as JSON
 
@@ -4752,9 +5768,14 @@ function printGlobalHelp() {
   telepty deliberate end <thread_id>             Close a thread
 
 \x1b[1mOther:\x1b[0m
-  telepty update                                 Update to latest version
+  telepty update                                 Update to latest version (Windows self-update guarded)
+  telepty update --plan [--json]                  Read-only external quiescence/recovery plan
+  telepty service status|install|uninstall|start|stop|restart  Manage the OS service
   telepty uninstall [--purge] [--dry-run]        Stop daemon + unload service; keep user data unless --purge
   telepty status-report --phase <p> [options]    Emit structured status event
+  telepty ledger status [--txn <id>]             Tracked-injection ledger status (owner/client; txn receipt lookup)
+  telepty ledger export-v3 --out <file>          Write a schema-3 ledger export under ~/.config/aigentry-telepty/exports
+  telepty ledger unlock --confirm                Remove a stale ledger lock (refuses while a daemon is alive)
 
 \x1b[1mExamples:\x1b[0m
   \x1b[2m# Wrap Claude Code for remote control\x1b[0m
@@ -4789,6 +5810,9 @@ if (require.main === module) {
 
 // Minimal test surface (no logic change) — pure decisions exposed for unit-testing.
 module.exports = {
+  decideDaemonVerbRoute,
+  resolveTeleptyEntryPoint,
+  serviceDeps,
   classifyBackend,        // #29: TERM_PROGRAM/CMUX/kitty → backend string
   isDaemonDestroyClose,   // #17 OQ-2: 1000 'Session destroyed' → terminate-not-reconnect
   isOwnerReplacedClose,   // #56: 4001 'Owner replaced' → exit-not-reconnect (durable Replace)
@@ -4804,6 +5828,14 @@ module.exports = {
   updateRestartSucceeded, // gh#61: did `update` leave a running daemon — skip is not a failure
   formatDaemonStopDiagnostic, // telepty#15: actionable can't-stop-daemon diagnostic (pure)
   restartDaemonGraceful,  // telepty#15: injectable seams for the blocked-restart fail-fast path
+  normalStopMode,         // Task 1215 W3: graceful (win32) vs signal stop for NORMAL callers (pure)
+  selectNormalStop,       // Task 1215 W3 (R2): the stop-step selector every normal caller uses (pure)
+  gracefulWindowsStop,    // Task 1215 W3 (R1): the exact-instance graceful gate (npm preuninstall awaits it)
+  runDaemonStopRestart,   // Task 1215 W3 (R2): main()'s `daemon stop|restart` dispatch (injectable seams)
+  runServiceCommandVerb,  // Task 1215 W3 (R2): main()'s `service <verb>` dispatch (injectable seams)
+  runUninstallCommand,    // Task 1215 W3 (R1): main()'s `uninstall` (graceful-first on Windows)
+  interactiveDaemonStart, // Task 1215 W3 (R2): the interactive menu `daemon` action
+  scheduledTaskGracefulVerb, // Task 1215 W3 (F1): graceful-first scheduled-task stop|restart (injectable seams)
   probeTimeoutMs,         // gh#82 (C): the one probe deadline, TELEPTY_PROBE_TIMEOUT_MS-overridable
   probeDaemonHealth,      // gh#82 (A/B): unauthenticated /api/health liveness re-confirmation
   resolveTargetToken,     // #844 F1: which credential belongs to THIS address — refuses, never assumes

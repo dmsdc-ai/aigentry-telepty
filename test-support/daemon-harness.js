@@ -1,6 +1,5 @@
 'use strict';
 
-const { once } = require('events');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -58,15 +57,25 @@ function getShellSpec() {
   return { command: 'bash', args: ['--noprofile', '--norc'] };
 }
 
+// Spawn-env overrides that make `homeDir` the EFFECTIVE home of a child process. `os.homedir()`
+// reads USERPROFILE on win32 and HOME elsewhere, so a fixture that overrides HOME alone is read
+// by the product under its real profile on Windows (#879: measured in release-0.4.5-bugfixes and
+// cross-machine-ssh-routing — seeded state invisible, token mismatch, "no daemon detected").
+function homeEnv(homeDir) {
+  return process.platform === 'win32'
+    ? { HOME: homeDir, USERPROFILE: homeDir }
+    : { HOME: homeDir };
+}
+
 function createTempHome() {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-home-'));
-  return {
-    homeDir,
-    env: process.platform === 'win32'
-      ? { HOME: homeDir, USERPROFILE: homeDir }
-      : { HOME: homeDir }
-  };
+  return { homeDir, env: homeEnv(homeDir) };
 }
+
+// Bounded shutdown of an owned daemon child (#879). Grace after kill() before escalating to
+// SIGKILL, then a second bound after which the shutdown is reported as a FAILURE, not assumed.
+const TERMINATE_GRACE_MS = 2000;
+const TERMINATE_KILL_MS = 5000;
 
 // Match the daemon's startup banner ("… listening on http://<host>:<port>") to
 // read back the OS-assigned port when the daemon is launched with PORT=0.
@@ -109,17 +118,12 @@ async function startTestDaemon(options = {}) {
   // daemon-RESTART test needs (#815: a persisted credential verifier must survive it). When the
   // caller owns the directory, stop() must not delete it out from under the next daemon.
   const ownsHome = !options.homeDir;
-  const { homeDir, env: homeEnv } = ownsHome
+  const { homeDir, env: homeDirEnv } = ownsHome
     ? createTempHome()
-    : {
-      homeDir: options.homeDir,
-      env: process.platform === 'win32'
-        ? { HOME: options.homeDir, USERPROFILE: options.homeDir }
-        : { HOME: options.homeDir }
-    };
+    : { homeDir: options.homeDir, env: homeEnv(options.homeDir) };
   const sharedEnv = {
     ...process.env,
-    ...homeEnv,
+    ...homeDirEnv,
     ...(options.env || {}),
     NO_UPDATE_NOTIFIER: '1',
     TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
@@ -136,7 +140,8 @@ async function startTestDaemon(options = {}) {
   const child = spawn(process.execPath, ['daemon.js'], {
     cwd: projectRoot,
     env: daemonEnv,
-    stdio: ['ignore', 'pipe', 'pipe']
+    // Task 1215 W3: the IPC channel is how a Windows normal stop reaches the daemon's own shutdown().
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc']
   });
 
   child.stdout.on('data', (chunk) => {
@@ -146,6 +151,61 @@ async function startTestDaemon(options = {}) {
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString();
   });
+
+  // #879 — exit is a FACT recorded from the 'exit' event, never inferred from `child.exitCode`.
+  // `child.kill()` on Windows is TerminateProcess, which libuv reports as a SIGNAL exit: exitCode
+  // stays null and signalCode becomes 'SIGTERM'. The old predicate `child.exitCode === null` read
+  // a daemon killed that way as still alive, so the next kill()/stop() on the same handle waited
+  // on an 'exit' event that had already been emitted — with no timer and no I/O behind it. That
+  // is the measured restart hang (run 40500878932: session-token-issuance-815 and
+  // observation-tracking-endpoint-60, pending test promise, only the suite daemon left as a handle).
+  const exitState = { exited: false, code: null, signal: null };
+  child.once('exit', (code, signal) => {
+    exitState.exited = true;
+    exitState.code = code;
+    exitState.signal = signal;
+  });
+
+  // Resolve true when the child has exited (now or within timeoutMs), false otherwise. The check
+  // and the listener attach happen in the same tick, so an exit already emitted is never missed
+  // and an exit emitted later is always seen; the losing timer is cancelled (#861).
+  function waitForExit(timeoutMs) {
+    if (exitState.exited) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let timer = null;
+      const onExit = () => { clearTimeout(timer); resolve(true); };
+      timer = setTimeout(() => { child.off('exit', onExit); resolve(false); }, timeoutMs);
+      child.once('exit', onExit);
+    });
+  }
+
+  // Bounded, idempotent shutdown of the owned child. Resolves with the recorded exit; throws when
+  // the child has not exited within TERMINATE_GRACE_MS + TERMINATE_KILL_MS, so a cleanup that
+  // did not complete is a failure the test reports rather than a silent return or an open wait.
+  async function terminateOwnedChild(label) {
+    if (exitState.exited) return exitState;
+    // Task 1215 W3: on win32 a normal stop first asks the daemon, over the IPC channel this harness owns,
+    // to run its own shutdown() (the path POSIX reaches with SIGTERM). Only if it has not exited within
+    // the existing grace does the forced path below run — and that is a CRASH (no shutdown, ledger lock
+    // left), recorded as such, never as a graceful stop.
+    if (process.platform === 'win32' && child.connected) {
+      try { child.send({ type: 'telepty.shutdown', v: 1 }); } catch { /* channel gone: forced path below */ }
+      if (await waitForExit(TERMINATE_GRACE_MS)) { exitState.stop = 'graceful_ipc'; return exitState; }
+      exitState.stop = 'forced_after_ipc_timeout';
+      process.stderr.write(`[daemon-harness] ${label}: graceful IPC stop of pid ${child.pid} did not complete within `
+        + `${TERMINATE_GRACE_MS}ms; forcing termination (crash semantics: no shutdown, ledger lock left)\n`);
+    } else if (process.platform !== 'win32') {
+      exitState.stop = 'signal';
+    }
+    child.kill(); // POSIX: SIGTERM, the daemon's own shutdown path; win32: TerminateProcess (crash)
+    if (await waitForExit(TERMINATE_GRACE_MS)) return exitState;
+    child.kill('SIGKILL');
+    if (await waitForExit(TERMINATE_KILL_MS)) return exitState;
+    throw new Error(
+      `${label}: daemon child pid ${child.pid} did not exit within `
+      + `${TERMINATE_GRACE_MS + TERMINATE_KILL_MS}ms after kill() and kill('SIGKILL')`
+    );
+  }
 
   // #820 — the daemon's own secret, resolved the same way every real consumer resolves it:
   // TELEPTY_AUTH_TOKEN if the caller pinned one in the spawn env, else the config.json this
@@ -199,7 +259,7 @@ async function startTestDaemon(options = {}) {
   }
 
   await waitFor(async () => {
-    if (child.exitCode !== null) {
+    if (exitState.exited) {
       throw new Error(`Daemon exited early.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
     }
 
@@ -223,6 +283,27 @@ async function startTestDaemon(options = {}) {
     }
   }, { timeoutMs: 7000, description: 'daemon start' });
 
+  // #1207 — the tracked-injection store opens asynchronously, AFTER the listener is up, and a tracked
+  // inject (`from` set) is refused `503 recovering` until it has. Tests written against the old
+  // synchronous ledger send one right after start, so by default readiness also waits (bounded) until
+  // the store has SETTLED — any state but `not_opened` / `recovering`; `lock_present` and the
+  // unavailable states count as settled and are left for the test to assert. A status this harness
+  // cannot read (non-200) is not waited on, and a timeout proceeds unchanged rather than adding a
+  // failure. `awaitLedger: false` keeps the old readiness for tests that observe the recovery itself.
+  if (options.awaitLedger !== false) {
+    const deadline = Date.now() + (options.ledgerTimeoutMs ?? 10000);
+    while (Date.now() < deadline && !exitState.exited) {
+      let store = null;
+      try {
+        const status = await request('/api/ledger/status');
+        if (status.status !== 200 || !status.body || !status.body.client) break;
+        store = status.body.client.store;
+      } catch { break; }
+      if (store !== 'not_opened' && store !== 'recovering') break;
+      await delay(25);
+    }
+  }
+
   async function cleanupSessions() {
     const list = await request('/api/sessions');
     if (list.status !== 200 || !Array.isArray(list.body)) {
@@ -239,57 +320,34 @@ async function startTestDaemon(options = {}) {
     }, { description: 'session cleanup' });
   }
 
-  // Bounded wait for the daemon child to exit, with the losing timer CANCELLED (#861).
-  //
-  // `Promise.race` abandons the loser; it does not cancel it. A plain `delay(2000)` here stays
-  // pending for the full 2s after the child has already exited, and a pending timer keeps the
-  // TEST process's event loop alive long after its last assertion. That is what four test files
-  // were papering over with `process.exit(0)` in an after-hook — which exits before the TAP
-  // stream has flushed and silently drops test results from the reported count.
-  async function waitForChildExit(timeoutMs = 2000) {
-    let timer;
-    const expired = new Promise((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); });
-    try {
-      return await Promise.race([once(child, 'exit').then(() => true), expired]);
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
   // Kill the daemon process WITHOUT the cleanupSessions() pass stop() does. A restart test needs
   // this: cleanupSessions DELETEs every session, and DELETE revokes credentials (#815), so
   // stopping politely would destroy the very state the restart is supposed to carry across.
+  // Idempotent: a second kill() (or a stop()) after the child exited returns at once.
+  //
+  // Windows note (#879, unchanged product semantics): TerminateProcess runs none of the daemon's
+  // shutdown handlers, so ConPTY shells of a kill()ed daemon are left to the job's termination.
+  // The diagnostic runner records them as unattributed/unknown — never as clean.
   async function kill() {
-    if (child.exitCode === null) {
-      child.kill();
-      const exited = await waitForChildExit();
-      if (!exited && child.exitCode === null) {
-        child.kill('SIGKILL');
-        await once(child, 'exit').catch(() => {});
-      }
-    }
+    await terminateOwnedChild('kill()');
   }
 
   async function stop() {
     try {
-      await cleanupSessions();
-    } catch {
-      // Ignore cleanup failures during shutdown and force-stop the daemon below.
-    }
-
-    if (child.exitCode === null) {
-      child.kill();
-
-      const exited = await waitForChildExit();
-
-      if (!exited && child.exitCode === null) {
-        child.kill('SIGKILL');
-        await once(child, 'exit').catch(() => {});
+      // A daemon that has already exited (kill() in a restart test, or a crash) has no sessions
+      // to clean up and no process to signal: no HTTP to a dead port, no wait on a past 'exit'.
+      if (!exitState.exited) {
+        try {
+          await cleanupSessions();
+        } catch {
+          // Ignore cleanup failures during shutdown and force-stop the daemon below.
+        }
+        await terminateOwnedChild('stop()');
       }
-    }
-
-    if (ownsHome) {
-      fs.rmSync(homeDir, { recursive: true, force: true });
+    } finally {
+      if (ownsHome) {
+        fs.rmSync(homeDir, { recursive: true, force: true });
+      }
     }
   }
 
@@ -433,7 +491,7 @@ async function startTestDaemon(options = {}) {
     stop,
     kill,
     waitFor,
-    isAlive: () => child.exitCode === null,
+    isAlive: () => !exitState.exited,
     getLogs: () => ({ stdout, stderr })
   };
 }
@@ -441,6 +499,7 @@ async function startTestDaemon(options = {}) {
 module.exports = {
   createSessionId,
   delay,
+  homeEnv,
   startTestDaemon,
   stripAnsi,
   waitFor

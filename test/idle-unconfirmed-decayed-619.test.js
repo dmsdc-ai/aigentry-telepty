@@ -25,11 +25,13 @@ process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = '1';
 // re-deriving it. never-false-complete preserved: the fact is recorded ONLY for a genuine
 // non-busy→turn transition at/after the inject CR, so a never-consumed inject still UNCONFIRMED.
 
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const daemon = require('../daemon');
 const { fireAutoReport, maybeRecordInjectConsumption } = daemon;
+const { trackedInjectId, beginTrackedEager, settleTracked, fireAndSettle } = require('../test-support/tracked-observation');
+after(async () => { await daemon.ledgerClient.close(2000); });
 
 const T0 = 1_700_000_000_000;
 
@@ -67,7 +69,7 @@ function makeGate({
   };
   ctx.pendingReport = {
     source: 'orch',
-    injectId: 'inj-619',
+    injectId: trackedInjectId('inj-619'),   // #1207: fresh durably begun id per fixture
     injectedAt: new Date(T0 - elapsedSec * 1000).toISOString(),
     injectedBodyPreview: BODY,
     ringBytesAtInject: preBytes,
@@ -85,11 +87,18 @@ function makeGate({
   };
   if (sampleChildCpu) ctx.deps.sampleChildCpu = sampleChildCpu;
   if (idleEvidenceReliable !== undefined) ctx.deps.idleEvidenceReliable = idleEvidenceReliable;
-  ctx.fire = (trigger = 'real-idle') =>
-    fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps);
-  ctx.flushTimers = () => {
+  // #1207: the source is told only after the observation is durable on a durably begun record —
+  // begun here, awaited by the first fire; each step then awaits the async emit (settle).
+  ctx.ready = beginTrackedEager(daemon, { injectId: ctx.pendingReport.injectId, sessionId: 'worker-1', source: ctx.pendingReport.source, session: ctx.session });
+  const progress = () => `${ctx.delivered.length}:${ctx.broadcasts.length}`;
+  ctx.fire = async (trigger = 'real-idle') => {
+    await ctx.ready;
+    return fireAndSettle(daemon, () => fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps), progress);
+  };
+  ctx.flushTimers = async () => {
     const due = ctx.timers.splice(0);
     for (const { fn, ms } of due) { ctx.nowMs += ms; fn(); }
+    await settleTracked(daemon, progress);
   };
   return ctx;
 }
@@ -125,7 +134,7 @@ function decayedLongCompletion(extra = {}) {
 // and what remains testable, and worth testing, is whether the evidence is classified correctly.
 function consumptionOf(ctx) {
   assert.equal(ctx.delivered.length, 1, 'exactly one observation is stated — never silence');
-  assert.match(ctx.delivered[0].msg, /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-619 /);
+  assert.match(ctx.delivered[0].msg, /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-619-\d+-\d+ /);
   assert.doesNotMatch(ctx.delivered[0].msg, /TASK_COMPLETE:|TASK_IDLE_UNCONFIRMED:/);
   const ev = ctx.broadcasts.find((b) => b.type === 'task_completion_unknown');
   assert.ok(ev);
@@ -133,10 +142,10 @@ function consumptionOf(ctx) {
   return ev.opts.extra.consumption;
 }
 
-test('#619 reproduce: long completion with decayed at-idle evidence no longer cries wolf', () => {
+test('#619 reproduce: long completion with decayed at-idle evidence no longer cries wolf', async () => {
   const ctx = makeGate(decayedLongCompletion());
-  ctx.fire('real-idle');
-  ctx.flushTimers(); // settle elapses: still idle, output stalled, no CPU → state it
+  await ctx.fire('real-idle');
+  await ctx.flushTimers(); // settle elapses: still idle, output stalled, no CPU → state it
   // The bug was the ACCUSATION: `TASK_IDLE_UNCONFIRMED: ... inject may NOT have been processed;
   // verify before treating as done` on a worker that had in fact finished. That sentence is
   // deleted, because "may not have been processed" was never a measurement either. The honest
@@ -151,7 +160,7 @@ test('#619 reproduce: long completion with decayed at-idle evidence no longer cr
 // fix — a durable early-consumption candidate makes the decayed at-idle evidence moot.
 // ---------------------------------------------------------------------------
 
-test('#619 fix: an early-recorded fresh-turn candidate survives 800s of decay', () => {
+test('#619 fix: an early-recorded fresh-turn candidate survives 800s of decay', async () => {
   const ctx = makeGate(decayedLongCompletion({
     // Captured at turn-start (~T-805s), long before idle — this is the decay-proof half.
     injectConsumptionCandidate: {
@@ -164,8 +173,8 @@ test('#619 fix: an early-recorded fresh-turn candidate survives 800s of decay', 
     // at classification time rather than at the edge.
     submitConfirm: { accepted: true, reason: 'state_working', ambiguous: false },
   }));
-  ctx.fire('real-idle');
-  ctx.flushTimers();
+  await ctx.fire('real-idle');
+  await ctx.flushTimers();
   // The #619 win, restated: consumption is established at idle-time from a fact recorded ~800s
   // earlier, with no dependence on a ring or an OSC mark that has since scrolled away.
   const consumption = consumptionOf(ctx);
@@ -187,7 +196,7 @@ test('#619 fix: an early-recorded fresh-turn candidate survives 800s of decay', 
 // migrated invariant pins the stronger rule.
 // ---------------------------------------------------------------------------
 
-test('#619 invariant: a recorded candidate alone, with an ambiguous confirm, is not consumption', () => {
+test('#619 invariant: a recorded candidate alone, with an ambiguous confirm, is not consumption', async () => {
   const ctx = makeGate(decayedLongCompletion({
     // The fresh-turn edge IS recorded — the old code's sole condition for promoting.
     injectConsumptionCandidate: {
@@ -197,8 +206,8 @@ test('#619 invariant: a recorded candidate alone, with an ambiguous confirm, is 
     // But the long turn's confirm is `no_observable`/ambiguous, which measured no screen. The
     // whitelist is narrower than `accepted === true` on purpose.
   }));
-  ctx.fire('real-idle');
-  ctx.flushTimers();
+  await ctx.fire('real-idle');
+  await ctx.flushTimers();
   const consumption = consumptionOf(ctx);
   assert.equal(consumption.status, 'not_established', 'never-false-complete preserved');
   assert.equal(consumption.basis, 'no_consumption_evidence');

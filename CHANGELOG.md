@@ -2,6 +2,175 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.10.0
+
+Two lines of work ship together in this release:
+- **Daemon storage (task 1207).** The tracked-injection ledger becomes a directory store written by
+  one worker thread. The store design is in BOUNDARY.md, "The tracked-injection ledger is a
+  directory store owned by one worker thread".
+- **Delivery, identity and principal work (the Linux line).** Listed under "Delivery and identity"
+  below. Several defaults change; see "Behaviour changes" before upgrading a consumer.
+
+The release also contains the three opt-in task-1215 contracts listed under 0.9.2 below, so an
+upgrade from 0.9.1 gets them too. It also includes the Windows CI repairs from #879: the test
+harness, `.gitattributes`, and an opt-in diagnostic workflow. These change no product code.
+
+To pick everything up, restart the daemon and every running `telepty allow` bridge. A bridge keeps
+the code it was started with.
+
+- **The tracked-injection ledger no longer rewrites its whole history on every observation.**
+  Measured on the unchanged 0.9.1 route (private synthetic ledgers): one full-ledger write, two
+  fsyncs and one rename per observation; 155–213 ms per event at a 64 MiB ledger. The ledger is now
+  a **directory store at the same path** (`~/.config/aigentry-telepty/tracked-injections.json/`):
+  hash-framed append-only segments, group commit with one fsync, an immutable cold tier for
+  history, a small hot working set, and a **single long-lived `worker_threads` owner** that is the
+  only opener of any file under it. Main-thread work per observation is independent of history.
+- **Durable before delivery, explicitly.** `POST /api/sessions/:id/inject` answers 200 and hands
+  bytes to the transport only after the owner's fsynced commit ACK. Outcomes are exactly four:
+  `ack`, `nack` (invalid before any write), `indeterminate` (a write was attempted; durability
+  unknown — never reported as success or failure, settled only by receipts at recovery), and
+  `rejected_admission` (capacity; nothing queued). New route results: `503 TRACKING_CAPACITY`
+  with `reason` ∈ `tracking_capacity_exhausted | sustained_exhaustion | disk_full | recovering |
+  owner_failed | unavailable_write | lock_present`; `500 TRACKING_PERSISTENCE_FAILED` keeps its
+  shape and adds `reason: tracking_outcome_indeterminate` for the indeterminate arm. Bus
+  `tracking_result` gains `tracking_backpressure`, `tracking_capacity_result`,
+  `tracking_capacity_exhausted`, `tracking_outcome_indeterminate`, `already_terminal`.
+- **One offline migration, under an O_EXCL lock, with every original retained.** The 0.9.1 file is
+  copied byte-identically into the store (`legacy/`), moved aside as
+  `tracked-injections.json.pre-0.10.<token>`, hash-verified on the aside artifact, and the
+  directory is published in its place. Every conflict (`legacy_modified`,
+  `original_modified_after_capture`, `legacy_recreated`, `original_modified`, `abandoned_staging`)
+  stops with all files in place; nothing is deleted, nothing is renamed back automatically. A
+  published store is recognised before any pending-migration scan, so a retained aside never
+  blocks a restart. The unguarded 0.9.1 binary cannot write over the directory (its rename fails).
+- **Lock fails closed; the operator recovers.** `tracked-injections.lock` beside the store; EEXIST
+  leaves the ledger `unavailable: lock_present` with the daemon's control plane up. No automatic
+  stale-lock breaking. New: `telepty ledger status [--txn <id>]`, `telepty ledger export-v3 --out
+  <file>` (schema-3 downgrade export, written under `~/.config/aigentry-telepty/exports/`), and
+  `telepty ledger unlock --confirm` (refuses while `daemon-state.json` names a live pid or the port
+  answers `/api/health`). Daemon routes `GET /api/ledger/status`, `POST /api/ledger/export` sit
+  behind the same host-token guard as the interaction routes.
+- **Facts are stored once.** `daemon_restart_observed` and owner-lifecycle facts are one frame each
+  and are overlaid onto records lazily in durable log order; `GET /api/inject-observations/:id`
+  output is identical to a log-order replay of the old per-record appends.
+- Capacity constants (pools, hot-set limits, group caps) are proposed and remain so until measured.
+  Windows is not a supported cutover platform until the directory-exclusion and migration gates are
+  run there. No history is deleted; no cold data is evicted (successor #1251).
+
+### Delivery and identity
+
+- **Injected text and its Enter stay paired (#107, #109).** The deferred Enter goes only to the
+  session instance, and the owner socket, that received the text. The next inject waits behind it.
+  A session that is destroyed or re-created in that window answers `410 SESSION_GONE`, and no bare
+  Enter is written to a replacement.
+- **Queued text cannot change owner (PR #108).** A queued message is bound to the instance that
+  admitted it and is delivered to that instance only. Each message waits for its own `msg_id`.
+- **Delivery that cannot be confirmed is named, not retried.** An outcome that is not known after a
+  write attempt is `DELIVERY_UNCERTAIN` with `delivery_uncertain: true`, `bytes_written: null` and
+  `retryable: false`. The tracked record gains `inject_delivery_unknown`. Do not resend it blindly.
+- **Poll-only mailbox sessions (#101).** Register with `delivery_type: "mailbox"` (with a lease).
+  An inject answers `queued: true, poll_only: true` once it is durably recorded. The owner reads
+  and acknowledges with its session bearer.
+- **Durable session store writes (#122).** Spawn, register and rename commit the session file
+  before credentials are revoked or a success is published. A store-write failure is
+  `503 SESSION_STORE_WRITE_FAILED`, and a spawn that cannot be saved is rolled back.
+- **Opt-in strict principals, owner proof, cooperative handoff and mailbox takeover (#132, #133).**
+  These are off by default: with `TELEPTY_PRINCIPAL_MODE` unset or `legacy`, nothing changes. API
+  notes are in `docs/api/` and `docs/security/`.
+- **Shutdown flushes the audit log (#114). Diagnostics (#102, #106)** report layered, read-only
+  measurements and correlate an inject through the ledger. A cold record is found, and a record
+  that cannot be read is `503`, never a false `404`.
+- **Shell-string hardening (PR #108 C1–C5, C7, C8).**
+  - kitty remote control runs as an argv array, against a socket owned by this user only.
+  - Spawn accepts only `USER`/`AGENT` (any case) as the prompt label, and a session-id allowlist
+    (`400 INVALID_SESSION_TYPE` / `INVALID_SESSION_ID`).
+  - Control characters are stripped from terminal titles.
+  - The session id is quoted for a remote `telepty attach`.
+  - AppleScript receives the window search terms as arguments, never as script text.
+  - The session, handoff and thread registries have no prototype, and restore skips persisted ids
+    that no producer may register (with a log line).
+- **New dependency:** `@xterm/headless` 6.0.0 for screen observation. It is loaded lazily, with a
+  fallback if it cannot be loaded. Its license is in `third-party-notices/`.
+
+### Behaviour changes (consumers, check before upgrading)
+
+- An aterm UDS endpoint that replies with nothing, or with non-JSON, used to count as delivered.
+  It is now `DELIVERY_UNCERTAIN`.
+- An HTTP delivery endpoint answering non-2xx after the attempt used to be `DELIVERY_FAILED`. It
+  is now `DELIVERY_UNCERTAIN`.
+- `DELETE` on a session that is still closing used to answer `200 {status: closing}`. It now
+  answers `409 SESSION_CLOSING`.
+- A session-store write failure on spawn, register or rename is now `503`.
+- Consumers that read these codes (for example Telesession) must be released together with this
+  version.
+
+**Upgrading from 0.9.x.** Back up `~/.config/aigentry-telepty/tracked-injections.json` and
+`~/.telepty/` first, by copy. Then restart only the daemon. Never migrate a 0.9.x daemon while it is
+still running. The first 0.10.0 start migrates the old file offline, under the lock. Check
+`telepty ledger status` afterwards: the ledger must be healthy, and the cold count must equal the
+old record count. The pre-0.10 aside's sha256 must also equal the backup's.
+
+Mailboxes use a v2 lock in this release. A legacy 0.9.x `.lock` file is refused with
+`MAILBOX_LOCK_LEGACY` and is never removed automatically. Inspect a mailbox root read-only with
+`node scripts/mailbox-preflight.js --root <dir>` first, and stop every 0.9.x mailbox writer
+(see `docs/security/mailbox-migration.md`).
+
+**Rolling back to 0.9.x.** While 0.10.0 is still healthy, write a downgrade file with
+`telepty ledger export-v3 --out <file>`. Stop the daemon with SIGTERM; a clean close releases the
+lock. Rename the `tracked-injections.json/` directory aside; do not delete it. Then put the export,
+or else the retained `tracked-injections.json.pre-0.10.*` aside, at `tracked-injections.json`.
+After that, start the 0.9.x daemon. This step is required: 0.9.x refuses tracked injects while a
+directory is at that path. This rollback covers the tracked-injection ledger only. No automatic
+conversion of the v2 mailbox lock back to 0.9.x exists, so a 0.9.x writer and a 0.10.0 daemon must
+never share a mailbox root.
+
+**Limits.**
+- A crash or SIGKILL leaves `tracked-injections.lock` in place. The next daemon then reports
+  `lock_present` and refuses tracked injects until `telepty ledger unlock --confirm` is run. The
+  daemon's own early exits release the lock (port in use, an invalid second config read).
+- **Durability by OS.** Every ACK follows a successful fsync of the file holding the commit, on every
+  OS. macOS and Linux also fsync the directory after creating or renaming an entry; an error there
+  fails closed. Windows cannot flush a directory handle (measured: `EPERM`, Windows CI run
+  41169574692; every store open used to fail there, so no tracked inject could begin). The store now
+  records `durability.dir_flush: "unsupported"` in `telepty ledger status` and continues. On Windows
+  a new segment's directory entry, or a rename, is therefore not explicitly flushed, and its survival
+  across power loss is up to the file system. A directory that cannot be opened, any other error,
+  and every file-fsync error still fail closed.
+- **Not yet measured:** this exact build on Windows, Linux or macOS; live CPU and responsiveness; and
+  migration of 128/256 MiB ledgers.
+- **Open, not addressed by this release:**
+  - #136: an accepted inject can stay pending behind the bridge readiness gate.
+  - #137: no per-stage receipts, and the bridge queue is not visible to the daemon.
+- **Release gate:** a real Mac↔Linux Telepty request/ACK, with the input actually consumed, is
+  required before publication. It has not been run for this build.
+- The stricter id rule for register, rename and WS auto-register (PR #108 NB4) is not adopted.
+  There, only the existing control-character and length checks apply.
+
+## 0.9.2 — 2026-10-27
+
+Three opt-in **daemon** HTTP contracts for Telesession/Kkoma-class consumers (task 1215). Each is
+selected by an explicit flag; a request without the flag behaves exactly as in 0.9.1, so existing
+bridges, CLIs and operators need no change. `/api/meta` now advertises `register-create-only`,
+`inject-exact-target` and `delete-owned-session` in `capabilities`.
+
+- **`POST /api/sessions/register` with `create_only: true`** (boolean) refuses an id the daemon
+  already holds with `409 SESSION_EXISTS` before the idempotent re-register path can touch the
+  record; a fresh id is created exactly as before (201 with its one-time credential). The invalid-id
+  checks and the #815 uncredentialed delivery-endpoint rule are unchanged.
+- **`POST /api/sessions/:id/inject` with `exact_target: true`** (boolean) delivers only to the
+  exact session id: a bare alias or a `-N` sibling name is `404 SESSION_NOT_FOUND` with nothing
+  delivered, audited or tracked. A successful response additionally carries `exact_target: true`
+  and the actual `session_id`. The sender, peer-lane (#533), payload, tracking, delivery and submit
+  guards run unchanged, so a refusal they produce is returned as-is.
+- **`DELETE /api/sessions/:id?owned=true`** tears down the exact id only, and only for a caller
+  presenting that instance's current session credential (sid, epoch and generation all matching);
+  a missing, foreign or stale bearer is `403 OWNED_DELETE_FORBIDDEN` with no side effect. The
+  tokenless operator `DELETE` and the #548 non-cascading alias rule are unchanged.
+
+Pinned by `test/telesession-capabilities-1215.test.js` (real daemon, loopback aterm sink, no PTY).
+Daemon change only — restart the daemon to pick it up. No CPU, native-module, platform or
+global-install changes are part of this release.
+
 ## 0.9.1 — 2026-10-26
 
 One **CLI** fix, [gh#118](https://github.com/dmsdc-ai/aigentry-telepty/issues/118). It applies to every

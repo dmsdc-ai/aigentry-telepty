@@ -1,7 +1,15 @@
 'use strict';
+const { protectedInputFailure } = require('../external-approval');
+const { setKittyTabTitle } = require('../kitty-control');   // PR #108 C4: argv, no shell
 
 const crypto = require('node:crypto');
+const capturedSelector = require('../vt/captured-selector');
 const { invalidateInteraction } = require('../interaction');
+const { recordReadyEvidence } = require('../readiness');
+const { applySshState, acceptSshWriteReceipt } = require('../ssh-session');
+const bridgeStage = require('../mailbox/bridge-stage');
+const inputPolicies = require('../mailbox/input-policy');
+const readinessHandshake = require('./readiness-handshake');
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
 
@@ -58,12 +66,54 @@ function installWebSocketTransport(deps) {
     // omits them gets the bus-only behaviour instead of a throw.
     recordObservation,
     listTrackedInjectionsForSession,
+    // #1207 — one durable session-scoped FACT per lifecycle event (overlaid onto every tracked
+    // inject of the session in log order) replaces one whole-ledger rewrite per record. Optional:
+    // a harness that passes only `recordObservation` keeps the per-record path. `ledgerLive`
+    // tells the owner which sessions are live (resident-tier hint; correctness never depends on it).
+    recordSessionFact,
+    ledgerLive,
     // #826 — policy + audit for the viewer write path, so it matches POST /inject. Returns
-    // whether the frame may be forwarded, and records the attempt either way. Optional, same
+    // an admission plus completion hook (or legacy boolean), recording dispatch after the
+    // writer callback. Optional, same
     // convention as above; the daemon always passes it.
     authorizeViewerInject,
-    acceptInteractionReceipt
+    acceptInteractionReceipt,
+    // #137 — durable ledger observation of a validated bridge stage receipt. Optional, same
+    // convention: without it a receipt still marks the bridge as supported and nothing else.
+    recordBridgeReceipt
   } = deps;
+
+  // #137 — called only for frames from the CURRENT owner socket of a wrapped session. Identity
+  // (owner generation), shape and size are checked before any effect; a receipt never sets
+  // consumption, acknowledgement or completion.
+  function acceptBridgeStageFrame(sessionId, session, msg) {
+    if (msg.type === 'bridge_queue') return bridgeStage.applyBridgeQueue(session, msg);
+    const ownerGeneration = session.interactionOwnerGeneration;
+    const checked = bridgeStage.validateBridgeReceipt(msg, ownerGeneration);
+    if (!checked.ok) return false;
+    session.bridgeStageGeneration = ownerGeneration;
+    if (typeof recordBridgeReceipt === 'function' && checked.receipt.inject_id) {
+      Promise.resolve().then(() => recordBridgeReceipt(sessionId, session, checked.receipt, ownerGeneration))
+        .catch(() => { /* named in the ledger path; a receipt never throws into the socket */ });
+    }
+    return true;
+  }
+
+  // Task 1215 F2 — spawn-readiness milestones from the CURRENT owner socket only (the caller checked
+  // ws === ownerWs). Identity, nonce and child sequence are validated in readiness-handshake.js; a
+  // refused frame has no effect. input_transport_ready is the only signal that releases the
+  // bootstrap gate of a negotiated owner, for every role.
+  function acceptReadinessMilestone(sessionId, session, msg) {
+    const accepted = readinessHandshake.acceptMilestone(sessionId, session, msg);
+    // Task 1215 (#879 discriminator): still no effect, but the refusal reason is now observable (bounded).
+    if (!accepted.ok) { readinessHandshake.noteRefusedMilestone(session, msg && msg.type, accepted.reason); return false; }
+    const event = JSON.stringify({ type: accepted.milestone === 'input_transport_ready' ? 'session_input_transport_ready' : 'session_process_started',
+      session_id: sessionId, owner_generation: session.interactionOwnerGeneration, child_seq: msg.child_seq,
+      meaning: 'transport_only_not_instruction_receipt', timestamp: new Date().toISOString() });
+    busClients.forEach(client => { if (client.readyState === 1) client.send(event); });
+    if (accepted.milestone === 'input_transport_ready') markBootstrapReady(sessionId, session, 'input_transport_ready');
+    return true;
+  }
 
   /**
    * #60 Stage A §3 "consumption of #815 owner lifecycle" — append an owner-lifecycle fact to
@@ -73,23 +123,29 @@ function installWebSocketTransport(deps) {
    *
    * Returns the named results, one per record — never undefined, never a bare return.
    */
-  function recordOwnerLifecycle(sessionId, session, cause, evidence) {
-    if (typeof recordObservation !== 'function' || typeof listTrackedInjectionsForSession !== 'function') {
+  async function recordOwnerLifecycle(sessionId, session, cause, evidence) {
+    if ((typeof recordSessionFact !== 'function' && typeof recordObservation !== 'function') || typeof listTrackedInjectionsForSession !== 'function') {
       // Named, not silent: a construction site without the ledger seam still emitted the bus
       // lifecycle event above, and this says exactly what did not happen.
       return ['observation_ledger_unavailable'];
     }
-    const records = listTrackedInjectionsForSession(sessionId);
-    if (records.length === 0) return ['no_tracked_inject'];
+    // #1207 — hot AND cold records of the session (the owner answers in ≤ 64 KiB chunks).
+    const records = await listTrackedInjectionsForSession(sessionId);
+    if (!Array.isArray(records) || records.length === 0) return ['no_tracked_inject'];
+    if (typeof recordSessionFact === 'function') {
+      // One fact frame for the whole session; one bus event per record; results one per record.
+      return recordSessionFact({ sessionId, session, cause, evidence, records, trigger: 'owner_lifecycle' });
+    }
     const active = pendingReports[sessionId] || null;
-    return records.map((record) => {
+    const results = [];
+    for (const record of records) {
       // Reuse the LIVE pending report when this is the session's active inject, so its consumption
       // provenance survives; a superseded record gets a minimal stub, which classifies as
       // `no_consumption_evidence` — accurate, because nothing about consumption was measured here.
       const pendingReport = active && active.injectId === record.inject_id
         ? active
         : { injectId: record.inject_id, source: record.transport_source };
-      return recordObservation({
+      results.push(await recordObservation({
         sessionId,
         session,
         pendingReport,
@@ -101,8 +157,9 @@ function installWebSocketTransport(deps) {
         evidence,
         deliverToSource: true,
         trigger: 'owner_lifecycle',
-      });
-    });
+      }));
+    }
+    return results;
   }
 
   // #843 B — the delivery adapters behind the ONE viewer-write gate.
@@ -124,18 +181,21 @@ function installWebSocketTransport(deps) {
   // Checked BEFORE authorizing so the audit line's `forwarded` keeps meaning that the bytes were
   // actually handed over, rather than becoming a claim about a write that had no target.
   function viewerInputDeliverer(session) {
+    if (protectedInputFailure(session)) return null;
+    if (session.sshRemote) return null; // SSH requires a current-child write receipt, never raw viewer bytes.
     if (session.type === 'wrapped') {
       const owner = session.ownerWs;
       if (!isOpenWebSocket(owner)) return null;
-      return (data) => owner.send(JSON.stringify({ type: 'inject', data }));
+      return (data, complete) => owner.send(JSON.stringify({ type: 'inject', data }), complete);
     }
-    if (session.ptyProcess) return (data) => session.ptyProcess.write(data);
+    if (session.ptyProcess) return (data, complete) => { session.ptyProcess.write(data); complete(); };
     return null;
   }
 
   // Geometry, deliberately NOT behind the inject gate — see the resize note in the message
   // handler below.
   function viewerResizeDeliverer(session) {
+    if (protectedInputFailure(session)) return null;
     if (session.type === 'wrapped') {
       const owner = session.ownerWs;
       if (!isOpenWebSocket(owner)) return null;
@@ -154,10 +214,11 @@ function installWebSocketTransport(deps) {
 
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url, 'http://' + req.headers.host);
-    const sessionId = url.pathname.split('/').pop();
+    const strictOwner = strictOwners.context(req);
+    const sessionId = strictOwner ? strictOwner.sessionId : url.pathname.split('/').pop();
     const session = sessions[sessionId];
     // ?owner=1 indicates the allow bridge (PTY owner), not an attach viewer
-    const isOwnerConnect = url.searchParams.get('owner') === '1';
+    const isOwnerConnect = !!strictOwner || url.searchParams.get('owner') === '1';
 
     // Ping/pong heartbeat — detect and terminate stale TCP half-open connections (30s interval)
     let isAlive = true;
@@ -172,6 +233,7 @@ function installWebSocketTransport(deps) {
       ws.ping();
     }, 30000);
 
+    if (strictOwner && (session !== strictOwner.session || !strictOwner.current())) { ws.terminate(); return; }
     if (!session) {
       const connectedAt = new Date().toISOString();
       // Auto-register wrapped session on WS connect (supports reconnect after daemon restart)
@@ -203,16 +265,16 @@ function installWebSocketTransport(deps) {
             };
       initializeBootstrapState(autoSession);
       sessions[sessionId] = autoSession;
+      if (typeof ledgerLive === 'function') ledgerLive(sessionId, true);   // #1207 resident-tier hint
       console.log(`[WS] Auto-registered wrapped session ${sessionId} on reconnect (command: ${autoSession.command})`);
       // Set tab title via kitty (no \x0c redraw — it causes flickering on multi-session reconnect)
       setTimeout(() => {
+        if (sessions[sessionId] !== autoSession || autoSession.ownerWs !== ws) return;
         const sock = findKittySocket();
         const wid = findKittyWindowId(sock, sessionId);
         if (sock && wid) {
           try {
-            require('child_process').execSync(`kitty @ --to unix:${sock} set-tab-title --match id:${wid} '⚡ telepty :: ${sessionId}'`, {
-              timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
-            });
+            setKittyTabTitle(sock, wid, sessionId);
           } catch {}
         }
       }, 1000);
@@ -221,6 +283,12 @@ function installWebSocketTransport(deps) {
     }
 
     const activeSession = sessions[sessionId];
+    if (activeSession.isClosing) {
+      activeSession.clients.delete(ws);
+      clearInterval(pingInterval);
+      try { ws.close(1011, 'Session is closing'); } catch {}
+      return;
+    }
 
     // #815: gate the owner claim. Before this, ANY local process could open ?owner=1 on ANY
     // session and take the PTY byte stream — last-writer-wins displaced the incumbent bridge with
@@ -303,23 +371,8 @@ function installWebSocketTransport(deps) {
       // injects were assigned to, and it is the evidence `owner_epoch_replaced` requires.
       const displacedSessionEpoch = activeSession.sessionEpoch || null;
       const displacedLiveOwnerSocket = displacedLiveOwner ? activeSession.ownerWs : null;
-      if (isOwnerConnect && activeSession.ownerWs && activeSession.ownerWs !== ws) {
-        // telepty#56 (durable last-writer-wins Replace): close the displaced owner with the
-        // dedicated terminal code 4001 'Owner replaced' instead of a bare terminate(). A
-        // terminate() is an abnormal 1006 close, which a bridge reads as a transient drop and
-        // RECONNECTS — re-contending for the id and oscillating forever (Total flaps 1<->2,
-        // injects dropped). 4001 is reason-independent (WS 4000-4999 = app-reserved), so the
-        // displaced bridge exits without reconnecting even when the close reason is lost on a
-        // half-open TCP socket. The session RECORD survives under the new owner; no shared-fate
-        // cascade — the displaced bridge's now-stale ownerToken is suppressed by the #536 DELETE
-        // guard. A fallback terminate() reaps a half-open socket that never ACKs the close.
-        console.log(`[WS] Replacing stale ownerWs for session ${sessionId}`);
-        const displaced = activeSession.ownerWs;
-        try { displaced.close(4001, 'Owner replaced'); } catch {}
-        setTimeout(() => {
-          if (displaced.readyState !== 3) { try { displaced.terminate(); } catch {} }
-        }, 1000);
-      }
+      const previousOwnerWs = activeSession.ownerWs;
+      const previous = Object.getOwnPropertyDescriptors(activeSession);
       activeSession.ownerWs = ws;
       // #60 Stage A §3 item 4/5 — the new owner's authenticated epoch, or NULL when it proved
       // none. Null is written deliberately rather than leaving the predecessor's value in place:
@@ -339,7 +392,7 @@ function installWebSocketTransport(deps) {
       // only carries owner_pid on reconnect, so a first-connect owner would otherwise have a null
       // ownerPid and `kill --force` could not SIGKILL the owning process. The bridge passes its pid
       // on the ?owner=1 URL; record it so the kill path always has a process to signal.
-      const claimOwnerPid = Number(url.searchParams.get('owner_pid'));
+      const claimOwnerPid = strictOwner ? NaN : Number(url.searchParams.get('owner_pid'));
       if (Number.isInteger(claimOwnerPid) && claimOwnerPid > 0) {
         activeSession.ownerPid = claimOwnerPid;
       }
@@ -349,18 +402,75 @@ function installWebSocketTransport(deps) {
       // so the live current owner always holds the current token while a displaced owner keeps a
       // stale one.
       activeSession.ownerToken = crypto.randomUUID();
+      activeSession.interactionProvider?.dispose();
+      activeSession.interactionProvider = null;
       activeSession.interactionOwnerGeneration = crypto.randomUUID();
+      // Task 1215: a policy requested at trusted registration binds to THIS owner generation only,
+      // and only for a claimant presenting the input-policy capability minted to the host launch
+      // (a session bearer is never enough); a claim without both is guarded. Leaving supervision
+      // re-arms the ready gate.
+      if (inputPolicies.bindInputPolicy(activeSession, new Date(), { capability: req.headers[inputPolicies.CAPABILITY_HEADER] })) {
+        activeSession.bootstrapReady = false;
+        activeSession.bootstrapReadyReason = null;
+        activeSession.ready = false;
+      }
+      // Task 1215 F2: this owner generation's spawn-readiness handshake starts empty.
+      readinessHandshake.beginOwnerGeneration(activeSession, { capable: readinessHandshake.declaresCapability(req.headers[readinessHandshake.CAPABILITY_HEADER]) });
+      activeSession.pendingHandoffCapability=null;
+      if (activeSession.sshRemote) activeSession.sshState = { phase: 'connecting', generation: 0, reason: 'owner_changed', owner_generation: activeSession.interactionOwnerGeneration };
+      markSessionConnected(activeSession);
+      initializeBootstrapState(activeSession);
+      const saved = persistSessions();
+      if (!saved || !saved.ok) {
+        if (!saved || !saved.committed) {
+          for (const key of Object.keys(activeSession)) delete activeSession[key];
+          Object.defineProperties(activeSession, previous);
+          if (!session) delete sessions[sessionId];
+        } else {
+          // The committed generation names this owner; detach it without restoring stale authority.
+          activeSession.ownerWs = null;
+        }
+        activeSession.clients.delete(ws);
+        clearInterval(pingInterval);
+        try { ws.close(1011, 'Session store write failed'); } catch {}
+        return;
+      }
+      if (strictOwner) activeSession.strictOwnerConnected = true;
+      if (strictOwner && !strictOwner.bind(ws)) { ws.terminate(); return; }
+      if (isOwnerConnect && previousOwnerWs && previousOwnerWs !== ws) {
+        // telepty#56 (durable last-writer-wins Replace): close the displaced owner with the
+        // dedicated terminal code 4001 'Owner replaced' instead of a bare terminate(). A
+        // terminate() is an abnormal 1006 close, which a bridge reads as a transient drop and
+        // RECONNECTS — re-contending for the id and oscillating forever (Total flaps 1<->2,
+        // injects dropped). 4001 is reason-independent (WS 4000-4999 = app-reserved), so the
+        // displaced bridge exits without reconnecting even when the close reason is lost on a
+        // half-open TCP socket. The session RECORD survives under the new owner; no shared-fate
+        // cascade — the displaced bridge's now-stale ownerToken is suppressed by the #536 DELETE
+        // guard. A fallback terminate() reaps a half-open socket that never ACKs the close.
+        console.log(`[WS] Replacing stale ownerWs for session ${sessionId}`);
+        const displaced = previousOwnerWs;
+        try { displaced.close(4001, 'Owner replaced'); } catch {}
+        setTimeout(() => {
+          if (displaced.readyState !== 3) { try { displaced.terminate(); } catch {} }
+        }, 1000);
+      }
       invalidateInteraction(activeSession, 'owner_replaced');
       try { ws.send(JSON.stringify({ type: 'owner_token', token: activeSession.ownerToken,
+        input_policy: inputPolicies.effectiveInputPolicy(activeSession),
+        ...(readinessHandshake.negotiated(activeSession) ? { transport_readiness: readinessHandshake.CAPABILITY,
+          readiness_nonce: activeSession.transportReadiness.nonce } : {}),
+        ...(activeSession.cooperativeHandoffCapable===true ? {cooperative_handoff:true} : {}),
         interaction_binding: { sid: sessionId, session_epoch: activeSession.sessionEpoch,
           credential_generation: activeSession.credentialGeneration || 1,
           owner_generation: activeSession.interactionOwnerGeneration,
           input_generation: activeSession.interactionInputGeneration || 0,
           geometry_generation: activeSession.interactionGeometryGeneration || 0,
           surface_id: activeSession.cmuxSurfaceId || sessionId } })); } catch {}
-      markSessionConnected(activeSession);
-      initializeBootstrapState(activeSession);
+
       console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
+      // Task 1215: a LEGACY owner (no handshake) keeps the pre-handshake release at owner bind. A
+      // negotiated owner is released only by its input_transport_ready milestone, for every role.
+      if (inputPolicies.userSupervised(activeSession) && !readinessHandshake.negotiated(activeSession)) markBootstrapReady(sessionId, activeSession, 'user_supervised_owner_bound');
       scheduleBootstrapPromptPoll(sessionId, activeSession);
       // #815: emit the honest lifecycle fact BEFORE any continuity claim. A live owner was
       // replaced — the daemon knows that for certain. It does NOT know whether the displaced
@@ -386,11 +496,12 @@ function installWebSocketTransport(deps) {
         // the mapper fails CLOSED to `unmapped_transition_cause` (missing required evidence). That
         // is the correct outcome and it is left to happen: the honest statement is "an owner was
         // replaced and we cannot bind it to an instance", never a synthesized epoch.
-        const results = recordOwnerLifecycle(sessionId, activeSession, 'owner_epoch_replaced', {
+        recordOwnerLifecycle(sessionId, activeSession, 'owner_epoch_replaced', {
           displaced_session_epoch: displacedSessionEpoch,
           displaced_owner_pid: displacedOwnerPid,
-        });
-        console.log(`[OBSERVE] ${sessionId} owner replaced — ${results.length} tracked inject(s): ${results.join(', ')}`);
+        }).then((results) => {
+          console.log(`[OBSERVE] ${sessionId} owner replaced — ${results.length} tracked inject(s): ${results.join(', ')}`);
+        }).catch((error) => console.error(`[OBSERVE] ${sessionId} owner replaced — lifecycle fact failed: ${error && error.message}`));
         // #60 Stage A §3 item 3 — mark the displaced socket so its own close handler can report
         // the death. Once `ownerWs` moved, that handler takes the "client detached" branch and the
         // displaced bridge's exit becomes invisible; the bridge reads close 4001 as terminal and
@@ -403,7 +514,6 @@ function installWebSocketTransport(deps) {
       if (hadDisconnectedOwner) {
         emitSessionLifecycleEvent('session_reconnect', sessionId, activeSession);
       }
-      persistSessions();
     } else {
       console.log(`[WS] Client attached to session ${sessionId} (Total: ${activeSession.clients.size})`);
       // #89 — replay the current screen to THIS viewer, synchronously, so it is queued ahead of
@@ -421,7 +531,15 @@ function installWebSocketTransport(deps) {
     ws.on('message', (message) => {
       try {
         const msg = JSON.parse(message);
+        if (strictOwner && !strictOwner.accept(msg)) return;
         const { type, data, cols, rows } = msg;
+        // Raw viewer bytes must be the exact string classified and audited below.
+        // Bound each raw write to64KiB UTF8; owner wire framing remains independently bounded.
+        if (type === 'input' && (typeof data !== 'string' || Buffer.byteLength(data) > 65536)) {
+          ws.send(JSON.stringify({type:'input_refused',success:false,bytes_written:0,
+            code:typeof data === 'string' ? 'INPUT_FRAME_TOO_LARGE' : 'INVALID_INPUT_FRAME'}));
+          return;
+        }
 
         // #732 (H5 guard): `activeSession` above is a snapshot taken once, at connect time.
         // If sessions[id] is ever replaced under a live owner — a delete+recreate through
@@ -432,13 +550,13 @@ function installWebSocketTransport(deps) {
         // with a working downstream, i.e. #732 again by a different route. Re-resolve the
         // live record on every frame so the snapshot can never become the routing authority.
         const activeSession = sessions[sessionId];
-        if (!activeSession) return;   // record is gone — nothing to feed
+        if (!activeSession || activeSession.isClosing) return;   // no owner reclaims or writes during teardown
 
         // An owner whose record was swapped re-adopts a FREE owner slot rather than silently
         // degrading into a viewer (the viewer branch drops 'output' entirely). Same
         // last-writer-wins rule as the connect-time claim: only an explicit ?owner=1 bridge,
         // and only when no other owner socket is open, so a live owner is never displaced.
-        if (activeSession.type === 'wrapped' && isOwnerConnect
+        if (!strictOwner && activeSession.type === 'wrapped' && isOwnerConnect
             && activeSession.ownerWs !== ws && !isOpenWebSocket(activeSession.ownerWs)) {
           activeSession.ownerWs = ws;
           activeSession.clients.add(ws);
@@ -447,6 +565,31 @@ function installWebSocketTransport(deps) {
         }
 
         if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+          if(type==='pending_handoff_receipt'){if(strictOwner)require('../principal/pending-handoff').acceptPendingReceipt(sessionId,activeSession,ws,msg);return;}
+          if (type === 'handoff_ack') { if(strictOwner) deps.acceptHandoffAck?.(sessionId,activeSession,ws,msg);return; }
+          if (type === 'ssh_state') { applySshState(activeSession, msg); return; }
+          if (type === 'ssh_write_receipt') { acceptSshWriteReceipt(activeSession, ws, msg); return; }
+          if (type === 'bridge_receipt' || type === 'bridge_queue') { acceptBridgeStageFrame(sessionId, activeSession, msg); return; }
+          if (type === 'process_started' || type === 'input_transport_ready') { acceptReadinessMilestone(sessionId, activeSession, msg); return; }
+          if (type === 'session_died' || type === 'session_restarted') {
+            // Task 1215 F2: the child that announced readiness is gone (or replaced).
+            readinessHandshake.clearReadiness(activeSession, type === 'session_died' ? 'child_exited' : 'child_restarted');
+            if (type === 'session_died') { activeSession.interactionProvider?.dispose(); activeSession.interactionProvider = null; }
+            invalidateInteraction(activeSession, 'child_lifecycle');
+            return;
+          }
+          if (type === 'interaction_provider') {
+            if (activeSession.externalApprovalPolicy || msg.owner_generation !== activeSession.interactionOwnerGeneration
+                || !capturedSelector.supportedProfile(msg.profile) || typeof msg.stream_id !== 'string'
+                || !/^[a-f0-9-]{36}$/.test(msg.stream_id) || !Number.isSafeInteger(msg.cols) || !Number.isSafeInteger(msg.rows)
+                || msg.cols < 1 || msg.rows < 1 || msg.cols > 1000 || msg.rows > 1000) return;
+            activeSession.interactionProvider?.dispose();
+            activeSession.cols = msg.cols; activeSession.rows = msg.rows;
+            activeSession.interactionProvider = capturedSelector.createCapturedSelector({ profile: msg.profile,
+              binding: () => capturedSelector.bindingForSession(activeSession), cols: msg.cols, rows: msg.rows,
+              sessionId, streamId: msg.stream_id, localSource: false });
+            return;
+          }
           if (type === 'interaction_receipt') {
             if (typeof acceptInteractionReceipt === 'function') acceptInteractionReceipt(sessionId, activeSession, ws, msg);
             return;
@@ -467,6 +610,7 @@ function installWebSocketTransport(deps) {
           // Owner sending output -> broadcast to other clients + update activity
           if (type === 'output') {
             invalidateInteraction(activeSession, 'output');
+            activeSession.interactionProvider?.feed(data, { stream_id: msg.stream_id, stream_offset: msg.stream_offset });
             activeSession.lastActivityAt = new Date().toISOString();
             appendToOutputRing(activeSession, data);
             sessionStateManager.feed(sessionId, data);
@@ -485,7 +629,10 @@ function installWebSocketTransport(deps) {
             activeSession.bridgeHeartbeatAt = new Date().toISOString();
             if (Number.isFinite(msg.pty_bytes)) activeSession.bridgePtyBytes = msg.pty_bytes;
             if (typeof msg.read_side === 'string') activeSession.bridgeReadSide = msg.read_side;
+            if (msg.bridge_queue) bridgeStage.applyBridgeQueue(activeSession, msg.bridge_queue);   // #137
           } else if (type === 'ready') {
+            if(strictOwner && msg.pending_handoff_receipts==='v1' && msg.owner_generation===activeSession.interactionOwnerGeneration)
+              activeSession.pendingHandoffCapability={owner:ws,generation:activeSession.interactionOwnerGeneration};
             if (isBootstrapGatedSession(activeSession)) {
               markBootstrapReady(sessionId, activeSession, 'bridge_ready');
             } else {
@@ -510,6 +657,7 @@ function installWebSocketTransport(deps) {
               ? msg.detector
               : 'unqualified';
             activeSession.readyCliKey = qualified && typeof msg.cli_key === 'string' ? msg.cli_key : null;
+            recordReadyEvidence(activeSession);
 
             console.log(`[READY] Session ${sessionId} surface is ready for inject (${activeSession.readyKind}, detector=${activeSession.readyDetector})`);
             // Broadcast readiness to bus (cmux/kitty paths now enabled for this session).
@@ -543,6 +691,10 @@ function installWebSocketTransport(deps) {
           // any client of a spawned session (a spawned session has no owner bridge, so all of its
           // sockets are viewers). #843 B: these two used to be separate branches with separate
           // rules, which is how #826 came to cover one of them.
+          if ((type === 'input' || type === 'resize') && protectedInputFailure(activeSession)) {
+            ws.send(JSON.stringify({ type: 'input_refused', ...protectedInputFailure(activeSession) }));
+            return;
+          }
           if (type === 'input') {
             // This is a WRITE into somebody's terminal, and until #826 it was the one write path
             // with no accountability: it skipped `auditAppend` (#47 P5), `classifyPeerLaneInject`
@@ -569,10 +721,12 @@ function installWebSocketTransport(deps) {
                   principal: presentedPrincipal
                 })
                 : true;
-              if (allowed) {
-                invalidateInteraction(activeSession, 'viewer_input');
-                deliver(data);
-              }
+              require('../audit/viewer-input').dispatchViewerInput({ authorization: allowed,
+                invalidate: () => invalidateInteraction(activeSession, 'viewer_input'),
+                deliver: complete => deliver(data, complete),
+                onFailure: () => { try { ws.send(JSON.stringify({ type:'input_refused', success:false,
+                  code:'INPUT_WRITE_OUTCOME_UNKNOWN', bytes_written:null, retryable:false, consumption:'unknown' })); } catch {} }
+              });
             }
           } else if (type === 'resize') {
             // RESIZE IS DELIBERATELY NOT BEHIND THE INJECT GATE.
@@ -597,6 +751,7 @@ function installWebSocketTransport(deps) {
           }
         }
       } catch (e) {
+        if (strictOwner) { ws.terminate(); return; }
         console.error('[WS] Invalid message format', e);
       }
     });
@@ -626,14 +781,16 @@ function installWebSocketTransport(deps) {
       // rule correctly ("no process-exit observation is implied") while the code beside it
       // implied exactly that.
       if (ws.__teleptyDisplaced) {
-        const results = recordOwnerLifecycle(sessionId, activeSession, 'owner_transport_detached', {
+        recordOwnerLifecycle(sessionId, activeSession, 'owner_transport_detached', {
           detached_at: new Date().toISOString(),
           displaced_session_epoch: ws.__teleptyDisplacedEpoch || null,
-        });
-        console.log(`[OBSERVE] ${sessionId} displaced owner socket detached — ${results.length} tracked inject(s): ${results.join(', ')}`);
+        }).then((results) => {
+          console.log(`[OBSERVE] ${sessionId} displaced owner socket detached — ${results.length} tracked inject(s): ${results.join(', ')}`);
+        }).catch((error) => console.error(`[OBSERVE] ${sessionId} displaced owner socket detached — lifecycle fact failed: ${error && error.message}`));
       }
 
       if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+        readinessHandshake.clearReadiness(activeSession, 'owner_disconnected');   // Task 1215 F2
         activeSession.ownerWs = null;
         // #29: cancel any pending owner-alive optimistic timer — the owner is gone, so the
         // floor must not flip a disconnected session ready (hygiene; the timer also re-guards
@@ -647,7 +804,8 @@ function installWebSocketTransport(deps) {
         emitSessionLifecycleEvent('session_disconnect', sessionId, activeSession, {
           clients: activeSession.clients.size
         });
-        persistSessions();
+        const saved = persistSessions();
+        if (!saved || !saved.ok) console.error('[WS] Owner disconnect was not durably saved:', sessionId);
       } else {
         console.log(`[WS] Client detached from session ${sessionId} (Total: ${activeSession.clients.size})`);
       }
@@ -674,7 +832,7 @@ function installWebSocketTransport(deps) {
             return;
           }
 
-          persistSessions();
+          // applySessionStateReport commits before publishing the event.
           return;
         }
 
@@ -737,7 +895,28 @@ function installWebSocketTransport(deps) {
   // true for every address (empty allowlist) and for every tailnet device (#672 auto-trust
   // populates the list, and a MATCH returns true just as completely as an empty list does), so
   // an uncredentialed handshake — viewer socket and `/api/bus` alike — upgraded with 101.
+  const strictOwners = require('./strict-owner').createStrictOwnerTransport({ authentication: deps.principalAuthentication, credentials,
+    sessions, wss, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
+  const observer = require('./observer').createObserverTransport({ authentication: deps.principalAuthentication,
+    sessions, server, tailnetServer, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
+  const strictInputs = require('./strict-input').createStrictInputTransport({ authentication: deps.principalAuthentication,
+    sessions, server, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
+  const sessionEvents = require('./session-events').createSessionEventTransport({ authentication: deps.principalAuthentication,
+    sessions, server, tailnetServer, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
+  const strictBus = require('./strict-bus').createStrictBusTransport({ authentication: deps.principalAuthentication,
+    sessions, server, homeDir: deps.homeDir, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
+  const applicationEvents = require('./application-events').createApplicationEventTransport({ authentication: deps.principalAuthentication,
+    sessions, server, tailnetServer, refuse: refuseUpgrade, forbiddenOrigin: isForbiddenOrigin, allowedPeer: isAllowedPeer });
   function handleUpgrade(req, socket, head) {
+    if (applicationEvents.handle(req, socket, head)) return;
+    if (strictBus.handle(req, socket, head)) return;
+    if (sessionEvents.handle(req, socket, head)) return;
+    if (observer.handle(req, socket, head) || strictOwners.handle(req, socket, head) || strictInputs.handle(req, socket, head)) return;
+    // Strict full-duplex routes have no per-frame authority adapter. Never let legacy upgrade
+    // credentials turn it into a full-duplex bypass of action/target authorization.
+    if (deps.principalAuthentication) {
+      return refuseUpgrade(socket, 401, 'Unauthorized', 'PRINCIPAL_WEBSOCKET_UNSUPPORTED', 'Full-duplex WebSocket routes are unsupported in strict principal mode.');
+    }
     const url = new URL(req.url, 'http://' + req.headers.host);
     // #843 — TWO named carriers for the daemon token, matching the HTTP door exactly:
     // `x-telepty-token` (header) and `?token=` (query). The HTTP middleware has always accepted
@@ -793,7 +972,7 @@ function installWebSocketTransport(deps) {
     if (listener) listener.on('upgrade', handleUpgrade);
   }
 
-  return { wss, busWss, handleUpgrade };
+  return { wss, busWss, handleUpgrade, closeObservers: () => { observer.close(); sessionEvents.close(); applicationEvents.close(); strictOwners.close(); strictInputs.close(); strictBus.close(); } };
 }
 
 module.exports = {

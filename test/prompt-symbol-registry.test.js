@@ -8,6 +8,7 @@ const {
   commandKey,
   isKnownAiCli,
   detectOutput,
+  detectSurfaceModal,
   normalizeOutputForDetection,
   ENTRIES
 } = require('../src/prompt-symbol-registry');
@@ -336,6 +337,61 @@ test('codex.detect regression: resume picker stays NOT-ready (anti-pattern wins)
 test('codex.detect regression: folder-trust modal stays NOT-ready (anti-pattern wins)', () => {
   const r = ENTRIES.codex.detect(CODEX_TRUST_MODAL);
   assert.equal(r.found, false);
+  assert.equal(r.reason, 'codex_modal_ui');
+});
+
+// --- Task1215 / issue103: upper/mixed-case model footer ("GPT-6-Astra") ---
+// No "OpenAI Codex (v" boot banner on screen, so only the strict scan can fire;
+// its footer check and the delivery-path composer marker must ignore case.
+const codexCaseScreen = (model) => [
+  '• Working (1m 02s • esc to interrupt)',
+  '',
+  '› Ask Codex to do anything',
+  '',
+  `  ${model} xhigh · /tmp/demo · Full Access · Context 40% used`,
+  '  ? shortcuts',
+].join('\n');
+
+test('codex.detect finds uppercase / mixed-case model footer without boot banner', () => {
+  for (const model of ['GPT-6-Astra', 'Gpt-6-Astra', 'gpt-6-astra']) {
+    const r = ENTRIES.codex.detect(codexCaseScreen(model));
+    assert.equal(r.found, true, `model=${model} should match`);
+    assert.equal(r.reason, 'codex_strict_line');
+  }
+});
+
+test('detectOutput finds uppercase footer screen through CRLF + ANSI', () => {
+  const raw = codexCaseScreen('GPT-6-Astra')
+    .split('\n')
+    .map((l) => (l.startsWith('›') ? `\x1b[1m›\x1b[0m\x1b[2m${l.slice(1)}\x1b[0m` : `\x1b[2m${l}\x1b[0m`))
+    .join('\r\n');
+  assert.equal(detectOutput('codex', raw).found, true);
+});
+
+test('codex.detect: modals with uppercase footer stay NOT-ready (anti-pattern wins)', () => {
+  const trust = 'Do you trust the contents of this directory?\nPress enter to continue\n\n'
+    + '  GPT-6-Astra xhigh · /tmp/demo';
+  const picker = '  Resume a previous session\n  Filter: \n› 1. demo   GPT-6-Astra xhigh · /tmp/demo\n';
+  for (const s of [trust, picker]) {
+    const r = ENTRIES.codex.detect(s);
+    assert.equal(r.found, false);
+    assert.equal(r.reason, 'codex_modal_ui');
+  }
+});
+
+test('detectSurfaceModal: uppercase composer after dismissed modal is not blocked', () => {
+  const ring = 'Do you trust the contents of this directory?\r\nPress enter to continue\r\n'
+    + codexCaseScreen('GPT-6-Astra').replace(/\n/g, '\r\n');
+  const r = detectSurfaceModal('codex', ring);
+  assert.equal(r.blocked, false, JSON.stringify(r));
+  assert.equal(r.reason, 'composer_after_modal');
+});
+
+test('detectSurfaceModal: modal after uppercase composer stays blocked', () => {
+  const ring = codexCaseScreen('GPT-6-Astra')
+    + '\nDo you trust the contents of this directory?\nPress enter to continue\n';
+  const r = detectSurfaceModal('codex', ring);
+  assert.equal(r.blocked, true);
   assert.equal(r.reason, 'codex_modal_ui');
 });
 

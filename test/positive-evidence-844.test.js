@@ -94,12 +94,26 @@ const cmuxSession = (id = UUID_A) => ({ backend: 'cmux', cmuxWorkspaceId: id });
 
 // ── isSurfaceAlive: only a parsed listing may say 'gone' ────────────────────────────────
 
-test('an EMPTY listing is unknown, not gone — nothing was enumerated to be absent from', () => {
+// #879: the fake `cmux` is a shebang script and the product calls it with execFileSync(shell:false),
+// which on win32 cannot start a text file or a .cmd shim (Node refuses .cmd without a shell), so the
+// listing is never obtained and every probe answers 'unknown' for the ENOENT reason — not for the
+// parsing reason these six cases exist to measure. All six fake-cmux cases are skipped on win32 with
+// this one reason, so none of them counts as executed coverage there (exact list: 'an EMPTY listing
+// is unknown', 'a listing with no ids in it is unknown', 'a TRUNCATED listing … is unknown', 'a
+// short-ref workspace id is unknown', 'a real listing that omits the id is still gone', 'a real
+// listing containing the id is alive'). The decideSurfaceGcAction and cleanupDaemonProcesses tests
+// below do not spawn the fake and stay live. cmux is a macOS app; the listing contract is measured
+// on Linux/macOS. Same shape as the announced skip in test/lifecycle-surface-acceptance.test.js.
+const FAKE_CMUX_WIN32_SKIP = process.platform === 'win32'
+  ? 'win32: fake cmux shebang/.cmd cannot be execFileSync(shell:false)-spawned; listing contract measured on Linux/macOS (fixture limit, #879)'
+  : false;
+
+test('an EMPTY listing is unknown, not gone — nothing was enumerated to be absent from', { skip: FAKE_CMUX_WIN32_SKIP }, () => {
   setWorkspaces('');
   assert.equal(backend.isSurfaceAlive(cmuxSession()), 'unknown');
 });
 
-test('a listing with no ids in it is unknown — a message is not an enumeration', () => {
+test('a listing with no ids in it is unknown — a message is not an enumeration', { skip: FAKE_CMUX_WIN32_SKIP }, () => {
   // What a half-succeeded, localised, or format-changed `list-workspaces` looks like: exit 0,
   // some bytes, no ids. Every one of these read as `gone` before, at full confidence.
   for (const output of [
@@ -114,7 +128,7 @@ test('a listing with no ids in it is unknown — a message is not an enumeration
   }
 });
 
-test('a TRUNCATED listing that happens to cut before our id is unknown, not gone', () => {
+test('a TRUNCATED listing that happens to cut before our id is unknown, not gone', { skip: FAKE_CMUX_WIN32_SKIP }, () => {
   // The dangerous middle case: the output parses, it is just incomplete. There is no way to tell
   // a truncated listing from a complete one, which is exactly why a miss cannot be trusted on its
   // own — but a truncation that removed EVERY id at least stops claiming absence.
@@ -122,7 +136,7 @@ test('a TRUNCATED listing that happens to cut before our id is unknown, not gone
   assert.equal(backend.isSurfaceAlive(cmuxSession()), 'unknown');
 });
 
-test('a short-ref workspace id is unknown — it could never match a uuid listing', () => {
+test('a short-ref workspace id is unknown — it could never match a uuid listing', { skip: FAKE_CMUX_WIN32_SKIP }, () => {
   // `--id-format uuids` is what the probe asks for, so only a uuid can be compared against the
   // answer. A `workspace:2` id missed every line and was declared gone, every sweep, forever.
   setWorkspaces(`workspace:1 ${UUID_A}\nworkspace:2 ${UUID_B}\n`);
@@ -130,12 +144,12 @@ test('a short-ref workspace id is unknown — it could never match a uuid listin
   assert.equal(backend.isSurfaceAlive(cmuxSession('7')), 'unknown');
 });
 
-test('a real listing that omits the id is still gone — the probe still works', () => {
+test('a real listing that omits the id is still gone — the probe still works', { skip: FAKE_CMUX_WIN32_SKIP }, () => {
   setWorkspaces(`workspace:1 ${UUID_B}\nworkspace:2 cccccccc-cccc-cccc-cccc-cccccccccccc\n`);
   assert.equal(backend.isSurfaceAlive(cmuxSession()), 'gone');
 });
 
-test('a real listing containing the id is alive, case-insensitively', () => {
+test('a real listing containing the id is alive, case-insensitively', { skip: FAKE_CMUX_WIN32_SKIP }, () => {
   setWorkspaces(`workspace:1 ${UUID_A}\nworkspace:2 ${UUID_B}\n`);
   assert.equal(backend.isSurfaceAlive(cmuxSession()), 'alive');
   setWorkspaces(`workspace:1 ${UUID_A.toUpperCase()}\n`);

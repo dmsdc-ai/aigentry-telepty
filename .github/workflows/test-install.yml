@@ -19,11 +19,8 @@ jobs:
     # backstop, NOT the fix — the root cause (undisposed state-machine poll timer holding the
     # test worker open) is fixed in test/submit-gate-restore-register-678.test.js.
     timeout-minutes: 20
-    # telepty #577: windows-latest has windows-specific reds (broker/ssh path,
-    # PTY/TUI spawn timeouts, snippet runtime-CRLF, launchd plist) tracked separately.
-    # Quarantine windows as non-blocking so ubuntu+macOS are the trustworthy gate
-    # (after #576 both are green). Remove this line when #577 lands.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    # telepty #879: windows-latest is a release gate like ubuntu/macOS. The former #577
+    # continue-on-error quarantine hid that `npm run test:ci` never started on Windows.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,6 +31,16 @@ jobs:
         run: npm ci
       - name: Run typecheck
         run: npm run typecheck
+      # Task 1215: the Darwin authority-file reader is a bundled native binary. Build it from the
+      # first-party source with the runner's own Apple toolchain and Node-API headers BEFORE the suite,
+      # so test/authority-file-darwin-1215.test.js exercises the real native reader (it fails, never
+      # skips, when the binary is absent). Nothing is downloaded and no npm lifecycle compiles it.
+      - name: Build the bundled Darwin authority reader (task 1215)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
+          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
       - name: Run regression suite
         run: npm run test:ci
       # #768: this one file drives a real daemon + a real `telepty allow` bridge + a real PTY

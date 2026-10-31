@@ -1,4 +1,9 @@
 'use strict';
+const { protectedInputFailure } = require('../external-approval');
+const { mailboxLeaseAlive } = require('./poll-session');
+const bridgeStage = require('./bridge-stage');
+const inputPolicies = require('./input-policy');
+const readinessHandshake = require('../transport/readiness-handshake');
 
 // Accessors retain the daemon's shared instances and original first-use timing.
 // Construction only creates functions; effect boundaries run when those functions do.
@@ -6,6 +11,7 @@ function createDeliveryRuntime(shared, {
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
 } = {}) {
   function auditAppend(record) {
+    if (shared.sessions?.[record.to]?.externalApprovalPolicy) record = { ...record, preview: false };
     try { shared.auditWriter.append(record); } catch { /* audit must never throw into a handler */ }
   }
 
@@ -23,8 +29,39 @@ function createDeliveryRuntime(shared, {
     };
   }
 
-  function commitTrackedInjections() {
-    return shared.sessionPersistence.saveTrackedInjections(shared.trackedInjections, shared.TRACKED_INJECTIONS_PATH);
+  // #1207 — there is no whole-ledger save boundary any more. Every writer (begin/abort/park here,
+  // recordObservation in session-actions, the interaction core) submits one small delta to the
+  // ledger owner through `shared.ledgerClient` and acts only on its explicit outcome. The guard
+  // semantics of the former commitTrackedInjections survive: an unavailable store authorizes no
+  // write — `ledgerUnavailable()` is checked before any in-memory or on-disk mutation, and the
+  // only transition back to healthy is a successful owner open (restoreTrackedInjections).
+  function ledgerUnavailable() {
+    const client = shared.ledgerClient;
+    if (!client || !shared.trackedLedgerHealthy || !client.isAvailable()) {
+      // The NAMED reason: the retained unavailable reason when the store is unreadable, else the
+      // store state itself (recovering / unavailable_write / lock_present / shutting_down), else
+      // the owner-failure reason. Never an errno string — those are detail, kept in status.
+      let reason = shared.trackedLedgerUnavailableReason || null;
+      if (!reason && client) {
+        if (client.state === 'unavailable') reason = client.reason || 'unavailable';
+        else if (client.state === 'closing' || client.state === 'closed') reason = 'shutting_down';
+        else reason = client.state;
+      }
+      return { ok: false, reason: reason || 'observation_store_unavailable' };
+    }
+    return null;
+  }
+
+  // Maps a ledger outcome onto the inject-route result shapes. `capacity:true` marks the 503 arm.
+  function beginFailure(outcome) {
+    if (!outcome) return { ok: false, reason: 'tracking_persistence_failed' };
+    if (outcome.outcome === 'indeterminate') return { ok: false, reason: 'tracking_outcome_indeterminate', txn: outcome.txn };
+    if (outcome.outcome === 'rejected_admission') return { ok: false, reason: outcome.reason || 'tracking_capacity_exhausted', capacity: true };
+    const r = outcome.reason;
+    if (['recovering', 'owner_failed', 'unavailable_write', 'lock_present', 'disk_full', 'sustained_exhaustion', 'tracking_capacity_exhausted', 'hot_capacity', 'shutting_down'].includes(r)) {
+      return { ok: false, reason: r, capacity: true };
+    }
+    return { ok: false, reason: 'tracking_persistence_failed', detail: r || null };
   }
 
   function interactionBinding(sid) {
@@ -39,17 +76,16 @@ function createDeliveryRuntime(shared, {
 
   function hasHeldInteraction(session) {
     if (!session) return false;
+    // #1207 — the committed-only read model replaces the in-memory mirror.
     return shared.interactionCore.isBusy(session.id)
-      || Object.values(shared.trackedInjections.interactions?.actions || {}).some(a => a.sid === session.id
-        && ['dispatched', 'outcome_unknown'].includes(a.stage))
-      || Object.values(shared.trackedInjections.interactions?.pending || {})
-      .some(p => p.sid === session.id && p.state === 'held');
+      || (!!shared.ledgerClient && shared.ledgerClient.readModel.hasHeldInteraction(session.id));
   }
 
   function dispatchInteraction(frame) {
     const sid = frame.request.identity.sid;
     const s = shared.sessions[sid];
     if (!s) return Promise.resolve(shared.interaction.refusal('wrong_owner'));
+    if (protectedInputFailure(s)) return Promise.resolve(shared.interaction.refusal('unsupported_capability'));
     if (s.type !== 'wrapped' || !shared.isOpenWebSocket(s.ownerWs)) {
       return Promise.resolve(shared.interaction.refusal('unsupported_capability'));
     }
@@ -71,36 +107,121 @@ function createDeliveryRuntime(shared, {
     });
   }
 
+  // #1207 — ONE restoration at a time. Overlapping restore calls (measured: two concurrent callers
+  // shared one owner open and then EACH wrote the daemon_restart_observed fact) share the single
+  // in-flight restoration and its outcome — failures included. A genuinely subsequent call, made after
+  // the shared one settled, performs its own restoration and its own fact. No flag outlives the work.
+  let restoreInFlight = null;
+  // One-shot watch that completes a first-open recovery across the client boundary (armRecoveryWatch).
+  let recoveryWatch = null;
+
   function restoreTrackedInjections() {
-    const loaded = shared.sessionPersistence.loadTrackedInjections(shared.TRACKED_INJECTIONS_PATH);
-    if (!loaded.ok) {
+    if (restoreInFlight) return restoreInFlight;
+    restoreInFlight = performRestore().finally(() => { restoreInFlight = null; });
+    return restoreInFlight;
+  }
+
+  async function performRestore() {
+    // #1207 — "restore" is the owner's open: lock verification, offline migration of a legacy file
+    // if one is at the path, recovery of segments, and a chunked committed-only snapshot. A failed
+    // open leaves the store unavailable with a NAMED reason and authorizes nothing; a successful
+    // open is the ONLY transition back to healthy (guard semantics preserved).
+    const client = shared.ledgerClient;
+    if (!client) {
       shared.trackedLedgerHealthy = false;
-      shared.trackedLedgerUnavailableReason = loaded.reason;
-      console.warn(`[OBSERVE] tracked-injection store unavailable (${loaded.reason}${loaded.detail ? `: ${loaded.detail}` : ''}) — every poll answers tracking_state=unavailable`);
-      return;
+      shared.trackedLedgerUnavailableReason = 'observation_store_unavailable';
+      return { ok: false, reason: 'no_ledger_client' };
     }
-    shared.trackedInjections = loaded.ledger;
-    const nowIso = new Date().toISOString();
-    let restored = 0;
-    for (const record of Object.values(shared.trackedInjections.injections)) {
-      shared.sessionPersistence.appendLedgerObservation(record, { kind: 'daemon_restart_observed', trigger: 'daemon_restart' }, nowIso);
-      restored++;
+    const opening = client.open({ liveSids: Object.keys(shared.sessions || {}) });
+    // The restore is in progress from here until `opening` settles. The poll handler and
+    // ledgerUnavailable() serve the shared lifecycle reason AHEAD of the client state, so a stale
+    // one — the daemon's initial `not_opened`, or the reason of a previous failed open — would be
+    // named while the owner is actually recovering, and `not_opened` selects the generic 500 branch
+    // in beginFailure (measured: frozen R1, polls `not_opened`, begins 500 during recovery). The
+    // store stays unhealthy; `recovering` is the client's own in-flight state and already maps to
+    // the 503 arm. open() has exactly one synchronous refusal, the lock (`lock_present`, or
+    // `unavailable` with `lock_error`): that outcome is already settled and keeps its precise name
+    // through the branch below, so nothing is marked `recovering` for it.
+    shared.trackedLedgerHealthy = false;
+    const lockRefused = client.state === 'lock_present' || (client.state === 'unavailable' && client.reason === 'lock_error');
+    if (!lockRefused) shared.trackedLedgerUnavailableReason = 'recovering';
+    const opened = await opening;
+    if (!opened.ok) {
+      shared.trackedLedgerHealthy = false;
+      shared.trackedLedgerUnavailableReason = opened.reason === 'manifest_format' || opened.state === 'unavailable_read'
+        ? 'observation_store_unavailable' : (opened.reason || 'observation_store_unavailable');
+      console.warn(`[OBSERVE] tracked-injection store unavailable (${opened.state}: ${opened.reason || 'unknown'}) — every poll answers tracking_state=unavailable`);
+      // The owner died during this open. The client's own bounded respawn policy may bring ONE
+      // replacement after this failed open has finalized (measured: previously none was constructed);
+      // health may only follow that replacement's COMPLETE snapshot, which the client reports as
+      // `available` — watched below, never assumed. An unavailable store stays fail-closed.
+      if (opened.reason === 'owner_failed') armRecoveryWatch(client);
+      return opened;
     }
-    if (restored > 0 || Object.keys(shared.trackedInjections.interactions.actions).length > 0) {
-      if (!commitTrackedInjections().ok) {
-        shared.trackedLedgerHealthy = false;
-        shared.trackedLedgerUnavailableReason = 'observation_store_write_failed';
+    return finishRecovery(client, opened.counts || {});
+  }
+
+  // The ONLY transition to healthy: a complete, swapped-in snapshot for the current owner — reached by
+  // a successful open, or by the client's `available` notification after an internal replacement.
+  // The restart fact is stored ONCE per recovery as a global fact and overlaid lazily onto every
+  // record in log order (DECISION §6, errata C3) — byte-for-byte the array today's per-record append
+  // would have produced, without rewriting history. Nothing is appended to an empty store.
+  async function finishRecovery(client, counts) {
+    shared.trackedLedgerHealthy = true;
+    shared.trackedLedgerUnavailableReason = null;
+    const hadRecords = (counts.hot || 0) + (counts.cold || 0) > 0;
+    let restartFact = null;
+    if (hadRecords) {
+      restartFact = await client.submit('fact', { scope: 'global', observation: { kind: 'daemon_restart_observed', trigger: 'daemon_restart', at: new Date().toISOString() } }, { class: 'L' });
+      if (restartFact.outcome !== 'ack') {
+        console.warn(`[OBSERVE] daemon_restart_observed fact not durable (${restartFact.outcome}: ${restartFact.reason || ''}) — recorded in ledger status, not retried`);
       }
-      console.log(`[OBSERVE] restored ${restored} tracked injection(s) — all still completion-unknown`);
+      console.log(`[OBSERVE] restored ${counts.hot || 0} hot + ${counts.cold || 0} cold tracked injection(s) — all still completion-unknown`);
     }
+    return { ok: true, counts, restartFact };
+  }
+
+  // After an `owner_failed` open: follow the SAME client's lifecycle until it either reports
+  // `available` after its replacement's snapshot (→ finishRecovery, unless a restoration in flight
+  // already owns the transition) or fails again / is closed / is replaced (→ fail-closed with the
+  // client's named reason, watch disarmed). While the replacement opens, the reason is `recovering`
+  // (the same naming the R1 correction gives an explicit restore). One listener, no timer, no retry,
+  // no budget of its own; it never flips health on anything but the client's post-snapshot report.
+  function armRecoveryWatch(client) {
+    if (recoveryWatch || typeof client.onStateChange !== 'function') return;
+    const disarm = () => { if (recoveryWatch) { const unsubscribe = recoveryWatch; recoveryWatch = null; unsubscribe(); } };
+    recoveryWatch = client.onStateChange((ev) => {
+      if (client !== shared.ledgerClient || ev.kind === 'closed') return disarm();
+      if (shared.trackedLedgerHealthy) return disarm();                 // an explicit restore completed meanwhile
+      if (ev.kind === 'recovering') { shared.trackedLedgerUnavailableReason = 'recovering'; return undefined; }
+      if (ev.kind === 'unavailable' || ev.kind === 'unavailable_read') {
+        shared.trackedLedgerUnavailableReason = ev.kind === 'unavailable_read' ? 'observation_store_unavailable' : (ev.reason || 'owner_failed');
+        return disarm();
+      }
+      if (ev.kind !== 'available') return undefined;
+      disarm();
+      if (restoreInFlight) return undefined;
+      restoreInFlight = finishRecovery(client, ev.counts || {}).catch((error) => {
+        shared.trackedLedgerHealthy = false;
+        shared.trackedLedgerUnavailableReason = 'observation_store_unavailable';
+        console.error(`[OBSERVE] recovery after owner replacement failed: ${error && error.message}`);
+        return { ok: false, reason: 'recovery_failed' };
+      }).finally(() => { restoreInFlight = null; });
+      return undefined;
+    });
   }
 
   function getTrackedInjection(injectId) {
-    if (typeof injectId !== 'string' || !injectId) return null;
-    if (injectId === '__proto__' || injectId === 'prototype' || injectId === 'constructor') return null;
-    const store = shared.trackedInjections.injections;
-    if (!Object.prototype.hasOwnProperty.call(store, injectId)) return null;
-    return store[injectId];
+    // Sync, committed-only, HOT records (the working set). Cold records are read asynchronously via
+    // fetchTrackedInjection (poll endpoint) and reheated only by a write (ensureHot).
+    if (!shared.ledgerClient) return null;
+    return shared.ledgerClient.readModel.getTrackedInjection(injectId);
+  }
+
+  async function fetchTrackedInjection(injectId) {
+    if (typeof injectId !== 'string' || !injectId) return { record: null, reason: 'invalid_id' };
+    if (!shared.ledgerClient) return { record: null, reason: 'observation_store_unavailable' };
+    return shared.ledgerClient.fetchTrackedInjection(injectId);
   }
 
   function sessionAuthenticationCapability(session) {
@@ -111,35 +232,32 @@ function createDeliveryRuntime(shared, {
     return { session_authentication: 'unavailable', session_authentication_reason: 'no_815_bearer_presented' };
   }
 
-  function beginTrackedInjection({ injectId, sessionId, source, session }) {
-    const nowIso = new Date().toISOString();
-    const injections = shared.trackedInjections.injections;
-    const priorInjection = Object.getOwnPropertyDescriptor(injections, injectId);
-    const superseded = [];
-    // Supersession: a second tracked dispatch for the same session retains the OLD record and
-    // appends `tracking_superseded` before the active pointer moves. The previous code only logged
-    // a warning and destructively overwrote a SID-keyed entry, so the old inject_id became
-    // unqueryable — and an inject_id nobody can query is indistinguishable from one that never
-    // existed.
-    for (const record of Object.values(injections)) {
-      if (record.session_id === sessionId && record.tracking_state === 'tracked') {
-        // Append mutates the history array in place and can trim its oldest entry.
-        // Retain descriptors/references so rollback also preserves absent fields.
-        const observations = record.observations;
-        superseded.push({
-          record,
-          fields: ['tracking_state', 'observation_seq', 'last_observation', 'observations']
-            .map(key => [key, Object.getOwnPropertyDescriptor(record, key)]),
-          observations,
-          history: Array.isArray(observations) ? Object.getOwnPropertyDescriptors(observations) : null,
-        });
-        record.tracking_state = 'superseded';
-        shared.sessionPersistence.appendLedgerObservation(record, {
-          kind: 'tracking_superseded', trigger: 'superseded_by_new_tracked_inject', superseded_by: injectId,
-        }, nowIso);
-      }
+  async function beginTrackedInjection({ injectId, sessionId, source, session }) {
+    // #1207 — refuse BEFORE any in-memory mutation. Measured on the 0.9.1 tree: after restore
+    // refused a truncated or future-schema file (bytes untouched), this path inserted into the
+    // empty mirror, committed it over the preserved bytes, flipped the store back to healthy and
+    // let the inject route deliver. An unavailable store still answers the failure shape the route
+    // already handles (500 TRACKING_PERSISTENCE_FAILED, tracking_state:'unavailable', no delivery).
+    const unavailable = ledgerUnavailable();
+    if (unavailable) {
+      console.error(`[OBSERVE] tracking REFUSED for ${injectId} — observation store unavailable (${unavailable.reason}); refusing delivery`);
+      return beginFailure({ outcome: 'nack', reason: unavailable.reason });
     }
+    const client = shared.ledgerClient;
+    // Reserve BEFORE accepting (errata C5): one terminal unit + two result units for this job, the
+    // admitted-jobs cap, the sustained-exhaustion gate and the free-space HINT. A refusal here is
+    // `rejected_admission`: nothing queued, nothing persisted, 503 TRACKING_CAPACITY on the route.
+    const reserved = client.reserveJob(injectId);
+    if (!reserved.ok) {
+      console.error(`[OBSERVE] tracking REFUSED for ${injectId} — capacity (${reserved.reason}); refusing delivery`);
+      return beginFailure({ outcome: 'rejected_admission', reason: reserved.reason });
+    }
+    const nowIso = new Date().toISOString();
 
+    // Supersession is decided by the OWNER from its hot session index (records of this session that
+    // are still `tracked`): the old record is retained and gains `tracking_superseded` in the same
+    // durable group as the new begin. The previous in-memory scan over every record (O(history))
+    // and its descriptor-level rollback are gone — a group is durable or it is not.
     const record = {
       inject_id: injectId,
       session_id: sessionId,
@@ -147,6 +265,7 @@ function createDeliveryRuntime(shared, {
       // with a reason rather than inventing availability from a bare SID or an open socket.
       session_epoch: (session && session.sessionEpoch) || null,
       session_epoch_reason: (session && session.sessionEpoch) ? null : 'no_815_epoch_fact',
+      owner_generation: (session && session.interactionOwnerGeneration) || null,
       transport_source: source || null,
       created_at: nowIso,
       observation_seq: 0,
@@ -166,84 +285,126 @@ function createDeliveryRuntime(shared, {
       },
       tracking_state: 'tracked',
     };
-    injections[injectId] = record;
+    // `tracking_started` is part of the begin frame itself (seq 1), exactly as before.
     shared.sessionPersistence.appendLedgerObservation(record, { kind: 'tracking_started', trigger: 'inject_accepted' }, nowIso);
 
-    const committed = commitTrackedInjections();
-    if (!committed.ok) {
-      // Reverse order also restores a history array shared by prior records.
-      for (let i = superseded.length - 1; i >= 0; i--) {
-        const prior = superseded[i];
-        if (prior.history) {
-          for (const key of Reflect.ownKeys(prior.observations)) {
-            if (!Object.prototype.hasOwnProperty.call(prior.history, key)) delete prior.observations[key];
-          }
-          Object.defineProperties(prior.observations, prior.history);
-        }
-        for (const [key, descriptor] of prior.fields) {
-          if (descriptor) Object.defineProperty(prior.record, key, descriptor);
-          else delete prior.record[key];
-        }
-      }
-      if (priorInjection) Object.defineProperty(injections, injectId, priorInjection);
-      else delete injections[injectId];
-      console.error(`[OBSERVE] tracking persistence FAILED for ${injectId} — refusing delivery (${committed.reason})`);
-      return { ok: false, reason: 'tracking_persistence_failed' };
+    const outcome = await client.submit('begin', { id: injectId, sid: sessionId, record, at: nowIso }, { class: 'T', jobId: injectId });
+    if (outcome.outcome !== 'ack') {
+      // Not durable ⇒ not tracked ⇒ no delivery. The job reservation is released on a nack or a
+      // pre-admission rejection; it is RETAINED on indeterminate (the begin may be on disk).
+      if (outcome.outcome !== 'indeterminate') client.releaseJob(injectId);
+      const failure = beginFailure(outcome);
+      console.error(`[OBSERVE] tracking ${outcome.outcome === 'indeterminate' ? 'INDETERMINATE' : 'FAILED'} for ${injectId} — refusing delivery (${failure.reason}${outcome.reason && outcome.reason !== failure.reason ? `: ${outcome.reason}` : ''})`);
+      return { ...failure, outcome };
     }
-    shared.trackedLedgerHealthy = true;
-    shared.trackedLedgerUnavailableReason = null;
-    return { ok: true, record };
+    if (outcome.result === 'already_exists') {
+      // Idempotency by key (errata C4 rule 4): a resubmitted begin for an inject_id that is already
+      // durable is not a second delivery authorization.
+      client.releaseJob(injectId);
+      return { ok: false, reason: 'already_exists', outcome };
+    }
+    const durable = client.readModel.getTrackedInjection(injectId) || record;
+    return { ok: true, record: durable, superseded: outcome.superseded || [], outcome };
   }
 
-  function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError, cause = {}) {
-    const record = getTrackedInjection(injectId);
-    if (!record) return 'tracking_unavailable';
-    record.tracking_state = 'aborted';
-    shared.sessionPersistence.appendLedgerObservation(record, {
+  async function abortTrackedInjection(injectId, sessionId, deliveryCode, deliveryError, cause = {}) {
+    const client = shared.ledgerClient;
+    if (!client || ledgerUnavailable()) return 'tracking_unavailable';
+    const hot = await client.ensureHot(injectId);
+    if (!hot.ok) return hot.reason === 'record_missing' || hot.reason === 'not_observed_by_daemon_epoch' ? 'tracking_unavailable' : (hot.outcome && hot.outcome.outcome === 'indeterminate' ? 'tracking_outcome_indeterminate' : 'tracking_persistence_failed');
+    // delivery_error is bounded at 1 KiB so the terminal frame always fits its reserved unit.
+    let error = deliveryError == null ? null : String(deliveryError);
+    let truncated = false;
+    if (error && Buffer.byteLength(error, 'utf8') > 1024) { error = Buffer.from(error, 'utf8').subarray(0, 1024).toString('utf8'); truncated = true; }
+    const observation = {
       kind: cause.kind || 'inject_delivery_refused',
       trigger: cause.trigger || 'delivery_refused',
       delivery_code: deliveryCode || 'DELIVERY_FAILED',
-      delivery_error: deliveryError || null,
+      delivery_error: error,
+      ...(truncated ? { delivery_error_truncated: true } : {}),
       // Omitting `bytesWritten` means the caller MEASURED zero (the synchronous refusal arm: the
       // route never handed a byte over). An explicit `null` means it could not measure — a throw
       // mid-drain can land on either side of the body write — and null is recorded rather than a
       // guessed zero.
       bytes_written: cause.bytesWritten === undefined ? 0 : cause.bytesWritten,
-    }, new Date().toISOString());
+      at: new Date().toISOString(),
+    };
     // The pending entry goes too. It is what makes the session look like it is awaiting a turn, and
     // it belongs to an inject whose bytes were never delivered — every later observation on this
-    // session would otherwise be filed against it.
+    // session would otherwise be filed against it. Released regardless of the durable outcome: the
+    // in-memory pending slot is not evidence, the ledger is.
     if (sessionId && shared.pendingReports[sessionId] && shared.pendingReports[sessionId].injectId === injectId) {
       delete shared.pendingReports[sessionId];
     }
-    const committed = commitTrackedInjections();
-    if (!committed.ok) {
-      console.error(`[OBSERVE] abort commit FAILED for ${injectId} (${committed.reason})`);
-      return 'tracking_persistence_failed';
-    }
-    return 'tracking_aborted';
+    // Terminal transition on the job's RESERVED T unit; released at the terminal ACK.
+    const outcome = await client.submit('state', { id: injectId, tracking_state: 'aborted', observation }, { class: 'T', jobId: injectId });
+    if (outcome.outcome === 'ack') return 'tracking_aborted';
+    if (outcome.outcome === 'indeterminate') { console.error(`[OBSERVE] abort INDETERMINATE for ${injectId} (${outcome.reason})`); return 'tracking_outcome_indeterminate'; }
+    console.error(`[OBSERVE] abort ${outcome.outcome} for ${injectId} (${outcome.reason})`);
+    return 'tracking_persistence_failed';
   }
 
-  function parkTrackedInjection(injectId, strategy, reason) {
-    if (!injectId) return 'no_tracked_inject';
-    const record = getTrackedInjection(injectId);
-    if (!record) return 'tracking_unavailable';
-    shared.sessionPersistence.appendLedgerObservation(record, {
-      kind: 'inject_parked',
-      trigger: strategy,
-      reason: reason || null,
-      bytes_written: 0,
-    }, new Date().toISOString());
-    const committed = commitTrackedInjections();
-    if (!committed.ok) {
-      console.error(`[OBSERVE] park commit FAILED for ${injectId} (${committed.reason})`);
+  // #1207 (measured on the four queue-flush paths): the terminal persistence outcome of a dropped or
+  // refused op is AWAITED by every notifier before it emits the failure event or resolves its caller,
+  // so a notification never outruns the record it describes. Never rejects: a thrown abort is logged
+  // and named as a failed persistence outcome — durability unknown is never reported as
+  // `tracking_aborted`; an op that carries no tracked record answers `no_tracked_inject` without an
+  // owner round trip (the previous unconditional call asked the owner for an id of `undefined`).
+  async function settleTerminalOutcome(op, sessionId, deliveryCode, deliveryError, cause) {
+    if (!op || !op.injectId) return 'no_tracked_inject';
+    try {
+      return await abortTrackedInjection(op.injectId, sessionId, deliveryCode, deliveryError, cause);
+    } catch (error) {
+      console.error(`[OBSERVE] abort THREW for ${op.injectId} (${error && error.message}) — persistence outcome unknown, reported as failed`);
       return 'tracking_persistence_failed';
     }
-    return 'tracking_parked';
+  }
+
+  async function parkTrackedInjection(injectId, strategy, reason) {
+    if (!injectId) return 'no_tracked_inject';
+    const client = shared.ledgerClient;
+    if (!client || ledgerUnavailable()) return 'tracking_unavailable';
+    const hot = await client.ensureHot(injectId);
+    if (!hot.ok) return hot.reason === 'record_missing' || hot.reason === 'not_observed_by_daemon_epoch' ? 'tracking_unavailable' : 'tracking_persistence_failed';
+    // `inject_parked` is a RESULT-class observation: it draws on the job's reserved R unit first,
+    // then the shared R pool; a refusal is named, never queued.
+    const outcome = await client.submit('obs', { id: injectId, observation: { kind: 'inject_parked', trigger: strategy, reason: reason || null, bytes_written: 0, at: new Date().toISOString() } }, { class: 'R', jobId: injectId, result: true });
+    if (outcome.outcome === 'ack') return 'tracking_parked';
+    if (outcome.outcome === 'indeterminate') { console.error(`[OBSERVE] park INDETERMINATE for ${injectId} (${outcome.reason})`); return 'tracking_outcome_indeterminate'; }
+    if (outcome.outcome === 'rejected_admission') { console.error(`[OBSERVE] park REJECTED for ${injectId} (${outcome.reason})`); return 'tracking_capacity_result'; }
+    console.error(`[OBSERVE] park ${outcome.outcome} for ${injectId} (${outcome.reason})`);
+    return 'tracking_persistence_failed';
+  }
+
+  // #137 — file one validated bridge stage receipt on its tracked record. The transport already
+  // bound it to the current owner socket and generation; this re-checks the RECORD identity
+  // (session, epoch, owner generation) before the write, and the owner generation again after
+  // the await. The observation is a bridge transport fact: it never carries consumption,
+  // acknowledgement or completion, and pty_written is a PTY master write only.
+  async function recordBridgeReceipt(sessionId, session, receipt, ownerGeneration) {
+    if (!receipt || !receipt.inject_id) return 'no_tracked_inject';
+    const client = shared.ledgerClient;
+    if (!client || ledgerUnavailable()) return 'tracking_unavailable';
+    const hot = await client.ensureHot(receipt.inject_id);
+    if (!hot.ok) return hot.reason === 'record_missing' || hot.reason === 'not_observed_by_daemon_epoch' ? 'tracking_unavailable' : 'tracking_persistence_failed';
+    const record = client.readModel.getTrackedInjection(receipt.inject_id);
+    if (!record || record.session_id !== sessionId || shared.sessions[sessionId] !== session
+      || session.interactionOwnerGeneration !== ownerGeneration
+      || (record.owner_generation && record.owner_generation !== ownerGeneration)
+      || (record.session_epoch && record.session_epoch !== (session.sessionEpoch || null))) return 'receipt_identity_mismatch';
+    const observation = { kind: 'bridge_receipt', trigger: `${receipt.stage}:${receipt.part || 'unknown'}`,
+      stage: receipt.stage, part: receipt.part, certainty: receipt.certainty, reason: receipt.reason,
+      daemon_msg_id: receipt.daemon_msg_id, bridge_msg_id: receipt.bridge_msg_id, bridge_seq: receipt.bridge_seq,
+      bridge_at_ms: receipt.at_ms, clock: receipt.clock, owner_generation: ownerGeneration, at: new Date().toISOString() };
+    const outcome = await client.submit('obs', { id: receipt.inject_id, observation }, { jobId: receipt.inject_id });
+    if (outcome.outcome === 'ack') return 'tracking_bridge_receipt';
+    if (outcome.outcome === 'indeterminate') { console.error(`[OBSERVE] bridge receipt INDETERMINATE for ${receipt.inject_id} (${outcome.reason})`); return 'tracking_outcome_indeterminate'; }
+    console.error(`[OBSERVE] bridge receipt ${outcome.outcome} for ${receipt.inject_id} (${outcome.reason})`);
+    return outcome.outcome === 'rejected_admission' ? 'tracking_capacity_result' : 'tracking_persistence_failed';
   }
 
   function deliveryAuditResult(delivery) {
-    return delivery && delivery.queued === true && delivery.strategy === 'bootstrap_queue' ? 'queued' : 'success';
+    return delivery && delivery.queued === true && (delivery.strategy === 'bootstrap_queue' || delivery.poll_only === true || delivery.delivery_status === 'retry_pending') ? 'queued' : 'success';
   }
 
   function getPendingReport(sessionId, registry = shared.pendingReports) {
@@ -394,6 +555,8 @@ function createDeliveryRuntime(shared, {
     const staleMs = (options.staleSeconds ?? shared.SESSION_STALE_SECONDS) * 1000;
     const disconnectedMs = getSessionDisconnectedMs(session, nowMs);
 
+    if (session.type === 'mailbox') return mailboxLeaseAlive(session, nowMs) ? 'CONNECTED' : 'DISCONNECTED';
+
     if (session.type === 'wrapped') {
       if (shared.isOpenWebSocket(session.ownerWs)) {
         // #732: an open owner socket is necessary, not sufficient. A session that has
@@ -430,6 +593,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function getSessionHealthReason(session, healthStatus) {
+    if (session.type === 'mailbox') return healthStatus === 'CONNECTED' ? 'MAILBOX_LEASE_VALID' : 'MAILBOX_LEASE_EXPIRED';
     if (session.type === 'wrapped') {
       if (healthStatus === 'CONNECTED') return 'OWNER_CONNECTED';
       // #732: the owner socket is open and answering pings; the output pipe behind it is not.
@@ -451,8 +615,11 @@ function createDeliveryRuntime(shared, {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  // Task 1215 F2: a negotiated owner (input-transport-ready-v1) that has not completed its
+  // handshake is not ready, for EVERY role; legacy owners keep the pre-handshake rule.
   function isBootstrapReady(session) {
-    return !shared.isBootstrapGatedSession(session) || session.bootstrapReady === true;
+    return (!shared.isBootstrapGatedSession(session) || session.bootstrapReady === true)
+      && !readinessHandshake.awaitingInputTransport(session);
   }
 
   function buildBootstrapBlock(session) {
@@ -467,7 +634,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function shouldQueueBootstrapOperation(session) {
-    return shared.isBootstrapGatedSession(session) && !isBootstrapReady(session);
+    return (shared.isBootstrapGatedSession(session) || readinessHandshake.awaitingInputTransport(session)) && !isBootstrapReady(session);
   }
 
   function hasBootstrapBacklog(session) {
@@ -504,6 +671,7 @@ function createDeliveryRuntime(shared, {
       depth: session.bootstrapQueue.length
     });
     scheduleBootstrapPromptPoll(sessionId, session);
+    armInputTransportTimeout(sessionId, session);
     return op;
   }
 
@@ -534,7 +702,10 @@ function createDeliveryRuntime(shared, {
     // modal park routes worker REPORTs — multi-line by definition — through it. Fixed here
     // rather than in the park branch so the boot caller stops rolling the same dice.
     const body = maybeBracketedPaste(prompt, session);
-    const textResult = await shared.writeDataToSession(sessionId, session, body);
+    // Task 1215: deliveries that waited for the transport handshake keep their frame ids, so the
+    // bridge can receipt them and can refuse a submit whose body it never wrote (pair).
+    const bodyMeta = { daemon_msg_id: `bootstrap:${op.op_id}`, inject_id: op.injectId || null, part: 'body' };
+    const textResult = await shared.writeDataToSession(sessionId, session, body, { frameMeta: bodyMeta });
     // #860 F2 — a failure here is reported back with the byte count that actually landed, because
     // the caller records it in the ledger. The two arms differ: nothing was written when the BODY
     // was refused, but the body is on the surface by the time the submit CR can fail, and an abort
@@ -543,7 +714,8 @@ function createDeliveryRuntime(shared, {
 
     if (!op.noEnter) {
       await sleep(shared.WRAPPED_SUBMIT_DELAY_MS);
-      const submitResult = await shared.writeDataToSession(sessionId, session, '\r');
+      const submitResult = await shared.writeDataToSession(sessionId, session, '\r',
+        { frameMeta: { daemon_msg_id: `${bodyMeta.daemon_msg_id}:submit`, inject_id: bodyMeta.inject_id, part: 'submit', pair: bodyMeta.daemon_msg_id } });
       if (!submitResult.success) return { ...submitResult, bytes_written: Buffer.byteLength(body) };
     }
 
@@ -720,17 +892,22 @@ function createDeliveryRuntime(shared, {
           if (op.type === 'inject') {
             const result = await executeBootstrapInject(sessionId, session, op);
             if (!result.success) {
+              // #860 F2 — durably; #1207 (measured) durably FIRST: this is a TERMINAL outcome for a
+              // dispatch whose record has said `tracked` since the route accepted it, and the push-only
+              // event below must not state it before the record does. The event carries the
+              // persistence outcome it is based on.
+              const tracking = await settleTerminalOutcome(op, sessionId, result.code || 'DELIVERY_FAILED', result.error, {
+                trigger: 'bootstrap_queue_failed',
+                // Linux: a delivery whose outcome is unknown is recorded as such, never as zero bytes.
+                ...(result.delivery_uncertain ? { kind: 'inject_delivery_unknown' } : {}),
+                bytesWritten: result.delivery_uncertain ? null : result.bytes_written,
+              });
               emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
                 op_id: op.op_id,
                 operation: op.type,
                 code: result.code || 'DELIVERY_FAILED',
-                error: result.error || 'bootstrap delivery failed'
-              });
-              // #860 F2 — and durably. The event above is push-only; this is a TERMINAL outcome for
-              // a dispatch whose record has said `tracked` since the route accepted it.
-              abortTrackedInjection(op.injectId, sessionId, result.code || 'DELIVERY_FAILED', result.error, {
-                trigger: 'bootstrap_queue_failed',
-                bytesWritten: result.bytes_written,
+                error: result.error || 'bootstrap delivery failed',
+                tracking
               });
             }
           } else if (op.type === 'submit') {
@@ -758,18 +935,19 @@ function createDeliveryRuntime(shared, {
               }
             });
           }
+          // #860 F2 — the same terminal outcome as the arm above, reached by a throw. `bytesWritten:
+          // null` because a throw can land on either side of the body write, and this is the one
+          // path that cannot say which. #1207 (measured): awaited before the event, as above.
+          const tracking = await settleTerminalOutcome(op, sessionId, 'BOOTSTRAP_DRAIN_FAILED', error.message || 'bootstrap drain failed', {
+            trigger: 'bootstrap_drain_failed',
+            bytesWritten: null,
+          });
           emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
             op_id: op.op_id,
             operation: op.type,
             code: 'BOOTSTRAP_DRAIN_FAILED',
-            error: error.message || 'bootstrap drain failed'
-          });
-          // #860 F2 — the same terminal outcome as the arm above, reached by a throw. `bytesWritten:
-          // null` because a throw can land on either side of the body write, and this is the one
-          // path that cannot say which.
-          abortTrackedInjection(op.injectId, sessionId, 'BOOTSTRAP_DRAIN_FAILED', error.message || 'bootstrap drain failed', {
-            trigger: 'bootstrap_drain_failed',
-            bytesWritten: null,
+            error: error.message || 'bootstrap drain failed',
+            tracking
           });
         }
       }
@@ -783,13 +961,36 @@ function createDeliveryRuntime(shared, {
     return session.bootstrapDrainPromise;
   }
 
+  // Task 1215 F2: an owner that negotiated the handshake never waits on a timer: if its
+  // input_transport_ready does not arrive, its queued deliveries fail explicitly (never a blind write).
+  function armInputTransportTimeout(sessionId, session) {
+    if (!readinessHandshake.awaitingInputTransport(session) || session.inputTransportTimer) return;
+    const generation = session.interactionOwnerGeneration;
+    session.inputTransportTimer = setTimeout(() => {
+      session.inputTransportTimer = null;
+      if (session.interactionOwnerGeneration !== generation || !readinessHandshake.awaitingInputTransport(session)
+          || !hasBootstrapBacklog(session)) return;
+      failBootstrapQueueOnTimeout(sessionId, session, { reason: 'input_transport_ready_timeout' });
+    }, shared.BOOTSTRAP_READY_TIMEOUT_MS);
+    if (session.inputTransportTimer && typeof session.inputTransportTimer.unref === 'function') session.inputTransportTimer.unref();
+  }
+
   function markBootstrapReady(sessionId, session, reason) {
     if (!session) return false;
     shared.initializeBootstrapState(session);
+    // Task 1215 F2: for a negotiated owner, spawn readiness is its authenticated transport handshake
+    // alone — a screen `ready` frame, prompt-symbol poll, owner-alive floor or restore never
+    // releases it, for any role. Legacy owners are unchanged.
+    if (readinessHandshake.negotiated(session) && (reason !== 'input_transport_ready' || !readinessHandshake.inputTransportReady(session))) return false;
     if (!shared.isBootstrapGatedSession(session)) {
+      // Task 1215: a user-supervised owner (or any non-gated negotiated owner) is admitted by owner
+      // + live transport. Anything parked before then drains now, FIFO, through the ordered drain.
+      if ((inputPolicies.userSupervised(session) || reason === 'input_transport_ready') && hasBootstrapBacklog(session)) drainBootstrapQueue(sessionId, session);
       return false;
     }
     if (session.bootstrapReady === true) {
+      // A new owner generation's handshake releases what queued while it was pending.
+      if (reason === 'input_transport_ready' && hasBootstrapBacklog(session)) drainBootstrapQueue(sessionId, session);
       return false;
     }
 
@@ -802,7 +1003,12 @@ function createDeliveryRuntime(shared, {
     return true;
   }
 
-  function failBootstrapQueueOnTimeout(sessionId, session, detail = {}) {
+  // #1207 (measured): a drop is TERMINAL for its dispatch, so each op's persistence outcome is awaited
+  // (FIFO, one at a time) BEFORE the per-op `bootstrap_queue_failed` event states it. The
+  // session-level `bootstrap_ready_timeout` event stays first — it is the actionable cause, not a
+  // terminal claim about any dispatch. The queue is emptied synchronously so nothing else drains the
+  // same ops. Resolves to a summary and never rejects (timer callbacks cannot await it).
+  async function failBootstrapQueueOnTimeout(sessionId, session, detail = {}) {
     const queued = Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0;
     emitBootstrapEvent('bootstrap_ready_timeout', sessionId, session, {
       ...detail,
@@ -810,7 +1016,8 @@ function createDeliveryRuntime(shared, {
       queued_dropped: queued,
       hint: `Session '${sessionId}' did not become inject-ready within ${shared.BOOTSTRAP_READY_TIMEOUT_MS}ms — the target CLI (e.g. codex MCP init) may be hung. Inspect the surface and re-spawn if needed; queued injects were flushed.`
     });
-    if (queued === 0) return;
+    const tracking = [];
+    if (queued === 0) return { queued_dropped: 0, tracking };
     const drained = session.bootstrapQueue.splice(0, queued);
     for (const op of drained) {
       if (op.type === 'submit') {
@@ -827,18 +1034,21 @@ function createDeliveryRuntime(shared, {
           }
         });
       }
+      // #860 F2 — DROPPED, not refused: this op was accepted, parked, and discarded without the
+      // daemon ever attempting a write. Zero bytes is a measurement here, not an assumption.
+      const outcome = await settleTerminalOutcome(op, sessionId, 'BOOTSTRAP_READY_TIMEOUT',
+        `target '${sessionId}' not ready within ${shared.BOOTSTRAP_READY_TIMEOUT_MS}ms`,
+        { kind: 'inject_delivery_dropped', trigger: 'bootstrap_ready_timeout' });
+      tracking.push({ op_id: op.op_id, inject_id: op.injectId || null, outcome });
       emitBootstrapEvent('bootstrap_queue_failed', sessionId, session, {
         op_id: op.op_id,
         operation: op.type,
         code: 'BOOTSTRAP_READY_TIMEOUT',
-        error: `target '${sessionId}' not ready within ${shared.BOOTSTRAP_READY_TIMEOUT_MS}ms`
+        error: `target '${sessionId}' not ready within ${shared.BOOTSTRAP_READY_TIMEOUT_MS}ms`,
+        tracking: outcome
       });
-      // #860 F2 — DROPPED, not refused: this op was accepted, parked, and discarded without the
-      // daemon ever attempting a write. Zero bytes is a measurement here, not an assumption.
-      abortTrackedInjection(op.injectId, sessionId, 'BOOTSTRAP_READY_TIMEOUT',
-        `target '${sessionId}' not ready within ${shared.BOOTSTRAP_READY_TIMEOUT_MS}ms`,
-        { kind: 'inject_delivery_dropped', trigger: 'bootstrap_ready_timeout' });
     }
+    return { queued_dropped: queued, tracking };
   }
 
   function shouldApplyOwnerAliveFloor(session, deps = {}) {
@@ -856,6 +1066,8 @@ function createDeliveryRuntime(shared, {
     const _setTimeout = deps.setTimeout || setTimeout;
     if (!session || !shared.isBootstrapGatedSession(session) || isBootstrapReady(session)) return;
     if (!shared.isOpenWebSocket(session.ownerWs)) return;
+    // Task 1215 F2: a negotiated owner's spawn readiness is its handshake, not a screen poll or floor.
+    if (readinessHandshake.negotiated(session)) return;
 
     // cmux: rendered-screen prompt poll (the cmux-only read-screen primitive). Unchanged,
     // including the #31 actionable bootstrap-timeout on miss/error.
@@ -868,14 +1080,16 @@ function createDeliveryRuntime(shared, {
         if (result && result.ready && shared.isOpenWebSocket(session.ownerWs)) {
           markBootstrapReady(sessionId, session, 'cmux_prompt_symbol');
         } else if (result && result.reason) {
-          failBootstrapQueueOnTimeout(sessionId, session, {
+          // #1207: the flush settles after its terminal outcomes; returned so the chain settles with it
+          return failBootstrapQueueOnTimeout(sessionId, session, {
             reason: result.reason,
             waited_ms: result.waited_ms || 0
           });
         }
+        return undefined;
       }).catch((error) => {
         session.bootstrapPromptPoll = null;
-        failBootstrapQueueOnTimeout(sessionId, session, {
+        return failBootstrapQueueOnTimeout(sessionId, session, {
           reason: 'prompt_symbol_error',
           error: error.message || String(error)
         });
@@ -935,6 +1149,7 @@ function createDeliveryRuntime(shared, {
       health_status: healthStatus,
       health_reason: healthReason,
       type: session.type || 'spawned',
+      ...(session.type === 'mailbox' ? { lease_expires_at: session.leaseExpiresAt || null } : {}),
       backend: session.backend || 'kitty',
       terminal: getSessionTerminalLabel(session),
       active_clients: session.clients ? session.clients.size : 0,
@@ -959,6 +1174,16 @@ function createDeliveryRuntime(shared, {
       bridge_heartbeat_at: session.bridgeHeartbeatAt || null,
       bridge_pty_bytes: session.bridgePtyBytes ?? null,
       bridge_read_side: session.bridgeReadSide || null,
+      // #137: owner-reported bridge stage support and queue summary (current owner generation only).
+      bridge_receipts: bridgeStage.bridgeReceiptSupport(session),
+      bridge_queue: bridgeStage.bridgeQueueView(session),
+      // Task 1215: effective recipient input policy (bound to the current owner generation).
+      input_policy: inputPolicies.effectiveInputPolicy(session),
+      input_policy_source: inputPolicies.userSupervised(session) ? session.inputPolicy.source : null,
+      // Task 1215 F2: session spawn-readiness milestones (current owner handshake), never receipts.
+      readiness: readinessHandshake.view(session),
+      // Per-message receipt honesty: no provider acknowledges a specific message today.
+      instruction_received: { status: 'unknown', reason: 'no_message_bound_provider_acknowledgement' },
       bootstrap: buildBootstrapBlock(session)
     };
   }
@@ -997,11 +1222,13 @@ function createDeliveryRuntime(shared, {
 
   function broadcastSessionEvent(eventType, sessionId, session, options = {}) {
     const event = buildSessionEvent(eventType, sessionId, session, options);
+    require('../transport/session-events').publishTrustedSessionEvent(session, sessionId, eventType, event);
     broadcastBusEvent(event);
     return event;
   }
 
   function getInjectFailure(session, options = {}) {
+    if (session.isClosing) return { httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing' };
     const healthStatus = getSessionHealthStatus(session, options);
     if (healthStatus === 'STALE') {
       return { httpStatus: 410, code: 'STALE', error: 'Session is stale and awaiting cleanup.' };
@@ -1039,6 +1266,9 @@ function createDeliveryRuntime(shared, {
   }
 
   function terminalLevelSubmit(id, session) {
+    if (session.isClosing) return null;
+    if (protectedInputFailure(session)) return null;
+    if (session.sshRemote) return null;
     if (hasHeldInteraction(session)) return null;
     if (submitViaPty(session)) return 'pty_cr';
     return null;
@@ -1080,6 +1310,8 @@ function createDeliveryRuntime(shared, {
   }
 
   function modalDeliveryDecision(session, options = {}, env = process.env) {
+    // Task 1215: the user supervises this surface; no rendered-screen modal classifier gates it.
+    if (inputPolicies.userSupervised(session)) return { action: 'deliver', reason: 'user_supervised' };
     const remedy = modalRemedy(env, session);
     if (remedy === 'off') return { action: 'deliver', reason: 'modal_gate_off' };
     if (!isSurfaceBlockedByModal(session)) return { action: 'deliver', reason: 'surface_clear' };
@@ -1145,10 +1377,14 @@ function createDeliveryRuntime(shared, {
     return Number.isFinite(configured) && configured > 0 ? configured : shared.MODAL_PARK_TTL_DEFAULT_MS;
   }
 
-  function flushModalParkQueue(sessionId, session, waitedMs) {
+  // #1207 (measured): each dropped op's terminal persistence outcome is awaited (FIFO) BEFORE the
+  // `modal_park_timeout` notification is emitted, and the notification carries those outcomes.
+  // Resolves to the number of ops flushed and never rejects.
+  async function flushModalParkQueue(sessionId, session, waitedMs) {
     const queued = Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0;
     if (queued === 0) return 0;
     const drained = session.bootstrapQueue.splice(0, queued);
+    const tracking = [];
     for (const op of drained) {
       if (op.type === 'submit') {
         resolveBootstrapSubmit(op, {
@@ -1163,14 +1399,16 @@ function createDeliveryRuntime(shared, {
       // #860 F2 — the third terminal path. A submit op answers its caller on the open HTTP request
       // above; an inject op's caller left long ago, and the ledger is the only thing that can still
       // tell it the body never reached the surface.
-      abortTrackedInjection(op.injectId, sessionId, 'SURFACE_MODAL_PARK_TIMEOUT',
+      const outcome = await settleTerminalOutcome(op, sessionId, 'SURFACE_MODAL_PARK_TIMEOUT',
         `parked behind a surface modal that did not clear within ${waitedMs}ms`,
         { kind: 'inject_delivery_dropped', trigger: 'surface_modal_park_timeout' });
+      tracking.push({ op_id: op.op_id, inject_id: op.injectId || null, outcome });
     }
     emitBootstrapEvent('modal_park_timeout', sessionId, session, {
       actionable: true,
       queued_dropped: queued,
       waited_ms: waitedMs,
+      tracking,
       hint: `Session '${sessionId}' has been showing a blocking modal for ${Math.round(waitedMs / 1000)}s — `
         + `${queued} parked inject(s) were flushed. Answer or dismiss the prompt on the surface, then re-inject.`,
     });
@@ -1188,7 +1426,7 @@ function createDeliveryRuntime(shared, {
     while (isSurfaceBlockedByModal(session)) {
       if (now() - start >= timeoutMs) {
         const waited = now() - start;
-        return { cleared: false, waited_ms: waited, flushed: flushModalParkQueue(sessionId, session, waited) };
+        return { cleared: false, waited_ms: waited, flushed: await flushModalParkQueue(sessionId, session, waited) };
       }
       await sleepFn(pollIntervalMs);
     }
@@ -1216,7 +1454,7 @@ function createDeliveryRuntime(shared, {
         return;
       }
       if (Date.now() >= deadline) {
-        flushModalParkQueue(sessionId, session, modalParkTtlMs());
+        flushModalParkQueue(sessionId, session, modalParkTtlMs()).catch((error) => console.error(`[MODAL] ${sessionId} park flush failed: ${error && error.message}`));
         return;
       }
       session.modalParkPoll = setTimeout(tick, shared.MODAL_PARK_POLL_MS);
@@ -1253,6 +1491,7 @@ function createDeliveryRuntime(shared, {
     if (term.includes('ghostty')) return 'ghostty';
     if (term.includes('tmux')) return 'tmux';
 
+    if (session.type === 'mailbox') return 'mailbox';
     if (session.type === 'aterm') return 'aterm';
     if (session.backend === 'cmux') return 'cmux';
     if (session.backend === 'kitty') return 'kitty';
@@ -1262,11 +1501,17 @@ function createDeliveryRuntime(shared, {
   }
 
   function submitViaPty(session) {
+    if (protectedInputFailure(session)) return false;
+    if (session.sshRemote) return false; // SSH submit is admitted by the receipt protocol only.
     if (hasHeldInteraction(session)) return false;
     shared.interaction.invalidateInteraction(session, 'submit');
     if (session.type === 'wrapped') {
       if (session.ownerWs && session.ownerWs.readyState === 1) {
-        session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+        // #137: a terminal-level submit names itself and the current owner generation; it is not
+        // bound to any one inject, so it carries no inject_id or pair.
+        session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r',
+          ...bridgeStage.frameMeta({ daemon_msg_id: `submit:${shared.crypto.randomUUID()}`, part: 'submit',
+            owner_generation: session.interactionOwnerGeneration }) }));
         armUpstreamProbe(session);   // #732: a submit is a delivery too — probe with it
         return true;
       }
@@ -1279,13 +1524,28 @@ function createDeliveryRuntime(shared, {
 
   function createInteractionRuntime() {
     return shared.interaction.createInteractionCore({
-      readLedger: () => shared.trackedLedgerHealthy ? shared.trackedInjections : null,
-      commitLedger: next => {
-        const saved = shared.sessionPersistence.saveTrackedInjections(next, shared.TRACKED_INJECTIONS_PATH);
-        if (!saved.ok) { shared.trackedLedgerHealthy = false; return false; }
-        shared.trackedInjections = next;
-        return true;
+      // #1207 — the core reads a committed-only VIEW of the interaction maps and commits one `iact`
+      // delta per stage (class I, reserved per act before saveRecord). An unavailable store reads
+      // as null, so the core refuses `storage_unavailable` before any write, as before.
+      readLedger: () => {
+        const client = shared.ledgerClient;
+        if (!client || ledgerUnavailable()) return null;
+        return { interactions: client.readModel.interactionsView() };
       },
+      commitLedger: async (next, change) => {
+        const client = shared.ledgerClient;
+        if (!client || ledgerUnavailable()) return false;
+        const action = change && change.record ? change.record : null;
+        if (!action) return false;
+        const outcome = await client.submit('iact', { action, pending: change.pending || null }, { class: 'I' });
+        // Durable ⇒ true. Indeterminate is NOT false: the core maps a falsy commit to a refusal it
+        // could later contradict, so the dispatch stage reports outcome_unknown through its own path.
+        if (outcome.outcome === 'ack') return true;
+        if (outcome.outcome === 'indeterminate') return 'indeterminate';
+        return false;
+      },
+      reserveAct: sid => shared.ledgerClient ? shared.ledgerClient.accounting.reserveAct(sid) : false,
+      releaseAct: sid => { if (shared.ledgerClient) shared.ledgerClient.accounting.releaseAct(sid); },
       observe: sid => shared.readyRegistry.observeInteraction(shared.sessions[sid]),
       binding: interactionBinding,
       authorize: principal => principal === 'authenticated-host-controller',
@@ -1306,16 +1566,19 @@ function createDeliveryRuntime(shared, {
     auditAppend,
     verifiedPrincipalFromReq,
     verifiedSenderFields,
-    commitTrackedInjections,
+    ledgerUnavailable,
+    beginFailure,
     interactionBinding,
     hasHeldInteraction,
     dispatchInteraction,
     restoreTrackedInjections,
     getTrackedInjection,
+    fetchTrackedInjection,
     sessionAuthenticationCapability,
     beginTrackedInjection,
     abortTrackedInjection,
     parkTrackedInjection,
+    recordBridgeReceipt,
     deliveryAuditResult,
     getPendingReport,
     markPendingReportSubmitStarted,

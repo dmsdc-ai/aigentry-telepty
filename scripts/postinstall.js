@@ -11,7 +11,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
 
 const pkg = require('../package.json');
 const { detectSupervisor, restartSupervisorDaemon } = require('../src/supervisor');
@@ -37,19 +37,51 @@ function readDaemonState(homeDir = os.homedir()) {
   }
 }
 
+// Use this install's CLI directly: Windows PATH may select the extensionless npm shim.
 function resolveTeleptyBin() {
-  try {
-    const cmd = os.platform() === 'win32' ? 'where telepty' : 'which telepty';
-    return execSync(cmd, { encoding: 'utf8' }).split('\n')[0].trim() || 'telepty';
-  } catch {
-    return 'telepty';
-  }
+  return process.execPath;
 }
 
-function spawnDetachedDaemon(bin) {
-  const child = spawn(bin, ['daemon'], { detached: true, stdio: 'ignore' });
-  child.unref();
-  return child;
+function spawnDetachedDaemon(bin = process.execPath, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = (options.spawn || spawn)(bin, [path.resolve(__dirname, '../cli.js'), 'daemon'], {
+      detached: true, stdio: 'ignore', windowsHide: true
+    });
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref();
+      resolve(child);
+    });
+  });
+}
+
+function printServiceHint(logger, supervisor, platform = process.platform) {
+  if (supervisor && supervisor.present) return false;
+  const linger = platform === 'darwin' || platform === 'win32'
+    ? ''
+    : ' (boot without login also needs: loginctl enable-linger $USER)';
+  logger.log(
+    '[telepty postinstall] No OS service manages the telepty daemon; it will not start after '
+    + `reboot/login. To enable: telepty service install${linger}`
+  );
+  return true;
+}
+
+// #1228: name a legacy dual-install so `npm rm -g aigentry-telepty` cannot take
+// the shared `telepty` link by surprise. Diagnosis only — never npm, never a
+// write into the prefix — and wrapped so a diagnosis can never break an install.
+function warnAboutLegacyInstall(options, logger, platform, env) {
+  try {
+    const ownership = require('../src/bin-ownership');
+    const diagnose = options.diagnoseBinOwnership || ownership.diagnoseBinOwnership;
+    const notice = ownership.formatMigrationNotice({
+      diagnosis: diagnose({ platform, env }),
+      version: pkg.version
+    });
+    if (notice) logger.warn(`[telepty postinstall] ${notice}`);
+  } catch {
+    // An inconclusive diagnosis is not a failed install.
+  }
 }
 
 async function waitForDaemonVersion({ port = 3848, version = pkg.version, timeoutMs = 8000, fetchImpl = fetch } = {}) {
@@ -72,26 +104,30 @@ async function waitForDaemonVersion({ port = 3848, version = pkg.version, timeou
 async function main(options = {}) {
   const env = options.env || process.env;
   const logger = options.logger || console;
+  const platform = options.platform || process.platform;
   const skip = shouldSkip(env);
   if (skip) {
     logger.log(`[telepty postinstall] Skipped (${skip}).`);
     return;
   }
 
+  warnAboutLegacyInstall(options, logger, platform, env);
+  const supervisor = (options.detectSupervisor || detectSupervisor)();
+
   const state = (options.readDaemonState || readDaemonState)(options.homeDir || os.homedir());
   if (!state || !Number.isInteger(state.pid) || state.pid <= 0) {
     logger.log('[telepty postinstall] No running daemon detected — nothing to restart.');
+    printServiceHint(logger, supervisor, platform);
     return;
   }
 
   if (state.version === pkg.version) {
     logger.log(`[telepty postinstall] Running daemon already at ${pkg.version} (pid ${state.pid}). No restart needed.`);
+    printServiceHint(logger, supervisor, platform);
     return;
   }
 
   logger.log(`[telepty postinstall] Detected stale daemon ${state.version || 'unknown'} (pid ${state.pid}); upgrading in-place to ${pkg.version}.`);
-
-  const supervisor = (options.detectSupervisor || detectSupervisor)();
 
   let stopped = 0;
   try {
@@ -139,12 +175,12 @@ async function main(options = {}) {
   // No supervisor installed: keep the pre-#757 fallback so upgrades do not leave
   // standalone/non-root installs without a daemon.
   try {
-    const bin = (options.resolveTeleptyBin || resolveTeleptyBin)();
-    (options.spawnDetachedDaemon || spawnDetachedDaemon)(bin);
+    await (options.spawnDetachedDaemon || spawnDetachedDaemon)();
     logger.log(`[telepty postinstall] Stopped ${stopped} stale daemon(s); spawned fresh ${pkg.version} daemon.`);
   } catch (err) {
     logger.warn(`[telepty postinstall] Daemon respawn failed: ${err.message}.`);
   }
+  printServiceHint(logger, supervisor, platform);
 }
 
 if (require.main === module) {
@@ -155,6 +191,7 @@ if (require.main === module) {
 
 module.exports = {
   main,
+  printServiceHint,
   readDaemonState,
   resolveTeleptyBin,
   shouldSkip,

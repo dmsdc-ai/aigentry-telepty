@@ -16,7 +16,7 @@ const hash = (bytes, algorithm = 'sha256', encoding = 'hex') =>
 const pkg = json(path.join(checkout, 'package.json'));
 assert.ok(['linux', 'darwin'].includes(process.platform), 'Linux/macOS only');
 assert.equal(pkg.name, '@dmsdc-ai/aigentry-telepty');
-assert.equal(pkg.version, '0.9.1');
+assert.equal(pkg.version, '0.10.0');
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-package-')));
 try {
   assert.ok(root !== checkout && !root.startsWith(checkout + path.sep), 'temp outside checkout');

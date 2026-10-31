@@ -1,0 +1,14 @@
+{
+  "schema": "telepty-bridge-136-stream-recipe/v1",
+  "provenance": "synthetic: hand-authored for telepty task 1215 regression tests; NOT captured from any user session, terminal or transcript; contains no host identifiers or credentials",
+  "describes": "codex-like start-up surface with no composer, no footer and no busy marker; CUP/EL only",
+  "geometry": { "cols": 80, "rows": 24 },
+  "preamble": ["\u001b[2J", "\u001b[H", "\u001b[?25l"],
+  "cycle": [
+    "\u001b[10;1H\u001b[2KPreparing workspace (step 1 of 3)\u001b[12;1H\u001b[2KReading project settings",
+    "\u001b[10;1H\u001b[2KPreparing workspace (step 2 of 3)\u001b[12;1H\u001b[2KIndexing local files",
+    "\u001b[10;1H\u001b[2KPreparing workspace (step 3 of 3)\u001b[12;1H\u001b[2KChecking sandbox policy"
+  ],
+  "repeat": 60,
+  "epilogue": []
+}

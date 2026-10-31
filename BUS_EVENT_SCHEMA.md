@@ -227,6 +227,8 @@ what it measured. None of them is a task outcome — all carry `completion_fact:
 { "type": "session.idle", "session_id": "string", "idleSeconds": "number", "lastActivityAt": "ISO 8601", "timestamp": "ISO 8601" }
 ```
 
+This event measures elapsed time since `lastActivityAt`, once per inactivity period after 60 seconds. It does not establish task completion, a free worker, or a stalled process. Delivery and transport activity can update the basis timestamp. Qualified composer evidence is available separately from `GET /api/sessions/:id/handshake`; see `docs/readiness-handshake.md`.
+
 ### `session_health` (periodic, every 10s)
 ```json
 { "type": "session_health", "session_id": "string", "payload": { "alive": true, "pid": "number|null", "type": "string", "clients": "number", "idleSeconds": "number|null" }, "timestamp": "ISO 8601" }
@@ -337,6 +339,45 @@ recorded. That is a measurement, not a proven ceiling, and a door found later is
 rather than a nuisance. No quantifier ("both", "all", "every") should replace this list: the
 previous wording said "both write paths" because two had been looked at, not because two existed.
 
+### Bootstrap / modal queue terminal notifications (#1207 candidate — acceptance pending)
+
+These describe the **candidate** delivery runtime under independent measurement for #1207; they are not
+an installed update. All three are session events (envelope as above, `sender: "daemon"`,
+`session_id`, `timestamp`, `transport`, `semantic`, plus a `bootstrap` block) emitted when an
+operation that was accepted into the per-session bootstrap/modal queue can no longer be delivered.
+
+```json
+{ "type": "bootstrap_ready_timeout", "session_id": "string", "reason": "string", "actionable": true, "queued_dropped": "number", "hint": "string", "bootstrap": { "...": "..." }, "timestamp": "ISO 8601" }
+```
+- Session-level **cause** notification, emitted first and unchanged. It states how many queued ops are
+  being dropped; it makes no claim about any dispatch's durable state.
+
+```json
+{ "type": "bootstrap_queue_failed", "session_id": "string", "op_id": "UUID", "operation": "inject|submit", "code": "string", "error": "string", "tracking": "tracking_aborted|tracking_outcome_indeterminate|tracking_persistence_failed|tracking_unavailable|no_tracked_inject", "bootstrap": { "...": "..." }, "timestamp": "ISO 8601" }
+```
+- Per-operation **terminal** notification (drain refusal, drain throw, bootstrap-ready timeout).
+  `tracking` is additive and states the persistence outcome the notification is based on; the event
+  is emitted **only after the terminal persistence attempt has settled**, never while it is in flight.
+- `tracking_aborted`: the dispatch's terminal `aborted` state is durable (fsynced commit ACK) and the
+  ledger reads `aborted`. Every other value is **not** a durably aborted dispatch:
+  `tracking_outcome_indeterminate` (a write/fsync attempt happened, durability unknown, the ledger
+  still reads `tracked`, the transaction is held unresolved and never retried automatically),
+  `tracking_persistence_failed` (refused or failed before durability), `tracking_unavailable` (the
+  store refused by name; the record may be unknown to it). `no_tracked_inject` means the op carried no
+  `injectId` (an untracked boot-time op) — it is not an owner persistence outcome and no record exists.
+- Ordering: the session-level `bootstrap_ready_timeout` cause **may precede** the per-operation
+  `bootstrap_queue_failed` notifications, which follow in queue (FIFO) order, each after its own
+  outcome.
+
+```json
+{ "type": "modal_park_timeout", "session_id": "string", "actionable": true, "queued_dropped": "number", "waited_ms": "number", "tracking": [ { "op_id": "UUID", "inject_id": "UUID|null", "outcome": "tracking_aborted|tracking_outcome_indeterminate|tracking_persistence_failed|tracking_unavailable|no_tracked_inject" } ], "hint": "string", "bootstrap": { "...": "..." }, "timestamp": "ISO 8601" }
+```
+- Emitted once per flush, **after every dropped op's terminal attempt has settled**; `tracking` lists
+  the outcome per op with the same vocabulary. The awaitable form `awaitModalParkDrain()` still
+  resolves `{ cleared, waited_ms, flushed }` with `flushed` a **number** (ops flushed), unchanged.
+- A consumer must not read any of these notifications as "delivered" or, unless `tracking` says
+  `tracking_aborted`, as "durably aborted". Poll the record for its committed state.
+
 ### `message_routed`
 ```json
 { "type": "message_routed", "message_id": "UUID", "from": "string", "to": "string", "reply_to": "string", "inject_id": "UUID", "deliberation_session_id": "string|null", "thread_id": "string|null", "timestamp": "ISO 8601" }
@@ -385,3 +426,42 @@ No new interaction bus event is emitted in this slice. Stages `prepared`, `dispa
 prompt transition, task consumption or semantic completion. Request bodies, authority
 references and retained task payloads stay in the private ledger. See
 [agent-cli-interaction.md](docs/agent-cli-interaction.md).
+
+## `session_sustained_idle_observation` (#37, additive)
+
+This observation supplements the unchanged legacy `session.idle` inactivity event.
+It uses the existing daemon `type`/`event_type` envelope and additionally supplies
+canonical `kind`, `version`, `message_id`, `source`, `source_host`, `target:null`, and
+`ts`. Its `observation.identity` binds machine, exact session ID, session epoch and
+owner generation. `completion_fact` is always null and `terminal` always false.
+
+`observation.classification` is one of:
+
+- `composer_ready`: fresh, current-owner qualified composer evidence; task completion remains unknown.
+- `awaiting_input`: a fresh known Codex/Claude modal matched in the bounded output text tail.
+- `transport_unavailable`: an owner socket is not open, a fresh authenticated heartbeat reports a destroyed read stream, an exit callback was observed, or Linux reports the recorded PID stopped/zombie/dead. PID observations do not establish process-start identity.
+- `unknown`: quiet output, stale/unqualified readiness, or an activity state that supplies insufficient evidence.
+
+The event never emits `free`, `stalled`, `hung`, or a completion verdict. An unchanged
+hash does not supply those missing facts. `output_tail_hash` hashes at most 16 KiB
+of UTF-8 output-ring text, explicitly **not a rendered terminal screen**; no prompt,
+screen body, command, environment, or credential is included. No cleanup, input,
+restart, dispatch, or repair action follows from this observation.
+
+Daemon environment options (validated integers, milliseconds):
+
+| Setting | Default | Bounds |
+|---|---:|---:|
+| `TELEPTY_SUSTAINED_IDLE_THRESHOLD_MS` | 60000 | 100–86400000 |
+| `TELEPTY_SUSTAINED_IDLE_DEBOUNCE_MS` | 3000 | 0–60000 |
+| `TELEPTY_SUSTAINED_IDLE_FRESHNESS_MS` | 300000 | 100–86400000 |
+| `TELEPTY_SUSTAINED_IDLE_MAX_PER_SWEEP` | 64 | 1–256 |
+
+Set `TELEPTY_SUSTAINED_IDLE=off` to disable the new observation. Sampling runs on
+the existing health-sweep cadence, so detection includes that cadence's delay.
+Classification must remain stable for the debounce window. At most one event is
+emitted per quiet episode; fresh output, input-generation changes, or a new
+working/thinking transition rearm it. Ready-frame/activity timestamps alone do
+not rearm it. Session/owner replacement starts a new scoped observation episode.
+Each sweep performs at most the configured number of classifications; later
+sessions are evaluated on subsequent sweeps after earlier episodes emit.

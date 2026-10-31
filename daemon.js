@@ -14,6 +14,8 @@ const { createAuthMiddleware, createIsAllowedPeer, createOriginGuard, createVeri
 const { detectTailnet, TAILNET_CIDR } = require('./src/net/tailnet');
 const { FileMailbox } = require('./src/mailbox/index');
 const { DeliveryEngine } = require('./src/mailbox/delivery');
+const { isSafeRegisteredSessionId } = require('./src/session-id');
+const { findKittySocket, findKittyWindowId } = require('./src/kitty-control');
 const { UnixSocketNotifier } = require('./src/mailbox/notifier');
 const { SessionStateManager, STATE_DISPLAY, OBSERVATION_DISPLAY, mapObservationCause, stripAnsi: stripAnsiState } = require('./session-state');
 // #60 Stage A: `classifyReportPrompt` is GONE. 0.8.0 parses no text as a terminal report — the
@@ -33,13 +35,15 @@ const { loadTeleptyConfig } = require('./src/config-file');
 const sessionPersistence = require('./src/session-store/persistence');
 const interaction = require('./src/interaction');
 const { createCredentialStore } = require('./src/session-store/session-credentials');
-const { createAuditWriter, readInjectLog } = require('./src/audit/inject-log');
+const { createAuditWriter } = require('./src/audit/inject-log');
+const { createAuditReader, registerAuditQueryRoute } = require('./src/audit/query-reader');
 const { applyProvenance } = require('./src/audit/provenance');
 const { registerSpawnRoute, buildSessionEnv } = require('./src/routes/spawn');
 const { createSessionRecordContext, registerSessionRegisterRoute, registerSessionRenameRoute } = require('./src/routes/session-records');
 const { registerHandoffRoutes, registerThreadRoutes } = require('./src/routes/coordination');
 const { createHttpApp, registerHealthAndAuth } = require('./src/protocol/http-app');
 const { registerMailboxRoutes } = require('./src/routes/mailbox');
+const { registerSharedReferenceRoutes } = require('./src/routes/shared-reference');
 const { registerFanoutRoutes } = require('./src/routes/fanout');
 const { createSessionDeliveryContext } = require('./src/mailbox/session-delivery');
 const {
@@ -83,7 +87,6 @@ const sessionActions = createSessionActions({
   get cancelModalParkPoll() { return cancelModalParkPoll; },
   get classifyConsumption() { return classifyConsumption; },
   get classifyPeerLaneInject() { return classifyPeerLaneInject; },
-  get commitTrackedInjections() { return commitTrackedInjections; },
   get completionObservation() { return completionObservation; },
   get confirmSubmitAfterDispatch() { return confirmSubmitAfterDispatch; },
   get crypto() { return crypto; },
@@ -104,6 +107,8 @@ const sessionActions = createSessionActions({
   get isBootstrapReady() { return isBootstrapReady; },
   get isOpenWebSocket() { return isOpenWebSocket; },
   get isSurfaceBlockedByModal() { return isSurfaceBlockedByModal; },
+  get ledgerClient() { return ledgerClient; },             // #1207 — the one storage owner's client
+  get ledgerUnavailable() { return ledgerUnavailable; },   // #1207 — guard: unavailable authorizes nothing
   get lifecycle() { return lifecycle; },
   get mailbox() { return mailbox; },
   get mapObservationCause() { return mapObservationCause; },
@@ -142,6 +147,7 @@ const {
   observationIdentity,
   markAbsenceDeliveredToSource,
   recordObservation,
+  recordSessionFact,
   pendingReportHasSubmitEvidence,
   maybeRecordInjectConsumption,
   maybeRecordLauncherConsumption,
@@ -166,7 +172,7 @@ const deliveryRuntime = createDeliveryRuntime({
   get auditWriter() { return auditWriter; },
   get sessionCredentials() { return sessionCredentials; },
   get sessionPersistence() { return sessionPersistence; },
-  get trackedInjections() { return trackedInjections; },
+  get ledgerClient() { return ledgerClient; },          // #1207 — replaces the in-memory mirror
   get TRACKED_INJECTIONS_PATH() { return TRACKED_INJECTIONS_PATH; },
   get interactionCore() { return interactionCore; },
   get pendingReports() { return pendingReports; },
@@ -203,7 +209,6 @@ const deliveryRuntime = createDeliveryRuntime({
   get trackedLedgerHealthy() { return trackedLedgerHealthy; },
   get trackedLedgerUnavailableReason() { return trackedLedgerUnavailableReason; },
   get CAPABILITY_STAGE_A() { return CAPABILITY_STAGE_A; },
-  set trackedInjections(value) { trackedInjections = value; },
   set trackedLedgerHealthy(value) { trackedLedgerHealthy = value; },
   set trackedLedgerUnavailableReason(value) { trackedLedgerUnavailableReason = value; },
 });
@@ -211,16 +216,18 @@ const {
   auditAppend,
   verifiedPrincipalFromReq,
   verifiedSenderFields,
-  commitTrackedInjections,
+  ledgerUnavailable,
   interactionBinding,
   hasHeldInteraction,
   dispatchInteraction,
   restoreTrackedInjections,
   getTrackedInjection,
+  fetchTrackedInjection,
   sessionAuthenticationCapability,
   beginTrackedInjection,
   abortTrackedInjection,
   parkTrackedInjection,
+  recordBridgeReceipt,
   deliveryAuditResult,
   getPendingReport,
   markPendingReportSubmitStarted,
@@ -326,6 +333,17 @@ if (!ENV_AUTH_TOKEN) {
 }
 const EXPECTED_TOKEN = ENV_AUTH_TOKEN || config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
+// Task 1215 W3B: identifies THIS daemon process for a bound graceful stop (exposed only through the
+// authenticated /api/meta). An identity, not a credential: the stop also requires the local admin token.
+const DAEMON_INSTANCE_ID = require('./src/daemon-shutdown').newInstanceId();
+const principalAuthentication = require('./src/principal/http').createPrincipalAuthenticationFromEnvironment({ machineId: MACHINE_ID, sessions: () => sessions });
+// Task 1215 combined mode: ordinary transport auth plus a separately configured operator verifier for
+// user-supervised registrations. Configured-but-invalid trust (or a strict-mode conflict) throws here,
+// so the daemon does not start without the verification it was told to perform.
+const supervisionAuthentication = require('./src/principal/http').createSupervisionAuthenticationFromEnvironment({ machineId: MACHINE_ID, sessions: () => sessions });
+// Neither supervision variable may reach a spawned session (src/routes/spawn.js copies process.env).
+delete process.env.TELEPTY_SUPERVISION_TRUST_FILE;
+delete process.env.TELEPTY_SUPERVISION_CLIENT_FILE;
 const net = require('net');
 const fs = require('fs');
 const SESSION_PERSIST_PATH = sessionPersistence.defaultSessionPersistPath();
@@ -404,6 +422,10 @@ function loadPersistedSessions() {
 }
 
 const app = createHttpApp({ express, cors });
+const { createEventLoopTelemetry, slowRequestObserver } = require('./src/diagnostics/event-loop');
+const eventLoopTelemetry = createEventLoopTelemetry();
+app.use(slowRequestObserver());
+if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') eventLoopTelemetry.start();
 
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
 const PEER_ALLOWLIST = (process.env.TELEPTY_PEER_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -443,6 +465,7 @@ const FANOUT_MAX_TARGETS = Math.max(1, Number(process.env.TELEPTY_FANOUT_MAX_TAR
 // env-overridable. The writer is off the delivery hot path: auditAppend() never blocks or
 // throws into a handler. P1 records claimed_from only (verified_sender_sid wired in P2).
 const AUDIT_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'injects.jsonl');
+const auditReader = createAuditReader({ path: AUDIT_LOG_PATH });
 const auditWriter = createAuditWriter({
   path: AUDIT_LOG_PATH,
   preview: process.env.TELEPTY_AUDIT_PREVIEW === '1',
@@ -513,7 +536,9 @@ const isAllowedPeer = createIsAllowedPeer(effectivePeerAllowlist);
 // entrances a browser can reach.
 const isForbiddenOrigin = createOriginGuard(ALLOWED_ORIGINS);
 
-registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin });
+registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin, principalAuthentication,
+  supervisionAuthentication,   // Task 1215 combined mode (HTTP only; WebSocket transport unchanged)
+  authorizeSessionRequest: req => require('./src/mailbox/poll-session').authorizeMailboxRequest(req, sessions, sessionCredentials) });
 
 const { resolveBindPort } = require('./src/bind-port');
 const PORT = resolveBindPort(process.env);
@@ -667,13 +692,36 @@ const LAUNCHER_CONSUMPTION_MIN_SECONDS = Number(process.env.TELEPTY_LAUNCHER_CON
 
 const TRACKED_INJECTIONS_PATH = process.env.TELEPTY_TRACKED_INJECTIONS_PATH
   || sessionPersistence.defaultTrackedInjectionsPath();
+const TRACKED_INJECTIONS_LOCK_PATH = sessionPersistence.defaultTrackedInjectionsLockPath(TRACKED_INJECTIONS_PATH);
 
-// In-memory mirror of the durable ledger. `trackedLedgerHealthy` is false when the store could
-// not be read: the endpoint then answers `tracking_state:"unavailable"` with a named reason
-// instead of pretending nothing was ever tracked.
-let trackedInjections = sessionPersistence.emptyTrackedInjections();
-let trackedLedgerHealthy = true;
-let trackedLedgerUnavailableReason = null;
+// #1207 — the ledger is a DIRECTORY STORE at the legacy path, owned by one long-lived worker
+// thread; this process holds a committed-only read model and submits small durable deltas. The
+// in-memory mirror is gone. `trackedLedgerHealthy` is false until the owner's open succeeds and
+// whenever the store is unreadable: the endpoint then answers `tracking_state:"unavailable"` with a
+// NAMED reason instead of pretending nothing was ever tracked.
+//
+// The O_EXCL lock is taken on the main thread here, immediately after the daemon singleton claim
+// above (errata C1). EEXIST fails closed: the store stays `unavailable: lock_present`, the lock
+// file is untouched, the control plane stays up, and `telepty ledger unlock --confirm` is the
+// operator's recovery. No automatic stale-lock breaking exists.
+const { createLedgerClient } = require('./src/session-store/ledger-client');
+const ledgerClient = createLedgerClient({
+  dir: TRACKED_INJECTIONS_PATH,
+  lockPath: TRACKED_INJECTIONS_LOCK_PATH,
+  legacyPath: TRACKED_INJECTIONS_PATH,
+  // The listener keeps a real daemon alive; a test that merely `require`s this file for its pure
+  // seams must still be able to exit, so the worker does not pin the event loop by itself.
+  unrefWorker: true,
+});
+let trackedLedgerHealthy = false;
+let trackedLedgerUnavailableReason = 'not_opened';
+{
+  const acquired = ledgerClient.acquireLock();
+  if (!acquired.held) {
+    trackedLedgerUnavailableReason = acquired.reason === 'lock_present' ? 'lock_present' : 'observation_store_unavailable';
+    console.warn(`[LEDGER] ${acquired.reason} at ${TRACKED_INJECTIONS_LOCK_PATH}${acquired.contents ? ` (${JSON.stringify(acquired.contents)})` : ''} — tracked-injection store unavailable; control plane continues; recover with: telepty ledger unlock --confirm`);
+  }
+}
 
 
 
@@ -710,9 +758,34 @@ app.get('/api/sessions/:id/interaction', requireInteractionController, (req, res
   const s = sessions[req.params.id];
   if (!s) return res.status(404).json(interaction.refusal('wrong_owner'));
   res.json({ ...readyRegistry.observeInteraction(s), identity: interactionBinding(req.params.id),
-    protocol_version: 1, live_adapter: false, task_binding_available: false,
-    retained_pending: Object.values(trackedInjections.interactions?.pending || {})
-      .filter(p => p.sid === req.params.id).map(p => ({ inject_id: p.inject_id, payload_digest: p.payload_digest, state: p.state })) });
+    protocol_version: 1, live_adapter: !!s.interactionProvider, task_binding_available: false,
+    retained_pending: ledgerClient.readModel.retainedPending(req.params.id)   // #1207 — committed-only read model
+      .map(p => ({ inject_id: p.inject_id, payload_digest: p.payload_digest, state: p.state })) });
+});
+
+// #1207 — ledger status and downgrade export, behind the SAME host-token guard as the interaction
+// routes (an opt-in controller surface, never the general middleware alone). The export writes
+// only to a path under this daemon's HOME; no arbitrary remote write target is accepted.
+app.get('/api/ledger/status', requireInteractionController, async (req, res) => {
+  const txn = typeof req.query.txn === 'string' && req.query.txn.length <= 128 ? req.query.txn : null;
+  const status = ledgerClient.status();
+  let owner = null;
+  try { owner = ledgerClient.isHealthy() ? await ledgerClient.ownerStatus() : null; } catch { owner = null; }
+  let resolved = null;
+  if (txn && ledgerClient.isHealthy()) { try { resolved = (await ledgerClient.resolve([txn]))[0] || null; } catch { resolved = null; } }
+  res.json({ schema_version: 1, healthy: trackedLedgerHealthy, unavailable_reason: trackedLedgerUnavailableReason, client: status, owner, txn: resolved });
+});
+app.post('/api/ledger/export', requireInteractionController, async (req, res) => {
+  const out = req.body && typeof req.body.out === 'string' ? req.body.out : null;
+  const exportsRoot = path.join(os.homedir(), '.config', 'aigentry-telepty', 'exports');
+  const resolvedOut = out && path.isAbsolute(out) ? path.resolve(out) : (out && !out.includes('..') && !out.includes('/') && !out.includes('\\') ? path.join(exportsRoot, out) : null);
+  if (!resolvedOut || !resolvedOut.startsWith(exportsRoot + path.sep) || !/^[A-Za-z0-9._-]{1,128}$/.test(path.basename(resolvedOut))) {
+    return res.status(400).json({ success: false, code: 'EXPORT_PATH_REFUSED', error: `out must name a file under ${exportsRoot}`, exports_root: exportsRoot });
+  }
+  if (!ledgerClient.isHealthy()) return res.status(503).json({ success: false, code: 'LEDGER_UNAVAILABLE', reason: trackedLedgerUnavailableReason });
+  try { fs.mkdirSync(exportsRoot, { recursive: true, mode: 0o700 }); } catch { /* reported by the export result */ }
+  const result = await ledgerClient.exportV3(resolvedOut);
+  res.status(result.ok ? 200 : 500).json({ success: result.ok === true, ...result });
 });
 app.get('/api/sessions/:id/interaction/receipts/:action', requireInteractionController, (req, res) => {
   const receipt = interactionCore.lookup(req.params.action);
@@ -744,11 +817,12 @@ app.post('/api/sessions/:id/interaction', requireInteractionController, async (r
  * is exactly the kind of fact their reader still needs. Ordered by creation so the caller emits
  * oldest-first.
  */
-function listTrackedInjectionsForSession(sessionId) {
+async function listTrackedInjectionsForSession(sessionId) {
   if (typeof sessionId !== 'string' || !sessionId) return [];
-  return Object.values(trackedInjections.injections)
-    .filter((record) => record && record.session_id === sessionId)
-    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  // #1207 — hot AND cold records, answered by the owner in ≤ 64 KiB chunks; already sorted by
+  // creation. Minimal fields only (inject_id, session_id, transport_source, tracking_state, …).
+  if (!trackedLedgerHealthy) return [];
+  try { return await ledgerClient.listForSession(sessionId); } catch { return []; }
 }
 
 /**
@@ -1034,15 +1108,16 @@ const deliveredAbsenceIdentities = new WeakMap();
 // `deps` remains the DI seam (clock, setTimeout, bus, deliver, live state, CPU sampler).
 // Returns a NAMED result on every path — never undefined, never a bare return.
 
-const sessions = {};
+// PR #108 N5 / P4: null-prototype registries — a persisted or requested `__proto__` key is data here.
+const sessions = Object.create(null);
 const busClients = new Set();
 const sessionRecordContext = createSessionRecordContext({
   sessions, sessionCredentials, sidNonces, sessionPersistPath: SESSION_PERSIST_PATH
 });
 const { persistSessions, issueSessionCredential, revokeSessionCredential,
   resolveSessionAlias, resolveSessionForDestroy } = sessionRecordContext;
-const handoffs = {};
-const threads = {};
+const handoffs = Object.create(null);
+const threads = Object.create(null);
 let teleptyConfig;
 try {
   teleptyConfig = loadTeleptyConfig();
@@ -1058,6 +1133,7 @@ try {
   // condition the daemon must not boot through.
   if (!ENV_AUTH_TOKEN) {
     console.error(`[CONFIG] Failed to load telepty config: ${err.message}`);
+    ledgerClient.releaseLock();   // #1207 — taken above; no owner open yet. Else the next daemon is lock_present.
     process.exit(1);
   }
   console.error(`[CONFIG] ${err.message}`);
@@ -1230,6 +1306,7 @@ const sessionDeliveryContext = createSessionDeliveryContext({
   emitInjectFailureEvent,
   sessions,
   broadcastSessionEvent,
+  persistSessions,
   getMailbox: () => mailbox,
   getMailboxNotifier: () => mailboxNotifier,
   getMailboxDelivery: () => mailboxDelivery,
@@ -1449,6 +1526,7 @@ const MODAL_PARK_POLL_MS = 500;
 
 
 function appendToOutputRing(session, data) {
+  require('./src/transport/observer').publishSessionOutput(session, data);
   if (!session.outputRing) session.outputRing = [];
   // #716: track bracketed-paste capability from the CLI's own mode-set output so
   // injects are wrapped (maybeBracketedPaste) only for paste-capable composers —
@@ -1459,12 +1537,14 @@ function appendToOutputRing(session, data) {
   // #52: monotonic byte counter — the inject-time watermark that scopes echo-evidence
   // matching to frames appended AFTER the inject (survives ring trimming below).
   session.outputRingTotalBytes = (session.outputRingTotalBytes || 0) + data.length;
+  if (data.length > 0) session.lastActualOutputAt = new Date().toISOString();
   session.outputRing.push(data);
   // Keep total data under ~200KB limit by trimming old entries
   let totalLen = session.outputRing.reduce((sum, d) => sum + d.length, 0);
   while (totalLen > 200000 && session.outputRing.length > 1) {
     totalLen -= session.outputRing[0].length;
     session.outputRing.shift();
+    session.outputRingRollover = (session.outputRingRollover || 0) + 1;
   }
 }
 
@@ -1501,14 +1581,34 @@ console.log(`[DAEMON] Terminal backend: ${DETECTED_TERMINAL}`);
 // #60 Stage A: restore the observation ledger BEFORE HTTP/WS readiness, so the first poll after
 // a restart is answered from durable state rather than from an empty map. A restored record
 // gains `daemon_restart_observed` and stays completion-unknown; it can never settle a dispatch.
-restoreTrackedInjections();
+//
+// #1207 — the restore is the owner's open (lock re-check, offline migration of a legacy file if
+// one is at the path, segment recovery, chunked snapshot) and runs OFF the main thread: the daemon
+// listens while the store is `recovering`; polls answer `unavailable: recovering` and begins are
+// refused 503 until `available`. `ledgerReady` settles either way and never rejects.
+const ledgerReady = ledgerClient.state === 'lock_present'
+  ? Promise.resolve({ ok: false, reason: 'lock_present' })
+  : restoreTrackedInjections().catch((error) => {
+    trackedLedgerHealthy = false;
+    trackedLedgerUnavailableReason = 'observation_store_unavailable';
+    console.error(`[LEDGER] open threw: ${error && error.message}`);
+    return { ok: false, reason: 'open_threw' };
+  });
 
 // Restore persisted session metadata (wrapped sessions await reconnect)
 const _persisted = loadPersistedSessions();
 for (const [id, meta] of Object.entries(_persisted)) {
+  // PR #108 review row 5 (P4): sessions.json is a user-owned file, but an id no producer may
+  // register (prototype names, path separators, dots only, controls) is never restored into the
+  // registry, the credential index or the ledger hint. Skipped with a log line, not repaired.
+  if (!isSafeRegisteredSessionId(id)) {
+    console.warn('[RESTORE] Skipping persisted session with an unsafe id:', JSON.stringify(id));
+    continue;
+  }
   const restored = sessionPersistence.buildRestoredWrappedSession(id, meta, { cwd: process.cwd() });
   if (!restored) continue;
   sessions[id] = restored;
+  ledgerClient.live(id, true);   // #1207 resident-tier hint (correctness never depends on it)
   // #815: re-index the persisted VERIFIER so the bearer the wrapped child already carries in its
   // spawn-time environment keeps verifying across this restart, with nothing reissued. Without
   // this, every restored session silently becomes an unauthenticated sender — the child's env
@@ -1528,10 +1628,12 @@ for (const [id, meta] of Object.entries(_persisted)) {
 
 registerSpawnRoute(app, {
   sessions, sessionStateManager, pty, persistSessions, appendToOutputRing,
-  revokeSessionCredential, busClients, os, buildSessionEnv
+  revokeSessionCredential, busClients, os, buildSessionEnv,
+  ledgerLive: (sid, on) => ledgerClient.live(sid, on)   // #1207
 });
 
-registerSessionRegisterRoute(app, { context: sessionRecordContext, sessionStateManager, busClients });
+registerSessionRegisterRoute(app, { context: sessionRecordContext, sessionStateManager, busClients, getMailbox: () => mailbox });
+require('./src/routes/external-approval').registerExternalApprovalRoutes(app, { sessions });
 
 sessionInspection.registerListRoute(app);
 
@@ -1543,22 +1645,10 @@ sessionInspection.registerListRoute(app);
 // to (alias-resolved), from (claimed OR verified), spoof; pagination via limit/cursor (newest
 // first). Reads the live injects.jsonl (one write path, file-backed) — separate lifecycle from
 // the ephemeral /api/events live bus, so the two are not conflated.
-app.get('/api/injects', (req, res) => {
-  const q = req.query || {};
-  const to = q.to ? (resolveSessionAlias(q.to) || q.to) : undefined;
-  const result = readInjectLog(AUDIT_LOG_PATH, {
-    since: q.since,
-    until: q.until,
-    to,
-    from: q.from,
-    spoof: q.spoof === '1' || q.spoof === 'true',
-    limit: q.limit,
-    cursor: q.cursor
-  });
-  res.json(result);
-});
+registerAuditQueryRoute(app, { reader: auditReader, resolveSessionAlias });
 
 sessionInspection.registerGetRoute(app);
+require('./src/readiness').registerReadinessRoute(app, { sessions, machineId: MACHINE_ID });
 
 // Auto-detected session state (from PTY output pattern analysis)
 app.get('/api/sessions/:id/state', (req, res) => {
@@ -1606,22 +1696,59 @@ app.get('/api/sessions/:id/state', (req, res) => {
 // Self-reported session state (explicit POST from session)
 sessionActions.registerStateRoute(app);
 
+const { createSessionDiagnostics, createDiagnosticsHandler } = require('./src/diagnostics/session');
+app.get('/api/sessions/:id/diagnostics', createDiagnosticsHandler({
+  sessions, machineId: MACHINE_ID, inspect: createSessionDiagnostics(), eventLoop: () => eventLoopTelemetry.snapshot(),
+  // #1207 — the authoritative ledger read (hot or cold, lazy facts overlaid), not the hot-only read
+  // model: a cold inject is still correlated. Only a true miss is "not observed" (404); every other
+  // reason (recovering, cold_offline, an unreadable store, a failed read) is 503, never a false 404.
+  readTracked: async (injectId) => {
+    const fetched = await fetchTrackedInjection(injectId);
+    if (fetched.record) return fetched.record;
+    if (fetched.reason === 'not_observed_by_daemon_epoch' || fetched.reason === 'invalid_id') return null;
+    throw Object.assign(new Error('tracked-injection read unavailable'), { status: 503, code: 'CORRELATION_UNAVAILABLE' });
+  },
+  ledgerAvailable: () => trackedLedgerHealthy
+}));
+
 app.get('/api/meta', (req, res) => {
   res.json({
     name: pkg.name,
     version: pkg.version,
     pid: process.pid,
+    instance_id: DAEMON_INSTANCE_ID,
     host: HOST,
     port: boundPort,
     machine_id: MACHINE_ID,
+    event_loop: eventLoopTelemetry.snapshot(),
     terminal: DETECTED_TERMINAL,
-    capabilities: ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox']
+    // #137: bridge-stage-receipts-v1 = this daemon accepts owner-bound bridge_receipt/bridge_queue
+    // frames and threads inject ids to the bridge. It says nothing about any one bridge's support.
+    capabilities: ['ssh-child-write-receipts-v1', 'bridge-stage-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session', 'daemon-graceful-stop-v1']
   });
 });
 
+// Task 1215 W3B: authenticated LOCAL graceful stop (Windows has no signal that runs shutdown()). Behind the
+// existing auth middleware AND its own checks in src/daemon-shutdown.js: loopback socket peer, no Origin,
+// x-telepty-token header (timing-safe), exact bounded {pid, instance_id} body for THIS process. Accepted ⇒
+// the same idempotent shutdown() the SIGINT/SIGTERM handlers call, only when running as the daemon main.
+{
+  const { STOP_PATH, createGracefulStopHandler } = require('./src/daemon-shutdown');
+  app.post(STOP_PATH, createGracefulStopHandler({ expectedToken: EXPECTED_TOKEN, pid: process.pid, instanceId: DAEMON_INSTANCE_ID,
+    isDaemonMain: require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1', shutdown: (code) => shutdown(code) }));
+}
+
 // --- Mailbox API endpoints ---
 
-registerMailboxRoutes(app, { sessions, resolveSessionAlias, getMailbox: () => mailbox });
+registerMailboxRoutes(app, { sessions, resolveSessionAlias, getMailbox: () => mailbox, sessionCredentials, persistSessions });
+const cooperativeHandoff = require('./src/principal/cooperative-handoff').registerCooperativeHandoff(app,{context:sessionRecordContext,getMailbox:()=>mailbox,
+  hasUnsettled:(id,s)=>!!pendingReports[id] || !!s.pendingSubmit || !!s.bootstrapDraining || hasBootstrapBacklog(s) || hasHeldInteraction(s)
+    // #1207 — the committed interaction view of the ledger owner replaces the removed in-memory
+    // mirror. While the store is not healthy that view is empty, which proves nothing: fail closed.
+    || !trackedLedgerHealthy
+    || Object.values(ledgerClient.readModel.interactionsView().actions).some(r=>r.sid===id && ['dispatched','outcome_unknown'].includes(r.stage))});
+require('./src/principal/takeover').registerMailboxTakeoverRoute(app, { context: sessionRecordContext, getMailbox: () => mailbox, broadcastSessionEvent });
+registerSharedReferenceRoutes(app);
 
 // Peer management endpoint (for cross-machine module)
 app.get('/api/peers', (req, res) => {
@@ -1629,7 +1756,7 @@ app.get('/api/peers', (req, res) => {
     const crossMachine = require('./cross-machine');
     res.json({
       active: crossMachine.listActivePeers(),
-      known: crossMachine.listKnownPeers()
+      known: crossMachine.listPublicKnownPeers()
     });
   } catch {
     res.json({ active: [], known: {} });
@@ -1666,35 +1793,7 @@ const SUBMIT_STRATEGIES = {
 
 
 
-// Send text directly to Kitty tab via remote control (bypasses allow bridge entirely)
-function findKittySocket() {
-  try {
-    const files = require('fs').readdirSync('/tmp').filter(f => f.startsWith('kitty-sock'));
-    return files.length > 0 ? '/tmp/' + files[0] : null;
-  } catch { return null; }
-}
-
-function findKittyWindowId(socket, sessionId) {
-  const { execSync } = require('child_process');
-  try {
-    const raw = execSync(`kitty @ --to unix:${socket} ls`, { timeout: 3000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-    const data = JSON.parse(raw);
-    for (const osw of data) {
-      for (const tab of osw.tabs) {
-        for (const w of tab.windows) {
-          // Only check process cmdlines for --id SESSION_ID pattern (not output text)
-          for (const p of (w.foreground_processes || [])) {
-            const cmd = (p.cmdline || []).join(' ');
-            if (cmd.includes('--id ' + sessionId) || cmd.includes('--id=' + sessionId)) {
-              return w.id;
-            }
-          }
-        }
-      }
-    }
-  } catch {}
-  return null;
-}
+// Kitty remote control lives in src/kitty-control.js (PR #108 C3: argv, owned socket, no shell).
 
 
 
@@ -1734,6 +1833,10 @@ sessionActions.registerSubmitRoute(app);
 // POST /api/sessions/submit-all — Submit all active sessions
 sessionInspection.registerSubmitAllRoute(app);
 
+require('./src/peer-forwarding').registerPeerForwardRoutes(app, {
+  sessions, loadPeers: () => require('./cross-machine').loadPeers()
+});
+sessionActions.registerInjectRoute(app, '/api/forwarded/sessions/:id/inject');
 sessionActions.registerInjectRoute(app);
 
 // #826 — the OTHER write path, kept next to the route above because they are twins and were
@@ -1756,44 +1859,13 @@ sessionActions.registerInjectRoute(app);
 // boundary), while `verified_sender_*` comes from the #815 bearer presented on the handshake and
 // never from the frame — the same split as `body.from` vs `x-telepty-session-token`.
 //
-// Returns whether the frame may be forwarded. Records the attempt either way.
-function authorizeViewerInject({ sessionId, session, data, claimedFrom, principal }) {
-  const inject_id = crypto.randomUUID();
-  const payload = typeof data === 'string' ? data : '';
-  const verdict = classifyPeerLaneInject({
-    from: claimedFrom, to: sessionId, prompt: payload, orchestratorSids: ORCHESTRATOR_SIDS
-  });
-  const blocked = verdict.decision === 'block';
-
-  if (blocked) {
-    broadcastSessionEvent('peer_inject_blocked', sessionId, session, {
-      extra: {
-        target_agent: sessionId,
-        from: claimedFrom || null,
-        reason: verdict.reason,
-        attempted_kind: verdict.kind,
-        envelope_present: verdict.envelopePresent,
-        inject_id
-      }
-    });
-    console.warn(`[PEER-GUARD] blocked ws-viewer inject ${claimedFrom} → ${sessionId} (${verdict.reason})`);
-  }
-
-  auditAppend({
-    ts: new Date().toISOString(), inject_id, kind: 'inject', source: 'ws-viewer',
-    claimed_from: claimedFrom || null, ...verifiedSenderFields(principal),
-    to: sessionId, to_alias: null,
-    origin: 'trusted-local', origin_host: MACHINE_ID, ref_path: null,
-    payload,
-    // `forwarded`, not `success`. The HTTP route's `success` means its delivery machinery
-    // reported success; all this path can measure is that the frame was written to the owner
-    // socket. Two different measurements must not wear the same word — that substitution is the
-    // defect class this release exists to remove.
-    delivery_result: blocked ? `blocked:${verdict.reason}` : 'forwarded'
-  });
-
-  return !blocked;
-}
+// Records admission before the attempt, and returns a completion hook so transport
+// dispatch is recorded only after its callback (or native write return).
+const authorizeViewerInject = require('./src/audit/viewer-input').createViewerInputAuthorization({
+  classify: classifyPeerLaneInject, audit: auditAppend, broadcast: broadcastSessionEvent,
+  verifiedSenderFields, machineId: MACHINE_ID, orchestratorSids: ORCHESTRATOR_SIDS,
+  randomUUID: () => crypto.randomUUID()
+});
 
 // GET /api/inject-observations/:inject_id — #60 Stage A, the orchestrator's poll target.
 //
@@ -1812,7 +1884,7 @@ function authorizeViewerInject({ sessionId, session, data, claimedFrom, principa
 //     NOT "this endpoint is absent" and NOT "nothing is tracked" — a consumer that folds it into
 //     an absence reason is making exactly the overclaim this release removes. Send the daemon
 //     token (`x-telepty-token`).
-app.get('/api/inject-observations/:inject_id', (req, res) => {
+app.get('/api/inject-observations/:inject_id', async (req, res) => {
   const injectId = req.params.inject_id;
 
   const unavailable = (reason, extra = {}) => res.status(200).json({
@@ -1829,14 +1901,19 @@ app.get('/api/inject-observations/:inject_id', (req, res) => {
     ...extra,
   });
 
+  // #1207 — `recovering` (owner still opening/migrating), `lock_present`, `unavailable_read` and a
+  // write-side outage are all NAMED here; the daemon keeps listening throughout.
   if (!trackedLedgerHealthy) {
-    return unavailable(trackedLedgerUnavailableReason || 'observation_store_unavailable');
+    return unavailable(trackedLedgerUnavailableReason || (ledgerClient.state === 'recovering' ? 'recovering' : 'observation_store_unavailable'));
   }
-  const record = getTrackedInjection(injectId);
+  // Hot (committed-only read model) or cold (owner, via index) with the lazy-fact overlay applied in
+  // log order — identical to what the per-record append used to produce. Reads never reheat.
+  const fetched = await fetchTrackedInjection(injectId);
+  const record = fetched.record;
   if (!record) {
-    // Either it was never tracked here, or it predates this daemon's schema-v2 store. Both are
-    // "this daemon epoch did not observe it" — explicitly, not by omission.
-    return unavailable('not_observed_by_daemon_epoch');
+    // Either it was never tracked here, or it predates this daemon's schema-v2 store, or its cold
+    // file is beyond the resident index cap (`cold_offline`). All explicit, never by omission.
+    return unavailable(fetched.reason || 'not_observed_by_daemon_epoch');
   }
 
   // #843 — the consumption block must be measured FOR THE INJECT BEING POLLED. This read
@@ -1946,39 +2023,9 @@ app.delete('/api/pendingReports/:id', (req, res) => {
 });
 
 // GET /api/sessions/:id/screen — read current screen buffer
-app.get('/api/sessions/:id/screen', (req, res) => {
-  const requestedId = req.params.id;
-  const resolvedId = resolveSessionAlias(requestedId);
-  if (!resolvedId) return res.status(404).json({ error: 'Session not found', requested: requestedId });
-  const session = sessions[resolvedId];
+app.get('/api/sessions/:id/screen', require('./src/routes/session-screen').createScreenHandler({ sessions, resolveSessionAlias }));
 
-  const lines = parseInt(req.query.lines) || 50;
-  const raw = req.query.raw === '1' || req.query.raw === 'true';
-
-  if (!session.outputRing || session.outputRing.length === 0) {
-    return res.json({ session_id: resolvedId, screen: '', lines: 0, raw: false });
-  }
-
-  // Join all buffered output
-  const fullOutput = session.outputRing.join('');
-
-  const cleaned = raw ? fullOutput : stripAnsiForScreen(fullOutput);
-
-  // Take last N lines
-  const allLines = cleaned.split('\n');
-  const lastLines = allLines.slice(-lines);
-  const screen = lastLines.join('\n').trim();
-
-  res.json({
-    session_id: resolvedId,
-    screen,
-    lines: lastLines.length,
-    total_lines: allLines.length,
-    raw: !!raw
-  });
-});
-
-registerSessionRenameRoute(app, { context: sessionRecordContext, sessionStateManager, busClients });
+registerSessionRenameRoute(app, { context: sessionRecordContext, sessionStateManager, busClients,getMailbox:()=>mailbox });
 
 sessionActions.registerKillRoute(app);
 
@@ -2001,6 +2048,7 @@ sessionActions.registerDeleteRoute(app);
 // Shared auto-router: handles turn_request events from any source (WS or HTTP)
 
 sessionActions.registerBusPublishRoute(app);
+require('./src/routes/application-events').registerApplicationEventRoute(app,{sessions});
 
 registerHandoffRoutes(app, { handoffs, crypto, busClients });
 
@@ -2122,6 +2170,8 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
 }
 
 const IDLE_THRESHOLD_SECONDS = 60;
+const { BUS_KIND: SUSTAINED_IDLE_KIND, idleObservationConfig, createSustainedIdleObserver } = require('./src/sustained-idle-observation');
+const sustainedIdleObserver = createSustainedIdleObserver(idleObservationConfig());
 // #916 block 4: the idle-TTL reaper's mode. `enforce` is the pre-#916 behaviour (auto-kill);
 // `warn` computes exactly the same victim list and LOGS what it would reap without touching it;
 // `off` does not arm the sweep at all.
@@ -2231,9 +2281,21 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
   setInterval(() => {
   const now = Date.now();
   for (const [id, session] of Object.entries(sessions)) {
+    const quietObservation = sustainedIdleObserver.observe(id, session, { nowMs: now, machineId: MACHINE_ID, activityState: sessionStateManager.getState(id) });
+    if (quietObservation) broadcastSessionEvent(SUSTAINED_IDLE_KIND, id, session, { nowMs: now, includeTransport: false, includeSemantic: false,
+      extra: { kind: SUSTAINED_IDLE_KIND, version: 1, message_id: crypto.randomUUID(), source: `telepty:${id}`,
+        source_host: MACHINE_ID, target: null, ts: quietObservation.observed_at, observation: quietObservation, completion_fact: null, terminal: false } });
+    if (session.isClosing) {
+      // Retrying an observed natural exit only commits metadata; its process
+      // handles/PIDs were retired at the exit callback, so no signal is sent.
+      const retry = Object.getOwnPropertyDescriptor(session, 'retryNaturalExitCleanup')?.value;
+      if (typeof retry === 'function') retry();
+      continue;
+    }
     const idleSeconds = session.lastActivityAt ? Math.floor((now - new Date(session.lastActivityAt).getTime()) / 1000) : null;
     const healthStatus = getSessionHealthStatus(session, { nowMs: now });
     const healthReason = getSessionHealthReason(session, healthStatus);
+    if(require('./src/principal/cooperative-handoff').activeHandoff(session) || (session.cooperativeHandoff?.state==='committed' && session.cooperativeHandoff.pending_count>0))continue;
     const disconnectedSeconds = session.lastDisconnectedAt
       ? Math.floor((now - new Date(session.lastDisconnectedAt).getTime()) / 1000)
       : null;
@@ -2419,15 +2481,27 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
       && disconnectedSeconds >= SESSION_CLEANUP_SECONDS;
 
     if (shouldCleanupDisconnected) {
-      emitSessionLifecycleEvent('session_cleanup', id, session, {
-        reason: 'STALE_DISCONNECTED',
-        disconnectedSeconds
-      });
+      // Commit the removal before revoking authority or publishing a lifecycle transition.
       delete sessions[id];
+      const saved = persistSessions();
+      if (!saved || !saved.ok) {
+        if (!saved || !saved.committed) {
+          Object.defineProperty(sessions, id, { value: session, enumerable: true, writable: true, configurable: true });
+        } else {
+          ledgerClient.live(id, false);   // #1207 — removal committed: the session's records become demotion-eligible
+          revokeSessionCredential(id);
+          sessionStateManager.unregister(id);
+        }
+        console.error('[CLEANUP] Session removal was not durably saved:', id);
+        continue;
+      }
+      ledgerClient.live(id, false);   // #1207 — the session's records become demotion-eligible
       revokeSessionCredential(id);  // #815: TTL/GC is the routine reuse path — revoke here too
       sessionStateManager.unregister(id);
+      emitSessionLifecycleEvent('session_cleanup', id, session, {
+        reason: 'STALE_DISCONNECTED', disconnectedSeconds
+      });
       console.log(`[CLEANUP] Removed stale session ${id} after ${disconnectedSeconds}s disconnected`);
-      persistSessions();
     }
   }
   }, HEALTH_POLL_MS);
@@ -2437,6 +2511,8 @@ if (server) server.on('error', async (error) => {
   clearDaemonState(process.pid);
 
   if (error && error.code === 'EADDRINUSE') {
+    // #1207 — both exits below: drain the owner and release the lock, as shutdown() does.
+    try { await ledgerClient.close(2000); } catch (closeError) { console.error(`[LEDGER] close failed: ${closeError && closeError.message}`); }
     // Probe health to determine if it's a telepty daemon on this port
     try {
       const probe = await fetch(`http://127.0.0.1:${PORT}/api/health`);
@@ -2454,7 +2530,8 @@ if (server) server.on('error', async (error) => {
 });
 
 
-installWebSocketTransport({
+const websocketTransport = installWebSocketTransport({
+  principalAuthentication,
   server,
   tailnetServer,
   sessions,
@@ -2488,17 +2565,39 @@ installWebSocketTransport({
   // replacement is a hard fact the daemon knows with certainty.
   recordObservation,
   listTrackedInjectionsForSession,
+  // #1207 — one durable session fact per owner-lifecycle event, plus the live-session hint.
+  recordSessionFact,
+  ledgerLive: (sid, on) => ledgerClient.live(sid, on),
   // #826 — the viewer write path gets the same policy verdict and the same audit line as
   // POST /api/sessions/:id/inject. See authorizeViewerInject.
   authorizeViewerInject,
-  acceptInteractionReceipt
+  acceptInteractionReceipt,
+  // #137 — durable observation of a validated, owner-bound bridge stage receipt.
+  recordBridgeReceipt,
+  acceptHandoffAck:cooperativeHandoff.acceptAck
 });
 
+// #1207 — shutdown drains the ledger owner after the transport, audit and mailbox closes (flush the
+// open group under the ack / indeterminate rules, checkpoint, MANIFEST clean_close:true, release the
+// lock only with matching contents) within a 2000 ms deadline; past it, remaining inflight work is
+// `indeterminate (shutting_down)`, the worker is terminated and the next open recovers from segments.
+// Idempotent: a second signal returns the same promise.
+let shuttingDown = null;
 function shutdown(code) {
-  mailboxDelivery.stop();
-  mailboxNotifier.cancelAll();
-  clearDaemonState(process.pid);
-  process.exit(code);
+  websocketTransport.closeObservers();
+  if (shuttingDown) return shuttingDown;
+  shuttingDown = (async () => {
+    eventLoopTelemetry.stop();
+    mailboxDelivery.stop();
+    mailboxNotifier.cancelAll();
+    if (server) server.close();
+    await auditReader.close();
+    try { await auditWriter.close(); } catch (error) { console.error('[AUDIT] Shutdown flush failed:', error.message); }
+    try { await ledgerClient.close(2000); } catch (error) { console.error(`[LEDGER] close failed: ${error && error.message}`); }
+    clearDaemonState(process.pid);
+    process.exit(code);
+  })();
+  return shuttingDown;
 }
 
 // Daemon-lifecycle signal/exit handlers — only when run as the daemon, so a test require does
@@ -2516,6 +2615,18 @@ function shutdown(code) {
 if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
   process.on('SIGINT', () => shutdown(0));
   process.on('SIGTERM', () => shutdown(0));
+  // Task 1215 W3: a normal stop on Windows. There, child.kill()/taskkill terminate the process without
+  // running any signal handler, so shutdown() (which releases the ledger lock) never ran. A parent that
+  // spawned this daemon WITH an IPC channel (the test harness) may ask for the same shutdown() over that
+  // already-owned channel. Registered only when the channel exists — never for a detached production
+  // daemon — and reachable by no HTTP/WS route, peer or other process. Exact bounded message; shutdown()
+  // is idempotent.
+  if (typeof process.send === 'function' && process.channel) {
+    process.on('message', (message) => {
+      if (message && typeof message === 'object' && !Array.isArray(message) && Object.keys(message).length === 2
+          && message.type === 'telepty.shutdown' && message.v === 1) shutdown(0);
+    });
+  }
   process.on('exit', () => {
     clearDaemonState(process.pid);
   });
@@ -2537,9 +2648,13 @@ module.exports = {
   beginTrackedInjection,          // #60 Stage A: durable write-before-delivery tracking record
   sessionAuthenticationCapability, // #860 F1: "observed" requires a bearer that was PRESENTED and verified
   deliveryAuditResult,            // #860 F2: audit `delivery_result` — `queued` is not `success`
-  getTrackedInjection,            // #60 Stage A: ledger read by inject_id
-  listTrackedInjectionsForSession, // #60 Stage A: ledger read by session (owner-lifecycle fan-out)
-  restoreTrackedInjections,       // #60 Stage A: restore + daemon_restart_observed, before readiness
+  getTrackedInjection,            // #60 Stage A: ledger read by inject_id (hot, committed-only read model)
+  fetchTrackedInjection,          // #1207: async ledger read by inject_id (hot or cold + lazy-fact overlay)
+  listTrackedInjectionsForSession, // #60 Stage A: ledger read by session (owner-lifecycle fan-out; async since #1207)
+  restoreTrackedInjections,       // #60 Stage A: restore + daemon_restart_observed, before readiness (async open since #1207)
+  recordSessionFact,              // #1207: one durable session-scoped fact per owner-lifecycle event
+  ledgerClient,                   // #1207: the storage owner's client (lock, read model, status, close)
+  ledgerReady,                    // #1207: settles when the owner's open finished (ok:true|false); never rejects
   observeInjectEchoEvidence,      // #60 Stage A: ring-scoped echo evidence (a field, no longer a gate)
   forceSubmitDeliveredToSurface,  // #544/#537/Bug B: PTY-native force-confirm (pty_cr = delivered)
   isTerminalGateFailure,          // #678: submit-gate disposition — no_state is best-effort dispatch, not hard-fail

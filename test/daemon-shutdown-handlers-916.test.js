@@ -37,6 +37,18 @@ function statePath(homeDir) {
   return path.join(homeDir, '.telepty', 'daemon-state.json');
 }
 
+// #1207 — the ledger owner's artifacts under the same HOME: the O_EXCL lock the daemon main thread
+// holds while running, and the directory store's MANIFEST whose `clean_close` only the drain writes.
+function ledgerLockPath(homeDir) {
+  return path.join(homeDir, '.config', 'aigentry-telepty', 'tracked-injections.lock');
+}
+function ledgerManifestPath(homeDir) {
+  return path.join(homeDir, '.config', 'aigentry-telepty', 'tracked-injections.json', 'MANIFEST.json');
+}
+function readManifest(homeDir) {
+  try { return JSON.parse(fs.readFileSync(ledgerManifestPath(homeDir), 'utf8')); } catch { return null; }
+}
+
 // Boot daemon.js exactly the way cli.js does: set the env flag, then require. `require.main` is
 // this `-e` script, never daemon.js — which is the whole point.
 function bootDaemonChild(homeDir) {
@@ -87,8 +99,12 @@ function waitExit(child, timeoutMs = 8000) {
   });
 }
 
-test('#916.1: SIGTERM runs the daemon shutdown path — exit 0, state file cleared', async () => {
-  if (process.platform === 'win32') return; // POSIX signal semantics
+// #879: announced skip instead of a silent `return` (a silently returned test counts as a pass).
+// Windows has no POSIX signal delivery (child.kill() is TerminateProcess); Windows-native shutdown
+// semantics are deferred to #577.
+const SIGNAL_WIN32_SKIP = process.platform === 'win32' ? 'win32: POSIX signal semantics (SIGTERM/SIGINT handlers) — Windows-native shutdown deferred, owner #577' : false;
+
+test('#916.1: SIGTERM runs the daemon shutdown path — exit 0, state file cleared', { skip: SIGNAL_WIN32_SKIP }, async () => {
   const homeDir = tempHome();
   const child = bootDaemonChild(homeDir);
   try {
@@ -97,6 +113,10 @@ test('#916.1: SIGTERM runs the daemon shutdown path — exit 0, state file clear
       await waitFor(() => fs.existsSync(statePath(homeDir))), true,
       '#910 must have claimed the state file before this test means anything'
     );
+    // #1207 — W2 (factory half): the ledger is open (lock held, store published) before the drain
+    // is asked to run, otherwise "clean_close" below would be vacuous.
+    assert.equal(await waitFor(() => fs.existsSync(ledgerLockPath(homeDir))), true, 'the daemon main thread holds the ledger lock while running');
+    assert.equal(await waitFor(() => { const m = readManifest(homeDir); return !!(m && m.published === true); }), true, 'the owner published the directory store');
 
     child.kill('SIGTERM');
     const exit = await waitExit(child);
@@ -112,31 +132,36 @@ test('#916.1: SIGTERM runs the daemon shutdown path — exit 0, state file clear
       false,
       'shutdown() must clear the claim it made — otherwise a state file outlives its daemon'
     );
+    // #1207 — the drain ran before exit: MANIFEST clean_close:true and the lock released by its holder.
+    const manifest = readManifest(homeDir);
+    assert.equal(manifest && manifest.clean_close, true, 'shutdown awaits ledgerClient.close(2000): the owner flushed, checkpointed and wrote clean_close');
+    assert.equal(fs.existsSync(ledgerLockPath(homeDir)), false, 'the lock is unlinked only by the holder, at clean shutdown, with matching contents');
   } finally {
     child.kill('SIGKILL');
   }
 });
 
-test('#916.1: SIGINT takes the same path', async () => {
-  if (process.platform === 'win32') return;
+test('#916.1: SIGINT takes the same path', { skip: SIGNAL_WIN32_SKIP }, async () => {
   const homeDir = tempHome();
   const child = bootDaemonChild(homeDir);
   try {
     assert.equal(await child.ready, true, 'daemon must be fully up before signalling');
     assert.equal(await waitFor(() => fs.existsSync(statePath(homeDir))), true);
 
+    assert.equal(await waitFor(() => fs.existsSync(ledgerLockPath(homeDir))), true);   // #1207
+
     child.kill('SIGINT');
     const exit = await waitExit(child);
 
     assert.deepEqual(exit, { code: 0, signal: null }, 'SIGINT is handled identically to SIGTERM');
     assert.equal(fs.existsSync(statePath(homeDir)), false);
+    assert.equal(fs.existsSync(ledgerLockPath(homeDir)), false, '#1207: same drain, same lock release');   // #1207
   } finally {
     child.kill('SIGKILL');
   }
 });
 
-test('#916.1: a bare test require registers nothing (the guard still discriminates)', async () => {
-  if (process.platform === 'win32') return;
+test('#916.1: a bare test require registers nothing (the guard still discriminates)', { skip: SIGNAL_WIN32_SKIP }, async () => {
   // No env flag: this is the "somebody required daemon.js for its exports" case. It must neither
   // claim state (#910/#896's contract) nor install process-wide signal handlers.
   const homeDir = tempHome();

@@ -149,6 +149,14 @@ jobs:
         run: npm ci
       - name: Run typecheck
         run: npm run typecheck
+      # Task 1215: build the bundled Darwin authority reader before the suite so the native test runs
+      # against the real binary on the macOS leg (absence fails that test; it never skips into green).
+      - name: Build the bundled Darwin authority reader (task 1215)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
+          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
       - name: Run regression suite
         run: npm run test:ci
       # #768: this file is deliberately excluded from the parallel list and runs alone. Both
@@ -184,9 +192,55 @@ jobs:
       - name: Run PTY-serialized regression tests
         run: npm run test:ci:pty
 
+  # Task 1215: THE binary that ships. Built once on macOS from the tag's first-party source with the
+  # runner's Apple toolchain and Node-API headers (explicit inputs, no download), verified universal
+  # (arm64 + x86_64), exercised by the native tests with zero skips, and handed to `publish` with its
+  # sha256. `publish` packs exactly these bytes and fails unless the tarball contains them.
+  authority-darwin:
+    name: Build and verify the Darwin authority reader
+    needs: guard
+    runs-on: macos-latest
+    timeout-minutes: 15
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build (universal, macOS >= 11, N-API 8)
+        id: build
+        run: |
+          set -euo pipefail
+          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
+          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
+          BIN=src/principal/native/prebuilt/darwin/authority-darwin.node
+          ARCHS="$(lipo -archs "$BIN" | tr ' ' '\n' | sort | tr '\n' ' ')"
+          test "$ARCHS" = "arm64 x86_64 " || { echo "::error::unexpected architectures: $ARCHS"; exit 1; }
+          echo "sha256=$(shasum -a 256 "$BIN" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Native reader tests must run and pass with zero skips
+        run: |
+          set -euo pipefail
+          node --require ./test-support/setup-env.js --test --test-reporter=tap \
+            test/authority-file-darwin-1215.test.js test/operator-supervision-1215.test.js | tee "$RUNNER_TEMP/native.tap"
+          grep -qx '# fail 0' "$RUNNER_TEMP/native.tap"
+          grep -qx '# skip 0' "$RUNNER_TEMP/native.tap" || { echo "::error::a native check was skipped; skipped is not green"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: authority-darwin
+          path: |
+            src/principal/native/prebuilt/darwin/authority-darwin.node
+            src/principal/native/prebuilt/darwin/authority-darwin.node.provenance.json
+          if-no-files-found: error
+
   publish:
     name: Publish and verify from the registry
-    needs: [guard, test]
+    needs: [guard, test, authority-darwin]
     runs-on: ubuntu-latest
     permissions:
       contents: write  # gh release create
@@ -207,6 +261,19 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - name: Install dependencies
         run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: authority-darwin
+          path: src/principal/native/prebuilt/darwin
+      - name: The bundled Darwin reader must be the bytes the macOS job built
+        env:
+          EXPECTED: ${{ needs.authority-darwin.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          BIN=src/principal/native/prebuilt/darwin/authority-darwin.node
+          chmod 0644 "$BIN" "$BIN.provenance.json"
+          ACTUAL="$(sha256sum "$BIN" | cut -d' ' -f1)"
+          test -n "$EXPECTED" && test "$ACTUAL" = "$EXPECTED" || { echo "::error::Darwin reader sha256 $ACTUAL != built $EXPECTED"; exit 1; }
 
       # `npm pack` does NOT run prepublishOnly (only prepack/prepare), but `npm publish` does —
       # so packing first and publishing from the directory would shasum one tarball and ship
@@ -224,6 +291,9 @@ jobs:
           echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
           echo "shasum=${SHASUM}" >> "$GITHUB_OUTPUT"
           echo "packed ${TARBALL} sha1=${SHASUM}"
+          # Task 1215: the tarball must carry the Darwin reader and its provenance, or Mac strict mode
+          # cannot read authority files after install.
+          node -e 'const f=new Set(require(process.env.RUNNER_TEMP+"/pack.json")[0].files.map(x=>x.path));for(const p of ["src/principal/native/prebuilt/darwin/authority-darwin.node","src/principal/native/prebuilt/darwin/authority-darwin.node.provenance.json","src/principal/authority-file-darwin.js"]){if(!f.has(p)){console.error("::error::tarball lacks "+p);process.exit(1)}}console.log("tarball carries the Darwin authority reader")'
 
       # Idempotence. npm versions are immutable, so a re-run or a twice-pushed tag must not try
       # to publish again. It must also not shrug and go green: "already there" is only

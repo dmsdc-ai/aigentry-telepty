@@ -50,6 +50,7 @@ const pty = require('node-pty');
 
 const registry = require('../src/prompt-symbol-registry');
 const { startTestDaemon, createSessionId, waitFor, delay } = require('../test-support/daemon-harness');
+const { writeFakeCli } = require('../test-support/platform-contract');
 
 const projectRoot = path.resolve(__dirname, '..');
 const RULE = '─'.repeat(120);
@@ -110,10 +111,11 @@ test('#752: the legacy empty-caret screen still detects (back-compat)', () => {
 // records every byte it is given. Named `claude` on purpose: the filename is what
 // isKnownAiCli reads, and it is the whole difference between this bug and a healthy
 // generic-command session.
+// #879: { command, env } from writeFakeCli — POSIX: the shebang file path as before; win32: a
+// `claude.cmd` shim + `claude.js` body and the bare name resolved through PATH, because Windows
+// cannot execute a shebang text file (measured: owner never connected, inject answered 503).
 function writeClaudeStub(dir, rxLog) {
-  const file = path.join(dir, 'claude');
-  fs.writeFileSync(file, `#!/usr/bin/env node
-const fs = require('fs');
+  return writeFakeCli(dir, 'claude', `const fs = require('fs');
 const RULE = '\\u2500'.repeat(120);
 const composer = () => process.stdout.write(
   '\\n' + RULE + '\\n\\u276f Try"refactordaemon.test.js"\\n' + RULE
@@ -126,12 +128,46 @@ setInterval(composer, 2000);
 process.stdin.on('data', (chunk) => {
   fs.appendFileSync(${JSON.stringify(rxLog)}, chunk);
 });
-`, 'utf8');
-  fs.chmodSync(file, 0o755);
-  return file;
+`);
 }
 
 let harness;
+
+// Task 1215 / #879 — ALLOWLISTED failure-boundary diagnostics for the win32 delivery failures. Emitted only when a
+// delivery wait fails; never payload bytes (only booleans for test-owned markers), tokens, env, URLs or credentials.
+// They do not change any assertion, wait, timeout or the test sequence; the original error is rethrown unchanged.
+async function diagSession(sessionId) {
+  try {
+    const res = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    const b = res.body && typeof res.body === 'object' ? res.body : {};
+    const t = b.transport && typeof b.transport === 'object' ? b.transport : {};
+    const r = t.readiness && typeof t.readiness === 'object' ? t.readiness : {};
+    const q = t.bridge_queue && typeof t.bridge_queue === 'object' ? t.bridge_queue : null;
+    return { status: res.status, healthStatus: b.healthStatus ?? null, type: b.type ?? null, input_policy: t.input_policy ?? null,
+      bootstrap_gated: t.bootstrap ? t.bootstrap.gated ?? null : null, readiness_capability: r.capability ?? null,
+      input_transport_ready: r.input_transport_ready ? r.input_transport_ready.status ?? null : null,
+      // Task 1215 (#879 discriminators): which handshake half is missing, any refused frame (fixed reason code) and the
+      // daemon-side bootstrap queue (counts only).
+      process_started: r.process_started ? r.process_started.status ?? null : null,
+      input_transport_ready_reason: r.input_transport_ready ? r.input_transport_ready.reason ?? null : null,
+      refused_frames: r.refused_frames ? { count: r.refused_frames.count ?? null, milestone: r.refused_frames.last ? r.refused_frames.last.milestone ?? null : null,
+        reason: r.refused_frames.last ? r.refused_frames.last.reason ?? null : null } : null,
+      bootstrap: t.bootstrap ? { ready: t.bootstrap.ready ?? null, queued: t.bootstrap.queued ?? null, draining: t.bootstrap.draining ?? null } : null,
+      instruction_received: t.instruction_received ? t.instruction_received.status ?? null : null, bridge_receipts: t.bridge_receipts ?? null,
+      bridge_queue: q ? { source: q.source ?? null, phase: q.phase ?? null, pending: q.pending ?? null, reason: q.reason ?? null } : null };
+  } catch (error) { return { error: (error && error.code) || 'request_failed' }; }
+}
+function diagInject(res) {
+  if (!res) return null;
+  const b = res.body && typeof res.body === 'object' ? res.body : {};
+  return { status: res.status, success: b.success ?? null, code: b.code ?? null, queued: b.queued ?? null,
+    bootstrap_queued: b.bootstrap_queued ?? null, strategy: b.strategy ?? null, tracking_state: b.tracking_state ?? null };
+}
+function diagPty(text, exit, markers) {
+  const plain = String(text || '').replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').replace(/\u001b\].*?\u0007/g, '');  // no new import
+  return { exit: exit === undefined ? null : exit, tail_bytes: Buffer.byteLength(String(text || ''), 'utf8'),  // 752 passes the bounded tail
+    markers: Object.fromEntries(Object.entries(markers).map(([name, needle]) => [name, plain.includes(needle)])) };
+}
 before(async () => {
   harness = await startTestDaemon({
     env: { AIGENTRY_ORCHESTRATOR_SIDS: 'orchestrator orch' }
@@ -147,13 +183,14 @@ test('#752 RED: an ad-hoc `telepty allow claude` session actually receives the i
   fs.writeFileSync(rxLog, '');
   const stub = writeClaudeStub(harness.homeDir, rxLog);
 
-  const bridge = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, stub], {
+  const bridge = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, stub.command], {
     cwd: projectRoot,
     cols: 120,
     rows: 40,
     name: process.platform === 'win32' ? 'xterm' : 'xterm-256color',
     env: {
       ...process.env,
+      ...stub.env,
       HOME: harness.homeDir,
       USERPROFILE: harness.homeDir,
       TELEPTY_HOST: harness.host,
@@ -167,12 +204,26 @@ test('#752 RED: an ad-hoc `telepty allow claude` session actually receives the i
     },
   });
   t.after(() => { try { bridge.kill(); } catch {} });
+  // #879 diagnostics only: additive listeners (UTF-8 byte total + a tail bounded to 65536 UTF-16 units for marker booleans; exit code).
+  let bridgeBytes = 0, bridgeTail = '', bridgeExit = null;
+  bridge.onData((d) => { bridgeBytes += Buffer.byteLength(d, 'utf8'); bridgeTail = (bridgeTail + d).slice(-65536); });
+  bridge.onExit(({ exitCode }) => { bridgeExit = exitCode; });
+  const BRIDGE_MARKERS = { inject_allowed: 'Inject allowed', stub_banner: 'ClaudeCodev2.1.220', owner_claim_refused: 'Owner claim refused',
+    // Task 1215 (#879 discriminators): the fixed exit-1 messages of `telepty allow` and the win32 spawn-target throws
+    // (booleans only), so the bridge's actual failure class is named without recording its output.
+    claim_timeout: 'Timed out waiting for owner claim', credential_refused: 'Credential refresh refused',
+    exe_not_found: 'cannot find executable', exe_unsupported: 'unsupported Windows executable type',
+    batch_args_refused: 'Windows batch arguments', uncaught_error: 'Error:', announce_unsent: 'transport readiness not announced', announce_pid_unavailable: 'pid=unavailable' };
 
   await waitFor(async () => {
     const list = await harness.request('/api/sessions');
     return Array.isArray(list.body)
       && list.body.some((s) => s.id === sessionId && s.healthStatus === 'CONNECTED');
-  }, { timeoutMs: 8000, description: 'allow bridge owner connected' });
+  }, { timeoutMs: 8000, description: 'allow bridge owner connected' }).catch(async (error) => {
+    t.diagnostic(`#879 diag owner_connected ${JSON.stringify({ bridge: diagPty(bridgeTail, bridgeExit, BRIDGE_MARKERS), bridge_bytes: bridgeBytes,
+      session: await diagSession(sessionId) })}`);
+    throw error;
+  });
 
   await delay(1200);   // let the composer paint
 
@@ -186,8 +237,11 @@ test('#752 RED: an ad-hoc `telepty allow claude` session actually receives the i
     timeoutMs: 10000,
     intervalMs: 200,
     description: 'injected body reaching the wrapped claude PTY',
-  }).catch(() => {
+  }).catch(async () => {
     const state = path.join(harness.homeDir, '.aigentry', 'mailbox', 'bridge', sessionId, 'state.jsonl');
+    t.diagnostic(`#879 diag body_delivery ${JSON.stringify({ inject: diagInject(inject), session: await diagSession(sessionId),
+      bridge: diagPty(bridgeTail, bridgeExit, BRIDGE_MARKERS), bridge_bytes: bridgeBytes,
+      stub_rx_bytes: fs.statSync(rxLog).size, bridge_mailbox_present: fs.existsSync(state) })}`);
     const parked = fs.existsSync(state) ? fs.readFileSync(state, 'utf8').trim() : '(no bridge mailbox)';
     assert.fail('the daemon reported success but the body never reached the PTY; '
       + `bridge mailbox says:\n${parked}`);

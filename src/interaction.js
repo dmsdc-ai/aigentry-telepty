@@ -130,23 +130,30 @@ function publicReceipt(record) {
     reason, terminal, bytes_written, receipt_seq, pending_inject_id, updated_at };
 }
 
-// This is an extension of the existing ledger, not another store or delivery queue. The
-// injected commit replaces the shared in-memory ledger only after its atomic save succeeds.
+// This is an extension of the existing ledger, not another store or delivery queue. #1207: the
+// injected commit is ASYNC and persists one interaction delta per stage; `commitLedger(next,
+// change)` resolves `true` only after the owner's fsynced ACK, `false` on a refusal established
+// before any write, and `'indeterminate'` when a write was attempted and its durability is
+// unknown — which is never reported as a persisted stage. `reserveAct`/`releaseAct` are the
+// per-act capacity reservation (class I) taken BEFORE the first saveRecord; a construction site
+// that omits them keeps the pre-#1207 behaviour (always admitted).
 function createInteractionCore({ readLedger, commitLedger, observe, binding, authorize, pendingTask,
-  dispatch, now = Date.now }) {
+  dispatch, now = Date.now, reserveAct = () => true, releaseAct = () => {} }) {
   const active = new Set();
   function uncertain(sid) {
     return Object.values(readLedger()?.interactions?.actions || {}).some(record => record.sid === sid
       && ['dispatched', 'outcome_unknown'].includes(record.stage));
   }
-  function saveRecord(record, pending) {
+  async function saveRecord(record, pending) {
     const ledger = readLedger();
     if (!ledger) return false;
     const interactions = ledger.interactions || { actions: {}, pending: {} };
     const next = { ...ledger, interactions: { ...interactions,
       actions: { ...interactions.actions, [record.action_id]: record },
       pending: { ...interactions.pending, ...(pending ? { [pending.inject_id]: pending } : {}) } } };
-    return commitLedger(next) === true;
+    const committed = await commitLedger(next, { record, pending: pending || null });
+    if (committed === 'indeterminate') return 'indeterminate';
+    return committed === true;
   }
   function lookup(id) {
     const ledger = readLedger();
@@ -154,9 +161,15 @@ function createInteractionCore({ readLedger, commitLedger, observe, binding, aut
     const actions = ledger.interactions?.actions || {};
     return own(actions, id) ? publicReceipt(actions[id]) : null;
   }
-  function transition(record, stage, extra = {}) {
+  async function transition(record, stage, extra = {}) {
     const next = { ...record, stage, ...extra, receipt_seq: record.receipt_seq + 1, updated_at: now() };
-    return saveRecord(next) ? next : null;
+    const saved = await saveRecord(next);
+    return saved === true ? next : (saved === 'indeterminate' ? 'indeterminate' : null);
+  }
+  // A storage outcome that is unknown is named as such on the refusal; it is never a 'refused'
+  // that a later reader could mistake for proof the stage was not persisted.
+  function storageRefusal(saved, extra = {}) {
+    return refusal('storage_unavailable', saved === 'indeterminate' ? { storage_outcome: 'indeterminate', ...extra } : extra);
   }
   async function act(r, principal) {
     const error = validateRequest(r, now());
@@ -173,6 +186,9 @@ function createInteractionCore({ readLedger, commitLedger, observe, binding, aut
     if (Object.keys(actions).length >= 10000) return refusal('busy');
     const sid = r.identity.sid;
     if (active.has(sid) || uncertain(sid)) return refusal('busy');
+    // #1207 — reserve the act's interaction capacity (3 entries, prepared/dispatched/final) BEFORE
+    // the first saveRecord. The existing `busy` refusal is the named result when it cannot be had.
+    if (reserveAct(sid) !== true) return refusal('busy');
     active.add(sid);
     let record;
     try {
@@ -197,15 +213,17 @@ function createInteractionCore({ readLedger, commitLedger, observe, binding, aut
       record = { action_id: r.action_id, request_digest: hash, interaction_request_id: r.interaction_request_id,
         sid, request: r, pending_inject_id: own(r, 'pending_inject_id') ? r.pending_inject_id : null, stage: 'prepared',
         reason: null, terminal: false, bytes_written: 0, receipt_seq: 1, updated_at: now() };
-      if (!saveRecord(record, pending)) return refusal('storage_unavailable');
+      const prepared = await saveRecord(record, pending);
+      if (prepared !== true) return storageRefusal(prepared);
       const observation = observe(sid);
       const invalid = validateObservation(r, observation, binding(sid), now());
       if (invalid) {
-        const refused = transition(record, 'refused', { reason: invalid, terminal: true });
-        return refused ? publicReceipt(refused) : refusal('storage_unavailable');
+        const refused = await transition(record, 'refused', { reason: invalid, terminal: true });
+        return refused && refused !== 'indeterminate' ? publicReceipt(refused) : storageRefusal(refused);
       }
-      record = transition(record, 'dispatched', { bytes_written: null });
-      if (!record) return refusal('storage_unavailable');
+      const dispatched = await transition(record, 'dispatched', { bytes_written: null });
+      if (!dispatched || dispatched === 'indeterminate') return storageRefusal(dispatched);
+      record = dispatched;
       // Persist BEFORE crossing the write boundary. A send is not a write receipt.
       let result;
       try { result = await dispatch({ type: 'interaction', request: r, request_digest: hash }); }
@@ -214,11 +232,11 @@ function createInteractionCore({ readLedger, commitLedger, observe, binding, aut
         || (result.stage === 'written' && Number.isSafeInteger(result.bytes_written) && result.bytes_written > 0
           && result.bytes_written <= 8192 && result.reason == null));
       const stage = known ? result.stage : 'outcome_unknown';
-      const finished = transition(record, stage, { reason: known ? result.reason || null : 'outcome_unknown',
+      const finished = await transition(record, stage, { reason: known ? result.reason || null : 'outcome_unknown',
         bytes_written: known ? result.bytes_written : null, terminal: stage !== 'written' });
-      return finished ? publicReceipt(finished) : refusal('storage_unavailable', {
+      return finished && finished !== 'indeterminate' ? publicReceipt(finished) : storageRefusal(finished, {
         stage: 'outcome_unknown', bytes_written: null, action_id: r.action_id });
-    } finally { active.delete(sid); }
+    } finally { active.delete(sid); releaseAct(sid); }
   }
   return { act, lookup, isBusy: sid => active.has(sid) || uncertain(sid) };
 }

@@ -1,0 +1,13 @@
+{
+  "schema": "telepty-bridge-136-stream-recipe/v1",
+  "provenance": "synthetic: hand-authored for telepty task 1215 regression tests; NOT captured from any user session, terminal or transcript; contains no host identifiers or credentials",
+  "describes": "codex-like directory-trust modal owning the surface, no composer; CUP/EL only",
+  "geometry": { "cols": 80, "rows": 24 },
+  "preamble": ["\u001b[2J", "\u001b[H", "\u001b[?25l"],
+  "cycle": [
+    "\u001b[8;1H\u001b[2KDo you trust the contents of this directory?\u001b[10;1H\u001b[2K› 1. Yes, continue\u001b[11;1H\u001b[2K  2. No, quit\u001b[13;1H\u001b[2KPress enter to continue\u001b[10;3H",
+    "\u001b[8;1H\u001b[2KDo you trust the contents of this directory?\u001b[10;1H\u001b[2K  1. Yes, continue\u001b[11;1H\u001b[2K› 2. No, quit\u001b[13;1H\u001b[2KPress enter to continue\u001b[11;3H"
+  ],
+  "repeat": 200,
+  "epilogue": []
+}
