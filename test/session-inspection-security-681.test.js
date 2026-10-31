@@ -28,14 +28,19 @@ nodeTest('session-inspection-security-681',{concurrency:false},async t=>{
   'http.cors','http.json_body','http.check','http.prototype_intact']));
  const G4_WITNESS_KEYS=Object.freeze(['successful_ids_match','failed_empty','effects_two','first_generation_advanced',
   'second_generation_advanced','invalidation_submit','upstream_probe_armed']);
- let g4Stage=null,g4Witness=null;
+ let g4Stage=null,g4Witness=null,g4Http=null;
+ // G4 HTTP status diagnostic: fixed recognized response codes only; anything else is 'other'.
+ const G4_CODES=Object.freeze(new Set(['PERMISSION_DENIED','ORIGIN_NOT_ALLOWED','PEER_NOT_ALLOWED','RATE_LIMITED',
+  'SUBMIT_ADMISSION_UNAVAILABLE']));
  async function group(id,fn){
-  enter(id);let value,failed=false;g4Stage=null;g4Witness=null;
+  enter(id);let value,failed=false;g4Stage=null;g4Witness=null;g4Http=null;
   await t.test(id,{concurrency:false},async sub=>{
    try{value=await fn(sub);if(active.status==='RUNNING')active.status='MATCH';}
    catch(error){failed=true;active.status='MISMATCH';
     const identity=['AssertionError','TypeError','RangeError'].includes(error?.name)?error.name:'Error';
     if(G4_STAGES.has(g4Stage))sub.diagnostic('G4 stage='+g4Stage);
+    if(g4Http)sub.diagnostic('G4 http='+JSON.stringify({status:g4Http.status,expected_status:g4Http.expected_status,
+      status_equal:g4Http.status_equal===true,code_category:g4Http.code_category}));
     if(g4Witness)sub.diagnostic('G4 witness='+JSON.stringify(Object.fromEntries(G4_WITNESS_KEYS.map(k=>[k,g4Witness[k]===true]))));
     throw new Error(identity+' in '+id+'; private diagnostic values suppressed');
    }
@@ -224,6 +229,9 @@ function request(app,row){
       if(row.registerId)requestRow.body={session_id:row.registerId,command:'generic-tool',cwd:fixtureRoot};
       wire=await request(selectedApp,requestRow);
       g4Stage='http.status';
+      {const statusNum=Number.isInteger(wire.status)&&wire.status>=100&&wire.status<=599?wire.status:null;let codeCategory='other';
+       try{const parsed=JSON.parse(wire.body);if(parsed&&typeof parsed.code==='string'&&G4_CODES.has(parsed.code))codeCategory=parsed.code;}catch{codeCategory='other';}
+       g4Http={status:statusNum,expected_status:Number.isInteger(row.status)?row.status:null,status_equal:statusNum===row.status,code_category:codeCategory};}
       if(row.allowTimingInconclusive)assert.ok([200,429].includes(wire.status));else assert.equal(wire.status,row.status);
       g4Stage='http.finished_disposed';assert.ok(wire.finished&&wire.disposed);g4Stage='http.listeners';assert.equal(wire.listeners,0);
       const header=/\r\nx-powered-by: ([^\r]+)/i.exec(wire.raw);

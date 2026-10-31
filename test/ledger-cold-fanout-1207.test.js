@@ -107,7 +107,7 @@ test('R5: one session with 1 hot + 2000 cold records — the real recordSessionF
   console.log(`[ledger-1207 R5] ${file} chunks=${readChunks.length} fact_frames=+${framesAfter.fact - framesBefore.fact} results=${results.length}`);
 }));
 
-test('R5 (real transport): an authenticated owner displacement through installWebSocketTransport reaches the same one-fact seam for the 2001-record session — requires a loopback listener and WebSocket clients in this process', () => withClientStore('r5-ws', async ({ store, R, shared, runtime, actions, injectHandler, ledgerClient }) => {
+test('R5 (real transport): an authenticated owner displacement through installWebSocketTransport writes two distinct O(1) lifecycle facts for the 2001-record session — owner_replaced_observed at the displacement and owner_transport_detached when the displaced socket closes; a viewer close and the replacement owner\'s own close add no detach fact — requires a loopback listener and WebSocket clients in this process', () => withClientStore('r5-ws', async ({ store, R, shared, runtime, actions, injectHandler, ledgerClient }) => {
   const http = require('http'); const express = require('express'); const WebSocket = require('ws');
   const { installWebSocketTransport } = require('../src/transport/websocket');
   const { createCredentialStore } = require('../src/session-store/session-credentials');
@@ -131,24 +131,51 @@ test('R5 (real transport): an authenticated owner displacement through installWe
     await connect(); await H.sleep(150);
     assert.equal(session.sessionEpoch, issued.epoch);
     const framesBefore = countFrames(store.dir); const busBefore = R.bus.length;
-    await connect();                                         // the displacement → one session fact
+    await connect();                                         // the displacement → replacement fact, then the displaced socket's departure fact
     const deadline = Date.now() + 10000;
-    while (Date.now() < deadline && countFrames(store.dir).fact === framesBefore.fact) await H.sleep(25);
+    while (Date.now() < deadline && !(sockets[0].readyState === WebSocket.CLOSED && countFrames(store.dir).fact - framesBefore.fact >= 2)) await H.sleep(25);
     await H.sleep(200);
     const framesAfter = countFrames(store.dir);
     // Task 1215 G7 — FAILURE-ONLY diagnostic: fixed stage name, allowlisted fact kinds in append order,
     // per-type frame deltas and the displaced socket's numeric readyState. No payloads, ids or paths.
-    if (framesAfter.fact - framesBefore.fact !== 1) {
+    if (framesAfter.fact - framesBefore.fact !== 2) {
       console.log(`[ledger-1207 R5-transport DIAG] ${JSON.stringify({ stage: 'fact_frames_after_displacement',
         added: framesAfter.fact - framesBefore.fact, kinds: factKindsInOrder(store.dir).slice(framesBefore.fact),
         frame_delta: Object.fromEntries(Object.keys(framesAfter).map((k) => [k, framesAfter[k] - framesBefore[k]])),
         displaced_socket_ready_state: sockets[0] ? sockets[0].readyState : null })}`);
     }
-    assert.equal(framesAfter.fact - framesBefore.fact, 1, 'the real transport wrote exactly one fact frame for 2001 records');
+    assert.equal(sockets[0].readyState, WebSocket.CLOSED, 'the displaced owner socket closed (close 4001)');
+    assert.deepEqual({ added: framesAfter.fact - framesBefore.fact, kinds: factKindsInOrder(store.dir).slice(framesBefore.fact),
+      obs: framesAfter.obs - framesBefore.obs, begin: framesAfter.begin - framesBefore.begin, state: framesAfter.state - framesBefore.state },
+    { added: 2, kinds: ['session:owner_replaced_observed', 'session:owner_transport_detached'], obs: 0, begin: 0, state: 0 },
+    'two distinct session facts (one frame each, O(1) for 2001 records): the replacement, then the displaced socket\'s departure; no per-record frames');
     const busEvents = R.bus.slice(busBefore).filter((b) => b.type === 'task_completion_unknown' && b.kind === 'owner_replaced_observed');
     assert.equal(busEvents.length, R5.cold + 1, 'per-record bus events retained');
     const file = H.writeEvidence(EVIDENCE, 'R5-transport.json', { case: 'R5-transport', reached_path: 'installWebSocketTransport → recordOwnerLifecycle → recordSessionFact (real seam) with a loopback listener', fact_frames_added: framesAfter.fact - framesBefore.fact, bus_events: busEvents.length });
     console.log(`[ledger-1207 R5-transport] ${file}`);
+    // Control 1 (separate phase): a NON-owner viewer (no ?owner=1, no bearer) connecting and closing adds no fact.
+    const controlBase = countFrames(store.dir); const controlKindsBase = factKindsInOrder(store.dir).length;
+    const viewer = await new Promise((resolve, reject) => { const ws = new WebSocket(`ws://127.0.0.1:${port}/api/sessions/${R5.sid}?token=${TOKEN}`); sockets.push(ws); ws.once('open', () => resolve(ws)); ws.once('error', reject); });
+    assert.equal(!!(session.ownerWs && session.ownerWs.readyState === WebSocket.OPEN), true, 'PRECONDITION: the replacement owner still holds the session');
+    viewer.close();
+    const viewerDeadline = Date.now() + 10000;
+    while (Date.now() < viewerDeadline && viewer.readyState !== WebSocket.CLOSED) await H.sleep(25);
+    await H.sleep(200);
+    const afterViewer = countFrames(store.dir);
+    assert.deepEqual({ closed: viewer.readyState === WebSocket.CLOSED, fact: afterViewer.fact - controlBase.fact },
+      { closed: true, fact: 0 }, 'a viewer close is not an owner lifecycle event');
+    // Control 2 (separate phase): the replacement owner's OWN close takes the owner-disconnect path — no departure fact.
+    const replacement = sockets[1];
+    assert.equal(!!(session.ownerWs && session.ownerWs.readyState === WebSocket.OPEN), true, 'PRECONDITION: replacement owner bound and open');
+    replacement.close();
+    const ownerDeadline = Date.now() + 10000;
+    while (Date.now() < ownerDeadline && replacement.readyState !== WebSocket.CLOSED) await H.sleep(25);
+    await H.sleep(200);
+    const afterOwnerClose = countFrames(store.dir);
+    assert.deepEqual({ closed: replacement.readyState === WebSocket.CLOSED, ownerCleared: session.ownerWs === null,
+      newDetach: factKindsInOrder(store.dir).slice(controlKindsBase).filter((k) => k === 'session:owner_transport_detached').length,
+      fact: afterOwnerClose.fact - afterViewer.fact },
+    { closed: true, ownerCleared: true, newDetach: 0, fact: 0 }, 'the current owner\'s own close writes no owner_transport_detached');
   } finally {
     for (const ws of sockets) { try { ws.terminate(); } catch { /* gone */ } }
     await new Promise((r) => server.close(() => r()));
