@@ -156,8 +156,16 @@ test('TP2: text not delivered within the bound is withdrawn — typed failure, a
   t.after(() => { try { ws.close(); } catch {} });
 
   const mailbox = new FileMailbox({ root });
-  for (const [index, to] of slowIds.entries()) mailbox.enqueue({ msg_id: `fixture-backlog-${index}`, from: 'fixture', to,
-    payload: 'x', created_at: Math.floor(Date.now() / 1000) - 1, attempt: 0 });
+  for (const [index, to] of slowIds.entries()) {
+    try {
+      mailbox.enqueue({ msg_id: `fixture-backlog-${index}`, from: 'fixture', to,
+        payload: 'x', created_at: Math.floor(Date.now() / 1000) - 1, attempt: 0 });
+    } catch (e) { // #1215 native21: TAP prints neither the row nor lock_diagnostic; surface both, rethrow the same error
+      if (e && typeof e === 'object' && Object.isExtensible(e)) e.message += ` [fixture backlog ${index}: `
+        + `${JSON.stringify({ mailbox_step: e.mailbox_step ?? null, lock_diagnostic: e.lock_diagnostic ?? null })}]`;
+      throw e;
+    }
+  }
   const kick = short.request(`/api/sessions/${encodeURIComponent(slowIds[0])}/inject`, { method: 'POST', body: { prompt: 'kick' } });
   await waitFor(() => receivedSlow > 0, { description: 'owned backlog actually entering delivery' });
   const res = await short.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, { method: 'POST', body: { prompt: 'late' } });

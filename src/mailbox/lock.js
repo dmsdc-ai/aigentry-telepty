@@ -296,7 +296,11 @@ function acquireLockObserved(sessionDir, options) {
       fd = fs.openSync(draft, 'wx', 0o600); fs.writeFileSync(fd, String(number)); fs.fsyncSync(fd);
     } finally { if (fd !== undefined) fs.closeSync(fd); }
     fs.renameSync(draft, path.join(own, 'number'));
-    while (performance.now() < deadline) {
+    // #1215 L1: the first admission scan after publication always runs, even when preparation (doorway, draft
+    // fsync, rename) already consumed the budget; later scans keep check-before-scan. A late first scan that is
+    // blocked throws at once (no pause). Predicate, numbering, FIFO and reap are unchanged.
+    for (let first = true; first || performance.now() < deadline; first = false) {
+      const late = first && performance.now() >= deadline;
       let blocked = false;
       const peers = entries(lock.dir); noteMax('peers_seen_max', peers.length);
       for (const peer of peers) {
@@ -310,7 +314,7 @@ function acquireLockObserved(sessionDir, options) {
         let released = false;
         return () => { if (!released) { removeTicket(own); released = true; } };
       }
-      note('admission_polls'); timedPause();
+      note('admission_polls'); if (late) break; timedPause();
     }
     throw timeout();
   } finally { if (!held) removeTicket(own); }

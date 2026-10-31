@@ -336,6 +336,63 @@ function byteClasses(raw) {
   return { esc: count(/\u001b/g), csi: count(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g), osc: count(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g),
     cr: count(/\r/g), lf: count(/\n/g), printable: [...plainText(raw)].filter((ch) => ch >= ' ' && ch !== '\u007f').length };
 }
+// Task 1215 pty33 (failure-only, observe-only; runs only after the unchanged 5000 ms wait has ALREADY failed and always ends
+// in the original error being rethrown). One fixed post-verdict window keeps the EXISTING collectOutput/frameTimeline
+// listeners recording, so a late prompt / late marker / close can be told apart (queued input vs early loss vs stall vs
+// exit). No PTY write, no resend, no retry, no polling loop; counts, times and fixed labels only — never output or title.
+const POST_VERDICT_WINDOW_MS = 20000;
+const UPSTREAM_PROBE_TIMEOUT_MS = 2000;
+// One payload-free GET /api/sessions/<sid> read of `transport.upstream_bytes` (built at src/mailbox/delivery-runtime.js:1183;
+// the daemon.js route serving it was not in the supplied source, so a missing shape is the typed `shape_absent`, never
+// inferred). Request AND body share one AbortController bound to `timeoutMs`; only status, one number and labels are kept.
+async function upstreamBytesProbe(sid, timeoutMs) {
+  const started = performance.now();
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  const done = (r) => ({ ...r, elapsed_ms: Math.round(performance.now() - started) });
+  try {
+    const res = await fetch(`${base()}/api/sessions/${encodeURIComponent(sid)}`, { headers: { 'x-telepty-token': TOKEN }, signal: ac.signal });
+    if (!res.ok) {
+      try { if (res.body) await res.body.cancel(); } catch { /* observation only */ }
+      return done({ ok: false, error: 'http_status', status: res.status });
+    }
+    const text = await res.text();
+    if (text.length > 1048576) return done({ ok: false, error: 'body_too_large', status: res.status });
+    let body = null;
+    try { body = JSON.parse(text); } catch { return done({ ok: false, error: 'parse_error', status: res.status }); }
+    const transport = body && typeof body.transport === 'object' && body.transport ? body.transport : null;
+    if (!transport || !Number.isFinite(transport.upstream_bytes)) {
+      return done({ ok: false, error: 'shape_absent', status: res.status, has_transport: transport !== null });
+    }
+    return done({ ok: true, status: res.status, upstream_bytes: transport.upstream_bytes });
+  } catch (err) {
+    if (ac.signal.aborted) return done({ ok: false, error: 'timeout', timeout_ms: timeoutMs });
+    return done({ ok: false, error: 'fetch_error', name: String(err && err.name).slice(0, 64),
+      code: String((err && err.cause && err.cause.code) || '').slice(0, 64) || null });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+// The existing timeline/output counters re-read at one point in time (fresh copies, so later frames cannot change them).
+function observationPoint(at, sid, timeline, output, origin) {
+  const raw = output();
+  const { stdout, stderr } = daemon.getLogs();
+  return { at, ms: Math.round(performance.now() - origin), first_output_ms: timeline.first_output_ms,
+    prompt_first_seen_ms: timeline.prompt_first_seen_ms, first_printable_ms: timeline.first_printable_ms, marker_ms: timeline.marker_ms,
+    close: timeline.close ? { ...timeline.close } : null, types: { ...timeline.types }, chunks: timeline.chunks.map((c) => ({ ...c })),
+    output_bytes: Buffer.byteLength(raw, 'utf8'), output_utf16_units: raw.length, control: timeline.control(),
+    exit_log_lines: `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid) && l.includes('[EXIT]')).length };
+}
+async function postVerdictObservation(sid, timeline, output, origin) {
+  const windowStart = performance.now();
+  const failure = observationPoint('failure', sid, timeline, output, origin);
+  failure.upstream = await upstreamBytesProbe(sid, UPSTREAM_PROBE_TIMEOUT_MS);
+  const remaining = Math.max(0, POST_VERDICT_WINDOW_MS - (performance.now() - windowStart));
+  await new Promise((resolve) => setTimeout(resolve, remaining));
+  const windowEnd = observationPoint('window_end', sid, timeline, output, origin);
+  windowEnd.upstream = await upstreamBytesProbe(sid, UPSTREAM_PROBE_TIMEOUT_MS);
+  return { window_ms: POST_VERDICT_WINDOW_MS, probe_timeout_ms: UPSTREAM_PROBE_TIMEOUT_MS, failure, window_end: windowEnd };
+}
 
 test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly like a wrapped one', async (t) => {
   const { sid, viewer, timing } = await spawned('spawnaudit');
@@ -346,7 +403,7 @@ test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly
   viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_OK\r', from: 'orchestrator' }));
   await daemon.waitFor(() => (output().includes('SPAWNMARKER_OK') ? true : null),
     { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' })
-    .catch((error) => {
+    .catch(async (error) => {
       // Task 1215 pty17 (windows42 NA-4): V8 formats `stack` lazily — read it BEFORE `message` changes (reading it after
       // already contained the note, which then appeared twice). Both notes are appended once, below.
       const stack = error.stack; const first = `${error.name}: ${error.message}`;
@@ -366,9 +423,17 @@ test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly
       const log = `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid)).slice(-8).map((l) => l.slice(0, 300));
       const tdiag = JSON.stringify({ spawn_response_ms: timing.spawn_response_ms, viewer_open_ms: timing.viewer_open_ms, write_sent_ms: writeSentMs,
         failed_at_ms: Math.round(performance.now() - timing.origin), ...timeline, control: timeline.control(), byte_classes: byteClasses(raw), log,
-        observation_limit: 'the existing 5000 ms wait only: this test has no outer test deadline, so nothing is observed after it' });
+        observation_limit: 'this timeline is the existing 5000 ms wait; post_verdict adds one fixed observe-only window after the verdict' });
       t.diagnostic(`#879 diag spawned_timeline ${tdiag}`);
-      const note = ` | K4 evidence ${diag} | timeline ${tdiag}`;
+      // Task 1215 pty33: the verdict and the original error (stack/first above) are already fixed; the window below can only
+      // add evidence. An observer fault is kept as a typed label and never replaces the original error, which is rethrown.
+      let post;
+      try { post = await postVerdictObservation(sid, timeline, output, timing.origin); }
+      catch (observerError) { post = { observer_error: String(observerError && observerError.name).slice(0, 64) }; }
+      finally { viewer.removeAllListeners('message'); } // the existing listeners live only for the bounded window
+      const pdiag = JSON.stringify(post);
+      t.diagnostic(`#879 diag spawned_post_verdict ${pdiag}`);
+      const note = ` | K4 evidence ${diag} | timeline ${tdiag} | post_verdict ${pdiag}`;
       error.message += note;
       if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
       throw error;

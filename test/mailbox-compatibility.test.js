@@ -168,3 +168,45 @@ test('#1215 characterization control: ADMISSION-phase EPERM on openSync of a LIV
  }finally{f.release();}
  assert.deepEqual(fs.readdirSync(f.lockDir),[]);
 });
+// #1215 L1 (native20 #10 measured: timeout, elapsed 553.7/500 ms, admission_polls 0, last_block null, thrown at lock.js:315).
+// ORIGINAL acquireLockObserved checks the deadline BEFORE its first admission scan, so preparation that outlasts the budget
+// (here: only the own draft fsync, stalled once for 600 ms) times out with zero scans and no contender. Candidate: exactly
+// one late first scan runs; uncontended it acquires, contended it refuses at once without a pause. Real lock path; only
+// the own draft fsync is delayed, nothing is substituted.
+function slowOwnDraftFsync(t,lockDir){
+ const open=fs.openSync,fsync=fs.fsyncSync,seen={draftFd:null,stalls:0,waited:null};
+ t.mock.method(fs,'openSync',function(p,...rest){const fd=open.call(fs,p,...rest);if(typeof p==='string'&&path.basename(p)==='draft'&&path.dirname(path.dirname(p))===lockDir)seen.draftFd=fd;return fd;});
+ t.mock.method(fs,'fsyncSync',function(fd,...rest){if(seen.stalls===0&&fd===seen.draftFd){seen.stalls++;seen.waited=Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,600);}return fsync.call(fs,fd,...rest);});
+ return seen;
+}
+test('#1215 L1: an UNCONTENDED acquisition whose own draft fsync outlasts the 500 ms budget still gets its first admission scan and acquires',t=>{
+ const {acquireLock,ensureSessionDir}=require('../src/mailbox/storage');
+ const dir=ensureSessionDir(fixture(t),'s'),lockDir=path.join(dir,'.lock'),seen=slowOwnDraftFsync(t,lockDir);
+ let release,refused;try{release=acquireLock(dir);}catch(e){refused=e;} // ORIGINAL: MAILBOX_LOCK_TIMEOUT, admission_polls 0
+ const evidence=JSON.stringify({stalls:seen.stalls,waited:seen.waited,code:refused?.code??null,lock_diagnostic:refused?.lock_diagnostic??null});
+ try{
+  assert.deepEqual([seen.stalls,seen.waited],[1,'timed-out'],`the own draft fsync was stalled past the budget: ${evidence}`);
+  assert.equal(refused,undefined,`uncontended acquisition refused after slow preparation: ${evidence}`);
+  assert.equal(fs.readdirSync(lockDir).length,1,'the acquirer holds its own ticket');
+  assert.throws(()=>acquireLock(dir),/lock timeout/i); // exclusivity: a second acquirer is still refused
+ }finally{if(release)release();}
+ assert.deepEqual(fs.readdirSync(lockDir),[]);
+});
+test('#1215 L1 control: with the same slow own fsync, a LIVE lower-number holder still refuses; the late first scan sees it and stops without pausing',t=>{
+ const {acquireLock,ensureSessionDir}=require('../src/mailbox/storage');
+ const dir=ensureSessionDir(fixture(t),'s'),lockDir=path.join(dir,'.lock'),holder=acquireLock(dir),held=fs.readdirSync(lockDir);
+ const seen=slowOwnDraftFsync(t,lockDir);
+ let second,refused;
+ try{
+  try{second=acquireLock(dir);}catch(e){refused=e;}
+  const d=refused?.lock_diagnostic??{},evidence=JSON.stringify({stalls:seen.stalls,waited:seen.waited,code:refused?.code??null,lock_diagnostic:refused?.lock_diagnostic??null});
+  assert.deepEqual([seen.stalls,seen.waited],[1,'timed-out'],evidence);
+  assert.equal(second,undefined,`acquired past a live lower-number holder: ${evidence}`);
+  assert.equal(refused?.code,'MAILBOX_LOCK_TIMEOUT',evidence);
+  assert.ok(d.admission_polls>=1,`the admission scan ran: ${evidence}`); // ORIGINAL: 0
+  assert.deepEqual([d.last_block_phase,d.last_block_reason],['admission','lower_number'],`and was blocked by the holder: ${evidence}`);
+  assert.deepEqual([d.pauses,d.doorway_rescans],[0,0],`stop-on-deadline: no pause after the late blocked scan: ${evidence}`);
+  assert.deepEqual(fs.readdirSync(lockDir),held,'the live holder ticket is retained; the refused acquirer removed its own');
+ }finally{if(second)second();holder();}
+ assert.deepEqual(fs.readdirSync(lockDir),[]);
+});
