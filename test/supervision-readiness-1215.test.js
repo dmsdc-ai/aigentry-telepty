@@ -58,12 +58,25 @@ const MODAL_RING = ['\x1b[2J> You are in /tmp/x\n\nDo you trust the contents of 
 const HOST_TOKEN = 'host-token-1215-fixture';
 const AUDIENCE = 'telepty-1215-fixture-machine';
 const OPERATOR_KEY = crypto.generateKeyPairSync('ed25519');
-function registerFixture(t, { sids = [] } = {}) {
+function registerFixture(t, { sids = [], restoreFrom = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-1215-repair-reg-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const sessions = {};
   const sessionCredentials = createCredentialStore();
-  const context = createSessionRecordContext({ sessions, sessionCredentials, sidNonces: new Map(), sessionPersistPath: path.join(dir, 'sessions.json') });
+  // Task 1215 G6: optionally boot this fixture "daemon" from another fixture's ACTUAL persisted file, with the
+  // product's own reader/builder in daemon.js's restore order (loadPersistedSessions → buildRestoredWrappedSession
+  // → sessionCredentials.adopt → initializeBootstrapState). The test writes no restore marker or owner field.
+  if (restoreFrom) {
+    for (const [id, meta] of Object.entries(persistence.loadPersistedSessions(restoreFrom))) {
+      const restored = persistence.buildRestoredWrappedSession(id, meta, { cwd: dir });
+      if (!restored) continue;
+      sessions[id] = restored;
+      sessionCredentials.adopt(id, meta);
+      routeMetadata.initializeBootstrapState(sessions[id]);
+    }
+  }
+  const persistPath = path.join(dir, 'sessions.json');
+  const context = createSessionRecordContext({ sessions, sessionCredentials, sidNonces: new Map(), sessionPersistPath: persistPath });
   let handler;
   registerSessionRegisterRoute({ post: (_p, h) => { handler = h; } }, { context, sessionStateManager: { register() {} }, busClients: new Set(),
     getMailbox: () => { throw new Error('PRECONDITION: no mailbox in this fixture'); } });
@@ -111,7 +124,7 @@ function registerFixture(t, { sids = [] } = {}) {
     readiness.beginOwnerGeneration(s, { capable });
     return s;
   }
-  return { sessions, register, claim };
+  return { sessions, register, claim, persistPath };
 }
 function modalRuntime() {
   return createDeliveryRuntime({ readyRegistry: registry, MODAL_REMEDIES: new Set(['hold', 'park', 'reject', 'off']),
@@ -203,6 +216,80 @@ test('F1 stale capabilities: downgrade revokes, credential-generation change inv
   assert.deepEqual({ live, afterRotation, stillGone, down: down.statusCode,
     reUp: [reUp.body.input_policy_pending, reUp.body.input_policy_refused], recreated: !!policies.verifyInputPolicyCapability(recreated, cap) },
   { live: true, afterRotation: false, stillGone: false, down: 200, reUp: [false, 'INPUT_POLICY_CAPABILITY_REQUIRED'], recreated: false });
+});
+
+// ===== G6: revocation survives persistence; a genuine restore stays recoverable ======================
+// Both tests run the same real path and differ ONLY in whether the owner explicitly downgraded:
+// operator 201 + capability claim → (optional downgrade) → the route's own writer persisted sessions.json →
+// a second fixture daemon restores that file with the product reader/builder → the same verified operator,
+// with the record's current epoch and its own bearer, re-requests user-supervised.
+// Fixture limits: in-memory route/middleware stand-in for HTTP and the owner socket. No daemon process,
+// PTY, native reader, installed package or model ACK.
+
+function g6Persisted(file) { return fs.readFileSync(file, 'utf8'); }
+
+test('G6 explicit downgrade survives persistence: after a real save/restore the verified owner reissue is refused', { timeout: 30000 }, t => {
+  const f1 = registerFixture(t, { sids: ['g6-down'] });
+  const reg = f1.register({ session_id: 'g6-down', command: 'codex', input_policy: 'user-supervised' }, { as: 'operator' });
+  assert.equal(reg.statusCode, 201, `PRECONDITION: operator registration ${JSON.stringify(reg.body)}`);
+  const cap = reg.body.input_policy_capability, bearer = reg.body.session_token;
+  assert.equal(typeof cap, 'string', 'PRECONDITION: capability issued');
+  assert.equal(policies.effectiveInputPolicy(f1.claim('g6-down', { capability: cap })), 'user-supervised', 'PRECONDITION: granted before the downgrade');
+  const grantedFile = g6Persisted(f1.persistPath);                     // written by the route's real writer
+  const down = f1.register({ session_id: 'g6-down', command: 'codex', input_policy: 'guarded' }, { as: 'operator', bearer });
+  assert.equal(down.statusCode, 200, `PRECONDITION: explicit downgrade accepted ${JSON.stringify(down.body)}`);
+  const downgradedFile = g6Persisted(f1.persistPath);
+  const f2 = registerFixture(t, { sids: ['g6-down'], restoreFrom: f1.persistPath });
+  const restored = f2.sessions['g6-down'];
+  assert.ok(restored, 'PRECONDITION: the product reader/builder restored the record');
+  assert.equal(restored.sessionEpoch, reg.body.session_epoch, 'PRECONDITION: the restored epoch is the instance epoch');
+  const reissue = f2.register({ session_id: 'g6-down', command: 'codex', input_policy: 'user-supervised' }, { as: 'operator', bearer, capability: cap });
+  const after = f2.claim('g6-down', { capability: cap });
+  assert.deepEqual({
+    grantedFileMarksRestorable: JSON.parse(grantedFile)['g6-down'].supervisionRestorable === true,
+    downgradedFileMarksRestorable: Object.hasOwn(JSON.parse(downgradedFile)['g6-down'], 'supervisionRestorable'),
+    secretsInFiles: [grantedFile, downgradedFile].some(x => x.includes(cap) || x.includes(bearer)),
+    restoredOwner: restored.owningPrincipal && restored.owningPrincipal.id,
+    reissue: [reissue.admitted, reissue.statusCode, reissue.body.input_policy_pending, reissue.body.input_policy_refused,
+      Object.hasOwn(reissue.body, 'input_policy_capability')],
+    effective: policies.effectiveInputPolicy(after),
+  }, { grantedFileMarksRestorable: true, downgradedFileMarksRestorable: false, secretsInFiles: false, restoredOwner: 'operator',
+    reissue: [true, 200, false, 'INPUT_POLICY_CAPABILITY_REQUIRED', false], effective: 'guarded' });
+});
+
+test('G6 granted and never revoked: after a real save/restore the same verified owner gets a FRESH capability; stale/wrong credentials and the lost capability are refused', { timeout: 30000 }, t => {
+  const f1 = registerFixture(t, { sids: ['g6-keep'] });
+  const reg = f1.register({ session_id: 'g6-keep', command: 'codex', input_policy: 'user-supervised' }, { as: 'operator' });
+  assert.equal(reg.statusCode, 201, `PRECONDITION: operator registration ${JSON.stringify(reg.body)}`);
+  const cap = reg.body.input_policy_capability, bearer = reg.body.session_token;
+  assert.equal(typeof cap, 'string', 'PRECONDITION: capability issued');
+  assert.equal(policies.effectiveInputPolicy(f1.claim('g6-keep', { capability: cap })), 'user-supervised', 'PRECONDITION: granted');
+  const file = g6Persisted(f1.persistPath);
+  const f2 = registerFixture(t, { sids: ['g6-keep'], restoreFrom: f1.persistPath });
+  const restored = f2.sessions['g6-keep'];
+  assert.ok(restored, 'PRECONDITION: the product reader/builder restored the record');
+  const reserialized = JSON.stringify(persistence.serializePersistedSessions(f2.sessions));
+  // Refusals first (they must not grant or consume anything), then the genuine reissue.
+  const noBearer = f2.register({ session_id: 'g6-keep', command: 'codex', input_policy: 'user-supervised' }, { as: 'operator', capability: cap });
+  const wrongBearer = f2.register({ session_id: 'g6-keep', command: 'codex', input_policy: 'user-supervised' },
+    { as: 'operator', bearer: `${reg.body.session_epoch}.${'A'.repeat(43)}`, capability: cap });
+  const reissue = f2.register({ session_id: 'g6-keep', command: 'codex', input_policy: 'user-supervised' }, { as: 'operator', bearer, capability: cap });
+  const fresh = reissue.body.input_policy_capability;
+  const withLost = f2.claim('g6-keep', { capability: cap });             // the pre-restart capability never binds
+  const lostEffective = policies.effectiveInputPolicy(withLost);
+  const bound = f2.claim('g6-keep', { capability: fresh });
+  assert.deepEqual({
+    fileMarksRestorable: JSON.parse(file)['g6-keep'].supervisionRestorable === true,
+    secretsInFile: file.includes(cap) || file.includes(bearer),
+    restoreMarkerSerialized: reserialized.includes('restoredFromPersistence'),
+    noBearer: [noBearer.statusCode, noBearer.body.input_policy_pending, noBearer.body.input_policy_refused],
+    wrongBearer: [wrongBearer.statusCode, wrongBearer.body.input_policy_pending, wrongBearer.body.input_policy_refused],
+    reissue: [reissue.admitted, reissue.statusCode, reissue.body.input_policy_pending, reissue.body.input_policy_refused],
+    freshIssued: typeof fresh === 'string' && fresh !== cap,
+    lostEffective, effective: policies.effectiveInputPolicy(bound), source: bound.inputPolicy && bound.inputPolicy.source,
+  }, { fileMarksRestorable: true, secretsInFile: false, restoreMarkerSerialized: false,
+    noBearer: [200, false, 'SESSION_CREDENTIAL_REQUIRED'], wrongBearer: [200, false, 'SESSION_CREDENTIAL_REQUIRED'],
+    reissue: [true, 200, true, null], freshIssued: true, lostEffective: 'guarded', effective: 'user-supervised', source: 'operator_principal_registration' });
 });
 
 test('R1 the shared legacy host token is never supervision authority: omitted session headers, admitted request, no capability', { timeout: 30000 }, t => {

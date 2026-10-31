@@ -233,7 +233,7 @@ test('invalid audit history survives restart and later saves as a refusal marker
 
 function registrationCustodyFixture(t) {
   const { FileMailbox } = require('../src/mailbox');
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-registration-custody-'));
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-registration-custody-')));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const mailbox = new FileMailbox({ root: path.join(home, 'mailboxes') });
   const sessions = Object.create(null), credentials = createCredentialStore(), events = [];
@@ -250,6 +250,37 @@ function registrationCustodyFixture(t) {
 }
 for (const failure of ['write', 'file-fsync', 'directory-fsync']) test(`mailbox registration refuses ${failure} initialization failure before authority publication`, t => {
   const f = registrationCustodyFixture(t);
+  if (failure === 'directory-fsync' && process.platform === 'win32') {
+    // Task 1215 / #879 W4 — accepted win32 contract (src/mailbox/index.js, #879 D1; src/session-store/persistence.js):
+    // win32 has no directory flush step, so this fault cannot fire there. Assert that contract instead: no
+    // directory is opened or flushed, and both custody files are flushed BEFORE the 201 is returned. The POSIX
+    // directory-fsync refusal below is unchanged.
+    const open = fs.openSync, flush = fs.fsyncSync, fdPaths = new Map(), trace = [];
+    t.mock.method(fs, 'openSync', function (target, ...rest) {
+      let directory = false;
+      try { directory = typeof target === 'string' && fs.lstatSync(target).isDirectory(); } catch { /* absent: not a directory */ }
+      if (directory) trace.push(`open-directory:${path.basename(target)}`);
+      const fd = open.call(this, target, ...rest);
+      fdPaths.set(fd, typeof target === 'string' ? target : null);
+      return fd;
+    });
+    t.mock.method(fs, 'fsyncSync', fd => {
+      trace.push(fs.fstatSync(fd).isDirectory() ? 'fsync-directory' : `fsync:${path.basename(fdPaths.get(fd) || '?')}`);
+      return flush(fd);
+    });
+    const result = f.register();
+    trace.push(`response:${result.statusCode}`);
+    t.mock.restoreAll();
+    assert.equal(result.statusCode, 201, `win32: ${JSON.stringify(result.body)}`);
+    assert.deepEqual(trace.filter(e => e.startsWith('open-directory') || e === 'fsync-directory'), [], `win32: no directory open/flush: ${JSON.stringify(trace)}`);
+    for (const leaf of ['inbox.jsonl', 'state.jsonl']) {
+      const flushed = trace.indexOf(`fsync:${leaf}`);
+      assert.ok(flushed !== -1 && flushed < trace.indexOf('response:201'), `win32: ${leaf} is flushed before the 201: ${JSON.stringify(trace)}`);
+    }
+    assert.deepEqual(Object.keys(f.sessions), ['unused']);
+    assert.deepEqual(f.mailbox.snapshotCustody('unused'), []);
+    return;
+  }
   if (failure === 'write') {
     const write = fs.writeFileSync;
     t.mock.method(fs, 'writeFileSync', (fd, content, ...rest) => {

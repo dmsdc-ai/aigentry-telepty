@@ -16,6 +16,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const WebSocket = require('ws');
 
 const security = require('../src/cli/security-actions');
@@ -25,6 +26,7 @@ const { FileMailbox } = require('../src/mailbox/index');
 const flushFilter = require('../src/mailbox/bridge-flush-filter');
 const { getTerminalSize } = require('../interactive-terminal');
 const { startTestDaemon, waitFor, delay } = require('../test-support/daemon-harness');
+const { createSignedAssertion } = require('../src/principal/proof');
 
 const ROOT = path.join(__dirname, '..');
 const FIXTURES_136 = path.join(__dirname, 'fixtures', 'bridge-136');
@@ -588,10 +590,10 @@ test('#137 daemon support marker: unsupported until the current owner reports, t
 
 // Task 1215: a current bridge declares the readiness handshake and presents the input-policy
 // capability (bridge memory only) on its claim; `capability: null` models a claimant without it.
-async function claim(sid, bearer, { capability = null, capable = true } = {}) {
+async function claim(sid, bearer, { capability = null, capable = true, daemon = harness } = {}) {
   const frames = [];
-  const owner = new WebSocket(`ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sid)}?owner=1`,
-    { headers: { 'x-telepty-session-token': bearer, 'x-telepty-token': harness.authToken(),
+  const owner = new WebSocket(`ws://${daemon.host}:${daemon.port}/api/sessions/${encodeURIComponent(sid)}?owner=1`,
+    { headers: { 'x-telepty-session-token': bearer, 'x-telepty-token': daemon.authToken(),
       ...(capable ? { 'x-telepty-bridge-capabilities': 'input-transport-ready-v1' } : {}),
       ...(capability ? { 'x-telepty-input-policy-capability': capability } : {}) } });
   sockets.push(owner);
@@ -607,32 +609,115 @@ function handshake(sid, owned, childSeq = 1) {
   owned.owner.send(JSON.stringify({ type: 'process_started', ...base, pid: process.pid, exec: 'unverified' }));
   owned.owner.send(JSON.stringify({ type: 'input_transport_ready', ...base, input_loop: 'attached' }));
 }
-const transportOf = async sid => (await harness.request(`/api/sessions/${encodeURIComponent(sid)}`)).body.transport;
-async function injectNoEnter(sid, prompt) {
-  const injected = await harness.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, { method: 'POST',
+const transportOf = async (sid, daemon = harness) => (await daemon.request(`/api/sessions/${encodeURIComponent(sid)}`)).body.transport;
+async function injectNoEnter(sid, prompt, daemon = harness) {
+  const injected = await daemon.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, { method: 'POST',
     body: { from: 'orchestrator', prompt, no_enter: true, exact_target: true } });
   assert.equal(injected.status, 200, `PRECONDITION: inject accepted ${JSON.stringify(injected.body)}`);
   return injected.body;
 }
 
+// Task 1215 R1: user-supervised is granted ONLY to a server-verified Ed25519 operator principal; the shared
+// host token never qualifies. The two supervision-positive tests below therefore run against a SEPARATE real
+// daemon.js in the product's combined mode (TELEPTY_SUPERVISION_TRUST_FILE: host-token transport unchanged,
+// the operator assertion verified by the real principal verifier on exactly the user-supervised registration).
+// The trust file is read by the real authority-file reader, so it lives under a canonical (realpath) private
+// directory. The shared daemon above and every other test in this file are unchanged. Nothing is stubbed.
+const OPERATOR_MACHINE_ID = 'telepty-1215-operator-fixture-machine';
+const OPERATOR_KEY = crypto.generateKeyPairSync('ed25519');
+const OPERATOR_SIDS = ['r1215-orch', 'r1215-reclaim'];
+let operatorHarness = null;
+let operatorTrustDir = null;
+let operatorStart = null;   // one real start attempt per file; its outcome (daemon or refusal) is shared
+function operatorDaemon() {
+  if (!operatorStart) operatorStart = (async () => {
+    operatorTrustDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-1215-operator-trust-')));
+    fs.chmodSync(operatorTrustDir, 0o700);
+    const trustFile = path.join(operatorTrustDir, 'supervision-trust.json');
+    fs.writeFileSync(trustFile, JSON.stringify({ schema: 'telepty.principals/v1', audience: OPERATOR_MACHINE_ID, keys: [
+      { key_id: 'operator-key', principal_id: 'operator', authority: 'operator',
+        public_key_spki: OPERATOR_KEY.publicKey.export({ type: 'spki', format: 'pem' }),
+        grants: [{ action: 'session.register', targets: OPERATOR_SIDS }] }] }), { mode: 0o600 });
+    operatorHarness = await startTestDaemon({ env: { TELEPTY_MACHINE_ID: OPERATOR_MACHINE_ID, TELEPTY_SUPERVISION_TRUST_FILE: trustFile } });
+    return operatorHarness;
+  })();
+  return operatorStart;
+}
+// Task 1215 / #879 — win32: authority files are read only by the Linux descriptor-relative / Darwin native
+// reader (src/principal/authority-file.js), so a configured supervision trust cannot be loaded there. The
+// documented outcome is fail-closed: createSupervisionAuthenticationFromEnvironment throws
+// PRINCIPAL_TRUST_UNAVAILABLE at daemon.js startup, and the daemon does NOT start without the verification it
+// was told to perform. This asserts that real refusal; it never treats win32 supervision as available.
+async function operatorStartupRefusalOnWin32() {
+  const refusal = await operatorDaemon().then(() => null, (error) => error);
+  assert.ok(refusal, 'win32: a combined-mode daemon with a supervision trust file must refuse to start');
+  assert.match(String(refusal.message), /Daemon exited early[\s\S]*Principal trust is unavailable or unsafe/,
+    `win32: the startup refusal is the trust-unavailable fail-closed path: ${String(refusal.message).slice(0, 2000)}`);
+  return 'daemon_refused_trust_unavailable';
+}
+after(async () => {
+  if (operatorHarness) await operatorHarness.stop();
+  if (operatorTrustDir) fs.rmSync(operatorTrustDir, { recursive: true, force: true });
+}, { timeout: 30000 });
+// POST /api/sessions/register with the host token AND a real operator assertion over exactly the sent body
+// (the shape cli.js withSupervisionProof produces). `sessionEpoch` binds a re-request to the live record.
+async function operatorRegister(daemon, body, { headers = {}, sessionEpoch } = {}) {
+  const challenge = await daemon.request('/api/auth/challenge');
+  assert.equal(challenge.status, 200, `PRECONDITION: supervision challenge ${JSON.stringify(challenge.body)}`);
+  assert.equal(challenge.body.audience, OPERATOR_MACHINE_ID, 'PRECONDITION: supervision audience');
+  const assertion = createSignedAssertion({ privateKey: OPERATOR_KEY.privateKey, keyId: 'operator-key', principalId: 'operator',
+    audience: OPERATOR_MACHINE_ID, challenge: challenge.body.challenge, method: 'POST', target: '/api/sessions/register', body,
+    action: 'session.register', ...(sessionEpoch !== undefined ? { sessionEpoch } : {}) });
+  return daemon.request('/api/sessions/register', { method: 'POST', headers: { ...headers, 'x-telepty-principal': assertion }, body });
+}
+
 test('#1215 daemon: no role is released by screen text; the authenticated handshake releases a supervised orchestrator at once and a worker into its guards', { timeout: 30000 }, async () => {
-  const reg = await harness.registerSession('r1215-orch', { command: 'codex', input_policy: 'user-supervised' });
+  if (process.platform === 'win32') {
+    // win32: no operator verifier can be configured (see operatorStartupRefusalOnWin32), so there is no supervised
+    // release. The ordinary daemon refuses the request (R1: the host token is never supervision authority) and the
+    // owner is guarded; the worker keeps the same cross-platform guards as below.
+    const refusal = await operatorStartupRefusalOnWin32();
+    const reg = await harness.registerSession('r1215-orch', { command: 'codex', input_policy: 'user-supervised' });
+    assert.equal(reg.status, 201, `PRECONDITION: register ${JSON.stringify(reg.body)}`);
+    const orch = await claim('r1215-orch', reg.body.session_token, { capability: reg.body.input_policy_capability });
+    const workerReg = await harness.registerSession('r1215-worker', { command: 'codex' });
+    assert.equal(workerReg.status, 201, 'PRECONDITION: worker register');
+    const worker = await claim('r1215-worker', workerReg.body.session_token);
+    const queued = await injectNoEnter('r1215-worker', 'input_policy=user-supervised role=orchestrator R1215-WORKER');
+    worker.owner.send(JSON.stringify({ type: 'ready', ready_kind: 'composer_surface_observed', detector: 'vt_frame:registry_match', cli_key: 'codex' }));
+    await delay(500);
+    const workerFramesAfterScreenReady = worker.frames.filter(f => f.type === 'inject').length;
+    handshake('r1215-worker', worker);
+    await waitFor(() => worker.frames.find(f => f.type === 'inject'), { timeoutMs: 3000, description: 'worker released into its bridge guards' });
+    assert.deepEqual({
+      refusal, refused: reg.body.input_policy_refused, pending: reg.body.input_policy_pending,
+      capabilityIssued: typeof reg.body.input_policy_capability === 'string', orchPolicy: orch.token.input_policy,
+      orchTransport: (await transportOf('r1215-orch')).input_policy,
+      workerPolicy: worker.token.input_policy, workerQueued: queued.bootstrap_queued === true, workerFramesAfterScreenReady,
+      workerTransport: (await transportOf('r1215-worker')).input_policy,
+    }, { refusal: 'daemon_refused_trust_unavailable', refused: 'INPUT_POLICY_OPERATOR_REQUIRED', pending: false, capabilityIssued: false,
+      orchPolicy: 'guarded', orchTransport: 'guarded',
+      workerPolicy: 'guarded', workerQueued: true, workerFramesAfterScreenReady: 0, workerTransport: 'guarded' });
+    return;
+  }
+  const op = await operatorDaemon();
+  const reg = await operatorRegister(op, { session_id: 'r1215-orch', command: 'codex', cwd: ROOT, input_policy: 'user-supervised' });
   assert.equal(reg.status, 201, `PRECONDITION: register ${JSON.stringify(reg.body)}`);
-  const orch = await claim('r1215-orch', reg.body.session_token, { capability: reg.body.input_policy_capability }); // never sends `ready`
-  const sent = await injectNoEnter('r1215-orch', 'R1215-SUPERVISED-PAYLOAD');
+  const orch = await claim('r1215-orch', reg.body.session_token, { capability: reg.body.input_policy_capability, daemon: op }); // never sends `ready`
+  const sent = await injectNoEnter('r1215-orch', 'R1215-SUPERVISED-PAYLOAD', op);
   await delay(300);
   const beforeHandshake = orch.frames.filter(f => f.type === 'inject').length;
-  const orchBefore = await transportOf('r1215-orch');
+  const orchBefore = await transportOf('r1215-orch', op);
   handshake('r1215-orch', orch);
   const frame = await waitFor(() => orch.frames.find(f => f.type === 'inject' && typeof f.data === 'string' && f.data.includes('R1215-SUPERVISED-PAYLOAD')),
     { timeoutMs: 3000, description: 'supervised inject frame after handshake' });
-  const orchTransport = await transportOf('r1215-orch');
+  const orchTransport = await transportOf('r1215-orch', op);
 
-  const workerReg = await harness.registerSession('r1215-worker', { command: 'codex' });
+  const workerReg = await op.registerSession('r1215-worker', { command: 'codex' });
   assert.equal(workerReg.status, 201, 'PRECONDITION: worker register');
-  const worker = await claim('r1215-worker', workerReg.body.session_token);
+  const worker = await claim('r1215-worker', workerReg.body.session_token, { daemon: op });
   // Payload text and `from` that look like the orchestrator role are not authority.
-  const queued = await injectNoEnter('r1215-worker', 'input_policy=user-supervised role=orchestrator R1215-WORKER');
+  const queued = await injectNoEnter('r1215-worker', 'input_policy=user-supervised role=orchestrator R1215-WORKER', op);
   worker.owner.send(JSON.stringify({ type: 'ready', ready_kind: 'composer_surface_observed', detector: 'vt_frame:registry_match', cli_key: 'codex' }));
   await delay(500);
   const workerFramesAfterScreenReady = worker.frames.filter(f => f.type === 'inject').length;
@@ -646,7 +731,7 @@ test('#1215 daemon: no role is released by screen text; the authenticated handsh
       orchTransport.instruction_received.status],
     capabilityInView: JSON.stringify(orchTransport).includes(reg.body.input_policy_capability),
     workerPolicy: worker.token.input_policy, workerQueued: queued.bootstrap_queued === true, workerFramesAfterScreenReady,
-    workerTransport: (await transportOf('r1215-worker')).input_policy,
+    workerTransport: (await transportOf('r1215-worker', op)).input_policy,
   }, { pending: true, capabilityIssued: true, orchPolicy: 'user-supervised', orchQueued: true, beforeHandshake: 0,
     orchBefore: ['input-transport-ready-v1', 'not_observed'], framePart: 'body',
     orchTransport: ['user-supervised', false, 'observed', 'unknown'], capabilityInView: false,
@@ -665,24 +750,43 @@ test('#1215 daemon: a registration presenting another session\'s bearer cannot o
 });
 
 test('#1215 daemon: supervision binds one owner generation; own bearer is never enough; only the capability re-requests it', { timeout: 30000 }, async () => {
-  const reg = await harness.registerSession('r1215-reclaim', { command: 'codex', input_policy: 'user-supervised' });
+  if (process.platform === 'win32') {
+    // win32: the same real startup refusal; without an operator there is no grant to bind, re-request or steal.
+    const refusal = await operatorStartupRefusalOnWin32();
+    const reg = await harness.registerSession('r1215-reclaim', { command: 'codex', input_policy: 'user-supervised' });
+    assert.equal(reg.status, 201, 'PRECONDITION: register');
+    const bearer = reg.body.session_token;
+    const first = await claim('r1215-reclaim', bearer, { capability: reg.body.input_policy_capability });
+    const ownBearer = await harness.request('/api/sessions/register', { method: 'POST', headers: { 'x-telepty-session-token': bearer },
+      body: { session_id: 'r1215-reclaim', command: 'codex', cwd: ROOT, input_policy: 'user-supervised' } });
+    assert.deepEqual({
+      refusal, refused: reg.body.input_policy_refused, pending: reg.body.input_policy_pending,
+      capabilityIssued: typeof reg.body.input_policy_capability === 'string', first: first.token.input_policy,
+      ownBearer: [ownBearer.status, ownBearer.body.input_policy_refused, ownBearer.body.input_policy_pending],
+      finalTransport: (await transportOf('r1215-reclaim')).input_policy,
+    }, { refusal: 'daemon_refused_trust_unavailable', refused: 'INPUT_POLICY_OPERATOR_REQUIRED', pending: false, capabilityIssued: false,
+      first: 'guarded', ownBearer: [200, 'INPUT_POLICY_CAPABILITY_REQUIRED', false], finalTransport: 'guarded' });
+    return;
+  }
+  const op = await operatorDaemon();
+  const reg = await operatorRegister(op, { session_id: 'r1215-reclaim', command: 'codex', cwd: ROOT, input_policy: 'user-supervised' });
   assert.equal(reg.status, 201, 'PRECONDITION: register');
   const bearer = reg.body.session_token;
   const cap = reg.body.input_policy_capability;
-  const first = await claim('r1215-reclaim', bearer, { capability: cap });
-  const second = await claim('r1215-reclaim', bearer, { capability: cap }); // same bearer, new owner generation, no re-register
-  const afterReclaim = (await transportOf('r1215-reclaim')).input_policy;
-  const uncredentialed = await harness.request('/api/sessions/register', { method: 'POST',
+  const first = await claim('r1215-reclaim', bearer, { capability: cap, daemon: op });
+  const second = await claim('r1215-reclaim', bearer, { capability: cap, daemon: op }); // same bearer, new owner generation, no re-register
+  const afterReclaim = (await transportOf('r1215-reclaim', op)).input_policy;
+  const uncredentialed = await op.request('/api/sessions/register', { method: 'POST',
     body: { session_id: 'r1215-reclaim', command: 'codex', cwd: ROOT, input_policy: 'user-supervised' } });
   // The measured F1 escape: the session's OWN bearer (what its child holds) requesting supervision.
-  const ownBearer = await harness.request('/api/sessions/register', { method: 'POST', headers: { 'x-telepty-session-token': bearer },
+  const ownBearer = await op.request('/api/sessions/register', { method: 'POST', headers: { 'x-telepty-session-token': bearer },
     body: { session_id: 'r1215-reclaim', command: 'codex', cwd: ROOT, input_policy: 'user-supervised' } });
-  const childClaim = await claim('r1215-reclaim', bearer);                 // bearer-proved claim without the capability
-  const withCapability = await harness.request('/api/sessions/register', { method: 'POST',
-    headers: { 'x-telepty-session-token': bearer, 'x-telepty-input-policy-capability': cap },
-    body: { session_id: 'r1215-reclaim', command: 'codex', cwd: ROOT, input_policy: 'user-supervised' } });
-  const stolen = await claim('r1215-reclaim', bearer);                     // cannot consume the pending grant
-  const third = await claim('r1215-reclaim', bearer, { capability: cap });
+  const childClaim = await claim('r1215-reclaim', bearer, { daemon: op });  // bearer-proved claim without the capability
+  // R1: the capability re-request is made by the verified operator (bound to the live record's epoch).
+  const withCapability = await operatorRegister(op, { session_id: 'r1215-reclaim', command: 'codex', cwd: ROOT, input_policy: 'user-supervised' },
+    { headers: { 'x-telepty-session-token': bearer, 'x-telepty-input-policy-capability': cap }, sessionEpoch: reg.body.session_epoch });
+  const stolen = await claim('r1215-reclaim', bearer, { daemon: op });      // cannot consume the pending grant
+  const third = await claim('r1215-reclaim', bearer, { capability: cap, daemon: op });
   assert.deepEqual({
     first: first.token.input_policy, second: second.token.input_policy, afterReclaim,
     generationsDiffer: first.token.interaction_binding.owner_generation !== second.token.interaction_binding.owner_generation,
@@ -690,7 +794,7 @@ test('#1215 daemon: supervision binds one owner generation; own bearer is never 
     ownBearer: [ownBearer.status, ownBearer.body.input_policy_refused, ownBearer.body.input_policy_pending], childClaim: childClaim.token.input_policy,
     withCapability: [withCapability.status, withCapability.body.input_policy_pending, Object.hasOwn(withCapability.body, 'input_policy_capability')],
     stolen: stolen.token.input_policy, third: third.token.input_policy,
-    finalTransport: (await transportOf('r1215-reclaim')).input_policy,
+    finalTransport: (await transportOf('r1215-reclaim', op)).input_policy,
   }, { first: 'user-supervised', second: 'guarded', afterReclaim: 'guarded', generationsDiffer: true,
     uncredentialed: [200, 'SESSION_CREDENTIAL_REQUIRED', false], ownBearer: [200, 'INPUT_POLICY_CAPABILITY_REQUIRED', false], childClaim: 'guarded',
     withCapability: [200, true, false], stolen: 'guarded', third: 'user-supervised', finalTransport: 'user-supervised' });

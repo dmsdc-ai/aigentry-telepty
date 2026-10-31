@@ -54,6 +54,30 @@ const PAUSED_FS = path.join(__dirname, 'fixtures', 'ledger-1207', 'paused-owner-
 const EVIDENCE = H.evidenceDir();
 const nowIso = () => new Date().toISOString();
 const isManifestTmp = (p) => typeof p === 'string' && path.basename(p).startsWith('MANIFEST.json.') && p.endsWith('.tmp');
+// Task 1215 / #879 W2 — simulated crash (same helper as ledger-owner-1207). A real crash ends the owner's
+// process and the OS releases every descriptor it held; the in-process "crash" (no close(), then release())
+// used to leave them open, which Windows measured as ENOTEMPTY at cleanup. trackOwnerFds wraps ONE owner's
+// fsImpl and records only the descriptors opened through it; crashOwner closes exactly those still open with
+// the real fs (never another owner's, and never the owner's close(): no flush, checkpoint or MANIFEST write),
+// then releases the lock as before. Evidence asserted: no `closed` message, no call through the owner's fs,
+// a byte-identical store tree.
+function trackOwnerFds(base = fs) {
+  const open = new Set(); let calls = 0;
+  const facade = Object.create(base);
+  facade.openSync = (...args) => { calls++; const fd = base.openSync(...args); open.add(fd); return fd; };
+  facade.closeSync = (fd, ...rest) => { calls++; try { return base.closeSync(fd, ...rest); } finally { open.delete(fd); } };
+  return { fs: facade, calls: () => calls, takeOpen: () => { const fds = [...open]; open.clear(); return fds; } };
+}
+function crashOwner(h, tracked) {
+  const parent = path.dirname(h.dir);
+  const treeBefore = shaTree(parent); const callsBefore = tracked.calls(); const closedBefore = h.ofType('closed').length;
+  const fds = tracked.takeOpen();
+  for (const fd of fds) fs.closeSync(fd);            // the OS-level release a process exit performs
+  assert.equal(tracked.calls(), callsBefore, 'crash cleanup makes no call through the owner fs');
+  assert.equal(h.ofType('closed').length, closedBefore, 'crash cleanup is not the owner close()');
+  assert.deepEqual(shaTree(parent), treeBefore, 'crash cleanup writes nothing');
+  return h.release();
+}
 const LIMITS = Object.freeze({ witnessMs: 5000, settleMs: 150, afterReleaseMs: 10000, stepMs: 5 });
 
 // Every string value reachable in a JSON-shaped value (status item, MANIFEST) — exact listing evidence.
@@ -109,7 +133,8 @@ for (const variant of [{ name: 'hot-record-stays-hot', live: true }, { name: 're
     try {
       let armed = false;
       const faultFs = createFaultFs({ faults: { renameSync: { code: 'EIO', times: 1, when: (args) => armed && isManifestTmp(String(args[0])) && String(args[1]).endsWith('MANIFEST.json') } } });
-      h = createOwnerHarness({ dir: s.dir, fsImpl: faultFs });
+      const crashed = trackOwnerFds(faultFs);
+      h = createOwnerHarness({ dir: s.dir, fsImpl: crashed.fs });
       assert.equal(h.open().state, 'available');
       if (variant.live) h.live('w', true);                   // a live session keeps its tracked record hot through a checkpoint
       assert.equal((await h.submit('begin', { id: 'A', sid: 'w', record: beginRecord('A', 'w'), at: nowIso() }, { cls: 'T' })).type, 'ack');
@@ -147,7 +172,7 @@ for (const variant of [{ name: 'hot-record-stays-hot', live: true }, { name: 're
       }
       const segBytesBefore = segmentFiles(s.dir).map((f) => [path.basename(f), fs.statSync(f).size]);
       // "crash": no close; a fresh owner recovers from the previous MANIFEST
-      h.release(); h = null;
+      crashOwner(h, crashed); h = null;
       h = createOwnerHarness({ dir: s.dir });
       const re = h.open();
       assert.equal(re.state, 'available', JSON.stringify(re.stateMessage));

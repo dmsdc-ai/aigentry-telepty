@@ -13,7 +13,7 @@ const grant = (action, targets) => ({ action, targets });
 const trust = (audience, keys) => ({ schema: 'telepty.principals/v1', audience, keys });
 
 test('owned broker discovery requires signed exact grants, current stream, and whitelist-only metadata', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-discovery-')); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'broker-discovery-'))); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const receiver = await startTestDaemon(); t.after(() => receiver.stop());
   const reg = await receiver.registerSession('worker', { command: 'PRIVATE_COMMAND', cwd: '/PRIVATE_CWD', delivery_type: 'mailbox' });
   assert.equal(reg.status, 201);
@@ -45,9 +45,21 @@ test('owned broker discovery requires signed exact grants, current stream, and w
   fs.writeFileSync(keyFile, source.privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
   fs.writeFileSync(configFile, JSON.stringify({ schema: 'telepty.broker-source/v1', principal_id: 'source', key_id: 'source',
     private_key_path: keyFile, hub_url: origin, hub_audience: 'hub' }), { mode: 0o600 });
-  const { stdout } = await require('node:util').promisify(require('node:child_process').execFile)(process.execPath,
-    ['cli.js', 'broker-discover-v1', '--config', configFile, 'node'], { cwd: path.resolve(__dirname, '..'), timeout: 5000 });
-  assert.deepEqual(JSON.parse(stdout).sessions, observed.sessions);
+  const execFile = require('node:util').promisify(require('node:child_process').execFile);
+  const cliArgs = ['cli.js', 'broker-discover-v1', '--config', configFile, 'node'], cliOptions = { cwd: path.resolve(__dirname, '..'), timeout: 5000 };
+  if (process.platform === 'win32') {
+    // Task 1215 / #879 W4 — accepted contract: the CLI reads its config and private key only through the
+    // Linux descriptor-relative / Darwin native authority-file reader; win32 fails closed
+    // (src/principal/authority-file.js → src/broker/main.js BROKER_FILE_UNSAFE → cli.js). The refusal is exact
+    // and discloses no discovery result; the authenticated in-process discovery is unchanged afterwards.
+    const refused = await execFile(process.execPath, cliArgs, cliOptions).then(() => null, (error) => error);
+    assert.ok(refused, 'win32: broker-discover-v1 fails closed');
+    assert.deepEqual({ code: refused.code, stdout: refused.stdout, stderr: refused.stderr }, { code: 1, stdout: '', stderr: 'BROKER_DISCOVERY_UNAVAILABLE\n' });
+    assert.deepEqual((await client.discover('node')).body.sessions, observed.sessions, 'win32: the refused CLI changed no discovery state');
+  } else {
+    const { stdout } = await execFile(process.execPath, cliArgs, cliOptions);
+    assert.deepEqual(JSON.parse(stdout).sessions, observed.sessions);
+  }
   assert.equal((await denied.discover('node')).status, 403);
   // A forged path identity cannot borrow a valid signature from another node.
   const challenge = await (await fetch(origin + '/v1/challenge')).json();

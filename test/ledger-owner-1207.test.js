@@ -36,6 +36,29 @@ const begin = (h, id, sid) => h.submit('begin', { id, sid, record: beginRecord(i
 const obs = (h, id, kind, trigger, extra = {}) => h.submit('obs', { id, observation: { kind, trigger, at: nowIso(), ...extra } });
 const state = (h, id, ts) => h.submit('state', { id, tracking_state: ts, observation: { kind: 'inject_delivery_refused', trigger: 'delivery_refused', delivery_code: 'X', bytes_written: 0, at: nowIso() } }, { cls: 'T' });
 async function withStore(fn) { const s = tmpStore(); try { return await fn(s); } finally { s.rm(); } }
+// Task 1215 / #879 W2 — simulated crash. A real crash ends the owner's process and the OS releases every
+// descriptor it held; the in-process "crash" (no close(), then release()) used to leave them open, which
+// Windows measured as ENOTEMPTY at cleanup. trackOwnerFds wraps ONE owner's fsImpl and records only the
+// descriptors opened through it; crashOwner closes exactly those still open with the real fs (never another
+// owner's, and never the owner's close(): no flush, checkpoint or MANIFEST write), then releases the lock as
+// before. Evidence asserted: no `closed` message, no call through the owner's fs, a byte-identical store tree.
+function trackOwnerFds(base = fs) {
+  const open = new Set(); let calls = 0;
+  const facade = Object.create(base);
+  facade.openSync = (...args) => { calls++; const fd = base.openSync(...args); open.add(fd); return fd; };
+  facade.closeSync = (fd, ...rest) => { calls++; try { return base.closeSync(fd, ...rest); } finally { open.delete(fd); } };
+  return { fs: facade, calls: () => calls, takeOpen: () => { const fds = [...open]; open.clear(); return fds; } };
+}
+function crashOwner(h, tracked) {
+  const parent = path.dirname(h.dir);
+  const treeBefore = shaTree(parent); const callsBefore = tracked.calls(); const closedBefore = h.ofType('closed').length;
+  const fds = tracked.takeOpen();
+  for (const fd of fds) fs.closeSync(fd);            // the OS-level release a process exit performs
+  assert.equal(tracked.calls(), callsBefore, 'crash cleanup makes no call through the owner fs');
+  assert.equal(h.ofType('closed').length, closedBefore, 'crash cleanup is not the owner close()');
+  assert.deepEqual(shaTree(parent), treeBefore, 'crash cleanup writes nothing');
+  return h.release();
+}
 
 test('fresh open: directory store published at the legacy path; begin is acked only after its commit frame is durable on disk', () => withStore(async (s) => {
   const h = createOwnerHarness({ dir: s.dir });
@@ -134,7 +157,8 @@ test('begin supersedes the session\'s hot tracked records in the same durable gr
 
 test('I1: a single fsync failure retries the same bytes in a NEW segment and acks (retried:true); recovery after a crash applies the group exactly once', () => withStore(async (s) => {
   const faultFs = createFaultFs({ faults: { fsyncSync: { code: 'EIO', times: 1, pathIncludes: `${path.sep}segments${path.sep}1-1.jsonl` } } });
-  let h = createOwnerHarness({ dir: s.dir, fsImpl: faultFs });
+  const crashed = trackOwnerFds(faultFs);
+  let h = createOwnerHarness({ dir: s.dir, fsImpl: crashed.fs });
   h.open();
   await begin(h, 'i', 'w');                                  // group 1 — fsync of segment 1-1 throws once → retry into 1-2
   assert.equal(faultFs._state.fired.length, 1, 'exactly one injected fsync failure');
@@ -151,7 +175,7 @@ test('I1: a single fsync failure retries the same bytes in a NEW segment and ack
   const retriedAck = h.ofType('ack').find((m) => m.txn && m.retried === true);
   assert.ok(retriedAck, 'the ack names the retry');
   // "crash": no close; a new owner recovers
-  h.release();
+  crashOwner(h, crashed);
   h = createOwnerHarness({ dir: s.dir });
   const reopened = h.open();
   assert.equal(reopened.state, 'available');
@@ -164,7 +188,8 @@ test('I1: a single fsync failure retries the same bytes in a NEW segment and ack
 
 test('I2 / S2: two write failures make every txn of the group INDETERMINATE (never ack, never nack); the store goes unavailable_write; reads serve committed only; no further frames', () => withStore(async (s) => {
   const faultFs = createFaultFs({ faults: { fsyncSync: { code: 'EIO', times: 2, pathIncludes: `${path.sep}segments${path.sep}` } } });
-  const h = createOwnerHarness({ dir: s.dir, fsImpl: faultFs });
+  const crashed = trackOwnerFds(faultFs);
+  const h = createOwnerHarness({ dir: s.dir, fsImpl: crashed.fs });
   h.open();
   const ok = await begin(h, 'durable', 'w');     // group 1 (segment 1-1) — fine? no: faults fire on the first two fsyncs
   // The first group already consumed both faults: begin resolved indeterminate.
@@ -183,17 +208,18 @@ test('I2 / S2: two write failures make every txn of the group INDETERMINATE (nev
   assert.deepEqual(segmentFiles(s.dir).map((f) => fs.statSync(f).size), sizes, 'no frame is appended after indeterminate');
   const status = h.read('status').items[0];
   assert.equal(status.store, 'unavailable_write'); assert.ok(status.possibly_durable);
-  h.release();
+  crashOwner(h, crashed);
 }));
 
 test('I3 / E4: settlement only at actual recovery — durable bytes resolve `committed{pos}` from receipts; frames without a commit frame are listed unapplied and resolve `not_applied`; unknown txns stay `unresolved`; receipts survive a checkpoint', () => withStore(async (s) => {
   // (a) bytes durable: writeSync succeeded, both fsyncs threw
   const faultFs = createFaultFs({ faults: { fsyncSync: { code: 'EIO', times: 2, pathIncludes: `${path.sep}segments${path.sep}` } } });
-  let h = createOwnerHarness({ dir: s.dir, fsImpl: faultFs });
+  const crashed1 = trackOwnerFds(faultFs);
+  let h = createOwnerHarness({ dir: s.dir, fsImpl: crashed1.fs });
   h.open();
   const ind = await begin(h, 'A', 'w');
   assert.equal(ind.type, 'indeterminate');
-  h.release();
+  crashOwner(h, crashed1);
   // (b) a torn tail: append half a frame to the last segment (crash between append and fsync)
   const files = segmentFiles(s.dir);
   const last = files[files.length - 1];
@@ -201,7 +227,8 @@ test('I3 / E4: settlement only at actual recovery — durable bytes resolve `com
   const tornFrame = F.encodeFrame({ t: 'obs', epoch: 1, seq: 9, txn: tornTxn, id: 'A', observation: { kind: 'x', trigger: 'y', at: 't' } });
   fs.appendFileSync(last, tornFrame.subarray(0, tornFrame.length - 4));
   const sizeBefore = fs.statSync(last).size;
-  h = createOwnerHarness({ dir: s.dir });
+  const crashed2 = trackOwnerFds();
+  h = createOwnerHarness({ dir: s.dir, fsImpl: crashed2.fs });
   const re = h.open();
   assert.equal(re.state, 'available');
   const rec = h.read('get', { id: 'A' }).items[0];
@@ -217,7 +244,7 @@ test('I3 / E4: settlement only at actual recovery — durable bytes resolve `com
   const activeSeg = segmentFiles(s.dir).pop();
   await obs(h, 'A', 'output_observed', 'output_received');
   fs.appendFileSync(activeSeg, F.encodeFrame({ t: 'obs', epoch: 2, seq: 99, txn: u, id: 'A', observation: { kind: 'q', trigger: 'r', at: 't' } }));
-  h.release();
+  crashOwner(h, crashed2);
   h = createOwnerHarness({ dir: s.dir });
   h.open();
   const r2 = h.read('resolve', { txns: [u, ind.txn] }).items;
@@ -391,19 +418,21 @@ test('M2 conflicts: legacy_modified (write to L between capture and aside) and l
   const legacy = writeLegacyLedger(s.dir, { count: 4 });
   let opens = 0;
   const f1 = createFaultFs({ faults: { openSync: { code: null, times: 1, when: (args) => args[0] === s.dir && ++opens === 3, before: () => fs.appendFileSync(s.dir, '\n') } } });
-  let h = createOwnerHarness({ dir: s.dir, fsImpl: f1 });
+  const crashed1 = trackOwnerFds(f1);
+  let h = createOwnerHarness({ dir: s.dir, fsImpl: crashed1.fs });
   const o1 = h.open();
   assert.equal(o1.reason, 'migration_conflict'); assert.equal(o1.stateMessage.detail, 'legacy_modified');
   assert.equal(fs.statSync(s.dir).isFile(), true, 'L untouched (still the file, with the writer\'s change)');
   assert.notEqual(sha256(fs.readFileSync(s.dir)), legacy.sha256);
   assert.equal(fs.readdirSync(s.parent).filter((n) => n.startsWith('tracked-injections.json.migrating.')).length, 1, 'S kept');
-  h.release();
+  crashOwner(h, crashed1);
   // clean slate: legacy_recreated at M6b
   s.rm(); const s2 = tmpStore();
   try {
     const leg2 = writeLegacyLedger(s2.dir, { count: 4 });
     const f2 = createFaultFs({ faults: { renameSync: { code: null, times: 1, when: (args) => String(args[0]).includes('.migrating.') && args[1] === s2.dir, before: () => fs.writeFileSync(s2.dir, 'recreated-by-old-writer') } } });
-    h = createOwnerHarness({ dir: s2.dir, fsImpl: f2 });
+    const crashed2 = trackOwnerFds(f2);
+    h = createOwnerHarness({ dir: s2.dir, fsImpl: crashed2.fs });
     const o2 = h.open();
     assert.equal(o2.reason, 'migration_conflict'); assert.equal(o2.stateMessage.detail, 'legacy_recreated');
     const names = fs.readdirSync(s2.parent);
@@ -411,16 +440,17 @@ test('M2 conflicts: legacy_modified (write to L between capture and aside) and l
     assert.equal(fs.readFileSync(s2.dir, 'utf8'), 'recreated-by-old-writer', 'the reappeared file is retained');
     const asideName = names.find((n) => n.startsWith('tracked-injections.json.pre-0.10.'));
     assert.equal(sha256(fs.readFileSync(path.join(s2.parent, asideName))), leg2.sha256);
-    h.release();
+    crashOwner(h, crashed2);
   } finally { s2.rm(); }
   // crash after M5 (before the aside rename): the next open redoes the migration with a new token; the abandoned staging dir is counted, not deleted
   const s3 = tmpStore();
   try {
     const leg3 = writeLegacyLedger(s3.dir, { count: 4 });
     const f3 = createFaultFs({ faults: { renameSync: { code: 'EIO', times: 1, when: (args) => args[0] === s3.dir } } });
-    h = createOwnerHarness({ dir: s3.dir, fsImpl: f3 });
+    const crashed3 = trackOwnerFds(f3);
+    h = createOwnerHarness({ dir: s3.dir, fsImpl: crashed3.fs });
     assert.equal(h.open().reason, 'open_failed');
-    h.release();
+    crashOwner(h, crashed3);
     assert.equal(sha256(fs.readFileSync(s3.dir)), leg3.sha256, 'L untouched');
     h = createOwnerHarness({ dir: s3.dir });
     const o3 = h.open();
@@ -434,11 +464,12 @@ test('M2 conflicts: legacy_modified (write to L between capture and aside) and l
       writeLegacyLedger(s4.dir, { count: 1 });
       fs.mkdirSync(path.join(s4.parent, 'tracked-injections.json.migrating.aaaa'));
       fs.mkdirSync(path.join(s4.parent, 'tracked-injections.json.migrating.bbbb'));
-      h = createOwnerHarness({ dir: s4.dir });
+      const crashed4 = trackOwnerFds();
+      h = createOwnerHarness({ dir: s4.dir, fsImpl: crashed4.fs });
       const o4 = h.open();
       assert.equal(o4.reason, 'migration_precondition'); assert.equal(o4.stateMessage.detail, 'abandoned_staging');
       assert.equal(fs.statSync(s4.dir).isFile(), true);
-      h.release();
+      crashOwner(h, crashed4);
     } finally { s4.rm(); }
   } finally { s3.rm(); }
 }));

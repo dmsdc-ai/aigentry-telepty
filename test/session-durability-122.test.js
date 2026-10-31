@@ -110,7 +110,11 @@ test('failed spawn persistence kills only the newly created PTY and publishes no
     const sessions = {}, events = [], states = [];
     registerSpawnRoute({ post: (_, fn) => handler = fn }, { sessions, sessionStateManager: { register: id => states.push(id) }, pty: { spawn: () => ({ pid: 123, kill: () => killed++, onData: () => { }, onExit: () => { } }) }, persistSessions: () => ({ ok: false, committed: false }), appendToOutputRing: () => { }, revokeSessionCredential: () => { }, busClients: new Set([{ readyState: 1, send: msg => events.push(msg) }]), os: { platform: () => process.platform }, buildSessionEnv: () => ({}), admission: { take: () => ({ allowed: true }) } });
     const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
-    handler({ body: { session_id: 'synthetic-spawn', command: 'synthetic-command' } }, res);
+    // Task 1215 / #879 W4: the spawn route resolves the command through the real target builder; on win32 that
+    // is a PATH×PATHEXT walk which refuses a synthetic bare name (500) before the injected persistence failure.
+    // process.execPath (an existing absolute executable) is resolvable on every platform; pty.spawn is the
+    // fixture above, so nothing is executed.
+    handler({ body: { session_id: 'synthetic-spawn', command: process.execPath } }, res);
     assert.equal(res.statusCode, 503);
     assert.deepEqual(sessions, {});
     assert.equal(killed, 1);
