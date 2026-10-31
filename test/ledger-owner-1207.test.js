@@ -35,7 +35,42 @@ function beginRecord(id, sid, at = nowIso()) {
 const begin = (h, id, sid) => h.submit('begin', { id, sid, record: beginRecord(id, sid), at: nowIso() }, { cls: 'T' });
 const obs = (h, id, kind, trigger, extra = {}) => h.submit('obs', { id, observation: { kind, trigger, at: nowIso(), ...extra } });
 const state = (h, id, ts) => h.submit('state', { id, tracking_state: ts, observation: { kind: 'inject_delivery_refused', trigger: 'delivery_refused', delivery_code: 'X', bytes_written: 0, at: nowIso() } }, { cls: 'T' });
-async function withStore(fn) { const s = tmpStore(); try { return await fn(s); } finally { s.rm(); } }
+async function withStore(fn) { const s = tmpStore(); const owned = []; return inStore(s, owned, () => fn(s, owned)); }
+// Task 1215 — owned fixture teardown. On Windows a file deleted while a descriptor is still open stays
+// delete-pending, so removing its directory fails ENOTEMPTY; a test body that fails BEFORE its owner is
+// closed or crash-released leaves exactly such a descriptor, and the cleanup error then REPLACED the
+// assertion error. inStore keeps both: it releases only what this test positively owns (descriptors
+// still open through each registered owner's tracker — the OS release a crash performs, no owner close()
+// and no store write — then that owner's token-verified lock), removes the private home, and reports a
+// teardown failure with the remaining entries, aggregated with the body error when there is one.
+// No retry, no wait, nothing swallowed.
+async function inStore(s, owned, body) {
+  let bodyError = null;
+  try { return await body(); } catch (error) { bodyError = error; throw error; } finally { ownedTeardown(s, owned, bodyError); }
+}
+function remainingEntries(root, max = 40) {
+  const out = [];
+  (function walk(d, rel) {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) { if (out.length >= max) return; const r = rel ? `${rel}/${e.name}` : e.name; out.push(e.isDirectory() ? `${r}/` : r); if (e.isDirectory()) walk(path.join(d, e.name), r); }
+  })(root, '');
+  return out;
+}
+function ownedTeardown(s, owned, bodyError) {
+  const failures = []; let releasedFds = 0;
+  for (const { h, tracked } of owned.splice(0)) {
+    for (const fd of tracked.takeOpen()) { try { fs.closeSync(fd); releasedFds++; } catch (error) { failures.push(error); } }
+    const r = h.release();            // token-verified: an already-released (or replaced) lock is lock_mismatch, a no-op
+    if (r && r.reason === 'unlink_failed') failures.push(new Error(`owned lock release failed: ${r.code}`));
+  }
+  try { s.rm(); } catch (error) {
+    failures.push(new Error(`owned fixture cleanup failed: ${error.code} ${error.path || ''}; released_fds=${releasedFds}; body_failed=${!!bodyError}; remaining=${JSON.stringify(remainingEntries(s.home))}`, { cause: error }));
+  }
+  if (!failures.length) return;
+  if (bodyError) throw new AggregateError([bodyError, ...failures], `test body failed (${bodyError.message}) and owned fixture teardown failed`);
+  throw failures.length === 1 ? failures[0] : new AggregateError(failures, 'owned fixture teardown failed');
+}
 // Task 1215 / #879 W2 — simulated crash. A real crash ends the owner's process and the OS releases every
 // descriptor it held; the in-process "crash" (no close(), then release()) used to leave them open, which
 // Windows measured as ENOTEMPTY at cleanup. trackOwnerFds wraps ONE owner's fsImpl and records only the
@@ -413,13 +448,13 @@ test('binding correction 2 / E2: a writer replacing the legacy file after captur
   h.release();
 }));
 
-test('M2 conflicts: legacy_modified (write to L between capture and aside) and legacy_recreated (file at L between the two renames) each stop with every file retained; a crash after M5 resumes to the same final store', () => withStore(async (s) => {
+test('M2 conflicts: legacy_modified (write to L between capture and aside) and legacy_recreated (file at L between the two renames) each stop with every file retained; a crash after M5 resumes to the same final store', () => withStore(async (s, owned) => {
   // legacy_modified: mutate L right before the h2 re-hash (hook on the statless hashing open after M5)
   const legacy = writeLegacyLedger(s.dir, { count: 4 });
   let opens = 0;
   const f1 = createFaultFs({ faults: { openSync: { code: null, times: 1, when: (args) => args[0] === s.dir && ++opens === 3, before: () => fs.appendFileSync(s.dir, '\n') } } });
   const crashed1 = trackOwnerFds(f1);
-  let h = createOwnerHarness({ dir: s.dir, fsImpl: crashed1.fs });
+  let h = createOwnerHarness({ dir: s.dir, fsImpl: crashed1.fs }); owned.push({ h, tracked: crashed1 });
   const o1 = h.open();
   assert.equal(o1.reason, 'migration_conflict'); assert.equal(o1.stateMessage.detail, 'legacy_modified');
   assert.equal(fs.statSync(s.dir).isFile(), true, 'L untouched (still the file, with the writer\'s change)');
@@ -427,12 +462,12 @@ test('M2 conflicts: legacy_modified (write to L between capture and aside) and l
   assert.equal(fs.readdirSync(s.parent).filter((n) => n.startsWith('tracked-injections.json.migrating.')).length, 1, 'S kept');
   crashOwner(h, crashed1);
   // clean slate: legacy_recreated at M6b
-  s.rm(); const s2 = tmpStore();
-  try {
+  ownedTeardown(s, owned, null); const s2 = tmpStore(); const owned2 = [];
+  await inStore(s2, owned2, () => {
     const leg2 = writeLegacyLedger(s2.dir, { count: 4 });
     const f2 = createFaultFs({ faults: { renameSync: { code: null, times: 1, when: (args) => String(args[0]).includes('.migrating.') && args[1] === s2.dir, before: () => fs.writeFileSync(s2.dir, 'recreated-by-old-writer') } } });
     const crashed2 = trackOwnerFds(f2);
-    h = createOwnerHarness({ dir: s2.dir, fsImpl: crashed2.fs });
+    h = createOwnerHarness({ dir: s2.dir, fsImpl: crashed2.fs }); owned2.push({ h, tracked: crashed2 });
     const o2 = h.open();
     assert.equal(o2.reason, 'migration_conflict'); assert.equal(o2.stateMessage.detail, 'legacy_recreated');
     const names = fs.readdirSync(s2.parent);
@@ -441,37 +476,38 @@ test('M2 conflicts: legacy_modified (write to L between capture and aside) and l
     const asideName = names.find((n) => n.startsWith('tracked-injections.json.pre-0.10.'));
     assert.equal(sha256(fs.readFileSync(path.join(s2.parent, asideName))), leg2.sha256);
     crashOwner(h, crashed2);
-  } finally { s2.rm(); }
+  });
   // crash after M5 (before the aside rename): the next open redoes the migration with a new token; the abandoned staging dir is counted, not deleted
-  const s3 = tmpStore();
-  try {
+  const s3 = tmpStore(); const owned3 = [];
+  await inStore(s3, owned3, async () => {
     const leg3 = writeLegacyLedger(s3.dir, { count: 4 });
     const f3 = createFaultFs({ faults: { renameSync: { code: 'EIO', times: 1, when: (args) => args[0] === s3.dir } } });
     const crashed3 = trackOwnerFds(f3);
-    h = createOwnerHarness({ dir: s3.dir, fsImpl: crashed3.fs });
+    h = createOwnerHarness({ dir: s3.dir, fsImpl: crashed3.fs }); owned3.push({ h, tracked: crashed3 });
     assert.equal(h.open().reason, 'open_failed');
     crashOwner(h, crashed3);
     assert.equal(sha256(fs.readFileSync(s3.dir)), leg3.sha256, 'L untouched');
-    h = createOwnerHarness({ dir: s3.dir });
+    const live3 = trackOwnerFds();     // pass-through tracker: lets a failed body release this owner's segment fd
+    h = createOwnerHarness({ dir: s3.dir, fsImpl: live3.fs }); owned3.push({ h, tracked: live3 });
     const o3 = h.open();
     assert.equal(o3.state, 'available');
     assert.equal(fs.readdirSync(s3.parent).filter((n) => n.startsWith('tracked-injections.json.migrating.')).length, 1, 'the abandoned staging dir from the crashed attempt is retained');
     assert.equal(h.read('get', { id: leg3.ids[0] }).items.length, 1);
     await h.close(); h.release();
     // two abandoned staging dirs + a legacy file ⇒ abandoned_staging precondition (operator cleanup)
-    const s4 = tmpStore();
-    try {
+    const s4 = tmpStore(); const owned4 = [];
+    await inStore(s4, owned4, () => {
       writeLegacyLedger(s4.dir, { count: 1 });
       fs.mkdirSync(path.join(s4.parent, 'tracked-injections.json.migrating.aaaa'));
       fs.mkdirSync(path.join(s4.parent, 'tracked-injections.json.migrating.bbbb'));
       const crashed4 = trackOwnerFds();
-      h = createOwnerHarness({ dir: s4.dir, fsImpl: crashed4.fs });
+      h = createOwnerHarness({ dir: s4.dir, fsImpl: crashed4.fs }); owned4.push({ h, tracked: crashed4 });
       const o4 = h.open();
       assert.equal(o4.reason, 'migration_precondition'); assert.equal(o4.stateMessage.detail, 'abandoned_staging');
       assert.equal(fs.statSync(s4.dir).isFile(), true);
       crashOwner(h, crashed4);
-    } finally { s4.rm(); }
-  } finally { s3.rm(); }
+    });
+  });
 }));
 
 test('X1: the installed 0.9.1 persistence cannot write over or read the directory store (errno recorded); no tmp residue; directory unchanged', { skip: !POSIX && 'errno recorded on POSIX only; Windows unsupported for cutover until measured' }, () => withStore(async (s) => {

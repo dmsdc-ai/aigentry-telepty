@@ -30,6 +30,46 @@ function withHome() {
   return { home, cfg: path.join(home, '.telepty', 'config.json') };
 }
 
+// Task 1215 — a daemon that reached `listening` has a ledger owner (a worker thread IN the daemon process)
+// holding .config/aigentry-telepty/tracked-injections.json/segments/* open. ChildProcess.kill() only
+// REQUESTS termination; removing the home before the process has exited raced those handles (Windows:
+// ENOTEMPTY on segments). Kill stays SIGKILL (no graceful path is simulated); teardown now waits,
+// bounded, for the actual 'exit', keeps the home and fails hard if it never comes, and reports a cleanup
+// failure together with — never instead of — the body's own failure. No retry, no sleep.
+const DAEMON_EXIT_BOUND_MS = 5000;
+function waitForExit(child, ms) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), ms);
+    child.once('exit', () => { clearTimeout(t); resolve(true); });
+  });
+}
+function remainingEntries(root, max = 40) {
+  const out = [];
+  (function walk(d, rel) {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) { if (out.length >= max) return; const r = rel ? `${rel}/${e.name}` : e.name; out.push(e.isDirectory() ? `${r}/` : r); if (e.isDirectory()) walk(path.join(d, e.name), r); }
+  })(root, '');
+  return out;
+}
+async function killExitedThenRemove(d, home, bodyError) {
+  const failures = [];
+  if (d) {
+    const exited = waitForExit(d, DAEMON_EXIT_BOUND_MS);
+    try { d.kill('SIGKILL'); } catch { /* already gone */ }
+    if (!(await exited)) failures.push(new Error(`daemon pid ${d.pid} did not exit within ${DAEMON_EXIT_BOUND_MS}ms of SIGKILL; owned home retained: ${home}`));
+  }
+  if (!failures.length) {
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch (error) {
+      failures.push(new Error(`owned home cleanup failed after daemon exit (exit=${d ? d.exitCode : 'n/a'} signal=${d ? d.signalCode : 'n/a'}): ${error.code} ${error.path || ''}; body_failed=${!!bodyError}; remaining=${JSON.stringify(remainingEntries(home))}`, { cause: error }));
+    }
+  }
+  if (!failures.length) return;
+  if (bodyError) throw new AggregateError([bodyError, ...failures], `test body failed (${bodyError.message}) and owned teardown failed`);
+  throw failures[0];
+}
+
 function seed(cfg, bytes) {
   fs.writeFileSync(cfg, bytes, { mode: 0o600 });
 }
@@ -327,7 +367,7 @@ test('the daemon refuses to boot on an unreadable config, loudly, without rewrit
 test('the daemon boots on a corrupt config when TELEPTY_AUTH_TOKEN supplies the secret', { timeout: 30000 }, async () => {
   const { home, cfg } = withHome();
   const ENV_TOKEN = `env-supplied-${randomUUID()}`;
-  let d = null;
+  let d = null; let bodyError = null;
   try {
     seed(cfg, '{"authToken":"REAL-SECR');
     const before = fs.readFileSync(cfg);
@@ -371,9 +411,8 @@ test('the daemon boots on a corrupt config when TELEPTY_AUTH_TOKEN supplies the 
     assert.equal(ok.status, 200, 'the env-supplied token must be the one the daemon actually enforces');
     const denied = await fetch(`http://127.0.0.1:${port}/api/sessions`, { headers: { 'x-telepty-token': 'REAL-SECR' } });
     assert.notEqual(denied.status, 200, 'and the unreadable file must not have supplied a working one');
-  } finally {
-    if (d) { try { d.kill('SIGKILL'); } catch { /* already gone */ } }
-    fs.rmSync(home, { recursive: true, force: true });
+  } catch (error) { bodyError = error; throw error; } finally {
+    await killExitedThenRemove(d, home, bodyError);
   }
 });
 
