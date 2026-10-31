@@ -333,7 +333,8 @@ class FileMailbox {
       // Flush existing valid custody too: a retry after an uncertain flush must establish
       // durability itself. No successful session ACK depends on a prior failed attempt.
       for (const leaf of ['inbox.jsonl', 'state.jsonl']) {
-        const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_RDONLY);
+        // #879 D1: FlushFileBuffers (win32 fsync) needs write access; O_RDWR without O_CREAT/O_TRUNC writes nothing.
+        const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_RDWR);
         try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       }
       if (process.platform !== 'win32') {
@@ -355,7 +356,7 @@ class FileMailbox {
     const sessionDir=this._sessionDir(sessionId),release=acquireLock(sessionDir);
     try{
       require('./custody').acknowledgedCustodySnapshot(sessionDir,sessionId,event);
-      for(const leaf of ['inbox.jsonl','state.jsonl']){const fd=openFile(path.join(sessionDir,leaf),fs.constants.O_RDONLY);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      for(const leaf of ['inbox.jsonl','state.jsonl']){const fd=openFile(path.join(sessionDir,leaf),fs.constants.O_RDWR);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
       if(process.platform!=='win32'){const fd=fs.openSync(sessionDir,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
       return callback();
     }finally{release();}
@@ -366,7 +367,7 @@ class FileMailbox {
     try{
       const rows=require('./custody').neverAttemptedCustodySnapshot(sessionDir,sessionId);
       // Flush the immutable bytes before an authority record can claim durable custody.
-      for(const leaf of ['inbox.jsonl','state.jsonl']){const fd=openFile(path.join(sessionDir,leaf),fs.constants.O_RDONLY);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+      for(const leaf of ['inbox.jsonl','state.jsonl']){const fd=openFile(path.join(sessionDir,leaf),fs.constants.O_RDWR);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
       if(process.platform!=='win32'){const fd=fs.openSync(sessionDir,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
       const result=callback(rows);if(result&&typeof result.then==='function')throw new Error('Custody callback must be synchronous');return result;
     }finally{release();}
@@ -380,7 +381,8 @@ class FileMailbox {
       const snapshot = require('./custody').strictCustodySnapshot(sessionDir, sessionId);
       if (durable) {
         for (const leaf of ['inbox.jsonl', 'state.jsonl']) {
-          const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_RDONLY);
+          // #879 D1: write access for the win32 flush; no create, truncate or write.
+          const fd = openFile(path.join(sessionDir, leaf), fs.constants.O_RDWR);
           try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
         }
         if (process.platform !== 'win32') {
