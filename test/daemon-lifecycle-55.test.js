@@ -343,3 +343,140 @@ test('stopDaemon: nothing running → no targets, no failures (idempotent)', () 
   assert.equal(result.stopped.length, 0);
   assert.equal(result.failed.length, 0);
 });
+
+// ── task 1215 W3: production normal stop/restart vs genuine crash (ledger lock) ─────────────────
+//
+// These cases drive the REAL CLI (`telepty daemon start|stop|restart`, `telepty ledger unlock`) against a
+// private HOME/port, and bind ownership before acting: the pid comes from that daemon's own /api/meta,
+// and the ledger lock file names that same pid. They distinguish three facts: the stop command's
+// result, the actual process exit, and whether the NEXT daemon for the same HOME gets the ledger.
+// On Windows the production stop path currently ends in `taskkill /F` (daemon-control.js →
+// src/win-kill-process.js), which runs no shutdown handler; the two normal-stop cases are expected to
+// stay RED there until that production path is corrected. Nothing here is skipped per platform.
+//
+// The crash control is the accepted fail-closed contract: a daemon killed without shutdown leaves its
+// lock, the next daemon reports lock_present, the lock bytes are untouched (no automatic steal), and
+// only `telepty ledger unlock --confirm` with no daemon alive clears it.
+
+const LEDGER_WAIT_MS = 20000; // the same bound test/integration/ledger-daemon-1207.test.js uses
+
+function ledgerLockPath(home) {
+  return path.join(home, '.config', 'aigentry-telepty', 'tracked-injections.lock');
+}
+
+function readLock(home) {
+  try { return fs.readFileSync(ledgerLockPath(home)); } catch { return null; }
+}
+
+async function ledgerStatus(port, home) {
+  try {
+    const token = tokenFor(home);
+    const res = await fetch(`http://127.0.0.1:${port}/api/ledger/status`, {
+      signal: AbortSignal.timeout(1000),
+      headers: token ? { 'x-telepty-token': token } : {}
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// Waits for a SETTLED ledger state of the daemon on `port` (available or lock_present) and returns it,
+// so a refusal is reported by name instead of as a timeout.
+function settledLedger(port, home, desc) {
+  return waitFor(async () => {
+    const s = await ledgerStatus(port, home);
+    return s && s.client && ['available', 'lock_present'].includes(s.client.store) ? s : null;
+  }, { timeoutMs: LEDGER_WAIT_MS, desc });
+}
+
+function processGone(pid) {
+  try { process.kill(pid, 0); return false; } catch { return true; }
+}
+
+// Starts a daemon through the CLI and returns its owned identity: the pid it reports and the lock it holds.
+async function startOwnedDaemon(home, port) {
+  const started = await runCli(['daemon', 'start'], home, port);
+  assert.equal(started.code, 0, `PRECONDITION: daemon start exits 0\nstderr:\n${started.stderr}`);
+  await waitFor(() => health(port), { desc: 'daemon health' });
+  const m = await waitFor(() => meta(port, home), { desc: 'daemon /api/meta' });
+  assert.ok(Number.isInteger(m.pid) && m.pid > 0, 'PRECONDITION: daemon reports its pid');
+  const ledger = await settledLedger(port, home, 'first ledger settle');
+  assert.equal(ledger.client.store, 'available', 'PRECONDITION: a fresh HOME opens its ledger');
+  const lock = readLock(home);
+  assert.ok(lock, 'PRECONDITION: the running daemon holds the ledger lock');
+  assert.equal(JSON.parse(lock.toString('utf8')).pid, m.pid, 'PRECONDITION: the lock is owned by this daemon pid');
+  return { pid: m.pid, lock };
+}
+
+test('#W3 production `daemon stop`: a normal stop exits the owned daemon, frees the port and releases the ledger lock', async () => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  const owned = await startOwnedDaemon(home, port);
+
+  const res = await runCli(['daemon', 'stop'], home, port);
+  await waitFor(async () => (await health(port)) === null, { desc: 'port freed after stop' });
+  await waitFor(() => processGone(owned.pid), { desc: 'owned daemon process exited' });
+  assert.deepEqual({ code: res.code, stopped: /stopped/i.test(res.stdout), lockReleased: readLock(home) === null },
+    { code: 0, stopped: true, lockReleased: true },
+    `a NORMAL stop must run the daemon shutdown that releases its ledger lock\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+});
+
+test('#W3 production `daemon restart`: the restarted daemon for the same HOME opens its ledger (not lock_present)', async () => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  const owned = await startOwnedDaemon(home, port);
+
+  const res = await runCli(['daemon', 'restart'], home, port);
+  assert.equal(res.code, 0, `daemon restart should exit 0\nstderr:\n${res.stderr}`);
+  await waitFor(() => processGone(owned.pid), { desc: 'previous daemon process exited' });
+  const next = await waitFor(async () => {
+    const m = await meta(port, home);
+    return m && m.pid && m.pid !== owned.pid ? m : null;
+  }, { desc: 'restarted daemon reachable with a new pid' });
+  const ledger = await settledLedger(port, home, 'restarted daemon ledger settle');
+  assert.deepEqual({ newPid: next.pid !== owned.pid, store: ledger.client.store, reason: ledger.unavailable_reason || null },
+    { newPid: true, store: 'available', reason: null },
+    'a normal restart must not leave the previous daemon\'s lock behind');
+});
+
+test('#W3 genuine crash control: a forced kill keeps lock_present, untouched, until an explicit operator unlock', async () => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  const owned = await startOwnedDaemon(home, port);
+
+  // Deliberate crash: no shutdown handler can run (POSIX SIGKILL; Windows TerminateProcess).
+  process.kill(owned.pid, 'SIGKILL');
+  await waitFor(() => processGone(owned.pid), { desc: 'crashed daemon process exited' });
+  await waitFor(async () => (await health(port)) === null, { desc: 'port freed after crash' });
+  const afterCrash = readLock(home);
+
+  await runCli(['daemon', 'start'], home, port);
+  const second = await waitFor(() => meta(port, home), { desc: 'second daemon /api/meta' });
+  const refusedLedger = await settledLedger(port, home, 'second daemon ledger settle');
+  const unlockWhileUp = await runCli(['ledger', 'unlock', '--confirm'], home, port);
+  const lockWhileUp = readLock(home);
+
+  const stopped = await runCli(['daemon', 'stop'], home, port);
+  await waitFor(() => processGone(second.pid), { desc: 'second daemon process exited' });
+  await waitFor(async () => (await health(port)) === null, { desc: 'port freed after second stop' });
+  const lockAfterStop = readLock(home);
+  const unlockNoConfirm = await runCli(['ledger', 'unlock'], home, port);
+  const unlock = await runCli(['ledger', 'unlock', '--confirm'], home, port);
+
+  await runCli(['daemon', 'start'], home, port);
+  const third = await settledLedger(port, home, 'third daemon ledger settle');
+  assert.deepEqual({
+    lockKeptByCrash: !!afterCrash && afterCrash.equals(owned.lock),
+    secondStore: refusedLedger.client.store, secondReason: refusedLedger.unavailable_reason,
+    unlockWhileUpRefused: unlockWhileUp.code !== 0, lockUntouchedWhileUp: !!lockWhileUp && lockWhileUp.equals(owned.lock),
+    secondStopCode: stopped.code, lockUntouchedAfterNonHolderStop: !!lockAfterStop && lockAfterStop.equals(owned.lock),
+    unlockNeedsConfirm: unlockNoConfirm.code !== 0 && /confirm_required/.test(unlockNoConfirm.stdout),
+    unlocked: unlock.code === 0 && /"unlocked": true/.test(unlock.stdout), thirdStore: third.client.store,
+  }, {
+    lockKeptByCrash: true, secondStore: 'lock_present', secondReason: 'lock_present',
+    unlockWhileUpRefused: true, lockUntouchedWhileUp: true, secondStopCode: 0, lockUntouchedAfterNonHolderStop: true,
+    unlockNeedsConfirm: true, unlocked: true, thirdStore: 'available',
+  }, `unlockWhileUp:\n${unlockWhileUp.stdout}\nunlock:\n${unlock.stdout}${unlock.stderr}`);
+});

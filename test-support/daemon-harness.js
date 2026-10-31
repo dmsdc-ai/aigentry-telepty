@@ -140,7 +140,8 @@ async function startTestDaemon(options = {}) {
   const child = spawn(process.execPath, ['daemon.js'], {
     cwd: projectRoot,
     env: daemonEnv,
-    stdio: ['ignore', 'pipe', 'pipe']
+    // Task 1215 W3: the IPC channel is how a Windows normal stop reaches the daemon's own shutdown().
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc']
   });
 
   child.stdout.on('data', (chunk) => {
@@ -183,7 +184,20 @@ async function startTestDaemon(options = {}) {
   // did not complete is a failure the test reports rather than a silent return or an open wait.
   async function terminateOwnedChild(label) {
     if (exitState.exited) return exitState;
-    child.kill(); // POSIX: SIGTERM, the daemon's own shutdown path; win32: TerminateProcess
+    // Task 1215 W3: on win32 a normal stop first asks the daemon, over the IPC channel this harness owns,
+    // to run its own shutdown() (the path POSIX reaches with SIGTERM). Only if it has not exited within
+    // the existing grace does the forced path below run — and that is a CRASH (no shutdown, ledger lock
+    // left), recorded as such, never as a graceful stop.
+    if (process.platform === 'win32' && child.connected) {
+      try { child.send({ type: 'telepty.shutdown', v: 1 }); } catch { /* channel gone: forced path below */ }
+      if (await waitForExit(TERMINATE_GRACE_MS)) { exitState.stop = 'graceful_ipc'; return exitState; }
+      exitState.stop = 'forced_after_ipc_timeout';
+      process.stderr.write(`[daemon-harness] ${label}: graceful IPC stop of pid ${child.pid} did not complete within `
+        + `${TERMINATE_GRACE_MS}ms; forcing termination (crash semantics: no shutdown, ledger lock left)\n`);
+    } else if (process.platform !== 'win32') {
+      exitState.stop = 'signal';
+    }
+    child.kill(); // POSIX: SIGTERM, the daemon's own shutdown path; win32: TerminateProcess (crash)
     if (await waitForExit(TERMINATE_GRACE_MS)) return exitState;
     child.kill('SIGKILL');
     if (await waitForExit(TERMINATE_KILL_MS)) return exitState;

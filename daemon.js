@@ -2601,6 +2601,18 @@ function shutdown(code) {
 if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
   process.on('SIGINT', () => shutdown(0));
   process.on('SIGTERM', () => shutdown(0));
+  // Task 1215 W3: a normal stop on Windows. There, child.kill()/taskkill terminate the process without
+  // running any signal handler, so shutdown() (which releases the ledger lock) never ran. A parent that
+  // spawned this daemon WITH an IPC channel (the test harness) may ask for the same shutdown() over that
+  // already-owned channel. Registered only when the channel exists — never for a detached production
+  // daemon — and reachable by no HTTP/WS route, peer or other process. Exact bounded message; shutdown()
+  // is idempotent.
+  if (typeof process.send === 'function' && process.channel) {
+    process.on('message', (message) => {
+      if (message && typeof message === 'object' && !Array.isArray(message) && Object.keys(message).length === 2
+          && message.type === 'telepty.shutdown' && message.v === 1) shutdown(0);
+    });
+  }
   process.on('exit', () => {
     clearDaemonState(process.pid);
   });
