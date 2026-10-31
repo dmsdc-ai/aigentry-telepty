@@ -18,8 +18,9 @@
 //   complete, positive tally is a non-pass.
 //
 // Scope guard: this file is runner-only. It changes no product module, no package script and no
-// test body. The inventory is derived at runtime from package.json `test:ci` / `test:ci:pty`, so
-// there is no second hand-maintained list to go stale. A timeout, a lost or unverified process, a
+// test body. The inventory is read at runtime from scripts/test-suites.json, the same file that
+// `npm run test:ci` / `test:ci:pty` execute through scripts/run-tests.mjs, so there is no second
+// hand-maintained list to go stale. A timeout, a lost or unverified process, a
 // spawn error, a stream that never closes or an incomplete tally is ALWAYS a non-zero exit — a
 // bound is never reported as a pass.
 //
@@ -36,7 +37,7 @@
 // Built-in modules only (no project imports). Node >= 20.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { createWriteStream, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { createWriteStream, mkdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -119,37 +120,36 @@ function parseArgs(argv) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Inventory — derived from package.json scripts, never hand-maintained.
-// `test:ci`     = node --require <preloads...> --test --test-reporter=spec <files...> && git diff ...
-// `test:ci:pty` = node --require <preloads...> --test --test-reporter=spec <file>
+// Inventory — scripts/test-suites.json, the one list scripts/run-tests.mjs executes. package.json
+// must invoke exactly these runner commands; any other script shape is refused, never parsed, so
+// the wrapper's own filename can never be mistaken for a test file.
 // ---------------------------------------------------------------------------------------------
-function parseScript(script, name) {
-  if (typeof script !== 'string') throw new Error(`${name}: script missing from package.json`);
-  const command = script.split('&&')[0].trim();
-  const tokens = command.split(/\s+/);
-  if (tokens[0] !== 'node') throw new Error(`${name}: expected the script to start with "node", got "${tokens[0]}"`);
-  const requires = [];
-  const files = [];
-  for (let i = 1; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (t === '--require' || t === '-r') { requires.push(tokens[++i]); continue; }
-    if (t.startsWith('--require=')) { requires.push(t.slice('--require='.length)); continue; }
-    if (t === '--test' || t.startsWith('--test-reporter')) continue;
-    if (t.startsWith('-')) throw new Error(`${name}: unrecognised node flag "${t}" — extend the parser deliberately`);
-    files.push(t);
+const SUITES_SCHEMA = 'telepty-test-suites/v1';
+const RUNNER_SCRIPTS = {
+  'test:ci': 'node scripts/run-tests.mjs test:ci && git diff --exit-code tests/snippet-protocol/v1/',
+  'test:ci:pty': 'node scripts/run-tests.mjs test:ci:pty',
+};
+
+function suiteFiles(suites, mode) {
+  const suite = suites.modes && Object.hasOwn(suites.modes, mode) ? suites.modes[mode] : null;
+  if (!suite || !Array.isArray(suite.files) || suite.files.length === 0) throw new Error(`${mode}: no test files in scripts/test-suites.json`);
+  for (const f of suite.flags || []) {
+    if (f !== '--test' && !f.startsWith('--test-reporter')) throw new Error(`${mode}: unrecognised node flag "${f}" — extend the parser deliberately`);
   }
-  if (files.length === 0) throw new Error(`${name}: no test files found`);
-  return { requires, files };
+  return suite.files;
 }
 
 function loadInventory() {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  const main = parseScript(pkg.scripts['test:ci'], 'test:ci');
-  const pty = parseScript(pkg.scripts['test:ci:pty'], 'test:ci:pty');
+  for (const [name, expected] of Object.entries(RUNNER_SCRIPTS)) {
+    if (pkg.scripts[name] !== expected) throw new Error(`${name}: expected package.json to run ${JSON.stringify(expected)}, got ${JSON.stringify(pkg.scripts[name])}`);
+  }
+  const suites = JSON.parse(readFileSync(join(SCRIPT_DIR, 'test-suites.json'), 'utf8'));
+  if (suites.schema !== SUITES_SCHEMA) throw new Error(`scripts/test-suites.json: expected schema ${SUITES_SCHEMA}`);
   return {
-    requires: main.requires,
-    main: main.files.map((file, index) => ({ phase: 'main', index, file })),
-    pty: pty.files.map((file, index) => ({ phase: 'pty', index, file })),
+    requires: suites.preload,
+    main: suiteFiles(suites, 'test:ci').map((file, index) => ({ phase: 'main', index, file })),
+    pty: suiteFiles(suites, 'test:ci:pty').map((file, index) => ({ phase: 'pty', index, file })),
     packageVersion: pkg.version,
   };
 }
@@ -163,7 +163,7 @@ function loadInventory() {
 // Timeout/TCPSocketWrap/ChildProcessStdio/...) plus `process._getActiveHandles()` (internal,
 // guarded) for child pids, ports and addresses.
 // ---------------------------------------------------------------------------------------------
-function preloadSource(intervalMs) {
+export function preloadSource(intervalMs) {
   return `'use strict';
 const t0 = Date.now();
 const log = (line) => { try { process.stderr.write('[879-child pid=' + process.pid + ' +' + ((Date.now() - t0) / 1000).toFixed(1) + 's] ' + line + '\\n'); } catch {} };
@@ -191,7 +191,9 @@ function summarise() {
 }
 const timer = setInterval(() => log('active-handles ' + JSON.stringify(summarise())), ${intervalMs});
 timer.unref();
-process.on('beforeExit', (code) => log('beforeExit code=' + code + ' handles=' + JSON.stringify(summarise())));
+// once: on a Windows pipe the stderr write below is asynchronous, so a persistent listener re-arms
+// the loop and fires beforeExit forever (run 41173717097, session-durability-122: 307,169 lines).
+process.once('beforeExit', (code) => log('beforeExit code=' + code + ' handles=' + JSON.stringify(summarise())));
 process.on('exit', (code) => log('exit code=' + code));
 `;
 }
@@ -723,4 +725,7 @@ async function main() {
   return summary.allAccounted ? 0 : 1;
 }
 
-main().then((code) => { process.exitCode = code; }, (e) => { process.stderr.write(`${e && e.stack}\n`); process.exitCode = 2; });
+// Entry point only, so test/test-runner-manifest.test.js can import preloadSource without a run.
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().then((code) => { process.exitCode = code; }, (e) => { process.stderr.write(`${e && e.stack}\n`); process.exitCode = 2; });
+}

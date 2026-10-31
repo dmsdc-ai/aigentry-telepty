@@ -19,11 +19,8 @@ jobs:
     # backstop, NOT the fix — the root cause (undisposed state-machine poll timer holding the
     # test worker open) is fixed in test/submit-gate-restore-register-678.test.js.
     timeout-minutes: 20
-    # telepty #577: windows-latest has windows-specific reds (broker/ssh path,
-    # PTY/TUI spawn timeouts, snippet runtime-CRLF, launchd plist) tracked separately.
-    # Quarantine windows as non-blocking so ubuntu+macOS are the trustworthy gate
-    # (after #576 both are green). Remove this line when #577 lands.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    # telepty #879: windows-latest is a release gate like ubuntu/macOS. The former #577
+    # continue-on-error quarantine hid that `npm run test:ci` never started on Windows.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
