@@ -1050,30 +1050,34 @@ test('R-1: an existing config is used read-only — exact token sent, bytes unch
 // ── R-2: `tolerate` is a list of step indices, not a boolean ──────────────────
 
 test('R-2: a tolerated first step may fail, but a denied final delete is exit 1 and never completed', async () => {
-  // win32 uninstall plans `/end` (tolerate: [0]) and then `/delete … /f`.
-  const toleratedWorld = winWorld({});
+  // Task 1215 W3 (R1): the scheduled-task uninstall no longer HAS a tolerated step — no `schtasks /end`; the plan is
+  // `/delete … /f` only, with `tolerate: []`, after a confirmed graceful stop. The index-tolerance half therefore runs
+  // on the systemd-user uninstall, whose step 0 (`disable --now`) is still tolerated (src/service.js planUninstall).
+  const toleratedWorld = linuxWorld({ unit: expectedUnit() });
   toleratedWorld.deps.execFileSync = ((inner) => (cmd, argv) => {
     const record = [cmd, ...(argv || [])];
-    if (record.join(' ') === 'schtasks /end /tn telepty-daemon') {
+    if (record.join(' ') === 'systemctl --user disable --now telepty') {
       toleratedWorld.calls.exec.push(record);
-      throw Object.assign(new Error('ERROR: The system cannot find the task specified.'), {
-        status: 1, stderr: 'ERROR: The system cannot find the task specified.'
+      throw Object.assign(new Error('Failed to disable unit: Unit file telepty.service is not loaded.'), {
+        status: 1, stderr: 'Failed to disable unit: Unit file telepty.service is not loaded.'
       });
     }
     return inner(cmd, argv);
   })(toleratedWorld.deps.execFileSync);
 
   const tolerated = await runServiceVerb('uninstall', CONSENTED, toleratedWorld.deps);
-  assert.equal(tolerated.exitCode, SERVICE_EXIT.OK, 'a not-running task is exactly what step 0 tolerates');
+  assert.equal(tolerated.exitCode, SERVICE_EXIT.OK, 'a not-loaded unit is exactly what step 0 tolerates');
   assert.equal(tolerated.ok, true);
   assert.ok(
-    toleratedWorld.calls.exec.some((c) => c.join(' ') === 'schtasks /delete /tn telepty-daemon /f'),
+    toleratedWorld.calls.removals.includes(UNIT_PATH)
+      && toleratedWorld.calls.exec.some((c) => c.join(' ') === 'systemctl --user daemon-reload'),
     'a tolerated failure must not stop the plan'
   );
-  assert.equal(tolerated.steps.find((s) => s.ok === false).command, 'schtasks /end /tn telepty-daemon',
+  assert.equal(tolerated.steps.find((s) => s.ok === false).command, 'systemctl --user disable --now telepty',
     'a tolerated failure is still reported');
 
-  const deniedWorld = winWorld({});
+  // The denied final delete is the scheduled task's only command, reached after a confirmed graceful stop.
+  const deniedWorld = winWorld({ deps: { gracefulStop: async () => decideStopOutcome({ status: 'stopped', pid: 4242, lockRetained: false }) } });
   deniedWorld.deps.execFileSync = ((inner) => (cmd, argv) => {
     const record = [cmd, ...(argv || [])];
     if (record.join(' ') === 'schtasks /delete /tn telepty-daemon /f') {
@@ -1089,6 +1093,9 @@ test('R-2: a tolerated first step may fail, but a denied final delete is exit 1 
   assert.equal(denied.ok, false);
   assert.equal(denied.reason, 'step-failed');
   assert.equal(denied.steps.find((s) => s.ok === false).command, 'schtasks /delete /tn telepty-daemon /f');
+  assert.deepEqual({ gracefulFirst: /^graceful stop/.test(denied.steps[0].command) && denied.steps[0].ok === true,
+    end: deniedWorld.calls.exec.some((c) => c.join(' ') === 'schtasks /end /tn telepty-daemon') },
+  { gracefulFirst: true, end: false }, 'the delete was reached through the graceful gate, never /end');
   assert.notEqual(denied.exitCode, tolerated.exitCode,
     'a tolerated step failure and a non-tolerated one must not be the same result');
 });
@@ -1331,9 +1338,13 @@ test('full Windows uninstall freshly queries task ownership and refuses foreign 
     '', Object.assign(new Error('query denied'), { stderr: 'query denied' })
   ]) {
     const calls = [];
+    // Task 1215 W3 (R1): uninstall reaches the service step only after a confirmed graceful stop and an empty
+    // dry-run census; both seams are recorded below to prove the ownership refusal was reached through them.
+    const cleanups = [];
     const result = runUninstall({
       platform: 'win32', homedir: HOME,
-      cleanupDaemonProcesses: () => ({ stopped: [], failed: [] }),
+      windowsStop: decideStopOutcome({ status: 'stopped', pid: 4242, lockRetained: false }),
+      cleanupDaemonProcesses: (o) => { cleanups.push(o || {}); return o && o.dryRun === true ? { stopped: [], failed: [], targets: [] } : { stopped: [], failed: [] }; },
       fs: { existsSync: () => false },
       serviceDeps: { packageRoot: PKG_ROOT, nodeBin: NODE_BIN, uid: UID, user: 'tester' },
       execFileSync: (command, argv) => {
@@ -1348,15 +1359,19 @@ test('full Windows uninstall freshly queries task ownership and refuses foreign 
     assert.ok(calls.some(call => call[1] === '/query'));
     assert.ok(!calls.some(call => ['/end', '/delete'].includes(call[1])));
     assert.equal(result.services.ok, false);
+    assert.deepEqual({ refused: result.refused || null, census: cleanups.map((o) => o.dryRun === true) }, { refused: null, census: [true] },
+      'the refusal is the fresh ownership refusal, reached after the graceful gate and a dry-run census (no forced sweep)');
   }
 });
 
 test('full Windows uninstall deletes only after a fresh owned-task query', () => {
   const { runUninstall } = require('../src/uninstall');
   const calls = [];
+  const cleanups = [];   // Task 1215 W3 (R1): the census seam (see the foreign/unknown case above)
   const result = runUninstall({
     platform: 'win32', homedir: HOME,
-    cleanupDaemonProcesses: () => ({ stopped: [], failed: [] }),
+    windowsStop: decideStopOutcome({ status: 'stopped', pid: 4242, lockRetained: false }),
+    cleanupDaemonProcesses: (o) => { cleanups.push(o || {}); return o && o.dryRun === true ? { stopped: [], failed: [], targets: [] } : { stopped: [], failed: [] }; },
     fs: { existsSync: () => false },
     serviceDeps: { packageRoot: PKG_ROOT, nodeBin: NODE_BIN, uid: UID, user: 'tester' },
     execFileSync: (command, argv) => {
@@ -1368,6 +1383,8 @@ test('full Windows uninstall deletes only after a fresh owned-task query', () =>
   const deletion = calls.findIndex(call => call[1] === '/delete');
   assert.ok(query >= 0 && deletion > query);
   assert.equal(result.services.ok, true);
+  assert.deepEqual({ end: calls.some(call => call[1] === '/end'), refused: result.refused || null, census: cleanups.map((o) => o.dryRun === true) },
+    { end: false, refused: null, census: [true] }, 'deleted after a confirmed graceful stop and a dry-run census; never /end, never a forced sweep');
 });
 
 test('generic cli.js daemon is foreign on every descriptor platform', () => {

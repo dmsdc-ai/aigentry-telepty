@@ -486,9 +486,12 @@ test('#1215 wiring: cli.js requests the policy at both registrations and trusts 
       || /sessionEnv = \{[^\n]*inputPolicyCapability/.test(CLI),
     capabilityHeaders: count(CLI, '...policyCapabilityHeaders()'),
     transportDeclared: CLI.includes("'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY"),
-    announces: count(CLI, 'allowSecurity.announceTransportReady();'),
+    // Task 1215 (#879): every announce CALL site — owner re-bind, crash restart, startup. The startup site's return value
+    // only selects the bounded announce-failure diagnostic, so it is a guarded call rather than a bare statement.
+    announces: count(CLI, 'allowSecurity.announceTransportReady()'),
+    startupAnnounceDiagnostic: count(CLI, 'if (!allowSecurity.announceTransportReady() && readinessNonce) {'),
   }, { destructured: true, registrations: 2, bothRequired: true, guardedOnClose: true, getter: true, refusedWarning: 2,
-    capabilityToEnv: false, capabilityHeaders: 2, transportDeclared: true, announces: 3 });
+    capabilityToEnv: false, capabilityHeaders: 2, transportDeclared: true, announces: 3, startupAnnounceDiagnostic: 1 });
 });
 
 // --- 3. daemon ----------------------------------------------------------------------------------
