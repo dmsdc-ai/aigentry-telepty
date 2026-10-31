@@ -234,16 +234,27 @@ test('daemon stop: with NO daemon running does NOT start one (the #55 ignore-arg
 
 test('#121: stopping an unrecorded daemon leaves an independently owned listener intact', async t => {
   const home = makeTempHome();
-  const server = net.createServer(socket => socket.end());
+  // Task 1215 G2: record what reaches this foreign listener — no stop (or any telepty action) may be sent to it.
+  const received = [];
+  const server = net.createServer(socket => { socket.on('data', (d) => received.push(String(d))); socket.end(); });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolve);
   });
   t.after(() => new Promise(resolve => server.close(resolve)));
   const port = server.address().port;
+  // Task 1215 G2 (review26): POSITIVE capture control — prove this fixture observes a known harmless request on this
+  // exact listener before relying on the absence of stop/meta requests below (the socket ends at once, so a capture
+  // that never worked would pass vacuously). Our own separate connection; the listener itself is never touched.
+  const PROBE = 'GET /telepty-1215-capture-control HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n';
+  await new Promise((resolve) => { const probe = net.connect(port, '127.0.0.1', () => { probe.end(PROBE); }); probe.on('close', resolve); probe.on('error', resolve); });
+  await waitFor(() => received.join('').includes('/telepty-1215-capture-control'), { timeoutMs: 5000, desc: 'PRECONDITION: the listener capture observes a known request' });
+  const captureBefore = received.length;
   const result = await runCli(['daemon', 'stop'], home, port);
   assert.equal(result.code, 0, result.stderr);
   assert.equal(server.listening, true, 'a port listener is not evidence of a daemon owned by this invocation');
+  assert.ok(captureBefore >= 1, 'PRECONDITION: capture control recorded before the stop');
+  assert.equal(/\/api\/daemon\/stop|\/api\/meta/.test(received.slice(captureBefore).join('')), false, 'no identification or stop request reached a listener that is not an identified telepty daemon');
   assert.equal(fs.existsSync(path.join(home, '.telepty', 'daemon-state.json')), false);
 });
 

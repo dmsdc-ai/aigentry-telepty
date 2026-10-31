@@ -15,8 +15,11 @@ const trust = (audience, keys) => ({ schema: 'telepty.principals/v1', audience, 
 test('owned broker discovery requires signed exact grants, current stream, and whitelist-only metadata', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'broker-discovery-'))); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const receiver = await startTestDaemon(); t.after(() => receiver.stop());
+  const registerBegun = Date.now(); // #1215 G5 diagnostics only
   const reg = await receiver.registerSession('worker', { command: 'PRIVATE_COMMAND', cwd: '/PRIVATE_CWD', delivery_type: 'mailbox' });
-  assert.equal(reg.status, 201);
+  // Failure-only message: a fixed-format response code (never the error text), body presence and the register call's elapsed ms.
+  const registerCode = reg.body && typeof reg.body.code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(reg.body.code) ? reg.body.code : null;
+  assert.equal(reg.status, 201, reg.status === 201 ? '' : `register diag ${JSON.stringify({ status: reg.status, has_body: reg.body != null && typeof reg.body === 'object', code: registerCode, elapsed_ms: Date.now() - registerBegun })}`);
   const source = pair(), node = pair(), hubKey = pair(), intruder = pair();
   const limits = { max_payload_bytes: 256, max_requests: 20, window_ms: 60000, timeout_ms: 1000, max_pending: 4 };
   const hub = createBrokerHub({ privateKey: hubKey.privateKey, homeDir: root, config: {

@@ -153,7 +153,11 @@ test('#109(b): queued callers are delivered in arrival order, each text followed
         : { at_ms: Date.now() - t0, label });
     } catch { /* not a frame */ }
   });
-  const diagnose = (stage) => t.diagnostic(`#879 diag ${stage} ${JSON.stringify({ queue_bound_ms: QUEUE_BOUND_MS, callers, frames: frameTimes, frames_omitted: framesOmitted })}`);
+  // #1215 G5: the daemon's own bounded barrier record(s) for a refusal (fixed fields only), last DAEMON_DIAG_CAP lines emitted after this test began.
+  const DAEMON_DIAG_CAP = 4, DAEMON_DIAG = '[telepty-diag] submit_barrier ', daemonDiagFrom = harness.getLogs().stderr.length;
+  const daemonDiag = () => harness.getLogs().stderr.slice(daemonDiagFrom).split(/\r?\n/).filter((line) => line.startsWith(DAEMON_DIAG)).slice(-DAEMON_DIAG_CAP)
+    .map((line) => { try { return JSON.parse(line.slice(DAEMON_DIAG.length)); } catch { return 'unparsed'; } });
+  const diagnose = (stage) => t.diagnostic(`#879 diag ${stage} ${JSON.stringify({ queue_bound_ms: QUEUE_BOUND_MS, callers, frames: frameTimes, frames_omitted: framesOmitted, daemon: daemonDiag() })}`);
   const pending = [];
   for (const p of ['f1', 'f2', 'f3']) {
     const issued = Date.now() - t0;

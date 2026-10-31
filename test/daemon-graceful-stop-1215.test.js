@@ -161,6 +161,129 @@ test('W3B client: refused, unidentified and unsupported targets are failures wit
   });
 });
 
+// Task 1215 G2 (review26 REWORK). Health is tri-state in the caller (cli.js probeDaemonHealth): true = a daemon
+// answered; false = refused / not a daemon answer (absent as a daemon); null = timeout or reset — presence UNKNOWN,
+// "never not there". Without a token nothing is requested (no /api/meta, no stop). The census (state-file pid + port
+// owner, command-line confirmed) still decides an owned target, but an UNKNOWN presence never authorizes a replacement:
+// a plain stop is benign (ok, nothing acted on), while every caller that needs a replacement refuses (exit 1).
+function noTokenDeps(probeHealth) { const c = clientDeps({ probeHealth }); c.deps.token = null; return c; }
+// The exact composition cli.js gracefulWindowsStop performs: requestGracefulStop, then the census only on no_answer.
+function gateOver(c, census) {
+  return async () => { const r = await requestGracefulStop(c.deps); return decideStopOutcome(r, r.status === 'no_answer' ? census : []); };
+}
+async function quietCli(fn) {
+  const log = console.log; const error = console.error; const exitCode = process.exitCode;
+  console.log = () => {}; console.error = () => {};
+  try { const value = await fn(); return { value, exitCode: process.exitCode }; } finally { console.log = log; console.error = error; process.exitCode = exitCode; }
+}
+
+test('W3 G2: without a local token — unknown presence never authorizes a replacement; genuine absence still does; nothing is ever requested', async () => {
+  const cases = { unknownEmpty: [async () => null, []], unknownOwned: [async () => null, [{ pid: PID, source: 'port-owner' }]],
+    answering: [async () => true, []], absentEmpty: [async () => false, []], absentOwned: [async () => false, [{ pid: PID, source: 'state-file' }]] };
+  const observed = {};
+  for (const [label, [probeHealth, census]] of Object.entries(cases)) {
+    const c = noTokenDeps(probeHealth);
+    const outcome = await gateOver(c, census)();
+    observed[label] = { requests: c.sent.length, ok: outcome.ok, startReplacement: outcome.startReplacement, exitCode: outcome.exitCode, stopped: outcome.stopped };
+  }
+  assert.deepEqual(observed, {
+    unknownEmpty: { requests: 0, ok: true, startReplacement: false, exitCode: 1, stopped: [] },   // benign stop; never a replacement
+    unknownOwned: { requests: 0, ok: false, startReplacement: false, exitCode: 1, stopped: [] },  // an owned target: unconfirmed, never forced
+    answering: { requests: 0, ok: false, startReplacement: false, exitCode: 1, stopped: [] },     // a daemon answered: unidentified, refused
+    absentEmpty: { requests: 0, ok: true, startReplacement: true, exitCode: 0, stopped: [] },     // genuine absence: unchanged
+    absentOwned: { requests: 0, ok: false, startReplacement: false, exitCode: 1, stopped: [] },
+  });
+  assert.deepEqual(await requestGracefulStop(noTokenDeps(async () => null).deps), { status: 'no_answer', reason: 'no_local_token', presence: 'unknown' });
+  assert.deepEqual(await requestGracefulStop(noTokenDeps(async () => false).deps), { status: 'no_answer', reason: 'no_local_token' });
+});
+
+test('W3 G2 callers: with unknown presence, restart / menu / uninstall start nothing while a plain stop exits 0; genuine absence still restarts once', async () => {
+  const cli = require('../cli');
+  const recorder = () => { const calls = []; const fn = (name, ret) => (...a) => { calls.push(name); return ret; }; return { calls, fn }; };
+  const deps = (r, probeHealth) => ({ platform: 'win32', port: 39003, detectSupervisor: () => ({ present: false }), logDaemonRestartEvent: () => {},
+    gracefulStop: gateOver(noTokenDeps(probeHealth), []), signalStop: r.fn('signal-stop', { stopped: [], failed: [] }),
+    startDetachedDaemon: r.fn('start', { pid: 777 }), cleanupDaemonProcesses: r.fn('sweep', { stopped: [], failed: [] }) });
+  const restart = recorder(); const re = await quietCli(() => cli.runDaemonStopRestart('restart', deps(restart, async () => null)));
+  const stop = recorder(); const st = await quietCli(() => cli.runDaemonStopRestart('stop', deps(stop, async () => null)));
+  const menu = recorder(); const me = await quietCli(() => cli.interactiveDaemonStart(deps(menu, async () => null)));
+  const uninstalled = [];
+  await cli.runUninstallCommand({ purge: false, dryRun: false }, { platform: 'win32', gracefulStop: gateOver(noTokenDeps(async () => null), []),
+    runUninstall: (opts) => { uninstalled.push(opts.windowsStop); return {}; } });
+  const absent = recorder(); const ab = await quietCli(() => cli.runDaemonStopRestart('restart', deps(absent, async () => false)));
+  assert.deepEqual({
+    restart: [restart.calls, re.exitCode], stop: [stop.calls, st.exitCode], menu: [menu.calls, me.value],
+    uninstallGate: uninstalled.map((w) => [w.ok, w.startReplacement]), absentRestart: [absent.calls, ab.exitCode],
+  }, {
+    restart: [[], 1], stop: [[], undefined], menu: [[], false],
+    uninstallGate: [[true, false]], absentRestart: [['start'], undefined],
+  });
+});
+
+// Task 1215 G2 (correction29): the SAME invariant on the token-present path. Only a REFUSED connection is evidence that
+// no daemon is there; a timeout or reset of the authenticated identity read is an UNKNOWN presence; unauthorized or
+// malformed replies are refusals, never absence. Requests are recorded exactly as sent (meta GETs, stop POSTs).
+const refusedConnection = () => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:39001'), { code: 'ECONNREFUSED' }) });
+const resetConnection = () => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) });
+const timedOut = () => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+function tokenDeps({ metaThrows, meta } = {}) {
+  const c = clientDeps(meta ? { meta } : {});
+  if (metaThrows) {
+    const inner = c.deps.fetchImpl;
+    c.deps.fetchImpl = async (url, options = {}) => {
+      if (url.endsWith('/api/meta')) { c.sent.push({ url, method: 'GET', headers: options.headers || {}, body: null }); throw metaThrows(); }
+      return inner(url, options);
+    };
+  }
+  return c;
+}
+const counts = (c) => ({ meta: c.sent.filter((s) => s.url.endsWith('/api/meta')).length, stop: c.sent.filter((s) => s.method === 'POST').length });
+
+test('W3 G2 token-present: a meta timeout/reset is unknown presence (no replacement); unauthorized/malformed are refusals; only a refused connection is absence; a real stop still authorizes', async () => {
+  const cases = {
+    metaTimeout: [{ metaThrows: timedOut }, []], metaReset: [{ metaThrows: resetConnection }, []],
+    unauthorized: [{ meta: { status: 401, json: async () => ({ code: 'PERMISSION_DENIED' }) } }, []],
+    malformed: [{ meta: { status: 200, json: async () => { throw new SyntaxError('Unexpected token'); } } }, []],
+    refusedAbsent: [{ metaThrows: refusedConnection }, []], refusedOwned: [{ metaThrows: refusedConnection }, [{ pid: PID, source: 'state-file' }]],
+    authenticatedStop: [{}, []],
+  };
+  const observed = {};
+  for (const [label, [opts, census]] of Object.entries(cases)) {
+    const c = tokenDeps(opts);
+    const result = await requestGracefulStop(c.deps);
+    const outcome = decideStopOutcome(result, result.status === 'no_answer' ? census : []);
+    observed[label] = { status: result.status, presence: result.presence || null, ...counts(c), ok: outcome.ok, startReplacement: outcome.startReplacement, exitCode: outcome.exitCode };
+  }
+  assert.deepEqual(observed, {
+    metaTimeout: { status: 'no_answer', presence: 'unknown', meta: 1, stop: 0, ok: true, startReplacement: false, exitCode: 1 },
+    metaReset: { status: 'no_answer', presence: 'unknown', meta: 1, stop: 0, ok: true, startReplacement: false, exitCode: 1 },
+    unauthorized: { status: 'unidentified', presence: null, meta: 1, stop: 0, ok: false, startReplacement: false, exitCode: 1 },
+    malformed: { status: 'unidentified', presence: null, meta: 1, stop: 0, ok: false, startReplacement: false, exitCode: 1 },
+    refusedAbsent: { status: 'no_answer', presence: null, meta: 1, stop: 0, ok: true, startReplacement: true, exitCode: 0 },
+    refusedOwned: { status: 'no_answer', presence: null, meta: 1, stop: 0, ok: false, startReplacement: false, exitCode: 1 },
+    authenticatedStop: { status: 'stopped', presence: null, meta: 1, stop: 1, ok: true, startReplacement: true, exitCode: 0 },   // positive control
+  });
+});
+
+test('W3 G2 token-present callers: restart starts nothing on unknown presence or a refusal, and starts exactly once after real absence or an authenticated stop', async () => {
+  const cli = require('../cli');
+  const run = async (opts, census = []) => {
+    const c = tokenDeps(opts); const calls = [];
+    const gate = async () => { const r = await requestGracefulStop(c.deps); return decideStopOutcome(r, r.status === 'no_answer' ? census : []); };
+    const res = await quietCli(() => cli.runDaemonStopRestart('restart', { platform: 'win32', port: 39004, detectSupervisor: () => ({ present: false }),
+      logDaemonRestartEvent: () => {}, gracefulStop: gate, signalStop: () => { calls.push('signal-stop'); return { stopped: [], failed: [] }; },
+      startDetachedDaemon: () => { calls.push('start'); return { pid: 777 }; } }));
+    return [calls, res.exitCode, counts(c).stop];
+  };
+  assert.deepEqual({
+    metaTimeout: await run({ metaThrows: timedOut }), metaReset: await run({ metaThrows: resetConnection }),
+    unauthorized: await run({ meta: { status: 403, json: async () => ({}) } }),
+    refusedAbsent: await run({ metaThrows: refusedConnection }), authenticatedStop: await run({}),
+  }, {
+    metaTimeout: [[], 1, 0], metaReset: [[], 1, 0], unauthorized: [[], 1, 0],
+    refusedAbsent: [['start'], undefined, 0], authenticatedStop: [['start'], undefined, 1],
+  });
+});
+
 test('W3B client: an exited daemon whose ledger lock still names it is NOT a clean stop; a lock owned by another pid is not this stop\'s concern', async () => {
   const retained = await requestGracefulStop(clientDeps({ readLockPid: () => PID }).deps);
   const foreign = await requestGracefulStop(clientDeps({ readLockPid: () => 999999 }).deps);

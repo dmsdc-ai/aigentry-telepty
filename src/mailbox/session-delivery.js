@@ -139,6 +139,7 @@ function createSessionDeliveryContext({
           httpStatus: 503, bytes_written: 0
         });
       }
+      const fetchBegun = Date.now(); // #1215 G5 diagnostics only
       try {
         const response = await fetch(session.deliveryEndpoint, {
           method: 'POST', redirect: 'error',
@@ -148,12 +149,14 @@ function createSessionDeliveryContext({
         });
         if (response.body) response.body.cancel().catch(() => {});
         if (!response.ok) {
+          emitHttpDeliveryDiag({ category: 'http_status', status_class: `${Math.floor(response.status / 100)}xx`, elapsed_ms: Date.now() - fetchBegun });
           return buildErrorBody('DELIVERY_UNCERTAIN', `HTTP endpoint returned ${response.status} after an attempt; do not retry blindly.`, {
             httpStatus: 502, deliveryStatus: response.status, delivery_uncertain: true, bytes_written: null
           });
         }
         return { success: true, transport_receipt: 'http_2xx', consumption: 'unknown', reply: 'unknown' };
-      } catch {
+      } catch (error) {
+        emitHttpDeliveryDiag({ category: httpFailureCategory(error), elapsed_ms: Date.now() - fetchBegun });
         return buildErrorBody('DELIVERY_UNCERTAIN', 'HTTP delivery response unavailable after an attempt; do not retry blindly.', {
           httpStatus: 503, delivery_uncertain: true, bytes_written: null
         });
@@ -215,6 +218,69 @@ function createSessionDeliveryContext({
     return Number.isFinite(configured) && configured > 0 ? configured : 10000;
   })();
   const MAILBOX_TEXT_WAIT_MS = 2 * DELIVERY_TIMEOUT_MS;
+  // #1215 G5 diagnostics only (no behaviour change): per-session submit-barrier phase times, kept in memory
+  // (the current holder plus the last BARRIER_RECENT releases) and written as ONE bounded stderr line on the
+  // existing QUEUE_TIMEOUT refusal. Fields are fixed categories and elapsed milliseconds only: no session id,
+  // pid, path, payload or raw error. Cost: a few Date.now() reads and one small object per barrier claim.
+  const BARRIER_RECENT = 4;
+  const barrierDiag = new WeakMap(); // session object → { current, recent[] }
+  function barrierState(session) {
+    let state = barrierDiag.get(session);
+    if (!state) { state = { current: null, recent: [] }; barrierDiag.set(session, state); }
+    return state;
+  }
+  function beginBarrier(session, submitDelayMs) {
+    const record = { claimedAt: Date.now(), submit_delay_ms: submitDelayMs, marks: {}, cr_ok: null, tick_outcome: null, released: false };
+    barrierState(session).current = record;
+    return record;
+  }
+  function markBarrier(record, phase) { if (record && !record.released && record.marks[phase] === undefined) record.marks[phase] = Date.now() - record.claimedAt; }
+  function endBarrier(session, record) {
+    if (!record || record.released) return;
+    record.released = true; record.marks.released = Date.now() - record.claimedAt;
+    const state = barrierState(session);
+    if (state.current === record) state.current = null;
+    state.recent.push(record); if (state.recent.length > BARRIER_RECENT) state.recent.shift();
+  }
+  const BARRIER_PHASES = ['tick_done', 'text_settled', 'cr_timer_fired', 'cr_write_done', 'released'];
+  function barrierView(record, nowMs) {
+    const view = { submit_delay_ms: record.submit_delay_ms, cr_ok: record.cr_ok, tick_outcome: record.tick_outcome };
+    for (const phase of BARRIER_PHASES) view[`${phase}_ms`] = record.marks[phase] ?? null;
+    // Timer lateness against the requested submit delay (scheduling delay, not CPU use).
+    view.cr_timer_late_ms = record.marks.cr_timer_fired !== undefined && record.marks.text_settled !== undefined
+      ? record.marks.cr_timer_fired - record.marks.text_settled - record.submit_delay_ms : null;
+    if (!record.released) {
+      view.age_ms = nowMs - record.claimedAt;
+      view.phase = [...BARRIER_PHASES].reverse().find(phase => record.marks[phase] !== undefined) || 'claimed';
+    }
+    return view;
+  }
+  function emitQueueTimeoutDiag(session, fields) {
+    const state = barrierDiag.get(session), nowMs = Date.now();
+    try {
+      console.error(`[telepty-diag] submit_barrier ${JSON.stringify({ category: 'queue_timeout', ...fields,
+        holder: state && state.current ? barrierView(state.current, nowMs) : null,
+        recent: state ? state.recent.map(record => barrierView(record, nowMs)) : [] })}`);
+    } catch { /* diagnostics never change the refusal */ }
+  }
+  const DIAG_CAUSE = /^(E[A-Z]{2,16}|UND_ERR_[A-Z_]{1,40})$/;
+  // #1215 correction5: a fixed category for a tick that threw — the error code only when it is a code-shaped token
+  // (e.g. MAILBOX_LOCK_TIMEOUT, EPERM); never the message, path or stack.
+  const DIAG_CODE = /^[A-Z][A-Z0-9_]{1,63}$/;
+  function tickFailureCategory(error) {
+    const code = error && error.code;
+    return typeof code === 'string' && DIAG_CODE.test(code) ? `threw_${code}` : 'threw_other';
+  }
+  function httpFailureCategory(error) {
+    if (error && error.name === 'TimeoutError') return 'timeout';
+    if (error && error.name === 'AbortError') return 'aborted';
+    const code = error && error.cause && error.cause.code;
+    return typeof code === 'string' && DIAG_CAUSE.test(code) ? `cause_${code}` : 'other';
+  }
+  function emitHttpDeliveryDiag(fields) {
+    try { console.error(`[telepty-diag] http_delivery ${JSON.stringify({ timeout_ms: DELIVERY_TIMEOUT_MS, ...fields })}`); }
+    catch { /* diagnostics never change the result */ }
+  }
   const injectionTargets = new Map(); // pending text stays bound to its original instance
   const immediateAttempts = new Map(); // only while the source is awaiting its immediate tick
   const mailboxTextWaiters = new Map(); // msg_id → { settle(ownerWs), lastFailure }
@@ -464,7 +530,9 @@ function createSessionDeliveryContext({
     // cumulative wait behind earlier submits (bounded here) from the work done before reaching the barrier.
     const queueEnteredAt = Date.now();
     const queueDeadline = queueEnteredAt + SUBMIT_QUEUE_TIMEOUT_MS;
+    let waitRounds = 0; // #1215 G5 diagnostics only: holders this caller waited behind
     while (session.pendingSubmit) {
+      waitRounds++;
       const remaining = queueDeadline - Date.now();
       let timer;
       const timedOut = remaining <= 0 || await Promise.race([
@@ -473,6 +541,8 @@ function createSessionDeliveryContext({
       ]);
       clearTimeout(timer);
       if (timedOut) {
+        emitQueueTimeoutDiag(session, { bound_ms: SUBMIT_QUEUE_TIMEOUT_MS, queue_wait_ms: Date.now() - queueEnteredAt,
+          pre_barrier_in_delivery_ms: queueEnteredAt - now, wait_rounds: waitRounds });
         return { success: false, httpStatus: 503, code: 'QUEUE_TIMEOUT', queue_wait_ms: Date.now() - queueEnteredAt,
           error: `Earlier submits on this session did not clear within ${SUBMIT_QUEUE_TIMEOUT_MS} ms; nothing was written. Retry.` };
       }
@@ -481,9 +551,11 @@ function createSessionDeliveryContext({
     const liveFailure = getInjectFailure(session, { nowMs: Date.now() });
     if (liveFailure) return { success: false, ...liveFailure };
     let releaseSubmit = () => {};
+    let barrier = null; // #1215 G5 diagnostics only
     if (!options.noEnter && session.type !== 'aterm') {
+      barrier = beginBarrier(session, session.type === 'wrapped' ? 500 : 300);
       session.pendingSubmit = new Promise((resolve) => {
-        releaseSubmit = () => { session.pendingSubmit = null; resolve(); };
+        releaseSubmit = () => { endBarrier(session, barrier); session.pendingSubmit = null; resolve(); };
       });
     }
 
@@ -531,9 +603,11 @@ function createSessionDeliveryContext({
       }
 
       // Deliver text synchronously — ensures text is written before inject returns success.
+      let tickOutcome = 'ok'; // #1215 correction5 diagnostics only: the swallowed failure is recorded, never acted on
       try {
         await getMailboxDelivery().tick();
-      } catch {}
+      } catch (error) { tickOutcome = tickFailureCategory(error); }
+      markBarrier(barrier, 'tick_done'); if (barrier && !barrier.released) barrier.tick_outcome = tickOutcome;
       immediateAttempts.delete(msgId);
       if (immediate.result?.delivery_uncertain) {
         injectionTargets.delete(msgId); releaseSubmit();
@@ -544,6 +618,7 @@ function createSessionDeliveryContext({
       // Send CR separately after delay (outside paste brackets)
       if (waitsForText) {
         const text = await textWait;
+        markBarrier(barrier, 'text_settled');
         if (!text.delivered) {
           if (text.retryPending && session.type === 'aterm') return { success: true, queued: true, msg_id: msgId, pending: ack.pending,
             strategy: 'mailbox', delivery_status: 'retry_pending', bytes_written: 0, submit: 'skipped' };
@@ -577,6 +652,7 @@ function createSessionDeliveryContext({
           const submitDelay = session.type === 'wrapped' ? 500 : 300;
           setTimeout(async () => {
             let submitResult;
+            markBarrier(barrier, 'cr_timer_fired');
             try {
               // #109: never a bare CR into an instance that did not get this inject's text.
               // PR #108 TP1: nor into an owner socket other than the one that got it.
@@ -584,6 +660,7 @@ function createSessionDeliveryContext({
                 ? await writeDataToSession(id, session, '\r', { frameMeta: submitIds(msgId, options.injectId) })
                 : sessionGoneResult();
             } finally {
+              markBarrier(barrier, 'cr_write_done'); if (barrier) barrier.cr_ok = !!(submitResult && submitResult.success);
               releaseSubmit();
             }
             if (!submitResult.success) {

@@ -859,6 +859,145 @@ test('telepty allow inject submits once without exposing routing metadata', asyn
   }
 });
 
+// Task 1215 G1 (review26: silent-child outcome UNKNOWN by source — measured natively here). The REAL allow bridge and
+// the REAL node-pty spawn a child that writes nothing to its terminal before input; it only records what it receives.
+// Readiness is the daemon's own view of the bridge's real handshake (never a fabricated frame, never a screen oracle);
+// one ordinary inject must then arrive exactly once. Actual-owner control: a milestone frame from a NON-owner socket on
+// the same session changes nothing. Inherently native (ConPTY), so non-Windows hosts skip; Windows CI must execute it.
+// Private daemon/home per test (beforeEach/afterEach), the bridge is this test's own child and is killed in finally.
+const G1_NATIVE_SKIP = process.platform === 'win32' ? false : 'native ConPTY silent-child readiness: measured on Windows CI only';
+test('#1215 G1 native: a SILENT child under the real allow bridge and ConPTY reaches readiness and receives one ordinary inject exactly once', { skip: G1_NATIVE_SKIP, timeout: 45000 }, async (t) => {
+  const sessionId = createSessionId('cli-g1-silent');
+  const rx = path.join(harness.homeDir, `${sessionId}.rx`);
+  fs.writeFileSync(rx, '');
+  const silentChild = [
+    "const fs = require('fs');",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.resume();",
+    `process.stdin.on('data', (chunk) => { fs.appendFileSync(${JSON.stringify(rx)}, chunk); });`
+  ].join(' ');
+  const cli = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, process.execPath, '-e', silentChild], {
+    cwd: projectRoot, cols: 80, rows: 24, name: 'xterm',
+    env: { ...process.env, HOME: harness.homeDir, USERPROFILE: harness.homeDir, TELEPTY_HOST: harness.host, TELEPTY_PORT: String(harness.port),
+      NO_UPDATE_NOTIFIER: '1', TELEPTY_DISABLE_UPDATE_NOTIFIER: '1' }
+  });
+  let output = ''; let cliExit = null; let inject = null;
+  cli.onData((chunk) => { output += chunk; });
+  cli.onExit(({ exitCode }) => { cliExit = exitCode; });
+  const MARK = 'g1-silent-once';
+  const DIAG_MARKERS = { inject_allowed: 'Inject allowed.', announce_unsent: 'transport readiness not announced', announce_pid_unavailable: 'pid=unavailable' };
+  const diagnose = (stage) => async (error) => {
+    t.diagnostic(`#879 diag ${stage} ${JSON.stringify({ bridge: diagPty(output, cliExit, DIAG_MARKERS), inject: diagInject(inject), session: await diagSession(sessionId),
+      child_rx_bytes: fs.statSync(rx).size })}`);
+    throw error;
+  };
+  const readinessOf = async () => {
+    const body = (await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`)).body;
+    return body && body.transport && body.transport.readiness ? body.transport.readiness : null;
+  };
+  try {
+    await waitFor(() => stripAnsi(output).includes('Inject allowed.'), { timeoutMs: 10000, description: 'allow bridge ready' })
+      .catch(diagnose('g1_bridge_ready'));
+    const ready = await waitFor(async () => {
+      const rd = await readinessOf();
+      return rd && rd.process_started && rd.process_started.status === 'observed'
+        && rd.input_transport_ready && rd.input_transport_ready.status === 'observed' ? rd : null;
+    }, { timeoutMs: 10000, description: 'the silent child\'s process_started + input_transport_ready observed by the daemon' })
+      .catch(diagnose('g1_readiness'));
+    assert.equal(fs.readFileSync(rx, 'utf8'), '', 'PRECONDITION: the child received nothing before the inject');
+
+    // Actual-owner control: a milestone frame from a non-owner socket is not the owner's handshake and changes nothing.
+    const viewer = await harness.connectSession(sessionId);
+    openOwnerSockets.push(viewer);   // closed by afterEach on every path
+    viewer.send(JSON.stringify({ type: 'input_transport_ready', schema: 1, session_id: sessionId, child_seq: ready.input_transport_ready.child_seq + 1, input_loop: 'attached' }));
+
+    inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+      method: 'POST', body: { prompt: MARK, from: 'orch', reply_to: 'orch' } });
+    assert.equal(inject.status, 200, JSON.stringify(inject.body));
+    await waitFor(() => (/g1-silent-once[\r\n]/.test(fs.readFileSync(rx, 'utf8')) ? true : null), { timeoutMs: 10000, description: 'the inject and its submit received by the silent child' })
+      .catch(diagnose('g1_delivery'));
+    const after = await readinessOf();
+    assert.deepEqual({ received: countOccurrences(fs.readFileSync(rx, 'utf8'), MARK),
+      readiness: [after.process_started.child_seq, after.input_transport_ready.child_seq, after.input_transport_ready.observed_at] },
+    { received: 1, readiness: [ready.process_started.child_seq, ready.input_transport_ready.child_seq, ready.input_transport_ready.observed_at] });
+  } finally {
+    cli.kill();
+  }
+});
+
+// Task 1215 G1 (correction29): native restart / stale-child control on the REAL `telepty allow --auto-restart` bridge and
+// REAL node-pty. The quiet child writes nothing to its terminal; it records what it receives, tagged with its own pid, and
+// exits abnormally when it receives a test-owned crash line (input-driven, never output). The bridge then respawns it
+// (a new child generation); readiness must be re-established by the NEW child's own handshake (higher child_seq, its own
+// pid), and a later ordinary inject must reach only the new child, exactly once. Daemon-side replay and stale/wrong-owner
+// frame refusal is not reachable natively without owner access; it is covered by the real handler tests
+// (readiness-handshake-22 G1, supervision-readiness-1215 F2) — see DECISION.md. Windows-only (ConPTY); Windows CI runs it.
+test('#1215 G1 native: after a crash-restart the quiet child\'s successor re-establishes readiness itself and alone receives the next inject, exactly once', { skip: G1_NATIVE_SKIP, timeout: 60000 }, async (t) => {
+  const sessionId = createSessionId('cli-g1-restart');
+  const rx = path.join(harness.homeDir, `${sessionId}.rx`);
+  fs.writeFileSync(rx, '');
+  const CRASH = 'g1-crash-now';
+  const quietChild = [
+    "const fs = require('fs');",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.resume();",
+    `process.stdin.on('data', (chunk) => { fs.appendFileSync(${JSON.stringify(rx)}, process.pid + ' ' + JSON.stringify(chunk) + '\\n');`,
+    `  if (chunk.includes(${JSON.stringify(CRASH)})) process.exit(1); });`
+  ].join(' ');
+  const cli = pty.spawn(process.execPath, ['cli.js', 'allow', '--auto-restart', '--id', sessionId, process.execPath, '-e', quietChild], {
+    cwd: projectRoot, cols: 80, rows: 24, name: 'xterm',
+    env: { ...process.env, HOME: harness.homeDir, USERPROFILE: harness.homeDir, TELEPTY_HOST: harness.host, TELEPTY_PORT: String(harness.port),
+      NO_UPDATE_NOTIFIER: '1', TELEPTY_DISABLE_UPDATE_NOTIFIER: '1' }
+  });
+  let output = ''; let cliExit = null; let inject = null;
+  cli.onData((chunk) => { output += chunk; });
+  cli.onExit(({ exitCode }) => { cliExit = exitCode; });
+  const DIAG_MARKERS = { inject_allowed: 'Inject allowed.', restarted: 'restarted (attempt', announce_unsent: 'transport readiness not announced', announce_pid_unavailable: 'pid=unavailable' };
+  const diagnose = (stage) => async (error) => {
+    t.diagnostic(`#879 diag ${stage} ${JSON.stringify({ bridge: diagPty(output, cliExit, DIAG_MARKERS), inject: diagInject(inject), session: await diagSession(sessionId),
+      child_rx_lines: fs.readFileSync(rx, 'utf8').split('\n').filter(Boolean).length })}`);
+    throw error;
+  };
+  const readinessOf = async () => {
+    const body = (await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`)).body;
+    return body && body.transport && body.transport.readiness ? body.transport.readiness : null;
+  };
+  const observedReady = (rd) => rd && rd.process_started && rd.process_started.status === 'observed'
+    && rd.input_transport_ready && rd.input_transport_ready.status === 'observed';
+  const lines = () => fs.readFileSync(rx, 'utf8').split('\n').filter(Boolean).map((l) => { const i = l.indexOf(' '); return { pid: Number(l.slice(0, i)), data: JSON.parse(l.slice(i + 1)) }; });
+  try {
+    await waitFor(() => stripAnsi(output).includes('Inject allowed.'), { timeoutMs: 10000, description: 'allow bridge ready' }).catch(diagnose('g1r_bridge_ready'));
+    const first = await waitFor(async () => { const rd = await readinessOf(); return observedReady(rd) ? rd : null; },
+      { timeoutMs: 10000, description: 'first child readiness observed' }).catch(diagnose('g1r_first_ready'));
+
+    inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, { method: 'POST', body: { prompt: CRASH, from: 'orch', reply_to: 'orch' } });
+    assert.equal(inject.status, 200, JSON.stringify(inject.body));
+    const second = await waitFor(async () => {
+      const rd = await readinessOf();
+      return observedReady(rd) && rd.input_transport_ready.child_seq > first.input_transport_ready.child_seq ? rd : null;
+    }, { timeoutMs: 20000, description: 'the respawned child\'s own readiness (higher child_seq)' }).catch(diagnose('g1r_second_ready'));
+
+    const MARK = 'g1-after-restart-once';
+    inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, { method: 'POST', body: { prompt: MARK, from: 'orch', reply_to: 'orch' } });
+    assert.equal(inject.status, 200, JSON.stringify(inject.body));
+    await waitFor(() => (/g1-after-restart-once[\r\n]/.test(lines().map((l) => l.data).join('')) ? true : null),
+      { timeoutMs: 10000, description: 'the next inject received by the successor' }).catch(diagnose('g1r_delivery'));
+
+    const got = lines();
+    const crashPids = [...new Set(got.filter((l) => l.data.includes(CRASH)).map((l) => l.pid))];
+    const markPids = [...new Set(got.filter((l) => l.data.includes('g1-after')).map((l) => l.pid))];
+    assert.deepEqual({
+      seqAdvanced: second.input_transport_ready.child_seq > first.input_transport_ready.child_seq,
+      newPid: second.process_started.pid !== first.process_started.pid,
+      crashOnlyOld: crashPids.length === 1 && crashPids[0] === first.process_started.pid,
+      markOnlyNew: markPids.length === 1 && markPids[0] === second.process_started.pid,
+      markOnce: countOccurrences(got.map((l) => l.data).join(''), MARK),
+    }, { seqAdvanced: true, newPid: true, crashOnlyOld: true, markOnlyNew: true, markOnce: 1 });
+  } finally {
+    cli.kill();
+  }
+});
+
 // #879: with the `.cmd` shim the fake claude now starts, registers and the inject returns 0 on
 // Windows (runs 40507287143 and 40507287234), but the post-bootstrap `SUBMIT:` line carrying the
 // bracketed-paste envelope never appeared within 10 s in either run. The logs do not identify the

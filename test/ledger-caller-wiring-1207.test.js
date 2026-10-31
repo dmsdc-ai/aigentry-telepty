@@ -292,7 +292,10 @@ test('N1: the interaction core on the owner — I reservation before saveRecord;
     reserveAct: (sid) => ledgerClient.accounting.reserveAct(sid), releaseAct: (sid) => ledgerClient.accounting.releaseAct(sid),
   });
   const acting = core.act(r, 'ctl');
-  await new Promise((res) => setTimeout(res, 60));
+  // Task 1215 G4: wait for the observable condition — two stage commits acked by the owner — instead of a fixed 60 ms
+  // scheduling assumption. Bounded by the 2000 ms this file already gives the ledger; the dispatch is HELD (release is
+  // not called yet), so a third stage cannot appear meanwhile, and the exact two-stage assertion below stays the control.
+  for (const deadline = Date.now() + 2000; stages.length < 2 && Date.now() < deadline;) await new Promise((res) => setTimeout(res, 5));
   assert.deepEqual(stages, [['prepared', 'ack'], ['dispatched', 'ack']], 'each stage acked (durable) before the next');
   assert.equal(ledgerClient.readModel.actionCount(), 1);
   assert.equal(core.lookup('a1').stage, 'dispatched');

@@ -83,6 +83,13 @@ test('multiple processes never overlap mailbox mutation or lose increments', asy
   assert.ok(results.slice(0, -1).every(r => r.done === 40));
   assert.equal(fs.readFileSync(path.join(dir, 'counter'), 'utf8'), '200');
   assert.equal(results.at(-1).removed, 0);
+  // #1215 G3 diagnostic contract (additive; the behavioural assertions above are unchanged): every contend worker
+  // reports its fixed-key lock totals — exactly one successful acquisition per iteration, pauses at 10 ms requested.
+  for (const r of results.slice(0, -1)) {
+    assert.equal(r.stats.lock.acquired, 40, `diag ${JSON.stringify(r.stats)}`);
+    assert.equal(r.stats.lock.pause_requested_ms, r.stats.lock.pauses * 10, `diag ${JSON.stringify(r.stats)}`);
+    assert.ok(Number.isSafeInteger(r.stats.cpu_user_ms) && Number.isSafeInteger(r.stats.cpu_system_ms), `diag ${JSON.stringify(r.stats)}`);
+  }
 });
 test('crashed owner is reaped without deleting a successor and old clients refuse v2 directory', async t => {
   const {root, dir} = fixture(t), w = worker(t, dir, 'hold'), held = w.next(); w.child.send('start');
@@ -160,6 +167,59 @@ test('an unlinked inode observed by lstat during normal release is a departed ti
   const successor = acquireLock(dir);
   try { assert.equal(observed, true); release(); assert.throws(() => acquireLock(dir), /lock timeout/i); }
   finally { successor(); }
+});
+// #1215 correction5 — measured on win32 (5d9 run 41211065629): a reader's FIRST lstat of a peer's `number` returned a
+// regular file with nlink 0 and the immediate RE-STAT raised EPERM (original lock.js:82:44, outside the first-stat handler).
+// The stat objects below are real lstat/fstat results with only nlink forced to 0, so the case is platform-independent.
+const nlinkZero = st => Object.assign(Object.create(Object.getPrototypeOf(st)), st, {nlink: 0});
+const epermLstat = file => Object.assign(new Error(`EPERM: operation not permitted, lstat '${file}'`), {code: 'EPERM', syscall: 'lstat', path: file});
+const restatCounters = () => Object.fromEntries(Object.entries(require('../src/mailbox/lock').lockDiagnostics()).filter(([key]) => key.startsWith('eperm_restat_')));
+test('#1215: EPERM on the nlink0 re-stat of a released peer ticket is a departure; the successor acquires and stays exclusive', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock'), release = acquireLock(dir), original = fs.lstatSync;
+  const number = path.join(lock, fs.readdirSync(lock)[0], 'number');
+  let stage = 'armed', releasing = false;
+  t.mock.method(fs, 'lstatSync', function(file, ...args) {
+    if (file === number && !releasing && stage === 'armed') { // first stat: the owner releases, the stat shows nlink 0
+      stage = 'first'; releasing = true;
+      const fd = fs.openSync(file, 'r');
+      try { release(); return nlinkZero(fs.fstatSync(fd)); } finally { fs.closeSync(fd); releasing = false; }
+    }
+    if (file === number && !releasing && stage === 'first') { stage = 'restat'; throw epermLstat(file); } // the re-stat
+    return original.call(fs, file, ...args);
+  });
+  const before = restatCounters();
+  const successor = acquireLock(dir);
+  try {
+    assert.equal(stage, 'restat', 'the first stat and the EPERM re-stat both happened');
+    const after = restatCounters(), progressed = ['relist_departed', 'relist_dir_gone', 'marked_entry']
+      .reduce((sum, key) => sum + after[`eperm_restat_${key}`] - before[`eperm_restat_${key}`], 0);
+    assert.equal(progressed, 1, `exactly one re-stat EPERM resolved as a departure: ${JSON.stringify({before, after})}`);
+    assert.equal(after.eperm_restat_unmarked_throw_entry_listed, before.eperm_restat_unmarked_throw_entry_listed);
+    release(); // the old release is a no-op
+    assert.throws(() => acquireLock(dir), /lock timeout/i); // Safety: the successor stays exclusive.
+  } finally { successor(); }
+  acquireLock(dir)(); // A departed leftover (delete-pending platforms) is finished by its owner on a later scan.
+  assert.deepEqual(fs.readdirSync(lock), []);
+});
+test('#1215: EPERM on the nlink0 re-stat of a still-listed unmarked live ticket stays refused and the ticket is retained', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock'), release = acquireLock(dir), original = fs.lstatSync;
+  const name = fs.readdirSync(lock)[0], number = path.join(lock, name, 'number'), body = fs.readFileSync(number, 'utf8');
+  let firsts = 0, restats = 0, pending = false;
+  const mock = t.mock.method(fs, 'lstatSync', function(file, ...args) {
+    if (file === number && !pending) { firsts++; pending = true; return nlinkZero(original.call(fs, file, ...args)); }
+    if (file === number && pending) { restats++; pending = false; throw epermLstat(file); }
+    return original.call(fs, file, ...args);
+  });
+  try {
+    let refused;
+    assert.throws(() => acquireLock(dir), error => { refused = error; return error.code === 'EPERM'; });
+    assert.ok(firsts >= 1 && restats >= 1, 'the nlink0 first stat and the EPERM re-stat both happened');
+    assert.equal(refused.syscall, 'lstat', 'the refusal is the original re-stat EPERM, not a substituted error');
+    assert.deepEqual(fs.readdirSync(lock), [name]); // The live holder's ticket is neither evicted nor marked departed.
+    assert.deepEqual(fs.readdirSync(path.join(lock, name)), ['number']);
+    assert.equal(fs.readFileSync(number, 'utf8'), body);
+  } finally { mock.mock.restore(); release(); }
+  assert.deepEqual(fs.readdirSync(lock), []);
 });
 test('#879: a release overlapped by a real open reader handle departs without blocking or breaking exclusion', t => {
   const {dir} = fixture(t), lock = path.join(dir, '.lock'), release = acquireLock(dir);

@@ -131,6 +131,35 @@ process.stdin.on('data', (chunk) => {
 `);
 }
 
+// Task 1215 G6 (#879 discriminator; booleans and one category only — never a path, a PATH/PATHEXT value, a credential,
+// a payload or an id). What the bridge's win32 PATH × PATHEXT walk is handed: the bridge copies its own environment
+// (cli.js sessionEnv) and src/win-resolve-executable.js reads the exact `PATH` key, so the key casing is reported with
+// the stub facts, and the same resolver is asked with this exact environment. A resolver hit is not readiness; the
+// owner/inject checks of the test still decide.
+function diagResolver(env, stub) {
+  try {
+    const keys = Object.keys(env);
+    const pathKeys = keys.filter((k) => k.toUpperCase() === 'PATH');
+    const pathextKey = keys.find((k) => k.toUpperCase() === 'PATHEXT');
+    const dir = path.dirname(stub.file);
+    const pathValue = pathKeys.length ? String(env[pathKeys[0]]) : '';
+    let walkFinds = null;
+    if (process.platform === 'win32') {
+      try { require('../src/win-resolve-executable').resolveWindowsExecutable(stub.command, env); walkFinds = true; } catch { walkFinds = false; }
+    }
+    return {
+      name_category: /[\\/]/.test(stub.command) ? 'path' : 'bare',
+      path_key_exact_upper: Object.hasOwn(env, 'PATH'), path_key_other_case: pathKeys.some((k) => k !== 'PATH'), path_key_count: pathKeys.length,
+      path_has_stub: pathValue.split(path.delimiter).some((p) => p && path.resolve(p) === path.resolve(dir)),
+      pathext_key_present: Boolean(pathextKey),
+      pathext_has_cmd: (pathextKey ? String(env[pathextKey]) : '').toUpperCase().split(';').includes('.CMD'),
+      stub_cmd_exists: process.platform === 'win32' ? fs.existsSync(path.join(dir, `${path.basename(stub.file, '.js')}.cmd`)) : null,
+      stub_body_exists: fs.existsSync(stub.file),
+      resolver_walk_finds: walkFinds,
+    };
+  } catch (error) { return { error: (error && error.code) || 'diag_failed' }; }
+}
+
 let harness;
 
 // Task 1215 / #879 — ALLOWLISTED failure-boundary diagnostics for the win32 delivery failures. Emitted only when a
@@ -183,12 +212,8 @@ test('#752 RED: an ad-hoc `telepty allow claude` session actually receives the i
   fs.writeFileSync(rxLog, '');
   const stub = writeClaudeStub(harness.homeDir, rxLog);
 
-  const bridge = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, stub.command], {
-    cwd: projectRoot,
-    cols: 120,
-    rows: 40,
-    name: process.platform === 'win32' ? 'xterm' : 'xterm-256color',
-    env: {
+  // Task 1215 G6: the same environment object, named so the resolver diagnostic describes exactly what the bridge got.
+  const bridgeEnv = {
       ...process.env,
       ...stub.env,
       HOME: harness.homeDir,
@@ -201,7 +226,13 @@ test('#752 RED: an ad-hoc `telepty allow claude` session actually receives the i
       TELEPTY_SESSION_ID: 'orchestrator',
       NO_UPDATE_NOTIFIER: '1',
       TELEPTY_DISABLE_UPDATE_NOTIFIER: '1',
-    },
+  };
+  const bridge = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, stub.command], {
+    cwd: projectRoot,
+    cols: 120,
+    rows: 40,
+    name: process.platform === 'win32' ? 'xterm' : 'xterm-256color',
+    env: bridgeEnv,
   });
   t.after(() => { try { bridge.kill(); } catch {} });
   // #879 diagnostics only: additive listeners (UTF-8 byte total + a tail bounded to 65536 UTF-16 units for marker booleans; exit code).
@@ -221,7 +252,7 @@ test('#752 RED: an ad-hoc `telepty allow claude` session actually receives the i
       && list.body.some((s) => s.id === sessionId && s.healthStatus === 'CONNECTED');
   }, { timeoutMs: 8000, description: 'allow bridge owner connected' }).catch(async (error) => {
     t.diagnostic(`#879 diag owner_connected ${JSON.stringify({ bridge: diagPty(bridgeTail, bridgeExit, BRIDGE_MARKERS), bridge_bytes: bridgeBytes,
-      session: await diagSession(sessionId) })}`);
+      session: await diagSession(sessionId), resolver: diagResolver(bridgeEnv, stub) })}`);
     throw error;
   });
 
@@ -241,7 +272,7 @@ test('#752 RED: an ad-hoc `telepty allow claude` session actually receives the i
     const state = path.join(harness.homeDir, '.aigentry', 'mailbox', 'bridge', sessionId, 'state.jsonl');
     t.diagnostic(`#879 diag body_delivery ${JSON.stringify({ inject: diagInject(inject), session: await diagSession(sessionId),
       bridge: diagPty(bridgeTail, bridgeExit, BRIDGE_MARKERS), bridge_bytes: bridgeBytes,
-      stub_rx_bytes: fs.statSync(rxLog).size, bridge_mailbox_present: fs.existsSync(state) })}`);
+      stub_rx_bytes: fs.statSync(rxLog).size, bridge_mailbox_present: fs.existsSync(state), resolver: diagResolver(bridgeEnv, stub) })}`);
     const parked = fs.existsSync(state) ? fs.readFileSync(state, 'utf8').trim() : '(no bridge mailbox)';
     assert.fail('the daemon reported success but the body never reached the PTY; '
       + `bridge mailbox says:\n${parked}`);

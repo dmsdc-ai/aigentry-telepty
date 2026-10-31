@@ -41,6 +41,13 @@ const BASELINE = ['sessions', 'wrapped-sessions', 'skill-installer', 'singleton-
   'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox'];
 
 let daemon;
+// #1215 G5 diagnostics only: the daemon's bounded http_delivery record(s) (fixed category + elapsed ms) emitted after
+// `from`, appended to an existing assertion message only when that assertion is already failing.
+const DAEMON_HTTP_DIAG = '[telepty-diag] http_delivery ', DAEMON_DIAG_CAP = 4;
+function daemonHttpDiag(from) {
+  return daemon.getLogs().stderr.slice(from).split(/\r?\n/).filter((line) => line.startsWith(DAEMON_HTTP_DIAG)).slice(-DAEMON_DIAG_CAP)
+    .map((line) => { try { return JSON.parse(line.slice(DAEMON_HTTP_DIAG.length)); } catch { return 'unparsed'; } });
+}
 let primarySink;   // the delivery endpoint every ordinary registration in this file uses
 let otherSink;     // a second endpoint, used only to prove a collision did NOT redirect delivery
 
@@ -301,8 +308,9 @@ test('1215 register-create-only: a colliding id is 409 SESSION_EXISTS and the pr
   assert.equal(afterView.body.deliveryEndpoint, primarySink.url, 'delivery endpoint not redirected');
 
   // Delivery still goes to the original endpoint only.
+  const diagFrom = daemon.getLogs().stderr.length;
   const res = await inject(sid, { prompt: 'still mine', exact_target: true });
-  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.status, 200, res.status === 200 ? '' : `${JSON.stringify(res.body)} | daemon ${JSON.stringify(daemonHttpDiag(diagFrom))}`);
   await waitForDelivery(primarySink, sid, 1);
   await delay(200);
   assert.deepEqual(otherSink.textsFor(sid), [], 'the colliding endpoint received nothing');

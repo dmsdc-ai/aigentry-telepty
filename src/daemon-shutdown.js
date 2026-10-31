@@ -87,12 +87,32 @@ async function readJson(response) {
   try { return await response.json(); } catch { return null; }
 }
 
+// Task 1215 G2 (correction29): the only transport failure that is evidence that no daemon is there is a REFUSED
+// connection — the same rule as cli.js isConnectionRefused (undici carries the code on `cause`). A timeout, a reset or
+// any other failure of the authenticated identity read is an UNKNOWN presence, which never authorizes a replacement.
+function connectionRefused(error) {
+  for (let e = error, depth = 0; e && depth < 4; e = e.cause, depth++) if (e.code === 'ECONNREFUSED') return true;
+  return false;
+}
+
 // CLI side. Every dependency is injected so the decision logic is testable without a daemon.
 async function requestGracefulStop({ port, token, fetchImpl, isProcessRunning, confirmCmdline, probeHealth, readLockPid,
   deadlineMs = DEFAULT_STOP_DEADLINE_MS, pollMs = DEFAULT_POLL_MS, now = () => Date.now(),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), signRequest = null }) {
   if (!Number.isInteger(port) || port <= 0) return { status: 'unidentified', reason: 'no_port' };
-  if (typeof token !== 'string' || !token) return { status: 'unidentified', reason: 'no_local_token' };
+  if (typeof token !== 'string' || !token) {
+    // Task 1215 G2: without the local admin token no daemon can be identified, so nothing is requested from it — no
+    // /api/meta, no stop. Only the unauthenticated health probe is consulted: `true` (a daemon answered) ⇒ refused as
+    // unidentified; otherwise `no_answer`, which the caller's dry-run census (state-file pid + port owner, command-line
+    // confirmed) resolves. A foreign listener is never a target. Grants nothing.
+    // Review26 (REWORK): only `false` is absence-as-a-daemon (refused / not a daemon answer). `null` — a timeout or a
+    // reset, which the caller defines as "never not there" — is an UNKNOWN presence: tagged, so that it can never
+    // authorize a replacement (decideStopOutcome) even when the census finds nothing to act on.
+    let answering = null;
+    try { answering = await probeHealth(); } catch { answering = null; }
+    if (answering === true) return { status: 'unidentified', reason: 'no_local_token' };
+    return answering === false ? { status: 'no_answer', reason: 'no_local_token' } : { status: 'no_answer', reason: 'no_local_token', presence: 'unknown' };
+  }
   const base = `http://127.0.0.1:${port}`;
   const proof = async (binding) => (signRequest ? { 'x-telepty-principal': await signRequest(binding) } : {});
   let metaProof;
@@ -101,8 +121,9 @@ async function requestGracefulStop({ port, token, fetchImpl, isProcessRunning, c
   let meta;
   try {
     meta = await fetchImpl(`${base}/api/meta`, { headers: { 'x-telepty-token': token, ...metaProof }, signal: AbortSignal.timeout(2000) });
-  } catch {
-    return { status: 'no_answer' };
+  } catch (error) {
+    // Task 1215 G2 (correction29): absence only on a refused connection; otherwise presence is unknown (no replacement).
+    return connectionRefused(error) ? { status: 'no_answer' } : { status: 'no_answer', presence: 'unknown', reason: 'meta_unanswered' };
   }
   if (meta.status === 401 || meta.status === 403) return { status: 'unidentified', reason: 'meta_refused' };
   if (meta.status !== 200) return { status: 'unidentified', reason: 'meta_status' };
@@ -152,6 +173,15 @@ function decideStopOutcome(result, dryRunTargets = []) {
       message: `telepty daemon pid ${result.pid} exited but its ledger lock is still held (cleanup not confirmed); not forcing anything.` };
   }
   if (result.status === 'no_answer' && dryRunTargets.length === 0) {
+    // Task 1215 G2 (review26): a benign stop result is not authority to start a replacement. With presence unknown and
+    // nothing owned to act on, a plain stop is ok (nothing was stopped or forced), but `startReplacement` stays false
+    // and `exitCode` is 1 for every caller that needed one (restart, menu start, update/repair, uninstall, service).
+    if (result.presence === 'unknown') {
+      return { ok: true, stopped: [], startReplacement: false, exitCode: 1, presence: 'unknown',
+        message: 'No telepty daemon was identified (the port did not answer as one; presence unknown) — nothing was stopped or forced, '
+          + 'and no replacement is started while presence is unknown. Run `telepty daemon stop` again once the port is idle, '
+          + 'or address the daemon with its local credential.' };
+    }
     return { ok: true, stopped: [], startReplacement: true, exitCode: 0, message: 'No telepty daemon running.' };
   }
   const who = result.pid ? `pid ${result.pid}` : (dryRunTargets.length ? dryRunTargets.map((t) => `pid ${t.pid}`).join(', ') : 'the daemon');

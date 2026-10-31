@@ -355,6 +355,8 @@ function createAllowSecurityContext(shared, {
     // whose output/exit handlers are attached.
     let childSeq = 0;
     let subscribedChild = null;
+    // Task 1215 G1: the subscribed child whose announcement waits for its real pid (see announceTransportReady).
+    let pidPendingChild = null;
     let relayOnReady = null;
     let bridgeScreen = null;
     let bridgeGeometry = null;
@@ -642,6 +644,13 @@ function createAllowSecurityContext(shared, {
     function announceTransportReady() {
       const child = shared.child;
       if (isClosed() || shared.handoffPending || !child || child !== subscribedChild || !canDeliver(child)) return false;
+      // Task 1215 G1 (measured: Windows CI `pid=unavailable`, process_started not_observed, no refused frame). node-pty's
+      // ConPTY terminal reports pid 0 when spawn() returns; the real pid is assigned when its conout pipe connects,
+      // which happens before that pipe can deliver any output (node-pty 1.2.0-beta.11 windowsTerminal.js:54-61,
+      // windowsPtyAgent.js:115-116). Nothing is ever announced without a real pid: this child's announcement is
+      // deferred to its first output (subscribeChild), once. No timer, no retry loop, no substitute pid.
+      if (!Number.isSafeInteger(child.pid) || child.pid <= 0) { pidPendingChild = child; return false; }
+      pidPendingChild = null;
       const base = { sessionId: shared.sessionId, binding: shared.interactionBinding, nonce: shared.readinessNonce, childSeq };
       const started = readinessHandshake.milestoneFrame('process_started', { ...base, pid: child.pid });
       const ready = readinessHandshake.milestoneFrame('input_transport_ready', base);
@@ -686,7 +695,12 @@ function createAllowSecurityContext(shared, {
     function subscribeChild(child, onData, onExit) {
       let exited = false;
       const current = () => !exited && canDeliver(child);
-      child.onData(data => { if (current()) onData(data); });
+      child.onData(data => {
+        if (!current()) return;
+        // Task 1215 G1: the first output of a pid-deferred child — on ConPTY its pid is assigned by now.
+        if (pidPendingChild === child && Number.isSafeInteger(child.pid) && child.pid > 0) announceTransportReady();
+        onData(data);
+      });
       child.onExit(event => {
         if (subscribedChild === child) subscribedChild = null;
         if (!current()) return;

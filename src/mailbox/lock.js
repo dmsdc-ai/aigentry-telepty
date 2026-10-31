@@ -9,6 +9,52 @@ const { resolveSessionDir } = require('./path-boundary');
 const TICKET = /^([1-9][0-9]*)-([a-f0-9]{32})$/;
 const MAX_CONTENDERS = 1024;
 const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+// #1215 G3/G5 diagnostics only (no behaviour change): fixed-key in-memory counters per acquisition,
+// folded into per-process totals. Never per-poll I/O; no pid, path, name or raw error is recorded.
+// A record is attached to an error acquireLock throws (`lock_diagnostic`) and lockDiagnostics()
+// returns the totals. Cost: two performance.now() per 10 ms pause plus integer increments.
+const PAUSE_REQUESTED_MS = 10;
+const COUNTERS = ['doorway_rescans', 'admission_polls', 'pauses', 'pause_requested_ms', 'pause_actual_ms', 'pauses_over_2x',
+  'blocked_unresolved', 'blocked_choosing', 'blocked_lower_number', 'blocked_tie_lower_name', 'blocked_self_owner',
+  'eperm_marked_entry', 'eperm_relist_departed', 'eperm_relist_unresolved', 'eperm_relist_dir_gone',
+  'eperm_unmarked_throw_entry_listed', 'eperm_unmarked_throw_entry_absent', 'eperm_read_departed', 'eperm_read_unresolved',
+  'eperm_read_throw', 'dir_unresolved',
+  // #1215 correction5: the nlink0 re-stat site (original :82) — re-stats taken and their EPERM outcomes.
+  'restat_nlink0', 'eperm_restat_marked_entry', 'eperm_restat_relist_departed', 'eperm_restat_relist_unresolved',
+  'eperm_restat_relist_dir_gone', 'eperm_restat_unmarked_throw_entry_listed', 'eperm_restat_unmarked_throw_entry_absent'];
+const MAXIMA = ['pause_actual_max_ms', 'peers_seen_max'];
+const counters = () => Object.fromEntries([...COUNTERS, ...MAXIMA].map(key => [key, 0]));
+const totals = {acquired: 0, timeouts: 0, errors: 0, wait_ms_total: 0, wait_ms_max: 0, ...counters()};
+let active = null; // the running acquisition's counters (acquireLock is synchronous and not re-entered)
+function note(key) { if (active) active[key]++; }
+function noteMax(key, value) { if (active && value > active[key]) active[key] = value; }
+function timedPause() {
+  const begun = performance.now(); pause();
+  if (!active) return;
+  const actual = performance.now() - begun;
+  active.pauses++; active.pause_requested_ms += PAUSE_REQUESTED_MS; active.pause_actual_ms += actual;
+  if (actual > 2 * PAUSE_REQUESTED_MS) active.pauses_over_2x++;
+  noteMax('pause_actual_max_ms', actual);
+}
+function noteBlock(phase, ticket, peer, number) {
+  if (!active) return;
+  const reason = ticket.unresolved ? 'unresolved' : ticket.number === 0 ? 'choosing'
+    : ticket.number < number ? 'lower_number' : 'tie_lower_name'; // the admission condition guarantees one of the four
+  const self = Number(TICKET.exec(peer)[1]) === process.pid;
+  active[`blocked_${reason}`]++; if (self) active.blocked_self_owner++;
+  active.last_block = {phase, reason, self_owner: self};
+}
+const round = value => Math.round(value * 10) / 10;
+function snapshot(record) {
+  const out = {};
+  for (const key of [...COUNTERS, ...MAXIMA]) out[key] = round(record[key]);
+  out.eperm_total = COUNTERS.filter(key => key.startsWith('eperm_')).reduce((sum, key) => sum + record[key], 0);
+  return out;
+}
+function lockDiagnostics() {
+  return {acquired: totals.acquired, timeouts: totals.timeouts, errors: totals.errors,
+    wait_ms_total: round(totals.wait_ms_total), wait_ms_max: round(totals.wait_ms_max), ...snapshot(totals)};
+}
 function failure(code = 'MAILBOX_LOCK_STORAGE') {
   return Object.assign(new Error(code === 'MAILBOX_LOCK_LEGACY'
     ? 'Legacy mailbox lock requires quiesced migration; refusing automatic removal'
@@ -56,8 +102,9 @@ function departed(dir) {
 // EPERM reading a peer ticket DIRECTORY itself (e.g. Windows delete-pending directory) is
 // unresolved metadata: never a departure (only ENOENT is), never admission; callers block.
 const UNRESOLVED = Symbol('unresolved');
+const SKIP_ENTRY = Symbol('skip-entry'); // checkTicketFiles: continue with the next entry
 function dirState(read) {
-  try { return read(); } catch (e) { if (e.code === 'EPERM') return UNRESOLVED; throw e; }
+  try { return read(); } catch (e) { if (e.code === 'EPERM') { note('dir_unresolved'); return UNRESOLVED; } throw e; }
 }
 function deletePending(file) { // An entry lstat cannot read (EPERM) or that is already gone.
   try { return statOptional(file) === null; } catch (e) { if (e.code === 'EPERM') return true; throw e; }
@@ -65,21 +112,40 @@ function deletePending(file) { // An entry lstat cannot read (EPERM) or that is 
 function checkTicketFiles(dir, names = ticketNames(dir)) {
   if (names === null) return null;
   const marked = names.includes(DEPARTED);
+  // One EPERM rule for the first stat and the nlink0 re-stat (#1215 correction5). Returns SKIP_ENTRY or
+  // {value} for checkTicketFiles to return; any other outcome rethrows the original error.
+  const onEperm = (e, name, prefix) => {
+    if (e.code !== 'EPERM') throw e;
+    if (marked) { note(`${prefix}marked_entry`); return SKIP_ENTRY; } // Delete-pending entry of a departing ticket; stat-able entries are still validated.
+    // An unmarked EPERM is a departure only when a re-list proves it; any other EPERM is storage failure.
+    const again = dirState(() => ticketNames(dir));
+    if (again === UNRESOLVED || again === null) { note(again === null ? `${prefix}relist_dir_gone` : `${prefix}relist_unresolved`); return {value: again}; }
+    if (again.includes(DEPARTED)) { note(`${prefix}relist_departed`); return {value: checkTicketFiles(dir, again)}; }
+    note(again.includes(name) ? `${prefix}unmarked_throw_entry_listed` : `${prefix}unmarked_throw_entry_absent`); // diagnostic split only
+    throw e;
+  };
   for (const name of names) {
     if (name === DEPARTED) continue; // The marker is never opened or stat'ed by readers.
     const file = path.join(dir, name);
     let st;
     try { st = statOptional(file); } catch (e) {
-      if (e.code !== 'EPERM') throw e;
-      if (marked) continue; // Delete-pending entry of a departing ticket; stat-able entries are still validated.
-      // An unmarked EPERM is a departure only when a re-list proves it; any other EPERM is storage failure.
-      const again = dirState(() => ticketNames(dir));
-      if (again === UNRESOLVED || again === null) return again;
-      if (again.includes(DEPARTED)) return checkTicketFiles(dir, again);
-      throw e;
+      const decided = onEperm(e, name, 'eperm_');
+      if (decided === SKIP_ENTRY) continue;
+      return decided.value;
     }
     // A concurrent owner can unlink after lookup but before stat captures nlink.
-    if (st?.isFile() && st.nlink === 0 && !statOptional(file)) continue;
+    if (st?.isFile() && st.nlink === 0) {
+      note('restat_nlink0');
+      // #1215 correction5: the re-stat of a just-unlinked file can itself report EPERM (measured on win32 at
+      // original :82:44); it follows the same marked/re-list/refusal rule as the first stat.
+      let again;
+      try { again = statOptional(file); } catch (e) {
+        const decided = onEperm(e, name, 'eperm_restat_');
+        if (decided === SKIP_ENTRY) continue;
+        return decided.value;
+      }
+      if (!again) continue;
+    }
     if (st && (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1 || st.size > 32)) throw failure('MAILBOX_UNSAFE_PATH');
   }
   return names;
@@ -152,8 +218,9 @@ function readTicket(parent, name, reap) {
     if (e.code === 'ENOENT') return null; // This unique participant has left.
     if (e.code === 'EPERM') { // Windows delete-pending number of a departure; an unmarked EPERM still throws.
       const gone = dirState(() => departed(dir));
-      if (gone === UNRESOLVED) return unresolved;
-      if (gone) return null;
+      if (gone === UNRESOLVED) { note('eperm_read_unresolved'); return unresolved; }
+      if (gone) { note('eperm_read_departed'); return null; }
+      note('eperm_read_throw');
     }
     throw e;
   } finally { if (fd !== undefined) fs.closeSync(fd); }
@@ -163,7 +230,32 @@ function readTicket(parent, name, reap) {
 // is an atomic rename of an immutable number; admission waits for choosing peers.
 // Assumes one local filesystem with coherent directory operations and one PID
 // namespace. No lease expiry, shared-name unlink or live-owner eviction exists.
-function acquireLock(sessionDir, options = {}) {
+function acquireLock(sessionDir, options = {}) { // #1215 diagnostics wrapper: return/throw unchanged
+  const record = active = {...counters(), last_block: null}, begun = performance.now();
+  let outcome = 'error';
+  try {
+    const release = acquireLockObserved(sessionDir, options);
+    outcome = 'acquired';
+    return release;
+  } catch (e) {
+    if (e && e.code === 'MAILBOX_LOCK_TIMEOUT') outcome = 'timeout';
+    if (e && typeof e === 'object' && Object.isExtensible(e) && !Object.hasOwn(e, 'lock_diagnostic')) {
+      const last = record.last_block || {};
+      e.lock_diagnostic = {outcome, elapsed_ms: round(performance.now() - begun), deadline_ms: options.timeoutMs ?? 500,
+        last_block_phase: last.phase || null, last_block_reason: last.reason || null, last_block_self_owner: last.self_owner ?? null,
+        ...snapshot(record)};
+    }
+    throw e;
+  } finally {
+    active = null;
+    const waited = performance.now() - begun;
+    if (outcome === 'acquired') totals.acquired++; else if (outcome === 'timeout') totals.timeouts++; else totals.errors++;
+    totals.wait_ms_total += waited; if (waited > totals.wait_ms_max) totals.wait_ms_max = waited;
+    for (const key of COUNTERS) totals[key] += record[key];
+    for (const key of MAXIMA) if (record[key] > totals[key]) totals[key] = record[key];
+  }
+}
+function acquireLockObserved(sessionDir, options) {
   const lock = lockDirectory(sessionDir, true);
   if (lock.legacy) throw failure('MAILBOX_LOCK_LEGACY');
   const deadline = performance.now() + (options.timeoutMs ?? 500);
@@ -178,12 +270,13 @@ function acquireLock(sessionDir, options = {}) {
     // doorway scan restarts (still announced as choosing) until every peer resolves.
     for (let unresolved = true; unresolved;) {
       unresolved = false; highest = 0;
-      for (const peer of entries(lock.dir)) {
+      const peers = entries(lock.dir); noteMax('peers_seen_max', peers.length);
+      for (const peer of peers) {
         const ticket = readTicket(lock.dir, peer, true);
-        if (ticket?.unresolved) { unresolved = true; break; }
+        if (ticket?.unresolved) { noteBlock('doorway', ticket, peer, 0); unresolved = true; break; }
         if (ticket && !ticket.removed) highest = Math.max(highest, ticket.number);
       }
-      if (unresolved) { if (performance.now() >= deadline) throw timeout(); pause(); }
+      if (unresolved) { note('doorway_rescans'); if (performance.now() >= deadline) throw timeout(); timedPause(); }
     }
     if (highest >= Number.MAX_SAFE_INTEGER) throw failure();
     const number = highest + 1, draft = path.join(own, 'draft');
@@ -194,18 +287,19 @@ function acquireLock(sessionDir, options = {}) {
     fs.renameSync(draft, path.join(own, 'number'));
     while (performance.now() < deadline) {
       let blocked = false;
-      for (const peer of entries(lock.dir)) {
+      const peers = entries(lock.dir); noteMax('peers_seen_max', peers.length);
+      for (const peer of peers) {
         if (peer === name) continue;
         const ticket = readTicket(lock.dir, peer, true);
         if (ticket && !ticket.removed && (ticket.unresolved || ticket.number === 0 || ticket.number < number
-          || (ticket.number === number && peer < name))) { blocked = true; break; }
+          || (ticket.number === number && peer < name))) { noteBlock('admission', ticket, peer, number); blocked = true; break; }
       }
       if (!blocked) {
         held = true;
         let released = false;
         return () => { if (!released) { removeTicket(own); released = true; } };
       }
-      pause();
+      note('admission_polls'); timedPause();
     }
     throw timeout();
   } finally { if (!held) removeTicket(own); }
@@ -220,4 +314,4 @@ function reapSessionLocks(sessionDir) {
   }
   return count;
 }
-module.exports = {acquireLock, reapSessionLocks, isProcessAlive};
+module.exports = {acquireLock, reapSessionLocks, isProcessAlive, lockDiagnostics};
