@@ -83,7 +83,7 @@ A session whose bridge has not reported in the current owner generation shows
 - Daemon ids are kept in the bridge's in-memory record index and in the dead-letter row. They are
   not written to `inbox.jsonl`/`state.jsonl`, whose strict custody schema does not admit them.
 
-## Recipient input policy: user-supervised orchestrator vs guarded worker (task 1215)
+## Recipient input policy: user-supervised orchestrator vs guarded worker
 
 Workers can show interaction and permission prompts, so they keep every screen gate above. The
 orchestrator is watched and controlled by the user, so its input is not gated on screen
@@ -95,156 +95,149 @@ inspection. The authority is `src/mailbox/input-policy.js`.
 | Bridge admission | Live child plus the user's own typing quiet (`IDLE_THRESHOLD`). No tail detector, no VT grid, no busy/modal/glyph/model/case matching. TEXT, paired CR, flush and own-record re-admission all use this rule. | Unchanged: tail or VT-frame ready; busy, modal, recent input, VT-unavailable and kill switch fail closed; no blind timer. |
 | Always kept | Receipts, duplicate suppression, TTL/pair quarantine, previous-bridge quarantine (no blind replay), payload preservation, body-before-submit order. | Same. |
 
-**How the policy is established (never inferred).** It is not read from a process or command name,
-SID text, `--from`, payload text, inject-frame fields or bridge-reported fields.
+The policy is never inferred: not from a process or command name, SID text, `--from`, payload text,
+inject-frame fields, bridge-reported fields, environment variables or the screen.
 
-1. *Request (registration).* `POST /api/sessions/register` takes `input_policy: "user-supervised" | "guarded"`.
-   `user-supervised` is refused (the session stays guarded; the response sets
-   `input_policy_refused: <code>`) in these cases:
-   - another session's `x-telepty-session-token` is presented, or a new registration presents
-     any session bearer (`INPUT_POLICY_SESSION_BEARER`);
-   - a re-registration of a live instance does not present that instance's input-policy
-     capability (`INPUT_POLICY_CAPABILITY_REQUIRED`) — **the session's own bearer is never enough**:
-     the bridge exports it to the child, so it proves "a process of this session", not the host;
-   - the request is not authenticated by a server-verified strict **operator principal**
-     (`INPUT_POLICY_OPERATOR_REQUIRED`) — new instance or capability re-request alike. The legacy
-     daemon token never qualifies: every wrapped child inherits it (`sessionEnv`, shared HOME
-     config), so a token match, an omitted session header, SID/role text or a client env check is
-     not host authority (task 1215 R1);
-   - the request re-registers a live credentialed instance without that instance's own bearer
+### Authority: a verified operator principal, in one of two configurations
+
+`user-supervised` is granted only to a request authenticated by a server-verified Ed25519
+**operator** principal (trust entry `authority: "operator"` with a `session.register` grant for the
+orchestrator's session id). The daemon token is never authority for it: every wrapped child inherits
+that token (child environment, shared HOME configuration), so a token match, an omitted session
+header, SID/role text or a client-side environment check does not qualify.
+
+| | Combined mode (ordinary transport + scoped operator proof) | Explicit strict mode |
+|---|---|---|
+| Daemon | `TELEPTY_SUPERVISION_TRUST_FILE=<trust file>` | `TELEPTY_PRINCIPAL_MODE=strict` + `TELEPTY_PRINCIPAL_TRUST_FILE=<trust file>` |
+| Bridge | `TELEPTY_SUPERVISION_CLIENT_FILE=<operator client config>` | `TELEPTY_PRINCIPAL_CLIENT_FILE=<operator client config>` |
+| Ordinary requests | Daemon token / session bearer / JWT peers exactly as without supervision | Every request must carry a principal assertion; no token fallback |
+| Operator proof | Only on `POST /api/sessions/register` asking for `user-supervised` (and its reconnect re-registration) | On every request |
+| Owner WebSocket | Ordinary owner claim (bearer + capability) | Strict owner transport |
+
+Both use the same `telepty.principals/v1` trust format, the same verifier (method, target, body
+digest, action, audience, challenge, expiry, nonce replay, grant, operator-only, persisted owner and
+current epoch on an existing record) and the same challenge endpoint `GET /api/auth/challenge`.
+
+Fail-closed configuration:
+- Neither strict mode nor `TELEPTY_SUPERVISION_TRUST_FILE` configured ⇒ supervision is off; every
+  `user-supervised` request is registered guarded with
+  `input_policy_refused: "INPUT_POLICY_OPERATOR_REQUIRED"`.
+- Trust file set but unreadable or invalid ⇒ the daemon does not start (verification is never
+  silently disabled). Set together with strict mode ⇒ `SUPERVISION_MODE_CONFLICT`, the daemon does
+  not start.
+- Combined mode: a presented operator proof that fails verification ⇒ the request is refused
+  (`SUPERVISION_PROOF_INVALID`, `detail` = verifier code); no proof ⇒ registered guarded with the
+  explicit refusal. Any other request ignores the header.
+- Bridge: `TELEPTY_SUPERVISION_CLIENT_FILE` combined with `TELEPTY_PRINCIPAL_CLIENT_FILE`, used without
+  `--input-policy user-supervised`, invalid, targeting a different daemon, or used with an SSH child
+  ⇒ refused before anything starts. It never switches the bridge to strict owner transport.
+
+### Grant lifecycle
+
+1. *Request (registration).* `POST /api/sessions/register` takes
+   `input_policy: "user-supervised" | "guarded"`. `user-supervised` is refused — the session stays
+   guarded and the response names `input_policy_refused` — when:
+   - another session's `x-telepty-session-token` is presented, or a new registration presents any
+     session bearer (`INPUT_POLICY_SESSION_BEARER`);
+   - an existing instance is re-registered without the instance's current bearer
      (`SESSION_CREDENTIAL_REQUIRED`; this also applies to `guarded`, so an uncredentialed caller
      cannot downgrade it either);
+   - an existing instance is re-registered without a verifiable input-policy capability and does not
+     meet the restored-owner rule below (`INPUT_POLICY_CAPABILITY_REQUIRED`) — the session's own
+     bearer is never enough, because the bridge exports it to the child;
+   - no verified operator principal authenticated the request (`INPUT_POLICY_OPERATOR_REQUIRED`);
    - the record has no credential (`INPUT_POLICY_CREDENTIAL_REQUIRED`);
-   - the session is SSH, mailbox/aterm or external-approval protected (`INPUT_POLICY_UNSUPPORTED`);
-   - in strict principal mode, the principal is not an `operator` (`INPUT_POLICY_OPERATOR_REQUIRED`;
-     the principal middleware already refuses non-operator wrapped registrations).
+   - the session is SSH, mailbox/aterm or external-approval protected (`INPUT_POLICY_UNSUPPORTED`).
 
-   A granted request is only **pending**: `input_policy_pending: true`. The 201 of a granted host
-   registration — and only it — also returns `input_policy_capability` (once, with the bearer). The
-   bridge keeps it in memory only: never in `process.env`, the child's environment, logs or any
-   view; the daemon keeps only its SHA-256, bound to the instance epoch, credential generation and
-   the grant attempt, in memory (`WeakMap`, never in `sessions.json`).
-2. *Bind (owner claim).* The next bearer-proved owner claim that ALSO presents
+   A granted request is only **pending** (`input_policy_pending: true`).
+2. *Capability.* An input-policy capability is returned in exactly two responses:
+   - the **201** of a granted new registration (with the session bearer, once);
+   - the **200** of a re-registration by the **restored persisted owner** (below), once, as a fresh
+     capability.
+
+   No other response carries it. The bridge keeps it in memory only — never in `process.env`, the
+   child's environment, logs or any view. The daemon keeps only its SHA-256, bound to the instance
+   epoch, credential generation and grant attempt, in memory (never in `sessions.json`).
+3. *Bind (owner claim).* The next bearer-proved owner claim that also presents
    `x-telepty-input-policy-capability` mints a new `owner_generation` and binds the pending policy to
-   exactly that generation. A claim without the capability (for example a child holding the
-   exported bearer) leaves the pending request untouched for its rightful owner and is guarded. A
-   later claim without a fresh pending request is guarded. Stale capabilities stop verifying on
-   downgrade, credential rotation, destroy/recreate or daemon restart; after a restart the bridge's
-   re-registration is refused and prints the GUARDED warning — supervision fails closed and needs a
-   relaunch.
-3. *Bridge.* The bridge is supervised only when it was launched with
-   `--input-policy user-supervised` **and** the daemon's `owner_token` for the current generation
-   says `user-supervised`. On disconnect it is guarded. A launch from inside a telepty session
-   (`TELEPTY_SESSION_ID`/`TELEPTY_SESSION_TOKEN` inherited) is refused. If supervision is lost
-   mid-child, VT readiness reports `unavailable:mid_stream_after_supervision` and fails closed.
+   exactly that generation. A claim without the capability (for example a child holding the exported
+   bearer) leaves the pending request for its rightful owner and is guarded. A later claim without a
+   fresh pending request is guarded. A live reconnect re-registers with its operator proof, current
+   epoch, bearer and held capability, then claims again.
+4. *Daemon restart / restore.* The capability is memory-only, so after a restore the bridge's held
+   capability no longer verifies. The persisted owner obtains a **fresh** capability (200, above) by
+   re-registering with `input_policy: "user-supervised"` when all of these hold: the operator assertion
+   is verified for `session.register` on that session id and bound to the record's current epoch; the
+   principal equals the persisted `owningPrincipal` (id, source, audience); the presented session
+   bearer verifies to that session id, epoch and current credential generation; and no live grant
+   exists. The old capability is never accepted again. Other operators, workers, stale epochs, and
+   missing or failed bearers are refused and stay guarded.
+5. *Not promoted (migration limitation).* A record registered without an operator owner (no
+   `owningPrincipal`, e.g. a legacy token registration), or a bridge relaunched without the
+   instance's bearer, cannot become supervised. There is no automatic takeover and no credential
+   reset; the supported path is a new instance launched by the approved boot helper.
+6. *Bridge.* The bridge is supervised only when it was launched with `--input-policy user-supervised`
+   **and** the daemon's `owner_token` for the current generation says `user-supervised`. On disconnect
+   it is guarded. A launch from inside a telepty session (`TELEPTY_SESSION_ID`/`TELEPTY_SESSION_TOKEN`
+   inherited) is refused. A refused grant prints `input_policy user-supervised was not granted (...);
+   this session runs GUARDED` (or `was not re-granted` on reconnect). If supervision is lost mid-child,
+   VT readiness reports `unavailable:mid_stream_after_supervision` and fails closed.
 
-**Interface for the orchestrator boot helper (package consumer).** Run this from the host terminal,
-not from inside a telepty-wrapped shell:
+Effective state: `GET /api/sessions/<sid>` → `transport.input_policy` (`user-supervised` or
+`guarded`) and `transport.input_policy_source` (`operator_principal_registration`).
 
-```
-telepty allow --id <orchestrator-sid> --input-policy user-supervised <cli> [args...]
-```
+### Environment scrubbing is not key isolation
 
-Check stderr: `input_policy user-supervised was not granted (...); this session runs GUARDED`
-means the grant failed. Effective state is `GET /api/sessions/<sid>` → `transport.input_policy`
-(`user-supervised` or `guarded`) and `transport.input_policy_source` (`operator_principal_registration`).
-The launch must run with `TELEPTY_PRINCIPAL_CLIENT_FILE` naming an enrolled operator key (trust file
-entry `authority: "operator"`) against a daemon started with `TELEPTY_PRINCIPAL_MODE=strict`; in legacy
-mode the request is refused and the session runs guarded. Workers are launched without the flag, or with
-`--input-policy guarded`.
+The daemon removes `TELEPTY_SUPERVISION_TRUST_FILE` and `TELEPTY_SUPERVISION_CLIENT_FILE` from its own
+environment, so spawned sessions do not inherit them; the bridge removes both (and, in strict mode,
+`TELEPTY_PRINCIPAL_CLIENT_FILE`) from its child's environment. That only hides the paths. The operator
+private key is isolated only when guarded workers cannot read it — confined workers, a separate uid,
+or a sandbox that denies the key path. A guarded worker running as the operator's uid can read a
+`0600` key. Key isolation is a deployment requirement this package does not provide or verify.
 
-**Combined mode (task 1215 auth-resume6 — source only, not yet independently run).** Ordinary
-deployments keep their transport credentials (daemon token, session bearer, JWT peers); supervision needs
-an ADDITIONAL operator proof:
-- Daemon: `TELEPTY_SUPERVISION_TRUST_FILE=<trust file>` (same `telepty.principals/v1` format and reader
-  as strict mode; the operator key needs a `session.register` grant for the orchestrator sid). Unset ⇒
-  feature off, every `user-supervised` request refused `INPUT_POLICY_OPERATOR_REQUIRED`. Set but
-  unreadable/invalid ⇒ the daemon does not start. Set together with `TELEPTY_PRINCIPAL_MODE=strict` ⇒
-  `SUPERVISION_MODE_CONFLICT`, the daemon does not start. The challenge is served at
-  `GET /api/auth/challenge`. The daemon removes both supervision variables from its own environment, so
-  spawned sessions never inherit them.
-- Verification: after ordinary admission, only `POST /api/sessions/register` with
-  `input_policy: "user-supervised"` that carries `x-telepty-principal` is verified by the real principal
-  verifier (method, target, body digest, action, audience, expiry, nonce replay, grant, operator-only,
-  owner + epoch on re-registration). A presented proof that fails ⇒ the request is refused
-  (`SUPERVISION_PROOF_INVALID`, `detail` = verifier code); no proof ⇒ registered guarded with the explicit
-  refusal. The shared token, body flags, worker principals, forged, malformed or replayed proofs never
-  grant. Every other request ignores the header.
-- Bridge: `TELEPTY_SUPERVISION_CLIENT_FILE=<operator client config> telepty allow --id <sid>
-  --input-policy user-supervised <cli>`. The client must target this local daemon (no SSH). It signs only
-  the user-supervised registration (and its reconnect re-registration, epoch-bound). It does not switch
-  to strict owner transport; combining it with `TELEPTY_PRINCIPAL_CLIENT_FILE`, or setting it without
-  `--input-policy user-supervised`, is refused before anything starts. Both variables are removed from
-  the child's environment. Removing variables does NOT keep the key from same-uid workers that know its
-  path — key isolation remains a separately measured deployment gate.
-- Strict mode (`TELEPTY_PRINCIPAL_MODE=strict`) is unchanged: no token fallback, no downgrade.
-- Daemon restart / restore (task 1215 lifecycle-resume8 — source only, not yet independently run): the
-  input-policy capability is memory-only and never persisted, so after a restore the bridge's held
-  capability no longer verifies. The persisted owner can obtain a FRESH one by re-registering with
-  `input_policy: "user-supervised"` when ALL of these hold: the request carries an operator assertion
-  verified for `session.register` on that sid and bound to the record's current epoch; the principal
-  equals the persisted `owningPrincipal` (id/source/audience); the presented session bearer verifies to
-  that sid, epoch and current credential generation; and no live grant exists. The 200 response then
-  returns the new capability once (the old one is never accepted); the next owner claim must present it.
-  Other operators, workers, stale epochs, missing or failed bearers, and records without an
-  `owningPrincipal` are refused and stay guarded. Limitation: a legacy record registered without an
-  operator owner, or a bridge relaunched without the instance's bearer, cannot be promoted — there is no
-  automatic takeover or credential reset; relaunch as a new instance instead.
-- macOS: trust and client files are read by the native reader, whose directory-handle experiment is
-  still unmeasured; until it is confirmed, combined mode on macOS cannot load its files. No prompt
-  delivery or ACK is claimed from source.
+### Platform support for trust and key files
 
-**Trust boundary, stated plainly.** Supervision authority is the strict operator principal, verified
-by the daemon (Ed25519 assertion bound to method, target, body digest, action, challenge, nonce and
-epoch). The legacy daemon token grants no supervision at all, so a guarded worker child that strips
-its session environment and reuses the inherited token is refused (`INPUT_POLICY_OPERATOR_REQUIRED`).
-**Deployment prerequisite (pending, not provided by this package):** the operator private key must be
-unreadable by guarded workers. cli.js removes `TELEPTY_PRINCIPAL_CLIENT_FILE` from the child env, but a
-same-uid, same-HOME key file is not isolated merely because the env omits it; isolation needs confined
-workers, a separate uid or a sandbox that denies the key path. Strict mode reads its trust and key files through `readAuthorityFile`, whose backend follows the
-actual host platform (a `platform` option that disagrees fails closed).
-
-**Platform support (task 1215 native-resume3 — SOURCE ONLY, native build and verification pending).**
-- Linux: descriptor-relative reads via `/proc/self/fd` (unchanged).
-- macOS: measured that `/dev/fd/<dirfd>/<name>` is not descriptor-relative there (`ENOENT`) and Node has
-  no `openat`. The Darwin backend is a first-party Node-API reader,
-  `src/principal/native/authority-darwin.c`, with ONE export `readVerified(path, maximum, privateFile)`:
-  it pins every directory with `openat(…, O_EVTONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)` (an event-only
-  handle: no directory data access is requested; whether openat/fstat/ACL reads accept it under a sandbox
-  is UNMEASURED, pending an unchanged independent retest; no O_RDONLY or pathname fallback) relative to the
-  previous descriptor, applies the Linux owner/mode/root-sticky rules, opens the leaf with
-  `O_NOFOLLOW|O_NONBLOCK`, requires a regular file owned by root/uid with `nlink == 1`, size within
-  `maximum`, no group/other bits when private, reads with a bounded loop and re-checks
-  dev/ino/size/mtime/ctime; any extended-ACL ALLOW entry granting write/delete/security/owner rights, or
-  an unreadable ACL, is unsafe. Every descriptor is closed and the buffer zeroed on all paths. Pathnames
-  are never re-read, so a rename after a directory is pinned cannot redirect the read.
-- Loading: `src/principal/authority-file-darwin.js` loads ONLY
+Trust and client files are read through `readAuthorityFile`, whose backend follows the actual host
+platform (a `platform` option that disagrees fails closed with `platform_mismatch`).
+- Linux: descriptor-relative reads via `/proc/self/fd`.
+- macOS: a bundled first-party Node-API reader (`src/principal/native/authority-darwin.c`, one export
+  `readVerified(path, maximum, privateFile)`). It pins every directory with
+  `openat(…, O_EVTONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)` relative to the previous descriptor, applies
+  the Linux owner/mode/root-sticky rules, opens the leaf with `O_NOFOLLOW|O_NONBLOCK`, requires a
+  regular file owned by root or the user with `nlink == 1`, size within `maximum` and no group/other
+  bits when private, reads with a bounded loop and re-checks dev/ino/size/mtime/ctime; an extended-ACL
+  ALLOW entry granting write/delete/security/owner rights, or an unreadable ACL, is unsafe. Every
+  descriptor is closed and the buffer zeroed on all paths; pathnames are never re-read and there is no
+  pathname or `O_RDONLY` fallback. `src/principal/authority-file-darwin.js` loads only
   `src/principal/native/prebuilt/darwin/authority-darwin.node` (fixed package path, no override, no
-  runtime compile or download). Absent or malformed → `reason: "darwin_native_reader_unavailable"`.
-- Build (release/CI only): `node scripts/build-authority-darwin.mjs --cc <clang> --sdk <MacOSX SDK>
+  runtime compile or download); absent or malformed ⇒ `darwin_native_reader_unavailable`.
+- macOS build (release/CI only): `node scripts/build-authority-darwin.mjs --cc <clang> --sdk <MacOSX SDK>
   --node-headers <dir with node_api.h>` → universal arm64+x86_64 bundle, `-mmacosx-version-min=11.0`,
   `NAPI_VERSION=8`, plus `authority-darwin.node.provenance.json` (source/header/compiler hashes, argv,
   archs, output sha256). Every compiler/lipo child gets only PATH, ZERO_AR_DATE, SOURCE_DATE_EPOCH,
   LANG and a private HOME/TMPDIR/TMP/TEMP inside a fresh 0700 `.build-*` directory beside the output
-  (verified before any spawn, removed on success and failure; no inherited credentials, proxies or SDK
-  search variables). Not hooked to any npm lifecycle script; the binary is not committed
-  (`.gitignore`) and ships through `files: ["src/"]`. Supported runtime: macOS ≥ 11 on arm64 or
-  x86_64, Node ≥ 20.
-- CI: `test-install.yml` and `release.yml` macOS legs build before the suite; release job
-  `authority-darwin` builds, checks `lipo -archs`, runs the native tests with **zero skips**, and
-  `publish` re-verifies the sha256 and fails unless the tarball contains the binary + provenance.
-- **Status: the binary has NOT been compiled; nothing above is measured yet.** Until the independent
-  builder compiles, loads and tests it, macOS strict mode fails closed and the Mac orchestrator is not
-  supervised. Sandboxed/confined filesystems may refuse `O_RDONLY` directory opens — not yet measured.
-Windows: unsupported (fails closed).
-Independent of platform, the threat model is other-uid substitution; a guarded worker running as the
-operator's uid can read a `0600` key, so operator-key exclusion from workers remains a deployment gate.
-Intentionally unsupported: earlier fixtures that obtained supervision with the legacy token (prior
-independent IND-4, repair IND-R4, the legacy-harness #1215 daemon cases in
-`test/bridge-actual-wiring-137.test.js`) now observe a refusal by design.
-This repository change does not alter already-installed or
-running sessions: they need the upgraded package, and the orchestrator must be relaunched with the
-flag.
+  (verified before any spawn, removed on success and failure). Not hooked to any npm lifecycle script;
+  the binary is not committed and ships through `files: ["src/"]`. CI macOS legs build it before the
+  suite; the release job checks `lipo -archs`, runs the native tests with zero skips, and `publish`
+  re-verifies its sha256 and fails unless the tarball contains it and its provenance.
+- Under a sandbox that denies reads of an ancestor directory (for example a home directory) while
+  allowing a subtree below it, the macOS reader is expected to refuse files in that subtree: it must
+  open every ancestor as a descriptor, while a plain path-based read only needs the final file. This
+  follows from the sandbox profile rules; the exact kernel denial has not been observed. Place
+  authority files where the reading process may open every ancestor directory.
+- Windows: unsupported (fails closed).
+
+### Verification status
+
+Independent unchanged regression runs passed for the restore lifecycle (4/4) and combined
+authentication (9/9), and the native macOS reader passed its frozen tests on darwin arm64 with a
+fixture outside the home directory (7 pass, 1 Linux-only skip). Not covered by those runs: an
+installed package, a live daemon/bridge/network, x86_64 or Windows, files under a sandbox-denied home
+directory, operator-key isolation, and real prompt delivery or ACK.
+
+Earlier fixtures that obtained supervision with the daemon token now observe a refusal by design.
+Already-installed or running sessions are not changed: they need the upgraded package and a relaunch
+through the approved boot helper.
 
 ## Spawn readiness milestones (`input-transport-ready-v1`, every role)
 
@@ -284,14 +277,21 @@ application/provider acknowledgement; none exists today, so `transport.instructi
 (`no_message_bound_provider_acknowledgement`). PTY write, Enter and the handshake never set it. The
 real Telepty prompt+nonce ACK remains the final delivery gate.
 
-## Consumer integration API for orchestrator-boot / dispatch (F3 — not integrated here)
+## Consumer integration API for orchestrator-boot / dispatch
 
 This repository does not contain or change the orchestrator consumer. Installed consumer
 integration is NOT claimed. What the consumer needs:
 
-1. **Launch** (host shell, never inside a telepty session):
-   `telepty allow --id <orch-sid> --input-policy user-supervised <cli> [args...]`.
-   Workers: no flag (or `--input-policy guarded`).
+1. **Launch** through the consumer's approved boot helper, from a host shell, never inside a telepty
+   session. The helper must pass `--input-policy user-supervised` **and** the correctly enrolled
+   operator client configuration for the daemon's mode (combined:
+   `TELEPTY_SUPERVISION_CLIENT_FILE=<config> telepty allow --id <orch-sid> --input-policy user-supervised <cli> [args...]`;
+   strict: `TELEPTY_PRINCIPAL_CLIENT_FILE=<config>` with the same arguments). Package support does not
+   mean an external helper already does this — verify the helper itself. Workers: no flag (or
+   `--input-policy guarded`) and no operator configuration.
+   Cleaning up or restarting an existing live orchestrator is the user's operation and must go
+   through that approved helper. Do not bypass it with a bare restart or by deleting current
+   credentials; a credentialless or unowned instance is not promoted (see *Grant lifecycle*).
 2. **Confirm policy**: poll `GET /api/sessions/<orch-sid>` (host token) until
    `transport.input_policy == "user-supervised"`; treat stderr `this session runs GUARDED` or
    `guarded` as a failed launch (relaunch; do not fall back silently).
