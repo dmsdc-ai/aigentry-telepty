@@ -1,6 +1,11 @@
 # Open Telepty issues: local delivery outcome — 2026-10-29
 
-Latest continuation: [signed strict readiness inspection](2026-10-30-signed-readiness-continuation.md),
+Latest compatibility pass: [Linux candidate and consumer integration](2026-10-31-telesession-compatibility.md).
+Fresh capability contracts16/16; isolated repaired consumer187 pass/zero fail/three
+skip out of190. Telepty runtime source remains b842f0c. Gateway/Mac acceptance
+and the same32 residual gates remain explicit; no remote issue closure occurred.
+
+Earlier continuation: [signed strict readiness inspection](2026-10-30-signed-readiness-continuation.md),
 2,535 total / 2,532 pass / zero fail / three skip. Signed inspection acceptance
 remains separate from real client enrollment, consumption and reply.
 
