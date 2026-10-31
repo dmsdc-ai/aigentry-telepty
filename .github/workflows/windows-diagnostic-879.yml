@@ -1,8 +1,9 @@
 name: Windows CI diagnostic (#879)
 
 # Opt-in, bounded, per-file diagnostic of the Windows regression job (telepty #879).
-# Does NOT replace test-install.yml. It runs the SAME inventory (derived at runtime from
-# package.json test:ci / test:ci:pty) one process per file with a per-file deadline, records
+# Does NOT replace test-install.yml. It runs the SAME inventory (read at runtime from
+# scripts/test-suites.json, which `npm run test:ci` / `test:ci:pty` execute through
+# scripts/run-tests.mjs) one process per file with a per-file deadline, records
 # exit-vs-stream-close timing and the descendant process tree on any deadline, and always
 # uploads the per-file logs + summary. A timeout, a lost process or a stream that never closes
 # is a job failure — it is never reported as green.
@@ -37,6 +38,8 @@ on:
     paths:
       - '.github/workflows/windows-diagnostic-879.yml'
       - 'scripts/windows-ci-diagnostic.mjs'
+      - 'scripts/run-tests.mjs'
+      - 'scripts/test-suites.json'
       - 'docs/reports/windows-ci-879.md'
       # #879 phase 2: the harness/fixture candidate lives in these paths; a change there must
       # trigger the next Windows per-file run (and the non-main regression job below).
