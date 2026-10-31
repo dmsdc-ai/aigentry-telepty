@@ -267,7 +267,8 @@
         "test/mailbox-compatibility-membership-1215.test.js",
         "test/supervision-config-persistence-1215.test.js",
         "test/supervision-preflight-lifecycle-1215.test.js",
-        "test/allow-admission-1215.test.js"
+        "test/allow-admission-1215.test.js",
+        "test/queue-deadline-admission-1215.test.js"
       ]
     },
     "test:watch": {
@@ -479,7 +480,8 @@
         "test/ledger-publication-1215.test.js",
         "test/supervision-config-persistence-1215.test.js",
         "test/supervision-preflight-lifecycle-1215.test.js",
-        "test/allow-admission-1215.test.js"
+        "test/allow-admission-1215.test.js",
+        "test/queue-deadline-admission-1215.test.js"
       ]
     },
     "test:ci": {
@@ -745,7 +747,8 @@
         "test/mailbox-compatibility-membership-1215.test.js",
         "test/supervision-config-persistence-1215.test.js",
         "test/supervision-preflight-lifecycle-1215.test.js",
-        "test/allow-admission-1215.test.js"
+        "test/allow-admission-1215.test.js",
+        "test/queue-deadline-admission-1215.test.js"
       ]
     },
     "test:ci:pty": {

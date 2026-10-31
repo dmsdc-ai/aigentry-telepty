@@ -211,13 +211,59 @@ jobs:
           ARCHS="$(lipo -archs "$BIN" | tr ' ' '\n' | sort | tr '\n' ' ')"
           test "$ARCHS" = "arm64 x86_64 " || { echo "::error::unexpected architectures: $ARCHS"; exit 1; }
           echo "sha256=$(shasum -a 256 "$BIN" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-      - name: Native reader tests must run and pass with zero skips
+      - name: Native reader tests must run and pass (only the named Linux-only case may skip)
         run: |
           set -euo pipefail
           node --require ./test-support/setup-env.js --test --test-reporter=tap \
             test/authority-file-darwin-1215.test.js test/operator-supervision-1215.test.js | tee "$RUNNER_TEMP/native.tap"
           grep -qx '# fail 0' "$RUNNER_TEMP/native.tap"
-          grep -qx '# skip 0' "$RUNNER_TEMP/native.tap" || { echo "::error::a native check was skipped; skipped is not green"; exit 1; }
+          # Task 1215 package76: reconcile the TAP against the EXACT expected test list. The former `grep -qx '# skip 0'`
+          # could never match: node's TAP summary field is `# skipped N`, so it refused every run (hosted run 41252023257,
+          # job 124687386887: tests 8, pass 7, fail 0, skipped 1). Exactly ONE skip is permitted, and only by name: the Linux
+          # descriptor-relative reader case, which test/authority-file-darwin-1215.test.js declares
+          # `skip: process.platform !== 'linux'` and which the Linux leg of the main suite (test:ci) runs and asserts. On this
+          # macOS job that is a platform exclusion of a NON-native Linux test, not a skipped native acceptance: both Darwin
+          # native-reader cases and all five operator cases must be reported `ok` with no directive, and any missing, extra,
+          # failed, cancelled, todo or other skipped test, or an absent/malformed plan or summary, fails this step.
+          node -e '
+            const fs = require("fs");
+            const EXPECTED = [
+              "Darwin: the bundled native reader loads, returns a normal private file and refuses unsafe shapes",
+              "Darwin: the real strict trust/client loaders read through the native reader",
+              "Linux: the descriptor-relative reader accepts a normal private file and rejects unsafe shapes and replaced parents",
+              "R1 legacy daemon: omitted session headers + the shared host token are admitted but never granted supervision",
+              "R1 session bearer is never authority, in legacy or alongside a valid operator signature",
+              "R1 forged, stale, replayed, body-mismatched and non-operator principals cannot open a supervised instance",
+              "R1 a valid verified operator keeps the feature: capability once, production-shaped bind, modal delivers; bearer-only claim stays guarded",
+              "the operator positive path through the REAL trust-file loader (Linux /proc reader, Darwin bundled native reader)",
+            ];
+            const LINUX_ONLY = EXPECTED[2];
+            const fail = (m) => { console.error("::error::native gate: " + m); process.exit(1); };
+            const points = [], plans = [], summary = {};
+            for (const l of fs.readFileSync(process.argv[1], "utf8").split(/\r?\n/)) {
+              let m = l.match(/^(not ok|ok) (\d+) - (.*?)(?: # (SKIP|TODO)\b.*)?$/);
+              if (m) { points.push({ ok: m[1] === "ok", n: Number(m[2]), name: m[3].replace(/\\#/g, "#"), directive: m[4] || null }); continue; }
+              m = l.match(/^1\.\.(\d+)$/);
+              if (m) { plans.push(Number(m[1])); continue; }
+              m = l.match(/^# (tests|suites|pass|fail|cancelled|skipped|todo) (\d+)$/);
+              if (m) { if (m[1] in summary) fail("duplicate summary field # " + m[1]); summary[m[1]] = Number(m[2]); }
+            }
+            for (const k of ["tests", "suites", "pass", "fail", "cancelled", "skipped", "todo"]) if (!Number.isInteger(summary[k])) fail("summary field # " + k + " absent or malformed");
+            if (plans.length !== 1 || plans[0] !== EXPECTED.length) fail("plan " + JSON.stringify(plans) + " is not exactly 1.." + EXPECTED.length);
+            if (summary.tests !== EXPECTED.length || points.length !== EXPECTED.length) fail("registered " + summary.tests + " / reported " + points.length + " != expected " + EXPECTED.length);
+            if (summary.suites !== 0 || summary.fail !== 0 || summary.cancelled !== 0 || summary.todo !== 0) fail("suites/fail/cancelled/todo must be 0: " + JSON.stringify(summary));
+            if (summary.skipped !== 1 || summary.pass !== EXPECTED.length - 1) fail("expected pass " + (EXPECTED.length - 1) + " and skipped 1: " + JSON.stringify(summary));
+            if (summary.pass + summary.fail + summary.cancelled + summary.skipped + summary.todo !== summary.tests) fail("summary counts do not reconcile: " + JSON.stringify(summary));
+            points.forEach((p, i) => { if (p.n !== i + 1) fail("test points are not numbered 1.." + points.length); });
+            for (const name of EXPECTED) {
+              const hits = points.filter((p) => p.name === name);
+              if (hits.length !== 1) fail("expected test reported " + hits.length + " times: " + name);
+              if (name === LINUX_ONLY) { if (!(hits[0].ok && hits[0].directive === "SKIP")) fail("the only permitted skip is the Linux-only case, as SKIP: " + name); }
+              else if (!(hits[0].ok && hits[0].directive === null)) fail("native/operator test did not pass without a directive: " + name);
+            }
+            const extra = points.filter((p) => !EXPECTED.includes(p.name)).map((p) => p.name);
+            if (extra.length) fail("unexpected test(s): " + JSON.stringify(extra));
+            console.log("native gate: " + summary.pass + "/" + summary.tests + " passed; the single skip is the Linux-only case (platform exclusion, asserted in the Linux leg of test:ci)");' "$RUNNER_TEMP/native.tap"
       - uses: actions/upload-artifact@v4
         with:
           name: authority-darwin
