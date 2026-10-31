@@ -2,7 +2,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const C = fs.constants;
-function unavailable() { throw Object.assign(new Error('Authority file is unavailable or unsafe'), { code: 'AUTHORITY_FILE_UNAVAILABLE' }); }
+function unavailable(reason) {
+  throw Object.assign(new Error('Authority file is unavailable or unsafe'), { code: 'AUTHORITY_FILE_UNAVAILABLE', ...(reason ? { reason } : {}) });
+}
 function anchor(fd, name) {
   if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\0')) unavailable();
   return `/proc/self/fd/${fd}/${name}`;
@@ -10,6 +12,14 @@ function anchor(fd, name) {
 
 // Linux descriptor-relative integrity adapter. Unsupported platforms fail closed.
 function readAuthorityFile(filePath, { maximum = 100 * 1024, privateFile = false, platform = process.platform } = {}) {
+  // Task 1215: the backend follows the ACTUAL host platform; the option may only agree with it.
+  if (platform !== process.platform) unavailable('platform_mismatch');
+  // Darwin: /dev/fd/<dirfd>/<name> is not descriptor-relative there (measured ENOENT) and Node has no
+  // openat, so the walk is done by the bundled native openat/fstat reader (authority-file-darwin.js),
+  // which applies these same rules (plus an ACL check). No pathname re-check substitute.
+  if (platform === 'darwin') {
+    return require('./authority-file-darwin').readAuthorityFileDarwin(filePath, { maximum, privateFile: privateFile === true });
+  }
   let dir, file;
   try {
     if (platform !== 'linux' || typeof process.getuid !== 'function' || !C.O_NOFOLLOW || !C.O_DIRECTORY

@@ -3,7 +3,9 @@ const crypto = require('node:crypto');
 const { WebSocketServer } = require('ws');
 const { storedOwningPrincipal } = require('../principal/http');
 const OWNER_FRAMES = new Set(['output', 'heartbeat', 'ready', 'session_died', 'session_restarted',
-  'pending_handoff_receipt', 'handoff_ack', 'interaction_provider', 'interaction_receipt', 'interaction_invalidated', 'ssh_state', 'ssh_write_receipt']);
+  'pending_handoff_receipt', 'handoff_ack', 'interaction_provider', 'interaction_receipt', 'interaction_invalidated', 'ssh_state', 'ssh_write_receipt',
+  'bridge_receipt', 'bridge_queue', // #137: bounded bridge stage frames; contents validated by the owner handler
+  'process_started', 'input_transport_ready']); // Task 1215 F2: readiness milestones; validated in readiness-handshake.js
 const localSocket = socket => socket?.encrypted === true || ['127.0.0.1','::1','::ffff:127.0.0.1'].includes(socket?.remoteAddress);
 function createStrictOwnerTransport({ authentication, credentials, sessions, wss, refuse, forbiddenOrigin, allowedPeer }) {
   const ownerWss = new WebSocketServer({ noServer:true, maxPayload:131072, perMessageDeflate:false });

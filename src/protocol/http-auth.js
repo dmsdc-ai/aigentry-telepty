@@ -157,8 +157,30 @@ const PEER_DENIED = {
 };
 const CREDENTIAL_DENIED = { error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED' };
 
+// Task 1215 — the one request shape that needs the ADDITIONAL operator proof in combined mode.
+function requestsSupervision(req) {
+  const body = req.body;
+  return req.method === 'POST' && String(req.originalUrl || req.url || '').split('?')[0] === '/api/sessions/register'
+    && !!body && typeof body === 'object' && !Array.isArray(body) && Object.hasOwn(body, 'input_policy') && body.input_policy === 'user-supervised';
+}
+
 function createAuthMiddleware(options) {
   const EXPECTED_TOKEN = options.expectedToken;
+  // Optional, combined mode only (ignored when principalAuthentication = strict mode is configured).
+  const supervision = options.supervisionAuthentication || null;
+  // Runs AFTER ordinary admission. Only an explicit user-supervised registration that presents
+  // x-telepty-principal is verified, by the real principal verifier (method, target, body digest,
+  // action, audience, expiry, nonce replay, grant, operator-only, owner/epoch). A presented proof that
+  // fails refuses the request; a missing proof lets the route keep its explicit policy refusal. The
+  // verified-principal record is written only by that verifier — never by this code.
+  function admitOrdinary(req, res, next) {
+    if (!supervision || !requestsSupervision(req) || !req.headers || req.headers['x-telepty-principal'] === undefined) return next();
+    const result = supervision.authorize(req);
+    if (result && result.ok && req.authenticationPrincipal && req.authenticationPrincipal.authority === 'operator') return next();
+    delete req.authenticationPrincipal;
+    return res.status(result && result.ok ? 403 : (result && result.status) || 401).json({ error: 'Supervision proof refused',
+      code: 'SUPERVISION_PROOF_INVALID', detail: result && result.ok ? 'PRINCIPAL_OPERATOR_REQUIRED' : (result && result.code) || 'PRINCIPAL_PROOF_INVALID' });
+  }
   const isAllowedPeer = options.isAllowedPeer;
   const verifyJwt = options.verifyJwt;
   // Default-deny when the caller passes no allowlist: a construction site that forgets this
@@ -195,13 +217,13 @@ function createAuthMiddleware(options) {
     // this that reaches a route.
     const token = req.headers['x-telepty-token'] || req.query.token;
     if (token === EXPECTED_TOKEN) {
-      return next();
+      return admitOrdinary(req, res, next);
     }
 
     // JWT Bearer token
     const authHeader = req.headers['authorization'] || '';
     if (authHeader.startsWith('Bearer ') && verifyJwt(authHeader.slice(7))) {
-      return next();
+      return admitOrdinary(req, res, next);
     }
 
     if (options.authorizeSessionRequest && options.authorizeSessionRequest(req)) {

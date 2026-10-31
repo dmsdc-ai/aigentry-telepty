@@ -1,6 +1,9 @@
 'use strict';
 const { protectedInputFailure } = require('../external-approval');
 const { mailboxLeaseAlive } = require('./poll-session');
+const bridgeStage = require('./bridge-stage');
+const inputPolicies = require('./input-policy');
+const readinessHandshake = require('../transport/readiness-handshake');
 
 // Accessors retain the daemon's shared instances and original first-use timing.
 // Construction only creates functions; effect boundaries run when those functions do.
@@ -373,6 +376,33 @@ function createDeliveryRuntime(shared, {
     return 'tracking_persistence_failed';
   }
 
+  // #137 — file one validated bridge stage receipt on its tracked record. The transport already
+  // bound it to the current owner socket and generation; this re-checks the RECORD identity
+  // (session, epoch, owner generation) before the write, and the owner generation again after
+  // the await. The observation is a bridge transport fact: it never carries consumption,
+  // acknowledgement or completion, and pty_written is a PTY master write only.
+  async function recordBridgeReceipt(sessionId, session, receipt, ownerGeneration) {
+    if (!receipt || !receipt.inject_id) return 'no_tracked_inject';
+    const client = shared.ledgerClient;
+    if (!client || ledgerUnavailable()) return 'tracking_unavailable';
+    const hot = await client.ensureHot(receipt.inject_id);
+    if (!hot.ok) return hot.reason === 'record_missing' || hot.reason === 'not_observed_by_daemon_epoch' ? 'tracking_unavailable' : 'tracking_persistence_failed';
+    const record = client.readModel.getTrackedInjection(receipt.inject_id);
+    if (!record || record.session_id !== sessionId || shared.sessions[sessionId] !== session
+      || session.interactionOwnerGeneration !== ownerGeneration
+      || (record.owner_generation && record.owner_generation !== ownerGeneration)
+      || (record.session_epoch && record.session_epoch !== (session.sessionEpoch || null))) return 'receipt_identity_mismatch';
+    const observation = { kind: 'bridge_receipt', trigger: `${receipt.stage}:${receipt.part || 'unknown'}`,
+      stage: receipt.stage, part: receipt.part, certainty: receipt.certainty, reason: receipt.reason,
+      daemon_msg_id: receipt.daemon_msg_id, bridge_msg_id: receipt.bridge_msg_id, bridge_seq: receipt.bridge_seq,
+      bridge_at_ms: receipt.at_ms, clock: receipt.clock, owner_generation: ownerGeneration, at: new Date().toISOString() };
+    const outcome = await client.submit('obs', { id: receipt.inject_id, observation }, { jobId: receipt.inject_id });
+    if (outcome.outcome === 'ack') return 'tracking_bridge_receipt';
+    if (outcome.outcome === 'indeterminate') { console.error(`[OBSERVE] bridge receipt INDETERMINATE for ${receipt.inject_id} (${outcome.reason})`); return 'tracking_outcome_indeterminate'; }
+    console.error(`[OBSERVE] bridge receipt ${outcome.outcome} for ${receipt.inject_id} (${outcome.reason})`);
+    return outcome.outcome === 'rejected_admission' ? 'tracking_capacity_result' : 'tracking_persistence_failed';
+  }
+
   function deliveryAuditResult(delivery) {
     return delivery && delivery.queued === true && (delivery.strategy === 'bootstrap_queue' || delivery.poll_only === true || delivery.delivery_status === 'retry_pending') ? 'queued' : 'success';
   }
@@ -585,8 +615,11 @@ function createDeliveryRuntime(shared, {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  // Task 1215 F2: a negotiated owner (input-transport-ready-v1) that has not completed its
+  // handshake is not ready, for EVERY role; legacy owners keep the pre-handshake rule.
   function isBootstrapReady(session) {
-    return !shared.isBootstrapGatedSession(session) || session.bootstrapReady === true;
+    return (!shared.isBootstrapGatedSession(session) || session.bootstrapReady === true)
+      && !readinessHandshake.awaitingInputTransport(session);
   }
 
   function buildBootstrapBlock(session) {
@@ -601,7 +634,7 @@ function createDeliveryRuntime(shared, {
   }
 
   function shouldQueueBootstrapOperation(session) {
-    return shared.isBootstrapGatedSession(session) && !isBootstrapReady(session);
+    return (shared.isBootstrapGatedSession(session) || readinessHandshake.awaitingInputTransport(session)) && !isBootstrapReady(session);
   }
 
   function hasBootstrapBacklog(session) {
@@ -638,6 +671,7 @@ function createDeliveryRuntime(shared, {
       depth: session.bootstrapQueue.length
     });
     scheduleBootstrapPromptPoll(sessionId, session);
+    armInputTransportTimeout(sessionId, session);
     return op;
   }
 
@@ -668,7 +702,10 @@ function createDeliveryRuntime(shared, {
     // modal park routes worker REPORTs — multi-line by definition — through it. Fixed here
     // rather than in the park branch so the boot caller stops rolling the same dice.
     const body = maybeBracketedPaste(prompt, session);
-    const textResult = await shared.writeDataToSession(sessionId, session, body);
+    // Task 1215: deliveries that waited for the transport handshake keep their frame ids, so the
+    // bridge can receipt them and can refuse a submit whose body it never wrote (pair).
+    const bodyMeta = { daemon_msg_id: `bootstrap:${op.op_id}`, inject_id: op.injectId || null, part: 'body' };
+    const textResult = await shared.writeDataToSession(sessionId, session, body, { frameMeta: bodyMeta });
     // #860 F2 — a failure here is reported back with the byte count that actually landed, because
     // the caller records it in the ledger. The two arms differ: nothing was written when the BODY
     // was refused, but the body is on the surface by the time the submit CR can fail, and an abort
@@ -677,7 +714,8 @@ function createDeliveryRuntime(shared, {
 
     if (!op.noEnter) {
       await sleep(shared.WRAPPED_SUBMIT_DELAY_MS);
-      const submitResult = await shared.writeDataToSession(sessionId, session, '\r');
+      const submitResult = await shared.writeDataToSession(sessionId, session, '\r',
+        { frameMeta: { daemon_msg_id: `${bodyMeta.daemon_msg_id}:submit`, inject_id: bodyMeta.inject_id, part: 'submit', pair: bodyMeta.daemon_msg_id } });
       if (!submitResult.success) return { ...submitResult, bytes_written: Buffer.byteLength(body) };
     }
 
@@ -923,13 +961,36 @@ function createDeliveryRuntime(shared, {
     return session.bootstrapDrainPromise;
   }
 
+  // Task 1215 F2: an owner that negotiated the handshake never waits on a timer: if its
+  // input_transport_ready does not arrive, its queued deliveries fail explicitly (never a blind write).
+  function armInputTransportTimeout(sessionId, session) {
+    if (!readinessHandshake.awaitingInputTransport(session) || session.inputTransportTimer) return;
+    const generation = session.interactionOwnerGeneration;
+    session.inputTransportTimer = setTimeout(() => {
+      session.inputTransportTimer = null;
+      if (session.interactionOwnerGeneration !== generation || !readinessHandshake.awaitingInputTransport(session)
+          || !hasBootstrapBacklog(session)) return;
+      failBootstrapQueueOnTimeout(sessionId, session, { reason: 'input_transport_ready_timeout' });
+    }, shared.BOOTSTRAP_READY_TIMEOUT_MS);
+    if (session.inputTransportTimer && typeof session.inputTransportTimer.unref === 'function') session.inputTransportTimer.unref();
+  }
+
   function markBootstrapReady(sessionId, session, reason) {
     if (!session) return false;
     shared.initializeBootstrapState(session);
+    // Task 1215 F2: for a negotiated owner, spawn readiness is its authenticated transport handshake
+    // alone — a screen `ready` frame, prompt-symbol poll, owner-alive floor or restore never
+    // releases it, for any role. Legacy owners are unchanged.
+    if (readinessHandshake.negotiated(session) && (reason !== 'input_transport_ready' || !readinessHandshake.inputTransportReady(session))) return false;
     if (!shared.isBootstrapGatedSession(session)) {
+      // Task 1215: a user-supervised owner (or any non-gated negotiated owner) is admitted by owner
+      // + live transport. Anything parked before then drains now, FIFO, through the ordered drain.
+      if ((inputPolicies.userSupervised(session) || reason === 'input_transport_ready') && hasBootstrapBacklog(session)) drainBootstrapQueue(sessionId, session);
       return false;
     }
     if (session.bootstrapReady === true) {
+      // A new owner generation's handshake releases what queued while it was pending.
+      if (reason === 'input_transport_ready' && hasBootstrapBacklog(session)) drainBootstrapQueue(sessionId, session);
       return false;
     }
 
@@ -1005,6 +1066,8 @@ function createDeliveryRuntime(shared, {
     const _setTimeout = deps.setTimeout || setTimeout;
     if (!session || !shared.isBootstrapGatedSession(session) || isBootstrapReady(session)) return;
     if (!shared.isOpenWebSocket(session.ownerWs)) return;
+    // Task 1215 F2: a negotiated owner's spawn readiness is its handshake, not a screen poll or floor.
+    if (readinessHandshake.negotiated(session)) return;
 
     // cmux: rendered-screen prompt poll (the cmux-only read-screen primitive). Unchanged,
     // including the #31 actionable bootstrap-timeout on miss/error.
@@ -1111,6 +1174,16 @@ function createDeliveryRuntime(shared, {
       bridge_heartbeat_at: session.bridgeHeartbeatAt || null,
       bridge_pty_bytes: session.bridgePtyBytes ?? null,
       bridge_read_side: session.bridgeReadSide || null,
+      // #137: owner-reported bridge stage support and queue summary (current owner generation only).
+      bridge_receipts: bridgeStage.bridgeReceiptSupport(session),
+      bridge_queue: bridgeStage.bridgeQueueView(session),
+      // Task 1215: effective recipient input policy (bound to the current owner generation).
+      input_policy: inputPolicies.effectiveInputPolicy(session),
+      input_policy_source: inputPolicies.userSupervised(session) ? session.inputPolicy.source : null,
+      // Task 1215 F2: session spawn-readiness milestones (current owner handshake), never receipts.
+      readiness: readinessHandshake.view(session),
+      // Per-message receipt honesty: no provider acknowledges a specific message today.
+      instruction_received: { status: 'unknown', reason: 'no_message_bound_provider_acknowledgement' },
       bootstrap: buildBootstrapBlock(session)
     };
   }
@@ -1237,6 +1310,8 @@ function createDeliveryRuntime(shared, {
   }
 
   function modalDeliveryDecision(session, options = {}, env = process.env) {
+    // Task 1215: the user supervises this surface; no rendered-screen modal classifier gates it.
+    if (inputPolicies.userSupervised(session)) return { action: 'deliver', reason: 'user_supervised' };
     const remedy = modalRemedy(env, session);
     if (remedy === 'off') return { action: 'deliver', reason: 'modal_gate_off' };
     if (!isSurfaceBlockedByModal(session)) return { action: 'deliver', reason: 'surface_clear' };
@@ -1432,7 +1507,11 @@ function createDeliveryRuntime(shared, {
     shared.interaction.invalidateInteraction(session, 'submit');
     if (session.type === 'wrapped') {
       if (session.ownerWs && session.ownerWs.readyState === 1) {
-        session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+        // #137: a terminal-level submit names itself and the current owner generation; it is not
+        // bound to any one inject, so it carries no inject_id or pair.
+        session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r',
+          ...bridgeStage.frameMeta({ daemon_msg_id: `submit:${shared.crypto.randomUUID()}`, part: 'submit',
+            owner_generation: session.interactionOwnerGeneration }) }));
         armUpstreamProbe(session);   // #732: a submit is a delivery too — probe with it
         return true;
       }
@@ -1499,6 +1578,7 @@ function createDeliveryRuntime(shared, {
     beginTrackedInjection,
     abortTrackedInjection,
     parkTrackedInjection,
+    recordBridgeReceipt,
     deliveryAuditResult,
     getPendingReport,
     markPendingReportSubmitStarted,

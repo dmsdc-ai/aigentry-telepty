@@ -227,6 +227,7 @@ const {
   beginTrackedInjection,
   abortTrackedInjection,
   parkTrackedInjection,
+  recordBridgeReceipt,
   deliveryAuditResult,
   getPendingReport,
   markPendingReportSubmitStarted,
@@ -333,6 +334,13 @@ if (!ENV_AUTH_TOKEN) {
 const EXPECTED_TOKEN = ENV_AUTH_TOKEN || config.authToken;
 const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
 const principalAuthentication = require('./src/principal/http').createPrincipalAuthenticationFromEnvironment({ machineId: MACHINE_ID, sessions: () => sessions });
+// Task 1215 combined mode: ordinary transport auth plus a separately configured operator verifier for
+// user-supervised registrations. Configured-but-invalid trust (or a strict-mode conflict) throws here,
+// so the daemon does not start without the verification it was told to perform.
+const supervisionAuthentication = require('./src/principal/http').createSupervisionAuthenticationFromEnvironment({ machineId: MACHINE_ID, sessions: () => sessions });
+// Neither supervision variable may reach a spawned session (src/routes/spawn.js copies process.env).
+delete process.env.TELEPTY_SUPERVISION_TRUST_FILE;
+delete process.env.TELEPTY_SUPERVISION_CLIENT_FILE;
 const net = require('net');
 const fs = require('fs');
 const SESSION_PERSIST_PATH = sessionPersistence.defaultSessionPersistPath();
@@ -526,6 +534,7 @@ const isAllowedPeer = createIsAllowedPeer(effectivePeerAllowlist);
 const isForbiddenOrigin = createOriginGuard(ALLOWED_ORIGINS);
 
 registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin, principalAuthentication,
+  supervisionAuthentication,   // Task 1215 combined mode (HTTP only; WebSocket transport unchanged)
   authorizeSessionRequest: req => require('./src/mailbox/poll-session').authorizeMailboxRequest(req, sessions, sessionCredentials) });
 
 const { resolveBindPort } = require('./src/bind-port');
@@ -1709,7 +1718,9 @@ app.get('/api/meta', (req, res) => {
     machine_id: MACHINE_ID,
     event_loop: eventLoopTelemetry.snapshot(),
     terminal: DETECTED_TERMINAL,
-    capabilities: ['ssh-child-write-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session']
+    // #137: bridge-stage-receipts-v1 = this daemon accepts owner-bound bridge_receipt/bridge_queue
+    // frames and threads inject ids to the bridge. It says nothing about any one bridge's support.
+    capabilities: ['ssh-child-write-receipts-v1', 'bridge-stage-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session']
   });
 });
 
@@ -2547,6 +2558,8 @@ const websocketTransport = installWebSocketTransport({
   // POST /api/sessions/:id/inject. See authorizeViewerInject.
   authorizeViewerInject,
   acceptInteractionReceipt,
+  // #137 — durable observation of a validated, owner-bound bridge stage receipt.
+  recordBridgeReceipt,
   acceptHandoffAck:cooperativeHandoff.acceptAck
 });
 

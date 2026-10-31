@@ -258,7 +258,9 @@ class FileMailbox {
     } finally { release(); }
   }
 
-  withdraw(sessionId, msgId, reason, { inFlight = false, deliveryUncertain = false } = {}) {
+  // #136: `meta` (bridge-only) records the daemon ids of a quarantined record beside its preserved
+  // payload. It is never written to inbox/state rows, whose strict custody schema it is not part of.
+  withdraw(sessionId, msgId, reason, { inFlight = false, deliveryUncertain = false, meta = null } = {}) {
     const sessionDir = this._sessionDir(sessionId);
     if (!fs.existsSync(sessionDir)) return false;
 
@@ -280,6 +282,7 @@ class FileMailbox {
         payload: msg.payload,
         reason: reason || 'withdrawn',
         ...(deliveryUncertain ? { delivery_uncertain: true, outcome: 'unknown', retryable: false } : {}),
+        ...(meta && typeof meta === 'object' && Object.keys(meta).length ? { meta } : {}),
         failed_at: now,
         attempts: msg.attempt || 0,
       });

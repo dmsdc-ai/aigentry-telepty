@@ -2,6 +2,14 @@
 const { createBoundedUdsResponse } = require('./uds-response');
 const { protectedInputFailure, externalApprovalVerifier } = require('../external-approval');
 const { sshInputFailure, requestSshWrite } = require('../ssh-session');
+const { frameMeta: bridgeFrameMeta } = require('./bridge-stage');
+
+// #137: the ids a wrapped owner inject frame carries so the bridge can file receipts against them.
+// owner_generation is always the CURRENT owner's; the rest is what the caller actually knows.
+function injectFrame(session, data, ids = {}) {
+  return JSON.stringify({ type: 'inject', data,
+    ...bridgeFrameMeta({ ...ids, owner_generation: session.interactionOwnerGeneration }) });
+}
 
 // Domain dependencies are the daemon's actual shared helpers and records.
 // Late mailbox getters are invoked only at the original points of use.
@@ -36,7 +44,7 @@ function createSessionDeliveryContext({
   net = require('net'), fetch = globalThis.fetch, AbortSignal = globalThis.AbortSignal,
   setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
 }) {
-  async function writeDataToSession(id, session, data, { beforeWrite } = {}) {
+  async function writeDataToSession(id, session, data, { beforeWrite, frameMeta } = {}) {
     if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return denied;
@@ -157,7 +165,7 @@ function createSessionDeliveryContext({
         return buildErrorBody('DISCONNECTED', 'Session owner is disconnected.', { httpStatus: 503 });
       }
       if (session.sshRemote) return requestSshWrite(session, data);
-      session.ownerWs.send(JSON.stringify({ type: 'inject', data }));
+      session.ownerWs.send(injectFrame(session, data, frameMeta));
       // #732: every wrapped delivery doubles as an upstream probe — a live PTY answers with
       // at least an echo. See armUpstreamProbe (no-op while an earlier probe is unanswered).
       armUpstreamProbe(session);
@@ -184,6 +192,12 @@ function createSessionDeliveryContext({
   // CR. Destroy/recreate leave the record unregistered; owner replacement changes the epoch.
   function isLiveSessionInstance(session, sessionEpoch) {
     return !session.isClosing && !require('../principal/cooperative-handoff').activeHandoff(session) && sessions[session.id] === session && (session.sessionEpoch || null) === sessionEpoch;
+  }
+
+  // #137: a deferred submit names the body it submits (pair) so the bridge can withdraw it with
+  // that body and never write it alone.
+  function submitIds(bodyMsgId, injectId) {
+    return { daemon_msg_id: `${bodyMsgId}:submit`, inject_id: injectId || null, part: 'submit', pair: bodyMsgId };
   }
 
   function sessionGoneResult() {
@@ -277,14 +291,16 @@ function createSessionDeliveryContext({
       // Signature covers prompt bytes; transport paste framing carries no extra text.
       const data = maybeBracketedPaste(prompt, session);
       interaction.invalidateInteraction(session, 'external_approved_input');
-      ownerWs.send(JSON.stringify({ type: 'inject', data }));
+      const bodyIds = { daemon_msg_id: `approved:${crypto.randomUUID()}`, inject_id: options.injectId || null, part: 'body' };
+      ownerWs.send(injectFrame(session, data, bodyIds));
       armUpstreamProbe(session);
       if (!options.noEnter) setTimeout(() => {
         try {
           if (gone() || !isOpenWebSocket(ownerWs) || Date.now() >= approval.document.expires_at) {
             emitInjectFailureEvent(id, 'SESSION_GONE', 'Protected submit binding or approval expired.', { phase: 'submit' }, session);
           } else {
-            ownerWs.send(JSON.stringify({ type: 'inject', data: '\r' }));
+            ownerWs.send(injectFrame(session, '\r', { daemon_msg_id: `${bodyIds.daemon_msg_id}:submit`,
+              inject_id: bodyIds.inject_id, part: 'submit', pair: bodyIds.daemon_msg_id }));
             armUpstreamProbe(session);
           }
         } catch {
@@ -500,7 +516,7 @@ function createSessionDeliveryContext({
         message_sha256:require('../principal/pending-handoff').messageDigest(queuedMessage)};
       const ack = mailboxForEnqueue.enqueue(queuedMessage);
       const immediate = { result: null }; immediateAttempts.set(msgId, immediate);
-      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs });
+      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || null });
       // Registered synchronously after the enqueue: no tick can run in between.
       const owesSubmit = !options.noEnter && session.type !== 'aterm';
       const waitsForText = owesSubmit || session.type === 'aterm';
@@ -562,7 +578,7 @@ function createSessionDeliveryContext({
               // #109: never a bare CR into an instance that did not get this inject's text.
               // PR #108 TP1: nor into an owner socket other than the one that got it.
               submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === text.ownerWs
-                ? await writeDataToSession(id, session, '\r')
+                ? await writeDataToSession(id, session, '\r', { frameMeta: submitIds(msgId, options.injectId) })
                 : sessionGoneResult();
             } finally {
               releaseSubmit();
@@ -605,7 +621,8 @@ function createSessionDeliveryContext({
       injectionTargets.delete(msgId);
       if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) { releaseSubmit(); return sessionGoneResult(); }
       const textOwnerWs = session.ownerWs;
-      const textResult = await writeDataToSession(id, session, deliveredBody);
+      const textResult = await writeDataToSession(id, session, deliveredBody,
+        { frameMeta: { daemon_msg_id: msgId, inject_id: options.injectId || null, part: 'body' } });
       if (!textResult.success) { releaseSubmit(); return textResult; }
 
       if (!options.noEnter && session.type !== 'aterm') {
@@ -616,7 +633,7 @@ function createSessionDeliveryContext({
             // #109: never a bare CR into an instance that did not get this inject's text.
             // PR #108 TP1: nor into an owner socket other than the one that got it.
             submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === textOwnerWs
-              ? await writeDataToSession(id, session, '\r')
+              ? await writeDataToSession(id, session, '\r', { frameMeta: submitIds(msgId, options.injectId) })
               : sessionGoneResult();
           } finally {
             releaseSubmit();
@@ -693,7 +710,8 @@ function createSessionDeliveryContext({
       const ownerWs = session.ownerWs;
       const beforeWrite = session.type === 'aterm'
         ? () => getMailbox().beginNonRetryableAttempt(sessionId, msg.msg_id) : undefined;
-      const result = await writeDataToSession(sessionId, session, msg.payload, { beforeWrite });
+      const result = await writeDataToSession(sessionId, session, msg.payload,
+        { beforeWrite, frameMeta: { daemon_msg_id: msg.msg_id, inject_id: target?.injectId || null, part: 'body' } });
       const immediate = immediateAttempts.get(msg.msg_id); if (immediate) immediate.result = result;
       const waiter = mailboxTextWaiters.get(msg.msg_id);
       if (waiter) {

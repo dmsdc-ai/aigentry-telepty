@@ -252,6 +252,10 @@
         "test/bridge-vt-frame-ready-136.test.js",
         "test/bridge-recovery-quarantine-136.test.js",
         "test/bridge-stage-receipts-137.test.js",
+        "test/bridge-actual-wiring-137.test.js",
+        "test/supervision-readiness-1215.test.js",
+        "test/operator-supervision-1215.test.js",
+        "test/authority-file-darwin-1215.test.js",
         "test/test-runner-manifest.test.js"
       ]
     },
@@ -452,6 +456,10 @@
         "test/bridge-vt-frame-ready-136.test.js",
         "test/bridge-recovery-quarantine-136.test.js",
         "test/bridge-stage-receipts-137.test.js",
+        "test/bridge-actual-wiring-137.test.js",
+        "test/supervision-readiness-1215.test.js",
+        "test/operator-supervision-1215.test.js",
+        "test/authority-file-darwin-1215.test.js",
         "test/test-runner-manifest.test.js"
       ]
     },
@@ -703,6 +711,10 @@
         "test/bridge-vt-frame-ready-136.test.js",
         "test/bridge-recovery-quarantine-136.test.js",
         "test/bridge-stage-receipts-137.test.js",
+        "test/bridge-actual-wiring-137.test.js",
+        "test/supervision-readiness-1215.test.js",
+        "test/operator-supervision-1215.test.js",
+        "test/authority-file-darwin-1215.test.js",
         "test/test-runner-manifest.test.js"
       ]
     },

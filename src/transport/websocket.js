@@ -7,6 +7,9 @@ const capturedSelector = require('../vt/captured-selector');
 const { invalidateInteraction } = require('../interaction');
 const { recordReadyEvidence } = require('../readiness');
 const { applySshState, acceptSshWriteReceipt } = require('../ssh-session');
+const bridgeStage = require('../mailbox/bridge-stage');
+const inputPolicies = require('../mailbox/input-policy');
+const readinessHandshake = require('./readiness-handshake');
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
 
@@ -74,8 +77,42 @@ function installWebSocketTransport(deps) {
     // writer callback. Optional, same
     // convention as above; the daemon always passes it.
     authorizeViewerInject,
-    acceptInteractionReceipt
+    acceptInteractionReceipt,
+    // #137 — durable ledger observation of a validated bridge stage receipt. Optional, same
+    // convention: without it a receipt still marks the bridge as supported and nothing else.
+    recordBridgeReceipt
   } = deps;
+
+  // #137 — called only for frames from the CURRENT owner socket of a wrapped session. Identity
+  // (owner generation), shape and size are checked before any effect; a receipt never sets
+  // consumption, acknowledgement or completion.
+  function acceptBridgeStageFrame(sessionId, session, msg) {
+    if (msg.type === 'bridge_queue') return bridgeStage.applyBridgeQueue(session, msg);
+    const ownerGeneration = session.interactionOwnerGeneration;
+    const checked = bridgeStage.validateBridgeReceipt(msg, ownerGeneration);
+    if (!checked.ok) return false;
+    session.bridgeStageGeneration = ownerGeneration;
+    if (typeof recordBridgeReceipt === 'function' && checked.receipt.inject_id) {
+      Promise.resolve().then(() => recordBridgeReceipt(sessionId, session, checked.receipt, ownerGeneration))
+        .catch(() => { /* named in the ledger path; a receipt never throws into the socket */ });
+    }
+    return true;
+  }
+
+  // Task 1215 F2 — spawn-readiness milestones from the CURRENT owner socket only (the caller checked
+  // ws === ownerWs). Identity, nonce and child sequence are validated in readiness-handshake.js; a
+  // refused frame has no effect. input_transport_ready is the only signal that releases the
+  // bootstrap gate of a negotiated owner, for every role.
+  function acceptReadinessMilestone(sessionId, session, msg) {
+    const accepted = readinessHandshake.acceptMilestone(sessionId, session, msg);
+    if (!accepted.ok) return false;
+    const event = JSON.stringify({ type: accepted.milestone === 'input_transport_ready' ? 'session_input_transport_ready' : 'session_process_started',
+      session_id: sessionId, owner_generation: session.interactionOwnerGeneration, child_seq: msg.child_seq,
+      meaning: 'transport_only_not_instruction_receipt', timestamp: new Date().toISOString() });
+    busClients.forEach(client => { if (client.readyState === 1) client.send(event); });
+    if (accepted.milestone === 'input_transport_ready') markBootstrapReady(sessionId, session, 'input_transport_ready');
+    return true;
+  }
 
   /**
    * #60 Stage A §3 "consumption of #815 owner lifecycle" — append an owner-lifecycle fact to
@@ -367,6 +404,17 @@ function installWebSocketTransport(deps) {
       activeSession.interactionProvider?.dispose();
       activeSession.interactionProvider = null;
       activeSession.interactionOwnerGeneration = crypto.randomUUID();
+      // Task 1215: a policy requested at trusted registration binds to THIS owner generation only,
+      // and only for a claimant presenting the input-policy capability minted to the host launch
+      // (a session bearer is never enough); a claim without both is guarded. Leaving supervision
+      // re-arms the ready gate.
+      if (inputPolicies.bindInputPolicy(activeSession, new Date(), { capability: req.headers[inputPolicies.CAPABILITY_HEADER] })) {
+        activeSession.bootstrapReady = false;
+        activeSession.bootstrapReadyReason = null;
+        activeSession.ready = false;
+      }
+      // Task 1215 F2: this owner generation's spawn-readiness handshake starts empty.
+      readinessHandshake.beginOwnerGeneration(activeSession, { capable: readinessHandshake.declaresCapability(req.headers[readinessHandshake.CAPABILITY_HEADER]) });
       activeSession.pendingHandoffCapability=null;
       if (activeSession.sshRemote) activeSession.sshState = { phase: 'connecting', generation: 0, reason: 'owner_changed', owner_generation: activeSession.interactionOwnerGeneration };
       markSessionConnected(activeSession);
@@ -407,6 +455,9 @@ function installWebSocketTransport(deps) {
       }
       invalidateInteraction(activeSession, 'owner_replaced');
       try { ws.send(JSON.stringify({ type: 'owner_token', token: activeSession.ownerToken,
+        input_policy: inputPolicies.effectiveInputPolicy(activeSession),
+        ...(readinessHandshake.negotiated(activeSession) ? { transport_readiness: readinessHandshake.CAPABILITY,
+          readiness_nonce: activeSession.transportReadiness.nonce } : {}),
         ...(activeSession.cooperativeHandoffCapable===true ? {cooperative_handoff:true} : {}),
         interaction_binding: { sid: sessionId, session_epoch: activeSession.sessionEpoch,
           credential_generation: activeSession.credentialGeneration || 1,
@@ -416,6 +467,9 @@ function installWebSocketTransport(deps) {
           surface_id: activeSession.cmuxSurfaceId || sessionId } })); } catch {}
 
       console.log(`[WS] Wrap owner ${isOwnerConnect && activeSession.clients.size > 1 ? 're-' : ''}connected for session ${sessionId} (Total: ${activeSession.clients.size})`);
+      // Task 1215: a LEGACY owner (no handshake) keeps the pre-handshake release at owner bind. A
+      // negotiated owner is released only by its input_transport_ready milestone, for every role.
+      if (inputPolicies.userSupervised(activeSession) && !readinessHandshake.negotiated(activeSession)) markBootstrapReady(sessionId, activeSession, 'user_supervised_owner_bound');
       scheduleBootstrapPromptPoll(sessionId, activeSession);
       // #815: emit the honest lifecycle fact BEFORE any continuity claim. A live owner was
       // replaced — the daemon knows that for certain. It does NOT know whether the displaced
@@ -514,7 +568,11 @@ function installWebSocketTransport(deps) {
           if (type === 'handoff_ack') { if(strictOwner) deps.acceptHandoffAck?.(sessionId,activeSession,ws,msg);return; }
           if (type === 'ssh_state') { applySshState(activeSession, msg); return; }
           if (type === 'ssh_write_receipt') { acceptSshWriteReceipt(activeSession, ws, msg); return; }
+          if (type === 'bridge_receipt' || type === 'bridge_queue') { acceptBridgeStageFrame(sessionId, activeSession, msg); return; }
+          if (type === 'process_started' || type === 'input_transport_ready') { acceptReadinessMilestone(sessionId, activeSession, msg); return; }
           if (type === 'session_died' || type === 'session_restarted') {
+            // Task 1215 F2: the child that announced readiness is gone (or replaced).
+            readinessHandshake.clearReadiness(activeSession, type === 'session_died' ? 'child_exited' : 'child_restarted');
             if (type === 'session_died') { activeSession.interactionProvider?.dispose(); activeSession.interactionProvider = null; }
             invalidateInteraction(activeSession, 'child_lifecycle');
             return;
@@ -570,6 +628,7 @@ function installWebSocketTransport(deps) {
             activeSession.bridgeHeartbeatAt = new Date().toISOString();
             if (Number.isFinite(msg.pty_bytes)) activeSession.bridgePtyBytes = msg.pty_bytes;
             if (typeof msg.read_side === 'string') activeSession.bridgeReadSide = msg.read_side;
+            if (msg.bridge_queue) bridgeStage.applyBridgeQueue(activeSession, msg.bridge_queue);   // #137
           } else if (type === 'ready') {
             if(strictOwner && msg.pending_handoff_receipts==='v1' && msg.owner_generation===activeSession.interactionOwnerGeneration)
               activeSession.pendingHandoffCapability={owner:ws,generation:activeSession.interactionOwnerGeneration};
@@ -730,6 +789,7 @@ function installWebSocketTransport(deps) {
       }
 
       if (activeSession.type === 'wrapped' && ws === activeSession.ownerWs) {
+        readinessHandshake.clearReadiness(activeSession, 'owner_disconnected');   // Task 1215 F2
         activeSession.ownerWs = null;
         // #29: cancel any pending owner-alive optimistic timer — the owner is gone, so the
         // floor must not flip a disconnected session ready (hygiene; the timer also re-guards

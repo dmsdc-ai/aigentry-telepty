@@ -71,6 +71,17 @@ function verifiedRequestPrincipal(req, { action, target } = {}) {
   try { if (requestBodyDigest(req) !== context.bodySha256) return null; } catch { return null; }
   return context.principal;
 }
+// Task 1215: the same verified record, plus what the verifier bound (action, grant target, session epoch).
+// Readable only through these checks: VERIFIED_REQUEST is a module-private Symbol written solely by
+// authorize() after signature/nonce/body/method/target/audience/expiry verification, and every read
+// re-checks method, request target, principal identity and the re-hashed raw body.
+function verifiedRequestBinding(req) {
+  const principal = verifiedRequestPrincipal(req);
+  if (!principal) return null;
+  const context = req[VERIFIED_REQUEST];
+  return Object.freeze({ principal, action: context.action, target: context.target,
+    sessionEpoch: typeof context.sessionEpoch === 'string' ? context.sessionEpoch : null });
+}
 function verifiedOwningPrincipal(req) {
   return storedOwningPrincipal(verifiedRequestPrincipal(req));
 }
@@ -163,7 +174,7 @@ function createPrincipalAuthentication({ trust, sessions, now, replayCapacity, c
       }
       req.authenticationPrincipal = principal;
       req[VERIFIED_REQUEST] = Object.freeze({ principal, action: result.action, target: result.target,
-        method: req.method, requestTarget: req.originalUrl || req.url, bodySha256: digest });
+        method: req.method, requestTarget: req.originalUrl || req.url, bodySha256: digest, sessionEpoch: result.sessionEpoch || null });
       return result;
     }
   });
@@ -176,5 +187,20 @@ function createPrincipalAuthenticationFromEnvironment({ env = process.env, machi
   const replayCapacity = env.TELEPTY_PRINCIPAL_REPLAY_CAPACITY === undefined ? 4096 : Number(env.TELEPTY_PRINCIPAL_REPLAY_CAPACITY);
   return createPrincipalAuthentication({ trust, sessions, replayCapacity });
 }
-module.exports = { loadPrincipalTrust, createPrincipalAuthentication, createPrincipalAuthenticationFromEnvironment,
-  verifiedOwningPrincipal, verifiedRequestPrincipal, storedOwningPrincipal, resolveAction };
+// Task 1215 — COMBINED mode: ordinary transport authentication stays in force (host token / JWT) and a
+// separately configured operator trust verifies ONLY the additional proof that a user-supervised
+// registration must carry (src/protocol/http-auth.js). Unset ⇒ null (feature off). Configured but
+// unreadable/invalid ⇒ throws (the daemon does not start) — verification is never silently disabled.
+// Explicit strict mode already demands an operator principal for every registration; combining both
+// would make the challenge endpoint ambiguous, so the conflict is refused rather than resolved.
+function createSupervisionAuthenticationFromEnvironment({ env = process.env, machineId, sessions, platform = process.platform } = {}) {
+  const file = env.TELEPTY_SUPERVISION_TRUST_FILE;
+  if (file === undefined || file === '') return null;
+  if (env.TELEPTY_PRINCIPAL_MODE === 'strict') {
+    throw Object.assign(new Error('TELEPTY_SUPERVISION_TRUST_FILE cannot be combined with TELEPTY_PRINCIPAL_MODE=strict'), { code: 'SUPERVISION_MODE_CONFLICT' });
+  }
+  const trust = loadPrincipalTrust(file, { audience: machineId, platform });
+  return createPrincipalAuthentication({ trust, sessions });
+}
+module.exports = { loadPrincipalTrust, createPrincipalAuthentication, createPrincipalAuthenticationFromEnvironment, createSupervisionAuthenticationFromEnvironment,
+  verifiedOwningPrincipal, verifiedRequestPrincipal, verifiedRequestBinding, storedOwningPrincipal, resolveAction };

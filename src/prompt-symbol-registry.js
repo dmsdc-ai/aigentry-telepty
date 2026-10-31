@@ -417,6 +417,27 @@ function detectOutput(command, output) {
   return entry.detect(screenLike);
 }
 
+// #136 (task 1215) — readiness from a RENDERED frame (src/vt/session-screen.js readFrame*), which
+// is what detect() was written for. Only a complete, current vt_grid qualifies; anything else is
+// `frame_incomplete` and never ready. Busy markers in the bottom 6 rows veto first (the same
+// expressions session-state.js uses), then detect() runs on the real rows, so its modal step 1
+// sees a screen instead of an append-only stream. Pure: no I/O, no timers.
+const FRAME_BUSY_MARKERS = [/\besc to interrupt\b/i, /\bstarting mcp servers?\b/i, /\bbooting mcp server\b/i];
+
+function detectFrame(command, frame) {
+  const entry = lookup(command);
+  if (!entry) return { found: false, reason: 'unknown_cli' };
+  if (!frame || frame.observation_basis !== 'vt_grid' || frame.snapshot_truncated !== false
+    || frame.lag_units !== 0 || !Array.isArray(frame.rows_text)) {
+    return { found: false, reason: 'frame_incomplete' };
+  }
+  const bottom = frame.rows_text.slice(-6).join('\n');
+  if (FRAME_BUSY_MARKERS.some((re) => re.test(bottom))) return { found: false, reason: 'busy_indicator' };
+  const hit = entry.detect(frame.rows_text.join('\n'));
+  if (!hit.found && /_modal_ui$/.test(hit.reason || '')) return { found: false, reason: 'modal_ui' };
+  return hit;
+}
+
 module.exports = {
   observeInteraction,
   encodeInteraction,
@@ -427,6 +448,7 @@ module.exports = {
   detectSurfaceModal,  // #737: positional modal check for the byte-stream delivery path
   detectSurfaceError,  // #801: per-CLI terminal-turn-failure markers (error-death vs completion)
   detectOutput,
+  detectFrame,         // #136: rendered-frame readiness for the bridge VT probe
   normalizeOutputForDetection,
   ENTRIES,
 };

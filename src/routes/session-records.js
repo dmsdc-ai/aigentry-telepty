@@ -1,6 +1,7 @@
 const { parseExternalApprovalPolicy } = require('../external-approval');
 const { validateSshMetadata } = require('../ssh-session');
-const { verifiedOwningPrincipal } = require('../principal/http');
+const { verifiedOwningPrincipal, verifiedRequestPrincipal, verifiedRequestBinding, storedOwningPrincipal } = require('../principal/http');
+const inputPolicies = require('../mailbox/input-policy');
 const { parseMailboxLease, renewMailboxLease } = require('../mailbox/poll-session');
 const { validateSessionId: validateMailboxId } = require('../mailbox/path-boundary');
 const sessionPersistence = require('../session-store/persistence');
@@ -29,6 +30,17 @@ function readIdentity(body, key) {
     return { error: `Invalid ${key}` };
   }
   return { value: descriptor.value };
+}
+
+// Task 1215: what the registration did with a requested input_policy. Pending is not effective:
+// it binds only at the next bearer-proved owner claim.
+// The capability is added by the 201 branch only (never by a re-register response).
+function policyResponse(inputPolicy, grant, capability = null) {
+  if (!inputPolicy.present) return {};
+  return { input_policy_requested: inputPolicy.policy,
+    input_policy_pending: !!(grant && grant.ok && inputPolicy.policy === 'user-supervised'),
+    input_policy_refused: grant && !grant.ok ? grant.code : null,
+    ...(capability ? { input_policy_capability: capability } : {}) };
 }
 
 function createSessionRecordContext({ sessions, sessionCredentials, sidNonces, sessionPersistPath }) {
@@ -103,6 +115,8 @@ function createSessionRecordContext({ sessions, sessionCredentials, sidNonces, s
     revokeSessionCredential, resolveSessionAlias, resolveSessionForDestroy };
 }
 
+// Task 1215 R1: user-supervised authority is the verified strict operator principal only
+// (src/mailbox/input-policy.js); no host-token or header-shape verifier is consulted here.
 function registerSessionRegisterRoute(app, { context, sessionStateManager, busClients, getMailbox = () => new (require('../mailbox').FileMailbox)() }) {
   const { sessions, sessionCredentials, issueSessionCredential, persistSessions } = context;
   app.post('/api/sessions/register', (req, res) => {
@@ -126,6 +140,13 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     }
     const external = parseExternalApprovalPolicy(req.body.external_approval_policy);
     if (external.error) return res.status(400).json({ code: 'INVALID_APPROVAL_POLICY', error: external.error });
+    // Task 1215 — recipient input policy. Only REQUESTED here (pending); the owner claim that
+    // follows binds it to that owner generation (src/mailbox/input-policy.js).
+    const inputPolicy = inputPolicies.parseInputPolicy(req.body);
+    if (inputPolicy.error) return res.status(400).json({ code: 'INVALID_INPUT_POLICY', error: inputPolicy.error });
+    const policyAuthority = { principal: verifiedRequestPrincipal(req),
+      bearer: req.headers['x-telepty-session-token'] ? sessionCredentials.verify(req.headers['x-telepty-session-token']) : null };
+    const presentedPolicyCapability = req.headers[inputPolicies.CAPABILITY_HEADER];
     const mailboxRequest = req.body.delivery_type === 'mailbox';
     if(Object.hasOwn(req.body,'cooperative_handoff') && typeof req.body.cooperative_handoff!=='boolean')return res.status(400).json({code:'HANDOFF_INVALID_REQUEST'});
     const cooperative = req.body.cooperative_handoff === true;
@@ -186,6 +207,36 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
         }
       }
       if (require('../principal/cooperative-handoff').activeHandoff(existing)) return res.status(409).json({code:'HANDOFF_FENCED'});
+      let policyGrant = null;
+      let reissuedCapability = null;
+      if (inputPolicy.present) {
+        // Task 1215 restore: the input-policy grant is memory-only, so after a daemon restart no capability
+        // can verify. The verified persisted owner may obtain a FRESH one, and only if every independent
+        // proof holds: the verifier's own binding (module-private record: signature, nonce, body, method,
+        // target, audience, expiry) for session.register on THIS record; ed25519 operator principal equal to
+        // the persisted owningPrincipal (id/source/audience); the bound epoch equal to the record epoch; the
+        // presented bearer verifying to this sid, epoch and current credential generation; and no live grant.
+        // A legacy unowned record, another principal, a stale epoch or a missing/failed bearer never qualifies.
+        const binding = inputPolicy.policy === 'user-supervised' ? verifiedRequestBinding(req) : null;
+        const persistedOwner = storedOwningPrincipal(existing.owningPrincipal);
+        const presentedCredential = req.headers['x-telepty-session-token'] ? sessionCredentials.verify(req.headers['x-telepty-session-token']) : null;
+        const ownerReissue = !!binding && binding.principal.source === 'ed25519' && binding.principal.authority === 'operator'
+          && binding.action === 'session.register' && binding.target === existing.id
+          && !!persistedOwner && persistedOwner.id === binding.principal.id && persistedOwner.source === binding.principal.source
+          && persistedOwner.audience === binding.principal.audience
+          && typeof existing.sessionEpoch === 'string' && binding.sessionEpoch === existing.sessionEpoch
+          && !!presentedCredential && presentedCredential.sid === existing.id && presentedCredential.epoch === existing.sessionEpoch
+          && presentedCredential.generation === (Number(existing.credentialGeneration) || 1)
+          && !inputPolicies.hasInputPolicyGrant(existing);
+        policyGrant = inputPolicies.authorizeInputPolicy({ policy: inputPolicy.policy, ...policyAuthority, sessionId: existing.id, existing,
+          credentialed, hasCredential: sessionCredentials.hasCredential(existing.id), external: !!existing.externalApprovalPolicy,
+          capabilityProved: !!inputPolicies.verifyInputPolicyCapability(existing, presentedPolicyCapability), ownerReissue,
+          sshRemote: !!(existing.sshRemote || sshRemote), wrapped: existing.type === 'wrapped' && !mailboxRequest
+            && (req.body.delivery_type === undefined || req.body.delivery_type === 'wrapped') });
+        // A refused policy never blocks the registration: the session stays guarded and the
+        // response names the refusal so the launcher can surface it.
+        if (!policyGrant.ok) console.warn(`[REGISTER] input_policy ${inputPolicy.policy} refused for ${existing.id} (${policyGrant.code}); session stays guarded`);
+      }
       if((req.body.delivery_type!==undefined || req.body.delivery!==undefined || req.body.delivery_endpoint!==undefined || req.body.ssh_remote!==undefined || req.body.provenance_capable===true)
         && require('../principal/pending-handoff').pendingNamespaceReserved(existing,getMailbox))return res.status(409).json({code:'HANDOFF_FENCED'});
       if (existing.type === 'mailbox' || mailboxRequest) {
@@ -238,6 +289,9 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       // #47 P4 — provenance capability is opt-in (default-OFF). Only flip it ON; never silently OFF
       // on a metadata re-register, or a session's delivered bytes would change mid-flight.
       if (req.body.provenance_capable === true) existing.provenanceCapable = true;
+      // Task 1215 restore: mint the fresh capability BEFORE the pending request so the pending binds to it.
+      if (policyGrant && policyGrant.ok && policyGrant.reissue) reissuedCapability = inputPolicies.mintInputPolicyCapability(existing);
+      if (policyGrant && policyGrant.ok) inputPolicies.requestInputPolicy(existing, inputPolicy.policy, policyGrant.source);
       // #678: a bridge reconnecting to an already-known session (e.g. one restored across a
       // daemon restart, or a re-`allow` of the same id) must still end up with a render-state
       // machine. register() is idempotent (returns the existing machine untouched), so this is
@@ -249,6 +303,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
           for (const key of Object.keys(existing)) delete existing[key];
           Object.defineProperties(existing, previous);
         }
+        if (reissuedCapability) { inputPolicies.revokeInputPolicyCapability(existing); delete existing.inputPolicyPending; }
         return res.status(503).json({ error: 'Session store write failed', code: 'SESSION_STORE_WRITE_FAILED' });
       }
       sessionStateManager.register(session_id);
@@ -259,11 +314,20 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       // The legitimate holder does not need a copy back: the bridge carries the bearer in its env
       // (cli.js) and the child got its copy at spawn. `session_epoch` is a non-secret instance
       // discriminator — it identifies WHICH instance answered, and proves nothing on its own.
-      return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_epoch: existing.sessionEpoch || null, ...(conditionalInstance ? { registration_instance_matched: true, credential_generation: existing.credentialGeneration } : {}), provenance_capable: !!existing.provenanceCapable });
+      // Task 1215: the single exception is a freshly minted input-policy capability for the verified
+      // persisted owner after a restore (above) — returned once, to that caller, never persisted.
+      return res.status(200).json({ session_id, type: existing.type, command: existing.command, cwd: existing.cwd, reregistered: true, session_epoch: existing.sessionEpoch || null, ...(conditionalInstance ? { registration_instance_matched: true, credential_generation: existing.credentialGeneration } : {}), provenance_capable: !!existing.provenanceCapable, ...policyResponse(inputPolicy, policyGrant, reissuedCapability) });
     }
 
     const { delivery_type, delivery_endpoint, delivery } = req.body;
     const resolvedEndpoint = delivery_endpoint || (delivery && delivery.address) || null;
+    let newPolicyGrant = null;
+    if (inputPolicy.present) {
+      newPolicyGrant = inputPolicies.authorizeInputPolicy({ policy: inputPolicy.policy, ...policyAuthority, sessionId: session_id,
+        existing: null, credentialed: false, hasCredential: false, external: !!external.policy, sshRemote: !!sshRemote,
+        wrapped: !delivery_type || delivery_type === 'wrapped' });
+      if (!newPolicyGrant.ok) console.warn(`[REGISTER] input_policy ${inputPolicy.policy} refused for ${session_id} (${newPolicyGrant.code}); session stays guarded`);
+    }
     // #815 — THE issuance point, and the only one. This branch runs exactly when the daemon does
     // not currently hold `session_id`, so every credential belongs to a fresh instance: a recreated
     // textual sid gets a new epoch and its predecessor's bearer can never resolve to it.
@@ -316,6 +380,10 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
       credentialVerifier: issued.verifier,
       credentialGeneration: issued.generation,
     };
+    // Task 1215 F1: the capability is minted here, with the bearer, to this one host caller, once.
+    const policyCapability = newPolicyGrant && newPolicyGrant.ok && inputPolicy.policy === 'user-supervised'
+      ? inputPolicies.mintInputPolicyCapability(sessionRecord) : null;
+    if (newPolicyGrant && newPolicyGrant.ok) inputPolicies.requestInputPolicy(sessionRecord, inputPolicy.policy, newPolicyGrant.source, new Date(), { origin: 'new_instance' });
     initializeBootstrapState(sessionRecord);
     applyTimestampMetadata(sessionRecord, req.body);
     Object.defineProperty(sessions, session_id, { value: sessionRecord, enumerable: true, writable: true, configurable: true });
@@ -365,7 +433,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
     // this response is on the wire the credential is already durable — a daemon that dies between
     // the two can never leave a bearer in a child's env with no verifier on disk to match it.
     // The bearer and nonce cross the wire HERE and only here, once, to this one caller.
-    res.status(201).json({ session_id, ...(owningPrincipal ? { owningPrincipal } : {}), type: mailboxRequest ? 'mailbox' : 'wrapped', ...(mailboxRequest ? { lease_expires_at: sessionRecord.leaseExpiresAt } : {}), command: sessionRecord.command, cwd, session_token: issued.bearer, session_epoch: issued.epoch, credential_generation: issued.generation, session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable });
+    res.status(201).json({ session_id, ...(owningPrincipal ? { owningPrincipal } : {}), type: mailboxRequest ? 'mailbox' : 'wrapped', ...(mailboxRequest ? { lease_expires_at: sessionRecord.leaseExpiresAt } : {}), command: sessionRecord.command, cwd, session_token: issued.bearer, session_epoch: issued.epoch, credential_generation: issued.generation, session_nonce: sessionRecord.provenanceNonce, provenance_capable: sessionRecord.provenanceCapable, ...policyResponse(inputPolicy, newPolicyGrant, policyCapability) });
   });
 }
 

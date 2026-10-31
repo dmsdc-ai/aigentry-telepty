@@ -2580,7 +2580,12 @@ async function main() {
       ? parseAllowInvocation('allow', ['allow', '--id', sshPlan.id, 'ssh', ...sshPlan.args])
       : parseAllowInvocation(cmd, args);
     if (!allowInvocation) return;
-    const { sessionId, command, cmdArgs, idleTtl, autoRestart } = allowInvocation;
+    const { sessionId, command, cmdArgs, idleTtl, autoRestart, inputPolicy: requestedInputPolicy = null } = allowInvocation;
+    // Task 1215: bridge-memory-only authority/readiness material (see readiness-handshake.js).
+    let inputPolicyCapability = null;
+    let readinessNonce = null;
+    const policyCapabilityHeaders = () => requestedInputPolicy === 'user-supervised' && inputPolicyCapability
+      ? { 'x-telepty-input-policy-capability': inputPolicyCapability } : {};
     let credentialChannel = null;
     if (process.env.TELEPTY_SESSION_CREDENTIAL_REFRESH === '1') {
       try {
@@ -2620,8 +2625,44 @@ async function main() {
       }catch{console.error('Invalid or unsafe cooperative handoff credential file.');process.exitCode=1;return;}
     }
     if(cooperativeEnabled && !strictOwnerClient){console.error('Cooperative handoff requires an explicit strict principal client.');process.exitCode=1;return;}
+    // Task 1215 combined mode: ordinary transport credentials stay in force; a SEPARATE operator client
+    // (TELEPTY_SUPERVISION_CLIENT_FILE) signs only the user-supervised registration. It never selects
+    // strict owner transport or cooperative handoff; conflicting or unused configuration is refused.
+    let supervisionClient = null;
+    let supervisionEpoch = null;
+    if (process.env.TELEPTY_SUPERVISION_CLIENT_FILE) {
+      if (strictOwnerClient) {
+        console.error('TELEPTY_SUPERVISION_CLIENT_FILE cannot be combined with TELEPTY_PRINCIPAL_CLIENT_FILE (strict mode signs every request itself). Nothing was started.');
+        process.exitCode = 1; return;
+      }
+      if (requestedInputPolicy !== 'user-supervised') {
+        console.error('TELEPTY_SUPERVISION_CLIENT_FILE is used only with --input-policy user-supervised. Nothing was started.');
+        process.exitCode = 1; return;
+      }
+      try {
+        const principalClient = require('./src/principal/client');
+        supervisionClient = principalClient.createPrincipalClient(principalClient.loadPrincipalClientConfiguration(process.env.TELEPTY_SUPERVISION_CLIENT_FILE));
+        if (supervisionClient.daemonUrl !== new URL(DAEMON_URL).origin || sshPlan) throw new Error('SUPERVISION_TARGET_UNSUPPORTED');
+      } catch {
+        console.error('Supervision requires a checked operator client configuration (TELEPTY_SUPERVISION_CLIENT_FILE) for this local daemon and a local child. Nothing was started.');
+        process.exitCode = 1; return;
+      }
+    }
+    // Adds the operator assertion to exactly one request shape: POST /api/sessions/register with
+    // input_policy user-supervised, signed over the JSON-roundtripped body that is sent. Anything else
+    // is passed through untouched. The assertion is never logged or stored.
+    async function withSupervisionProof(url, options) {
+      const target = new URL(url);
+      if (target.pathname !== '/api/sessions/register' || (options.method || 'GET') !== 'POST' || typeof options.body !== 'string') return options;
+      const body = JSON.parse(options.body);
+      if (!body || body.input_policy !== 'user-supervised') return options;
+      if (target.origin !== supervisionClient.daemonUrl) throw new Error('SUPERVISION_TARGET_UNSUPPORTED');
+      const assertion = await supervisionClient.assertion({ method: 'POST', target: target.pathname + target.search, body,
+        action: 'session.register', ...(supervisionEpoch ? { sessionEpoch: supervisionEpoch } : {}), signal: AbortSignal.timeout(5000) });
+      return { ...options, headers: { ...Object.fromEntries(new Headers(options.headers).entries()), 'x-telepty-principal': assertion } };
+    }
     const allowFetchWithAuth = async (url, options = {}) => {
-      if (!strictOwnerClient) return fetchWithAuth(url, options);
+      if (!strictOwnerClient) return fetchWithAuth(url, supervisionClient ? await withSupervisionProof(url, options) : options);
       const target = new URL(url);
       if (target.origin !== strictOwnerClient.daemonUrl) throw new Error('PRINCIPAL_ALLOW_TARGET_UNSUPPORTED');
       const ownerToken = target.searchParams.get('owner_token');
@@ -2638,8 +2679,10 @@ async function main() {
       const assertion = await strictOwnerClient.assertion({ method, target:target.pathname+target.search, body, action,
         ...(strictOwnerEpoch ? {sessionEpoch:strictOwnerEpoch} : {}), signal });
       const bearer = scopedSessionToken(url, {localOrigin:buildDaemonUrl('127.0.0.1',PORT)});
+      const policyCapabilityHeader = new Headers(options.headers).get('x-telepty-input-policy-capability');
       return fetch(requestUrl,{...options,method,signal,redirect:'error',headers:{'content-type':'application/json',
         ...(ownerToken ? {'x-telepty-owner-token':ownerToken} : {}),
+        ...(policyCapabilityHeader ? {'x-telepty-input-policy-capability':policyCapabilityHeader} : {}),
         'x-telepty-principal':assertion,...(bearer ? {'x-telepty-session-token':bearer} : {})}});
     };
 
@@ -2690,16 +2733,25 @@ async function main() {
           // #47 P4 — provenance banner is opt-in per session (default-OFF). Operators flip it ON
           // for sessions whose onboarding understands the fence via TELEPTY_PROVENANCE=1.
           ...(process.env.TELEPTY_PROVENANCE === '1' ? { provenance_capable: true } : {}),
+          ...(requestedInputPolicy ? { input_policy: requestedInputPolicy } : {}),
           ...(idleTtl !== null ? { idle_ttl: idleTtl } : {})
         })
       });
       const data = await res.json();
+      // Task 1215 F1: the input-policy capability lives in this bridge's memory only — never in
+      // process.env/sessionEnv (the child), never printed. Removed from `data` before anyone else reads it.
+      if (res.ok && data && typeof data.input_policy_capability === 'string') inputPolicyCapability = data.input_policy_capability;
+      if (data) delete data.input_policy_capability;
+      if (res.ok && requestedInputPolicy === 'user-supervised' && !data.input_policy_pending) {
+        console.error(`⚠️  [allow] input_policy user-supervised was not granted (${data.input_policy_refused || 'unsupported by daemon'}); this session runs GUARDED.`);
+      }
       if (res.ok && handoffAdoption && (data.registration_instance_matched !== true || data.reregistered !== true
           || data.session_epoch !== handoffAdoption.expected_epoch || data.credential_generation !== handoffAdoption.expected_credential_generation)) {
         console.error('Daemon did not confirm the exact handoff instance; successor child was not started.');
         process.exitCode = 1; return;
       }
       if (res.ok && strictOwnerClient) strictOwnerEpoch = data.session_epoch;
+      if (res.ok && supervisionClient && typeof data.session_epoch === 'string') supervisionEpoch = data.session_epoch;
       if (!res.ok) {
         console.error(`❌ Error: ${data.error}`);
         process.exit(1);
@@ -2722,6 +2774,9 @@ async function main() {
     const sessionCwd = process.cwd();
     const sessionEnv = { ...process.env, ...(credentialChannel ? { TELEPTY_SESSION_CREDENTIAL_PATH: credentialChannel.credentialPath, TELEPTY_SESSION_CREDENTIAL_INSTANCE: credentialChannel.instance } : {}), TELEPTY_SESSION_ID: sessionId, TELEPTY_AVAILABLE: 'true', ...(process.env.TELEPTY_SESSION_TOKEN ? { TELEPTY_SESSION_TOKEN: process.env.TELEPTY_SESSION_TOKEN } : {}), ...(process.env.TELEPTY_SESSION_NONCE ? { TELEPTY_SESSION_NONCE: process.env.TELEPTY_SESSION_NONCE } : {}) };
     if (strictOwnerClient) delete sessionEnv.TELEPTY_PRINCIPAL_CLIENT_FILE;
+    // Task 1215: no supervision configuration reaches the child (proof/capability stay in this bridge).
+    delete sessionEnv.TELEPTY_SUPERVISION_CLIENT_FILE;
+    delete sessionEnv.TELEPTY_SUPERVISION_TRUST_FILE;
     delete sessionEnv.TELEPTY_HANDOFF_CREDENTIAL_FILE;
     let child = null;
     let handoffPending = null;
@@ -2734,9 +2789,14 @@ async function main() {
     const DEATH_LOG_PATH = path.join(os.homedir(), '.telepty', 'logs', 'session-deaths.log');
 
     let readyNotified = false;
+    // Task 1215: effective policy = requested at launch AND confirmed by the daemon for the
+    // current owner generation (owner_token). Anything else, including a disconnect, is guarded.
+    let inputPolicy = 'guarded';
     let allowSessionClosed = false;
     let cleanupTerminal = () => {};
     const allowSignalHandlers = new Map();
+    // #137: identity of the code this bridge actually loaded — read once, at bridge start.
+    const bridgeIdentity = require('./src/mailbox/bridge-stage').bridgeIdentity(__dirname, pkg.version);
     const allowSecurity = createAllowSecurityContext({
       get sessionId() { return sessionId; },
       get command() { return command; },
@@ -2785,6 +2845,9 @@ async function main() {
       get reconnectTimer() { return reconnectTimer; },
       get heartbeatTimer() { return heartbeatTimer; },
       get allowSignalHandlers() { return allowSignalHandlers; },
+      get bridgeIdentity() { return bridgeIdentity; },
+      get inputPolicy() { return inputPolicy; },
+      get readinessNonce() { return readinessNonce; },
       get FileMailbox() { return FileMailbox; },
       get path() { return path; },
       get os() { return os; },
@@ -3007,7 +3070,7 @@ async function main() {
         try {
           const rereg = await allowFetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...policyCapabilityHeaders() },
             body: JSON.stringify({
               session_id: sessionId,
               command,
@@ -3020,6 +3083,7 @@ async function main() {
               term: terminalType,
               owner_pid: process.pid,
               ...(child && child.pid ? { pty_pid: child.pid } : {}),
+              ...(requestedInputPolicy ? { input_policy: requestedInputPolicy } : {}),
               ...(idleTtl !== null ? { idle_ttl: idleTtl } : {})
             })
           });
@@ -3032,8 +3096,15 @@ async function main() {
           // sessionEnv current for future respawns; opt-in Linux running-child refresh uses the
           // instance-bound channel described in docs/plans/credential-refresh-92.md.
           const reregData = await rereg.json().catch(() => null);
+          // A first registration of a fresh instance (daemon GC'd us) mints a fresh capability.
+          if (rereg.ok && reregData && typeof reregData.input_policy_capability === 'string') inputPolicyCapability = reregData.input_policy_capability;
+          if (reregData) delete reregData.input_policy_capability;
+          if (rereg.ok && requestedInputPolicy === 'user-supervised' && reregData && reregData.input_policy_pending === false) {
+            console.error(`⚠️  [allow] input_policy user-supervised was not re-granted (${reregData.input_policy_refused || 'unsupported by daemon'}); this session runs GUARDED.`);
+          }
           if (allowSessionClosed) return;
           if (rereg.ok && strictOwnerClient && reregData?.session_epoch) strictOwnerEpoch = reregData.session_epoch;
+          if (rereg.ok && supervisionClient && typeof reregData?.session_epoch === 'string') supervisionEpoch = reregData.session_epoch;
           credentialChannel?.stageRegistration(rereg, reregData);
           adoptRegistrationCredential(rereg, reregData, process.env, sessionEnv, DAEMON_URL);
         } catch (e) {
@@ -3057,6 +3128,7 @@ async function main() {
       }
       if (allowSessionClosed) return;
       const ownerSocket = new WebSocket(wsUrl, {headers:{...(ownerBearer ? {'x-telepty-session-token':ownerBearer} : {}),
+        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY, ...policyCapabilityHeaders(),
         ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
       const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
       daemonWs = ownerSocket;
@@ -3107,8 +3179,12 @@ async function main() {
             currentOwnerToken = msg.token || null;
             if (currentOwnerToken) acceptInitialOwner();
             interactionBinding = msg.interaction_binding || null;
+            readinessNonce = typeof msg.readiness_nonce === 'string' ? msg.readiness_nonce : null;
+            inputPolicy = requestedInputPolicy === 'user-supervised' && msg.input_policy === 'user-supervised' ? 'user-supervised' : 'guarded';
             if(strictOwnerClient && readyNotified && promptReady)daemonWs.send(JSON.stringify({type:'ready',...(readyQualification||{}),...pendingReadyFields()}));
             invalidateBridgeInteraction('owner_bound');
+            if (!sshPlan) allowSecurity.reportBridgeQueue(true); // #137: announces bridge-stage-receipts-v1 to this owner generation
+            allowSecurity.announceTransportReady(); // Task 1215 F2: a live child re-announces to this owner generation
             if (sshInput && child) {
               const state = sshInput.snapshot();
               daemonWs.send(JSON.stringify({ type: 'ssh_state', ...state }));
@@ -3158,50 +3234,17 @@ async function main() {
             return;
           }
           if (msg.type === 'inject') {
-            invalidateBridgeInteraction('automated_input');
-            const chunks = [];
-            const rawData = typeof msg.data === 'string' ? msg.data : String(msg.data ?? '');
-            // Keep text+CR combined — do NOT split them.
-            chunks.push(rawData);
-
-            for (const chunk of chunks) {
-              if (!chunk) {
-                continue;
-              }
-
-              const isCr = chunk === '\r';
-              if (isCr && bridgePendingCount > 0) {
-                // CR with pending queued text — queue CR too and wait for the
-                // same readiness gate as the text. This preserves order during
-                // bootstrap and busy-session delivery.
-                enqueueBridgeMessage(chunk);
-                if (isIdle()) {
-                  if (queueFlushTimer) { clearTimeout(queueFlushTimer); queueFlushTimer = null; }
-                  flushBridgeMailbox();
-                } else {
-                  scheduleIdleFlush();
-                }
-              } else if (isCr) {
-                // CR always written immediately — never idle-gated.
-                child.write(chunk);
-              } else if (isIdle()) {
-                // Text when idle — write immediately.
-                child.write(chunk);
-                promptReady = false;
-                lastInjectTextTime = Date.now();
-              } else {
-                // Text when not idle — queue for safe delivery.
-                enqueueBridgeMessage(chunk);
-                scheduleIdleFlush();
-              }
-            }
+            // Task 1215 F4: the shared production handler (src/cli/security-actions.js).
+            const handled = allowSecurity.handleOwnerInject(msg);
+            if (handled.textWritten) lastInjectTextTime = Date.now();
             // Reset readyNotified so next prompt detection re-notifies daemon (auto-report)
-            if (rawData && rawData !== '\r') {
+            if (handled.rawData && handled.rawData !== '\r') {
               readyNotified = false;
             }
           } else if (msg.type === 'resize') {
             invalidateBridgeInteraction('resize');
             child.resize(msg.cols, msg.rows);
+            allowSecurity.noteBridgeGeometry(msg.cols, msg.rows);
           }
         } catch (e) {
           // ignore malformed messages
@@ -3220,6 +3263,8 @@ async function main() {
           closeAllowSession({destroySession:false});exitAllowSession(0);return;
         }
         interactionBinding = null;
+        readinessNonce = null;
+        inputPolicy = 'guarded';
         if (strictOwnerClient) pendingOwnerFrames.length = 0;
         wsReady = false;
         // #17 (OQ-2): the daemon explicitly destroyed this session (manual kill or the
@@ -3350,7 +3395,7 @@ async function main() {
         if(handoffPending)return;
         const size = getTerminalSize(process.stdout, { cols: 120, rows: 40 });
         invalidateBridgeInteraction('resize');
-        if (child) child.resize(size.cols, size.rows);
+        if (child) { child.resize(size.cols, size.rows); allowSecurity.noteBridgeGeometry(size.cols, size.rows); }
       }
     });
     // #844: `destroySession: false` closes THIS bridge's own resources and nothing else — no
@@ -3460,7 +3505,9 @@ async function main() {
         daemonWs.send(JSON.stringify({
           type: 'heartbeat',
           pty_bytes: ptyBytesRead,
-          read_side: ptyReadSide
+          read_side: ptyReadSide,
+          // #137: the same bounded queue summary as bridge_queue (in-memory, no history read).
+          ...(sshPlan ? {} : { bridge_queue: allowSecurity.bridgeQueueSummary() })
         }));
       }
     }, BRIDGE_HEARTBEAT_MS);
@@ -3505,6 +3552,7 @@ async function main() {
               // Re-attach output relay, prompt detection, and exit handler
               attachChildExitHandler();
               emitRestartEvent(crashCount);
+              allowSecurity.announceTransportReady(); // Task 1215 F2: the new child, after the daemon cleared the old one
               console.log(`\x1b[32m✅ Session '${sessionId}' restarted (attempt ${crashCount}).\x1b[0m\n`);
               // Reset crash counter if session survives 30s
               setTimeout(() => { if (crashCount > 0) crashCount = 0; }, 30000);
@@ -3553,6 +3601,8 @@ async function main() {
     }
 
     replayPendingOwnerFrames();
+    // Task 1215 F2: child created, output/exit subscription attached, owner inject loop live.
+    allowSecurity.announceTransportReady();
 
     // Graceful shutdown on SIGINT (let child handle it via PTY)
     process.on('SIGINT', () => {});
@@ -3938,7 +3988,9 @@ async function main() {
           } else if (consumption === 'unknown') {
             console.log(`✅ Submitted via ${submitData.strategy}${tail} (consumption=unknown — delivered to PTY; turn-consumption not observable).`);
           } else {
-            console.log(`✅ Submitted via ${submitData.strategy}${tail}.`);
+            // Task 1215: a submit handed to a wrapped session's owner bridge is not a PTY write
+            // and not consumption; the bridge may still hold its body. Receipts tell (inject_id).
+            console.log(`✅ Submitted via ${submitData.strategy}${tail} (handed to the session transport; PTY write and consumption unconfirmed by this response).`);
           }
         } else if (submitRes && submitRes.status === 504) {
           // Soft failure: REPL never readied. Orchestrator scripts depend on

@@ -2,6 +2,8 @@
 const { randomUUID } = require('node:crypto');
 const { processState } = require('./process-state');
 const { correlateRequest, validInjectId } = require('./correlation');
+const { bridgeReceiptSupport, bridgeQueueView } = require('../mailbox/bridge-stage');
+const readinessHandshake = require('../transport/readiness-handshake');
 const unknown = reason => ({ status: 'unknown', reason });
 function timestamp(value, now, ttl = 15000) {
   const ms = Date.parse(value);
@@ -30,6 +32,7 @@ function createSessionDiagnostics({ now = Date.now, kill = process.kill, maxWind
       ? counters[key] - previous.counters[key] : null;
     samples.set(session, { machineId, sessionId, instance: epoch, epoch, ownerGeneration, at, counters });
     const readSide = ['open', 'closed', 'ended', 'error', 'paused'].includes(session.bridgeReadSide) ? session.bridgeReadSide : null;
+    const bridgeQueue = bridgeQueueView(session);
     return { schema_version: 1, observed_at: new Date(at).toISOString(), read_only: true,
       identity: { machine_id: machineId, session_id: sessionId, session_epoch: session.sessionEpoch || null,
         instance_id: epoch, owner_generation: ownerGeneration, credential_generation: session.credentialGeneration || null },
@@ -47,6 +50,16 @@ function createSessionDiagnostics({ now = Date.now, kill = process.kill, maxWind
           last_actual_output: timestamp(session.lastActualOutputAt, at), last_activity: timestamp(session.lastActivityAt, at),
           forwarding: unknown('no_end_to_end_forwarding_probe'), input_write: unknown('no_correlated_write_receipt'),
           reason: 'output_silence_cannot_distinguish_waiting_suspended_hung_or_blocked_forwarding' },
+        // #137 — the bridge's own queue report (current owner generation only). Bridge-reported,
+        // not a daemon measurement; an old bridge is explicitly unsupported, never assumed empty.
+        bridge_queue: bridgeQueue ? { status: 'observed', source: 'bridge_report', ...timestamp(bridgeQueue.observed_at, at),
+          receipts: bridgeReceiptSupport(session), phase: bridgeQueue.phase, reason: bridgeQueue.reason, pending: bridgeQueue.pending,
+          in_flight: bridgeQueue.in_flight, oldest_age_ms: bridgeQueue.oldest_age_ms, first_ready_observed: bridgeQueue.first_ready_observed,
+          ready_source: bridgeQueue.ready_source, vt: bridgeQueue.vt, bridge_version: bridgeQueue.bridge_version,
+          bridge_code_digest: bridgeQueue.bridge_code_digest } : { ...unknown('no_bridge_queue_report'), receipts: bridgeReceiptSupport(session) },
+        // Task 1215 F2 — session spawn-readiness milestones from the current owner's authenticated
+        // handshake. Transport facts only: never instruction receipt, consumption or completion.
+        spawn_readiness: readinessHandshake.view(session),
         wrapped_process: { presence: processPresence(session.ptyPid || session.ptyProcess?.pid, kill),
           scheduler_state: includeProcessState ? processState(session.ptyPid || session.ptyProcess?.pid, { ...processStateOptions, now }) : unknown('process_state_probe_not_requested'), responsiveness: unknown('no_agent_response_probe') }
       },

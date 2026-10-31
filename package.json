@@ -44,7 +44,8 @@
     "test:ci": "node scripts/run-tests.mjs test:ci && git diff --exit-code tests/snippet-protocol/v1/",
     "test:ci:pty": "node scripts/run-tests.mjs test:ci:pty",
     "typecheck": "tsc --noEmit",
-    "regen-fixtures": "node scripts/regen-snippet-fixtures.js"
+    "regen-fixtures": "node scripts/regen-snippet-fixtures.js",
+    "build:authority-darwin": "node scripts/build-authority-darwin.mjs"
   },
   "keywords": [
     "pty",

@@ -205,11 +205,15 @@ await op('corrupt-dequeue-leaf',async()=>{corrupt('dequeue','inbox.jsonl');});
 await op('recover-unsafe',async()=>{const n=shared.bridgePendingCount;allow.recoverBridgeMailbox();assert.equal(shared.bridgePendingCount,n);});
 await op('flush-dequeue-refusal',async()=>{const gen=shared.interactionBinding.input_generation,n=effects.length;assert.throws(()=>allow.flushBridgeMailbox(),e=>e.code==='MAILBOX_UNSAFE_PATH');assert.equal(shared.bridgePendingCount,1);assert.equal(effects.length,n);assert.equal(shared.interactionBinding.input_generation,gen);});
 await op('filter-target-input',async()=>{shared.bridgeTarget='filter';shared.bridgePendingCount=0;});
-await op('seed-old',async()=>{const now=Math.floor(Date.now()/1000);shared.bridgeMailbox.enqueue({msg_id:'old',from:'fixture',to:'filter',payload:'expired',created_at:now-601});});
-await op('seed-same-a',async()=>{const now=Math.floor(Date.now()/1000);shared.bridgeMailbox.enqueue({msg_id:'same-a',from:'fixture',to:'filter',payload:'same',created_at:now-0});});
-await op('seed-same-b',async()=>{const now=Math.floor(Date.now()/1000);shared.bridgeMailbox.enqueue({msg_id:'same-b',from:'fixture',to:'filter',payload:'same',created_at:now-0});});
+// #136 F4: records of a PREVIOUS bridge are quarantined, never replayed (bridge-recovery-quarantine-136), so
+// the filter group seeds through THIS context; recovery keeps its own records queued. Dropped records are
+// dead-lettered with their payload, never relabelled acked.
+const filterIds=()=>{const rows=journal('filter','inbox.jsonl');return {old:rows.find(x=>x.payload==='expired').msg_id,sameB:rows.filter(x=>x.payload==='same')[1].msg_id};};
+await op('seed-old',async()=>{syntheticNow=Date.now()-601000;allow.enqueueBridgeMessage('expired');});
+await op('seed-same-a',async()=>{syntheticNow=Date.now();allow.enqueueBridgeMessage('same');});
+await op('seed-same-b',async()=>{allow.enqueueBridgeMessage('same');});
 await op('recover-filter',async()=>{allow.recoverBridgeMailbox();assert.equal(shared.bridgePendingCount,3);});
-await op('flush-filter',async()=>{syntheticNow=Date.now();allow.flushBridgeMailbox();assert.equal(timeouts.size,1);const rows=journal('filter');assert.ok(rows.some(x=>x.msg_id==='old'&&x.state==='acked'));assert.ok(rows.some(x=>x.msg_id==='same-b'&&x.state==='acked'));});
+await op('flush-filter',async()=>{syntheticNow=Date.now();allow.flushBridgeMailbox();assert.equal(timeouts.size,1);const rows=journal('filter'),ids=filterIds();for(const id of [ids.old,ids.sameB]){assert.ok(rows.some(x=>x.msg_id===id&&x.state==='dead_letter'));assert.ok(!rows.some(x=>x.msg_id===id&&x.state==='acked'));}assert.deepEqual(journal('filter','dead-letter.jsonl').map(x=>[x.payload,x.reason]),[['expired','expired_unwritten'],['same','bridge_duplicate']]);});
 await op('callback-filter',async()=>{advanceOne();assert.equal(effects.findLast(x=>x.kind==='pty-write').data,'same');assert.equal(journal('filter').at(-1).state,'acked');});
 await op('ack-target-input',async()=>{shared.bridgeTarget='ack';shared.bridgePendingCount=0;});
 await op('enqueue-ack',async()=>{allow.enqueueBridgeMessage('ack\r\n');});
