@@ -110,8 +110,45 @@ function childEnv(homeDir, port) {
   };
 }
 
-function runCli(args, homeDir, port, { timeoutMs = 8000 } = {}) {
+// Task 1215 windows127 (failure-only, owned fixture daemon only): what the fixture can observe about ITS OWN daemon at
+// the moment runCli's bound fires. Fixed fields only: elapsed since the CLI spawn; the owned daemon pid's liveness via
+// signal 0 (alive | gone | exists_no_permission | unknown); one /api/health request carrying that HOME's token, capped
+// at 1000 ms ABSOLUTE (answered, HTTP status, health status token or an allowlisted error name/code). Never a command
+// line, environment, token, arbitrary body, or any other process. It observes; it never decides a pass.
+function observeOwnedDaemon({ pid, home }, port, spawnedAt, timeoutMs) {
+  const elapsed = Date.now() - spawnedAt;
+  let liveness = 'unknown';
+  if (Number.isInteger(pid) && pid > 0) {
+    try { process.kill(pid, 0); liveness = 'alive'; }
+    catch (e) { liveness = e && e.code === 'ESRCH' ? 'gone' : (e && e.code === 'EPERM' ? 'exists_no_permission' : 'unknown'); }
+  }
+  const started = Date.now();
+  const token = tokenFor(home);
+  const probe = (async () => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1000),
+        headers: token ? { 'x-telepty-token': token } : {} });
+      let status = null;
+      try { const b = await res.json(); status = b && typeof b.status === 'string' && /^[a-z_]{1,32}$/.test(b.status) ? b.status : 'other'; } catch { /* no JSON */ }
+      return { answered: true, http_status: res.status, health_status: status };
+    } catch (e) {
+      const code = e && e.cause && e.cause.code;
+      return { answered: false, error: ['AbortError', 'TimeoutError', 'TypeError'].includes(e && e.name) ? e.name : 'other',
+        cause_code: typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(code) ? code : null };
+    }
+  })();
+  let cap;
+  const capped = new Promise((resolve) => { cap = setTimeout(() => resolve({ answered: false, error: 'cap_1000ms' }), 1000); });
+  return Promise.race([probe, capped]).then((health) => {
+    clearTimeout(cap);
+    return { elapsed_since_spawn_ms: elapsed, runcli_timeout_ms: timeoutMs, owned_daemon_pid: liveness,
+      health: { ...health, probe_ms: Date.now() - started } };
+  });
+}
+
+function runCli(args, homeDir, port, { timeoutMs = 8000, owned = null } = {}) {
   return new Promise((resolve, reject) => {
+    const spawnedAt = Date.now();
     const cli = spawn(process.execPath, [CLI, ...args], {
       cwd: REPO_ROOT,
       env: childEnv(homeDir, port),
@@ -120,14 +157,21 @@ function runCli(args, homeDir, port, { timeoutMs = 8000 } = {}) {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; cli.kill('SIGKILL'); }, timeoutMs);
+    let ownedEvidence = null; // Task 1215 windows127: only when the caller passes owned fixture metadata
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (owned) ownedEvidence = observeOwnedDaemon(owned, port, spawnedAt, timeoutMs).catch(() => null);
+      cli.kill('SIGKILL');
+    }, timeoutMs);
     cli.stdout.on('data', (c) => { stdout += c.toString(); });
     cli.stderr.on('data', (c) => { stderr += c.toString(); });
     cli.on('error', (e) => { clearTimeout(timer); reject(e); });
     cli.on('close', (code, signal) => {
       clearTimeout(timer);
       if (timedOut) {
-        reject(new Error(`CLI \`${args.join(' ')}\` did not return (blocked).\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+        const fail = (note) => reject(new Error(`CLI \`${args.join(' ')}\` did not return (blocked).\nstdout:\n${stdout}\nstderr:\n${stderr}${note}`));
+        if (!ownedEvidence) { fail(''); return; }
+        ownedEvidence.then((evidence) => fail(evidence ? `\n#1215 windows127 owned-daemon evidence ${JSON.stringify(evidence)}` : ''));
         return;
       }
       resolve({ code, signal, stdout, stderr });
@@ -207,7 +251,8 @@ test('daemon stop: terminates the running daemon process and frees the port', as
   const pid = m && m.pid;
   assert.ok(Number.isInteger(pid) && pid > 0, 'daemon should report a pid via /api/meta');
 
-  const res = await runCli(['daemon', 'stop'], home, port);
+  // Task 1215 windows127: owned metadata adds failure-only evidence to the unchanged 8000 ms timeout branch.
+  const res = await runCli(['daemon', 'stop'], home, port, { owned: { pid, home } });
   assert.equal(res.code, 0, `daemon stop should exit 0\nstderr:\n${res.stderr}`);
   assert.match(res.stdout, /stopped/i);
 
