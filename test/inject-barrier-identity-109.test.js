@@ -15,7 +15,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const WebSocket = require('ws');
 
-const { startTestDaemon, createSessionId, waitFor } = require('../test-support/daemon-harness');
+const { startTestDaemon, createSessionId, waitFor, HARNESS_OBSERVATION_MARGIN_MS } = require('../test-support/daemon-harness');
 
 const QUEUE_BOUND_MS = 1200;
 
@@ -49,8 +49,10 @@ async function wrappedOwner(sid, h = harness) {
   return ownerSocket(sid, h);
 }
 
-const inject = (sid, prompt, h = harness) => h.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, {
-  method: 'POST', body: { prompt }
+// Task 1215 harness133: `requestOptions` (default none) carries only an explicit harness observation budget; callers that
+// pass nothing keep the 5000 ms harness default.
+const inject = (sid, prompt, h = harness, requestOptions = {}) => h.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, {
+  method: 'POST', body: { prompt }, ...requestOptions
 });
 const destroy = (sid) => harness.request(`/api/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -150,6 +152,10 @@ test('#109(b): the barrier wait is bounded — late callers get QUEUE_TIMEOUT, a
 // cannot be asserted against the shared 1200 ms bound. That bound is covered by the bounded-wait test above, which keeps
 // the shared fixture; this case uses its own daemon at the product default bound (session-delivery.js, 10000 ms).
 const PRODUCT_QUEUE_BOUND_MS = 10000;
+// Task 1215 harness133: a queued inject's product bound is the barrier wait (PRODUCT_QUEUE_BOUND_MS) plus the text wait
+// MAILBOX_TEXT_WAIT_MS = 2 x DELIVERY_TIMEOUT_MS (session-delivery.js; daemon.js default 5000) = 20000 ms. This case's
+// harness OBSERVATION budget is that plus the one named margin (not a product deadline; the other cases are unchanged).
+const QUEUED_INJECT_BOUND_MS = PRODUCT_QUEUE_BOUND_MS + 2 * 5000;
 test('#109(b): queued callers are delivered in arrival order, each text followed by its own CR', async (t) => {
   // Own fixture: no queue-bound override (an inherited one is removed: spawn drops undefined values). Stopped on any outcome.
   const own = await startTestDaemon({ env: { TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS: undefined } });
@@ -182,7 +188,7 @@ test('#109(b): queued callers are delivered in arrival order, each text followed
   const pending = [];
   for (const p of ['f1', 'f2', 'f3']) {
     const issued = Date.now() - t0;
-    pending.push(inject(sid, p, own).then((r) => {
+    pending.push(inject(sid, p, own, { timeoutMs: QUEUED_INJECT_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS }).then((r) => {
       callers.push({ p, issued_ms: issued, answered_ms: Date.now() - t0, status: r.status, code: (r.body && r.body.code) || null,
         // Task 1215 (#879 discriminator): the daemon-measured barrier wait of a refusal (pre-barrier = answered - issued - this).
         queue_wait_ms: r.body && Number.isSafeInteger(r.body.queue_wait_ms) ? r.body.queue_wait_ms : null });

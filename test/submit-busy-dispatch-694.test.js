@@ -26,11 +26,21 @@ const path = require('node:path');
 const WebSocket = require('ws');
 
 const { isBusyDispatchState } = require('../src/submit-gate');
+const { HARNESS_OBSERVATION_MARGIN_MS } = require('../test-support/daemon-harness');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const TOKEN = 'test-694-token';
 const LISTENING_BANNER = /listening on https?:\/\/[^\s]+:(\d+)/;
 const BODY = 'FIX694 regression body one two three four five six seven eight nine ten';
+// Task 1215 harness133: this file's own raw /submit requests were UNBOUNDED (no harness request() involved). Each now
+// carries an explicit OBSERVATION budget: its own source-derived product upper bound plus the one named harness margin.
+// This is not a product deadline and not the first-CR/gate performance assertions below. Gated path (session-actions.js
+// submit route): gate (or the busy settle 1200, which is smaller) + gatedTerminalSubmit settle 1200 + verify
+// + retries x (retry delay + 1200 + verify) + classifyInjectConsumption 1200, with the product defaults verify 1500,
+// retries 1 and delay 500 when the body omits them (delivery-runtime.js parseSubmitRetryOptions).
+// gate 10000 -> 17100 (+ margin 19100); gate 6000 -> 13100 (+ margin 15100); both fit the 30000 ms harness maximum.
+const submitUpperBoundMs = ({ gate, verify = 1500, retries = 1, retryDelay = 500 }) =>
+  gate + 1200 + verify + retries * (retryDelay + 1200 + verify) + 1200;
 
 function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
 // Task 1215 windows127: waits for a test-observed EVENT (bounded); it asserts nothing about time.
@@ -103,11 +113,26 @@ async function bootDaemon(homeDir) {
   }
   if (!port) { child.kill('SIGKILL'); throw new Error(`daemon never bound:\n${stdout}`); }
 
-  const req = (pathname, opts = {}) => fetch(`http://127.0.0.1:${port}${pathname}`, {
-    method: opts.method || 'GET',
-    headers: { 'x-telepty-token': TOKEN, ...(opts.body ? { 'Content-Type': 'application/json' } : {}) },
-    ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
-  }).then(async (r) => ({ status: r.status, headers_at: Date.now(), body: await r.json().catch(() => null) }));
+  // Task 1215 harness133: an optional `opts.timeoutMs` bounds one request (headers AND body). On expiry it rejects with
+  // code HARNESS_REQUEST_TIMEOUT (method and route only). The timer is cleared on every path. Without it: unchanged.
+  const req = (pathname, opts = {}) => {
+    const controller = opts.timeoutMs ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), opts.timeoutMs) : null;
+    const expired = () => Object.assign(new Error(`submit-busy-dispatch-694 ${opts.method || 'GET'} ${pathname.split('?')[0]}: `
+      + `no complete response within the ${opts.timeoutMs}ms observation budget (HARNESS_REQUEST_TIMEOUT)`), { code: 'HARNESS_REQUEST_TIMEOUT' });
+    return fetch(`http://127.0.0.1:${port}${pathname}`, {
+      method: opts.method || 'GET',
+      headers: { 'x-telepty-token': TOKEN, ...(opts.body ? { 'Content-Type': 'application/json' } : {}) },
+      ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
+      ...(controller ? { signal: controller.signal } : {}),
+    }).then(async (r) => {
+      const headersAt = Date.now();
+      const body = await r.json().catch(() => null);
+      if (controller && controller.signal.aborted) throw expired(); // a body cut by the budget is not a null body
+      return { status: r.status, headers_at: headersAt, body };
+    }, (error) => { throw controller && controller.signal.aborted ? expired() : error; })
+      .finally(() => clearTimeout(timer));
+  };
 
   const stop = async () => {
     if (child.exitCode === null) {
@@ -214,6 +239,7 @@ test('#694(a) idle target: clean ready path (gate_wait_ms=0, consumed, no gated_
     await delay(120);
 
     const res = await d.req(`/api/sessions/${id}/submit`, { method: 'POST',
+      timeoutMs: submitUpperBoundMs({ gate: 10000 }) + HARNESS_OBSERVATION_MARGIN_MS,
       body: { injected_body: BODY, gate_timeout_ms: 10000, prompt_symbol_gate: false } });
     bridge.close();
 
@@ -259,6 +285,7 @@ test('#694(b) busy target: fast-path dispatches without the full-timeout burn', 
     const GATE = 6000; // a full burn here would be ~6s; the fast-path must be ≪ that
     const t0 = Date.now();
     const res = await d.req(`/api/sessions/${id}/submit`, { method: 'POST',
+      timeoutMs: submitUpperBoundMs({ gate: GATE }) + HARNESS_OBSERVATION_MARGIN_MS,
       body: { injected_body: BODY, gate_timeout_ms: GATE, prompt_symbol_gate: false } });
     const doneAt = Date.now();
     const gateWait = res.body && res.body.gate_wait_ms;
@@ -324,6 +351,7 @@ test('#694(b2) busy target: a bounded confirm retry after body_still_visible is 
     const GATE = 6000;
     const t0 = Date.now();
     const res = await d.req(`/api/sessions/${id}/submit`, { method: 'POST',
+      timeoutMs: submitUpperBoundMs({ gate: GATE }) + HARNESS_OBSERVATION_MARGIN_MS,
       body: { injected_body: BODY, gate_timeout_ms: GATE, prompt_symbol_gate: false } });
     const doneAt = Date.now();
     const gateWait = res.body && res.body.gate_wait_ms;

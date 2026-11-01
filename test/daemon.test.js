@@ -12,7 +12,15 @@ const { afterEach, beforeEach, test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('http');
 const WebSocket = require('ws');
-const { createSessionId, delay, startTestDaemon, waitFor } = require('../test-support/daemon-harness');
+const { createSessionId, delay, startTestDaemon, waitFor, HARNESS_OBSERVATION_MARGIN_MS } = require('../test-support/daemon-harness');
+// Task 1215 harness133: per-request harness OBSERVATION budgets (not product deadlines) for the three /submit calls whose
+// product bound reaches or exceeds the 5000 ms harness default. Each is that request's own source-derived upper bound plus
+// the one named margin. Gated path: gate + settle 1200 + verify + retries x (delay + settle 1200 + verify) + classify 1200
+// (session-actions.js submit route; delivery-runtime.js gatedTerminalSubmit/parseSubmitRetryOptions; submit-gate.js).
+// Bootstrap-queued: waitForBootstrapSubmit races gate_timeout_ms (delivery-runtime.js).
+const SUBMIT_BOOTSTRAP_QUEUED_BOUND_MS = 5000;                               // gate_timeout_ms 5000 race
+const SUBMIT_RETRIES2_BOUND_MS = 1000 + 1200 + 200 + 2 * (100 + 1200 + 200) + 1200; // 6600
+const SUBMIT_RETRIES1_BOUND_MS = 1000 + 1200 + 200 + 1 * (100 + 1200 + 200) + 1200; // 5100
 
 // #730: codex is paste-capable BY IDENTITY now, so an injected body reaches a codex
 // session wrapped in bracketed paste even when the fixture never relayed an ESC[?2004h.
@@ -636,6 +644,7 @@ test('bootstrap queued submit waits behind queued text and preserves order', asy
 
   const submitPromise = harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
     method: 'POST',
+    timeoutMs: SUBMIT_BOOTSTRAP_QUEUED_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS,
     body: {
       injected_body: 'queued-submit',
       gate_timeout_ms: 5000
@@ -715,6 +724,7 @@ test('codex submit confirmation resends CR when context-ref remains visible and 
 
   const submit = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
     method: 'POST',
+    timeoutMs: SUBMIT_RETRIES2_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS,
     body: {
       injected_body: body,
       prompt_symbol_gate: false,
@@ -775,6 +785,7 @@ test('codex submit confirmation returns 504 when context-ref remains unsubmitted
 
   const submit = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
     method: 'POST',
+    timeoutMs: SUBMIT_RETRIES1_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS,
     body: {
       injected_body: body,
       prompt_symbol_gate: false,

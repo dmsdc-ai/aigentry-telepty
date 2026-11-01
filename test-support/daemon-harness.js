@@ -102,6 +102,59 @@ async function parseResponse(response) {
   };
 }
 
+// Task 1215 harness129: a TEST-HARNESS bound on previously unbounded HTTP waits (not a product deadline, and not a
+// claim that real responses must be faster). One deadline covers the response headers AND the body. A caller
+// AbortSignal is optional. The deadline and an external abort are distinct typed outcomes (HARNESS_REQUEST_TIMEOUT /
+// HARNESS_REQUEST_ABORTED) whose diagnostics carry only method, route without query, elapsed time and code. Any other
+// failure is rethrown unchanged. The timer and listener are released on every path.
+// Task 1215 harness133: the default is 5000 ms. An EXPLICIT per-call `timeoutMs` (finite and positive) may raise or
+// lower it, hard-capped at HARNESS_REQUEST_MAX_MS, so it stays below the 60 s file kill. Callers whose product
+// legitimately waits longer opt in with that request's own product bound + HARNESS_OBSERVATION_MARGIN_MS. This is an
+// observation cap, never a product deadline. The fixture-level `requestTimeoutMs` stays lower-only.
+const REQUEST_TIMEOUT_MS = 5000;
+const HARNESS_REQUEST_MAX_MS = 30000;
+const HARNESS_OBSERVATION_MARGIN_MS = 2000;
+const STOP_CLEANUP_MS = 10000;
+const lowered = (value, max) => (Number.isFinite(value) && value > 0 ? Math.min(value, max) : max);
+function requestBudget(timeoutMs) {
+  if (timeoutMs === undefined || timeoutMs === null) return REQUEST_TIMEOUT_MS;
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw Object.assign(new TypeError('daemon-harness request timeoutMs must be a finite positive number (HARNESS_REQUEST_INVALID_TIMEOUT)'),
+      { code: 'HARNESS_REQUEST_INVALID_TIMEOUT' });
+  }
+  return Math.min(timeoutMs, HARNESS_REQUEST_MAX_MS);
+}
+
+function harnessRequestError(code, method, route, elapsedMs) {
+  const what = code === 'HARNESS_REQUEST_TIMEOUT' ? 'no complete response within the harness deadline' : 'aborted by the caller';
+  return Object.assign(new Error(`daemon-harness ${method} ${route}: ${what} after ${elapsedMs}ms (${code})`),
+    { code, method, route, elapsed_ms: elapsedMs });
+}
+
+async function boundedRequest(url, init = {}, { timeoutMs, signal } = {}) {
+  const method = String(init.method || 'GET').toUpperCase();
+  const route = new URL(url).pathname;
+  const budget = requestBudget(timeoutMs);
+  const begun = Date.now();
+  const controller = new AbortController();
+  let outcome = null;
+  const onAbort = () => { if (!outcome) outcome = 'HARNESS_REQUEST_ABORTED'; controller.abort(); };
+  const timer = setTimeout(() => { if (!outcome) outcome = 'HARNESS_REQUEST_TIMEOUT'; controller.abort(); }, budget);
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
+    return await parseResponse(await fetch(url, { ...init, signal: controller.signal }));
+  } catch (error) {
+    if (outcome) throw harnessRequestError(outcome, method, route, Date.now() - begun);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
+}
+
 async function startTestDaemon(options = {}) {
   // Bind an OS-assigned ephemeral port (PORT=0) unless the caller pins one. This is
   // collision-free: the daemon holds the socket continuously from the moment the kernel
@@ -111,6 +164,9 @@ async function startTestDaemon(options = {}) {
   // port is read back from the daemon's startup banner below.
   const requestedPort = options.port ?? 0;
   const host = options.host ?? '127.0.0.1';
+  // Task 1215 harness129: focused fixture tests may only LOWER these bounds.
+  const requestTimeoutMs = lowered(options.requestTimeoutMs, REQUEST_TIMEOUT_MS);
+  const cleanupTimeoutMs = lowered(options.cleanupTimeoutMs, STOP_CLEANUP_MS);
   // Resolved to the real OS-assigned port after read-back when requestedPort === 0.
   let port = requestedPort;
   let portResolved = requestedPort !== 0;
@@ -254,8 +310,8 @@ async function startTestDaemon(options = {}) {
       init.body = JSON.stringify(options.body);
     }
 
-    const response = await fetch(`http://${host}:${port}${pathname}`, init);
-    return parseResponse(response);
+    return boundedRequest(`http://${host}:${port}${pathname}`, init,
+      { timeoutMs: options.timeoutMs ?? requestTimeoutMs, signal: options.signal });
   }
 
   await waitFor(async () => {
@@ -276,8 +332,8 @@ async function startTestDaemon(options = {}) {
       // #820: /api/health, not /api/sessions. Health is registered BEFORE the auth middleware
       // (daemon.js), so readiness no longer depends on holding a credential — which matters
       // because the credential is a file this daemon has not necessarily written yet.
-      const response = await fetch(`http://${host}:${port}/api/health`);
-      return response.ok;
+      const health = await boundedRequest(`http://${host}:${port}/api/health`, {}, { timeoutMs: requestTimeoutMs });
+      return health.response.ok;
     } catch {
       return false;
     }
@@ -304,20 +360,61 @@ async function startTestDaemon(options = {}) {
     }
   }
 
-  async function cleanupSessions() {
-    const list = await request('/api/sessions');
+  // Task 1215 harness133: an exact 403 OWNED_DELETE_FORBIDDEN (session-actions.js owned/protected DELETE) is the
+  // contract refusing a token-only delete. That listed session is counted, excluded from the drain predicate and left
+  // to the owned-daemon termination. Not excused:
+  //   - transport/timeout/abort errors (rethrown as-is);
+  //   - every other non-2xx, including 404 "Exact session id required.", because this list supplied exact ids
+  //     (HARNESS_CLEANUP_DELETE_FAILED);
+  //   - a 2xx-deleted session still listed after the drain wait.
+  // Returns a fixed-shape summary: counts plus status/code keys only, never ids, bodies or messages.
+  const DIAG_CODE = /^[A-Z][A-Z0-9_]{1,63}$/;
+  async function cleanupSessions({ signal } = {}) {
+    const summary = { listed: 0, deleted: 0, refused: 0, failed: 0, refused_codes: {}, failed_statuses: {} };
+    const list = await request('/api/sessions', { signal });
     if (list.status !== 200 || !Array.isArray(list.body)) {
-      return;
+      return summary;
+    }
+    summary.listed = list.body.length;
+
+    const outcomes = await Promise.allSettled(list.body.map(async (session) => ({ id: session.id,
+      res: await request(`/api/sessions/${encodeURIComponent(session.id)}`, { method: 'DELETE', signal }) })));
+    const rejected = outcomes.find((outcome) => outcome.status === 'rejected');
+    if (rejected) throw rejected.reason;
+    const refusedIds = new Set();
+    for (const { value: { id, res } } of outcomes) {
+      const code = res.body && typeof res.body.code === 'string' && DIAG_CODE.test(res.body.code) ? res.body.code : null;
+      if (res.status >= 200 && res.status < 300) summary.deleted++;
+      else if (res.status === 403 && code === 'OWNED_DELETE_FORBIDDEN') {
+        summary.refused++; refusedIds.add(id); summary.refused_codes[code] = (summary.refused_codes[code] || 0) + 1;
+      } else {
+        const key = code ? `${res.status}:${code}` : String(res.status);
+        summary.failed++; summary.failed_statuses[key] = (summary.failed_statuses[key] || 0) + 1;
+      }
+    }
+    if (summary.failed > 0) {
+      throw Object.assign(new Error(`daemon-harness cleanupSessions: ${summary.failed} of ${summary.listed} DELETE(s) answered `
+        + `non-2xx ${JSON.stringify(summary.failed_statuses)} (HARNESS_CLEANUP_DELETE_FAILED)`), { code: 'HARNESS_CLEANUP_DELETE_FAILED', summary });
     }
 
-    await Promise.all(list.body.map((session) => request(`/api/sessions/${encodeURIComponent(session.id)}`, {
-      method: 'DELETE'
-    })));
-
     await waitFor(async () => {
-      const current = await request('/api/sessions');
-      return current.status === 200 && Array.isArray(current.body) && current.body.length === 0;
+      const current = await request('/api/sessions', { signal });
+      return current.status === 200 && Array.isArray(current.body) && current.body.every((session) => refusedIds.has(session.id));
     }, { description: 'session cleanup' });
+    return summary;
+  }
+
+  // Task 1215 harness129: stop()'s cleanup signal is INDEPENDENT and bounded (cleanupTimeoutMs). A still-live case
+  // signal can end it earlier; an already-aborted one is ignored, so teardown still gets its bounded cleanup.
+  function cleanupSignal(caseSignal) {
+    const controller = new AbortController();
+    let expired = false;
+    const timer = setTimeout(() => { expired = true; controller.abort(); }, cleanupTimeoutMs);
+    const onCaseAbort = () => controller.abort();
+    const follow = caseSignal && !caseSignal.aborted;
+    if (follow) caseSignal.addEventListener('abort', onCaseAbort, { once: true });
+    return { signal: controller.signal, expired: () => expired,
+      dispose() { clearTimeout(timer); if (follow) caseSignal.removeEventListener('abort', onCaseAbort); } };
   }
 
   // Kill the daemon process WITHOUT the cleanupSessions() pass stop() does. A restart test needs
@@ -332,17 +429,38 @@ async function startTestDaemon(options = {}) {
     await terminateOwnedChild('kill()');
   }
 
-  async function stop() {
+  // Task 1215 harness129: termination of the owned child is reached in `finally` whatever the bounded cleanup did.
+  // A cleanup failure is no longer swallowed: it is rethrown AFTER termination. A cleanup that ran out of its own
+  // bound is typed HARNESS_STOP_CLEANUP_TIMEOUT, with the original error as `cause`. If termination fails too, both
+  // errors are kept (AggregateError, cleanup error first).
+  async function stop({ signal } = {}) {
     try {
       // A daemon that has already exited (kill() in a restart test, or a crash) has no sessions
       // to clean up and no process to signal: no HTTP to a dead port, no wait on a past 'exit'.
       if (!exitState.exited) {
+        let cleanupError = null, terminateError = null, summary = null;
+        const cleanup = cleanupSignal(signal);
         try {
-          await cleanupSessions();
-        } catch {
-          // Ignore cleanup failures during shutdown and force-stop the daemon below.
+          summary = await cleanupSessions({ signal: cleanup.signal });
+        } catch (error) {
+          cleanupError = cleanup.expired()
+            ? Object.assign(new Error(`daemon-harness stop(): session cleanup did not finish within ${cleanupTimeoutMs}ms `
+              + '(HARNESS_STOP_CLEANUP_TIMEOUT)', { cause: error }), { code: 'HARNESS_STOP_CLEANUP_TIMEOUT' })
+            : error;
+        } finally {
+          cleanup.dispose();
+          try { await terminateOwnedChild('stop()'); } catch (error) { terminateError = error; }
         }
-        await terminateOwnedChild('stop()');
+        if (cleanupError && terminateError) {
+          throw new AggregateError([cleanupError, terminateError], 'stop(): session cleanup failed and the owned daemon did not exit');
+        }
+        if (cleanupError || terminateError) throw cleanupError || terminateError;
+        // Task 1215 harness133: contractual refusals are reported (one fixed-shape line, counts only) and returned.
+        if (summary && summary.refused > 0) {
+          process.stderr.write(`[daemon-harness] stop(): ${summary.refused} of ${summary.listed} listed session(s) refused the `
+            + 'token-only DELETE by contract (403 OWNED_DELETE_FORBIDDEN); ended by the owned-daemon termination\n');
+        }
+        return summary;
       }
     } finally {
       if (ownsHome) {
@@ -497,6 +615,9 @@ async function startTestDaemon(options = {}) {
 }
 
 module.exports = {
+  HARNESS_OBSERVATION_MARGIN_MS,
+  HARNESS_REQUEST_MAX_MS,
+  boundedRequest,
   createSessionId,
   delay,
   homeEnv,
