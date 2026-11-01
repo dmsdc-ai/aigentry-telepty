@@ -1,0 +1,268 @@
+name: Dependency resolution evidence (task 1215, COLLECTION ONLY / NOT SECURITY PASS)
+
+# Task 1215 / release1238 / resolution180 — DIAGNOSTIC LOCK-RESOLUTION COLLECTOR. Target base final54
+# 94ac9090b36d1cc8ee0cf30da1abb1df9c5ddae7 (package.json / package-lock.json identical to final53).
+#
+# WHAT THIS IS. Two independent jobs, one per candidate range set frozen under .github/fixtures/dependency-resolution-1215/:
+#   a = SDK ^1.32.0, ws ^8.21.0 (consumer floors); b = a + zod ^4.6.6 (breaking major, comparison only).
+# Each job authenticates the original package.json / package-lock.json bytes, then copies its fixture over package.json
+# INSIDE THIS DISPOSABLE CHECKOUT ONLY, and runs each command exactly once, bounded, without any script:
+#   npm update --package-lock-only --ignore-scripts --no-audit --fund=false   (genuine registry resolution)
+#   npm ci --ignore-scripts --no-audit --fund=false                           (produced-lock consistency)
+#   npm audit --json --ignore-scripts                                          (findings on the produced lock)
+#   npm ls --all --json                                                        (resolved tree)
+# It keeps argv, exit code, stdout and stderr of every command separately, the produced package.json and
+# package-lock.json, their diffs against the originals, hashes and a facts-only summary.
+#
+# WHAT THIS IS NOT. A green job is COLLECTION ONLY / NOT SECURITY PASS and says nothing about runtime, MCP tools/list,
+# schema or validation compatibility (variant b's compatibility is a separate, unmeasured gate). Nothing is fixed,
+# forced, overridden, hand-edited, committed or published. No secret, token, auth or extra registry; no environment is
+# printed; node_modules, caches and first-party code are never uploaded. Nothing is retried.
+#
+# FAILS CLOSED on: original or fixture bytes that are not the frozen bodies; a toolchain other than Node v20.20.0 /
+# npm 10.8.2; a registry other than https://registry.npmjs.org/ or fetch-retries other than 0; npm update or npm ci
+# failure; a produced lock whose root ranges differ from the fixture or that npm ci changes; an audit exit other than
+# 0/1 or output that is not exactly one npm audit v2 report; npm ls exit != 0, an error object or any missing / invalid /
+# extraneous node; a timeout; a stream or file over its bound; evidence over 4 MiB or with an unexpected file.
+#
+# ACTION REFS: the same three exact 40-hex commit SHAs as .github/workflows/dependency-audit-1215.yml.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/dependency-resolution-1215-180'
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: npm lock resolution variant ${{ matrix.variant }} (COLLECTION ONLY / NOT SECURITY PASS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - variant: a
+            fixture: .github/fixtures/dependency-resolution-1215/package-a.json
+            fixture_sha256: 6879f9ef439d246c151d4b107873ed4e1b8304c50024f4e27892330330383104
+          - variant: b
+            fixture: .github/fixtures/dependency-resolution-1215/package-b.json
+            fixture_sha256: 974f5d7faf603108385277055e7407b7977c283bcf7bda8d07244fce10e109c9
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.0'
+      - name: Collect lock resolution evidence (bounded; no scripts, no fix, no retry)
+        id: collect
+        env:
+          VARIANT: ${{ matrix.variant }}
+          FIXTURE: ${{ matrix.fixture }}
+          EXPECTED_FIXTURE_SHA256: ${{ matrix.fixture_sha256 }}
+          EXPECTED_PACKAGE_JSON_SHA256: fb8832167fff4abf13340e53df67855737c68bc08c26377acc466b193ef72db0
+          EXPECTED_PACKAGE_LOCK_SHA256: a1d9db1faf5a0ea05663953a15a452980849c4dcb95a68e55d14213ec28879cf
+          npm_config_registry: 'https://registry.npmjs.org/'
+          npm_config_fetch_retries: '0'
+        run: |
+          set -euo pipefail
+          umask 077
+          EVIDENCE="$RUNNER_TEMP/dependency-resolution-1215"
+          WORK="$RUNNER_TEMP/dependency-resolution-1215-work"
+          mkdir "$EVIDENCE" "$WORK"
+          stage=start
+          trap 'rc=$?; printf "variant=%s\nstage=%s\nscript_exit=%s\nlabel=COLLECTION ONLY / NOT SECURITY PASS\n" "$VARIANT" "$stage" "$rc" > "$EVIDENCE/collection-result.txt"' EXIT
+
+          # run_capped NAME STDOUT_MAX STDERR_MAX SECONDS CMD... : argv, stdout, stderr and exit code go to separate files.
+          # Each stream keeps at most MAX+1 bytes; reaching MAX+1 means "over the bound" and fails the collection.
+          run_capped() {
+            local p="$EVIDENCE/$1" out_max="$2" err_max="$3" secs="$4" out_size err_size
+            shift 4
+            printf '%s\n' "$@" > "$p.argv"
+            set +e
+            { timeout --kill-after=10s "${secs}s" "$@" 2>&1 1>&3 3>&- | head -c "$((err_max + 1))" > "$p.stderr"
+              echo "${PIPESTATUS[0]}" > "$p.exit_code"; } 3>&1 | head -c "$((out_max + 1))" > "$p.stdout"
+            set -e
+            out_size="$(stat -c %s "$p.stdout")"
+            err_size="$(stat -c %s "$p.stderr")"
+            echo "$(basename "$p"): exit=$(cat "$p.exit_code") stdout_bytes=${out_size} stderr_bytes=${err_size}"
+            if [ "$out_size" -gt "$out_max" ] || [ "$err_size" -gt "$err_max" ]; then
+              echo "::error::$(basename "$p") output exceeded its bound (stdout ${out_size}/${out_max}, stderr ${err_size}/${err_max}); collection failed"
+              return 1
+            fi
+          }
+          sha() { sha256sum "$1" | cut -d' ' -f1; }
+          # copy_capped SRC DEST MAX : copies a produced file into the evidence only if it is within its bound.
+          copy_capped() {
+            [ "$(stat -c %s "$1")" -le "$3" ] || { echo "::error::$(basename "$1") exceeds $3 bytes; collection failed"; return 1; }
+            cp "$1" "$EVIDENCE/$2"
+          }
+
+          stage=toolchain
+          for tool in timeout head stat sha256sum jq diff; do command -v "$tool" > /dev/null || { echo "::error::required tool '$tool' is missing; collection failed"; exit 1; }; done
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"; JQ_VERSION="$(jq --version)"
+          printf 'variant=%s\nnode=%s\nnpm=%s\njq=%s\nkernel=%s\n' "$VARIANT" "$NODE_VERSION" "$NPM_VERSION" "$JQ_VERSION" "$(uname -srm)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.0" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.0; collection failed"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2; collection failed"; exit 1; }
+          # Compared, never printed: a registry URL could carry credentials.
+          [ "$(npm config get registry)" = "https://registry.npmjs.org/" ] || { echo "::error::the configured npm registry is not https://registry.npmjs.org/; collection failed"; exit 1; }
+          [ "$(npm config get fetch-retries)" = "0" ] || { echo "::error::npm fetch-retries is not 0; collection failed"; exit 1; }
+
+          stage=input-hashes
+          PKG="$(sha package.json)"; LOCK="$(sha package-lock.json)"; FIX="$(sha "$FIXTURE")"
+          printf 'original package.json sha256=%s\noriginal package-lock.json sha256=%s\nfixture %s sha256=%s\n' "$PKG" "$LOCK" "$FIXTURE" "$FIX" > "$EVIDENCE/hashes.txt"
+          [ "$PKG" = "$EXPECTED_PACKAGE_JSON_SHA256" ] || { echo "::error::package.json ${PKG} is not the frozen original; collection failed"; exit 1; }
+          [ "$LOCK" = "$EXPECTED_PACKAGE_LOCK_SHA256" ] || { echo "::error::package-lock.json ${LOCK} is not the frozen original; collection failed"; exit 1; }
+          [ "$FIX" = "$EXPECTED_FIXTURE_SHA256" ] || { echo "::error::fixture ${FIXTURE} ${FIX} is not the frozen variant; collection failed"; exit 1; }
+
+          stage=apply-fixture
+          cp package.json "$WORK/original-package.json"
+          cp package-lock.json "$WORK/original-package-lock.json"
+          cp "$FIXTURE" package.json
+
+          stage=npm-update
+          run_capped npm-update 65536 65536 120 npm update --package-lock-only --ignore-scripts --no-audit --fund=false
+          UPDATE_EXIT="$(cat "$EVIDENCE/npm-update.exit_code")"
+          [ "$UPDATE_EXIT" = 0 ] || { echo "::error::npm update exited ${UPDATE_EXIT}; resolution failed"; exit 1; }
+          jq -e --slurpfile fx "$FIXTURE" '.lockfileVersion == 3 and (.packages[""].dependencies == $fx[0].dependencies)' package-lock.json > /dev/null \
+            || { echo "::error::produced lock root ranges do not equal the fixture dependencies; resolution failed"; exit 1; }
+          PRODUCED_PKG="$(sha package.json)"; PRODUCED_LOCK="$(sha package-lock.json)"
+          printf 'produced package.json sha256=%s\nproduced package-lock.json sha256=%s\n' "$PRODUCED_PKG" "$PRODUCED_LOCK" >> "$EVIDENCE/hashes.txt"
+          copy_capped package.json produced-package.json 65536
+          copy_capped package-lock.json produced-package-lock.json 524288
+
+          stage=diff
+          run_capped package-diff 65536 4096 15 diff -u "$WORK/original-package.json" package.json
+          run_capped lock-diff 524288 4096 15 diff -u "$WORK/original-package-lock.json" package-lock.json
+          for d in package-diff lock-diff; do
+            case "$(cat "$EVIDENCE/$d.exit_code")" in 0|1) ;; *) echo "::error::${d} failed; collection failed"; exit 1 ;; esac
+          done
+
+          stage=npm-ci
+          run_capped npm-ci 65536 65536 120 npm ci --ignore-scripts --no-audit --fund=false
+          CI_EXIT="$(cat "$EVIDENCE/npm-ci.exit_code")"
+          [ "$CI_EXIT" = 0 ] || { echo "::error::npm ci exited ${CI_EXIT}; the produced lock is not consistent"; exit 1; }
+          [ "$(sha package-lock.json)" = "$PRODUCED_LOCK" ] || { echo "::error::npm ci changed the produced lock; collection failed"; exit 1; }
+          [ "$(sha package.json)" = "$PRODUCED_PKG" ] || { echo "::error::npm ci changed package.json; collection failed"; exit 1; }
+
+          stage=npm-audit
+          run_capped npm-audit 1048576 65536 90 npm audit --json --ignore-scripts
+          AUDIT_EXIT="$(cat "$EVIDENCE/npm-audit.exit_code")"
+          case "$AUDIT_EXIT" in
+            0|1) ;;
+            *) echo "::error::npm audit exited ${AUDIT_EXIT} (not 0/1: network, timeout or signal); collection failed"; exit 1 ;;
+          esac
+          jq -s -e '
+            length == 1 and (.[0] |
+              type == "object"
+              and (has("error") | not)
+              and .auditReportVersion == 2
+              and (.vulnerabilities | type == "object")
+              and (.metadata.vulnerabilities | type == "object")
+              and ([.metadata.vulnerabilities | .info, .low, .moderate, .high, .critical, .total] | all(type == "number"))
+              and ([.vulnerabilities[] |
+                    (.name | type == "string")
+                    and (.severity | IN("info", "low", "moderate", "high", "critical"))
+                    and (.isDirect | type == "boolean")
+                    and (.via | type == "array")
+                    and (.effects | type == "array")
+                    and (.nodes | type == "array")] | all))
+          ' "$EVIDENCE/npm-audit.stdout" > /dev/null || { echo "::error::npm audit stdout is not exactly one npm audit v2 report; collection failed"; exit 1; }
+          TOTAL="$(jq -r '.metadata.vulnerabilities.total' "$EVIDENCE/npm-audit.stdout")"
+          if [ "$AUDIT_EXIT" = 1 ] && [ "$TOTAL" = 0 ]; then
+            echo "::error::npm audit exited 1 but reported zero vulnerabilities; collection failed"
+            exit 1
+          fi
+
+          stage=npm-ls
+          run_capped npm-ls 1048576 65536 60 npm ls --all --json
+          LS_EXIT="$(cat "$EVIDENCE/npm-ls.exit_code")"
+          [ "$LS_EXIT" = 0 ] || { echo "::error::npm ls exited ${LS_EXIT}; the installed tree is inconsistent"; exit 1; }
+          jq -s -e '
+            length == 1 and (.[0] |
+              type == "object" and (has("error") | not) and (has("problems") | not)
+              and (.dependencies | type == "object")
+              and ([.. | objects | select(.missing == true or .invalid == true or .extraneous == true)] | length == 0))
+          ' "$EVIDENCE/npm-ls.stdout" > /dev/null || { echo "::error::npm ls JSON reports problems or is malformed; collection failed"; exit 1; }
+
+          stage=summary
+          jq --slurpfile lock package-lock.json --arg variant "$VARIANT" --arg commit "$GITHUB_SHA" \
+             --arg fixture_sha256 "$FIX" --arg produced_lock_sha256 "$PRODUCED_LOCK" --argjson audit_exit "$AUDIT_EXIT" '
+            def ghsa: [(.url // "") | match("GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}") | .string][0];
+            ($lock[0].packages) as $lp |
+            def resolved($n): [$lp | to_entries[] | select(.key | endswith("node_modules/" + $n)) | "\(.key)@\(.value.version)"];
+            {
+              label: "COLLECTION ONLY / NOT SECURITY PASS",
+              note: "Facts copied from npm audit --json and the produced lock. Resolution is genuine npm registry output for this run only; no compatibility, exploitability or runtime exposure is inferred.",
+              variant: $variant, commit: $commit, expected_base: "94ac9090b36d1cc8ee0cf30da1abb1df9c5ddae7",
+              fixture_sha256: $fixture_sha256, produced_lock_sha256: $produced_lock_sha256,
+              root_ranges: $lp[""].dependencies,
+              root_resolved: ($lp[""].dependencies | keys | map({key: ., value: $lp["node_modules/" + .].version}) | from_entries),
+              previously_flagged_resolved: (["@hono/node-server", "@modelcontextprotocol/sdk", "body-parser", "express-rate-limit", "fast-uri", "hono",
+                "ip-address", "path-to-regexp", "proxy-addr", "qs", "ws", "zod"] | map({key: ., value: resolved(.)}) | from_entries),
+              audit_exit_code: $audit_exit,
+              metadata: .metadata,
+              vulnerabilities: ([.vulnerabilities | to_entries[] | .value as $v | {
+                name: $v.name, severity: $v.severity, isDirect: $v.isDirect, range: $v.range, fixAvailable: $v.fixAvailable,
+                via_packages: [$v.via[] | strings],
+                advisories: [$v.via[] | objects | {ghsa: ghsa, source, severity, range}],
+                nodes: [$v.nodes[] as $n | {path: $n, version: $lp[$n].version, dev: ($lp[$n].dev // false)}]
+              }] | sort_by(.name))
+            }
+          ' "$EVIDENCE/npm-audit.stdout" | head -c 262145 > "$EVIDENCE/summary.json"
+          [ "$(stat -c %s "$EVIDENCE/summary.json")" -le 262144 ] || { echo "::error::summary.json exceeded 262144 bytes; collection failed"; exit 1; }
+          jq -r '
+            "# Dependency resolution evidence, variant \(.variant) — COLLECTION ONLY / NOT SECURITY PASS", "",
+            "Genuine npm resolution for this run; not a compatibility or security result.", "",
+            "- commit: \(.commit) (expected base \(.expected_base) plus these diagnostic files)",
+            "- root ranges: \(.root_ranges | tojson)",
+            "- root resolved: \(.root_resolved | tojson)",
+            "- npm audit exit code: \(.audit_exit_code); reported counts: \(.metadata.vulnerabilities | tojson)", "",
+            "| package | severity | isDirect | nodes | advisories |", "|---|---|---|---|---|",
+            (.vulnerabilities[] | "| \(.name) | \(.severity) | \(.isDirect) | \([.nodes[] | "\(.path)@\(.version)"] | join("<br>")) | \([.advisories[] | "\(.ghsa // .source) (\(.severity))"] | join("<br>")) |")
+          ' "$EVIDENCE/summary.json" | head -c 65537 > "$EVIDENCE/SUMMARY.md"
+          [ "$(stat -c %s "$EVIDENCE/SUMMARY.md")" -le 65536 ] || { echo "::error::SUMMARY.md exceeded 65536 bytes; collection failed"; exit 1; }
+          cat "$EVIDENCE/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=COLLECTION ONLY / NOT SECURITY PASS::variant ${VARIANT}: npm audit exit ${AUDIT_EXIT}, ${TOTAL} vulnerable packages reported on the produced lock; this is not a security pass"
+          stage=complete
+
+      - name: Bound evidence (allowlisted files only, <= 4 MiB)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/dependency-resolution-1215"
+          test -d "$EVIDENCE" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          [ -z "$(find "$EVIDENCE" -mindepth 1 ! -type f -print -quit)" ] || { echo "::error::evidence contains a non-regular file; not uploading"; exit 1; }
+          shopt -s dotglob nullglob
+          for f in "$EVIDENCE"/*; do
+            case "$(basename "$f")" in
+              collection-result.txt|toolchain.txt|hashes.txt|produced-package.json|produced-package-lock.json|summary.json|SUMMARY.md) ;;
+              npm-update.argv|npm-update.stdout|npm-update.stderr|npm-update.exit_code) ;;
+              package-diff.argv|package-diff.stdout|package-diff.stderr|package-diff.exit_code) ;;
+              lock-diff.argv|lock-diff.stdout|lock-diff.stderr|lock-diff.exit_code) ;;
+              npm-ci.argv|npm-ci.stdout|npm-ci.stderr|npm-ci.exit_code) ;;
+              npm-audit.argv|npm-audit.stdout|npm-audit.stderr|npm-audit.exit_code) ;;
+              npm-ls.argv|npm-ls.stdout|npm-ls.stderr|npm-ls.exit_code) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+          done
+          TOTAL_BYTES="$(find "$EVIDENCE" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')"
+          echo "evidence bytes=${TOTAL_BYTES}"
+          [ "$TOTAL_BYTES" -le 4194304 ] || { echo "::error::evidence is ${TOTAL_BYTES} bytes (> 4 MiB); not uploading"; exit 1; }
+
+      - name: Upload resolution evidence (no node_modules, cache or credentials)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: dependency-resolution-1215-180-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dependency-resolution-1215
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,94 @@
+{
+  "name": "@dmsdc-ai/aigentry-telepty",
+  "version": "0.10.0",
+  "main": "daemon.js",
+  "bin": {
+    "aigentry-telepty": "install.js",
+    "telepty": "cli.js",
+    "telepty-install": "install.js",
+    "telepty-mcp": "mcp-server/index.mjs"
+  },
+  "files": [
+    "cli.js",
+    "daemon.js",
+    "install.js",
+    "auth.js",
+    "cross-machine.js",
+    "daemon-control.js",
+    "entitlement.js",
+    "host-spec.js",
+    "interactive-terminal.js",
+    "runtime-info.js",
+    "session-routing.js",
+    "session-state.js",
+    "shared-context.js",
+    "skill-installer.js",
+    "terminal-backend.js",
+    "install.sh",
+    "install.ps1",
+    "mcp-server/",
+    "scripts/postinstall.js",
+    "scripts/preuninstall.js",
+    "scripts/mailbox-preflight.js",
+    "src/",
+    "third-party-notices/",
+    "skills/",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "prepublishOnly": "node scripts/gen-readme.mjs",
+    "postinstall": "node scripts/postinstall.js",
+    "preuninstall": "node scripts/preuninstall.js",
+    "test": "node scripts/run-tests.mjs test && git diff --exit-code tests/snippet-protocol/v1/",
+    "test:watch": "node scripts/run-tests.mjs test:watch",
+    "test:ci": "node scripts/run-tests.mjs test:ci && git diff --exit-code tests/snippet-protocol/v1/",
+    "test:ci:pty": "node scripts/run-tests.mjs test:ci:pty",
+    "typecheck": "tsc --noEmit",
+    "regen-fixtures": "node scripts/regen-snippet-fixtures.js",
+    "build:authority-darwin": "node scripts/build-authority-darwin.mjs"
+  },
+  "keywords": [
+    "pty",
+    "terminal",
+    "session",
+    "multiplexer",
+    "remote",
+    "inject",
+    "ai-cli",
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "codex",
+    "gemini",
+    "cross-machine",
+    "tailscale"
+  ],
+  "author": "dmsdc-ai",
+  "license": "MIT",
+  "description": "Universal terminal session bridge \u2014 connect any terminal to any terminal, any machine",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmsdc-ai/aigentry-telepty.git"
+  },
+  "homepage": "https://github.com/dmsdc-ai/aigentry-telepty#readme",
+  "bugs": {
+    "url": "https://github.com/dmsdc-ai/aigentry-telepty/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "node-pty": "^1.2.0-beta.11",
+    "prompts": "^2.4.2",
+    "ws": "^8.21.0",
+    "zod": "^4.6.6",
+    "@xterm/headless": "6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.41",
+    "typescript": "^6.0.3"
+  }
+}
