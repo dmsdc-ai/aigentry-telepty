@@ -26,7 +26,7 @@ name: MCP dependency contract O/A/B (task 1215, MCP CONTRACT ONLY / NOT A RELEAS
 on:
   push:
     branches:
-      - 'diagnostic/mcp-compatibility-1215-183'
+      - 'diagnostic/mcp-guard-1215-187'
 
 permissions:
   contents: read
@@ -55,7 +55,7 @@ jobs:
           EXPECTED_LOCK_A_SHA256: 44a168cf892b349ce5833ca37bcfece4642e18e89cdc794da5d89cdff72d5f31
           EXPECTED_PACKAGE_B_SHA256: 974f5d7faf603108385277055e7407b7977c283bcf7bda8d07244fce10e109c9
           EXPECTED_LOCK_B_SHA256: 16eb17fc9cdd8a9aa09e1e7cca0248efa72b6cadf25a9bd142e431efa4d7ad61
-          EXPECTED_DRIVER_SHA256: b81f23c1bf24648162d4f13d99807a25d97359702ee3d9590f2c09a5f527b779
+          EXPECTED_DRIVER_SHA256: 7531d41caea7dc9af5c59396d8a4242f5dfb882339f47dd7940322d60b4baafa
           npm_config_registry: 'https://registry.npmjs.org/'
           npm_config_fetch_retries: '0'
         run: |
