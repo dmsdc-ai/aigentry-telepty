@@ -191,3 +191,56 @@ test('#106 malformed filters, worker construction and unexpected exit fail witho
   const result = await failed.read(); assert.equal(result.code, 'AUDIT_QUERY_FAILED');
   assert.doesNotMatch(JSON.stringify(result), /SECRET|private|runtime detail/);
 });
+
+// Task 1215 mac163 (frozen BEFORE any product proposal; expected RED on a9073b8d). Measured: macOS run 41283171662
+// job 124779069750, the serial backward-reader case above got AUDIT_QUERY_BUSY / worker_capacity at :29 (which of its
+// 7 serial reads was not recorded); Windows and Linux passed. Source: read() resolves a completed result BEFORE its job
+// leaves `active` (finish: resolve, then stop; release runs only after terminate()'s promise or the worker's 'exit'),
+// while capacity deliberately counts a terminating worker until it exits (the timed-out-worker case above). A strictly
+// serial caller is therefore refused by its OWN already-delivered results whenever two terminations are still pending.
+// Deterministic, no timers: each worker posts its result in a microtask, and its termination completes (exit + resolve)
+// one setImmediate later, as a real thread's does. The whole serial chain runs inside one microtask drain on the
+// original, before either pending termination can complete.
+class ExitLaterWorker extends ControlledWorker {
+  terminate() {
+    this.terminated++;
+    return new Promise((resolve) => setImmediate(() => { this.exited = true; this.emit('exit', 1); resolve(1); }));
+  }
+}
+const OK_PAGE = '{"injects":[],"next_cursor":null}';
+function exitLaterReader(t, { postResult }) {
+  const workers = [];
+  const reader = createAuditReader({ path: '/daemon-owned/log',
+    workerFactory: (file, options) => {
+      assert.match(file, /inject-query-worker\.js$/); assert.equal(options.workerData.path, '/daemon-owned/log');
+      const w = new ExitLaterWorker(); workers.push(w);
+      if (postResult) queueMicrotask(() => w.emit('message', { ok: true, json: OK_PAGE }));
+      return w;
+    },
+    setTimer: fn => fn, clearTimer: () => {} });
+  t.after(() => reader.close());
+  return { reader, workers };
+}
+
+test('#106 [mac163] a strictly serial caller is never refused for capacity by its own already-delivered results while their workers are still terminating', async t => {
+  const { reader, workers } = exitLaterReader(t, { postResult: true });
+  const results = [];
+  for (let i = 0; i < 3; i++) results.push(await reader.read());   // strictly serial: each read starts after the previous result was delivered
+  const shape = results.map(r => (r.ok ? 'ok' : `${r.code}/${r.reason}`));
+  assert.deepEqual(shape, ['ok', 'ok', 'ok'], `a read issued after the previous result was delivered must be admitted (observed ${JSON.stringify(shape)}; workers spawned ${workers.length})`);
+  assert.ok(results.every(r => r.json === OK_PAGE), 'each admitted read returns its own complete page');
+  assert.equal(workers.length, 3, 'one native worker per admitted read');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(workers.every(w => w.terminated === 1 && w.exited === true), 'every worker was terminated once and actually exited');
+});
+
+test('#106 [mac163] control: two reads whose results are NOT yet delivered still bound a third concurrent read (AUDIT_QUERY_BUSY) and no third native worker is spawned', async t => {
+  const { reader, workers } = exitLaterReader(t, { postResult: false });
+  const a = reader.read(); const b = reader.read();
+  assert.equal((await reader.read()).code, 'AUDIT_QUERY_BUSY', 'genuine overload is still refused by name');
+  assert.equal(workers.length, 2, 'the capacity bound of two native workers is unchanged');
+  workers[0].emit('message', { ok: true, json: OK_PAGE }); workers[1].emit('message', { ok: true, json: OK_PAGE });
+  assert.equal((await a).ok, true); assert.equal((await b).ok, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(workers.every(w => w.terminated === 1 && w.exited === true), 'both workers were terminated once and actually exited');
+});
