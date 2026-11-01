@@ -1,0 +1,180 @@
+name: Cleanup EPIPE diagnostic (task 1215 / cleanup185, Windows, original vs candidate B)
+
+# Task 1215 / release1238 / cleanup185 — DIAGNOSTIC ONLY. Not a release gate; a green leg is NOT a pass.
+#
+# OBSERVED (B Windows run 41290843984 / job 124801596324):
+# - test/daemon.test.js:333 "#45 operator-lane multicast" failed in its afterEach stop().
+# - The cleanup listed 2 sessions and deleted 2. The owned daemon then exited with code 1 at +273 ms (cleanup clock), and
+#   the drain request was refused (ECONNREFUSED at +5233 ms).
+# - Daemon stderr carried EPIPE with only emitErrorNT/emitErrorCloseNT frames, and every `fatal` flag was false.
+# - Which endpoint emitted the error, and whether the dependency set matters, were NOT measured.
+#
+# THIS RUN: one finite run per variant, on the SAME source tree, of the smallest complete existing file that contains the
+# failing case, test/daemon.test.js. It uses the exact test:ci preload and flags (scripts/test-suites.json) and the real
+# daemon; only a TAP file reporter is added. The two variants differ ONLY in package.json + package-lock.json:
+# - original:    .github/fixtures/cleanup-epipe-1215/*-original.json (the exact supplied original bodies);
+# - candidate-b: the committed B package.json + package-lock.json.
+# The harness reports the missing error channel (cleanup185 `error_event` markers and `output_at_ms`) on failure only.
+#
+# BOUNDS:
+# - job ≤ 8 min; npm ci ≤ 3 min; tests ≤ 4 min;
+# - no rerun, retry, loop or continue-on-error; npm ci respects each frozen lock (no update, audit, force or override);
+# - command exit codes are recorded separately from artifact collection, and a failed test fails the job;
+# - evidence ≤ 2 MiB per variant from an allowlist, kept 7 days: no credentials, environment, cache, node_modules or user
+#   logs; all target data comes from the private tests.
+# - core.autocrlf stays the runner default, as in the measured job. Every supplied body is LF-only, so bytes are verified
+#   as sha256 of the checkout with CR removed.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/cleanup-epipe-1215-185'
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup-epipe:
+    name: daemon.test.js once on Windows (${{ matrix.variant }}) — diagnostic only
+    runs-on: windows-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [original, candidate-b]
+    defaults:
+      run:
+        shell: bash
+    env:
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.2'
+
+      - name: Select and verify the variant inputs (exact bytes, CR removed)
+        id: inputs
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/cleanup-epipe-1215-evidence"
+          mkdir "$EVIDENCE" "$RUNNER_TEMP/cleanup-epipe-1215-raw"
+          lf_sha() { tr -d '\r' < "$1" | sha256sum | cut -d' ' -f1; }
+          expect() {
+            local got
+            got="$(lf_sha "$1")"
+            printf '%s lf_sha256=%s cr_present=%s\n' "$1" "$got" "$(grep -q $'\r' "$1" && echo yes || echo no)" >> "$EVIDENCE/input-hashes.txt"
+            [ "$got" = "$2" ] || { echo "::error::$1 is not the reviewed body (lf_sha256 ${got}); nothing was run"; exit 1; }
+          }
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"
+          printf 'variant=%s\ncommit=%s\nnode=%s\nnpm=%s\ncore_autocrlf=%s\n' "$VARIANT" "$GITHUB_SHA" "$NODE_VERSION" "$NPM_VERSION" \
+            "$(git config --get core.autocrlf || echo unset)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.2" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.2"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2"; exit 1; }
+          # Shared, reviewed bytes: the failing test file, the test:ci inventory and preload, and the cleanup185 harness.
+          expect test/daemon.test.js 097c7ebfdd27923e4bb32d0a630bf07f5fd19fba84e4dfc839c8de771dc9b511
+          expect scripts/test-suites.json 1382f0b24939ce4e53226be509fee6d029bb481de85f9b7a166ae2ffb8ee14d5
+          expect test-support/setup-env.js 9431f9e39b6051c95be8bd61929ebab3fc3317ad41f7cef6b9466bc6100fd4ef
+          expect test-support/daemon-harness.js 07c80d5b398df09e78a31f204b3f52cf818aca2c50a3cf7158cca40a555b6b59
+          case "$VARIANT" in
+            original)
+              expect .github/fixtures/cleanup-epipe-1215/package-original.json fb8832167fff4abf13340e53df67855737c68bc08c26377acc466b193ef72db0
+              expect .github/fixtures/cleanup-epipe-1215/package-lock-original.json a1d9db1faf5a0ea05663953a15a452980849c4dcb95a68e55d14213ec28879cf
+              cp .github/fixtures/cleanup-epipe-1215/package-original.json package.json
+              cp .github/fixtures/cleanup-epipe-1215/package-lock-original.json package-lock.json
+              PKG=fb8832167fff4abf13340e53df67855737c68bc08c26377acc466b193ef72db0
+              LOCK=a1d9db1faf5a0ea05663953a15a452980849c4dcb95a68e55d14213ec28879cf ;;
+            candidate-b)
+              PKG=974f5d7faf603108385277055e7407b7977c283bcf7bda8d07244fce10e109c9
+              LOCK=16eb17fc9cdd8a9aa09e1e7cca0248efa72b6cadf25a9bd142e431efa4d7ad61 ;;
+            *) echo "::error::unknown variant"; exit 1 ;;
+          esac
+          expect package.json "$PKG"
+          expect package-lock.json "$LOCK"
+          echo "PKG=$PKG" >> "$GITHUB_OUTPUT"
+          echo "LOCK=$LOCK" >> "$GITHUB_OUTPUT"
+
+      - name: npm ci (frozen lock, normal lifecycle; exit recorded)
+        timeout-minutes: 3
+        env:
+          PKG: ${{ steps.inputs.outputs.PKG }}
+          LOCK: ${{ steps.inputs.outputs.LOCK }}
+        run: |
+          set -uo pipefail
+          EVIDENCE="$RUNNER_TEMP/cleanup-epipe-1215-evidence"; RAW="$RUNNER_TEMP/cleanup-epipe-1215-raw"
+          npm ci --no-audit --fund=false > "$RAW/npm-ci.stdout" 2> "$RAW/npm-ci.stderr"
+          rc=$?
+          echo "$rc" > "$EVIDENCE/npm-ci.exit_code"
+          echo "npm ci exit=${rc}"
+          [ "$rc" = 0 ] || exit "$rc"
+          set -e
+          for f in package.json package-lock.json; do
+            want="$PKG"; [ "$f" = package-lock.json ] && want="$LOCK"
+            [ "$(tr -d '\r' < "$f" | sha256sum | cut -d' ' -f1)" = "$want" ] || { echo "::error::npm ci changed ${f}"; exit 1; }
+          done
+          for p in node-pty ws express zod @modelcontextprotocol/sdk @hono/node-server body-parser; do
+            printf '%s=%s\n' "$p" "$(node -p "require('./node_modules/$p/package.json').version")"
+          done > "$EVIDENCE/installed-versions.txt"
+          cat "$EVIDENCE/installed-versions.txt"
+
+      - name: Run test/daemon.test.js once (exact test:ci preload and flags; exit recorded)
+        timeout-minutes: 4
+        run: |
+          set -uo pipefail
+          EVIDENCE="$RUNNER_TEMP/cleanup-epipe-1215-evidence"; RAW="$RUNNER_TEMP/cleanup-epipe-1215-raw"
+          node --require ./test-support/setup-env.js --test --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=tap --test-reporter-destination="$RAW/test.tap" test/daemon.test.js > "$RAW/test.stdout" 2> "$RAW/test.stderr"
+          rc=$?
+          echo "$rc" > "$EVIDENCE/test.exit_code"
+          tail -n 60 "$RAW/test.stdout" | cut -c1-400
+          echo "::notice title=cleanup185 ${VARIANT} (diagnostic only)::daemon.test.js exit ${rc}; a green leg does not erase the retained full-suite failure"
+          exit "$rc"
+
+      - name: Bound evidence (allowlisted, <= 2 MiB; runs whatever the commands did)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/cleanup-epipe-1215-evidence"; RAW="$RUNNER_TEMP/cleanup-epipe-1215-raw"
+          test -d "$EVIDENCE" && test -d "$RAW" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          : > "$EVIDENCE/capture-bounds.txt"
+          copy_capped() { # copy_capped NAME MAX_BYTES
+            if [ -f "$RAW/$1" ]; then
+              local size; size="$(wc -c < "$RAW/$1" | tr -d ' ')"
+              head -c "$2" "$RAW/$1" > "$EVIDENCE/$1"
+              printf '%s raw_bytes=%s kept_bytes=%s truncated=%s\n' "$1" "$size" "$(wc -c < "$EVIDENCE/$1" | tr -d ' ')" \
+                "$([ "$size" -gt "$2" ] && echo yes || echo no)" >> "$EVIDENCE/capture-bounds.txt"
+            else
+              printf '%s absent\n' "$1" >> "$EVIDENCE/capture-bounds.txt"
+            fi
+          }
+          copy_capped npm-ci.stdout 32768
+          copy_capped npm-ci.stderr 32768
+          copy_capped test.stdout 786432
+          copy_capped test.stderr 65536
+          copy_capped test.tap 1048576
+          for f in npm-ci.exit_code test.exit_code; do [ -f "$EVIDENCE/$f" ] || printf '%s absent (step not reached or ended by its bound)\n' "$f" >> "$EVIDENCE/capture-bounds.txt"; done
+          cat "$EVIDENCE/capture-bounds.txt"
+          shopt -s dotglob nullglob
+          total=0
+          for f in "$EVIDENCE"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::non-regular evidence entry; not uploading"; exit 1; }
+            case "$(basename "$f")" in
+              toolchain.txt|input-hashes.txt|installed-versions.txt|capture-bounds.txt|npm-ci.exit_code|npm-ci.stdout|npm-ci.stderr|test.exit_code|test.stdout|test.stderr|test.tap) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+            total=$((total + $(wc -c < "$f" | tr -d ' ')))
+          done
+          echo "evidence bytes=${total}"
+          [ "$total" -le 2097152 ] || { echo "::error::evidence is ${total} bytes (> 2 MiB); not uploading"; exit 1; }
+
+      - name: Upload evidence (no lockfile, credentials, cache or node_modules)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: cleanup-epipe-1215-185-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cleanup-epipe-1215-evidence
+          if-no-files-found: error
+          retention-days: 7

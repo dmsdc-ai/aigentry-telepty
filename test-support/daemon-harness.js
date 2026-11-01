@@ -174,6 +174,16 @@ function diagnosticLogMarkers(text, { scrub = [] } = {}) {
   for (const secret of scrub) if (typeof secret === 'string' && secret) tail = tail.split(secret).join('');
   const lines = tail.split(/\r?\n/);
   const errorNames = [], errorCodes = [], stackFunctions = [];
+  // Task 1215 cleanup185 (failure-only, additive): Node's own "Unhandled 'error' event" crash shape, as fixed tokens.
+  // CI 41290843984 showed EPIPE with emitErrorNT/emitErrorCloseNT and every `fatal` flag false. No DIAG_FATAL pattern
+  // matches Node's unhandled-'error'-event banner, and the frame pattern below skips `fn [as alias] (` frames and
+  // `node:` built-in module ids, which are what can name the emitting stream. Kept:
+  //   - whether that banner is present;
+  //   - the identifier named by "Emitted 'error' event on <X> instance";
+  //   - `syscall:` / `errno:` property values;
+  //   - aliased frame names and Node built-in module ids (node:…, never a file path).
+  // Same window and scrub; each list is bounded to DIAG_LIST_MAX; `stack_functions` and `fatal` are unchanged.
+  const errorEvent = { unhandled: /Unhandled 'error' event/.test(tail), emitted_on: [], syscalls: [], errnos: [], aliased_frames: [], builtin_modules: [] };
   const add = (list, value) => { if (!list.includes(value) && list.length < DIAG_LIST_MAX) list.push(value); };
   for (const line of lines) {
     const named = /^\s*(?:Uncaught\s+)?([A-Z][A-Za-z]{0,31})(?=:|\s|$)/.exec(line);
@@ -181,12 +191,22 @@ function diagnosticLogMarkers(text, { scrub = [] } = {}) {
     for (const m of line.matchAll(/\b(E[A-Z]{2,15}|ERR_[A-Z0-9_]{2,48}|UND_ERR_[A-Z0-9_]{2,40})\b/g)) add(errorCodes, m[1]);
     const frame = /^\s+at (?:async )?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$<][\w$<>]*){0,3}) \(/.exec(line);
     if (frame && frame[1].length <= 64) add(stackFunctions, frame[1]);
+    const emitted = /^Emitted 'error' event on ([A-Za-z_$][\w$]{0,63}) instance\b/.exec(line);
+    if (emitted) add(errorEvent.emitted_on, emitted[1]);
+    const syscall = /^\s*syscall: '([a-z][a-z0-9_]{0,31})',?$/.exec(line);
+    if (syscall) add(errorEvent.syscalls, syscall[1]);
+    const errno = /^\s*errno: (-?\d{1,6}),?$/.exec(line);
+    if (errno) add(errorEvent.errnos, Number(errno[1]));
+    const aliased = /^\s+at (?:async )?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$<][\w$<>]*){0,3}) \[as ([A-Za-z_$][\w$]{0,63})\] \(/.exec(line);
+    if (aliased && aliased[1].length <= 64) add(errorEvent.aliased_frames, `${aliased[1]} [as ${aliased[2]}]`);
+    for (const m of line.matchAll(/(?<![\w/\\.])(node:[a-z_]{1,32}(?:\/[a-z_]{1,32}){0,4})(?=:\d)/g)) add(errorEvent.builtin_modules, m[1]);
   }
   const fatal = {};
   for (const [key, pattern] of DIAG_FATAL) fatal[key] = pattern.test(tail);
   const lineCounts = {};
   for (const prefix of DIAG_LINE_PREFIXES) lineCounts[prefix] = lines.filter((line) => line.startsWith(prefix)).length;
-  return { window_bytes: tail.length, error_names: errorNames, error_codes: errorCodes, stack_functions: stackFunctions, fatal, line_prefix_counts: lineCounts };
+  return { window_bytes: tail.length, error_names: errorNames, error_codes: errorCodes, stack_functions: stackFunctions, fatal, line_prefix_counts: lineCounts,
+    error_event: errorEvent };
 }
 // A cleanup failure on the TRANSPORT (refused/reset/socket), as opposed to a harness-typed outcome or an HTTP answer.
 const DIAG_TRANSPORT_CODE = /^(E[A-Z]{2,15}|UND_ERR_[A-Z0-9_]{2,40})$/;
@@ -286,12 +306,19 @@ async function startTestDaemon(options = {}) {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc']
   });
 
+  // Task 1215 cleanup185 (failure-only): arrival times of the owned child's output chunks, reported only by
+  // transportDiagnostic and only relative to the cleanup start. Recording them changes nothing that is read or written.
+  const outputAt = { stdout_last: null, stderr_first: null, stderr_last: null };
+
   child.stdout.on('data', (chunk) => {
     stdout += chunk.toString();
+    outputAt.stdout_last = Date.now();
   });
 
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString();
+    if (outputAt.stderr_first === null) outputAt.stderr_first = Date.now();
+    outputAt.stderr_last = Date.now();
   });
 
   // #879 — exit is a FACT recorded from the 'exit' event, never inferred from `child.exitCode`.
@@ -531,6 +558,10 @@ async function startTestDaemon(options = {}) {
       daemon: { exited: exitState.exited, exit_code: Number.isInteger(exitState.code) ? exitState.code : null,
         exit_signal: typeof exitState.signal === 'string' && /^SIG[A-Z0-9]{1,16}$/.test(exitState.signal) ? exitState.signal : null,
         exited_at_ms: exitAt === null ? null : exitAt - begun },
+      // cleanup185: same clock as exited_at_ms (negative = before the cleanup started; null = no chunk arrived).
+      output_at_ms: { stdout_last: outputAt.stdout_last === null ? null : outputAt.stdout_last - begun,
+        stderr_first: outputAt.stderr_first === null ? null : outputAt.stderr_first - begun,
+        stderr_last: outputAt.stderr_last === null ? null : outputAt.stderr_last - begun },
       markers: { stderr: diagnosticLogMarkers(stderr, { scrub }), stdout: diagnosticLogMarkers(stdout, { scrub }) } };
   }
   async function cleanupSessions({ signal, remainingMs } = {}) {
