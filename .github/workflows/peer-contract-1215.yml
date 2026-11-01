@@ -1,0 +1,316 @@
+name: Peer success / ledger performance gate contracts (task 1215 / peer235, original vs candidate)
+
+# Task 1215 / release1238 / peer235 — ISOLATED DIAGNOSTIC; not shipped, not a release gate. Product source is c33f9e8 in
+# EVERY leg (proven by `git diff --name-only ORIGINAL_SHA`); only the two test files differ between legs.
+#   D-A peer-forwarding-111: the success leg asserted 200 under the 500 ms FIXTURE grant (Windows 41312809155: 202 after
+#       628 ms; the destination accepted once later and nothing was resent). The candidate uses the product-validated
+#       maximum grant of 10000 ms for answer-requiring legs only.
+#   D-B ledger-control-responsiveness-1207: an invalid idle baseline (inconclusive) failed co-scheduled CI (diagnostic
+#       41312809365). The candidate reports it as performance NOT-MEASURED in ordinary runs and requires a valid pass in a
+#       dedicated single-file run with TELEPTY_LEDGER_PERF_GATE=1.
+#
+# THIS RUN, once per job (no rerun, retry, loop or continue-on-error), Windows, Linux and macOS:
+#   1. frozen controls — the "[peer235 …]" cases of the CANDIDATE files, identical bytes and selection in BOTH legs.
+#      PC1-original reproduces the original coupling deterministically (a real 200 released after 1000 ms → 202 under
+#      the 500 ms grant); G3 reproduces the original invalid-gate failure on the measured diagnostic windows.
+#   2. fixtures — original leg: both test files restored from ORIGINAL_SHA; candidate leg: candidate files. Each file is
+#      run alone, once. Exact membership is required. The original's outcome on a hosted runner is NOT expected to be
+#      red: it must be a pass, or fail ONLY by its documented signature (peer 202 vs 200; ledger 'inconclusive' vs
+#      'pass'); anything else is unexpected.
+#   3. candidate leg only — the performance gate: the same ledger file, once, --test-concurrency=1,
+#      TELEPTY_LEDGER_PERF_GATE=1. Only a VALID pass of F2 and R1 succeeds; inconclusive or fail stays a failure.
+#
+# BOUNDS: job <= 30 min; npm ci <= 8 min; controls <= 6 min; fixtures <= 10 min; gate <= 5 min; evidence <= 4 MiB
+# allowlisted, retained 7 days even on failure. errexit is disabled explicitly ONLY around each captured command.
+# core.autocrlf stays the runner default, so bytes are verified as sha256 with CR removed.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/peer-contract-1215-235'
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: peer/ledger contracts (${{ matrix.os }}, ${{ matrix.leg }}) — diagnostic only
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        leg: [original, candidate]
+    defaults:
+      run:
+        shell: bash
+    env:
+      LEG: ${{ matrix.leg }}
+      ORIGINAL_SHA: c33f9e823a11f76702d81834f07d396c0a5bcd30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.2'
+
+      - name: Write the step library and prove the candidate identity (exact bytes, CR removed)
+        run: |
+          set -euo pipefail
+          LIB="$RUNNER_TEMP/peer235"; EVIDENCE="$LIB/evidence"; RAW="$LIB/raw"
+          mkdir "$LIB" "$EVIDENCE" "$RAW"
+          cat > "$LIB/peer_pre.txt" <<'NAMES'
+          opt-in exact peer forwarding scopes authority, preserves receipts, deduplicates and retains timeout uncertainty
+          [peer174] measurement: real source route, real global fetch and a real destination daemon under the original 500 ms grant record fixed-shape timing and error class
+          [peer174] protocol control: an acceptance the real destination recorded but the source route did not observe before its deadline stays outcome_unknown and is never resent
+          NAMES
+          cat > "$LIB/peer_new.txt" <<'NAMES'
+          [peer235 PC1-original] a real destination response released after twice the original 500 ms grant: the real AbortSignal fires first, 202 outcome_unknown, delivered once, never resent
+          [peer235 PC1-success] the same delayed real response under the 10000 ms success grant is accepted: 200, exact receipt, one frame, replay never resends
+          [peer235 PC2] nondelayed positive control: the loopback relay is transparent under the 10000 ms success grant: 200, one frame, no resend
+          NAMES
+          cat > "$LIB/ledger_pre.txt" <<'NAMES'
+          F2 [1 MiB]: a 1 ms heartbeat during 32 measured flips through the genuine observation path; main-thread store writes == 0; per-event owner bytes bounded; every flip durable and named
+          R1 [1 MiB]: open while a 1 ms heartbeat runs and 50 polls/s drive the poll data path; begin while recovering is refused by name; every poll answered; no message > 64 KiB
+          F2/R1 cross-tier comparison (same run): ratios recorded against the proposed 3x gate; incomplete when one tier is selected
+          W5 heartbeat acceptance predicate: rejects zero sampling, stalls, incomplete coverage and invalid baselines; accepts the measured win32 idle-timer windows
+          NAMES
+          cat > "$LIB/ledger_new.txt" <<'NAMES'
+          [peer235 G1] heartbeat gate placement: pass passes, fail fails in every mode, inconclusive is NOT-MEASURED in ordinary runs and FAILS the dedicated gate, anything else fails
+          [peer235 G2] TELEPTY_LEDGER_PERF_GATE: unset or empty is ordinary, exactly "1" is the gate, anything else is refused
+          [peer235 G3] the measured invalid baseline (diagnostic job 124866555686): the ORIGINAL policy fails ordinary CI; the candidate reports NOT-MEASURED there and FAILS the dedicated gate
+          [peer235 G4] the same measured workload with a valid baseline is a stall: FAIL in ordinary runs and in the dedicated gate (bound unchanged at 50 ms)
+          NAMES
+          : > "$LIB/none.txt"
+          cat > "$LIB/lib.sh" <<'LIBRARY'
+          LIB="$RUNNER_TEMP/peer235"; EVIDENCE="$LIB/evidence"; RAW="$LIB/raw"
+          sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+          lf_sha() { tr -d '\r' < "$1" | sha; }
+          expect() {
+            local got; got="$(lf_sha "$1")"
+            printf '%s lf_sha256=%s\n' "$1" "$got" >> "$EVIDENCE/input-hashes.txt"
+            [ "$got" = "$2" ] || { echo "::error::$1 is not the reviewed body (lf_sha256 ${got})"; exit 1; }
+          }
+          identity() { # identity LABEL "allowed paths" [tracked]: tracked changes plus untracked files (tracked only after tests ran)
+            { git diff --name-only "$ORIGINAL_SHA" --; if [ "${3:-}" != tracked ]; then git ls-files --others --exclude-standard; fi; } | LC_ALL=C sort -u > "$EVIDENCE/identity-$1.txt"
+            cat "$EVIDENCE/identity-$1.txt"
+            local changed
+            while IFS= read -r changed; do
+              case " $2 " in *" $changed "*) ;; *) echo "::error::${changed} differs from ${ORIGINAL_SHA} but is not allowed at '$1'"; exit 1 ;; esac
+            done < "$EVIDENCE/identity-$1.txt"
+          }
+          prefix() { sed 's/^/ok - /' "$@"; }
+          # run_test NAME FILE PATTERN|- GATE(1|0): one node --test run of one file; raw streams, TAP and exit kept.
+          run_test() {
+            local name="$1" file="$2" pattern="$3" gate="$4" rc
+            set -- --require ./test-support/setup-env.js --test --test-concurrency=1
+            if [ "$pattern" != - ]; then set -- "$@" "--test-name-pattern=$pattern"; fi
+            set -- "$@" --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap "--test-reporter-destination=$RAW/$name.tap" "$file"
+            set +e
+            if [ "$gate" = 1 ]; then env -u TELEPTY_LEDGER_1207_TIERS TELEPTY_LEDGER_PERF_GATE=1 node "$@" > "$RAW/$name.stdout" 2> "$RAW/$name.stderr"
+            else env -u TELEPTY_LEDGER_1207_TIERS -u TELEPTY_LEDGER_PERF_GATE node "$@" > "$RAW/$name.stdout" 2> "$RAW/$name.stderr"; fi
+            rc=$?
+            set -e
+            echo "$rc" > "$EVIDENCE/$name.exit_code"
+            { tr -d '\r' < "$RAW/$name.tap" 2>/dev/null || true; } > "$RAW/$name.tap.lf"
+            { grep -E '^(not )?ok [0-9]+ - ' "$RAW/$name.tap.lf" || true; } | sed -E 's/^(not )?ok [0-9]+ - /\1ok - /' > "$EVIDENCE/$name.members"
+            tail -n 40 "$RAW/$name.stdout" | cut -c1-300 || true
+          }
+          rc_of() { cat "$EVIDENCE/$1.exit_code"; }
+          count() { local v; v="$({ grep -E "^# $2 [0-9]+$" "$RAW/$1.tap.lf" || true; } | tail -n 1 | awk '{print $3}')"; echo "${v:-missing}"; }
+          names_of() { sed -E 's/ # SKIP.*$//; s/^(not )?ok - //' "$EVIDENCE/$1.members" | LC_ALL=C sort; }
+          # membership NAME EXPECTED_LINES SKIPPABLE_NAMES → "yes <skipped>" or "no <skipped>". Exact selected lines; any
+          # other line must be "ok - <skippable> # SKIP…", all or none of the skippable names; no duplicates.
+          membership() {
+            local name="$1" ok=yes others=0 line nm total
+            : > "$RAW/$name.selected"; : > "$RAW/$name.others"
+            while IFS= read -r line; do
+              case "$line" in *" # SKIP"*) printf '%s\n' "$line" >> "$RAW/$name.others" ;; *) printf '%s\n' "$line" >> "$RAW/$name.selected" ;; esac
+            done < "$EVIDENCE/$name.members"
+            LC_ALL=C sort "$RAW/$name.selected" > "$RAW/$name.selected.sorted"
+            LC_ALL=C sort "$2" > "$RAW/$name.expected.sorted"
+            diff -u "$RAW/$name.expected.sorted" "$RAW/$name.selected.sorted" > "$EVIDENCE/$name.membership-diff" || ok=no
+            while IFS= read -r line; do
+              others=$((others + 1)); nm="${line#ok - }"; nm="${nm%% \# SKIP*}"
+              case "$line" in "ok - "*) ;; *) ok=no ;; esac
+              grep -qxF -- "$nm" "$3" || ok=no
+            done < "$RAW/$name.others"
+            total="$(grep -c . "$3" || true)"
+            if [ "$others" != 0 ] && [ "$others" != "$total" ]; then ok=no; fi
+            if [ -n "$(names_of "$name" | uniq -d)" ]; then ok=no; fi
+            echo "$ok $others"
+          }
+          # Exact count summary for a run that must be fully green with N passing selected tests.
+          green() { # green NAME EXPECTED_LINES SKIPPABLE N
+            local m s; m="$(membership "$1" "$2" "$3")"; s="${m#* }"
+            [ "$(rc_of "$1")" = 0 ] && [ "${m%% *}" = yes ] && [ "$(count "$1" pass)" = "$4" ] && [ "$(count "$1" fail)" = 0 ] \
+              && [ "$(count "$1" cancelled)" = 0 ] && [ "$(count "$1" todo)" = 0 ] && [ "$(count "$1" skipped)" = "$s" ]
+          }
+          # gate_lines NAME → the #1215 peer235 heartbeat_gate diagnostics of F2/R1, one per line.
+          gate_lines() { { grep -E '^ *# #1215 peer235 heartbeat_gate ' "$RAW/$1.tap.lf" || true; } | sed -E 's/^ *# //'; }
+          LIBRARY
+          source "$LIB/lib.sh"
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"
+          printf 'leg=%s\nos=%s\ncommit=%s\noriginal=%s\nnode=%s\nnpm=%s\ncore_autocrlf=%s\n' "$LEG" "$RUNNER_OS" "$GITHUB_SHA" "$ORIGINAL_SHA" \
+            "$NODE_VERSION" "$NPM_VERSION" "$(git config --get core.autocrlf || echo unset)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.2" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.2"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2"; exit 1; }
+          git cat-file -e "${ORIGINAL_SHA}^{commit}" || { echo "::error::original ${ORIGINAL_SHA} is not in this history; nothing was run"; exit 1; }
+          expect test/peer-forwarding-111.test.js 4b9eac35f5f94a7acbb2319251273b26591661b23049ef5d7a382edd7dd265d0
+          expect test/ledger-control-responsiveness-1207.test.js 8530faceccda6bed0ea0ee4d4eb640de371f6b80ffbc27128c409b88738df192
+          expect src/peer-forwarding.js 8ba0998d4cec78a4b1f175e1263a0d4a1da2d07dfa65f92ff0a5ef1dec62a33e
+          identity candidate ".github/workflows/peer-contract-1215.yml .github/workflows/test-install.yml test/ledger-control-responsiveness-1207.test.js test/peer-forwarding-111.test.js"
+
+      - name: npm ci (frozen lock, normal lifecycle; exit recorded)
+        id: install
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/peer235/lib.sh"
+          set +e
+          npm ci --no-audit --fund=false > "$RAW/npm-ci.stdout" 2> "$RAW/npm-ci.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/npm-ci.exit_code"
+          echo "npm ci exit=${rc}"
+          [ "$rc" = 0 ] || exit "$rc"
+
+      - name: Frozen controls — identical candidate cases in both legs, once each
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/peer235/lib.sh"
+          run_test controls-peer test/peer-forwarding-111.test.js '^\[peer235 ' 0
+          run_test controls-ledger test/ledger-control-responsiveness-1207.test.js '^\[peer235 ' 0
+          prefix "$LIB/peer_new.txt" > "$RAW/exp-controls-peer.txt"; prefix "$LIB/ledger_new.txt" > "$RAW/exp-controls-ledger.txt"
+          verdict=unexpected
+          if green controls-peer "$RAW/exp-controls-peer.txt" "$LIB/peer_pre.txt" 3 && green controls-ledger "$RAW/exp-controls-ledger.txt" "$LIB/ledger_pre.txt" 4; then verdict=green; fi
+          printf 'leg=%s\nos=%s\ncontrols_peer=exit %s pass %s fail %s skipped %s\ncontrols_ledger=exit %s pass %s fail %s skipped %s\nverdict=%s\n' "$LEG" "$RUNNER_OS" \
+            "$(rc_of controls-peer)" "$(count controls-peer pass)" "$(count controls-peer fail)" "$(count controls-peer skipped)" \
+            "$(rc_of controls-ledger)" "$(count controls-ledger pass)" "$(count controls-ledger fail)" "$(count controls-ledger skipped)" "$verdict" > "$EVIDENCE/verdict-controls.txt"
+          cat "$EVIDENCE/verdict-controls.txt"
+          echo "::notice title=peer235 ${RUNNER_OS} ${LEG} controls (diagnostic only)::verdict ${verdict}"
+          [ "$verdict" = green ]
+
+      - name: Fixture files — original (restored from ORIGINAL_SHA) or candidate, each alone, once
+        if: always() && steps.install.outcome == 'success'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/peer235/lib.sh"
+          if [ "$LEG" = original ]; then
+            git show "${ORIGINAL_SHA}:test/peer-forwarding-111.test.js" > test/peer-forwarding-111.test.js
+            git show "${ORIGINAL_SHA}:test/ledger-control-responsiveness-1207.test.js" > test/ledger-control-responsiveness-1207.test.js
+            expect test/peer-forwarding-111.test.js 66bc684f86f80c3c37a5696863d6167f8329bb99a25ef2d2901aa6973d1c964d
+            expect test/ledger-control-responsiveness-1207.test.js 919ba1c3b0e2c7d61a6f3e075b8f31a44f6e6e15f5f0ef1a0e3c6d32ce59a993
+            identity original-fixtures ".github/workflows/peer-contract-1215.yml .github/workflows/test-install.yml" tracked
+          fi
+          run_test fixture-peer test/peer-forwarding-111.test.js - 0
+          run_test fixture-ledger test/ledger-control-responsiveness-1207.test.js - 0
+          peer=unexpected; ledger=unexpected; performance=none
+          if [ "$LEG" = candidate ]; then
+            { prefix "$LIB/peer_pre.txt"; prefix "$LIB/peer_new.txt"; } > "$RAW/exp-fixture-peer.txt"
+            { prefix "$LIB/ledger_pre.txt"; prefix "$LIB/ledger_new.txt"; } > "$RAW/exp-fixture-ledger.txt"
+            if green fixture-peer "$RAW/exp-fixture-peer.txt" "$LIB/none.txt" 6; then peer=green; fi
+            gate_lines fixture-ledger > "$EVIDENCE/fixture-ledger.gate"
+            gates_ok=no
+            if [ "$(grep -c . "$EVIDENCE/fixture-ledger.gate" || true)" = 2 ] \
+               && [ "$({ grep -cE '^#1215 peer235 heartbeat_gate (F2|R1) \[1 MiB\] mode=ordinary functional=pass performance=(PASS|NOT-MEASURED) verdict=(pass|inconclusive)$' "$EVIDENCE/fixture-ledger.gate" || true; })" = 2 ] \
+               && [ "$(sed -E 's/^#1215 peer235 heartbeat_gate (F2|R1) .*$/\1/' "$EVIDENCE/fixture-ledger.gate" | LC_ALL=C sort | tr '\n' ' ')" = "F2 R1 " ]; then gates_ok=yes; fi
+            if green fixture-ledger "$RAW/exp-fixture-ledger.txt" "$LIB/none.txt" 8 && [ "$gates_ok" = yes ]; then ledger=green; fi
+            performance="$(sed -E 's/^#1215 peer235 heartbeat_gate (F2|R1) \[1 MiB\] .*performance=([A-Z-]+).*$/\1=\2/' "$EVIDENCE/fixture-ledger.gate" | LC_ALL=C sort | tr '\n' ' ')"
+          else
+            # Original files: names exact; outcome a pass, or ONLY the documented coupling signature.
+            prefix "$LIB/peer_pre.txt" > "$RAW/exp-fixture-peer.txt"; prefix "$LIB/ledger_pre.txt" > "$RAW/exp-fixture-ledger.txt"
+            P0="$(sed -n 1p "$LIB/peer_pre.txt")"; F2N="$(sed -n 1p "$LIB/ledger_pre.txt")"; R1N="$(sed -n 2p "$LIB/ledger_pre.txt")"
+            if [ "$(names_of fixture-peer)" = "$(LC_ALL=C sort "$LIB/peer_pre.txt")" ] && [ "$(count fixture-peer cancelled)" = 0 ]; then
+              if green fixture-peer "$RAW/exp-fixture-peer.txt" "$LIB/none.txt" 3; then peer=original_pass
+              elif [ "$(rc_of fixture-peer)" != 0 ] && [ "$(count fixture-peer fail)" = 1 ] && grep -qxF -- "not ok - $P0" "$EVIDENCE/fixture-peer.members" \
+                 && grep -qE '^ +expected: 200$' "$RAW/fixture-peer.tap.lf" && grep -qE '^ +actual: 202$' "$RAW/fixture-peer.tap.lf"; then peer=original_coupling_observed; fi
+            fi
+            if [ "$(names_of fixture-ledger)" = "$(LC_ALL=C sort "$LIB/ledger_pre.txt")" ] && [ "$(count fixture-ledger cancelled)" = 0 ]; then
+              if green fixture-ledger "$RAW/exp-fixture-ledger.txt" "$LIB/none.txt" 4; then ledger=original_pass
+              elif [ "$(rc_of fixture-ledger)" != 0 ] && { grep -E '^not ok - ' "$EVIDENCE/fixture-ledger.members" || true; } | sed 's/^not ok - //' | { grep -vxF -e "$F2N" -e "$R1N" || true; } | { ! grep -q .; } \
+                 && grep -qE "^ +actual: 'inconclusive'$" "$RAW/fixture-ledger.tap.lf" && ! grep -qE "^ +actual: 'fail'$" "$RAW/fixture-ledger.tap.lf"; then ledger=original_invalid_gate_failure; fi
+            fi
+          fi
+          printf 'leg=%s\nos=%s\nfixture_peer=exit %s pass %s fail %s -> %s\nfixture_ledger=exit %s pass %s fail %s -> %s\nordinary_performance=%s\n' "$LEG" "$RUNNER_OS" \
+            "$(rc_of fixture-peer)" "$(count fixture-peer pass)" "$(count fixture-peer fail)" "$peer" \
+            "$(rc_of fixture-ledger)" "$(count fixture-ledger pass)" "$(count fixture-ledger fail)" "$ledger" "$performance" > "$EVIDENCE/verdict-fixtures.txt"
+          cat "$EVIDENCE/verdict-fixtures.txt"
+          echo "::notice title=peer235 ${RUNNER_OS} ${LEG} fixtures (diagnostic only)::peer ${peer}; ledger ${ledger}; ordinary performance ${performance} (functional pass is not performance acceptance)"
+          case "$peer" in green|original_pass|original_coupling_observed) ;; *) exit 1 ;; esac
+          case "$ledger" in green|original_pass|original_invalid_gate_failure) ;; *) exit 1 ;; esac
+
+      - name: Candidate performance gate — same ledger file alone, once, TELEPTY_LEDGER_PERF_GATE=1 (valid pass required)
+        if: always() && matrix.leg == 'candidate' && steps.install.outcome == 'success'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/peer235/lib.sh"
+          run_test perf-ledger test/ledger-control-responsiveness-1207.test.js - 1
+          { prefix "$LIB/ledger_pre.txt"; prefix "$LIB/ledger_new.txt"; } > "$RAW/exp-perf-ledger.txt"
+          gate_lines perf-ledger > "$EVIDENCE/perf-ledger.gate"
+          verdict=perf_gate_not_valid
+          if green perf-ledger "$RAW/exp-perf-ledger.txt" "$LIB/none.txt" 8 \
+             && [ "$({ grep -cxE '#1215 peer235 heartbeat_gate (F2|R1) \[1 MiB\] mode=perf_gate functional=pass performance=PASS verdict=pass' "$EVIDENCE/perf-ledger.gate" || true; })" = 2 ] \
+             && [ "$(grep -c . "$EVIDENCE/perf-ledger.gate" || true)" = 2 ] \
+             && [ "$(sed -E 's/^#1215 peer235 heartbeat_gate (F2|R1) .*$/\1/' "$EVIDENCE/perf-ledger.gate" | LC_ALL=C sort | tr '\n' ' ')" = "F2 R1 " ]; then verdict=valid_pass; fi
+          printf 'os=%s\nperf_gate=exit %s pass %s fail %s\ngate_lines=%s\nverdict=%s\n' "$RUNNER_OS" "$(rc_of perf-ledger)" "$(count perf-ledger pass)" "$(count perf-ledger fail)" \
+            "$(grep -c . "$EVIDENCE/perf-ledger.gate" || true)" "$verdict" > "$EVIDENCE/verdict-perf.txt"
+          cat "$EVIDENCE/verdict-perf.txt" "$EVIDENCE/perf-ledger.gate"
+          echo "::notice title=peer235 ${RUNNER_OS} performance gate (diagnostic only)::verdict ${verdict}"
+          [ "$verdict" = valid_pass ]
+
+      - name: Bound evidence (allowlisted, <= 4 MiB; runs whatever the commands did)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          LIB="$RUNNER_TEMP/peer235"; EVIDENCE="$LIB/evidence"; RAW="$LIB/raw"
+          test -d "$EVIDENCE" && test -d "$RAW" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          : > "$EVIDENCE/capture-bounds.txt"
+          copy_capped() { # copy_capped NAME MAX_BYTES
+            if [ -f "$RAW/$1" ] && [ ! -L "$RAW/$1" ]; then
+              local size; size="$(wc -c < "$RAW/$1" | tr -d ' ')"
+              head -c "$2" "$RAW/$1" > "$EVIDENCE/$1"
+              printf '%s raw_bytes=%s kept_bytes=%s truncated=%s\n' "$1" "$size" "$(wc -c < "$EVIDENCE/$1" | tr -d ' ')" \
+                "$([ "$size" -gt "$2" ] && echo yes || echo no)" >> "$EVIDENCE/capture-bounds.txt"
+            else
+              printf '%s absent\n' "$1" >> "$EVIDENCE/capture-bounds.txt"
+            fi
+          }
+          copy_capped npm-ci.stdout 32768
+          copy_capped npm-ci.stderr 32768
+          for run in controls-peer controls-ledger fixture-peer fixture-ledger perf-ledger; do
+            copy_capped "$run.stdout" 262144
+            copy_capped "$run.stderr" 131072
+            copy_capped "$run.tap" 262144
+          done
+          cat "$EVIDENCE/capture-bounds.txt"
+          shopt -s dotglob nullglob
+          total=0
+          for f in "$EVIDENCE"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::non-regular evidence entry; not uploading"; exit 1; }
+            case "$(basename "$f")" in
+              toolchain.txt|input-hashes.txt|identity-candidate.txt|identity-original-fixtures.txt|capture-bounds.txt) ;;
+              npm-ci.exit_code|npm-ci.stdout|npm-ci.stderr|verdict-controls.txt|verdict-fixtures.txt|verdict-perf.txt) ;;
+              controls-peer.*|controls-ledger.*|fixture-peer.*|fixture-ledger.*|perf-ledger.*) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+            total=$((total + $(wc -c < "$f" | tr -d ' ')))
+          done
+          echo "evidence bytes=${total}"
+          [ "$total" -le 4194304 ] || { echo "::error::evidence is ${total} bytes (> 4 MiB); not uploading"; exit 1; }
+
+      - name: Upload evidence (no lockfile, credentials, cache or node_modules)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: peer-contract-1215-235-${{ matrix.os }}-${{ matrix.leg }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peer235/evidence
+          if-no-files-found: error
+          retention-days: 7

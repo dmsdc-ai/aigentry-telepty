@@ -12,6 +12,12 @@ const crypto = require('node:crypto');
 const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const grant = { enabled: true, operations: ['inject'], sessions: ['same@literal'], hop_limit: 1,
   max_payload_bytes: 128, max_requests: 8, window_ms: 60000, timeout_ms: 500 };
+// #1215 peer235 — the product-validated MAXIMUM operator grant (grantFor accepts integers 100–10000 ms), used for the legs
+// that need a real destination ANSWER so that runner latency is not the variable of a success test. It is not a product
+// deadline, default or latency SLA. `grant` (500 ms) stays the fixture value of the measurement and protocol legs.
+const SUCCESS_GRANT_TIMEOUT_MS = 10000;
+// Harness observation cap for one forward under that grant (product bound + daemon-harness margin), never a product deadline.
+const FORWARD_REQUEST_BUDGET_MS = SUCCESS_GRANT_TIMEOUT_MS + 2000;
 
 test('opt-in exact peer forwarding scopes authority, preserves receipts, deduplicates and retains timeout uncertainty', async () => {
   const source = await startTestDaemon({ env: { TELEPTY_AUTH_TOKEN: '' } });
@@ -39,12 +45,12 @@ test('opt-in exact peer forwarding scopes authority, preserves receipts, dedupli
     let peer = { transport: 'http', host: target.host, port: target.port, token: target.authToken() };
     const seed = () => fs.writeFileSync(file, JSON.stringify({ peers: { exact: peer } }));
     seed();
-    const request = (body, name = 'exact', sid = 'same@literal') => source.request(`/api/peers/${name}/sessions/${encodeURIComponent(sid)}/inject`, { method: 'POST', body });
+    const request = (body, name = 'exact', sid = 'same@literal') => source.request(`/api/peers/${name}/sessions/${encodeURIComponent(sid)}/inject`, { method: 'POST', body, timeoutMs: FORWARD_REQUEST_BUDGET_MS });
     const body = { prompt: 'Synthetic forwarded input', expected_epoch: remoteRegistration.body.session_epoch,
       idempotency_key: 'synthetic-forward-key-0001', no_enter: true };
     assert.equal((await request(body)).status, 403);
     assert.equal((await request(body, 'unknown')).body.code, 'PEER_UNKNOWN');
-    peer.forwarding = { ...grant }; seed();
+    peer.forwarding = { ...grant, timeout_ms: SUCCESS_GRANT_TIMEOUT_MS }; seed(); // #1215 peer235: success, not latency
     assert.equal((await request(body, 'exact', 'ungranted')).status, 403);
     assert.equal((await request({ ...body, prompt: 'x'.repeat(129) })).status, 403);
     assert.equal((await request({ ...body, url: 'http://example.invalid' })).status, 400);
@@ -78,7 +84,7 @@ test('opt-in exact peer forwarding scopes authority, preserves receipts, dedupli
       // source's ledger reserve and the forward, so it neither locates the source timer origin nor names the error.
       return JSON.stringify({ source: response.body, destination, source_call: {
         caller_elapsed_ms: callerElapsedMs,
-        grant_timeout_ms: grant.timeout_ms,
+        grant_timeout_ms: SUCCESS_GRANT_TIMEOUT_MS,
         interpretation: 'correlation only; includes harness and reserve time; does not identify the caught error',
       }, after_non_200: {
         observation_bound_ms: 3000,
@@ -164,7 +170,7 @@ test('opt-in exact peer forwarding scopes authority, preserves receipts, dedupli
     assert.equal(redirected.status, 202);
     assert.equal(redirected.body.state, 'outcome_unknown');
     assert.equal(redirectedRequests, 0);
-    peer = { ...peer, port: target.port, token: target.authToken(), forwarding: { ...grant, sessions: ['same@literal', 'not-created', 'broadcast'] } }; seed();
+    peer = { ...peer, port: target.port, token: target.authToken(), forwarding: { ...grant, timeout_ms: SUCCESS_GRANT_TIMEOUT_MS, sessions: ['same@literal', 'not-created', 'broadcast'] } }; seed();
     const missing = await request({ ...body, idempotency_key: 'synthetic-forward-key-0005' }, 'exact', 'not-created');
     assert.equal(missing.status, 404);
     assert.equal(missing.body.code, 'SESSION_NOT_FOUND');
@@ -375,5 +381,135 @@ test('[peer174] protocol control: an acceptance the real destination recorded bu
     assert.equal(query.status, 200);
     assert.equal(query.body.state, 'outcome_unknown');
     assert.equal(frames.length, 1);
+  });
+});
+
+// #1215 peer235 — frozen confirmation that success semantics were coupled to the 500 ms FIXTURE deadline, and that the
+// 10000 ms success grant decouples them without touching the product timeout path.
+// The caller is the REAL product route (registerPeerForwardRoutes via captureForwardRoutes). Its fetch is a
+// passthrough that hands the SAME url and init (the route's own AbortSignal.timeout(grant.timeout_ms), redirect:'error')
+// to the real global fetch and only records when that signal aborts. Its peer endpoint is a loopback relay in front of
+// a REAL destination daemon. On arrival the relay forwards the exact request (method, path, headers including
+// x-telepty-token, body bytes) to the destination at once, so the destination validates, deduplicates, delivers and
+// records exactly as for a direct call. It keeps the destination's complete real response and releases it (status,
+// content-type and body bytes unchanged) by a timer due at max(response complete, arrival + holdMs). A second request
+// is counted and never forwarded. Nothing fabricates a receipt or ignores the abort.
+// Causality: the route creates its timer before the request is sent, so with holdMs = 2 x the 500 ms grant the abort
+// is due at least 500 ms before the release. Both timers run in this one process and Node processes expired timers in
+// expiry order, so the abort is handled first even on a delayed event loop.
+const RELAY_HOLD_MS = 2 * grant.timeout_ms;
+function startRelay(target, clock, holdMs) {
+  const obs = { requests: 0, arrival_ms: null, destination_status: null, destination_complete_ms: null, destination_error: null,
+    release_ms: null, client_closed_before_release: null };
+  const at = () => performance.now() - clock.begun;
+  let releaseTimer = null;
+  const server = http.createServer((req, res) => {
+    obs.requests++;
+    if (obs.requests > 1) { req.resume(); res.writeHead(500); res.end(); return; } // counted, never forwarded
+    obs.arrival_ms = at();
+    let clientClosed = false;
+    res.on('close', () => { if (obs.release_ms === null) clientClosed = true; });
+    const chunks = [];
+    req.on('data', (chunk) => { chunks.push(chunk); });
+    req.on('end', () => {
+      const upstream = http.request({ host: target.host, port: target.port, method: req.method, path: req.url,
+        headers: { ...req.headers, host: `${target.host}:${target.port}` }, timeout: SUCCESS_GRANT_TIMEOUT_MS }, (answer) => {
+        const parts = [];
+        answer.on('data', (chunk) => { parts.push(chunk); });
+        answer.on('end', () => {
+          obs.destination_status = answer.statusCode; obs.destination_complete_ms = at();
+          const payload = Buffer.concat(parts);
+          // Re-armed for any remainder (a timer started from the cached loop time can fire before the full hold).
+          const fire = () => {
+            const left = obs.arrival_ms + holdMs - at();
+            if (left > 0) { releaseTimer = setTimeout(fire, Math.ceil(left)); return; }
+            releaseTimer = null;
+            obs.release_ms = at(); obs.client_closed_before_release = clientClosed;
+            if (res.destroyed || res.writableEnded) return;
+            res.writeHead(answer.statusCode, { 'content-type': answer.headers['content-type'] || 'application/json', 'content-length': payload.length });
+            res.end(payload);
+          };
+          releaseTimer = setTimeout(fire, Math.max(0, Math.ceil(obs.arrival_ms + holdMs - at())));
+        });
+      });
+      upstream.on('timeout', () => upstream.destroy(Object.assign(new Error('relay upstream bound'), { code: 'RELAY_UPSTREAM_BOUND' })));
+      upstream.on('error', (error) => { obs.destination_error = safeToken(error && error.code) || 'other'; if (!res.destroyed) res.destroy(); });
+      upstream.end(Buffer.concat(chunks));
+    });
+  });
+  return {
+    obs,
+    listen: () => new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port))),
+    close: () => new Promise((resolve) => { if (releaseTimer) clearTimeout(releaseTimer); server.closeAllConnections(); server.close(() => resolve()); }),
+  };
+}
+// Passthrough to the real global fetch with the identical init (signal included); records only the abort time.
+function signalObservedFetch(obs, clock) {
+  return (url, init) => {
+    obs.fetch_calls++;
+    if (init && init.signal) init.signal.addEventListener('abort', () => { if (obs.abort_ms === null) obs.abort_ms = performance.now() - clock.begun; }, { once: true });
+    return globalThis.fetch(url, init);
+  };
+}
+async function relayedForward(idempotencyKey, timeoutMs, holdMs, check) {
+  await withRealDestination(idempotencyKey, async ({ target, routeHome, frames, peer, body }) => {
+    const clock = { begun: performance.now() };
+    const relay = startRelay(target, clock, holdMs);
+    const port = await relay.listen();
+    const caller = { fetch_calls: 0, abort_ms: null, route_return_ms: null, grant_timeout_ms: timeoutMs, hold_ms: holdMs };
+    try {
+      const relayed = { ...peer, port, forwarding: { ...peer.forwarding, timeout_ms: timeoutMs } };
+      const routes = captureForwardRoutes({ sessions: {}, loadPeers: () => ({ peers: { relayed } }), homeDir: routeHome, fetch: signalObservedFetch(caller, clock) });
+      const forward = routes.get('POST /api/peers/:peer/sessions/:sid/inject');
+      const req = { params: { peer: 'relayed', sid: 'same@literal' }, body };
+      const first = await invokeRoute(forward, req);
+      caller.route_return_ms = performance.now() - clock.begun;
+      await waitFor(() => relay.obs.release_ms !== null || relay.obs.destination_error !== null, { timeoutMs: SUCCESS_GRANT_TIMEOUT_MS + 2000, description: 'relay release' });
+      const observed = await observeDestinationRow(target.homeDir, body.idempotency_key, 3000);
+      const evidence = () => JSON.stringify({ caller, relay: relay.obs, route: { status: first.status, state: safeToken(first.body && first.body.state), code: safeToken(first.body && first.body.code) },
+        destination: { state: observed.row ? observed.row.state : 'row_absent', remote_status: observed.row && Number.isInteger(observed.row.remote_status) ? observed.row.remote_status : null }, frames: frames.length });
+      // Setup boundary: the real destination must have answered 200 through the relay, exactly once.
+      assert.deepEqual({ requests: relay.obs.requests, destination_status: relay.obs.destination_status, destination_error: relay.obs.destination_error, fetch_calls: caller.fetch_calls },
+        { requests: 1, destination_status: 200, destination_error: null, fetch_calls: 1 }, `setup: ${evidence()}`);
+      assert.equal(observed.row && observed.row.state, 'accepted', evidence());
+      await waitFor(() => frames.length === 1, { description: 'one remote injection (peer235)' });
+      await check({ first, caller, relay: relay.obs, evidence });
+      const replay = await invokeRoute(forward, req);
+      assert.equal(replay.status, first.status, evidence());
+      if (first.status === 200) assert.equal(replay.body.inject_id, first.body.inject_id, evidence());
+      else assert.equal(replay.body.state, 'outcome_unknown', evidence());
+      assert.deepEqual({ fetch_calls: caller.fetch_calls, relay_requests: relay.obs.requests, frames: frames.length }, { fetch_calls: 1, relay_requests: 1, frames: 1 }, `replay never resends: ${evidence()}`);
+    } finally { await relay.close(); }
+  });
+}
+
+test('[peer235 PC1-original] a real destination response released after twice the original 500 ms grant: the real AbortSignal fires first, 202 outcome_unknown, delivered once, never resent', async () => {
+  await relayedForward('synthetic-forward-key-0235a', grant.timeout_ms, RELAY_HOLD_MS, ({ first, caller, relay, evidence }) => {
+    assert.equal(first.status, 202, `the original 500 ms success grant cannot observe a real 200 released after ${RELAY_HOLD_MS} ms: ${evidence()}`);
+    assert.equal(first.body.state, 'outcome_unknown', evidence());
+    assert.equal(first.body.code, 'PEER_OUTCOME_UNKNOWN', evidence());
+    assert.ok(caller.abort_ms !== null && caller.abort_ms < relay.release_ms, `causality: the route's own signal aborted before the real response was released: ${evidence()}`);
+    assert.ok(relay.release_ms - relay.arrival_ms >= RELAY_HOLD_MS, `the real response was held for the full hold: ${evidence()}`);
+  });
+});
+
+test('[peer235 PC1-success] the same delayed real response under the 10000 ms success grant is accepted: 200, exact receipt, one frame, replay never resends', async () => {
+  await relayedForward('synthetic-forward-key-0235b', SUCCESS_GRANT_TIMEOUT_MS, RELAY_HOLD_MS, ({ first, caller, relay, evidence }) => {
+    assert.equal(first.status, 200, evidence());
+    assert.equal(first.body.state, 'accepted', evidence());
+    assert.equal(first.body.routing_receipt.remote_inject_id, first.body.inject_id, evidence());
+    assert.equal(first.body.verified_foreign_identity, false, evidence());
+    assert.ok(relay.release_ms - relay.arrival_ms >= RELAY_HOLD_MS, `the 200 was released only after the hold, beyond the original grant: ${evidence()}`);
+    assert.deepEqual({ abort_before_return: caller.abort_ms !== null && caller.abort_ms < caller.route_return_ms, client_closed_before_release: relay.client_closed_before_release },
+      { abort_before_return: false, client_closed_before_release: false }, evidence());
+  });
+});
+
+test('[peer235 PC2] nondelayed positive control: the loopback relay is transparent under the 10000 ms success grant: 200, one frame, no resend', async () => {
+  await relayedForward('synthetic-forward-key-0235c', SUCCESS_GRANT_TIMEOUT_MS, 0, ({ first, relay, evidence }) => {
+    assert.equal(first.status, 200, evidence());
+    assert.equal(first.body.state, 'accepted', evidence());
+    assert.equal(first.body.routing_receipt.remote_inject_id, first.body.inject_id, evidence());
+    assert.equal(relay.client_closed_before_release, false, evidence());
   });
 });
