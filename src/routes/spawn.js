@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const { verifiedOwningPrincipal } = require('../principal/http');
 const { defaultSpawnAdmission } = require('../spawn-admission');
 const { isValidSessionId } = require('../session-id');
+const { ownPtyInputErrors } = require('../pty-input-lifecycle');
 
 const STRIPPED_SESSION_ENV_KEYS = [
   'CLAUDECODE',
@@ -129,6 +130,9 @@ function registerSpawnRoute(app, {
         cwd,
         env: customEnv
       });
+      // #1215 pipe196 — own the Windows agent input channel's errors before anything (including a rollback kill) can
+      // write to it; a failed input fences only this session (see src/pty-input-lifecycle.js).
+      const ptyInput = ownPtyInputErrors(ptyProcess, { sessionId: session_id, platform: os.platform() });
 
       const owningPrincipal = verifiedOwningPrincipal(req);
       const sessionRecord = {
@@ -150,6 +154,8 @@ function registerSpawnRoute(app, {
         outputRing: [],
         ready: true,
             };
+      // Non-enumerable, like retryNaturalExitCleanup: never serialized or listed.
+      Object.defineProperty(sessionRecord, 'ptyInput', { configurable: true, value: ptyInput });
       sessions[session_id] = sessionRecord;
       const saved = persistSessions();
       if (!saved || !saved.ok) {

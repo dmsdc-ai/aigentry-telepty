@@ -1,0 +1,192 @@
+name: PTY input lifecycle regression (task 1215 / pipe196, Windows, original vs fix)
+
+# Task 1215 / release1238 / pipe196 — DIAGNOSTIC COMPARISON of ONE frozen regression; not a release gate or full suite.
+#
+# MEASURED (separate, not reproduced here): Windows B full test:ci run 41295961906. owner-daemon-744-1.json shows the
+# daemon (pid 1352) died of an unhandled EPIPE `write` on node-pty's agent input socket, first written by
+# WindowsTerminal._doWrite.
+#
+# THIS RUN, once per leg (no rerun, retry, loop or continue-on-error), on the SAME integrated commit:
+#   original = dependency-B base BASE_SHA plus only the frozen test test/pty-input-lifecycle-1215.test.js. The workflow
+#              restores src/routes/spawn.js and scripts/test-suites.json from BASE_SHA and removes the new
+#              src/pty-input-lifecycle.js. The identity is then PROVEN with `git diff --name-only BASE_SHA`.
+#   fix      = BASE_SHA plus the frozen test, the two product files and the test registration (exact hashes below).
+# Both legs install the exact committed B package.json + package-lock.json with a genuine `npm ci` (normal lifecycle,
+# no --ignore-scripts), then run the frozen test once with the exact test:ci preload and flags.
+# Verdict, recorded separately from the raw exit code:
+#   - original must FAIL at the exact regression assertion, with the scope control passing (a setup error or an
+#     unexpected pass fails the leg);
+#   - fix must PASS unchanged.
+#
+# BOUNDS: job <= 10 min; npm ci <= 4 min; test <= 3 min; evidence <= 2 MiB allowlisted, retained 7 days even on failure.
+# The default bash shell is `-eo pipefail`, so errexit is disabled explicitly ONLY around each captured command and is
+# restored immediately: the raw rc is always recorded (the owner191 workflow lost test-ci.exit_code this way).
+# core.autocrlf stays the runner default, so checkout bytes are verified as sha256 with CR removed.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/pty-input-lifecycle-1215-196'
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: frozen PTY input regression on Windows (${{ matrix.leg }}) — diagnostic only
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [original, fix]
+    defaults:
+      run:
+        shell: bash
+    env:
+      LEG: ${{ matrix.leg }}
+      BASE_SHA: 5bd7af7cdc64a8f88168dd847a84c6ab33c24ef3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.2'
+
+      - name: Select and prove the leg's source identity (exact bytes, CR removed)
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/pty-input-1215-evidence"
+          mkdir "$EVIDENCE" "$RUNNER_TEMP/pty-input-1215-raw"
+          lf_sha() { tr -d '\r' < "$1" | sha256sum | cut -d' ' -f1; }
+          expect() {
+            local got; got="$(lf_sha "$1")"
+            printf '%s lf_sha256=%s\n' "$1" "$got" >> "$EVIDENCE/input-hashes.txt"
+            [ "$got" = "$2" ] || { echo "::error::$1 is not the reviewed body (lf_sha256 ${got}); nothing was run"; exit 1; }
+          }
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"
+          printf 'leg=%s\ncommit=%s\nbase=%s\nnode=%s\nnpm=%s\ncore_autocrlf=%s\n' "$LEG" "$GITHUB_SHA" "$BASE_SHA" "$NODE_VERSION" "$NPM_VERSION" \
+            "$(git config --get core.autocrlf || echo unset)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.2" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.2"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2"; exit 1; }
+          git cat-file -e "${BASE_SHA}^{commit}" || { echo "::error::base ${BASE_SHA} is not in this history; nothing was run"; exit 1; }
+          # Shared frozen bytes in both legs.
+          expect test/pty-input-lifecycle-1215.test.js 397759e3d56752802d35793c8cee8c487e0479a7763741ca6f2bbe2d2ebf51da
+          expect test-support/setup-env.js 9431f9e39b6051c95be8bd61929ebab3fc3317ad41f7cef6b9466bc6100fd4ef
+          expect package.json 974f5d7faf603108385277055e7407b7977c283bcf7bda8d07244fce10e109c9
+          expect package-lock.json 16eb17fc9cdd8a9aa09e1e7cca0248efa72b6cadf25a9bd142e431efa4d7ad61
+          case "$LEG" in
+            fix)
+              expect src/routes/spawn.js b2c64c31ac63e58ee3f83d26c91103cec9d769a06835538bc2127e0594ef98ef
+              expect src/pty-input-lifecycle.js 1dcdfd6d181504d7e30116652ff71649f624cfcae3655bdc3f3a765e2ed91954
+              expect scripts/test-suites.json 8d5d44e79255953a00b1fd65a419411001275ea93efca77c43cf5f43090b9015
+              ALLOWED=".github/workflows/pty-input-lifecycle-1215.yml scripts/test-suites.json src/pty-input-lifecycle.js src/routes/spawn.js test/pty-input-lifecycle-1215.test.js" ;;
+            original)
+              git show "${BASE_SHA}:src/routes/spawn.js" > src/routes/spawn.js
+              git show "${BASE_SHA}:scripts/test-suites.json" > scripts/test-suites.json
+              rm -f src/pty-input-lifecycle.js
+              expect src/routes/spawn.js 636ef813d6bfdae8fa28b4647f875ed3923ef9cba9a68ae95a9d5a529ba39766
+              expect scripts/test-suites.json 1382f0b24939ce4e53226be509fee6d029bb481de85f9b7a166ae2ffb8ee14d5
+              [ ! -e src/pty-input-lifecycle.js ] || { echo "::error::the candidate module is still present in the original leg"; exit 1; }
+              ALLOWED=".github/workflows/pty-input-lifecycle-1215.yml test/pty-input-lifecycle-1215.test.js" ;;
+            *) echo "::error::unknown leg"; exit 1 ;;
+          esac
+          # Identity proof: every path that differs from BASE_SHA (tracked changes plus untracked files) must be allowed.
+          { git diff --name-only "$BASE_SHA" --; git ls-files --others --exclude-standard; } | sort -u > "$EVIDENCE/identity-vs-base.txt"
+          cat "$EVIDENCE/identity-vs-base.txt"
+          while IFS= read -r changed; do
+            case " $ALLOWED " in *" $changed "*) ;; *) echo "::error::${changed} differs from ${BASE_SHA} but is not part of the ${LEG} leg"; exit 1 ;; esac
+          done < "$EVIDENCE/identity-vs-base.txt"
+
+      - name: npm ci (frozen B lock, normal lifecycle; exit recorded)
+        id: install
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/pty-input-1215-evidence"; RAW="$RUNNER_TEMP/pty-input-1215-raw"
+          set +e
+          npm ci --no-audit --fund=false > "$RAW/npm-ci.stdout" 2> "$RAW/npm-ci.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/npm-ci.exit_code"
+          echo "npm ci exit=${rc}"
+          [ "$rc" = 0 ] || exit "$rc"
+          for p in node-pty ws express zod @modelcontextprotocol/sdk; do
+            printf '%s=%s\n' "$p" "$(node -p "require('./node_modules/$p/package.json').version")"
+          done > "$EVIDENCE/installed-versions.txt"
+          cat "$EVIDENCE/installed-versions.txt"
+
+      - name: Run the frozen regression once (exact test:ci preload and flags; raw exit recorded)
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/pty-input-1215-evidence"; RAW="$RUNNER_TEMP/pty-input-1215-raw"
+          set +e
+          node --require ./test-support/setup-env.js --test --test-reporter=spec test/pty-input-lifecycle-1215.test.js > "$RAW/test.stdout" 2> "$RAW/test.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/test.exit_code"
+          tail -n 60 "$RAW/test.stdout" | cut -c1-400
+          regression_assertion=no; scope_control_passed=no; contract_passed=no
+          grep -q "the daemon-equivalent process died after the injected PTY input EPIPE" "$RAW/test.stdout" && regression_assertion=yes
+          grep -q "^✔ \[control\] an error on a stream the PTY input owner does not own stays fatal" "$RAW/test.stdout" && scope_control_passed=yes
+          grep -q "^✔ \[contract reproduction\]" "$RAW/test.stdout" && contract_passed=yes
+          case "$LEG" in
+            original)
+              if [ "$rc" != 0 ] && [ "$regression_assertion" = yes ] && [ "$scope_control_passed" = yes ] && [ "$contract_passed" = no ]; then verdict=expected_regression_failure; else verdict=unexpected; fi ;;
+            fix)
+              if [ "$rc" = 0 ] && [ "$contract_passed" = yes ] && [ "$scope_control_passed" = yes ]; then verdict=pass; else verdict=fail; fi ;;
+          esac
+          printf 'leg=%s\ntest_exit=%s\nregression_assertion=%s\nscope_control_passed=%s\ncontract_passed=%s\nverdict=%s\n' \
+            "$LEG" "$rc" "$regression_assertion" "$scope_control_passed" "$contract_passed" "$verdict" > "$EVIDENCE/verdict.txt"
+          cat "$EVIDENCE/verdict.txt"
+          echo "::notice title=pipe196 ${LEG} (diagnostic only)::test exit ${rc}; verdict ${verdict}"
+          case "$verdict" in expected_regression_failure|pass) exit 0 ;; *) exit 1 ;; esac
+
+      - name: Bound evidence (allowlisted, <= 2 MiB; runs whatever the commands did)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/pty-input-1215-evidence"; RAW="$RUNNER_TEMP/pty-input-1215-raw"
+          test -d "$EVIDENCE" && test -d "$RAW" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          : > "$EVIDENCE/capture-bounds.txt"
+          copy_capped() { # copy_capped NAME MAX_BYTES
+            if [ -f "$RAW/$1" ] && [ ! -L "$RAW/$1" ]; then
+              local size; size="$(wc -c < "$RAW/$1" | tr -d ' ')"
+              head -c "$2" "$RAW/$1" > "$EVIDENCE/$1"
+              printf '%s raw_bytes=%s kept_bytes=%s truncated=%s\n' "$1" "$size" "$(wc -c < "$EVIDENCE/$1" | tr -d ' ')" \
+                "$([ "$size" -gt "$2" ] && echo yes || echo no)" >> "$EVIDENCE/capture-bounds.txt"
+            else
+              printf '%s absent\n' "$1" >> "$EVIDENCE/capture-bounds.txt"
+            fi
+          }
+          copy_capped npm-ci.stdout 32768
+          copy_capped npm-ci.stderr 32768
+          copy_capped test.stdout 524288
+          copy_capped test.stderr 262144
+          for f in npm-ci.exit_code test.exit_code verdict.txt; do [ -f "$EVIDENCE/$f" ] || printf '%s absent (step not reached or ended by its bound)\n' "$f" >> "$EVIDENCE/capture-bounds.txt"; done
+          cat "$EVIDENCE/capture-bounds.txt"
+          shopt -s dotglob nullglob
+          total=0
+          for f in "$EVIDENCE"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::non-regular evidence entry; not uploading"; exit 1; }
+            case "$(basename "$f")" in
+              toolchain.txt|input-hashes.txt|identity-vs-base.txt|installed-versions.txt|capture-bounds.txt|npm-ci.exit_code|npm-ci.stdout|npm-ci.stderr|test.exit_code|test.stdout|test.stderr|verdict.txt) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+            total=$((total + $(wc -c < "$f" | tr -d ' ')))
+          done
+          echo "evidence bytes=${total}"
+          [ "$total" -le 2097152 ] || { echo "::error::evidence is ${total} bytes (> 2 MiB); not uploading"; exit 1; }
+
+      - name: Upload evidence (no lockfile, credentials, cache or node_modules)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: pty-input-lifecycle-1215-196-${{ matrix.leg }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pty-input-1215-evidence
+          if-no-files-found: error
+          retention-days: 7
