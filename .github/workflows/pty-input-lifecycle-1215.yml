@@ -1,0 +1,210 @@
+name: PTY input lifecycle + S24 regression (task 1215 / pipe200, Windows, original vs fix)
+
+# Task 1215 / release1238 / pipe200 — DIAGNOSTIC COMPARISON of TWO frozen contracts; not a release gate or full suite.
+#
+# MEASURED (separate, not reproduced here): Windows B full test:ci run 41295961906. owner-daemon-744-1.json shows the
+# daemon (pid 1352) died of an unhandled EPIPE `write` on node-pty's agent input socket, first written by
+# WindowsTerminal._doWrite.
+#
+# THIS RUN, once per leg (no rerun, retry, loop or continue-on-error), on the SAME integrated commit:
+#   original = dependency-B base BASE_SHA plus only the two frozen tests. The workflow restores the five product files
+#              and scripts/test-suites.json from BASE_SHA and removes the new src/pty-input-lifecycle.js. The identity is
+#              then PROVEN with `git diff --name-only BASE_SHA`.
+#   fix      = BASE_SHA plus the two frozen tests, the six product files and the test registration (exact hashes below).
+# Both legs install the exact committed B package.json + package-lock.json with a genuine `npm ci` (normal lifecycle,
+# no --ignore-scripts), then run both frozen test files once with the exact test:ci preload and flags.
+# Verdict, recorded separately from the raw exit code:
+#   original must FAIL at EXACTLY the two expected assertions, with every control passing. Those are the PTY contract
+#            exit assertion and the S24 "raw exception text reached the inject response" assertion. The controls are the
+#            PTY scope control, S24 reachability and S24 controls. A setup error, any other failure or an unexpected pass
+#            fails the leg;
+#   fix      must PASS all five tests unchanged.
+#
+# BOUNDS: job <= 10 min; npm ci <= 4 min; tests <= 3 min; evidence <= 2 MiB allowlisted, retained 7 days even on failure.
+# The default bash shell is `-eo pipefail`, so errexit is disabled explicitly ONLY around each captured command and is
+# restored immediately: the raw rc is always recorded (the owner191 workflow lost test-ci.exit_code this way).
+# core.autocrlf stays the runner default, so checkout bytes are verified as sha256 with CR removed.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/pty-input-lifecycle-1215-200'
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: frozen PTY input + S24 regressions on Windows (${{ matrix.leg }}) — diagnostic only
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [original, fix]
+    defaults:
+      run:
+        shell: bash
+    env:
+      LEG: ${{ matrix.leg }}
+      BASE_SHA: 5bd7af7cdc64a8f88168dd847a84c6ab33c24ef3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.2'
+
+      - name: Select and prove the leg's source identity (exact bytes, CR removed)
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/pty-input-1215-evidence"
+          mkdir "$EVIDENCE" "$RUNNER_TEMP/pty-input-1215-raw"
+          lf_sha() { tr -d '\r' < "$1" | sha256sum | cut -d' ' -f1; }
+          expect() {
+            local got; got="$(lf_sha "$1")"
+            printf '%s lf_sha256=%s\n' "$1" "$got" >> "$EVIDENCE/input-hashes.txt"
+            [ "$got" = "$2" ] || { echo "::error::$1 is not the reviewed body (lf_sha256 ${got}); nothing was run"; exit 1; }
+          }
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"
+          printf 'leg=%s\ncommit=%s\nbase=%s\nnode=%s\nnpm=%s\ncore_autocrlf=%s\n' "$LEG" "$GITHUB_SHA" "$BASE_SHA" "$NODE_VERSION" "$NPM_VERSION" \
+            "$(git config --get core.autocrlf || echo unset)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.2" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.2"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2"; exit 1; }
+          git cat-file -e "${BASE_SHA}^{commit}" || { echo "::error::base ${BASE_SHA} is not in this history; nothing was run"; exit 1; }
+          PRODUCT="src/routes/spawn.js src/mailbox/session-delivery.js src/mailbox/delivery-runtime.js src/transport/websocket.js src/routes/session-actions.js"
+          # Shared frozen bytes in both legs.
+          expect test/pty-input-lifecycle-1215.test.js 51079e41913ec3d749d5e09e14cd9cdddd1a16db6b4b76e9beb48ef332099455
+          expect test/inject-error-disclosure-1215.test.js cd7a9827ae4611c9590bc535681eb60855788887801604473cba17cefa642283
+          expect test-support/setup-env.js 9431f9e39b6051c95be8bd61929ebab3fc3317ad41f7cef6b9466bc6100fd4ef
+          expect package.json 974f5d7faf603108385277055e7407b7977c283bcf7bda8d07244fce10e109c9
+          expect package-lock.json 16eb17fc9cdd8a9aa09e1e7cca0248efa72b6cadf25a9bd142e431efa4d7ad61
+          case "$LEG" in
+            fix)
+              expect src/pty-input-lifecycle.js 0d749152d0e4791a34e079332236f5ac28c2161ce754328d654fb5e449482baf
+              expect src/routes/spawn.js 44cd806f68936b08578a74ba9f2b2c64de6abbd7bad4f0a73f50dc4fb40fcf32
+              expect src/mailbox/session-delivery.js 5109fb21a39bde30851e0a1e0414b44cf8cf21de16cb59b821bdd35551e36e80
+              expect src/mailbox/delivery-runtime.js 710860255af8e9dc19c48bd7d7df93495041d637f7f9a59622d309adb3ad6162
+              expect src/transport/websocket.js 6a1b6aa99653cc1dac4a021aa2cbc09875231dec0618bdcb1aa78203c282ee13
+              expect src/routes/session-actions.js 0e2aef69563049c4420986fae953b6da5f6ad86506327da48966b60e55257f12
+              expect scripts/test-suites.json 8d7208e384ec48fa173d5524f9060906c7c2daa0ffe424c128da53f58b0c2408
+              ALLOWED=".github/workflows/pty-input-lifecycle-1215.yml scripts/test-suites.json src/mailbox/delivery-runtime.js src/mailbox/session-delivery.js src/pty-input-lifecycle.js src/routes/session-actions.js src/routes/spawn.js src/transport/websocket.js test/inject-error-disclosure-1215.test.js test/pty-input-lifecycle-1215.test.js" ;;
+            original)
+              for f in $PRODUCT scripts/test-suites.json; do git show "${BASE_SHA}:${f}" > "$f"; done
+              rm -f src/pty-input-lifecycle.js
+              expect src/routes/spawn.js 636ef813d6bfdae8fa28b4647f875ed3923ef9cba9a68ae95a9d5a529ba39766
+              expect src/mailbox/session-delivery.js 4f70d665ae256e4f44c2bde06fdb24d8fdc0f671251c035921d368f7cb2c2f7d
+              expect src/mailbox/delivery-runtime.js d99138511d65ef6336d5ae24b3b8d2eaf94ff3d34b2cae0188c8075d858524b6
+              expect src/transport/websocket.js b341fae04d890542cbbb7e21c4fa442cfd8228651d6358fecf7529372f509133
+              expect src/routes/session-actions.js f4833517a63faf54c773ad6e73286d19f0f5fbc3122aff6ea88861be01a23386
+              expect scripts/test-suites.json 1382f0b24939ce4e53226be509fee6d029bb481de85f9b7a166ae2ffb8ee14d5
+              [ ! -e src/pty-input-lifecycle.js ] || { echo "::error::the candidate module is still present in the original leg"; exit 1; }
+              ALLOWED=".github/workflows/pty-input-lifecycle-1215.yml test/inject-error-disclosure-1215.test.js test/pty-input-lifecycle-1215.test.js" ;;
+            *) echo "::error::unknown leg"; exit 1 ;;
+          esac
+          # Identity proof: every path that differs from BASE_SHA (tracked changes plus untracked files) must be allowed.
+          { git diff --name-only "$BASE_SHA" --; git ls-files --others --exclude-standard; } | sort -u > "$EVIDENCE/identity-vs-base.txt"
+          cat "$EVIDENCE/identity-vs-base.txt"
+          while IFS= read -r changed; do
+            case " $ALLOWED " in *" $changed "*) ;; *) echo "::error::${changed} differs from ${BASE_SHA} but is not part of the ${LEG} leg"; exit 1 ;; esac
+          done < "$EVIDENCE/identity-vs-base.txt"
+
+      - name: npm ci (frozen B lock, normal lifecycle; exit recorded)
+        id: install
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/pty-input-1215-evidence"; RAW="$RUNNER_TEMP/pty-input-1215-raw"
+          set +e
+          npm ci --no-audit --fund=false > "$RAW/npm-ci.stdout" 2> "$RAW/npm-ci.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/npm-ci.exit_code"
+          echo "npm ci exit=${rc}"
+          [ "$rc" = 0 ] || exit "$rc"
+          for p in node-pty ws express zod @modelcontextprotocol/sdk; do
+            printf '%s=%s\n' "$p" "$(node -p "require('./node_modules/$p/package.json').version")"
+          done > "$EVIDENCE/installed-versions.txt"
+          cat "$EVIDENCE/installed-versions.txt"
+
+      - name: Run both frozen test files once (exact test:ci preload and flags; raw exit recorded)
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/pty-input-1215-evidence"; RAW="$RUNNER_TEMP/pty-input-1215-raw"
+          set +e
+          node --require ./test-support/setup-env.js --test --test-reporter=spec test/pty-input-lifecycle-1215.test.js test/inject-error-disclosure-1215.test.js \
+            > "$RAW/test.stdout" 2> "$RAW/test.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/test.exit_code"
+          tail -n 80 "$RAW/test.stdout" | cut -c1-400
+          has() { if grep -q "$1" "$RAW/test.stdout"; then echo yes; else echo no; fi; }
+          pty_assertion="$(has 'the daemon-equivalent process died after the injected PTY input EPIPE')"
+          s24_assertion="$(has 'raw exception text reached the inject response')"
+          pty_contract="$(has '^✔ \[contract reproduction\]')"
+          pty_scope="$(has '^✔ \[control\] an error on a stream the PTY input owner does not own stays fatal')"
+          s24_reach="$(has '^✔ \[S24 reachability\]')"
+          s24_negative="$(has '^✔ \[S24 negative\]')"
+          s24_controls="$(has '^✔ \[S24 controls\]')"
+          failed_count="$(grep -c '^✖ ' "$RAW/test.stdout" || true)"
+          case "$LEG" in
+            original)
+              if [ "$rc" != 0 ] && [ "$pty_assertion" = yes ] && [ "$s24_assertion" = yes ] && [ "$pty_contract" = no ] && [ "$s24_negative" = no ] \
+                && [ "$pty_scope" = yes ] && [ "$s24_reach" = yes ] && [ "$s24_controls" = yes ]; then verdict=expected_regression_failures; else verdict=unexpected; fi ;;
+            fix)
+              if [ "$rc" = 0 ] && [ "$pty_contract" = yes ] && [ "$pty_scope" = yes ] && [ "$s24_reach" = yes ] && [ "$s24_negative" = yes ] && [ "$s24_controls" = yes ]; then verdict=pass; else verdict=fail; fi ;;
+          esac
+          printf 'leg=%s\ntest_exit=%s\nfailed_lines=%s\npty_assertion=%s\ns24_assertion=%s\npty_contract=%s\npty_scope=%s\ns24_reachability=%s\ns24_negative=%s\ns24_controls=%s\nverdict=%s\n' \
+            "$LEG" "$rc" "$failed_count" "$pty_assertion" "$s24_assertion" "$pty_contract" "$pty_scope" "$s24_reach" "$s24_negative" "$s24_controls" "$verdict" > "$EVIDENCE/verdict.txt"
+          cat "$EVIDENCE/verdict.txt"
+          echo "::notice title=pipe200 ${LEG} (diagnostic only)::test exit ${rc}; verdict ${verdict}"
+          case "$verdict" in expected_regression_failures|pass) exit 0 ;; *) exit 1 ;; esac
+
+      - name: Bound evidence (allowlisted, <= 2 MiB; runs whatever the commands did)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/pty-input-1215-evidence"; RAW="$RUNNER_TEMP/pty-input-1215-raw"
+          test -d "$EVIDENCE" && test -d "$RAW" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          : > "$EVIDENCE/capture-bounds.txt"
+          copy_capped() { # copy_capped NAME MAX_BYTES
+            if [ -f "$RAW/$1" ] && [ ! -L "$RAW/$1" ]; then
+              local size; size="$(wc -c < "$RAW/$1" | tr -d ' ')"
+              head -c "$2" "$RAW/$1" > "$EVIDENCE/$1"
+              printf '%s raw_bytes=%s kept_bytes=%s truncated=%s\n' "$1" "$size" "$(wc -c < "$EVIDENCE/$1" | tr -d ' ')" \
+                "$([ "$size" -gt "$2" ] && echo yes || echo no)" >> "$EVIDENCE/capture-bounds.txt"
+            else
+              printf '%s absent\n' "$1" >> "$EVIDENCE/capture-bounds.txt"
+            fi
+          }
+          copy_capped npm-ci.stdout 32768
+          copy_capped npm-ci.stderr 32768
+          copy_capped test.stdout 524288
+          copy_capped test.stderr 262144
+          for f in npm-ci.exit_code test.exit_code verdict.txt; do [ -f "$EVIDENCE/$f" ] || printf '%s absent (step not reached or ended by its bound)\n' "$f" >> "$EVIDENCE/capture-bounds.txt"; done
+          cat "$EVIDENCE/capture-bounds.txt"
+          shopt -s dotglob nullglob
+          total=0
+          for f in "$EVIDENCE"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::non-regular evidence entry; not uploading"; exit 1; }
+            case "$(basename "$f")" in
+              toolchain.txt|input-hashes.txt|identity-vs-base.txt|installed-versions.txt|capture-bounds.txt|npm-ci.exit_code|npm-ci.stdout|npm-ci.stderr|test.exit_code|test.stdout|test.stderr|verdict.txt) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+            total=$((total + $(wc -c < "$f" | tr -d ' ')))
+          done
+          echo "evidence bytes=${total}"
+          [ "$total" -le 2097152 ] || { echo "::error::evidence is ${total} bytes (> 2 MiB); not uploading"; exit 1; }
+
+      - name: Upload evidence (no lockfile, credentials, cache or node_modules)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: pty-input-lifecycle-1215-200-${{ matrix.leg }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pty-input-1215-evidence
+          if-no-files-found: error
+          retention-days: 7

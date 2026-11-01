@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const { verifiedOwningPrincipal } = require('../principal/http');
 const { defaultSpawnAdmission } = require('../spawn-admission');
 const { isValidSessionId } = require('../session-id');
+const { ownPtyInputErrors } = require('../pty-input-lifecycle');
 
 const STRIPPED_SESSION_ENV_KEYS = [
   'CLAUDECODE',
@@ -129,6 +130,14 @@ function registerSpawnRoute(app, {
         cwd,
         env: customEnv
       });
+      // #1215 pipe200 — own the Windows agent input channel's errors before anything can write to it (see
+      // src/pty-input-lifecycle.js). An unsupported shape is never published as a writable session. This PTY was
+      // created by this request and has had no write and no kill, so the single rollback kill below is the only kill.
+      const ptyInput = ownPtyInputErrors(ptyProcess, { sessionId: session_id, platform: os.platform() });
+      if (ptyInput.state === 'unsupported') {
+        try { ptyProcess.kill(); } catch (error) { console.error('[SPAWN] Rollback kill failed:', error.message); }
+        return res.status(503).json({ error: 'PTY input channel cannot be supervised by this node-pty build.', code: 'PTY_INPUT_UNSUPPORTED' });
+      }
 
       const owningPrincipal = verifiedOwningPrincipal(req);
       const sessionRecord = {
@@ -150,6 +159,8 @@ function registerSpawnRoute(app, {
         outputRing: [],
         ready: true,
             };
+      // Non-enumerable, like retryNaturalExitCleanup: never serialized or listed.
+      Object.defineProperty(sessionRecord, 'ptyInput', { configurable: true, value: ptyInput });
       sessions[session_id] = sessionRecord;
       const saved = persistSessions();
       if (!saved || !saved.ok) {
