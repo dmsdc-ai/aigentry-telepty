@@ -90,32 +90,31 @@ function createLedgerClient(options = {}) {
     return result;
   }
   // #1215 native44 — used ONLY by open(), in the same synchronous run that assigns C.opening (no yield in
-  // between, so a concurrent open() always joins it): the exclusive create stays synchronous on
-  // this thread (its refusals keep their synchronous shapes; a second acquirer can never also create); the
-  // lock record's write + fsync + close run on the libuv threadpool (lock.acquireDurable). While pending,
+  // between, so a concurrent open() always joins it): lock152 — the kernel O_EXCL create, and then the
+  // lock record's write + fsync + close, all run on the libuv threadpool (lock.acquireDurable); a second
+  // acquirer can still never also create, and refusals are named when the create answers. While pending,
   // C.lockHeld stays false and open() waits for the durable outcome before any owner exists, so nothing is
   // served or reported available earlier. A durable-step failure is the existing `lock_error` (step write)
   // and the created file stays in place. native51: an injected fs without the callback API takes the
   // explicit synchronous acquire() instead of an async-labelled synchronous fallback.
+  // #1215 lock152 — the exclusive CREATE now runs off this thread too (lock.acquireDurable: kernel O_EXCL through
+  // the libuv threadpool; measured 158.61 ms synchronous openSync on the main thread, Windows CI 41279221489). The
+  // whole acquisition is the one pending promise C.lockDurable, assigned in this synchronous run, so a concurrent
+  // open() joins and close() waits for it exactly as for native44's durability step. A refusal (lock_present /
+  // lock_error at lock_dir, create or write) is named when the create answers, with lockRefused()'s exact state and
+  // reason. An injected fs without the full callback API keeps the explicit synchronous acquire() (native51).
   function acquireLockForOpen() {
-    if (!['write', 'fsync', 'close'].every((name) => typeof fs[name] === 'function')) return acquireLock();
+    if (!lock.hasAsyncLockApi(fs)) return acquireLock();
     C.token = crypto.randomBytes(16).toString('hex');
-    const result = lock.acquireDurable(lockPath, { pid: C.pid, token: C.token }, fs);
-    C.lockInfo = result;
-    if (result.created) {
-      const pending = result.durable.then((settled) => {
-        if (C.lockDurable === pending) C.lockDurable = null;
-        C.lockInfo = settled;
-        if (settled.held) { C.lockHeld = true; return settled; }
-        if (!C.closing && C.state !== 'closed') {
-          C.state = 'unavailable'; C.reason = settled.reason; C.reasonDetail = { lockPath, contents: null, code: settled.code || null };
-        }
-        return settled;
-      });
-      C.lockDurable = pending;
-      return { held: true, durable: false, lockPath, pid: C.pid, token: C.token };
-    }
-    return lockRefused(result);
+    const pending = lock.acquireDurable(lockPath, { pid: C.pid, token: C.token }, fs).then((settled) => {
+      if (C.lockDurable === pending) C.lockDurable = null;
+      C.lockInfo = settled;
+      if (settled.held) { C.lockHeld = true; return settled; }
+      if (!C.closing && C.state !== 'closed') lockRefused(settled);
+      return settled;
+    });
+    C.lockDurable = pending;
+    return { held: true, durable: false, lockPath, pid: C.pid, token: C.token };
   }
   function releaseLock() {
     if (!C.lockHeld) return { released: false, reason: 'not_held' };

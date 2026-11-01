@@ -368,6 +368,8 @@ function slowLockFs(lockPath, { failDurable = false } = {}) {
   gate.fs = new Proxy(fs, { get(target, key) {
     const real = target[key];
     if (key === 'openSync') return (p, ...rest) => { const fd = real.call(target, p, ...rest); if (p === lockPath) { gate.creates++; lockFds.add(fd); } return fd; };
+    // lock152: the same create count and lock-fd tracking for an ASYNCHRONOUS create of the lock path.
+    if (key === 'open') return (p, ...rest) => { const cb = rest.pop(); return real.call(target, p, ...rest, (error, fd) => { if (!error && p === lockPath) { gate.creates++; lockFds.add(fd); } cb(error, fd); }); };
     if (key === 'fsyncSync') return (fd, ...rest) => {
       if (!lockFds.has(fd)) return real.call(target, fd, ...rest);
       gate.syncCalls++; sleepSync(DURABILITY.delayMs);
@@ -558,4 +560,158 @@ test('restore lifecycle 4d (native51 regression, review D1): the daemon.js load-
   const opened = await next.runtime.restoreTrackedInjections();
   evidence.next_open = { ok: opened.ok, reason: opened.reason || null, state: next.ledgerClient.state };
   assert.equal(opened.ok, true, JSON.stringify(opened)); assert.equal(next.ledgerClient.state, 'available');
+}));
+
+// ------------------------------------------------------------------------------------------------
+// 5 — Task 1215 lock152 (frozen BEFORE the product edit). Measured cause (main Windows CI 41279221489): one 160.6 ms
+// main-loop gap in R1, 158.61 ms of it inside the SYNCHRONOUS O_EXCL openSync that creates tracked-injections.lock
+// during restoreTrackedInjections(). These cases go through the REAL restore -> ledger client -> ledger-lock
+// acquisition, with the REAL kernel O_CREAT|O_EXCL create underneath. The fixture makes that create deliberately SLOW
+// on BOTH paths:
+//   - a synchronous openSync of the lock path sleeps SLOW_CREATE.delayMs on the CALLING thread, then creates;
+//   - an asynchronous open of the lock path creates, then answers its callback SLOW_CREATE.delayMs later (off the
+//     calling thread).
+// `probe.reached` proves the slow create was really reached on whichever path the product takes, so a product that
+// stops calling the fixture cannot pass: an unreached create is a failure, never a skip. 5a is the regression
+// (expected RED on 1eabf752: the create blocks the main loop). 5b-5d are refusal/early-close/error controls (expected
+// GREEN on both). Author-written; NOT RUN in this phase.
+// ------------------------------------------------------------------------------------------------
+const SLOW_CREATE = Object.freeze({ delayMs: 300, stallBoundMs: 50, reachMs: 5000 });   // stallBoundMs = the existing #1207 heartbeat contract bound
+function slowCreateFs(lockPath) {
+  const probe = { reached: 0, sync: 0, async: 0, pending: 0 };
+  const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  probe.fs = new Proxy(fs, { get(target, key) {
+    const real = target[key];
+    if (key === 'openSync') return (p, ...rest) => {
+      if (p !== lockPath) return real.call(target, p, ...rest);
+      probe.reached++; probe.sync++;
+      sleepSync(SLOW_CREATE.delayMs);                 // a slow create on the CALLING thread ...
+      return real.call(target, p, ...rest);           // ... then the REAL exclusive create
+    };
+    if (key === 'open') return (p, ...rest) => {
+      if (p !== lockPath) return real.call(target, p, ...rest);
+      const callback = rest.pop();
+      probe.reached++; probe.async++; probe.pending++;
+      return real.call(target, p, ...rest, (error, fd) => {   // the REAL exclusive create ...
+        setTimeout(() => { probe.pending--; callback(error, fd); }, SLOW_CREATE.delayMs);   // ... answered late, off the calling thread
+      });
+    };
+    return real;
+  } });
+  return probe;
+}
+async function withSlowCreateStore(name, { lockPath = null } = {}, fn) {
+  const store = H.privateStore(`telepty-1207-slowcreate-${name}-`);
+  const effectiveLock = lockPath ? lockPath(store) : store.lockPath;
+  const probe = slowCreateFs(effectiveLock);
+  const counter = { constructed: 0 };
+  const build = (messages, R) => {
+    const Observed = H.makeObservedWorker(messages);
+    class CountingWorker extends Observed { constructor(...args) { super(...args); counter.constructed++; } }
+    return H.buildShared(store, R, { messages, clientOptions: { fs: probe.fs, Worker: CountingWorker, ...(lockPath ? { lockPath: effectiveLock } : {}) } });
+  };
+  const R = H.recorders(); const messages = { inbound: [], outbound: [] };
+  const built = build(messages, R);
+  const extra = [];
+  const evidence = { case: `slowcreate-${name}`, started_at: nowIso(), node: process.version, platform: process.platform, limits: SLOW_CREATE,
+    labels: { fault: 'client-injected fs: the lock path create only; sync = sleep on calling thread then real create, async = real create then late callback', inject: 'REAL captured inject handler (in-process call)' } };
+  let failed = true;
+  try { await fn({ store, lockPath: effectiveLock, probe, counter, R, messages, evidence, build, extra, ...built }); failed = false; } finally {
+    evidence.closed = await H.closeBounded(built.ledgerClient, LIMITS.closeMs);
+    for (const c of extra) await H.closeBounded(c, LIMITS.closeMs);
+    evidence.probe = { reached: probe.reached, sync: probe.sync, async: probe.async, pending: probe.pending }; evidence.workers_constructed = counter.constructed;
+    evidence.failed = failed; evidence.finished_at = nowIso();
+    const file = H.writeEvidence(EVIDENCE, `slowcreate-${name}.json`, evidence);
+    console.log(`[ledger-1207 slowcreate ${name}] evidence=${file}`);
+    if (failed) console.log(`[ledger-1207 slowcreate ${name}] FAILED — private HOME preserved: ${store.home}`);
+    else fs.rmSync(store.home, { recursive: true, force: true });
+  }
+}
+
+test('[lock152] restore lifecycle 5a (regression): a SLOW lock create never blocks the main loop (no gap >= 50 ms); the slow create is reached exactly once; while it is pending the store is recovering, not available, the lock is not held, no owner exists and the captured inject handler refuses 503 recovering with no delivery; afterwards one owner, available, and the REAL private lock names this client (expected RED on 1eabf752: the O_EXCL create runs synchronously on the main thread)', () => withSlowCreateStore('created', {}, async ({ store, probe, counter, R, messages, evidence, shared, runtime, injectHandler, ledgerClient }) => {
+  const meter = loopGapMeter();
+  const restoring = runtime.restoreTrackedInjections();
+  let settled = null; restoring.then((v) => { settled = v; });
+  const reached = await waitFor(() => probe.reached >= 1, SLOW_CREATE.reachMs);
+  const pendingWhenObserved = probe.pending;
+  const status = ledgerClient.status();
+  const during = { settled, state: ledgerClient.state, available: ledgerClient.isAvailable(), lock_held: status.lock.held, workers: counter.constructed, open_messages: openMessages(messages), shared: snap(shared) };
+  const res = H.makeRes();
+  await injectHandler(H.makeReq('while the lock create is pending', 'orch', 'w1'), res);
+  during.inject = { status: res.statusCode, code: res.body && res.body.code, reason: res.body && res.body.reason, deliveries: R.delivery.length };
+  const opened = await restoring;
+  const loop = meter.stop();
+  evidence.during = during; evidence.loop = loop; evidence.pending_when_observed = pendingWhenObserved;
+  evidence.opened = { ok: opened.ok, reason: opened.reason || null, workers: counter.constructed, open_messages: openMessages(messages), shared: snap(shared) };
+  assert.equal(reached, true, 'NON-VACUITY: the slow lock create was reached on the path the product takes');
+  assert.ok(loop.max_gap_ms < SLOW_CREATE.stallBoundMs, `the main loop never stalls >= ${SLOW_CREATE.stallBoundMs} ms while the lock is created (observed max gap ${loop.max_gap_ms} ms over ${loop.ticks} ticks; the slow create takes ${SLOW_CREATE.delayMs} ms)`);
+  assert.equal(probe.reached, 1, 'exactly one exclusive create');
+  assert.equal(pendingWhenObserved, 1, 'the slow create was still pending after the restore call returned (it did not complete on the calling thread)');
+  assert.equal(during.settled, null, 'the restore has not settled while the lock create is pending');
+  assert.equal(during.state, 'recovering'); assert.equal(during.available, false);
+  assert.equal(during.lock_held, false, 'a lock that is not yet created and durable is not reported held');
+  assert.equal(during.workers, 0, 'no owner Worker exists before the lock is created and durable');
+  assert.equal(during.open_messages, 0, 'no open message reached any owner before the lock is created and durable');
+  assert.equal(during.inject.status, 503, `refused while recovering (observed ${JSON.stringify(during.inject)})`);
+  assert.equal(during.inject.code, 'TRACKING_CAPACITY'); assert.equal(during.inject.reason, 'recovering');
+  assert.equal(during.inject.deliveries, 0, 'no delivery before the store is usable');
+  assert.equal(opened.ok, true, JSON.stringify(opened));
+  assert.equal(ledgerClient.isAvailable(), true); assert.equal(shared.trackedLedgerHealthy, true);
+  assert.equal(counter.constructed, 1, 'exactly one owner Worker'); assert.equal(openMessages(messages), 1);
+  assert.equal(ledgerClient.status().lock.held, true);
+  const contents = lockFile(store.lockPath);
+  assert.ok(contents && Number(contents.pid) === process.pid && contents.token === ledgerClient._internal.token, `the REAL lock names this client (${JSON.stringify(contents)})`);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(store.lockPath).mode & 0o777, 0o600, 'the lock stays private (0600)');
+}));
+
+for (const kind of ['foreign', 'unreadable']) test(`[lock152] restore lifecycle 5b (control, ${kind} lock): a ${kind === 'foreign' ? 'REAL foreign stale-owner' : 'unreadable'} lock at the lock path — the slow exclusive create is reached once and answers EEXIST; restore refuses by name lock_present, the client names lock_present, no owner is spawned, the captured inject handler keeps 503 TRACKING_CAPACITY / lock_present with no delivery, and the lock bytes are untouched (expected GREEN on 1eabf752 and on the candidate)`, () => withSlowCreateStore(`present-${kind}`, {}, async ({ store, probe, counter, R, messages, evidence, shared, runtime, injectHandler, ledgerClient }) => {
+  const foreign = { pid: 2147483646, token: crypto.randomBytes(16).toString('hex'), started_at: nowIso() };
+  const bytes = kind === 'foreign' ? Buffer.from(`${JSON.stringify(foreign)}\n`) : Buffer.from('not json');
+  fs.writeFileSync(store.lockPath, bytes, { mode: 0o600 });
+  const opened = await runtime.restoreTrackedInjections();
+  evidence.opened = { ok: opened.ok, state: opened.state || null, reason: opened.reason || null, lock: opened.lock ? { held: opened.lock.held, reason: opened.lock.reason, step: opened.lock.step } : null, shared: snap(shared) };
+  assert.equal(probe.reached, 1, 'NON-VACUITY: the slow exclusive create was attempted (and answered EEXIST)');
+  assert.equal(opened.ok, false); assert.equal(opened.reason, 'lock_present', JSON.stringify(opened));
+  assert.ok(opened.lock && opened.lock.reason === 'lock_present' && opened.lock.step === 'create', `classified at the create step (${JSON.stringify(opened.lock)})`);
+  assert.deepEqual(opened.lock.contents, kind === 'foreign' ? foreign : 'unreadable', 'the present lock is reported, never taken');
+  assert.equal(ledgerClient.state, 'lock_present'); assert.equal(ledgerClient.status().lock.held, false);
+  assert.equal(shared.trackedLedgerHealthy, false); assert.equal(shared.trackedLedgerUnavailableReason, 'lock_present');
+  assert.equal(counter.constructed, 0, 'no owner behind a present lock'); assert.equal(openMessages(messages), 0);
+  const res = H.makeRes();
+  await injectHandler(H.makeReq(`behind a ${kind} lock`, 'orch', 'w1'), res);
+  evidence.inject = { status: res.statusCode, body: res.body, deliveries: R.delivery.length };
+  assert.equal(res.statusCode, 503); assert.equal(res.body.code, 'TRACKING_CAPACITY'); assert.equal(res.body.reason, 'lock_present');
+  assert.equal(R.delivery.length, 0, 'no delivery');
+  assert.ok(fs.readFileSync(store.lockPath).equals(bytes), 'the present lock bytes are untouched (no stale-owner break)');
+}));
+
+test('[lock152] restore lifecycle 5c (control, early close): close() while the slow lock create is pending — the restore settles closed with no owner and no open message, and the lock this client created is released once its create and durability complete (never leaked, never resurrected); a fresh client for the store then opens available (expected GREEN on 1eabf752 and on the candidate)', () => withSlowCreateStore('close', {}, async ({ store, probe, counter, messages, evidence, build, extra, runtime, ledgerClient }) => {
+  const restoring = runtime.restoreTrackedInjections();
+  assert.equal(await waitFor(() => probe.reached >= 1, SLOW_CREATE.reachMs), true, 'NON-VACUITY: the slow lock create was reached');
+  const closing = ledgerClient.close(LIMITS.closeMs);
+  const [restored, closed] = await Promise.all([restoring, closing]);
+  evidence.restored = { ok: restored.ok, reason: restored.reason || null }; evidence.close = closed;
+  assert.equal(restored.ok, false); assert.equal(restored.reason, 'closed', JSON.stringify(restored));
+  assert.equal(counter.constructed, 0, 'no owner was resurrected after close'); assert.equal(openMessages(messages), 0);
+  assert.equal(ledgerClient.state, 'closed'); assert.equal(ledgerClient.isAvailable(), false);
+  assert.equal(closed.lock.released, true, `the client's own lock is released by close (${JSON.stringify(closed.lock)})`);
+  assert.equal(fs.existsSync(store.lockPath), false, 'no leaked lock file');
+  const next = build({ inbound: [], outbound: [] }, H.recorders()); extra.push(next.ledgerClient);
+  const reopened = await next.runtime.restoreTrackedInjections();
+  evidence.reopened = { ok: reopened.ok, reason: reopened.reason || null, state: next.ledgerClient.state };
+  assert.equal(reopened.ok, true, JSON.stringify(reopened)); assert.equal(next.ledgerClient.state, 'available');
+}));
+
+test('[lock152] restore lifecycle 5d (control, error propagation): the lock directory is a regular FILE — restore refuses by name lock_error classified at the lock_dir step, the client is unavailable/lock_error, the create step is never reached, nothing is created under the file and no owner is spawned (expected GREEN on 1eabf752 and on the candidate)', () => withSlowCreateStore('notdir', { lockPath: (store) => path.join(store.parent, 'blocked', 'tracked-injections.lock') }, async ({ store, lockPath, probe, counter, messages, evidence, shared, runtime, ledgerClient }) => {
+  const blocker = path.dirname(lockPath);
+  fs.writeFileSync(blocker, 'not a directory');
+  const opened = await runtime.restoreTrackedInjections();
+  evidence.opened = { ok: opened.ok, state: opened.state || null, reason: opened.reason || null, lock: opened.lock ? { held: opened.lock.held, reason: opened.lock.reason, step: opened.lock.step, code: opened.lock.code } : null, shared: snap(shared) };
+  assert.equal(opened.ok, false); assert.equal(opened.reason, 'lock_error', JSON.stringify(opened));
+  assert.ok(opened.lock && opened.lock.reason === 'lock_error' && opened.lock.step === 'lock_dir', `classified at the lock_dir step (${JSON.stringify(opened.lock)})`);
+  assert.equal(ledgerClient.state, 'unavailable'); assert.equal(ledgerClient.reason, 'lock_error');
+  assert.equal(shared.trackedLedgerHealthy, false); assert.equal(shared.trackedLedgerUnavailableReason, 'lock_error');
+  assert.equal(probe.reached, 0, 'the create step is never reached when the lock directory cannot be made');
+  assert.equal(fs.readFileSync(blocker, 'utf8'), 'not a directory', 'the blocking file is untouched');
+  assert.equal(counter.constructed, 0); assert.equal(openMessages(messages), 0);
 }));

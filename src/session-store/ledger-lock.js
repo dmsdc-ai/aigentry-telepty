@@ -9,18 +9,22 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-function readLock(lockPath, fsImpl = fs) {
+function lockFromText(text) {
   try {
-    const text = fsImpl.readFileSync(lockPath, 'utf8');
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { readable: true, contents: parsed, raw: text };
-      return { readable: false, contents: 'unreadable', raw: text };
-    } catch { return { readable: false, contents: 'unreadable', raw: text }; }
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return { readable: false, contents: 'absent', raw: null, error: 'ENOENT' };
-    return { readable: false, contents: 'unreadable', raw: null, error: error && error.code };
-  }
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { readable: true, contents: parsed, raw: text };
+    return { readable: false, contents: 'unreadable', raw: text };
+  } catch { return { readable: false, contents: 'unreadable', raw: text }; }
+}
+function lockFromReadError(error) {
+  if (error && error.code === 'ENOENT') return { readable: false, contents: 'absent', raw: null, error: 'ENOENT' };
+  return { readable: false, contents: 'unreadable', raw: null, error: error && error.code };
+}
+
+function readLock(lockPath, fsImpl = fs) {
+  let text;
+  try { text = fsImpl.readFileSync(lockPath, 'utf8'); } catch (error) { return lockFromReadError(error); }
+  return lockFromText(text);
 }
 
 /**
@@ -37,7 +41,8 @@ function lockFailure(lockPath, step, error, extra = {}) {
   return { held: false, reason: 'lock_error', step, lockPath, code: error && error.code, message: error && error.message, ...extra };
 }
 
-// #1215 native44 — the synchronous EXCLUSIVE step shared by acquire() and acquireDurable(): the lock
+// #1215 native44 — the synchronous EXCLUSIVE step of acquire() (acquireDurable reaches it only through its
+// sync-API fallback to acquire(); lock152 moved acquireDurable's own create off the calling thread): the lock
 // directory and the O_EXCL create, classified exactly as before. Returns a failure result, or
 // `{ fd, body }` once this call has created the lock file (exclusivity is decided here, before return).
 function createExclusive(lockPath, { pid, token, startedAt }, fsImpl) {
@@ -74,39 +79,47 @@ function acquire(lockPath, { pid = process.pid, token, startedAt = new Date().to
 }
 
 /**
- * #1215 native44 — acquire() with its DURABILITY step off the calling thread (measured: a 258 ms
- * fsyncSync on the daemon main thread inside the ledger open, Windows CI, df4cb86).
+ * #1215 native44 + lock152 — acquire() with BOTH its exclusive step and its durability step off the
+ * calling thread. Measured on the daemon main thread inside the ledger open (Windows CI): a 258 ms
+ * fsyncSync (native44, df4cb86), then a 158.61 ms O_EXCL openSync of this lock (lock152, run 41279221489).
  *
- * The exclusive step (mkdirSync + O_EXCL openSync, and readLock on EEXIST) is still synchronous, so
- * its failures are returned synchronously with acquire()'s exact shapes and two acquirers can never
- * both create. When this call created the file it returns `{ created: true, lockPath, pid, token,
- * durable }`. `durable` never rejects and settles to exactly what acquire() returns for the write step:
- * `{ held: true, lockPath, pid, token }` after write + fsync + close completed through fs's callback
- * API (libuv threadpool), or `{ held: false, reason: 'lock_error', step: 'write', ... }` with the created
- * file left in place, never unlinked. Until `durable` reports held the lock is NOT durable and a caller
- * must not spawn an owner, serve the store or report it available.
+ * The exclusive step is the SAME mkdir (recursive, 0700) and the SAME kernel O_CREAT|O_EXCL|O_WRONLY 0600
+ * create as createExclusive(), issued through fs's callback API (libuv threadpool) and classified exactly
+ * as there: only an EEXIST from the create is `lock_present` (with the present lock read, never taken);
+ * a directory failure is `lock_error` step lock_dir; any other create errno is `lock_error` step create.
+ * Exclusivity is still decided by the kernel create, so two acquirers can never both create.
  *
- * An injected fsImpl without the callback API (write/fsync/close) is driven through its sync API —
- * that path blocks the caller exactly like acquire(); production passes node:fs, which always has it.
+ * Returns a promise that never rejects and settles to exactly what acquire() returns:
+ * `{ held: true, lockPath, pid, token }` after create + write + fsync + close, or acquire()'s refusal
+ * shapes. A write-step failure leaves the created file in place, never unlinked. Until it settles held the
+ * lock is NOT created-and-durable, and a caller must not spawn an owner, serve the store or report it
+ * available. An invalid token still throws synchronously, as before.
+ *
+ * An injected fsImpl without the full callback API (mkdir/open/readFile/write/fsync/close) is driven
+ * through acquire() — that path blocks the caller exactly like acquire(); production passes node:fs.
  */
+const ASYNC_LOCK_API = Object.freeze(['mkdir', 'open', 'readFile', 'write', 'fsync', 'close']);
+function hasAsyncLockApi(fsImpl) { return ASYNC_LOCK_API.every((name) => typeof fsImpl[name] === 'function'); }
 function acquireDurable(lockPath, { pid = process.pid, token, startedAt = new Date().toISOString() } = {}, fsImpl = fs) {
-  const created = createExclusive(lockPath, { pid, token, startedAt }, fsImpl);
-  if (!('fd' in created)) return created;
-  const { fd, body } = created;
-  const held = { held: true, lockPath, pid, token };
-  if (!['write', 'fsync', 'close'].every((name) => typeof fsImpl[name] === 'function')) {
-    let settled;
-    try { fsImpl.writeSync(fd, body); fsImpl.fsyncSync(fd); } catch (error) {
-      try { fsImpl.closeSync(fd); } catch { /* best effort */ }
-      settled = lockFailure(lockPath, 'write', error);
-    }
-    if (!settled) { try { fsImpl.closeSync(fd); settled = held; } catch (error) { settled = lockFailure(lockPath, 'write', error); } }
-    return { created: true, lockPath, pid, token, durable: Promise.resolve(settled) };
-  }
+  if (typeof token !== 'string' || !token) throw new TypeError('ledger-lock: token required');
+  if (!hasAsyncLockApi(fsImpl)) return Promise.resolve(acquire(lockPath, { pid, token, startedAt }, fsImpl));
   const call = (name, ...args) => new Promise((resolve, reject) => {
     try { fsImpl[name](...args, (error, value) => (error ? reject(error) : resolve(value))); } catch (error) { reject(error); }
   });
-  const durable = (async () => {
+  return (async () => {
+    try { await call('mkdir', path.dirname(lockPath), { recursive: true, mode: 0o700 }); } catch (error) {
+      return lockFailure(lockPath, 'lock_dir', error, error && error.code === 'EEXIST' ? { detail: 'lock_dir_not_directory' } : {});
+    }
+    let fd;
+    try { fd = await call('open', lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600); } catch (error) {
+      if (error && error.code === 'EEXIST') {
+        let current;
+        try { current = lockFromText(await call('readFile', lockPath, 'utf8')); } catch (readError) { current = lockFromReadError(readError); }
+        return { held: false, reason: 'lock_present', step: 'create', lockPath, contents: current.readable ? current.contents : 'unreadable' };
+      }
+      return lockFailure(lockPath, 'create', error);
+    }
+    const body = JSON.stringify({ pid, token, started_at: startedAt }) + '\n';
     try {
       await call('write', fd, body);
       await call('fsync', fd);
@@ -116,9 +129,8 @@ function acquireDurable(lockPath, { pid = process.pid, token, startedAt = new Da
       return lockFailure(lockPath, 'write', error);
     }
     try { await call('close', fd); } catch (error) { return lockFailure(lockPath, 'write', error); }
-    return held;
+    return { held: true, lockPath, pid, token };
   })();
-  return { created: true, lockPath, pid, token, durable };
 }
 
 /** True iff the lock exists, is readable and names exactly this `{pid, token}`. */
@@ -158,4 +170,4 @@ async function operatorUnlock(lockPath, { confirm = false, daemonState = null, i
   return { unlocked: true, lockPath, contents: current.contents };
 }
 
-module.exports = { acquire, acquireDurable, verify, release, readLock, operatorUnlock };
+module.exports = { acquire, acquireDurable, hasAsyncLockApi, verify, release, readLock, operatorUnlock };
