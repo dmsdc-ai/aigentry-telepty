@@ -435,3 +435,101 @@ test('[observe148] a request timeout records the pending stage: body when header
     assert.ok(Number.isInteger(error.timer_late_ms) && error.timer_late_ms >= 0);
   } finally { await stub.close(); }
 });
+
+// Task 1215 diag153 — failure-only cleanup evidence for TRANSPORT failures (not HARNESS_REQUEST_TIMEOUT). The harness
+// rethrows the ORIGINAL error with ONE fixed-shape `cleanup_diagnostic` ({trigger:'transport', failure, daemon,
+// markers, probe}). `probe` is the same at-most-once-per-daemon observe148 episode, so a timeout and a transport
+// failure on one daemon can never both probe. Markers come from the owned daemon's own captured output and keep only
+// whitelisted error names, code tokens, stack function names, fatal-marker booleans and fixed line-prefix counts.
+const { diagnosticLogMarkers } = require('../test-support/daemon-harness');
+const DIAG_TOKEN_SHAPE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+test('[diag153] a transport failure in cleanup rethrows the ORIGINAL error with one fixed-shape, non-recursive diagnostic', { timeout: 30000 }, async () => {
+  const stub = await ownedStub('reset'); // every route, including the episode's probes, resets the connection
+  const harness = await startTestDaemon();
+  started.push(harness);
+  const from = `http://${harness.host}:${harness.port}`, realFetch = globalThis.fetch;
+  try {
+    let first, second;
+    globalThis.fetch = (input, init) => realFetch(String(input).startsWith(from) ? stub.origin + String(input).slice(from.length) : input, init);
+    try {
+      first = await harness.cleanupSessions().then(() => null, (e) => e);
+      second = await harness.cleanupSessions().then(() => null, (e) => e);
+    } finally { globalThis.fetch = realFetch; }
+    assert.ok(first instanceof TypeError, `PRECONDITION: the cleanup failed on the transport: ${first && first.name}`);
+    assert.equal(first.code, undefined, 'the original error is not re-typed');
+    const d = first.cleanup_diagnostic;
+    assert.equal(d && d.trigger, 'transport', JSON.stringify(d));
+    assert.equal(d.failure.name, 'TypeError');
+    assert.ok(d.failure.cause_code === null || DIAG_TOKEN_SHAPE.test(d.failure.cause_code), `cause code is a bounded token: ${d.failure.cause_code}`);
+    assert.ok(Number.isInteger(d.failure.at_ms) && d.failure.at_ms >= 0, 'failure time is relative to the cleanup start');
+    assert.deepEqual({ exited: d.daemon.exited, exit_code: d.daemon.exit_code, exit_signal: d.daemon.exit_signal, exited_at_ms: d.daemon.exited_at_ms },
+      { exited: false, exit_code: null, exit_signal: null, exited_at_ms: null }, 'the owned daemon was still running');
+    assert.equal(d.probe && d.probe.episode, 'ran', 'the one bounded episode ran');
+    assert.ok(d.probe.budget_ms <= 2000, `the episode is bounded: ${d.probe.budget_ms}`);
+    assert.equal(d.probe.health.answered, false); assert.equal(d.probe.meta.answered, false);
+    for (const stream of ['stderr', 'stdout']) {
+      const m = d.markers[stream];
+      assert.ok(m && Array.isArray(m.error_names) && Array.isArray(m.error_codes) && Array.isArray(m.stack_functions), `${stream} markers are fixed-shape`);
+      assert.ok(m.error_names.length <= 8 && m.error_codes.length <= 8 && m.stack_functions.length <= 8, `${stream} markers are bounded`);
+    }
+    assert.ok(second && second.cleanup_diagnostic && second.cleanup_diagnostic.probe.episode === 'already_used', 'at most ONE episode per daemon');
+    assert.deepEqual(stub.seen, ['GET /api/sessions', 'GET /api/health', 'GET /api/meta', 'GET /api/sessions'],
+      'one episode, no retry, no recursive cleanup request');
+    const token = harness.authToken(), text = JSON.stringify(d) + JSON.stringify(second.cleanup_diagnostic);
+    for (const secret of [token, stub.origin, harness.homeDir].filter(Boolean)) assert.ok(!text.includes(secret), 'no token, origin or home path');
+  } finally {
+    globalThis.fetch = realFetch;
+    await harness.stop().catch(() => {});
+    if (harness.isAlive()) await harness.kill().catch(() => {});
+    await stub.close();
+  }
+});
+
+test('[diag153] an exited owned daemon is distinguished from a refused or reset transport', { timeout: 30000 }, async () => {
+  const harness = await startTestDaemon();
+  started.push(harness);
+  try {
+    await harness.kill();
+    assert.equal(harness.isAlive(), false, 'PRECONDITION: the owned daemon exited');
+    const error = await harness.cleanupSessions().then(() => null, (e) => e);
+    assert.ok(error instanceof TypeError, `PRECONDITION: the dead port failed on the transport: ${error && error.name}`);
+    const d = error.cleanup_diagnostic;
+    assert.equal(d && d.trigger, 'transport', JSON.stringify(d));
+    assert.equal(d.daemon.exited, true, 'the diagnostic says the owned process had exited');
+    assert.ok(Number.isInteger(d.daemon.exit_code) || (typeof d.daemon.exit_signal === 'string' && /^SIG[A-Z0-9]+$/.test(d.daemon.exit_signal)),
+      `exit code or signal recorded: ${JSON.stringify(d.daemon)}`);
+    assert.ok(Number.isInteger(d.daemon.exited_at_ms) && d.daemon.exited_at_ms <= d.failure.at_ms, 'the exit preceded the failed request');
+    assert.equal(d.probe && d.probe.episode, 'skipped_daemon_exited', 'no probe of a dead daemon');
+  } finally {
+    if (harness.isAlive()) await harness.kill().catch(() => {});
+  }
+});
+
+test('[diag153] daemon log markers keep only whitelisted names, codes and stack function names, bounded', () => {
+  const secretToken = 'ESECRETTOKENX', prompt = 'echo do-not-leak-PROMPT-71';
+  const log = [
+    '[DAEMON] listening on http://127.0.0.1:51234',
+    `[KILL] Session sess-SECRETID-1 removed (${prompt})`,
+    `Uncaught TypeError: Cannot read properties of undefined (reading 'kill') token=${secretToken}`,
+    '    at WindowsPtyAgent.kill (C:\\Users\\runneradmin\\secret-dir\\node_modules\\node-pty\\lib\\windowsPtyAgent.js:1:2)',
+    '    at async handleDelete (/home/runner/private/route.js:3:4)',
+    '    at C:\\Users\\runneradmin\\anonymous.js:9:9',
+    'Error: EPIPE: broken pipe, write',
+    `code: 'ERR_SOCKET_CLOSED' ${secretToken}`,
+    ...Array.from({ length: 20 }, (_, i) => `ERR_SYNTH_${String.fromCharCode(65 + i)}`),
+  ].join('\n');
+  const m = diagnosticLogMarkers(log, { scrub: [secretToken] });
+  assert.deepEqual(m.error_names, ['TypeError', 'Error']);
+  assert.ok(m.error_codes.includes('EPIPE') && m.error_codes.includes('ERR_SOCKET_CLOSED'), JSON.stringify(m.error_codes));
+  assert.ok(m.error_codes.length <= 8, 'codes are bounded');
+  assert.deepEqual(m.stack_functions, ['WindowsPtyAgent.kill', 'handleDelete'], 'function names only, never paths');
+  assert.equal(m.fatal.uncaught_exception, true);
+  assert.equal(m.line_prefix_counts['[KILL]'], 1); assert.equal(m.line_prefix_counts['[DAEMON]'], 1);
+  const text = JSON.stringify(m);
+  for (const leak of [secretToken, 'SECRETID', 'do-not-leak', 'PROMPT', 'Users', 'runner', 'home', 'reading', '51234', 'broken pipe'])
+    assert.ok(!text.includes(leak), `no raw log content: ${leak}`);
+  const big = diagnosticLogMarkers('x'.repeat(200000) + '\nRangeError: y');
+  assert.ok(big.window_bytes <= 65536, 'the scanned window is bounded'); assert.deepEqual(big.error_names, ['RangeError']);
+  assert.deepEqual(diagnosticLogMarkers(undefined).error_names, [], 'absent output is empty, never a throw');
+});

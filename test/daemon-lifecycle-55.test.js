@@ -146,6 +146,37 @@ function observeOwnedDaemon({ pid, home }, port, spawnedAt, timeoutMs) {
   });
 }
 
+// Task 1215 diag153 (failure-only, owned fixture daemon only): after runCli's unchanged bound has already failed a case,
+// watch ONLY the owned daemon pid (signal 0, no process-table scan) every `intervalMs` for at most `maxMs` from the watch
+// start. Results:
+//   - `exited`, with `exit_after_timeout_ms` measured from `since` (the moment the bound fired);
+//   - `still_alive` at the bound;
+//   - `unknown` (no valid pid, or an indeterminate liveness answer).
+// It reports and never decides: the case stays failed, and the CLI was already killed, so a later exit does not show
+// the CLI would have succeeded. Bounds: 12000 ms max at 100 ms intervals, which fits inside the per-file 60 s
+// diagnostic cap (this file took 37.4 s there, including the failed case).
+const POST_FAILURE_WATCH_MS = 12000, POST_FAILURE_WATCH_INTERVAL_MS = 100;
+const POST_FAILURE_WATCH_NOTE = 'the CLI was already killed at its bound; a later daemon exit does not show the CLI would have succeeded';
+function ownedPidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e && e.code === 'ESRCH' ? false : (e && e.code === 'EPERM' ? true : null); }
+}
+async function watchOwnedPidExit(pid, { since = Date.now(), maxMs = POST_FAILURE_WATCH_MS, intervalMs = POST_FAILURE_WATCH_INTERVAL_MS,
+  isAlive = ownedPidAlive, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), now = Date.now } = {}) {
+  const shape = (result, at, checks) => ({ result, exit_after_timeout_ms: result === 'exited' ? at : null, observed_until_ms: at,
+    interval_ms: intervalMs, max_ms: maxMs, checks });
+  if (!Number.isInteger(pid) || pid <= 0) return shape('unknown', null, 0);
+  const start = now();
+  for (let checks = 1; ; checks++) {
+    const alive = isAlive(pid);
+    const at = now() - since;
+    if (alive === false) return shape('exited', at, checks);
+    if (alive !== true) return shape('unknown', at, checks);
+    if (now() - start >= maxMs) return shape('still_alive', at, checks);
+    await sleep(intervalMs);
+  }
+}
+
 function runCli(args, homeDir, port, { timeoutMs = 8000, owned = null } = {}) {
   return new Promise((resolve, reject) => {
     const spawnedAt = Date.now();
@@ -158,8 +189,10 @@ function runCli(args, homeDir, port, { timeoutMs = 8000, owned = null } = {}) {
     let stderr = '';
     let timedOut = false;
     let ownedEvidence = null; // Task 1215 windows127: only when the caller passes owned fixture metadata
+    let boundFiredAt = null; // Task 1215 diag153: reference time of the post-failure watch
     const timer = setTimeout(() => {
       timedOut = true;
+      boundFiredAt = Date.now();
       if (owned) ownedEvidence = observeOwnedDaemon(owned, port, spawnedAt, timeoutMs).catch(() => null);
       cli.kill('SIGKILL');
     }, timeoutMs);
@@ -171,7 +204,13 @@ function runCli(args, homeDir, port, { timeoutMs = 8000, owned = null } = {}) {
       if (timedOut) {
         const fail = (note) => reject(new Error(`CLI \`${args.join(' ')}\` did not return (blocked).\nstdout:\n${stdout}\nstderr:\n${stderr}${note}`));
         if (!ownedEvidence) { fail(''); return; }
-        ownedEvidence.then((evidence) => fail(evidence ? `\n#1215 windows127 owned-daemon evidence ${JSON.stringify(evidence)}` : ''));
+        // Task 1215 diag153: the case has ALREADY failed (the CLI was killed at its bound). Before reporting, watch ONLY
+        // the owned daemon pid for a bounded time; the rejection below happens whatever the watch sees.
+        ownedEvidence
+          .then((evidence) => watchOwnedPidExit(owned.pid, { since: boundFiredAt })
+            .catch(() => ({ result: 'unknown' }))
+            .then((watch) => fail((evidence ? `\n#1215 windows127 owned-daemon evidence ${JSON.stringify(evidence)}` : '')
+              + `\n#1215 diag153 post-failure watch ${JSON.stringify({ ...watch, note: POST_FAILURE_WATCH_NOTE })}`)));
         return;
       }
       resolve({ code, signal, stdout, stderr });
@@ -601,4 +640,30 @@ test('#1215 G2-R1 native: a foreign HTTP 404 listener on the port is never treat
   assert.equal(server.listening, true, 'the foreign listener is untouched');
   assert.deepEqual(received.slice(1).filter((r) => /\/api\/meta|\/api\/daemon\/stop/.test(r)), [], 'no identification or stop request reached it');
   assert.equal(fs.existsSync(path.join(home, '.telepty', 'daemon-state.json')), false, 'no daemon state was created');
+});
+
+// Task 1215 diag153 — the post-failure owned-pid watch (used only AFTER runCli's unchanged 8000 ms bound has already
+// failed the stop case) is bounded, observes ONLY the given pid, and reports `exited` (with the time after the bound)
+// or `still_alive` at its bound, or `unknown`. A deterministic clock, sleep and liveness stand in for the real ones.
+test('[diag153] post-failure owned-pid watch reports exited or still_alive within its bound', async () => {
+  let t = 1000;
+  const now = () => t;
+  const sleep = async (ms) => { t += ms; };
+  let calls = 0;
+  const exitsOnFourth = () => (++calls < 4);
+  assert.deepEqual(await watchOwnedPidExit(1234, { since: 900, maxMs: 12000, intervalMs: 100, isAlive: exitsOnFourth, sleep, now }),
+    { result: 'exited', exit_after_timeout_ms: 400, observed_until_ms: 400, interval_ms: 100, max_ms: 12000, checks: 4 });
+
+  t = 5000; let probes = 0;
+  const neverExits = () => { probes++; return true; };
+  const alive = await watchOwnedPidExit(1234, { since: 4000, maxMs: 1000, intervalMs: 100, isAlive: neverExits, sleep, now });
+  assert.deepEqual(alive, { result: 'still_alive', exit_after_timeout_ms: null, observed_until_ms: 2000, interval_ms: 100, max_ms: 1000, checks: 11 });
+  assert.equal(probes, 11, 'bounded: one check per interval up to the bound, then it stops');
+
+  t = 0;
+  assert.equal((await watchOwnedPidExit(1234, { since: 0, maxMs: 1000, intervalMs: 100, isAlive: () => null, sleep, now })).result, 'unknown',
+    'an indeterminate liveness answer is reported as unknown, never as exited');
+  let touched = false;
+  assert.equal((await watchOwnedPidExit(0, { since: 0, isAlive: () => { touched = true; return false; }, sleep, now })).result, 'unknown');
+  assert.equal(touched, false, 'no probe without a valid owned pid');
 });

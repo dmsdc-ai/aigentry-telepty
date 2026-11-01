@@ -156,6 +156,52 @@ function diagAuditWriter(a) {
   out.last_error_code = diagToken(a.last_error_code); out.writing_stage = diagToken(a.writing_stage);
   return out;
 }
+// Task 1215 diag153 (failure-only): sanitized markers from the OWNED daemon's own captured output. Only these are kept,
+// each list bounded to DIAG_LIST_MAX:
+//   - whitelisted error class names that start a line;
+//   - code tokens (E…, ERR_…, UND_ERR_…);
+//   - stack-frame function names (never paths);
+//   - fatal-marker booleans and counts of the daemon's fixed line prefixes.
+// Never a message, path, prompt, id, token, body or command line. `scrub` removes caller-known secrets (the auth
+// token) before scanning. The scan is limited to the last DIAG_LOG_WINDOW characters.
+const DIAG_LOG_WINDOW = 65536, DIAG_LIST_MAX = 8;
+const DIAG_ERROR_NAMES = ['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'AggregateError', 'AbortError', 'SystemError', 'EvalError', 'URIError'];
+const DIAG_FATAL = [['uncaught_exception', /\buncaughtException\b|^Uncaught\b/m], ['unhandled_rejection', /\bunhandledRejection\b|UnhandledPromiseRejection/],
+  ['fatal_error', /FATAL ERROR/], ['native_assertion', /Assertion failed/]];
+const DIAG_LINE_PREFIXES = ['[KILL]', '[EXIT]', '[LEDGER]', '[AUDIT]', '[DAEMON]', '[CLEANUP]'];
+function diagnosticLogMarkers(text, { scrub = [] } = {}) {
+  let tail = typeof text === 'string' ? text.slice(-DIAG_LOG_WINDOW) : '';
+  for (const secret of scrub) if (typeof secret === 'string' && secret) tail = tail.split(secret).join('');
+  const lines = tail.split(/\r?\n/);
+  const errorNames = [], errorCodes = [], stackFunctions = [];
+  const add = (list, value) => { if (!list.includes(value) && list.length < DIAG_LIST_MAX) list.push(value); };
+  for (const line of lines) {
+    const named = /^\s*(?:Uncaught\s+)?([A-Z][A-Za-z]{0,31})(?=:|\s|$)/.exec(line);
+    if (named && DIAG_ERROR_NAMES.includes(named[1])) add(errorNames, named[1]);
+    for (const m of line.matchAll(/\b(E[A-Z]{2,15}|ERR_[A-Z0-9_]{2,48}|UND_ERR_[A-Z0-9_]{2,40})\b/g)) add(errorCodes, m[1]);
+    const frame = /^\s+at (?:async )?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$<][\w$<>]*){0,3}) \(/.exec(line);
+    if (frame && frame[1].length <= 64) add(stackFunctions, frame[1]);
+  }
+  const fatal = {};
+  for (const [key, pattern] of DIAG_FATAL) fatal[key] = pattern.test(tail);
+  const lineCounts = {};
+  for (const prefix of DIAG_LINE_PREFIXES) lineCounts[prefix] = lines.filter((line) => line.startsWith(prefix)).length;
+  return { window_bytes: tail.length, error_names: errorNames, error_codes: errorCodes, stack_functions: stackFunctions, fatal, line_prefix_counts: lineCounts };
+}
+// A cleanup failure on the TRANSPORT (refused/reset/socket), as opposed to a harness-typed outcome or an HTTP answer.
+const DIAG_TRANSPORT_CODE = /^(E[A-Z]{2,15}|UND_ERR_[A-Z0-9_]{2,40})$/;
+function transportCauseCode(error) {
+  for (let e = error, depth = 0; e && typeof e === 'object' && depth < 4; e = e.cause, depth++) {
+    if (typeof e.code === 'string' && DIAG_TRANSPORT_CODE.test(e.code)) return e.code;
+  }
+  return null;
+}
+function isTransportFailure(error) {
+  if (!error || typeof error !== 'object') return false;
+  if (typeof error.code === 'string' && error.code.startsWith('HARNESS_')) return false;
+  return transportCauseCode(error) !== null || (error instanceof TypeError && error.cause !== undefined);
+}
+
 function diagProbeShape(p, pick) {
   if (!p.answered) return { answered: false, unavailable: p.unavailable, total_ms: p.total_ms };
   return { answered: true, http_status: p.http_status, headers_ms: p.headers_ms, total_ms: p.total_ms, ...pick(p.body) };
@@ -256,7 +302,9 @@ async function startTestDaemon(options = {}) {
   // is the measured restart hang (run 40500878932: session-token-issuance-815 and
   // observation-tracking-endpoint-60, pending test promise, only the suite daemon left as a handle).
   const exitState = { exited: false, code: null, signal: null };
+  let exitAt = null; // Task 1215 diag153: failure-only relative exit time (kept off exitState, whose shape callers see)
   child.once('exit', (code, signal) => {
+    exitAt = Date.now();
     exitState.exited = true;
     exitState.code = code;
     exitState.signal = signal;
@@ -465,7 +513,28 @@ async function startTestDaemon(options = {}) {
       controller.abort();
     }
   }
+  // Task 1215 diag153 (failure-only): a cleanup that failed on the TRANSPORT (not a harness-typed outcome) gets ONE
+  // fixed-shape `cleanup_diagnostic` on the ORIGINAL error, which is rethrown unchanged. Contents:
+  //   - the failure's whitelisted name and transport cause code, with its time from the cleanup start;
+  //   - the owned child's exit facts (exited, code, signal, exit time relative to the cleanup start);
+  //   - sanitized output markers (diagnosticLogMarkers, auth token scrubbed);
+  //   - `probe`: the SAME at-most-once-per-daemon observe148 episode (skipped when the daemon has exited), so a
+  //     timeout and a transport failure on one daemon never both probe.
+  // No success-path traffic, no retry, no change to cleanup semantics.
+  function transportDiagnostic(error, begun) {
+    let token = null; try { token = authToken(); } catch { token = null; }
+    const scrub = [token].filter(Boolean);
+    const cause = error.cause && typeof error.cause === 'object' ? error.cause : null;
+    return { trigger: 'transport',
+      failure: { name: DIAG_ERROR_NAMES.includes(error.name) ? error.name : 'other', cause_name: cause && DIAG_ERROR_NAMES.includes(cause.name) ? cause.name : (cause ? 'other' : null),
+        cause_code: transportCauseCode(error), at_ms: Date.now() - begun },
+      daemon: { exited: exitState.exited, exit_code: Number.isInteger(exitState.code) ? exitState.code : null,
+        exit_signal: typeof exitState.signal === 'string' && /^SIG[A-Z0-9]{1,16}$/.test(exitState.signal) ? exitState.signal : null,
+        exited_at_ms: exitAt === null ? null : exitAt - begun },
+      markers: { stderr: diagnosticLogMarkers(stderr, { scrub }), stdout: diagnosticLogMarkers(stdout, { scrub }) } };
+  }
   async function cleanupSessions({ signal, remainingMs } = {}) {
+    const begun = Date.now();
     try {
       return await cleanupSessionsObserved({ signal });
     } catch (error) {
@@ -473,6 +542,13 @@ async function startTestDaemon(options = {}) {
         && !Object.hasOwn(error, 'cleanup_diagnostic')) {
         try { error.cleanup_diagnostic = await cleanupDiagnosticEpisode({ signal, remainingMs }); }
         catch { error.cleanup_diagnostic = { episode: 'unavailable' }; }
+      } else if (isTransportFailure(error) && Object.isExtensible(error) && !Object.hasOwn(error, 'cleanup_diagnostic')) {
+        try {
+          const diagnostic = transportDiagnostic(error, begun);
+          try { diagnostic.probe = await cleanupDiagnosticEpisode({ signal, remainingMs }); }
+          catch { diagnostic.probe = { episode: 'unavailable' }; }
+          error.cleanup_diagnostic = diagnostic;
+        } catch { error.cleanup_diagnostic = { trigger: 'transport', episode: 'unavailable' }; }
       }
       throw error;
     }
@@ -733,6 +809,7 @@ module.exports = {
   HARNESS_REQUEST_MAX_MS,
   boundedRequest,
   createSessionId,
+  diagnosticLogMarkers,
   delay,
   homeEnv,
   startTestDaemon,
