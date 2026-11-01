@@ -18,11 +18,11 @@ const { resolveAction } = require('../src/principal/http');
 
 const MARK = 'MARK-1215-private';
 
-function fixture(deliver) {
+function fixture(deliver, sessionId = 'target') {
   const events = [], audit = [], bus = [];
-  const session = { id: 'target', type: 'spawned', clients: new Set(), isClosing: false, outputRing: [], ready: true };
+  const session = { id: sessionId, type: 'spawned', clients: new Set(), isClosing: false, outputRing: [], ready: true };
   const shared = {
-    sessions: { target: session }, pendingReports: Object.create(null), crypto, MACHINE_ID: 'synthetic-host', ORCHESTRATOR_SIDS: [],
+    sessions: { [sessionId]: session }, pendingReports: Object.create(null), crypto, MACHINE_ID: 'synthetic-host', ORCHESTRATOR_SIDS: [],
     busClients: [{ readyState: 1, send: (frame) => bus.push(String(frame)) }],
     resolveSessionAlias: (id) => (Object.hasOwn(shared.sessions, id) ? id : null),
     respondWithError: (res, status, code, error, extra = {}) => res.status(status).json({ success: false, code, error, ...extra }),
@@ -89,4 +89,33 @@ test('[S24 controls] normal refusals keep their status and code; a normal delive
   assert.equal(ok.body.success, true);
   assert.equal(typeof ok.body.inject_id, 'string');
   assert.equal(ok.body.strategy, 'synthetic');
+});
+
+// #1215 format211 (security208 T3, javascript/FormatString): the local diagnostic must not let a session id act as a
+// util.format directive. Register/WS admit '%' in ids (spawn ids do not). console.error is captured through the REAL
+// node:util.format(...args), exactly as Node formats it; joining the arguments would hide the defect.
+async function captureConsoleErrorFormatted(fn) {
+  const { format } = require('node:util');
+  const original = console.error;
+  const lines = [];
+  console.error = (...args) => { lines.push(format(...args)); };
+  try { return { result: await fn(), lines }; } finally { console.error = original; }
+}
+
+test('[S24 T3] a percent-containing session id cannot consume the local diagnostic; response and event stay generic', async () => {
+  const id = 't%c';
+  const f = fixture(async () => { throw new Error('MARK-T3'); }, id);
+  const { result: res, lines } = await captureConsoleErrorFormatted(() => f.call(id, { prompt: 'synthetic prompt' }));
+  assert.equal(res.statusCode, 500);
+  assert.equal(res.body.code, 'DELIVERY_FAILED');
+  const logLine = lines.find((line) => line.includes('[INJECT] delivery threw for')) || '';
+  assert.ok(logLine.includes('MARK-T3'), 'MARK-T3 missing from the formatted local log');
+  assert.ok(logLine.includes(`for ${id} inject_id=`), 'the literal session id is not preserved in the formatted local log');
+  assert.doesNotMatch(JSON.stringify(res.body), /MARK-T3/, 'the thrown text reached the inject response');
+  assert.equal(res.body.error, 'Delivery failed; see daemon log.');
+  const failure = f.events.find((event) => event.includes('DELIVERY_FAILED'));
+  assert.ok(failure, 'the inject_failed event is still emitted');
+  assert.match(failure, /Delivery failed; see daemon log\./);
+  for (const event of f.events) assert.doesNotMatch(event, /MARK-T3/, 'the thrown text reached an event sink');
+  for (const frame of f.bus) assert.doesNotMatch(frame, /MARK-T3/, 'the thrown text reached a bus frame');
 });

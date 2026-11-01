@@ -1751,7 +1751,7 @@ function createSessionActions(shared, effects = {}) {
         // and is not entitled to host paths or internal state. The raw exception therefore stays a LOCAL operator
         // diagnostic. The response and the inject_failed event/bus sink carry one stable text, with the unchanged
         // status 500 and code DELIVERY_FAILED.
-        console.error(`[INJECT] delivery threw for ${id} inject_id=${inject_id}:`, err && err.stack ? err.stack : err);
+        console.error('[INJECT] delivery threw for %s inject_id=%s:', id, inject_id, err && err.stack ? err.stack : err);
         (0, shared.emitInjectFailureEvent)(id, 'DELIVERY_FAILED', INJECT_DELIVERY_FAILED_TEXT, { inject_id }, session);
         res.status(500).json((0, shared.buildErrorBody)('DELIVERY_FAILED', INJECT_DELIVERY_FAILED_TEXT));
       }
