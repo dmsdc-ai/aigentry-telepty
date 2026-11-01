@@ -1,0 +1,272 @@
+name: Broker local-inject success contract (task 1215 / broker244, original vs candidate)
+
+# Task 1215 / release1238 / broker244 — ISOLATED DIAGNOSTIC; not shipped, not a release gate. Product source is 68b8565 in
+# EVERY leg (proven by `git diff --name-only ORIGINAL_SHA`); only test/broker-routing-topology.test.js differs.
+# Windows full run 41319575461 / job 124886718515 failed three success legs of that file: the local daemon delivered, but
+# the broker node's FIXTURE local_timeout_ms (500 ms) fired first and the node truthfully reported outcome_unknown /
+# BROKER_LOCAL_OUTCOME_UNKNOWN. The candidate gives success-only legs the product-validated maximum (10000 ms) and keeps
+# every uncertainty leg and assertion unchanged.
+#
+# THIS RUN, once per job (no rerun, retry, loop or continue-on-error), Windows, Linux and macOS:
+#   1. frozen controls — the "[broker244 …]" cases of the CANDIDATE file, identical bytes and selection in BOTH legs: the
+#      real node, its real AbortSignal and a real daemon answer held 1000 ms -> outcome_unknown under 500 (deterministic
+#      reproduction of the coupling), accepted under 10000, plus a nondelayed transparency control; delivered once, never
+#      resent.
+#   2. fixture — original leg: the file restored from ORIGINAL_SHA; candidate leg: the candidate file; run alone, once.
+#      Candidate: all nine cases pass. Original on a hosted runner is load-dependent: a pass, or failures ONLY of the
+#      documented kind (every failing case's TAP YAML block names BROKER_LOCAL_OUTCOME_UNKNOWN); anything else is
+#      unexpected. Its uncertainty legs (lost reply result, red142 classification) are the reused controls.
+# Dual reporters (spec on stdout, TAP file). Names are TAP-escaped from the exact test bytes. Membership is exact and the
+# selected/skipped split is retained; missing TAP, members or counts fail.
+#
+# BOUNDS: job <= 25 min; npm ci <= 8 min; each test step <= 6 min; evidence <= 4 MiB allowlisted, retained 7 days even on
+# failure. errexit is disabled explicitly ONLY around each captured command. Bytes are verified as sha256 with CR removed.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/broker-contract-1215-244'
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: broker local-inject contract (${{ matrix.os }}, ${{ matrix.leg }}) — diagnostic only
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        leg: [original, candidate]
+    defaults:
+      run:
+        shell: bash
+    env:
+      LEG: ${{ matrix.leg }}
+      ORIGINAL_SHA: 68b8565da39232c016c254953f6c23dd3fde10a4
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.2'
+
+      - name: Write the step library and prove the candidate identity (exact bytes, CR removed)
+        run: |
+          set -euo pipefail
+          LIB="$RUNNER_TEMP/broker244"; EVIDENCE="$LIB/evidence"; RAW="$LIB/raw"
+          mkdir "$LIB" "$EVIDENCE" "$RAW"
+          cat > "$LIB/names_original.txt" <<'NAMES'
+          owned broker broadcast and reply preserve durable exact routing, scopes, and uncertainty
+          a lost reply result (result POST) stays one frame and a truthful bounded unknown, never retried
+          a lost reply result (challenge GET before it) stays one frame and a truthful bounded unknown, never retried
+          [1215-red142] a rejected local inject (timeout) yields exactly one node result, one delivery at most, and a live bridge
+          [1215-red142] a rejected local inject (string-code control) yields exactly one node result, one delivery at most, and a live bridge
+          [1215-red142] a rejected local inject (challenge-code control) yields exactly one node result, one delivery at most, and a live bridge
+          NAMES
+          cat > "$LIB/names_controls.txt" <<'NAMES'
+          [broker244 BC1-original] a real local answer released after twice the original 500 ms local_timeout_ms: the real signal fires first, outcome_unknown / BROKER_LOCAL_OUTCOME_UNKNOWN, delivered once, never resent
+          [broker244 BC1-success] the same delayed real local answer under the 10000 ms success local_timeout_ms is accepted: one frame, never resent
+          [broker244 BC2] nondelayed positive control: the loopback relay is transparent under the 10000 ms success local_timeout_ms: accepted, one frame, no resend
+          NAMES
+          : > "$LIB/none.txt"
+          cat > "$LIB/lib.sh" <<'LIBRARY'
+          LIB="$RUNNER_TEMP/broker244"; EVIDENCE="$LIB/evidence"; RAW="$LIB/raw"
+          sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+          lf_sha() { tr -d '\r' < "$1" | sha; }
+          expect() {
+            local got; got="$(lf_sha "$1")"
+            printf '%s lf_sha256=%s\n' "$1" "$got" >> "$EVIDENCE/input-hashes.txt"
+            [ "$got" = "$2" ] || { echo "::error::$1 is not the reviewed body (lf_sha256 ${got})"; exit 1; }
+          }
+          identity() { # identity LABEL "allowed paths" [tracked]
+            { git diff --name-only "$ORIGINAL_SHA" --; if [ "${3:-}" != tracked ]; then git ls-files --others --exclude-standard; fi; } | LC_ALL=C sort -u > "$EVIDENCE/identity-$1.txt"
+            cat "$EVIDENCE/identity-$1.txt"
+            local changed
+            while IFS= read -r changed; do
+              case " $2 " in *" $changed "*) ;; *) echo "::error::${changed} differs from ${ORIGINAL_SHA} but is not allowed at '$1'"; exit 1 ;; esac
+            done < "$EVIDENCE/identity-$1.txt"
+          }
+          prefix() { sed 's/^/ok - /' "$@"; }
+          # run_test NAME FILE PATTERN|-: one node --test run of one file; raw streams, LF TAP, exit and members kept.
+          run_test() {
+            local name="$1" file="$2" pattern="$3" rc
+            set -- --require ./test-support/setup-env.js --test --test-concurrency=1
+            if [ "$pattern" != - ]; then set -- "$@" "--test-name-pattern=$pattern"; fi
+            set -- "$@" --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap "--test-reporter-destination=$RAW/$name.tap" "$file"
+            set +e
+            node "$@" > "$RAW/$name.stdout" 2> "$RAW/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$EVIDENCE/$name.exit_code"
+            if [ -f "$RAW/$name.tap" ]; then tr -d '\r' < "$RAW/$name.tap" > "$RAW/$name.tap.lf"; echo present > "$EVIDENCE/$name.tap_state"; else : > "$RAW/$name.tap.lf"; echo missing > "$EVIDENCE/$name.tap_state"; fi
+            { grep -E '^(not )?ok [0-9]+ - ' "$RAW/$name.tap.lf" || true; } | sed -E 's/^(not )?ok [0-9]+ - /\1ok - /' > "$EVIDENCE/$name.members"
+            tail -n 40 "$RAW/$name.stdout" | cut -c1-300 || true
+          }
+          rc_of() { cat "$EVIDENCE/$1.exit_code"; }
+          count() { local v; v="$({ grep -E "^# $2 [0-9]+$" "$RAW/$1.tap.lf" || true; } | tail -n 1 | awk '{print $3}')"; echo "${v:-missing}"; }
+          names_of() { sed -E 's/ # SKIP.*$//; s/^(not )?ok - //' "$EVIDENCE/$1.members" | LC_ALL=C sort; }
+          # membership NAME EXPECTED_LINES SKIPPABLE_NAMES → "yes <skipped>" or "no <skipped>"; selected/skipped split and diff kept.
+          membership() {
+            local name="$1" ok=yes others=0 line nm total
+            : > "$EVIDENCE/$name.selected"; : > "$EVIDENCE/$name.skipped"
+            while IFS= read -r line; do
+              case "$line" in *" # SKIP"*) printf '%s\n' "$line" >> "$EVIDENCE/$name.skipped" ;; *) printf '%s\n' "$line" >> "$EVIDENCE/$name.selected" ;; esac
+            done < "$EVIDENCE/$name.members"
+            LC_ALL=C sort "$EVIDENCE/$name.selected" > "$RAW/$name.selected.sorted"
+            LC_ALL=C sort "$2" > "$RAW/$name.expected.sorted"
+            diff -u "$RAW/$name.expected.sorted" "$RAW/$name.selected.sorted" > "$EVIDENCE/$name.membership-diff" || ok=no
+            while IFS= read -r line; do
+              others=$((others + 1)); nm="${line#ok - }"; nm="${nm%% \# SKIP*}"
+              case "$line" in "ok - "*) ;; *) ok=no ;; esac
+              grep -qxF -- "$nm" "$3" || ok=no
+            done < "$EVIDENCE/$name.skipped"
+            total="$(grep -c . "$3" || true)"
+            if [ "$others" != 0 ] && [ "$others" != "$total" ]; then ok=no; fi
+            if [ -n "$(names_of "$name" | uniq -d)" ]; then ok=no; fi
+            [ "$(cat "$EVIDENCE/$name.tap_state")" = present ] || ok=no
+            echo "$ok $others"
+          }
+          green() { # green NAME EXPECTED_LINES SKIPPABLE N
+            local m s; m="$(membership "$1" "$2" "$3")"; s="${m#* }"
+            [ "$(rc_of "$1")" = 0 ] && [ "${m%% *}" = yes ] && [ "$(count "$1" pass)" = "$4" ] && [ "$(count "$1" fail)" = 0 ] \
+              && [ "$(count "$1" cancelled)" = 0 ] && [ "$(count "$1" todo)" = 0 ] && [ "$(count "$1" skipped)" = "$s" ]
+          }
+          # failure_blocks NAME: one file per `not ok` case holding its TAP YAML block (up to the closing "  ..."); prints the count.
+          failure_blocks() {
+            rm -f "$EVIDENCE/$1".failure-*.txt
+            awk -v out="$EVIDENCE/$1.failure-" '/^not ok [0-9]+ - /{n++; f=out n ".txt"; cap=1} cap{print > f} cap && /^  \.\.\.$/{cap=0; close(f)} END{print n+0}' "$RAW/$1.tap.lf"
+          }
+          summary() { printf 'exit %s pass %s fail %s cancelled %s skipped %s todo %s tap %s' "$(rc_of "$1")" "$(count "$1" pass)" "$(count "$1" fail)" \
+            "$(count "$1" cancelled)" "$(count "$1" skipped)" "$(count "$1" todo)" "$(cat "$EVIDENCE/$1.tap_state")"; }
+          LIBRARY
+          source "$LIB/lib.sh"
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"
+          printf 'leg=%s\nos=%s\ncommit=%s\noriginal=%s\nnode=%s\nnpm=%s\ncore_autocrlf=%s\n' "$LEG" "$RUNNER_OS" "$GITHUB_SHA" "$ORIGINAL_SHA" \
+            "$NODE_VERSION" "$NPM_VERSION" "$(git config --get core.autocrlf || echo unset)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.2" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.2"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2"; exit 1; }
+          git cat-file -e "${ORIGINAL_SHA}^{commit}" || { echo "::error::original ${ORIGINAL_SHA} is not in this history; nothing was run"; exit 1; }
+          expect test/broker-routing-topology.test.js d79cc3cde13469b0c2f54a900b80a8f40c102406651fcef33e1cd7fe3bed5c56
+          expect src/broker/node.js 25b88bd4cd685d5ca32cce3bcf434974fa7c19cff9c8c5b1c6c4540e4d5f3875
+          expect src/broker/hub.js 9e961cedd60d373fb8116ef9b0747fda7244d7f606d63d94765e4a1867301496
+          expect src/broker/dispatch.js a0297abf21160436dc418ace78435764c1fe24ad3f40780de81061c4abd27571
+          expect src/broker/http.js e4a575acbe9fa3f75b750c468ff95f93f391e01c1678cb183022a1f4d00a1c8d
+          expect test-support/daemon-harness.js c526b65955ccadbface8c8de4a54cdf859769a1217a933925c9ea436c5bfa59a
+          identity candidate ".github/workflows/broker-contract-1215.yml test/broker-routing-topology.test.js"
+
+      - name: npm ci (frozen lock, normal lifecycle; exit recorded)
+        id: install
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/broker244/lib.sh"
+          set +e
+          npm ci --no-audit --fund=false > "$RAW/npm-ci.stdout" 2> "$RAW/npm-ci.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/npm-ci.exit_code"
+          echo "npm ci exit=${rc}"
+          [ "$rc" = 0 ] || exit "$rc"
+
+      - name: Frozen controls — identical candidate cases in both legs, once
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/broker244/lib.sh"
+          run_test controls test/broker-routing-topology.test.js '^\[broker244 ' -
+          prefix "$LIB/names_controls.txt" > "$RAW/exp-controls.txt"
+          controls=unexpected
+          if green controls "$RAW/exp-controls.txt" "$LIB/names_original.txt" "$(grep -c . "$LIB/names_controls.txt")"; then controls=green; fi
+          printf 'leg=%s\nos=%s\ncontrols=%s -> %s\n' "$LEG" "$RUNNER_OS" "$(summary controls)" "$controls" > "$EVIDENCE/verdict-controls.txt"
+          cat "$EVIDENCE/verdict-controls.txt"
+          echo "::notice title=broker244 ${RUNNER_OS} ${LEG} controls (diagnostic only)::verdict ${controls}"
+          [ "$controls" = green ]
+
+      - name: Fixture file — original (restored from ORIGINAL_SHA) or candidate, alone, once
+        if: always() && steps.install.outcome == 'success'
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/broker244/lib.sh"
+          if [ "$LEG" = original ]; then
+            git show "${ORIGINAL_SHA}:test/broker-routing-topology.test.js" > test/broker-routing-topology.test.js
+            expect test/broker-routing-topology.test.js 486d56f8c32046479c41c2b35d16cfd40b0d13c6bd2c8da2c00c9d83a618224e
+            identity original-fixture ".github/workflows/broker-contract-1215.yml" tracked
+          fi
+          run_test fixture test/broker-routing-topology.test.js - -
+          blocks="$(failure_blocks fixture)"
+          verdict=unexpected
+          if [ "$LEG" = candidate ]; then
+            { prefix "$LIB/names_original.txt"; prefix "$LIB/names_controls.txt"; } > "$RAW/exp-fixture.txt"
+            total="$(cat "$LIB/names_original.txt" "$LIB/names_controls.txt" | grep -c .)"
+            if green fixture "$RAW/exp-fixture.txt" "$LIB/none.txt" "$total" && [ "$blocks" = 0 ]; then verdict=green; fi
+          else
+            prefix "$LIB/names_original.txt" > "$RAW/exp-fixture.txt"
+            if [ "$(cat "$EVIDENCE/fixture.tap_state")" = present ] && [ "$(names_of fixture)" = "$(LC_ALL=C sort "$LIB/names_original.txt")" ] && [ "$(count fixture cancelled)" = 0 ]; then
+              if green fixture "$RAW/exp-fixture.txt" "$LIB/none.txt" "$(grep -c . "$LIB/names_original.txt")"; then verdict=original_pass
+              elif [ "$(rc_of fixture)" != 0 ] && [ "$blocks" != 0 ] && [ "$blocks" = "$(count fixture fail)" ]; then
+                documented=yes
+                for f in "$EVIDENCE"/fixture.failure-*.txt; do grep -qF 'BROKER_LOCAL_OUTCOME_UNKNOWN' "$f" || documented=no; done
+                if [ "$documented" = yes ]; then verdict=original_local_timeout_signature; fi
+              fi
+            fi
+          fi
+          printf 'leg=%s\nos=%s\nfixture=%s -> %s\nfailure_blocks=%s\n' "$LEG" "$RUNNER_OS" "$(summary fixture)" "$verdict" "$blocks" > "$EVIDENCE/verdict-fixture.txt"
+          cat "$EVIDENCE/verdict-fixture.txt"
+          echo "::notice title=broker244 ${RUNNER_OS} ${LEG} fixture (diagnostic only)::verdict ${verdict}"
+          case "$verdict" in green|original_pass|original_local_timeout_signature) ;; *) exit 1 ;; esac
+
+      - name: Bound evidence (allowlisted, <= 4 MiB; runs whatever the commands did)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          LIB="$RUNNER_TEMP/broker244"; EVIDENCE="$LIB/evidence"; RAW="$LIB/raw"
+          test -d "$EVIDENCE" && test -d "$RAW" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          : > "$EVIDENCE/capture-bounds.txt"
+          copy_capped() { # copy_capped NAME MAX_BYTES
+            if [ -f "$RAW/$1" ] && [ ! -L "$RAW/$1" ]; then
+              local size; size="$(wc -c < "$RAW/$1" | tr -d ' ')"
+              head -c "$2" "$RAW/$1" > "$EVIDENCE/$1"
+              printf '%s raw_bytes=%s kept_bytes=%s truncated=%s\n' "$1" "$size" "$(wc -c < "$EVIDENCE/$1" | tr -d ' ')" \
+                "$([ "$size" -gt "$2" ] && echo yes || echo no)" >> "$EVIDENCE/capture-bounds.txt"
+            else
+              printf '%s absent\n' "$1" >> "$EVIDENCE/capture-bounds.txt"
+            fi
+          }
+          copy_capped npm-ci.stdout 32768
+          copy_capped npm-ci.stderr 32768
+          for run in controls fixture; do
+            copy_capped "$run.stdout" 524288
+            copy_capped "$run.stderr" 262144
+            copy_capped "$run.tap" 524288
+          done
+          cat "$EVIDENCE/capture-bounds.txt"
+          shopt -s dotglob nullglob
+          total=0
+          for f in "$EVIDENCE"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::non-regular evidence entry; not uploading"; exit 1; }
+            case "$(basename "$f")" in
+              toolchain.txt|input-hashes.txt|identity-candidate.txt|identity-original-fixture.txt|capture-bounds.txt) ;;
+              npm-ci.exit_code|npm-ci.stdout|npm-ci.stderr|verdict-controls.txt|verdict-fixture.txt) ;;
+              controls.*|fixture.*) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+            total=$((total + $(wc -c < "$f" | tr -d ' ')))
+          done
+          echo "evidence bytes=${total}"
+          [ "$total" -le 4194304 ] || { echo "::error::evidence is ${total} bytes (> 4 MiB); not uploading"; exit 1; }
+
+      - name: Upload evidence (no lockfile, credentials, cache or node_modules)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: broker-contract-1215-244-${{ matrix.os }}-${{ matrix.leg }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/broker244/evidence
+          if-no-files-found: error
+          retention-days: 7
