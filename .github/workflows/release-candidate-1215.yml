@@ -306,12 +306,16 @@ jobs:
   # Unchanged from release.yml `consumer` (steps verbatim; checkout pin and artifact name differ), plus the identity record
   # included in the same byte check.
   consumer:
-    name: Installed consumer (${{ matrix.os }})
+    name: Installed consumer (${{ matrix.os }}, node ${{ matrix.node }})
     needs: [source, pack]
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20]
+        include:
+          - os: macos-latest
+            node: '25.2.1'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -320,7 +324,7 @@ jobs:
           ref: ${{ needs.source.outputs.commit }}
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ matrix.node }}
       - uses: actions/download-artifact@v4
         with:
           name: release-candidate-1215-package
