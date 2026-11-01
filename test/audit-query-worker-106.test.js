@@ -244,3 +244,45 @@ test('#106 [mac163] control: two reads whose results are NOT yet delivered still
   await new Promise(resolve => setImmediate(resolve));
   assert.ok(workers.every(w => w.terminated === 1 && w.exited === true), 'both workers were terminated once and actually exited');
 });
+
+// Task 1215 mac168 — review166 M1 (frozen BEFORE the product fix). Delivered results on still-LIVE threads keep their
+// capacity. The mac163 regression above would also pass an unsafe fix that frees a slot at settlement while its thread
+// is alive; this case refuses both that fix and the original:
+//   original: RED at step 3 (a result is delivered before its job is released);
+//   free-at-settlement fix: RED at step 2 (a third native worker is admitted).
+// Workers whose terminate() never settles (as in the timed-out-worker case), with a manual wall timer.
+test('#106 [mac168 M1] delivered results on still-live threads keep capacity: a third read is refused, results wait for release or the wall bound, an actual exit frees exactly one slot, and close delivers the stored page', async t => {
+  class LiveHeldWorker extends ControlledWorker { terminate() { this.terminated++; return new Promise(() => {}); } }
+  const workers = []; const timers = [];
+  const reader = createAuditReader({ path: '/daemon-owned/log',
+    workerFactory: () => { const w = new LiveHeldWorker(); workers.push(w); return w; },
+    setTimer: fn => { timers.push(fn); return fn; }, clearTimer: () => {} });
+  t.after(() => reader.close());
+  // 1. two reads; both workers post a valid page, then one macrotask passes
+  const a = reader.read(); const b = reader.read();
+  let aSettled = null; let bSettled = null; a.then(v => { aSettled = v; }); b.then(v => { bSettled = v; });
+  workers[0].emit('message', { ok: true, json: OK_PAGE }); workers[1].emit('message', { ok: true, json: OK_PAGE });
+  await new Promise(resolve => setImmediate(resolve));
+  // 2. both threads are still live: a third read is refused and no third native worker is spawned
+  assert.equal((await reader.read()).code, 'AUDIT_QUERY_BUSY', 'step 2: delivered-but-live workers still hold both slots');
+  assert.equal(workers.length, 2, 'step 2: no third native worker while two threads are live');
+  // 3. neither result is delivered before its job is released (or bounded)
+  assert.equal(aSettled, null, `step 3: a is not delivered before its release (observed ${JSON.stringify(aSettled)})`);
+  assert.equal(bSettled, null, `step 3: b is not delivered before its release (observed ${JSON.stringify(bSettled)})`);
+  // 4. the wall bound delivers the stored valid page (not TIMEOUT) while its capacity stays held
+  timers[0]();
+  const aValue = await a;
+  assert.equal(aValue.ok, true, `step 4: the wall bound delivers the stored page, not a timeout (${JSON.stringify(aValue)})`);
+  assert.equal(aValue.json, OK_PAGE);
+  assert.equal((await reader.read()).code, 'AUDIT_QUERY_BUSY', 'step 4: the delivered page does not free its live thread\'s slot');
+  // 5. an actual exit frees exactly one slot
+  workers[0].emit('exit', 1);
+  const c = reader.read();
+  assert.equal(workers.length, 3, 'step 5: the exited worker\'s slot admits exactly one new read');
+  // 6. close delivers the stored page and CLOSED for the unresolved read; every worker was terminated exactly once
+  await reader.close();
+  const bValue = await b; const cValue = await c;
+  assert.equal(bValue.ok, true, `step 6: close delivers the stored page (${JSON.stringify(bValue)})`); assert.equal(bValue.json, OK_PAGE);
+  assert.equal(cValue.code, 'AUDIT_QUERY_CLOSED', 'step 6: an unresolved read is CLOSED');
+  assert.deepEqual(workers.map(w => w.terminated), [1, 1, 1], 'step 6: terminate was requested exactly once per worker');
+});
