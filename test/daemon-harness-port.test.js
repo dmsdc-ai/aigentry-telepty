@@ -533,3 +533,32 @@ test('[diag153] daemon log markers keep only whitelisted names, codes and stack 
   assert.ok(big.window_bytes <= 65536, 'the scanned window is bounded'); assert.deepEqual(big.error_names, ['RangeError']);
   assert.deepEqual(diagnosticLogMarkers(undefined).error_names, [], 'absent output is empty, never a throw');
 });
+
+// Task 1215 win158 — the spec reporter prints nested error properties only to a fixed depth, so in Windows CI run
+// 41281433751 the diag153 `markers` arrived as `[Object]`. The SAME fixed-schema cleanup_diagnostic is therefore also
+// attached as bounded JSON text (`cleanup_diagnostic_json`), on failure only, with the original error unchanged.
+test('[win158] a cleanup diagnostic is also rendered as bounded JSON text that reporter depth cannot hide', { timeout: 30000 }, async () => {
+  const stub = await ownedStub('reset');
+  const harness = await startTestDaemon();
+  started.push(harness);
+  const from = `http://${harness.host}:${harness.port}`, realFetch = globalThis.fetch;
+  try {
+    let error;
+    globalThis.fetch = (input, init) => realFetch(String(input).startsWith(from) ? stub.origin + String(input).slice(from.length) : input, init);
+    try { error = await harness.cleanupSessions().then(() => null, (e) => e); } finally { globalThis.fetch = realFetch; }
+    assert.ok(error instanceof TypeError, `PRECONDITION: the cleanup failed on the transport: ${error && error.name}`);
+    assert.equal(error.code, undefined, 'the original error is not re-typed');
+    assert.equal(typeof error.cleanup_diagnostic_json, 'string', 'the diagnostic is rendered as text');
+    assert.ok(error.cleanup_diagnostic_json.length <= 8192, `bounded text: ${error.cleanup_diagnostic_json.length}`);
+    assert.deepEqual(JSON.parse(error.cleanup_diagnostic_json), error.cleanup_diagnostic, 'exactly the same fixed-schema object');
+    assert.ok(error.cleanup_diagnostic_json.includes('"markers"'), 'the nested markers are visible in the text');
+    for (const secret of [harness.authToken(), stub.origin, harness.homeDir].filter(Boolean)) {
+      assert.ok(!error.cleanup_diagnostic_json.includes(secret), 'no token, origin or home path in the text');
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    await harness.stop().catch(() => {});
+    if (harness.isAlive()) await harness.kill().catch(() => {});
+    await stub.close();
+  }
+});

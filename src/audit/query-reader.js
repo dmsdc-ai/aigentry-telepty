@@ -36,34 +36,42 @@ function createAuditReader({ path: auditPath, timeoutMs = 10000,
       try { worker = workerFactory(WORKER_FILE, { workerData: { path: auditPath, filters, budgets: BUDGETS }, trackUnmanagedFds: true,
         resourceLimits: { maxOldGenerationSizeMb: 32, maxYoungGenerationSizeMb: 4, stackSizeMb: 2 } }); }
       catch { resolve(result('AUDIT_QUERY_FAILED')); return; }
-      const job = { worker, settled: false, timer: null, stop: null };
+      // PROPOSAL (mac163): a worker-produced outcome is delivered once that job's capacity is released (its worker
+      // exited or terminate() settled), so a strictly serial caller is never refused by its own delivered results.
+      // Capacity still counts a terminating worker until it exits; the wall timer still bounds every wait.
+      const job = { worker, settled: false, timer: null, stop: null, deliver: null };
+      const deliverPending = () => { if (!job.deliver) return false; const deliver = job.deliver; job.deliver = null; deliver(); return true; };
       active.add(job); worker.unref();
       function release() {
         active.delete(job);
         if (job.timer !== null) clearTimer(job.timer);
         worker.removeListener('message', message); worker.removeListener('error', error); worker.removeListener('exit', exit);
+        deliverPending();
       }
       function stop() {
         try { Promise.resolve(worker.terminate()).then(release, () => {}); } catch { /* stays capacity-bound until exit */ }
       }
-      function finish(value) {
+      function finish(value, { afterRelease = false } = {}) {
         if (job.settled) return;
         job.settled = true;
+        if (afterRelease) { job.deliver = () => resolve(value); stop(); return; }   // the timer stays armed as the bound
         if (job.timer !== null) clearTimer(job.timer);
         resolve(value); stop();
       }
-      job.stop = () => finish(result('AUDIT_QUERY_CLOSED'));
+      job.stop = () => { if (!deliverPending()) finish(result('AUDIT_QUERY_CLOSED')); };
       function message(value) {
         if (value && value.ok === true && typeof value.json === 'string' && Buffer.byteLength(value.json) <= BUDGETS.replyBytes) {
-          finish({ ok: true, json: value.json });
+          finish({ ok: true, json: value.json }, { afterRelease: true });
         } else if (value && value.ok === false && WORKER_CODES.has(value.code) && reasons.has(value.reason)) {
-          finish(result(value.code, 503, value.reason));
-        } else finish(result('AUDIT_QUERY_FAILED'));
+          finish(result(value.code, 503, value.reason), { afterRelease: true });
+        } else finish(result('AUDIT_QUERY_FAILED'), { afterRelease: true });
       }
-      function error() { finish(result('AUDIT_QUERY_FAILED')); }
+      function error() { finish(result('AUDIT_QUERY_FAILED'), { afterRelease: true }); }
       function exit() { if (!job.settled) finish(result('AUDIT_QUERY_FAILED')); release(); }
       worker.on('message', message); worker.on('error', error); worker.on('exit', exit);
-      job.timer = setTimer(() => finish(result('AUDIT_QUERY_TIMEOUT', 503, 'wall_timeout')), timeoutMs);
+      // A delivered-after-release outcome whose worker still has not exited by the wall bound is delivered then
+      // (capacity stays held until exit, exactly like a timed-out worker).
+      job.timer = setTimer(() => { if (!deliverPending()) finish(result('AUDIT_QUERY_TIMEOUT', 503, 'wall_timeout')); }, timeoutMs);
     });
   }
   async function close() {

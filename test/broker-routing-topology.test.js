@@ -387,7 +387,13 @@ for (const red of RED142) test(`[1215-red142] a rejected local inject (${red.var
     let later;
     await waitFor(async () => { later = (await source.receipt('red142-after-0001')).body; return later.state !== 'pending'; },
       { timeoutMs: 15000, description: 'the later receipt left pending' });
-    assert.equal(later.state, 'accepted', `the live bridge delivered the later envelope ${evidence()}`);
+    // Task 1215 win158 (failure-message evidence only; the assertion is unchanged): the later receipt's fixed fields.
+    // Its `code` separates node b's local-inject classifications (src/broker/node.js handle()):
+    // BROKER_LOCAL_OUTCOME_UNKNOWN (the local call rejected, e.g. its local_timeout_ms abort) vs
+    // BROKER_LOCAL_INJECT_REFUSED (an answer that was not an exact accepted receipt).
+    assert.equal(later.state, 'accepted', `the live bridge delivered the later envelope ${evidence()} later_receipt ${JSON.stringify({
+      state: later.state ?? null, code: typeof later.code === 'string' && CODE_TOKEN.test(later.code) ? later.code : null,
+      remote_queued: later.remote_queued ?? null, has_remote_inject_id: Boolean(later.remote_inject_id) })}`);
     await waitFor(() => frames.length >= red.frames + 1, { timeoutMs: 5000, description: 'the later local frame' });
     assert.deepEqual({ forwarded, rejected, frames: frames.length }, { forwarded: 2, rejected: 1, frames: red.frames + 1 },
       `one local attempt per envelope, the first never retried ${evidence()}`);

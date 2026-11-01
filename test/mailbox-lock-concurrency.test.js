@@ -477,3 +477,17 @@ for (const kind of ['symlink', 'hardlink']) test(`[1215-red141] control: a ${kin
     assert.equal(fs.readFileSync(leafFile, 'utf8'), '', 'the linked file is untouched');
   } finally { if (release) release(); }
 });
+
+// Task 1215 win164 — guard-semantics control (test-only; pins the source fact the Windows per-file failure turned on).
+// A sweep worker is given progressGuard(0): it carries NO milestones, so its 10 s timer is a whole-work budget that no
+// stderr line re-arms. Neither the existing `sweep` lines nor the diagnostic `sweep_tick` / `sweep_done` lines are progress,
+// so the "(last milestone -1)" a sweep timeout reports is the budget's expiry, not a lost or rejected milestone.
+test('[win164] a sweep worker carries no milestones: no sweep, sweep_tick or sweep_done record re-arms its guard', () => {
+  const g = progressGuard(0), rec = value => `${PROGRESS_PREFIX}${JSON.stringify(value)}\n`;
+  assert.equal(g.milestones, 0, 'one budget of (0 + 1) x stallMs, never re-armed');
+  for (const record of [{ kind: 'sweep', iteration: 49 }, { kind: 'sweep_tick', iteration: 9 }, { kind: 'sweep_done', iteration: 349 },
+    { kind: 'progress', iteration: 9 }]) {
+    assert.equal(g.feed(rec(record)), 0, `${record.kind} is not a sweep milestone`);
+  }
+  assert.equal(g.last, -1);
+});

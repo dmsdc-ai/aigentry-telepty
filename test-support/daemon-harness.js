@@ -164,7 +164,7 @@ function diagAuditWriter(a) {
 //   - fatal-marker booleans and counts of the daemon's fixed line prefixes.
 // Never a message, path, prompt, id, token, body or command line. `scrub` removes caller-known secrets (the auth
 // token) before scanning. The scan is limited to the last DIAG_LOG_WINDOW characters.
-const DIAG_LOG_WINDOW = 65536, DIAG_LIST_MAX = 8;
+const DIAG_LOG_WINDOW = 65536, DIAG_LIST_MAX = 8, DIAG_JSON_MAX = 8192;
 const DIAG_ERROR_NAMES = ['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'AggregateError', 'AbortError', 'SystemError', 'EvalError', 'URIError'];
 const DIAG_FATAL = [['uncaught_exception', /\buncaughtException\b|^Uncaught\b/m], ['unhandled_rejection', /\bunhandledRejection\b|UnhandledPromiseRejection/],
   ['fatal_error', /FATAL ERROR/], ['native_assertion', /Assertion failed/]];
@@ -549,6 +549,16 @@ async function startTestDaemon(options = {}) {
           catch { diagnostic.probe = { episode: 'unavailable' }; }
           error.cleanup_diagnostic = diagnostic;
         } catch { error.cleanup_diagnostic = { trigger: 'transport', episode: 'unavailable' }; }
+      }
+      // Task 1215 win158 (failure-only): the spec reporter prints nested error properties only to a fixed depth (CI run
+      // 41281433751 showed the markers as `[Object]`). The SAME fixed-schema object is therefore also attached as bounded
+      // JSON text. There is nothing new in it, and the original error, its code and its message are unchanged.
+      if (error && typeof error === 'object' && Object.isExtensible(error) && Object.hasOwn(error, 'cleanup_diagnostic')
+        && !Object.hasOwn(error, 'cleanup_diagnostic_json')) {
+        try {
+          const text = JSON.stringify(error.cleanup_diagnostic);
+          if (typeof text === 'string') error.cleanup_diagnostic_json = text.length <= DIAG_JSON_MAX ? text : `${text.slice(0, DIAG_JSON_MAX)}…(truncated)`;
+        } catch { /* the object stays attached; text is only a rendering */ }
       }
       throw error;
     }
