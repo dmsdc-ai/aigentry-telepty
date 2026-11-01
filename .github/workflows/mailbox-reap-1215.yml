@@ -1,0 +1,278 @@
+name: Mailbox reap EPERM regression (task 1215 / lock227, original vs fix)
+
+# Task 1215 / release1238 / lock227 — ISOLATED DIAGNOSTIC for the Windows job 124852862725 failure (8f7a70b tree);
+# not shipped, not a release gate. A reap of an already-departed or dead-owner ticket (readTicket:197/:200) called
+# removeTicket, whose own ticket-directory listings (:158 via checkTicketFiles → ticketNames:97, and :176) had no EPERM
+# handling, so a delete-pending directory threw a raw EPERM scandir out of acquireLock.
+#
+# THIS RUN, once per job (no rerun, retry, loop or continue-on-error), on the SAME integrated commit, Windows and Ubuntu:
+#   original = ORIGINAL_SHA plus only the frozen test file. The workflow restores src/mailbox/lock.js from ORIGINAL_SHA,
+#              and the identity is PROVEN with `git diff --name-only ORIGINAL_SHA`.
+#   fix      = ORIGINAL_SHA plus the frozen test file and the lock.js candidate (exact hashes below).
+# Both legs run a genuine `npm ci` (normal lifecycle), then the identical frozen file once, selecting ONLY the eleven
+# "[L227 …]" cases with --test-name-pattern. They use the exact test:ci preload, with a spec reporter on stdout and a
+# TAP file.
+# Verdict, recorded separately from the raw exit code; TAP membership must be EXACT:
+#   original: R1–R5 `not ok`, each with its own first-assertion message ending in "seam-scandir" (the seam-injected
+#             EPERM escaped), and P1, P2, N1–N4 `ok`. Totals: pass 6 / fail 5 / cancelled 0 / todo 0.
+#   fix:      all eleven `ok`. Totals: pass 11 / fail 0 / cancelled 0 / todo 0.
+#   Every other TAP test line must be one of the ten pre-existing C1–C10 names marked `# SKIP` (name filter). Their
+#   count must be 0 or 10 and must equal `# skipped`. A selected case that is skipped, missing or duplicated fails.
+#   Setup, import, exit, timing or registration failures never count as the expected RED.
+# SUPPORTING (fix leg only, once, separate verdict): the UNCHANGED test/mailbox-lock-concurrency.test.js case
+#   "multiple processes never overlap mailbox mutation or lose increments". It is timing-dependent supporting evidence,
+#   not the reproduction; a failure fails this job visibly but never changes verdict.txt.
+#
+# BOUNDS: job <= 15 min; npm ci <= 5 min; regression <= 3 min; supporting <= 4 min; evidence <= 2 MiB allowlisted,
+# retained 7 days even on failure. The default bash shell is `-eo pipefail`, so errexit is disabled explicitly ONLY
+# around each captured command and is restored immediately. core.autocrlf stays the runner default, so bytes are
+# verified as sha256 with CR removed.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/mailbox-reap-1215-227'
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: frozen mailbox reap regression (${{ matrix.os }}, ${{ matrix.leg }}) — diagnostic only
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        leg: [original, fix]
+    defaults:
+      run:
+        shell: bash
+    env:
+      LEG: ${{ matrix.leg }}
+      ORIGINAL_SHA: 8f7a70bd5ee229282d91f8fd9db2d25e6e6d7546
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.2'
+
+      - name: Select and prove the leg's source identity (exact bytes, CR removed)
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/mailbox-reap-1215-evidence"
+          mkdir "$EVIDENCE" "$RUNNER_TEMP/mailbox-reap-1215-raw"
+          lf_sha() { tr -d '\r' < "$1" | sha256sum | cut -d' ' -f1; }
+          expect() {
+            local got; got="$(lf_sha "$1")"
+            printf '%s lf_sha256=%s\n' "$1" "$got" >> "$EVIDENCE/input-hashes.txt"
+            [ "$got" = "$2" ] || { echo "::error::$1 is not the reviewed body (lf_sha256 ${got}); nothing was run"; exit 1; }
+          }
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"
+          printf 'leg=%s\nos=%s\ncommit=%s\noriginal=%s\nnode=%s\nnpm=%s\ncore_autocrlf=%s\n' "$LEG" "$RUNNER_OS" "$GITHUB_SHA" "$ORIGINAL_SHA" \
+            "$NODE_VERSION" "$NPM_VERSION" "$(git config --get core.autocrlf || echo unset)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.2" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.2"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2"; exit 1; }
+          git cat-file -e "${ORIGINAL_SHA}^{commit}" || { echo "::error::original ${ORIGINAL_SHA} is not in this history; nothing was run"; exit 1; }
+          expect test/mailbox-departure-review-879.test.js e9320afda585e4e13576dc4c95b273a18978a0fceb5f318bd510bf2190b811eb
+          expect test/mailbox-lock-concurrency.test.js ccb8c5b9b43e1558e1529dce58df05d76d121f472c27af974618166778109b91
+          expect test-support/mailbox-lock-worker.js 8f6b993ac1af61fb4e5e282b24cc476e32e572c353778f94a62143d639346f7e
+          case "$LEG" in
+            fix)
+              expect src/mailbox/lock.js 0d821c4d67d3e127b5ba9d362bfb185786244db6bcd094c30e4e356340f427ad
+              ALLOWED=".github/workflows/mailbox-reap-1215.yml src/mailbox/lock.js test/mailbox-departure-review-879.test.js" ;;
+            original)
+              git show "${ORIGINAL_SHA}:src/mailbox/lock.js" > src/mailbox/lock.js
+              expect src/mailbox/lock.js 41e39b51105236c0b890d2c4fb476aba9fef71df16990c75b002a1d9a45537af
+              ALLOWED=".github/workflows/mailbox-reap-1215.yml test/mailbox-departure-review-879.test.js" ;;
+            *) echo "::error::unknown leg"; exit 1 ;;
+          esac
+          # Identity proof: every path that differs from ORIGINAL_SHA (tracked changes plus untracked files) must be allowed.
+          { git diff --name-only "$ORIGINAL_SHA" --; git ls-files --others --exclude-standard; } | LC_ALL=C sort -u > "$EVIDENCE/identity-vs-original.txt"
+          cat "$EVIDENCE/identity-vs-original.txt"
+          while IFS= read -r changed; do
+            case " $ALLOWED " in *" $changed "*) ;; *) echo "::error::${changed} differs from ${ORIGINAL_SHA} but is not part of the ${LEG} leg"; exit 1 ;; esac
+          done < "$EVIDENCE/identity-vs-original.txt"
+
+      - name: npm ci (frozen lock, normal lifecycle; exit recorded)
+        id: install
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/mailbox-reap-1215-evidence"; RAW="$RUNNER_TEMP/mailbox-reap-1215-raw"
+          set +e
+          npm ci --no-audit --fund=false > "$RAW/npm-ci.stdout" 2> "$RAW/npm-ci.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/npm-ci.exit_code"
+          echo "npm ci exit=${rc}"
+          [ "$rc" = 0 ] || exit "$rc"
+
+      - name: Run the selected frozen cases once (exact test:ci preload; raw exit, spec and TAP recorded)
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/mailbox-reap-1215-evidence"; RAW="$RUNNER_TEMP/mailbox-reap-1215-raw"
+          set +e
+          node --require ./test-support/setup-env.js --test --test-name-pattern="^\[L227 " \
+            --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap --test-reporter-destination="$RAW/test.tap" \
+            test/mailbox-departure-review-879.test.js > "$RAW/test.stdout" 2> "$RAW/test.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/test.exit_code"
+          tail -n 80 "$RAW/test.stdout" | cut -c1-400
+          cat > "$RAW/red.txt" <<'NAMES'
+          [L227 R1] admission reap of a departed ticket: EPERM at the first removeTicket listing is left to the finishing remover
+          [L227 R2] departed reap: EPERM at the post-unlink re-list is left to the finishing remover
+          [L227 R3] dead-owner reap in acquireLock: EPERM at the first listing (a concurrent reaper finishing) is left to it
+          [L227 R4] dead-owner reap in reapSessionLocks: EPERM at the re-list is left pending and never counted as removed
+          [L227 R5] a persistently refused departed-ticket reap listing is bounded: one attempt per scan, cleanup left pending
+          NAMES
+          cat > "$RAW/control.txt" <<'NAMES'
+          [L227 P1] positive control: a departed own-pid ticket is fully reaped through removeTicket
+          [L227 P2] positive control: a dead owner's unmarked ticket is fully reaped and counted once
+          [L227 N1] denial control: a persistent EPERM listing of an UNMARKED live ticket blocks to timeout and keeps it
+          [L227 N2] owner control: an EPERM listing of the owner's own ticket during release() still throws
+          [L227 N3] owner control: an EPERM listing of the owner's own ticket during failed-acquisition cleanup still throws
+          [L227 N4] unlink control: a refused unlink of a stat-able entry in a departed reap still throws and keeps the evidence
+          NAMES
+          cat > "$RAW/preexisting.txt" <<'NAMES'
+          C1 R1: transient EPERM lstat on a peer ticket DIRECTORY blocks, then the acquirer progresses after it clears
+          C2 R1: transient EPERM readdir of a peer ticket DIRECTORY blocks, then the acquirer progresses after it clears
+          C3 R1 control: a PERSISTENT EPERM lstat on a peer ticket directory never admits and never evicts the peer
+          C4 live-owner control: a real holder stays exclusive, unmarked and unevicted
+          C5 R2: marker-present SYMLINK number is refused as unsafe; the link target and the evidence are kept
+          C6 R2: marker-present DIRECTORY number is refused as unsafe; its contents and the evidence are kept
+          C7 R2: marker-present HARD-LINKED number is refused as unsafe; the other link and the evidence are kept
+          C8 R2 control: the same SYMLINK number without a marker is refused as unsafe (fixture validity)
+          C9 control: EPERM on a number whose peer is departing (marker listed, directory present) is a departure
+          C10 permission control: EPERM on a live number WITHOUT a marker still fails closed and keeps the ticket
+          NAMES
+          cat > "$RAW/messages.txt" <<'NAMES'
+          [L227 R1] removeTicket first-listing EPERM escaped the admission reap: seam-scandir
+          [L227 R2] removeTicket re-list EPERM escaped the departed reap: seam-scandir
+          [L227 R3] removeTicket first-listing EPERM escaped the dead-owner reap: seam-scandir
+          [L227 R4] removeTicket re-list EPERM escaped the dead-owner reap: seam-scandir
+          [L227 R5] a persistent reap-listing EPERM escaped acquireLock: seam-scandir
+          NAMES
+          for f in red control preexisting messages; do sed -i 's/^ *//' "$RAW/$f.txt"; done
+          case "$LEG" in
+            original) { sed 's/^/not ok - /' "$RAW/red.txt"; sed 's/^/ok - /' "$RAW/control.txt"; } | LC_ALL=C sort > "$RAW/expected.txt"; want_pass=6; want_fail=5 ;;
+            fix) { sed 's/^/ok - /' "$RAW/red.txt"; sed 's/^/ok - /' "$RAW/control.txt"; } | LC_ALL=C sort > "$RAW/expected.txt"; want_pass=11; want_fail=0 ;;
+          esac
+          # Top-level TAP test lines, numbers removed: "ok - name", "not ok - name", or "ok - name # SKIP reason".
+          { tr -d '\r' < "$RAW/test.tap" 2>/dev/null || true; } | { grep -E '^(not )?ok [0-9]+ - ' || true; } \
+            | sed -E 's/^(not )?ok [0-9]+ - /\1ok - /' > "$EVIDENCE/members.txt"
+          { grep -F '[L227 ' "$EVIDENCE/members.txt" || true; } | LC_ALL=C sort > "$RAW/selected.txt"
+          { grep -vF '[L227 ' "$EVIDENCE/members.txt" || true; } > "$RAW/others.txt"
+          membership=no; diff -u "$RAW/expected.txt" "$RAW/selected.txt" && membership=yes
+          others=0; others_ok=yes
+          while IFS= read -r line; do
+            others=$((others + 1))
+            name="${line#ok - }"; name="${name% \# SKIP*}"
+            case "$line" in "ok - "*" # SKIP"*) ;; *) others_ok=no ;; esac
+            grep -qxF -- "$name" "$RAW/preexisting.txt" || others_ok=no
+          done < "$RAW/others.txt"
+          dupes="$({ sed -E 's/ # SKIP.*$//; s/^(not )?ok - //' "$EVIDENCE/members.txt" | LC_ALL=C sort | uniq -d; } | wc -l | tr -d ' ')"
+          count() { local v; v="$({ tr -d '\r' < "$RAW/test.tap" 2>/dev/null || true; } | { grep -E "^# $1 [0-9]+$" || true; } | tail -n 1 | awk '{print $3}')"; echo "${v:-missing}"; }
+          pass="$(count pass)"; fail="$(count fail)"; cancelled="$(count cancelled)"; skipped="$(count skipped)"; todo="$(count todo)"
+          messages=yes
+          if [ "$LEG" = original ]; then
+            while IFS= read -r m; do [ "$({ grep -cF -- "$m" "$RAW/test.tap" || true; })" = 1 ] || messages=no; done < "$RAW/messages.txt"
+          elif grep -qF 'seam-scandir' "$RAW/test.tap" 2>/dev/null; then messages=no; fi
+          verdict=unexpected
+          if [ "$membership" = yes ] && [ "$others_ok" = yes ] && [ "$dupes" = 0 ] && { [ "$others" = 0 ] || [ "$others" = 10 ]; } \
+             && [ "$pass" = "$want_pass" ] && [ "$fail" = "$want_fail" ] && [ "$cancelled" = 0 ] && [ "$todo" = 0 ] && [ "$skipped" = "$others" ] \
+             && [ "$messages" = yes ]; then
+            if [ "$LEG" = original ] && [ "$rc" != 0 ]; then verdict=expected_red; fi
+            if [ "$LEG" = fix ] && [ "$rc" = 0 ]; then verdict=green; fi
+          fi
+          printf 'leg=%s\nos=%s\ntest_exit=%s\ntap_pass=%s\ntap_fail=%s\ntap_cancelled=%s\ntap_skipped=%s\ntap_todo=%s\nmembership_exact=%s\nfiltered_lines=%s\nfiltered_ok=%s\nduplicates=%s\nred_messages=%s\nverdict=%s\n' \
+            "$LEG" "$RUNNER_OS" "$rc" "$pass" "$fail" "$cancelled" "$skipped" "$todo" "$membership" "$others" "$others_ok" "$dupes" "$messages" "$verdict" > "$EVIDENCE/verdict.txt"
+          cat "$EVIDENCE/verdict.txt"
+          echo "::notice title=lock227 ${RUNNER_OS} ${LEG} (diagnostic only)::test exit ${rc}; verdict ${verdict}"
+          case "$verdict" in expected_red|green) exit 0 ;; *) exit 1 ;; esac
+
+      - name: Supporting evidence (fix leg only) — the unchanged concurrency case, once
+        if: always() && matrix.leg == 'fix' && steps.install.outcome == 'success'
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/mailbox-reap-1215-evidence"; RAW="$RUNNER_TEMP/mailbox-reap-1215-raw"
+          NAME='multiple processes never overlap mailbox mutation or lose increments'
+          set +e
+          node --require ./test-support/setup-env.js --test --test-name-pattern="^${NAME}\$" \
+            --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap --test-reporter-destination="$RAW/concurrency.tap" \
+            test/mailbox-lock-concurrency.test.js > "$RAW/concurrency.stdout" 2> "$RAW/concurrency.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/concurrency.exit_code"
+          tail -n 40 "$RAW/concurrency.stdout" | cut -c1-400
+          count() { local v; v="$({ tr -d '\r' < "$RAW/concurrency.tap" 2>/dev/null || true; } | { grep -E "^# $1 [0-9]+$" || true; } | tail -n 1 | awk '{print $3}')"; echo "${v:-missing}"; }
+          pass="$(count pass)"; fail="$(count fail)"; cancelled="$(count cancelled)"
+          selected="$({ tr -d '\r' < "$RAW/concurrency.tap" 2>/dev/null || true; } | { grep -cxE "ok [0-9]+ - ${NAME}" || true; })"
+          supporting=fail
+          if [ "$rc" = 0 ] && [ "$pass" = 1 ] && [ "$fail" = 0 ] && [ "$cancelled" = 0 ] && [ "$selected" = 1 ]; then supporting=pass; fi
+          printf 'os=%s\nconcurrency_exit=%s\ntap_pass=%s\ntap_fail=%s\ntap_cancelled=%s\nselected_ok_lines=%s\nsupporting=%s\n' \
+            "$RUNNER_OS" "$rc" "$pass" "$fail" "$cancelled" "$selected" "$supporting" > "$EVIDENCE/supporting-verdict.txt"
+          cat "$EVIDENCE/supporting-verdict.txt"
+          echo "::notice title=lock227 ${RUNNER_OS} supporting (diagnostic only)::concurrency exit ${rc}; supporting ${supporting}"
+          [ "$supporting" = pass ]
+
+      - name: Bound evidence (allowlisted, <= 2 MiB; runs whatever the commands did)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/mailbox-reap-1215-evidence"; RAW="$RUNNER_TEMP/mailbox-reap-1215-raw"
+          test -d "$EVIDENCE" && test -d "$RAW" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          : > "$EVIDENCE/capture-bounds.txt"
+          copy_capped() { # copy_capped NAME MAX_BYTES
+            if [ -f "$RAW/$1" ] && [ ! -L "$RAW/$1" ]; then
+              local size; size="$(wc -c < "$RAW/$1" | tr -d ' ')"
+              head -c "$2" "$RAW/$1" > "$EVIDENCE/$1"
+              printf '%s raw_bytes=%s kept_bytes=%s truncated=%s\n' "$1" "$size" "$(wc -c < "$EVIDENCE/$1" | tr -d ' ')" \
+                "$([ "$size" -gt "$2" ] && echo yes || echo no)" >> "$EVIDENCE/capture-bounds.txt"
+            else
+              printf '%s absent\n' "$1" >> "$EVIDENCE/capture-bounds.txt"
+            fi
+          }
+          copy_capped npm-ci.stdout 32768
+          copy_capped npm-ci.stderr 32768
+          copy_capped test.stdout 262144
+          copy_capped test.stderr 262144
+          copy_capped test.tap 262144
+          copy_capped concurrency.stdout 262144
+          copy_capped concurrency.stderr 262144
+          copy_capped concurrency.tap 262144
+          for f in npm-ci.exit_code test.exit_code members.txt verdict.txt concurrency.exit_code supporting-verdict.txt; do
+            [ -f "$EVIDENCE/$f" ] || printf '%s absent (step not reached, not applicable to this leg, or ended by its bound)\n' "$f" >> "$EVIDENCE/capture-bounds.txt"
+          done
+          cat "$EVIDENCE/capture-bounds.txt"
+          shopt -s dotglob nullglob
+          total=0
+          for f in "$EVIDENCE"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::non-regular evidence entry; not uploading"; exit 1; }
+            case "$(basename "$f")" in
+              toolchain.txt|input-hashes.txt|identity-vs-original.txt|capture-bounds.txt|npm-ci.exit_code|npm-ci.stdout|npm-ci.stderr) ;;
+              test.exit_code|test.stdout|test.stderr|test.tap|members.txt|verdict.txt) ;;
+              concurrency.exit_code|concurrency.stdout|concurrency.stderr|concurrency.tap|supporting-verdict.txt) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+            total=$((total + $(wc -c < "$f" | tr -d ' ')))
+          done
+          echo "evidence bytes=${total}"
+          [ "$total" -le 2097152 ] || { echo "::error::evidence is ${total} bytes (> 2 MiB); not uploading"; exit 1; }
+
+      - name: Upload evidence (no lockfile, credentials, cache or node_modules)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: mailbox-reap-1215-227-${{ matrix.os }}-${{ matrix.leg }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mailbox-reap-1215-evidence
+          if-no-files-found: error
+          retention-days: 7

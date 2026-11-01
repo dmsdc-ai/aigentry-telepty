@@ -24,7 +24,10 @@ const COUNTERS = ['doorway_rescans', 'admission_polls', 'pauses', 'pause_request
   'eperm_restat_relist_dir_gone', 'eperm_restat_unmarked_throw_entry_listed', 'eperm_restat_unmarked_throw_entry_absent',
   // #1215 lock10: the read-site EPERM whose re-list shows the published `number` gone (departure final stage), and a
   // diagnostic split of the remaining throws (not `eperm_`-prefixed, so eperm_total is not double counted).
-  'eperm_read_number_gone', 'read_throw_number_listed'];
+  'eperm_read_number_gone', 'read_throw_number_listed',
+  // #1215 lock227: a REAP's own listing of the ticket directory (removeTicket's first listing / post-unlink re-list)
+  // refused with EPERM; the cleanup is left pending for the remover finishing it (counted, never claimed removed).
+  'eperm_reap_list_unresolved', 'eperm_reap_relist_unresolved'];
 const MAXIMA = ['pause_actual_max_ms', 'peers_seen_max'];
 const counters = () => Object.fromEntries([...COUNTERS, ...MAXIMA].map(key => [key, 0]));
 const totals = {acquired: 0, timeouts: 0, errors: 0, wait_ms_total: 0, wait_ms_max: 0, ...counters()};
@@ -153,9 +156,14 @@ function checkTicketFiles(dir, names = ticketNames(dir)) {
   }
   return names;
 }
-function removeTicket(dir) {
+function removeTicket(dir, reap = false) {
   // Only this unique acquisition's directory is removed. Its name is never reused.
-  const names = checkTicketFiles(dir);
+  // #1215 lock227: only readTicket's departed/dead-owner REAP passes reap (never the owner's release or abort). A reap
+  // reads this directory's listing through dirState: EPERM there (a delete-pending directory another remover is
+  // finishing) leaves the cleanup pending and returns UNRESOLVED. Entry stat/unlink refusals are unchanged.
+  const listed = reap ? dirState(() => ticketNames(dir)) : ticketNames(dir);
+  if (listed === UNRESOLVED) { note('eperm_reap_list_unresolved'); return UNRESOLVED; }
+  const names = checkTicketFiles(dir, listed);
   if (names === null) return;
   if (names === UNRESOLVED) throw failure();
   let marked = names.includes(DEPARTED);
@@ -173,7 +181,8 @@ function removeTicket(dir) {
   }
   // A peer still holding a ticket file keeps it listed (Windows delete-pending). The marker
   // then stays, the ticket reads as departed, and a later owner or dead-owner pass finishes it.
-  const rest = ticketNames(dir);
+  const rest = reap ? dirState(() => ticketNames(dir)) : ticketNames(dir);
+  if (rest === UNRESOLVED) { note('eperm_reap_relist_unresolved'); return UNRESOLVED; }
   if (rest === null || rest.length !== 1 || rest[0] !== DEPARTED) return;
   const marker = path.join(dir, DEPARTED);
   try { fs.unlinkSync(marker); }
@@ -194,10 +203,11 @@ function readTicket(parent, name, reap) {
   if (names === UNRESOLVED) return unresolved;
   if (names === null) return null; // This unique participant has left.
   if (names.includes(DEPARTED)) { // Departed, not a stale lock: only its owner or a dead-owner reap finishes it.
-    if (reap && (pid === process.pid || !isProcessAlive(pid))) removeTicket(dir);
+    if (reap && (pid === process.pid || !isProcessAlive(pid))) removeTicket(dir, true);
     return null;
   }
-  if (reap && !isProcessAlive(pid)) { removeTicket(dir); return {removed: true}; }
+  // #1215 lock227: an unresolved dead-owner reap is not counted as removed (the dead owner blocks nothing either way).
+  if (reap && !isProcessAlive(pid)) return removeTicket(dir, true) === UNRESOLVED ? null : {removed: true};
   const published = names.includes('number'); // #1215 lock10: this read listed (and stat-validated) a published number
   let fd;
   try {
