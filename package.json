@@ -78,13 +78,13 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "node-pty": "^1.2.0-beta.11",
     "prompts": "^2.4.2",
-    "ws": "^8.19.0",
-    "zod": "^3.24.0",
+    "ws": "^8.21.0",
+    "zod": "^4.6.6",
     "@xterm/headless": "6.0.0"
   },
   "devDependencies": {
