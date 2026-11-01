@@ -765,6 +765,55 @@ function createSessionActions(shared, effects = {}) {
     };
   }
 
+  // #1215 fix93 — DELETE of a spawned PTY sent ONE node-pty kill() (SIGHUP on POSIX; node-pty swallows
+  // its errors) and never looked again, so a child ignoring SIGHUP outlived its deleted record untracked
+  // (CI 41256450955 F2). Confirm the end of THIS captured child through its own onExit: the record's
+  // onExit cleanup bails once the record is gone, so session.ptyProcess/pid fields prove nothing after
+  // DELETE. Not ended within the lifecycle's 5000 ms grace => escalate ONCE via
+  // lifecycle.killSessionProcess(force) at the pid captured from this pty — never a record fallback
+  // (ptyPid/ownerPid). The response is untouched: 200 {status:'closing'} still means "requested".
+  const DELETE_EXIT_GRACE_MS = 5000;
+  function confirmDeletedPtyExit(id, session, pty) {
+    const pid = Number.isInteger(pty.pid) && pty.pid > 0 ? pty.pid : null;
+    if (!pid || typeof pty.onExit !== 'function') {
+      console.warn(`[KILL] Session ${id} PTY exit cannot be confirmed (no pid or exit observer); not escalating`);
+      return;
+    }
+    const clear = effects.setTimeout ? effects.clearTimeout : globalThis.clearTimeout;
+    let ended = false, timer = null, listener = null;
+    const stop = () => {
+      if (timer && typeof clear === 'function') clear(timer);
+      timer = null;
+      try { if (listener && typeof listener.dispose === 'function') listener.dispose(); } catch {}
+      listener = null;
+    };
+    try {
+      listener = pty.onExit(() => { ended = true; stop(); });
+    } catch (error) {
+      console.warn(`[KILL] Session ${id} PTY exit cannot be confirmed: ${error.message}; not escalating`);
+      return;
+    }
+    timer = scheduleTimeout(() => {
+      timer = null;
+      if (ended) return;
+      console.warn(`[KILL] Session ${id} PTY pid ${pid} did not exit within ${DELETE_EXIT_GRACE_MS} ms of delete; escalating once (SIGKILL)`);
+      Promise.resolve()
+        .then(() => shared.lifecycle.killSessionProcess(session, { ...effects.lifecycle, pid, force: true }))
+        .then(kill => (kill && kill.signaled ? null : `escalation not delivered (${(kill && kill.reason) || 'unknown'})`),
+          error => `escalation failed: ${error && error.message}`)
+        .then(failure => {
+          if (ended) return;
+          if (failure) console.error(`[KILL] Session ${id} PTY pid ${pid} ${failure}`);
+          timer = scheduleTimeout(() => {
+            timer = null;
+            if (!ended) console.error(`[KILL] Session ${id} PTY pid ${pid} exit NOT confirmed ${DELETE_EXIT_GRACE_MS} ms after escalation; it may still be running untracked`);
+            stop();
+          }, DELETE_EXIT_GRACE_MS);
+        })
+        .catch(error => { console.error(`[KILL] Session ${id} PTY exit confirmation failed: ${error && error.message}`); stop(); });
+    }, DELETE_EXIT_GRACE_MS);
+  }
+
   async function busAutoRoute(msg) {
     const eventType = msg.type || msg.kind;
     const isRoutable = (eventType === 'turn_request' || eventType === 'deliberation_route_turn') && (msg.target || msg.target_session_id);
@@ -1800,7 +1849,10 @@ function createSessionActions(shared, effects = {}) {
         if (session.type === 'wrapped') {
           if (session.clients) session.clients.forEach(ws => ws.close(1000, 'Session destroyed'));
         } else if (session.ptyProcess) {
-          session.ptyProcess.kill();
+          // #1215 fix93 — arm the exit confirmation on the captured pty before signalling it.
+          const pty = session.ptyProcess;
+          confirmDeletedPtyExit(id, session, pty);
+          pty.kill();
         }
       } catch (err) {
         killError = err;

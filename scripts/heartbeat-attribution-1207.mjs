@@ -215,11 +215,18 @@ async function runArm(arm, outDir, ctx) {
 
   // 1. idle sibling sampler (both arms)
   let ready = false;
+  // perf89: coverage is decided on ONE clock (this harness's absNow) from the causal order the harness enforces, never by
+  // comparing two processes' performance.timeOrigin clocks (run 41254607100: harness-vs-sibling offset >= 57 ms, growing).
+  let readyRecvAbs = null;     // harness clock when the `ready` line arrived
+  let siblingReadyAbs = null;  // sibling clock printed on that line (data only)
   const sibling = runChild({ label: 'sibling', args: [path.join('test', 'fixtures', 'ledger-1207', 'heartbeat-sibling-sampler.js'), path.join(dir, 'sibling.json'), String(LIMITS.siblingMaxMs)],
-    env: baseEnv, dir, timeoutMs: LIMITS.siblingMaxMs + 30000, stdinPipe: true, onStdoutLine: (l) => { if (l.startsWith('ready ')) ready = true; } });
+    env: baseEnv, dir, timeoutMs: LIMITS.siblingMaxMs + 30000, stdinPipe: true,
+    onStdoutLine: (l) => { if (l.startsWith('ready ') && !ready) { ready = true; readyRecvAbs = absNow(); siblingReadyAbs = Number(l.slice(6)); } } });
   const readyBy = Date.now() + LIMITS.siblingReadyMs;
   while (!ready && Date.now() < readyBy && !sibling.rec.events.some((e) => e.ev === 'exit')) await new Promise((r) => setTimeout(r, 20));
   if (!ready) result.incomplete_reasons.push('sibling_not_ready');
+  // Snapshot BEFORE the target is spawned: a `ready` that arrives later must not count as start coverage.
+  const readyBeforeSpawn = ready;
 
   // 2. target (both arms) + neighbour lanes (CONTENDED only), started together. Every workload child is tracked so an arm
   //    timeout kills ALL of them before the next arm starts (no cross-arm contamination).
@@ -310,13 +317,28 @@ async function runArm(arm, outDir, ctx) {
   // spawn→exit window; otherwise every interval's overlap is null (SIBLING-OVERLAP-UNAVAILABLE) and the arm is incomplete.
   const evAt = (name) => { const e = targetRec.events.find((x) => x.ev === name); return e ? e.abs_ms : null; };
   const targetWindow = { start_ms: evAt('spawn'), end_ms: evAt('exit') };
+  const sibExit = (siblingFinal.events || []).find((x) => x.ev === 'exit');
+  const siblingExitAbs = sibExit ? sibExit.abs_ms : null;   // harness clock, same as targetWindow
   const siblingWhy = !siblingData ? 'no_sibling_output'
     : siblingData.stop_reason !== 'stdin_end' ? `stop_reason_${siblingData.stop_reason}`
       : siblingData.gaps_dropped !== 0 ? `gaps_dropped_${siblingData.gaps_dropped}`
         : !(Number.isFinite(targetWindow.start_ms) && Number.isFinite(targetWindow.end_ms)) ? 'target_window_unknown'
-          : !(siblingData.abs_start_ms <= targetWindow.start_ms && siblingData.abs_end_ms >= targetWindow.end_ms) ? 'sibling_window_does_not_cover_target' : null;
+          // start: sampling began before `ready` (sampler source) and `ready` reached this harness before the target spawned
+          : !(readyBeforeSpawn && Number.isFinite(readyRecvAbs) && readyRecvAbs <= targetWindow.start_ms) ? 'sibling_not_ready_before_target_spawn'
+            // end: the sibling stopped (stdin end, sent only after the target settled) and exited after the target exited
+            : !(Number.isFinite(siblingExitAbs) && siblingExitAbs >= targetWindow.end_ms) ? 'sibling_exited_before_target_exit' : null;
   result.sibling_overlap_valid = siblingWhy === null;
   result.target_window = targetWindow;
+  // The four harness-clock instants the coverage rule used, persisted so the verdict can be re-checked from arm.json alone.
+  result.sibling_coverage_harness_clock = { ready_received_before_spawn: readyBeforeSpawn, ready_recv_ms: readyRecvAbs,
+    target_spawn_ms: targetWindow.start_ms, target_exit_ms: targetWindow.end_ms, sibling_exit_ms: siblingExitAbs };
+  // Data only, never a verdict: the former cross-process comparison, and a LOWER BOUND on (sibling clock - harness clock)
+  // implied by `ready` preceding the spawn (positive values prove the sibling clock reads ahead by at least that much).
+  result.cross_process_clock = siblingData ? {
+    sibling_abs_start_minus_target_spawn_ms: Number.isFinite(siblingData.abs_start_ms) && Number.isFinite(targetWindow.start_ms) ? siblingData.abs_start_ms - targetWindow.start_ms : null,
+    sibling_abs_end_minus_target_exit_ms: Number.isFinite(siblingData.abs_end_ms) && Number.isFinite(targetWindow.end_ms) ? siblingData.abs_end_ms - targetWindow.end_ms : null,
+    sibling_ahead_lower_bound_ms: Number.isFinite(siblingReadyAbs) && Number.isFinite(targetWindow.start_ms) ? siblingReadyAbs - targetWindow.start_ms : null,
+  } : null;
   if (siblingWhy) result.incomplete_reasons.push(`sibling_overlap_invalid:${siblingWhy}`);
   const siblingGaps = siblingWhy === null ? siblingData.gaps : null;
   result.cases = SELECTED.map((s) => {
