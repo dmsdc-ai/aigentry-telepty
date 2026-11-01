@@ -33,10 +33,47 @@ process.env.USERPROFILE = TMP_HOME;
 process.env.PORT = '0';
 
 const daemonModule = require('../daemon');
+const { createSessionDeliveryFixture } = require('../test-support/session-delivery-fixture');
+const queueFixture = createSessionDeliveryFixture();
+after(() => queueFixture.dispose());
 
 let daemon;
-before(async () => { daemon = await startTestDaemon(); });
-after(async () => { if (daemon) await daemon.stop(); });
+// #1207 — three ledgers are in play and each is isolated: the subprocess daemon's directory store
+// under its harness HOME, THIS process's store under TMP_HOME (daemonModule), and the queue
+// fixture's private store (test-support/session-delivery-fixture.js), which holds the tracked
+// records of the F2 cases. Every open is asynchronous; each is awaited before a record is opened.
+before(async () => {
+  const opened = await daemonModule.ledgerReady;
+  assert.equal(opened.ok, true, `the in-process ledger must open first: ${JSON.stringify(opened)}`);
+  daemon = await startTestDaemon();
+  await daemon.waitFor(async () => {
+    const r = await daemon.request('/api/ledger/status');
+    return r.status === 200 && r.body && r.body.client && r.body.client.store === 'available';
+  }, { timeoutMs: 15000, description: 'the test daemon\'s ledger to be available' });
+});
+after(async () => {
+  if (daemon) await daemon.stop();
+  await daemonModule.ledgerClient.close(2000);
+});
+
+// #1207 — the three queue-flush paths (`flushModalParkQueue`, `failBootstrapQueueOnTimeout`,
+// `drainBootstrapQueue`'s failure arms) AWAIT the terminal outcome (`settleTerminalOutcome` at all
+// four call sites in src/mailbox/delivery-runtime.js) before they notify or settle. Some cases here
+// do not hold the flush's promise (it is fired, or entered from a timer), so the durable terminal
+// transition is polled. The assertion is on the durable state, with a failsafe deadline, and nothing
+// asserted is relaxed.
+// The tracked records of these cases live in the queue fixture's own ledger (the store they were
+// begun in), so that is the read model polled here.
+async function abortedRecord(injectId, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  let record = queueFixture.getTrackedInjection(injectId);
+  while (Date.now() < deadline && !(record && record.tracking_state === 'aborted')) {
+    await new Promise((r) => setTimeout(r, 10));
+    record = queueFixture.getTrackedInjection(injectId);
+  }
+  assert.ok(record, `${injectId} must stay readable in the ledger`);
+  return record;
+}
 
 // The audit writer batches, so the line is not on disk the instant the route answers.
 async function auditLineFor(injectId) {
@@ -136,9 +173,9 @@ const CLEAR_RING = '';
 // Open a tracked record the way the inject route does, then park through the production path —
 // `deliverInjectionToSession` is the enqueue, exactly as the route calls it.
 async function parkTracked(sessionId, session, injectId, opts = {}) {
-  const begun = daemonModule.beginTrackedInjection({ injectId, sessionId, source: 'orchestrator', session });
+  const begun = await queueFixture.beginTrackedInjection({ injectId, sessionId, source: 'orchestrator', session });   // #1207 durable before it returns
   assert.equal(begun.ok, true);
-  const delivery = await daemonModule.deliverInjectionToSession(sessionId, session, 'REPORT: stranded', {
+  const delivery = await queueFixture.deliverInjectionToSession(sessionId, session, 'REPORT: stranded', {
     noEnter: true, from: 'orchestrator', injectId, ...opts,
   });
   assert.equal(delivery.queued, true, 'precondition: the op parked instead of being written');
@@ -151,10 +188,10 @@ test('#860 F2: a park dropped at the modal TTL is aborted in the ledger, not onl
   const session = claudeSession(MODAL_RING);              // nobody ever answers the modal
   await parkTracked(sid, session, 'inj-modal-ttl');
 
-  const outcome = await daemonModule.awaitModalParkDrain(sid, session, { timeoutMs: 120, pollIntervalMs: 20 });
+  const outcome = await queueFixture.awaitModalParkDrain(sid, session, { timeoutMs: 120, pollIntervalMs: 20 });
   assert.equal(outcome.flushed, 1, 'precondition: the TTL flushed the parked op');
 
-  const record = daemonModule.getTrackedInjection('inj-modal-ttl');
+  const record = await abortedRecord('inj-modal-ttl');
   assert.equal(record.tracking_state, 'aborted',
     'the op was discarded and the ledger still said the dispatch was in flight');
   assert.equal(record.last_observation.kind, 'inject_delivery_dropped');
@@ -168,10 +205,10 @@ test('#860 F2: a park dropped at the bootstrap-ready timeout is aborted in the l
   const session = claudeSession(CLEAR_RING, { ready: false });
   await parkTracked(sid, session, 'inj-boot-timeout');
 
-  daemonModule.failBootstrapQueueOnTimeout(sid, session, { reason: 'bootstrap_ready_timeout' });
+  queueFixture.failBootstrapQueueOnTimeout(sid, session, { reason: 'bootstrap_ready_timeout' });
   assert.equal(session.bootstrapQueue.length, 0, 'precondition: the timeout flushed the queue');
 
-  const record = daemonModule.getTrackedInjection('inj-boot-timeout');
+  const record = await abortedRecord('inj-boot-timeout');
   assert.equal(record.tracking_state, 'aborted');
   assert.equal(record.last_observation.kind, 'inject_delivery_dropped');
   assert.equal(record.last_observation.trigger, 'bootstrap_ready_timeout');
@@ -185,9 +222,9 @@ test('#860 F2: a drain whose write is refused is aborted in the ledger, with the
 
   session.bootstrapReady = true;                           // the CLI comes up …
   session.ownerWs.readyState = 3;                          // … and the bridge is gone by the time it drains
-  await daemonModule.drainBootstrapQueue(sid, session);
+  await queueFixture.drainBootstrapQueue(sid, session);
 
-  const record = daemonModule.getTrackedInjection('inj-drain-fail');
+  const record = await abortedRecord('inj-drain-fail');
   assert.equal(record.tracking_state, 'aborted');
   assert.equal(record.last_observation.kind, 'inject_delivery_refused',
     'the write was ATTEMPTED and refused — that is not the same measurement as never attempting it');
@@ -205,9 +242,9 @@ test('#860 F2: a submit CR refused AFTER the body landed is not recorded as a de
   await parkTracked(sid, session, 'inj-cr-fail', { noEnter: false });   // this one submits
 
   session.bootstrapReady = true;
-  await daemonModule.drainBootstrapQueue(sid, session);
+  await queueFixture.drainBootstrapQueue(sid, session);
 
-  const record = daemonModule.getTrackedInjection('inj-cr-fail');
+  const record = await abortedRecord('inj-cr-fail');
   assert.equal(record.tracking_state, 'aborted');
   assert.equal(record.last_observation.kind, 'inject_delivery_refused');
   assert.equal(session.written.length, 1, 'precondition: the body landed, the CR did not');
@@ -220,8 +257,8 @@ test('#860 F2: an UNtracked inject through the same queue changes nothing', asyn
   // inject_id has to no-op on its absence rather than throw inside a drain.
   const sid = 'f2-untracked';
   const session = claudeSession(MODAL_RING);
-  const delivery = await daemonModule.deliverInjectionToSession(sid, session, 'no record', { noEnter: true });
+  const delivery = await queueFixture.deliverInjectionToSession(sid, session, 'no record', { noEnter: true });
   assert.equal(delivery.queued, true);
-  const outcome = await daemonModule.awaitModalParkDrain(sid, session, { timeoutMs: 120, pollIntervalMs: 20 });
+  const outcome = await queueFixture.awaitModalParkDrain(sid, session, { timeoutMs: 120, pollIntervalMs: 20 });
   assert.equal(outcome.flushed, 1, 'the flush must survive an op with no tracked record');
 });

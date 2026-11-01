@@ -34,7 +34,7 @@ process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = '1';
 // Hermetic: temp HOME + PORT=0 before the require, same discipline as
 // test/completion-unknown-observation-60.test.js — no daemon spawn, no PTY, no HTTP.
 
-const { test } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -48,6 +48,16 @@ process.env.PORT = '0';
 const daemon = require('../daemon');
 const { recordObservation, beginTrackedInjection, getTrackedInjection } = daemon;
 
+// #1207 — the ledger under TMP_HOME is a worker-owned directory store; its open is asynchronous
+// and every begin/observe resolves only after the owner's fsynced ACK. The once-per-inject source
+// suppression under test is unchanged in meaning; it is now keyed on the client's stable per-inject
+// identity instead of the (immutable, replaced-on-ack) read-model record object.
+before(async () => {
+  const opened = await daemon.ledgerReady;
+  assert.equal(opened.ok, true, `the private ledger must open first: ${JSON.stringify(opened)}`);
+});
+after(async () => { await daemon.ledgerClient.close(2000); });
+
 // The three causes an idle session actually cycles through, with the evidence each row
 // requires (session-state.js OBSERVATION_CAUSES).
 const IDLE_CYCLE = [
@@ -60,7 +70,7 @@ let seq = 0;
 
 // One inject, tracked for real, then N observations driven through the real emitter. Returns
 // what the SOURCE received and what the BUS received, so the two legs can be asserted apart.
-function driveObservations(sequence) {
+async function driveObservations(sequence) {
   seq += 1;
   const sessionId = `worker-914-${seq}`;
   const injectId = `probe-914-${seq}`;
@@ -68,7 +78,7 @@ function driveObservations(sequence) {
   const delivered = [];
   const busEvents = [];
 
-  const begun = beginTrackedInjection({
+  const begun = await beginTrackedInjection({
     injectId,
     sessionId,
     session,
@@ -83,8 +93,10 @@ function driveObservations(sequence) {
   };
 
   const results = [];
+  // Sequential on purpose: each observation is evaluated against the COMMITTED state of the one
+  // before it (the owner's ordered overlay), exactly as the settle ticks arrive in production.
   for (const step of sequence) {
-    results.push(recordObservation({
+    results.push(await recordObservation({
       sessionId,
       session,
       pendingReport,
@@ -106,9 +118,9 @@ function driveObservations(sequence) {
 }
 
 // ── The defect ──────────────────────────────────────────────────────────────────────────
-test('#914: cycling causes on one inject deliver the SAME absences to the source over and over', () => {
+test('#914: cycling causes on one inject deliver the SAME absences to the source over and over', async () => {
   // Two full laps of the idle cycle: 6 observations, 3 distinct `kind|cause` identities.
-  const { delivered } = driveObservations([...IDLE_CYCLE, ...IDLE_CYCLE]);
+  const { delivered } = await driveObservations([...IDLE_CYCLE, ...IDLE_CYCLE]);
 
   assert.equal(
     delivered.length,
@@ -118,16 +130,16 @@ test('#914: cycling causes on one inject deliver the SAME absences to the source
   );
 });
 
-test('#914: even a single alternating pair re-delivers today (A,B,A ⇒ 2, not 3)', () => {
+test('#914: even a single alternating pair re-delivers today (A,B,A ⇒ 2, not 3)', async () => {
   const [a, b] = IDLE_CYCLE;
-  const { delivered } = driveObservations([a, b, a]);
+  const { delivered } = await driveObservations([a, b, a]);
 
   assert.equal(delivered.length, 2, 'A,B,A is two distinct absences, so the source hears two');
 });
 
 // ── The invariants the fix must not move ────────────────────────────────────────────────
-test('#914: the bus still hears EVERY observation — dedup is a delivery concern only', () => {
-  const { busEvents } = driveObservations([...IDLE_CYCLE, ...IDLE_CYCLE]);
+test('#914: the bus still hears EVERY observation — dedup is a delivery concern only', async () => {
+  const { busEvents } = await driveObservations([...IDLE_CYCLE, ...IDLE_CYCLE]);
 
   const absences = busEvents.filter((e) => e.type === 'task_completion_unknown');
   assert.equal(
@@ -137,27 +149,27 @@ test('#914: the bus still hears EVERY observation — dedup is a delivery concer
   );
 });
 
-test('#914: the ledger still records every observation — observation_seq unchanged', () => {
-  const { record } = driveObservations([...IDLE_CYCLE, ...IDLE_CYCLE]);
+test('#914: the ledger still records every observation — observation_seq unchanged', async () => {
+  const { record } = await driveObservations([...IDLE_CYCLE, ...IDLE_CYCLE]);
 
   // 6 observations + the `tracking_started` entry beginTrackedInjection appends.
   assert.equal(record.observation_seq, 7, 'ledger append semantics must be untouched');
   assert.equal(record.observations.length, 7);
 });
 
-test('#914: the FIRST absence for an inject is always delivered (§A2)', () => {
-  const { delivered } = driveObservations([IDLE_CYCLE[0]]);
+test('#914: the FIRST absence for an inject is always delivered (§A2)', async () => {
+  const { delivered } = await driveObservations([IDLE_CYCLE[0]]);
   assert.equal(delivered.length, 1, 'absence is emitted, never silence');
 });
 
-test('#914: a genuinely NEW observation kind is still delivered after the cycle goes quiet', () => {
+test('#914: a genuinely NEW observation kind is still delivered after the cycle goes quiet', async () => {
   const withExit = [
     ...IDLE_CYCLE,
     ...IDLE_CYCLE,
     // Not an idle tick — the process actually died. This must reach the source.
     { destination: 'dead', cause: 'process_exit', evidence: { exit_observed_at: new Date().toISOString() } },
   ];
-  const { delivered } = driveObservations(withExit);
+  const { delivered } = await driveObservations(withExit);
 
   assert.equal(delivered.length, 4, '3 distinct idle absences + the new session_process_exited');
   assert.match(
@@ -167,18 +179,18 @@ test('#914: a genuinely NEW observation kind is still delivered after the cycle 
   );
 });
 
-test('#914: back-to-back identical observations stay deduped by the existing ledger rule', () => {
+test('#914: back-to-back identical observations stay deduped by the existing ledger rule', async () => {
   const [a] = IDLE_CYCLE;
-  const { results, delivered } = driveObservations([a, a]);
+  const { results, delivered } = await driveObservations([a, a]);
 
   assert.equal(results[1], 'observation_duplicate', 'the existing last_observation rule is untouched');
   assert.equal(delivered.length, 1);
 });
 
 // Two injects are two conversations: suppression is per-inject, never global.
-test('#914: suppression is scoped to one inject — a second inject hears its own first absence', () => {
-  const first = driveObservations([...IDLE_CYCLE]);
-  const second = driveObservations([...IDLE_CYCLE]);
+test('#914: suppression is scoped to one inject — a second inject hears its own first absence', async () => {
+  const first = await driveObservations([...IDLE_CYCLE]);
+  const second = await driveObservations([...IDLE_CYCLE]);
 
   assert.equal(first.delivered.length, 3);
   assert.equal(second.delivered.length, 3, 'a different inject is a different conversation');

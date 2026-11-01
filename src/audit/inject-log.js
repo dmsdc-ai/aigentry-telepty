@@ -62,6 +62,38 @@ function buildAuditLine(record = {}) {
     payload_preview: previewOn ? truncatePreview(payload, previewBytes) : null,
     delivery_result: record.delivery_result || 'success'
   };
+  if (record.claimed_return && typeof record.claimed_return.locator === 'string') {
+    line.claimed_return_locator = record.claimed_return.locator;
+    line.return_locator_verification = 'unverified';
+    line.claimed_cross_host = record.claimed_return.claimed_cross_host === true;
+  }
+  // Broker adapters prehash before enqueueing so even an enabled preview setting cannot
+  // retain remote payloads. Node authentication never becomes a foreign session identity.
+  if (record.kind === 'broker' && record.broker) {
+    const broker = record.broker;
+    line.payload_sha256 = broker.payload_sha256;
+    line.payload_bytes = broker.payload_bytes;
+    line.payload_preview = null;
+    line.claimed_from = null;
+    line.verified_sender_sid = null;
+    line.verified_sender_epoch = null;
+    line.verified_sender_generation = null;
+    line.spoof_suspected = false;
+    line.origin = 'untrusted-remote';
+    line.broker_event = broker.event;
+    line.to = broker.target_sid;
+    line.broker_target_node = broker.target_node;
+    line.authenticated_node_id = broker.node;
+    line.authenticated_node_key_id = broker.key;
+    line.authenticated_identity_scope = 'broker-node';
+    line.foreign_session_identity_verified = false;
+    line.broker_request_sha256 = broker.request_sha256;
+    line.broker_receipt_id = broker.receipt_id;
+    line.broker_state = broker.state;
+    line.broker_http_status = broker.status;
+    line.broker_code = broker.code;
+    line.delivery_result = 'not-a-physical-delivery-receipt';
+  }
   return JSON.stringify(line);
 }
 
@@ -90,13 +122,18 @@ function createAuditWriter(options = {}) {
   const emitter = new EventEmitter();
   let queue = [];
   let timer = null;
-  let writing = false;
+  let writing = null;
   let closed = false;
   let droppedTotal = 0;
+  // #1215 diagnostics: O(1) counters and the in-flight stage, read by status(). No I/O, no payload,
+  // no behaviour change: a stalled stage, an armed timer that never fired and a dropped batch differ here.
+  const stat = { appended: 0, written_lines: 0, batches: 0, errors: 0, last_error_code: null, stage: null,
+    timer_armed_at: null, writing_started_at: null, last_write_ms: null, max_write_ms: 0, last_write_end_at: null };
 
   ensureDir();
 
   function ensureDir() {
+    if (options.storage) return;
     const dir = path.dirname(filePath);
     try {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -112,6 +149,7 @@ function createAuditWriter(options = {}) {
       droppedTotal += 1;
       emitter.emit('audit_overflow', { dropped: droppedTotal, queueMax });
     }
+    stat.appended += 1;
     queue.push({
       ...record,
       preview: record.preview != null ? record.preview : preview,
@@ -121,27 +159,49 @@ function createAuditWriter(options = {}) {
   }
 
   function scheduleFlush() {
-    if (timer || writing || queue.length === 0) return;
+    if (closed || timer || writing || queue.length === 0) return;
     timer = setTimeout(() => { timer = null; flush().catch(() => {}); }, flushMs);
+    stat.timer_armed_at = Date.now();
     if (timer && typeof timer.unref === 'function') timer.unref();
   }
 
   async function flush() {
-    if (writing || queue.length === 0) return;
-    writing = true;
+    if (writing) await writing;
+    if (queue.length === 0) return;
+    writing = writeBatch();
+    await writing;
+  }
+
+  async function writeBatch() {
     const batch = queue;
     queue = [];
+    stat.writing_started_at = Date.now(); stat.timer_armed_at = null; stat.stage = 'build';
     try {
-      await rotateIfNeeded();
       const data = batch.map((r) => buildAuditLine(r)).join('\n') + '\n';
+      if (options.storage) {
+        stat.stage = 'storage';
+        await options.storage.writeBatch(data, { maxBytes, maxFiles, maxAgeDays });
+        stat.written_lines += batch.length;
+        return;
+      }
+      stat.stage = 'rotate';
+      await rotateIfNeeded();
+      stat.stage = 'append';
       await fs.promises.appendFile(filePath, data, { mode: 0o600 });
+      stat.written_lines += batch.length;
+      stat.stage = 'chmod';
       // appendFile's mode only applies on create — chmod each flush so a pre-existing file
       // (or umask-loosened create) is forced to 0600 (the file may carry preview content).
       try { await fs.promises.chmod(filePath, 0o600); } catch { /* best-effort */ }
     } catch (err) {
+      stat.errors += 1; stat.last_error_code = (err && err.code) || 'error';
       emitter.emit('audit_error', err);
     } finally {
-      writing = false;
+      const end = Date.now();
+      stat.batches += 1; stat.stage = null; stat.last_write_end_at = end;
+      stat.last_write_ms = end - stat.writing_started_at; stat.max_write_ms = Math.max(stat.max_write_ms, stat.last_write_ms);
+      stat.writing_started_at = null;
+      writing = null;
       if (queue.length > 0) scheduleFlush();
     }
   }
@@ -157,6 +217,7 @@ function createAuditWriter(options = {}) {
       }
       try { await fs.promises.rename(filePath, `${filePath}.1`); } catch { /* nothing to rotate */ }
     }
+    stat.stage = 'prune';
     await pruneByAge();
   }
 
@@ -175,13 +236,25 @@ function createAuditWriter(options = {}) {
   async function close() {
     closed = true;
     if (timer) { clearTimeout(timer); timer = null; }
-    await flush();
+    do { await flush(); } while (writing || queue.length > 0);
+  }
+
+  // #1215 diagnostics: a bounded, payload-free snapshot (counts, booleans, ms, an errno code).
+  function status() {
+    const now = Date.now();
+    const ago = (t) => (t === null ? null : now - t);
+    return { queued: queue.length, appended: stat.appended, written_lines: stat.written_lines, batches: stat.batches,
+      dropped: droppedTotal, errors: stat.errors, last_error_code: stat.last_error_code, closed, flush_ms: flushMs,
+      timer_armed: !!timer, timer_armed_ms_ago: timer ? ago(stat.timer_armed_at) : null,
+      writing: !!writing, writing_stage: stat.stage, writing_for_ms: ago(stat.writing_started_at),
+      last_write_ms: stat.last_write_ms, max_write_ms: stat.max_write_ms, last_write_end_ms_ago: ago(stat.last_write_end_at) };
   }
 
   return {
     append,
     flush,
     close,
+    status,
     on: emitter.on.bind(emitter),
     off: emitter.off.bind(emitter)
   };

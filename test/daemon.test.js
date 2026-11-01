@@ -12,7 +12,15 @@ const { afterEach, beforeEach, test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('http');
 const WebSocket = require('ws');
-const { createSessionId, delay, startTestDaemon, waitFor } = require('../test-support/daemon-harness');
+const { createSessionId, delay, startTestDaemon, waitFor, HARNESS_OBSERVATION_MARGIN_MS } = require('../test-support/daemon-harness');
+// Task 1215 harness133: per-request harness OBSERVATION budgets (not product deadlines) for the three /submit calls whose
+// product bound reaches or exceeds the 5000 ms harness default. Each is that request's own source-derived upper bound plus
+// the one named margin. Gated path: gate + settle 1200 + verify + retries x (delay + settle 1200 + verify) + classify 1200
+// (session-actions.js submit route; delivery-runtime.js gatedTerminalSubmit/parseSubmitRetryOptions; submit-gate.js).
+// Bootstrap-queued: waitForBootstrapSubmit races gate_timeout_ms (delivery-runtime.js).
+const SUBMIT_BOOTSTRAP_QUEUED_BOUND_MS = 5000;                               // gate_timeout_ms 5000 race
+const SUBMIT_RETRIES2_BOUND_MS = 1000 + 1200 + 200 + 2 * (100 + 1200 + 200) + 1200; // 6600
+const SUBMIT_RETRIES1_BOUND_MS = 1000 + 1200 + 200 + 1 * (100 + 1200 + 200) + 1200; // 5100
 
 // #730: codex is paste-capable BY IDENTITY now, so an injected body reaches a codex
 // session wrapped in bracketed paste even when the fixture never relayed an ESC[?2004h.
@@ -636,6 +644,7 @@ test('bootstrap queued submit waits behind queued text and preserves order', asy
 
   const submitPromise = harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
     method: 'POST',
+    timeoutMs: SUBMIT_BOOTSTRAP_QUEUED_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS,
     body: {
       injected_body: 'queued-submit',
       gate_timeout_ms: 5000
@@ -715,6 +724,7 @@ test('codex submit confirmation resends CR when context-ref remains visible and 
 
   const submit = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
     method: 'POST',
+    timeoutMs: SUBMIT_RETRIES2_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS,
     body: {
       injected_body: body,
       prompt_symbol_gate: false,
@@ -775,6 +785,7 @@ test('codex submit confirmation returns 504 when context-ref remains unsubmitted
 
   const submit = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
     method: 'POST',
+    timeoutMs: SUBMIT_RETRIES1_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS,
     body: {
       injected_body: body,
       prompt_symbol_gate: false,
@@ -962,7 +973,36 @@ test('wrapped sessions emit disconnect/reconnect/stale lifecycle and clean up af
   await waitFor(() => messages.find((message) => (
     message.type === 'session_cleanup' &&
     message.session_id === sessionId
-  )), { timeoutMs: 5000, description: 'session cleanup event' });
+  )), { timeoutMs: 5000, description: 'session cleanup event' })
+    .catch((error) => {
+      // Task 1215 lifecycle56 (failure-only; the unchanged 5000 ms wait has ALREADY failed and the same error is
+      // rethrown; nothing is sent, requested or retried). Reads only what this test already holds: the bus messages
+      // it collected (the sweep broadcasts session_health for this sid every 100 ms with the cleanup inputs
+      // clients/disconnectedSeconds/healthStatus) and the harness's captured daemon log. Separates: sweep stalled
+      // (last health old), not eligible (clients > 0 / disconnectedSeconds < 2), removal not durably saved
+      // ([CLEANUP] … not durably saved), emitted-but-not-received (Removed stale session logged, no bus event),
+      // and a closed bus socket. Counts, fixed fields and ≤ 8 log lines of ≤ 300 chars only.
+      const stack = error.stack; const first = `${error.name}: ${error.message}`;
+      const mine = messages.filter((m) => m && m.session_id === sessionId);
+      const types = {};
+      for (const m of mine) types[m.type] = (types[m.type] || 0) + 1;
+      const health = mine.filter((m) => m.type === 'session_health');
+      const last = health.length ? health[health.length - 1] : null;
+      const at = (m) => (m && typeof m.timestamp === 'string' ? Date.parse(m.timestamp) : null);
+      const stale = mine.find((m) => m.type === 'session_stale') || null;
+      const p = last && last.payload ? last.payload : {};
+      const { stdout, stderr } = harness.getLogs();
+      const log = `${stdout}\n${stderr}`.split(/\r?\n/)
+        .filter((l) => l.includes(sessionId) || l.includes('[CLEANUP]') || l.includes('[HEALTH]')).slice(-8).map((l) => l.slice(0, 300));
+      const note = ` | #1215 lifecycle56 evidence ${JSON.stringify({ types, health_count: health.length,
+        last_health: last ? { health_status: p.healthStatus ?? null, clients: p.clients ?? null, disconnected_seconds: p.disconnectedSeconds ?? null,
+          health_reason: p.healthReason ?? null, age_ms: at(last) === null ? null : Date.now() - at(last) } : null,
+        stale_to_failure_ms: at(stale) === null ? null : Date.now() - at(stale),
+        bus_ready_state: bus.readyState, daemon_alive: harness.isAlive(), log })}`;
+      error.message += note;
+      if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
+      throw error;
+    });
 
   await waitFor(async () => {
     const list = await harness.request('/api/sessions');
@@ -1063,7 +1103,7 @@ test('broadcast inject reports disconnected wrapped sessions with a reason code'
   assert.match(failure.error, /disconnected/i);
 });
 
-test('aterm delivery timeouts surface a TIMEOUT error code', async () => {
+test('aterm HTTP delivery timeout retains unknown outcome instead of a queued retry', async () => {
   await harness.stop();
   harness = await startTestDaemon({
     env: {
@@ -1089,14 +1129,17 @@ test('aterm delivery timeouts surface a TIMEOUT error code', async () => {
     });
     assert.equal(registered.status, 201);
 
-    // Mailbox enqueue succeeds; delivery timeout happens asynchronously
+    // A response timeout cannot establish whether the endpoint already acted.
     const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
       method: 'POST',
       body: { prompt: 'hello timeout' }
     });
-    assert.equal(inject.status, 200);
-    assert.equal(inject.body.success, true);
-    assert.equal(inject.body.strategy, 'mailbox');
+    assert.equal(inject.status, 503);
+    assert.equal(inject.body.success, false);
+    assert.equal(inject.body.code, 'DELIVERY_UNCERTAIN');
+    assert.equal(inject.body.delivery_uncertain, true);
+    assert.equal(inject.body.retryable, false);
+    assert.equal(inject.body.bytes_written, null);
   } finally {
     await new Promise((resolve) => delayedServer.close(resolve));
   }
@@ -1120,7 +1163,7 @@ test('aterm registration with delivery unix_socket stores delivery and enables U
     conn.on('data', (chunk) => { buf += chunk.toString(); });
     conn.on('end', () => {
       try { received.push(JSON.parse(buf.trim())); } catch {}
-      conn.end();
+      conn.end(JSON.stringify({ success: true }));
     });
   });
 
@@ -1194,14 +1237,16 @@ test('aterm UDS inject propagates error when target rejects payload', {
       delivery: { transport: 'unix_socket', address: socketPath }
     });
 
-    // Mailbox enqueue succeeds; delivery rejection happens asynchronously via delivery engine
+    // Rejection after a payload write does not prove zero effects; retain uncertainty.
     const inject = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
       method: 'POST',
       body: { prompt: 'hello error' }
     });
 
-    assert.equal(inject.body.success, true);
-    assert.equal(inject.body.strategy, 'mailbox');
+    assert.equal(inject.body.success, false);
+    assert.equal(inject.body.delivery_uncertain, true);
+    assert.equal(inject.body.retryable, false);
+    assert.equal(inject.body.bytes_written, null);
   } finally {
     udsServer.close();
     try { require('fs').unlinkSync(socketPath); } catch {}

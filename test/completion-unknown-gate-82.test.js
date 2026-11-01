@@ -24,7 +24,7 @@
 // Hermetic: no daemon spawn, no PTY, no HTTP. Uses the recordObservation/fireAutoReport DI seam
 // exactly as test/completion-unknown-observation-60.test.js does.
 
-const { test } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -39,6 +39,16 @@ process.env.PORT = '0';
 
 const daemon = require('../daemon');
 const { recordObservation } = daemon;
+
+// #1207 — the ledger is a directory store owned by a worker thread under TMP_HOME; `require` only
+// STARTS its open. Begin/observe are durable (fsynced ACK) and therefore async: wait for the open
+// to settle before the first begin, and close this process's own client at the end so the lock is
+// released and the worker exits.
+before(async () => {
+  const opened = await daemon.ledgerReady;
+  assert.equal(opened.ok, true, `the private ledger must open before any tracked record exists: ${JSON.stringify(opened)}`);
+});
+after(async () => { await daemon.ledgerClient.close(2000); });
 const {
   shouldPushCompletionUnknown,
   PROCESS_FACT_OBSERVATION_KINDS,
@@ -51,21 +61,24 @@ const sessionView = require('../src/cli/session-view');
 
 // One observation, with everything observable captured: what the source was told, what the bus
 // heard. `cause`/`destination` select the row in session-state.js OBSERVATION_CAUSES.
-function observe({ cause, destination, evidence = {}, env = null }) {
+async function observe({ cause, destination, evidence = {}, env = null }) {
   const delivered = [];
   const busEvents = [];
   const session = { id: 'worker-1', type: 'wrapped' };
   const injectId = `gate-82-${cause}-${Date.now()}`;
   // The ledger record has to exist for "the observation is still recorded and queryable" to be
   // the thing under test rather than an assumption. Created the way the inject handler does.
-  const begun = daemon.beginTrackedInjection({ injectId, sessionId: 'worker-1', source: 'orch', session });
+  // #1207: durable before it returns (the begin frame's commit was fsynced by the owner).
+  const begun = await daemon.beginTrackedInjection({ injectId, sessionId: 'worker-1', source: 'orch', session });
   assert.equal(begun.ok, true, 'the tracked record must commit before the observation');
 
   const previous = process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH;
   if (env === null) delete process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH;
   else process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = env;
   try {
-    const result = recordObservation({
+    // #1207: the bus event and the source push happen AFTER the owner's outcome, so the result is
+    // awaited before anything about `delivered`/`busEvents` is asserted.
+    const result = await recordObservation({
       sessionId: 'worker-1',
       session,
       pendingReport: { source: 'orch', injectId },
@@ -102,16 +115,16 @@ function assertRecorded(r, kind) {
   assert.equal(record.last_observation.kind, kind, 'the observation is queryable by inject_id');
 }
 
-test('gh#82(F): `pty_quiet` is NOT pushed to the source while the outcome protocol is unavailable', () => {
-  const r = observe({ cause: 'silence_timeout', destination: 'idle' });
+test('gh#82(F): `pty_quiet` is NOT pushed to the source while the outcome protocol is unavailable', async () => {
+  const r = await observe({ cause: 'silence_timeout', destination: 'idle' });
   assert.deepEqual(r.delivered, [],
     'the reporter\'s 4-of-5 shape: ~5s of silence is a model thinking, and it was pushed as an '
     + 'alarm on essentially every inject');
   assertRecorded(r, 'pty_quiet');
 });
 
-test('gh#82(F): a repeated-error pattern is NOT pushed either — it matched spinner frames', () => {
-  const r = observe({
+test('gh#82(F): a repeated-error pattern is NOT pushed either — it matched spinner frames', async () => {
+  const r = await observe({
     cause: 'repeated_error_pattern',
     destination: 'error',
     evidence: { error_fingerprint: 'twisting-spinner', repeat_count: 3, window_ms: 20000 },
@@ -121,8 +134,8 @@ test('gh#82(F): a repeated-error pattern is NOT pushed either — it matched spi
 });
 
 test('gh#82(F): `session_process_exited` IS still pushed — a worker that actually died is the '
-  + 'one absence an orchestrator must not miss', () => {
-  const r = observe({
+  + 'one absence an orchestrator must not miss', async () => {
+  const r = await observe({
     cause: 'process_exit',
     destination: 'dead',
     evidence: { exit_observed_at: '2026-09-07T07:45:12.503Z' },
@@ -134,8 +147,8 @@ test('gh#82(F): `session_process_exited` IS still pushed — a worker that actua
 });
 
 test('gh#82(F): `session_termination_requested` is NOT pushed — it tells the requester what the '
-  + 'requester just did, about a session that is already gone', () => {
-  const r = observe({
+  + 'requester just did, about a session that is already gone', async () => {
+  const r = await observe({
     cause: 'termination_requested',
     destination: 'dead',
     evidence: { reason: 'operator_delete', requested_at: '2026-09-07T07:45:12.503Z' },
@@ -144,8 +157,8 @@ test('gh#82(F): `session_termination_requested` is NOT pushed — it tells the r
   assertRecorded(r, 'session_termination_requested');
 });
 
-test('gh#82(F): TELEPTY_COMPLETION_UNKNOWN_PUSH=1 restores the 0.8.1 push, opt-in', () => {
-  const r = observe({ cause: 'silence_timeout', destination: 'idle', env: '1' });
+test('gh#82(F): TELEPTY_COMPLETION_UNKNOWN_PUSH=1 restores the 0.8.1 push, opt-in', async () => {
+  const r = await observe({ cause: 'silence_timeout', destination: 'idle', env: '1' });
   assert.equal(r.delivered.length, 1, 'an operator who wants every absence can still have it');
   assert.match(r.delivered[0].msg, /TASK_COMPLETION_UNKNOWN: worker-1/);
   assertRecorded(r, 'pty_quiet');

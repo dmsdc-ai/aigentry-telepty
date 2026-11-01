@@ -1,0 +1,28 @@
+{
+  "schema": "telepty-bridge-137-receipt-cases/v1",
+  "provenance": "synthetic: hand-authored for telepty task 1215 regression tests; NOT captured from any session; contains no host identifiers, payloads or credentials",
+  "owner_generation": "owner-gen-1215-current",
+  "base": {
+    "type": "bridge_receipt", "schema": 1, "daemon_msg_id": "dm-1-body", "inject_id": "00000000-0000-4000-8000-000000000001",
+    "part": "body", "bridge_msg_id": "bridge-msg-1", "stage": "pty_written", "reason": null, "certainty": "written",
+    "bridge_seq": 1, "at_ms": 1000, "clock": "bridge_wall", "owner_generation": "owner-gen-1215-current"
+  },
+  "cases": [
+    { "name": "genuine pty_written", "patch": {}, "ok": true },
+    { "name": "genuine quarantined unknown", "patch": { "stage": "quarantined", "certainty": "unknown", "reason": "recovered_in_flight_unknown" }, "ok": true },
+    { "name": "stale owner generation", "patch": { "owner_generation": "owner-gen-stale" }, "ok": false, "reason": "owner_generation" },
+    { "name": "missing owner generation", "patch": { "owner_generation": null }, "ok": false, "reason": "owner_generation" },
+    { "name": "payload key", "patch": { "payload": "x" }, "ok": false, "reason": "payload_key" },
+    { "name": "data key", "patch": { "data": "x" }, "ok": false, "reason": "payload_key" },
+    { "name": "forbidden stage consumed", "patch": { "stage": "consumed", "certainty": "written" }, "ok": false, "reason": "stage" },
+    { "name": "forbidden stage turn_accepted", "patch": { "stage": "turn_accepted", "certainty": "written" }, "ok": false, "reason": "stage" },
+    { "name": "forbidden stage completed", "patch": { "stage": "completed", "certainty": "written" }, "ok": false, "reason": "stage" },
+    { "name": "withheld claiming written", "patch": { "stage": "withheld", "certainty": "written" }, "ok": false, "reason": "stage" },
+    { "name": "pty_written claiming unknown", "patch": { "certainty": "unknown" }, "ok": false, "reason": "stage" },
+    { "name": "non-uuid inject id", "patch": { "inject_id": "not-a-uuid" }, "ok": false, "reason": "inject_id" },
+    { "name": "unknown part", "patch": { "part": "header" }, "ok": false, "reason": "part" },
+    { "name": "free-text reason", "patch": { "reason": "contains spaces and text" }, "ok": false, "reason": "reason" },
+    { "name": "wrong clock", "patch": { "clock": "daemon_wall" }, "ok": false, "reason": "sequence" },
+    { "name": "oversize", "patch": { "bridge_msg_id": "b", "reason": "x" }, "pad_reason_units": 600, "ok": false, "reason": "oversize" }
+  ]
+}

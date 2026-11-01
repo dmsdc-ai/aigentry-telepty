@@ -24,6 +24,17 @@ const path = require('path');
 
 const DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.JS';
 
+// Windows environment names are case-insensitive, but a plain-object copy of process.env (cli.js sessionEnv
+// `{ ...process.env }`) keeps the OS spelling (`Path`), so an exact `env.PATH` read missed an existing executable
+// (#752, native 3b2c44a: path_key_other_case, resolver_walk_finds:false). Among keys that match case-insensitively
+// the lexicographically first one wins — the rule Node's child_process applies to duplicate Windows env keys — so
+// an exact upper-case key keeps its existing precedence and the choice never depends on insertion order.
+// Read-only: the env object (and process.env) is never modified.
+function envValue(env, name) {
+  const keys = Object.keys(env).filter((key) => key.toUpperCase() === name).sort();
+  return keys.length ? env[keys[0]] : undefined;
+}
+
 function resolveWindowsExecutable(command, env, opts) {
   if (typeof command !== 'string' || command.length === 0) {
     throw new Error('telepty: resolveWindowsExecutable requires a non-empty command');
@@ -52,8 +63,8 @@ function resolveWindowsExecutable(command, env, opts) {
   }
 
   // Bare name → walk PATH × PATHEXT.
-  const exts = parseExtsForPathWalk(e.PATHEXT || DEFAULT_PATHEXT);
-  const dirs = (e.PATH || '').split(';').filter(Boolean);
+  const exts = parseExtsForPathWalk(envValue(e, 'PATHEXT') || DEFAULT_PATHEXT);
+  const dirs = (envValue(e, 'PATH') || '').split(';').filter(Boolean);
   for (const dir of dirs) {
     for (const ext of exts) {
       const candidate = p.join(dir, command + ext);
@@ -66,7 +77,7 @@ function resolveWindowsExecutable(command, env, opts) {
 }
 
 function tryWithExt(absPath, env, existsSync, originalCommand) {
-  const exts = parseExts(env.PATHEXT || DEFAULT_PATHEXT);
+  const exts = parseExts(envValue(env, 'PATHEXT') || DEFAULT_PATHEXT);
   for (const ext of exts) {
     if (ext === '') continue;
     const candidate = absPath + ext;

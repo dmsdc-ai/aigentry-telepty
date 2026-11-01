@@ -1,0 +1,43 @@
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { createAuditWriter, readInjectLog } = require('../src/audit/inject-log');
+const { startTestDaemon } = require('../test-support/daemon-harness');
+test('close waits for an in-flight append and drains the following batch', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-close-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, 'audit.jsonl'), writer = createAuditWriter({ path: file, flushMs: 60000 });
+    const append = fs.promises.appendFile;
+    let unblock, started;
+    const begun = new Promise(r => started = r), gate = new Promise(r => unblock = r);
+    t.mock.method(fs.promises, 'appendFile', async (...args) => { started(); await gate; return append(...args); });
+    writer.append({ inject_id: 'first' });
+    const flushing = writer.flush();
+    await begun;
+    writer.append({ inject_id: 'second' });
+    let closed = false;
+    const closing = writer.close().then(() => closed = true);
+    await new Promise(r => setImmediate(r));
+    assert.equal(closed, false);
+    unblock();
+    await Promise.all([flushing, closing]);
+    assert.deepEqual(readInjectLog(file).injects.map(r => r.inject_id), ['second', 'first']);
+});
+test('SIGTERM drains an accepted inject before restart within audit flush window', { skip: process.platform === 'win32' }, async (t) => {
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-audit-shutdown-'));
+    let daemon;
+    t.after(async () => { if (daemon)
+        await daemon.stop(); fs.rmSync(homeDir, { recursive: true, force: true }); });
+    daemon = await startTestDaemon({ homeDir, env: { TELEPTY_AUDIT_FLUSH_MS: '60000' } });
+    await daemon.spawnSession('audit-shutdown-target');
+    const res = await daemon.request('/api/sessions/audit-shutdown-target/inject', { method: 'POST', body: { prompt: 'synthetic audit shutdown fixture', from: 'orchestrator' } });
+    assert.equal(res.status, 200);
+    await daemon.stop();
+    daemon = await startTestDaemon({ homeDir, env: { TELEPTY_AUDIT_FLUSH_MS: '60000' } });
+    const audit = await daemon.request('/api/injects?to=audit-shutdown-target');
+    assert.equal(audit.status, 200);
+    assert.ok(audit.body.injects.some(row => row.to === 'audit-shutdown-target'));
+});

@@ -26,6 +26,7 @@ const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
 const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
+const { assertOwnerOnlyMode, posixModeSkip } = require('../test-support/platform-contract');
 
 let daemon;
 let logPath;
@@ -237,13 +238,47 @@ test('#815 GUARD: first registration of an unknown sid still mints a usable toke
 // environment, and the environment of a running process cannot be changed from outside: if the
 // credential did not survive the restart, every restored session would silently become an
 // unauthenticated sender and no reissuance could ever reach the child.
-test('#815 item4: the same bearer still verifies after a daemon RESTART (verifier persisted)', async () => {
+// Task 1215 / #879 (windows42 NA-3) — FAILURE-ONLY cleanup evidence for item4. Windows main job 124632994984: the
+// `finally` rmSync(home) threw ENOTEMPTY, and because a `finally` throw REPLACES the try block's outcome, whether the
+// assertions above it passed was unknown. Now a try-block failure is always the error that propagates; a cleanup failure is
+// attached to it as a bounded note (or, when the body passed, is itself thrown as before). On ENOTEMPTY only: residual names
+// relative to the owned HOME (lstat walk, never following a symlink, depth <= 4, <= 32 entries, no contents or absolute
+// paths) and whether the second daemon's own log already showed the target PTY's `[EXIT] Session <sid>` line when stop()
+// returned. Evidence only — no retry, kill, wait, deletion or ordering change; which process held the entry stays unknown.
+function noteOn(error, note) {
+  if (!error || typeof error !== 'object' || !Object.isExtensible(error) || typeof error.message !== 'string') return;
+  const stack = error.stack; // V8 formats stack lazily: read it BEFORE changing message, so the note is not duplicated
+  const first = `${error.name}: ${error.message}`;
+  error.message += note;
+  if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
+}
+function homeResidual(root) {
+  const entries = []; let truncated = false;
+  (function walk(dir, rel, depth) {
+    let names;
+    try { names = fs.readdirSync(dir).sort(); } catch (e) { entries.push({ name: rel || '.', error: e.code || 'readdir_failed' }); return; }
+    for (const name of names) {
+      if (entries.length >= 32) { truncated = true; return; }
+      const relName = rel ? `${rel}/${name}` : name;
+      let st;
+      try { st = fs.lstatSync(path.join(dir, name)); } catch (e) { entries.push({ name: relName, error: e.code || 'lstat_failed' }); continue; }
+      const type = st.isSymbolicLink() ? 'symlink' : st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other';
+      entries.push({ name: relName, type });
+      if (type === 'dir') { if (depth < 4) walk(path.join(dir, name), relName, depth + 1); else truncated = true; }
+    }
+  })(root, '', 1);
+  return { entries, truncated };
+}
+
+test('#815 item4: the same bearer still verifies after a daemon RESTART (verifier persisted)', async (t) => {
   // An isolated daemon PAIR over one shared HOME, so the file-backed handover is the real thing
   // and the suite's own daemon is left untouched.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-815-restart-'));
   const sid = createSessionId('restart815');
   const first = await startTestDaemon({ homeDir: home, env: { TELEPTY_AUDIT_FLUSH_MS: '10' } });
   let second = null;
+  let target = null;     // hoisted only so the failure-only cleanup note can name the spawned PTY
+  let bodyError = null;
   try {
     const reg = await first.request('/api/sessions/register', {
       method: 'POST', body: { session_id: sid, command: 'x' }
@@ -261,10 +296,11 @@ test('#815 item4: the same bearer still verifies after a daemon RESTART (verifie
     const persisted = fs.readFileSync(persistedPath, 'utf8');
     assert.equal(persisted.includes(bearer), false, 'the raw bearer must NEVER be persisted');
     assert.equal(persisted.includes(epoch), true, 'the epoch is persisted — non-secret discriminator');
-    assert.equal(fs.statSync(persistedPath).mode & 0o777, 0o600, 'verifier store is owner-only');
+    // #879: named subtest, skipped on win32 (mode bits ≠ ACL); every other assertion stays live.
+    await assertOwnerOnlyMode(t, persistedPath, 'verifier store is owner-only');
 
     second = await startTestDaemon({ homeDir: home, env: { TELEPTY_AUDIT_FLUSH_MS: '10' } });
-    const target = createSessionId('target815f');
+    target = createSessionId('target815f');
     await second.spawnSession(target);
     const res = await second.request(`/api/sessions/${encodeURIComponent(target)}/inject`, {
       method: 'POST',
@@ -281,16 +317,31 @@ test('#815 item4: the same bearer still verifies after a daemon RESTART (verifie
 
     assert.equal(line.verified_sender_sid, sid, 'the child\'s spawn-time bearer still authenticates');
     assert.equal(line.verified_sender_epoch, epoch, 'and resolves to the SAME instance');
-  } finally {
-    if (second) await second.stop();
-    else await first.stop();
-    fs.rmSync(home, { recursive: true, force: true });
+  } catch (error) { bodyError = error; throw error; } finally {
+    // The native cleanup is unchanged: stop the live daemon, then remove HOME (skipped, as before, if stop() throws).
+    let cleanupError = null;
+    let exitLoggedBeforeStopReturned = null;
+    try {
+      if (second) await second.stop();
+      else await first.stop();
+      // The second daemon's own stdout as received when stop() returned (observation only).
+      if (second && target) exitLoggedBeforeStopReturned = second.getLogs().stdout.includes(`[EXIT] Session ${target} exited`);
+      fs.rmSync(home, { recursive: true, force: true });
+    } catch (error) { cleanupError = error; }
+    if (cleanupError) {
+      const diag = { cleanup_code: (cleanupError && cleanupError.code) || null, cleanup_syscall: (cleanupError && cleanupError.syscall) || null,
+        pty_exit_logged_before_stop_returned: exitLoggedBeforeStopReturned, second_daemon_started: !!second,
+        ...(cleanupError && cleanupError.code === 'ENOTEMPTY' ? { residual: homeResidual(home) } : {}) };
+      const note = ` | [telepty-diag] item4_cleanup ${JSON.stringify(diag)}`;
+      if (bodyError) noteOn(bodyError, note);     // the try block's failure stays the outcome; cleanup is attached
+      else { noteOn(cleanupError, note); throw cleanupError; } // body passed: the cleanup failure is the failure, as before
+    }
   }
 });
 
 // sessions.json now carries credential verifiers, so it must be owner-only — including a file
 // left world-readable by a pre-#815 daemon, which is why load() chmods too.
-test('#815 item4: sessions.json is 0600', async () => {
+test('#815 item4: sessions.json is 0600', { skip: posixModeSkip() }, async () => {
   const sid = createSessionId('mode815');
   await register(sid);
   const p = path.join(daemon.homeDir, '.config', 'aigentry-telepty', 'sessions.json');

@@ -41,11 +41,13 @@ process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = '1';
 // The gate harness (`makeGate`) mirrors test/idle-unconfirmed-decayed-619.test.js (the closest
 // cousin) with the same 806.9s decayed profile. Not registered in package.json this phase.
 
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const daemon = require('../daemon');
 const { fireAutoReport, maybeRecordInjectConsumption } = daemon;
+const { trackedInjectId, beginTrackedEager, settleTracked, fireAndSettle } = require('../test-support/tracked-observation');
+after(async () => { await daemon.ledgerClient.close(2000); });
 const { SessionStateMachine } = require('../session-state');
 const reportEnforcement = require('../src/report-enforcement');
 
@@ -57,7 +59,7 @@ const BODY =
 // #60 Stage A: both verdicts are deleted. Every path below emits the same literal statement, and
 // the four FIX 1 conjuncts that used to select between the verdicts are each still observable —
 // as `consumption.basis` on that statement. See the per-guard assertions.
-const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-721 — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
+const UNKNOWN_RE = /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-721-\d+-\d+ — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
 function consumptionOf(ctx) {
   assert.equal(ctx.delivered.length, 1, 'a statement is emitted (not suppressed)');
@@ -111,7 +113,8 @@ function makeGate({
   // The gate measures elapsed from injectedAt; pin it to the decayed profile regardless of the
   // (real wall-clock) timestamps a driven pendingReport picked up from the state machine.
   pr.injectedAt = new Date(T0 - elapsedSec * 1000).toISOString();
-  if (!pr.injectId) pr.injectId = 'inj-721';
+  // #1207: a fresh durably begun id per fixture (the driven report keeps its 'inj-721' prefix).
+  pr.injectId = trackedInjectId(pr.injectId || 'inj-721');
   if (!pr.source) pr.source = 'orch';
   ctx.pendingReport = pr;
 
@@ -127,11 +130,18 @@ function makeGate({
   };
   if (sampleChildCpu) ctx.deps.sampleChildCpu = sampleChildCpu;
   if (idleEvidenceReliable !== undefined) ctx.deps.idleEvidenceReliable = idleEvidenceReliable;
-  ctx.fire = (trigger = 'real-idle') =>
-    fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps);
-  ctx.flushTimers = () => {
+  // #1207: the source is told only after the observation is durable on a durably begun record —
+  // begun here, awaited by the first fire; each step then awaits the async emit (settle).
+  ctx.ready = beginTrackedEager(daemon, { injectId: ctx.pendingReport.injectId, sessionId: 'worker-1', source: ctx.pendingReport.source, session: ctx.session });
+  const progress = () => `${ctx.delivered.length}:${ctx.broadcasts.length}`;
+  ctx.fire = async (trigger = 'real-idle') => {
+    await ctx.ready;
+    return fireAndSettle(daemon, () => fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps), progress);
+  };
+  ctx.flushTimers = async () => {
     const due = ctx.timers.splice(0);
     for (const { fn, ms } of due) { ctx.nowMs += ms; fn(); }
+    await settleTracked(daemon, progress);
   };
   return ctx;
 }
@@ -229,7 +239,7 @@ function driveWorkerLauncherTurn(variant) {
   }
 }
 
-test('#721 Repro 1 (root cause b): a wrapped-launcher completion is cried-wolf because the edge-gated #619 recorder never credits it; FIX 1 rescues it at the idle gate → TASK_COMPLETE', () => {
+test('#721 Repro 1 (root cause b): a wrapped-launcher completion is cried-wolf because the edge-gated #619 recorder never credits it; FIX 1 rescues it at the idle gate → TASK_COMPLETE', async () => {
   const { pendingReport, transitions, idleState, idleTrigger } = driveWorkerLauncherTurn('1a');
   const edges = transitions.map((t) => `${t.from}->${t.to}(${t.trigger}) since_ms>=submit:${t.since_ms != null && t.submitStartedAt != null && t.since_ms >= new Date(t.submitStartedAt).getTime()}`).join(', ');
 
@@ -262,8 +272,8 @@ test('#721 Repro 1 (root cause b): a wrapped-launcher completion is cried-wolf b
     preFrames: ['… 800s of launcher build/test output (body scrolled off) …\n'],
     postFrames: ['all 128 checks passed\n'],
   });
-  ctx.fire('real-idle');
-  ctx.flushTimers();
+  await ctx.fire('real-idle');
+  await ctx.flushTimers();
   const consumption = consumptionOf(ctx);
   assert.equal(consumption.basis, 'submit_accepted_and_output_advanced');
   assert.equal(consumption.status, 'not_established',
@@ -308,19 +318,19 @@ function launcherGate({ sessionType = 'wrapped', elapsedSec = 806.9, submitConfi
 // which is a finer instrument than the old binary, because it distinguishes the three reasons a
 // guard can trip rather than collapsing them into one label.
 
-test('#721 FIX 1 guard (d): a wrapped session UNDER the elapsed floor (#537 ~4.5s startup-settle) is not credited', () => {
+test('#721 FIX 1 guard (d): a wrapped session UNDER the elapsed floor (#537 ~4.5s startup-settle) is not credited', async () => {
   const ctx = launcherGate({ elapsedSec: 4.5 }); // startup-settle, below the 30s floor
-  ctx.fire('real-idle');
-  ctx.flushTimers();
+  await ctx.fire('real-idle');
+  await ctx.flushTimers();
   assert.equal(consumptionOf(ctx).basis, 'no_consumption_evidence',
     'below the floor the watermark is not taken — never-false-complete (BUG-B) preserved');
   assert.equal(ctx.pendingReport.launcherWatermarkAt, undefined, 'no launcher watermark below the floor');
 });
 
-test('#721 FIX 1 guard (b): a wrapped session whose submit definitively FAILED (accepted:false)', () => {
+test('#721 FIX 1 guard (b): a wrapped session whose submit definitively FAILED (accepted:false)', async () => {
   const ctx = launcherGate({ submitConfirm: { accepted: false, reason: 'cmux_send_failed' } });
-  ctx.fire('real-idle');
-  ctx.flushTimers();
+  await ctx.fire('real-idle');
+  await ctx.flushTimers();
   const consumption = consumptionOf(ctx);
   // Sharper than the old label: a failed submit is POSITIVE non-consumption, and rejection
   // precedence means it is evaluated before the watermark rather than merely outranking it.
@@ -329,10 +339,10 @@ test('#721 FIX 1 guard (b): a wrapped session whose submit definitively FAILED (
   assert.equal(ctx.pendingReport.launcherWatermarkAt, undefined);
 });
 
-test('#721 FIX 1 guard (scope): a NON-wrapped session with the identical shape is not credited', () => {
+test('#721 FIX 1 guard (scope): a NON-wrapped session with the identical shape is not credited', async () => {
   const ctx = launcherGate({ sessionType: 'spawned' }); // not a launcher → FIX 1 must not apply
-  ctx.fire('real-idle');
-  ctx.flushTimers();
+  await ctx.fire('real-idle');
+  await ctx.flushTimers();
   assert.equal(consumptionOf(ctx).basis, 'no_consumption_evidence',
     'the watermark stays scoped to wrapped sessions');
   assert.equal(ctx.pendingReport.launcherWatermarkAt, undefined, 'no launcher watermark for a non-wrapped session');

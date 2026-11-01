@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const LEAVES = ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl', '.lock'];
+const LEAVES = ['inbox.jsonl', 'state.jsonl', 'dead-letter.jsonl', 'handoff-settlements.jsonl', '.lock'];
 
 function unsafePath() {
   return Object.assign(new Error('Unsafe mailbox storage path'), { code: 'MAILBOX_UNSAFE_PATH' });
@@ -40,10 +40,15 @@ function canonicalRoot(root) {
   return canonical;
 }
 
-function checkLeaf(p) {
-  const st = lstatOptional(p);
+// #1215 fix144: the leaf predicate is applied to ONE explicit observation. `st === null` means absent, which is allowed.
+// It never re-stats, so a caller that has already observed a leaf classifies exactly what it observed.
+function classifyLeaf(st) {
   if (st && (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1)) throw unsafePath();
   return st;
+}
+
+function checkLeaf(p) {
+  return classifyLeaf(lstatOptional(p));
 }
 
 function resolveSessionDir(root, id) {
@@ -55,7 +60,17 @@ function resolveSessionDir(root, id) {
   if (st) {
     if (!st.isDirectory() || st.isSymbolicLink()) throw unsafePath();
     // Inspect links without following their targets; preflight before any effects.
-    for (const leaf of LEAVES) checkLeaf(path.join(dir, leaf));
+    // #1215 fix144: each leaf is observed ONCE. The .lock directory exemption and the regular-leaf classification use
+    // that same observation, an absent one included. Before, a missing .lock was re-stated by checkLeaf, and a
+    // legitimate first mkdir by a concurrent contender between the two stats was refused as MAILBOX_UNSAFE_PATH
+    // (measured on Windows). Anything that appears after an absent observation is re-verified by the caller that acts
+    // on it: lockDirectory's own lstat after its mkdir (lock.js:79-83) refuses symlinks/junctions and hardlinked or
+    // other non-directory entries.
+    for (const leaf of LEAVES) {
+      const file = path.join(dir, leaf), observed = lstatOptional(file);
+      if (leaf === '.lock' && observed && observed.isDirectory() && !observed.isSymbolicLink()) continue;
+      classifyLeaf(observed);
+    }
   }
   return dir;
 }
@@ -112,4 +127,4 @@ function rethrowBoundary(err) {
   if (err.code === 'MAILBOX_INVALID_SESSION_ID' || err.code === 'MAILBOX_UNSAFE_PATH') throw err;
 }
 
-module.exports = { canonicalRoot, resolveSessionDir, checkRoot, checkFile, openFile, readFile, writeFile, unlinkFile, rethrowBoundary };
+module.exports = { validateSessionId, canonicalRoot, resolveSessionDir, checkRoot, checkFile, openFile, readFile, writeFile, unlinkFile, rethrowBoundary };

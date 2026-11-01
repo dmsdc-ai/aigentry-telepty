@@ -24,22 +24,27 @@ process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = '1';
 //   2) forceSubmitDeliveredToSurface() — PTY-native force-confirm (#544: a successful
 //      pty_cr IS real delivery on every backend; honesty comes from the PTY-derived confirm).
 
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const daemon = require('../daemon');
 const { fireAutoReport, forceSubmitDeliveredToSurface } = daemon;
+const { trackedInjectId, beginTracked, settleTracked } = require('../test-support/tracked-observation');
+after(async () => { await daemon.ledgerClient.close(2000); });
 
 const NOW = 1_700_000_000_000; // fixed clock
 
 // Drive fireAutoReport with an injected clock + a captured deliver fn, returning the
 // auto-report message that would be delivered back to the source session (or null).
-function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4.5 } = {}) {
+// #1207: the source is told only after the observation is durable on a durably begun tracked
+// record, so the record is begun first (fresh id per call — see test-support/tracked-observation)
+// and the settle chain is awaited.
+async function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4.5 } = {}) {
   const captured = [];
   const timers = []; // #48: settle-and-recheck defers UNCONFIRMED — capture and flush below
   const pendingReport = {
     source: 'orch',
-    injectId: 'inj-1',
+    injectId: trackedInjectId('inj-1'),
     injectedAt: new Date(NOW - elapsedSec * 1000).toISOString(),
     ...pendingReportOverrides,
   };
@@ -53,8 +58,14 @@ function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4
     deliverInjectionToSession: (srcId, _srcSession, msg) => captured.push({ srcId, msg }),
     getAutoState: () => 'idle', // #48: still idle at recheck → the honest label fires
   };
-  fireAutoReport('worker-1', { id: 'worker-1' }, pendingReport, trigger, deps);
-  while (timers.length) timers.shift()(); // #48: run the settle recheck
+  await beginTracked(daemon, { injectId: pendingReport.injectId, sessionId: 'worker-1', source: 'orch' });
+  const decision = fireAutoReport('worker-1', { id: 'worker-1' }, pendingReport, trigger, deps);
+  if (decision && typeof decision.then === 'function') await decision;
+  for (let guard = 0; guard < 50; guard++) { // #48: run the settle recheck (and any re-arm), then await its async emit
+    while (timers.length) timers.shift()();
+    await settleTracked(daemon, () => captured.length);
+    if (!timers.length) break;
+  }
   return captured.length ? captured[0].msg : null;
 }
 
@@ -75,7 +86,7 @@ function runGate(pendingReportOverrides, { trigger = 'real-idle', elapsedSec = 4
 // exactly which rule fired, so the A/B vs C/D/D2 difference is still visible where it is real.
 
 const COMPLETION_UNKNOWN_RE =
-  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1 — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
+  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-1-\d+-\d+ — no completion fact observed; pty_quiet=\d+\.\ds(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
 function assertNoVerdict(msg) {
   assert.ok(msg, 'an observation should be delivered — never silence');
@@ -84,8 +95,8 @@ function assertNoVerdict(msg) {
   assert.doesNotMatch(msg, /TASK_IDLE_UNCONFIRMED:/);
 }
 
-test('A: real-idle with submit expected + submit explicitly FAILED → no verdict, absence stated', () => {
-  const msg = runGate({
+test('A: real-idle with submit expected + submit explicitly FAILED → no verdict, absence stated', async () => {
+  const msg = await runGate({
     submitExpected: true,
     submitConfirm: { accepted: false, reason: 'cmux_send_failed' },
   });
@@ -96,19 +107,19 @@ test('A: real-idle with submit expected + submit explicitly FAILED → no verdic
   assert.match(msg, /consumption=not_established/);
 });
 
-test('B: real-idle with submit expected + only startup sawWorkingAfterInject (no confirm)', () => {
+test('B: real-idle with submit expected + only startup sawWorkingAfterInject (no confirm)', async () => {
   // sawWorkingAfterInject is startup-polluted and must NOT be trusted when a submit was expected.
   // Stage A makes that structural: the flag is not an input to any consumption admission, so it
   // cannot dress a never-started worker up as a started one under any label.
-  const msg = runGate({ submitExpected: true, sawWorkingAfterInject: true });
+  const msg = await runGate({ submitExpected: true, sawWorkingAfterInject: true });
   assertNoVerdict(msg);
   assert.match(msg, /consumption=not_established/);
 });
 
 // ---------------- the three cases that used to be promoted to TASK_COMPLETE ----------------
 
-test('C: real-idle with a force accept + real work (82s) is NOT a completion', () => {
-  const msg = runGate({
+test('C: real-idle with a force accept + real work (82s) is NOT a completion', async () => {
+  const msg = await runGate({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 82_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force' },
@@ -121,15 +132,15 @@ test('C: real-idle with a force accept + real work (82s) is NOT a completion', (
   assert.match(msg, /consumption=not_established/);
 });
 
-test('D: real-idle, no submit expected (auto-enter inject) + saw working is NOT a completion', () => {
-  const msg = runGate({ submitExpected: false, sawWorkingAfterInject: true }, { elapsedSec: 5 });
+test('D: real-idle, no submit expected (auto-enter inject) + saw working is NOT a completion', async () => {
+  const msg = await runGate({ submitExpected: false, sawWorkingAfterInject: true }, { elapsedSec: 5 });
   assertNoVerdict(msg);
 });
 
-test('D2: real-idle, no submit expected, above the old elapsed floor is NOT a completion', () => {
+test('D2: real-idle, no submit expected, above the old elapsed floor is NOT a completion', async () => {
   // The legacy floor is deleted as a decision input. Elapsed is carried as a measurement — the
   // text still reports it — but crossing a threshold is not evidence that work finished.
-  const msg = runGate({ submitExpected: false }, { elapsedSec: 5 });
+  const msg = await runGate({ submitExpected: false }, { elapsedSec: 5 });
   assertNoVerdict(msg);
   assert.match(msg, /pty_quiet=5\.0s/);
 });

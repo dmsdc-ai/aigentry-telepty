@@ -32,7 +32,18 @@ const { startTestDaemon, createSessionId } = require('../test-support/daemon-har
 
 let daemon;
 
-before(async () => { daemon = await startTestDaemon(); });
+// #1207 — the daemon answers /api/health (the harness's readiness) while its ledger owner may still
+// be opening the directory store under the harness HOME; a tracked inject that lands in that window
+// is refused `503 recovering` by design. Wait for the ledger to reach the state the test needs, so
+// each arm asserts on the store it means to.
+async function awaitLedger(d, states = ['available'], timeoutMs = 20000) {
+  return d.waitFor(async () => {
+    const r = await d.request('/api/ledger/status');
+    return r.status === 200 && r.body && r.body.client && states.includes(r.body.client.store) ? r.body : null;
+  }, { timeoutMs, description: `ledger store in [${states.join('|')}]` });
+}
+
+before(async () => { daemon = await startTestDaemon(); await awaitLedger(daemon); });
 after(async () => { if (daemon) await daemon.stop(); });
 
 // A tracked dispatch: `from` present is what makes the daemon open a durable record.
@@ -45,6 +56,38 @@ async function dispatch(target, prompt, from = 'orchestrator') {
 
 function observations(injectId, d = daemon) {
   return d.request(`/api/inject-observations/${encodeURIComponent(injectId)}`);
+}
+
+// Task 1215 observe148 (failure-only evidence for the session_process_exited wait). It runs only after the unchanged
+// wait has ALREADY failed, attaches fixed-shape `exit_evidence` to the original error, and the caller rethrows that
+// error.
+// - Evidence: last poll status and observation-kind tokens; ms since spawn and since dispatch; owned daemon alive (the
+//   harness exit event, no PID probing); whether the owned daemon's own stdout holds this session's exit marker
+//   (boolean only, never log text); and ONE GET /state bounded at 2000 ms (activity kind/cause tokens and duration_ms
+//   only, never previews or fields).
+// - A failed or slow probe is 'unavailable'. It never replaces the original failure.
+const EXIT_EVIDENCE_MS = 2000;
+const EVIDENCE_TOKEN = /^[a-z][a-z0-9_]{0,63}$/;
+const evidenceToken = (v) => (typeof v === 'string' && EVIDENCE_TOKEN.test(v) ? v : null);
+function observationKinds(body) {
+  const list = body && Array.isArray(body.observations) ? body.observations : null;
+  return list ? list.slice(-16).map((o) => evidenceToken(o && o.kind) || 'other') : null;
+}
+async function attachExitEvidence(error, { sid, spawnedAt, dispatchedAt, lastPoll }) {
+  if (!error || typeof error !== 'object' || !Object.isExtensible(error) || Object.hasOwn(error, 'exit_evidence')) return;
+  const now = Date.now();
+  const evidence = { elapsed_since_spawn_ms: now - spawnedAt, elapsed_since_dispatch_ms: now - dispatchedAt, last_poll: lastPoll,
+    daemon_alive: daemon.isAlive(), exit_marker_logged: 'unavailable', session_state: 'unavailable' };
+  try { evidence.exit_marker_logged = daemon.getLogs().stdout.includes(`[EXIT] Session ${sid} exited with code`); } catch { /* unavailable */ }
+  try {
+    const st = await daemon.request(`/api/sessions/${encodeURIComponent(sid)}/state`, { timeoutMs: EXIT_EVIDENCE_MS });
+    const a = st.body && st.body.activity_observation;
+    evidence.session_state = { http_status: st.status, kind: evidenceToken(a && a.kind), cause: evidenceToken(a && a.cause),
+      duration_ms: a && Number.isFinite(a.duration_ms) ? a.duration_ms : null };
+  } catch (probeError) {
+    evidence.session_state = { unavailable: (probeError && typeof probeError.code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(probeError.code)) ? probeError.code : 'error' };
+  }
+  error.exit_evidence = evidence;
 }
 
 // Shared assertions — every body this endpoint returns, on every arm, must satisfy these.
@@ -94,13 +137,46 @@ test('missing_tracking_is_explicit: malformed and hostile inject_ids are unavail
 
 // --- §8.1 pending_overwrite_emits_superseded -------------------------------------------------
 
+// #1215 lock10 diagnostics only (win32 8a0219b diagnostic job: the FIRST inject answered 500 DELIVERY_UNCERTAIN,
+// tracking_state aborted, bytes_written null, before any supersession step). The route overwrites the underlying
+// code, and no daemon output reached the job log. Built ONLY when that assertion is already failing, and appended to
+// its message: the spawn answer (status/success/code only), the daemon log lines naming this sid, and this sid's
+// mailbox state.jsonl trail (whitelisted state fields, never payload). Separates a deliver callback that threw or
+// returned an uncertain write ([MAILBOX] Delivery outcome unknown + dead_letter row) from an ACK-store failure (fenced
+// in_flight row, no dead_letter, no such line) and from a session that never spawned. Bounded: 8 lines × 300 chars.
+function firstInjectDiag(sid, spawned) {
+  const cap = (l) => String(l).slice(0, 300);
+  const { stdout, stderr } = daemon.getLogs();
+  const log = `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid)).slice(-8).map(cap);
+  const root = process.env.AIGENTRY_MAILBOX_DIR || path.join(daemon.homeDir, '.aigentry', 'mailbox');
+  const dir = path.join(root, sid);
+  let mailbox;
+  try {
+    const names = fs.readdirSync(dir).slice(0, 16);
+    let trail = null;
+    try {
+      trail = fs.readFileSync(path.join(dir, 'state.jsonl'), 'utf8').split('\n').filter(Boolean).slice(-8).map((l) => {
+        try {
+          const r = JSON.parse(l); const keep = {};
+          for (const k of ['state', 'non_retryable_attempt', 'delivery_uncertain', 'outcome', 'retryable', 'reason', 'attempt']) if (r[k] !== undefined) keep[k] = typeof r[k] === 'string' ? cap(r[k]) : r[k];
+          return keep;
+        } catch { return { unparsed: true }; }
+      });
+    } catch (e) { trail = { error: e.code || 'read_failed' }; }
+    let lockEntries = null; try { lockEntries = fs.readdirSync(path.join(dir, '.lock')).length; } catch (e) { lockEntries = e.code || 'error'; }
+    mailbox = { names, state_trail: trail, lock_entries: lockEntries };
+  } catch (e) { mailbox = { error: e.code || 'readdir_failed' }; }
+  const spawn = spawned ? { status: spawned.status, success: spawned.body && spawned.body.success, code: spawned.body && spawned.body.code } : null;
+  return ` | [telepty-diag] first_inject ${JSON.stringify({ spawn, log, mailbox })}`;
+}
+
 test('pending_overwrite_emits_superseded: a second dispatch retains the first inject_id and names the supersession', () => {
   return (async () => {
     const sid = createSessionId('supersede');
-    await daemon.spawnSession(sid);
+    const spawned = await daemon.spawnSession(sid);
 
     const first = await dispatch(sid, 'first task');
-    assert.equal(first.status, 200, `first inject failed: ${JSON.stringify(first.body)}`);
+    assert.equal(first.status, 200, first.status === 200 ? '' : `first inject failed: ${JSON.stringify(first.body)}${firstInjectDiag(sid, spawned)}`);
     const firstId = first.body.inject_id;
     assert.equal(typeof firstId, 'string');
 
@@ -139,6 +215,7 @@ test('tracking_unknown_survives_restart: a record survives a daemon restart and 
     // out, which would destroy the very state the restart is supposed to carry across.
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty60-restart-'));
     const first = await startTestDaemon({ homeDir });
+    await awaitLedger(first);
     let second = null;
     try {
       const sid = createSessionId('restart');
@@ -156,6 +233,9 @@ test('tracking_unknown_survives_restart: a record survives a daemon restart and 
 
       await first.kill();
       second = await startTestDaemon({ homeDir });
+      // #1207: recovery (segment replay + snapshot) runs off the main thread; a poll during it is
+      // `unavailable: recovering`, which is correct and not the arm under test.
+      await awaitLedger(second);
 
       const after = await second.request(`/api/inject-observations/${encodeURIComponent(injectId)}`);
       const body = assertDiscriminatedUnknown(after, 'after restart');
@@ -185,7 +265,11 @@ test('tracking_unknown_survives_restart: a record survives a daemon restart and 
 test('tracking_persist_failure_prevents_delivery: an unwritable ledger aborts the delivery, and no bytes reach the target', () => {
   return (async () => {
     // Make the ledger path unwritable in the one way that cannot be mistaken for anything else: its
-    // parent directory is a FILE, so mkdirSync throws and the atomic write returns {ok:false}.
+    // parent directory is a FILE. #1207: the ledger is a directory store beside an O_EXCL lock in
+    // that same parent, so the daemon's main-thread lock acquisition fails (ENOTDIR), no store is
+    // ever opened, and begin refuses before any mutation. The observed contract is unchanged —
+    // 500 TRACKING_PERSISTENCE_FAILED, tracking_state unavailable, reason tracking_persistence_failed,
+    // zero bytes delivered — and remains UNMEASURED until the frozen suites are executed.
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty60-nowrite-'));
     const blocker = path.join(home, 'blocked');
     fs.writeFileSync(blocker, 'not a directory');
@@ -193,6 +277,8 @@ test('tracking_persist_failure_prevents_delivery: an unwritable ledger aborts th
 
     const d = await startTestDaemon({ env: { TELEPTY_TRACKED_INJECTIONS_PATH: ledgerPath } });
     try {
+      // The store never becomes available here; wait until the client has left `recovering`.
+      await awaitLedger(d, ['unavailable', 'lock_present', 'unavailable_read'], 20000);
       const sid = createSessionId('nowrite');
       await d.spawnSession(sid);
       // A marker that could only appear on the target's screen if the bytes were delivered.
@@ -245,17 +331,25 @@ test('dead_reports_absence_to_source: a process exit is reported as absence, and
     // actually seen, and requires `exit_observed_at` to be stated at all (#843). This arm is the
     // entrance that genuinely observes one. See test/delete-death-observation-60.test.js.
     const sid = createSessionId('dying');
+    const spawnedAt = Date.now(); // observe148: evidence timing only
     await daemon.spawnSession(sid, { command: 'bash', args: ['-c', 'sleep 3'] });
     const res = await dispatch(sid, 'work this process will not survive', source);
+    const dispatchedAt = Date.now(); // observe148: evidence timing only
     assert.equal(res.status, 200);
     const injectId = res.body.inject_id;
 
+    let lastPoll = null; // observe148: the last poll's status and kind tokens, read only by the failure evidence
     const body = await daemon.waitFor(async () => {
       const poll = await observations(injectId);
+      lastPoll = { status: poll.status, kinds: observationKinds(poll.body) };
       if (poll.status !== 200) return null;
       const kinds = (poll.body.observations || []).map(o => o.kind);
       return kinds.includes('session_process_exited') ? poll.body : null;
-    }, { timeoutMs: 6000, description: 'session_process_exited observation' });
+    }, { timeoutMs: 6000, description: 'session_process_exited observation' })
+      .catch(async (error) => {
+        try { await attachExitEvidence(error, { sid, spawnedAt, dispatchedAt, lastPoll }); } catch { /* evidence is optional; the original failure is not */ }
+        throw error;
+      });
 
     // The pending entry is released on death; the LEDGER record is not. A poll after the process
     // is gone still gets a named observation instead of a 404.

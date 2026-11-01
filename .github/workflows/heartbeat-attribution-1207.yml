@@ -1,0 +1,55 @@
+name: Heartbeat attribution probe (#1207, diagnostic only)
+
+# Task 1215 native55 — DIAGNOSTIC-ONLY paired hosted experiment. NOT a test gate and NOT release acceptance.
+# Runs scripts/heartbeat-attribution-1207.mjs once per OS: 20 arms in a fixed alternating CONTENDED/SOLO order (N = 10 per
+# arm, fixed in the script) over the UNCHANGED frozen test/ledger-control-responsiveness-1207.test.js, selecting only the
+# 1 MiB F2 and R1 cases, with an idle sibling sampler in both arms. The job is red only when the EXPERIMENT is incomplete
+# (timeout, overflow, cleanup failure, missing artifact, node mismatch); test failures and inconclusive verdicts are data.
+# The primary verdict stays with test-install.yml, which this workflow does not change. Evidence is always uploaded as an
+# ordinary GitHub Actions artifact. Triggers mirror windows-diagnostic-879.yml: manual dispatch, and pull_request filtered
+# to this probe's own files. Nothing here runs on push to main.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/heartbeat-attribution-1207.yml'
+      - 'scripts/heartbeat-attribution-1207.mjs'
+      - 'test/fixtures/ledger-1207/heartbeat-gap-diagnostics.js'
+      - 'test/fixtures/ledger-1207/heartbeat-sibling-sampler.js'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: paired heartbeat probe (${{ matrix.os }}, node 20.20.0) — diagnostic only
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # <= 25 min per OS (dispatch bound). The script's own budget is 20 min of arms; the rest covers checkout, npm ci and upload.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Paired CONTENDED/SOLO probe (N=10 per arm, fixed; diagnostic only)
+        run: node scripts/heartbeat-attribution-1207.mjs --out heartbeat-attribution-1207 --expect-node v20.20.0
+
+      - name: Upload probe evidence (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: heartbeat-attribution-1207-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: heartbeat-attribution-1207
+          if-no-files-found: warn
+          retention-days: 14

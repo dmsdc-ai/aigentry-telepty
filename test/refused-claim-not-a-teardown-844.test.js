@@ -31,6 +31,7 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fsDiag = require('node:fs'); // #879 N2 failure-only cleanup evidence (homeResidual)
 const pty = require('node-pty');
 
 const { startTestDaemon, createSessionId, stripAnsi, waitFor, delay } = require('../test-support/daemon-harness');
@@ -39,10 +40,92 @@ const projectRoot = path.resolve(__dirname, '..');
 
 let harness;
 
-before(async () => { harness = await startTestDaemon(); });
-after(async () => { if (harness) await harness.stop(); });
+// Task 1215 / #879 — ALLOWLISTED failure-boundary diagnostics for the win32 delivery failures. Emitted only when a
+// delivery wait fails; never payload bytes (only booleans for test-owned markers), tokens, env, URLs or credentials.
+// They do not change any assertion, wait, timeout or the test sequence; the original error is rethrown unchanged.
+async function diagSession(sessionId) {
+  try {
+    const res = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    const b = res.body && typeof res.body === 'object' ? res.body : {};
+    const t = b.transport && typeof b.transport === 'object' ? b.transport : {};
+    const r = t.readiness && typeof t.readiness === 'object' ? t.readiness : {};
+    const q = t.bridge_queue && typeof t.bridge_queue === 'object' ? t.bridge_queue : null;
+    return { status: res.status, healthStatus: b.healthStatus ?? null, type: b.type ?? null, input_policy: t.input_policy ?? null,
+      bootstrap_gated: t.bootstrap ? t.bootstrap.gated ?? null : null, readiness_capability: r.capability ?? null,
+      input_transport_ready: r.input_transport_ready ? r.input_transport_ready.status ?? null : null,
+      // Task 1215 (#879 discriminators): which handshake half is missing, any refused frame (fixed reason code) and the
+      // daemon-side bootstrap queue (counts only).
+      process_started: r.process_started ? r.process_started.status ?? null : null,
+      input_transport_ready_reason: r.input_transport_ready ? r.input_transport_ready.reason ?? null : null,
+      refused_frames: r.refused_frames ? { count: r.refused_frames.count ?? null, milestone: r.refused_frames.last ? r.refused_frames.last.milestone ?? null : null,
+        reason: r.refused_frames.last ? r.refused_frames.last.reason ?? null : null } : null,
+      bootstrap: t.bootstrap ? { ready: t.bootstrap.ready ?? null, queued: t.bootstrap.queued ?? null, draining: t.bootstrap.draining ?? null } : null,
+      instruction_received: t.instruction_received ? t.instruction_received.status ?? null : null, bridge_receipts: t.bridge_receipts ?? null,
+      bridge_queue: q ? { source: q.source ?? null, phase: q.phase ?? null, pending: q.pending ?? null, reason: q.reason ?? null } : null };
+  } catch (error) { return { error: (error && error.code) || 'request_failed' }; }
+}
+function diagInject(res) {
+  if (!res) return null;
+  const b = res.body && typeof res.body === 'object' ? res.body : {};
+  return { status: res.status, success: b.success ?? null, code: b.code ?? null, queued: b.queued ?? null,
+    bootstrap_queued: b.bootstrap_queued ?? null, strategy: b.strategy ?? null, tracking_state: b.tracking_state ?? null };
+}
+function diagPty(text, exit, markers) {
+  const plain = stripAnsi(String(text || ''));
+  return { exit: exit === undefined ? null : exit, bytes: Buffer.byteLength(String(text || ''), 'utf8'),
+    markers: Object.fromEntries(Object.entries(markers).map(([name, needle]) => [name, plain.includes(needle)])) };
+}
 
-function spawnBridge(sessionId) {
+// Task 1215 / #879 (windows40 N2) — FAILURE-ONLY cleanup evidence. Windows main job 124625652428: this file's after hook
+// failed with ENOTEMPTY removing the harness HOME after all three tests passed; which entry remained, and whether the bridges
+// this file spawned with that HOME had exited, was not recorded. Only when the existing harness.stop() throws ENOTEMPTY,
+// the SAME error is rethrown with bounded metadata appended: residual names relative to the owned HOME (lstat walk, never
+// following a symlink, depth <= 4, <= 32 entries, no contents or absolute paths) and each spawned bridge's observed exit.
+// No cleanup, wait, kill, retry or ordering change: this gathers evidence; it does not fix the cleanup failure.
+const spawnedBridges = [];
+function homeResidual(root) {
+  const entries = []; let truncated = false;
+  const walk = (dir, rel, depth) => {
+    let names;
+    try { names = fsDiag.readdirSync(dir).sort(); } catch (e) { entries.push({ name: rel || '.', error: e.code || 'readdir_failed' }); return; }
+    for (const name of names) {
+      if (entries.length >= 32) { truncated = true; return; }
+      const relName = rel ? `${rel}/${name}` : name;
+      let st;
+      try { st = fsDiag.lstatSync(path.join(dir, name)); } catch (e) { entries.push({ name: relName, error: e.code || 'lstat_failed' }); continue; }
+      const type = st.isSymbolicLink() ? 'symlink' : st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other';
+      entries.push({ name: relName, type });
+      if (type === 'dir') { if (depth < 4) walk(path.join(dir, name), relName, depth + 1); else truncated = true; }
+    }
+  };
+  walk(root, '', 1);
+  return { entries, truncated };
+}
+function bridgeExits(failedAt) {
+  return spawnedBridges.slice(0, 16).map((b) => ({ kind: b.kind, exit_code: b.exitCode ?? null, signal: b.signal ?? null,
+    exited_before_failure_ms: b.exitedAt === undefined ? null : failedAt - b.exitedAt }));
+}
+
+before(async () => { harness = await startTestDaemon(); });
+after(async () => {
+  if (!harness) return;
+  try { await harness.stop(); } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOTEMPTY' && typeof error.message === 'string') {
+      const failedAt = Date.now(), first = `${error.name}: ${error.message}`;
+      const note = ` | [telepty-diag] home_residual ${JSON.stringify({ residual: homeResidual(harness.homeDir), bridges: bridgeExits(failedAt) })}`;
+      error.message += note;
+      if (typeof error.stack === 'string' && error.stack.startsWith(first)) error.stack = first + note + error.stack.slice(first.length);
+    }
+    throw error;
+  }
+});
+
+// #879: `bash` is not a Windows primitive (it may resolve to the WSL launcher, or not at all). The
+// incumbent only needs a long-lived interactive child that echoes what it is given, so win32 uses
+// this suite's own node by absolute path in REPL mode. POSIX keeps `bash` unchanged.
+const INCUMBENT_COMMAND = process.platform === 'win32' ? [process.execPath, '-i'] : ['bash'];
+
+function spawnBridge(sessionId, commandArgs = INCUMBENT_COMMAND) {
   const env = {
     ...process.env,
     HOME: harness.homeDir,
@@ -57,7 +140,7 @@ function spawnBridge(sessionId) {
   delete env.TELEPTY_SESSION_TOKEN;
   delete env.TELEPTY_SESSION_ID;
 
-  const proc = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, 'bash'], {
+  const proc = pty.spawn(process.execPath, ['cli.js', 'allow', '--id', sessionId, ...commandArgs], {
     cwd: projectRoot,
     cols: 100,
     rows: 30,
@@ -67,6 +150,10 @@ function spawnBridge(sessionId) {
   const output = { text: '', exit: null };
   proc.onData((d) => { output.text += d; });
   proc.onExit(({ exitCode }) => { output.exit = exitCode; });
+  // Task 1215 / #879 N2: observe-only exit facts for the failure-only cleanup evidence above (no behaviour change).
+  const observed = { kind: commandArgs === INCUMBENT_COMMAND ? 'bridge_incumbent_command' : 'bridge_custom_command' };
+  spawnedBridges.push(observed);
+  proc.onExit(({ exitCode, signal }) => { observed.exitCode = exitCode; observed.signal = signal ?? null; observed.exitedAt = Date.now(); });
   return { proc, output };
 }
 
@@ -86,6 +173,8 @@ test('a bridge whose owner claim is REFUSED does not destroy the session it was 
     const sessions = await listSessions();
     return sessions.some((s) => s.id === sessionId && s.healthStatus === 'CONNECTED');
   }, { timeoutMs: 15000, description: 'incumbent bridge owner connected' });
+
+  const beforeChallenge = (await listSessions()).find(s => s.id === sessionId);
 
   // ── challenger: a re-registration, so #815 hands it no credential and the claim is refused ──
   const b = spawnBridge(sessionId);
@@ -112,6 +201,12 @@ test('a bridge whose owner claim is REFUSED does not destroy the session it was 
     + 'authorise a destructive remediation (#835)');
   assert.equal(survivor.healthStatus, 'CONNECTED',
     'the healthy incumbent must still own its socket after another bridge was refused');
+  assert.equal(survivor.ownerPid, beforeChallenge.ownerPid, 'refused challenger must not replace incumbent owner PID');
+  // The owner claim can precede the incumbent's own asynchronous PTY metadata update.
+  // Only an already observed PTY PID is stable across the challenge.
+  if (beforeChallenge.ptyPid != null) {
+    assert.equal(survivor.ptyPid, beforeChallenge.ptyPid, 'incumbent PTY PID is preserved');
+  }
   assert.equal(a.output.exit, null,
     'the incumbent bridge exited — it was torn down by a bridge the daemon had just refused');
 });
@@ -145,5 +240,36 @@ test('the incumbent still accepts an inject after the refused claim — it was n
     `the incumbent must still accept injects; got ${injected.status} ${JSON.stringify(injected.body)}`);
 
   await waitFor(async () => stripAnsi(a.output.text).includes(MARK),
-    { timeoutMs: 10000, description: 'incumbent PTY received the inject' });
+    { timeoutMs: 10000, description: 'incumbent PTY received the inject' }).catch(async (error) => {
+    // #879 diagnostics only (allowlisted; MARK is test-owned): where did the accepted inject stop?
+    t.diagnostic(`#879 diag incumbent_delivery ${JSON.stringify({ inject: diagInject(injected), session: await diagSession(sessionId),
+      incumbent: diagPty(a.output.text, a.output.exit, { inject_allowed: 'Inject allowed', repl_prompt: '> ', mark_echo: MARK, announce_unsent: 'transport readiness not announced', announce_pid_unavailable: 'pid=unavailable' }),
+      challenger: diagPty(b.output.text, b.output.exit, { owner_claim_refused: 'Owner claim refused' }) })}`);
+    throw error;
+  });
+});
+
+
+test('#135: refused claimant never starts its command or announces ownership', async (t) => {
+  const fs = require('node:fs');
+  const sessionId = createSessionId('claim-order-135');
+  const incumbent = spawnBridge(sessionId);
+  t.after(() => { try { incumbent.proc.kill(); } catch {} });
+  await waitFor(() => /Inject allowed/.test(incumbent.output.text),
+    { timeoutMs: 15000, description: 'accepted bridge starts' });
+  const { FileMailbox } = require('../src/mailbox');
+  const mailbox = new FileMailbox({ root: path.join(harness.homeDir, '.aigentry', 'mailbox', 'bridge') });
+  mailbox.enqueue({ msg_id: 'pending-135', from: 'original-sender', to: sessionId,
+    payload: 'pending for incumbent', created_at: Math.floor(Date.now() / 1000), attempt: 0 });
+  const marker = path.join(harness.homeDir, 'refused-child-started');
+  const challenger = spawnBridge(sessionId, [process.execPath, '-e',
+    `require('fs').writeFileSync(${JSON.stringify(marker)}, 'started'); setInterval(() => {}, 1000);`]);
+  t.after(() => { try { challenger.proc.kill(); } catch {} });
+  await waitFor(() => challenger.output.exit !== null,
+    { timeoutMs: 15000, description: 'challenger refused' });
+  assert.match(challenger.output.text, /Owner claim refused/);
+  assert.equal(challenger.output.exit, 1);
+  assert.doesNotMatch(challenger.output.text, /Inject allowed|Recovered .*undelivered/);
+  assert.equal(fs.existsSync(marker), false, 'unowned command must never execute');
+  assert.equal(mailbox.peek(sessionId).length, 1, 'incumbent mailbox must remain intact');
 });

@@ -11,7 +11,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
 
 const pkg = require('../package.json');
 const { detectSupervisor, restartSupervisorDaemon } = require('../src/supervisor');
@@ -37,26 +37,67 @@ function readDaemonState(homeDir = os.homedir()) {
   }
 }
 
+// Use this install's CLI directly: Windows PATH may select the extensionless npm shim.
 function resolveTeleptyBin() {
+  return process.execPath;
+}
+
+function spawnDetachedDaemon(bin = process.execPath, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = (options.spawn || spawn)(bin, [path.resolve(__dirname, '../cli.js'), 'daemon'], {
+      detached: true, stdio: 'ignore', windowsHide: true
+    });
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref();
+      resolve(child);
+    });
+  });
+}
+
+function printServiceHint(logger, supervisor, platform = process.platform) {
+  if (supervisor && supervisor.present) return false;
+  const linger = platform === 'darwin' || platform === 'win32'
+    ? ''
+    : ' (boot without login also needs: loginctl enable-linger $USER)';
+  logger.log(
+    '[telepty postinstall] No OS service manages the telepty daemon; it will not start after '
+    + `reboot/login. To enable: telepty service install${linger}`
+  );
+  return true;
+}
+
+// #1228: name a legacy dual-install so `npm rm -g aigentry-telepty` cannot take
+// the shared `telepty` link by surprise. Diagnosis only — never npm, never a
+// write into the prefix — and wrapped so a diagnosis can never break an install.
+function warnAboutLegacyInstall(options, logger, platform, env) {
   try {
-    const cmd = os.platform() === 'win32' ? 'where telepty' : 'which telepty';
-    return execSync(cmd, { encoding: 'utf8' }).split('\n')[0].trim() || 'telepty';
+    const ownership = require('../src/bin-ownership');
+    const diagnose = options.diagnoseBinOwnership || ownership.diagnoseBinOwnership;
+    const notice = ownership.formatMigrationNotice({
+      diagnosis: diagnose({ platform, env }),
+      version: pkg.version
+    });
+    if (notice) logger.warn(`[telepty postinstall] ${notice}`);
   } catch {
-    return 'telepty';
+    // An inconclusive diagnosis is not a failed install.
   }
 }
 
-function spawnDetachedDaemon(bin) {
-  const child = spawn(bin, ['daemon'], { detached: true, stdio: 'ignore' });
-  child.unref();
-  return child;
+// Task 1215 F2: /api/meta is authenticated (#820: loopback is not a credential). Present the existing local daemon
+// token with the client precedence TELEPTY_AUTH_TOKEN, else ~/.telepty/config.json authToken — read-only, never
+// minted (auth.js getConfig create:false). Unavailable => no header; the value is never logged.
+function localDaemonToken(env = process.env) {
+  if (env.TELEPTY_AUTH_TOKEN) return env.TELEPTY_AUTH_TOKEN;
+  try { return require('../auth').getConfig({ create: false }).authToken; } catch { return null; }
 }
 
-async function waitForDaemonVersion({ port = 3848, version = pkg.version, timeoutMs = 8000, fetchImpl = fetch } = {}) {
+async function waitForDaemonVersion({ port = 3848, version = pkg.version, timeoutMs = 8000, fetchImpl = fetch, token = null } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const res = await fetchImpl(`http://127.0.0.1:${port}/api/meta`, {
+        headers: token ? { 'x-telepty-token': token } : {},
         signal: AbortSignal.timeout(800)
       });
       if (res && res.ok) {
@@ -72,26 +113,47 @@ async function waitForDaemonVersion({ port = 3848, version = pkg.version, timeou
 async function main(options = {}) {
   const env = options.env || process.env;
   const logger = options.logger || console;
+  const platform = options.platform || process.platform;
   const skip = shouldSkip(env);
   if (skip) {
     logger.log(`[telepty postinstall] Skipped (${skip}).`);
     return;
   }
 
+  warnAboutLegacyInstall(options, logger, platform, env);
+  const supervisor = (options.detectSupervisor || detectSupervisor)();
+
   const state = (options.readDaemonState || readDaemonState)(options.homeDir || os.homedir());
   if (!state || !Number.isInteger(state.pid) || state.pid <= 0) {
     logger.log('[telepty postinstall] No running daemon detected — nothing to restart.');
+    printServiceHint(logger, supervisor, platform);
     return;
   }
 
   if (state.version === pkg.version) {
     logger.log(`[telepty postinstall] Running daemon already at ${pkg.version} (pid ${state.pid}). No restart needed.`);
+    printServiceHint(logger, supervisor, platform);
     return;
   }
 
   logger.log(`[telepty postinstall] Detected stale daemon ${state.version || 'unknown'} (pid ${state.pid}); upgrading in-place to ${pkg.version}.`);
 
-  const supervisor = (options.detectSupervisor || detectSupervisor)();
+  // Task 1215 service36: a replacement daemon that would refuse its supervision setting must not replace a running
+  // one. Preflight BEFORE the stop; on a refusal skip both stop and restart, so the old daemon keeps running, and
+  // name the code only (no path, no config content). Lazy require, as for daemon-control below.
+  try {
+    const supervision = require('../src/principal/supervision-config');
+    try {
+      supervision.preflightSupervision({ env, platform, configPath: supervision.defaultConfigPath(options.homeDir || os.homedir()) });
+    } catch (err) {
+      logger.warn(`[telepty postinstall] Supervision preflight refused (${supervision.refusalCode(err)}); the running `
+        + `${state.version || 'unknown'} daemon was NOT stopped or restarted. Fix the supervisionTrustFile setting, then run: telepty daemon restart`);
+      return;
+    }
+  } catch {
+    logger.warn('[telepty postinstall] Supervision preflight unavailable (SUPERVISION_PREFLIGHT_FAILED); the running daemon was NOT stopped or restarted.');
+    return;
+  }
 
   let stopped = 0;
   try {
@@ -126,7 +188,8 @@ async function main(options = {}) {
     const meta = await waitForVersion({
       port: Number(state.port) || 3848,
       version: pkg.version,
-      timeoutMs: options.waitTimeoutMs || 8000
+      timeoutMs: options.waitTimeoutMs || 8000,
+      token: localDaemonToken(env)
     });
     if (meta) {
       logger.log(`[telepty postinstall] Stopped ${stopped} stale daemon(s); ${supervisor.kind} started ${pkg.version} daemon (pid ${meta.pid}).`);
@@ -139,12 +202,12 @@ async function main(options = {}) {
   // No supervisor installed: keep the pre-#757 fallback so upgrades do not leave
   // standalone/non-root installs without a daemon.
   try {
-    const bin = (options.resolveTeleptyBin || resolveTeleptyBin)();
-    (options.spawnDetachedDaemon || spawnDetachedDaemon)(bin);
+    await (options.spawnDetachedDaemon || spawnDetachedDaemon)();
     logger.log(`[telepty postinstall] Stopped ${stopped} stale daemon(s); spawned fresh ${pkg.version} daemon.`);
   } catch (err) {
     logger.warn(`[telepty postinstall] Daemon respawn failed: ${err.message}.`);
   }
+  printServiceHint(logger, supervisor, platform);
 }
 
 if (require.main === module) {
@@ -155,6 +218,7 @@ if (require.main === module) {
 
 module.exports = {
   main,
+  printServiceHint,
   readDaemonState,
   resolveTeleptyBin,
   shouldSkip,

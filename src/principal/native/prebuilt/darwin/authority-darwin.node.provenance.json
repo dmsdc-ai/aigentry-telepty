@@ -1,0 +1,72 @@
+{
+  "schema": "telepty.native-build/v1",
+  "artifact": "src/principal/native/prebuilt/darwin/authority-darwin.node",
+  "sha256": "2d4bde2dea1b6d16e1f33ad6637ca0c5e996ab66e59f266580a84d4835daed37",
+  "bytes": 84976,
+  "archs": [
+    "arm64",
+    "x86_64"
+  ],
+  "min_macos": "11.0",
+  "napi_version": 8,
+  "source": {
+    "path": "src/principal/native/authority-darwin.c",
+    "sha256": "e86029e0ffe977c0a929faa3ea9fac64406f11939dd2e801a1dfedcaaf26d0e8"
+  },
+  "compiler": {
+    "path": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+    "sha256": "7def90dd8829726686213a747fc5bff1583df933dae5edc55d755479e0bfe00a",
+    "version": "Apple clang version 21.0.0 (clang-2100.1.1.101)"
+  },
+  "sdk": {
+    "path": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.4.sdk",
+    "settings_sha256": "f231d03c93d59ebfffd410e941e50db8fcef6ec19ebe715967ab07ac44a51fc8"
+  },
+  "node_headers": {
+    "node_api.h": "cf2446da4783a707dc9399321cff3ea28dce86fafdf38746fc47f1b293f5a040",
+    "node_api_types.h": "8d5d854088d5725fec9775510e0aeeeb790a41ad083c49bb721d950b86e6bd61",
+    "js_native_api.h": "89393f07881fcba3ed097a5989fba1746f1c2cf611f19ba4dcb17071da8a661e",
+    "js_native_api_types.h": "0410c31e227f81e2981363c4d543f4832ac3df785343ec64cee621742ff8a034"
+  },
+  "argv": [
+    "-arch",
+    "arm64",
+    "-arch",
+    "x86_64",
+    "-mmacosx-version-min=11.0",
+    "-isysroot",
+    "/Library/Developer/CommandLineTools/SDKs/MacOSX26.4.sdk",
+    "-isystem",
+    "/Users/duckyoungkim/aigentry-validation/telepty-1215-native-recheck/output/work/node-headers",
+    "-std=gnu11",
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-fvisibility=hidden",
+    "-fstack-protector-strong",
+    "-D_FORTIFY_SOURCE=2",
+    "-DNAPI_VERSION=8",
+    "-ffile-prefix-map=/Users/duckyoungkim/aigentry-validation/telepty-1215-native-recheck/output/work/repo=.",
+    "-ffile-prefix-map=/Users/duckyoungkim/aigentry-validation/telepty-1215-native-recheck/output/work/node-headers=node-headers",
+    "-ffile-prefix-map=/Library/Developer/CommandLineTools/SDKs/MacOSX26.4.sdk=sdk",
+    "-bundle",
+    "-undefined",
+    "dynamic_lookup",
+    "-Wl,-dead_strip",
+    "-o",
+    "<out>",
+    "/Users/duckyoungkim/aigentry-validation/telepty-1215-native-recheck/output/work/repo/src/principal/native/authority-darwin.c"
+  ],
+  "env": {
+    "PATH": "/usr/bin:/bin",
+    "ZERO_AR_DATE": "1",
+    "SOURCE_DATE_EPOCH": "0",
+    "LANG": "C",
+    "HOME": "<work>/home",
+    "TMPDIR": "<work>/tmp/",
+    "TMP": "<work>/tmp",
+    "TEMP": "<work>/tmp"
+  },
+  "builder_node": "v20.20.0"
+}

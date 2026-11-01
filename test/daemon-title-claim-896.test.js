@@ -22,6 +22,17 @@
 // ephemeral port and never 3848; HOME is the per-process temp home test-support/setup-env.js
 // installs, so no live session state is read or restored. Each child exits immediately after
 // recording its title. The production daemon on :3848 is never contacted.
+//
+// win32 (#879) — evidence-supported hypothesis, not an instrumented cause. Measured: in run
+// 40507287143 (parallel `test:ci`) the bare-require probe read "telepty-daemon"; in run 40507287234
+// (per-file runner, which spawns each file with `windowsHide: true`) the same file passed 2/2. The
+// logs do not show which process wrote that title. The hypothesis is that on win32 `process.title`
+// is backed by the console title (libuv GetConsoleTitleW / SetConsoleTitleW), which processes on
+// the same console share, and that a sibling test file's real daemon had set it. The intended
+// fixture isolation is to spawn the probe child with `windowsHide: true` so it is not attached to
+// the suite's console; it is a no-op on POSIX. Whether this isolates the title on the CI runner is
+// for the actual Windows CI run to verify — the assertions below are unchanged, so a title that
+// still reads as a daemon is still a failure, never a skip.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -53,6 +64,7 @@ function titleAfterRequire(env) {
         timeout: 30000,
         killSignal: 'SIGKILL',
         stdio: ['ignore', 'ignore', 'ignore'],
+        windowsHide: true,            // #879: intended console isolation on win32 (see header)
         env: {
           ...env,
           TELEPTY_896_OUT: out,

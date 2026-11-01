@@ -164,8 +164,10 @@ function api(port, home) {
 // It has to be upgrade-only: holding the whole bridge->daemon direction also starves the
 // CLI's own HTTP health/version probes, and the CLI then concludes the daemon is broken and
 // goes off to restart it — which tests daemon management, not this pipe.
-function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0 }) {
+function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0, manualHoldWsUpgrade = false }) {
   const pairs = new Set();
+  const upgradeReleases = [];
+  let upgradesReleased = false;
   const state = { up: true, down: true }; // up = bridge->daemon, down = daemon->bridge
   const server = net.createServer((client) => {
     const upstream = net.connect(targetPort, targetHost);
@@ -174,19 +176,21 @@ function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0 
     // Per-connection: `held` is an array while this connection's bytes are being queued,
     // and null once it is a straight pass-through (either plain HTTP or the hold expired).
     let held = null;
-    let sniffed = holdWsUpgradeMs <= 0;
+    let sniffed = !manualHoldWsUpgrade && holdWsUpgradeMs <= 0;
     client.on('data', (c) => {
       if (!state.up) return;
       if (!sniffed) {
         // Request line + headers arrive in one loopback segment, so the first chunk decides.
         sniffed = true;
-        if (/upgrade:\s*websocket/i.test(c.toString('latin1'))) {
+        if (/upgrade:\s*websocket/i.test(c.toString('latin1')) && (!manualHoldWsUpgrade || !upgradesReleased)) {
           held = [];
-          setTimeout(() => {
-            const queued = held;
+          const release = () => {
+            const queued = held || [];
             held = null;
             for (const b of queued) { if (state.up) upstream.write(b); }
-          }, holdWsUpgradeMs).unref();
+          };
+          if (manualHoldWsUpgrade) upgradeReleases.push(release);
+          else setTimeout(release, holdWsUpgradeMs).unref();
         }
       }
       if (held) held.push(c); else upstream.write(c);
@@ -201,6 +205,10 @@ function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0 
   });
   return {
     listen: () => new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port))),
+    releaseUpgrades() {
+      upgradesReleased = true;
+      for (const release of upgradeReleases.splice(0)) release();
+    },
     blackhole(dir) {
       if (dir === 'up' || dir === 'both') state.up = false;
       if (dir === 'down' || dir === 'both') state.down = false;

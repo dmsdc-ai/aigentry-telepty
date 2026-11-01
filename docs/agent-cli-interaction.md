@@ -1,10 +1,51 @@
 # Agent CLI interaction core (partial)
 
-This opt-in protocol implements action identity, durable receipts and the final-writer
-boundary. **No live Codex observation adapter is enabled.** Observation returns
-`available:false`, `observation_unavailable` and an empty supported-operation list.
-No screen, input selection, composer readiness or task consumption is inferred from
-the historical PTY ring. Existing inject/submit and manual Enter APIs retain their syntax.
+This protocol implements action identity, durable receipts and a synchronous final-writer
+boundary. Default sessions have no selector adapter and return `available:false`.
+An explicit, narrow captured-surface profile now uses a bounded real VT grid instead
+of the historical output ring. No automatic trust, plan approval, update, resume,
+authentication or raw-key capability is enabled.
+
+## Bounded captured profiles (#39, #36, #40)
+
+Set `TELEPTY_INTERACTION_PROFILE=claude-2.1.220-captured-color-v1` before `telepty allow`
+to opt into the exact color-question capture from the existing Claude Code 2.1.220
+regression fixture. The only operation is `select` with value `red` or `blue`.
+It accepts the exact captured visible lines, including the question and known options;
+unknown text, wrapping, a different question, a missing dependency, partial stream,
+pending parser work, stale binding or approval-sensitive text refuses. The capture
+is a normalized output tail reconstructed as VT input, not the original differential
+ANSI stream. Version evidence is honestly `operator-selected-captured-profile`, and
+`native_behavior_verified` is false. This is not executable attestation or acceptance
+of a live installed Claude CLI.
+
+`codex-0.144.1-captured-update-v1` observes the existing captured Codex update nag
+through the real VT parser but exposes no input operations. Trust/plan/update/resume
+and authentication surfaces remain unwriteable. No launch flags, trust configuration,
+update preferences, or external approval policies are altered. Thus #36/#40 do not
+become automatic approval or dismissal features.
+
+Frames bind the profile/version into their digest and prompt revision; request fences
+also require the current session epoch, credential generation, owner generation,
+input/geometry generations, question ID, surface and dimensions. The final writer
+reobserves without awaiting before encoding and writing. Encoding requires a private
+in-process provider capability, accepts no raw keys, and consumes the visible capture
+before the physical write; an identical repaint is not permission to write it again.
+A written receipt proves bytes accepted at that boundary, not native semantic choice,
+question completion or authorization to resume retained work.
+
+The bridge announces a new child stream before its first output. Only its authenticated
+current owner may install the profile on the daemon; output offsets feed independent
+bounded grids at both ends. Missing origin, gaps, restore/reconnect mid-stream, geometry
+or binding ambiguity fail closed. A fresh child stream is needed to regain complete
+observation after a daemon loses its VT state. Externally protected records reject
+provider activation and remain restricted to their supported signed-inject ingress.
+
+The parser is exactly `@xterm/headless` 6.0.0 (PR84 source, MIT notice included).
+No terminal-reply listener connects its DSR/DA/OSC output to the PTY, clipboard or host.
+Tests use the real pinned parser and only test-owned fake TUIs/PTYs. They verify typed
+write receipts, stale/unsupported negatives and signature-boundary preservation;
+no installed Codex, Claude, Warp or native macOS/Windows behavior was controlled.
 
 ## CLI and HTTP
 
@@ -98,9 +139,9 @@ review, and does not automatically reconstruct/replay a possibly written task.
 **Automatic release/resume is not enabled.** A future measured ordinary empty composer,
 sealed task binding and final-writer task/submit pairing are required before releasing
 held content through the existing FIFO. No absence-of-modal heuristic releases it.
-Current selection/transition receipts, semantic consumption, multi-question completion,
-mouse, expanded keys, human decision verification, direct PTY support and actual1136
-caller wiring remain open. No live/provider/installed acceptance follows from this core.
+Semantic transition/consumption receipts, multi-question completion, mouse, expanded
+keys, human decision verification and installed-provider acceptance remain open.
+The captured-profile write receipt above does not establish those facts.
 
 Independent942 should exercise the real constructors with its own provider and byte
 journal: same/conflicting ID, stale owner/input/resize/revision, uncertain write, storage

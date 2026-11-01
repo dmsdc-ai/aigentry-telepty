@@ -19,11 +19,8 @@ jobs:
     # backstop, NOT the fix — the root cause (undisposed state-machine poll timer holding the
     # test worker open) is fixed in test/submit-gate-restore-register-678.test.js.
     timeout-minutes: 20
-    # telepty #577: windows-latest has windows-specific reds (broker/ssh path,
-    # PTY/TUI spawn timeouts, snippet runtime-CRLF, launchd plist) tracked separately.
-    # Quarantine windows as non-blocking so ubuntu+macOS are the trustworthy gate
-    # (after #576 both are green). Remove this line when #577 lands.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    # telepty #879: windows-latest is a release gate like ubuntu/macOS. The former #577
+    # continue-on-error quarantine hid that `npm run test:ci` never started on Windows.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,8 +31,40 @@ jobs:
         run: npm ci
       - name: Run typecheck
         run: npm run typecheck
+      # Task 1215: the Darwin authority-file reader is a bundled native binary. Build it from the
+      # first-party source with the runner's own Apple toolchain and Node-API headers BEFORE the suite,
+      # so test/authority-file-darwin-1215.test.js exercises the real native reader (it fails, never
+      # skips, when the binary is absent). Nothing is downloaded and no npm lifecycle compiles it.
+      - name: Build the bundled Darwin authority reader (task 1215)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
+          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
+      # Task 1215 / #879 (DIAGNOSTIC ONLY, Windows only): a bounded load observer brackets ONLY the regression suite step
+      # below, which stays the unchanged `npm run test:ci` with its own exit. The observer measures (CPU-time deltas,
+      # event-loop timer delay, sparse process-start probes) and decides nothing; its own failure is a visible step
+      # failure that never changes the job result. Mac/Linux skip these steps.
+      - name: Start Windows load observer (diagnostic only, task 1215 / #879)
+        id: load_observer_start
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: node scripts/windows-load-observer-879.mjs start --out "${{ runner.temp }}/windows-load-observer-879" --max-ms 1080000
       - name: Run regression suite
         run: npm run test:ci
+      - name: Stop Windows load observer (diagnostic only)
+        if: always() && runner.os == 'Windows' && steps.load_observer_start.outcome != 'skipped'
+        continue-on-error: true
+        run: node scripts/windows-load-observer-879.mjs stop --out "${{ runner.temp }}/windows-load-observer-879"
+      - name: Upload Windows load observer evidence (diagnostic only)
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-load-observer-879-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-load-observer-879
+          if-no-files-found: warn
+          retention-days: 14
       # #768: this one file drives a real daemon + a real `telepty allow` bridge + a real PTY
       # with a deliberately delayed WS handshake. Inside the parallel list it lands on a worker
       # alongside whatever else node --test schedules there, and on the 3-core macOS runner that
@@ -46,6 +75,9 @@ jobs:
       # has the cores. Give it its own step so it runs alone and gates just the same.
       - name: Run PTY-serialized regression tests
         run: npm run test:ci:pty
+      # Task 1215 G2: self-pack consumer check on every supported OS, Windows included (npm-cli.js under
+      # this node, .cmd/.ps1 shim relations, private APPDATA/LOCALAPPDATA/TMP/TEMP), plus npm ls identity,
+      # the macOS installed native authority read and an installed daemon + PTY smoke. The release
+      # workflow runs the same helper against ONE canonical archive (--pack-only / --tarball).
       - name: Check packaged consumer
-        if: runner.os == 'Linux' || runner.os == 'macOS'
         run: node scripts/check-package.mjs

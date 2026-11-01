@@ -128,3 +128,53 @@ test('F1: the DELETE still removes the session — the fix is ordering, not rete
     description: 'the session to be gone from the registry',
   });
 });
+
+// Task 1215 delete88 — F2 (POSIX, deterministic): a DELETE of a spawned PTY must END the child process, measured by the
+// daemon's own onExit record (`[EXIT] Session <sid> exited with code`, src/routes/spawn.js — the first statement of
+// onExit, before any registry guard), not by the record disappearing. The child ignores SIGHUP by construction
+// (`trap '' HUP`; SIG_IGN survives `exec`), so a teardown that sends node-pty's default kill() signal (SIGHUP) and
+// never confirms or escalates leaves it running. This is NOT a reproduction of the historical Mac instance (unattributed).
+//
+// Causal readiness, no sleep: the viewer is attached FIRST (a spawned session's viewer gets no replay, so output printed
+// before attach would be lost), then one input line is written through that viewer (the existing viewer-write gate). The
+// child reads the line only after `trap` ran, then prints the marker: seeing the marker on the viewer proves the HUP
+// disposition is in force. The exit observation is armed (stdout offset) before the DELETE; the acceptance bound is the
+// package smoke's 15000 ms. Containment: the child self-exits via `exec sleep 20` (bounded orphan, nothing is killed by
+// the test); the asserted PRECONDITION places that self-exit after the acceptance window, so it can never satisfy it.
+const F2_POSIX_ONLY = process.platform === 'win32' ? 'POSIX SIGHUP/SIG_IGN semantics; not defined for Windows ConPTY' : false;
+test('F2: DELETE of a spawned PTY whose child ignores SIGHUP must end the child within 15 s (daemon [EXIT] record)',
+  { skip: F2_POSIX_ONLY, timeout: 60000 }, async () => {
+    const sessionId = createSessionId('delete-hup');
+    const MARKER = 'hup-ignored-armed', EXIT_ACCEPT_MS = 15000, SELF_EXIT_MS = 20000;
+    const script = `trap '' HUP; read line; printf '${MARKER}\\n'; exec sleep ${SELF_EXIT_MS / 1000}`;
+    const spawned = await harness.spawnSession(sessionId, { command: 'sh', args: ['-c', script] });
+    assert.ok([200, 201].includes(spawned.status), `PRECONDITION: spawn ${spawned.status} ${JSON.stringify(spawned.body)}`);
+    const viewer = await harness.connectSession(sessionId);
+    let output = '';
+    viewer.on('message', (raw) => {
+      try { const msg = JSON.parse(raw.toString()); if (msg.type === 'output' && typeof msg.data === 'string') output += msg.data; } catch { /* not a frame */ }
+    });
+    try {
+      const inputSentAt = Date.now();
+      viewer.send(JSON.stringify({ type: 'input', data: 'go\r', from: 'orchestrator' }));
+      await waitFor(() => output.includes(MARKER), { timeoutMs: 10000, description: 'PRECONDITION: the HUP-ignored marker on the viewer' });
+
+      const exitLine = `[EXIT] Session ${sessionId} exited with code`;
+      const exitFrom = harness.getLogs().stdout.length; // the real exit observation, armed before the DELETE
+      const deleteStartedAt = Date.now();
+      assert.ok(deleteStartedAt - inputSentAt < SELF_EXIT_MS - EXIT_ACCEPT_MS - 1000,
+        `PRECONDITION: the child's bounded self-exit lies after the acceptance window (${deleteStartedAt - inputSentAt} ms)`);
+      const res = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.equal(res.body && res.body.success, true, JSON.stringify(res.body));
+
+      const exited = await waitFor(() => harness.getLogs().stdout.slice(exitFrom).includes(exitLine),
+        { timeoutMs: EXIT_ACCEPT_MS, description: 'the deleted PTY child to exit' }).then(() => true, () => false);
+      const since = harness.getLogs().stdout.slice(exitFrom);
+      assert.equal(exited, true, `no [EXIT] for the deleted PTY within ${EXIT_ACCEPT_MS} ms of DELETE: ${JSON.stringify({
+        waited_ms: Date.now() - deleteStartedAt, kill_removed_logged: since.includes(`[KILL] Session ${sessionId} removed`),
+        delete_status: res.body && res.body.status ? String(res.body.status).slice(0, 32) : null })}`);
+    } finally {
+      try { viewer.close(); } catch { /* already closed */ }
+    }
+  });

@@ -110,8 +110,76 @@ function childEnv(homeDir, port) {
   };
 }
 
-function runCli(args, homeDir, port, { timeoutMs = 8000 } = {}) {
+// Task 1215 windows127 (failure-only, owned fixture daemon only): what the fixture can observe about ITS OWN daemon at
+// the moment runCli's bound fires. Fixed fields only: elapsed since the CLI spawn; the owned daemon pid's liveness via
+// signal 0 (alive | gone | exists_no_permission | unknown); one /api/health request carrying that HOME's token, capped
+// at 1000 ms ABSOLUTE (answered, HTTP status, health status token or an allowlisted error name/code). Never a command
+// line, environment, token, arbitrary body, or any other process. It observes; it never decides a pass.
+function observeOwnedDaemon({ pid, home }, port, spawnedAt, timeoutMs) {
+  const elapsed = Date.now() - spawnedAt;
+  let liveness = 'unknown';
+  if (Number.isInteger(pid) && pid > 0) {
+    try { process.kill(pid, 0); liveness = 'alive'; }
+    catch (e) { liveness = e && e.code === 'ESRCH' ? 'gone' : (e && e.code === 'EPERM' ? 'exists_no_permission' : 'unknown'); }
+  }
+  const started = Date.now();
+  const token = tokenFor(home);
+  const probe = (async () => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1000),
+        headers: token ? { 'x-telepty-token': token } : {} });
+      let status = null;
+      try { const b = await res.json(); status = b && typeof b.status === 'string' && /^[a-z_]{1,32}$/.test(b.status) ? b.status : 'other'; } catch { /* no JSON */ }
+      return { answered: true, http_status: res.status, health_status: status };
+    } catch (e) {
+      const code = e && e.cause && e.cause.code;
+      return { answered: false, error: ['AbortError', 'TimeoutError', 'TypeError'].includes(e && e.name) ? e.name : 'other',
+        cause_code: typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(code) ? code : null };
+    }
+  })();
+  let cap;
+  const capped = new Promise((resolve) => { cap = setTimeout(() => resolve({ answered: false, error: 'cap_1000ms' }), 1000); });
+  return Promise.race([probe, capped]).then((health) => {
+    clearTimeout(cap);
+    return { elapsed_since_spawn_ms: elapsed, runcli_timeout_ms: timeoutMs, owned_daemon_pid: liveness,
+      health: { ...health, probe_ms: Date.now() - started } };
+  });
+}
+
+// Task 1215 diag153 (failure-only, owned fixture daemon only): after runCli's unchanged bound has already failed a case,
+// watch ONLY the owned daemon pid (signal 0, no process-table scan) every `intervalMs` for at most `maxMs` from the watch
+// start. Results:
+//   - `exited`, with `exit_after_timeout_ms` measured from `since` (the moment the bound fired);
+//   - `still_alive` at the bound;
+//   - `unknown` (no valid pid, or an indeterminate liveness answer).
+// It reports and never decides: the case stays failed, and the CLI was already killed, so a later exit does not show
+// the CLI would have succeeded. Bounds: 12000 ms max at 100 ms intervals, which fits inside the per-file 60 s
+// diagnostic cap (this file took 37.4 s there, including the failed case).
+const POST_FAILURE_WATCH_MS = 12000, POST_FAILURE_WATCH_INTERVAL_MS = 100;
+const POST_FAILURE_WATCH_NOTE = 'the CLI was already killed at its bound; a later daemon exit does not show the CLI would have succeeded';
+function ownedPidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e && e.code === 'ESRCH' ? false : (e && e.code === 'EPERM' ? true : null); }
+}
+async function watchOwnedPidExit(pid, { since = Date.now(), maxMs = POST_FAILURE_WATCH_MS, intervalMs = POST_FAILURE_WATCH_INTERVAL_MS,
+  isAlive = ownedPidAlive, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), now = Date.now } = {}) {
+  const shape = (result, at, checks) => ({ result, exit_after_timeout_ms: result === 'exited' ? at : null, observed_until_ms: at,
+    interval_ms: intervalMs, max_ms: maxMs, checks });
+  if (!Number.isInteger(pid) || pid <= 0) return shape('unknown', null, 0);
+  const start = now();
+  for (let checks = 1; ; checks++) {
+    const alive = isAlive(pid);
+    const at = now() - since;
+    if (alive === false) return shape('exited', at, checks);
+    if (alive !== true) return shape('unknown', at, checks);
+    if (now() - start >= maxMs) return shape('still_alive', at, checks);
+    await sleep(intervalMs);
+  }
+}
+
+function runCli(args, homeDir, port, { timeoutMs = 8000, owned = null } = {}) {
   return new Promise((resolve, reject) => {
+    const spawnedAt = Date.now();
     const cli = spawn(process.execPath, [CLI, ...args], {
       cwd: REPO_ROOT,
       env: childEnv(homeDir, port),
@@ -120,14 +188,29 @@ function runCli(args, homeDir, port, { timeoutMs = 8000 } = {}) {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; cli.kill('SIGKILL'); }, timeoutMs);
+    let ownedEvidence = null; // Task 1215 windows127: only when the caller passes owned fixture metadata
+    let boundFiredAt = null; // Task 1215 diag153: reference time of the post-failure watch
+    const timer = setTimeout(() => {
+      timedOut = true;
+      boundFiredAt = Date.now();
+      if (owned) ownedEvidence = observeOwnedDaemon(owned, port, spawnedAt, timeoutMs).catch(() => null);
+      cli.kill('SIGKILL');
+    }, timeoutMs);
     cli.stdout.on('data', (c) => { stdout += c.toString(); });
     cli.stderr.on('data', (c) => { stderr += c.toString(); });
     cli.on('error', (e) => { clearTimeout(timer); reject(e); });
     cli.on('close', (code, signal) => {
       clearTimeout(timer);
       if (timedOut) {
-        reject(new Error(`CLI \`${args.join(' ')}\` did not return (blocked).\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+        const fail = (note) => reject(new Error(`CLI \`${args.join(' ')}\` did not return (blocked).\nstdout:\n${stdout}\nstderr:\n${stderr}${note}`));
+        if (!ownedEvidence) { fail(''); return; }
+        // Task 1215 diag153: the case has ALREADY failed (the CLI was killed at its bound). Before reporting, watch ONLY
+        // the owned daemon pid for a bounded time; the rejection below happens whatever the watch sees.
+        ownedEvidence
+          .then((evidence) => watchOwnedPidExit(owned.pid, { since: boundFiredAt })
+            .catch(() => ({ result: 'unknown' }))
+            .then((watch) => fail((evidence ? `\n#1215 windows127 owned-daemon evidence ${JSON.stringify(evidence)}` : '')
+              + `\n#1215 diag153 post-failure watch ${JSON.stringify({ ...watch, note: POST_FAILURE_WATCH_NOTE })}`)));
         return;
       }
       resolve({ code, signal, stdout, stderr });
@@ -207,7 +290,8 @@ test('daemon stop: terminates the running daemon process and frees the port', as
   const pid = m && m.pid;
   assert.ok(Number.isInteger(pid) && pid > 0, 'daemon should report a pid via /api/meta');
 
-  const res = await runCli(['daemon', 'stop'], home, port);
+  // Task 1215 windows127: owned metadata adds failure-only evidence to the unchanged 8000 ms timeout branch.
+  const res = await runCli(['daemon', 'stop'], home, port, { owned: { pid, home } });
   assert.equal(res.code, 0, `daemon stop should exit 0\nstderr:\n${res.stderr}`);
   assert.match(res.stdout, /stopped/i);
 
@@ -226,9 +310,36 @@ test('daemon stop: with NO daemon running does NOT start one (the #55 ignore-arg
   // The old behavior printed "Starting telepty daemon..." and started a daemon.
   assert.doesNotMatch(res.stdout, /Starting telepty daemon/i, 'stop must never START a daemon');
 
-  // Give any (erroneously) spawned daemon a moment, then assert nothing is listening.
-  await new Promise((r) => setTimeout(r, 600));
-  assert.equal(await health(port), null, 'stop on an idle port must leave nothing listening');
+  // #121: the released ephemeral port may now belong to another parallel test.
+  // Only a state claim under this invocation's unique HOME is attributable to it.
+  assert.equal(fs.existsSync(path.join(home, '.telepty', 'daemon-state.json')), false,
+    'stop without a recorded daemon must not create a daemon state claim');
+});
+
+test('#121: stopping an unrecorded daemon leaves an independently owned listener intact', async t => {
+  const home = makeTempHome();
+  // Task 1215 G2: record what reaches this foreign listener — no stop (or any telepty action) may be sent to it.
+  const received = [];
+  const server = net.createServer(socket => { socket.on('data', (d) => received.push(String(d))); socket.end(); });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const port = server.address().port;
+  // Task 1215 G2 (review26): POSITIVE capture control — prove this fixture observes a known harmless request on this
+  // exact listener before relying on the absence of stop/meta requests below (the socket ends at once, so a capture
+  // that never worked would pass vacuously). Our own separate connection; the listener itself is never touched.
+  const PROBE = 'GET /telepty-1215-capture-control HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n';
+  await new Promise((resolve) => { const probe = net.connect(port, '127.0.0.1', () => { probe.end(PROBE); }); probe.on('close', resolve); probe.on('error', resolve); });
+  await waitFor(() => received.join('').includes('/telepty-1215-capture-control'), { timeoutMs: 5000, desc: 'PRECONDITION: the listener capture observes a known request' });
+  const captureBefore = received.length;
+  const result = await runCli(['daemon', 'stop'], home, port);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(server.listening, true, 'a port listener is not evidence of a daemon owned by this invocation');
+  assert.ok(captureBefore >= 1, 'PRECONDITION: capture control recorded before the stop');
+  assert.equal(/\/api\/daemon\/stop|\/api\/meta/.test(received.slice(captureBefore).join('')), false, 'no identification or stop request reached a listener that is not an identified telepty daemon');
+  assert.equal(fs.existsSync(path.join(home, '.telepty', 'daemon-state.json')), false);
 });
 
 test('daemon restart: cycles the daemon (stop + start) and leaves it reachable', async () => {
@@ -326,4 +437,233 @@ test('stopDaemon: nothing running → no targets, no failures (idempotent)', () 
   assert.deepEqual(killed, []);
   assert.equal(result.stopped.length, 0);
   assert.equal(result.failed.length, 0);
+});
+
+// ── task 1215 W3: production normal stop/restart vs genuine crash (ledger lock) ─────────────────
+//
+// These cases drive the REAL CLI (`telepty daemon start|stop|restart`, `telepty ledger unlock`) against a
+// private HOME/port, and bind ownership before acting: the pid comes from that daemon's own /api/meta,
+// and the ledger lock file names that same pid. They distinguish three facts: the stop command's
+// result, the actual process exit, and whether the NEXT daemon for the same HOME gets the ledger.
+// On Windows the production stop path currently ends in `taskkill /F` (daemon-control.js →
+// src/win-kill-process.js), which runs no shutdown handler; the two normal-stop cases are expected to
+// stay RED there until that production path is corrected. Nothing here is skipped per platform.
+//
+// The crash control is the accepted fail-closed contract: a daemon killed without shutdown leaves its
+// lock, the next daemon reports lock_present, the lock bytes are untouched (no automatic steal), and
+// only `telepty ledger unlock --confirm` with no daemon alive clears it.
+
+const LEDGER_WAIT_MS = 20000; // the same bound test/integration/ledger-daemon-1207.test.js uses
+
+function ledgerLockPath(home) {
+  return path.join(home, '.config', 'aigentry-telepty', 'tracked-injections.lock');
+}
+
+function readLock(home) {
+  try { return fs.readFileSync(ledgerLockPath(home)); } catch { return null; }
+}
+
+async function ledgerStatus(port, home) {
+  try {
+    const token = tokenFor(home);
+    const res = await fetch(`http://127.0.0.1:${port}/api/ledger/status`, {
+      signal: AbortSignal.timeout(1000),
+      headers: token ? { 'x-telepty-token': token } : {}
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// Waits for a SETTLED ledger state of the daemon on `port` (available or lock_present) and returns it,
+// so a refusal is reported by name instead of as a timeout.
+function settledLedger(port, home, desc) {
+  return waitFor(async () => {
+    const s = await ledgerStatus(port, home);
+    return s && s.client && ['available', 'lock_present'].includes(s.client.store) ? s : null;
+  }, { timeoutMs: LEDGER_WAIT_MS, desc });
+}
+
+function processGone(pid) {
+  try { process.kill(pid, 0); return false; } catch { return true; }
+}
+
+// Starts a daemon through the CLI and returns its owned identity: the pid it reports and the lock it holds.
+async function startOwnedDaemon(home, port) {
+  const started = await runCli(['daemon', 'start'], home, port);
+  assert.equal(started.code, 0, `PRECONDITION: daemon start exits 0\nstderr:\n${started.stderr}`);
+  await waitFor(() => health(port), { desc: 'daemon health' });
+  const m = await waitFor(() => meta(port, home), { desc: 'daemon /api/meta' });
+  assert.ok(Number.isInteger(m.pid) && m.pid > 0, 'PRECONDITION: daemon reports its pid');
+  const ledger = await settledLedger(port, home, 'first ledger settle');
+  assert.equal(ledger.client.store, 'available', 'PRECONDITION: a fresh HOME opens its ledger');
+  const lock = readLock(home);
+  assert.ok(lock, 'PRECONDITION: the running daemon holds the ledger lock');
+  assert.equal(JSON.parse(lock.toString('utf8')).pid, m.pid, 'PRECONDITION: the lock is owned by this daemon pid');
+  return { pid: m.pid, lock };
+}
+
+test('#W3 production `daemon stop`: a normal stop exits the owned daemon, frees the port and releases the ledger lock', async () => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  const owned = await startOwnedDaemon(home, port);
+
+  const res = await runCli(['daemon', 'stop'], home, port);
+  await waitFor(async () => (await health(port)) === null, { desc: 'port freed after stop' });
+  await waitFor(() => processGone(owned.pid), { desc: 'owned daemon process exited' });
+  assert.deepEqual({ code: res.code, stopped: /stopped/i.test(res.stdout), lockReleased: readLock(home) === null },
+    { code: 0, stopped: true, lockReleased: true },
+    `a NORMAL stop must run the daemon shutdown that releases its ledger lock\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+});
+
+test('#W3 production `daemon restart`: the restarted daemon for the same HOME opens its ledger (not lock_present)', async () => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  const owned = await startOwnedDaemon(home, port);
+
+  const res = await runCli(['daemon', 'restart'], home, port);
+  assert.equal(res.code, 0, `daemon restart should exit 0\nstderr:\n${res.stderr}`);
+  await waitFor(() => processGone(owned.pid), { desc: 'previous daemon process exited' });
+  const next = await waitFor(async () => {
+    const m = await meta(port, home);
+    return m && m.pid && m.pid !== owned.pid ? m : null;
+  }, { desc: 'restarted daemon reachable with a new pid' });
+  const ledger = await settledLedger(port, home, 'restarted daemon ledger settle');
+  assert.deepEqual({ newPid: next.pid !== owned.pid, store: ledger.client.store, reason: ledger.unavailable_reason || null },
+    { newPid: true, store: 'available', reason: null },
+    'a normal restart must not leave the previous daemon\'s lock behind');
+});
+
+test('#W3 genuine crash control: a forced kill keeps lock_present, untouched, until an explicit operator unlock', async () => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  const owned = await startOwnedDaemon(home, port);
+
+  // Deliberate crash: no shutdown handler can run (POSIX SIGKILL; Windows TerminateProcess).
+  process.kill(owned.pid, 'SIGKILL');
+  await waitFor(() => processGone(owned.pid), { desc: 'crashed daemon process exited' });
+  await waitFor(async () => (await health(port)) === null, { desc: 'port freed after crash' });
+  const afterCrash = readLock(home);
+
+  await runCli(['daemon', 'start'], home, port);
+  const second = await waitFor(() => meta(port, home), { desc: 'second daemon /api/meta' });
+  const refusedLedger = await settledLedger(port, home, 'second daemon ledger settle');
+  const unlockWhileUp = await runCli(['ledger', 'unlock', '--confirm'], home, port);
+  const lockWhileUp = readLock(home);
+
+  const stopped = await runCli(['daemon', 'stop'], home, port);
+  await waitFor(() => processGone(second.pid), { desc: 'second daemon process exited' });
+  await waitFor(async () => (await health(port)) === null, { desc: 'port freed after second stop' });
+  const lockAfterStop = readLock(home);
+  const unlockNoConfirm = await runCli(['ledger', 'unlock'], home, port);
+  const unlock = await runCli(['ledger', 'unlock', '--confirm'], home, port);
+
+  await runCli(['daemon', 'start'], home, port);
+  const third = await settledLedger(port, home, 'third daemon ledger settle');
+  assert.deepEqual({
+    lockKeptByCrash: !!afterCrash && afterCrash.equals(owned.lock),
+    secondStore: refusedLedger.client.store, secondReason: refusedLedger.unavailable_reason,
+    unlockWhileUpRefused: unlockWhileUp.code !== 0, lockUntouchedWhileUp: !!lockWhileUp && lockWhileUp.equals(owned.lock),
+    secondStopCode: stopped.code, lockUntouchedAfterNonHolderStop: !!lockAfterStop && lockAfterStop.equals(owned.lock),
+    unlockNeedsConfirm: unlockNoConfirm.code !== 0 && /confirm_required/.test(unlockNoConfirm.stdout),
+    unlocked: unlock.code === 0 && /"unlocked": true/.test(unlock.stdout), thirdStore: third.client.store,
+  }, {
+    lockKeptByCrash: true, secondStore: 'lock_present', secondReason: 'lock_present',
+    unlockWhileUpRefused: true, lockUntouchedWhileUp: true, secondStopCode: 0, lockUntouchedAfterNonHolderStop: true,
+    unlockNeedsConfirm: true, unlocked: true, thirdStore: 'available',
+  }, `unlockWhileUp:\n${unlockWhileUp.stdout}\nunlock:\n${unlock.stdout}${unlock.stderr}`);
+});
+
+// ── Task 1215 G2-N1 (review30): native restart from NO daemon, with and without a local token ──────────────────
+// The Windows normal stop gate classifies a closed port by its transport outcome: only a refused connection is absence.
+// Whether a Windows loopback refusal arrives inside the gate's existing bounds (1 s unauthenticated health / 2 s
+// identity read) is UNMEASURED; these cases measure it on CI. The refusal latency observed by the test itself is
+// reported as a diagnostic, never asserted. The contract asserted is the ordinary lifecycle: a restart from nothing
+// exits 0 and leaves a reachable daemon. Isolated temp HOME + free port; every daemon started is tracked and killed in
+// after(). No deadline was raised to make this pass.
+function refusalProbe(port) {
+  return new Promise((resolve) => {
+    const t0 = Date.now(); let done = false;
+    const finish = (code) => { if (done) return; done = true; clearTimeout(timer); try { socket.destroy(); } catch {} resolve({ code, ms: Date.now() - t0 }); };
+    const socket = net.connect(port, '127.0.0.1');
+    const timer = setTimeout(() => finish('NO_RESULT_5000MS'), 5000);
+    socket.once('error', (e) => finish(e.code || 'ERROR'));
+    socket.once('connect', () => finish('CONNECTED'));
+  });
+}
+
+test('#1215 G2-N1 native: `daemon restart` with NO daemon and NO local token restarts one (refused connection = absence)', async (t) => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  t.diagnostic(`#1215 G2-N1 no_token refusal ${JSON.stringify({ platform: process.platform, ...(await refusalProbe(port)) })}`);
+  const res = await runCli(['daemon', 'restart'], home, port);
+  assert.equal(res.code, 0, `restart from nothing should exit 0\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+  assert.match(res.stdout, /restarted/i);
+  await waitFor(async () => (await health(port)) ? true : null, { desc: 'restarted daemon reachable' });
+});
+
+test('#1215 G2-N1 native: `daemon restart` with NO daemon but WITH a local token restarts one (refused connection = absence)', async (t) => {
+  const home = makeTempHome();
+  const port = trackDaemonPort(await pickFreePort(), home);
+  // A real local token: a real daemon start writes it under this HOME; the real stop then leaves nothing running.
+  await runCli(['daemon', 'start'], home, port);
+  await waitFor(() => meta(port, home), { desc: 'PRECONDITION: seeding daemon up (writes the local token)' });
+  const stopped = await runCli(['daemon', 'stop'], home, port);
+  assert.equal(stopped.code, 0, `PRECONDITION: seeding daemon stopped\nstderr:\n${stopped.stderr}`);
+  await waitFor(async () => (await health(port)) === null, { desc: 'PRECONDITION: nothing answers on the port' });
+  t.diagnostic(`#1215 G2-N1 with_token refusal ${JSON.stringify({ platform: process.platform, ...(await refusalProbe(port)) })}`);
+  const res = await runCli(['daemon', 'restart'], home, port);
+  assert.equal(res.code, 0, `restart from nothing should exit 0\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+  assert.match(res.stdout, /restarted/i);
+  await waitFor(async () => (await meta(port, home)) ? true : null, { desc: 'restarted daemon reachable with the local token' });
+});
+
+// A foreign HTTP listener (answers 404 to everything) is NOT absence: with no local token the Windows gate must not
+// start a replacement on it, must not claim success, and must send it no identification or stop request. Windows-only:
+// the gate is the win32 normal stop path; the unit tests pin the same decision on every platform.
+test('#1215 G2-R1 native: a foreign HTTP 404 listener on the port is never treated as absence — no replacement, no success claim, no meta/stop', { skip: process.platform === 'win32' ? false : 'win32 graceful-stop gate only (unit tests pin the decision on all platforms)' }, async (t) => {
+  const home = makeTempHome();
+  const received = [];
+  const server = require('node:http').createServer((req, res) => { received.push(`${req.method} ${req.url}`); res.statusCode = 404; res.end('not found'); });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  t.after(() => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve); }));
+  const port = server.address().port;
+  // Positive capture control: this listener's capture observes a known harmless request before relying on absences.
+  const control = await fetch(`http://127.0.0.1:${port}/telepty-1215-capture-control`, { signal: AbortSignal.timeout(5000) });
+  assert.equal(control.status, 404, 'PRECONDITION: the foreign listener answers 404');
+  assert.deepEqual(received, ['GET /telepty-1215-capture-control'], 'PRECONDITION: the capture observes requests');
+  const res = await runCli(['daemon', 'restart'], home, port);
+  assert.equal(res.code, 1, `restart must refuse on an unidentified listener\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+  assert.doesNotMatch(res.stdout, /restarted/i);
+  assert.equal(server.listening, true, 'the foreign listener is untouched');
+  assert.deepEqual(received.slice(1).filter((r) => /\/api\/meta|\/api\/daemon\/stop/.test(r)), [], 'no identification or stop request reached it');
+  assert.equal(fs.existsSync(path.join(home, '.telepty', 'daemon-state.json')), false, 'no daemon state was created');
+});
+
+// Task 1215 diag153 — the post-failure owned-pid watch (used only AFTER runCli's unchanged 8000 ms bound has already
+// failed the stop case) is bounded, observes ONLY the given pid, and reports `exited` (with the time after the bound)
+// or `still_alive` at its bound, or `unknown`. A deterministic clock, sleep and liveness stand in for the real ones.
+test('[diag153] post-failure owned-pid watch reports exited or still_alive within its bound', async () => {
+  let t = 1000;
+  const now = () => t;
+  const sleep = async (ms) => { t += ms; };
+  let calls = 0;
+  const exitsOnFourth = () => (++calls < 4);
+  assert.deepEqual(await watchOwnedPidExit(1234, { since: 900, maxMs: 12000, intervalMs: 100, isAlive: exitsOnFourth, sleep, now }),
+    { result: 'exited', exit_after_timeout_ms: 400, observed_until_ms: 400, interval_ms: 100, max_ms: 12000, checks: 4 });
+
+  t = 5000; let probes = 0;
+  const neverExits = () => { probes++; return true; };
+  const alive = await watchOwnedPidExit(1234, { since: 4000, maxMs: 1000, intervalMs: 100, isAlive: neverExits, sleep, now });
+  assert.deepEqual(alive, { result: 'still_alive', exit_after_timeout_ms: null, observed_until_ms: 2000, interval_ms: 100, max_ms: 1000, checks: 11 });
+  assert.equal(probes, 11, 'bounded: one check per interval up to the bound, then it stops');
+
+  t = 0;
+  assert.equal((await watchOwnedPidExit(1234, { since: 0, maxMs: 1000, intervalMs: 100, isAlive: () => null, sleep, now })).result, 'unknown',
+    'an indeterminate liveness answer is reported as unknown, never as exited');
+  let touched = false;
+  assert.equal((await watchOwnedPidExit(0, { since: 0, isAlive: () => { touched = true; return false; }, sleep, now })).result, 'unknown');
+  assert.equal(touched, false, 'no probe without a valid owned pid');
 });

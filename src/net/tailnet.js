@@ -1,6 +1,6 @@
 'use strict';
 
-// Tailnet detection for seamless cross-machine (tailnet auto-bind + auto-trust).
+// Tailnet detection for seamless cross-machine (tailnet interface auto-bind).
 // PURE + injectable: takes an os.networkInterfaces()-shaped object so the decision
 // logic is unit-testable without a real tailnet. No subprocess (no `tailscale` CLI):
 // the interface scan already yields the bind IP, and a child_process call would only
@@ -11,9 +11,9 @@ const os = require('os');
 const net = require('net');
 
 // Tailscale assigns node IPs from the CGNAT range 100.64.0.0/10 (100.64.0.0 –
-// 100.127.255.255). This is also the *effective trust CIDR* — safe only because the
-// daemon binds the socket to the tailnet interface itself (see daemon.js), so only
-// WireGuard-tunneled tailnet peers can reach it.
+// 100.127.255.255). This is a network-admission CIDR, not an API credential. The
+// daemon binds to the selected interface (see daemon.js); authentication remains
+// mandatory and this range alone does not prove Tailscale or user identity.
 const TAILNET_CIDR = '100.64.0.0/10';
 
 const _cgnat = new net.BlockList();

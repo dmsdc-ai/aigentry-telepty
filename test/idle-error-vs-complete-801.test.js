@@ -70,11 +70,14 @@ process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = '1';
 //   pre-fix main  codex-400  → TASK_COMPLETE      fix build  codex-400  → TASK_ERROR
 //   pre-fix main  control    → TASK_COMPLETE      fix build  control    → TASK_COMPLETE
 
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const registry = require('../src/prompt-symbol-registry');
-const { fireAutoReport, detectIdleAfterError } = require('../daemon');
+const daemon = require('../daemon');
+const { fireAutoReport, detectIdleAfterError } = daemon;
+const { trackedInjectId, beginTrackedEager, settleTracked, fireAndSettle } = require('../test-support/tracked-observation');
+after(async () => { await daemon.ledgerClient.close(2000); });
 
 // ── Fixtures: verbatim tails of the REAL PTY byte streams, after
 //    normalizeOutputForDetection. Nothing here is hand-written; the glued words and the
@@ -237,7 +240,7 @@ function makeGate({ preFrames = [], postFrames = [], pendingReportOverrides = {}
   };
   ctx.pendingReport = {
     source: 'orch',
-    injectId: 'inj-801',
+    injectId: trackedInjectId('inj-801'),   // #1207: fresh durably begun id per fixture
     injectedAt: new Date(T0 - 204_500).toISOString(),   // the c757s profile
     injectedBodyPreview: BODY,
     ringBytesAtInject: preFrames.reduce((s, d) => s + d.length, 0),
@@ -261,14 +264,21 @@ function makeGate({ preFrames = [], postFrames = [], pendingReportOverrides = {}
     getAutoState: () => 'idle',
   };
   ctx.timers = [];
-  ctx.fire = (trigger = 'real-idle') =>
-    fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps);
+  // #1207: the source is told only after the observation is durable on a durably begun record —
+  // begun here, awaited by the first fire; each step then awaits the async emit (settle).
+  ctx.ready = beginTrackedEager(daemon, { injectId: ctx.pendingReport.injectId, sessionId: 'worker-1', source: ctx.pendingReport.source, session: ctx.session });
+  const progress = () => `${ctx.delivered.length}:${ctx.broadcasts.length}`;
+  ctx.fire = async (trigger = 'real-idle') => {
+    await ctx.ready;
+    return fireAndSettle(daemon, () => fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps), progress);
+  };
   // #60 Stage A: every quiet observation now goes through the #48/#52 settle debounce — the old
   // code let a `confirmed` completion bypass it, and there are no confirmed completions left.
   // So the emission happens on the settle recheck, not on the first fire.
-  ctx.flushTimers = () => {
+  ctx.flushTimers = async () => {
     let n = 0;
     while (ctx.timers.length && n < 50) { ctx.timers.shift().fn(); n++; }
+    await settleTracked(daemon, progress);
     return n;
   };
   return ctx;
@@ -276,12 +286,12 @@ function makeGate({ preFrames = [], postFrames = [], pendingReportOverrides = {}
 
 // The literal absence statement this path now emits, for a 204.5s quiet after the c757s inject.
 const UNKNOWN_204 =
-  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-801 — no completion fact observed; pty_quiet=(\d+\.\d)s(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
+  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-801-\d+-\d+ — no completion fact observed; pty_quiet=(\d+\.\d)s(?:; elapsed_since_inject=\d+\.\ds)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
-test('#801 THE BUG: an error-death is no longer reported as a completion', () => {
+test('#801 THE BUG: an error-death is no longer reported as a completion', async () => {
   const g = makeGate({ preFrames: ['boot\n'], postFrames: [BODY + '\n', CLAUDE_ERROR_RING] });
-  g.fire();
-  g.flushTimers();
+  await g.fire();
+  await g.flushTimers();
   assert.equal(g.delivered.length, 1);
   const msg = g.delivered[0].msg;
   // The bug was the daemon calling this a COMPLETION. That is fixed at the root rather than by
@@ -306,48 +316,48 @@ test('#801 THE BUG: an error-death is no longer reported as a completion', () =>
 // `silence_timeout` requires just ['silence_ms'], so both fields are dropped before the envelope
 // is built. Measured consequence: this error-death and the gemini CONTROL below now emit
 // byte-identical output. A grep confirms error_marker/error_detail have zero production readers.
-test('#801 the bus event carries the marker for the observability lane', () => {
+test('#801 the bus event carries the marker for the observability lane', async () => {
   const g = makeGate({ preFrames: ['boot\n'], postFrames: [CLAUDE_ERROR_RING] });
-  g.fire();
-  g.flushTimers();
+  await g.fire();
+  await g.flushTimers();
   const ev = g.broadcasts.find((b) => b.type === 'task_completion_unknown');
   assert.equal(ev.opts.extra.observation.error_marker, 'claude_api_error');
   assert.match(ev.opts.extra.observation.error_detail, /529 Overloaded/);
 });
 
-test('#801 codex error-death is not reported as a completion either', () => {
+test('#801 codex error-death is not reported as a completion either', async () => {
   const g = makeGate({ command: 'codex', preFrames: ['boot\n'], postFrames: [CODEX_ERROR_RING] });
-  g.fire();
-  g.flushTimers();
+  await g.fire();
+  await g.flushTimers();
   assert.match(g.delivered[0].msg, UNKNOWN_204);
   assert.doesNotMatch(g.delivered[0].msg, /TASK_COMPLETE|TASK_ERROR/);
 });
 
-test('#801 CONTROL: a genuine completion is also only ever an observation', () => {
+test('#801 CONTROL: a genuine completion is also only ever an observation', async () => {
   // These two fixtures are real answered turns — the strongest "this really did finish" input
   // the daemon ever had. They still produce no completion claim, which is the whole cutover:
   // the daemon never had a fact for the control case either, it just had fewer doubts.
   for (const [command, ring] of [['claude', CLAUDE_OK_RING], ['codex', CODEX_OK_RING]]) {
     const g = makeGate({ command, preFrames: ['boot\n'], postFrames: [BODY + '\n', ring] });
-    g.fire();
-    g.flushTimers();
+    await g.fire();
+    await g.flushTimers();
     assert.match(g.delivered[0].msg, UNKNOWN_204, `${command} control`);
     assert.doesNotMatch(g.delivered[0].msg, /TASK_COMPLETE/, `${command} control`);
   }
 });
 
-test('#801 CONTROL: an unmeasured CLI showing the same banner is treated identically', () => {
+test('#801 CONTROL: an unmeasured CLI showing the same banner is treated identically', async () => {
   // Fail-open is preserved trivially now — an unrecognised screen cannot suppress a completion
   // claim that no longer exists. (This case is also the measurement behind the HOLD above: it
   // is currently indistinguishable from the claude error-death, which is the regression.)
   const g = makeGate({ command: 'gemini', preFrames: ['boot\n'], postFrames: [CLAUDE_ERROR_RING] });
-  g.fire();
-  g.flushTimers();
+  await g.fire();
+  await g.flushTimers();
   assert.match(g.delivered[0].msg, UNKNOWN_204);
   assert.doesNotMatch(g.delivered[0].msg, /TASK_COMPLETE|TASK_ERROR/);
 });
 
-test('#801 an unconfirmed idle is stated the same way — no relabelling remains possible', () => {
+test('#801 an unconfirmed idle is stated the same way — no relabelling remains possible', async () => {
   // The original point was that #801's check only ever intercepted a claim of COMPLETION and
   // never touched the honest warning. With one statement for every path there is no label left
   // to relabel; what is asserted instead is that dropping the consumption evidence changes the
@@ -363,8 +373,8 @@ test('#801 an unconfirmed idle is stated the same way — no relabelling remains
     },
   });
   g.deps.idleEvidenceReliable = false;
-  g.fire();
-  g.flushTimers();
+  await g.fire();
+  await g.flushTimers();
   assert.equal(g.delivered.length, 1);
   assert.match(g.delivered[0].msg, UNKNOWN_204);
   assert.doesNotMatch(g.delivered[0].msg, /TASK_ERROR|TASK_IDLE_UNCONFIRMED/);

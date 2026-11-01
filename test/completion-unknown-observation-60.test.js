@@ -28,7 +28,7 @@ process.env.TELEPTY_COMPLETION_UNKNOWN_PUSH = '1';
 // Hermetic: no daemon spawn, no PTY, no HTTP. Uses the exported deps DI seam (injected clock,
 // captured deliver fn, captured bus) exactly as test/enforce-submit-gate.test.js does.
 
-const { test } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -48,7 +48,29 @@ const daemon = require('../daemon');
 const sessionPersistence = require('../src/session-store/persistence');
 const { fireAutoReport, recordObservation, describeSessionTeardown } = daemon;
 
+// #1207 — the ledger under TMP_HOME is a worker-owned directory store; `require` only STARTS its
+// open, and every begin/observe resolves after the owner's fsynced ACK. The emitter's contract is
+// unchanged (named result, bus always hears, source told once); only its timing is asynchronous.
+before(async () => {
+  const opened = await daemon.ledgerReady;
+  assert.equal(opened.ok, true, `the private ledger must open first: ${JSON.stringify(opened)}`);
+});
+after(async () => { await daemon.ledgerClient.close(2000); });
+
 const NOW = 1_700_000_000_000; // fixed clock
+const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The settle chain re-enters fireAutoReport from a timer callback whose returned promise is
+// discarded (as in production). The observable outcome is the bus event, so wait for it — or, for
+// an arm that emits nothing, for a bounded quiet period. The deadline is a failsafe: an emission
+// that genuinely never happens still fails the "exactly one absence" assertion.
+async function settled(busEvents, { quietMs = 400 } = {}) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < quietMs) {
+    if (busEvents.some((e) => e.type === 'task_completion_unknown')) { await tick(20); return; }
+    await tick(5);
+  }
+}
 
 // Terminal vocabulary Stage A must never produce again. `TASK_ERROR` is included: it also
 // asserts a task outcome ("the inject was NOT processed") from a screen scrape.
@@ -69,7 +91,7 @@ const NAMED_RESULTS = new Set([
 // Drive fireAutoReport with an injected clock, capturing BOTH the source-facing delivery and
 // the bus. Returns the decision plus everything observable, so one call can be asserted for
 // "no terminal claim" and "one absence emission" together.
-function runObservation(pendingReportOverrides, {
+async function runObservation(pendingReportOverrides, {
   trigger = 'real-idle',
   elapsedSec = 5.0,
   autoState = 'idle',          // live state at the settle recheck; 'idle' keeps the target
@@ -100,9 +122,13 @@ function runObservation(pendingReportOverrides, {
     sampleChildCpu: () => null,   // unobservable → the #52 CPU re-arm cannot fire
     ...extraDeps,
   };
-  const decision = fireAutoReport('worker-1', session, pendingReport, trigger, deps);
+  let decision = fireAutoReport('worker-1', session, pendingReport, trigger, deps);
+  // #1207: the emit path returns the recordObservation promise (a durable outcome); the deferral
+  // and duplicate arms still return their named strings synchronously.
+  if (decision && typeof decision.then === 'function') decision = await decision;
   let guard = 0;
   while (timers.length && guard++ < 50) timers.shift()(); // flush the settle chain
+  await settled(busEvents);
   return { decision, delivered, busEvents, pendingReport };
 }
 
@@ -151,8 +177,8 @@ function assertNamedDecision(r) {
 
 // --- §8.1 elapsed_is_not_completion -----------------------------------------------------
 
-test('elapsed_is_not_completion: 5.0s of elapsed time is not a completion fact', () => {
-  const r = runObservation({}, { trigger: 'real-idle', elapsedSec: 5.0 });
+test('elapsed_is_not_completion: 5.0s of elapsed time is not a completion fact', async () => {
+  const r = await runObservation({}, { trigger: 'real-idle', elapsedSec: 5.0 });
   assertNoTerminalOutcome(r);
   const body = assertOneAbsence(r);
   assert.equal(body.observation.kind, 'pty_quiet');
@@ -161,10 +187,10 @@ test('elapsed_is_not_completion: 5.0s of elapsed time is not a completion fact',
 
 // --- §8.1 working_edge_is_not_completion ------------------------------------------------
 
-test('working_edge_is_not_completion: a busy edge 0.2s after inject is not a completion fact', () => {
+test('working_edge_is_not_completion: a busy edge 0.2s after inject is not a completion fact', async () => {
   // sawWorkingAfterInject is startup-polluted (#537): a claude that merely BOOTED rides this
   // edge without ever consuming the inject.
-  const r = runObservation(
+  const r = await runObservation(
     { sawWorkingAfterInject: true },
     { trigger: 'real-idle', elapsedSec: 0.2 }
   );
@@ -175,13 +201,13 @@ test('working_edge_is_not_completion: a busy edge 0.2s after inject is not a com
 
 // --- §8.1 submit_accept_is_not_completion -----------------------------------------------
 
-test('submit_accept_is_not_completion: a force-accepted submit + reliable idle is not completion', () => {
+test('submit_accept_is_not_completion: a force-accepted submit + reliable idle is not completion', async () => {
   // idleEvidenceReliable:true is pinned deliberately — it selects the production
   // reliable-idle promotion branch (daemon.js:700-715) rather than relying on an omitted
   // dependency. The earlier probe that omitted it was vacuous and its RED was withdrawn.
   // `force` is NOT screen-derived consumption evidence, and with no fresh non-busy→busy edge
   // there is nothing here that measures consumption at all.
-  const r = runObservation({
+  const r = await runObservation({
     submitExpected: true,
     submitConfirmedAt: new Date(NOW - 10_000).toISOString(),
     submitConfirm: { accepted: true, reason: 'force', ambiguous: false },
@@ -197,12 +223,12 @@ test('submit_accept_is_not_completion: a force-accepted submit + reliable idle i
 
 // --- §8.1 consumed_settled_path_is_total ------------------------------------------------
 
-test('consumed_settled_path_is_total: the settled+consumed path emits absence, never silence', () => {
+test('consumed_settled_path_is_total: the settled+consumed path emits absence, never silence', async () => {
   // This is the #52 gate at daemon.js:803-810 — a bare `return` that emits nothing and sets
   // nothing. Today it is reached only when `confirmed` is false, and `confirmed === true`
   // bypasses it; the moment `confirmed` gets stricter, EVERY non-fact turn routes here and
   // goes silent. Consumption must be a FIELD of the observation, never a gate in front of it.
-  const r = runObservation({
+  const r = await runObservation({
     submitExpected: true,
     unconfirmedSettleDone: true,
     submitStartedAt: new Date(NOW - 30_000).toISOString(),
@@ -229,7 +255,7 @@ test('consumed_settled_path_is_total: the settled+consumed path emits absence, n
 
 // --- §A2 totality: every eligible invocation returns a named decision -------------------
 
-test('every_eligible_invocation_returns_a_named_decision: no path returns undefined', () => {
+test('every_eligible_invocation_returns_a_named_decision: no path returns undefined', async () => {
   // §A2 item 2: "Every eligible invocation returns and persists one of observation_emitted,
   // observation_duplicate, unmapped_transition_cause, tracking_superseded,
   // tracking_unavailable, or another named nonterminal result." A bare `return` is the defect.
@@ -251,7 +277,7 @@ test('every_eligible_invocation_returns_a_named_decision: no path returns undefi
     ['recheck says working (suppression arm)', {}, { trigger: 'real-idle', elapsedSec: 5, autoState: 'working' }],
   ];
   for (const [label, overrides, opts] of arms) {
-    const r = runObservation(overrides, opts);
+    const r = await runObservation(overrides, opts);
     assert.ok(
       NAMED_RESULTS.has(r.decision),
       `[${label}] expected a named observation decision, got ${JSON.stringify(r.decision)}`
@@ -262,7 +288,7 @@ test('every_eligible_invocation_returns_a_named_decision: no path returns undefi
 
 // --- §8.1 duplicate handling ------------------------------------------------------------
 
-test('duplicate_idle_transition_is_total: a repeat of the same observation is named, not silent', () => {
+test('duplicate_idle_transition_is_total: a repeat of the same observation is named, not silent', async () => {
   // The once-only `idleNotified` latch (daemon.js:127 guard, :819 assignment) is burned by a
   // WRONG-label emission and then drops the later genuine one. Stage A replaces it with
   // dedup keyed on OBSERVATION IDENTITY, which cannot become an authority gate: the repeat is
@@ -290,7 +316,7 @@ test('duplicate_idle_transition_is_total: a repeat of the same observation is na
 
   // Dedup lives in the LEDGER, keyed on observation identity, so the record has to exist for the
   // dedup path to be the thing under test. Create it the way the inject handler does.
-  const begun = daemon.beginTrackedInjection({
+  const begun = await daemon.beginTrackedInjection({
     injectId: pendingReport.injectId, sessionId: 'worker-1', source: 'orch', session,
   });
   assert.equal(begun.ok, true, 'the tracked record must commit before delivery');
@@ -299,12 +325,14 @@ test('duplicate_idle_transition_is_total: a repeat of the same observation is na
   // is the identity dedup, not the debounce. (The debounce itself is covered by the totality arms.)
   pendingReport.unconfirmedSettleDone = true;
 
-  const first = recordObservation({
+  // #1207: sequential awaits — the dedup verdict is the OWNER's, against the committed state of
+  // the observation before, exactly as the settle ticks arrive one at a time in production.
+  const first = await recordObservation({
     sessionId: 'worker-1', session, pendingReport,
     destination: 'idle', cause: 'silence_timeout', evidence: { silence_ms: 5000 },
     deliverToSource: true, trigger: 'real-idle', deps,
   });
-  const second = recordObservation({
+  const second = await recordObservation({
     sessionId: 'worker-1', session, pendingReport,
     destination: 'idle', cause: 'silence_timeout', evidence: { silence_ms: 5000 },
     deliverToSource: true, trigger: 'real-idle', deps,
@@ -312,7 +340,7 @@ test('duplicate_idle_transition_is_total: a repeat of the same observation is na
   // A DIFFERENT measurement on the same inject is not a duplicate — the dedup must not become an
   // authority gate that swallows later genuine observations, which is exactly what the one-way
   // `idleNotified` bit did.
-  const third = recordObservation({
+  const third = await recordObservation({
     sessionId: 'worker-1', session, pendingReport,
     destination: 'waiting', cause: 'input_request_pattern', evidence: { matched_line: 'Continue?' },
     deliverToSource: true, trigger: 'transition', deps,
@@ -340,79 +368,104 @@ test('duplicate_idle_transition_is_total: a repeat of the same observation is na
 
 // --- #843 failed_commit_is_not_silence --------------------------------------------------
 
-test('failed_commit_is_not_silence: a ledger write failure is still emitted, and does not poison the retry', () => {
+// #1207 — retargeted to the directory store's real write boundary. The 0.9.1 fault (chmod 0500 on the
+// ledger's parent directory) no longer produces a write failure: the owner appends to a segment fd it
+// already holds open, so that arm measured a write that SUCCEEDED (`observation_emitted`, correctly).
+// The fault now lands where a write can actually fail — the segment FILE fsync, through the test-only
+// fault facade the owner worker accepts as `fsImplPath` (test/fixtures/ledger-1207/fault-fs.js; the
+// daemon passes none) — on a private store driven by the REAL session actions, runtime and client
+// (test/fixtures/ledger-1207/control-harness.js). The contract under test is the admitted one for a
+// failed write (DECISION §7): one retry in a NEW segment file, then `indeterminate` + `unavailable_write`
+// — never a rollback, never an automatic retry, never success and never a durable failure. §A2 is
+// unchanged: the absence is still emitted, by name. What the 0.9.1 body also asserted — that the
+// source is pushed an envelope about an observation that is not durable — is the inverse of #1207's
+// durable-before-delivery rule (session-actions.js recordObservation: the source is notified only after
+// the fsynced ACK), so that half now asserts the source is NOT told; the bus still hears it.
+test('failed_commit_is_not_silence: a ledger write failure is still emitted, and does not poison the retry', async () => {
   // §A2 inside the emitter written to enforce §A2. `recordObservation` returned
   // `tracking_persistence_failed` BEFORE the broadcast, so a store that could not be written
   // produced no bus event and no source delivery at all — total silence, which is the one output
   // Stage A forbids. And because `appendLedgerObservation` had already mutated
   // `record.last_observation`, the identity dedup then suppressed every RETRY of that same
   // measurement as a duplicate: the first attempt was silent and the first silenced the rest.
-  //
-  // Drive the real failure, not a stub: make the ledger directory unwritable, which is exactly
-  // how this reproduces in the field (a HOME whose .config is read-only).
-  const ledgerDir = path.join(TMP_HOME, '.config', 'aigentry-telepty');
-  fs.mkdirSync(ledgerDir, { recursive: true });
-
-  const session = { id: 'ledger-1', type: 'spawned' };
-  const pendingReport = { source: 'orch', injectId: 'inj-ledger', unconfirmedSettleDone: true };
-  const busEvents = [];
-  const delivered = [];
-  const deps = {
-    broadcastSessionEvent: (type, sid, _s, payload) => busEvents.push({ type, sid, payload }),
-    resolveSessionAlias: (s) => s,
-    sessions: { orch: { id: 'orch' }, 'ledger-1': session },
-    deliverInjectionToSession: (srcId, _s, msg) => delivered.push({ srcId, msg }),
-  };
-  const measurement = () => ({
-    sessionId: 'ledger-1', session, pendingReport,
-    destination: 'idle', cause: 'silence_timeout', evidence: { silence_ms: 6000 },
-    deliverToSource: true, trigger: 'transition', deps,
-  });
-
-  const begun = daemon.beginTrackedInjection({
-    injectId: pendingReport.injectId, sessionId: 'ledger-1', source: 'orch', session,
-  });
-  assert.equal(begun.ok, true, 'the write-ahead record must commit while the store is still writable');
-  const seqBefore = daemon.getTrackedInjection(pendingReport.injectId).observation_seq;
-
-  fs.chmodSync(ledgerDir, 0o500);
-  let first;
+  const H = require('./fixtures/ledger-1207/control-harness');
+  const { segmentFiles } = require('./fixtures/ledger-1207/owner-harness');
+  const FAULT_FS = path.join(__dirname, 'fixtures', 'ledger-1207', 'fault-fs.js');
+  const store = H.privateStore('telepty60-obs-fault-');
+  // The worker reads its faults at spawn (the open below). FRESH store: no recovery re-fsync, no restart
+  // fact, so `skip: 1` passes exactly the begin's group; the observation's group and its retry in a new
+  // segment file are the two faulted segment-FILE fsyncs (the trailing separator never matches a
+  // directory flush). EIO is injected identically on every platform — no chmod, no win32 special case.
+  const prevFaults = process.env.LEDGER_1207_FAULTS;
+  process.env.LEDGER_1207_FAULTS = JSON.stringify({ fsyncSync: { code: 'EIO', times: 2, skip: 1, pathIncludes: `${path.sep}segments${path.sep}` } });
+  const { runtime, actions, ledgerClient } = H.buildShared(store, H.recorders(), { clientOptions: { fsImplPath: FAULT_FS } });
   try {
-    first = recordObservation(measurement());
+    const restored = await runtime.restoreTrackedInjections();
+    if (prevFaults === undefined) delete process.env.LEDGER_1207_FAULTS; else process.env.LEDGER_1207_FAULTS = prevFaults;
+    assert.equal(restored.ok, true, JSON.stringify(restored));
+    assert.equal(restored.restartFact, null, 'precondition: an empty store writes no restart fact');
+
+    const session = { id: 'ledger-1', type: 'spawned' };
+    const pendingReport = { source: 'orch', injectId: 'inj-ledger', unconfirmedSettleDone: true };
+    const busEvents = [];
+    const delivered = [];
+    const deps = {
+      broadcastSessionEvent: (type, sid, _s, payload) => busEvents.push({ type, sid, payload }),
+      resolveSessionAlias: (s) => s,
+      sessions: { orch: { id: 'orch' }, 'ledger-1': session },
+      deliverInjectionToSession: (srcId, _s, msg) => delivered.push({ srcId, msg }),
+    };
+    const measurement = () => ({
+      sessionId: 'ledger-1', session, pendingReport,
+      destination: 'idle', cause: 'silence_timeout', evidence: { silence_ms: 6000 },
+      deliverToSource: true, trigger: 'transition', deps,
+    });
+
+    const begun = await runtime.beginTrackedInjection({
+      injectId: pendingReport.injectId, sessionId: 'ledger-1', source: 'orch', session,
+    });
+    assert.equal(begun.ok, true, 'the write-ahead record must commit while the store is still writable');
+    const seqBefore = runtime.getTrackedInjection(pendingReport.injectId).observation_seq;
+
+    const first = await actions.recordObservation(measurement());
+    assert.equal(first, 'tracking_outcome_indeterminate',
+      'a write whose durability is unknown is named as such — never success, never a durable failure');
+    assert.equal(segmentFiles(store.dir).length, 2, 'the fault reached the segment write: the retry went to a NEW segment file');
+    assert.equal(ledgerClient.state, 'unavailable_write');
+    assert.equal(ledgerClient.status().unresolved_count, 1, 'the txn is held for resolution, never retried');
+    assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 1,
+      'a store that cannot be written is a condition to REPORT: the bus must still hear the absence');
+    const body = busEvents[0].payload.extra;
+    assert.equal(body.tracking_result, 'tracking_outcome_indeterminate',
+      'the envelope must NAME the durability gap rather than presenting a normal observation');
+    assert.equal(body.completion_fact, null);
+    assert.equal(body.terminal, false);
+    assert.equal(delivered.length, 0, 'the source is told only after a durable ACK; an indeterminate write is never pushed as recorded');
+
+    // The committed read model never describes the possibly-durable append: no advanced sequence and no
+    // un-acked `last_observation` — the state that used to turn the retry into a phantom duplicate.
+    const committed = runtime.getTrackedInjection(pendingReport.injectId);
+    assert.equal(committed.observation_seq, seqBefore,
+      'a failed commit must not advance the durable sequence it failed to write');
+    assert.notEqual(committed.last_observation && committed.last_observation.kind, 'pty_quiet',
+      'the un-persisted observation must not be left standing as the record\'s last one');
+
+    // The same measurement again: the write side is out (`unavailable_write`), so it is named and heard —
+    // never deduplicated against the attempt that may not have landed, and never pushed.
+    const second = await actions.recordObservation(measurement());
+    assert.equal(second, 'tracking_unavailable',
+      `the retry of an observation that never landed must be named, got ${JSON.stringify(second)}`);
+    assert.notEqual(second, 'observation_duplicate');
+    assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 2);
+    assert.equal(busEvents[1].payload.extra.tracking_result, 'tracking_unavailable');
+    assert.equal(delivered.length, 0);
+    for (const e of busEvents) {
+      assert.ok(!TERMINAL_EVENT_RE.test(e.type), `terminal event emitted: ${e.type}`);
+    }
   } finally {
-    fs.chmodSync(ledgerDir, 0o700);
-  }
-
-  assert.equal(first, 'tracking_persistence_failed',
-    'the named result is right — it is the silence around it that is the defect');
-  assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 1,
-    'a store that cannot be written is a condition to REPORT: the bus must still hear the absence');
-  assert.equal(delivered.length, 1,
-    'and the source waiting on this inject must still be told, not left inferring from silence');
-  const body = busEvents[0].payload.extra;
-  assert.equal(body.tracking_result, 'tracking_persistence_failed',
-    'the envelope must NAME the durability gap rather than presenting a normal observation');
-  assert.equal(body.completion_fact, null);
-  assert.equal(body.terminal, false);
-
-  // The in-memory record must be rolled back to exactly what is on disk. A `last_observation`
-  // describing an append that never reached the ledger is a claim about durable state that was
-  // not measured — and it is what turns the retry into a phantom duplicate.
-  const rolledBack = daemon.getTrackedInjection(pendingReport.injectId);
-  assert.equal(rolledBack.observation_seq, seqBefore,
-    'a failed commit must not advance the durable sequence it failed to write');
-  assert.notEqual(rolledBack.last_observation && rolledBack.last_observation.kind, 'pty_quiet',
-    'the un-persisted observation must not be left standing as the record\'s last one');
-
-  // The retry, once the store is writable again, is the FIRST successful statement of this
-  // measurement — never a duplicate of one that only ever existed in memory.
-  const second = recordObservation(measurement());
-  assert.equal(second, 'observation_emitted',
-    `the retry of an observation that never landed must be emitted, got ${JSON.stringify(second)}`);
-  assert.equal(daemon.getTrackedInjection(pendingReport.injectId).last_observation.kind, 'pty_quiet');
-  assert.equal(busEvents.filter(e => e.type === 'task_completion_unknown').length, 2);
-  for (const d of delivered) {
-    assert.ok(!TERMINAL_TEXT_RE.test(d.msg), `terminal outcome emitted: ${d.msg}`);
+    if (prevFaults === undefined) delete process.env.LEDGER_1207_FAULTS; else process.env.LEDGER_1207_FAULTS = prevFaults;
+    await H.closeBounded(ledgerClient, 2000);
+    fs.rmSync(store.home, { recursive: true, force: true });
   }
 });
 
@@ -461,7 +514,7 @@ test('arbitrary_reverse_message_is_not_report: no text is parsed as a terminal r
 
 // --- #843 a frozen reason contradicted by its own record --------------------------------
 
-test('capability_reason_matches_the_record: an epoch fact is not reported as "no epoch fact"', () => {
+test('capability_reason_matches_the_record: an epoch fact is not reported as "no epoch fact"', async () => {
   // `CAPABILITY_STAGE_A` is frozen with `session_authentication_reason: 'no_815_epoch_fact'` and
   // spread onto every ledger record — including records whose own `session_epoch` field holds an
   // epoch. One response body then carries both `session_epoch: "<id>"` and a reason saying there is
@@ -485,7 +538,7 @@ test('capability_reason_matches_the_record: an epoch fact is not reported as "no
     },
   });
   const restored = sessionPersistence.buildRestoredWrappedSession('epoch-1', persisted['epoch-1']);
-  const withEpoch = daemon.beginTrackedInjection({
+  const withEpoch = await daemon.beginTrackedInjection({
     injectId: 'inj-epoch', sessionId: 'epoch-1', source: 'orch', session: restored,
   });
   assert.equal(withEpoch.ok, true);
@@ -499,7 +552,7 @@ test('capability_reason_matches_the_record: an epoch fact is not reported as "no
   assert.equal(record.capability.session_authentication_reason, 'no_815_bearer_presented');
 
   // The no-epoch case is untouched: an absence is still reported as an absence, with its reason.
-  const unproven = daemon.beginTrackedInjection({
+  const unproven = await daemon.beginTrackedInjection({
     injectId: 'inj-noepoch', sessionId: 'epoch-2', source: 'orch', session: { id: 'epoch-2' },
   });
   assert.equal(unproven.ok, true);

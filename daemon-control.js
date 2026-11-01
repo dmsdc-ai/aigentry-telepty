@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -56,9 +57,29 @@ function readDaemonState() {
   }
 }
 
+// #1215 fix144: publish the claim so that every reader sees either the previous complete document or the new complete
+// one, never a truncated or partial file. Writing the final path directly created/truncated it before the bytes landed,
+// and readDaemonState() then reported null (measured: 0 and 68 bytes before the 136-byte claim). The document is written
+// in full to an exclusive (O_EXCL, 0600) uniquely named temp file owned by this process in the same directory, then
+// renamed over the final path. The live state is never truncated or unlinked first. On failure the owned temp file is
+// removed once and the original error propagates. No fsync: this restores the complete-read publication invariant, not
+// crash or power-loss durability.
 function writeDaemonState(state) {
   ensureTeleptyDir();
-  fs.writeFileSync(DAEMON_STATE_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
+  const temp = `${DAEMON_STATE_FILE}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  let fd, created = false;
+  try {
+    fd = fs.openSync(temp, 'wx', 0o600);
+    created = true; // only a file this call exclusively created is ever removed below
+    fs.writeFileSync(fd, JSON.stringify(state, null, 2));
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(temp, DAEMON_STATE_FILE);
+  } catch (error) {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* the original error is what propagates */ } }
+    if (created) { try { fs.rmSync(temp, { force: true }); } catch { /* bounded: one attempt on our own temp file only */ } }
+    throw error;
+  }
 }
 
 function clearDaemonState(expectedPid) {
@@ -420,6 +441,10 @@ function cleanupDaemonProcesses(opts) {
       }
     }
   }
+
+  // Task 1215 W3B: a dry run reports the surgical targets without signalling or clearing anything, so a
+  // caller can tell "no daemon" from "a daemon that did not accept a graceful stop" without forcing.
+  if (o.dryRun === true) return { stopped: [], failed: [], targets: [...targets.values()] };
 
   const stopped = [];
   const failed = [];

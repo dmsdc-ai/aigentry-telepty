@@ -258,6 +258,19 @@ async function installSkills() {
   }
 }
 
+// Task 1215 service36: the supervision preflight main() runs before ANY unload, stop, cleanup or descriptor write.
+// A refusal throws with its code only (no path, no config content); main()'s caller prints it and exits 1, so a
+// running service/daemon is left exactly as it was. Lazy require: the builders' module load is unchanged.
+function assertSupervisionPreflight(options = {}) {
+  const supervision = require('./src/principal/supervision-config');
+  try {
+    return supervision.preflightSupervision(options);
+  } catch (err) {
+    const code = supervision.refusalCode(err);
+    throw Object.assign(new Error(`Supervision preflight refused (${code}); no service was unloaded, stopped or replaced.`), { code });
+  }
+}
+
 async function main() {
   console.log("🚀 Installing @dmsdc-ai/aigentry-telepty...");
 
@@ -275,6 +288,7 @@ async function main() {
   if (!fs.existsSync(launchOptions.cliJs)) {
     throw new Error(`Cannot find daemon entrypoint: ${launchOptions.cliJs}`);
   }
+  assertSupervisionPreflight();   // Task 1215 service36: before step 4's unload/cleanup/descriptor writes
 
   // 4. Setup OS-specific autostart or background daemon
   const platform = os.platform();
@@ -380,6 +394,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  assertSupervisionPreflight,
   buildLaunchdPlist,
   buildSystemdService,
   buildWindowsAutostartCommand,

@@ -183,8 +183,10 @@ test('R3b: with no explicit port the repair path addresses the CLI default', asy
 // A REAL process carrying the REAL production title owns :3848; the CLI addresses :52209.
 // The confirmation step runs for real (pidMatchesTeleptyCmdline against the live title); only
 // the killer is injected, so the child is never signalled by the code under test.
-test('R4: a CLI addressing :52209 never signals the titled daemon on :3848', async () => {
-  if (process.platform === 'win32') return; // title replacement is Unix-only
+test('R4: a CLI addressing :52209 never signals the titled daemon on :3848', {
+  // #879: announced skip instead of a silent `return` (a silently returned test counts as a pass).
+  skip: process.platform === 'win32' ? 'win32: process-title replacement and the ps title scan are Unix-only' : false
+}, async () => {
   const child = spawnTitledChild();
   try {
     await waitMs(700); // let ps observe the renamed title

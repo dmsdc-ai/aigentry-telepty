@@ -1,0 +1,10 @@
+{
+  "schema": "telepty-bridge-136-stream-recipe/v1",
+  "provenance": "synthetic: hand-authored for telepty task 1215 regression tests; NOT captured from any user session, terminal or transcript; contains no host identifiers or credentials",
+  "describes": "line-structured codex-like surface (banner + composer + footer, CRLF separated) that the EXISTING raw-tail detector already matches (codex_multi_signal); positive legacy control",
+  "geometry": { "cols": 80, "rows": 24 },
+  "preamble": [">_ OpenAI Codex (v0.166.0)\r\n\r\n"],
+  "cycle": ["› Ask Codex to do anything\r\n\r\n  gpt-5.5 xhigh · /tmp/x\r\n"],
+  "repeat": 1,
+  "epilogue": []
+}

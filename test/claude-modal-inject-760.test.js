@@ -50,6 +50,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const registry = require('../src/prompt-symbol-registry');
+const { createSessionDeliveryFixture } = require('../test-support/session-delivery-fixture');
 
 // ── Fixtures: verbatim tails of the REAL PTY byte streams, after
 //    normalizeOutputForDetection. Nothing here is hand-written.
@@ -275,8 +276,9 @@ test('#760: TELEPTY_MODAL_REMEDY=off also un-gates the bootstrap drain', async (
 
 // ── The park: not lost, delivered after the modal clears, order preserved. ──
 
-test('#760 RED: a modal-parked inject is queued and acked, not written and not refused', async () => {
-  const daemon = require('../daemon');
+test('#760 RED: a modal-parked inject is queued and acked, not written and not refused', async (t) => {
+  const daemon = createSessionDeliveryFixture();
+  t.after(() => daemon.dispose());
   const session = claudeSession(PLAN_RING);
   const result = await daemon.deliverInjectionToSession('c760-park', session, 'REPORT: worker one', {});
   assert.equal(result.success, true, 'a park must ACK — a refusal makes the caller re-inject');
@@ -286,8 +288,9 @@ test('#760 RED: a modal-parked inject is queued and acked, not written and not r
   assert.equal(session.bootstrapQueue[0].prompt, 'REPORT: worker one');
 });
 
-test('#760 RED: the park drains in FIFO order once the modal clears', async () => {
-  const daemon = require('../daemon');
+test('#760 RED: the park drains in FIFO order once the modal clears', async (t) => {
+  const daemon = createSessionDeliveryFixture();
+  t.after(() => daemon.dispose());
   const session = claudeSession(PLAN_RING);
 
   for (const body of ['first', 'second', 'third']) {
@@ -311,8 +314,9 @@ test('#760 RED: the park drains in FIFO order once the modal clears', async () =
 // The race the FIFO alone does not close: the modal clears between two dispatches. Dispatch
 // two sees a clear surface, takes the mailbox path, and lands before dispatch one — which is
 // still sitting in the queue waiting for the drain. Everything behind a backlog must park.
-test('#760: a dispatch arriving after the modal clears still parks behind the backlog', async () => {
-  const daemon = require('../daemon');
+test('#760: a dispatch arriving after the modal clears still parks behind the backlog', async (t) => {
+  const daemon = createSessionDeliveryFixture();
+  t.after(() => daemon.dispose());
   const session = claudeSession(ASK_RING);
   await daemon.deliverInjectionToSession('c760-race', session, 'first', { noEnter: true });
   assert.equal(session.bootstrapQueue.length, 1);
@@ -329,8 +333,9 @@ test('#760: a dispatch arriving after the modal clears still parks behind the ba
   assert.deepEqual(session.written.map(unwrap), ['first', 'second']);
 });
 
-test('#760 RED: the drain never writes into a still-modal surface', async () => {
-  const daemon = require('../daemon');
+test('#760 RED: the drain never writes into a still-modal surface', async (t) => {
+  const daemon = createSessionDeliveryFixture();
+  t.after(() => daemon.dispose());
   const session = claudeSession(ASK_RING);
   await daemon.deliverInjectionToSession('c760-guard', session, 'must not land', { noEnter: true });
   // Call the boot drain directly — it must refuse on its own, not rely on its caller. The
@@ -340,8 +345,9 @@ test('#760 RED: the drain never writes into a still-modal surface', async () => 
   assert.equal(session.bootstrapQueue.length, 1, 'the op must stay parked, not be consumed');
 });
 
-test('#760: a park that outlives its TTL is flushed with an actionable error, not silently', async () => {
-  const daemon = require('../daemon');
+test('#760: a park that outlives its TTL is flushed with an actionable error, not silently', async (t) => {
+  const daemon = createSessionDeliveryFixture();
+  t.after(() => daemon.dispose());
   const session = claudeSession(ASK_RING);           // nobody ever answers it
   await daemon.deliverInjectionToSession('c760-ttl', session, 'stranded', { noEnter: true });
   const outcome = await daemon.awaitModalParkDrain('c760-ttl', session, { timeoutMs: 120, pollIntervalMs: 20 });

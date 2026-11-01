@@ -48,8 +48,11 @@ function applyTimestampMetadata(session, body) {
   }
 }
 
+// Task 1215: a user-supervised owner (bound to the current owner generation at a trusted
+// registration, src/mailbox/input-policy.js) is never gated on a bridge ready/screen signal.
 function isBootstrapGatedSession(session) {
-  return !!(session && session.type === 'wrapped' && readyRegistry.isKnownAiCli(session.command));
+  return !!(session && session.type === 'wrapped' && readyRegistry.isKnownAiCli(session.command)
+    && !require('../mailbox/input-policy').userSupervised(session));
 }
 
 function initializeBootstrapState(session) {

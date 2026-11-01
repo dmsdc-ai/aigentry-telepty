@@ -32,6 +32,8 @@ const { createSessionId, delay, startTestDaemon, waitFor } = require('../test-su
 
 const daemon = require('../daemon');
 const { fireAutoReport } = daemon;
+const { trackedInjectId, beginTrackedEager, settleTracked, fireAndSettle } = require('../test-support/tracked-observation');
+after(async () => { await daemon.ledgerClient.close(2000); });
 
 // ---------------------------------------------------------------------------
 // Unit: fireAutoReport settle-and-recheck via the deps DI seam
@@ -45,7 +47,7 @@ const T0 = 1_700_000_000_000; // fixed clock origin
 // have been processed — also unmeasurable) are both gone, along with the elapsed-time floor that
 // used to pick between them.
 const COMPLETION_UNKNOWN_RE =
-  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-48 — no completion fact observed; (\S+?)(?:=(\d+\.\d)s)?(?:; elapsed_since_inject=(\d+\.\d)s)?; consumption=(observed|not_established); outcome protocol unavailable$/;
+  /^TASK_COMPLETION_UNKNOWN: worker-1 inject=inj-48-\d+-\d+ — no completion fact observed; (\S+?)(?:=(\d+\.\d)s)?(?:; elapsed_since_inject=(\d+\.\d)s)?; consumption=(observed|not_established); outcome protocol unavailable$/;
 
 const REMOVED_LABELS = [/TASK_COMPLETE:/, /TASK_IDLE_UNCONFIRMED:/, /TASK_COMPLETE_WITH_REPORT/];
 
@@ -87,7 +89,7 @@ function makeGate({ elapsedSec = 0.2, pendingReportOverrides = {}, autoState = '
   };
   ctx.pendingReport = {
     source: 'orch',
-    injectId: 'inj-48',
+    injectId: trackedInjectId('inj-48'),   // #1207: fresh durably begun id per fixture
     injectedAt: new Date(T0 - elapsedSec * 1000).toISOString(),
     ...pendingReportOverrides,
   };
@@ -101,19 +103,26 @@ function makeGate({ elapsedSec = 0.2, pendingReportOverrides = {}, autoState = '
     deliverInjectionToSession: (srcId, _s, msg) => ctx.delivered.push({ srcId, msg }),
     getAutoState: () => ctx.autoState,
   };
-  ctx.fire = (trigger = 'ready-signal') =>
-    fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps);
+  // #1207: the source is told only after the observation is durable on a durably begun record —
+  // begun here, awaited by the first fire; each step then awaits the async emit (settle).
+  ctx.ready = beginTrackedEager(daemon, { injectId: ctx.pendingReport.injectId, sessionId: 'worker-1', source: ctx.pendingReport.source, session: ctx.session });
+  const progress = () => `${ctx.delivered.length}:${ctx.broadcasts.length}`;
+  ctx.fire = async (trigger = 'ready-signal') => {
+    await ctx.ready;
+    return fireAndSettle(daemon, () => fireAutoReport('worker-1', ctx.session, ctx.pendingReport, trigger, ctx.deps), progress);
+  };
   // Run the currently-armed timers once (advancing the clock by each delay).
-  ctx.flushTimers = () => {
+  ctx.flushTimers = async () => {
     const due = ctx.timers.splice(0);
     for (const { fn, ms } of due) { ctx.nowMs += ms; fn(); }
+    await settleTracked(daemon, progress);
   };
   return ctx;
 }
 
-test('#48 FP: ready-signal 0.2s after a plain inject does NOT notify immediately — settle armed', () => {
+test('#48 FP: ready-signal 0.2s after a plain inject does NOT notify immediately — settle armed', async () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
-  ctx.fire();
+  await ctx.fire();
   assert.equal(ctx.delivered.length, 0, 'no immediate follow-up delivery');
   assert.equal(ctx.broadcasts.length, 0, 'no immediate broadcast');
   // `idleNotified` is RETIRED — the once-only guard is now ledger identity dedup inside the
@@ -125,18 +134,18 @@ test('#48 FP: ready-signal 0.2s after a plain inject does NOT notify immediately
   assert.equal(ctx.timers.length, 1, 'settle recheck timer armed');
 });
 
-test('#48 FP: session working at recheck → suppressed entirely, once-only guard not consumed', () => {
+test('#48 FP: session working at recheck → suppressed entirely, once-only guard not consumed', async () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
-  ctx.fire();
+  await ctx.fire();
   ctx.autoState = 'working'; // the transition gap closed during the settle window
-  ctx.flushTimers();
+  await ctx.flushTimers();
   assert.equal(ctx.delivered.length, 0, 'suppressed — inject IS being processed');
   assert.equal(ctx.broadcasts.length, 0);
   assert.equal(ctx.pendingReport.unconfirmedSettleDone, undefined,
     'suppression consumed nothing — a later busy→idle observation may still be stated');
 });
 
-test('#48 FP: real-idle mid-work flip (codex ~4.8s) with unconfirmed submit → suppressed when working at recheck', () => {
+test('#48 FP: real-idle mid-work flip (codex ~4.8s) with unconfirmed submit → suppressed when working at recheck', async () => {
   const ctx = makeGate({
     elapsedSec: 4.8,
     pendingReportOverrides: {
@@ -144,17 +153,17 @@ test('#48 FP: real-idle mid-work flip (codex ~4.8s) with unconfirmed submit → 
       submitConfirm: { accepted: false, reason: 'submit_unconfirmed' },
     },
   });
-  ctx.fire('real-idle');
+  await ctx.fire('real-idle');
   ctx.autoState = 'working';
-  ctx.flushTimers();
+  await ctx.flushTimers();
   assert.equal(ctx.delivered.length, 0);
   assert.equal(ctx.pendingReport.unconfirmedSettleDone, undefined);
 });
 
-test('#48 signal preserved: still idle + output stalled after settle → the absence is stated (format intact)', () => {
+test('#48 signal preserved: still idle + output stalled after settle → the absence is stated (format intact)', async () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
-  ctx.fire();
-  ctx.flushTimers(); // state stays idle, lastActivityAt unchanged
+  await ctx.fire();
+  await ctx.flushTimers(); // state stays idle, lastActivityAt unchanged
   assert.equal(ctx.delivered.length, 1, 'genuinely-unconsumed inject still notifies');
   assert.equal(ctx.delivered[0].srcId, 'orch');
   // RENAMED PRESENCE. The notification still fires, on the same path, after the same settle, to
@@ -169,14 +178,14 @@ test('#48 signal preserved: still idle + output stalled after settle → the abs
   assert.equal(extra.observation.kind, 'legacy_ready_observed');
 });
 
-test('#48 never-false-complete: elapsed crossing the floor during settle cannot promote to an outcome', () => {
+test('#48 never-false-complete: elapsed crossing the floor during settle cannot promote to an outcome', async () => {
   // Armed at 0.2s (sub-floor); the settle window pushes fire-time elapsed past
   // AUTO_REPORT_MIN_REAL_SECONDS. The old code CHOSE its label from elapsed time, so this test
   // pinned that the label was fixed at arm time. Stage A removes the choice outright: elapsed is
   // a FIELD on the observation and never a threshold, so there is no label for time to promote.
   const ctx = makeGate({ elapsedSec: 0.2 });
-  ctx.fire();
-  ctx.flushTimers();
+  await ctx.fire();
+  await ctx.flushTimers();
   assert.equal(ctx.delivered.length, 1);
   const stated = assertStatesAbsence(ctx.delivered[0].msg);
   const extra = completionUnknownEvent(ctx);
@@ -187,25 +196,25 @@ test('#48 never-false-complete: elapsed crossing the floor during settle cannot 
   assert.ok(extra.observation.elapsed_ms >= 5000);
 });
 
-test('#48: output advance while still idle-classified re-settles (bounded) before notifying', () => {
+test('#48: output advance while still idle-classified re-settles (bounded) before notifying', async () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
-  ctx.fire();
+  await ctx.fire();
   // Output advanced during the settle window (sparse TUI redraw) but state still idle.
   ctx.session.lastActivityAt = new Date(T0 + 100).toISOString();
-  ctx.flushTimers();
+  await ctx.flushTimers();
   assert.equal(ctx.delivered.length, 0, 're-settled instead of firing');
   assert.equal(ctx.timers.length, 1, 'a fresh settle window is open');
   // Output now stalls → the next recheck fires.
-  ctx.flushTimers();
+  await ctx.flushTimers();
   assert.equal(ctx.delivered.length, 1);
   assertStatesAbsence(ctx.delivered[0].msg);
 });
 
-test('#48: suppression keeps the door open — a later real-idle still states the absence', () => {
+test('#48: suppression keeps the door open — a later real-idle still states the absence', async () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
-  ctx.fire();
+  await ctx.fire();
   ctx.autoState = 'working';
-  ctx.flushTimers(); // suppressed; the settle is NOT marked done, so the path stays open
+  await ctx.flushTimers(); // suppressed; the settle is NOT marked done, so the path stays open
   assert.equal(ctx.delivered.length, 0);
   assert.equal(ctx.pendingReport.unconfirmedSettleDone, undefined, 'suppression consumed nothing');
 
@@ -213,7 +222,7 @@ test('#48: suppression keeps the door open — a later real-idle still states th
   ctx.pendingReport.sawWorkingAfterInject = true;
   ctx.nowMs = T0 + 30_000;
   ctx.autoState = 'idle';
-  ctx.fire('real-idle');
+  await ctx.fire('real-idle');
 
   // The old assertion was that THIS fire promoted straight to TASK_COMPLETE — "confirmed
   // completions are never deferred". There are no confirmed completions left to fast-path, so
@@ -222,25 +231,25 @@ test('#48: suppression keeps the door open — a later real-idle still states th
   // absence has been pollable since delivery. What this test still guards is the door-open
   // property — suppression must not have consumed the session's right to be described later.
   assert.equal(ctx.delivered.length, 0, 'the later observation debounces like any other');
-  ctx.flushTimers();
+  await ctx.flushTimers();
   assert.equal(ctx.delivered.length, 1, 'the door stayed open — the later quiet is still stated');
   const stated = assertStatesAbsence(ctx.delivered[0].msg);
   assert.equal(stated.kind, 'pty_quiet', 'a real-idle entrance with no cause supplied is silence, named as such');
 });
 
-test('#48: a second trigger while a settle window is open does not double-arm or notify', () => {
+test('#48: a second trigger while a settle window is open does not double-arm or notify', async () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
-  ctx.fire();
-  ctx.fire('real-idle'); // e.g. classifier idle flip lands while ready-signal settle is open
+  await ctx.fire();
+  await ctx.fire('real-idle'); // e.g. classifier idle flip lands while ready-signal settle is open
   assert.equal(ctx.timers.length, 1, 'single settle window');
   assert.equal(ctx.delivered.length, 0);
 });
 
-test('#48: settle recheck stands down when the pending report was cleared (REPORT arrived)', () => {
+test('#48: settle recheck stands down when the pending report was cleared (REPORT arrived)', async () => {
   const ctx = makeGate({ elapsedSec: 0.2 });
-  ctx.fire();
+  await ctx.fire();
   delete ctx.deps.pendingReports['worker-1']; // REPORT consumed the entry
-  ctx.flushTimers();
+  await ctx.flushTimers();
   assert.equal(ctx.delivered.length, 0);
   assert.equal(ctx.broadcasts.length, 0);
 });

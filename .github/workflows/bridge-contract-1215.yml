@@ -1,0 +1,82 @@
+name: Bridge contract 1215 (#136/#137 regression)
+
+# Task 1215 regression-source CI. It runs ONLY the four bridge regression files, serially, on the
+# exact candidate tree of the pull request, and reports their actual exit status.
+#
+# This workflow is meant for a separate DRAFT regression branch BEFORE the production fix.
+# There, the RED cases are EXPECTED to fail, so a red run is the measurement, not a defect. A
+# green run of this job is NOT a release gate and must not be reported as release success. The
+# expected per-case outcomes are recorded in REGRESSION-MAP.json and stay NOTRUN until this
+# job measures them.
+#
+# Security posture:
+# - no secrets;
+# - read-only token, with checkout credentials not persisted;
+# - no publish, no root lifecycle scripts (npm ci --ignore-scripts);
+# - only node-pty's own build is run, because daemon.js:3 requires it at load;
+# - private HOME/TMPDIR/npm cache under RUNNER_TEMP;
+# - loopback-only daemons (TELEPTY_NO_TAILNET_AUTO=1);
+# - no client-initiated daemon restarts.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridge-contract-1215-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bridge-contract:
+    name: bridge regression (#136/#137)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TELEPTY_CLIENT_RESTART: 'off'
+      TELEPTY_SKIP_DAEMON_REPAIR: '1'
+      TELEPTY_NO_TAILNET_AUTO: '1'
+      TELEPTY_SKIP_POSTINSTALL: '1'
+      NO_UPDATE_NOTIFIER: '1'
+      TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
+    steps:
+      # SHAs pinned to existing upstream releases: actions/checkout v4.2.2 and
+      # actions/setup-node v4.4.0. The controller must verify them against GitHub before
+      # adoption; that verification was not possible offline in the authoring sandbox.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20.20.0'
+      - name: Verify exact Node
+        run: |
+          test "$(node --version)" = "v20.20.0"
+      - name: Private HOME, TMPDIR and npm cache
+        run: |
+          base="$RUNNER_TEMP/bridge-1215"
+          mkdir -p "$base/home" "$base/tmp" "$base/npm-cache"
+          chmod 700 "$base" "$base/home" "$base/tmp" "$base/npm-cache"
+          {
+            echo "HOME=$base/home"
+            echo "USERPROFILE=$base/home"
+            echo "TMPDIR=$base/tmp"
+            echo "npm_config_cache=$base/npm-cache"
+          } >> "$GITHUB_ENV"
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build node-pty only (required by daemon.js)
+        run: |
+          npm rebuild node-pty --foreground-scripts
+          node -e "require('node-pty'); require('@xterm/headless'); console.log('deps ok')"
+      - name: Run the four bridge regression files serially (raw TAP, actual exit)
+        shell: bash
+        run: |
+          set -o pipefail
+          node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=tap \
+            test/bridge-first-ready-stall-136.test.js \
+            test/bridge-vt-frame-ready-136.test.js \
+            test/bridge-recovery-quarantine-136.test.js \
+            test/bridge-stage-receipts-137.test.js \
+            2>&1 | tee "$RUNNER_TEMP/bridge-1215.tap"

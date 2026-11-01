@@ -13,3 +13,5 @@ test-*.mjs
 .cross_session_deliberation.json
 .deliberation_request_bridge.json
 .deliberation_request_bridge_retry.json
+# Task 1215: CI-built native artifacts (built by scripts/build-authority-darwin.mjs, never committed)
+src/principal/native/prebuilt/

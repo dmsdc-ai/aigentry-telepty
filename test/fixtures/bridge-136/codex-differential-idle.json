@@ -1,0 +1,14 @@
+{
+  "schema": "telepty-bridge-136-stream-recipe/v1",
+  "provenance": "synthetic: hand-authored for telepty task 1215 regression tests; NOT captured from any user session, terminal or transcript; contains no host identifiers or credentials",
+  "describes": "codex-like idle composer painted only by CUP/EL differential repaint (no LF/CR, no boot banner); rendered frame shows composer row 20 and footer row 22",
+  "geometry": { "cols": 80, "rows": 24 },
+  "preamble": ["\u001b[2J", "\u001b[H", "\u001b[?25l"],
+  "cycle": [
+    "\u001b[18;1H\u001b[2KTip: use /status to inspect the current session\u001b[20;1H\u001b[2K› Summarize the latest changes\u001b[22;1H\u001b[2K  GPT-6-Astra xhigh · /tmp/x\u001b[20;3H",
+    "\u001b[18;1H\u001b[2KTip: press / to open the command list\u001b[20;1H\u001b[2K› Summarize the latest changes\u001b[22;1H\u001b[2K  GPT-6-Astra xhigh · /tmp/x\u001b[20;3H",
+    "\u001b[18;1H\u001b[2KTip: drag a file in to attach it\u001b[20;1H\u001b[2K› Summarize the latest changes\u001b[22;1H\u001b[2K  GPT-6-Astra xhigh · /tmp/x\u001b[20;3H"
+  ],
+  "repeat": 180,
+  "epilogue": ["\u001b[?25h"]
+}

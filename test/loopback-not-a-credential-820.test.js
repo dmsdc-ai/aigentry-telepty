@@ -497,7 +497,7 @@ function upgradeHarness(allowlist) {
     markSessionConnected: () => {},
     scheduleBootstrapPromptPoll: () => {},
     emitSessionLifecycleEvent: () => {},
-    persistSessions: () => {},
+    persistSessions: () => ({ ok: true, committed: true }),
     appendToOutputRing: () => {},
     sessionStateManager: { feed: () => {} },
     isBootstrapGatedSession: () => false,

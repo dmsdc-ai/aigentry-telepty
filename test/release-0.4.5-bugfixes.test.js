@@ -10,7 +10,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
-const { createSessionId, startTestDaemon, waitFor } = require('../test-support/daemon-harness');
+const { createSessionId, homeEnv, startTestDaemon, waitFor } = require('../test-support/daemon-harness');
 
 const projectRoot = path.resolve(__dirname, '..');
 const pkg = require(path.join(projectRoot, 'package.json'));
@@ -104,7 +104,7 @@ test('#470: daemon startup marks restored sessions with live ownerPid as ready',
     }
   }));
 
-  harness = await startTestDaemon({ env: { HOME: homeDir } });
+  harness = await startTestDaemon({ env: homeEnv(homeDir) }); // #879: USERPROFILE too on win32
 
   // Eager-probe runs from server.listen callback; readiness flips
   // asynchronously. Bound to a few seconds.
@@ -143,7 +143,7 @@ test('#470: restored session with dead ownerPid stays unready', async () => {
     }
   }));
 
-  harness = await startTestDaemon({ env: { HOME: homeDir } });
+  harness = await startTestDaemon({ env: homeEnv(homeDir) }); // #879: USERPROFILE too on win32
 
   // Give the eager-probe a generous window to run; it must NOT mark a
   // dead-owner session ready.
@@ -199,7 +199,7 @@ test('#469: postinstall is a no-op when no daemon-state.json exists', async () =
     const result = await runPostinstall({
       TELEPTY_SKIP_POSTINSTALL: '',
       npm_config_global: 'true',
-      HOME: tmpHome
+      ...homeEnv(tmpHome) // #879: postinstall reads os.homedir() → USERPROFILE on win32
     });
     assert.equal(result.code, 0);
     assert.match(result.stdout, /No running daemon detected/);
@@ -220,7 +220,7 @@ test('#469: postinstall no-ops when running daemon already matches package versi
     const result = await runPostinstall({
       TELEPTY_SKIP_POSTINSTALL: '',
       npm_config_global: 'true',
-      HOME: tmpHome
+      ...homeEnv(tmpHome) // #879: postinstall reads os.homedir() → USERPROFILE on win32
     });
     assert.equal(result.code, 0);
     assert.match(result.stdout, new RegExp(`already at ${pkg.version.replace(/\./g, '\\.')}`));

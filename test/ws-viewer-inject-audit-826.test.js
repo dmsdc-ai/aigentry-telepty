@@ -24,6 +24,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto'); // Task 1215 native39: readiness-token nonce only
 const WebSocket = require('ws');
 
 const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
@@ -226,12 +227,14 @@ test('the orchestrator lane is untouched — the guardrail did not become a tigh
 // comment one branch up calls the wrapped path "the one write path with no accountability"; the
 // spawned path still was exactly that, and the six #826 cases all build wrapped fixtures, so
 // nothing ever went through this door.
-async function spawned(prefix) {
+async function spawned(prefix, overrides) { // Task 1215 native39: optional spawn overrides (undefined = unchanged default shell)
   const sid = createSessionId(prefix);
-  const res = await daemon.spawnSession(sid);
+  const origin = performance.now(); // Task 1215 diagnostics12: timing origin for the failure-only timeline (no behaviour)
+  const res = await daemon.spawnSession(sid, overrides);
+  const spawnResponseMs = Math.round(performance.now() - origin);
   assert.ok([200, 201].includes(res.status), `spawn: ${res.status} ${JSON.stringify(res.body)}`);
   const viewer = await open(`/api/sessions/${encodeURIComponent(sid)}?token=${encodeURIComponent(TOKEN)}`);
-  return { sid, viewer };
+  return { sid, viewer, timing: { origin, spawn_response_ms: spawnResponseMs, viewer_open_ms: Math.round(performance.now() - origin) } };
 }
 
 // Everything the PTY has echoed back to this socket. For a spawned session the shell echoes what
@@ -247,13 +250,248 @@ function collectOutput(ws) {
   return () => chunks.join('');
 }
 
-test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly like a wrapped one', async () => {
-  const { sid, viewer } = await spawned('spawnaudit');
-  const output = collectOutput(viewer);
+// Task 1215 diagnostics12 (diagnostics only; observes frames, never acts on them, and is read only after the existing
+// 5000 ms wait has already failed). Native Windows diagnostic runs 41226376589 / 41229418760 measured 115 output bytes and
+// no echo; this separates refusal (input_refused), shell exit (socket close), and the ORDER of first output / first prompt
+// text vs the write. prompt_first_seen_ms is an ordering observation of rendered text, never a readiness claim. Bounded:
+// first 16 output chunks (ms + byte length only), fixed type counters, <= 8 other type names, 64 KiB of prompt scan.
+const plainText = (raw) => raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').replace(/\u001b\].*?(\u0007|\u001b\\)/g, '');
+// Task 1215 pty17 (windows42 NA-1) — payload-free control-sequence IDENTITIES of the viewer output for the failure-only
+// timeline (byte-identical copy of the parser in test/cross-host-inject.test.js; a test file may not import another).
+// CSI parameter/intermediate bytes + final byte, OSC command number only, never text/title/payload; split-safe bounded
+// state; <= 32 distinct identities; 262144-code-point parse bound. Observation only: nothing is answered or written.
+function controlSequenceIdentities() {
+  const ids = new Map();
+  let state = 'text'; let params = ''; let osc = ''; let fed = 0; let overflow = 0; let truncated = false; let printable = 0;
+  const CODE_POINT_BOUND = 262144; // pty18: `fed` counts for-of CODE POINTS (not UTF-8 bytes); the bound and the report say so
+  const add = (id) => { if (ids.has(id)) ids.set(id, ids.get(id) + 1); else if (ids.size < 32) ids.set(id, 1); else overflow++; };
+  function step(ch) {
+    const code = ch.codePointAt(0);
+    if (state === 'text') {
+      if (code === 0x1b) state = 'esc';
+      else if (code >= 0x20 && code !== 0x7f && !(code >= 0x80 && code < 0xa0)) { printable++; return true; }
+    } else if (state === 'esc') {
+      if (ch === '[') { state = 'csi'; params = ''; } else if (ch === ']') { state = 'osc'; osc = ''; }
+      else if (code === 0x1b) add('ESC ?');
+      else { add(code >= 0x20 && code < 0x7f ? `ESC ${ch}` : 'ESC ?'); state = 'text'; }
+    } else if (state === 'csi') {
+      if (code >= 0x40 && code <= 0x7e) { add(`CSI ${params}${ch}`); state = 'text'; }
+      else if (code >= 0x20 && code <= 0x3f) { if (params.length < 32) params += ch; else { add('CSI overlong'); state = 'csi_skip'; } }
+      else { add('CSI malformed'); state = code === 0x1b ? 'esc' : 'text'; }
+    } else if (state === 'csi_skip') {
+      if (code >= 0x40 && code <= 0x7e) state = 'text'; else if (!(code >= 0x20 && code <= 0x3f)) state = code === 0x1b ? 'esc' : 'text';
+    } else if (state === 'osc') {
+      if (code >= 0x30 && code <= 0x39 && osc.length < 5) osc += ch;
+      else { add(`OSC ${osc || '-'}`); state = code === 0x07 ? 'text' : code === 0x1b ? 'osc_esc' : 'osc_body'; }
+    } else if (state === 'osc_body') {
+      if (code === 0x07) state = 'text'; else if (code === 0x1b) state = 'osc_esc';
+    } else if (state === 'osc_esc') {
+      if (ch === '\\') state = 'text'; else { state = 'esc'; return step(ch); } // not ST: a new sequence began
+    }
+    return false;
+  }
+  return {
+    feed(chunk) {
+      let sawPrintable = false;
+      for (const ch of chunk) { if (fed >= CODE_POINT_BOUND) { truncated = true; break; } fed++; if (step(ch)) sawPrintable = true; }
+      return sawPrintable;
+    },
+    report: () => ({ identities: Object.fromEntries(ids), distinct_overflow: overflow, printable, parser_state: state, truncated,
+      code_point_bound: CODE_POINT_BOUND, fed_code_points: fed }),
+  };
+}
+function frameTimeline(ws, origin) {
+  const ms = () => Math.round(performance.now() - origin);
+  const tl = { first_output_ms: null, prompt_first_seen_ms: null, chunks: [], types: { output: 0, input_refused: 0, other: 0 }, other_types: [], close: null,
+    first_printable_ms: null, marker_ms: null }; // pty17: + first printable / marker times (same listener, existing window)
+  const control = controlSequenceIdentities();
+  tl.control = control.report; // read at failure time
+  let scanned = '';
+  ws.on('message', (buf) => {
+    let msg = null;
+    try { msg = JSON.parse(buf.toString()); } catch { tl.types.other++; return; }
+    const type = msg && typeof msg.type === 'string' ? msg.type : null;
+    if (type === 'output' && typeof msg.data === 'string') {
+      const at = ms(); tl.types.output++;
+      if (tl.first_output_ms === null) tl.first_output_ms = at;
+      if (tl.chunks.length < 16) tl.chunks.push({ ms: at, bytes: Buffer.byteLength(msg.data, 'utf8') });
+      if (control.feed(msg.data) && tl.first_printable_ms === null) tl.first_printable_ms = at;
+      // pty18: `scanned` grows under its unchanged 64 KiB cap whether or not a prompt was already seen (before, it stopped growing at
+      // the first prompt, so a later marker could never be found); both checks run on each growth, including the cap-crossing chunk.
+      if (scanned.length < 65536) {
+        scanned += msg.data;
+        if (tl.prompt_first_seen_ms === null && plainText(scanned).includes('PS ')) tl.prompt_first_seen_ms = at;
+        if (tl.marker_ms === null && (scanned.includes('SPAWNMARKER_OK') || plainText(scanned).includes('SPAWNMARKER_OK'))) tl.marker_ms = at;
+      }
+    } else if (type === 'input_refused') tl.types.input_refused++;
+    else {
+      tl.types.other++;
+      if (type && /^[a-z_]{1,32}$/.test(type) && tl.other_types.length < 8 && !tl.other_types.includes(type)) tl.other_types.push(type);
+    }
+  });
+  ws.on('close', (code) => { if (!tl.close) tl.close = { code, ms: ms() }; });
+  return tl;
+}
+function byteClasses(raw) {
+  const count = (re) => (raw.match(re) || []).length;
+  return { esc: count(/\u001b/g), csi: count(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g), osc: count(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g),
+    cr: count(/\r/g), lf: count(/\n/g), printable: [...plainText(raw)].filter((ch) => ch >= ' ' && ch !== '\u007f').length };
+}
+// Task 1215 pty33 (failure-only, observe-only; runs only after the unchanged 5000 ms wait has ALREADY failed and always ends
+// in the original error being rethrown). One fixed post-verdict window keeps the EXISTING collectOutput/frameTimeline
+// listeners recording, so a late prompt / late marker / close can be told apart (queued input vs early loss vs stall vs
+// exit). No PTY write, no resend, no retry, no polling loop; counts, times and fixed labels only — never output or title.
+const POST_VERDICT_WINDOW_MS = 20000;
+const UPSTREAM_PROBE_TIMEOUT_MS = 2000;
+// One payload-free GET /api/sessions/<sid> read of `transport.upstream_bytes` (built at src/mailbox/delivery-runtime.js:1183;
+// the daemon.js route serving it was not in the supplied source, so a missing shape is the typed `shape_absent`, never
+// inferred). Request AND body share one AbortController bound to `timeoutMs`; only status, one number and labels are kept.
+async function upstreamBytesProbe(sid, timeoutMs) {
+  const started = performance.now();
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  const done = (r) => ({ ...r, elapsed_ms: Math.round(performance.now() - started) });
+  try {
+    const res = await fetch(`${base()}/api/sessions/${encodeURIComponent(sid)}`, { headers: { 'x-telepty-token': TOKEN }, signal: ac.signal });
+    if (!res.ok) {
+      try { if (res.body) await res.body.cancel(); } catch { /* observation only */ }
+      return done({ ok: false, error: 'http_status', status: res.status });
+    }
+    const text = await res.text();
+    if (text.length > 1048576) return done({ ok: false, error: 'body_too_large', status: res.status });
+    let body = null;
+    try { body = JSON.parse(text); } catch { return done({ ok: false, error: 'parse_error', status: res.status }); }
+    const transport = body && typeof body.transport === 'object' && body.transport ? body.transport : null;
+    if (!transport || !Number.isFinite(transport.upstream_bytes)) {
+      return done({ ok: false, error: 'shape_absent', status: res.status, has_transport: transport !== null });
+    }
+    return done({ ok: true, status: res.status, upstream_bytes: transport.upstream_bytes });
+  } catch (err) {
+    if (ac.signal.aborted) return done({ ok: false, error: 'timeout', timeout_ms: timeoutMs });
+    return done({ ok: false, error: 'fetch_error', name: String(err && err.name).slice(0, 64),
+      code: String((err && err.cause && err.cause.code) || '').slice(0, 64) || null });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+// The existing timeline/output counters re-read at one point in time (fresh copies, so later frames cannot change them).
+function observationPoint(at, sid, timeline, output, origin) {
+  const raw = output();
+  const { stdout, stderr } = daemon.getLogs();
+  return { at, ms: Math.round(performance.now() - origin), first_output_ms: timeline.first_output_ms,
+    prompt_first_seen_ms: timeline.prompt_first_seen_ms, first_printable_ms: timeline.first_printable_ms, marker_ms: timeline.marker_ms,
+    close: timeline.close ? { ...timeline.close } : null, types: { ...timeline.types }, chunks: timeline.chunks.map((c) => ({ ...c })),
+    output_bytes: Buffer.byteLength(raw, 'utf8'), output_utf16_units: raw.length, control: timeline.control(),
+    exit_log_lines: `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid) && l.includes('[EXIT]')).length };
+}
+async function postVerdictObservation(sid, timeline, output, origin) {
+  const windowStart = performance.now();
+  const failure = observationPoint('failure', sid, timeline, output, origin);
+  failure.upstream = await upstreamBytesProbe(sid, UPSTREAM_PROBE_TIMEOUT_MS);
+  const remaining = Math.max(0, POST_VERDICT_WINDOW_MS - (performance.now() - windowStart));
+  await new Promise((resolve) => setTimeout(resolve, remaining));
+  const windowEnd = observationPoint('window_end', sid, timeline, output, origin);
+  windowEnd.upstream = await upstreamBytesProbe(sid, UPSTREAM_PROBE_TIMEOUT_MS);
+  return { window_ms: POST_VERDICT_WINDOW_MS, probe_timeout_ms: UPSTREAM_PROBE_TIMEOUT_MS, failure, window_end: windowEnd };
+}
 
+// Task 1215 native39 — HERMETIC TEST PROTOCOL ONLY (never a production screen gate). Measured on native Windows (diagnostic
+// run, df4cb86): the single write was sent at 58 ms, the 5000 ms wait failed at 5092 ms with 115 control-only bytes, and the
+// UNCHANGED write's echo then arrived at 6013 ms, after the first prompt at 5518 ms — the 5000 ms bound was spent on PowerShell
+// startup, not on delivery. On win32 the REAL spawned PowerShell (same executable, -NoLogo -NoProfile kept) defines its own
+// prompt function through -NoExit -Command, so the shell itself prints a per-test token at its first prompt, i.e. when its
+// console host starts reading input. The shell builds the token by concatenation, so the literal never appears in argv or a
+// title; no argv element contains whitespace, a double quote or a backslash, so the CreateProcess command-line quoting layer
+// leaves each one verbatim (single quotes are PowerShell string delimiters, not argv quoting; PowerShell joins the words
+// after -Command with spaces). Off win32 this returns null and the POSIX path is unchanged.
+//
+// Task 1215 native44 — DETERMINISTIC RELEASE (replaces native39's "token absent before the write" check, which was a
+// scheduling race on a fast shell). Before it defines that prompt, the -Command script waits — bounded by
+// STARTUP_BOUND_MS on the shell's own clock — for a PRIVATE gate file that only the test creates: <USERPROFILE>/
+// tp1215-gate-<nonce>. USERPROFILE is the daemon's test HOME on win32 (daemon-harness homeEnv) and a spawned session
+// inherits the daemon's environment (src/routes/spawn.js buildSessionEnv), so no path travels in argv. The test creates
+// the gate only after the daemon has recorded the frame (the spawned door appends its `ws-viewer` audit line right after
+// ptyProcess.write: src/transport/websocket.js viewerInputDeliverer + src/audit/viewer-input.js), so the ONE write is in
+// the PTY before the shell can become ready — by construction, not by timing. No second send, no production gate.
+const STARTUP_BOUND_MS = 20000; // <= 30000 (dispatch bound); chosen so the failure path incl. the unchanged 20 s pty33 window stays under the 60000 ms diagnostic per-file timeout
+function powershellReadiness() {
+  if (process.platform !== 'win32') return null;
+  const nonce = crypto.randomBytes(6).toString('hex');
+  const gatePath = path.join(daemon.homeDir, `tp1215-gate-${nonce}`);
+  // Single-space separated; split into argv words below (none contains whitespace, `"` or `\`).
+  const script = `$g=Join-Path $env:USERPROFILE 'tp1215-gate-${nonce}'; $d=[DateTime]::UtcNow.AddMilliseconds(${STARTUP_BOUND_MS}); `
+    + `while(-not(Test-Path -LiteralPath $g) -and [DateTime]::UtcNow -lt $d){Start-Sleep -Milliseconds 20}; `
+    + `function prompt { 'TP1215READY'+'${nonce}>' }`;
+  return { token: `TP1215READY${nonce}`, gatePath,
+    release: () => { fs.writeFileSync(gatePath, '', { flag: 'wx', mode: 0o600 }); },
+    overrides: { args: ['-NoLogo', '-NoProfile', '-NoExit', '-Command', ...script.split(' ')] } };
+}
+const hasReadiness = (raw, token) => raw.includes(token) || plainText(raw).includes(token);
+
+test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly like a wrapped one', async (t) => {
+  const readiness = powershellReadiness(); // Task 1215 native39: null off win32
+  const { sid, viewer, timing } = await spawned('spawnaudit', readiness ? readiness.overrides : undefined);
+  const output = collectOutput(viewer);
+  const timeline = frameTimeline(viewer, timing.origin); // Task 1215 diagnostics12: observe-only
+
+  const writeSentMs = Math.round(performance.now() - timing.origin);
+  // Task 1215 native44: the ONE write below precedes the release by construction (see powershellReadiness); there is no
+  // second send, retry or retype at any stage.
+  const startup = { bound_ms: readiness ? STARTUP_BOUND_MS : null, recorded_ms: null, ready_at_release: null, released_ms: null, ready_observed_ms: null };
   viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_OK\r', from: 'orchestrator' }));
+  const onFailure = async (error) => {
+      // Task 1215 pty17 (windows42 NA-4): V8 formats `stack` lazily — read it BEFORE `message` changes (reading it after
+      // already contained the note, which then appeared twice). Both notes are appended once, below.
+      const stack = error.stack; const first = `${error.name}: ${error.message}`;
+      // Task 1215 (#879 discriminator, diagnostics only; no bytes): did anything come back, and is the marker present
+      // once terminal escape sequences are removed (split echo) vs absent altogether (write never reached the PTY)?
+      const raw = output(); const plain = raw.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').replace(/\u001b\].*?(\u0007|\u001b\\)/g, '');
+      // Task 1215 G-SHELL step 1 (K4), still diagnostics only: printable/prompt summary and a NON-asserting audit look-up,
+      // separating "forwarded but the shell never rendered/echoed" from "never forwarded". Counts and fixed labels only.
+      const audit = auditLines().filter((l) => l.to === sid && l.source === 'ws-viewer');
+      const diag = JSON.stringify({ output_bytes: Buffer.byteLength(raw, 'utf8'), any_output: raw.length > 0,
+        marker_raw: raw.includes('SPAWNMARKER_OK'), marker_plain: plain.includes('SPAWNMARKER_OK'), command_plain: plain.includes('echo SPAWNMARKER'),
+        printable: [...plain].filter((ch) => ch >= ' ' && ch !== '\u007f').length, prompt_ps: plain.includes('PS '),
+        audit_lines: audit.length, delivery_results: audit.slice(-4).map((l) => String(l.delivery_result).slice(0, 64)) });
+      t.diagnostic(`#879 diag spawned_echo ${diag}`);
+      // Task 1215 diagnostics12: the bounded timeline (no raw output), plus <= 8 daemon log lines naming this sid (<= 300 chars).
+      const { stdout, stderr } = daemon.getLogs();
+      const log = `${stdout}\n${stderr}`.split(/\r?\n/).filter((l) => l.includes(sid)).slice(-8).map((l) => l.slice(0, 300));
+      const tdiag = JSON.stringify({ spawn_response_ms: timing.spawn_response_ms, viewer_open_ms: timing.viewer_open_ms, write_sent_ms: writeSentMs,
+        failed_at_ms: Math.round(performance.now() - timing.origin), startup, ...timeline, control: timeline.control(), byte_classes: byteClasses(raw), log,
+        observation_limit: 'this timeline is the win32-only bounded startup stage (startup.bound_ms, null off win32) then the existing 5000 ms wait; post_verdict adds one fixed observe-only window after the verdict' });
+      t.diagnostic(`#879 diag spawned_timeline ${tdiag}`);
+      // Task 1215 pty33: the verdict and the original error (stack/first above) are already fixed; the window below can only
+      // add evidence. An observer fault is kept as a typed label and never replaces the original error, which is rethrown.
+      let post;
+      try { post = await postVerdictObservation(sid, timeline, output, timing.origin); }
+      catch (observerError) { post = { observer_error: String(observerError && observerError.name).slice(0, 64) }; }
+      finally { viewer.removeAllListeners('message'); } // the existing listeners live only for the bounded window
+      const pdiag = JSON.stringify(post);
+      t.diagnostic(`#879 diag spawned_post_verdict ${pdiag}`);
+      const note = ` | K4 evidence ${diag} | timeline ${tdiag} | post_verdict ${pdiag}`;
+      error.message += note;
+      if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
+      throw error;
+  };
+  // Task 1215 native39/native44: stage 1 (win32 only) — the daemon has recorded the frame (existing audit wait), the test
+  // releases the shell's private gate, then a bounded startup ends with the shell's own readiness token.
+  if (readiness) {
+    await waitForAudit((l) => l.to === sid && l.source === 'ws-viewer').catch(onFailure);
+    startup.recorded_ms = Math.round(performance.now() - timing.origin);
+    startup.ready_at_release = hasReadiness(output(), readiness.token);
+    assert.equal(startup.ready_at_release, false, 'protocol: the shell cannot print its readiness token before the test releases it');
+    readiness.release();
+    startup.released_ms = Math.round(performance.now() - timing.origin);
+    await daemon.waitFor(() => (hasReadiness(output(), readiness.token) ? true : null),
+      { timeoutMs: STARTUP_BOUND_MS, description: 'the spawned PowerShell to print its test readiness prompt (bounded startup stage)' })
+      .catch(onFailure);
+    startup.ready_observed_ms = Math.round(performance.now() - timing.origin);
+  }
+  // Stage 2 — the ORIGINAL 5000 ms delivery bound and marker, now starting once readiness is observed (win32) / at once (POSIX).
   await daemon.waitFor(() => (output().includes('SPAWNMARKER_OK') ? true : null),
-    { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' });
+    { timeoutMs: 5000, description: 'the orchestrator-lane write to reach the spawned PTY' })
+    .catch(onFailure);
 
   const lines = await waitForAudit((l) => l.to === sid && l.source === 'ws-viewer');
   assert.equal(lines.length, 1, 'one line per viewer write, same as the wrapped door');
@@ -266,10 +504,31 @@ test('#843: a SPAWNED session\'s viewer write is authorized and audited, exactly
 });
 
 test('#843: #533 applies at the spawned door too — the block is not one `else` away', async () => {
-  const { sid, viewer } = await spawned('spawnpeer');
+  const readiness = powershellReadiness(); // Task 1215 native44: null off win32 (POSIX path unchanged)
+  const { sid, viewer } = await spawned('spawnpeer', readiness ? readiness.overrides : undefined);
   const output = collectOutput(viewer);
 
   viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_LEAK\r', from: 'peer-alpha' }));
+  // Task 1215 native44 (win32): measured, PowerShell can print nothing for > 5 s after spawn, so a window that starts at the
+  // write proves nothing there. Readiness/control phase: once the daemon has decided this frame (its audit line), the test
+  // releases the shell and waits for the shell's own readiness token — proof the real shell is now reading input and
+  // rendering, so anything queued in its PTY would be echoed within the unchanged window below.
+  if (readiness) {
+    await waitForAudit((l) => l.to === sid && l.source === 'ws-viewer');
+    readiness.release();
+    await daemon.waitFor(() => (hasReadiness(output(), readiness.token) ? true : null),
+      { timeoutMs: STARTUP_BOUND_MS, description: 'the spawned PowerShell to print its test readiness prompt (control phase before the no-leak window)' });
+    // Task 1215 native51 (review F1): a rendered prompt does not prove that input queued before the release was
+    // already consumed (measured: queued typeahead echoed ~495 ms after the first prompt). ONE permitted
+    // orchestrator-lane frame with a distinct marker is sent now and its echo awaited within the original 5000 ms
+    // delivery bound. PTY input is FIFO, so its echo proves that anything queued ahead of it — a leaked
+    // SPAWNMARKER_LEAK included — has already been read and rendered before the unchanged window below starts.
+    // Its forwarded audit line comes AFTER the blocked one (that line was awaited above), so lines[0] below is
+    // still the peer-alpha refusal.
+    viewer.send(JSON.stringify({ type: 'input', data: 'echo SPAWNMARKER_CTRL\r', from: 'orchestrator' }));
+    await daemon.waitFor(() => (output().includes('SPAWNMARKER_CTRL') ? true : null),
+      { timeoutMs: 5000, description: 'the orchestrator-lane control marker to echo (FIFO drain before the no-leak window)' });
+  }
   // A shell echoes what is typed into it, so if these bytes reached the PTY the marker comes back
   // within milliseconds. Give it a full second before concluding it did not.
   await new Promise((r) => setTimeout(r, 1000));

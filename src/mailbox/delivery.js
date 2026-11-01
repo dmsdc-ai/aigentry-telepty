@@ -1,16 +1,23 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
+function lockRefused(error, sessionId) {
+  const refused = ['MAILBOX_LOCK_TIMEOUT', 'MAILBOX_LOCK_LEGACY', 'MAILBOX_LOCK_STORAGE'].includes(error.code)
+    || error.message.includes('lock timeout');
+  if (refused && ['MAILBOX_LOCK_LEGACY', 'MAILBOX_LOCK_STORAGE'].includes(error.code)) {
+    console.error(`[MAILBOX] Delivery paused for ${sessionId}: ${error.message}`);
+  }
+  return refused;
+}
+
 
 /**
  * DeliveryEngine — polls mailbox for pending messages and delivers them.
  *
  * For each registered session, dequeues messages and calls the deliverFn callback.
- * On success: ack. On failure: nack (retry with backoff, then dead-letter).
+ * On success: ack. Definite failures nack; uncertain outcomes are quarantined without retry.
  *
  * Also handles:
- * - In-flight timeout recovery (auto-nack stuck messages)
+ * - In-flight recovery (fenced attempts stay unknown; untouched legacy entries can retry)
  * - TTL expiry (expire stale pending messages)
  * - Stale lock detection: consecutive failure tracking + exponential backoff
  */
@@ -26,6 +33,7 @@ class DeliveryEngine {
   constructor(mailbox, options = {}) {
     this.mailbox = mailbox;
     this.deliverFn = options.deliverFn;
+    this.canProcess = options.canProcess || (()=>true);
     this.sessionResolver = options.sessionResolver || (() => this.mailbox.listSessions());
     this.pollMs = options.pollMs || mailbox.config.deliveryPollMs || 200;
     this.onDelivery = options.onDelivery || null;
@@ -76,9 +84,9 @@ class DeliveryEngine {
 
     try {
       const sessionIds = this.sessionResolver();
-      const lockBreakThreshold = this.mailbox.config.lockBreakAfterFailures || 3;
 
       for (const sessionId of sessionIds) {
+        if(!this.canProcess(sessionId))continue;
         // Fix 5: Skip sessions in backoff
         const skipUntil = this._skipUntil.get(sessionId) || 0;
         if (Date.now() < skipUntil) continue;
@@ -87,12 +95,13 @@ class DeliveryEngine {
 
         // 1. Recover in-flight timeouts
         try {
+          if(!this.canProcess(sessionId))continue;
           const recovered = this.mailbox.recoverInflight(sessionId);
           if (recovered > 0) {
             console.log(`[MAILBOX] Recovered ${recovered} in-flight message(s) for ${sessionId}`);
           }
         } catch (err) {
-          if (err.message.includes('lock timeout')) {
+          if (lockRefused(err, sessionId)) {
             lockFailed = true;
           } else {
             console.error(`[MAILBOX] recoverInflight error for ${sessionId}: ${err.message}`);
@@ -102,12 +111,13 @@ class DeliveryEngine {
         // 2. Expire stale messages
         if (!lockFailed) {
           try {
+            if(!this.canProcess(sessionId))continue;
             const expired = this.mailbox.expireStale(sessionId);
             if (expired > 0) {
               console.log(`[MAILBOX] Expired ${expired} stale message(s) for ${sessionId}`);
             }
           } catch (err) {
-            if (err.message.includes('lock timeout')) {
+            if (lockRefused(err, sessionId)) {
               lockFailed = true;
             } else {
               console.error(`[MAILBOX] expireStale error for ${sessionId}: ${err.message}`);
@@ -118,6 +128,7 @@ class DeliveryEngine {
         // 3. Dequeue and deliver
         if (!lockFailed) {
           try {
+            if(!this.canProcess(sessionId))continue;
             const msg = this.mailbox.dequeue(sessionId);
             if (!msg) {
               // Success path (no message but lock acquired OK)
@@ -134,24 +145,41 @@ class DeliveryEngine {
               continue;
             }
 
-            let result;
-            try {
-              result = await this.deliverFn(sessionId, msg);
-            } catch (err) {
-              result = { success: false, error: err.message };
+            let result, fenced = false;
+            try { fenced = this.mailbox.beginNonRetryableAttempt(sessionId, msg.msg_id); }
+            catch { /* Fail before entering an effectful callback if durability is unavailable. */ }
+            if (!fenced) result = { success: false, code: 'TRACKING_PERSISTENCE_FAILED', bytes_written: 0,
+              error: 'Delivery attempt fence unavailable; callback was not invoked.' };
+            else {
+              try { result = await this.deliverFn(sessionId, msg); }
+              catch { result = { success: false, code: 'DELIVERY_UNCERTAIN', delivery_uncertain: true, bytes_written: null,
+                error: 'Delivery callback threw; physical outcome is unknown.' }; }
             }
 
             if (result && result.success) {
-              this.mailbox.ack(sessionId, msg.msg_id);
+              try { this.mailbox.ack(sessionId, msg.msg_id, result); }
+              catch {
+                // Physical invocation is not a durable transport-ACK receipt. Its
+                // attempt fence remains authoritative; never invoke the deliverer again.
+                if (this.onDelivery) this.onDelivery(sessionId, msg.msg_id, {success:false,delivery_uncertain:true,
+                  outcome:'unknown',retryable:false,bytes_written:null,code:'MAILBOX_ACK_STORE_UNAVAILABLE'});
+                continue;
+              }
               if (this.onDelivery) {
                 this.onDelivery(sessionId, msg.msg_id, { success: true });
               }
+            } else if (result && result.delivery_uncertain === true) {
+              let quarantined = false;
+              try { quarantined = this.mailbox.withdraw(sessionId, msg.msg_id, 'delivery_outcome_unknown', { inFlight: true, deliveryUncertain: true }); }
+              catch { /* The fsynced attempt fence still prevents restart recovery from retrying. */ }
+              if (this.onDelivery) this.onDelivery(sessionId, msg.msg_id, { ...result, success: false, outcome: 'unknown', retryable: false, quarantined });
+              console.warn(`[MAILBOX] Delivery outcome unknown for ${sessionId}/${msg.msg_id}; automatic retry disabled`);
             } else {
               const reason = (result && result.error) || 'delivery failed';
               this.mailbox.nack(sessionId, msg.msg_id, reason);
               console.log(`[MAILBOX] Delivery failed for ${sessionId}/${msg.msg_id}: ${reason} (attempt ${msg.attempt})`);
               if (this.onDelivery) {
-                this.onDelivery(sessionId, msg.msg_id, { success: false, error: reason });
+                this.onDelivery(sessionId, msg.msg_id, { ...result, success: false, error: reason });
               }
             }
 
@@ -159,7 +187,7 @@ class DeliveryEngine {
             this._lockFailures.delete(sessionId);
             this._skipUntil.delete(sessionId);
           } catch (err) {
-            if (err.message.includes('lock timeout')) {
+            if (lockRefused(err, sessionId)) {
               lockFailed = true;
             } else {
               console.error(`[MAILBOX] Delivery loop error for ${sessionId}: ${err.message}`);
@@ -167,23 +195,13 @@ class DeliveryEngine {
           }
         }
 
-        // Fix 4 & 5: Handle lock failure — track, force-break, backoff
+        // Contention is not evidence that a writer has stopped. Keep backing
+        // off; dead v2 owners are reaped by acquisition/startup, never force-unlink.
         if (lockFailed) {
-          const failCount = (this._lockFailures.get(sessionId) || 0) + 1;
+          const failCount = Math.min((this._lockFailures.get(sessionId) || 0) + 1, 16);
           this._lockFailures.set(sessionId, failCount);
-
-          // Fix 4: Force-break after N consecutive failures
-          if (failCount >= lockBreakThreshold) {
-            const lockPath = path.join(this.mailbox._sessionDir(sessionId), '.lock');
-            try { fs.unlinkSync(lockPath); } catch {}
-            console.warn(`[MAILBOX] Force-broke stale lock for ${sessionId} after ${failCount} consecutive failures`);
-            this._lockFailures.delete(sessionId);
-            this._skipUntil.delete(sessionId);
-          } else {
-            // Fix 5: Exponential backoff — skip this session for increasing intervals
-            const backoffMs = Math.min(this.pollMs * (1 << failCount), 30000);
-            this._skipUntil.set(sessionId, Date.now() + backoffMs);
-          }
+          const backoffMs = Math.min(this.pollMs * (2 ** failCount), 30000);
+          this._skipUntil.set(sessionId, Date.now() + backoffMs);
         }
       }
     } finally {

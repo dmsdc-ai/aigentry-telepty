@@ -2,143 +2,12 @@
 
 const fs = require('fs');
 const path = require('path');
-const { resolveSessionDir, checkRoot, checkFile, openFile, readFile, writeFile, unlinkFile, rethrowBoundary } = require('./path-boundary');
+const { resolveSessionDir, checkRoot, checkFile, openFile, readFile, writeFile } = require('./path-boundary');
 
-// --- Advisory file locking (PID-based, per-session) ---
-
-const LOCK_POLL_MS = 10;
-const LOCK_TIMEOUT_MS = 500;
-const DEFAULT_STALE_LOCK_AGE_MS = 60000; // 60s — lock hold time is ~5ms, so 60s is definitionally stale
-
-function isProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e.code === 'EPERM';
-  }
-}
-
-/**
- * Acquire an advisory lock for a session directory.
- * Returns a release function. Throws on timeout.
- *
- * @param {string} sessionDir
- * @param {Object} [options]
- * @param {number} [options.staleLockAgeMs] — break locks older than this (default 60s)
- */
-function acquireLock(sessionDir, options = {}) {
-  const lockPath = path.join(sessionDir, '.lock');
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
-  const staleLockAgeMs = options.staleLockAgeMs || DEFAULT_STALE_LOCK_AGE_MS;
-
-  while (Date.now() < deadline) {
-    try {
-      const fd = openFile(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }
-      return () => {
-        try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
-      };
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-
-      // Lock file exists — check age first, then PID
-
-      // Fix 2: Lock age threshold — if lock is older than staleLockAgeMs,
-      // break regardless of PID (handles PID recycling)
-      try {
-        const stat = checkFile(lockPath);
-        const ageMs = Date.now() - stat.mtimeMs;
-        if (ageMs > staleLockAgeMs) {
-          try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
-          continue;
-        }
-      } catch (err) {
-        rethrowBoundary(err);
-        // stat failed — file may have been removed between EEXIST and stat
-        continue;
-      }
-
-      // Fix 1: Invalid PID handling — treat NaN, 0, negative, empty as stale
-      try {
-        const content = readFile(lockPath).trim();
-        const pid = Number(content);
-        if (!Number.isFinite(pid) || pid <= 0 || !isProcessAlive(pid)) {
-          // Invalid PID (empty, NaN, 0, negative) OR dead PID → stale lock
-          try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
-          continue;
-        }
-      } catch (err) {
-        rethrowBoundary(err);
-        // Can't read lock file — remove and retry
-        try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
-        continue;
-      }
-
-      // Lock is held by a live process with a recent lock — wait
-      const buffer = new SharedArrayBuffer(4);
-      const view = new Int32Array(buffer);
-      Atomics.wait(view, 0, 0, LOCK_POLL_MS);
-    }
-  }
-
-  throw new Error(`Mailbox lock timeout for ${sessionDir}`);
-}
-
-/**
- * Break stale lock files across all session directories (startup sweep).
- * Returns count of broken locks.
- *
- * @param {string} root — mailbox root directory
- * @param {Object} [options]
- * @param {number} [options.staleLockAgeMs] — age threshold (default 60s)
- */
-function breakStaleLocks(root, options = {}) {
-  const staleLockAgeMs = options.staleLockAgeMs || DEFAULT_STALE_LOCK_AGE_MS;
-  const dirs = listSessionDirs(root);
-  let broken = 0;
-
-  for (const { sessionId, dir } of dirs) {
-    const lockPath = path.join(dir, '.lock');
-    if (!checkFile(lockPath)) continue;
-
-    let shouldBreak = false;
-    let reason = '';
-
-    try {
-      const stat = checkFile(lockPath);
-      const ageMs = Date.now() - stat.mtimeMs;
-
-      if (ageMs > staleLockAgeMs) {
-        shouldBreak = true;
-        reason = `age ${Math.round(ageMs / 1000)}s > ${Math.round(staleLockAgeMs / 1000)}s threshold`;
-      } else {
-        // Check PID validity
-        const content = readFile(lockPath).trim();
-        const pid = Number(content);
-        if (!Number.isFinite(pid) || pid <= 0) {
-          shouldBreak = true;
-          reason = `invalid PID: ${JSON.stringify(content)}`;
-        } else if (!isProcessAlive(pid)) {
-          shouldBreak = true;
-          reason = `dead PID ${pid}`;
-        }
-      }
-    } catch (err) {
-      rethrowBoundary(err);
-      // Can't read/stat lock — treat as stale
-      shouldBreak = true;
-      reason = 'unreadable lock file';
-    }
-
-    if (shouldBreak) {
-      try { unlinkFile(lockPath); } catch (err) { rethrowBoundary(err); }
-      console.log(`[MAILBOX] Broke stale lock for ${sessionId}: ${reason}`);
-      broken++;
-    }
-  }
-
-  return broken;
+// Versioned local-filesystem locking. Legacy PID files are never auto-unlinked.
+const { acquireLock, reapSessionLocks, isProcessAlive } = require('./lock');
+function breakStaleLocks(root) {
+  return listSessionDirs(root).reduce((count, {dir}) => count + reapSessionLocks(dir), 0);
 }
 
 // --- JSONL read/write ---
@@ -228,26 +97,25 @@ function countPending(sessionDir, nowSecs) {
  */
 function compact(sessionDir, threshold) {
   const states = loadStates(sessionDir);
+  const journal = readJsonl(path.join(sessionDir, 'state.jsonl'));
+  const unknown = new Set(journal.filter(row => row.delivery_uncertain === true || row.outcome === 'unknown' || row.retryable === false).map(row => row.msg_id));
   const terminalStates = new Set(['acked', 'expired', 'dead_letter']);
-  let terminalCount = 0;
-  for (const entry of states.values()) {
-    if (terminalStates.has(entry.state)) terminalCount++;
-  }
-
+  const terminalCount = [...states.values()].filter(row => terminalStates.has(row.state) && !unknown.has(row.msg_id)).length;
   if (terminalCount < threshold) return;
 
   const messages = loadMessages(sessionDir);
-  const activeMessages = messages.filter(m => {
-    const st = states.get(m.msg_id);
-    return !st || !terminalStates.has(st.state);
-  });
+  const activeMessages = messages.filter(message => unknown.has(message.msg_id) || !terminalStates.has(states.get(message.msg_id)?.state));
+  const pristine = require('./custody').pristinePendingIds(sessionDir, path.basename(sessionDir));
   writeJsonl(path.join(sessionDir, 'inbox.jsonl'), activeMessages);
 
-  const activeStates = [];
+  // Preserve explicit unknown history and payload independently of the optional DLQ.
+  // A generic later ACK cannot manufacture a settlement proof.
+  const activeStates = journal.filter(row => unknown.has(row.msg_id));
   for (const entry of states.values()) {
-    if (!terminalStates.has(entry.state)) {
-      activeStates.push(entry);
-    }
+    if (unknown.has(entry.msg_id) || terminalStates.has(entry.state)) continue;
+    if (entry.never_attempted === true && !pristine.has(entry.msg_id)) {
+      const safe = { ...entry }; delete safe.never_attempted; activeStates.push(safe);
+    } else activeStates.push(entry);
   }
   writeJsonl(path.join(sessionDir, 'state.jsonl'), activeStates);
 }

@@ -1,8 +1,12 @@
+const { protectedInputFailure } = require('../external-approval');
+const { normalizeAuthorityAudit } = require('../principal/authority-audit');
+const { storedOwningPrincipal } = require('../principal/http');
 // Production session inspection and batch-submit operations.
 // Deliberately retains the daemon's non-strict execution semantics.
 const { defaultSubmitAdmission } = require('../submit-admission');
+const { readinessSnapshot } = require('../readiness');
 
-function createSessionInspectionContext(shared, { execSync: nativeExecSync, admission = defaultSubmitAdmission } = {}) {
+function createSessionInspectionContext(shared, { execFileSync: nativeExecFileSync, admission = defaultSubmitAdmission } = {}) {
 function serializeSession(id, session, options = {}) {
   const nowMs = options.nowMs ?? Date.now();
   const idleSeconds = session.lastActivityAt ? Math.floor((nowMs - new Date(session.lastActivityAt).getTime()) / 1000) : null;
@@ -16,9 +20,16 @@ function serializeSession(id, session, options = {}) {
 
   return {
     id,
+    session_epoch: session.sessionEpoch || null,
+    lastInjectReturn: session.lastInjectReturn || null,
+    ...(normalizeAuthorityAudit(session.authorityAudit)?.length ? { authorityAudit: normalizeAuthorityAudit(session.authorityAudit) } : {}),
+    ...(storedOwningPrincipal(session.owningPrincipal) ? { owningPrincipal: storedOwningPrincipal(session.owningPrincipal) } : {}),
     locator: { machine_id: shared.MACHINE_ID, session_id: id, project_id: projectId },
     type: session.type || 'spawned',
+    ...(session.externalApprovalPolicy ? { input_policy: { authority: 'external-signer', supported_ingress: ['inject'], other_writes: 'denied' } } : {}),
+    ...(session.type === 'mailbox' ? { lease_expires_at: session.leaseExpiresAt || null } : {}),
     command: session.command,
+    ...(session.sshRemote ? { sshRemote: session.sshRemote, ssh: session.sshState || { phase: 'connecting', reason: 'owner_not_observed' } } : {}),
     cwd: session.cwd,
     backend: session.backend || 'kitty',
     terminal: (0, shared.getSessionTerminalLabel)(session),
@@ -33,6 +44,7 @@ function serializeSession(id, session, options = {}) {
     idleSeconds,
     active_clients: session.clients ? session.clients.size : 0,
     ready: session.ready || false,
+    handshake: readinessSnapshot(session, { nowMs, machineId: shared.MACHINE_ID }),
     delivery: session.delivery || null,
     deliveryEndpoint: session.deliveryEndpoint || null,
     healthStatus,
@@ -90,8 +102,9 @@ function getSubmitStrategy(command) {
 }
 
 function submitViaOsascript(sessionId, keyCombo) {
-  const execSync = nativeExecSync === undefined ? require('child_process').execSync : nativeExecSync;
+  const execFileSync = nativeExecFileSync === undefined ? require('child_process').execFileSync : nativeExecFileSync;
   const session = shared.sessions[sessionId];
+  if (protectedInputFailure(session)) return false;
   // Build fallback search terms: session ID, project dir name, CLI-specific patterns
   const searchTerms = [sessionId];
   if (session) {
@@ -108,13 +121,13 @@ function submitViaOsascript(sessionId, keyCombo) {
     ? 'key code 36 using command down'
     : 'key code 36';
 
-  // Try each search term until we find a matching window
-  const searchTermsStr = searchTerms.map(t => `"${t}"`).join(', ');
+  // Try each search term until we find a matching window. The terms (caller data: session id,
+  // cwd basename) are run-handler arguments, never AppleScript or shell text (PR #108 review C5).
   const script = `
+    on run argv
     tell application "System Events"
       tell process "stable"
-        set searchList to {${searchTermsStr}}
-        repeat with term in searchList
+        repeat with term in argv
           repeat with w in windows
             if name of w contains (term as text) then
               perform action "AXRaise" of w
@@ -126,10 +139,11 @@ function submitViaOsascript(sessionId, keyCombo) {
         end repeat
         return "window_not_found"
       end tell
-    end tell`;
+    end tell
+    end run`;
 
   try {
-    const result = execSync(`osascript -e '${script}'`, { timeout: 5000 }).toString().trim();
+    const result = execFileSync('osascript', ['-e', script, ...searchTerms], { timeout: 5000 }).toString().trim();
     const ok = result.startsWith('ok:');
     if (ok) console.log(`[SUBMIT] osascript matched: ${result}`);
     return ok;
@@ -180,8 +194,14 @@ app.get('/api/sessions/:id', (req, res) => {
   const resolvedId = (0, shared.resolveSessionAlias)(requestedId);
   if (!resolvedId) return res.status(404).json({ error: 'Session not found' });
   const session = shared.sessions[resolvedId];
+  const view = serializeSession(resolvedId, session);
   res.json({
-    ...serializeSession(resolvedId, session),
+    ...view,
+    // #137 single-session contract: the current owner's bridge stage support and queue summary at the
+    // top level — the SAME values as transport.bridge_receipts / transport.bridge_queue (current owner
+    // generation only, from bridge-stage.js; never inferred). The list route is unchanged.
+    bridge_receipts: view.transport ? view.transport.bridge_receipts : null,
+    bridge_queue: view.transport ? view.transport.bridge_queue : null,
     alias: requestedId !== resolvedId ? requestedId : null,
     lastInjectFrom: session.lastInjectFrom || null,
     lastInjectReplyTo: session.lastInjectReplyTo || null

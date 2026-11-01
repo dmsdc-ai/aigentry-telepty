@@ -1,0 +1,14 @@
+{
+  "schema": "telepty-bridge-136-stream-recipe/v1",
+  "provenance": "synthetic: hand-authored for telepty task 1215 regression tests; NOT captured from any user session, terminal or transcript; contains no host identifiers or credentials",
+  "describes": "codex-like composer + footer still painted while a turn is running: row 19 carries the 'esc to interrupt' busy marker inside the bottom 6 rows; CUP/EL only",
+  "geometry": { "cols": 80, "rows": 24 },
+  "preamble": ["\u001b[2J", "\u001b[H", "\u001b[?25l"],
+  "cycle": [
+    "\u001b[19;1H\u001b[2K• Working (1s • esc to interrupt)\u001b[20;1H\u001b[2K› Summarize the latest changes\u001b[22;1H\u001b[2K  GPT-6-Astra xhigh · /tmp/x\u001b[20;3H",
+    "\u001b[19;1H\u001b[2K• Working (2s • esc to interrupt)\u001b[20;1H\u001b[2K› Summarize the latest changes\u001b[22;1H\u001b[2K  GPT-6-Astra xhigh · /tmp/x\u001b[20;3H",
+    "\u001b[19;1H\u001b[2K• Working (3s • esc to interrupt)\u001b[20;1H\u001b[2K› Summarize the latest changes\u001b[22;1H\u001b[2K  GPT-6-Astra xhigh · /tmp/x\u001b[20;3H"
+  ],
+  "repeat": 180,
+  "epilogue": []
+}
