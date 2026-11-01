@@ -108,7 +108,12 @@ test('failed spawn persistence kills only the newly created PTY and publishes no
     const { registerSpawnRoute } = require('../src/routes/spawn');
     let handler, killed = 0;
     const sessions = {}, events = [], states = [];
-    registerSpawnRoute({ post: (_, fn) => handler = fn }, { sessions, sessionStateManager: { register: id => states.push(id) }, pty: { spawn: () => ({ pid: 123, kill: () => killed++, onData: () => { }, onExit: () => { } }) }, persistSessions: () => ({ ok: false, committed: false }), appendToOutputRing: () => { }, revokeSessionCredential: () => { }, busClients: new Set([{ readyState: 1, send: msg => events.push(msg) }]), os: { platform: () => process.platform }, buildSessionEnv: () => ({}), admission: { take: () => ({ allowed: true }) } });
+    const child = { pid: 123, kill: () => killed++, onData: () => { }, onExit: () => { } };
+    // #1215 fixtures205: on win32 the real spawn route refuses a PTY without node-pty's supported Windows input interface
+    // (503 PTY_INPUT_UNSUPPORTED) BEFORE persistence. Only the win32 fake gets that minimal shape, so this test keeps
+    // reaching the persistence rollback: `_agent.inSocket` as a never-connected net.Socket, destroyed when the test ends.
+    if (process.platform === 'win32') { child._agent = { inSocket: new (require('node:net').Socket)() }; t.after(() => child._agent.inSocket.destroy()); }
+    registerSpawnRoute({ post: (_, fn) => handler = fn }, { sessions, sessionStateManager: { register: id => states.push(id) }, pty: { spawn: () => child }, persistSessions: () => ({ ok: false, committed: false }), appendToOutputRing: () => { }, revokeSessionCredential: () => { }, busClients: new Set([{ readyState: 1, send: msg => events.push(msg) }]), os: { platform: () => process.platform }, buildSessionEnv: () => ({}), admission: { take: () => ({ allowed: true }) } });
     const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
     // Task 1215 / #879 W4: the spawn route resolves the command through the real target builder; on win32 that
     // is a PATH×PATHEXT walk which refuses a synthetic bare name (500) before the injected persistence failure.
@@ -116,6 +121,7 @@ test('failed spawn persistence kills only the newly created PTY and publishes no
     // fixture above, so nothing is executed.
     handler({ body: { session_id: 'synthetic-spawn', command: process.execPath } }, res);
     assert.equal(res.statusCode, 503);
+    assert.equal(res.body.code, 'SESSION_STORE_WRITE_FAILED', 'the refusal is the persistence rollback, not an earlier refusal');
     assert.deepEqual(sessions, {});
     assert.equal(killed, 1);
     assert.deepEqual(events, []);

@@ -8,6 +8,10 @@ function fixture(t){
  const home=fs.mkdtempSync(path.join(os.tmpdir(),'natural-exit-122-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
  const file=path.join(home,'sessions.json'),sessions=Object.create(null),events=[];let exit,handler,fault=null;
  const child={pid:12345,onData:()=>{},onExit:fn=>{exit=fn;},kill:()=>events.push('unexpected-kill')};
+ // #1215 fixtures205: on win32 the real spawn route refuses a PTY without node-pty's supported Windows input interface
+ // (503 PTY_INPUT_UNSUPPORTED). Only the win32 fake gets that minimal shape: `_agent.inSocket` as a never-connected
+ // net.Socket (no handle, connection or listener), destroyed when the test ends.
+ if(process.platform==='win32'){child._agent={inSocket:new (require('node:net').Socket)()};t.after(()=>child._agent.inSocket.destroy());}
  const save=()=>{if(fault==='before')return{ok:false,committed:false};if(fault==='throw')throw Error('synthetic storage failure');const result=persistence.savePersistedSessions(sessions,file);return fault==='after'?{ok:false,committed:true}:result;};
  registerSpawnRoute({post:(_route,fn)=>{handler=fn;}},{sessions,sessionStateManager:{register:()=>{},feed:()=>{},markDead:()=>events.push('observed-exit'),unregister:()=>events.push('unregister')},pty:{spawn:()=>child},persistSessions:save,appendToOutputRing:()=>{},revokeSessionCredential:()=>events.push('revoke'),busClients:new Set(),os:{platform:()=>process.platform},buildSessionEnv:()=>({}),admission:{take:()=>({allowed:true})}});
  const res={statusCode:200,status(code){this.statusCode=code;return this;},json(body){this.body=body;return this;}};
