@@ -144,3 +144,101 @@ test('#910: postinstall reaches its upgrade path once a state file exists', asyn
     'that early return is the branch #910 stops production from taking every time'
   );
 });
+
+// Task 1215 repro141 (RED by design against 55568519; a reproduction, not a product fix). External-reader invariant
+// of daemon-state.json publication: with an existing COMPLETE self-owned claim, a reader that runs while a
+// replacement is in progress must see the previous complete claim, and after publication the new complete claim.
+// It must never see an empty or partial document, which the public reader reports as null.
+//
+// Barrier:
+// - In-process the replacement is one synchronous call, so a reader can only observe its intermediate states at a
+//   pause point. While the replacement claim runs, the fs write calls that touch the owned state directory are
+//   wrapped with the SAME genuine operations: open (which creates or truncates), then a probe; write the first half,
+//   then a probe; write the rest, close, then a probe. The same probe also runs after any write-capable open, write or
+//   rename in that directory. A temp-and-rename publication is therefore exercised as well, and the case cannot pass
+//   vacuously.
+// - The probe is the real public readDaemonState() plus the final file's byte length.
+// - The fixture claim is this test process's own identity, in the preload-isolated test HOME. No real daemon or
+//   other PID is consulted.
+// - Every patched fs function is restored in finally.
+// Source-predicted RED today: writeDaemonState truncates the FINAL path first (daemon-control.js:59-62), so the probe
+// after create/truncate observes null at 0 bytes. The CI empty-vs-partial length at :83 was not recorded.
+test('[1215-red141] a reader during a paused claim replacement sees the previous or the new complete claim, never empty/partial', () => {
+  const daemonControl = require('../daemon-control');
+  const { claimDaemonState, readDaemonState, clearDaemonState, DAEMON_STATE_FILE } = daemonControl;
+  const home = os.homedir(), stateDir = path.dirname(DAEMON_STATE_FILE);
+  // PRECONDITIONS (failures, never skips): only the preload-isolated test HOME may hold this fixture claim.
+  assert.match(path.basename(home), /^telepty-test-home-/, 'PRECONDITION: HOME must be the preload-isolated test home');
+  assert.ok(DAEMON_STATE_FILE.startsWith(home + path.sep), 'PRECONDITION: the state file lives under the isolated HOME');
+  assert.equal(fs.existsSync(DAEMON_STATE_FILE), false, 'PRECONDITION: no prior claim in the isolated home');
+
+  const same = require('node:util').isDeepStrictEqual;
+  const original = { openSync: fs.openSync, writeSync: fs.writeSync, closeSync: fs.closeSync, writeFileSync: fs.writeFileSync, renameSync: fs.renameSync };
+  const observations = [], hookErrors = [], trackedFds = new Set();
+  let inProbe = false, previous = null;
+  const inStateDir = (p) => typeof p === 'string' && path.dirname(path.resolve(p)) === stateDir;
+  const writable = (flags) => typeof flags === 'number'
+    ? (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC)) !== 0
+    : typeof flags === 'string' && /[wa+]/.test(flags);
+  const probe = (boundary) => {
+    if (inProbe || observations.length >= 32) return;
+    inProbe = true;
+    try {
+      let bytes = null; try { bytes = fs.statSync(DAEMON_STATE_FILE).size; } catch (e) { bytes = e.code === 'ENOENT' ? 'absent' : 'stat_error'; }
+      observations.push({ boundary, bytes, state: readDaemonState() });
+    } catch (e) { hookErrors.push({ boundary, error: e && e.code ? e.code : 'probe_error' }); }
+    finally { inProbe = false; }
+  };
+  try {
+    // 1. Initial publication (no barrier): absent before, then a complete self-owned claim.
+    const first = claimDaemonState({ host: '127.0.0.1', port: 0, version: '1215-red141-initial' });
+    assert.equal(first.claimed, true, 'CONTROL: the fixture can publish its own first claim');
+    assert.deepEqual(readDaemonState(), first.state, 'CONTROL: the public reader returns the complete first claim');
+    previous = first.state;
+
+    // 2. Replacement through the barrier.
+    fs.openSync = function (p, flags, ...rest) {
+      const fd = original.openSync.call(fs, p, flags, ...rest);
+      if (inStateDir(p) && writable(flags === undefined ? 'r' : flags)) { trackedFds.add(fd); probe('after-create-or-truncate'); }
+      return fd;
+    };
+    fs.writeSync = function (fd, ...rest) { const n = original.writeSync.call(fs, fd, ...rest); if (trackedFds.has(fd)) probe('after-write'); return n; };
+    fs.closeSync = function (fd) { trackedFds.delete(fd); return original.closeSync.call(fs, fd); };
+    fs.writeFileSync = function (file, data, options) {
+      if (!inStateDir(file)) return original.writeFileSync.call(fs, file, data, options);
+      const opts = typeof options === 'string' ? { encoding: options } : (options || {});
+      const bytes = typeof data === 'string' ? Buffer.from(data, opts.encoding || 'utf8') : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+      const fd = original.openSync.call(fs, file, opts.flag || 'w', opts.mode === undefined ? 0o666 : opts.mode); // genuine create/truncate
+      try {
+        probe('after-create-or-truncate');
+        const half = Math.floor(bytes.length / 2);
+        let offset = 0;
+        while (offset < half) offset += original.writeSync.call(fs, fd, bytes, offset, half - offset);
+        if (half > 0) probe('after-partial-write');
+        while (offset < bytes.length) offset += original.writeSync.call(fs, fd, bytes, offset, bytes.length - offset);
+      } finally { original.closeSync.call(fs, fd); }
+      probe('after-complete-write');
+    };
+    fs.renameSync = function (from, to) { const r = original.renameSync.call(fs, from, to); if (inStateDir(to)) probe('after-rename'); return r; };
+    let second;
+    try { second = claimDaemonState({ host: '127.0.0.1', port: 0, version: '1215-red141-replacement' }); }
+    finally { Object.assign(fs, original); }
+    assert.ok(Object.keys(original).every((name) => fs[name] === original[name]), 'CONTROL: every patched fs function was restored');
+
+    // 3. Truthful outcome. Test-hook health is checked first, then non-vacuity, then the contract.
+    assert.deepEqual(hookErrors, [], 'TEST HOOK FAILURE (not a product result): the reader probe itself failed');
+    assert.equal(second.claimed, true, 'CONTROL: the self-owned replacement is admitted');
+    const seen = observations.map(({ boundary, bytes, state }) => ({ boundary, bytes,
+      seen: state === null ? 'null' : same(state, previous) ? 'previous' : same(state, second.state) ? 'new' : 'other' }));
+    assert.ok(seen.some((o) => o.boundary === 'after-create-or-truncate'),
+      `NON-VACUITY: the replacement must create or truncate a file in the owned state directory while the reader probes ${JSON.stringify(seen)}`);
+    assert.deepEqual(seen.filter((o) => o.seen !== 'previous' && o.seen !== 'new'), [],
+      `the reader saw neither the previous nor the new complete claim during replacement ${JSON.stringify(seen)}`);
+    const firstNew = seen.findIndex((o) => o.seen === 'new');
+    assert.ok(firstNew === -1 || seen.slice(firstNew).every((o) => o.seen === 'new'), `once published, the new claim never reverts ${JSON.stringify(seen)}`);
+    assert.deepEqual(readDaemonState(), second.state, 'after publication the reader returns the new complete claim');
+  } finally {
+    Object.assign(fs, original);
+    clearDaemonState(process.pid); // owned claim only (removes it only while it names this process)
+  }
+});
