@@ -16,6 +16,25 @@ const grant = (action, targets) => ({ action, targets });
 const entry = (key, principal, pair, grants) => ({ key_id: key, principal_id: principal,
   public_key_spki: pair.publicKey.export({ type: 'spki', format: 'pem' }), grants });
 const trust = (audience, keys) => ({ schema: 'telepty.principals/v1', audience, keys });
+// Task 1215 windows121 (diagnostics only): a bounded, fixed-shape record of each request a bridge's test fetch seam issued —
+// kind, settled, HTTP status OR an allowlisted error name, and error/cause code only when it is an uppercase code token.
+// Never a prompt, URL, id, token, header, message or stack. observe() returns the caller's promise unchanged.
+const OUTCOME_LIMIT = 32, CODE_TOKEN = /^[A-Z][A-Z0-9_]{1,63}$/, ERROR_NAMES = ['TypeError', 'AbortError', 'TimeoutError', 'SyntaxError', 'Error'];
+function requestOutcomes() {
+  const records = []; let issued = 0;
+  const kind = (url) => { const text = String(url); return text.includes('/v1/challenge') ? 'challenge' : text.includes('/results/') ? 'results' : /\/stream$/.test(text) ? 'stream' : 'other'; };
+  const token = (value) => (typeof value === 'string' && CODE_TOKEN.test(value) ? value : null);
+  return { kind,
+    observe(url, pending) {
+      const entry = { seq: ++issued, kind: kind(url), settled: false, status: null, error: null, code: null, cause_code: null };
+      if (records.length < OUTCOME_LIMIT) records.push(entry);
+      Promise.resolve(pending).then((response) => { entry.settled = true; entry.status = Number.isInteger(response && response.status) ? response.status : null; },
+        (reason) => { entry.settled = true; entry.error = ERROR_NAMES.includes(reason && reason.name) ? reason.name : 'other';
+          entry.code = token(reason && reason.code); entry.cause_code = token(reason && reason.cause && reason.cause.code); });
+      return pending;
+    },
+    snapshot: () => ({ issued, kept: records.length, records: records.map((entry) => ({ ...entry })) }) };
+}
 test('owned broker broadcast and reply preserve durable exact routing, scopes, and uncertainty', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-routing-'));
   const daemon = await startTestDaemon();
@@ -34,6 +53,7 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
     ]) } });
   const bridges = [], owners = []; let origin, dropResults = false;
   const nodeRuns = {}; // Task 1215 native39: diagnostics only — how each bridge's run loop settled (fixed labels / code tokens)
+  const nodeARequests = requestOutcomes(); // Task 1215 windows121: diagnostics only — node a's per-request outcomes
   const client = (principal, key, privateKey) => createBrokerClient({ config: { principal_id: principal, key_id: key, hub_audience: 'hub', hub_url: origin }, privateKey });
   try {
     const address = await hub.listen(); origin = `http://127.0.0.1:${address.port}`;
@@ -46,7 +66,7 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
     for (const [node, keys, targets] of [['a', a, ['b/return-worker']], ['b', b, ['a/worker', 'a/other']]]) {
       const bridge = createBrokerNode({ fetch: (url, options) => {
         if (node === 'b' && dropResults && url.includes('/results/')) return Promise.reject(new TypeError('Synthetic lost result'));
-        return fetch(url, options);
+        return node === 'a' ? nodeARequests.observe(url, fetch(url, options)) : fetch(url, options);
       }, privateKey: keys.privateKey, localToken: daemon.authToken(), config: {
         schema: 'telepty.broker-node/v1', principal_id: node, key_id: node, hub_url: origin, hub_audience: 'hub',
         hub_principal_id: 'hub', audience: node, local_daemon_url: `http://127.0.0.1:${daemon.port}`, local_timeout_ms: 500,
@@ -96,7 +116,8 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
         const note = ` | #1215 native39 evidence ${JSON.stringify({ waited_ms: Math.round(performance.now() - replyAdmitted),
           last_receipt: answer ? { state: answer.state ?? null, code: answer.code ?? null, remote_queued: answer.remote_queued ?? null,
             has_remote_inject_id: Boolean(answer.remote_inject_id), in_reply_to_matches: answer.in_reply_to === receipt } : null,
-          frames: { worker: count('worker'), other: count('other'), 'return-worker': count('return-worker') }, nodes: { ...nodeRuns } })}`;
+          frames: { worker: count('worker'), other: count('other'), 'return-worker': count('return-worker') }, nodes: { ...nodeRuns },
+          node_a_requests: nodeARequests.snapshot() })}`;
         error.message += note;
         if (typeof stack === 'string' && stack.startsWith(first)) error.stack = first + note + stack.slice(first.length);
         throw error;
@@ -185,6 +206,82 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
     assert.equal(frames.length, deliveredBeforeReplay, 'lost result never causes delivery replay');
 
   } finally {
+    for (const bridge of bridges) await bridge.stop();
+    for (const owner of owners) owner.close();
+    await hub.close(); await daemon.stop(); fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Task 1215 windows121: a deterministic uncertain result on node a's REPLY leg. This is a diagnostic reproduction of the
+// Windows :88 tuple; it fixes nothing, and the original trigger stays unknown. Node a's fetch seam holds ONE request of the
+// named stage that follows its local forwarded inject: the result POST, or (a separate variant) the challenge GET just
+// before it. It holds that request until the hub's own 500 ms result timer has recorded outcome_unknown/BROKER_RESULT_TIMEOUT,
+// then rejects it with a coded socket TypeError. Holding keeps node a's stream open, so the hub's stream-loss path
+// (BROKER_STREAM_LOST, hub.js close handler) cannot pre-empt the timer. The ordering is event-driven, with no added clock constant.
+for (const stage of ['results', 'challenge']) test(`a lost reply result (${stage === 'results' ? 'result POST' : 'challenge GET before it'}) stays one frame and a truthful bounded unknown, never retried`, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-uncertain-'));
+  const daemon = await startTestDaemon();
+  const a = pair(), b = pair(), h = pair();
+  const limits = { max_payload_bytes: 512, max_requests: 100, window_ms: 60000, timeout_ms: 500, max_pending: 16 };
+  const hub = createBrokerHub({ homeDir: root, privateKey: h.privateKey, config: { schema: 'telepty.broker-hub/v1',
+    principal_id: 'hub', key_id: 'h', audience: 'hub', stream_ms: 60000,
+    nodes: { a: { audience: 'a' }, b: { audience: 'b' } }, limits: { a: limits, b: limits },
+    trust: trust('hub', [
+      entry('a', 'a', a, [grant('broker.stream', ['a']), grant('broker.result', ['a']), grant('broker.inject', ['b/worker']), grant('broker.receipt', ['a'])]),
+      entry('b', 'b', b, [grant('broker.stream', ['b']), grant('broker.result', ['b']), grant('broker.reply_context', ['b']),
+        grant('broker.reply', ['a/return-worker']), grant('broker.receipt', ['b'])])
+    ]) } });
+  const bridges = [], owners = [], frames = [], epochs = {}, attempts = { challenge: 0, results: 0 };
+  const requests = requestOutcomes();
+  let localInjected = false, release;
+  const released = new Promise((resolve) => { release = resolve; });
+  try {
+    const address = await hub.listen(); const origin = `http://127.0.0.1:${address.port}`;
+    for (const sid of ['worker', 'return-worker']) {
+      epochs[sid] = (await daemon.registerSession(sid)).body.session_epoch;
+      const owner = await daemon.connectSession(sid, daemon.ownerAuth(sid)); owners.push(owner);
+      owner.on('message', raw => { const frame = JSON.parse(raw); if (frame.type === 'inject') frames.push({ sid, frame }); });
+    }
+    for (const [node, keys, targets] of [['a', a, ['b/return-worker']], ['b', b, ['a/worker']]]) {
+      const bridge = createBrokerNode({ fetch: (url, options) => {
+        if (node !== 'a') return fetch(url, options);
+        const kind = requests.kind(url);
+        if (String(url).includes('/api/forwarded/')) localInjected = true;
+        if (localInjected && (kind === 'challenge' || kind === 'results')) attempts[kind] += 1;
+        const held = localInjected && kind === stage && attempts[kind] === 1;
+        return requests.observe(url, held ? released.then(() => { throw new TypeError('fetch failed',
+          { cause: Object.assign(new Error('synthetic'), { code: 'UND_ERR_SOCKET' }) }); }) : fetch(url, options));
+      }, privateKey: keys.privateKey, localToken: daemon.authToken(), config: {
+        schema: 'telepty.broker-node/v1', principal_id: node, key_id: node, hub_url: origin, hub_audience: 'hub',
+        hub_principal_id: 'hub', audience: node, local_daemon_url: `http://127.0.0.1:${daemon.port}`, local_timeout_ms: 500,
+        hub_trust: trust(node, [entry('h', 'hub', h, [grant('broker.envelope', targets)])]) } });
+      bridges.push(bridge); await bridge.start();
+    }
+    const client = (principal, privateKey) => createBrokerClient({ config: { principal_id: principal, key_id: principal, hub_audience: 'hub', hub_url: origin }, privateKey });
+    const source = client('a', a.privateKey), responder = client('b', b.privateKey);
+    const count = (sid) => frames.filter((f) => f.sid === sid).length;
+    const original = await source.inject('b', 'worker', { prompt: 'Synthetic original', expected_epoch: epochs.worker, idempotency_key: 'uncertain-original-0001', no_enter: true });
+    assert.equal(original.status, 202, JSON.stringify({ code: original.body && original.body.code }));
+    await waitFor(async () => (await source.receipt('uncertain-original-0001')).body.state === 'accepted');
+    const replyBody = { target_node: 'a', return_session: 'return-worker', expected_epoch: epochs['return-worker'],
+      idempotency_key: 'uncertain-reply-0001', prompt: 'Synthetic reply', no_enter: true };
+    assert.equal((await responder.reply(original.body.receipt_id, replyBody)).status, 202);
+    let answer;
+    await waitFor(async () => { answer = (await responder.receipt(replyBody.idempotency_key)).body; return answer.state !== 'pending'; });
+    assert.deepEqual({ state: answer.state, code: answer.code }, { state: 'outcome_unknown', code: 'BROKER_RESULT_TIMEOUT' });
+    await waitFor(() => attempts[stage] === 1, { description: `node a issued the held ${stage} request` });
+    release();
+    const reason = await bridges[0].completion.then(() => null, (failure) => failure);
+    assert.ok(reason instanceof TypeError && reason.cause && reason.cause.code === 'UND_ERR_SOCKET', 'node a completion rejects with the coded socket failure');
+    await waitFor(() => count('worker') >= 1 && count('return-worker') >= 1);
+    assert.deepEqual(attempts, stage === 'results' ? { challenge: 1, results: 1 } : { challenge: 1, results: 0 }, 'the result path ran once and was never retried');
+    assert.deepEqual(requests.snapshot().records.filter((r) => r.error !== null).map(({ seq, ...rest }) => rest),
+      [{ kind: stage, settled: true, status: null, error: 'TypeError', code: null, cause_code: 'UND_ERR_SOCKET' }]);
+    const after = (await responder.receipt(replyBody.idempotency_key)).body;
+    assert.deepEqual({ state: after.state, code: after.code }, { state: 'outcome_unknown', code: 'BROKER_RESULT_TIMEOUT' }, 'node a stopping later does not rewrite the bounded unknown');
+    assert.deepEqual({ worker: count('worker'), 'return-worker': count('return-worker') }, { worker: 1, 'return-worker': 1 }, 'exactly one local frame per leg; no duplicate');
+  } finally {
+    release();
     for (const bridge of bridges) await bridge.stop();
     for (const owner of owners) owner.close();
     await hub.close(); await daemon.stop(); fs.rmSync(root, { recursive: true, force: true });
