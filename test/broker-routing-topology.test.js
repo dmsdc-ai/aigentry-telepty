@@ -287,3 +287,115 @@ for (const stage of ['results', 'challenge']) test(`a lost reply result (${stage
     await hub.close(); await daemon.stop(); fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// Task 1215 broker142 — [1215-red142] deterministic regression of the node's local-inject failure classification
+// (src/broker/node.js handle(): `catch (failure) { result = failure.code?.startsWith('BROKER_LOCAL_CHALLENGE') ? … }`).
+// It runs through the REAL public path: createBrokerNode → start() → stream → handle(envelope) → local send seam
+// (non-strict local auth: node.js `send(${local}/api/forwarded/…)`) → result POST, against a real hub and a real daemon
+// (the same fixtures as the cases above). Node b's fetch seam:
+//   - forwards the FIRST /api/forwarded/ inject for real (minus its 500 ms abort signal, so the local delivery itself
+//     completes deterministically and is counted), then rejects that call with the variant's failure;
+//   - the 'challenge' control rejects without delivering.
+// Event-driven: each case waits for whichever happens first, node b issuing its result POST or node b's run loop
+// settling. There is no sleep and no clock constant. The hub's result timer is set to its maximum (10000 ms) so a
+// corrected node can never lose a race to it.
+// Expected (the node's own contract, node.js:134-137):
+//   - a DOMException TimeoutError (the shape fetch rejects with when AbortSignal.timeout fires; its legacy `code` is
+//     a NUMBER) → exactly one result POST with outcome_unknown / BROKER_LOCAL_OUTCOME_UNKNOWN, one local frame, and the
+//     bridge still serves a later independent envelope;
+//   - controls: a string-coded failure → the same outcome_unknown; a BROKER_LOCAL_CHALLENGE* string code →
+//     failed / BROKER_LOCAL_CHALLENGE_REFUSED with no frame.
+// The unchanged product is expected to fail the 'timeout' variant at the result-POST assertion (its catch dereferences
+// a numeric code). That TypeError is reported as evidence, never asserted as desired behaviour. "PRECONDITION:" marks
+// a setup invariant (its failure is INVALID, not product RED).
+const RED142 = [
+  { variant: 'timeout', deliver: true, failure: () => new DOMException('The operation was aborted due to timeout', 'TimeoutError'),
+    expect: { state: 'outcome_unknown', code: 'BROKER_LOCAL_OUTCOME_UNKNOWN' }, frames: 1 },
+  { variant: 'string-code control', deliver: true, failure: () => Object.assign(new Error('synthetic local failure'), { code: 'ECONNRESET' }),
+    expect: { state: 'outcome_unknown', code: 'BROKER_LOCAL_OUTCOME_UNKNOWN' }, frames: 1 },
+  { variant: 'challenge-code control', deliver: false, failure: () => Object.assign(new Error('synthetic local challenge'), { code: 'BROKER_LOCAL_CHALLENGE_FAILED' }),
+    expect: { state: 'failed', code: 'BROKER_LOCAL_CHALLENGE_REFUSED' }, frames: 0 },
+];
+for (const red of RED142) test(`[1215-red142] a rejected local inject (${red.variant}) yields exactly one node result, one delivery at most, and a live bridge`, { timeout: 60000 }, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-red142-'));
+  const daemon = await startTestDaemon();
+  const a = pair(), b = pair(), h = pair();
+  const limits = { max_payload_bytes: 512, max_requests: 100, window_ms: 60000, timeout_ms: 10000, max_pending: 16 };
+  const hub = createBrokerHub({ homeDir: root, privateKey: h.privateKey, config: { schema: 'telepty.broker-hub/v1',
+    principal_id: 'hub', key_id: 'h', audience: 'hub', stream_ms: 60000,
+    nodes: { a: { audience: 'a' }, b: { audience: 'b' } }, limits: { a: limits, b: limits },
+    trust: trust('hub', [
+      entry('a', 'a', a, [grant('broker.inject', ['b/worker']), grant('broker.receipt', ['a'])]),
+      entry('b', 'b', b, [grant('broker.stream', ['b']), grant('broker.result', ['b'])])
+    ]) } });
+  const owners = [], frames = [];
+  let bridge = null, forwarded = 0, rejected = 0, settled = null, onResult, onSettled;
+  const resultPosts = [];
+  const resultIssued = new Promise((resolve) => { onResult = resolve; });
+  const runSettled = new Promise((resolve) => { onSettled = resolve; });
+  try {
+    const sample = red.failure();
+    if (red.variant === 'timeout') {
+      assert.equal(sample.name, 'TimeoutError', 'PRECONDITION: the injected failure is a DOMException TimeoutError');
+      assert.equal(typeof sample.code, 'number', 'PRECONDITION: a DOMException carries a numeric legacy code (the shape under test)');
+    }
+    const address = await hub.listen(); const origin = `http://127.0.0.1:${address.port}`;
+    const epoch = (await daemon.registerSession('worker')).body.session_epoch;
+    const owner = await daemon.connectSession('worker', daemon.ownerAuth('worker')); owners.push(owner);
+    owner.on('message', (raw) => { const frame = JSON.parse(raw); if (frame.type === 'inject') frames.push(frame); });
+    bridge = createBrokerNode({ fetch: (url, options) => {
+      const text = String(url);
+      if (text.includes('/results/')) { resultPosts.push(text); onResult(); }
+      if (!text.includes('/api/forwarded/')) return fetch(url, options);
+      forwarded += 1;
+      if (forwarded !== 1) return fetch(url, options); // later envelopes reach the local daemon unchanged
+      rejected += 1;
+      if (!red.deliver) return Promise.reject(red.failure());
+      // The local delivery itself is made deterministic: the product's 500 ms timer signal is replaced (for THIS one
+      // controlled call only) by the test's own cancellation, t.signal, which node:test aborts at the 60 s case timeout.
+      // The failure is injected after the delivery completes. Every later request keeps the product signal unchanged.
+      const { signal, ...unbounded } = options;
+      return fetch(url, { ...unbounded, signal: t.signal }).then(async (response) => { await response.arrayBuffer(); throw red.failure(); });
+    }, privateKey: b.privateKey, localToken: daemon.authToken(), config: {
+      schema: 'telepty.broker-node/v1', principal_id: 'b', key_id: 'b', hub_url: origin, hub_audience: 'hub',
+      hub_principal_id: 'hub', audience: 'b', local_daemon_url: `http://127.0.0.1:${daemon.port}`, local_timeout_ms: 500,
+      hub_trust: trust('b', [entry('h', 'hub', h, [grant('broker.envelope', ['a/worker'])])]) } });
+    await bridge.start();
+    bridge.completion.then(() => { settled = { state: 'ended' }; onSettled(); },
+      (reason) => { settled = { state: 'rejected', name: ERROR_NAMES.includes(reason && reason.name) ? reason.name : 'other',
+        code: typeof (reason && reason.code) === 'string' && CODE_TOKEN.test(reason.code) ? reason.code : null }; onSettled(); });
+    const source = createBrokerClient({ config: { principal_id: 'a', key_id: 'a', hub_audience: 'hub', hub_url: origin }, privateKey: a.privateKey });
+
+    const first = await source.inject('b', 'worker', { prompt: 'Synthetic red142', expected_epoch: epoch, idempotency_key: 'red142-first-0001', no_enter: true });
+    assert.equal(first.status, 202, `PRECONDITION: the hub admitted the envelope ${JSON.stringify({ code: first.body && first.body.code })}`);
+    const firstWinner = await Promise.race([resultIssued.then(() => 'result_posted'), runSettled.then(() => 'run_settled')]);
+    const evidence = () => JSON.stringify({ forwarded, rejected, result_posts: resultPosts.length, frames: frames.length, node_b_run: settled });
+    assert.equal(rejected, 1, `PRECONDITION: the first local inject was rejected by the seam ${evidence()}`);
+    assert.equal(firstWinner, 'result_posted', `node b must report its own result for a rejected local inject ${evidence()}`);
+    let answer;
+    await waitFor(async () => { answer = (await source.receipt('red142-first-0001')).body; return answer.state !== 'pending'; },
+      { timeoutMs: 15000, description: 'the first receipt left pending' });
+    assert.deepEqual({ state: answer.state, code: answer.code }, red.expect, `the node's own classification reached the hub ${evidence()}`);
+    await waitFor(() => frames.length >= red.frames, { timeoutMs: 5000, description: 'the first local frame' });
+    assert.equal(frames.length, red.frames, `at most the one real local delivery; never a second ${evidence()}`);
+    assert.equal(settled, null, `the bridge run loop is still running after the rejected inject ${evidence()}`);
+
+    // The same running bridge still serves a later, independent envelope (no restart, no retry of the first).
+    assert.equal(resultPosts.length, 1, `exactly one result POST for the first envelope ${evidence()}`);
+    const second = await source.inject('b', 'worker', { prompt: 'Synthetic red142 after', expected_epoch: epoch, idempotency_key: 'red142-after-0001', no_enter: true });
+    assert.equal(second.status, 202, `PRECONDITION: the hub admitted the later envelope ${JSON.stringify({ code: second.body && second.body.code })}`);
+    let later;
+    await waitFor(async () => { later = (await source.receipt('red142-after-0001')).body; return later.state !== 'pending'; },
+      { timeoutMs: 15000, description: 'the later receipt left pending' });
+    assert.equal(later.state, 'accepted', `the live bridge delivered the later envelope ${evidence()}`);
+    await waitFor(() => frames.length >= red.frames + 1, { timeoutMs: 5000, description: 'the later local frame' });
+    assert.deepEqual({ forwarded, rejected, frames: frames.length }, { forwarded: 2, rejected: 1, frames: red.frames + 1 },
+      `one local attempt per envelope, the first never retried ${evidence()}`);
+    assert.equal(resultPosts.length, 2, `one result POST per envelope; the first was never re-posted ${evidence()}`);
+    assert.equal(settled, null, `the bridge is still running ${evidence()}`);
+  } finally {
+    if (bridge) await bridge.stop();
+    for (const owner of owners) owner.close();
+    await hub.close(); await daemon.stop(); fs.rmSync(root, { recursive: true, force: true });
+  }
+});

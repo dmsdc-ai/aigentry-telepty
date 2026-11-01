@@ -21,7 +21,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const WebSocket = require('ws');
 
-const { startTestDaemon, createSessionId, waitFor } = require('../test-support/daemon-harness');
+const { startTestDaemon, createSessionId, waitFor, HARNESS_OBSERVATION_MARGIN_MS } = require('../test-support/daemon-harness');
 
 let harness;
 before(async () => { harness = await startTestDaemon(); });
@@ -46,8 +46,13 @@ async function wrappedOwner(prefix) {
   return { sid, ws, frames };
 }
 
+// Task 1215 harness136: a harness OBSERVATION budget (not a product deadline, not the ordering assertion). An inject
+// into this wrapped session may legitimately wait behind the submit barrier (SUBMIT_QUEUE_TIMEOUT_MS, product default
+// 10000, src/mailbox/session-delivery.js) and then for its text (MAILBOX_TEXT_WAIT_MS = 2 x DELIVERY_TIMEOUT_MS, daemon.js
+// default 5000). The 5000 ms harness default cut that contract short (Windows CI final49: both cases at 5007-5009 ms).
+const QUEUED_INJECT_BOUND_MS = 10000 + 2 * 5000;
 const inject = (sid, prompt) => harness.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, {
-  method: 'POST', body: { prompt }
+  method: 'POST', body: { prompt }, timeoutMs: QUEUED_INJECT_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS
 });
 
 test('#107: back-to-back injects reach the owner as text1 CR text2 CR — never text1 text2 CR CR', async (t) => {

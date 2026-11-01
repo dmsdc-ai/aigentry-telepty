@@ -13,7 +13,7 @@ const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
+const { startTestDaemon, createSessionId, HARNESS_OBSERVATION_MARGIN_MS } = require('../test-support/daemon-harness');
 const { beginAuditCompletion, classify, AuditCompletionError } = require('../test-support/audit-completion');
 
 // #1215 audit44 (root disposition D1): every case that waits for an audit line declares { timeout: 60000 }; its t.signal is
@@ -21,6 +21,16 @@ const { beginAuditCompletion, classify, AuditCompletionError } = require('../tes
 // test-support/audit-completion.js). 60000 ms is the already-admitted Windows diagnostic per-file ceiling, not a product
 // latency promise. Main-loop stalls stay an open performance investigation; a passing wait does not close them.
 const AUDIT_CASE = { timeout: 60000 };
+// Task 1215 harness136: per-request harness OBSERVATION budgets (not product deadlines; the audit-completion waits
+// and assertions are unchanged). The 5000 ms harness default cut these product contracts short (Windows CI final49:
+// GET /api/injects at 5001 ms, multicast at 5005 ms). Each is the request's own source bound plus the one margin.
+// - inject into a fresh spawned PTY session: no barrier wait; text wait MAILBOX_TEXT_WAIT_MS = 2 x DELIVERY_TIMEOUT_MS
+//   (src/mailbox/session-delivery.js; daemon.js default 5000).
+// - multicast: src/routes/fanout.js delivers its targets SEQUENTIALLY, so 2 targets x that text wait.
+// - GET /api/injects: the audit query worker wall timeout (src/audit/query-reader.js default 10000; daemon.js passes none).
+const INJECT_BOUND_MS = 2 * 5000;
+const MULTICAST_2_BOUND_MS = 2 * INJECT_BOUND_MS;
+const AUDIT_QUERY_BOUND_MS = 10000;
 
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 
@@ -97,7 +107,7 @@ test('P1: inject appends an audit line (schema v1, claimed_from, hash-only)', AU
   const payload = 'audit me please';
   const audit = await beginAuditCompletion(daemon, t.signal);
   const res = await daemon.request(`/api/sessions/${encodeURIComponent(sid)}/inject`, {
-    method: 'POST', body: { prompt: payload, from: 'orchestrator' }
+    method: 'POST', timeoutMs: INJECT_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS, body: { prompt: payload, from: 'orchestrator' }
   });
   assert.equal(res.status, 200);
 
@@ -125,7 +135,7 @@ test('P2: valid session token (claim == verified) => verified_sender_sid set, no
   await daemon.spawnSession(target);
   const audit = await beginAuditCompletion(daemon, t.signal);
   const res = await daemon.request(`/api/sessions/${encodeURIComponent(target)}/inject`, {
-    method: 'POST',
+    method: 'POST', timeoutMs: INJECT_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS,
     headers: { 'x-telepty-session-token': token },
     body: { prompt: 'verified hello', from: 'orchestrator' }
   });
@@ -149,7 +159,7 @@ test('P2: spoof — claim orchestrator but token maps to a different sid => spoo
   await daemon.spawnSession(target);
   const audit = await beginAuditCompletion(daemon, t.signal);
   const res = await daemon.request(`/api/sessions/${encodeURIComponent(target)}/inject`, {
-    method: 'POST',
+    method: 'POST', timeoutMs: INJECT_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS,
     headers: { 'x-telepty-session-token': token },
     body: { prompt: 'i am totally the orchestrator', from: 'orchestrator' }
   });
@@ -167,7 +177,7 @@ test('P2: absent token => verified_sender_sid null (operator/unverified, no spoo
   await daemon.spawnSession(target);
   const audit = await beginAuditCompletion(daemon, t.signal);
   const res = await daemon.request(`/api/sessions/${encodeURIComponent(target)}/inject`, {
-    method: 'POST', body: { prompt: 'no token here', from: 'orchestrator' }
+    method: 'POST', timeoutMs: INJECT_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS, body: { prompt: 'no token here', from: 'orchestrator' }
   });
   assert.equal(res.status, 200);
   const lines = await waitForAudit(audit, (l) => l.to === target && l.claimed_from === 'orchestrator');
@@ -182,11 +192,12 @@ test('P3: GET /api/injects returns lines filtered by to + from with pagination s
   await daemon.spawnSession(target);
   const audit = await beginAuditCompletion(daemon, t.signal);
   await daemon.request(`/api/sessions/${encodeURIComponent(target)}/inject`, {
-    method: 'POST', body: { prompt: 'p3 query body', from: 'orchestrator' }
+    method: 'POST', timeoutMs: INJECT_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS, body: { prompt: 'p3 query body', from: 'orchestrator' }
   });
   await waitForAudit(audit, (l) => l.to === target); // ensure flushed (completion observed, then the line is present)
 
-  const res = await daemon.request(`/api/injects?to=${encodeURIComponent(target)}&from=orchestrator&limit=50`);
+  const res = await daemon.request(`/api/injects?to=${encodeURIComponent(target)}&from=orchestrator&limit=50`,
+    { timeoutMs: AUDIT_QUERY_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS });
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(res.body.injects));
   assert.equal(Object.prototype.hasOwnProperty.call(res.body, 'next_cursor'), true);
@@ -230,7 +241,7 @@ test('P1: multicast appends one audit line per target sharing an inject_id', AUD
   await daemon.spawnSession(b);
   const audit = await beginAuditCompletion(daemon, t.signal);
   const res = await daemon.request('/api/sessions/multicast/inject', {
-    method: 'POST', body: { session_ids: [a, b], prompt: 'fan out', from: 'orchestrator' }
+    method: 'POST', timeoutMs: MULTICAST_2_BOUND_MS + HARNESS_OBSERVATION_MARGIN_MS, body: { session_ids: [a, b], prompt: 'fan out', from: 'orchestrator' }
   });
   assert.equal(res.status, 200);
 

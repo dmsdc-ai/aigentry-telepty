@@ -67,6 +67,22 @@ function closeOwnedResources({servers=[],sockets=[]}={}){
  const bound=new Promise((_resolve,reject)=>{timer=setTimeout(()=>reject(Object.assign(new Error(`CLEANUP_RESOURCE_CLOSE_TIMEOUT pending ${JSON.stringify(pending)}`),{code:'CLEANUP_RESOURCE_CLOSE_TIMEOUT'})),RESOURCE_CLOSE_BOUND_MS);});
  return Promise.race([Promise.all(waits),bound]).finally(()=>clearTimeout(timer));
 }
+// Task 1215 handoff137 (fixture correctness, test-only):
+// - The fixture child's bearer is `${epoch}.${secret}` (16- and 32-byte base64url; session-credentials.js:27-28,60-62).
+//   The child now publishes it atomically (temp file + rename), and the fixture accepts it only when it is COMPLETE.
+//   Source-reachable race: a poll that lands between the file's creation and its write reads '', giving epoch '' and
+//   an empty session_epoch that createSignedAssertion rejects (proof.js:74) with the same "Invalid principal assertion
+//   input" the Linux CI reported. CI recorded neither the bearer bytes nor the epoch, so the original CI cause is
+//   UNCONFIRMED; this race is the source-derived candidate, not a measured one.
+// - A request the fixture deliberately HOLDS (an aterm UDS delivery whose reply the case withholds) is bounded by the
+//   product's own UDS DELIVERY_TIMEOUT_MS (daemon.js:370, default 5000; this fixture sets no TELEPTY_DELIVERY_TIMEOUT_MS).
+//   That equals the harness default request budget (daemon-harness.js:114), so the harness abort can race and hide the
+//   product's own answer (source-derived; CI measured only the harness timeout at 5000/5001 ms). Per the harness
+//   contract (daemon-harness.js:109-117) such a request opts into its product
+//   bound + HARNESS_OBSERVATION_MARGIN_MS. This observes the product outcome; it changes no deadline.
+const COMPLETE_BEARER=/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/;
+function completeBearer(text){return typeof text==='string'&&COMPLETE_BEARER.test(text)?text:null;}
+const HELD_DELIVERY_OBSERVATION_MS=5000+2000;
 async function fixture(t,ignore=false){
  let daemon=null,child=null;const teardown=ownedTeardown();teardown.daemon(()=>daemon);t.after(()=>teardown.run());
  const home=teardown.home(fs.mkdtempSync(path.join(os.tmpdir(),'cooperative-fixture-')));const pair=crypto.generateKeyPairSync('ed25519');const trust=path.join(home,'trust.json'),key=path.join(home,'key.pem');
@@ -74,10 +90,10 @@ async function fixture(t,ignore=false){
  const senderPair=crypto.generateKeyPairSync('ed25519');const trusted=JSON.parse(fs.readFileSync(trust,'utf8'));trusted.keys.push({key_id:'sender',principal_id:'sender',public_key_spki:senderPair.publicKey.export({type:'spki',format:'pem'}),grants:[{action:'session.inject',targets:['fixture']}]});fs.writeFileSync(trust,JSON.stringify(trusted),{mode:0o600});
  const env={TELEPTY_PRINCIPAL_MODE:'strict',TELEPTY_PRINCIPAL_TRUST_FILE:trust,TELEPTY_MACHINE_ID:'fixture',TELEPTY_SESSION_STALE_SECONDS:'1',TELEPTY_SESSION_CLEANUP_SECONDS:'1',TELEPTY_HEALTH_POLL_MS:'100'};daemon=await startTestDaemon({homeDir:home,env});
  const config=path.join(home,'client.json');fs.writeFileSync(config,JSON.stringify({schema:'telepty.principal-client/v1',daemon_url:`http://${daemon.host}:${daemon.port}`,principal_id:'owner',key_id:'owner',audience:'fixture',private_key_path:key}),{mode:0o600});
- const credential=path.join(home,'child-proof');const program=`const fs=require('fs');${ignore?"process.on('SIGTERM',()=>{});":''}fs.writeFileSync(${JSON.stringify(credential)},process.env.TELEPTY_SESSION_TOKEN,{mode:0o600});setInterval(()=>{},1000);`;
+ const credential=path.join(home,'child-proof');const program=`const fs=require('fs');${ignore?"process.on('SIGTERM',()=>{});":''}fs.writeFileSync(${JSON.stringify(credential+'.tmp')},process.env.TELEPTY_SESSION_TOKEN,{mode:0o600});fs.renameSync(${JSON.stringify(credential+'.tmp')},${JSON.stringify(credential)});setInterval(()=>{},1000);`;
  child=teardown.child('fixture-child',require('child_process').spawn(process.execPath,['--require','./test-support/setup-env.js','cli.js','allow','--id','fixture',process.execPath,'-e',program],{cwd:path.resolve(__dirname,'..'),env:{...process.env,HOME:home,TELEPTY_HOST:daemon.host,TELEPTY_PORT:String(daemon.port),TELEPTY_PRINCIPAL_CLIENT_FILE:config,TELEPTY_COOPERATIVE_HANDOFF:'1'},stdio:['ignore','pipe','pipe']}));let logs='';child.stdout.on('data',b=>logs+=b);child.stderr.on('data',b=>logs+=b);
- await waitFor(()=>{if(child.exitCode!==null)throw new Error(logs);return fs.existsSync(credential);});const bearer=fs.readFileSync(credential,'utf8');let epoch=bearer.split('.')[0];
- async function request(method,target,body,extra={}){const challenge=(await daemon.request('/api/auth/challenge',{noAuth:true})).body.challenge;const proof=createSignedAssertion({privateKey:extra.sender?senderPair.privateKey:pair.privateKey,keyId:extra.sender?'sender':'owner',principalId:extra.sender?'sender':'owner',audience:'fixture',challenge,method,target,body,action:extra.action || (target.endsWith('/inject')?'session.inject':'session.takeover'),sessionEpoch:extra.epoch||epoch});return daemon.request(target,{method,...(body?{body}:{}),headers:{'x-telepty-principal':proof,...(extra.sender?{}:{'x-telepty-session-token':extra.bearer||bearer})}});}
+ let bearer=null;await waitFor(()=>{if(child.exitCode!==null)throw new Error(logs);bearer=fs.existsSync(credential)?completeBearer(fs.readFileSync(credential,'utf8')):null;return bearer!==null;});let epoch=bearer.split('.')[0];
+ async function request(method,target,body,extra={}){const challenge=(await daemon.request('/api/auth/challenge',{noAuth:true})).body.challenge;const proof=createSignedAssertion({privateKey:extra.sender?senderPair.privateKey:pair.privateKey,keyId:extra.sender?'sender':'owner',principalId:extra.sender?'sender':'owner',audience:'fixture',challenge,method,target,body,action:extra.action || (target.endsWith('/inject')?'session.inject':'session.takeover'),sessionEpoch:extra.epoch||epoch});return daemon.request(target,{method,...(body?{body}:{}),headers:{'x-telepty-principal':proof,...(extra.sender?{}:{'x-telepty-session-token':extra.bearer||bearer})},...(extra.timeoutMs?{timeoutMs:extra.timeoutMs}:{})});}
  const target='/api/sessions/fixture/handoff';const status=()=>request('GET',target);const intent=async()=>{const response=await status();assert.equal(response.status,200,JSON.stringify(response.body));const s=response.body;return {intent_id:crypto.randomUUID(),expected_epoch:epoch,credential_generation:s.credential_generation,owner_generation:s.owner_generation};};
  return {home,config,child,teardown,bearer,epoch,request,status,intent,target,origin:`http://${daemon.host}:${daemon.port}`,logs:()=>logs,restart:async()=>{const port=daemon.port;await daemon.kill();daemon=await startTestDaemon({homeDir:home,port,env});}};
 }
@@ -198,11 +214,18 @@ for(const restart of [false,true])test(`explicit sender+owner pending consent pr
  const f=await fixture(t),net=require('node:net');const sockets=new Set();let held;const socketPath=path.join(f.home,'hold.sock');
  const server=net.createServer({allowHalfOpen:true},socket=>{sockets.add(socket);socket.on('data',()=>{held=socket;});socket.on('error',()=>{});});f.teardown.resource('case-socket-server',()=>closeOwnedResources({sockets:[...sockets],servers:[server]}));await new Promise(resolve=>server.listen(socketPath,resolve));
  const registered=await f.request('POST','/api/sessions/register',{session_id:'moved',command:'fixture',delivery_type:'aterm',delivery:{transport:'unix_socket',address:socketPath}},{action:'session.register'});assert.equal(registered.status,201,JSON.stringify(registered.body));
- const blocking=f.request('POST','/api/sessions/moved/inject',{prompt:'hold-other-session',no_enter:true,exact_target:true,expected_epoch:registered.body.session_epoch},{action:'session.inject',epoch:registered.body.session_epoch});await waitFor(()=>held);
+ const heldAt=Date.now();const blocking=f.request('POST','/api/sessions/moved/inject',{prompt:'hold-other-session',no_enter:true,exact_target:true,expected_epoch:registered.body.session_epoch},{action:'session.inject',epoch:registered.body.session_epoch,timeoutMs:HELD_DELIVERY_OBSERVATION_MS});await waitFor(()=>held);
+ // handoff137: record when and how the held delivery ended (fixed fields only: ms since issue, HTTP status, code token)
+ let blockingSettled=null;const codeToken=v=>typeof v==='string'&&/^[A-Z][A-Z0-9_]{1,63}$/.test(v)?v:null;blocking.then(r=>{blockingSettled={ms:Date.now()-heldAt,status:r.status,code:codeToken(r.body&&r.body.code)};},e=>{blockingSettled={ms:Date.now()-heldAt,status:null,code:codeToken(e&&e.code)||'other'};});
  const payload='pending-byte-exact-中😀';const response=await f.request('POST','/api/sessions/fixture/inject',{prompt:payload,no_enter:true,exact_target:true,expected_epoch:f.epoch,allow_cooperative_handoff:true},{sender:true});assert.equal(response.status,200,JSON.stringify(response.body));
  const secondPayload='second-pending-😀';assert.equal((await f.request('POST','/api/sessions/fixture/inject',{prompt:secondPayload,no_enter:true,exact_target:true,expected_epoch:f.epoch,allow_cooperative_handoff:true},{sender:true})).status,200);
  const {FileMailbox}=require('../src/mailbox');const mailbox=new FileMailbox({root:path.join(f.home,'.aigentry','mailbox')});const directory=path.join(f.home,'.aigentry','mailbox','fixture'),rows=mailbox.withNeverAttemptedCustody('fixture',rows=>rows);assert.equal(rows.length,2);assert.equal(rows[0].payload,payload);assert.equal(rows[0].from,'inject');assert.equal(rows[0].cooperative_handoff.sender.id,'sender');assert.equal(rows[0].cooperative_handoff.recipient.id,'owner');const before=['inbox.jsonl','state.jsonl'].map(leaf=>fs.readFileSync(path.join(directory,leaf),'utf8'));
- const body={...await f.intent(),pending_policy:'never-attempted'};const handed=await f.request('POST',f.target,body);assert.equal(handed.status,200,JSON.stringify(handed.body));assert.equal(handed.body.pending_count,2);assert.match(handed.body.pending_digest,/^[a-f0-9]{64}$/);assert.deepEqual(['inbox.jsonl','state.jsonl'].map(leaf=>fs.readFileSync(path.join(directory,leaf),'utf8')),before);await waitFor(()=>f.child.exitCode!==null);
+ const body={...await f.intent(),pending_policy:'never-attempted'};const handed=await f.request('POST',f.target,body);
+ // handoff137 PRECONDITION: the fixture premise is that the held moved delivery keeps the single-flight delivery tick busy
+ // (delivery.js:81-83) until the handoff has answered. If the product's UDS bound ended the hold first, the pending rows
+ // were no longer protected, and the outcome below would not be what this case tests.
+ assert.equal(blockingSettled,null,'PRECONDITION: the held moved delivery outlasted the handoff (product UDS bound DELIVERY_TIMEOUT_MS 5000) '+JSON.stringify({handoff_answered_ms:Date.now()-heldAt,held_delivery:blockingSettled}));
+ assert.equal(handed.status,200,JSON.stringify(handed.body));assert.equal(handed.body.pending_count,2);assert.match(handed.body.pending_digest,/^[a-f0-9]{64}$/);assert.deepEqual(['inbox.jsonl','state.jsonl'].map(leaf=>fs.readFileSync(path.join(directory,leaf),'utf8')),before);await waitFor(()=>f.child.exitCode!==null);
  held.end('{"success":true}\n');await blocking;if(restart)await f.restart();
  const receipt=path.join(f.home,'pending-successor.json'),output=path.join(f.home,'pending-child-output');fs.writeFileSync(receipt,JSON.stringify({schema:'telepty.handoff-credential/v1',session_id:'fixture',origin:f.origin,session_epoch:handed.body.session_epoch,session_token:handed.body.session_token,session_nonce:handed.body.session_nonce,credential_generation:2}),{mode:0o600});
  const successor=require('child_process').spawn(process.execPath,['--require','./test-support/setup-env.js','cli.js','allow','--id','fixture',process.execPath,'-e',`const fs=require('fs');process.stdin.setRawMode(true);process.stdin.on('data',data=>{fs.appendFileSync(${JSON.stringify(output)},data);process.stdout.write('> ');});process.stdin.resume();process.stdout.write('> ');setInterval(()=>{},1000)`],{cwd:path.resolve(__dirname,'..'),env:{...process.env,HOME:f.home,TELEPTY_HOST:new URL(f.origin).hostname,TELEPTY_PORT:new URL(f.origin).port,TELEPTY_PRINCIPAL_CLIENT_FILE:f.config,TELEPTY_COOPERATIVE_HANDOFF:'1',TELEPTY_HANDOFF_CREDENTIAL_FILE:receipt},stdio:['ignore','pipe','pipe']});let logs='';successor.stdout.on('data',b=>logs+=b);successor.stderr.on('data',b=>logs+=b);f.teardown.child('successor-child',successor);
@@ -212,7 +235,7 @@ for(const restart of [false,true])test(`explicit sender+owner pending consent pr
 });
 test('an unconsented ordinary HTTP pending message cannot cross an owner epoch',{skip:process.platform!=='linux',timeout:12000},async t=>{
  const f=await fixture(t),net=require('node:net');let held;const socketPath=path.join(f.home,'unconsented.sock'),sockets=new Set();const server=net.createServer({allowHalfOpen:true},socket=>{sockets.add(socket);socket.on('data',()=>held=socket);socket.on('error',()=>{});});f.teardown.resource('case-socket-server',()=>closeOwnedResources({sockets:[...sockets],servers:[server]}));await new Promise(resolve=>server.listen(socketPath,resolve));
- const created=await f.request('POST','/api/sessions/register',{session_id:'moved',command:'fixture',delivery_type:'aterm',delivery:{transport:'unix_socket',address:socketPath}},{action:'session.register'});const blocker=f.request('POST','/api/sessions/moved/inject',{prompt:'block',no_enter:true,exact_target:true,expected_epoch:created.body.session_epoch},{action:'session.inject',epoch:created.body.session_epoch});await waitFor(()=>held);
+ const created=await f.request('POST','/api/sessions/register',{session_id:'moved',command:'fixture',delivery_type:'aterm',delivery:{transport:'unix_socket',address:socketPath}},{action:'session.register'});const blocker=f.request('POST','/api/sessions/moved/inject',{prompt:'block',no_enter:true,exact_target:true,expected_epoch:created.body.session_epoch},{action:'session.inject',epoch:created.body.session_epoch,timeoutMs:HELD_DELIVERY_OBSERVATION_MS});await waitFor(()=>held);
  assert.equal((await f.request('POST','/api/sessions/fixture/inject',{prompt:'unconsented',no_enter:true,exact_target:true,expected_epoch:f.epoch})).status,200);
  const result=await f.request('POST',f.target,{...await f.intent(),pending_policy:'never-attempted'});assert.equal(result.body.code,'HANDOFF_PENDING_OR_UNKNOWN');assert.equal(f.child.exitCode,null);held.end('{"success":true}\n');await blocker;
 });
@@ -247,4 +270,17 @@ test('owned teardown attempts every step after a cleanup failure, removes HOME l
  assert.equal(server.listening,false,'the owned server is closed');assert.ok(client.closed&&[...accepted].every(socket=>socket.closed),'every owned socket emitted close');
  assert.ok(child.exitCode!==null||child.signalCode!==null,'the owned child was terminated, not only signalled');
  assert.equal(fs.existsSync(home),false,'HOME was removed, and last');
+});
+// Task 1215 handoff137: deterministic regression of the fixture's credential acceptance (no daemon, all platforms). An
+// EMPTY read of the child's credential file is a source-reachable race that reproduces the Linux CI error: epoch ''
+// becomes session_epoch '', which the real proof constructor refuses. CI did not record the bearer bytes or epoch, so
+// the original CI cause remains unconfirmed. The fixture must reject every empty or partial read and accept only the
+// complete bearer.
+test('fixture accepts only a complete published session bearer, never the empty or partial read that broke the Linux case',()=>{
+ const epochPart='A'.repeat(22),secretPart='b'.repeat(43),full=`${epochPart}.${secretPart}`;
+ for(const partial of ['',epochPart.slice(0,10),epochPart,`${epochPart}.`,`${epochPart}.${secretPart.slice(0,20)}`,`${full}\n`,` ${full}`])assert.equal(completeBearer(partial),null,`rejects a ${partial.length}-char partial read`);
+ assert.equal(completeBearer(undefined),null);assert.equal(completeBearer(full),full);
+ const sign=sessionEpoch=>createSignedAssertion({privateKey:crypto.generateKeyPairSync('ed25519').privateKey,keyId:'owner',principalId:'owner',audience:'fixture',challenge:'c'.repeat(32),method:'POST',target:'/api/sessions/register',body:{session_id:'moved'},action:'session.register',sessionEpoch});
+ assert.throws(()=>sign(''.split('.')[0]),/Invalid principal assertion input/,'the empty read reproduces the exact CI error');
+ assert.doesNotThrow(()=>sign(full.split('.')[0]),'the complete bearer epoch is a valid session_epoch for the same request');
 });

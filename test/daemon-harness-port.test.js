@@ -266,7 +266,7 @@ test('stop(): an exact protected-session refusal survives cleanup and the owned 
     assert.equal(probe.body && probe.body.code, 'OWNED_DELETE_FORBIDDEN');
     const summary = await harness.stop();
     assert.equal(harness.isAlive(), false, 'the owned daemon really exited');
-    assert.deepEqual(summary, { listed: 2, deleted: 1, refused: 1, failed: 0,
+    assert.deepEqual(summary, { listed: 2, deleted: 1, absent: 0, refused: 1, failed: 0,
       refused_codes: { OWNED_DELETE_FORBIDDEN: 1 }, failed_statuses: {} }, JSON.stringify(summary));
   } finally {
     if (harness.isAlive()) await harness.kill().catch(() => {});
@@ -287,7 +287,7 @@ test('stop(): non-contractual DELETE answers still surface after the owned daemo
     const { error } = await stopWithCleanupAt(harness, stub.origin);
     assert.equal(harness.isAlive(), false, 'the owned daemon child was terminated anyway');
     assert.equal(error && error.code, 'HARNESS_CLEANUP_DELETE_FAILED', `surfaced: ${error && error.message}`);
-    assert.deepEqual(error.summary, { listed: 2, deleted: 0, refused: 0, failed: 2, refused_codes: {},
+    assert.deepEqual(error.summary, { listed: 2, deleted: 0, absent: 0, refused: 0, failed: 2, refused_codes: {},
       failed_statuses: { 404: 1, '403:SOME_OTHER_REFUSAL': 1 } });
     assert.deepEqual([...stub.seen].sort(), ['DELETE /api/sessions/exact-404', 'DELETE /api/sessions/other-403', 'GET /api/sessions'],
       'both DELETEs were answered and no drain poll followed a failed DELETE');
@@ -295,4 +295,143 @@ test('stop(): non-contractual DELETE answers still surface after the owned daemo
     if (harness.isAlive()) await harness.kill().catch(() => {});
     await stub.close();
   }
+});
+
+// Task 1215 harness136 — the source-proven teardown race (Linux CI final49, cli.test.js 'telepty allow inject submits once…'):
+// the test kills its `telepty allow` bridge, whose exit DELETE (src/cli/security-actions.js) races afterEach stop(). When the
+// bridge wins, the harness DELETE gets the DELETE route's exact already-absent answer, 404 { error: 'Session not found',
+// requested: <id> } (src/routes/session-actions.js). That exact body for the listed id is idempotent (`absent`); the drain
+// still has to prove the session is gone; every other 404 shape stays a failure.
+test('stop(): the exact already-absent 404 for the listed id is idempotent and the drain still proves absence', { timeout: 30000 }, async () => {
+  let lists = 0;
+  const stub = await ownedStub('never', {
+    'GET /api/sessions': (req, res) => json(res, 200, lists++ === 0 ? [{ id: 'raced-away' }] : []),
+    'DELETE /api/sessions/raced-away': (req, res) => json(res, 404, { error: 'Session not found', requested: 'raced-away' }),
+  });
+  const harness = await startTestDaemon();
+  started.push(harness);
+  try {
+    const { error, value } = await stopWithCleanupAt(harness, stub.origin);
+    assert.equal(error, null, `an already-absent session is not a cleanup failure: ${error && error.message}`);
+    assert.deepEqual(value, { listed: 1, deleted: 0, absent: 1, refused: 0, failed: 0, refused_codes: {}, failed_statuses: {} });
+    assert.ok(lists >= 2, 'the drain re-listed after the DELETE (absence was verified, not assumed)');
+    assert.equal(harness.isAlive(), false, 'the owned daemon child was terminated');
+  } finally {
+    if (harness.isAlive()) await harness.kill().catch(() => {});
+    await stub.close();
+  }
+});
+
+test('stop(): an already-absent 404 is not trusted while the session is still listed', { timeout: 30000 }, async () => {
+  const stub = await ownedStub('never', {
+    'GET /api/sessions': (req, res) => json(res, 200, [{ id: 'still-here' }]),
+    'DELETE /api/sessions/still-here': (req, res) => json(res, 404, { error: 'Session not found', requested: 'still-here' }),
+  });
+  const harness = await startTestDaemon();
+  started.push(harness);
+  try {
+    const { error } = await stopWithCleanupAt(harness, stub.origin);
+    assert.equal(harness.isAlive(), false, 'the owned daemon child was terminated anyway');
+    assert.ok(error && /session cleanup/.test(error.message), `the failed drain surfaces: ${error && error.message}`);
+    assert.equal(error.summary && error.summary.absent, 1, 'the drain failure carries the truthful counts');
+  } finally {
+    if (harness.isAlive()) await harness.kill().catch(() => {});
+    await stub.close();
+  }
+});
+
+test('stop(): a 404 for a different requested id, or without one, is still a cleanup failure', { timeout: 30000 }, async () => {
+  const stub = await ownedStub('never', {
+    'GET /api/sessions': (req, res) => json(res, 200, [{ id: 'mismatch' }, { id: 'bare' }]),
+    'DELETE /api/sessions/mismatch': (req, res) => json(res, 404, { error: 'Session not found', requested: 'someone-else' }),
+    'DELETE /api/sessions/bare': (req, res) => json(res, 404, { error: 'Session not found' }),
+  });
+  const harness = await startTestDaemon();
+  started.push(harness);
+  try {
+    const { error } = await stopWithCleanupAt(harness, stub.origin);
+    assert.equal(harness.isAlive(), false, 'the owned daemon child was terminated anyway');
+    assert.equal(error && error.code, 'HARNESS_CLEANUP_DELETE_FAILED', `surfaced: ${error && error.message}`);
+    assert.deepEqual(error.summary, { listed: 2, deleted: 0, absent: 0, refused: 0, failed: 2, refused_codes: {}, failed_statuses: { 404: 2 } });
+  } finally {
+    if (harness.isAlive()) await harness.kill().catch(() => {});
+    await stub.close();
+  }
+});
+
+// Task 1215 observe148 — failure-only cleanup diagnostics. When cleanup fails with HARNESS_REQUEST_TIMEOUT, the harness
+// runs ONE bounded diagnostic episode (health, then meta) on fresh direct requests and rethrows the ORIGINAL error.
+// These owned-stub fixtures prove that the episode is bounded, non-recursive and single, that malformed or non-answers
+// are labelled 'unavailable', that no token reaches the diagnostic, and that the original error survives.
+test('[observe148] a cleanup request timeout runs ONE bounded, non-recursive diagnostic episode and rethrows the original error', { timeout: 30000 }, async () => {
+  // /api/sessions and /api/meta never answer; /api/health answers.
+  const stub = await ownedStub('never', { 'GET /api/health': (req, res) => json(res, 200, { status: 'ok', version: 'stub' }) });
+  const harness = await startTestDaemon({ requestTimeoutMs: NEGATIVE_BOUND_MS });
+  started.push(harness);
+  try {
+    assert.equal(harness.isAlive(), true, 'PRECONDITION: the owned daemon runs');
+    const { error, elapsed } = await stopWithCleanupAt(harness, stub.origin);
+    assert.equal(harness.isAlive(), false, 'the owned daemon child was terminated anyway');
+    assert.ok(error, 'the cleanup failure is reported, not swallowed');
+    assert.equal(error.code, 'HARNESS_REQUEST_TIMEOUT', 'the ORIGINAL request timeout is rethrown, not replaced or re-typed');
+    assert.equal(error.stage, 'headers'); assert.equal(error.budget_ms, NEGATIVE_BOUND_MS);
+    assert.ok(Number.isInteger(error.timer_late_ms) && error.timer_late_ms >= 0, `timer lateness recorded: ${error.timer_late_ms}`);
+    const d = error.cleanup_diagnostic;
+    assert.equal(d && d.episode, 'ran', JSON.stringify(d));
+    assert.ok(d.budget_ms <= 2000 && d.elapsed_ms <= d.budget_ms + 500, `the episode is bounded: ${JSON.stringify(d)}`);
+    assert.equal(d.daemon.exited, false, 'observed while the owned daemon still ran');
+    assert.deepEqual({ answered: d.health.answered, http_status: d.health.http_status, status: d.health.status }, { answered: true, http_status: 200, status: 'ok' });
+    assert.deepEqual({ answered: d.meta.answered, unavailable: d.meta.unavailable }, { answered: false, unavailable: 'episode_bound' },
+      'a probe that never answers is only unavailable');
+    assert.deepEqual(stub.seen, ['GET /api/sessions', 'GET /api/health', 'GET /api/meta'], 'exactly one episode: no retry, no recursive cleanup request');
+    const token = harness.authToken(), text = JSON.stringify(d);
+    assert.ok(!token || !text.includes(token), 'the diagnostic carries no token');
+    assert.ok(!text.includes(stub.origin), 'the diagnostic carries no origin');
+    assert.ok(elapsed < 15000, `stop() settled (${elapsed} ms)`);
+  } finally {
+    if (harness.isAlive()) await harness.kill().catch(() => {});
+    await stub.close();
+  }
+});
+
+test('[observe148] malformed probe answers are unavailable and a second cleanup timeout on the same daemon runs no further episode', { timeout: 30000 }, async () => {
+  const stub = await ownedStub('never', {
+    'GET /api/health': (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('not json'); },
+    'GET /api/meta': (req, res) => json(res, 200, { event_loop: 'bogus', audit_writer: 7 }),
+  });
+  const harness = await startTestDaemon({ requestTimeoutMs: NEGATIVE_BOUND_MS });
+  started.push(harness);
+  const from = `http://${harness.host}:${harness.port}`, realFetch = globalThis.fetch;
+  try {
+    let first, second;
+    globalThis.fetch = (input, init) => realFetch(String(input).startsWith(from) ? stub.origin + String(input).slice(from.length) : input, init);
+    try {
+      first = await harness.cleanupSessions().then(() => null, (e) => e);
+      second = await harness.cleanupSessions().then(() => null, (e) => e);
+    } finally { globalThis.fetch = realFetch; }
+    assert.equal(first && first.code, 'HARNESS_REQUEST_TIMEOUT', 'the original error is rethrown');
+    assert.equal(second && second.code, 'HARNESS_REQUEST_TIMEOUT', 'the original error is rethrown');
+    const d = first.cleanup_diagnostic;
+    assert.equal(d && d.episode, 'ran', JSON.stringify(d));
+    assert.deepEqual({ answered: d.health.answered, status: d.health.status }, { answered: true, status: 'unavailable' }, 'a non-JSON health answer is unavailable');
+    assert.deepEqual({ event_loop: d.meta.event_loop, audit_writer: d.meta.audit_writer }, { event_loop: 'unavailable', audit_writer: 'unavailable' });
+    assert.equal(second.cleanup_diagnostic && second.cleanup_diagnostic.episode, 'already_used', 'at most ONE diagnostic episode per daemon');
+    assert.deepEqual(stub.seen, ['GET /api/sessions', 'GET /api/health', 'GET /api/meta', 'GET /api/sessions'], 'the second timeout sent no probe');
+  } finally {
+    globalThis.fetch = realFetch;
+    await harness.stop().catch(() => {});
+    if (harness.isAlive()) await harness.kill().catch(() => {});
+    await stub.close();
+  }
+});
+
+test('[observe148] a request timeout records the pending stage: body when headers already arrived', { timeout: 15000 }, async () => {
+  const stub = await ownedStub();
+  try {
+    const error = await boundedRequest(`${stub.origin}/headers-only`, {}, { timeoutMs: NEGATIVE_BOUND_MS }).then(() => null, (e) => e);
+    assert.equal(error && error.code, 'HARNESS_REQUEST_TIMEOUT');
+    assert.equal(error.stage, 'body', 'headers had arrived; the body was pending');
+    assert.equal(error.budget_ms, NEGATIVE_BOUND_MS);
+    assert.ok(Number.isInteger(error.timer_late_ms) && error.timer_late_ms >= 0);
+  } finally { await stub.close(); }
 });

@@ -58,6 +58,38 @@ function observations(injectId, d = daemon) {
   return d.request(`/api/inject-observations/${encodeURIComponent(injectId)}`);
 }
 
+// Task 1215 observe148 (failure-only evidence for the session_process_exited wait). It runs only after the unchanged
+// wait has ALREADY failed, attaches fixed-shape `exit_evidence` to the original error, and the caller rethrows that
+// error.
+// - Evidence: last poll status and observation-kind tokens; ms since spawn and since dispatch; owned daemon alive (the
+//   harness exit event, no PID probing); whether the owned daemon's own stdout holds this session's exit marker
+//   (boolean only, never log text); and ONE GET /state bounded at 2000 ms (activity kind/cause tokens and duration_ms
+//   only, never previews or fields).
+// - A failed or slow probe is 'unavailable'. It never replaces the original failure.
+const EXIT_EVIDENCE_MS = 2000;
+const EVIDENCE_TOKEN = /^[a-z][a-z0-9_]{0,63}$/;
+const evidenceToken = (v) => (typeof v === 'string' && EVIDENCE_TOKEN.test(v) ? v : null);
+function observationKinds(body) {
+  const list = body && Array.isArray(body.observations) ? body.observations : null;
+  return list ? list.slice(-16).map((o) => evidenceToken(o && o.kind) || 'other') : null;
+}
+async function attachExitEvidence(error, { sid, spawnedAt, dispatchedAt, lastPoll }) {
+  if (!error || typeof error !== 'object' || !Object.isExtensible(error) || Object.hasOwn(error, 'exit_evidence')) return;
+  const now = Date.now();
+  const evidence = { elapsed_since_spawn_ms: now - spawnedAt, elapsed_since_dispatch_ms: now - dispatchedAt, last_poll: lastPoll,
+    daemon_alive: daemon.isAlive(), exit_marker_logged: 'unavailable', session_state: 'unavailable' };
+  try { evidence.exit_marker_logged = daemon.getLogs().stdout.includes(`[EXIT] Session ${sid} exited with code`); } catch { /* unavailable */ }
+  try {
+    const st = await daemon.request(`/api/sessions/${encodeURIComponent(sid)}/state`, { timeoutMs: EXIT_EVIDENCE_MS });
+    const a = st.body && st.body.activity_observation;
+    evidence.session_state = { http_status: st.status, kind: evidenceToken(a && a.kind), cause: evidenceToken(a && a.cause),
+      duration_ms: a && Number.isFinite(a.duration_ms) ? a.duration_ms : null };
+  } catch (probeError) {
+    evidence.session_state = { unavailable: (probeError && typeof probeError.code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(probeError.code)) ? probeError.code : 'error' };
+  }
+  error.exit_evidence = evidence;
+}
+
 // Shared assertions — every body this endpoint returns, on every arm, must satisfy these.
 function assertDiscriminatedUnknown(res, label) {
   assert.equal(res.status, 200,
@@ -299,17 +331,25 @@ test('dead_reports_absence_to_source: a process exit is reported as absence, and
     // actually seen, and requires `exit_observed_at` to be stated at all (#843). This arm is the
     // entrance that genuinely observes one. See test/delete-death-observation-60.test.js.
     const sid = createSessionId('dying');
+    const spawnedAt = Date.now(); // observe148: evidence timing only
     await daemon.spawnSession(sid, { command: 'bash', args: ['-c', 'sleep 3'] });
     const res = await dispatch(sid, 'work this process will not survive', source);
+    const dispatchedAt = Date.now(); // observe148: evidence timing only
     assert.equal(res.status, 200);
     const injectId = res.body.inject_id;
 
+    let lastPoll = null; // observe148: the last poll's status and kind tokens, read only by the failure evidence
     const body = await daemon.waitFor(async () => {
       const poll = await observations(injectId);
+      lastPoll = { status: poll.status, kinds: observationKinds(poll.body) };
       if (poll.status !== 200) return null;
       const kinds = (poll.body.observations || []).map(o => o.kind);
       return kinds.includes('session_process_exited') ? poll.body : null;
-    }, { timeoutMs: 6000, description: 'session_process_exited observation' });
+    }, { timeoutMs: 6000, description: 'session_process_exited observation' })
+      .catch(async (error) => {
+        try { await attachExitEvidence(error, { sid, spawnedAt, dispatchedAt, lastPoll }); } catch { /* evidence is optional; the original failure is not */ }
+        throw error;
+      });
 
     // The pending entry is released on death; the LEDGER record is not. A poll after the process
     // is gone still gets a named observation instead of a 404.

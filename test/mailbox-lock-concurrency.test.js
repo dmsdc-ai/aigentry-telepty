@@ -397,3 +397,83 @@ test('#1215 control: EPERM on a published live peer number that the re-list stil
   } finally { mock.mock.restore(); release(); }
   assert.deepEqual(fs.readdirSync(lock), []);
 });
+
+// Task 1215 repro141 (RED by design against 55568519; a reproduction, not a product fix). FIRST .lock creation race in
+// the actual acquireLock -> lockDirectory -> resolveSessionDir path. resolveSessionDir observes .lock with one lstat
+// for its directory exemption (path-boundary.js:59). When .lock is missing it then takes a SECOND lstat inside
+// checkLeaf (:44). A concurrent first contender that creates .lock in between (its mkdir at lock.js:77) makes that
+// second stat a directory, so the call fails `!isFile()` with MAILBOX_UNSAFE_PATH: the Windows per-file diagnostic
+// failure at iteration 0.
+// Barrier:
+// - At the genuine "missing" result of the first fs.lstatSync/fs.statSync of exactly <dir>/.lock, the barrier creates
+//   the entry another contender would. Then it returns that same genuine missing result.
+// - It fires once and only on that path. fs functions are restored in finally.
+// - It asserts the public outcome and the real on-disk lock effects, never a stat count.
+// The symlink/junction and hardlink controls inject UNSAFE entries at the same boundary and must stay refused: the
+// accepted path types are not widened. The exact Windows failing predicate was not recorded by CI.
+function firstLockCreationBarrier(lockPath, inject) {
+  const original = { lstatSync: fs.lstatSync, statSync: fs.statSync };
+  const state = { ran: false, error: null };
+  const fire = () => { state.ran = true; try { inject(); } catch (e) { state.error = (e && e.code) || 'inject_error'; } };
+  const atMissing = (real) => function (p, ...rest) {
+    const target = !state.ran && typeof p === 'string' && path.resolve(p) === lockPath;
+    let result;
+    try { result = real.call(fs, p, ...rest); }
+    catch (e) { if (target && e && e.code === 'ENOENT') fire(); throw e; }
+    if (target && result === undefined) fire(); // throwIfNoEntry:false spelling of the same "missing" observation
+    return result;
+  };
+  fs.lstatSync = atMissing(original.lstatSync); fs.statSync = atMissing(original.statSync);
+  return { state, original, restore() { Object.assign(fs, original); } };
+}
+function ownTickets(lock) {
+  let names; try { names = fs.readdirSync(lock); } catch (e) { return e.code; }
+  return names.filter((name) => new RegExp(`^${process.pid}-[a-f0-9]{32}$`).test(name) && fs.existsSync(path.join(lock, name, 'number')));
+}
+function acquireThroughBarrier(dir, barrier) {
+  let outcome, release = null;
+  try { release = acquireLock(dir); outcome = { ok: true }; }
+  catch (e) { outcome = { ok: false, code: (e && e.code) || 'error' }; }
+  finally { barrier.restore(); }
+  assert.ok(fs.lstatSync === barrier.original.lstatSync && fs.statSync === barrier.original.statSync, 'CONTROL: patched fs functions restored');
+  assert.equal(barrier.state.error, null, 'TEST HOOK FAILURE (not a product result): the concurrent contender entry could not be created');
+  assert.equal(barrier.state.ran, true, 'NON-VACUITY: the lock path observed .lock missing and the contender created it at that boundary');
+  return { outcome, release };
+}
+test('[1215-red141] control: first lock creation without a concurrent contender is admitted (hook-free baseline)', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock');
+  assert.equal(fs.existsSync(lock), false, 'PRECONDITION: first creation (no .lock yet)');
+  const release = acquireLock(dir);
+  try { assert.equal(ownTickets(lock).length, 1, 'the acquisition holds exactly one real ticket'); }
+  finally { release(); }
+  assert.equal(ownTickets(lock).length, 0, 'release removes the ticket');
+});
+test('[1215-red141] a safe .lock directory created by a concurrent first contender after the missing observation is admitted', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock');
+  assert.equal(fs.existsSync(lock), false, 'PRECONDITION: first creation (no .lock yet)');
+  const barrier = firstLockCreationBarrier(lock, () => fs.mkdirSync(lock, { mode: 0o700 })); // exactly the contender's own mkdir (lock.js:77)
+  const { outcome, release } = acquireThroughBarrier(dir, barrier);
+  try {
+    const st = fs.lstatSync(lock);
+    assert.ok(st.isDirectory() && !st.isSymbolicLink(), 'CONTROL: the contender .lock is a real, safe directory');
+    assert.deepEqual(outcome, { ok: true }, `a legitimate concurrent first .lock creation must be admitted, got ${JSON.stringify(outcome)}`);
+    assert.equal(ownTickets(lock).length, 1, 'the admitted acquisition holds exactly one real ticket in the shared .lock');
+  } finally { if (release) release(); }
+  assert.equal(ownTickets(lock).length, 0, 'release removes the ticket');
+  const again = acquireLock(dir); again(); // the shared .lock stays usable
+});
+for (const kind of ['symlink', 'hardlink']) test(`[1215-red141] control: a ${kind} appearing as .lock at the same boundary is still refused`, t => {
+  const {root, dir} = fixture(t), lock = path.join(dir, '.lock');
+  const elsewhere = path.join(root, 'elsewhere'), leafFile = path.join(root, 'elsewhere-file');
+  fs.mkdirSync(elsewhere, { mode: 0o700 }); fs.writeFileSync(leafFile, '');
+  assert.equal(fs.existsSync(lock), false, 'PRECONDITION: first creation (no .lock yet)');
+  const barrier = firstLockCreationBarrier(lock, () => kind === 'symlink'
+    ? fs.symlinkSync(elsewhere, lock, process.platform === 'win32' ? 'junction' : 'dir')
+    : fs.linkSync(leafFile, lock));
+  const { outcome, release } = acquireThroughBarrier(dir, barrier);
+  try {
+    assert.deepEqual(outcome, { ok: false, code: 'MAILBOX_UNSAFE_PATH' }, `an unsafe ${kind} .lock must stay refused, got ${JSON.stringify(outcome)}`);
+    assert.deepEqual(fs.readdirSync(elsewhere), [], 'nothing was created through the link');
+    assert.equal(fs.readFileSync(leafFile, 'utf8'), '', 'the linked file is untouched');
+  } finally { if (release) release(); }
+});

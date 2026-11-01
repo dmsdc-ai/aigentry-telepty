@@ -131,23 +131,63 @@ function harnessRequestError(code, method, route, elapsedMs) {
     { code, method, route, elapsed_ms: elapsedMs });
 }
 
+// Task 1215 observe148 (failure-only diagnostics): fixed-shape pickers for the ONE bounded cleanup diagnostic episode.
+// They copy only numeric, boolean and code-token fields that the routes already expose: /api/health {status},
+// /api/meta event_loop (src/diagnostics/event-loop.js snapshot) and audit_writer (src/audit/inject-log.js status). They
+// never copy ids, host/port/pid, timestamps, previews or bodies. Anything missing or malformed is 'unavailable'.
+const DIAG_TOKEN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const diagNumber = (v) => (Number.isFinite(v) ? v : null);
+const diagBool = (v) => (typeof v === 'boolean' ? v : null);
+const diagToken = (v) => (typeof v === 'string' && DIAG_TOKEN.test(v) ? v : null);
+function diagEventLoop(e) {
+  if (!e || typeof e !== 'object' || Array.isArray(e)) return 'unavailable';
+  const l = e.latest && typeof e.latest === 'object' ? e.latest : null;
+  return { status: diagToken(e.status), freshness_ms: diagNumber(e.freshness_ms), stale: diagBool(e.stale),
+    latest: l ? { window_ms: diagNumber(l.window_ms), count: diagNumber(l.count), p50_ms: diagNumber(l.p50_ms), p99_ms: diagNumber(l.p99_ms),
+      max_ms: diagNumber(l.max_ms) } : null,
+    last_stall_max_ms: e.last_stall && typeof e.last_stall === 'object' ? diagNumber(e.last_stall.max_ms) : null };
+}
+function diagAuditWriter(a) {
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return 'unavailable';
+  const out = {};
+  for (const k of ['queued', 'appended', 'written_lines', 'batches', 'dropped', 'errors', 'flush_ms', 'timer_armed_ms_ago', 'writing_for_ms',
+    'last_write_ms', 'max_write_ms', 'last_write_end_ms_ago']) out[k] = diagNumber(a[k]);
+  for (const k of ['closed', 'timer_armed', 'writing']) out[k] = diagBool(a[k]);
+  out.last_error_code = diagToken(a.last_error_code); out.writing_stage = diagToken(a.writing_stage);
+  return out;
+}
+function diagProbeShape(p, pick) {
+  if (!p.answered) return { answered: false, unavailable: p.unavailable, total_ms: p.total_ms };
+  return { answered: true, http_status: p.http_status, headers_ms: p.headers_ms, total_ms: p.total_ms, ...pick(p.body) };
+}
+
 async function boundedRequest(url, init = {}, { timeoutMs, signal } = {}) {
   const method = String(init.method || 'GET').toUpperCase();
   const route = new URL(url).pathname;
   const budget = requestBudget(timeoutMs);
   const begun = Date.now();
   const controller = new AbortController();
-  let outcome = null;
+  // observe148: `stage` says whether headers or the body were still pending, and `timerLateMs` how late this
+  // process's own timer fired. Both are added to the ORIGINAL timeout error only.
+  let outcome = null, stage = 'headers', timerLateMs = null;
   const onAbort = () => { if (!outcome) outcome = 'HARNESS_REQUEST_ABORTED'; controller.abort(); };
-  const timer = setTimeout(() => { if (!outcome) outcome = 'HARNESS_REQUEST_TIMEOUT'; controller.abort(); }, budget);
+  const timer = setTimeout(() => {
+    if (!outcome) { outcome = 'HARNESS_REQUEST_TIMEOUT'; timerLateMs = Math.max(0, Date.now() - begun - budget); }
+    controller.abort();
+  }, budget);
   if (signal) {
     if (signal.aborted) onAbort();
     else signal.addEventListener('abort', onAbort, { once: true });
   }
   try {
-    return await parseResponse(await fetch(url, { ...init, signal: controller.signal }));
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    stage = 'body';
+    return await parseResponse(response);
   } catch (error) {
-    if (outcome) throw harnessRequestError(outcome, method, route, Date.now() - begun);
+    if (outcome) {
+      throw Object.assign(harnessRequestError(outcome, method, route, Date.now() - begun),
+        outcome === 'HARNESS_REQUEST_TIMEOUT' ? { budget_ms: budget, stage, timer_late_ms: timerLateMs } : {});
+    }
     throw error;
   } finally {
     clearTimeout(timer);
@@ -367,10 +407,78 @@ async function startTestDaemon(options = {}) {
   //   - every other non-2xx, including 404 "Exact session id required.", because this list supplied exact ids
   //     (HARNESS_CLEANUP_DELETE_FAILED);
   //   - a 2xx-deleted session still listed after the drain wait.
+  // Task 1215 harness136: the one ALREADY-ABSENT answer is idempotent. A listed session can be removed by someone else
+  // between this list and its DELETE: for example the `telepty allow` bridge's own exit DELETE
+  // (src/cli/security-actions.js) racing a test's teardown (cli.test.js kills the bridge, then afterEach stop()). The
+  // DELETE route answers exactly 404 { error: 'Session not found', requested: <the id> } when the record no longer
+  // resolves (src/routes/session-actions.js). That exact body, for the exact listed id, is counted `absent`. The
+  // session stays IN the drain predicate, so it must really be gone. Every other 404 (e.g. 'Exact session id
+  // required.', or a different `requested`) still fails.
   // Returns a fixed-shape summary: counts plus status/code keys only, never ids, bodies or messages.
   const DIAG_CODE = /^[A-Z][A-Z0-9_]{1,63}$/;
-  async function cleanupSessions({ signal } = {}) {
-    const summary = { listed: 0, deleted: 0, refused: 0, failed: 0, refused_codes: {}, failed_statuses: {} };
+  // Task 1215 observe148 (failure-only): when cleanup fails with HARNESS_REQUEST_TIMEOUT, run at most ONE extra bounded
+  // diagnostic episode per daemon, then RETHROW THE ORIGINAL ERROR with `cleanup_diagnostic` attached:
+  // - The episode is fresh: unauthenticated GET /api/health, then GET /api/meta, both direct fetch calls under one
+  //   AbortController. They never go through request()/boundedRequest()/cleanupSessions(), so there is no recursion
+  //   and no retry.
+  // - Its total budget is min(2000 ms, remaining stop() cleanup budget - margin), so it cannot cross stop()'s own bound
+  //   and re-type the failure. Abort closes pending bodies, and the timer and listener are released.
+  // - It only says what the owned daemon answered. A non-answer is 'unavailable', never proof of an event-loop cause.
+  // No diagnostic failure ever replaces, hides or passes the original error.
+  const DIAG_EPISODE_MS = 2000, DIAG_EPISODE_MARGIN_MS = 100;
+  let diagnosticEpisodeUsed = false;
+  async function cleanupDiagnosticEpisode({ signal, remainingMs } = {}) {
+    const daemonState = () => ({ exited: exitState.exited, exit_code: Number.isInteger(exitState.code) ? exitState.code : null,
+      exit_signal: typeof exitState.signal === 'string' && /^SIG[A-Z0-9]{1,16}$/.test(exitState.signal) ? exitState.signal : null });
+    if (diagnosticEpisodeUsed) return { episode: 'already_used', daemon: daemonState() };
+    diagnosticEpisodeUsed = true;
+    if (exitState.exited) return { episode: 'skipped_daemon_exited', daemon: daemonState() };
+    const budget = Math.min(DIAG_EPISODE_MS, typeof remainingMs === 'function' ? remainingMs() - DIAG_EPISODE_MARGIN_MS : DIAG_EPISODE_MS);
+    if (!(budget > 0) || (signal && signal.aborted)) return { episode: 'skipped_no_budget', daemon: daemonState() };
+    const controller = new AbortController(), begun = Date.now();
+    const timer = setTimeout(() => controller.abort(), budget);
+    const onAbort = () => controller.abort();
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    const probe = async (pathname, headers) => {
+      const at = Date.now();
+      try {
+        const res = await fetch(`http://${host}:${port}${pathname}`, { headers, signal: controller.signal });
+        const headersMs = Date.now() - at;
+        let body;
+        try { body = JSON.parse(await res.text()); } catch { body = undefined; }
+        return { answered: true, http_status: res.status, headers_ms: headersMs, total_ms: Date.now() - at, body };
+      } catch (error) {
+        return { answered: false, unavailable: controller.signal.aborted ? 'episode_bound' : (diagToken(error && error.cause && error.cause.code) || 'error'),
+          total_ms: Date.now() - at };
+      }
+    };
+    try {
+      const health = await probe('/api/health', {});
+      let token = null; try { token = authToken(); } catch { token = null; }
+      const meta = await probe('/api/meta', token ? { 'x-telepty-token': token } : {});
+      return { episode: 'ran', budget_ms: budget, elapsed_ms: Date.now() - begun, daemon: daemonState(),
+        health: diagProbeShape(health, (b) => ({ status: (b && diagToken(b.status)) || 'unavailable' })),
+        meta: diagProbeShape(meta, (b) => ({ event_loop: diagEventLoop(b && b.event_loop), audit_writer: diagAuditWriter(b && b.audit_writer) })) };
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      controller.abort();
+    }
+  }
+  async function cleanupSessions({ signal, remainingMs } = {}) {
+    try {
+      return await cleanupSessionsObserved({ signal });
+    } catch (error) {
+      if (error && typeof error === 'object' && error.code === 'HARNESS_REQUEST_TIMEOUT' && Object.isExtensible(error)
+        && !Object.hasOwn(error, 'cleanup_diagnostic')) {
+        try { error.cleanup_diagnostic = await cleanupDiagnosticEpisode({ signal, remainingMs }); }
+        catch { error.cleanup_diagnostic = { episode: 'unavailable' }; }
+      }
+      throw error;
+    }
+  }
+  async function cleanupSessionsObserved({ signal } = {}) {
+    const summary = { listed: 0, deleted: 0, absent: 0, refused: 0, failed: 0, refused_codes: {}, failed_statuses: {} };
     const list = await request('/api/sessions', { signal });
     if (list.status !== 200 || !Array.isArray(list.body)) {
       return summary;
@@ -385,6 +493,7 @@ async function startTestDaemon(options = {}) {
     for (const { value: { id, res } } of outcomes) {
       const code = res.body && typeof res.body.code === 'string' && DIAG_CODE.test(res.body.code) ? res.body.code : null;
       if (res.status >= 200 && res.status < 300) summary.deleted++;
+      else if (res.status === 404 && res.body && res.body.error === 'Session not found' && res.body.requested === id) summary.absent++;
       else if (res.status === 403 && code === 'OWNED_DELETE_FORBIDDEN') {
         summary.refused++; refusedIds.add(id); summary.refused_codes[code] = (summary.refused_codes[code] || 0) + 1;
       } else {
@@ -400,7 +509,11 @@ async function startTestDaemon(options = {}) {
     await waitFor(async () => {
       const current = await request('/api/sessions', { signal });
       return current.status === 200 && Array.isArray(current.body) && current.body.every((session) => refusedIds.has(session.id));
-    }, { description: 'session cleanup' });
+    }, { description: 'session cleanup' }).catch((error) => {
+      // harness136: the drain is the truth check for `deleted` and `absent`; its failure carries the counts.
+      if (error && typeof error === 'object' && Object.isExtensible(error) && !Object.hasOwn(error, 'summary')) error.summary = summary;
+      throw error;
+    });
     return summary;
   }
 
@@ -410,10 +523,11 @@ async function startTestDaemon(options = {}) {
     const controller = new AbortController();
     let expired = false;
     const timer = setTimeout(() => { expired = true; controller.abort(); }, cleanupTimeoutMs);
+    const endsAt = Date.now() + cleanupTimeoutMs; // observe148: lets the diagnostic episode stay inside this bound
     const onCaseAbort = () => controller.abort();
     const follow = caseSignal && !caseSignal.aborted;
     if (follow) caseSignal.addEventListener('abort', onCaseAbort, { once: true });
-    return { signal: controller.signal, expired: () => expired,
+    return { signal: controller.signal, expired: () => expired, remainingMs: () => endsAt - Date.now(),
       dispose() { clearTimeout(timer); if (follow) caseSignal.removeEventListener('abort', onCaseAbort); } };
   }
 
@@ -441,7 +555,7 @@ async function startTestDaemon(options = {}) {
         let cleanupError = null, terminateError = null, summary = null;
         const cleanup = cleanupSignal(signal);
         try {
-          summary = await cleanupSessions({ signal: cleanup.signal });
+          summary = await cleanupSessions({ signal: cleanup.signal, remainingMs: cleanup.remainingMs });
         } catch (error) {
           cleanupError = cleanup.expired()
             ? Object.assign(new Error(`daemon-harness stop(): session cleanup did not finish within ${cleanupTimeoutMs}ms `

@@ -132,7 +132,8 @@ function createBrokerNode({ config, privateKey, localToken, localPrincipal, fetc
         || ['FORWARD_OUTCOME_UNKNOWN', 'FORWARD_STORAGE_UNAVAILABLE'].includes(receipt.code) ? 'outcome_unknown' : 'failed',
         code: 'BROKER_LOCAL_INJECT_REFUSED' };
     } catch (failure) {
-      result = failure.code?.startsWith('BROKER_LOCAL_CHALLENGE')
+      // A rejection's code is not always a string (a DOMException TimeoutError carries a numeric legacy code).
+      result = typeof failure?.code === 'string' && failure.code.startsWith('BROKER_LOCAL_CHALLENGE')
         ? { state: 'failed', code: 'BROKER_LOCAL_CHALLENGE_REFUSED' }
         : { state: 'outcome_unknown', code: 'BROKER_LOCAL_OUTCOME_UNKNOWN' };
     }
