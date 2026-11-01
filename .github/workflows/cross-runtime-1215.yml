@@ -1,0 +1,159 @@
+name: Cross-runtime consumer (task 1215, diagnostic only)
+
+# Task 1215 / runtime175 — ONE diagnostic job for the runtime split the real Mac activation has: the user installs with
+# Node 20.20.0 / npm 10.8.2 (shell PATH), and launchd runs the daemon with Node 25.2.1 (job PATH). The canonical
+# release-candidate consumer installs and runs with the SAME node, so it never measured this split.
+#
+# WHAT THIS IS. The EXISTING canonical archive (release-candidate-1215.yml run 41285424284, artifact
+# release-candidate-1215-package) is downloaded, never rebuilt, and pinned by sha256. It is then validated by the
+# EXISTING shipped verifier `scripts/check-package.mjs --tarball --manifest` at the archive's own commit, started with
+# Node 25.2.1 while Node 20.20.0 / npm 10.8.2 is first on PATH. On POSIX that verifier installs with the `npm` on PATH
+# (check-package.mjs:263) and runs the Darwin reader probe (:433) and the daemon + PTY smoke (:455; daemon.js:3 loads
+# node-pty) with `process.execPath`, inside ONE run and ONE private install tree: install = 20.20.0, run = 25.2.1.
+#
+# WHAT THIS IS NOT. The verifier's `telepty --version|--help|init` checks run through the installed `.bin/telepty`
+# shebang (`#!/usr/bin/env node`, :397), so they resolve the PATH node (20.20.0), NOT 25.2.1. No Mac host activation,
+# global install, service, real root/bridge transport, account auth, provider call or publication is exercised. Nothing
+# is written to the repository and no secret is read.
+#
+# FAILS CLOSED on: a checkout that is not the archive commit; a node/npm pair other than install 20.20.0 + npm 10.8.2
+# and runtime 25.2.1 (or the same binary for both); a downloaded archive, manifest or identity record that is not the
+# pinned bytes; and any verifier failure.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/cross-runtime-1215-175'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cross-runtime-1215-175
+  cancel-in-progress: false
+
+env:
+  ARCHIVE_COMMIT: 6ca252c6eb9b691e465a114e4eb456cabd96a482
+  SOURCE_RUN: '41285424284'
+  ARTIFACT: release-candidate-1215-package
+  FILENAME: dmsdc-ai-aigentry-telepty-0.10.0.tgz
+  ARCHIVE_SHA256: 6208ad26182cef319612a2d1066c4e5c6a091eb0fabca87bae7fc5d8a165fc70
+  MANIFEST_SHA256: 95039c5166863ac447f47387d2c810f8d98e79ded35969a577a68aab263ca1a9
+  IDENTITY_SHA256: 0625732f3d405b59478afd90e1505d164383a7f0340609486aaa72b9b0633d4e
+  INSTALL_NODE_VERSION: v20.20.0
+  INSTALL_NPM_VERSION: 10.8.2
+  RUNTIME_NODE_VERSION: v25.2.1
+  # Declared intent only: the verifier builds a closed child environment (check-package.mjs:232-239) that does not pass
+  # this through. Its install is NON-GLOBAL in a private HOME, and it asserts postinstall's "non-global install" skip
+  # (:350); that branch (scripts/postinstall.js:25) is what keeps any daemon or service untouched here.
+  TELEPTY_SKIP_POSTINSTALL: '1'
+
+jobs:
+  cross-runtime:
+    name: Install node 20.20.0 / npm 10.8.2, run node 25.2.1 (macos-latest)
+    if: github.repository == 'dmsdc-ai/aigentry-telepty'
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.ARCHIVE_COMMIT }}
+          persist-credentials: false
+      - name: The checkout is the archive commit (verifier, goldens and package.json of THAT tree)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ARCHIVE_COMMIT" || { echo "::error::checkout is not $ARCHIVE_COMMIT"; exit 1; }
+          echo "checkout=$(git rev-parse HEAD)"
+
+      # Runtime first, so the install toolchain set up next is the one first on PATH.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '25.2.1'
+      - name: Record the runtime node (launchd-equivalent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUNTIME_NODE="$(realpath "$(command -v node)")"
+          echo "RUNTIME_NODE=$RUNTIME_NODE" >> "$GITHUB_ENV"
+          echo "runtime_node=$RUNTIME_NODE"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20.20.0'
+      - name: Record and pin the install/run pair (fails if it differs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          EVID="$RUNNER_TEMP/evidence"; mkdir -p "$EVID"; echo "EVID=$EVID" >> "$GITHUB_ENV"
+          INSTALL_NODE="$(realpath "$(command -v node)")"; NPM_BIN="$(realpath "$(command -v npm)")"
+          GOT_INSTALL="$(node --version)"; GOT_NPM="$(npm --version)"; GOT_RUNTIME="$("$RUNTIME_NODE" --version)"
+          {
+            echo "install_node=$INSTALL_NODE version=$GOT_INSTALL"
+            echo "install_npm=$NPM_BIN version=$GOT_NPM"
+            echo "runtime_node=$RUNTIME_NODE version=$GOT_RUNTIME"
+          } | tee "$EVID/pair.txt"
+          test "$GOT_INSTALL" = "$INSTALL_NODE_VERSION" || { echo "::error::install node $GOT_INSTALL != $INSTALL_NODE_VERSION"; exit 1; }
+          test "$GOT_NPM" = "$INSTALL_NPM_VERSION" || { echo "::error::install npm $GOT_NPM != $INSTALL_NPM_VERSION"; exit 1; }
+          test "$GOT_RUNTIME" = "$RUNTIME_NODE_VERSION" || { echo "::error::runtime node $GOT_RUNTIME != $RUNTIME_NODE_VERSION"; exit 1; }
+          test "$INSTALL_NODE" != "$RUNTIME_NODE" || { echo "::error::install and runtime node are the same binary"; exit 1; }
+
+      - name: Download the existing canonical artifact (same repository; no rebuild)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/package"; mkdir -p "$DIR"; echo "DIR=$DIR" >> "$GITHUB_ENV"
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT" --dir "$DIR"
+      - name: Identity — the downloaded archive, manifest and identity record are the pinned bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          ( cd "$DIR" && ls -1A ) | sort | tee "$EVID/artifact-files.txt"
+          printf '%s\n' "$FILENAME" package-manifest.json release-candidate-identity.json | sort | diff - "$EVID/artifact-files.txt"
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$FILENAME" "$MANIFEST_SHA256" package-manifest.json "$IDENTITY_SHA256" release-candidate-identity.json \
+            | ( cd "$DIR" && shasum -a 256 -c ) | tee "$EVID/identity.txt"
+          grep -F "\"commit\": \"$ARCHIVE_COMMIT\"" "$DIR/release-candidate-identity.json" >/dev/null
+          grep -F "\"sha256\": \"$ARCHIVE_SHA256\"" "$DIR/release-candidate-identity.json" >/dev/null
+          echo "IDENTITY: PASS (commit $ARCHIVE_COMMIT, archive $ARCHIVE_SHA256)" | tee -a "$EVID/identity.txt"
+
+      - name: Shipped verifier under the runtime node (install = PATH npm/node 20.20.0, run = 25.2.1)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNTIME_NODE" scripts/check-package.mjs --tarball "$DIR/$FILENAME" --manifest "$DIR/package-manifest.json" 2>&1 \
+            | tee "$EVID/check-package.log"
+
+      - name: Summary (identity and membership are reported separately from install/runtime)
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG="${EVID:-/nonexistent}/check-package.log"
+          mark() { if [ -f "$LOG" ] && grep -Fq "$2" "$LOG"; then echo "- $1: present"; else echo "- $1: ABSENT"; fi; }
+          {
+            echo "### cross-runtime-1215-175"
+            echo '```'; cat "${EVID:-/nonexistent}/pair.txt" 2>/dev/null || echo "pair: not recorded"; echo '```'
+            grep -F 'IDENTITY: PASS' "${EVID:-/nonexistent}/identity.txt" 2>/dev/null || echo "IDENTITY: not passed"
+            mark 'manifest + membership verified before install (verifier tarball-mode identity line)' '"mode":"tarball","filename"'
+            mark 'npm ls (resolved dependency identity)' '"npm_ls"'
+            mark 'daemon + PTY smoke under the runtime node' '"daemon_smoke"'
+            mark 'verifier PASS (install 20.20.0 / run 25.2.1)' '"result":"PASS"'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Bound the evidence (failure only)
+        if: failure()
+        shell: bash
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/bounded"; mkdir -p "$OUT"
+          for f in pair.txt artifact-files.txt identity.txt; do [ -f "$EVID/$f" ] && cp "$EVID/$f" "$OUT/"; done
+          [ -f "$EVID/check-package.log" ] && tail -c 2097152 "$EVID/check-package.log" > "$OUT/check-package.tail.log"
+          true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: cross-runtime-1215-175-evidence
+          path: ${{ runner.temp }}/bounded
+          retention-days: 5
+          if-no-files-found: ignore
