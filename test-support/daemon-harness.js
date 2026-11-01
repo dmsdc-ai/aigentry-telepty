@@ -261,6 +261,62 @@ async function boundedRequest(url, init = {}, { timeoutMs, signal } = {}) {
   }
 }
 
+// Task 1215 owner191 (DIAGNOSTIC OPT-IN ONLY): when TELEPTY_EPIPE_OWNER_DIAGNOSTIC_DIR names an absolute directory, each
+// owned daemon is launched as `node --require test-support/epipe-owner-diagnostic-1215.cjs daemon.js`. That preload
+// records the owner stream and process identity of a fatal unhandled stream 'error' into a harness-private directory.
+// The directory is removed after a bounded, sanitized read. Without the variable, none of this runs: the launch argv,
+// the daemon environment, the returned object and every diagnostic shape stay exactly as before.
+// Bounds: OWNER_DAEMON_MAX of preload records read per daemon, an OWNER_SUMMARY_MAX summary on a cleanup failure, and
+// at most one published file per daemon, written only when the daemon recorded an event or exited non-zero.
+const OWNER_PRELOAD = path.join(__dirname, 'epipe-owner-diagnostic-1215.cjs');
+const OWNER_DAEMON_MAX = 65536, OWNER_SUMMARY_MAX = 8192;
+let ownerSequence = 0;
+function ownerDiagnosticRoot() {
+  const root = process.env.TELEPTY_EPIPE_OWNER_DIAGNOSTIC_DIR;
+  return typeof root === 'string' && root.length > 0 && path.isAbsolute(root) ? root : null;
+}
+// Reads the preload's own fixed-shape records (owner-<pid>.jsonl), bounded to OWNER_DAEMON_MAX in total, daemon first.
+function readOwnerRecords(dir, daemonPid) {
+  const out = { records: [], unparsed: 0, bytes: 0, truncated: false, files: 0 };
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((name) => /^owner-\d{1,10}\.jsonl$/.test(name)); } catch { return out; }
+  names.sort((a, b) => (a === `owner-${daemonPid}.jsonl` ? -1 : b === `owner-${daemonPid}.jsonl` ? 1 : a < b ? -1 : 1));
+  for (const name of names) {
+    out.files++;
+    let text;
+    try { text = fs.readFileSync(path.join(dir, name), 'utf8'); } catch { continue; }
+    if (out.bytes + Buffer.byteLength(text) > OWNER_DAEMON_MAX) { out.truncated = true; text = text.slice(0, Math.max(0, OWNER_DAEMON_MAX - out.bytes)); }
+    out.bytes += Buffer.byteLength(text);
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      try { const record = JSON.parse(line); if (record && typeof record === 'object' && typeof record.event === 'string') out.records.push(record); else out.unparsed++; }
+      catch { out.unparsed++; }
+    }
+    if (out.truncated) break;
+  }
+  return out;
+}
+// Events = every non-start record. Process identities are kept for the daemon and for every process with an event.
+function ownerEvidence(read, daemonPid, spawnedAt) {
+  const relative = (record) => {
+    const { wall_ms: wall, ...rest } = record;
+    return { ...rest, at_ms_since_spawn: Number.isFinite(wall) ? wall - spawnedAt : null };
+  };
+  const events = read.records.filter((record) => record.event !== 'start').map(relative);
+  const withEvents = new Set(events.map((record) => record.pid));
+  const processes = read.records.filter((record) => record.event === 'start' && (record.pid === daemonPid || withEvents.has(record.pid)))
+    .map((record) => ({ pid: record.pid, ppid: record.ppid, role: record.role, entry: record.entry }));
+  return { schema: 'telepty-epipe-owner-1215/v1', daemon_pid: Number.isInteger(daemonPid) ? daemonPid : null, processes, events,
+    read: { files: read.files, bytes: read.bytes, truncated: read.truncated, unparsed: read.unparsed } };
+}
+function boundedOwnerJson(evidence, max) {
+  let text = JSON.stringify(evidence);
+  for (let keep = evidence.events.length - 1; Buffer.byteLength(text) > max && keep >= 0; keep--) {
+    text = JSON.stringify({ ...evidence, events: evidence.events.slice(0, keep), events_dropped_for_bound: evidence.events.length - keep });
+  }
+  return Buffer.byteLength(text) <= max ? text : JSON.stringify({ schema: evidence.schema, daemon_pid: evidence.daemon_pid, over_bound: true });
+}
+
 async function startTestDaemon(options = {}) {
   // Bind an OS-assigned ephemeral port (PORT=0) unless the caller pins one. This is
   // collision-free: the daemon holds the socket continuously from the moment the kernel
@@ -290,16 +346,20 @@ async function startTestDaemon(options = {}) {
     NO_UPDATE_NOTIFIER: '1',
     TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
   };
+  // owner191 (opt-in only): a harness-private record directory; null, and therefore inert, without the opt-in.
+  const ownerRoot = ownerDiagnosticRoot();
+  const ownerDir = ownerRoot ? fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-epipe-owner-')) : null;
   const daemonEnv = {
     ...sharedEnv,
     PORT: String(requestedPort),
-    HOST: host
+    HOST: host,
+    ...(ownerDir ? { TELEPTY_EPIPE_OWNER_DIR: ownerDir, TELEPTY_EPIPE_OWNER_PARENT_PID: String(process.pid) } : {})
   };
 
   let stdout = '';
   let stderr = '';
 
-  const child = spawn(process.execPath, ['daemon.js'], {
+  const child = spawn(process.execPath, ownerDir ? ['--require', OWNER_PRELOAD, 'daemon.js'] : ['daemon.js'], {
     cwd: projectRoot,
     env: daemonEnv,
     // Task 1215 W3: the IPC channel is how a Windows normal stop reaches the daemon's own shutdown().
@@ -309,6 +369,24 @@ async function startTestDaemon(options = {}) {
   // Task 1215 cleanup185 (failure-only): arrival times of the owned child's output chunks, reported only by
   // transportDiagnostic and only relative to the cleanup start. Recording them changes nothing that is read or written.
   const outputAt = { stdout_last: null, stderr_first: null, stderr_last: null };
+
+  // owner191 (opt-in only): bounded reads of the preload records. finalizeOwner() runs at most once, after the owned
+  // child ended (stop/kill). It publishes one file to the opt-in directory only when there was an event or a non-zero
+  // exit, then removes the private directory. Every step ignores its own I/O failure, so it never changes stop/kill.
+  const ownerSpawnedAt = Date.now();
+  let ownerFinal = null;
+  const ownerSnapshot = () => ownerEvidence(readOwnerRecords(ownerDir, child.pid), child.pid, ownerSpawnedAt);
+  function finalizeOwner() {
+    if (!ownerDir || ownerFinal) return;
+    try {
+      ownerFinal = ownerSnapshot();
+      if (ownerFinal.events.length > 0 || (Number.isInteger(exitState.code) && exitState.code !== 0)) {
+        fs.writeFileSync(path.join(ownerRoot, `owner-daemon-${process.pid}-${++ownerSequence}.json`),
+          `${boundedOwnerJson({ ...ownerFinal, exit_code: Number.isInteger(exitState.code) ? exitState.code : null }, OWNER_DAEMON_MAX)}\n`, { mode: 0o600, flag: 'wx' });
+      }
+    } catch { /* diagnostic only */ }
+    try { fs.rmSync(ownerDir, { recursive: true, force: true }); } catch { /* a still-running descendant may hold it on Windows */ }
+  }
 
   child.stdout.on('data', (chunk) => {
     stdout += chunk.toString();
@@ -562,7 +640,10 @@ async function startTestDaemon(options = {}) {
       output_at_ms: { stdout_last: outputAt.stdout_last === null ? null : outputAt.stdout_last - begun,
         stderr_first: outputAt.stderr_first === null ? null : outputAt.stderr_first - begun,
         stderr_last: outputAt.stderr_last === null ? null : outputAt.stderr_last - begun },
-      markers: { stderr: diagnosticLogMarkers(stderr, { scrub }), stdout: diagnosticLogMarkers(stdout, { scrub }) } };
+      markers: { stderr: diagnosticLogMarkers(stderr, { scrub }), stdout: diagnosticLogMarkers(stdout, { scrub }) },
+      // owner191 (opt-in only, last so the existing fields survive the DIAG_JSON_MAX rendering): the preload's own
+      // owner/process records, bounded to OWNER_SUMMARY_MAX.
+      ...(ownerDir ? { owner: JSON.parse(boundedOwnerJson(ownerSnapshot(), OWNER_SUMMARY_MAX)) } : {}) };
   }
   async function cleanupSessions({ signal, remainingMs } = {}) {
     const begun = Date.now();
@@ -657,7 +738,11 @@ async function startTestDaemon(options = {}) {
   // shutdown handlers, so ConPTY shells of a kill()ed daemon are left to the job's termination.
   // The diagnostic runner records them as unattributed/unknown — never as clean.
   async function kill() {
-    await terminateOwnedChild('kill()');
+    try {
+      await terminateOwnedChild('kill()');
+    } finally {
+      finalizeOwner(); // owner191: returns at once without the opt-in
+    }
   }
 
   // Task 1215 harness129: termination of the owned child is reached in `finally` whatever the bounded cleanup did.
@@ -694,6 +779,7 @@ async function startTestDaemon(options = {}) {
         return summary;
       }
     } finally {
+      finalizeOwner(); // owner191: returns at once without the opt-in
       if (ownsHome) {
         fs.rmSync(homeDir, { recursive: true, force: true });
       }
@@ -841,7 +927,9 @@ async function startTestDaemon(options = {}) {
     kill,
     waitFor,
     isAlive: () => !exitState.exited,
-    getLogs: () => ({ stdout, stderr })
+    getLogs: () => ({ stdout, stderr }),
+    // owner191 (opt-in only; absent otherwise): the bounded owner evidence, final after stop()/kill().
+    ...(ownerDir ? { ownerDiagnostic: () => ownerFinal || ownerSnapshot() } : {})
   };
 }
 

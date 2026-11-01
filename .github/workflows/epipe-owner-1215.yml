@@ -1,0 +1,217 @@
+name: EPIPE owner diagnostic (task 1215 / owner191, Windows, original vs candidate B)
+
+# Task 1215 / release1238 / owner191 — DIAGNOSTIC ONLY. Not a release gate; a green leg is NOT a pass, and a full green
+# run with no captured crash is an inconclusive diagnosis, not a root-cause fix.
+#
+# OBSERVED (B Windows run 41290843984 / job 124801596324, full test:ci): the owned daemon of test/daemon.test.js
+# "#45 operator-lane multicast" exited 1 at +273 ms on the cleanup clock. Its stderr showed EPIPE with only
+# emitErrorNT/emitErrorCloseNT frames, and the cleanup then got ECONNREFUSED at +5233 ms. The emitting stream and process
+# were not identified. cleanup188 later ran daemon.test.js alone on O and B without reproducing it.
+#
+# THIS RUN, once per variant (no rerun, retry, loop or continue-on-error):
+#   1. the behavioural controls test/epipe-owner-diagnostic-1215.test.js (synthetic monitor semantics plus real launch
+#      wiring; not a reproduction);
+#   2. the UNCHANGED `npm run test:ci` (same runner, inventory, flags and concurrency as test-install.yml) with the
+#      explicit opt-in TELEPTY_EPIPE_OWNER_DIAGNOSTIC_DIR. With it, every harness-owned daemon runs under the
+#      owner-attribution preload. It records the owner stream of an unhandled stream 'error', its process and role
+#      (daemon or forked descendant), and publishes one bounded file per daemon that recorded an event or exited non-zero.
+# The two variants differ ONLY in package.json + package-lock.json:
+#   - original:    .github/fixtures/cleanup-epipe-1215/*-original.json;
+#   - candidate-b: the committed B package.json + package-lock.json.
+# Install is a genuine `npm ci` on the frozen lock with normal lifecycle scripts (no update, audit, force or override).
+#
+# BOUNDS:
+#   - job <= 12 min; npm ci <= 3 min; controls <= 2 min; test:ci <= 7 min;
+#   - failures stay failures: each command's exit is recorded and the step exits with it;
+#   - evidence <= 4 MiB per variant from an allowlist, kept 7 days even on failure: no credentials, environment, cache,
+#     node_modules or user logs.
+#   - core.autocrlf stays the runner default, as in the measured jobs, so bytes are verified as sha256 with CR removed.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/epipe-owner-1215-191'
+
+permissions:
+  contents: read
+
+jobs:
+  epipe-owner:
+    name: test:ci once on Windows with owner attribution (${{ matrix.variant }}) — diagnostic only
+    runs-on: windows-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [original, candidate-b]
+    defaults:
+      run:
+        shell: bash
+    env:
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.2'
+
+      - name: Select and verify the variant inputs (exact bytes, CR removed)
+        id: inputs
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/epipe-owner-1215-evidence"
+          mkdir "$EVIDENCE" "$RUNNER_TEMP/epipe-owner-1215-raw" "$RUNNER_TEMP/epipe-owner-1215-owner"
+          lf_sha() { tr -d '\r' < "$1" | sha256sum | cut -d' ' -f1; }
+          expect() {
+            local got
+            got="$(lf_sha "$1")"
+            printf '%s lf_sha256=%s cr_present=%s\n' "$1" "$got" "$(grep -q $'\r' "$1" && echo yes || echo no)" >> "$EVIDENCE/input-hashes.txt"
+            [ "$got" = "$2" ] || { echo "::error::$1 is not the reviewed body (lf_sha256 ${got}); nothing was run"; exit 1; }
+          }
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"
+          printf 'variant=%s\ncommit=%s\nnode=%s\nnpm=%s\ncore_autocrlf=%s\n' "$VARIANT" "$GITHUB_SHA" "$NODE_VERSION" "$NPM_VERSION" \
+            "$(git config --get core.autocrlf || echo unset)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.2" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.2"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2"; exit 1; }
+          # Shared, reviewed bytes: the test:ci runner, inventory and preload, the harness, the owner preload and its controls.
+          expect scripts/run-tests.mjs 87225da20edf8729fece0dd22a2e37eea695f40b0409445da032c0e53d288713
+          expect scripts/test-suites.json 1382f0b24939ce4e53226be509fee6d029bb481de85f9b7a166ae2ffb8ee14d5
+          expect test-support/setup-env.js 9431f9e39b6051c95be8bd61929ebab3fc3317ad41f7cef6b9466bc6100fd4ef
+          expect test-support/daemon-harness.js cbce55ce3df0cb0134f8b87d90c2c42d3ac7e7da80e41a0c91f0bf77a6c8529d
+          expect test-support/epipe-owner-diagnostic-1215.cjs 5ee70c6df74988daccad75569e3d7fa7197f71a69be4ee4b824a8a07b05e45ef
+          expect test/epipe-owner-diagnostic-1215.test.js 4b69f373c870adc61015b6388c3a330b82e40fa25849a4a5435d38e64ea7f411
+          case "$VARIANT" in
+            original)
+              expect .github/fixtures/cleanup-epipe-1215/package-original.json fb8832167fff4abf13340e53df67855737c68bc08c26377acc466b193ef72db0
+              expect .github/fixtures/cleanup-epipe-1215/package-lock-original.json a1d9db1faf5a0ea05663953a15a452980849c4dcb95a68e55d14213ec28879cf
+              cp .github/fixtures/cleanup-epipe-1215/package-original.json package.json
+              cp .github/fixtures/cleanup-epipe-1215/package-lock-original.json package-lock.json
+              PKG=fb8832167fff4abf13340e53df67855737c68bc08c26377acc466b193ef72db0
+              LOCK=a1d9db1faf5a0ea05663953a15a452980849c4dcb95a68e55d14213ec28879cf ;;
+            candidate-b)
+              PKG=974f5d7faf603108385277055e7407b7977c283bcf7bda8d07244fce10e109c9
+              LOCK=16eb17fc9cdd8a9aa09e1e7cca0248efa72b6cadf25a9bd142e431efa4d7ad61 ;;
+            *) echo "::error::unknown variant"; exit 1 ;;
+          esac
+          expect package.json "$PKG"
+          expect package-lock.json "$LOCK"
+          echo "PKG=$PKG" >> "$GITHUB_OUTPUT"
+          echo "LOCK=$LOCK" >> "$GITHUB_OUTPUT"
+
+      - name: npm ci (frozen lock, normal lifecycle; exit recorded)
+        id: install
+        timeout-minutes: 3
+        env:
+          PKG: ${{ steps.inputs.outputs.PKG }}
+          LOCK: ${{ steps.inputs.outputs.LOCK }}
+        run: |
+          set -uo pipefail
+          EVIDENCE="$RUNNER_TEMP/epipe-owner-1215-evidence"; RAW="$RUNNER_TEMP/epipe-owner-1215-raw"
+          npm ci --no-audit --fund=false > "$RAW/npm-ci.stdout" 2> "$RAW/npm-ci.stderr"
+          rc=$?
+          echo "$rc" > "$EVIDENCE/npm-ci.exit_code"
+          echo "npm ci exit=${rc}"
+          [ "$rc" = 0 ] || exit "$rc"
+          set -e
+          for f in package.json package-lock.json; do
+            want="$PKG"; [ "$f" = package-lock.json ] && want="$LOCK"
+            [ "$(tr -d '\r' < "$f" | sha256sum | cut -d' ' -f1)" = "$want" ] || { echo "::error::npm ci changed ${f}"; exit 1; }
+          done
+          for p in node-pty ws express zod @modelcontextprotocol/sdk @hono/node-server body-parser; do
+            printf '%s=%s\n' "$p" "$(node -p "require('./node_modules/$p/package.json').version")"
+          done > "$EVIDENCE/installed-versions.txt"
+          cat "$EVIDENCE/installed-versions.txt"
+
+      - name: Run the owner-diagnostic controls once (exit recorded)
+        id: controls
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          EVIDENCE="$RUNNER_TEMP/epipe-owner-1215-evidence"; RAW="$RUNNER_TEMP/epipe-owner-1215-raw"
+          node --require ./test-support/setup-env.js --test --test-reporter=spec test/epipe-owner-diagnostic-1215.test.js \
+            > "$RAW/controls.stdout" 2> "$RAW/controls.stderr"
+          rc=$?
+          echo "$rc" > "$EVIDENCE/controls.exit_code"
+          tail -n 40 "$RAW/controls.stdout" | cut -c1-400
+          exit "$rc"
+
+      - name: Run the unchanged npm run test:ci once with the owner opt-in (exit recorded)
+        id: suite
+        if: always() && steps.install.outcome == 'success'
+        timeout-minutes: 7
+        run: |
+          set -uo pipefail
+          EVIDENCE="$RUNNER_TEMP/epipe-owner-1215-evidence"; RAW="$RUNNER_TEMP/epipe-owner-1215-raw"
+          TELEPTY_EPIPE_OWNER_DIAGNOSTIC_DIR="$RUNNER_TEMP/epipe-owner-1215-owner" npm run test:ci > "$RAW/test-ci.stdout" 2> "$RAW/test-ci.stderr"
+          rc=$?
+          echo "$rc" > "$EVIDENCE/test-ci.exit_code"
+          tail -n 60 "$RAW/test-ci.stdout" | cut -c1-400
+          shopt -s nullglob; published=("$RUNNER_TEMP/epipe-owner-1215-owner"/owner-daemon-*.json)
+          echo "published owner files: ${#published[@]}"
+          echo "::notice title=owner191 ${VARIANT} (diagnostic only)::test:ci exit ${rc}; a green leg without a captured crash is inconclusive"
+          exit "$rc"
+
+      - name: Bound evidence (allowlisted, <= 4 MiB; runs whatever the commands did)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/epipe-owner-1215-evidence"; RAW="$RUNNER_TEMP/epipe-owner-1215-raw"; OWNER="$RUNNER_TEMP/epipe-owner-1215-owner"
+          test -d "$EVIDENCE" && test -d "$RAW" && test -d "$OWNER" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          : > "$EVIDENCE/capture-bounds.txt"
+          copy_capped() { # copy_capped SOURCE_DIR NAME MAX_BYTES
+            if [ -f "$1/$2" ] && [ ! -L "$1/$2" ]; then
+              local size; size="$(wc -c < "$1/$2" | tr -d ' ')"
+              head -c "$3" "$1/$2" > "$EVIDENCE/$2"
+              printf '%s raw_bytes=%s kept_bytes=%s truncated=%s\n' "$2" "$size" "$(wc -c < "$EVIDENCE/$2" | tr -d ' ')" \
+                "$([ "$size" -gt "$3" ] && echo yes || echo no)" >> "$EVIDENCE/capture-bounds.txt"
+            else
+              printf '%s absent\n' "$2" >> "$EVIDENCE/capture-bounds.txt"
+            fi
+          }
+          copy_capped "$RAW" npm-ci.stdout 32768
+          copy_capped "$RAW" npm-ci.stderr 32768
+          copy_capped "$RAW" controls.stdout 262144
+          copy_capped "$RAW" controls.stderr 65536
+          copy_capped "$RAW" test-ci.stdout 1572864
+          copy_capped "$RAW" test-ci.stderr 262144
+          # Harness-published owner files (each <= 64 KiB by construction), at most 1 MiB in total, in name order.
+          shopt -s nullglob
+          owner_total=0; owner_skipped=0; owner_present=0
+          for f in "$OWNER"/owner-daemon-*.json; do
+            owner_present=$((owner_present + 1))
+            name="$(basename "$f")"
+            case "$name" in owner-daemon-[0-9]*-[0-9]*.json) ;; *) owner_skipped=$((owner_skipped + 1)); continue ;; esac
+            [ -f "$f" ] && [ ! -L "$f" ] || { owner_skipped=$((owner_skipped + 1)); continue; }
+            size="$(wc -c < "$f" | tr -d ' ')"
+            if [ "$size" -gt 65536 ] || [ $((owner_total + size)) -gt 1048576 ]; then owner_skipped=$((owner_skipped + 1)); continue; fi
+            cp "$f" "$EVIDENCE/$name"; owner_total=$((owner_total + size))
+          done
+          printf 'owner files present=%s kept_bytes=%s skipped=%s\n' "$owner_present" "$owner_total" "$owner_skipped" >> "$EVIDENCE/capture-bounds.txt"
+          for f in npm-ci.exit_code controls.exit_code test-ci.exit_code; do [ -f "$EVIDENCE/$f" ] || printf '%s absent (step not reached or ended by its bound)\n' "$f" >> "$EVIDENCE/capture-bounds.txt"; done
+          cat "$EVIDENCE/capture-bounds.txt"
+          shopt -s dotglob nullglob
+          total=0
+          for f in "$EVIDENCE"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::non-regular evidence entry; not uploading"; exit 1; }
+            case "$(basename "$f")" in
+              toolchain.txt|input-hashes.txt|installed-versions.txt|capture-bounds.txt|npm-ci.exit_code|npm-ci.stdout|npm-ci.stderr) ;;
+              controls.exit_code|controls.stdout|controls.stderr|test-ci.exit_code|test-ci.stdout|test-ci.stderr) ;;
+              owner-daemon-[0-9]*-[0-9]*.json) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+            total=$((total + $(wc -c < "$f" | tr -d ' ')))
+          done
+          echo "evidence bytes=${total}"
+          [ "$total" -le 4194304 ] || { echo "::error::evidence is ${total} bytes (> 4 MiB); not uploading"; exit 1; }
+
+      - name: Upload evidence (no lockfile, credentials, cache or node_modules)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: epipe-owner-1215-191-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/epipe-owner-1215-evidence
+          if-no-files-found: error
+          retention-days: 7
