@@ -242,6 +242,40 @@ function createSessionDeliveryContext({
     if (state.current === record) state.current = null;
     state.recent.push(record); if (state.recent.length > BARRIER_RECENT) state.recent.shift();
   }
+  // #1215 windows110 diagnostics only, opt-in TELEPTY_QUEUE_DIAGNOSTICS=1 (read once, here). Off: nothing below samples
+  // and the G5 record is unchanged. On: one sample (monotonic time, process.cpuUsage(), read-only lockDiagnostics() totals)
+  // at claim, after the holder's mailbox.enqueue and at its deliverFn entry (only while it awaits its immediate tick); the
+  // queue_timeout record then carries claim→enqueue and enqueue→deliver deltas. Whole-process counters, not causality.
+  const QUEUE_DIAG = process.env.TELEPTY_QUEUE_DIAGNOSTICS === '1';
+  const QUEUE_DIAG_LOCK = { lock_acquired: 'acquired', lock_wait_ms: 'wait_ms_total', lock_pauses: 'pauses',
+    lock_pause_actual_ms: 'pause_actual_ms', lock_pauses_over_2x: 'pauses_over_2x', lock_eperm: 'eperm_total' };
+  const lockTotals = QUEUE_DIAG ? (() => { try { return require('./lock').lockDiagnostics; } catch { return null; } })() : null;
+  function queueDiagSample() {
+    const sample = { t: performance.now(), cpu: process.cpuUsage(), lock: null };
+    try {
+      const totals = lockTotals && lockTotals();
+      if (totals) sample.lock = Object.fromEntries(Object.entries(QUEUE_DIAG_LOCK).map(([field, key]) => [field, totals[key]]));
+    } catch { /* lock totals unavailable: lock fields stay null */ }
+    return sample;
+  }
+  function beginQueueDiag(record) {
+    try { if (record) record.span = { claim: queueDiagSample(), enqueue_done: null, deliver_entered: null }; } catch { /* never changes delivery */ }
+  }
+  function markQueueDiag(record, milestone) {
+    try { if (record && record.span && !record.released && record.span[milestone] === null) record.span[milestone] = queueDiagSample(); }
+    catch { /* never changes delivery */ }
+  }
+  const round1 = value => Math.round(value * 10) / 10;
+  function queueDiagSpan(from, to) {
+    if (!from || !to) return null;
+    const span = { elapsed_ms: round1(to.t - from.t), cpu_user_ms: round1((to.cpu.user - from.cpu.user) / 1000),
+      cpu_system_ms: round1((to.cpu.system - from.cpu.system) / 1000) };
+    for (const field of Object.keys(QUEUE_DIAG_LOCK)) {
+      const before = from.lock && from.lock[field], after = to.lock && to.lock[field];
+      span[field] = Number.isFinite(before) && Number.isFinite(after) ? round1(after - before) : null;
+    }
+    return span;
+  }
   const BARRIER_PHASES = ['tick_done', 'text_settled', 'cr_timer_fired', 'cr_write_done', 'released'];
   function barrierView(record, nowMs) {
     const view = { submit_delay_ms: record.submit_delay_ms, cr_ok: record.cr_ok, tick_outcome: record.tick_outcome };
@@ -249,6 +283,8 @@ function createSessionDeliveryContext({
     // Timer lateness against the requested submit delay (scheduling delay, not CPU use).
     view.cr_timer_late_ms = record.marks.cr_timer_fired !== undefined && record.marks.text_settled !== undefined
       ? record.marks.cr_timer_fired - record.marks.text_settled - record.submit_delay_ms : null;
+    if (record.span) view.queue_diag = { claim_to_enqueue: queueDiagSpan(record.span.claim, record.span.enqueue_done),
+      enqueue_to_deliver: queueDiagSpan(record.span.enqueue_done, record.span.deliver_entered) };
     if (!record.released) {
       view.age_ms = nowMs - record.claimedAt;
       view.phase = [...BARRIER_PHASES].reverse().find(phase => record.marks[phase] !== undefined) || 'claimed';
@@ -258,8 +294,16 @@ function createSessionDeliveryContext({
   function emitQueueTimeoutDiag(session, fields) {
     const state = barrierDiag.get(session), nowMs = Date.now();
     try {
+      const holder = state && state.current ? barrierView(state.current, nowMs) : null;
+      // #1215 windows113 R1 (flag on only): ONE sample at refusal closes the UNRELEASED holder's spans, covering the
+      // deliverFn→send/write tail up to this refusal. Not retained; recent (released) views are unchanged.
+      if (QUEUE_DIAG && holder && holder.queue_diag) {
+        const refusal = queueDiagSample(), span = state.current.span;
+        holder.queue_diag.claim_to_refusal = queueDiagSpan(span.claim, refusal);
+        holder.queue_diag.deliver_to_refusal = queueDiagSpan(span.deliver_entered, refusal);
+      }
       console.error(`[telepty-diag] submit_barrier ${JSON.stringify({ category: 'queue_timeout', ...fields,
-        holder: state && state.current ? barrierView(state.current, nowMs) : null,
+        holder,
         recent: state ? state.recent.map(record => barrierView(record, nowMs)) : [] })}`);
     } catch { /* diagnostics never change the refusal */ }
   }
@@ -575,6 +619,7 @@ function createSessionDeliveryContext({
     let barrier = null; // #1215 G5 diagnostics only
     if (!options.noEnter && session.type !== 'aterm') {
       barrier = beginBarrier(session, session.type === 'wrapped' ? 500 : 300);
+      if (QUEUE_DIAG) beginQueueDiag(barrier);
       session.pendingSubmit = new Promise((resolve) => {
         releaseSubmit = () => { endBarrier(session, barrier); session.pendingSubmit = null; resolve(); };
       });
@@ -611,7 +656,9 @@ function createSessionDeliveryContext({
       if(options.cooperativeHandoffConsent)queuedMessage.cooperative_handoff={...options.cooperativeHandoffConsent,inject_id:options.injectId || null,
         message_sha256:require('../principal/pending-handoff').messageDigest(queuedMessage)};
       const ack = mailboxForEnqueue.enqueue(queuedMessage);
+      if (QUEUE_DIAG) markQueueDiag(barrier, 'enqueue_done');
       const immediate = { result: null }; immediateAttempts.set(msgId, immediate);
+      if (QUEUE_DIAG) immediate.barrier = barrier;
       injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || null });
       // Registered synchronously after the enqueue: no tick can run in between.
       const owesSubmit = !options.noEnter && session.type !== 'aterm';
@@ -773,6 +820,7 @@ function createSessionDeliveryContext({
       && !(session.cooperativeHandoff?.pending_count>(session.cooperativeHandoff?.pending_dispatch_started?.length||0)
         && (!require('../readiness').pendingWriteReady(session) || session.pendingHandoffCapability?.owner!==session.ownerWs || session.pendingHandoffCapability?.generation!==session.interactionOwnerGeneration));},
     deliverFn: async (sessionId, msg) => {
+      if (QUEUE_DIAG) markQueueDiag(immediateAttempts.get(msg?.msg_id)?.barrier, 'deliver_entered');
       const session = sessions[sessionId];
       if (!session) return { success: false, error: 'Session not found' };
       const consent=msg.cooperative_handoff;

@@ -47,8 +47,49 @@ test('opt-in exact peer forwarding scopes authority, preserves receipts, dedupli
     assert.equal((await request({ ...body, prompt: 'x'.repeat(129) })).status, 403);
     assert.equal((await request({ ...body, url: 'http://example.invalid' })).status, 400);
     assert.equal((await source.request('/api/peers')).text.includes('max_requests'), false);
+    // #1215 windows109 — failure-only diagnostics for a non-200 first forward. Runs only on that failure and
+    // before the unchanged assertion below: one read-only observation (<= 3000 ms) of this fixture's own
+    // destination row through the existing ledger reader, never another injection, resend or retry. The
+    // received response is kept as received; anything not observed is reported as 'unknown'.
+    async function unacceptedForwardDiagnostics(response) {
+      const observedAt = performance.now();
+      let destination;
+      try { destination = createForwardLedger(target.homeDir).all(); } catch (error) { destination = { read_error: (error && error.code) || 'unknown' }; }
+      const destinationLedger = createForwardLedger(target.homeDir);
+      const rowKey = digest(`inbound:${digest(`outbound:${body.idempotency_key}`)}`);
+      let row = null, readError = null, elapsed = 0;
+      for (;;) {
+        try { row = destinationLedger.read(rowKey); readError = null; } catch (error) { row = null; readError = (error && error.code) || 'unknown'; }
+        elapsed = performance.now() - observedAt;
+        if ((row && row.state !== 'pending') || elapsed >= 3000) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(50, 3000 - elapsed)));
+      }
+      const secrets = [source.authToken(), target.authToken()].filter((value) => typeof value === 'string' && value.length > 0);
+      const tail = (text) => {
+        const kept = String(text || '').split(/\r?\n/).map((line) => (/authori[sz]ation|cookie|token|secret|credential|grant/i.test(line)
+          || secrets.some((secret) => line.includes(secret)) ? '[line redacted]' : line)).join('\n');
+        const bytes = Buffer.from(kept, 'utf8');
+        return bytes.length <= 1024 ? kept : bytes.subarray(bytes.length - 1024).toString('utf8');
+      };
+      const logs = target.getLogs();
+      return JSON.stringify({ source: response.body, destination, after_non_200: {
+        observation_bound_ms: 3000,
+        elapsed_ms_since_non_200_observed: Math.round(elapsed),
+        outcome: readError ? 'read_error' : !row ? 'row_absent' : row.state === 'pending' ? 'pending_at_bound' : 'settled',
+        read_error: readError,
+        final_state: row ? row.state : 'unknown',
+        remote_status: row && Number.isInteger(row.remote_status) ? row.remote_status : 'unknown',
+        remote_receipt_success: row && row.remote_receipt && typeof row.remote_receipt.success === 'boolean' ? row.remote_receipt.success : 'unknown',
+        remote_frames_observed: remoteFrames.length,
+        target_exit_event_recorded: !target.isAlive(),
+        target_exit_code_signal: 'unknown (not exposed by the harness)',
+        target_stdout_tail: tail(logs.stdout),
+        target_stderr_tail: tail(logs.stderr),
+      } });
+    }
     const accepted = await request(body);
-    assert.equal(accepted.status, 200, JSON.stringify({ source: accepted.body, destination: createForwardLedger(target.homeDir).all() }));
+    const unacceptedDiagnostics = accepted.status === 200 ? null : await unacceptedForwardDiagnostics(accepted);
+    assert.equal(accepted.status, 200, unacceptedDiagnostics || JSON.stringify({ source: accepted.body, destination: createForwardLedger(target.homeDir).all() }));
     assert.equal(accepted.body.state, 'accepted');
     assert.equal(accepted.body.routing_receipt.session, 'same@literal');
     assert.equal(accepted.body.routing_receipt.remote_inject_id, accepted.body.inject_id);
