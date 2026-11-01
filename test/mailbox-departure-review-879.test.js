@@ -163,3 +163,208 @@ test('C10 permission control: EPERM on a live number WITHOUT a marker still fail
   const observed = { ...o, peer: listing(p.dir) };
   assert.deepEqual(observed, { error: 'EPERM', acquired: false, peer: ['number'] }, JSON.stringify(observed));
 });
+
+// ---- #1215 lock227: EPERM from removeTicket's OWN ticket-directory listing during a REAP --------------------------
+// Windows job 124852862725 (8f7a70b tree): acquireLockObserved:308 (admission) → readTicket:197 (DEPARTED listed) →
+// removeTicket:158 → checkTicketFiles → ticketNames:97 readdirSync threw a raw EPERM scandir out of acquireLock. Here
+// the same branches are driven through counted seams with a fixed per-call schedule (no sleeps, races or children).
+// A "concurrent remover finishing" is the seam itself completing the departure (unlink + rmdir with the real fs) right
+// before it throws EPERM, modelling a delete-pending directory. Unlike C1–C10, the dead-owner cases (R3, R4, P2) make
+// exactly one synthetic pid (DEAD_PID, never this process) report ESRCH through a process.kill seam; no real process
+// is signalled or declared dead. The cases without a reap (N2, N3) and the denial controls (N1, N4) are unchanged rules.
+// A RED case's first assertion names the escaped error: on the original it is the seam's own EPERM (`seam-scandir`).
+const { reapSessionLocks, lockDiagnostics } = require('../src/mailbox/lock');
+const DEAD_PID = 2147483646; // a valid ticket pid (<= 0x7fffffff); only the seam below ever answers for it
+const COUNTER_KEYS = ['dir_unresolved', 'eperm_total', 'eperm_reap_list_unresolved', 'eperm_reap_relist_unresolved'];
+const NO_COUNTS = { dir_unresolved: 0, eperm_total: 0, eperm_reap_list_unresolved: 0, eperm_reap_relist_unresolved: 0 };
+// Process-wide lock totals across one case (a key the module does not have counts as 0).
+function counterDelta(before) {
+  const after = lockDiagnostics();
+  return Object.fromEntries(COUNTER_KEYS.map(key => [key, (after[key] ?? 0) - (before[key] ?? 0)]));
+}
+// A pre-made acquisition ticket of an arbitrary pid.
+function ticketOf(lockDir, pid, files = {}) {
+  const name = `${pid}-${crypto.randomBytes(16).toString('hex')}`, dir = path.join(lockDir, name);
+  fs.mkdirSync(dir, { mode: 0o700 });
+  for (const [file, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, file), content, { mode: 0o600 });
+  return { name, dir };
+}
+// Counted readdirSync seam for one ticket directory. plan(call) (1-based) returns undefined (real listing), true
+// (throw EPERM scandir) or a function (run it, then throw EPERM scandir). Every injected error is kept by identity.
+function listingSeam(t, isTarget, plan) {
+  const readdir = fs.readdirSync, seam = { calls: 0, injected: [] };
+  seam.finish = dir => { for (const name of readdir.call(fs, dir)) fs.unlinkSync(path.join(dir, name)); fs.rmdirSync(dir); };
+  t.mock.method(fs, 'readdirSync', function (target, ...rest) {
+    if (isTarget(target)) {
+      const action = plan(++seam.calls);
+      if (action) {
+        if (typeof action === 'function') action();
+        const e = eperm('scandir', target); seam.injected.push(e); throw e;
+      }
+    }
+    return readdir.call(this, target, ...rest);
+  });
+  return seam;
+}
+// process.kill seam: exactly DEAD_PID is reported dead (ESRCH); every other call is the real process.kill.
+function deadPidSeam(t) {
+  const kill = process.kill, seam = { probes: 0 };
+  t.mock.method(process, 'kill', function (pid, signal) {
+    if (pid === DEAD_PID) { seam.probes++; throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH', errno: -3, syscall: 'kill' }); }
+    return kill.call(this, pid, signal);
+  });
+  return seam;
+}
+// An error a seam injected is named `seam-<syscall>`; anything else by its code (or message).
+function classify(e, seams) {
+  return seams.some(seam => seam.injected.includes(e)) ? `seam-${e.syscall}` : (e && e.code) || String(e && e.message);
+}
+function acquireOnce(sessionDir, seams, timeoutMs = 1000) {
+  let release = null, error = null;
+  try { release = acquireLock(sessionDir, { timeoutMs }); } catch (e) { error = classify(e, seams); }
+  return { error, release };
+}
+function reapOnce(sessionDir, seams) {
+  try { return { error: null, removed: reapSessionLocks(sessionDir) }; } catch (e) { return { error: classify(e, seams), removed: null }; }
+}
+
+test('[L227 R1] admission reap of a departed ticket: EPERM at the first removeTicket listing is left to the finishing remover', t => {
+  const f = fixture(t), before = lockDiagnostics(), rename = fs.renameSync;
+  let p = null;
+  // The departed peer appears right after this acquirer publishes its number, so the reap runs in the ADMISSION scan.
+  t.mock.method(fs, 'renameSync', function (from, to, ...rest) {
+    const result = rename.call(this, from, to, ...rest);
+    if (p === null && path.basename(to) === 'number' && path.dirname(path.dirname(to)) === f.lockDir) p = peer(f.lockDir, { departed: '', number: '1' });
+    return result;
+  });
+  const seam = listingSeam(t, target => p !== null && target === p.dir, call => (call === 2 ? () => seam.finish(p.dir) : undefined));
+  const o = acquireOnce(f.sessionDir, [seam]);
+  t.mock.restoreAll();
+  if (o.release) o.release();
+  assert.equal(o.error, null, `[L227 R1] removeTicket first-listing EPERM escaped the admission reap: ${o.error}`);
+  const observed = { created: p !== null, calls: seam.calls, injected: seam.injected.length, dirGone: !fs.existsSync(p.dir), lock: listing(f.lockDir) };
+  assert.deepEqual(observed, { created: true, calls: 2, injected: 1, dirGone: true, lock: [] }, JSON.stringify(observed));
+  assert.deepEqual(counterDelta(before), { ...NO_COUNTS, dir_unresolved: 1, eperm_total: 1, eperm_reap_list_unresolved: 1 });
+});
+
+test('[L227 R2] departed reap: EPERM at the post-unlink re-list is left to the finishing remover', t => {
+  const f = fixture(t), before = lockDiagnostics(), p = peer(f.lockDir, { departed: '', number: '1' });
+  const seam = listingSeam(t, target => target === p.dir, call => (call === 3 ? () => seam.finish(p.dir) : undefined));
+  const o = acquireOnce(f.sessionDir, [seam]);
+  t.mock.restoreAll();
+  if (o.release) o.release();
+  assert.equal(o.error, null, `[L227 R2] removeTicket re-list EPERM escaped the departed reap: ${o.error}`);
+  const observed = { calls: seam.calls, injected: seam.injected.length, dirGone: !fs.existsSync(p.dir), lock: listing(f.lockDir) };
+  assert.deepEqual(observed, { calls: 3, injected: 1, dirGone: true, lock: [] }, JSON.stringify(observed));
+  assert.deepEqual(counterDelta(before), { ...NO_COUNTS, dir_unresolved: 1, eperm_total: 1, eperm_reap_relist_unresolved: 1 });
+});
+
+test('[L227 R3] dead-owner reap in acquireLock: EPERM at the first listing (a concurrent reaper finishing) is left to it', t => {
+  const f = fixture(t), before = lockDiagnostics(), p = ticketOf(f.lockDir, DEAD_PID, { number: '1' }), dead = deadPidSeam(t);
+  const seam = listingSeam(t, target => target === p.dir, call => (call === 2 ? () => seam.finish(p.dir) : undefined));
+  const o = acquireOnce(f.sessionDir, [seam]);
+  t.mock.restoreAll();
+  if (o.release) o.release();
+  assert.equal(o.error, null, `[L227 R3] removeTicket first-listing EPERM escaped the dead-owner reap: ${o.error}`);
+  const observed = { probes: dead.probes, calls: seam.calls, injected: seam.injected.length, dirGone: !fs.existsSync(p.dir), lock: listing(f.lockDir) };
+  assert.deepEqual(observed, { probes: 1, calls: 2, injected: 1, dirGone: true, lock: [] }, JSON.stringify(observed));
+  assert.deepEqual(counterDelta(before), { ...NO_COUNTS, dir_unresolved: 1, eperm_total: 1, eperm_reap_list_unresolved: 1 });
+});
+
+test('[L227 R4] dead-owner reap in reapSessionLocks: EPERM at the re-list is left pending and never counted as removed', t => {
+  const f = fixture(t), before = lockDiagnostics(), p = ticketOf(f.lockDir, DEAD_PID, { number: '1' }), dead = deadPidSeam(t);
+  const seam = listingSeam(t, target => target === p.dir, call => (call === 3 ? () => seam.finish(p.dir) : undefined));
+  const o = reapOnce(f.sessionDir, [seam]);
+  t.mock.restoreAll();
+  assert.equal(o.error, null, `[L227 R4] removeTicket re-list EPERM escaped the dead-owner reap: ${o.error}`);
+  const observed = { removed: o.removed, probes: dead.probes, calls: seam.calls, injected: seam.injected.length, dirGone: !fs.existsSync(p.dir) };
+  assert.deepEqual(observed, { removed: 0, probes: 1, calls: 3, injected: 1, dirGone: true }, JSON.stringify(observed));
+  assert.deepEqual(counterDelta(before), NO_COUNTS, 'no acquisition is active, so nothing is counted');
+});
+
+test('[L227 R5] a persistently refused departed-ticket reap listing is bounded: one attempt per scan, cleanup left pending', t => {
+  const f = fixture(t), before = lockDiagnostics(), p = peer(f.lockDir, { departed: '', number: '1' });
+  const seam = listingSeam(t, target => target === p.dir, call => (call % 2 === 0 ? true : undefined)); // every removeTicket listing
+  const o = acquireOnce(f.sessionDir, [seam]);
+  t.mock.restoreAll();
+  const pending = listing(p.dir);
+  if (o.release) o.release();
+  assert.equal(o.error, null, `[L227 R5] a persistent reap-listing EPERM escaped acquireLock: ${o.error}`);
+  const observed = { calls: seam.calls, injected: seam.injected.length, pending };
+  assert.deepEqual(observed, { calls: 4, injected: 2, pending: ['departed', 'number'] }, JSON.stringify(observed));
+  assert.deepEqual(counterDelta(before), { ...NO_COUNTS, dir_unresolved: 2, eperm_total: 2, eperm_reap_list_unresolved: 2 });
+  acquireLock(f.sessionDir)(); // the refusal cleared: an ordinary later reap finishes the departure
+  assert.deepEqual(listing(f.lockDir), []);
+});
+
+test('[L227 P1] positive control: a departed own-pid ticket is fully reaped through removeTicket', t => {
+  const f = fixture(t), before = lockDiagnostics(), p = peer(f.lockDir, { departed: '', number: '1' });
+  const seam = listingSeam(t, target => target === p.dir, () => undefined);
+  const o = acquireOnce(f.sessionDir, [seam]);
+  t.mock.restoreAll();
+  if (o.release) o.release();
+  const observed = { error: o.error, acquired: !!o.release, calls: seam.calls, dirGone: !fs.existsSync(p.dir), lock: listing(f.lockDir), counters: counterDelta(before) };
+  assert.deepEqual(observed, { error: null, acquired: true, calls: 3, dirGone: true, lock: [], counters: NO_COUNTS }, JSON.stringify(observed));
+});
+
+test('[L227 P2] positive control: a dead owner\'s unmarked ticket is fully reaped and counted once', t => {
+  const f = fixture(t), p = ticketOf(f.lockDir, DEAD_PID, { number: '1' }), dead = deadPidSeam(t);
+  const seam = listingSeam(t, target => target === p.dir, () => undefined);
+  const o = reapOnce(f.sessionDir, [seam]);
+  t.mock.restoreAll();
+  const observed = { ...o, probes: dead.probes, calls: seam.calls, dirGone: !fs.existsSync(p.dir), lock: listing(f.lockDir) };
+  assert.deepEqual(observed, { error: null, removed: 1, probes: 1, calls: 3, dirGone: true, lock: [] }, JSON.stringify(observed));
+});
+
+test('[L227 N1] denial control: a persistent EPERM listing of an UNMARKED live ticket blocks to timeout and keeps it', t => {
+  const f = fixture(t), before = lockDiagnostics(), p = peer(f.lockDir, { number: '1' });
+  const seam = listingSeam(t, target => target === p.dir, () => true);
+  const o = acquireOnce(f.sessionDir, [seam], 200);
+  t.mock.restoreAll();
+  const counters = counterDelta(before);
+  const observed = { error: o.error, acquired: !!o.release, everyCallRefused: seam.calls > 0 && seam.injected.length === seam.calls,
+    blockedEachScan: counters.dir_unresolved === seam.calls, peer: listing(p.dir), counters: { ...counters, dir_unresolved: 0 } };
+  assert.deepEqual(observed, { error: 'MAILBOX_LOCK_TIMEOUT', acquired: false, everyCallRefused: true, blockedEachScan: true, peer: ['number'], counters: NO_COUNTS },
+    JSON.stringify({ observed, calls: seam.calls }));
+});
+
+test('[L227 N2] owner control: an EPERM listing of the owner\'s own ticket during release() still throws', t => {
+  const f = fixture(t), release = acquireLock(f.sessionDir), [own] = fs.readdirSync(f.lockDir), ownDir = path.join(f.lockDir, own);
+  const seam = listingSeam(t, target => target === ownDir, () => true);
+  let error = null;
+  try { release(); } catch (e) { error = classify(e, [seam]); }
+  t.mock.restoreAll();
+  const kept = listing(ownDir);
+  release(); // a refused release is not marked released: the same release finishes once the refusal clears
+  const observed = { error, injected: seam.injected.length, kept, after: listing(f.lockDir) };
+  assert.deepEqual(observed, { error: 'seam-scandir', injected: 1, kept: ['number'], after: [] }, JSON.stringify(observed));
+});
+
+test('[L227 N3] owner control: an EPERM listing of the owner\'s own ticket during failed-acquisition cleanup still throws', t => {
+  const f = fixture(t), before = lockDiagnostics(), blocker = peer(f.lockDir, { number: '1' }), rename = fs.renameSync;
+  let ownDir = null;
+  // Armed only once this acquirer has published: after that its own directory is listed only by the abort cleanup.
+  t.mock.method(fs, 'renameSync', function (from, to, ...rest) {
+    const result = rename.call(this, from, to, ...rest);
+    if (ownDir === null && path.basename(to) === 'number' && path.dirname(path.dirname(to)) === f.lockDir) ownDir = path.dirname(to);
+    return result;
+  });
+  const seam = listingSeam(t, target => ownDir !== null && target === ownDir, () => true);
+  const o = acquireOnce(f.sessionDir, [seam], 100);
+  t.mock.restoreAll();
+  const observed = { error: o.error, acquired: !!o.release, injected: seam.injected.length, own: ownDir && listing(ownDir), blocker: listing(blocker.dir), counters: counterDelta(before) };
+  assert.deepEqual(observed, { error: 'seam-scandir', acquired: false, injected: 1, own: ['number'], blocker: ['number'], counters: NO_COUNTS }, JSON.stringify(observed));
+});
+
+test('[L227 N4] unlink control: a refused unlink of a stat-able entry in a departed reap still throws and keeps the evidence', t => {
+  const f = fixture(t), before = lockDiagnostics(), p = peer(f.lockDir, { departed: '', number: '1' }), number = path.join(p.dir, 'number');
+  const unlink = fs.unlinkSync, refused = { injected: [] };
+  t.mock.method(fs, 'unlinkSync', function (target, ...rest) {
+    if (target === number) { const e = eperm('unlink', target); refused.injected.push(e); throw e; }
+    return unlink.call(this, target, ...rest);
+  });
+  const o = acquireOnce(f.sessionDir, [refused]);
+  t.mock.restoreAll();
+  const observed = { error: o.error, acquired: !!o.release, injected: refused.injected.length, evidence: listing(p.dir), counters: counterDelta(before) };
+  assert.deepEqual(observed, { error: 'seam-unlink', acquired: false, injected: 1, evidence: ['departed', 'number'], counters: NO_COUNTS }, JSON.stringify(observed));
+});

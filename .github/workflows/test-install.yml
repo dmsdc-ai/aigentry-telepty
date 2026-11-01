@@ -65,6 +65,15 @@ jobs:
           path: ${{ runner.temp }}/windows-load-observer-879
           if-no-files-found: warn
           retention-days: 14
+      # Task 1215 peer235: the dedicated ledger PERFORMANCE gate on every OS. `npm run test:ci` above co-schedules files and
+      # gates the ledger file's FUNCTIONAL assertions and any valid-control stall; an invalid idle baseline there is reported
+      # as performance NOT-MEASURED, never as a pass. This step runs the SAME file (same workload, controls and 50 ms bound)
+      # once, alone, with --test-concurrency=1 and TELEPTY_LEDGER_PERF_GATE=1, where only a VALID pass succeeds: an
+      # inconclusive or a fail verdict fails this step. Mandatory: no continue-on-error, no retry.
+      - name: Run ledger performance gate (single file, no co-scheduled tests; task 1215)
+        env:
+          TELEPTY_LEDGER_PERF_GATE: '1'
+        run: node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=spec test/ledger-control-responsiveness-1207.test.js
       # #768: this one file drives a real daemon + a real `telepty allow` bridge + a real PTY
       # with a deliberately delayed WS handshake. Inside the parallel list it lands on a worker
       # alongside whatever else node --test schedules there, and on the 3-core macOS runner that

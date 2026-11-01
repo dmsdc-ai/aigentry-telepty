@@ -150,7 +150,7 @@ function heartbeatAcceptance(workload, controls, contract = HEARTBEAT_CONTRACT) 
 // F2 — main-thread blocking during sustained observation traffic, one tier at a time
 // ------------------------------------------------------------------------------------------------
 for (const tier of TIERS) {
-  test(`F2 [${tier} MiB]: a 1 ms heartbeat during ${F2.measuredFlips} measured flips through the genuine observation path; main-thread store writes == 0; per-event owner bytes bounded; every flip durable and named`, async () => {
+  test(`F2 [${tier} MiB]: a 1 ms heartbeat during ${F2.measuredFlips} measured flips through the genuine observation path; main-thread store writes == 0; per-event owner bytes bounded; every flip durable and named`, async (t) => {
     const store = H.privateStore(`telepty-1207-f2-${tier}MiB-`);
     const seeded = H.seedTier(store, tier);
     const R = H.recorders();
@@ -245,7 +245,8 @@ for (const tier of TIERS) {
         for (const r of f.bus_results) assert.ok(['observation_emitted', 'observation_duplicate'].includes(r), `every bus result during traffic is a durable outcome or a named duplicate, got ${r}`);
       }
       assert.equal(mainWrites, 0, 'the main thread never writes to the store during observation traffic');
-      assert.equal(evidence.heartbeat_acceptance.verdict, 'pass', `heartbeat acceptance (sampled the whole measured interval, no main-loop gap >= ${HEARTBEAT_CONTRACT.stallBoundMs} ms, valid same-process controls): ${JSON.stringify(evidence.heartbeat_acceptance)}`);
+      // #1215 peer235: gate placement (see heartbeatGate): a stall fails everywhere; an invalid baseline fails only the dedicated gate.
+      evidence.heartbeat_gate = assertHeartbeatGate(evidence.heartbeat_acceptance, `heartbeat acceptance (sampled the whole measured interval, no main-loop gap >= ${HEARTBEAT_CONTRACT.stallBoundMs} ms, valid same-process controls)`);
       assert.deepEqual(evidence.messages.over_64KiB_outside_exceptions, [], 'no main-thread message above 64 KiB outside ack.entry/submit.delta');
       assert.deepEqual(evidence.messages.over_frame_cap, [], 'no message above the largest frame cap');
       const rec = await ledgerClient.fetchTrackedInjection(injectId);
@@ -255,6 +256,7 @@ for (const tier of TIERS) {
       assert.equal(status.counts.cold + status.counts.hot, seeded.count + 1, 'retained history + the new record');
       evidence.record = { observation_seq: rec.record.observation_seq, kinds: rec.record.observations.map((o) => o.kind) };
       evidence.rss_bytes_end = process.memoryUsage().rss;
+      t.diagnostic(gateLine(`F2 [${tier} MiB]`, evidence.heartbeat_gate));
       failed = false;
       f2ByTier.set(tier, evidence);
     } finally {
@@ -279,7 +281,7 @@ for (const tier of TIERS) {
 // the poll handler's data path; begin while recovering; message-size observations
 // ------------------------------------------------------------------------------------------------
 for (const tier of TIERS) {
-  test(`R1 [${tier} MiB]: open while a 1 ms heartbeat runs and ${R1.pollsPerSecond} polls/s drive the poll data path; begin while recovering is refused by name; every poll answered; no message > 64 KiB`, async () => {
+  test(`R1 [${tier} MiB]: open while a 1 ms heartbeat runs and ${R1.pollsPerSecond} polls/s drive the poll data path; begin while recovering is refused by name; every poll answered; no message > 64 KiB`, async (t) => {
     const store = H.privateStore(`telepty-1207-r1-${tier}MiB-`);
     const seeded = H.seedTier(store, tier);
     const R = H.recorders();
@@ -371,7 +373,9 @@ for (const tier of TIERS) {
       }
       assert.equal(R.delivery.length, 0, 'no begin issued during recovery delivered anything');
       assert.deepEqual(evidence.messages.over_64KiB_outside_exceptions, [], 'no main-thread message above 64 KiB outside ack.entry/submit.delta (snapshot/read chunks are bounded)');
-      assert.equal(evidence.heartbeat_acceptance.verdict, 'pass', `heartbeat acceptance (sampled the whole measured phase incl. the ${openWall.toFixed(0)} ms open, no main-loop gap >= ${HEARTBEAT_CONTRACT.stallBoundMs} ms, valid same-process controls): ${JSON.stringify(evidence.heartbeat_acceptance)}`);
+      // #1215 peer235: gate placement (see heartbeatGate): a stall fails everywhere; an invalid baseline fails only the dedicated gate.
+      evidence.heartbeat_gate = assertHeartbeatGate(evidence.heartbeat_acceptance, `heartbeat acceptance (sampled the whole measured phase incl. the ${openWall.toFixed(0)} ms open, no main-loop gap >= ${HEARTBEAT_CONTRACT.stallBoundMs} ms, valid same-process controls)`);
+      t.diagnostic(gateLine(`R1 [${tier} MiB]`, evidence.heartbeat_gate));
       failed = false;
       r1ByTier.set(tier, evidence);
     } finally {
@@ -394,8 +398,11 @@ for (const tier of TIERS) {
 // Cross-tier comparison: recorded when ≥ 2 tiers ran in this process; otherwise marked incomplete.
 // The 3× figure is the F2 contract PROPOSAL; it is recorded against observed ratios, not asserted.
 // ------------------------------------------------------------------------------------------------
-test('F2/R1 cross-tier comparison (same run): ratios recorded against the proposed 3x gate; incomplete when one tier is selected', () => {
+test('F2/R1 cross-tier comparison (same run): ratios recorded against the proposed 3x gate; incomplete when one tier is selected', (t) => {
   const summary = { tiers_selected: TIERS, f2_tiers_measured: [...f2ByTier.keys()], r1_tiers_measured: [...r1ByTier.keys()], generated_at: new Date().toISOString(),
+    performance_gate: { mode: PERF_GATE ? 'perf_gate' : 'ordinary', note: 'F2/R1 functional pass is separate from performance; NOT-MEASURED is never a performance pass (#1215 peer235)',
+      F2: Object.fromEntries([...f2ByTier].map(([k, v]) => [`${k}MiB`, v.heartbeat_gate ? v.heartbeat_gate.performance : null])),
+      R1: Object.fromEntries([...r1ByTier].map(([k, v]) => [`${k}MiB`, v.heartbeat_gate ? v.heartbeat_gate.performance : null])) },
     metric_limits: ['process_cpu is whole-process CPU incl. the owner worker thread (Node 20 process.cpuUsage); main-thread CPU attribution UNMEASURED', 'message sizes are a JSON serialization proxy, not structured-clone bytes', 'poll latency is the handler DATA PATH, not the HTTP handler'] };
   if (TIERS.length < 2 || !f2ByTier.has(1)) {
     summary.cross_tier_gate = 'INCOMPLETE: one tier selected (default 1 MiB) or the 1 MiB reference did not complete; comparison-ready evidence emitted per tier (F2-<tier>MiB.json, R1-<tier>MiB.json)';
@@ -415,6 +422,7 @@ test('F2/R1 cross-tier comparison (same run): ratios recorded against the propos
   }
   const file = H.writeEvidence(EVIDENCE, 'CROSS-TIER.json', summary);
   console.log(`[ledger-1207 cross-tier] ${file} ${summary.cross_tier_gate}`);
+  t.diagnostic(`#1215 peer235 performance_summary ${JSON.stringify(summary.performance_gate)}`);
   assert.ok(fs.existsSync(file), 'the comparison evidence file is written');
 });
 
@@ -462,4 +470,94 @@ test('W5 heartbeat acceptance predicate: rejects zero sampling, stalls, incomple
     incomplete_phase_coverage: 'fail', sum_exceeds_window: 'fail',
     idle_overloaded: 'inconclusive', idle_zero_samples: 'inconclusive', idle_missing: 'inconclusive', block_not_visible: 'inconclusive', block_missing_request: 'inconclusive',
   }, JSON.stringify(observed));
+});
+
+// ------------------------------------------------------------------------------------------------
+// Task 1215 peer235 — GATE PLACEMENT only. heartbeatAcceptance, HEARTBEAT_CONTRACT (stallBoundMs 50), the controls and
+// the workload are unchanged. Ordinary runs (test:ci, co-scheduled with other files) gate the FUNCTIONAL assertions and
+// a valid-control stall: 'fail' fails in every mode. An invalid baseline ('inconclusive') is reported as performance
+// NOT-MEASURED there, never as a pass and never as coverage. TELEPTY_LEDGER_PERF_GATE=1 marks the dedicated single-file
+// run (test-install.yml, --test-concurrency=1) where a VALID pass is mandatory: 'inconclusive' FAILS it.
+// ------------------------------------------------------------------------------------------------
+const PERF_GATE_ENV = 'TELEPTY_LEDGER_PERF_GATE';
+function perfGateMode(env = process.env) {
+  const raw = env[PERF_GATE_ENV];
+  if (raw === undefined || raw === '') return false;
+  if (raw === '1') return true;
+  throw new Error(`${PERF_GATE_ENV} must be unset or exactly "1" (got ${JSON.stringify(String(raw).slice(0, 16))}); a misconfigured gate is never treated as ordinary`);
+}
+const PERF_GATE = perfGateMode();
+function heartbeatGate(acceptance, gateMode = PERF_GATE) {
+  const mode = gateMode ? 'perf_gate' : 'ordinary';
+  const verdict = acceptance && acceptance.verdict;
+  if (verdict === 'pass') return { mode, verdict, performance: 'PASS', gate: 'pass' };
+  if (verdict === 'fail') return { mode, verdict, performance: 'FAIL', gate: 'fail' };
+  if (verdict === 'inconclusive') return { mode, verdict, performance: 'NOT-MEASURED', gate: gateMode ? 'fail' : 'not_measured' };
+  return { mode, verdict: verdict === undefined ? null : String(verdict), performance: 'INVALID', gate: 'fail' };
+}
+// The one assertion F2 and R1 make on the heartbeat verdict (message keeps the case's original text).
+function assertHeartbeatGate(acceptance, message, gateMode = PERF_GATE) {
+  const g = heartbeatGate(acceptance, gateMode);
+  assert.notEqual(g.gate, 'fail', `${message} [peer235 gate mode=${g.mode} performance=${g.performance}]: ${JSON.stringify(acceptance)}`);
+  return g;
+}
+const gateLine = (label, g) => `#1215 peer235 heartbeat_gate ${label} mode=${g.mode} functional=pass performance=${g.performance} verdict=${g.verdict}`;
+
+test('[peer235 G1] heartbeat gate placement: pass passes, fail fails in every mode, inconclusive is NOT-MEASURED in ordinary runs and FAILS the dedicated gate, anything else fails', () => {
+  const observed = {};
+  for (const verdict of ['pass', 'fail', 'inconclusive', 'other', null]) {
+    for (const gateMode of [false, true]) {
+      const acceptance = verdict === null ? null : { verdict };
+      let threw = false;
+      try { assertHeartbeatGate(acceptance, 'control', gateMode); } catch (error) { threw = error && error.code === 'ERR_ASSERTION'; }
+      const g = heartbeatGate(acceptance, gateMode);
+      observed[`${verdict}/${g.mode}`] = { performance: g.performance, gate: g.gate, threw };
+    }
+  }
+  assert.deepEqual(observed, {
+    'pass/ordinary': { performance: 'PASS', gate: 'pass', threw: false }, 'pass/perf_gate': { performance: 'PASS', gate: 'pass', threw: false },
+    'fail/ordinary': { performance: 'FAIL', gate: 'fail', threw: true }, 'fail/perf_gate': { performance: 'FAIL', gate: 'fail', threw: true },
+    'inconclusive/ordinary': { performance: 'NOT-MEASURED', gate: 'not_measured', threw: false }, 'inconclusive/perf_gate': { performance: 'NOT-MEASURED', gate: 'fail', threw: true },
+    'other/ordinary': { performance: 'INVALID', gate: 'fail', threw: true }, 'other/perf_gate': { performance: 'INVALID', gate: 'fail', threw: true },
+    'null/ordinary': { performance: 'INVALID', gate: 'fail', threw: true }, 'null/perf_gate': { performance: 'INVALID', gate: 'fail', threw: true },
+  }, JSON.stringify(observed));
+});
+
+test('[peer235 G2] TELEPTY_LEDGER_PERF_GATE: unset or empty is ordinary, exactly "1" is the gate, anything else is refused', () => {
+  const parse = (env) => { try { return perfGateMode(env); } catch { return 'refused'; } };
+  const observed = { unset: parse({}), empty: parse({ [PERF_GATE_ENV]: '' }), one: parse({ [PERF_GATE_ENV]: '1' }), zero: parse({ [PERF_GATE_ENV]: '0' }),
+    word: parse({ [PERF_GATE_ENV]: 'true' }), spaced: parse({ [PERF_GATE_ENV]: ' 1' }), this_run: typeof PERF_GATE };
+  assert.deepEqual(observed, { unset: false, empty: false, one: true, zero: 'refused', word: 'refused', spaced: 'refused', this_run: 'boolean' }, JSON.stringify(observed));
+});
+
+// Measured windows of diagnostic run 41312809365 / job 124866555686, main#184 R1 [1 MiB] (artifact stdout log line 21 for the
+// controls, line 20 for the workload; the phase wall was not logged, so the workload sum is used as its wall, as in W5).
+const DIAG_184 = Object.freeze({
+  controls: Object.freeze({
+    idle_pre: { n: 75, wall_ms: 757.328, sum_ms: 757.2979, max_ms: 16.1705 },
+    idle_post: { n: 20, wall_ms: 766.1899, sum_ms: 766.0999999999999, max_ms: 87.3521 },
+    block: { n: 34, wall_ms: 543.7261, sum_ms: 543.5409999999999, max_ms: 135.7987, block_requested_ms: 100 },
+  }),
+  workload: Object.freeze({ n: 242, wall_ms: 2020.3190000000002, sum_ms: 2020.3190000000002, max_ms: 50.6726 }),
+});
+
+test('[peer235 G3] the measured invalid baseline (diagnostic job 124866555686): the ORIGINAL policy fails ordinary CI; the candidate reports NOT-MEASURED there and FAILS the dedicated gate', () => {
+  const acceptance = heartbeatAcceptance(DIAG_184.workload, DIAG_184.controls);
+  let originalPolicyThrew = false;
+  try { assert.equal(acceptance.verdict, 'pass'); } catch (error) { originalPolicyThrew = error && error.code === 'ERR_ASSERTION'; }  // the original F2/R1 assertion
+  const ordinary = heartbeatGate(acceptance, false), gate = heartbeatGate(acceptance, true);
+  let gateThrew = false;
+  try { assertHeartbeatGate(acceptance, 'control', true); } catch (error) { gateThrew = error && error.code === 'ERR_ASSERTION'; }
+  const observed = { verdict: acceptance.verdict, reasons: acceptance.reasons, original_policy_threw: originalPolicyThrew,
+    ordinary: { performance: ordinary.performance, gate: ordinary.gate }, perf_gate: { performance: gate.performance, gate: gate.gate, threw: gateThrew } };
+  assert.deepEqual(observed, { verdict: 'inconclusive', reasons: ['idle_post: idle max gap 87.3521 ms >= 50 ms (overloaded or invalid baseline)'], original_policy_threw: true,
+    ordinary: { performance: 'NOT-MEASURED', gate: 'not_measured' }, perf_gate: { performance: 'NOT-MEASURED', gate: 'fail', threw: true } }, JSON.stringify(observed));
+});
+
+test('[peer235 G4] the same measured workload with a valid baseline is a stall: FAIL in ordinary runs and in the dedicated gate (bound unchanged at 50 ms)', () => {
+  const controls = { ...DIAG_184.controls, idle_post: DIAG_184.controls.idle_pre };  // the job's own valid idle window
+  const acceptance = heartbeatAcceptance(DIAG_184.workload, controls);
+  const threw = (gateMode) => { try { assertHeartbeatGate(acceptance, 'control', gateMode); return false; } catch (error) { return error && error.code === 'ERR_ASSERTION'; } };
+  const observed = { verdict: acceptance.verdict, bound: HEARTBEAT_CONTRACT.stallBoundMs, ordinary_threw: threw(false), perf_gate_threw: threw(true) };
+  assert.deepEqual(observed, { verdict: 'fail', bound: 50, ordinary_threw: true, perf_gate_threw: true }, JSON.stringify(observed));
 });
