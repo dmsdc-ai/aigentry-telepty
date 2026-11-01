@@ -51,9 +51,6 @@ jobs:
         continue-on-error: true
         run: node scripts/windows-load-observer-879.mjs start --out "${{ runner.temp }}/windows-load-observer-879" --max-ms 1080000
       - name: Run regression suite
-        # Task 1215 windows110 (diagnostics only): opt-in queue_timeout fields on Windows; empty (off) elsewhere.
-        env:
-          TELEPTY_QUEUE_DIAGNOSTICS: ${{ runner.os == 'Windows' && '1' || '' }}
         run: npm run test:ci
       - name: Stop Windows load observer (diagnostic only)
         if: always() && runner.os == 'Windows' && steps.load_observer_start.outcome != 'skipped'
