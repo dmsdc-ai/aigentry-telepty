@@ -1,0 +1,216 @@
+name: MCP dependency contract O/A/B (task 1215, MCP CONTRACT ONLY / NOT A RELEASE PASS)
+
+# Task 1215 / release1238 / compat183 — DIAGNOSTIC MCP CONTRACT COMPARISON.
+#
+# WHAT THIS IS. One job materializes three private source copies of THIS exact commit (git archive HEAD):
+#   O = the original root package.json / package-lock.json (frozen hashes below)
+#   A = O + .github/fixtures/mcp-compatibility-1215/package-a.json + package-lock-a.json (SDK ^1.32.0, ws ^8.21.0)
+#   B = O + package-b.json + package-lock-b.json (A + zod ^4.6.6)
+# Each copy gets exactly one `npm ci --ignore-scripts --no-audit --fund=false` (no lifecycle/native build, no resolver
+# update, no audit). Then the ORIGINAL O copy's SDK client and frozen driver test/mcp-dependency-contract-1215.test.js
+# drive each copy's own `mcp-server/index.mjs` with that copy's own locked dependencies: O first (baseline), then A and
+# B compared with O. The test owns a private loopback fixture, a random synthetic token and private HOME/tmp per child.
+#
+# WHAT THIS IS NOT. MCP contract only. The all-OS full suite, real installed macOS/Linux prompt ACK, Snyk/security and
+# release remain separate. Nothing is fixed, adopted, committed or published. No secret, token, auth or extra registry;
+# no environment dump; node_modules, caches, archives and first-party code are never uploaded. Nothing is retried.
+#
+# FAILS CLOSED on: original/fixture/driver bytes that are not the frozen bodies; a toolchain other than Node v20.20.0 /
+# npm 10.8.2; a registry other than https://registry.npmjs.org/ or fetch-retries other than 0; any npm ci failure; a
+# contract run that exits non-zero (normative failure, O-equality mismatch or timeout); a missing or malformed result;
+# a stream or file over its bound; evidence over 4 MiB or with an unexpected file. Failures that O also has are labelled
+# baseline_original_failure in the results, never as an A/B regression; the job still fails on them.
+#
+# ACTION REFS: the same three exact 40-hex commit SHAs as the other task-1215 diagnostic workflows.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/mcp-compatibility-1215-183'
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: MCP dependency contract O/A/B (MCP CONTRACT ONLY)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.0'
+      - name: Install O/A/B and run the frozen MCP contract (bounded; no scripts, no retry)
+        id: collect
+        env:
+          EXPECTED_PACKAGE_JSON_SHA256: fb8832167fff4abf13340e53df67855737c68bc08c26377acc466b193ef72db0
+          EXPECTED_PACKAGE_LOCK_SHA256: a1d9db1faf5a0ea05663953a15a452980849c4dcb95a68e55d14213ec28879cf
+          EXPECTED_PACKAGE_A_SHA256: 6879f9ef439d246c151d4b107873ed4e1b8304c50024f4e27892330330383104
+          EXPECTED_LOCK_A_SHA256: 44a168cf892b349ce5833ca37bcfece4642e18e89cdc794da5d89cdff72d5f31
+          EXPECTED_PACKAGE_B_SHA256: 974f5d7faf603108385277055e7407b7977c283bcf7bda8d07244fce10e109c9
+          EXPECTED_LOCK_B_SHA256: 16eb17fc9cdd8a9aa09e1e7cca0248efa72b6cadf25a9bd142e431efa4d7ad61
+          EXPECTED_DRIVER_SHA256: b81f23c1bf24648162d4f13d99807a25d97359702ee3d9590f2c09a5f527b779
+          npm_config_registry: 'https://registry.npmjs.org/'
+          npm_config_fetch_retries: '0'
+        run: |
+          set -euo pipefail
+          umask 077
+          EVIDENCE="$RUNNER_TEMP/mcp-compatibility-1215"
+          ROOT="$RUNNER_TEMP/mcp-compatibility-1215-trees"
+          FIXTURES=.github/fixtures/mcp-compatibility-1215
+          DRIVER=test/mcp-dependency-contract-1215.test.js
+          mkdir "$EVIDENCE" "$ROOT"
+          stage=start
+          trap 'rc=$?; printf "stage=%s\nscript_exit=%s\nlabel=MCP CONTRACT ONLY / NOT A RELEASE PASS\n" "$stage" "$rc" > "$EVIDENCE/collection-result.txt"' EXIT
+
+          # run_capped NAME STDOUT_MAX STDERR_MAX SECONDS CMD... : argv, stdout, stderr and exit code go to separate files.
+          # Each stream keeps at most MAX+1 bytes; reaching MAX+1 means "over the bound" and fails the collection.
+          run_capped() {
+            local p="$EVIDENCE/$1" out_max="$2" err_max="$3" secs="$4" out_size err_size
+            shift 4
+            printf '%s\n' "$@" > "$p.argv"
+            set +e
+            { timeout --kill-after=10s "${secs}s" "$@" 2>&1 1>&3 3>&- | head -c "$((err_max + 1))" > "$p.stderr"
+              echo "${PIPESTATUS[0]}" > "$p.exit_code"; } 3>&1 | head -c "$((out_max + 1))" > "$p.stdout"
+            set -e
+            out_size="$(stat -c %s "$p.stdout")"
+            err_size="$(stat -c %s "$p.stderr")"
+            echo "$(basename "$p"): exit=$(cat "$p.exit_code") stdout_bytes=${out_size} stderr_bytes=${err_size}"
+            if [ "$out_size" -gt "$out_max" ] || [ "$err_size" -gt "$err_max" ]; then
+              echo "::error::$(basename "$p") output exceeded its bound (stdout ${out_size}/${out_max}, stderr ${err_size}/${err_max}); collection failed"
+              return 1
+            fi
+          }
+          sha() { sha256sum "$1" | cut -d' ' -f1; }
+          must() { [ "$(sha "$1")" = "$2" ] || { echo "::error::$1 is not the frozen body; collection failed"; return 1; }; }
+
+          stage=toolchain
+          for tool in timeout head stat sha256sum jq git tar; do command -v "$tool" > /dev/null || { echo "::error::required tool '$tool' is missing; collection failed"; exit 1; }; done
+          env -C / true || { echo "::error::env -C is unsupported; collection failed"; exit 1; }
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"; JQ_VERSION="$(jq --version)"
+          printf 'node=%s\nnpm=%s\njq=%s\nkernel=%s\n' "$NODE_VERSION" "$NPM_VERSION" "$JQ_VERSION" "$(uname -srm)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.0" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.0; collection failed"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2; collection failed"; exit 1; }
+          # Compared, never printed: a registry URL could carry credentials.
+          [ "$(npm config get registry)" = "https://registry.npmjs.org/" ] || { echo "::error::the configured npm registry is not https://registry.npmjs.org/; collection failed"; exit 1; }
+          [ "$(npm config get fetch-retries)" = "0" ] || { echo "::error::npm fetch-retries is not 0; collection failed"; exit 1; }
+
+          stage=input-hashes
+          must package.json "$EXPECTED_PACKAGE_JSON_SHA256"
+          must package-lock.json "$EXPECTED_PACKAGE_LOCK_SHA256"
+          must "$FIXTURES/package-a.json" "$EXPECTED_PACKAGE_A_SHA256"
+          must "$FIXTURES/package-lock-a.json" "$EXPECTED_LOCK_A_SHA256"
+          must "$FIXTURES/package-b.json" "$EXPECTED_PACKAGE_B_SHA256"
+          must "$FIXTURES/package-lock-b.json" "$EXPECTED_LOCK_B_SHA256"
+          must "$DRIVER" "$EXPECTED_DRIVER_SHA256"
+
+          stage=materialize
+          for T in O A B; do
+            mkdir "$ROOT/$T"
+            git archive --format=tar HEAD | tar -x -C "$ROOT/$T"
+          done
+          cp "$FIXTURES/package-a.json" "$ROOT/A/package.json"; cp "$FIXTURES/package-lock-a.json" "$ROOT/A/package-lock.json"
+          cp "$FIXTURES/package-b.json" "$ROOT/B/package.json"; cp "$FIXTURES/package-lock-b.json" "$ROOT/B/package-lock.json"
+          must "$ROOT/O/package.json" "$EXPECTED_PACKAGE_JSON_SHA256"; must "$ROOT/O/package-lock.json" "$EXPECTED_PACKAGE_LOCK_SHA256"
+          must "$ROOT/A/package.json" "$EXPECTED_PACKAGE_A_SHA256"; must "$ROOT/A/package-lock.json" "$EXPECTED_LOCK_A_SHA256"
+          must "$ROOT/B/package.json" "$EXPECTED_PACKAGE_B_SHA256"; must "$ROOT/B/package-lock.json" "$EXPECTED_LOCK_B_SHA256"
+          must "$ROOT/O/$DRIVER" "$EXPECTED_DRIVER_SHA256"
+          SERVER_SHA="$(sha "$ROOT/O/mcp-server/index.mjs")"
+          for T in O A B; do
+            [ "$(sha "$ROOT/$T/mcp-server/index.mjs")" = "$SERVER_SHA" ] || { echo "::error::mcp-server/index.mjs differs in tree ${T}; collection failed"; exit 1; }
+            printf '%s package.json=%s package-lock.json=%s mcp-server/index.mjs=%s\n' "$T" "$(sha "$ROOT/$T/package.json")" "$(sha "$ROOT/$T/package-lock.json")" "$SERVER_SHA" >> "$EVIDENCE/hashes.txt"
+          done
+          printf 'driver %s=%s commit=%s\n' "$DRIVER" "$EXPECTED_DRIVER_SHA256" "$GITHUB_SHA" >> "$EVIDENCE/hashes.txt"
+
+          stage=npm-ci
+          for T in O A B; do
+            run_capped "npm-ci-$T" 65536 65536 90 env -C "$ROOT/$T" npm ci --ignore-scripts --no-audit --fund=false
+            CI_EXIT="$(cat "$EVIDENCE/npm-ci-$T.exit_code")"
+            [ "$CI_EXIT" = 0 ] || { echo "::error::npm ci in tree ${T} exited ${CI_EXIT}; collection failed"; exit 1; }
+            run_capped "npm-ls-$T" 262144 65536 20 env -C "$ROOT/$T" npm ls @modelcontextprotocol/sdk zod zod-to-json-schema ws --all --json
+            case "$(cat "$EVIDENCE/npm-ls-$T.exit_code")" in 0|1) ;; *) echo "::error::npm ls in tree ${T} failed; collection failed"; exit 1 ;; esac
+            jq -s -e 'length == 1 and (.[0] | type == "object" and (has("error") | not))' "$EVIDENCE/npm-ls-$T.stdout" > /dev/null \
+              || { echo "::error::npm ls in tree ${T} is not one JSON object; collection failed"; exit 1; }
+          done
+
+          stage=contract
+          contract() {
+            local T="$1"; shift
+            run_capped "contract-$T" 262144 65536 70 env -C "$ROOT/O" "TELEPTY_MCP_CONTRACT_SERVER_ROOT=$ROOT/$T" \
+              "TELEPTY_MCP_CONTRACT_RESULT=$EVIDENCE/result-$T.json" "$@" \
+              node --require ./test-support/setup-env.js --test "$DRIVER"
+            jq -e '.schema == "telepty-mcp-dependency-contract-1215/v1" and (.cases | type == "object") and (has("error") | not)' "$EVIDENCE/result-$T.json" > /dev/null \
+              || { echo "::error::contract result for tree ${T} is missing or malformed; collection failed"; return 1; }
+          }
+          contract O
+          contract A "TELEPTY_MCP_CONTRACT_BASELINE=$EVIDENCE/result-O.json"
+          contract B "TELEPTY_MCP_CONTRACT_BASELINE=$EVIDENCE/result-O.json"
+
+          stage=summary
+          jq -n --slurpfile o "$EVIDENCE/result-O.json" --slurpfile a "$EVIDENCE/result-A.json" --slurpfile b "$EVIDENCE/result-B.json" \
+             --arg commit "$GITHUB_SHA" --arg eo "$(cat "$EVIDENCE/contract-O.exit_code")" --arg ea "$(cat "$EVIDENCE/contract-A.exit_code")" --arg eb "$(cat "$EVIDENCE/contract-B.exit_code")" '
+            def tree($r; $exit): {
+              exit_code: ($exit | tonumber), server: $r.server, client: $r.client,
+              protocol_offered: $r.protocol_offered, negotiated_protocol: $r.negotiated_protocol,
+              cases: ($r.cases | map_values({pass, failures})),
+              comparison: $r.comparison
+            };
+            { label: "MCP CONTRACT ONLY / NOT A RELEASE PASS",
+              note: "Same O client and driver against each tree server. Normative failures fail the job; reported_differences are record-only. baseline_original_failure marks a failure O also has.",
+              commit: $commit, O: tree($o[0]; $eo), A: tree($a[0]; $ea), B: tree($b[0]; $eb) }
+          ' | head -c 262145 > "$EVIDENCE/summary.json"
+          [ "$(stat -c %s "$EVIDENCE/summary.json")" -le 262144 ] || { echo "::error::summary.json exceeded 262144 bytes; collection failed"; exit 1; }
+          jq -r '
+            "# MCP dependency contract O/A/B — MCP CONTRACT ONLY / NOT A RELEASE PASS", "",
+            "- commit: \(.commit)",
+            (["O", "A", "B"][] as $t | .[$t] | "- \($t): exit \(.exit_code); sdk \(.server.versions["@modelcontextprotocol/sdk"]), zod \(.server.versions.zod); protocol \(.negotiated_protocol); failing cases \([.cases | to_entries[] | select(.value.pass != true) | .key] | join(", ") | if . == "" then "none" else . end); normative differences \(.comparison.normative_differences // [] | length); reported differences \(.comparison.reported_differences // [] | length)")
+          ' "$EVIDENCE/summary.json" | head -c 65537 > "$EVIDENCE/SUMMARY.md"
+          [ "$(stat -c %s "$EVIDENCE/SUMMARY.md")" -le 65536 ] || { echo "::error::SUMMARY.md exceeded 65536 bytes; collection failed"; exit 1; }
+          cat "$EVIDENCE/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
+
+          stage=verdict
+          FAILED=""
+          for T in O A B; do [ "$(cat "$EVIDENCE/contract-$T.exit_code")" = 0 ] || FAILED="$FAILED $T"; done
+          if [ -n "$FAILED" ]; then
+            echo "::error::MCP contract failed for tree(s):${FAILED} (see summary.json; baseline_original_failure marks failures O also has)"
+            exit 1
+          fi
+          echo "::notice title=MCP CONTRACT ONLY::O, A and B met the frozen MCP contract on the recorded hashes; this is not a full-suite, installed, security or release pass"
+          stage=complete
+
+      - name: Bound evidence (allowlisted files only, <= 4 MiB)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/mcp-compatibility-1215"
+          test -d "$EVIDENCE" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          [ -z "$(find "$EVIDENCE" -mindepth 1 ! -type f -print -quit)" ] || { echo "::error::evidence contains a non-regular file; not uploading"; exit 1; }
+          shopt -s dotglob nullglob
+          for f in "$EVIDENCE"/*; do
+            case "$(basename "$f")" in
+              collection-result.txt|toolchain.txt|hashes.txt|summary.json|SUMMARY.md|result-O.json|result-A.json|result-B.json) ;;
+              npm-ci-[OAB].argv|npm-ci-[OAB].stdout|npm-ci-[OAB].stderr|npm-ci-[OAB].exit_code) ;;
+              npm-ls-[OAB].argv|npm-ls-[OAB].stdout|npm-ls-[OAB].stderr|npm-ls-[OAB].exit_code) ;;
+              contract-[OAB].argv|contract-[OAB].stdout|contract-[OAB].stderr|contract-[OAB].exit_code) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+          done
+          TOTAL_BYTES="$(find "$EVIDENCE" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')"
+          echo "evidence bytes=${TOTAL_BYTES}"
+          [ "$TOTAL_BYTES" -le 4194304 ] || { echo "::error::evidence is ${TOTAL_BYTES} bytes (> 4 MiB); not uploading"; exit 1; }
+
+      - name: Upload MCP contract evidence (no node_modules, cache, archive or credentials)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: mcp-compatibility-1215-183-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mcp-compatibility-1215
+          if-no-files-found: error
+          retention-days: 7
