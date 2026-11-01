@@ -1,0 +1,276 @@
+name: Bounded submit-queue contract (task 1215 / queue239, original vs candidate)
+
+# Task 1215 / release1238 / queue239 — ISOLATED DIAGNOSTIC; not shipped, not a release gate. Product source is da97671 in
+# EVERY leg (proven by `git diff --name-only ORIGINAL_SHA`); only test/inject-barrier-identity-109.test.js differs.
+# Windows diagnostic 41316988399 / job 124879010996 failed #109(b) on the CALLER-latency gate `slowest < 1200 + 800`
+# (slowest 2074 ms) while every refusal was a typed 503 QUEUE_TIMEOUT with a daemon-measured wait. The candidate judges
+# the bound on the daemon's own clock and records, and records caller latency on every run.
+#
+# THIS RUN, once per job (no rerun, retry, loop or continue-on-error), Windows, Linux and macOS:
+#   1. frozen controls — the "[queue239 …]" cases of the CANDIDATE file, identical bytes and selection in BOTH legs. K1
+#      reproduces the original gate's rejection on the exact recorded evidence; K2 proves that untyped/unknown answers,
+#      unmeasured refusals, an unexercised bound and missing/extra/unparsed/foreign daemon evidence are rejected.
+#   2. reused deterministic controls — the UNCHANGED test/queue-deadline-admission-1215.test.js in both legs (P1 expired
+#      waiter refused under an overdue holder release; C2 deadline-first typed refusal; C3 SESSION_GONE precedence).
+#   3. fixture — original leg: the file restored from ORIGINAL_SHA; candidate leg: the candidate file; run alone, once.
+#      Candidate: all eight cases pass and exactly one caller-latency observation line is present. Original on a hosted
+#      runner is load-dependent: a pass, or ONLY its documented signature (the bounded case `not ok` with error
+#      "slowest caller waited …", expected true / actual false); anything else is unexpected.
+# TAP escapes '#' in test names and diagnostics as '\#' (Node 20): every expected name below is the escaped form taken
+# from the exact test bytes. Membership is exact; missing TAP, members or counts fail.
+#
+# BOUNDS: job <= 25 min; npm ci <= 8 min; each test step <= 5 min; evidence <= 4 MiB allowlisted, retained 7 days even on
+# failure. errexit is disabled explicitly ONLY around each captured command. Bytes are verified as sha256 with CR removed.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/queue-contract-1215-239'
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: bounded queue contract (${{ matrix.os }}, ${{ matrix.leg }}) — diagnostic only
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        leg: [original, candidate]
+    defaults:
+      run:
+        shell: bash
+    env:
+      LEG: ${{ matrix.leg }}
+      ORIGINAL_SHA: da976719485e629a1c91ed054020ff6893b4d84d
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.2'
+
+      - name: Write the step library and prove the candidate identity (exact bytes, CR removed)
+        run: |
+          set -euo pipefail
+          LIB="$RUNNER_TEMP/queue239"; EVIDENCE="$LIB/evidence"; RAW="$LIB/raw"
+          mkdir "$LIB" "$EVIDENCE" "$RAW"
+          cat > "$LIB/names_109.txt" <<'NAMES'
+          \#109(a): an inject queued behind the barrier when its session is destroyed answers SESSION_GONE, not 200
+          \#109(a): an inject queued across destroy+recreate under the same id never reaches the replacement
+          \#109(b): the barrier wait is bounded — late callers get QUEUE_TIMEOUT, and only 200s are delivered
+          \#109(b): queued callers are delivered in arrival order, each text followed by its own CR
+          \#109: a rename inside the submit delay still delivers the CR to the same live instance
+          \#109: a destroy+recreate inside the submit delay writes no CR to the replacement
+          NAMES
+          cat > "$LIB/names_k.txt" <<'NAMES'
+          [queue239 K1] the measured failing evidence: the original caller-latency gate rejects it, the bounded-wait contract accepts it, and the clocks differ by pre-barrier time plus timer lateness
+          [queue239 K2] the bounded-wait contract rejects untyped or unknown answers, unmeasured refusals, a bound that was not exercised and missing, extra, unparsed or foreign daemon evidence
+          NAMES
+          cat > "$LIB/names_admission.txt" <<'NAMES'
+          P1 RED: a waiter whose barrier deadline expired before admission is refused and nothing is written
+          P1 control C1: a waiter inside its bound is admitted after the holder CR (no block)
+          P1 control C2: when the deadline timer runs first, the typed QUEUE_TIMEOUT refusal writes nothing
+          P1 control C3: SESSION_GONE keeps precedence over the expired deadline and nothing is written
+          \#1215 diagnostic: the queue_timeout record attributes a blocking next-holder enqueue to its claim→enqueue span
+          \#1215 diagnostic control: with TELEPTY_QUEUE_DIAGNOSTICS unset the queue_timeout holder keeps the G5 shape
+          NAMES
+          cat > "$LIB/bounded.txt" <<'NAMES'
+          \#109(b): the barrier wait is bounded — late callers get QUEUE_TIMEOUT, and only 200s are delivered
+          NAMES
+          : > "$LIB/none.txt"
+          cat > "$LIB/lib.sh" <<'LIBRARY'
+          LIB="$RUNNER_TEMP/queue239"; EVIDENCE="$LIB/evidence"; RAW="$LIB/raw"
+          sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+          lf_sha() { tr -d '\r' < "$1" | sha; }
+          expect() {
+            local got; got="$(lf_sha "$1")"
+            printf '%s lf_sha256=%s\n' "$1" "$got" >> "$EVIDENCE/input-hashes.txt"
+            [ "$got" = "$2" ] || { echo "::error::$1 is not the reviewed body (lf_sha256 ${got})"; exit 1; }
+          }
+          identity() { # identity LABEL "allowed paths" [tracked]
+            { git diff --name-only "$ORIGINAL_SHA" --; if [ "${3:-}" != tracked ]; then git ls-files --others --exclude-standard; fi; } | LC_ALL=C sort -u > "$EVIDENCE/identity-$1.txt"
+            cat "$EVIDENCE/identity-$1.txt"
+            local changed
+            while IFS= read -r changed; do
+              case " $2 " in *" $changed "*) ;; *) echo "::error::${changed} differs from ${ORIGINAL_SHA} but is not allowed at '$1'"; exit 1 ;; esac
+            done < "$EVIDENCE/identity-$1.txt"
+          }
+          prefix() { sed 's/^/ok - /' "$@"; }
+          # run_test NAME FILE PATTERN|-: one node --test run of one file; raw streams, LF TAP, exit and members kept.
+          run_test() {
+            local name="$1" file="$2" pattern="$3" rc
+            set -- --require ./test-support/setup-env.js --test --test-concurrency=1
+            if [ "$pattern" != - ]; then set -- "$@" "--test-name-pattern=$pattern"; fi
+            set -- "$@" --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap "--test-reporter-destination=$RAW/$name.tap" "$file"
+            set +e
+            env -u TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS -u TELEPTY_QUEUE_DIAGNOSTICS node "$@" > "$RAW/$name.stdout" 2> "$RAW/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$EVIDENCE/$name.exit_code"
+            if [ -f "$RAW/$name.tap" ]; then tr -d '\r' < "$RAW/$name.tap" > "$RAW/$name.tap.lf"; echo present > "$EVIDENCE/$name.tap_state"; else : > "$RAW/$name.tap.lf"; echo missing > "$EVIDENCE/$name.tap_state"; fi
+            { grep -E '^(not )?ok [0-9]+ - ' "$RAW/$name.tap.lf" || true; } | sed -E 's/^(not )?ok [0-9]+ - /\1ok - /' > "$EVIDENCE/$name.members"
+            tail -n 40 "$RAW/$name.stdout" | cut -c1-300 || true
+          }
+          rc_of() { cat "$EVIDENCE/$1.exit_code"; }
+          count() { local v; v="$({ grep -E "^# $2 [0-9]+$" "$RAW/$1.tap.lf" || true; } | tail -n 1 | awk '{print $3}')"; echo "${v:-missing}"; }
+          names_of() { sed -E 's/ # SKIP.*$//; s/^(not )?ok - //' "$EVIDENCE/$1.members" | LC_ALL=C sort; }
+          # membership NAME EXPECTED_LINES SKIPPABLE_NAMES → "yes <skipped>" or "no <skipped>"; the selected/skipped split and
+          # the diff are kept as evidence. Any other line must be "ok - <skippable> # SKIP…", all or none; no duplicates.
+          membership() {
+            local name="$1" ok=yes others=0 line nm total
+            : > "$EVIDENCE/$name.selected"; : > "$EVIDENCE/$name.skipped"
+            while IFS= read -r line; do
+              case "$line" in *" # SKIP"*) printf '%s\n' "$line" >> "$EVIDENCE/$name.skipped" ;; *) printf '%s\n' "$line" >> "$EVIDENCE/$name.selected" ;; esac
+            done < "$EVIDENCE/$name.members"
+            LC_ALL=C sort "$EVIDENCE/$name.selected" > "$RAW/$name.selected.sorted"
+            LC_ALL=C sort "$2" > "$RAW/$name.expected.sorted"
+            diff -u "$RAW/$name.expected.sorted" "$RAW/$name.selected.sorted" > "$EVIDENCE/$name.membership-diff" || ok=no
+            while IFS= read -r line; do
+              others=$((others + 1)); nm="${line#ok - }"; nm="${nm%% \# SKIP*}"
+              case "$line" in "ok - "*) ;; *) ok=no ;; esac
+              grep -qxF -- "$nm" "$3" || ok=no
+            done < "$EVIDENCE/$name.skipped"
+            total="$(grep -c . "$3" || true)"
+            if [ "$others" != 0 ] && [ "$others" != "$total" ]; then ok=no; fi
+            if [ -n "$(names_of "$name" | uniq -d)" ]; then ok=no; fi
+            [ "$(cat "$EVIDENCE/$name.tap_state")" = present ] || ok=no
+            echo "$ok $others"
+          }
+          green() { # green NAME EXPECTED_LINES SKIPPABLE N
+            local m s; m="$(membership "$1" "$2" "$3")"; s="${m#* }"
+            [ "$(rc_of "$1")" = 0 ] && [ "${m%% *}" = yes ] && [ "$(count "$1" pass)" = "$4" ] && [ "$(count "$1" fail)" = 0 ] \
+              && [ "$(count "$1" cancelled)" = 0 ] && [ "$(count "$1" todo)" = 0 ] && [ "$(count "$1" skipped)" = "$s" ]
+          }
+          summary() { printf 'exit %s pass %s fail %s cancelled %s skipped %s todo %s tap %s' "$(rc_of "$1")" "$(count "$1" pass)" "$(count "$1" fail)" \
+            "$(count "$1" cancelled)" "$(count "$1" skipped)" "$(count "$1" todo)" "$(cat "$EVIDENCE/$1.tap_state")"; }
+          LIBRARY
+          source "$LIB/lib.sh"
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"
+          printf 'leg=%s\nos=%s\ncommit=%s\noriginal=%s\nnode=%s\nnpm=%s\ncore_autocrlf=%s\n' "$LEG" "$RUNNER_OS" "$GITHUB_SHA" "$ORIGINAL_SHA" \
+            "$NODE_VERSION" "$NPM_VERSION" "$(git config --get core.autocrlf || echo unset)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.2" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.2"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2"; exit 1; }
+          git cat-file -e "${ORIGINAL_SHA}^{commit}" || { echo "::error::original ${ORIGINAL_SHA} is not in this history; nothing was run"; exit 1; }
+          expect test/inject-barrier-identity-109.test.js 7a284cceda4f555dee236e2924beb3dcb3c606c0fb1b2e4e38e61e81453976e2
+          expect test/queue-deadline-admission-1215.test.js 1eb68f9b6563dd552ad8b988dbacb7ea53648bee0f7409a7c699811b465051b4
+          expect src/mailbox/session-delivery.js 5109fb21a39bde30851e0a1e0414b44cf8cf21de16cb59b821bdd35551e36e80
+          expect test-support/daemon-harness.js c526b65955ccadbface8c8de4a54cdf859769a1217a933925c9ea436c5bfa59a
+          identity candidate ".github/workflows/queue-contract-1215.yml test/inject-barrier-identity-109.test.js"
+
+      - name: npm ci (frozen lock, normal lifecycle; exit recorded)
+        id: install
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/queue239/lib.sh"
+          set +e
+          npm ci --no-audit --fund=false > "$RAW/npm-ci.stdout" 2> "$RAW/npm-ci.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$EVIDENCE/npm-ci.exit_code"
+          echo "npm ci exit=${rc}"
+          [ "$rc" = 0 ] || exit "$rc"
+
+      - name: Frozen and reused controls — identical in both legs, once each
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/queue239/lib.sh"
+          run_test controls test/inject-barrier-identity-109.test.js '^\[queue239 ' -
+          run_test admission test/queue-deadline-admission-1215.test.js - -
+          prefix "$LIB/names_k.txt" > "$RAW/exp-controls.txt"; prefix "$LIB/names_admission.txt" > "$RAW/exp-admission.txt"
+          controls=unexpected; admission=unexpected
+          if green controls "$RAW/exp-controls.txt" "$LIB/names_109.txt" 2; then controls=green; fi
+          if green admission "$RAW/exp-admission.txt" "$LIB/none.txt" "$(grep -c . "$LIB/names_admission.txt")"; then admission=green; fi
+          printf 'leg=%s\nos=%s\ncontrols=%s -> %s\nadmission=%s -> %s\n' "$LEG" "$RUNNER_OS" "$(summary controls)" "$controls" "$(summary admission)" "$admission" > "$EVIDENCE/verdict-controls.txt"
+          cat "$EVIDENCE/verdict-controls.txt"
+          echo "::notice title=queue239 ${RUNNER_OS} ${LEG} controls (diagnostic only)::frozen ${controls}; reused admission ${admission}"
+          [ "$controls" = green ] && [ "$admission" = green ]
+
+      - name: Fixture file — original (restored from ORIGINAL_SHA) or candidate, alone, once
+        if: always() && steps.install.outcome == 'success'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/queue239/lib.sh"
+          if [ "$LEG" = original ]; then
+            git show "${ORIGINAL_SHA}:test/inject-barrier-identity-109.test.js" > test/inject-barrier-identity-109.test.js
+            expect test/inject-barrier-identity-109.test.js 289a83a827583bd24a77030673e7605cc82c49eb72b45b7617a3683485e2b778
+            identity original-fixture ".github/workflows/queue-contract-1215.yml" tracked
+          fi
+          run_test fixture test/inject-barrier-identity-109.test.js - -
+          { grep -E '^ *# task1215 queue239 caller latency observation \(not a product bound\): ' "$RAW/fixture.tap.lf" || true; } > "$EVIDENCE/fixture.latency"
+          verdict=unexpected
+          if [ "$LEG" = candidate ]; then
+            { prefix "$LIB/names_109.txt"; prefix "$LIB/names_k.txt"; } > "$RAW/exp-fixture.txt"
+            if green fixture "$RAW/exp-fixture.txt" "$LIB/none.txt" 8 && [ "$(grep -c . "$EVIDENCE/fixture.latency" || true)" = 1 ]; then verdict=green; fi
+          else
+            prefix "$LIB/names_109.txt" > "$RAW/exp-fixture.txt"
+            BOUNDED="$(cat "$LIB/bounded.txt")"
+            if [ "$(cat "$EVIDENCE/fixture.tap_state")" = present ] && [ "$(names_of fixture)" = "$(LC_ALL=C sort "$LIB/names_109.txt")" ] && [ "$(count fixture cancelled)" = 0 ]; then
+              if green fixture "$RAW/exp-fixture.txt" "$LIB/none.txt" 6; then verdict=original_pass
+              elif [ "$(rc_of fixture)" != 0 ] && [ "$(count fixture fail)" = 1 ] && [ "$(count fixture pass)" = 5 ] && grep -qxF -- "not ok - $BOUNDED" "$EVIDENCE/fixture.members" \
+                 && grep -qE "^ +error: 'slowest caller waited [0-9]+ ms with a 1200 ms bound: " "$RAW/fixture.tap.lf" \
+                 && grep -qE '^ +expected: true$' "$RAW/fixture.tap.lf" && grep -qE '^ +actual: false$' "$RAW/fixture.tap.lf"; then verdict=original_latency_gate_signature; fi
+            fi
+          fi
+          printf 'leg=%s\nos=%s\nfixture=%s -> %s\nlatency_observation_lines=%s\n' "$LEG" "$RUNNER_OS" "$(summary fixture)" "$verdict" "$(grep -c . "$EVIDENCE/fixture.latency" || true)" > "$EVIDENCE/verdict-fixture.txt"
+          cat "$EVIDENCE/verdict-fixture.txt"
+          echo "::notice title=queue239 ${RUNNER_OS} ${LEG} fixture (diagnostic only)::verdict ${verdict}"
+          case "$verdict" in green|original_pass|original_latency_gate_signature) ;; *) exit 1 ;; esac
+
+      - name: Bound evidence (allowlisted, <= 4 MiB; runs whatever the commands did)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          LIB="$RUNNER_TEMP/queue239"; EVIDENCE="$LIB/evidence"; RAW="$LIB/raw"
+          test -d "$EVIDENCE" && test -d "$RAW" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          : > "$EVIDENCE/capture-bounds.txt"
+          copy_capped() { # copy_capped NAME MAX_BYTES
+            if [ -f "$RAW/$1" ] && [ ! -L "$RAW/$1" ]; then
+              local size; size="$(wc -c < "$RAW/$1" | tr -d ' ')"
+              head -c "$2" "$RAW/$1" > "$EVIDENCE/$1"
+              printf '%s raw_bytes=%s kept_bytes=%s truncated=%s\n' "$1" "$size" "$(wc -c < "$EVIDENCE/$1" | tr -d ' ')" \
+                "$([ "$size" -gt "$2" ] && echo yes || echo no)" >> "$EVIDENCE/capture-bounds.txt"
+            else
+              printf '%s absent\n' "$1" >> "$EVIDENCE/capture-bounds.txt"
+            fi
+          }
+          copy_capped npm-ci.stdout 32768
+          copy_capped npm-ci.stderr 32768
+          for run in controls admission fixture; do
+            copy_capped "$run.stdout" 262144
+            copy_capped "$run.stderr" 262144
+            copy_capped "$run.tap" 262144
+          done
+          cat "$EVIDENCE/capture-bounds.txt"
+          shopt -s dotglob nullglob
+          total=0
+          for f in "$EVIDENCE"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::non-regular evidence entry; not uploading"; exit 1; }
+            case "$(basename "$f")" in
+              toolchain.txt|input-hashes.txt|identity-candidate.txt|identity-original-fixture.txt|capture-bounds.txt) ;;
+              npm-ci.exit_code|npm-ci.stdout|npm-ci.stderr|verdict-controls.txt|verdict-fixture.txt) ;;
+              controls.*|admission.*|fixture.*) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+            total=$((total + $(wc -c < "$f" | tr -d ' ')))
+          done
+          echo "evidence bytes=${total}"
+          [ "$total" -le 4194304 ] || { echo "::error::evidence is ${total} bytes (> 4 MiB); not uploading"; exit 1; }
+
+      - name: Upload evidence (no lockfile, credentials, cache or node_modules)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: queue-contract-1215-239-${{ matrix.os }}-${{ matrix.leg }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/queue239/evidence
+          if-no-files-found: error
+          retention-days: 7
