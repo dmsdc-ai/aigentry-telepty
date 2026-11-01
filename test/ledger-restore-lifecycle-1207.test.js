@@ -368,6 +368,8 @@ function slowLockFs(lockPath, { failDurable = false } = {}) {
   gate.fs = new Proxy(fs, { get(target, key) {
     const real = target[key];
     if (key === 'openSync') return (p, ...rest) => { const fd = real.call(target, p, ...rest); if (p === lockPath) { gate.creates++; lockFds.add(fd); } return fd; };
+    // lock152: the same create count and lock-fd tracking for an ASYNCHRONOUS create of the lock path.
+    if (key === 'open') return (p, ...rest) => { const cb = rest.pop(); return real.call(target, p, ...rest, (error, fd) => { if (!error && p === lockPath) { gate.creates++; lockFds.add(fd); } cb(error, fd); }); };
     if (key === 'fsyncSync') return (fd, ...rest) => {
       if (!lockFds.has(fd)) return real.call(target, fd, ...rest);
       gate.syncCalls++; sleepSync(DURABILITY.delayMs);
