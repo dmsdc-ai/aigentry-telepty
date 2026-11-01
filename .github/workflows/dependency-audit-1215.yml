@@ -1,0 +1,222 @@
+name: Dependency audit evidence (task 1215, COLLECTION ONLY / NOT SECURITY PASS)
+
+# Task 1215 / release1238 / audit173 — DIAGNOSTIC EVIDENCE COLLECTOR. Base 6ca252c6eb9b691e465a114e4eb456cabd96a482.
+#
+# WHAT THIS IS. The authorized Linux CI `npm ci` reported "12 vulnerabilities (3 moderate, 8 high, 1 critical)". Counts
+# do not identify advisories. This job installs the EXACT hash-verified locked tree without running any script
+# (`npm ci --ignore-scripts --no-audit --fund=false`) and asks registry.npmjs.org for the audit report
+# (`npm audit --json --ignore-scripts`). It keeps the raw JSON, stdout, stderr and exit code of each command separately,
+# plus a facts-only summary: public advisory IDs, the isDirect flag, the lockfile dev/optional/peer flags, via and effects.
+#
+# WHAT THIS IS NOT. A green run is COLLECTION ONLY / NOT SECURITY PASS. `npm audit` exit 1 (vulnerabilities reported) is
+# evidence that is collected, not a collector success criterion. Nothing is fixed, overridden, forced or published. No
+# secret, token, registry-url, auth or extra registry is configured. No environment is printed. The lockfile, package.json
+# and credential files are never uploaded (only allowlisted evidence files under runner.temp are). Nothing is retried.
+#
+# FAILS CLOSED on: package.json / package-lock.json bytes that are not the supplied exact bodies (before and after the
+# install); a toolchain other than Node v20.20.2 / npm 10.8.2; a configured registry other than https://registry.npmjs.org/;
+# any npm ci failure; an audit exit other than 0/1 (network, timeout, signal); a stream over its byte bound; audit output
+# that is not exactly one npm audit v2 report (e.g. an `error` object); exit 1 with zero reported vulnerabilities; and
+# evidence over 2 MiB or with an unexpected file.
+#
+# ACTION REFS: the three official actions are pinned to the exact 40-hex commit SHAs supplied by the controller (audit176;
+# official GitHub commit API responses independently checked at 2026-11-01T08:12:55Z). The other repository workflows
+# still reference the tags actions/checkout@v4, actions/setup-node@v4 and actions/upload-artifact@v4.
+
+on:
+  push:
+    branches:
+      - 'diagnostic/dependency-audit-1215-173'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: npm audit evidence (COLLECTION ONLY / NOT SECURITY PASS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # exact controller-supplied pin
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # exact controller-supplied pin
+        with:
+          node-version: '20.20.2'
+      - name: Collect npm audit evidence (bounded; no scripts, no fix)
+        id: collect
+        env:
+          EXPECTED_PACKAGE_JSON_SHA256: fb8832167fff4abf13340e53df67855737c68bc08c26377acc466b193ef72db0
+          EXPECTED_PACKAGE_LOCK_SHA256: a1d9db1faf5a0ea05663953a15a452980849c4dcb95a68e55d14213ec28879cf
+        run: |
+          set -euo pipefail
+          umask 077
+          EVIDENCE="$RUNNER_TEMP/dependency-audit-1215"
+          mkdir "$EVIDENCE"
+          stage=start
+          trap 'rc=$?; printf "stage=%s\nscript_exit=%s\nlabel=COLLECTION ONLY / NOT SECURITY PASS\n" "$stage" "$rc" > "$EVIDENCE/collection-result.txt"' EXIT
+
+          # run_capped NAME STDOUT_MAX STDERR_MAX SECONDS CMD... : stdout, stderr and exit code go to three separate files.
+          # Each stream keeps at most MAX+1 bytes; reaching MAX+1 means "over the bound" and fails the collection.
+          run_capped() {
+            local p="$EVIDENCE/$1" out_max="$2" err_max="$3" secs="$4" out_size err_size
+            shift 4
+            set +e
+            { timeout --kill-after=10s "${secs}s" "$@" 2>&1 1>&3 3>&- | head -c "$((err_max + 1))" > "$p.stderr"
+              echo "${PIPESTATUS[0]}" > "$p.exit_code"; } 3>&1 | head -c "$((out_max + 1))" > "$p.stdout"
+            set -e
+            out_size="$(stat -c %s "$p.stdout")"
+            err_size="$(stat -c %s "$p.stderr")"
+            echo "$(basename "$p"): exit=$(cat "$p.exit_code") stdout_bytes=${out_size} stderr_bytes=${err_size}"
+            if [ "$out_size" -gt "$out_max" ] || [ "$err_size" -gt "$err_max" ]; then
+              echo "::error::$(basename "$p") output exceeded its bound (stdout ${out_size}/${out_max}, stderr ${err_size}/${err_max}); collection failed"
+              return 1
+            fi
+          }
+
+          stage=toolchain
+          for tool in timeout head stat sha256sum jq; do command -v "$tool" > /dev/null || { echo "::error::required tool '$tool' is missing; collection failed"; exit 1; }; done
+          NODE_VERSION="$(node --version)"; NPM_VERSION="$(npm --version)"; JQ_VERSION="$(jq --version)"
+          printf 'node=%s\nnpm=%s\njq=%s\nkernel=%s\n' "$NODE_VERSION" "$NPM_VERSION" "$JQ_VERSION" "$(uname -srm)" > "$EVIDENCE/toolchain.txt"
+          [ "$NODE_VERSION" = "v20.20.2" ] || { echo "::error::node is ${NODE_VERSION}, not v20.20.2; collection failed"; exit 1; }
+          [ "$NPM_VERSION" = "10.8.2" ] || { echo "::error::npm is ${NPM_VERSION}, not 10.8.2; collection failed"; exit 1; }
+          # Compared, never printed: a registry URL could carry credentials.
+          [ "$(npm config get registry)" = "https://registry.npmjs.org/" ] || { echo "::error::the configured npm registry is not https://registry.npmjs.org/; collection failed"; exit 1; }
+
+          stage=input-hashes
+          check_inputs() {
+            local pkg lock
+            pkg="$(sha256sum package.json | cut -d' ' -f1)"
+            lock="$(sha256sum package-lock.json | cut -d' ' -f1)"
+            printf '%s package.json sha256=%s\n%s package-lock.json sha256=%s\n' "$1" "$pkg" "$1" "$lock" >> "$EVIDENCE/input-hashes.txt"
+            [ "$pkg" = "$EXPECTED_PACKAGE_JSON_SHA256" ] || { echo "::error::package.json ${pkg} is not the supplied exact body (${1}); collection failed"; return 1; }
+            [ "$lock" = "$EXPECTED_PACKAGE_LOCK_SHA256" ] || { echo "::error::package-lock.json ${lock} is not the supplied exact body (${1}); collection failed"; return 1; }
+          }
+          check_inputs before-install
+
+          stage=npm-ci
+          run_capped npm-ci 65536 65536 120 npm ci --ignore-scripts --no-audit --fund=false
+          CI_EXIT="$(cat "$EVIDENCE/npm-ci.exit_code")"
+          [ "$CI_EXIT" = 0 ] || { echo "::error::npm ci exited ${CI_EXIT}; collection failed (npm-ci.stderr is in the artifact)"; exit 1; }
+          stage=input-hashes-after-install
+          check_inputs after-install
+
+          stage=npm-audit
+          run_capped npm-audit 1048576 65536 90 npm audit --json --ignore-scripts
+          AUDIT_EXIT="$(cat "$EVIDENCE/npm-audit.exit_code")"
+          case "$AUDIT_EXIT" in
+            0|1) ;;
+            *) echo "::error::npm audit exited ${AUDIT_EXIT} (not 0/1: network, timeout or signal); collection failed"; exit 1 ;;
+          esac
+
+          stage=validate-report
+          jq -s -e '
+            length == 1 and (.[0] |
+              type == "object"
+              and (has("error") | not)
+              and .auditReportVersion == 2
+              and (.vulnerabilities | type == "object")
+              and (.metadata.vulnerabilities | type == "object")
+              and ([.metadata.vulnerabilities | .info, .low, .moderate, .high, .critical, .total] | all(type == "number"))
+              and ([.vulnerabilities[] |
+                    (.name | type == "string")
+                    and (.severity | IN("info", "low", "moderate", "high", "critical"))
+                    and (.isDirect | type == "boolean")
+                    and (.via | type == "array")
+                    and (.effects | type == "array")
+                    and (.nodes | type == "array")] | all))
+          ' "$EVIDENCE/npm-audit.stdout" > /dev/null || { echo "::error::npm audit stdout is not exactly one npm audit v2 report; collection failed (raw npm-audit.stdout is in the artifact)"; exit 1; }
+          TOTAL="$(jq -r '.metadata.vulnerabilities.total' "$EVIDENCE/npm-audit.stdout")"
+          if [ "$AUDIT_EXIT" = 1 ] && [ "$TOTAL" = 0 ]; then
+            echo "::error::npm audit exited 1 but reported zero vulnerabilities; collection failed"
+            exit 1
+          fi
+
+          stage=summary
+          jq --slurpfile pkg package.json --slurpfile lock package-lock.json \
+             --arg commit "$GITHUB_SHA" --argjson audit_exit "$AUDIT_EXIT" '
+            def ghsa: [(.url // "") | match("GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}") | .string][0];
+            ($pkg[0]) as $p | ($lock[0].packages) as $lp |
+            {
+              label: "COLLECTION ONLY / NOT SECURITY PASS",
+              note: "Facts copied from npm audit --json (raw: npm-audit.stdout) and the hash-verified package.json/package-lock.json. No exploitability, reachability or runtime exposure is inferred.",
+              commit: $commit,
+              expected_base: "6ca252c6eb9b691e465a114e4eb456cabd96a482",
+              audit_exit_code: $audit_exit,
+              audit_exit_meaning: (if $audit_exit == 1 then "npm reported vulnerabilities (evidence, not collector success)" else "npm audit exited 0; inspect the recorded metadata counts" end),
+              auditReportVersion: .auditReportVersion,
+              metadata: .metadata,
+              reference_npm_ci_counts: {source: "authorized Linux CI npm ci on 6ca252c6 (comparison only)", total: 12, moderate: 3, high: 8, critical: 1},
+              vulnerabilities: ([.vulnerabilities | to_entries[] | .value as $v | {
+                name: $v.name,
+                severity: $v.severity,
+                isDirect: $v.isDirect,
+                declared_in: ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"
+                              | select(($p[.] // {}) | has($v.name))],
+                range: $v.range,
+                fixAvailable: $v.fixAvailable,
+                via_packages: [$v.via[] | strings],
+                advisories: [$v.via[] | objects
+                             | {ghsa: ghsa, source, url, title, severity, cwe, cvss, range, name, dependency}],
+                effects: $v.effects,
+                nodes: [$v.nodes[] as $n | {
+                  path: $n,
+                  in_lockfile: ($lp | has($n)),
+                  version: $lp[$n].version,
+                  dev: ($lp[$n].dev // false),
+                  optional: ($lp[$n].optional // false),
+                  devOptional: ($lp[$n].devOptional // false),
+                  peer: ($lp[$n].peer // false)
+                }]
+              }] | sort_by(.name)),
+              advisory_ids: ([.vulnerabilities[] | .via[] | objects | {ghsa: ghsa, source, url, severity}] | unique)
+            }
+          ' "$EVIDENCE/npm-audit.stdout" | head -c 262145 > "$EVIDENCE/summary.json"
+          [ "$(stat -c %s "$EVIDENCE/summary.json")" -le 262144 ] || { echo "::error::summary.json exceeded 262144 bytes; collection failed"; exit 1; }
+          jq -r '
+            "# Dependency audit evidence — COLLECTION ONLY / NOT SECURITY PASS", "",
+            "Facts only, copied from `npm audit --json` (raw: `npm-audit.stdout`) and the hash-verified lockfile. No exploitability, reachability or runtime exposure is inferred. A completed collection is not a security pass.", "",
+            "- commit: \(.commit) (expected base \(.expected_base) plus this workflow)",
+            "- npm audit exit code: \(.audit_exit_code) — \(.audit_exit_meaning)",
+            "- reported counts: \(.metadata.vulnerabilities | tojson)",
+            "- reference counts (authorized npm ci): total 12 = 3 moderate, 8 high, 1 critical",
+            "- dependency counts: \(.metadata.dependencies | tojson)", "",
+            "| package | severity | isDirect | declared in | lock nodes (dev flag) | via | effects | advisories |",
+            "|---|---|---|---|---|---|---|---|",
+            (.vulnerabilities[] | "| \(.name) | \(.severity) | \(.isDirect) | \(.declared_in | join(", ")) | \([.nodes[] | "\(.path)@\(.version) dev=\(.dev)"] | join("<br>")) | \(.via_packages | join(", ")) | \(.effects | join(", ")) | \([.advisories[] | "\(.ghsa // .url // .source) (\(.severity))"] | join("<br>")) |")
+          ' "$EVIDENCE/summary.json" | head -c 131073 > "$EVIDENCE/SUMMARY.md"
+          [ "$(stat -c %s "$EVIDENCE/SUMMARY.md")" -le 131072 ] || { echo "::error::SUMMARY.md exceeded 131072 bytes; collection failed"; exit 1; }
+          cat "$EVIDENCE/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=COLLECTION ONLY / NOT SECURITY PASS::npm audit exit ${AUDIT_EXIT}, ${TOTAL} vulnerable packages reported; evidence collected, this is not a security pass"
+          stage=complete
+
+      - name: Bound evidence (allowlisted files only, <= 2 MiB)
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/dependency-audit-1215"
+          test -d "$EVIDENCE" || { echo "::error::no evidence directory; nothing to upload"; exit 1; }
+          [ -z "$(find "$EVIDENCE" -mindepth 1 ! -type f -print -quit)" ] || { echo "::error::evidence contains a non-regular file; not uploading"; exit 1; }
+          shopt -s dotglob nullglob
+          for f in "$EVIDENCE"/*; do
+            case "$(basename "$f")" in
+              collection-result.txt|toolchain.txt|input-hashes.txt|npm-ci.stdout|npm-ci.stderr|npm-ci.exit_code|npm-audit.stdout|npm-audit.stderr|npm-audit.exit_code|summary.json|SUMMARY.md) ;;
+              *) echo "::error::unexpected evidence file '$(basename "$f")'; not uploading"; exit 1 ;;
+            esac
+          done
+          TOTAL_BYTES="$(find "$EVIDENCE" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')"
+          echo "evidence bytes=${TOTAL_BYTES}"
+          [ "$TOTAL_BYTES" -le 2097152 ] || { echo "::error::evidence is ${TOTAL_BYTES} bytes (> 2 MiB); not uploading"; exit 1; }
+
+      - name: Upload audit evidence (no lockfile, no credentials)
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # exact controller-supplied pin
+        with:
+          name: dependency-audit-1215-173-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dependency-audit-1215
+          if-no-files-found: error
+          retention-days: 7
