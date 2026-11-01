@@ -1,5 +1,7 @@
 const { protectedInputFailure } = require('../external-approval');
 const { claimedReturnMetadata } = require('../claimed-return');
+// #1215 pipe200 S24: the stable public text for an inject delivery that threw (details are in the daemon log only).
+const INJECT_DELIVERY_FAILED_TEXT = 'Delivery failed; see daemon log.';
 // Production session actions. Keep non-strict semantics of the original daemon bodies.
 // shared supplies lazy access to the daemon's actual stores and producers.
 // effects is constructor-only: timer scheduling, lifecycle signal/sleep/liveness options,
@@ -1745,8 +1747,13 @@ function createSessionActions(shared, effects = {}) {
           } : {})
         });
       } catch (err) {
-        (0, shared.emitInjectFailureEvent)(id, 'DELIVERY_FAILED', err.message, { inject_id }, session);
-        res.status(500).json((0, shared.buildErrorBody)('DELIVERY_FAILED', err.message));
+        // #1215 pipe200 S24 (disclosure197 P1): a strict-mode non-owner holding only session.inject reaches this catch,
+        // and is not entitled to host paths or internal state. The raw exception therefore stays a LOCAL operator
+        // diagnostic. The response and the inject_failed event/bus sink carry one stable text, with the unchanged
+        // status 500 and code DELIVERY_FAILED.
+        console.error(`[INJECT] delivery threw for ${id} inject_id=${inject_id}:`, err && err.stack ? err.stack : err);
+        (0, shared.emitInjectFailureEvent)(id, 'DELIVERY_FAILED', INJECT_DELIVERY_FAILED_TEXT, { inject_id }, session);
+        res.status(500).json((0, shared.buildErrorBody)('DELIVERY_FAILED', INJECT_DELIVERY_FAILED_TEXT));
       }
     });
   }

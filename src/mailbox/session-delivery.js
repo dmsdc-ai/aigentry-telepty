@@ -3,6 +3,7 @@ const { createBoundedUdsResponse } = require('./uds-response');
 const { protectedInputFailure, externalApprovalVerifier } = require('../external-approval');
 const { sshInputFailure, requestSshWrite } = require('../ssh-session');
 const { frameMeta: bridgeFrameMeta } = require('./bridge-stage');
+const { ptyInputFailure } = require('../pty-input-lifecycle');
 
 // #137: the ids a wrapped owner inject frame carries so the bridge can file receipts against them.
 // owner_generation is always the CURRENT owner's; the rest is what the caller actually knows.
@@ -177,6 +178,10 @@ function createSessionDeliveryContext({
 
     if (!session.ptyProcess || session.ptyProcess.killed) {
       return buildErrorBody('DISCONNECTED', 'PTY process is not connected.', { httpStatus: 503 });
+    }
+    // #1215 pipe200 — shared PTY input guard: a failed input channel is refused, never reported as delivered.
+    if (ptyInputFailure(session)) {
+      return buildErrorBody('DISCONNECTED', 'PTY input channel failed.', { httpStatus: 503, bytes_written: 0, reason: 'pty_input_failed' });
     }
 
     session.ptyProcess.write(data);

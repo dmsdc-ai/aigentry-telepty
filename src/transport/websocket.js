@@ -1,5 +1,6 @@
 'use strict';
 const { protectedInputFailure } = require('../external-approval');
+const { ptyInputFailure } = require('../pty-input-lifecycle');
 const { setKittyTabTitle } = require('../kitty-control');   // PR #108 C4: argv, no shell
 
 const crypto = require('node:crypto');
@@ -188,7 +189,7 @@ function installWebSocketTransport(deps) {
       if (!isOpenWebSocket(owner)) return null;
       return (data, complete) => owner.send(JSON.stringify({ type: 'inject', data }), complete);
     }
-    if (session.ptyProcess) return (data, complete) => { session.ptyProcess.write(data); complete(); };
+    if (session.ptyProcess && !ptyInputFailure(session)) return (data, complete) => { session.ptyProcess.write(data); complete(); };
     return null;
   }
 
@@ -693,6 +694,11 @@ function installWebSocketTransport(deps) {
           // rules, which is how #826 came to cover one of them.
           if ((type === 'input' || type === 'resize') && protectedInputFailure(activeSession)) {
             ws.send(JSON.stringify({ type: 'input_refused', ...protectedInputFailure(activeSession) }));
+            return;
+          }
+          // #1215 pipe200 — shared PTY input guard: input into a failed input channel is refused, never forwarded.
+          if (type === 'input' && ptyInputFailure(activeSession)) {
+            ws.send(JSON.stringify({ type: 'input_refused', success: false, code: 'DISCONNECTED', bytes_written: 0, reason: 'pty_input_failed' }));
             return;
           }
           if (type === 'input') {

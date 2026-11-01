@@ -4,6 +4,7 @@ const { mailboxLeaseAlive } = require('./poll-session');
 const bridgeStage = require('./bridge-stage');
 const inputPolicies = require('./input-policy');
 const readinessHandshake = require('../transport/readiness-handshake');
+const { ptyInputFailure } = require('../pty-input-lifecycle');
 
 // Accessors retain the daemon's shared instances and original first-use timing.
 // Construction only creates functions; effect boundaries run when those functions do.
@@ -599,6 +600,7 @@ function createDeliveryRuntime(shared, {
       return 'DISCONNECTED';
     }
 
+    if (ptyInputFailure(session)) return 'DISCONNECTED';   // #1215 pipe200: input unavailable, not an observed exit
     return session.ptyProcess && !session.ptyProcess.killed ? 'CONNECTED' : 'DISCONNECTED';
   }
 
@@ -618,6 +620,7 @@ function createDeliveryRuntime(shared, {
       return 'DELIVERY_ENDPOINT_MISSING';
     }
 
+    if (ptyInputFailure(session)) return 'PTY_INPUT_FAILED';   // #1215 pipe200: never PTY_EXITED for a live process
     return session.ptyProcess && !session.ptyProcess.killed ? 'PTY_RUNNING' : 'PTY_EXITED';
   }
 
@@ -1527,6 +1530,7 @@ function createDeliveryRuntime(shared, {
       }
       return false;
     } else {
+      if (ptyInputFailure(session)) return false;   // #1215 pipe200: shared PTY input guard (deferred CR)
       session.ptyProcess.write('\r');
       return true;
     }
