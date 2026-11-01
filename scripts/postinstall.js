@@ -84,11 +84,20 @@ function warnAboutLegacyInstall(options, logger, platform, env) {
   }
 }
 
-async function waitForDaemonVersion({ port = 3848, version = pkg.version, timeoutMs = 8000, fetchImpl = fetch } = {}) {
+// Task 1215 F2: /api/meta is authenticated (#820: loopback is not a credential). Present the existing local daemon
+// token with the client precedence TELEPTY_AUTH_TOKEN, else ~/.telepty/config.json authToken — read-only, never
+// minted (auth.js getConfig create:false). Unavailable => no header; the value is never logged.
+function localDaemonToken(env = process.env) {
+  if (env.TELEPTY_AUTH_TOKEN) return env.TELEPTY_AUTH_TOKEN;
+  try { return require('../auth').getConfig({ create: false }).authToken; } catch { return null; }
+}
+
+async function waitForDaemonVersion({ port = 3848, version = pkg.version, timeoutMs = 8000, fetchImpl = fetch, token = null } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const res = await fetchImpl(`http://127.0.0.1:${port}/api/meta`, {
+        headers: token ? { 'x-telepty-token': token } : {},
         signal: AbortSignal.timeout(800)
       });
       if (res && res.ok) {
@@ -179,7 +188,8 @@ async function main(options = {}) {
     const meta = await waitForVersion({
       port: Number(state.port) || 3848,
       version: pkg.version,
-      timeoutMs: options.waitTimeoutMs || 8000
+      timeoutMs: options.waitTimeoutMs || 8000,
+      token: localDaemonToken(env)
     });
     if (meta) {
       logger.log(`[telepty postinstall] Stopped ${stopped} stale daemon(s); ${supervisor.kind} started ${pkg.version} daemon (pid ${meta.pid}).`);
