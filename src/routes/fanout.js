@@ -76,9 +76,10 @@ function registerFanoutRoutes(app, {
     }
     // #45 — defense-in-depth blast-radius cap (operator lane too).
     if (session_ids.length > FANOUT_MAX_TARGETS) {
-      return respondWithError(res, 429, 'FANOUT_TARGET_CAP',
-        `multicast target count ${session_ids.length} exceeds cap ${FANOUT_MAX_TARGETS}`,
-        { cap: FANOUT_MAX_TARGETS, requested: session_ids.length });
+      // Task 1215: the public text is rendered from these numbers (publicErrorContext), never from a string.
+      return respondWithError(res, 429, 'FANOUT_TARGET_CAP', null,
+        { cap: FANOUT_MAX_TARGETS, requested: session_ids.length },
+        { kind: 'fanout_limit', operation: 'multicast', requested: session_ids.length, cap: FANOUT_MAX_TARGETS });
     }
 
     const results = { successful: [], failed: [] };
@@ -117,7 +118,8 @@ function registerFanoutRoutes(app, {
             timestamp: new Date().toISOString()
           });
         } catch (err) {
-          results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
+          // Task 1215: the raw exception text never reaches the public per-target result.
+          results.failed.push({ id, code: 'DELIVERY_FAILED', error: 'Multicast delivery failed for this target.' });
           auditMulticastTarget(inject_id, 'multicast', from, verifiedSender, id, prompt, 'failed:DELIVERY_FAILED');
         }
       } else {
@@ -155,9 +157,10 @@ function registerFanoutRoutes(app, {
     }
     // #45 — defense-in-depth blast-radius cap (operator lane too).
     if (targetIds.length > FANOUT_MAX_TARGETS) {
-      return respondWithError(res, 429, 'FANOUT_TARGET_CAP',
-        `broadcast target count ${targetIds.length} exceeds cap ${FANOUT_MAX_TARGETS}`,
-        { cap: FANOUT_MAX_TARGETS, requested: targetIds.length });
+      // Task 1215: the public text is rendered from these numbers (publicErrorContext), never from a string.
+      return respondWithError(res, 429, 'FANOUT_TARGET_CAP', null,
+        { cap: FANOUT_MAX_TARGETS, requested: targetIds.length },
+        { kind: 'fanout_limit', operation: 'broadcast', requested: targetIds.length, cap: FANOUT_MAX_TARGETS });
     }
 
     const results = { successful: [], failed: [] };
@@ -184,7 +187,8 @@ function registerFanoutRoutes(app, {
         results.successful.push({ id, strategy: delivery.strategy, ...(delivery.poll_only ? { queued: true, delivered: false, msg_id: delivery.msg_id } : {}) });
         auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, deliveryAuditResult(delivery));  // #860 F2
       } catch (err) {
-        results.failed.push({ id, code: 'DELIVERY_FAILED', error: err.message });
+        // Task 1215: the raw exception text never reaches the public per-target result.
+        results.failed.push({ id, code: 'DELIVERY_FAILED', error: 'Broadcast delivery failed for this target.' });
         auditMulticastTarget(inject_id, 'broadcast', from, verifiedSender, id, prompt, 'failed:DELIVERY_FAILED');
       }
     }

@@ -1,5 +1,6 @@
 const { protectedInputFailure } = require('../external-approval');
 const { claimedReturnMetadata } = require('../claimed-return');
+const { validInjectId } = require('../diagnostics/correlation');
 // #1215 pipe200 S24: the stable public text for an inject delivery that threw (details are in the daemon log only).
 const INJECT_DELIVERY_FAILED_TEXT = 'Delivery failed; see daemon log.';
 // Production session actions. Keep non-strict semantics of the original daemon bodies.
@@ -510,7 +511,10 @@ function createSessionActions(shared, effects = {}) {
     // the recipient is now idle, so a genuine idle→working/thinking turn is observable as
     // `consumed` (#53). A still-`queued` result means the CR did not fire the composer — retry.
     const fireCR = async () => {
-      const strategy = await (0, shared.gatedTerminalSubmit)(id, session, injectedBody, true);
+      // Task 1215 submit286: the re-fired CR names the same validated inject_id as its /submit;
+      // terminalLevelSubmit re-checks its record identity at this write.
+      const strategy = await (0, shared.gatedTerminalSubmit)(id, session, injectedBody, true,
+        opts.injectId ? { injectId: opts.injectId } : undefined);
       if (!strategy) return { redelivered: false, reason: 'strategy_failed' };
       const submittedAtMs = Date.now();
       const sinceBytes = session.outputRingTotalBytes || 0;
@@ -997,6 +1001,12 @@ function createSessionActions(shared, effects = {}) {
       // Per-request bypass for manual overrides (`telepty send-key`). Skips gate +
       // verify and dispatches once via the existing terminal-level chain.
       const force = req.body?.force === true;
+      // Task 1215 submit286: optional correlation — the inject_id of the body this CR submits.
+      // Syntax-checked here; a missing or malformed value is simply absent (legacy, never a 400).
+      // terminalLevelSubmit keeps it on the CR frame only for a record of this exact session,
+      // epoch and owner generation. It changes no gate, retry, status or byte.
+      const submitInjectId = validInjectId(req.body?.inject_id) ? req.body.inject_id : null;
+      const submitOptions = submitInjectId ? { injectId: submitInjectId } : undefined;
 
       const gateOff = String(process.env.TELEPTY_SUBMIT_GATE || '').toLowerCase() === 'off';
 
@@ -1109,7 +1119,7 @@ function createSessionActions(shared, effects = {}) {
           console.log(`[SUBMIT] force CR gap ${forceCrGapMs}ms for ${id} (un-enveloped multi-line body)`);
           await new Promise((resolve) => scheduleTimeout(resolve, forceCrGapMs));
         }
-        const strategy = (0, shared.terminalLevelSubmit)(id, session);
+        const strategy = (0, shared.terminalLevelSubmit)(id, session, submitOptions);
         const forceSubmittedAtMs = Date.now();
         if (strategy) {
           // #537 / Bug B: force-confirm must reflect ACTUAL delivery. A pty_cr fallback on a
@@ -1132,6 +1142,7 @@ function createSessionActions(shared, effects = {}) {
               submittedAtMs: forceSubmittedAtMs,
               ringBytesAtSubmit: forceRingBytesAtSubmit,
               emitSubmitBus,
+              injectId: submitInjectId,
             });
           }
           emitSubmitBus({ strategy, attempts: 1, gated: false, forced: true, submit_confirmed: deliveredToSurface });
@@ -1195,11 +1206,11 @@ function createSessionActions(shared, effects = {}) {
         if (preDelayMs > 0) {
           await new Promise(resolve => scheduleTimeout(resolve, preDelayMs));
         }
-        let legacyStrategy = (0, shared.terminalLevelSubmit)(id, session);
+        let legacyStrategy = (0, shared.terminalLevelSubmit)(id, session, submitOptions);
         let legacyAttempts = legacyStrategy ? 1 : 0;
         for (let i = 0; i < retries && legacyStrategy; i++) {
           await new Promise(resolve => scheduleTimeout(resolve, retryDelayMs));
-          (0, shared.terminalLevelSubmit)(id, session);
+          (0, shared.terminalLevelSubmit)(id, session, submitOptions);
           legacyAttempts++;
         }
         if (legacyStrategy) {
@@ -1316,7 +1327,7 @@ function createSessionActions(shared, effects = {}) {
         (0, shared.markPendingReportSubmitStarted)(id, injectedBody);
       }
       const settleEnabled = req.body?.input_settle_gate !== false;
-      let strategy = await (0, shared.gatedTerminalSubmit)(id, session, injectedBody, settleEnabled);
+      let strategy = await (0, shared.gatedTerminalSubmit)(id, session, injectedBody, settleEnabled, submitOptions);
       let submittedAtMs = Date.now();
       // #53: outputRing watermark at the CR — scopes consumption-evidence matching to frames
       // appended AFTER this submit (composer redraw / new-turn render), surviving ring trimming.
@@ -1348,7 +1359,7 @@ function createSessionActions(shared, effects = {}) {
         confirm = await (0, shared.confirmSubmitAfterDispatch)(id, session, injectedBody, submittedAtMs, verifyTimeoutMs);
         while (confirm && !confirm.accepted && confirm.retryable && attempts <= retries) {
           await new Promise(resolve => scheduleTimeout(resolve, retryDelayMs));
-          const retryStrategy = await (0, shared.gatedTerminalSubmit)(id, session, injectedBody, settleEnabled);
+          const retryStrategy = await (0, shared.gatedTerminalSubmit)(id, session, injectedBody, settleEnabled, submitOptions);
           submittedAtMs = Date.now();
           ringBytesAtSubmit = session.outputRingTotalBytes || 0;
           if (!retryStrategy) break;
@@ -1387,6 +1398,7 @@ function createSessionActions(shared, effects = {}) {
             submittedAtMs,
             ringBytesAtSubmit,
             emitSubmitBus,
+            injectId: submitInjectId,
           });
         }
 
@@ -1623,7 +1635,9 @@ function createSessionActions(shared, effects = {}) {
                 text_bytes_written: delivery.text_bytes_written ?? null, bytes_written: delivery.bytes_written ?? null,
                 retry_safe: delivery.bytes_written === 0 && delivery.text_written !== true } : {}),
 
-              ...(delivery.delivery_uncertain ? { delivery_uncertain: true, retryable: false, bytes_written: null, submit: 'skipped' } : {}) });
+              ...(delivery.delivery_uncertain ? { delivery_uncertain: true, retryable: false, bytes_written: null, submit: 'skipped' } : {}) },
+            // Task 1215: a numeric public text travels as its internal (non-enumerable) context, never re-parsed.
+            delivery.publicErrorContext);
         }
 
         if (from) session.lastInjectFrom = from;
@@ -1795,7 +1809,8 @@ function createSessionActions(shared, effects = {}) {
         console.log(`[KILL] Session ${resolvedId} closed (reason=${result.reason}, force=${result.force}, pid=${result.kill.pid || 'none'})`);
         res.json(result);
       } catch (err) {
-        res.status(500).json({ error: err.message || 'Failed to kill session' });
+        // Task 1215: the raw exception text never reaches the public response; the stable text was the fallback.
+        res.status(500).json({ error: 'Failed to kill session' });
       }
     });
   }

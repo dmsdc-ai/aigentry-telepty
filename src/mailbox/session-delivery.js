@@ -151,9 +151,10 @@ function createSessionDeliveryContext({
         if (response.body) response.body.cancel().catch(() => {});
         if (!response.ok) {
           emitHttpDeliveryDiag({ category: 'http_status', status_class: `${Math.floor(response.status / 100)}xx`, elapsed_ms: Date.now() - fetchBegun });
-          return buildErrorBody('DELIVERY_UNCERTAIN', `HTTP endpoint returned ${response.status} after an attempt; do not retry blindly.`, {
+          // Task 1215: the public text is rendered from the numeric status (publicErrorContext), never from a string.
+          return buildErrorBody('DELIVERY_UNCERTAIN', null, {
             httpStatus: 502, deliveryStatus: response.status, delivery_uncertain: true, bytes_written: null
-          });
+          }, { kind: 'http_status', status: response.status });
         }
         return { success: true, transport_receipt: 'http_2xx', consumption: 'unknown', reply: 'unknown' };
       } catch (error) {
@@ -600,8 +601,9 @@ function createSessionDeliveryContext({
     const queueTimeoutRefusal = () => {
       emitQueueTimeoutDiag(session, { bound_ms: SUBMIT_QUEUE_TIMEOUT_MS, queue_wait_ms: Date.now() - queueEnteredAt,
         pre_barrier_in_delivery_ms: queueEnteredAt - now, wait_rounds: waitRounds });
-      return { success: false, httpStatus: 503, code: 'QUEUE_TIMEOUT', queue_wait_ms: Date.now() - queueEnteredAt,
-        error: `Earlier submits on this session did not clear within ${SUBMIT_QUEUE_TIMEOUT_MS} ms; nothing was written. Retry.` };
+      // Task 1215: the public text is rendered from the numeric bound (publicErrorContext), never from a string.
+      return buildErrorBody('QUEUE_TIMEOUT', null, { httpStatus: 503, queue_wait_ms: Date.now() - queueEnteredAt },
+        { kind: 'submit_timeout', timeoutMs: SUBMIT_QUEUE_TIMEOUT_MS });
     };
     while (session.pendingSubmit) {
       waitRounds++;

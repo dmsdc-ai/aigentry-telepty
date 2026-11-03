@@ -271,7 +271,8 @@
         "test/supervision-config-persistence-1215.test.js",
         "test/supervision-preflight-lifecycle-1215.test.js",
         "test/allow-admission-1215.test.js",
-        "test/queue-deadline-admission-1215.test.js"
+        "test/queue-deadline-admission-1215.test.js",
+        "test/submit-public-error-contract.test.js"
       ]
     },
     "test:watch": {
@@ -484,7 +485,8 @@
         "test/supervision-config-persistence-1215.test.js",
         "test/supervision-preflight-lifecycle-1215.test.js",
         "test/allow-admission-1215.test.js",
-        "test/queue-deadline-admission-1215.test.js"
+        "test/queue-deadline-admission-1215.test.js",
+        "test/submit-public-error-contract.test.js"
       ]
     },
     "test:ci": {
@@ -754,7 +756,8 @@
         "test/supervision-config-persistence-1215.test.js",
         "test/supervision-preflight-lifecycle-1215.test.js",
         "test/allow-admission-1215.test.js",
-        "test/queue-deadline-admission-1215.test.js"
+        "test/queue-deadline-admission-1215.test.js",
+        "test/submit-public-error-contract.test.js"
       ]
     },
     "test:ci:pty": {

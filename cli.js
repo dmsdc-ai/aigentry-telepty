@@ -4197,6 +4197,9 @@ async function main() {
           retries: submitRetries,
           retry_delay_ms: 500,
           ...(submitForce ? { force: true } : {}),
+          // Task 1215 submit286: the inject_id of THIS successful inject, so the CR's bridge receipt
+          // can join its record. Optional correlation only; the daemon validates and may drop it.
+          ...(data && typeof data.inject_id === 'string' ? { inject_id: data.inject_id } : {}),
         };
         let submitRes = null;
         let submitData = null;
