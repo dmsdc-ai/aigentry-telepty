@@ -59,6 +59,15 @@ the code it was started with.
 
 ### Delivery and identity
 
+- **Submit receipt correlation.** The CLI carries the injection ID into its submit request, and
+  the daemon labels the Enter frame only while that record still belongs to the live session,
+  instance and owner. Diagnostics identify this as `transport_receipt_by_inject_id`: it records
+  the transport write, not the contents submitted or receipt by the model. Legacy requests
+  without an injection ID keep their existing behavior.
+- **Public errors keep their intended guidance.** Internal exception text is replaced with
+  stable public messages in the affected delivery, fanout, kill and bootstrap paths. Numeric
+  messages use validated caller values; stalled-output and modal-dialog guidance remains
+  actionable. Existing status codes and delivery outcomes are preserved.
 - **Injected text and its Enter stay paired (#107, #109).** The deferred Enter goes only to the
   session instance, and the owner socket, that received the text. The next inject waits behind it.
   A session that is destroyed or re-created in that window answers `410 SESSION_GONE`, and no bare

@@ -5,6 +5,7 @@ const bridgeStage = require('./bridge-stage');
 const inputPolicies = require('./input-policy');
 const readinessHandshake = require('../transport/readiness-handshake');
 const { ptyInputFailure } = require('../pty-input-lifecycle');
+const { validInjectId } = require('../diagnostics/correlation');
 
 // Accessors retain the daemon's shared instances and original first-use timing.
 // Construction only creates functions; effect boundaries run when those functions do.
@@ -475,12 +476,169 @@ function createDeliveryRuntime(shared, {
     });
   }
 
-  function buildErrorBody(code, error, extra = {}) {
-    return { success: false, code, error, ...extra };
+  // Task 1215 (Snyk ServerLeak): this body is a response/bus boundary. `extra` cannot override success/code/error,
+  // cannot itself be an Error, and drops top-level Error values plus the raw exception carriers `stack`/`detail`
+  // (the only `detail` producer is a raw socket err.message; it stays in the local operator log, and no consumer
+  // reads it). `publicErrorContext` is reserved too: it is never a JSON field (see buildErrorBody).
+  const ERROR_BODY_RESERVED = new Set(['success', 'code', 'error', 'stack', 'detail', 'publicErrorContext']);
+  // Task 1215 (Snyk295/301): explicit public-error contract. A string's type says nothing about whether it is an
+  // exception message, so the public `error` text is CODE-OWNED. Without a publicErrorContext it is one of:
+  //   - a PUBLIC_ERROR_TEXTS member, i.e. the daemon-authored texts the admitted callers pass: route literals,
+  //     deliverInjectionToSession / writeDataToSession / requestSshWrite / protectedInputFailure / getInjectFailure
+  //     results, and applySessionStateReport results;
+  //   - SSH_SUBMIT_UNCONFIRMED_PREFIX plus a catalog member;
+  //   - a SURFACE_MODAL refusal text, derived from the authoritative MODAL_HINT_BY_CLI.
+  // A text with numbers is never parsed back out of a string. Its caller passes a publicErrorContext, and
+  // PUBLIC_ERROR_CONTEXT_FORMATS validates that context and renders the text.
+  // Any other string (an exception message included) and any non-string become GENERIC_PUBLIC_ERROR. null and
+  // undefined stay as they are. A new public text must be added here, or it is answered generically.
+  const GENERIC_PUBLIC_ERROR = 'Internal error';
+  const PUBLIC_ERROR_TEXTS = Object.freeze([
+    'Another approved write claimed the submit barrier; retry with this unspent approval.',
+    'Approval must remain valid through the deferred submit.',
+    'Approved owner write could not be confirmed; approval cannot be reused.',
+    'Cooperative handoff fences terminal writes.',
+    'Delivery endpoint is missing.',
+    'Delivery failed; see daemon log.',
+    'Delivery outcome unknown after an attempt; automatic retry disabled. Do not retry blindly.',
+    'Delivery outcome unknown after enqueue; no direct retry was attempted.',
+    'Delivery was not confirmed before the caller deadline; outcome unknown and automatic retry disabled. Do not retry blindly.',
+    'Delivery was refused before text was written.',
+    'Earlier submits did not clear; no approved text was written.',
+    'HTTP attempt could not be durably fenced; nothing written.',
+    'HTTP delivery response unavailable after an attempt; do not retry blindly.',
+    'Invalid claimed return locator',
+    'Kill requires the current session credential.',
+    'Mailbox enqueue failed.',
+    'Mailbox sessions accept queued text only.',
+    'No current-child write receipt; input may have been written. Do not retry blindly.',
+    'Observation tracking capacity is not available; no task bytes were delivered.',
+    'Observation tracking could not be persisted; no task bytes were delivered.',
+    'Original task retained pending measured composer readiness.',
+    'Owned delete requires the current session credential.',
+    'PTY input channel failed.',
+    'PTY process is not connected.',
+    'Peer-lane fan-out blocked: broadcast/multicast is operator-only. Use bin/ask.sh for peer→peer.',
+    'Peer-lane inject blocked: not a sanctioned ask-request/ask-reply envelope. Use bin/ask.sh.',
+    'Pending text was withdrawn before delivery; nothing was written.',
+    'Protected SSH inject requires a bound SSH write receipt adapter.',
+    'Protected inject cannot be parked or retained for later delivery.',
+    'Protected inject requires a clear surface and empty bootstrap queue.',
+    'SSH bridge disconnected.',
+    'SSH bridge refused input; no bytes were written or queued.',
+    'SSH bridge send failed.',
+    'SSH child write was not confirmed. Do not retry blindly.',
+    'SSH delivery could not be confirmed; input may have been written. Do not retry blindly.',
+    'SSH input exceeds 256 KiB.',
+    'SSH remote composer is not ready for this write; nothing was queued. Resolve authentication/bootstrap locally or wait for qualified readiness.',
+    'Session is closing',
+    'Session is stale and awaiting cleanup.',
+    'Session not found',
+    'Session output pipe is dead: the owner is connected but has returned no output since the last delivery.',
+    'Session owner disconnected.',
+    'Session owner is disconnected.',
+    'Session store write failed',
+    'Session was destroyed or replaced while this write was pending; it was not written.',
+    'Signed inject currently supports wrapped sessions only.',
+    'Signed inject requires the enrolled target policy.',
+    'Target session epoch differs',
+    'This protected session requires an external signature through the supported inject ingress.',
+    'Too many pending SSH writes.',
+    'UDS attempt could not be durably fenced; nothing written.',
+    'UDS delivery timed out.',
+    'UDS endpoint is unreachable.',
+    'UDS endpoint reported an error after the write attempt.',
+    'UDS response did not confirm endpoint acceptance; do not retry blindly.',
+    'UDS response exceeded 65536 bytes; delivery outcome is uncertain.',
+    'UDS response failed after a write attempt; delivery outcome unknown.',
+    'UDS write outcome unknown; do not retry blindly.',
+    'needs_input must be a boolean',
+    'phase is required',
+    'prompt is required',
+    'seq must be a non-negative integer',
+    'state report payload must be a JSON object',
+  ]);
+  // Code-owned formatters for the public texts that carry numbers. Each kind is tied to the one code its real
+  // callers use:
+  //   - http_status: session-delivery writeDataToSession, aterm HTTP endpoint;
+  //   - submit_timeout: session-delivery queueTimeoutRefusal;
+  //   - fanout_limit: fanout multicast/broadcast cap.
+  // A context must be a plain object with exactly the kind's keys, and its fields must be real Numbers (no string
+  // coercion). Integers stay integers. Operator-configured caps/timeouts stay finite positive Numbers and may be
+  // fractional. They render with the same `${n}` the callers used.
+  const PUBLIC_ERROR_CONTEXT_FORMATS = Object.freeze({
+    http_status: Object.freeze({ code: 'DELIVERY_UNCERTAIN', keys: ['kind', 'status'],
+      valid: c => typeof c.status === 'number' && Number.isInteger(c.status) && c.status >= 100 && c.status <= 599,
+      format: c => `HTTP endpoint returned ${c.status} after an attempt; do not retry blindly.` }),
+    submit_timeout: Object.freeze({ code: 'QUEUE_TIMEOUT', keys: ['kind', 'timeoutMs'],
+      valid: c => typeof c.timeoutMs === 'number' && Number.isFinite(c.timeoutMs) && c.timeoutMs > 0,
+      format: c => `Earlier submits on this session did not clear within ${c.timeoutMs} ms; nothing was written. Retry.` }),
+    fanout_limit: Object.freeze({ code: 'FANOUT_TARGET_CAP', keys: ['kind', 'operation', 'requested', 'cap'],
+      valid: c => (c.operation === 'multicast' || c.operation === 'broadcast')
+        && typeof c.requested === 'number' && Number.isSafeInteger(c.requested) && c.requested >= 0
+        && typeof c.cap === 'number' && Number.isFinite(c.cap) && c.cap > 0,
+      format: c => `${c.operation === 'broadcast' ? 'broadcast' : 'multicast'} target count ${c.requested} exceeds cap ${c.cap}` }),
+  });
+  // Returns { text, context } for a valid context, else null. `context` is a frozen copy holding only the kind's keys.
+  function publicErrorContextText(code, publicErrorContext) {
+    const ctx = publicErrorContext;
+    if (!ctx || typeof ctx !== 'object' || Array.isArray(ctx)) return null;
+    const proto = Object.getPrototypeOf(ctx);
+    if (proto !== Object.prototype && proto !== null) return null;
+    if (typeof ctx.kind !== 'string' || !Object.prototype.hasOwnProperty.call(PUBLIC_ERROR_CONTEXT_FORMATS, ctx.kind)) return null;
+    const spec = PUBLIC_ERROR_CONTEXT_FORMATS[ctx.kind];
+    if (code !== spec.code) return null;
+    const keys = Object.keys(ctx);
+    if (keys.length !== spec.keys.length || !spec.keys.every(key => keys.includes(key))) return null;
+    const context = Object.freeze(Object.fromEntries(spec.keys.map(key => [key, ctx[key]])));
+    return spec.valid(context) ? { text: spec.format(context), context } : null;
+  }
+  const SSH_SUBMIT_UNCONFIRMED_PREFIX = 'Text was written to the SSH child, but submit was not confirmed. Do not retry blindly. ';
+  function publicErrorText(error) {
+    // Absent stays absent, as literal constants: JSON null stays null, undefined stays an omitted key.
+    if (error === null) return null;
+    if (error === undefined) return undefined;
+    if (typeof error !== 'string') return GENERIC_PUBLIC_ERROR;
+    // Frozen-catalog lookup (63 entries): the input is used only for `===`; the catalog entry is returned.
+    for (const entry of PUBLIC_ERROR_TEXTS) if (entry === error) return entry;
+    if (error.startsWith(SSH_SUBMIT_UNCONFIRMED_PREFIX)) {
+      const cause = error.slice(SSH_SUBMIT_UNCONFIRMED_PREFIX.length);
+      for (const entry of PUBLIC_ERROR_TEXTS) if (entry === cause) return SSH_SUBMIT_UNCONFIRMED_PREFIX + entry;
+      return GENERIC_PUBLIC_ERROR;
+    }
+    // SURFACE_MODAL refusal texts are modalRejectionResponse's own output. The CLI is one of MODAL_HINT_BY_CLI's
+    // keys (codex/claude), because isSurfaceBlockedByModal is true only for a SURFACE_MODAL_RULES CLI, and the
+    // reason is modalDeliveryDecision's `${cli}_modal_ui`. They are derived at call time: MODAL_HINT_BY_CLI is a
+    // daemon const declared after this runtime is created. The input is used only for `===`; the locally built
+    // text is returned.
+    for (const [cli, hint] of Object.entries(shared.MODAL_HINT_BY_CLI || {})) {
+      const text = modalRejectionResponse({ reason: `${cli}_modal_ui`, hint }).error;
+      if (text === error) return text;
+    }
+    return GENERIC_PUBLIC_ERROR;
+  }
+  // `publicErrorContext` (optional) selects a numeric formatter. If it is given, `error` is ignored and an invalid
+  // context gives GENERIC_PUBLIC_ERROR. The validated copy rides on the body as a NON-ENUMERABLE property:
+  //   - an internal delivery result can carry it to the route (session-actions inject);
+  //   - JSON never serializes it;
+  //   - an object spread that overrides `error` (session-delivery mailbox arms) does not inherit it.
+  function buildErrorBody(code, error, extra = {}, publicErrorContext) {
+    const safeExtra = {};
+    if (extra && typeof extra === 'object' && !(extra instanceof Error)) {
+      for (const [key, value] of Object.entries(extra)) {
+        if (!ERROR_BODY_RESERVED.has(key) && !(value instanceof Error)) safeExtra[key] = value;
+      }
+    }
+    const contextual = publicErrorContext === undefined ? null : publicErrorContextText(code, publicErrorContext);
+    const publicError = publicErrorContext === undefined ? publicErrorText(error)
+      : (contextual ? contextual.text : GENERIC_PUBLIC_ERROR);
+    const body = { success: false, code, error: publicError, ...safeExtra };
+    if (contextual) Object.defineProperty(body, 'publicErrorContext', { value: contextual.context, enumerable: false });
+    return body;
   }
 
-  function respondWithError(res, httpStatus, code, error, extra = {}) {
-    return res.status(httpStatus).json(buildErrorBody(code, error, extra));
+  function respondWithError(res, httpStatus, code, error, extra = {}, publicErrorContext) {
+    return res.status(httpStatus).json(buildErrorBody(code, error, extra, publicErrorContext));
   }
 
   function classifyPeerLaneInject({ from, to, prompt, orchestratorSids } = {}) {
@@ -783,7 +941,7 @@ function createDeliveryRuntime(shared, {
     return shared.submitGate.confirmSubmitAccepted(session, injectedBody, buildSubmitConfirmOptions(id, session, submittedAtMs, verifyTimeoutMs));
   }
 
-  async function gatedTerminalSubmit(id, session, injectedBody, settleEnabled) {
+  async function gatedTerminalSubmit(id, session, injectedBody, settleEnabled, options) {
     if (injectedBody && injectedBody.length > 0 && settleEnabled !== false) {
       const settle = await shared.submitGate.awaitInputSettled(session, injectedBody, {
         timeoutMs: 1200,
@@ -796,7 +954,7 @@ function createDeliveryRuntime(shared, {
         console.log(`[SUBMIT] input-settle gate timed out for ${id} (${settle.waited_ms}ms, echoed=${settle.echoed}) — sending CR best-effort`);
       }
     }
-    return terminalLevelSubmit(id, session);
+    return terminalLevelSubmit(id, session, options);
   }
 
   async function executeBootstrapSubmit(sessionId, session, op) {
@@ -808,7 +966,9 @@ function createDeliveryRuntime(shared, {
     }
 
     const settleEnabled = body.input_settle_gate !== false;
-    let strategy = await gatedTerminalSubmit(sessionId, session, injectedBody, settleEnabled);
+    // Task 1215 submit286: a parked /submit keeps its optional inject_id (op.body is its req.body).
+    const submitOptions = validInjectId(body.inject_id) ? { injectId: body.inject_id } : undefined;
+    let strategy = await gatedTerminalSubmit(sessionId, session, injectedBody, settleEnabled, submitOptions);
     const submittedAtMs = Date.now();
     if (!strategy) {
       if (injectedBody) {
@@ -829,7 +989,7 @@ function createDeliveryRuntime(shared, {
     let confirm = await confirmSubmitAfterDispatch(sessionId, session, injectedBody, submittedAtMs, verifyTimeoutMs);
     while (confirm && !confirm.accepted && confirm.retryable && attempts <= retries) {
       await sleep(retryDelayMs);
-      const retryStrategy = await gatedTerminalSubmit(sessionId, session, injectedBody, settleEnabled);
+      const retryStrategy = await gatedTerminalSubmit(sessionId, session, injectedBody, settleEnabled, submitOptions);
       const retrySubmittedAtMs = Date.now();
       if (!retryStrategy) break;
       strategy = retryStrategy;
@@ -940,7 +1100,8 @@ function createDeliveryRuntime(shared, {
             resolveBootstrapSubmit(op, {
               status: 500,
               body: {
-                error: error.message || 'bootstrap submit failed',
+                // Task 1215: this body is the /submit HTTP response (waitForBootstrapSubmit); stable public text only.
+                error: 'bootstrap submit failed',
                 strategy: 'none',
                 attempts: 0,
                 gated: false,
@@ -951,7 +1112,8 @@ function createDeliveryRuntime(shared, {
           // #860 F2 — the same terminal outcome as the arm above, reached by a throw. `bytesWritten:
           // null` because a throw can land on either side of the body write, and this is the one
           // path that cannot say which. #1207 (measured): awaited before the event, as above.
-          const tracking = await settleTerminalOutcome(op, sessionId, 'BOOTSTRAP_DRAIN_FAILED', error.message || 'bootstrap drain failed', {
+          // Task 1215: the ledger delivery_error and the event below carry the stable text, never the exception message.
+          const tracking = await settleTerminalOutcome(op, sessionId, 'BOOTSTRAP_DRAIN_FAILED', 'bootstrap drain failed', {
             trigger: 'bootstrap_drain_failed',
             bytesWritten: null,
           });
@@ -959,7 +1121,7 @@ function createDeliveryRuntime(shared, {
             op_id: op.op_id,
             operation: op.type,
             code: 'BOOTSTRAP_DRAIN_FAILED',
-            error: error.message || 'bootstrap drain failed',
+            error: 'bootstrap drain failed',
             tracking
           });
         }
@@ -1104,7 +1266,8 @@ function createDeliveryRuntime(shared, {
         session.bootstrapPromptPoll = null;
         return failBootstrapQueueOnTimeout(sessionId, session, {
           reason: 'prompt_symbol_error',
-          error: error.message || String(error)
+          // Task 1215: the bootstrap_ready_timeout event carries the stable reason text, never the exception message.
+          error: 'prompt_symbol_error'
         });
       });
       return;
@@ -1278,12 +1441,26 @@ function createDeliveryRuntime(shared, {
     });
   }
 
-  function terminalLevelSubmit(id, session) {
+  // Task 1215 submit286 — the optional inject_id a submit names rides on its CR frame only for a
+  // well-formed id of a HOT committed record of this exact session, live record, epoch and owner
+  // generation (recordBridgeReceipt's identity predicate; read-only, no reheat, no write). Anything
+  // else is null and the CR goes out id-less as before; the receipt is re-checked when it arrives.
+  function submitCorrelationId(id, session, injectId) {
+    if (!validInjectId(injectId)) return null;
+    const record = getTrackedInjection(injectId);
+    if (!record || record.session_id !== id || shared.sessions[id] !== session
+      || (record.owner_generation && record.owner_generation !== session.interactionOwnerGeneration)
+      || (record.session_epoch && record.session_epoch !== (session.sessionEpoch || null))) return null;
+    return injectId;
+  }
+
+  function terminalLevelSubmit(id, session, options) {
     if (session.isClosing) return null;
     if (protectedInputFailure(session)) return null;
     if (session.sshRemote) return null;
     if (hasHeldInteraction(session)) return null;
-    if (submitViaPty(session)) return 'pty_cr';
+    const injectId = options && options.injectId ? submitCorrelationId(id, session, options.injectId) : null;
+    if (submitViaPty(session, injectId ? { injectId } : undefined)) return 'pty_cr';
     return null;
   }
 
@@ -1513,17 +1690,20 @@ function createDeliveryRuntime(shared, {
     return null;
   }
 
-  function submitViaPty(session) {
+  function submitViaPty(session, options) {
     if (protectedInputFailure(session)) return false;
     if (session.sshRemote) return false; // SSH submit is admitted by the receipt protocol only.
     if (hasHeldInteraction(session)) return false;
     shared.interaction.invalidateInteraction(session, 'submit');
     if (session.type === 'wrapped') {
       if (session.ownerWs && session.ownerWs.readyState === 1) {
-        // #137: a terminal-level submit names itself and the current owner generation; it is not
-        // bound to any one inject, so it carries no inject_id or pair.
+        // #137: a terminal-level submit names itself and the current owner generation. It carries
+        // no pair (its body's daemon_msg_id is not known here). Task 1215 submit286: it carries the
+        // inject_id only when terminalLevelSubmit correlated one to this exact record; without
+        // one the frame is byte-identical to before (frameMeta omits a null id).
         session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r',
-          ...bridgeStage.frameMeta({ daemon_msg_id: `submit:${shared.crypto.randomUUID()}`, part: 'submit',
+          ...bridgeStage.frameMeta({ daemon_msg_id: `submit:${shared.crypto.randomUUID()}`,
+            inject_id: options && options.injectId ? options.injectId : null, part: 'submit',
             owner_generation: session.interactionOwnerGeneration }) }));
         armUpstreamProbe(session);   // #732: a submit is a delivery too — probe with it
         return true;

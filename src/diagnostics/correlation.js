@@ -27,11 +27,15 @@ function correlateRequest(record, { injectId, sessionId, sessionEpoch, ownerGene
   const bridgeQueued = bridge.findLast(row => row.stage === 'queued' || row.stage === 'withheld');
   const bridgeStopped = bridge.findLast(row => row.stage === 'quarantined' || row.stage === 'refused');
   const ptyWrite = row => ({ ...observed(row), stage_source: 'bridge_receipt', certainty: 'written', meaning: 'pty_master_write_only' });
+  // Task 1215: the submit receipt is matched to this record only by the inject_id label on the CR frame.
+  // The basis is stated only for an observed receipt; an unknown stage (no or invalid receipt) gets none.
+  const submitReceipt = submitWritten ? ptyWrite(submitWritten) : unknown('no_submit_write_receipt');
   return { correlation: scopedOwner ? 'exact_instance_and_owner' : 'exact_epoch_owner_unavailable', inject_id: injectId,
     request_accepted: observed({ at: record.created_at }),
     input_written: refused?.bytes_written === 0 ? { ...observed(refused, 'not_written'), bytes_written: 0 }
       : bodyWritten ? ptyWrite(bodyWritten) : unknown('no_inject_payload_write_receipt'),
-    submit_written: submitWritten ? ptyWrite(submitWritten) : unknown('no_submit_write_receipt'),
+    submit_written: submitReceipt.status === 'observed'
+      ? { ...submitReceipt, correlation_basis: 'transport_receipt_by_inject_id' } : submitReceipt,
     acknowledgement: unknown('no_correlated_agent_acknowledgement_fact'),
     // Task 1215: needs a message-bound application/provider acknowledgement; PTY write, Enter and the
     // owner handshake are not one, so this stays unknown until a provider supplies it.
@@ -47,6 +51,7 @@ function correlateRequest(record, { injectId, sessionId, sessionEpoch, ownerGene
     tracking_state: ['tracked', 'aborted', 'superseded'].includes(record.tracking_state) ? record.tracking_state : 'unknown',
     completion_fact: null, limits: ['Accepted tracking is not a PTY write, agent acknowledgement, reply, or task completion.',
       'A bridge pty_written receipt is a PTY master write, not model consumption, turn acceptance or completion.',
-      'Absence from bounded observation history does not establish an event never happened.'] };
+      'Absence from bounded observation history does not establish an event never happened.',
+      'A submit_written receipt confirms a CR write labeled with an inject_id, not the submitted composer contents or model receipt.'] };
 }
 module.exports = { correlateRequest, correlationError, validInjectId: value => typeof value === 'string' && ID.test(value) };
