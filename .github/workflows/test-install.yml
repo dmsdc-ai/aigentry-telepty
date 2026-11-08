@@ -1,92 +1,140 @@
-name: Regression Tests
+# NON-SHIPPING DIAGNOSTIC (task 1215 / tester task 1238, phase 508). Lives only on a separate
+# probe branch; it is NOT a release gate, NOT a waiver of PR143 CI failures, and does not replace
+# the mandatory six-lane source CI. Manual trigger only, read-only token, no secrets.
+# Compares exact BASE 556a4ba3 vs failing HEAD 83d6cebd (PR143, before 507) on native runners:
+#   P1 (Linux/macOS): C4 cli cleanup x2 + wrapper DESTROY control, 3 measurements per job.
+#   P2/P3 (Windows):  C7 mailbox lock + C8 1215 consumer shape, 5 measurements each per job.
+# Every measurement runs; each exit is recorded in results.tsv; the job fails if ANY failed.
+name: Native Node26 diagnostic probe (task 1215, non-shipping)
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
-
+permissions:
+  contents: read
 jobs:
-  test:
+  probe:
+    name: probe ${{ matrix.os }} node${{ matrix.node }} ${{ matrix.source }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node: [20, '26.13.0']
+        node: ['20', '26.13.0']
+        source: [base, head]
+        include:
+          - source: base
+            sha: 556a4ba3bcbdbcd42d2cca1bdf14a0f3cef7e421
+          - source: head
+            sha: 83d6cebd2fbd48bd22b1aee0540f265bcec8c474
     runs-on: ${{ matrix.os }}
-    # Belt against a hung test never exiting (#645): green mac/ubuntu runs finish in ~2min,
-    # so a 20min cap fails a hang fast instead of burning the 6h job ceiling. This is a
-    # backstop, NOT the fix — the root cause (undisposed state-machine poll timer holding the
-    # test worker open) is fixed in test/submit-gate-restore-register-678.test.js.
-    timeout-minutes: 20
-    # telepty #879: windows-latest is a release gate like ubuntu/macOS. The former #577
-    # continue-on-error quarantine hid that `npm run test:ci` never started on Windows.
+    timeout-minutes: 8
+    defaults:
+      run:
+        shell: bash
+    env:
+      PROBE_SOURCE: ${{ matrix.source }}
+      PROBE_SHA: ${{ matrix.sha }}
+      PROBE_NODE: ${{ matrix.node }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node }}
-          cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Run typecheck
-        run: npm run typecheck
-      # Task 1215: the Darwin authority-file reader is a bundled native binary. Build it from the
-      # first-party source with the runner's own Apple toolchain and Node-API headers BEFORE the suite,
-      # so test/authority-file-darwin-1215.test.js exercises the real native reader (it fails, never
-      # skips, when the binary is absent). Nothing is downloaded and no npm lifecycle compiles it.
-      - name: Build the bundled Darwin authority reader (task 1215)
-        if: runner.os == 'macOS'
+      - name: Prepare evidence directory
         run: |
           set -euo pipefail
-          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
-          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
-      # Task 1215 / #879 (DIAGNOSTIC ONLY, Windows only): a bounded load observer brackets ONLY the regression suite step
-      # below, which stays the unchanged `npm run test:ci` with its own exit. The observer measures (CPU-time deltas,
-      # event-loop timer delay, sparse process-start probes) and decides nothing; its own failure is a visible step
-      # failure that never changes the job result. Mac/Linux skip these steps.
-      - name: Start Windows load observer (diagnostic only, task 1215 / #879)
-        id: load_observer_start
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        run: node scripts/windows-load-observer-879.mjs start --out "${{ runner.temp }}/windows-load-observer-879" --max-ms 1080000
-      - name: Run regression suite
-        run: npm run test:ci
-      - name: Stop Windows load observer (diagnostic only)
-        if: always() && runner.os == 'Windows' && steps.load_observer_start.outcome != 'skipped'
-        continue-on-error: true
-        run: node scripts/windows-load-observer-879.mjs stop --out "${{ runner.temp }}/windows-load-observer-879"
-      - name: Upload Windows load observer evidence (diagnostic only)
-        if: always() && runner.os == 'Windows'
-        continue-on-error: true
+          OUT="$RUNNER_TEMP/native-probe"
+          mkdir -p "$OUT"
+          printf 'OUT=%s\n' "$OUT" >> "$GITHUB_ENV"
+          printf 'group\tcase\titeration\texit\n' > "$OUT/results.tsv"
+          printf 'source=%s\nbound_sha=%s\nrequested_node=%s\nrunner_os=%s\nrunner_arch=%s\nimage=%s %s\nrun=%s attempt=%s\n' \
+            "$PROBE_SOURCE" "$PROBE_SHA" "$PROBE_NODE" "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-}" "${ImageVersion:-}" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$OUT/metadata.txt"
+      - name: Checkout exact bound source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - name: Verify checked-out source identity
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          printf 'checked_out_sha=%s\n' "$actual" >> "$OUT/metadata.txt"
+          if [ "$actual" != "$PROBE_SHA" ]; then
+            printf 'SETUP_FAILED source identity: got %s want %s\n' "$actual" "$PROBE_SHA" | tee -a "$OUT/metadata.txt"
+            exit 1
+          fi
+      - name: Verify selected test titles in this source
+        run: |
+          set -euo pipefail
+          test -f test-support/setup-env.js
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            test -f test/mailbox-lock-concurrency.test.js
+            want_names="1 0 0"
+            got_names="$(grep -c '1215 consumer shape' test/telesession-capabilities-1215.test.js) 0 0"
+          else
+            want_names="1 1 1"
+            got_names="$(grep -cF "test('telepty allow works without a TTY by using fallback terminal dimensions'" test/cli.test.js)"
+            got_names="$got_names $(grep -cF "test('telepty allow restores terminal keyboard modes after the child exits'" test/cli.test.js)"
+            got_names="$got_names $(grep -cF "a daemon-issued DESTROY still terminates the" test/wrapper-reregister-82.test.js)"
+            hits="$(grep -cE 'without a TTY|terminal keyboard modes|DESTROY' test/cli.test.js test/wrapper-reregister-82.test.js | tr '\n' ' ')"
+            printf 'pattern_hits_per_file=%s\n' "$hits" >> "$OUT/metadata.txt"
+            if [ "$hits" != "test/cli.test.js:2 test/wrapper-reregister-82.test.js:1 " ]; then
+              printf 'SETUP_FAILED pattern would select other tests: %s\n' "$hits" | tee -a "$OUT/metadata.txt"
+              exit 1
+            fi
+          fi
+          printf 'title_counts=%s (want %s)\n' "$got_names" "$want_names" >> "$OUT/metadata.txt"
+          if [ "$got_names" != "$want_names" ]; then
+            printf 'SETUP_FAILED selected titles: got %s want %s\n' "$got_names" "$want_names" | tee -a "$OUT/metadata.txt"
+            exit 1
+          fi
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Record toolchain
+        run: |
+          set -euo pipefail
+          printf 'node=%s\nnpm=%s\nuname=%s\n' "$(node -v)" "$(npm -v)" "$(uname -a)" >> "$OUT/metadata.txt"
+      - name: Install dependencies (unchanged lock)
+        run: |
+          set -euo pipefail
+          npm ci > "$OUT/npm-ci.log" 2>&1
+          git diff --exit-code -- package.json package-lock.json
+          printf 'setup=complete\n' >> "$OUT/metadata.txt"
+      - name: Run diagnostic measurements
+        id: measure
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            for i in 1 2 3 4 5; do
+              if node --require ./test-support/setup-env.js --test test/mailbox-lock-concurrency.test.js > "$OUT/P2-mailbox-lock-iter$i.log" 2>&1; then rc=0; else rc=$?; fi
+              printf 'P2\tmailbox-lock-concurrency\t%s\t%s\n' "$i" "$rc" >> "$OUT/results.tsv"
+            done
+            for i in 1 2 3 4 5; do
+              if node --require ./test-support/setup-env.js --test --test-name-pattern='1215 consumer shape' test/telesession-capabilities-1215.test.js > "$OUT/P3-consumer-shape-iter$i.log" 2>&1; then rc=0; else rc=$?; fi
+              printf 'P3\t1215-consumer-shape\t%s\t%s\n' "$i" "$rc" >> "$OUT/results.tsv"
+            done
+          else
+            for i in 1 2 3; do
+              if node --require ./test-support/setup-env.js --test --test-name-pattern='without a TTY|terminal keyboard modes|DESTROY' test/cli.test.js test/wrapper-reregister-82.test.js > "$OUT/P1-cli-wrapper-iter$i.log" 2>&1; then rc=0; else rc=$?; fi
+              printf 'P1\tcli-cleanup+wrapper-destroy\t%s\t%s\n' "$i" "$rc" >> "$OUT/results.tsv"
+            done
+          fi
+          printf 'measurements=complete\n' >> "$OUT/metadata.txt"
+      - name: Aggregate (fails if any measurement failed or is missing)
+        if: always() && steps.measure.outcome != 'skipped'
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then want=10; else want=3; fi
+          rows="$(tail -n +2 "$OUT/results.tsv" | wc -l | tr -d ' ')"
+          failed="$(tail -n +2 "$OUT/results.tsv" | awk -F '\t' '$4 != "0"' | wc -l | tr -d ' ')"
+          printf 'rows=%s want=%s failed=%s\n' "$rows" "$want" "$failed" | tee -a "$OUT/metadata.txt"
+          { printf '### %s node%s %s %s\n```\n' "$RUNNER_OS" "$PROBE_NODE" "$PROBE_SOURCE" "$PROBE_SHA"; cat "$OUT/results.tsv"; printf '```\n'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rows" != "$want" ] || [ "$failed" != "0" ]; then
+            printf 'DIAGNOSTIC_FAIL: %s of %s measurements failed or missing\n' "$failed" "$want"
+            exit 1
+          fi
+      - name: Upload probe evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-load-observer-879-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/windows-load-observer-879
-          if-no-files-found: warn
+          name: native-probe-${{ matrix.os }}-node${{ matrix.node }}-${{ matrix.source }}-${{ matrix.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-probe
+          if-no-files-found: error
           retention-days: 14
-      # Task 1215 peer235: the dedicated ledger PERFORMANCE gate on every OS. `npm run test:ci` above co-schedules files and
-      # gates the ledger file's FUNCTIONAL assertions and any valid-control stall; an invalid idle baseline there is reported
-      # as performance NOT-MEASURED, never as a pass. This step runs the SAME file (same workload, controls and 50 ms bound)
-      # once, alone, with --test-concurrency=1 and TELEPTY_LEDGER_PERF_GATE=1, where only a VALID pass succeeds: an
-      # inconclusive or a fail verdict fails this step. Mandatory: no continue-on-error, no retry.
-      - name: Run ledger performance gate (single file, no co-scheduled tests; task 1215)
-        env:
-          TELEPTY_LEDGER_PERF_GATE: '1'
-        run: node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=spec test/ledger-control-responsiveness-1207.test.js
-      # #768: this one file drives a real daemon + a real `telepty allow` bridge + a real PTY
-      # with a deliberately delayed WS handshake. Inside the parallel list it lands on a worker
-      # alongside whatever else node --test schedules there, and on the 3-core macOS runner that
-      # pairing pushed test/enforce-report.test.js:359 from 1.2s to its 10s ceiling — a test that
-      # only waits for a bus event and loses nothing, so the honest fix is to stop contending
-      # rather than to raise its budget. Measured: dropping this file from the parallel list
-      # restores macOS to green (run 30204629841). `npm test` still includes it; a dev machine
-      # has the cores. Give it its own step so it runs alone and gates just the same.
-      - name: Run PTY-serialized regression tests
-        run: npm run test:ci:pty
-      # Task 1215 G2: self-pack consumer check on every supported OS, Windows included (npm-cli.js under
-      # this node, .cmd/.ps1 shim relations, private APPDATA/LOCALAPPDATA/TMP/TEMP), plus npm ls identity,
-      # the macOS installed native authority read and an installed daemon + PTY smoke. The release
-      # workflow runs the same helper against ONE canonical archive (--pack-only / --tarball).
-      - name: Check packaged consumer
-        run: node scripts/check-package.mjs
