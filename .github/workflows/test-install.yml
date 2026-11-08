@@ -1,147 +1,176 @@
-name: Regression Tests
+# Task 1215 probe529 — NONSHIPPING paired Linux diagnostic (manual only). This file replaces test-install.yml ONLY on a dedicated
+# diagnostic branch (never PR143). Each job measures the fixed OLD and NEW public sources, each in its own detached worktree, with
+# the SAME two diagnostic test overlays taken from this commit (only those two paths change). Complete records mean
+# MEASUREMENT-COMPLETE, never application acceptance; any missing record, identity mismatch or timeout is INCOMPLETE = FAIL.
+name: Linux paired probe 1215 (NONSHIPPING)
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  probe:
+    name: paired probe (ubuntu, node ${{ matrix.node }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
         node: [20, '26.13.0']
-    runs-on: ${{ matrix.os }}
-    # Belt against a hung test never exiting (#645): green mac/ubuntu runs finish in ~2min,
-    # so a 20min cap fails a hang fast instead of burning the 6h job ceiling. This is a
-    # backstop, NOT the fix — the root cause (undisposed state-machine poll timer holding the
-    # test worker open) is fixed in test/submit-gate-restore-register-678.test.js.
-    timeout-minutes: 20
-    # telepty #879: windows-latest is a release gate like ubuntu/macOS. The former #577
-    # continue-on-error quarantine hid that `npm run test:ci` never started on Windows.
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.node == '26.13.0' && 20 || 4 }}
+    env:
+      NODE_LABEL: ${{ matrix.node }}
+      OLD_SHA: 27e4fd1cea7fdb1226c902757ad662f89eac89d8
+      OLD_TREE: 6f0bd065189b7789955a384caa84f00b58cc7f87
+      NEW_SHA: 301facb531fe857586cc88a17c43939860d84f2d
+      NEW_TREE: 010f2600e5414312c64dede9491e94e28ff3e7f1
+      COOP_BLOB: d20c3350c99394a9b6f0204dc5caafce3bbde398
+      UDS_BLOB: 89aeb8423f628d696c4f357813b6aa293f2edc97
+      A_PATTERN: '^actual cooperative handoff waits for owned child exit'
+      U_PATTERN: '^UDS oversize:'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Run typecheck
-        run: npm run typecheck
-      # Task 1215: the Darwin authority-file reader is a bundled native binary. Build it from the
-      # first-party source with the runner's own Apple toolchain and Node-API headers BEFORE the suite,
-      # so test/authority-file-darwin-1215.test.js exercises the real native reader (it fails, never
-      # skips, when the binary is absent). Nothing is downloaded and no npm lifecycle compiles it.
-      - name: Build the bundled Darwin authority reader (task 1215)
-        if: runner.os == 'macOS'
-        run: |
-          set -euo pipefail
-          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
-          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
-      # Task 1215 lock525 versioned regression witness (Linux + Node 26.13.0 only; NOT acceptance of old code, NOT native
-      # Windows proof). The SAME six lock525 tests run against the old lock.js (fixed public commit 27e4fd1c, blob a9ce9d7a)
-      # and must fail exactly (a)-(d) on genuine MAILBOX_LOCK_STORAGE with (e)/(f) passing, then against the restored
-      # current lock.js where all six must pass. Only src/mailbox/lock.js is swapped, and it is restored on every exit.
-      - name: lock525 RED/GREEN witness (Linux, Node 26.13.0)
-        if: runner.os == 'Linux' && matrix.node == '26.13.0'
-        timeout-minutes: 2
+      - name: Prepare paired sources (identity, overlay, npm ci)
+        id: prepare
         shell: bash
         run: |
           set -uo pipefail
-          set +e   # GitHub runs bash with -e; the expected OLD rc 1 and no-match greps must be captured, every check stays explicit
-          W="$RUNNER_TEMP/lock525-witness"; LOCK=src/mailbox/lock.js; mkdir -p "$W"
-          OLD_COMMIT=27e4fd1cea7fdb1226c902757ad662f89eac89d8; OLD_BLOB=a9ce9d7a7e8f062df35777f931107ba6ebaa4f47
-          cp -p "$LOCK" "$W/current-lock.js" || exit 1
-          trap 'cp -p "$W/current-lock.js" "$LOCK"' EXIT INT TERM
-          CUR_BLOB=$(git hash-object "$LOCK") || exit 1
-          echo "head=$(git rev-parse HEAD) current_lock_blob=$CUR_BLOB old_commit=$OLD_COMMIT old_lock_blob=$OLD_BLOB" | tee "$W/summary.txt"
-          git fetch --no-tags --depth=1 origin "$OLD_COMMIT" || { echo "::error::fetch of $OLD_COMMIT failed"; exit 1; }
-          [ "$(git rev-parse "$OLD_COMMIT:$LOCK")" = "$OLD_BLOB" ] || { echo "::error::old lock blob mismatch"; exit 1; }
-          git cat-file blob "$OLD_BLOB" > "$LOCK" && [ "$(git hash-object "$LOCK")" = "$OLD_BLOB" ] || { echo "::error::old lock not in place"; exit 1; }
-          run() {   # $1 label: the identical command for both runs; rc and TAP kept
-            node --require ./test-support/setup-env.js --test --test-reporter=tap --test-name-pattern='^lock525 ' \
-              test/mailbox-lock-concurrency.test.js > "$W/$1.tap" 2>&1
-            echo $? > "$W/$1.rc"
-          }
-          letters() {   # $1 label, $2 'ok' | 'not ok': matching case letters, sorted, no SKIP/TODO lines
-            grep -E "^ *$2 [0-9]+ - lock525 \([a-f]\)" "$W/$1.tap" | grep -vE '# (SKIP|TODO)' \
-              | sed -E 's/.* - lock525 \(([a-f])\).*/\1/' | sort | tr -d '\n'
-          }
-          storage() {   # $1 label: letters of not-ok cases whose own TAP block names MAILBOX_LOCK_STORAGE
-            awk '/^ *(not )?ok [0-9]+ - /{cur=""; if (match($0, /^ *not ok [0-9]+ - lock525 \([a-f]\)/)) cur=substr($0, RLENGTH-1, 1)}
-                 cur != "" && /MAILBOX_LOCK_STORAGE/ {seen[cur]=1} END {for (k in seen) print k}' "$W/$1.tap" | sort | tr -d '\n'
-          }
-          marks() { grep -cE "lock525 \([a-f]\).*# (SKIP|TODO)" "$W/$1.tap"; }
-          fail=0
-          run old
-          o="rc=$(cat "$W/old.rc") notok=$(letters old 'not ok') ok=$(letters old ok) storage=$(storage old) marks=$(marks old)"
-          echo "OLD $o" | tee -a "$W/summary.txt"
-          [ "$o" = "rc=1 notok=abcd ok=ef storage=abcd marks=0" ] || { echo "::error::old lock.js did not give the exact RED"; fail=1; }
-          cp -p "$W/current-lock.js" "$LOCK" && cmp -s "$W/current-lock.js" "$LOCK" && [ "$(git hash-object "$LOCK")" = "$CUR_BLOB" ] \
-            || { echo "::error::current lock.js not restored"; exit 1; }
-          run new
-          n="rc=$(cat "$W/new.rc") notok=$(letters new 'not ok') ok=$(letters new ok) marks=$(marks new)"
-          echo "NEW $n" | tee -a "$W/summary.txt"
-          [ "$n" = "rc=0 notok= ok=abcdef marks=0" ] || { echo "::error::current lock.js did not give the exact GREEN"; fail=1; }
-          [ -s "$W/summary.txt" ] || { echo "::error::witness summary missing"; fail=1; }
-          exit "$fail"
-      - name: Upload lock525 witness records
-        if: always() && runner.os == 'Linux' && matrix.node == '26.13.0'
+          P="$RUNNER_TEMP/probe529"; mkdir -p "$P/overlay" "$P/out"
+          printf 'kind\tsource\titeration\trc\telapsed_ms\tok\tnot_ok\tdiag\n' > "$P/out/summary.tsv"
+          cp test/cooperative-handoff.test.js test/uds-delivery-uncertainty.test.js "$P/overlay/" || exit 1
+          echo "probe_commit=$(git rev-parse HEAD) overlay_coop=$(git hash-object "$P/overlay/cooperative-handoff.test.js") overlay_uds=$(git hash-object "$P/overlay/uds-delivery-uncertainty.test.js") node=$(node -v) npm=$(npm -v)" | tee "$P/out/identity.txt"
+          for src in old new; do
+            if [ "$src" = old ]; then sha=$OLD_SHA; tree=$OLD_TREE; else sha=$NEW_SHA; tree=$NEW_TREE; fi
+            git fetch --no-tags --depth=1 origin "$sha" || { echo "::error::fetch $src failed"; exit 1; }
+            git worktree add --detach "$P/$src" "$sha" || exit 1
+            got_sha=$(git -C "$P/$src" rev-parse HEAD); got_tree=$(git -C "$P/$src" rev-parse 'HEAD^{tree}')
+            { [ "$got_sha" = "$sha" ] && [ "$got_tree" = "$tree" ]; } || { echo "::error::$src identity mismatch"; exit 1; }
+            { [ "$(git -C "$P/$src" hash-object test/cooperative-handoff.test.js)" = "$COOP_BLOB" ] \
+              && [ "$(git -C "$P/$src" hash-object test/uds-delivery-uncertainty.test.js)" = "$UDS_BLOB" ]; } \
+              || { echo "::error::$src original test blobs differ"; exit 1; }
+            cp "$P/overlay/cooperative-handoff.test.js" "$P/overlay/uds-delivery-uncertainty.test.js" "$P/$src/test/" || exit 1
+            changed=$(git -C "$P/$src" status --porcelain | sort | tr '\n' ';')
+            [ "$changed" = " M test/cooperative-handoff.test.js; M test/uds-delivery-uncertainty.test.js;" ] \
+              || { echo "::error::$src unexpected tracked change: $changed"; exit 1; }
+            echo "$src sha=$got_sha tree=$got_tree original_blobs_ok=1 overlay_applied=1" | tee -a "$P/out/identity.txt"
+            (cd "$P/$src" && npm ci) > "$P/out/$src-npm-ci.txt" 2>&1 || { echo "::error::npm ci $src failed"; exit 1; }
+          done
+      # Shared recorder: expected nonzero test exits are RECORDED (set +e), never hidden; completeness is checked by the verdict.
+      - name: Measure A (cooperative handoff x3 per source)
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: ${{ matrix.node == '26.13.0' && 4 || 2 }}
+        shell: bash
+        env:
+          KIND: A
+          ITERATIONS: '3'
+          FILE: test/cooperative-handoff.test.js
+        run: |
+          set -uo pipefail
+          set +e
+          P="$RUNNER_TEMP/probe529"; if [ "$KIND" = A ]; then pat="$A_PATTERN"; name='actual cooperative handoff waits for owned child exit'; else pat="$U_PATTERN"; name='UDS oversize:'; fi
+          for src in old new; do for i in $(seq 1 "$ITERATIONS"); do
+            out="$P/out/$KIND-$src-$i.tap"; t0=$(date +%s%3N)
+            (cd "$P/$src" && node --require ./test-support/setup-env.js --test --test-reporter=tap --test-name-pattern="$pat" "$FILE") > "$out" 2>&1
+            rc=$?; ms=$(( $(date +%s%3N) - t0 ))
+            ok=$(grep -E "^ *ok [0-9]+ - $name" "$out" | grep -vc '# SKIP'); nok=$(grep -cE "^ *not ok [0-9]+ - $name" "$out"); diag=$(grep -c "telepty-diag\] $KIND" "$out")
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$KIND" "$src" "$i" "$rc" "$ms" "$ok" "$nok" "$diag" | tee -a "$P/out/summary.tsv"
+          done; done
+          exit 0
+      - name: Measure UDS oversize x3 per source (Node 26.13.0 only)
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && matrix.node == '26.13.0' }}
+        timeout-minutes: 2
+        shell: bash
+        env:
+          KIND: UDS
+          ITERATIONS: '3'
+          FILE: test/uds-delivery-uncertainty.test.js
+        run: |
+          set -uo pipefail
+          set +e
+          P="$RUNNER_TEMP/probe529"; if [ "$KIND" = A ]; then pat="$A_PATTERN"; name='actual cooperative handoff waits for owned child exit'; else pat="$U_PATTERN"; name='UDS oversize:'; fi
+          for src in old new; do for i in $(seq 1 "$ITERATIONS"); do
+            out="$P/out/$KIND-$src-$i.tap"; t0=$(date +%s%3N)
+            (cd "$P/$src" && node --require ./test-support/setup-env.js --test --test-reporter=tap --test-name-pattern="$pat" "$FILE") > "$out" 2>&1
+            rc=$?; ms=$(( $(date +%s%3N) - t0 ))
+            ok=$(grep -E "^ *ok [0-9]+ - $name" "$out" | grep -vc '# SKIP'); nok=$(grep -cE "^ *not ok [0-9]+ - $name" "$out"); diag=$(grep -c "telepty-diag\] $KIND" "$out")
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$KIND" "$src" "$i" "$rc" "$ms" "$ok" "$nok" "$diag" | tee -a "$P/out/summary.tsv"
+          done; done
+          exit 0
+      - name: Full unchanged npm run test:ci (old, Node 26.13.0 only)
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && matrix.node == '26.13.0' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          SRC: old
+        run: |
+          set -uo pipefail
+          set +e
+          P="$RUNNER_TEMP/probe529"; t0=$(date +%s%3N)
+          (cd "$P/$SRC" && npm run test:ci) > "$P/out/FULL-$SRC.txt" 2>&1
+          rc=$?; ms=$(( $(date +%s%3N) - t0 ))
+          printf 'FULL\t%s\t1\t%s\t%s\t-\t-\t-\n' "$SRC" "$rc" "$ms" | tee -a "$P/out/summary.tsv"
+          exit 0
+      - name: Full unchanged npm run test:ci (new, Node 26.13.0 only)
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && matrix.node == '26.13.0' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          SRC: new
+        run: |
+          set -uo pipefail
+          set +e
+          P="$RUNNER_TEMP/probe529"; t0=$(date +%s%3N)
+          (cd "$P/$SRC" && npm run test:ci) > "$P/out/FULL-$SRC.txt" 2>&1
+          rc=$?; ms=$(( $(date +%s%3N) - t0 ))
+          printf 'FULL\t%s\t1\t%s\t%s\t-\t-\t-\n' "$SRC" "$rc" "$ms" | tee -a "$P/out/summary.tsv"
+          exit 0
+      - name: Probe verdict (measurement completeness, NOT acceptance)
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          P="$RUNNER_TEMP/probe529"; S="$P/out/summary.tsv"; bad=0
+          [ "$(grep -c ' original_blobs_ok=1 overlay_applied=1' "$P/out/identity.txt" 2>/dev/null)" = 2 ] || { echo "identity/overlay record incomplete"; bad=1; }
+          rows() { awk -F'\t' -v k="$1" '$1==k && $4!="" && ($6+$7)==1 && $8>=1' "$S" 2>/dev/null | wc -l | tr -d ' '; }
+          full=$(awk -F'\t' '$1=="FULL" && $4!=""' "$S" 2>/dev/null | wc -l | tr -d ' ')
+          wa=6; wu=0; wf=0; [ "$NODE_LABEL" = '26.13.0' ] && { wu=6; wf=2; }
+          echo "A complete=$(rows A)/$wa UDS complete=$(rows UDS)/$wu FULL recorded=$full/$wf" | tee "$P/out/verdict.txt"
+          { [ "$(rows A)" = "$wa" ] && [ "$(rows UDS)" = "$wu" ] && [ "$full" = "$wf" ]; } || bad=1
+          # 530: a FULL row counts only with ONE complete spec summary (fixed test count, cancelled 0, pass+fail+skipped=tests,
+          # rc 0/1); targeted UDS-oversize data must exist; each source tree must still hold ONLY the two identical overlays.
+          sumv() { sed -E 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null | awk -v k="$2" '($1=="ℹ" || $1=="#") && $2==k {print $3}'; }
+          num() { [[ "$1" =~ ^[0-9]+$ ]]; }
+          for src in old new; do
+            if [ "$NODE_LABEL" = '26.13.0' ]; then
+              f="$P/out/FULL-$src.txt"; want=3171; [ "$src" = new ] && want=3178
+              rc=$(awk -F'\t' -v s="$src" '$1=="FULL" && $2==s {print $4}' "$S" 2>/dev/null)
+              t=$(sumv "$f" tests); ps=$(sumv "$f" pass); fl=$(sumv "$f" fail); ca=$(sumv "$f" cancelled); sk=$(sumv "$f" skipped)
+              echo "FULL $src rc=$rc tests=$t pass=$ps fail=$fl cancelled=$ca skipped=$sk want=$want" | tee -a "$P/out/verdict.txt"
+              { [ -s "$f" ] && num "$t" && num "$ps" && num "$fl" && num "$ca" && num "$sk" && [ "$t" = "$want" ] && [ "$ca" = 0 ] \
+                && [ "$((ps + fl + sk))" = "$t" ] && { [ "$rc" = 0 ] || [ "$rc" = 1 ]; }; } || { echo "FULL $src INCOMPLETE"; bad=1; }
+              # 531: both target records must come from THIS source's FULL log, not from another (filtered) iteration.
+              grep -qE 'telepty-diag\] UDS .{0,8}mode.{0,6}oversize' "$f" \
+                || { echo "UDS oversize record missing in FULL $src"; bad=1; }
+              grep -qF '[telepty-diag] A ' "$f" || { echo "A record missing in FULL $src"; bad=1; }
+            fi
+            { [ "$(git -C "$P/$src" status --porcelain --untracked-files=no 2>/dev/null | sort | tr '\n' ';')" \
+                = " M test/cooperative-handoff.test.js; M test/uds-delivery-uncertainty.test.js;" ] \
+              && cmp -s "$P/overlay/cooperative-handoff.test.js" "$P/$src/test/cooperative-handoff.test.js" \
+              && cmp -s "$P/overlay/uds-delivery-uncertainty.test.js" "$P/$src/test/uds-delivery-uncertainty.test.js"; } \
+              || { echo "$src source tree changed after measurement"; bad=1; }
+          done
+          [ "$bad" = 0 ] && echo "MEASUREMENT COMPLETE (not acceptance)" | tee -a "$P/out/verdict.txt" || echo "INCOMPLETE = FAIL" | tee -a "$P/out/verdict.txt"
+          exit "$bad"
+      - name: Upload probe records
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lock525-witness-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/lock525-witness
+          name: probe529-node${{ matrix.node }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/probe529/out
           if-no-files-found: error
           retention-days: 7
-      # Task 1215 / #879 (DIAGNOSTIC ONLY, Windows only): a bounded load observer brackets ONLY the regression suite step
-      # below, which stays the unchanged `npm run test:ci` with its own exit. The observer measures (CPU-time deltas,
-      # event-loop timer delay, sparse process-start probes) and decides nothing; its own failure is a visible step
-      # failure that never changes the job result. Mac/Linux skip these steps.
-      - name: Start Windows load observer (diagnostic only, task 1215 / #879)
-        id: load_observer_start
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        run: node scripts/windows-load-observer-879.mjs start --out "${{ runner.temp }}/windows-load-observer-879" --max-ms 1080000
-      - name: Run regression suite
-        run: npm run test:ci
-      - name: Stop Windows load observer (diagnostic only)
-        if: always() && runner.os == 'Windows' && steps.load_observer_start.outcome != 'skipped'
-        continue-on-error: true
-        run: node scripts/windows-load-observer-879.mjs stop --out "${{ runner.temp }}/windows-load-observer-879"
-      - name: Upload Windows load observer evidence (diagnostic only)
-        if: always() && runner.os == 'Windows'
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-load-observer-879-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/windows-load-observer-879
-          if-no-files-found: warn
-          retention-days: 14
-      # Task 1215 peer235: the dedicated ledger PERFORMANCE gate on every OS. `npm run test:ci` above co-schedules files and
-      # gates the ledger file's FUNCTIONAL assertions and any valid-control stall; an invalid idle baseline there is reported
-      # as performance NOT-MEASURED, never as a pass. This step runs the SAME file (same workload, controls and 50 ms bound)
-      # once, alone, with --test-concurrency=1 and TELEPTY_LEDGER_PERF_GATE=1, where only a VALID pass succeeds: an
-      # inconclusive or a fail verdict fails this step. Mandatory: no continue-on-error, no retry.
-      - name: Run ledger performance gate (single file, no co-scheduled tests; task 1215)
-        env:
-          TELEPTY_LEDGER_PERF_GATE: '1'
-        run: node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=spec test/ledger-control-responsiveness-1207.test.js
-      # #768: this one file drives a real daemon + a real `telepty allow` bridge + a real PTY
-      # with a deliberately delayed WS handshake. Inside the parallel list it lands on a worker
-      # alongside whatever else node --test schedules there, and on the 3-core macOS runner that
-      # pairing pushed test/enforce-report.test.js:359 from 1.2s to its 10s ceiling — a test that
-      # only waits for a bus event and loses nothing, so the honest fix is to stop contending
-      # rather than to raise its budget. Measured: dropping this file from the parallel list
-      # restores macOS to green (run 30204629841). `npm test` still includes it; a dev machine
-      # has the cores. Give it its own step so it runs alone and gates just the same.
-      - name: Run PTY-serialized regression tests
-        run: npm run test:ci:pty
-      # Task 1215 G2: self-pack consumer check on every supported OS, Windows included (npm-cli.js under
-      # this node, .cmd/.ps1 shim relations, private APPDATA/LOCALAPPDATA/TMP/TEMP), plus npm ls identity,
-      # the macOS installed native authority read and an installed daemon + PTY smoke. The release
-      # workflow runs the same helper against ONE canonical archive (--pack-only / --tarball).
-      - name: Check packaged consumer
-        run: node scripts/check-package.mjs

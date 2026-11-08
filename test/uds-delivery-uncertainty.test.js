@@ -35,18 +35,24 @@ function fixture(root, address) {
   return { mailbox, engine, context, session, events };
 }
 for (const mode of ['oversize', 'timeout', 'empty', 'malformed', 'no-ack']) {
-  test(`UDS ${mode}: source reports unknown, repeated ticks/restart never repeat body or submit`, { skip: process.platform === 'win32', timeout: 10000 }, async () => {
+  test(`UDS ${mode}: source reports unknown, repeated ticks/restart never repeat body or submit`, { skip: process.platform === 'win32', timeout: 10000 }, async (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 't-uds-unknown-')), address = path.join(root, 'sock'), sockets = new Set();
     let bodies = 0; const texts = [];
+    // Task 1215 probe529 (NONSHIPPING diagnostics only): numeric timings + existing safe result fields; no added waiting.
+    const p = { t0: Date.now(), seen_ms: null, data_ms: null, body_ms: null, end_ms: null, close_ms: null, result_ms: null, bodies_at_result: null, http_status: null, bytes_written: null }; let probeError = null;
+    const at = key => { if (p[key] === null) p[key] = Date.now() - p.t0; };
     const server = net.createServer({ allowHalfOpen: true }, socket => {
       sockets.add(socket); socket.on('error', () => {}); socket.on('close', () => sockets.delete(socket));
+      at('seen_ms'); socket.on('data', () => at('data_ms')); socket.on('end', () => at('end_ms')); socket.on('close', () => at('close_ms'));
       let input = '';
-      socket.on('data', chunk => { input += chunk.toString(); if (input.includes('\n')) { bodies++; texts.push(JSON.parse(input).text); if (mode === 'oversize') socket.end(Buffer.alloc(70000, 'x')); else if (mode === 'empty') socket.end(); else if (mode === 'malformed') socket.end('not-json'); else if (mode === 'no-ack') socket.end('{}'); } });
+      socket.on('data', chunk => { input += chunk.toString(); if (input.includes('\n')) { bodies++; at('body_ms'); texts.push(JSON.parse(input).text); if (mode === 'oversize') socket.end(Buffer.alloc(70000, 'x')); else if (mode === 'empty') socket.end(); else if (mode === 'malformed') socket.end('not-json'); else if (mode === 'no-ack') socket.end('{}'); } });
     });
     await new Promise(resolve => server.listen(address, resolve));
     try {
       const f = fixture(path.join(root, 'mailbox'), address);
       const result = await f.context.deliverInjectionToSession('fixture', f.session, 'PRIVATE_BODY', { noEnter: false, from: 'fixture-source' });
+      at('result_ms'); p.bodies_at_result = bodies; p.http_status = Number.isInteger(result && result.httpStatus) ? result.httpStatus : null;
+      p.bytes_written = result && 'bytes_written' in result ? result.bytes_written : 'absent';
       assert.equal(result.success, false); assert.equal(result.code, 'DELIVERY_UNCERTAIN'); assert.equal(result.delivery_uncertain, true);
       assert.equal(result.retryable, false); assert.equal(result.submit, 'skipped'); assert.equal(bodies, 1); assert.deepEqual(texts, ['PRIVATE_BODY']);
       assert.equal(f.mailbox.messageState('fixture', result.msg_id), 'dead_letter');
@@ -59,7 +65,12 @@ for (const mode of ['oversize', 'timeout', 'empty', 'malformed', 'no-ack']) {
       const restarted = fixture(path.join(root, 'mailbox'), address);
       for (let i = 0; i < 4; i++) await restarted.engine.tick();
       assert.equal(bodies, 1); assert.equal(restarted.mailbox.messageState('fixture', result.msg_id), 'dead_letter');
-    } finally { for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); fs.rmSync(root, { recursive: true, force: true }); }
+    } catch (error) { probeError = error; throw error; } finally {
+      for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); fs.rmSync(root, { recursive: true, force: true });
+      // 504 = the 60 ms timer settled (TIMEOUT path); 502 = the response path (too large / unconfirmed); 503 = error path.
+      const rec = JSON.stringify({ mode, ...p, t0: undefined, transport: p.http_status === 504 ? 'timeout' : p.http_status === 502 ? 'response_path' : p.http_status === 503 ? 'error_path' : 'other', final_bodies: bodies });
+      if (probeError instanceof Error) { try { probeError.message += ` | [telepty-diag] UDS ${rec}`; } catch {} } else if (!probeError) t.diagnostic(`[telepty-diag] UDS ${rec}`);
+    }
   });
 }
 test('fsynced attempt fence survives restart before a response/outcome is recorded', () => {
