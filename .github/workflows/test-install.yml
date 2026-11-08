@@ -1,92 +1,181 @@
-name: Regression Tests
+# Task 1215 resume522 — NONSHIPPING native diagnostic probe (manual only). Replaces test-install.yml ONLY on a dedicated
+# probe branch; never a release or merge gate. Two fixed, controller-preserved source commits are measured; nothing is
+# built, published or installed globally. TELEPTY_NATIVE_PROBE=1 is set only on the measurement steps.
+# Verdicts: every exit, missing row, skip, failure or timeout is a FAILURE; nothing is retried until it passes.
+name: Native diagnostic probe 1215 (NONSHIPPING)
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  probe:
+    name: probe (${{ matrix.source }}, ${{ matrix.os }}, node ${{ matrix.node }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: [20, '26.13.0']
+        source: [base, head]
+        include:
+          - source: base
+            sha: 7ef1fef6931aedcf13af1361bd04598bb6deb0fa
+            tree: 7e6ced2e52f62511490887a02137f1d0e7aed785
+          - source: head
+            sha: 23a0895191e524431f225b8b0c246df058c197cd
+            tree: 9cecac1236b1fe70dd08abb253ea51b8146d00ea
     runs-on: ${{ matrix.os }}
-    # Belt against a hung test never exiting (#645): green mac/ubuntu runs finish in ~2min,
-    # so a 20min cap fails a hang fast instead of burning the 6h job ceiling. This is a
-    # backstop, NOT the fix — the root cause (undisposed state-machine poll timer holding the
-    # test worker open) is fixed in test/submit-gate-restore-register-678.test.js.
-    timeout-minutes: 20
-    # telepty #879: windows-latest is a release gate like ubuntu/macOS. The former #577
-    # continue-on-error quarantine hid that `npm run test:ci` never started on Windows.
+    timeout-minutes: 8
+    env:
+      NODE_LABEL: ${{ matrix.node }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      # Identity gate: the checked-out commit AND tree must be the fixed ones; records toolchain/platform/commands.
+      - name: Source identity and toolchain record
+        id: identity
+        shell: bash
+        run: |
+          set -u
+          OUT="$RUNNER_TEMP/probe1215"; mkdir -p "$OUT"
+          printf 'measurement\titeration\trc\tpass\tfail\tskip\tverdict\n' > "$OUT/summary.tsv"
+          sha="$(git rev-parse HEAD)"; tree="$(git rev-parse 'HEAD^{tree}')"
+          {
+            echo "source=${{ matrix.source }} want_sha=${{ matrix.sha }} got_sha=$sha want_tree=${{ matrix.tree }} got_tree=$tree"
+            echo "node=$(node -v) npm=$(npm -v) os=$RUNNER_OS arch=$RUNNER_ARCH image=${ImageOS:-unknown}/${ImageVersion:-unknown} matrix_node=$NODE_LABEL"
+            echo "run=${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} files=$(git ls-files | wc -l | tr -d ' ')"
+            echo "cmd=node --require ./test-support/setup-env.js --test --test-reporter=tap --test-name-pattern=<fixed> <file>; M3=npm run test:ci"
+          } | tee "$OUT/identity.txt"
+          if [ "$sha" != "${{ matrix.sha }}" ] || [ "$tree" != "${{ matrix.tree }}" ]; then echo "::error::source identity mismatch"; exit 1; fi
       - name: Install dependencies
+        id: install
         run: npm ci
-      - name: Run typecheck
-        run: npm run typecheck
-      # Task 1215: the Darwin authority-file reader is a bundled native binary. Build it from the
-      # first-party source with the runner's own Apple toolchain and Node-API headers BEFORE the suite,
-      # so test/authority-file-darwin-1215.test.js exercises the real native reader (it fails, never
-      # skips, when the binary is absent). Nothing is downloaded and no npm lifecycle compiles it.
-      - name: Build the bundled Darwin authority reader (task 1215)
+      - name: Build the bundled Darwin authority reader (task 1215, as registered)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
           NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
           node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
-      # Task 1215 / #879 (DIAGNOSTIC ONLY, Windows only): a bounded load observer brackets ONLY the regression suite step
-      # below, which stays the unchanged `npm run test:ci` with its own exit. The observer measures (CPU-time deltas,
-      # event-loop timer delay, sparse process-start probes) and decides nothing; its own failure is a visible step
-      # failure that never changes the job result. Mac/Linux skip these steps.
-      - name: Start Windows load observer (diagnostic only, task 1215 / #879)
-        id: load_observer_start
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        run: node scripts/windows-load-observer-879.mjs start --out "${{ runner.temp }}/windows-load-observer-879" --max-ms 1080000
-      - name: Run regression suite
-        run: npm run test:ci
-      - name: Stop Windows load observer (diagnostic only)
-        if: always() && runner.os == 'Windows' && steps.load_observer_start.outcome != 'skipped'
-        continue-on-error: true
-        run: node scripts/windows-load-observer-879.mjs stop --out "${{ runner.temp }}/windows-load-observer-879"
-      - name: Upload Windows load observer evidence (diagnostic only)
-        if: always() && runner.os == 'Windows'
-        continue-on-error: true
+      # Filtered measurements, Unix: M1 (3 x the two CLI cleanup cases) and M2 (row C: 5 on 26.13.0, 2 on 20).
+      - name: Filtered measurements M1 + M2 (Unix)
+        id: filtered_unix
+        if: ${{ !cancelled() && runner.os != 'Windows' && steps.identity.outcome == 'success' && steps.install.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: bash
+        env:
+          TELEPTY_NATIVE_PROBE: '1'
+        run: |
+          set +e
+          OUT="$RUNNER_TEMP/probe1215"; AGG=0
+          run_case() {   # $1 measurement, $2 iteration, $3 file, $4 name pattern, $5.. fixed TAP name substrings (all required)
+            local m="$1" i="$2" file="$3" pat="$4" log rc pass=0 fail=0 skip=0 s v=PASS; shift 4
+            log="$OUT/$m-iter$i.txt"
+            node --require ./test-support/setup-env.js --test --test-reporter=tap --test-name-pattern="$pat" "$file" > "$log" 2>&1
+            rc=$?
+            for s in "$@"; do
+              pass=$((pass + $(grep -E '^ *ok [0-9]+ - ' "$log" | grep -F -- "$s" | grep -vc '# SKIP')))
+              skip=$((skip + $(grep -E '^ *ok [0-9]+ - ' "$log" | grep -F -- "$s" | grep -c '# SKIP')))
+              fail=$((fail + $(grep -E '^ *not ok [0-9]+ - ' "$log" | grep -cF -- "$s")))
+            done
+            if [ "$rc" -ne 0 ] || [ "$pass" -ne "$#" ] || [ "$fail" -ne 0 ] || [ "$skip" -ne 0 ]; then v=FAIL; AGG=1; fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "$i" "$rc" "$pass" "$fail" "$skip" "$v" | tee -a "$OUT/summary.tsv"
+          }
+          M1_PAT='^(telepty allow works without a TTY by using fallback terminal dimensions|telepty allow restores terminal keyboard modes after the child exits)$'
+          M1_A='telepty allow works without a TTY by using fallback terminal dimensions'
+          M1_B='telepty allow restores terminal keyboard modes after the child exits'
+          M2_PAT='^gh#82 \(D\) row C \(#17 negative control\)'
+          M2_N='negative control): a daemon-issued DESTROY still terminates the wrapper'
+          for i in 1 2 3; do run_case M1 "$i" test/cli.test.js "$M1_PAT" "$M1_A" "$M1_B"; done
+          M2_ITER=2; [ "$NODE_LABEL" = '26.13.0' ] && M2_ITER=5
+          for i in $(seq 1 "$M2_ITER"); do run_case M2 "$i" test/wrapper-reregister-82.test.js "$M2_PAT" "$M2_N"; done
+          exit "$AGG"
+      # Filtered measurements, Windows (pwsh like the registered suite): M1 (3 x two cases) and M4 (10 x the lock case).
+      - name: Filtered measurements M1 + M4 (Windows)
+        id: filtered_windows
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.identity.outcome == 'success' && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: pwsh
+        env:
+          TELEPTY_NATIVE_PROBE: '1'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path $env:RUNNER_TEMP 'probe1215'; $script:agg = 0
+          function Run-Case([string]$m, [int]$i, [string]$file, [string]$pat, [string[]]$names) {
+            $log = Join-Path $out "$m-iter$i.txt"
+            node --require ./test-support/setup-env.js --test --test-reporter=tap "--test-name-pattern=$pat" $file *> $log
+            $rc = $LASTEXITCODE
+            $lines = @(Get-Content -LiteralPath $log)
+            $pass = 0; $fail = 0; $skip = 0
+            foreach ($n in $names) {
+              $ok = @($lines | Where-Object { $_ -match '^\s*ok \d+ - ' -and $_.Contains($n) })
+              $pass += @($ok | Where-Object { -not $_.Contains('# SKIP') }).Count
+              $skip += @($ok | Where-Object { $_.Contains('# SKIP') }).Count
+              $fail += @($lines | Where-Object { $_ -match '^\s*not ok \d+ - ' -and $_.Contains($n) }).Count
+            }
+            $v = if ($rc -eq 0 -and $pass -eq $names.Count -and $fail -eq 0 -and $skip -eq 0) { 'PASS' } else { 'FAIL' }
+            if ($v -ne 'PASS') { $script:agg = 1 }
+            $row = "$m`t$i`t$rc`t$pass`t$fail`t$skip`t$v"
+            Add-Content -LiteralPath (Join-Path $out 'summary.tsv') -Value $row
+            Write-Output $row
+          }
+          $m1Pat = '^(telepty allow works without a TTY by using fallback terminal dimensions|telepty allow restores terminal keyboard modes after the child exits)$'
+          $m1Names = @('telepty allow works without a TTY by using fallback terminal dimensions', 'telepty allow restores terminal keyboard modes after the child exits')
+          foreach ($i in 1..3) { Run-Case 'M1' $i 'test/cli.test.js' $m1Pat $m1Names }
+          $m4Pat = '^multiple processes never overlap mailbox mutation or lose increments$'
+          foreach ($i in 1..10) { Run-Case 'M4' $i 'test/mailbox-lock-concurrency.test.js' $m4Pat @('multiple processes never overlap mailbox mutation or lose increments') }
+          exit $script:agg
+      # M3: ONE full concurrent suite per source on windows + 26.13.0, after the filtered cases (their data is already kept).
+      - name: M3 full npm run test:ci (Windows, 26.13.0)
+        id: m3
+        if: ${{ !cancelled() && runner.os == 'Windows' && matrix.node == '26.13.0' && steps.identity.outcome == 'success' && steps.install.outcome == 'success' }}
+        timeout-minutes: 4
+        shell: pwsh
+        env:
+          TELEPTY_NATIVE_PROBE: '1'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path $env:RUNNER_TEMP 'probe1215'
+          npm run test:ci *> (Join-Path $out 'M3-iter1.txt')
+          $rc = $LASTEXITCODE
+          $v = if ($rc -eq 0) { 'PASS' } else { 'FAIL' }
+          $row = "M3`t1`t$rc`t-`t-`t-`t$v"
+          Add-Content -LiteralPath (Join-Path $out 'summary.tsv') -Value $row
+          Write-Output $row
+          Get-Content -LiteralPath (Join-Path $out 'M3-iter1.txt') -Tail 40
+          exit $rc
+      # Aggregate: exact expected rows per measurement for this cell (N/A = 0); a missing row = INCOMPLETE = FAIL.
+      - name: Aggregate verdict
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          OUT="$RUNNER_TEMP/probe1215"; S="$OUT/summary.tsv"; bad=0
+          w_M1=3; w_M2=0; w_M4=0; w_M3=0
+          if [ "$RUNNER_OS" = Windows ]; then w_M4=10; [ "$NODE_LABEL" = '26.13.0' ] && w_M3=1
+          else w_M2=2; [ "$NODE_LABEL" = '26.13.0' ] && w_M2=5; fi
+          [ -s "$OUT/identity.txt" ] || { echo "identity record missing"; bad=1; }
+          for m in M1 M2 M4 M3; do
+            eval "want=\$w_$m"
+            got=$(awk -F'\t' -v m="$m" '$1==m' "$S" 2>/dev/null | wc -l | tr -d ' ')
+            ok=$(awk -F'\t' -v m="$m" '$1==m && $7=="PASS"' "$S" 2>/dev/null | wc -l | tr -d ' ')
+            note=''; [ "$want" = 0 ] && note=' (N/A for this cell)'
+            printf '%s\twant=%s\tgot=%s\tpass=%s%s\n' "$m" "$want" "$got" "$ok" "$note" | tee -a "$OUT/aggregate.txt"
+            if [ "$got" != "$want" ] || [ "$ok" != "$want" ]; then bad=1; fi
+          done
+          echo "steps: identity=${{ steps.identity.outcome }} install=${{ steps.install.outcome }} unix=${{ steps.filtered_unix.outcome }} windows=${{ steps.filtered_windows.outcome }} m3=${{ steps.m3.outcome }}" | tee -a "$OUT/aggregate.txt"
+          [ "$bad" = 0 ] && echo "AGGREGATE PASS" | tee -a "$OUT/aggregate.txt" || echo "AGGREGATE FAIL (failed, skipped, missing or incomplete)" | tee -a "$OUT/aggregate.txt"
+          exit "$bad"
+      - name: Upload probe records
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-load-observer-879-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/windows-load-observer-879
-          if-no-files-found: warn
-          retention-days: 14
-      # Task 1215 peer235: the dedicated ledger PERFORMANCE gate on every OS. `npm run test:ci` above co-schedules files and
-      # gates the ledger file's FUNCTIONAL assertions and any valid-control stall; an invalid idle baseline there is reported
-      # as performance NOT-MEASURED, never as a pass. This step runs the SAME file (same workload, controls and 50 ms bound)
-      # once, alone, with --test-concurrency=1 and TELEPTY_LEDGER_PERF_GATE=1, where only a VALID pass succeeds: an
-      # inconclusive or a fail verdict fails this step. Mandatory: no continue-on-error, no retry.
-      - name: Run ledger performance gate (single file, no co-scheduled tests; task 1215)
-        env:
-          TELEPTY_LEDGER_PERF_GATE: '1'
-        run: node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=spec test/ledger-control-responsiveness-1207.test.js
-      # #768: this one file drives a real daemon + a real `telepty allow` bridge + a real PTY
-      # with a deliberately delayed WS handshake. Inside the parallel list it lands on a worker
-      # alongside whatever else node --test schedules there, and on the 3-core macOS runner that
-      # pairing pushed test/enforce-report.test.js:359 from 1.2s to its 10s ceiling — a test that
-      # only waits for a bus event and loses nothing, so the honest fix is to stop contending
-      # rather than to raise its budget. Measured: dropping this file from the parallel list
-      # restores macOS to green (run 30204629841). `npm test` still includes it; a dev machine
-      # has the cores. Give it its own step so it runs alone and gates just the same.
-      - name: Run PTY-serialized regression tests
-        run: npm run test:ci:pty
-      # Task 1215 G2: self-pack consumer check on every supported OS, Windows included (npm-cli.js under
-      # this node, .cmd/.ps1 shim relations, private APPDATA/LOCALAPPDATA/TMP/TEMP), plus npm ls identity,
-      # the macOS installed native authority read and an installed daemon + PTY smoke. The release
-      # workflow runs the same helper against ONE canonical archive (--pack-only / --tarball).
-      - name: Check packaged consumer
-        run: node scripts/check-package.mjs
+          name: probe1215-${{ matrix.source }}-${{ matrix.os }}-node${{ matrix.node }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/probe1215
+          if-no-files-found: error
+          retention-days: 7
