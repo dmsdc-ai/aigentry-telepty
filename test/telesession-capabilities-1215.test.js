@@ -485,9 +485,28 @@ test('1215 consumer shape: inbox bearer + plain first line + exact_target to the
 
   const prompt = '[telesession nonce=fedcba9876543210fedcba9876543210 reply-to=' + inbox + ']\nconsumer hello orchestrator';
   const audit = await beginAuditCompletion(daemon, t.signal);
+  const logFrom = { stdout: daemon.getLogs().stdout.length, stderr: daemon.getLogs().stderr.length }; // 515: this request's window
   const res = await inject(target, {
     prompt, from: inbox, reply_to: inbox, exact_target: true,
-  }, { 'x-telepty-session-token': inboxReg.session_token });
+  }, { 'x-telepty-session-token': inboxReg.session_token }).catch((error) => {
+    // Task 1215 515 (NONSHIPPING, M3): ONLY on the harness request deadline, this request's window of daemon [INJECT]/[WS]
+    // lines naming the target or inbox sid, plus [AUDIT] lines (they carry no sid), capped and redacted. Else unchanged.
+    if (error && error.code === 'HARNESS_REQUEST_TIMEOUT') {
+      try {
+        const { stdout, stderr } = daemon.getLogs();
+        const redact = /((?:token|bearer|secret|authorization|password)[A-Za-z_]*["']?\s*[:=]\s*["']?|Bearer\s+)[^\s"'&,;}]+/gi;
+        const pick = (text) => { const out = []; let bytes = 0;
+          for (const l of text.split(/\r?\n/)) {
+            if (!(/\[(INJECT|WS)\]/.test(l) && (l.includes(target) || l.includes(inbox))) && !l.startsWith('[AUDIT]')) continue;
+            bytes += Buffer.byteLength(l, 'utf8') + 1; if (bytes > 4000) { out.push('[capped]'); break; } out.push(l.replace(redact, '$1<redacted>'));
+          }
+          return out; };
+        error.message += ` | [telepty-diag] M3 ${JSON.stringify({ stage: error.stage ?? null, timer_late_ms: error.timer_late_ms ?? null,
+          stdout: pick(stdout.slice(logFrom.stdout)), stderr: pick(stderr.slice(logFrom.stderr)), http_delivery: daemonHttpDiag(logFrom.stderr) })}`;
+      } catch { /* never replaces the failure */ }
+    }
+    throw error;
+  });
 
   // HTTP success in the exact shape the consumer requires before it trusts the routing.
   assert.equal(res.status, 200, `inject failed: ${JSON.stringify(res.body)}`);

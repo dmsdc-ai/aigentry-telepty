@@ -1888,6 +1888,15 @@ function createSessionActions(shared, effects = {}) {
   function registerDeleteRoute(app) {
     app.delete('/api/sessions/:id', (req, res) => {
       const requestedId = req.params.id;
+      // #1215 516 NONSHIPPING native probe (CI only; TELEPTY_NATIVE_PROBE=1, default off = nothing installed): did this DELETE
+      // reach the handler, and with which status did the server finish its response? `finish` is server-side completion, not
+      // proof the caller received it. Fixed tag, JSON-escaped requested sid, numeric status only; it can never throw here.
+      if (process.env.TELEPTY_NATIVE_PROBE === '1') {
+        const probeSid = String(requestedId).slice(0, 128);
+        const probeLine = (event, extra) => { try { console.log(`[NATIVE-PROBE] ${JSON.stringify({ event, sid: probeSid, ...extra })}`); } catch { /* data only */ } };
+        probeLine('delete_enter', {});
+        try { res.once('finish', () => probeLine('delete_finish', { status: Number(res.statusCode) })); } catch { /* data only */ }
+      }
       // #1215 delete-owned-session — opt-in owned delete. `?owned=true` names the exact own record
       // only (no resolveSessionForDestroy fallback: a bare alias is 404 even with one live sibling).
       const ownedDelete = req.query.owned === 'true';

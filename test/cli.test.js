@@ -47,6 +47,19 @@ function diagPty(text, exit, markers) {
   return { exit: exit === undefined ? null : exit, bytes: Buffer.byteLength(String(text || ''), 'utf8'),
     markers: Object.fromEntries(Object.entries(markers).map(([name, needle]) => [name, plain.includes(needle)])) };
 }
+// Task 1215 515 (NONSHIPPING, failure-only M1): the daemon's own log lines that name ONE test-owned synthetic session id and
+// a [KILL]/[WS]/[REGISTER] tag, per stream, capped at 4000 B, credential values redacted. Read from the harness log
+// accessor only; no request is made (nothing can race or repair the condition under test).
+const DIAG_REDACT = /((?:token|bearer|secret|authorization|password)[A-Za-z_]*["']?\s*[:=]\s*["']?|Bearer\s+)[^\s"'&,;}]+/gi;
+function diagCap(lines, cap = 4000) {
+  let out = ''; for (const line of lines) { if (Buffer.byteLength(out + line, 'utf8') + 1 > cap) return `${out}[capped]`; out += `${line}\n`; }
+  return out;
+}
+function daemonLinesFor(logs, id) {
+  const pick = (text) => diagCap(String(text || '').split(/\r?\n/)
+    .filter((line) => line.includes(id) && /\[(KILL|WS|REGISTER|NATIVE-PROBE)\]/.test(line)).map((line) => line.replace(DIAG_REDACT, '$1<redacted>')));
+  return { stdout: pick(logs.stdout), stderr: pick(logs.stderr) };
+}
 const projectRoot = path.resolve(__dirname, '..');
 const TERMINAL_CLEANUP_SEQUENCE = '\x1b[<u\x1b[>4;0m\x1b[?2004l';
 
@@ -771,7 +784,10 @@ test('telepty allow works without a TTY by using fallback terminal dimensions', 
   await waitFor(async () => {
     const list = await harness.request('/api/sessions');
     return list.status === 200 && !list.body.some((session) => session.id === sessionId);
-  }, { description: 'wrapped session cleanup after non-interactive allow' });
+  }, { description: 'wrapped session cleanup after non-interactive allow' }).catch((error) => {
+    try { if (error instanceof Error) error.message += ` | [telepty-diag] M1 daemon ${JSON.stringify(daemonLinesFor(harness.getLogs(), sessionId))}`; } catch { /* 515: never replaces the failure */ }
+    throw error;
+  });
 });
 
 test('telepty allow rejects malformed --idle-ttl before spawning', async () => {
@@ -1224,7 +1240,10 @@ test('telepty allow restores terminal keyboard modes after the child exits', asy
     await waitFor(async () => {
       const list = await harness.request('/api/sessions');
       return list.status === 200 && !list.body.some((session) => session.id === sessionId);
-    }, { description: 'wrapped session cleanup after interactive allow exit' });
+    }, { description: 'wrapped session cleanup after interactive allow exit' }).catch((error) => {
+      try { if (error instanceof Error) error.message += ` | [telepty-diag] M1 daemon ${JSON.stringify(daemonLinesFor(harness.getLogs(), sessionId))}`; } catch { /* 515: never replaces the failure */ }
+      throw error;
+    });
   } finally {
     cli.kill();
   }
