@@ -1016,18 +1016,26 @@ test('519 A daemon: an UNTRACKED inject + /submit with its returned inject_id ge
   const session = H.registerSession(sid);
   const injectId = await untrackedInject(sid, 'D519 body');
   const body = bodyFramesOf(session.ownerWs, 'D519 body');
-  const ok = await H.submit(sid, { injected_body: 'D519 body', retries: 0, inject_id: injectId });
-  const wrong = await H.submit(sid, { injected_body: 'D519 body', retries: 0, inject_id: crypto.randomUUID() });
+  // 521: H.submit's crFrames() is a LAZY view from that request's start to the moment it is read, so each request's summary
+  // is taken at its own completion, before any later call. `firstRequest` keeps its lazy view for the cumulative check.
+  const firstRequest = await H.submit(sid, { injected_body: 'D519 body', retries: 0, inject_id: injectId });
+  const ok = crSummary(firstRequest);
+  const wrong = crSummary(await H.submit(sid, { injected_body: 'D519 body', retries: 0, inject_id: crypto.randomUUID() }));
   H.registerSession('d519-other');
   const otherId = await untrackedInject('d519-other', 'D519 other body');
-  const other = await H.submit(sid, { injected_body: 'D519 other body', retries: 0, inject_id: otherId });
-  const idless = await H.submit(sid, { injected_body: 'D519 body', retries: 0 });
-  H.claimOwner(session, H.ownerSocket(), { supervised: true });
+  const other = crSummary(await H.submit(sid, { injected_body: 'D519 other body', retries: 0, inject_id: otherId }));
+  const idless = crSummary(await H.submit(sid, { injected_body: 'D519 body', retries: 0 }));
+  const replacement = H.ownerSocket();
+  H.claimOwner(session, replacement, { supervised: true });
   H.negotiate(session, { capable: true, header: CAPABILITY_HEADER_VALUE });
   H.transportReady(session);
-  const crossGen = await H.submit(sid, { injected_body: 'D519 body', retries: 0, inject_id: injectId });
-  assert.deepEqual({ bodyIds: body.map(f => f.inject_id ?? null), ok: crSummary(ok), wrong: crSummary(wrong), other: crSummary(other),
-    idless: crSummary(idless), crossGen: crSummary(crossGen) }, {
+  const crossGen = crSummary(await H.submit(sid, { injected_body: 'D519 body', retries: 0, inject_id: injectId }));
+  // Cumulative: every CR the ORIGINAL owner socket received from the first request on (any late write included), and the
+  // replacement socket's CRs, read after the last request.
+  const originalOwnerCrs = firstRequest.crFrames().map(f => [f.inject_id ?? null, f.pair ?? null]);
+  const replacementCrs = replacement.frames.filter(f => f.type === 'inject' && f.data === '\r').length;
+  assert.deepEqual({ originalOwnerCrs, replacementCrs }, { originalOwnerCrs: [[injectId, body[0] && body[0].daemon_msg_id], [null, null]], replacementCrs: 0 });
+  assert.deepEqual({ bodyIds: body.map(f => f.inject_id ?? null), ok, wrong, other, idless, crossGen }, {
     bodyIds: [injectId],
     ok: { status: 200, stage: 'sent_to_bridge', reason: null, consumption: 'unknown', confirmed: false, crs: [[injectId, body[0] && body[0].daemon_msg_id]] },
     wrong: REFUSED('submit_pair_unavailable'), other: REFUSED('submit_pair_unavailable'),
