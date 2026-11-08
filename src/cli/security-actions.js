@@ -325,6 +325,7 @@ function createAllowSecurityContext(shared, {
 } = {}) {
     // This fence belongs to this context, even if another context resets shared state.
     let closed = false;
+    let teardown = null;   // hotfix523: { startedAt, done } of the ONE teardown DELETE this context's close started
     const deliveryTimers = new Set();
     function isClosed() {
       if (shared.allowSessionClosed) closed = true;
@@ -792,8 +793,17 @@ function createAllowSecurityContext(shared, {
     }
 
     function updateDaemonProcessMetadata() {
+      // hotfix524: a metadata refresh is never a create/recovery authority. It names THIS bridge's accepted instance, the
+      // current owner claim's binding (epoch + credential generation), captured now, before any async work, through the
+      // register route's existing instance preconditions: a destroyed or replaced instance is refused before any create
+      // or update. Closed, unbound or unproven: withheld. A refusal is never retried, and no bare sid is ever sent.
+      const binding = shared.interactionBinding;
+      if (isClosed() || !binding || binding.sid !== shared.sessionId || !/^[A-Za-z0-9_-]{22}$/.test(binding.session_epoch || '')
+        || !Number.isSafeInteger(binding.credential_generation) || binding.credential_generation < 1) return;
       const body = {
         session_id: shared.sessionId,
+        expected_epoch: binding.session_epoch,
+        expected_credential_generation: binding.credential_generation,
         command: shared.command,
         ...(shared.sshPlan ? { ssh_remote: shared.sshPlan.metadata } : {}),
         cwd: process.cwd(),
@@ -1122,7 +1132,10 @@ function createAllowSecurityContext(shared, {
         const deleteUrl = shared.currentOwnerToken
           ? `${shared.DAEMON_URL}/api/sessions/${encodeURIComponent(shared.sessionId)}?owner_token=${encodeURIComponent(shared.currentOwnerToken)}`
           : `${shared.DAEMON_URL}/api/sessions/${encodeURIComponent(shared.sessionId)}`;
-        (0, shared.fetchWithAuth)(deleteUrl, { method: 'DELETE' }).catch(() => {});
+        // hotfix523: still started exactly once here; its settlement is kept so an explicit exit can wait for it
+        // (settleTeardown) instead of process.exit discarding it. A refusal or error is recorded as not ok, never as deleted.
+        teardown = { startedAt: now(), done: (0, shared.fetchWithAuth)(deleteUrl, { method: 'DELETE' })
+          .then(res => ({ ok: !!(res && res.ok), status: res && Number.isInteger(res.status) ? res.status : null }), () => ({ ok: false, status: null })) };
       }
       try {
         shared.daemonWs.close();
@@ -1131,6 +1144,15 @@ function createAllowSecurityContext(shared, {
         removeSignalHandler(signalName, handler);
       }
       return true;
+    }
+    // hotfix523: settles with the teardown DELETE this context's close started, or at ONE budget measured from its start
+    // ({ ok: false, status: null, timed_out: true }). null when no DELETE was started. Never a new request or a retry.
+    function settleTeardown(budgetMs = 2500) {
+      if (!teardown) return null;
+      let timer = null;
+      const bound = new Promise(resolve => { timer = setTimeout(() => resolve({ ok: false, status: null, timed_out: true }),
+        Math.max(0, teardown.startedAt + budgetMs - now())); });
+      return Promise.race([teardown.done, bound]).finally(() => clearTimeout(timer));
     }
 
     function createBridgeMailbox() {
@@ -1166,7 +1188,7 @@ function cooperativeQueueEmpty(){
       if(deliveryTimers.size || shared.bridgePendingCount || shared.queueFlushTimer)return false;
       try{return shared.bridgeMailbox.snapshotCustody(shared.bridgeTarget).length===0;}catch{return false;}
     }
-return { cooperativeQueueEmpty, updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox,
+return { cooperativeQueueEmpty, updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, settleTeardown, createBridgeMailbox, recoverBridgeMailbox,
   noteBridgeGeometry, writeDirectInject, bridgeQueueSummary, reportBridgeQueue, handleOwnerInject, announceTransportReady };
 }
 

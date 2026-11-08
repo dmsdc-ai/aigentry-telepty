@@ -203,6 +203,61 @@ test('a ticket released while its descriptor is read is a departure, not corrupt
   finally { successor(); }
   assert.equal(departed, true);
 });
+// #1215 lock525 — measured on win32 Node 26 (native524 M4, 5/20): the peer's `number` descriptor reported 0 links at OPEN
+// (4x) or at READ (1x) while lstat still saw the delete-pending file; every other predicate held. Four re-lists showed the
+// DEPARTED marker, one was a directory EPERM. Simulated here ONLY: that descriptor link count (fstat), the retiring owner's
+// marker and a ticket-directory EPERM, around the REAL acquireLock/release. RED on 524: (a)/(b) throw MAILBOX_LOCK_STORAGE.
+const lockCounters = () => require('../src/mailbox/lock').lockDiagnostics();
+function deletePending(t, dir, { at = 'open', marker = true, eperm = 0, size = null, markOnEperm = false } = {}) {
+  const ticket = path.join(dir, '.lock', fs.readdirSync(path.join(dir, '.lock'))[0]), number = path.join(ticket, 'number');
+  const s = { fd: null, fstats: 0, armed: false, epermLeft: eperm };
+  const open = fs.openSync, fstat = fs.fstatSync, readdir = fs.readdirSync;
+  t.mock.method(fs, 'openSync', function(file, ...args) { const fd = open.call(fs, file, ...args); if (file === number && s.fd === null) s.fd = fd; return fd; });
+  t.mock.method(fs, 'fstatSync', function(fd, ...args) {
+    const st = fstat.call(fs, fd, ...args);
+    if (fd !== s.fd || s.armed || ++s.fstats < (at === 'open' ? 1 : 2)) return st;
+    s.armed = true;
+    if (marker) fs.writeFileSync(path.join(ticket, 'departed'), '');   // the owner's marker precedes its unlink
+    return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { nlink: 0 }, size === null ? {} : { size });
+  });
+  t.mock.method(fs, 'readdirSync', function(file, ...args) {
+    if (s.armed && file === ticket && s.epermLeft !== 0) {
+      if (s.epermLeft > 0) s.epermLeft--;
+      if (markOnEperm) fs.writeFileSync(path.join(ticket, 'departed'), '');   // the owner then proceeds to depart
+      throw Object.assign(new Error(`EPERM: operation not permitted, scandir '${file}'`), { code: 'EPERM' });
+    }
+    return readdir.call(fs, file, ...args);
+  });
+  return { number, disarm() { s.epermLeft = 0; }, armed: () => s.armed };
+}
+const delta = (before, key) => lockCounters()[key] - before[key];
+const lockDir = dir => fs.readdirSync(path.join(dir, '.lock'));
+// One registered case each (exact CI names `lock525 (a)`..`(f)`); a new counter is read only AFTER a functional success.
+for (const [id, opts, key] of [['a', { at: 'open' }, 'nlink0_departed'], ['b', { at: 'read' }, 'nlink0_departed'],
+  ['c', { marker: false, eperm: 1, markOnEperm: true }, 'nlink0_unresolved']]) {
+  test(`lock525 (${id}) a retiring peer whose descriptor reports 0 links (${JSON.stringify(opts)}) is admitted only after a proved departure`, t => {
+    const {dir} = fixture(t), release = acquireLock(dir), sim = deletePending(t, dir, opts), before = lockCounters();
+    const successor = acquireLock(dir);
+    try { release(); } finally { successor(); }
+    assert.deepEqual([sim.armed(), lockDir(dir)], [true, []]);
+    assert.equal(delta(before, key), 1);
+  });
+}
+test('lock525 (d) a permanent ticket-directory EPERM is never admitted: TIMEOUT, holder evidence kept', t => {
+  const {dir} = fixture(t), release = acquireLock(dir), sim = deletePending(t, dir, { marker: false, eperm: -1 });
+  try { assert.throws(() => acquireLock(dir, { timeoutMs: 200 }), { code: 'MAILBOX_LOCK_TIMEOUT' }); assert.equal(fs.readFileSync(sim.number, 'utf8'), '1'); }
+  finally { sim.disarm(); release(); }
+  assert.deepEqual(lockDir(dir), []);
+});
+// (e)/(f): functional negative controls with the SAME outcome on older and current code (refusal, evidence kept, cleanup).
+for (const [id, opts] of [['e', { marker: false }], ['f', { marker: true, size: 64 }]]) {
+  test(`lock525 (${id}) a 0-link descriptor (${JSON.stringify(opts)}): unmarked or otherwise corrupt stays MAILBOX_LOCK_STORAGE`, t => {
+    const {dir} = fixture(t), release = acquireLock(dir), sim = deletePending(t, dir, opts);
+    try { assert.throws(() => acquireLock(dir), { code: 'MAILBOX_LOCK_STORAGE' }); assert.equal(fs.readFileSync(sim.number, 'utf8'), '1'); }
+    finally { release(); }
+    assert.deepEqual([sim.armed(), lockDir(dir)], [true, []]);
+  });
+}
 test('corrupt live tickets and unknown entries are refused without deleting evidence', t => {
   const {root, dir} = fixture(t), release = acquireLock(dir), lock = path.join(dir, '.lock');
   const name = fs.readdirSync(lock)[0], number = path.join(lock, name, 'number');

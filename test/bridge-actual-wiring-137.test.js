@@ -1179,3 +1179,34 @@ test('#1215 daemon: supervision binds one owner generation; own bearer is never 
     uncredentialed: [200, 'SESSION_CREDENTIAL_REQUIRED', false], ownBearer: [200, 'INPUT_POLICY_CAPABILITY_REQUIRED', false], childClaim: 'guarded',
     withCapability: [200, true, false], stolen: 'guarded', third: 'user-supervised', finalTransport: 'user-supervised' });
 });
+
+// hotfix523 M1 (RED on 521: settleTeardown does not exist; native Node 26 cleanup cases lose the DELETE because
+// exitAllowSession calls process.exit in the same turn). The REAL closeAllowSession starts ONE teardown DELETE (owner token)
+// and keeps its settlement; settleTeardown waits for it within ONE 2500 ms budget measured from its start, never retries,
+// and reports a refusal/timeout as not ok. destroySession:false starts no DELETE and leaves nothing to wait for.
+test('523 teardown: one DELETE per close; settleTeardown resolves on its answer or at the 2500 ms budget; none for destroySession:false', { timeout: 30000 }, async t => {
+  const capture = b => { const calls = []; const answers = [];
+    b.shared.fetchWithAuth = (url, options) => { calls.push([url, options.method]); return new Promise(resolve => { answers.push(resolve); }); };
+    return { calls, answers }; };
+  const settledAfter = async (promise, b, ms) => { let out = 'pending'; promise.then(r => { out = r; }); await b.clock.advance(ms); await new Promise(r => setImmediate(r)); return out; };
+  const a = createBridge(t, { sid: 'b523-answered' }); const ca = capture(a);
+  assert.equal(a.allow.closeAllowSession(), true);
+  assert.equal(a.allow.closeAllowSession(), false);
+  const answered = a.allow.settleTeardown(2500);
+  const beforeAnswer = await settledAfter(answered, a, 1000);
+  ca.answers[0]({ ok: false, status: 403 });
+  const refused = await settledAfter(answered, a, 0);
+  const s = createBridge(t, { sid: 'b523-silent' }); const cs = capture(s);
+  assert.equal(s.allow.closeAllowSession(), true);
+  const silent = s.allow.settleTeardown(2500);
+  const at2499 = await settledAfter(silent, s, 2499);
+  const at2500 = await settledAfter(silent, s, 1);
+  const k = createBridge(t, { sid: 'b523-keep' }); const ck = capture(k);
+  assert.equal(k.allow.closeAllowSession({ destroySession: false }), true);
+  assert.deepEqual({ calls: ca.calls, beforeAnswer, refused, silentCalls: cs.calls.length, at2499, at2500,
+    keepCalls: ck.calls.length, keepSettle: k.allow.settleTeardown(2500) }, {
+    calls: [['http://127.0.0.1:9/api/sessions/b523-answered?owner_token=synthetic-owner-token', 'DELETE']],
+    beforeAnswer: 'pending', refused: { ok: false, status: 403 }, silentCalls: 1,
+    at2499: 'pending', at2500: { ok: false, status: null, timed_out: true }, keepCalls: 0, keepSettle: null,
+  });
+});

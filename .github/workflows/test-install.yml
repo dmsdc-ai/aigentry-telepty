@@ -41,6 +41,61 @@ jobs:
           set -euo pipefail
           NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
           node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
+      # Task 1215 lock525 versioned regression witness (Linux + Node 26.13.0 only; NOT acceptance of old code, NOT native
+      # Windows proof). The SAME six lock525 tests run against the old lock.js (fixed public commit 27e4fd1c, blob a9ce9d7a)
+      # and must fail exactly (a)-(d) on genuine MAILBOX_LOCK_STORAGE with (e)/(f) passing, then against the restored
+      # current lock.js where all six must pass. Only src/mailbox/lock.js is swapped, and it is restored on every exit.
+      - name: lock525 RED/GREEN witness (Linux, Node 26.13.0)
+        if: runner.os == 'Linux' && matrix.node == '26.13.0'
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub runs bash with -e; the expected OLD rc 1 and no-match greps must be captured, every check stays explicit
+          W="$RUNNER_TEMP/lock525-witness"; LOCK=src/mailbox/lock.js; mkdir -p "$W"
+          OLD_COMMIT=27e4fd1cea7fdb1226c902757ad662f89eac89d8; OLD_BLOB=a9ce9d7a7e8f062df35777f931107ba6ebaa4f47
+          cp -p "$LOCK" "$W/current-lock.js" || exit 1
+          trap 'cp -p "$W/current-lock.js" "$LOCK"' EXIT INT TERM
+          CUR_BLOB=$(git hash-object "$LOCK") || exit 1
+          echo "head=$(git rev-parse HEAD) current_lock_blob=$CUR_BLOB old_commit=$OLD_COMMIT old_lock_blob=$OLD_BLOB" | tee "$W/summary.txt"
+          git fetch --no-tags --depth=1 origin "$OLD_COMMIT" || { echo "::error::fetch of $OLD_COMMIT failed"; exit 1; }
+          [ "$(git rev-parse "$OLD_COMMIT:$LOCK")" = "$OLD_BLOB" ] || { echo "::error::old lock blob mismatch"; exit 1; }
+          git cat-file blob "$OLD_BLOB" > "$LOCK" && [ "$(git hash-object "$LOCK")" = "$OLD_BLOB" ] || { echo "::error::old lock not in place"; exit 1; }
+          run() {   # $1 label: the identical command for both runs; rc and TAP kept
+            node --require ./test-support/setup-env.js --test --test-reporter=tap --test-name-pattern='^lock525 ' \
+              test/mailbox-lock-concurrency.test.js > "$W/$1.tap" 2>&1
+            echo $? > "$W/$1.rc"
+          }
+          letters() {   # $1 label, $2 'ok' | 'not ok': matching case letters, sorted, no SKIP/TODO lines
+            grep -E "^ *$2 [0-9]+ - lock525 \([a-f]\)" "$W/$1.tap" | grep -vE '# (SKIP|TODO)' \
+              | sed -E 's/.* - lock525 \(([a-f])\).*/\1/' | sort | tr -d '\n'
+          }
+          storage() {   # $1 label: letters of not-ok cases whose own TAP block names MAILBOX_LOCK_STORAGE
+            awk '/^ *(not )?ok [0-9]+ - /{cur=""; if (match($0, /^ *not ok [0-9]+ - lock525 \([a-f]\)/)) cur=substr($0, RLENGTH-1, 1)}
+                 cur != "" && /MAILBOX_LOCK_STORAGE/ {seen[cur]=1} END {for (k in seen) print k}' "$W/$1.tap" | sort | tr -d '\n'
+          }
+          marks() { grep -cE "lock525 \([a-f]\).*# (SKIP|TODO)" "$W/$1.tap"; }
+          fail=0
+          run old
+          o="rc=$(cat "$W/old.rc") notok=$(letters old 'not ok') ok=$(letters old ok) storage=$(storage old) marks=$(marks old)"
+          echo "OLD $o" | tee -a "$W/summary.txt"
+          [ "$o" = "rc=1 notok=abcd ok=ef storage=abcd marks=0" ] || { echo "::error::old lock.js did not give the exact RED"; fail=1; }
+          cp -p "$W/current-lock.js" "$LOCK" && cmp -s "$W/current-lock.js" "$LOCK" && [ "$(git hash-object "$LOCK")" = "$CUR_BLOB" ] \
+            || { echo "::error::current lock.js not restored"; exit 1; }
+          run new
+          n="rc=$(cat "$W/new.rc") notok=$(letters new 'not ok') ok=$(letters new ok) marks=$(marks new)"
+          echo "NEW $n" | tee -a "$W/summary.txt"
+          [ "$n" = "rc=0 notok= ok=abcdef marks=0" ] || { echo "::error::current lock.js did not give the exact GREEN"; fail=1; }
+          [ -s "$W/summary.txt" ] || { echo "::error::witness summary missing"; fail=1; }
+          exit "$fail"
+      - name: Upload lock525 witness records
+        if: always() && runner.os == 'Linux' && matrix.node == '26.13.0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lock525-witness-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lock525-witness
+          if-no-files-found: error
+          retention-days: 7
       # Task 1215 / #879 (DIAGNOSTIC ONLY, Windows only): a bounded load observer brackets ONLY the regression suite step
       # below, which stays the unchanged `npm run test:ci` with its own exit. The observer measures (CPU-time deltas,
       # event-loop timer delay, sparse process-start probes) and decides nothing; its own failure is a visible step

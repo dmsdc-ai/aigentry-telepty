@@ -3651,11 +3651,20 @@ async function main() {
     // belong to somebody else, so neither is ours to discard.
 
 
+    let exitStarted = false;   // hotfix523: exactly one exit, with the first code
     function exitAllowSession(code, exitCtx) {
+      if (exitStarted) return;
+      exitStarted = true;
       if (exitCtx) {
         logSessionDeath(exitCtx.exitCode, exitCtx.signal, exitCtx.duration);
       }
-      process.exit(code);
+      // hotfix523: let the teardown DELETE that closeAllowSession already started settle (ONE 2500 ms total budget) before
+      // process.exit discards it. No new request or retry; an unconfirmed teardown is said, never claimed as deleted.
+      const settling = allowSecurity.settleTeardown(2500);
+      if (!settling) { process.exit(code); return; }
+      settling.then(result => {
+        if (!result.ok) console.error(`[allow] Session teardown not confirmed (${result.timed_out ? 'timed out' : result.status ? `HTTP ${result.status}` : 'request failed'}).`);
+      }).finally(() => process.exit(code));
     }
 
     // Intercept terminal title escape sequences and prefix with session ID
