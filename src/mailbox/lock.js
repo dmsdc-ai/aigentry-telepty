@@ -61,6 +61,22 @@ function lockDiagnostics() {
   return {acquired: totals.acquired, timeouts: totals.timeouts, errors: totals.errors,
     wait_ms_total: round(totals.wait_ms_total), wait_ms_max: round(totals.wait_ms_max), ...snapshot(totals)};
 }
+// #1215 515 NONSHIPPING native probe (CI only; TELEPTY_NATIVE_PROBE=1, default off = no extra reads). It runs only on an
+// error that an existing predicate is ALREADY throwing, attaches `native_probe` to that same error and never throws or
+// changes the outcome. The re-list is a later observation (not atomic) and its extra I/O can perturb scheduling.
+const probeScalars = st => (st ? {nlink: st.nlink, size: st.size, dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs} : null);
+const probeLabels = pairs => pairs.filter(pair => pair[1]).map(pair => pair[0]);
+function probeRelist(dir) {
+  try { const n = fs.readdirSync(dir); return {count: n.length, departed: n.includes('departed'), number: n.includes('number'), draft: n.includes('draft')}; }
+  catch (e) { return {error: typeof e?.code === 'string' ? e.code : 'unknown'}; }
+}
+function probe(error, collect) {
+  try {
+    if (process.env.TELEPTY_NATIVE_PROBE === '1' && error && typeof error === 'object' && Object.isExtensible(error)
+      && !Object.hasOwn(error, 'native_probe')) error.native_probe = collect();
+  } catch (e) { try { error.native_probe = {probe_error: typeof e?.code === 'string' ? e.code : 'unknown'}; } catch { /* data only */ } }
+  return error;
+}
 function failure(code = 'MAILBOX_LOCK_STORAGE') {
   return Object.assign(new Error(code === 'MAILBOX_LOCK_LEGACY'
     ? 'Legacy mailbox lock requires quiesced migration; refusing automatic removal'
@@ -187,7 +203,9 @@ function removeTicket(dir, reap = false) {
   const marker = path.join(dir, DEPARTED);
   try { fs.unlinkSync(marker); }
   catch (e) { if (e.code === 'ENOENT' || (marked && e.code === 'EPERM' && deletePending(marker))) return; throw e; }
-  try { fs.rmdirSync(dir); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  try { fs.rmdirSync(dir); } catch (e) {
+    if (e.code !== 'ENOENT') throw reap && e.code === 'EPERM' ? probe(e, () => ({site: 'reap_rmdir', relist: probeRelist(dir)})) : e;
+  }
 }
 function readTicket(parent, name, reap) {
   const match = TICKET.exec(name), dir = path.join(parent, name);
@@ -219,12 +237,21 @@ function readTicket(parent, name, reap) {
     fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
     const opened = fs.fstatSync(fd);
     if (opened.nlink === 0 && !statOptional(file)) return null; // The unique ticket was released after open.
-    if (!opened.isFile() || opened.nlink !== 1 || opened.size > 32 || opened.dev !== before.dev || opened.ino !== before.ino) throw failure();
+    if (!opened.isFile() || opened.nlink !== 1 || opened.size > 32 || opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw probe(failure(), () => ({site: 'open_check', failed: probeLabels([['not_file', !opened.isFile()], ['nlink', opened.nlink !== 1],
+        ['size', opened.size > 32], ['dev', opened.dev !== before.dev], ['ino', opened.ino !== before.ino]]),
+      before: probeScalars(before), opened: probeScalars(opened), relist: probeRelist(dir)}));
+    }
     const bytes = Buffer.alloc(33), count = fs.readSync(fd, bytes, 0, bytes.length, 0);
     const after = fs.fstatSync(fd);
     if (after.nlink === 0 && !statOptional(file)) return null;
     if (count !== opened.size || count > 32 || after.nlink !== 1 || after.size !== opened.size
-      || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) throw failure();
+      || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) {
+      throw probe(failure(), () => ({site: 'read_check', read_count: count, failed: probeLabels([['count_size', count !== opened.size],
+        ['count_cap', count > 32], ['nlink', after.nlink !== 1], ['size', after.size !== opened.size], ['mtime', after.mtimeMs !== opened.mtimeMs],
+        ['ctime', after.ctimeMs !== opened.ctimeMs]]), before: probeScalars(before), opened: probeScalars(opened), after: probeScalars(after),
+      relist: probeRelist(dir)}));
+    }
     const value = bytes.subarray(0, count).toString('utf8');
     if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) throw failure();
     return {name, number: Number(value)};
@@ -264,7 +291,7 @@ function acquireLock(sessionDir, options = {}) { // #1215 diagnostics wrapper: r
       const last = record.last_block || {};
       e.lock_diagnostic = {outcome, elapsed_ms: round(performance.now() - begun), deadline_ms: options.timeoutMs ?? 500,
         last_block_phase: last.phase || null, last_block_reason: last.reason || null, last_block_self_owner: last.self_owner ?? null,
-        ...snapshot(record)};
+        ...snapshot(record), ...(Object.hasOwn(e, 'native_probe') ? {native_probe: e.native_probe} : {})}; // 515: probe only
     }
     throw e;
   } finally {

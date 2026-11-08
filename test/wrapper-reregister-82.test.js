@@ -165,7 +165,8 @@ test('gh#82 (D) row A: a daemon that came back with a ROTATED token is reachable
 test('gh#82 (D) row C (#17 negative control): a daemon-issued DESTROY still terminates the '
   + 'wrapper — it must never re-register', { skip: SKIP }, async (t) => {
   const sid = `reregC-${process.pid}`;
-  const { home, port, bridge } = await bootBridge(t, sid);
+  const { home, port, bridge, started } = await bootBridge(t, sid);
+  const daemon = started[0]; // 515 diagnostics: this row's only daemon (read on failure only)
 
   // close 1000 'Session destroyed' — the one close code that means the daemon ended this session
   // deliberately. #17: reconnecting here would resurrect a session the GC just removed.
@@ -185,6 +186,27 @@ test('gh#82 (D) row C (#17 negative control): a daemon-issued DESTROY still term
   // And it stays gone: nothing re-registers the id behind the operator's back.
   await H.delay(3000);
   const body = await H.api(port, home).session(sid);
-  assert.equal(body && body.id, undefined,
-    'a destroyed session came back — the reconnect loop defeated the destroy (#17)');
+  try {
+    assert.equal(body && body.id, undefined,
+      'a destroyed session came back — the reconnect loop defeated the destroy (#17)');
+  } catch (error) {
+    try { error.message += ` | [telepty-diag] M2 ${JSON.stringify(rowCDiag(bridge, daemon, sid))}`; } catch { /* never replaces the failure */ }
+    throw error;
+  }
 });
+
+// Task 1215 515 (NONSHIPPING, failure-only M2): which insertion path re-created the destroyed id and how the bridge
+// exited. POST /api/sessions/register logs `[REGISTER] Registered|Re-registered … <sid>`; the owner-WS path logs
+// `[WS] Auto-registered … <sid>`. Exit 0 = destroy/4001 path, 1 = e.g. owner claim refused (4003). Tails capped, redacted.
+const DIAG_REDACT = /((?:token|bearer|secret|authorization|password)[A-Za-z_]*["']?\s*[:=]\s*["']?|Bearer\s+)[^\s"'&,;}]+/gi;
+function rowCDiag(bridge, daemon, sid) {
+  const redact = (text) => String(text || '').replace(DIAG_REDACT, '$1<redacted>');
+  const lines = (text) => String(text || '').split(/\r?\n/).filter((l) => l.includes(sid) && /\[(REGISTER|KILL|WS)\]/.test(l)).map(redact);
+  const cap = (list) => { const out = []; let bytes = 0; for (const l of list) { bytes += Buffer.byteLength(l, 'utf8') + 1; if (bytes > 4000) { out.push('[capped]'); break; } out.push(l); } return out; };
+  const out = lines(daemon.stdout), killAt = out.findIndex((l) => l.includes(`[KILL] Session ${sid} removed`));
+  const after = (re) => out.some((l, i) => re.test(l) && killAt >= 0 && i > killAt);
+  return { exit_code: bridge.child.exitCode, signal_code: bridge.child.signalCode,
+    bridge_out_tail: redact(bridge.out).slice(-2000), bridge_err_tail: redact(bridge.err).slice(-2000),
+    daemon_stdout: cap(out), daemon_stderr: cap(lines(daemon.stderr)), kill_seen: killAt >= 0,
+    post_register_after_kill: after(/\[REGISTER\] (Registered|Re-registered)/), ws_auto_register_after_kill: after(/\[WS\] Auto-registered/) };
+}
