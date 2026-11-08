@@ -98,19 +98,35 @@ function createSubmitCaptureScript() {
 // #879: returns { command, env } from writeFakeCli — on POSIX the shebang file path as before; on
 // win32 a `claude.cmd` shim + `claude.js` body and the bare name `claude` resolved through PATH,
 // because Windows cannot execute a shebang text file (measured: bridge never connected, 503).
-function writeFakeClaudeCommand(dir) {
-  const script = `process.stdin.setEncoding('utf8');
+// Task 1215 (511): input before the composer is DISCARDED on purpose (a still-starting CLI). `discardLog`: bounded test-only
+// record of exactly the discarded bytes (JSON chunk per line, at most 4096 chars), never an ACK or output. `composerAfterEnter`:
+// the composer is drawn once a discarded chunk carried a line delimiter (an event, no timer race); else the original 700 ms.
+function writeFakeClaudeCommand(dir, { discardLog = null, composerAfterEnter = false } = {}) {
+  const script = `const fs = require('fs');
+process.stdin.setEncoding('utf8');
 process.stdin.resume();
 let ready = false;
 let buffer = '';
+let discarded = 0;
+const DISCARD_LOG = ${JSON.stringify(discardLog)};
 process.stdout.write('Claude welcome\\n❯ welcome input\\n');
-setTimeout(() => {
+function showComposer() {
+  if (ready) return;
   ready = true;
   buffer = '';
   process.stdout.write('\\n────────────────\\n❯\\n────────────────\\n');
-}, 700);
+}
+${composerAfterEnter ? '' : 'setTimeout(showComposer, 700);'}
 process.stdin.on('data', (chunk) => {
-  if (!ready) return;
+  if (!ready) {
+    if (DISCARD_LOG && discarded < 4096) {
+      const kept = chunk.slice(0, 4096 - discarded);
+      discarded += kept.length;
+      fs.appendFileSync(DISCARD_LOG, JSON.stringify(kept) + '\\n');
+    }
+    if (${composerAfterEnter ? 'true' : 'false'} && /[\\r\\n]/.test(chunk)) showComposer();
+    return;
+  }
   for (const ch of chunk) {
     if (ch === '\\r' || ch === '\\n') {
       process.stdout.write('\\nSUBMIT:' + buffer + '\\n');
@@ -1009,11 +1025,114 @@ const BOOTSTRAP_WIN32_SKIP = process.platform === 'win32'
   ? 'win32: wrapped fake-claude under ConPTY — post-bootstrap submit never observed (runs 40507287143 + 40507287234), byte-loss layer not identified; Windows-native runtime deferred, owner #577'
   : false;
 
-test('telepty allow queues first fake-claude inject until welcome bootstrap ready', { skip: BOOTSTRAP_WIN32_SKIP }, async () => {
-  const sessionId = createSessionId('cli-allow-bootstrap');
-  const fakeClaude = writeFakeClaudeCommand(harness.homeDir);
+// Task 1215 (511): the fake claude's composer frame, i.e. its own application-ready signal (not the welcome line).
+const FAKE_CLAUDE_COMPOSER = /─{16}\r?\n❯\r?\n─{16}/;
+const readDiscarded = (file) => (fs.existsSync(file)
+  ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)).join('') : '');
 
-  const cli = pty.spawn(process.execPath, [
+// Task 1215 (511) — replaces the obsolete "early input is consumed by the app" expectation. 0.10.1 hands an inject to the PTY
+// at once; this still-starting child DISCARDS it (by design, recorded in discardLog). Asserted: the transport effect (body + one
+// Enter before the composer), the truthful report (consumption unknown, never consumed / a new turn), no replay after the
+// composer. The early inject's application outcome is intentionally unobservable; real CLI/model acceptance is not proven.
+test('telepty allow early transport: body + ONE Enter reach a still-starting fake claude (discarded there), are never replayed after its composer, and are reported consumption unknown', { skip: BOOTSTRAP_WIN32_SKIP }, async () => {
+  const sessionId = createSessionId('cli-allow-early');
+  const discardLog = path.join(harness.homeDir, `${sessionId}.discarded`);
+  const cli = spawnAllowFakeClaude(sessionId, writeFakeClaudeCommand(harness.homeDir, { discardLog, composerAfterEnter: true }));
+  let output = '';
+  cli.onData((chunk) => { output += chunk; });
+  const EARLY = '\u001b[200~early-token\u001b[201~';
+  try {
+    await waitFor(async () => {
+      const body = (await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}`)).body;
+      const rd = body && body.transport && body.transport.readiness;
+      return rd && rd.input_transport_ready && rd.input_transport_ready.status === 'observed';
+    }, { timeoutMs: 7000, description: 'input transport ready (transport only; the application has not drawn its composer)' });
+    assert.equal(FAKE_CLAUDE_COMPOSER.test(stripAnsi(output)), false, 'PRECONDITION: no composer before the early inject');
+
+    const early = await harness.runCli(['inject', '--submit', sessionId, 'early-token'], { timeoutMs: 10000 });
+    assert.equal(early.code, 0, early.stderr);
+    await waitFor(() => /[\r\n]/.test(readDiscarded(discardLog)), { timeoutMs: 10000, description: 'early body + Enter at the child before its composer' });
+    await waitFor(() => FAKE_CLAUDE_COMPOSER.test(stripAnsi(output)), { timeoutMs: 10000, description: 'composer drawn after the early input' });
+    const discardedAtComposer = readDiscarded(discardLog);
+
+    // The follow-up through the public API, after the composer: the only submit this application accepts.
+    const follow = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/inject`, {
+      method: 'POST', body: { prompt: 'follow-token', no_enter: true } });
+    assert.equal(follow.status, 200, JSON.stringify(follow.body));
+    const submit = await harness.request(`/api/sessions/${encodeURIComponent(sessionId)}/submit`, {
+      method: 'POST', body: { injected_body: 'follow-token', retries: 0, retry_delay_ms: 500, inject_id: follow.body.inject_id } });
+    await waitFor(() => stripAnsi(output).includes('SUBMIT:'), { timeoutMs: 10000, description: 'fake claude submit after its composer' });
+
+    const normalized = stripAnsi(output);
+    // PTY line discipline may turn the bridge's literal CR into LF at child stdin (bridge unit tests prove the single
+    // literal CR); normalise CRLF first so one Enter is never counted twice.
+    const terminalNormalized = discardedAtComposer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    assert.deepEqual({
+      discarded: terminalNormalized,
+      earlyBodies: countOccurrences(discardedAtComposer, EARLY),
+      enters: countOccurrences(terminalNormalized, '\n'),
+      discardedLater: readDiscarded(discardLog) === discardedAtComposer,
+      cli: [/stage: sent_to_bridge/.test(early.stdout), /consumption=unknown/.test(early.stdout),
+        /consumption=consumed|— consumed as a new turn/.test(early.stdout)],
+      api: [submit.status, submit.body.submit_stage, submit.body.consumption, submit.body.submit_confirmed],
+      submits: countOccurrences(normalized, 'SUBMIT:'),
+      accepted: /SUBMIT:\u001b\[200~follow-token\u001b\[201~\r?\n/.test(normalized),
+    }, {
+      discarded: `${EARLY}\n`, earlyBodies: 1, enters: 1, discardedLater: true,
+      cli: [true, true, false],
+      api: [200, 'sent_to_bridge', 'unknown', false],
+      submits: 1, accepted: true,
+    });
+  } finally {
+    cli.kill();
+  }
+});
+
+// Task 1215 (511) — first-instruction positive path (caller bootstrap policy, not a bridge gate): the caller waits ONCE for
+// the fixture's actual composer render — not mere registration, not a fixed delay — and then injects. The full bracketed
+// body is accepted exactly once with one submit, and nothing was discarded. Real CLI/model acceptance is not proven here.
+test('telepty allow first instruction: a caller that waits once for the fake claude composer gets the full body accepted once', { skip: BOOTSTRAP_WIN32_SKIP }, async () => {
+  const sessionId = createSessionId('cli-allow-bootstrap');
+  const discardLog = path.join(harness.homeDir, `${sessionId}.discarded`);
+  const cli = spawnAllowFakeClaude(sessionId, writeFakeClaudeCommand(harness.homeDir, { discardLog }));
+
+  let output = '';
+  cli.onData((chunk) => {
+    output += chunk;
+  });
+
+  try {
+    await waitFor(async () => {
+      const list = await harness.request('/api/sessions');
+      return list.body.some((session) => session.id === sessionId);
+    }, {
+      timeoutMs: 7000,
+      description: 'fake claude registered'
+    });
+    await waitFor(() => FAKE_CLAUDE_COMPOSER.test(stripAnsi(output)), { timeoutMs: 10000, description: 'fake claude composer (caller bootstrap, once)' });
+
+    const inject = await harness.runCli(['inject', sessionId, 'dispatch-token'], { timeoutMs: 10000 });
+    assert.equal(inject.code, 0, inject.stderr);
+
+    // #760: the drained bootstrap body now carries the #716/#730 bracketed-paste envelope,
+    // like every other inject path. The stub echoes whatever bytes it receives (a real
+    // claude interprets the markers instead), and the harness stripAnsi only removes SGR —
+    // so the markers are still in `output` and the assertion names them.
+    await waitFor(() => stripAnsi(output).includes(`SUBMIT:\u001b[200~dispatch-token\u001b[201~`), {
+      timeoutMs: 10000,
+      description: 'fake claude submit after its composer'
+    });
+
+    const normalized = stripAnsi(output);
+    assert.equal(countOccurrences(normalized, 'SUBMIT:'), 1);
+    assert.equal(readDiscarded(discardLog), '', 'nothing reached the child before its composer');
+  } finally {
+    cli.kill();
+  }
+});
+
+function spawnAllowFakeClaude(sessionId, fakeClaude) {
+  return pty.spawn(process.execPath, [
     'cli.js',
     'allow',
     '--id',
@@ -1035,39 +1154,7 @@ test('telepty allow queues first fake-claude inject until welcome bootstrap read
       TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
     }
   });
-
-  let output = '';
-  cli.onData((chunk) => {
-    output += chunk;
-  });
-
-  try {
-    await waitFor(async () => {
-      const list = await harness.request('/api/sessions');
-      return list.body.some((session) => session.id === sessionId);
-    }, {
-      timeoutMs: 7000,
-      description: 'fake claude registered'
-    });
-
-    const inject = await harness.runCli(['inject', sessionId, 'dispatch-token'], { timeoutMs: 10000 });
-    assert.equal(inject.code, 0, inject.stderr);
-
-    // #760: the drained bootstrap body now carries the #716/#730 bracketed-paste envelope,
-    // like every other inject path. The stub echoes whatever bytes it receives (a real
-    // claude interprets the markers instead), and the harness stripAnsi only removes SGR —
-    // so the markers are still in `output` and the assertion names them.
-    await waitFor(() => stripAnsi(output).includes(`SUBMIT:\u001b[200~dispatch-token\u001b[201~`), {
-      timeoutMs: 10000,
-      description: 'fake claude post-bootstrap submit'
-    });
-
-    const normalized = stripAnsi(output);
-    assert.equal(countOccurrences(normalized, 'SUBMIT:'), 1);
-  } finally {
-    cli.kill();
-  }
-});
+}
 
 test('telepty allow restores terminal keyboard modes after the child exits', async () => {
   const sessionId = createSessionId('cli-allow-cleanup');

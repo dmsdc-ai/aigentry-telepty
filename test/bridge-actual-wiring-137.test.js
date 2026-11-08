@@ -178,9 +178,10 @@ test('#137 wiring: cli.js inject handler delegates to the shared production hand
     delegates: count(handler, 'allowSecurity.handleOwnerInject(msg)'),
     cliRawChildWrite: /child\.write\(/.test(handler),
     metaKeys: /for \(const key of \['daemon_msg_id', 'inject_id', 'part', 'pair', 'owner_generation'\]\)/.test(shared),
-    enqueueWithMeta: count(shared, 'enqueueBridgeMessage(rawData, meta)'),
+    // 507 C1: the exact meta form plus the exact meta+guard form (the CR routes pass their single-CR guard).
+    enqueueWithMeta: count(shared, 'enqueueBridgeMessage(rawData, meta)') + count(shared, 'enqueueBridgeMessage(rawData, meta, guard)'),
     enqueueWithoutMeta: count(shared, 'enqueueBridgeMessage(rawData)'),
-    directViaContext: count(shared, 'writeDirectInject(rawData, meta)'),
+    directViaContext: count(shared, 'writeDirectInject(rawData, meta)') + count(shared, 'writeDirectInject(rawData, meta, guard)'),
     rawChildWrite: /child\.write\(/.test(shared),
     exported: /handleOwnerInject, announceTransportReady \};/.test(SECURITY),
   }, { delegates: 1, cliRawChildWrite: false, metaKeys: true, enqueueWithMeta: 2, enqueueWithoutMeta: 0, directViaContext: 2, rawChildWrite: false, exported: true });

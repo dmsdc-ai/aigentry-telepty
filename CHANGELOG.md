@@ -53,6 +53,12 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   Enter is not blocked. With 256 bodies still waiting in one session, a new inject is refused before it is queued
   (`BODY_CUSTODY_FULL`, nothing written) instead of dropping an accepted body's Enter. A modal that appears while the
   Enter waits for its body is checked again before the write: the Enter is parked behind it or refused.
+- A guarded bridge that lost user supervision mid-child no longer writes blind. The output that child printed while
+  supervised was never read, so a modal on screen cannot be seen. Body and Enter stay queued (`modal_unobservable`)
+  until a new child starts.
+- An inject is not held until the wrapped application has started. A CLI that is still starting may drop it,
+  and the report says only that it reached the PTY (consumption unknown). A caller that needs its first instruction
+  applied waits once for the application's own ready signal first. Output or busy later never delays an inject.
 - A dropped consecutive duplicate at the bridge flush no longer prints a warning. Its dead-letter and
   receipt are unchanged.
 - Restart every running `telepty allow` bridge to pick this up. A bridge keeps the code it was

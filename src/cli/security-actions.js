@@ -512,6 +512,9 @@ function createAllowSecurityContext(shared, {
       return surfaceModal(shared.outputTail || '') ? 'modal_ui' : null;
     }
     function childExited(child) { return !!child && exitedChildren.has(child); }
+    // 507 C2: this child printed while the owner was supervised (fed to neither grid nor tail), so for a guarded known
+    // CLI a modal drawn then cannot be seen: fail closed until a new child resets the stream origin (resetBridgeScreen).
+    function modalUnobservable() { return !supervised() && shared.knownAiCli && !shared.sshPlan && vtSkippedOutput; }
     function withholdReason() {
       if (shared.handoffPending) return 'handoff_pending';
       // Task 1215 F6: the reason is read from actual state, never a fixed label.
@@ -519,6 +522,7 @@ function createAllowSecurityContext(shared, {
       if (userInputRecent()) return 'user_input_recent';
       if (isClosed()) return 'session_closed';
       if (childExited(shared.child)) return 'child_restarting';
+      if (modalUnobservable()) return 'modal_unobservable';
       if (!supervised() && bridgeModalReason()) return 'modal_ui';
       if (!shared.child || !canWrite(shared.child)) return 'child_unavailable';
       if (!shared.wsReady || shared.daemonWs?.readyState !== 1) return 'owner_transport_unavailable';
@@ -911,7 +915,7 @@ function createAllowSecurityContext(shared, {
       if(shared.handoffPending)return false;
       if (now() - shared.lastUserInputTime <= shared.IDLE_THRESHOLD) return false;
       if (childExited(shared.child)) return false;
-      return supervised() || !bridgeModalReason();
+      return supervised() || (!modalUnobservable() && !bridgeModalReason());
     }
 
     function observePromptReady(data) {
@@ -945,6 +949,7 @@ function createAllowSecurityContext(shared, {
       // Task 1215 hotfix 0.10.1: restart window — nothing is dequeued for an exited child; the records stay pending
       // (custody, order) and the still-armed tick drains them once into the successor.
       if (childExited(child)) return;
+      if (modalUnobservable()) return; // 507 C2: also on a tail-ready onReady route; records stay pending (custody, TTL)
       if (shared.queueFlushTimer) { clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
       if (shared.idleCheckTimer) { clearInterval(shared.idleCheckTimer); shared.idleCheckTimer = null; }
       if (shared.bridgePendingCount === 0) return;

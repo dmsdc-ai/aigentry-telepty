@@ -53,7 +53,8 @@ test('hotfix 1215: package.json, both package-lock.json fields and the check-pac
 test('hotfix 1215: only the version lines differ from BASE (dependencies, resolutions, integrities, lockfile format untouched)', () => {
   const result = {};
   for (const [rel, lines] of Object.entries(VERSION_LINES)) {
-    const text = read(rel).split('\n');
+    // 507 C6: a Windows autocrlf checkout reads CRLF; compare the LF bytes the BASE hashes were taken over.
+    const text = read(rel).replace(/\r\n/g, '\n').split('\n');
     const atRelease = lines.every(([index, template]) => text[index] === fill(template, RELEASE));
     for (const [index, template] of lines) if (text[index] === fill(template, RELEASE)) text[index] = fill(template, BASE_VERSION);
     result[rel] = { atRelease, restoredMatchesBase: sha256(text.join('\n')) === BASE_SHA256[rel] };

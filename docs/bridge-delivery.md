@@ -98,6 +98,9 @@ message while the CLI is busy is left to the CLI's own input handling. These con
 an inject, each with a `withheld` or `refused` receipt:
 
 - a real modal or permission prompt (`modal_ui`, guarded owners only)
+- a modal that cannot be observed (`modal_unobservable`, guarded known AI CLIs only): the current child
+  printed while its owner was user-supervised, so that output reached neither the VT grid nor the tail.
+  After a fall back to guarded, body and CR stay queued until a new child starts a new stream.
 - the local user typing within 2 s (`user_input_recent`)
 - an exited child during restart (`child_restarting` / `child_exited`)
 - a pending handoff
@@ -105,6 +108,13 @@ an inject, each with a `withheld` or `refused` receipt:
 - an unwritable child or owner transport.
 
 The TTL and dead-letter custody are unchanged.
+
+**Before the application has started.** `input_transport_ready` and `pty_written` prove only that
+bytes reached the child's PTY. An application that is still starting may not read them, or may drop
+them. The bridge does not wait for its startup and replays nothing. Consumption stays `unknown`
+(`submit_confirmed: false`). A caller whose first instruction must be applied waits once for the
+application's own ready signal before that inject (caller bootstrap policy, not a bridge gate).
+After that, output or busy never delays an inject. Whether a given CLI keeps early input is not established.
 
 **Capability.** A 0.10.1 bridge adds `immediate-submit-v1` to the authenticated owner-claim header
 `x-telepty-bridge-capabilities`, alongside `input-transport-ready-v1`. The daemon binds it at the
@@ -245,7 +255,7 @@ inspection. The authority is `src/mailbox/input-policy.js`.
 | | `user-supervised` (orchestrator) | `guarded` (workers, unknown, default) |
 |---|---|---|
 | Daemon admission | Authenticated current owner, live owner WebSocket and that owner's `input_transport_ready` milestone. No screen ready gate (`isBootstrapGatedSession` is false), no modal classifier or park (`modalDeliveryDecision` delivers). Items queued before the handshake drain FIFO when it arrives. | `input_transport_ready` (never a screen `ready`) releases the bootstrap gate; then modal hold/park/refuse as before. |
-| Bridge admission | Live child plus the user's own typing quiet (`IDLE_THRESHOLD`). No tail detector, no VT grid, no busy/modal/glyph/model/case matching. TEXT, paired CR, flush and own-record re-admission all use this rule. | Unchanged: tail or VT-frame ready; busy, modal, recent input, VT-unavailable and kill switch fail closed; no blind timer. |
+| Bridge admission | Live child plus the user's own typing quiet (`IDLE_THRESHOLD`). No tail detector, no VT grid, no busy/modal/glyph/model/case matching. TEXT, paired CR, flush and own-record re-admission all use this rule. | 0.10.1: written at once, with no ready, startup, busy, VT or kill-switch wait. A true modal (`modal_ui`), an unobservable modal (`modal_unobservable`), recent input and an exited child hold it; no blind timer. |
 | Always kept | Receipts, duplicate suppression, TTL/pair quarantine, previous-bridge quarantine (no blind replay), payload preservation, body-before-submit order. | Same. |
 
 The policy is never inferred: not from a process or command name, SID text, `--from`, payload text,
@@ -405,7 +415,8 @@ Local admission check (`telepty allow-check --input-policy user-supervised`):
    it is guarded. A launch from inside a telepty session (`TELEPTY_SESSION_ID`/`TELEPTY_SESSION_TOKEN`
    inherited) is refused. A refused grant prints `input_policy user-supervised was not granted (...);
    this session runs GUARDED` (or `was not re-granted` on reconnect). If supervision is lost mid-child,
-   VT readiness reports `unavailable:mid_stream_after_supervision` and fails closed.
+   VT readiness reports `unavailable:mid_stream_after_supervision` and fails closed: injects are held as
+   `modal_unobservable` (never written blind) until the child is replaced.
 
 Effective state: `GET /api/sessions/<sid>` → `transport.input_policy` (`user-supervised` or
 `guarded`) and `transport.input_policy_source` (`operator_principal_registration`).

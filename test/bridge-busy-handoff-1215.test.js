@@ -95,11 +95,20 @@ function createBridge(t, { sid, command = 'codex', readyRegistry = registry } = 
   const stdout = { columns: 80, rows: 24, isTTY: true, write() { return true; } };
   const first = childDouble(log, 'child-0');
   children.push(first);
+  // 507 C5: on win32 the real spawnChild resolves the bare command through sessionEnv PATH x PATHEXT before the fake
+  // spawnPty. A session-local <command>.cmd stub under this test's own root (never executed) keeps `codex`/knownAiCli.
+  const sessionEnv = {};
+  if (process.platform === 'win32') {
+    const bin = path.join(root, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, `${command}.cmd`), '@echo off\r\n');
+    Object.assign(sessionEnv, { PATH: bin, PATHEXT: '.CMD' });
+  }
   const shared = {
     sessionId: sid, command, cmdArgs: [], sshPlan: null, child: first, handoffPending: null, idleTtl: null,
     detectedBackend: 'fixture', terminalProgram: 'fixture', terminalType: 'xterm-256color',
     DAEMON_URL: 'http://127.0.0.1:9', fetchWithAuth: () => Promise.reject(new Error('no network in fixture')),
-    sessionCwd: root, sessionEnv: {}, bridgeTarget: sid, bridgeMsgSeq: 0, bridgePendingCount: 0,
+    sessionCwd: root, sessionEnv, bridgeTarget: sid, bridgeMsgSeq: 0, bridgePendingCount: 0,
     promptReady: false, lastUserInputTime: 0, IDLE_THRESHOLD: 2000,
     knownAiCli: readyRegistry.isKnownAiCli(command), outputTail: '', readyRegistry, readyQualification: null,
     promptPattern: /[❯>$#%]\s*$/, firstReadyObserved: false, queueFlushTimer: null, idleCheckTimer: null,
@@ -330,6 +339,30 @@ test('hotfix: a TRUE modal on the rendered frame still withholds body and CR (wi
   assert.deepEqual({ onModal, writes: b.writes() }, {
     onModal: { writes: [], withheld: ['body:modal_ui:not_written', 'submit:modal_ui:not_written'], reason: 'modal_ui' },
     writes: ['HF-MODAL', '\r'],
+  });
+});
+
+// 507 C2 (RED on 492: body and CR are written at once to child-0). A modal drawn while the owner was supervised is in
+// neither the VT grid nor the tail, so after the fall back to guarded the modal state is unobservable: body and CR are
+// withheld (modal_unobservable) until a new child gives a new stream origin, then drain once into it.
+test('507 C2: guarded after skipped supervised output withholds body and CR (modal_unobservable) until a new child; never written to the old child', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'hf-modal-unobservable' });
+  b.shared.inputPolicy = 'user-supervised';
+  b.feed(MODAL);
+  b.shared.inputPolicy = 'guarded';
+  const { injectId, body, submit } = b.daemonInject('HF-UNOBSERVABLE');
+  b.injectFrame(body);
+  b.injectFrame(submit);
+  await b.clock.advance(16000);
+  const held = { writes: b.writes(), withheld: b.receipts(injectId, 'withheld').map(r => `${r.msg.part}:${r.msg.reason}:${r.msg.certainty}`),
+    reason: b.allow.bridgeQueueSummary().reason, pending: b.shared.bridgePendingCount };
+  const old = b.children[0];
+  old.exit({ exitCode: 1 });
+  const next = b.respawn();
+  await b.clock.advance(3000);
+  assert.deepEqual({ held, oldWrites: old.writes, newWrites: next.writes, written: b.receipts(injectId, 'pty_written').map(r => r.msg.part) }, {
+    held: { writes: [], withheld: ['body:modal_unobservable:not_written', 'submit:modal_unobservable:not_written'], reason: 'modal_unobservable', pending: 2 },
+    oldWrites: [], newWrites: ['HF-UNOBSERVABLE', '\r'], written: ['body', 'submit'],
   });
 });
 
