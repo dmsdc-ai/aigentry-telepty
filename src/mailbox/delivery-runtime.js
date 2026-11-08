@@ -7,6 +7,116 @@ const readinessHandshake = require('../transport/readiness-handshake');
 const { ptyInputFailure } = require('../pty-input-lifecycle');
 const { validInjectId } = require('../diagnostics/correlation');
 
+// Task 1215 hotfix 0.10.1 — immediate-submit-v1. A 0.10.1 bridge declares it on its authenticated owner-WS handshake
+// header (x-telepty-bridge-capabilities, next to input-transport-ready-v1). It means the bridge writes an authorized
+// inject at once (no ready/idle/output gate) and admits at most ONE submit CR per inject_id/pair per owner generation.
+// websocket.js binds it at the single owner-generation mint, so every claim resets it. An old bridge never declares it,
+// and it is never inferred from a receipt or from timing.
+const IMMEDIATE_SUBMIT_CAPABILITY = 'immediate-submit-v1';
+const SUBMIT_PAIR_MAX = 256;
+function bindImmediateSubmitCapability(session, headerValue) {
+  const declared = typeof headerValue === 'string' && headerValue.length <= 256
+    && headerValue.split(',').map(part => part.trim()).includes(IMMEDIATE_SUBMIT_CAPABILITY);
+  session.immediateSubmitGeneration = declared && typeof session.interactionOwnerGeneration === 'string'
+    ? session.interactionOwnerGeneration : null;
+  return session.immediateSubmitGeneration !== null;
+}
+// Honoured only for the CURRENT owner generation, and only together with that generation's negotiated
+// input-transport handshake (the input-transport fence the immediate path keeps).
+function immediateSubmitSupport(session) {
+  if (!session || session.type !== 'wrapped' || session.sshRemote) return 'not_applicable';
+  return typeof session.immediateSubmitGeneration === 'string'
+    && session.immediateSubmitGeneration === session.interactionOwnerGeneration
+    && readinessHandshake.negotiated(session) ? 'supported' : 'unsupported_by_bridge';
+}
+// The body daemon_msg_id this daemon handed to the current owner for an inject_id, so the immediate CR can name its
+// pair. The entry is bounded and kept in memory only, never persisted (sessions.json is whitelisted). It is bound to the owner generation at hand-over.
+function rememberSubmitPair(session, injectId, daemonMsgId) {
+  if (!session || session.type !== 'wrapped' || !validInjectId(injectId) || typeof daemonMsgId !== 'string' || !daemonMsgId) return false;
+  if (!(session.submitPairs instanceof Map)) session.submitPairs = new Map();
+  session.submitPairs.delete(injectId);
+  session.submitPairs.set(injectId, { daemon_msg_id: daemonMsgId, owner_generation: session.interactionOwnerGeneration || null });
+  while (session.submitPairs.size > SUBMIT_PAIR_MAX) session.submitPairs.delete(session.submitPairs.keys().next().value);
+  return true;
+}
+function submitPairFor(session, injectId) {
+  const entry = validInjectId(injectId) && session && session.submitPairs instanceof Map ? session.submitPairs.get(injectId) : null;
+  return entry && entry.owner_generation && entry.owner_generation === session.interactionOwnerGeneration ? entry.daemon_msg_id : null;
+}
+// hotfix480 F1 — bodies of a wrapped session still in daemon custody (mailbox pending / in flight). session-delivery holds
+// one at enqueue and settles it on the body's actual handoff to the owner (handed) or when it leaves custody any other
+// way. An immediate CR waits on that event (never a poll/dwell/output wait), bounded. In memory, bounded per session.
+const BODY_CUSTODY_MAX = 256;
+function holdBodyCustody(session, msgId, injectId) {
+  if (!session || typeof msgId !== 'string') return;
+  if (!(session.bodyCustody instanceof Map)) session.bodyCustody = new Map();
+  session.bodyCustody.set(msgId, { injectId: validInjectId(injectId) ? injectId : null, waiters: [] });
+}
+// hotfix492 N4: live custody is never evicted; at the bound a NEW body is refused before it is queued (session-delivery).
+function bodyCustodyFull(session) {
+  return !!session && session.bodyCustody instanceof Map && session.bodyCustody.size >= BODY_CUSTODY_MAX;
+}
+// handed: true (handed to the owner), false (left custody unwritten), 'unknown' (left custody, outcome unknown).
+function settleBodyCustody(session, msgId, handed) {
+  const entry = session && session.bodyCustody instanceof Map ? session.bodyCustody.get(msgId) : null;
+  if (!entry) return;
+  session.bodyCustody.delete(msgId);
+  for (const resolve of entry.waiters) resolve(handed === true || handed === 'unknown' ? handed : false);
+}
+// null at once when nothing it must follow is in custody (named: that inject's body; id-less: every body). Otherwise
+// { handed, unknown } once all of them settled, or { timed_out: true } at the bound.
+function awaitBodyCustody(session, injectId, timeoutMs) {
+  const ahead = session && session.bodyCustody instanceof Map
+    ? [...session.bodyCustody.values()].filter(entry => !injectId || entry.injectId === injectId) : [];
+  if (!ahead.length) return null;
+  let timer;
+  const settled = Promise.all(ahead.map(entry => new Promise(resolve => entry.waiters.push(resolve))))
+    .then(results => ({ handed: results.every(r => r === true), unknown: results.includes('unknown') }));
+  const timeout = new Promise(resolve => { timer = setTimeout(resolve, timeoutMs, { timed_out: true }); });
+  return Promise.race([settled, timeout]).finally(() => clearTimeout(timer));
+}
+// hotfix480 F1-F4 — THE immediate single-CR attempt (the /submit route and the queued drain). In order: wait behind a
+// body still in daemon custody; re-check owner instance, ADMITTING generation and capability; a named inject needs this
+// generation's pair (never an id-less CR for it); `beforeEffect` may still refuse; then ONE CR. A refusal writes nothing.
+// hotfix492 N2: after an actual custody wait, `modalCheck` (the applicable modal decision) is asked again right before
+// the effect; a decision other than deliver is returned as `modal` and nothing is written.
+async function immediateSubmitAttempt(session, { injectId = null, generation, timeoutMs, isCurrent, beforeEffect = () => true, submit,
+  modalCheck = () => null }) {
+  const custody = awaitBodyCustody(session, injectId, timeoutMs);
+  const waited = custody ? await custody : null;
+  if (waited && waited.timed_out) return { strategy: null, reason: 'body_custody_pending' };
+  if (waited && !waited.handed && injectId) return { strategy: null, reason: waited.unknown ? 'body_outcome_unknown' : 'body_not_handed' };
+  if (!isCurrent() || session.interactionOwnerGeneration !== generation || immediateSubmitSupport(session) !== 'supported') {
+    return { strategy: null, reason: 'owner_generation_changed' };
+  }
+  if (injectId && !submitPairFor(session, injectId)) {
+    const foreign = session.submitPairs instanceof Map && session.submitPairs.has(injectId);
+    return { strategy: null, reason: foreign ? 'owner_generation_changed' : 'submit_pair_unavailable', prior_submit: 'unknown' };
+  }
+  const modal = waited ? modalCheck() : null;
+  if (modal) return { strategy: null, reason: modal.reason, modal };
+  if (!beforeEffect()) return { strategy: null, reason: 'cancelled' };
+  return { strategy: submit({ ...(injectId ? { injectId } : {}), immediate: true }), ...(waited ? { queued_behind_body: true } : {}) };
+}
+// hotfix480: the extra response fields of an attempt (reason / prior_submit / queued_behind_body), nothing else.
+function immediateAttemptFields(attempt) {
+  const fields = { ...attempt };
+  delete fields.strategy;
+  delete fields.modal;   // hotfix492: the decision object is the caller's, never a response field
+  return fields;
+}
+// The /submit response of the immediate path. It reports only what the daemon knows: whether the CR frame was handed to
+// the current owner socket. The bridge receipt reports the PTY write. Consumption is unknown, and nothing is confirmed.
+function immediateSubmitOutcome(strategy, extra = {}) {
+  if (!strategy) {
+    return { status: 503, body: { error: 'Submit not written: the owner bridge cannot take it for this owner generation',
+      strategy: 'none', attempts: 0, gated: false, immediate_submit: true, submit_stage: 'not_written', ...extra } };
+  }
+  return { status: 200, body: { success: true, strategy, attempts: 1, gated: false, immediate_submit: true,
+    submit_stage: 'sent_to_bridge', pty_write: 'reported_by_bridge_receipt', consumption: 'unknown',
+    consumption_reason: 'not_observed_by_immediate_submit', submit_confirmed: false, ...extra } };
+}
+
 // Accessors retain the daemon's shared instances and original first-use timing.
 // Construction only creates functions; effect boundaries run when those functions do.
 function createDeliveryRuntime(shared, {
@@ -882,6 +992,8 @@ function createDeliveryRuntime(shared, {
     // was refused, but the body is on the surface by the time the submit CR can fail, and an abort
     // that stamped `bytes_written: 0` on that one would be the same defect it exists to close.
     if (!textResult.success) return { ...textResult, bytes_written: 0 };
+    // Task 1215 hotfix 0.10.1: a later immediate /submit for this inject names this body as its pair.
+    if (op.noEnter && session.type === 'wrapped') rememberSubmitPair(session, op.injectId, bodyMeta.daemon_msg_id);
 
     if (!op.noEnter) {
       await sleep(shared.WRAPPED_SUBMIT_DELAY_MS);
@@ -968,6 +1080,30 @@ function createDeliveryRuntime(shared, {
     const settleEnabled = body.input_settle_gate !== false;
     // Task 1215 submit286: a parked /submit keeps its optional inject_id (op.body is its req.body).
     const submitOptions = validInjectId(body.inject_id) ? { injectId: body.inject_id } : undefined;
+    // Task 1215 hotfix 0.10.1: a queued/parked submit for an immediate-submit bridge is ONE CR when it drains, with no
+    // settle wait and no confirm retry. Capability and owner generation are re-read here, at the write.
+    // hotfix480 F2: an op the /submit route admitted as immediate is PINNED (op.immediateGeneration = that generation).
+    // It is refused before effects if the owner, generation or capability changed; it never falls to the legacy retry
+    // branch. Unpinned ops (admitted legacy, other callers) keep the re-read.
+    const pinned = typeof op.immediateGeneration === 'string';
+    if (pinned || immediateSubmitSupport(session) === 'supported') {
+      const attempt = await immediateSubmitAttempt(session, { injectId: submitOptions ? submitOptions.injectId : null,
+        generation: pinned ? op.immediateGeneration : session.interactionOwnerGeneration,
+        timeoutMs: Math.min(Math.max(Number(body.gate_timeout_ms) || 10000, 500), 30000),
+        isCurrent: () => shared.sessions[sessionId] === session,
+        // No effect after the caller's timeout declared this op unwritten; the flag records that an effect started.
+        beforeEffect: () => (op.cancelled ? false : (op.effectStarted = true)),
+        // hotfix492 N2: a modal that came up during the custody wait refuses this drained CR (not_written, its reason).
+        modalCheck: () => { const decision = modalDeliveryDecision(session); return decision.action === 'deliver' ? null : decision; },
+        submit: options => terminalLevelSubmit(sessionId, session, options) });
+      const immediateStrategy = attempt.strategy;
+      if (injectedBody) {
+        markPendingReportSubmitUnconfirmed(sessionId, immediateStrategy
+          ? { reason: 'consumption_unknown', attempts: 1, retryable: false }
+          : { reason: 'strategy_failed', attempts: 0, retryable: false });
+      }
+      return immediateSubmitOutcome(immediateStrategy, { bootstrap_queued: true, ...immediateAttemptFields(attempt) });
+    }
     let strategy = await gatedTerminalSubmit(sessionId, session, injectedBody, settleEnabled, submitOptions);
     const submittedAtMs = Date.now();
     if (!strategy) {
@@ -1353,6 +1489,8 @@ function createDeliveryRuntime(shared, {
       // #137: owner-reported bridge stage support and queue summary (current owner generation only).
       bridge_receipts: bridgeStage.bridgeReceiptSupport(session),
       bridge_queue: bridgeStage.bridgeQueueView(session),
+      // Task 1215 hotfix 0.10.1: whether /submit takes the single-CR immediate path for the current owner generation.
+      immediate_submit: immediateSubmitSupport(session),
       // Task 1215: effective recipient input policy (bound to the current owner generation).
       input_policy: inputPolicies.effectiveInputPolicy(session),
       input_policy_source: inputPolicies.userSupervised(session) ? session.inputPolicy.source : null,
@@ -1459,8 +1597,15 @@ function createDeliveryRuntime(shared, {
     if (protectedInputFailure(session)) return null;
     if (session.sshRemote) return null;
     if (hasHeldInteraction(session)) return null;
-    const injectId = options && options.injectId ? submitCorrelationId(id, session, options.injectId) : null;
-    if (submitViaPty(session, injectId ? { injectId } : undefined)) return 'pty_cr';
+    const correlated = options && options.injectId ? submitCorrelationId(id, session, options.injectId) : null;
+    // Task 1215 hotfix 0.10.1: an immediate CR also names its body (pair) when this daemon handed that body to the
+    // CURRENT owner generation. The bridge then refuses it if that body went unwritten, and keys its single-CR guard on it.
+    // A legacy call never passes `immediate`, so its frame is byte-identical to before.
+    const pair = options && options.immediate === true ? submitPairFor(session, options.injectId) : null;
+    // hotfix480 F3/F4: an immediate CR for a NAMED inject goes only with this generation's pair, never id-less.
+    if (options && options.immediate === true && options.injectId && !pair) return null;
+    const injectId = correlated || (pair ? options.injectId : null);
+    if (submitViaPty(session, injectId || pair ? { injectId, pair } : undefined)) return 'pty_cr';
     return null;
   }
 
@@ -1704,6 +1849,7 @@ function createDeliveryRuntime(shared, {
         session.ownerWs.send(JSON.stringify({ type: 'inject', data: '\r',
           ...bridgeStage.frameMeta({ daemon_msg_id: `submit:${shared.crypto.randomUUID()}`,
             inject_id: options && options.injectId ? options.injectId : null, part: 'submit',
+            pair: options && options.pair ? options.pair : null,
             owner_generation: session.interactionOwnerGeneration }) }));
         armUpstreamProbe(session);   // #732: a submit is a delivery too — probe with it
         return true;
@@ -1839,4 +1985,8 @@ function createDeliveryRuntime(shared, {
   };
 }
 
-module.exports = { createDeliveryRuntime };
+module.exports = { createDeliveryRuntime,
+  // Task 1215 hotfix 0.10.1: immediate-submit-v1 (pure; websocket.js, session-actions.js, session-delivery.js, cli.js).
+  IMMEDIATE_SUBMIT_CAPABILITY, bindImmediateSubmitCapability, immediateSubmitSupport, rememberSubmitPair, immediateSubmitOutcome,
+  // hotfix480: body custody (session-delivery) and the shared immediate attempt (session-actions, bootstrap drain).
+  holdBodyCustody, settleBodyCustody, immediateSubmitAttempt, immediateAttemptFields, bodyCustodyFull };

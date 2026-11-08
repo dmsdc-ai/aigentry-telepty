@@ -1,6 +1,9 @@
 const { protectedInputFailure } = require('../external-approval');
 const { claimedReturnMetadata } = require('../claimed-return');
 const { validInjectId } = require('../diagnostics/correlation');
+// Task 1215 hotfix 0.10.1: immediate-submit-v1 support (current owner generation) and its honest response shape.
+const { immediateSubmitSupport, immediateSubmitOutcome, immediateSubmitAttempt, immediateAttemptFields } = require('../mailbox/delivery-runtime');
+const readinessHandshake = require('../transport/readiness-handshake');
 // #1215 pipe200 S24: the stable public text for an inject delivery that threw (details are in the daemon log only).
 const INJECT_DELIVERY_FAILED_TEXT = 'Delivery failed; see daemon log.';
 // Production session actions. Keep non-strict semantics of the original daemon bodies.
@@ -1009,6 +1012,15 @@ function createSessionActions(shared, effects = {}) {
       const submitOptions = submitInjectId ? { injectId: submitInjectId } : undefined;
 
       const gateOff = String(process.env.TELEPTY_SUBMIT_GATE || '').toLowerCase() === 'off';
+      // Task 1215 hotfix 0.10.1: a wrapped bridge holding immediate-submit-v1 for THIS owner generation writes the CR at
+      // once and admits one CR per inject_id/pair. Its /submit keeps every real fence (closing, protected input, ssh,
+      // input-transport/bootstrap queue, modal, held interaction, owner socket/generation) and sends exactly ONE CR:
+      // no prompt-symbol/REPL/settle wait, no confirm retry, no queued redeliver, no gate-off retries, forced or not.
+      const immediate = immediateSubmitSupport(session) === 'supported';
+      const immediateGeneration = session.interactionOwnerGeneration;
+      const immediateStage = stage => (immediate ? { immediate_submit: true, submit_stage: stage } : {});
+      // hotfix480 F2: an op this request queues or parks as immediate is pinned to the generation+capability that admitted it.
+      const admission = immediate ? { immediateGeneration } : {};
 
       console.log(`[SUBMIT] Session ${id} (${session.command})${retries > 0 ? `, retries: ${retries}, pre_delay: ${preDelayMs}ms` : ''}${gateOff ? ' [gate=off]' : ''}`);
 
@@ -1019,10 +1031,15 @@ function createSessionActions(shared, effects = {}) {
       // #471 (0.4.5): force=true must bypass the bootstrap gate. Without `!force`
       // here the per-request escape hatch (cli.js --submit-force) is enqueued and
       // 504s before the force-bypass block below ever runs.
-      if (!force && (0, shared.isBootstrapGatedSession)(session) && (!(0, shared.isBootstrapReady)(session) || (0, shared.hasBootstrapBacklog)(session) || session.bootstrapDraining)) {
+      // Task 1215 hotfix 0.10.1: for an immediate bridge the input-transport fence (an unwired child) and the FIFO backlog
+      // apply to every caller, forced too: a CR handed to an unwired bridge would be buffered, not written.
+      const bootstrapFenced = (0, shared.isBootstrapGatedSession)(session) || (immediate
+        && (readinessHandshake.awaitingInputTransport(session) || (0, shared.hasBootstrapBacklog)(session) || session.bootstrapDraining));
+      if ((!force || immediate) && bootstrapFenced && (!(0, shared.isBootstrapReady)(session) || (0, shared.hasBootstrapBacklog)(session) || session.bootstrapDraining)) {
         const op = (0, shared.enqueueBootstrapOperation)(id, session, {
           type: 'submit',
-          body: { ...(req.body || {}) }
+          body: { ...(req.body || {}) },
+          ...admission,
         });
         // #760: this branch is also how the CR half of `telepty inject --submit` reaches the
         // queue after its body was modal-parked (hasBootstrapBacklog above). Awaiting it would
@@ -1036,12 +1053,20 @@ function createSessionActions(shared, effects = {}) {
             parked: 'surface_modal',
             reason: (0, shared.modalDeliveryDecision)(session, { force: false }).reason,
             pending: session.bootstrapQueue.length,
+            ...immediateStage('queued'),
           }));
         }
         if ((0, shared.isBootstrapReady)(session)) {
           (0, shared.drainBootstrapQueue)(id, session);
         }
         const queuedSubmit = await (0, shared.waitForBootstrapSubmit)(op, session, gateTimeoutMs);
+        // Task 1215 hotfix 0.10.1: say what happened to the CR. hotfix480 F2: derived from the op's actual progress, not
+        // from the status: a failed op whose effect never started (cancelled, flushed, refused) is not_written; once the
+        // pinned op started its single write the outcome is unknown.
+        if (immediate && queuedSubmit.body && !queuedSubmit.body.submit_stage) {
+          queuedSubmit.body = { ...queuedSubmit.body, ...immediateStage(queuedSubmit.status < 400 ? 'sent_to_bridge'
+            : op.effectStarted ? 'unknown' : 'not_written') };
+        }
         if (queuedSubmit.status >= 400 && injectedBody) {
           (0, shared.markPendingReportSubmitUnconfirmed)(id, {
             reason: queuedSubmit.body && queuedSubmit.body.reason ? queuedSubmit.body.reason : 'bootstrap_submit_failed',
@@ -1065,6 +1090,41 @@ function createSessionActions(shared, effects = {}) {
         });
       }
 
+      // Task 1215 hotfix 0.10.1: the immediate path's single attempt. terminalLevelSubmit re-checks closing, protected
+      // input, ssh, held interaction and the open owner socket, and stamps the current owner generation (plus the body
+      // pair this daemon handed to that generation). It never retries or redelivers, and it never claims consumption.
+      // hotfix480 F1-F4: a CR whose body is still in daemon custody is queued behind it and released on its handoff
+      // (bounded by gate_timeout_ms); a named inject needs this generation's pair; the generation is the admitting one.
+      async function respondImmediateSubmit(forced) {
+        // A modal hold may have spanned an owner change: never send this CR under another owner generation or instance.
+        const attempt = await immediateSubmitAttempt(session, { injectId: submitInjectId, generation: immediateGeneration,
+          timeoutMs: gateTimeoutMs, isCurrent: () => shared.sessions[id] === session,
+          modalCheck: () => { const d = (0, shared.modalDeliveryDecision)(session, { force: forced }); return d.action === 'deliver' ? null : d; },
+          submit: options => (0, shared.terminalLevelSubmit)(id, session, options) });
+        // hotfix492 N2: a modal that came up while this CR waited on its body: park it behind the modal, pinned, or refuse.
+        if (attempt.modal) {
+          if (injectedBody) (0, shared.markPendingReportSubmitUnconfirmed)(id, { reason: 'codex_modal_ui', attempts: 0, retryable: true });
+          emitSubmitBus({ strategy: 'none', attempts: 0, gated: !forced, forced, submit_confirmed: false, reason: attempt.modal.reason,
+            ...(attempt.modal.action === 'park' ? { parked: 'surface_modal' } : {}) });
+          if (attempt.modal.action === 'park') {
+            const op = (0, shared.parkOperationOnModal)(id, session, { type: 'submit', body: { ...(req.body || {}) }, ...admission }, attempt.modal);
+            return res.json((0, shared.bootstrapQueuedResponse)(op, { parked: 'surface_modal', reason: attempt.modal.reason,
+              hint: attempt.modal.hint, pending: session.bootstrapQueue.length, forced, ...immediateStage('queued') }));
+          }
+          return res.status(409).json({ ...(0, shared.modalRejectionResponse)(attempt.modal), strategy: 'none', attempts: 0,
+            gated: !forced, forced, ...immediateStage('not_written') });
+        }
+        const strategy = attempt.strategy;
+        if (injectedBody) {
+          (0, shared.markPendingReportSubmitUnconfirmed)(id, strategy
+            ? { reason: 'consumption_unknown', attempts: 1, retryable: false }
+            : { reason: 'strategy_failed', attempts: 0, retryable: false });
+        }
+        const outcome = immediateSubmitOutcome(strategy, { forced, ...immediateAttemptFields(attempt) });
+        emitSubmitBus(outcome.body);
+        return res.status(outcome.status).json(outcome.body);
+      }
+
       // ── Per-request bypass: { force: true } skips gate + verify (0.3.1+) ──
       // Used by `telepty send-key` (manual override). Mirrors the env-var
       // escape-hatch but at request scope.
@@ -1082,6 +1142,7 @@ function createSessionActions(shared, effects = {}) {
             const op = (0, shared.parkOperationOnModal)(id, session, {
               type: 'submit',
               body: { ...(req.body || {}) },
+              ...admission,
             }, forceModalDecision);
             emitSubmitBus({
               strategy: 'none', attempts: 0, gated: false, forced: true,
@@ -1093,6 +1154,7 @@ function createSessionActions(shared, effects = {}) {
               hint: forceModalDecision.hint,
               pending: session.bootstrapQueue.length,
               forced: true,
+              ...immediateStage('queued'),
             }));
           }
           console.log(`[SUBMIT] force refused for ${id} — ${forceModalDecision.reason}`);
@@ -1106,8 +1168,10 @@ function createSessionActions(shared, effects = {}) {
             attempts: 0,
             gated: false,
             forced: true,
+            ...immediateStage('not_written'),
           });
         }
+        if (immediate) return respondImmediateSubmit(true);
         if (injectedBody) {
           (0, shared.markPendingReportSubmitStarted)(id, injectedBody);
         }
@@ -1172,6 +1236,7 @@ function createSessionActions(shared, effects = {}) {
           const op = (0, shared.parkOperationOnModal)(id, session, {
             type: 'submit',
             body: { ...(req.body || {}) },
+            ...admission,
           }, submitModalDecision);
           emitSubmitBus({
             strategy: 'none', attempts: 0, gated: true, forced: false,
@@ -1182,6 +1247,7 @@ function createSessionActions(shared, effects = {}) {
             reason: submitModalDecision.reason,
             hint: submitModalDecision.hint,
             pending: session.bootstrapQueue.length,
+            ...immediateStage('queued'),
           }));
         }
         console.log(`[SUBMIT] refused for ${id} — ${submitModalDecision.reason}`);
@@ -1195,8 +1261,10 @@ function createSessionActions(shared, effects = {}) {
           attempts: 0,
           gated: true,
           forced: false,
+          ...immediateStage('not_written'),
         });
       }
+      if (immediate) return respondImmediateSubmit(false);
 
       // ── Legacy escape-hatch path: blind pre-delay + retries (0.2.x behavior) ──
       if (gateOff) {

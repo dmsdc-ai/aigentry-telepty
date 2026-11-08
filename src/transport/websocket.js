@@ -11,6 +11,7 @@ const { applySshState, acceptSshWriteReceipt } = require('../ssh-session');
 const bridgeStage = require('../mailbox/bridge-stage');
 const inputPolicies = require('../mailbox/input-policy');
 const readinessHandshake = require('./readiness-handshake');
+const { bindImmediateSubmitCapability } = require('../mailbox/delivery-runtime');   // Task 1215 hotfix 0.10.1
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
 
@@ -417,6 +418,8 @@ function installWebSocketTransport(deps) {
       }
       // Task 1215 F2: this owner generation's spawn-readiness handshake starts empty.
       readinessHandshake.beginOwnerGeneration(activeSession, { capable: readinessHandshake.declaresCapability(req.headers[readinessHandshake.CAPABILITY_HEADER]) });
+      // Task 1215 hotfix 0.10.1: immediate-submit-v1 binds to THIS owner generation only (reset by every claim; old bridges never declare it).
+      bindImmediateSubmitCapability(activeSession, req.headers[readinessHandshake.CAPABILITY_HEADER]);
       activeSession.pendingHandoffCapability=null;
       if (activeSession.sshRemote) activeSession.sshState = { phase: 'connecting', generation: 0, reason: 'owner_changed', owner_generation: activeSession.interactionOwnerGeneration };
       markSessionConnected(activeSession);

@@ -6,6 +6,11 @@ what it reports back. Nothing here establishes that a model read, accepted or co
 
 ## Readiness (F1)
 
+> **0.10.1:** a ready or idle frame, output quiet, VT availability and the settle timer no longer
+> hold an inject. The bridge writes at once. Only a real modal, local typing, an exited child, a
+> handoff or a closed session hold it. This section describes 0.10.0 and still describes how the
+> first-ready fields of `bridge_queue` are computed. See *Immediate delivery and a single Enter* below.
+
 > Task 1215 repair: everything in this section is the **guarded worker's per-delivery interaction
 > guard** (withhold while busy, modal, permission prompt, composer not observed, or user typing).
 > It is not spawn readiness. Spawn readiness for every role is the authenticated transport
@@ -82,6 +87,154 @@ A session whose bridge has not reported in the current owner generation shows
   nothing is purged. A refused claim (4003) touches nothing.
 - Daemon ids are kept in the bridge's in-memory record index and in the dead-letter row. They are
   not written to `inbox.jsonl`/`state.jsonl`, whose strict custody schema does not admit them.
+
+## Immediate delivery and a single Enter (`immediate-submit-v1`, 0.10.1)
+
+**Bridge admission.** An authorized inject into a live, writable wrapped child is written at once,
+in order and exactly once. This holds while the CLI is working, thinking, streaming, loading or
+showing a frame no detector recognizes. Output, a busy marker, a missing composer, an unobserved
+first ready, VT being unavailable and the settle timer are not reasons to hold it. Queueing a
+message while the CLI is busy is left to the CLI's own input handling. These conditions still hold
+an inject, each with a `withheld` or `refused` receipt:
+
+- a real modal or permission prompt (`modal_ui`, guarded owners only)
+- the local user typing within 2 s (`user_input_recent`)
+- an exited child during restart (`child_restarting` / `child_exited`)
+- a pending handoff
+- a closed session
+- an unwritable child or owner transport.
+
+The TTL and dead-letter custody are unchanged.
+
+**Capability.** A 0.10.1 bridge adds `immediate-submit-v1` to the authenticated owner-claim header
+`x-telepty-bridge-capabilities`, alongside `input-transport-ready-v1`. The daemon binds it at the
+single place an owner generation is minted, so every claim resets it. It is honoured only for that
+generation and only with that generation's negotiated input-transport handshake. It is never
+inferred from a receipt or from timing. View: `GET /api/sessions/<sid>` → `transport.immediate_submit`
+(`supported` | `unsupported_by_bridge` | `not_applicable`).
+
+**`POST /api/sessions/<sid>/submit` on a supported session.** The request keeps every real fence:
+
+- closing session
+- protected input or external approval or handoff
+- ssh
+- the input-transport/bootstrap queue: an unwired child, plus FIFO behind parked work. This queue is bounded by `gate_timeout_ms` and then cancelled, so a cancelled op is never written later.
+- the modal gate (hold, park or refuse)
+- held interaction, the open owner socket and the current owner generation (re-checked at the write)
+
+Then it sends **exactly one** CR frame, stamped with the owner generation and, for a named inject, the `inject_id`
+and the `pair` of the body this daemon handed to the same generation (required since hotfix480, see below). These are skipped on this path: the prompt-symbol
+wait (8 s), the REPL-ready/busy-settle wait (10 s), the input-settle wait (1.2 s), the confirm retry
+loop, the queued redeliver, gate-off retries and the force CR gap. `force: true` takes the same
+single-attempt path and does **not** bypass the input-transport fence. Response:
+
+| `submit_stage` | HTTP | meaning |
+|---|---|---|
+| `sent_to_bridge` | 200 | the CR frame was handed to the current owner bridge. `pty_write: reported_by_bridge_receipt`, `consumption: unknown`, `submit_confirmed: false` |
+| `queued` | 200 | parked behind a real fence (`parked: surface_modal`); written once, in order, when it clears, or dropped with a recorded outcome |
+| `not_written` | 409/503/504 | refused, cancelled or flushed before any CR frame was sent |
+| `unknown` | 5xx | a queued op failed or timed out after its single write had started. Do not retry blindly. |
+
+`telepty inject --submit` prints that stage. It exits 0 for `sent_to_bridge` and `queued` and 1 for
+`not_written` and `unknown`. It never prints "gated-timeout" for this path and never suggests a forced Enter.
+
+**One Enter per message at the bridge.** The bridge admits at most one submit CR per `inject_id` and
+per `pair` in each owner generation. This covers repeated `/submit` calls, an older daemon's retries, and a
+paired CR followed by a terminal-level CR. The admitted CR's state is recorded before the write
+(`admitted` → `attempted` → `written`, or `unknown` if `child.write` threw, or `not_written` if it
+was refused or quarantined unwritten). A later CR for the same key is refused, not written, with
+reason `duplicate_submit:<that state>`. That receipt names only the later frame's own
+`daemon_msg_id`. It never relabels the earlier CR, so a written or unknown Enter is never reported as not
+written. A direct write that throws is receipted `unknown`/`write_threw` and is never retried. Id-less
+legacy CRs are never deduped and keep the adjacency refusals. Body→CR FIFO is unchanged.
+
+**Body custody before the Enter (hotfix480).** `inject --submit` can reach `/submit` while its body is
+still in the daemon mailbox: the delivery tick was already running, or an earlier message was ahead,
+because each tick dequeues one message per session. The daemon tracks every wrapped body from the
+moment it is queued until it leaves its custody. A named immediate CR whose body is still held is queued
+behind that exact body. It is released once, on that body's actual handoff to the owner, and the
+owner instance, the admitting generation and the pair are checked again. This is an event, not
+a poll, dwell, output or ready wait. It is bounded by `gate_timeout_ms`:
+
+- **Timeout.** The response is `not_written`/`body_custody_pending`, and the CR is never written later.
+- **Body leaves without a handoff.** If the body is withdrawn, dead-lettered, has an unknown outcome, or its session or owner
+  changed, the response is `not_written`/`body_not_handed`.
+
+An id-less immediate CR, such as a manual or legacy caller,
+waits the same way behind every body still held for the session, and it stays id-less. The same attempt
+runs on the direct path, forced or not, and on the queued/parked drain.
+
+**Terminal mailbox transitions end custody (hotfix492).** When the delivery engine's own TTL expiry
+(`expireStale`) or in-flight recovery (`recoverInflight`) moves messages of a session to a terminal state,
+every body still held for that session whose message is now terminal leaves custody at once:
+
+- `expired` was never handed, so a waiting named CR gets `not_written`/`body_not_handed`.
+- A `dead_letter` or purged message may be a recovered, fenced attempt whose write is unknown, so it gets
+  `not_written`/`body_outcome_unknown`. It is never reported as never written, and it is never replayed.
+- Bodies that are pending, in flight or retrying stay held.
+
+A manual id-less Enter is therefore not blocked by a body that can no longer be handed. No age, output or polling rule
+is involved, and the dead letter keeps its payload.
+
+**Modal re-check after the wait (hotfix492).** If the CR actually waited on its body, the modal decision that applies
+to this owner is asked again right before the single write. It keeps the owner policy: a user-supervised owner
+is never gated by the surface classifier, and `TELEPTY_MODAL_REMEDY=off` stays off.
+- On the `/submit` route, `park` parks the CR behind the modal (pinned, `queued`), and `hold`/`reject` answer 409
+  `SURFACE_MODAL` `not_written`.
+- A queued drain refuses `not_written` with the modal reason.
+
+**Pinned queued ops (hotfix480).** An op that `/submit` queues or parks on the immediate path records the
+owner generation and capability that admitted it. At drain, it is refused before any effect if
+the owner instance, generation or capability changed (`not_written`/`owner_generation_changed`). It never
+falls back to the legacy settle/confirm/retry branch. The stage of a failed queued op comes from its own
+progress: `not_written` while its single write has not started (cancelled, flushed, refused), and `unknown` once it has.
+A 504 alone is never read as "no Enter". A cancelled op is never written later.
+
+**A named inject never gets an id-less Enter (hotfix480, fail-closed).** An immediate CR for an
+`inject_id` is sent only together with the pair of a body that this daemon handed to the current owner
+generation. If that body went to another generation, the response is `not_written`/`owner_generation_changed`.
+If the daemon has no pair for it (never handed, or retired from the bounded history), the response is
+`not_written`/`submit_pair_unavailable` with `prior_submit: unknown`. That refusal covers this request
+only. It says nothing about an earlier Enter for the same inject, and nothing is replayed. Manual calls
+without an `inject_id` keep their own guards.
+
+**Lifetime and capacity (exact).**
+
+| state | where | bound | lifetime | on overflow |
+|---|---|---|---|---|
+| body custody | daemon, per session, in memory | 256 entries | from enqueue until the body is handed, leaves custody, or its mailbox message turns terminal | never evicted (hotfix492): a NEW wrapped inject is refused before it is queued, 503 `BODY_CUSTODY_FULL`, `bytes_written: 0`; accepted bodies keep their Enter |
+| pair history | daemon, per session, in memory | 256 entries | owner generation of the handoff | the oldest is dropped; a later named /submit for it is refused `submit_pair_unavailable` |
+| single-CR guard | bridge process, in memory | 4096 keys, 2 per message | the body's keys are entered as `open` when it arrives; the CR moves them to admitted/…/written | the oldest key is dropped, and its owner generation is marked; a named CR with no keys in a marked generation is refused `submit_guard_evicted` |
+
+Nothing is persisted. A daemon or bridge restart starts empty: there is no guarantee across a restart,
+and restart custody applies instead. The bridge remembers the marks of the 64 most recent generations.
+An old (0.10.0) daemon is not covered: its id-less CRs were never deduped.
+
+**Dropped duplicates are quiet.** At the bridge flush, a consecutive duplicate that is dropped prints no
+warning. It is still dead-lettered with its payload (`bridge_duplicate`/`not_written`) and receipted
+exactly as before. Stale/expired drops and write errors still warn and report.
+
+**Compatibility.**
+- New daemon with an old (0.10.0) bridge: `immediate_submit: unsupported_by_bridge`, and `/submit` keeps the
+legacy gated path and wording. That bridge still holds injects until it sees a ready prompt.
+- Old daemon with a new bridge: the bridge writes at once and dedupes, and the old daemon's `/submit` waits and retries as before. Its extra CRs for the same `inject_id` are refused at the bridge.
+- ssh, spawned, aterm and other unwrapped sessions are `not_applicable` and unchanged.
+
+**Records already queued before the upgrade (custody, no auto-replay).** A running bridge keeps
+the code it was started with. Records that a 0.10.0 bridge holds (for example `pending 2 / stalled /
+ready_unobserved`) stay in that bridge's queue until the user or controller restarts it. Restarting a
+bridge is an explicit operator act; this release does not do it. When a 0.10.1 bridge starts on that
+queue, it dead-letters every leftover record with its payload and `msg_id`. Pending records become
+`recovered_previous_bridge`/`not_written`, and in-flight ones become `recovered_in_flight_unknown`/`unknown`.
+They are never replayed, purged or acked. To reconcile, use the existing read-only views only:
+
+- `GET /api/sessions/<sid>` → `transport.bridge_queue` (current owner generation) and `transport.immediate_submit`
+- `telepty diagnose <sid> --inject-id <id>` → `messaging.input_written` / `submit_written`
+- the bridge's own `~/.aigentry/mailbox/bridge/<sid>/dead-letter.jsonl`, read only
+- the controller's custody record of the original instruction.
+
+Re-issuing is a new inject with a new `inject_id`. Never send a bare Enter for a record whose outcome
+is unknown. Do not hand-edit or purge a queue directory.
 
 ## Recipient input policy: user-supervised orchestrator vs guarded worker
 

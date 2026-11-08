@@ -179,7 +179,7 @@ let cachedAuthToken = null;
 // TELEPTY_AUTH_TOKEN for a client but not for the daemon produces a 401 that looks like a
 // credential bug; the variable is therefore documented (BOUNDARY.md) as something you set for
 // BOTH ends or neither, and never silently preferred at one end only.
-const { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken } = require('./src/cli/security-actions');
+const { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken, describeImmediateSubmit } = require('./src/cli/security-actions');
 const cliSecurity = createCliSecurityActions({
   get cachedAuthToken() { return cachedAuthToken; },
   get cachedPeerTokens() { return cachedPeerTokens; },
@@ -3375,7 +3375,7 @@ async function main() {
       }
       if (allowSessionClosed) return;
       const ownerSocket = new WebSocket(wsUrl, {headers:{...(ownerBearer ? {'x-telepty-session-token':ownerBearer} : {}),
-        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY, ...policyCapabilityHeaders(),
+        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', ' + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY, ...policyCapabilityHeaders(),
         ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
       const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
       daemonWs = ownerSocket;
@@ -4218,12 +4218,19 @@ async function main() {
           submitRes = null;
           submitData = null;
         }
+        // Task 1215 hotfix 0.10.1: a daemon on the immediate-submit path says what happened to the Enter
+        // (sent_to_bridge / queued / not_written / unknown). Print exactly that; never "gated-timeout".
+        const immediateOutcome = !lastError && submitRes
+          ? describeImmediateSubmit(submitRes.status, submitData, { injectId: data && data.inject_id }) : null;
         if (lastError) {
           console.error(`⚠️  Submit failed: ${lastError.message}`);
           // #840: the text landed but no turn fired, and nothing else will fire it. The caller
           // cannot claim this dispatch was delivered — dispatch.sh's non-zero arm records the
           // transport result as `unknown`, which is exactly the honest word for it.
           markCommandFailed();
+        } else if (immediateOutcome) {
+          if (immediateOutcome.failed) { console.error(immediateOutcome.text); markCommandFailed(); }
+          else console.log(immediateOutcome.text);
         } else if (submitRes && submitRes.ok) {
           const gateNote = submitData.gated && submitData.gate_wait_ms > 0
             ? ` [gate ${submitData.gate_wait_ms}ms]`

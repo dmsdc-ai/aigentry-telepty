@@ -236,7 +236,10 @@ test('#137 validator: every forged/stale/forbidden receipt shape is refused; gen
 
 // --- 2. bridge context behaviour -----------------------------------------------------------------
 
-test('#136 post-first-ready busy safety: after a drained ready, a busy frame gets no 5 s blind flush and no write', { timeout: 30000 }, async t => {
+// Task 1215 hotfix 0.10.1 (replaces the #136 post-first-ready busy safety assertion: busy frame -> no write, withheld
+// busy_indicator): a busy frame after a drained ready is output, not a modal. The second pair is written at once, exactly
+// once, and the compatibility 5 s blind flush is still never armed.
+test('#136 post-first-ready busy / hotfix: after a drained ready, a busy frame receives the next pair at once; no 5 s blind flush', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b137w-busy-after-ready' });
   b.feed(IDLE);
   await settleVt();
@@ -244,20 +247,22 @@ test('#136 post-first-ready busy safety: after a drained ready, a busy frame get
   b.injectFrame(first.body);
   b.injectFrame(first.submit);
   await b.clock.advance(3000);
-  assert.deepEqual(b.writes, ['FIRST-READY-BODY', '\r'], 'PRECONDITION: the first inject drained on a ready frame');
-  assert.equal(b.shared.firstReadyObserved, true, 'PRECONDITION: first ready observed');
+  assert.deepEqual(b.writes, ['FIRST-READY-BODY', '\r'], 'PRECONDITION: the first inject was written');
   b.feed(BUSY);
   await settleVt();
   const timersBefore = b.clock.calls.timeouts.length;
   const second = b.daemonInject('SECOND-WHILE-BUSY');
   b.injectFrame(second.body);
   b.injectFrame(second.submit);
+  const atOnce = b.writes.slice();
   await b.clock.advance(20000);
   assert.deepEqual({
+    atOnce,
     writes: b.writes,
     blindFlushTimers: b.clock.calls.timeouts.slice(timersBefore).filter(ms => ms === 5000).length,
     withheld: b.receipts(second.injectId, 'withheld').filter(r => r.msg.part === 'body').map(r => r.msg.reason),
-  }, { writes: ['FIRST-READY-BODY', '\r'], blindFlushTimers: 0, withheld: ['busy_indicator'] });
+  }, { atOnce: ['FIRST-READY-BODY', '\r', 'SECOND-WHILE-BUSY', '\r'],
+    writes: ['FIRST-READY-BODY', '\r', 'SECOND-WHILE-BUSY', '\r'], blindFlushTimers: 0, withheld: [] });
 });
 
 test('#136 exit custody: a destroying close dead-letters every undelivered record with its payload before clearing the queue', { timeout: 30000 }, async t => {
@@ -265,6 +270,7 @@ test('#136 exit custody: a destroying close dead-letters every undelivered recor
   const b = createBridge(t, { sid });
   b.feed(LOADING);
   const { injectId, body, submit } = b.daemonInject('EXIT-BODY');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(body);
   b.injectFrame(submit);
   // A record a previous process had in flight (outcome unknown).
@@ -290,6 +296,7 @@ test('#136 exit custody: a destroying close dead-letters every undelivered recor
 test('#136 exit custody fails closed: if a record cannot be dead-lettered, the queue is not purged', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b137w-exit-fail-closed' });
   const { body } = b.daemonInject('KEPT-BODY');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(body);
   b.shared.bridgeMailbox.withdraw = () => { throw new Error('synthetic withdraw failure'); };
   assert.equal(b.allow.closeAllowSession({ destroySession: true }), true);
@@ -300,7 +307,9 @@ test('#136 exit custody fails closed: if a record cannot be dead-lettered, the q
   }, { inbox: ['KEPT-BODY'], lastState: 'pending', dead: [] });
 });
 
-test('#136 kill switch: TELEPTY_BRIDGE_VT_READY=0 never weakens the gate (a known CLI on an idle frame is still not written)', { timeout: 30000 }, async t => {
+// Task 1215 hotfix 0.10.1 (replaces "the kill switch never weakens the gate: not written"): readiness is no longer a
+// gate at all, so the kill switch has nothing to weaken; it still reports vt disabled and arms no blind flush.
+test('#136 kill switch / hotfix: TELEPTY_BRIDGE_VT_READY=0 only disables the VT; a known CLI is written at once, no 5 s blind flush', { timeout: 30000 }, async t => {
   const saved = process.env.TELEPTY_BRIDGE_VT_READY;
   process.env.TELEPTY_BRIDGE_VT_READY = '0';
   t.after(() => { if (saved === undefined) delete process.env.TELEPTY_BRIDGE_VT_READY; else process.env.TELEPTY_BRIDGE_VT_READY = saved; });
@@ -312,7 +321,7 @@ test('#136 kill switch: TELEPTY_BRIDGE_VT_READY=0 never weakens the gate (a know
   b.injectFrame(submit);
   await b.clock.advance(20000);
   assert.deepEqual({ writes: b.writes, vt: b.allow.bridgeQueueSummary().vt, blindFlushTimers: b.clock.calls.timeouts.filter(ms => ms === 5000).length },
-    { writes: [], vt: 'disabled', blindFlushTimers: 0 });
+    { writes: ['KILL-SWITCH-BODY', '\r'], vt: 'disabled', blindFlushTimers: 0 });
 });
 
 // Task 1215 CI18 (Windows job 124591988699 @5914cc3): the submit's enqueue hit MAILBOX_LOCK_TIMEOUT and the
@@ -325,6 +334,7 @@ test('#136 kill switch under mailbox failure: a CR that cannot be queued behind 
   b.feed(IDLE);
   await settleVt();
   const { injectId, body, submit } = b.daemonInject('KILL-SWITCH-MAILBOX-BODY');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(body);
   assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: the body is queued, so the CR takes the queued branch');
   b.shared.bridgeMailbox.enqueue = () => { throw Object.assign(new Error('synthetic lock timeout'), { code: 'MAILBOX_LOCK_TIMEOUT' }); };
@@ -345,7 +355,7 @@ test('#136 kill switch under mailbox failure: a CR that cannot be queued behind 
 
 test('#136 lone submit: a CR whose body was quarantined unwritten is refused, not written alone', { timeout: 60000 }, async t => {
   const b = createBridge(t, { sid: 'b137w-lone-submit' });
-  b.feed(LOADING);
+  b.feed(MODAL); // Task 1215 hotfix 0.10.1: held by a true modal (a loading screen no longer withholds)
   await settleVt();
   const { injectId, body, submit } = b.daemonInject('LONE-SUBMIT-BODY');
   b.injectFrame(body);
@@ -360,7 +370,7 @@ test('#136 lone submit: a CR whose body was quarantined unwritten is refused, no
 test('#137 queue summary: the real VT feed and the bridge identity reach the bounded summary the heartbeat carries', { timeout: 30000 }, async t => {
   const identity = bridgeStage.bridgeIdentity(ROOT, require('../package.json').version);
   const b = createBridge(t, { sid: 'b137w-summary', identity });
-  b.feed(LOADING);
+  b.feed(MODAL); // Task 1215 hotfix 0.10.1: held by a true modal (a loading screen no longer withholds)
   await settleVt();
   b.injectFrame(b.daemonInject('SUMMARY-BODY').body);
   await b.clock.advance(16000);
@@ -371,7 +381,7 @@ test('#137 queue summary: the real VT feed and the bridge identity reach the bou
     digest: summary.bridge_code_digest === identity.bridge_code_digest && /^[a-f0-9]{64}$/.test(summary.bridge_code_digest),
     bytes: Buffer.byteLength(JSON.stringify(summary)) <= bridgeStage.QUEUE_MAX_BYTES,
     payloadFree: !JSON.stringify(summary).includes('SUMMARY-BODY'),
-  }, { valid: true, vt: 'available', phase: 'stalled', pending: 1, reason: 'first_ready_unobserved', digest: true, bytes: true, payloadFree: true });
+  }, { valid: true, vt: 'available', phase: 'stalled', pending: 1, reason: 'modal_ui', digest: true, bytes: true, payloadFree: true });
 });
 
 // --- 2b. task 1215 role split: user-supervised orchestrator vs guarded worker --------------------
@@ -472,6 +482,7 @@ test('#1215 C1 kill switch: a BODY whose enqueue fails is refused unwritten and 
   await settleVt();
   const { injectId, body, submit } = b.daemonInject('KILL-SWITCH-BODY-FAIL');
   const calls = failEnqueue(b);
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(body);
   assert.equal(calls.enqueue, 1, 'PRECONDITION: the gate is closed, so the body reached the enqueue');
   assert.equal(b.shared.bridgePendingCount, 0, 'PRECONDITION: the failed body is not counted, so the CR takes the direct path');
@@ -524,6 +535,7 @@ test('#1215 C2 guarded MODAL: a SUBMIT whose enqueue fails behind its queued bod
 test('#1215 R2 pair integrity: queued body, refused submit, gate reopens, second inject — the next submit carries only its own body', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1215-r2-glue' });
   const first = b.daemonInject('R2-BODY-ONE');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(first.body);
   assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: no ready yet, so body one is queued');
   const realEnqueue = b.shared.bridgeMailbox.enqueue;
@@ -553,6 +565,7 @@ test('#1215 R2 pair integrity: queued body, refused submit, gate reopens, second
 test('#1215 R2 hold: while the mailbox keeps failing, the body of a refused submit is held across ticks and a reopened gate, never written', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1215-r2-held' });
   const { injectId, body, submit } = b.daemonInject('R2-HELD-BODY');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(body);
   assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: no ready yet, so the body is queued');
   const mailbox = b.shared.bridgeMailbox;
@@ -580,6 +593,7 @@ test('#1215 R2 neighbours: only the refused submit\'s own body is withdrawn; an 
   const b = createBridge(t, { sid: 'b1215-r2-neighbour' });
   const a = b.daemonInject('R2-PAIR-A');
   const c = b.daemonInject('R2-PAIR-B');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(a.body);
   b.injectFrame(a.submit);
   b.injectFrame(c.body);
@@ -592,6 +606,7 @@ test('#1215 R2 neighbours: only the refused submit\'s own body is withdrawn; an 
   await settleVt();
   await b.clock.advance(3000);
   const legacy = createBridge(t, { sid: 'b1215-r2-neighbour-legacy' });
+  legacy.shared.lastUserInputTime = legacy.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   for (const data of ['LEGACY-A', '\r', 'LEGACY-B']) legacy.injectFrame({ type: 'inject', data }); // an old daemon sends no ids
   assert.equal(legacy.shared.bridgePendingCount, 3, 'PRECONDITION: legacy pair A and body B are queued');
   const legacyEnqueue = legacy.shared.bridgeMailbox.enqueue;
@@ -622,6 +637,7 @@ const promptOnlyRegistry = { ...registry, isKnownAiCli: () => false };
 test('#1215 O1 in-flight order: a CR arriving while its flushed body is still on a delivery timer is chained after it, never written first', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1215-o1-inflight', readyRegistry: promptOnlyRegistry });
   const { injectId, body, submit } = b.daemonInject('O1-BODY');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(body);
   assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: no prompt yet, so the body is queued');
   b.feed('fixture $ '); // the prompt: onReady flushes the body onto a delivery timer that has not fired yet
@@ -640,6 +656,7 @@ test('#1215 O1 neighbours: with an earlier pair and the next body in one flushed
   const b = createBridge(t, { sid: 'b1215-o1-neighbours', readyRegistry: promptOnlyRegistry });
   const a = b.daemonInject('O1-PAIR-A');
   const c = b.daemonInject('O1-PAIR-B');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(a.body);
   b.injectFrame(a.submit);
   b.injectFrame(c.body);
@@ -671,6 +688,7 @@ test('#1215 O1 control: with nothing pending or in flight, an ordinary pair is s
 // real #720 batch filter (consecutive-duplicate CR drop) is not what decides them; the pairing branch is.
 test('#1215 O2 legacy: an id-less CR whose id-less body was refused behind another queued body is refused, so it never submits that other body', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1215-o2-legacy' });
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame({ type: 'inject', data: 'O2-LEGACY-A' }); // an old daemon sends no ids; A's own CR comes later
   assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: legacy body A is queued');
   const realEnqueue = b.shared.bridgeMailbox.enqueue;
@@ -694,6 +712,7 @@ test('#1215 O2 control (current ids): a refused body\'s CR with ids, queued behi
   const b = createBridge(t, { sid: 'b1215-o2-ids' });
   const a = b.daemonInject('O2-IDS-A');
   const c = b.daemonInject('O2-IDS-B');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the queue is held by local typing (a not-ready/loading screen no longer holds it)
   b.injectFrame(a.body);
   assert.equal(b.shared.bridgePendingCount, 1, 'PRECONDITION: body A is queued; its submit comes later');
   const realEnqueue = b.shared.bridgeMailbox.enqueue;
