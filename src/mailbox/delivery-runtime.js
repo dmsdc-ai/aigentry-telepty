@@ -985,7 +985,7 @@ function createDeliveryRuntime(shared, {
     const body = maybeBracketedPaste(prompt, session);
     // Task 1215: deliveries that waited for the transport handshake keep their frame ids, so the
     // bridge can receipt them and can refuse a submit whose body it never wrote (pair).
-    const bodyMeta = { daemon_msg_id: `bootstrap:${op.op_id}`, inject_id: op.injectId || null, part: 'body' };
+    const bodyMeta = { daemon_msg_id: `bootstrap:${op.op_id}`, inject_id: op.injectId || op.pairInjectId || null, part: 'body' };
     const textResult = await shared.writeDataToSession(sessionId, session, body, { frameMeta: bodyMeta });
     // #860 F2 — a failure here is reported back with the byte count that actually landed, because
     // the caller records it in the ledger. The two arms differ: nothing was written when the BODY
@@ -993,7 +993,7 @@ function createDeliveryRuntime(shared, {
     // that stamped `bytes_written: 0` on that one would be the same defect it exists to close.
     if (!textResult.success) return { ...textResult, bytes_written: 0 };
     // Task 1215 hotfix 0.10.1: a later immediate /submit for this inject names this body as its pair.
-    if (op.noEnter && session.type === 'wrapped') rememberSubmitPair(session, op.injectId, bodyMeta.daemon_msg_id);
+    if (op.noEnter && session.type === 'wrapped') rememberSubmitPair(session, op.injectId || op.pairInjectId, bodyMeta.daemon_msg_id);
 
     if (!op.noEnter) {
       await sleep(shared.WRAPPED_SUBMIT_DELAY_MS);

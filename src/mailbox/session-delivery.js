@@ -481,6 +481,7 @@ function createSessionDeliveryContext({
         // and the ledger part company — the route returns, and whatever this queue eventually does
         // with the op is the only thing left that can answer for it.
         injectId: options.injectId || null,
+        pairInjectId: options.pairInjectId || null,   // Task 1215 519: pair bookkeeping only
         options: {
           source: options.source || 'inject',
           from: options.from || 'daemon'
@@ -532,6 +533,7 @@ function createSessionDeliveryContext({
           prompt,
           noEnter: !!options.noEnter,
           injectId: options.injectId || null,     // #860 F2 — see the bootstrap-queue push above
+          pairInjectId: options.pairInjectId || null,
           options: { source: options.source || 'inject', from: options.from || 'daemon' },
         }, injectParkDecision);
         await parkTrackedInjection(options.injectId, 'bootstrap_queue', injectParkDecision.reason);   // #1207 durable before ack
@@ -677,8 +679,8 @@ function createSessionDeliveryContext({
       if (QUEUE_DIAG) markQueueDiag(barrier, 'enqueue_done');
       const immediate = { result: null }; immediateAttempts.set(msgId, immediate);
       if (QUEUE_DIAG) immediate.barrier = barrier;
-      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || null });
-      if (session.type === 'wrapped') holdBodyCustody(session, msgId, options.injectId || null);   // hotfix480 F1
+      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || options.pairInjectId || null });
+      if (session.type === 'wrapped') holdBodyCustody(session, msgId, options.injectId || options.pairInjectId || null);   // hotfix480 F1
       // Registered synchronously after the enqueue: no tick can run in between.
       const owesSubmit = !options.noEnter && session.type !== 'aterm';
       const waitsForText = owesSubmit || session.type === 'aterm';

@@ -993,3 +993,60 @@ test('492 N2 daemon: a USER-SUPERVISED owner keeps its policy — a modal-lookin
   assert.deepEqual({ response: [s.response.status, s.response.body.submit_stage], order: injectFrames(ws).map(f => (f.data === '\r' ? 'CR' : 'BODY')) },
     { response: [200, 'sent_to_bridge'], order: ['BODY', 'CR'] });
 });
+
+// 519 A (RED on 511: 503 not_written submit_pair_unavailable, 0 CR) — the public `telepty inject --submit <sid> <text>` WITHOUT
+// --from is an UNTRACKED inject. The daemon returns its inject_id and hands the body to the current owner, so /submit with that
+// id must get ONE CR paired to that body. Controls stay refused with no CR: an id never issued, another session's id, the same
+// id after an owner-generation change. A /submit without inject_id stays the legacy id-less CR (no pair attached).
+async function untrackedInject(sid, prompt) {
+  const r = await H.call('/api/sessions/:id/inject', sid, { prompt, no_enter: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(r.status, 200, `PRECONDITION: untracked inject accepted ${JSON.stringify(r.body)}`);
+  assert.match(String(r.body.inject_id), /^[a-f0-9-]{36}$/, 'PRECONDITION: inject_id returned to the caller');
+  return r.body.inject_id;
+}
+const bodyFramesOf = (ws, text) => ws.frames.filter(f => f.type === 'inject' && f.part === 'body' && String(f.data).includes(text));
+const crSummary = s => ({ status: s.response.status, stage: s.response.body.submit_stage, reason: s.response.body.reason ?? null,
+  consumption: s.response.body.consumption ?? null, confirmed: s.response.body.submit_confirmed ?? null,
+  crs: s.crFrames().map(f => [f.inject_id ?? null, f.pair ?? null]) });
+const REFUSED = reason => ({ status: 503, stage: 'not_written', reason, consumption: null, confirmed: null, crs: [] });
+
+test('519 A daemon: an UNTRACKED inject + /submit with its returned inject_id gets ONE paired CR; wrong, other-session and cross-generation ids are refused; no id stays id-less', { timeout: 30000 }, async () => {
+  const sid = 'd519-untracked';
+  const session = H.registerSession(sid);
+  const injectId = await untrackedInject(sid, 'D519 body');
+  const body = bodyFramesOf(session.ownerWs, 'D519 body');
+  const ok = await H.submit(sid, { injected_body: 'D519 body', retries: 0, inject_id: injectId });
+  const wrong = await H.submit(sid, { injected_body: 'D519 body', retries: 0, inject_id: crypto.randomUUID() });
+  H.registerSession('d519-other');
+  const otherId = await untrackedInject('d519-other', 'D519 other body');
+  const other = await H.submit(sid, { injected_body: 'D519 other body', retries: 0, inject_id: otherId });
+  const idless = await H.submit(sid, { injected_body: 'D519 body', retries: 0 });
+  H.claimOwner(session, H.ownerSocket(), { supervised: true });
+  H.negotiate(session, { capable: true, header: CAPABILITY_HEADER_VALUE });
+  H.transportReady(session);
+  const crossGen = await H.submit(sid, { injected_body: 'D519 body', retries: 0, inject_id: injectId });
+  assert.deepEqual({ bodyIds: body.map(f => f.inject_id ?? null), ok: crSummary(ok), wrong: crSummary(wrong), other: crSummary(other),
+    idless: crSummary(idless), crossGen: crSummary(crossGen) }, {
+    bodyIds: [injectId],
+    ok: { status: 200, stage: 'sent_to_bridge', reason: null, consumption: 'unknown', confirmed: false, crs: [[injectId, body[0] && body[0].daemon_msg_id]] },
+    wrong: REFUSED('submit_pair_unavailable'), other: REFUSED('submit_pair_unavailable'),
+    idless: { status: 200, stage: 'sent_to_bridge', reason: null, consumption: 'unknown', confirmed: false, crs: [[null, null]] },
+    crossGen: REFUSED('owner_generation_changed'),
+  });
+});
+
+test('519 A daemon bootstrap path: an UNTRACKED inject queued before the transport handshake is paired when the drain hands its body; its /submit gets ONE paired CR', { timeout: 30000 }, async () => {
+  const sid = 'd519-bootstrap';
+  const session = H.registerSession(sid, { ready: false });
+  const injectId = await untrackedInject(sid, 'D519 queued body');
+  assert.equal(bodyFramesOf(session.ownerWs, 'D519 queued body').length, 0, 'PRECONDITION: queued behind the transport handshake');
+  H.transportReady(session);
+  for (let i = 0; i < 40 && bodyFramesOf(session.ownerWs, 'D519 queued body').length === 0; i++) await sleep(50);
+  const body = bodyFramesOf(session.ownerWs, 'D519 queued body');
+  const ok = await H.submit(sid, { injected_body: 'D519 queued body', retries: 0, inject_id: injectId });
+  assert.deepEqual({ bodyIds: body.map(f => [f.inject_id ?? null, String(f.daemon_msg_id).startsWith('bootstrap:')]), ok: crSummary(ok) }, {
+    bodyIds: [[injectId, true]],
+    ok: { status: 200, stage: 'sent_to_bridge', reason: null, consumption: 'unknown', confirmed: false, crs: [[injectId, body[0] && body[0].daemon_msg_id]] },
+  });
+});

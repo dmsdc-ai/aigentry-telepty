@@ -1026,7 +1026,14 @@ const BOOTSTRAP_WIN32_SKIP = process.platform === 'win32'
   : false;
 
 // Task 1215 (511): the fake claude's composer frame, i.e. its own application-ready signal (not the welcome line).
-const FAKE_CLAUDE_COMPOSER = /─{16}\r?\n❯\r?\n─{16}/;
+const FAKE_CLAUDE_COMPOSER = /─{16}\n❯\n─{16}/;
+// Task 1215 (519 B): the fixture writes LF; its node-pty slave hands cli.js CRLF, and cli.js writes that to the outer test PTY,
+// whose output processing may add another CR (CR CR LF). Only output line endings are normalised (one or more CR before LF);
+// a bare CR, the welcome line or a near-miss frame never match (see the matcher control below).
+const termLines = (text) => text.replace(/\r+\n/g, '\n');
+const composerSeen = (text) => FAKE_CLAUDE_COMPOSER.test(termLines(stripAnsi(text)));
+// 519 B: on an existing composer-wait failure only, the last 600 chars of the PTY output, JSON-escaped (measurement owed).
+const withOutputTail = (output) => (error) => { try { if (error instanceof Error) error.message += ` | [telepty-diag] pty_tail ${JSON.stringify(String(output()).slice(-600))}`; } catch { /* never replaces the failure */ } throw error; };
 const readDiscarded = (file) => (fs.existsSync(file)
   ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)).join('') : '');
 
@@ -1047,12 +1054,12 @@ test('telepty allow early transport: body + ONE Enter reach a still-starting fak
       const rd = body && body.transport && body.transport.readiness;
       return rd && rd.input_transport_ready && rd.input_transport_ready.status === 'observed';
     }, { timeoutMs: 7000, description: 'input transport ready (transport only; the application has not drawn its composer)' });
-    assert.equal(FAKE_CLAUDE_COMPOSER.test(stripAnsi(output)), false, 'PRECONDITION: no composer before the early inject');
+    assert.equal(composerSeen(output), false, 'PRECONDITION: no composer before the early inject');
 
     const early = await harness.runCli(['inject', '--submit', sessionId, 'early-token'], { timeoutMs: 10000 });
     assert.equal(early.code, 0, early.stderr);
     await waitFor(() => /[\r\n]/.test(readDiscarded(discardLog)), { timeoutMs: 10000, description: 'early body + Enter at the child before its composer' });
-    await waitFor(() => FAKE_CLAUDE_COMPOSER.test(stripAnsi(output)), { timeoutMs: 10000, description: 'composer drawn after the early input' });
+    await waitFor(() => composerSeen(output), { timeoutMs: 10000, description: 'composer drawn after the early input' }).catch(withOutputTail(() => output));
     const discardedAtComposer = readDiscarded(discardLog);
 
     // The follow-up through the public API, after the composer: the only submit this application accepts.
@@ -1076,7 +1083,7 @@ test('telepty allow early transport: body + ONE Enter reach a still-starting fak
         /consumption=consumed|— consumed as a new turn/.test(early.stdout)],
       api: [submit.status, submit.body.submit_stage, submit.body.consumption, submit.body.submit_confirmed],
       submits: countOccurrences(normalized, 'SUBMIT:'),
-      accepted: /SUBMIT:\u001b\[200~follow-token\u001b\[201~\r?\n/.test(normalized),
+      accepted: /SUBMIT:\u001b\[200~follow-token\u001b\[201~\n/.test(termLines(normalized)),
     }, {
       discarded: `${EARLY}\n`, earlyBodies: 1, enters: 1, discardedLater: true,
       cli: [true, true, false],
@@ -1109,7 +1116,8 @@ test('telepty allow first instruction: a caller that waits once for the fake cla
       timeoutMs: 7000,
       description: 'fake claude registered'
     });
-    await waitFor(() => FAKE_CLAUDE_COMPOSER.test(stripAnsi(output)), { timeoutMs: 10000, description: 'fake claude composer (caller bootstrap, once)' });
+    await waitFor(() => composerSeen(output), { timeoutMs: 10000, description: 'fake claude composer (caller bootstrap, once)' })
+      .catch(withOutputTail(() => output));
 
     const inject = await harness.runCli(['inject', sessionId, 'dispatch-token'], { timeoutMs: 10000 });
     assert.equal(inject.code, 0, inject.stderr);
@@ -1129,6 +1137,17 @@ test('telepty allow first instruction: a caller that waits once for the fake cla
   } finally {
     cli.kill();
   }
+});
+
+// Task 1215 (519 B) pure matcher control: the composer frame is accepted with LF, CRLF and nested-PTY CR-CR-LF line endings
+// only; a bare CR, a 15-dash rule, the welcome prompt line and a composer row with text are near misses that never match.
+test('519 B matcher control: fake claude composer matches LF / CRLF / CR-CR-LF frames and rejects near misses', () => {
+  const rule = '─'.repeat(16);
+  const frame = (eol) => `welcome${eol}${rule}${eol}❯${eol}${rule}${eol}`;
+  assert.deepEqual(['\n', '\r\n', '\r\r\n'].map((eol) => composerSeen(frame(eol))), [true, true, true]);
+  const nearMiss = [frame('\r'), `${'─'.repeat(15)}\n❯\n${rule}\n`, 'Claude welcome\r\n❯ welcome input\r\n', `${rule}\r\n❯ typed\r\n${rule}\r\n`];
+  assert.deepEqual(nearMiss.map(composerSeen), [false, false, false, false]);
+  assert.deepEqual([termLines('a\r\r\nb\r\nc\nd\re'), termLines('SUBMIT:x\r\r\n')], ['a\nb\nc\nd\re', 'SUBMIT:x\n']);
 });
 
 function spawnAllowFakeClaude(sessionId, fakeClaude) {

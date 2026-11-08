@@ -1669,6 +1669,8 @@ function createSessionActions(shared, effects = {}) {
           // #860 F2 — carried so that a park keeps its link to the write-ahead record. Null for an
           // untracked operator inject (no `from`), and every consumer of it no-ops on null.
           injectId: trackedRecord ? inject_id : null,
+          // Task 1215 519: the inject_id returned to THIS caller names its body pair even when untracked (no ledger use).
+          pairInjectId: inject_id,
           // #47 P4 — the daemon-verified sender (never body.from) labels the provenance banner.
           verifiedSenderSid
         });
