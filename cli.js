@@ -3040,6 +3040,7 @@ async function main() {
     // current owner generation (owner_token). Anything else, including a disconnect, is guarded.
     let inputPolicy = 'guarded';
     let allowSessionClosed = false;
+    let exitStarted = false;   // hotfix523: exactly one exit, with the first code
     let cleanupTerminal = () => {};
     const allowSignalHandlers = new Map();
     // #137: identity of the code this bridge actually loaded — read once, at bridge start.
@@ -3651,7 +3652,6 @@ async function main() {
     // belong to somebody else, so neither is ours to discard.
 
 
-    let exitStarted = false;   // hotfix523: exactly one exit, with the first code
     function exitAllowSession(code, exitCtx) {
       if (exitStarted) return;
       exitStarted = true;
