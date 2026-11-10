@@ -40,7 +40,7 @@ function diagnostic(probe, self) {
 // duplicate, malformed, out-of-range or non-milestone records never re-arm it. Bound: at most floor(iterations / 10)
 // re-arms, so a worker is given at most (floor(iterations / 10) + 1) × stallMs in total — 50 s for 40 iterations.
 const PROGRESS_PREFIX = 'lock-diag ', PROGRESS_EVERY = 10;
-function progressGuard(iterations) {
+function progressGuard(iterations, kind = 'progress') {
   let pending = '', last = -1;
   const milestones = Math.floor(iterations / PROGRESS_EVERY);
   return {
@@ -53,7 +53,7 @@ function progressGuard(iterations) {
         const line = raw.replace(/\r$/, '');
         if (!line.startsWith(PROGRESS_PREFIX)) continue;
         let record; try { record = JSON.parse(line.slice(PROGRESS_PREFIX.length)); } catch { continue; }
-        const i = record && record.kind === 'progress' ? record.iteration : undefined;
+        const i = record && record.kind === kind ? record.iteration : undefined;
         if (!Number.isSafeInteger(i) || i < 0 || i >= iterations || (i + 1) % PROGRESS_EVERY !== 0 || i <= last) continue;
         last = i; advanced++;
       }
@@ -61,10 +61,11 @@ function progressGuard(iterations) {
     },
   };
 }
+const guardFor = (mode, iterations) => mode === 'sweep' ? progressGuard(iterations, 'sweep_tick') : progressGuard(mode === 'contend' ? iterations : 0);
 function worker(t, dir, mode, iterations = 1, probe = () => ({}), { stallMs = 10000 } = {}) {
   const forked = performance.now();
   const child = fork(path.join(__dirname, '../test-support/mailbox-lock-worker.js'), [dir, mode, String(iterations)], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
-  const guard = progressGuard(mode === 'contend' ? iterations : 0);
+  const guard = guardFor(mode, iterations);
   let output = '', onProgress = null;
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', b => { output += b; if (guard.feed(b) > 0 && onProgress) onProgress(); });
@@ -143,7 +144,7 @@ test('#1215 guard control: only valid, strictly advancing milestone records coun
   assert.equal(g.feed(rec({kind: 'progress', iteration: 39})), 1);
   assert.equal(g.last, 39);
   assert.equal(g.feed(rec({kind: 'progress', iteration: 39})), 0, 'no record re-arms after the last milestone');
-  assert.equal(progressGuard(1).milestones, 0, 'non-contend workers get exactly one stall window');
+  assert.equal(progressGuard(1).milestones, 0, 'hold and choose workers get exactly one stall window');
 });
 test('#1215 guard negative control: a real worker that stops making progress is rejected within its own stall window', async t => {
   const {root, dir} = fixture(t), stallMs = 500;
@@ -668,7 +669,8 @@ for (const kind of ['symlink', 'hardlink']) test(`[1215-red141] control: a ${kin
 // A sweep worker is given progressGuard(0): it carries NO milestones, so its 10 s timer is a whole-work budget that no
 // stderr line re-arms. Neither the existing `sweep` lines nor the diagnostic `sweep_tick` / `sweep_done` lines are progress,
 // so the "(last milestone -1)" a sweep timeout reports is the budget's expiry, not a lost or rejected milestone.
-test('[win164] a sweep worker carries no milestones: no sweep, sweep_tick or sweep_done record re-arms its guard', () => {
+// fix664 (option A) supersedes this for the sweep worker: guardFor('sweep', n) re-arms on each advancing `sweep_tick`; progressGuard(0) stays the hold/choose guard.
+test('[win164] a milestone-free guard (hold/choose; the pre-fix664 sweeper): no sweep, sweep_tick or sweep_done record re-arms it', () => {
   const g = progressGuard(0), rec = value => `${PROGRESS_PREFIX}${JSON.stringify(value)}\n`;
   assert.equal(g.milestones, 0, 'one budget of (0 + 1) x stallMs, never re-armed');
   for (const record of [{ kind: 'sweep', iteration: 49 }, { kind: 'sweep_tick', iteration: 9 }, { kind: 'sweep_done', iteration: 349 },
@@ -676,4 +678,10 @@ test('[win164] a sweep worker carries no milestones: no sweep, sweep_tick or swe
     assert.equal(g.feed(rec(record)), 0, `${record.kind} is not a sweep milestone`);
   }
   assert.equal(g.last, -1);
+});
+test('[fix664] the actual selector re-arms a sweeper only on valid, strictly advancing sweep_tick records, at most floor(n / 10) times', () => {
+  const g = guardFor('sweep', 350), rec = (kind, iteration) => `${PROGRESS_PREFIX}${JSON.stringify({kind, iteration})}\n`, ticks = Array.from({length: 35}, (_, k) => rec('sweep_tick', 10 * k + 9)).join('');
+  assert.equal(g.feed(rec('sweep_tick', 9)), 1, 'an advancing sweeper tick re-arms the actual sweep guard');
+  assert.equal(g.feed([['sweep_tick', 9], ['sweep_tick', 344], ['sweep_tick', 359], ['sweep_tick', '349'], ['sweep', 349], ['progress', 349], ['sweep_done', 349]].map(r => rec(...r)).join('') + ticks + ticks), 34, 'duplicate, mid-chunk, out-of-range, non-integer and unrelated records never re-arm; a repeated (decreasing) flood re-arms once per remaining milestone');
+  assert.deepEqual([g.milestones, g.last, guardFor('contend', 40).milestones, guardFor('hold', 1).milestones, guardFor('choose', 1).milestones], [35, 349, 4, 0, 0], '(35 + 1) x stallMs = 360000 ms for 350 sweeps');
 });
