@@ -306,8 +306,7 @@ function createLedgerClient(options = {}) {
   }
   function rebuildAdmittedJobs() {
     // admitted_jobs = hot tracked records; existing reservations for ids no longer hot are kept
-    // (their terminal may still be inflight / unresolved). Over-cap keeps everything and refuses
-    // new begins until below cap (status names over_cap).
+    // (their terminal may still be inflight / unresolved). #1273: there is no admitted-jobs cap.
     for (const r of C.readModel.records.values()) if (r.tracking_state === 'tracked') accounting.reserveJob(r.inject_id);
   }
   function applyEffects(effects) {
@@ -329,6 +328,9 @@ function createLedgerClient(options = {}) {
       applyEffects(m.effects);
       if (inflight.kind === 'iact' && inflight.delta) { C.readModel.actions.set(inflight.delta.action.action_id, inflight.delta.action); if (inflight.delta.pending) C.readModel.pending.set(inflight.delta.pending.inject_id, inflight.delta.pending); }
       if (inflight.kind === 'state') accounting.releaseJob(inflight.id);
+      // #1273 — a record that became terminal in this durable group (a begin's supersession of the
+      // session's previous tracked record) releases its job exactly as its own terminal ACK would.
+      for (const e of m.effects || []) if (F.TERMINAL_STATES.includes(e.tracking_state)) accounting.releaseJob(e.id);
     }
     if (m.result === 'already_terminal' && inflight.kind === 'state') accounting.releaseJob(inflight.id);
     inflight.resolve({ outcome: 'ack', txn: m.txn, seq: m.seq, epoch: m.epoch, result: m.result, basis: m.basis, entry: m.entry || null, record_state: m.record_state || null,
@@ -343,7 +345,18 @@ function createLedgerClient(options = {}) {
       inflight.resolve({ outcome: 'rejected_admission', txn: m.txn, class: inflight.class, reason: m.reason, resident: m.resident || null, owner: true });
       return;
     }
-    inflight.resolve({ outcome: 'nack', txn: m.txn, reason: m.reason, code: m.code || null, tracking_state: m.tracking_state || null });
+    const nacked = { outcome: 'nack', txn: m.txn, reason: m.reason, code: m.code || null, tracking_state: m.tracking_state || null };
+    // #1273 — residency relief may demote a record between a caller's ensureHot() and its write; the
+    // owner then nacks `record_cold` BEFORE any persistence attempt. Reheat it through ensureHot() (the
+    // same job reservation and resident admission as any write) and resubmit the SAME delta once; any
+    // other outcome is answered as is. Indeterminate / unresolved outcomes are never retried.
+    if (m.reason === 'record_cold' && (inflight.kind === 'obs' || inflight.kind === 'state') && inflight.id && !inflight.coldRetried) {
+      ensureHot(inflight.id)
+        .then((hot) => (hot.ok ? submit(inflight.kind, inflight.delta, { class: inflight.class, jobId: inflight.jobId, coldRetried: true }) : nacked))
+        .then(inflight.resolve, () => inflight.resolve(nacked));
+      return;
+    }
+    inflight.resolve(nacked);
   }
   function resolveIndeterminate(txn, inflight, reason, group = null) {
     C.inflight.delete(txn);
@@ -401,7 +414,7 @@ function createLedgerClient(options = {}) {
     }
     if (!admitted.ok) return Promise.resolve({ outcome: 'rejected_admission', txn, class: admitted.class || cls, reason: admitted.reason, detail: admitted.detail || null });
     return new Promise((resolve) => {
-      C.inflight.set(txn, { kind, class: admitted.class || cls, bytes: admitted.bytes || bytes, jobId, reserved: admitted.reserved === true, resolve, id: delta.id || null, startedAt: now(), delta });
+      C.inflight.set(txn, { kind, class: admitted.class || cls, bytes: admitted.bytes || bytes, jobId, reserved: admitted.reserved === true, resolve, id: delta.id || null, startedAt: now(), delta, coldRetried: opts.coldRetried === true });
       postToOwner({ type: 'submit', txn, class: admitted.class || cls, kind, delta, bytes });
       syncLoopRef();
     });
@@ -488,7 +501,7 @@ function createLedgerClient(options = {}) {
     const acct = accounting.status();
     return { store: C.state, reason: C.reason, detail: C.reasonDetail, epoch: C.epoch, healthy: isHealthy(), lock: { path: lockPath, held: C.lockHeld, durability_pending: !!C.lockDurable, pid: C.pid, contents: C.lockInfo && C.lockInfo.contents ? C.lockInfo.contents : null },
       counts: C.counts, resident: C.resident, recovery: C.recovery, read_model: { records: C.readModel.records.size, actions: C.readModel.actions.size, pending: C.readModel.pending.size },
-      inflight: C.inflight.size, accounting: acct, over_cap: acct.admitted_jobs > F.R_MAX_JOBS, unresolved: [...C.unresolved.entries()].slice(0, 64).map(([txn, u]) => ({ txn, ...u })), unresolved_count: C.unresolved.size,
+      inflight: C.inflight.size, accounting: acct, unresolved: [...C.unresolved.entries()].slice(0, 64).map(([txn, u]) => ({ txn, ...u })), unresolved_count: C.unresolved.size,
       resolved_count: C.resolved.size, last_indeterminate: C.lastIndeterminate, respawns: C.respawns.length, dir, legacyPath };
   }
   function close(deadlineMs = 2000) {

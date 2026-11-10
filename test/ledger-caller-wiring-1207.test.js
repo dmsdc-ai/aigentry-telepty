@@ -205,25 +205,27 @@ test('F1/F3/F4 (1 MiB tier; 64 MiB opt-in): per-event owner bytes <= 16 KiB and 
 // and production specifies no precedence between them, so each condition now has a fixture that
 // isolates it; no assertion accepts "either reason".
 
-test('C2: reject BEFORE accept — at R_MAX the real handler answers 503 TRACKING_CAPACITY tracking_capacity_exhausted with 0 deliveries; the reserved terminal of an existing job still commits', () => withStore(async (s) => {
+// #1273 — C2 now pins the REMOVAL of the admitted-jobs ceiling: 512 open job reservations no longer
+// refuse a begin (the former R_MAX_JOBS gate); reject-before-accept for genuine conditions is E5 below.
+test('C2 (#1273): 512 open job reservations do NOT refuse a begin — the real handler answers 200 and delivers once; the reserved terminal of an existing job still commits', () => withStore(async (s) => {
   const R = recorders();
   const { runtime, handler, ledgerClient } = buildShared(s, R);
   assert.equal((await runtime.restoreTrackedInjections()).ok, true);
   const first = makeRes(); await handler(makeReq('first'), first); assert.equal(first.statusCode, 200);
-  // fill the admitted-jobs cap with reservations (the accounting is the real one)
-  for (let i = ledgerClient.accounting.status().admitted_jobs; i < F.R_MAX_JOBS; i++) assert.equal(ledgerClient.accounting.reserveJob(`cap-${i}`).ok, true);
-  const res = makeRes(); await handler(makeReq('one too many'), res);
-  assert.equal(res.statusCode, 503); assert.equal(res.body.code, 'TRACKING_CAPACITY'); assert.equal(res.body.reason, 'tracking_capacity_exhausted'); assert.equal(res.body.tracking_state, 'unavailable');
-  assert.equal(R.delivery.length, 1, 'no delivery for the refused inject');
-  assert.deepEqual(R.audit.map((a) => a.delivery_result), ['success']);
-  assert.ok(R.bus.some((b) => b.type === 'inject_failed'), 'bus hears the refusal');
-  // the first job's terminal still commits on its reserved unit
-  const aborted = await runtime.abortTrackedInjection(first.body.inject_id, 'w1', 'DELIVERY_FAILED', 'x'.repeat(2048));
+  // open 512 job reservations (the former cap; the accounting is the real one)
+  for (let i = ledgerClient.accounting.status().admitted_jobs; i < 512; i++) assert.equal(ledgerClient.accounting.reserveJob(`cap-${i}`).ok, true);
+  const res = makeRes(); await handler(makeReq('one more'), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body)); assert.equal(res.body.success, true);
+  assert.equal(R.delivery.length, 2, 'the begin past 512 open jobs is delivered exactly once');
+  assert.deepEqual(R.audit.map((a) => a.delivery_result), ['success', 'success']);
+  assert.equal(R.bus.some((b) => b.type === 'inject_failed'), false, 'no refusal');
+  // the begin superseded `first`; the CURRENT job's terminal still commits on its reserved unit
+  assert.equal(ledgerClient.readModel.getTrackedInjection(first.body.inject_id).tracking_state, 'superseded');
+  const aborted = await runtime.abortTrackedInjection(res.body.inject_id, 'w1', 'DELIVERY_FAILED', 'x'.repeat(2048));
   assert.equal(aborted, 'tracking_aborted');
-  const rec = ledgerClient.readModel.getTrackedInjection(first.body.inject_id);
+  const rec = ledgerClient.readModel.getTrackedInjection(res.body.inject_id);
   assert.equal(rec.tracking_state, 'aborted'); assert.equal(rec.last_observation.delivery_error_truncated, true); assert.equal(Buffer.byteLength(rec.last_observation.delivery_error), 1024);
-  // only the R_MAX condition held here: releasing the cap reservations restores begins
-  for (let i = 0; i < F.R_MAX_JOBS; i++) ledgerClient.accounting.releaseJob(`cap-${i}`);
+  for (let i = 0; i < 512; i++) ledgerClient.accounting.releaseJob(`cap-${i}`);
   const after = makeRes(); await handler(makeReq('after release'), after);
   assert.equal(after.statusCode, 200, JSON.stringify(after.body));
   await ledgerClient.close(2000);
@@ -234,7 +236,7 @@ test('E5: a full O pool rejects transition observations pre-admission (named on 
   const R = recorders();
   const { shared, runtime, handler, actions, ledgerClient } = buildShared(s, R, { now: () => now });
   assert.equal((await runtime.restoreTrackedInjections()).ok, true);
-  // the only job reservation in this fixture is the one begin below: R_MAX cannot be the refusal reason
+  // the only job reservation in this fixture is the one begin below (#1273: there is no job-count refusal)
   // E5: fill the O pool to its exact entry/byte capacity (each unit reserves the 16 KiB frame cap,
   // so the byte bound binds first) WITHOUT a rejection yet; a transition observation is then
   // rejected pre-admission, nothing persisted
@@ -257,7 +259,7 @@ test('E5: a full O pool rejects transition observations pre-admission (named on 
   assert.equal(ledgerClient._internal.inflight.size, 0, 'no retained main-thread queue');
   // sustained: the pool rejected within 5 s and is still full ⇒ begin refused with sustained_exhaustion
   now += 100;
-  assert.ok(ledgerClient.accounting.status().admitted_jobs < F.R_MAX_JOBS, 'fixture isolation: the admitted-jobs cap is NOT reached, so only the sustained condition can refuse');
+  assert.equal(ledgerClient.accounting.status().job_count_limit, null, 'fixture isolation: no job-count limit exists, so only the sustained condition can refuse');
   const third = makeRes(); await handler(makeReq('third'), third);
   assert.equal(third.statusCode, 503); assert.equal(third.body.code, 'TRACKING_CAPACITY'); assert.equal(third.body.reason, 'sustained_exhaustion');
   assert.equal(R.delivery.length, 1, 'the refused begin delivered nothing');

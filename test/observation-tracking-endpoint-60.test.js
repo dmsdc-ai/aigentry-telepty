@@ -23,14 +23,21 @@
 // the track that owns src/transport/websocket.js — it needs a daemon seam that does not exist yet,
 // and a RED test for a seam belongs with the seam.
 
-const { test, before, after } = require('node:test');
+const { test, before, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
+const { startTestDaemon, createSessionId, OBSERVE607, observe607 } = require('../test-support/daemon-harness');
 
 let daemon;
+
+// Task 1215 CI609 (MEASUREMENT ONLY, opt-in TELEPTY_CI_OBSERVE607=1; unset registers nothing): per-test start/end records.
+if (OBSERVE607) {
+  const label = (t) => String((t && t.name) || '').replace(/[^\w .:,()|'-]/g, '?').slice(0, 120);
+  beforeEach((t) => observe607('test', { stage: 'test_start', test: label(t) }));
+  afterEach((t) => observe607('test', { stage: 'test_end', test: label(t) }));
+}
 
 // #1207 — the daemon answers /api/health (the harness's readiness) while its ledger owner may still
 // be opening the directory store under the harness HOME; a tracked inject that lands in that window
@@ -332,13 +339,28 @@ test('dead_reports_absence_to_source: a process exit is reported as absence, and
     // entrance that genuinely observes one. See test/delete-death-observation-60.test.js.
     const sid = createSessionId('dying');
     const spawnedAt = Date.now(); // observe148: evidence timing only
-    await daemon.spawnSession(sid, { command: 'bash', args: ['-c', 'sleep 3'] });
+    // CI609 (opt-in only; PERTURBATION: one extra `date` + file write after the sleep): M2 child-completion marker in a private
+    // per-iteration temp dir. Its path is bash's $0 argument, never interpolated into the script text, and is used only
+    // when it is in a strict charset (no space/quote/glob), so no PTY command-line quoting is involved; otherwise no marker.
+    const obsDir = OBSERVE607 ? fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-obs607-')) : null;
+    const doneFile = obsDir ? path.join(obsDir, 'dying.done') : null, donePath = doneFile && doneFile.split(path.sep).join('/');
+    const marker = donePath && /^[A-Za-z0-9_:/.~-]{1,200}$/.test(donePath);
+    await daemon.spawnSession(sid, { command: 'bash', args: marker ? ['-c', 'sleep 3; date +%s%3N > $0', donePath] : ['-c', 'sleep 3'] });
     const res = await dispatch(sid, 'work this process will not survive', source);
     const dispatchedAt = Date.now(); // observe148: evidence timing only
     assert.equal(res.status, 200);
     const injectId = res.body.inject_id;
 
     let lastPoll = null; // observe148: the last poll's status and kind tokens, read only by the failure evidence
+    // CI609 (opt-in): M2 child marker vs the daemon [EXIT] line receive time, M6 full bounded last-poll kinds, M1 meta on failure.
+    const observeDying = async (outcome) => {
+      if (!OBSERVE607) return;
+      try {
+        let childDone; try { const v = fs.readFileSync(doneFile, 'utf8').trim(); childDone = /^[0-9]{10,16}$/.test(v) ? Number(v) : 'malformed'; } catch { childDone = marker ? 'absent' : 'marker_unsupported_path'; }
+        observe607('test', { stage: 'dying_wait', outcome, session: sid, spawned_ms: spawnedAt, dispatched_ms: dispatchedAt, child_done_ms: childDone,
+          exit_line_received_ms: daemon.observedExitLineAt(sid), last_poll: lastPoll, meta: outcome === 'timeout' ? await daemon.observeMeta() : null });
+      } catch { /* measurement only */ } finally { fs.rmSync(obsDir, { recursive: true, force: true }); }
+    };
     const body = await daemon.waitFor(async () => {
       const poll = await observations(injectId);
       lastPoll = { status: poll.status, kinds: observationKinds(poll.body) };
@@ -348,8 +370,10 @@ test('dead_reports_absence_to_source: a process exit is reported as absence, and
     }, { timeoutMs: 6000, description: 'session_process_exited observation' })
       .catch(async (error) => {
         try { await attachExitEvidence(error, { sid, spawnedAt, dispatchedAt, lastPoll }); } catch { /* evidence is optional; the original failure is not */ }
+        await observeDying('timeout');
         throw error;
       });
+    await observeDying('observed');
 
     // The pending entry is released on death; the LEDGER record is not. A poll after the process
     // is gone still gets a named observation instead of a 404.

@@ -4,6 +4,7 @@ const { protectedInputFailure, externalApprovalVerifier } = require('../external
 const { sshInputFailure, requestSshWrite } = require('../ssh-session');
 const { frameMeta: bridgeFrameMeta } = require('./bridge-stage');
 const { ptyInputFailure } = require('../pty-input-lifecycle');
+const { rememberSubmitPair, holdBodyCustody, settleBodyCustody, bodyCustodyFull } = require('./delivery-runtime');   // Task 1215 hotfix 0.10.1 / hotfix480 F1 / hotfix492
 
 // #137: the ids a wrapped owner inject frame carries so the bridge can file receipts against them.
 // owner_generation is always the CURRENT owner's; the rest is what the caller actually knows.
@@ -349,6 +350,10 @@ function createSessionDeliveryContext({
     catch { /* diagnostics never change the result */ }
   }
   const injectionTargets = new Map(); // pending text stays bound to its original instance
+  // hotfix480 F1: every exit of a body from custody goes through delete; one that was not its handoff releases (refuses)
+  // an immediate CR queued behind it. The handoff settles it as handed before this delete.
+  const dropInjectionTarget = injectionTargets.delete.bind(injectionTargets);
+  injectionTargets.delete = msgId => { const target = injectionTargets.get(msgId); if (target) settleBodyCustody(target.session, msgId, false); return dropInjectionTarget(msgId); };
   const immediateAttempts = new Map(); // only while the source is awaiting its immediate tick
   const mailboxTextWaiters = new Map(); // msg_id → { settle(ownerWs), lastFailure }
 
@@ -476,6 +481,7 @@ function createSessionDeliveryContext({
         // and the ledger part company — the route returns, and whatever this queue eventually does
         // with the op is the only thing left that can answer for it.
         injectId: options.injectId || null,
+        pairInjectId: options.pairInjectId || null,   // Task 1215 519: pair bookkeeping only
         options: {
           source: options.source || 'inject',
           from: options.from || 'daemon'
@@ -527,6 +533,7 @@ function createSessionDeliveryContext({
           prompt,
           noEnter: !!options.noEnter,
           injectId: options.injectId || null,     // #860 F2 — see the bootstrap-queue push above
+          pairInjectId: options.pairInjectId || null,
           options: { source: options.source || 'inject', from: options.from || 'daemon' },
         }, injectParkDecision);
         await parkTrackedInjection(options.injectId, 'bootstrap_queue', injectParkDecision.reason);   // #1207 durable before ack
@@ -650,6 +657,12 @@ function createSessionDeliveryContext({
         session.lastActivityAt = new Date().toISOString();
         return { ...text, submit: options.noEnter ? 'skipped' : 'written', queued: false, consumption: 'unknown' };
       }
+      // hotfix492 N4: live body custody is bounded and never evicted; a NEW body beyond it is refused before it is queued.
+      if (session.type === 'wrapped' && bodyCustodyFull(session)) {
+        releaseSubmit();
+        return { success: false, httpStatus: 503, code: 'BODY_CUSTODY_FULL', bytes_written: 0, msg_id: msgId,
+          error: 'Delivery was refused before text was written.' };
+      }
       const mailboxForEnqueue = getMailbox();
       enqueueAttempted = true;
       const queuedMessage = {
@@ -666,7 +679,8 @@ function createSessionDeliveryContext({
       if (QUEUE_DIAG) markQueueDiag(barrier, 'enqueue_done');
       const immediate = { result: null }; immediateAttempts.set(msgId, immediate);
       if (QUEUE_DIAG) immediate.barrier = barrier;
-      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || null });
+      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || options.pairInjectId || null });
+      if (session.type === 'wrapped') holdBodyCustody(session, msgId, options.injectId || options.pairInjectId || null);   // hotfix480 F1
       // Registered synchronously after the enqueue: no tick can run in between.
       const owesSubmit = !options.noEnter && session.type !== 'aterm';
       const waitsForText = owesSubmit || session.type === 'aterm';
@@ -877,10 +891,26 @@ function createSessionDeliveryContext({
         else waiter.lastFailure = result;
       }
       if (result.success) {
+        // Task 1215 hotfix 0.10.1: an immediate /submit for this inject names this body (pair) in this owner generation.
+        // hotfix480 F1: remembered, then the handoff releases a CR queued behind this body (before the delete below).
+        if (session.type === 'wrapped' && target?.injectId) rememberSubmitPair(session, target.injectId, msg.msg_id);
+        if (target) settleBodyCustody(target.session, msg.msg_id, true);
         injectionTargets.delete(msg.msg_id);
         session.lastActivityAt = new Date().toISOString();
       }
       return result;
+    },
+    // hotfix492 N1: after the engine moved messages of this session to a terminal mailbox state (TTL expiry, in-flight
+    // recovery), a body still in custody whose message is terminal leaves it: `expired` was never handed (not written);
+    // `dead_letter`/absent may be a recovered fenced attempt (unknown). pending/in_flight/nacked bodies stay held.
+    onTerminal: sessionId => {
+      for (const [msgId, target] of injectionTargets) {
+        if (target.session !== sessions[sessionId] || !(target.session.bodyCustody instanceof Map) || !target.session.bodyCustody.has(msgId)) continue;
+        const state = getMailbox().messageState(sessionId, msgId);
+        if (state !== 'expired' && state !== 'dead_letter' && state !== null) continue;
+        settleBodyCustody(target.session, msgId, state === 'expired' ? false : 'unknown');
+        injectionTargets.delete(msgId);
+      }
     },
     onDelivery: (sessionId, msgId, result) => {
       if (result.delivery_uncertain) {

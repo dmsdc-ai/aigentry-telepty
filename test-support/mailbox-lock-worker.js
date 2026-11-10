@@ -35,7 +35,7 @@ process.once('message', () => {
     // or the last tick shows a long single call. A `sweep_done` line before the final message tells "finished but
     // the message never arrived" from "still running". Fixed numeric fields, at most SWEEP_TICK_LINES lines on
     // their own budget (the emitDiag cap and the existing `sweep` lines are unchanged). Neither kind is a progress
-    // milestone: the parent's guard accepts only kind 'progress', and a sweep worker has none.
+    // milestone for a contender; since fix664 the parent's sweep guard (test guardFor) re-arms only on an advancing `sweep_tick`.
     const SWEEP_TICK_EVERY = 10, SWEEP_TICK_LINES = 40;
     let tickLines = 0, sweepMs = 0, sweepMaxMs = 0, lastSweepMs = 0, waitMs = 0;
     const tick = (kind, i) => {

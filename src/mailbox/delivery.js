@@ -37,6 +37,8 @@ class DeliveryEngine {
     this.sessionResolver = options.sessionResolver || (() => this.mailbox.listSessions());
     this.pollMs = options.pollMs || mailbox.config.deliveryPollMs || 200;
     this.onDelivery = options.onDelivery || null;
+    // hotfix492 N1: told after recoverInflight/expireStale moved messages of a session to a terminal state.
+    this.onTerminal = options.onTerminal || null;
     this._setInterval = options.setInterval || setInterval;
     this._clearInterval = options.clearInterval || clearInterval;
     this._timer = null;
@@ -78,6 +80,13 @@ class DeliveryEngine {
     return this._tick();
   }
 
+  // hotfix492 N1: never lets the observer change the tick's own outcome.
+  _terminal(sessionId) {
+    if (!this.onTerminal) return;
+    try { this.onTerminal(sessionId); }
+    catch (err) { console.error(`[MAILBOX] terminal-state observer failed for ${sessionId}: ${err && err.message}`); }
+  }
+
   async _tick() {
     if (this._tickInProgress) return;
     this._tickInProgress = true;
@@ -99,6 +108,7 @@ class DeliveryEngine {
           const recovered = this.mailbox.recoverInflight(sessionId);
           if (recovered > 0) {
             console.log(`[MAILBOX] Recovered ${recovered} in-flight message(s) for ${sessionId}`);
+            this._terminal(sessionId);
           }
         } catch (err) {
           if (lockRefused(err, sessionId)) {
@@ -115,6 +125,7 @@ class DeliveryEngine {
             const expired = this.mailbox.expireStale(sessionId);
             if (expired > 0) {
               console.log(`[MAILBOX] Expired ${expired} stale message(s) for ${sessionId}`);
+              this._terminal(sessionId);
             }
           } catch (err) {
             if (lockRefused(err, sessionId)) {

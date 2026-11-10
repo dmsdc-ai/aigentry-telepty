@@ -147,37 +147,12 @@ function createBridge(t, { sid }) {
   function feed(stream, chunk = 1024) {
     for (let i = 0; i < stream.length; i += chunk) relay(stream.slice(i, i + chunk));
   }
-  // Mirror of cli.js:3160-3196 (owner-WS 'inject' frame). The optional frame fields are
-  // forwarded as the proposed second argument (design F3); the current code ignores it.
+  // Task 1215 hotfix 0.10.1: the PRODUCTION owner-WS inject handler (cli.js calls allowSecurity.handleOwnerInject),
+  // replacing the former line-for-line mirror of the pre-F4 cli.js branch so this test gate cannot diverge from production.
+  // Only cli.js's own closure state (readyNotified) is kept here.
   function injectFrame(frame) {
-    allow.invalidateBridgeInteraction('automated_input');
-    const rawData = typeof frame.data === 'string' ? frame.data : String(frame.data ?? '');
-    const meta = {};
-    for (const key of ['daemon_msg_id', 'inject_id', 'part', 'pair', 'owner_generation']) {
-      if (frame[key] !== undefined) meta[key] = frame[key];
-    }
-    for (const chunk of [rawData]) {
-      if (!chunk) continue;
-      const isCr = chunk === '\r';
-      if (isCr && shared.bridgePendingCount > 0) {
-        allow.enqueueBridgeMessage(chunk, meta);
-        if (allow.isIdle()) {
-          if (shared.queueFlushTimer) { clock.clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
-          allow.flushBridgeMailbox();
-        } else {
-          allow.scheduleIdleFlush();
-        }
-      } else if (isCr) {
-        shared.child.write(chunk);
-      } else if (allow.isIdle()) {
-        shared.child.write(chunk);
-        shared.promptReady = false;
-      } else {
-        allow.enqueueBridgeMessage(chunk, meta);
-        allow.scheduleIdleFlush();
-      }
-    }
-    if (rawData && rawData !== '\r') readyNotified = false;
+    const handled = allow.handleOwnerInject(frame);
+    if (handled.rawData && handled.rawData !== '\r') readyNotified = false;
   }
   let injectSeq = 0;
   function daemonInject(text) {
@@ -308,9 +283,11 @@ test('#136 F4: a consecutive duplicate dropped at flush is dead-lettered (bridge
   const b = createBridge(t, { sid: 'b136-duplicate-drop' });
   const first = b.daemonInject('SAME-QUESTION');
   const second = b.daemonInject('SAME-QUESTION');
+  // Task 1215 hotfix 0.10.1: "not ready" no longer queues an inject; the local user typing does. Same queue, same flush.
+  b.shared.lastUserInputTime = b.clock.now();
   b.injectFrame(first.body);
   b.injectFrame(second.body);
-  assert.deepEqual(b.entries().map(e => e.state), ['pending', 'pending'], 'PRECONDITION: both copies queued while not ready');
+  assert.deepEqual(b.entries().map(e => e.state), ['pending', 'pending'], 'PRECONDITION: both copies queued while the user types');
   b.feed(LEGACY);
   await b.clock.advance(3000);
   assert.deepEqual({

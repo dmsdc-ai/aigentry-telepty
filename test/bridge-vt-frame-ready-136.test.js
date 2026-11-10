@@ -150,37 +150,12 @@ function createBridge(t, { sid }) {
   function feed(stream, chunk = 1024) {
     for (let i = 0; i < stream.length; i += chunk) relay(stream.slice(i, i + chunk));
   }
-  // Mirror of cli.js:3160-3196 (owner-WS 'inject' frame). The optional frame fields are
-  // forwarded as the proposed second argument (design F3); the current code ignores it.
+  // Task 1215 hotfix 0.10.1: the PRODUCTION owner-WS inject handler (cli.js calls allowSecurity.handleOwnerInject),
+  // replacing the former line-for-line mirror of the pre-F4 cli.js branch so this test gate cannot diverge from production.
+  // Only cli.js's own closure state (readyNotified) is kept here.
   function injectFrame(frame) {
-    allow.invalidateBridgeInteraction('automated_input');
-    const rawData = typeof frame.data === 'string' ? frame.data : String(frame.data ?? '');
-    const meta = {};
-    for (const key of ['daemon_msg_id', 'inject_id', 'part', 'pair', 'owner_generation']) {
-      if (frame[key] !== undefined) meta[key] = frame[key];
-    }
-    for (const chunk of [rawData]) {
-      if (!chunk) continue;
-      const isCr = chunk === '\r';
-      if (isCr && shared.bridgePendingCount > 0) {
-        allow.enqueueBridgeMessage(chunk, meta);
-        if (allow.isIdle()) {
-          if (shared.queueFlushTimer) { clock.clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
-          allow.flushBridgeMailbox();
-        } else {
-          allow.scheduleIdleFlush();
-        }
-      } else if (isCr) {
-        shared.child.write(chunk);
-      } else if (allow.isIdle()) {
-        shared.child.write(chunk);
-        shared.promptReady = false;
-      } else {
-        allow.enqueueBridgeMessage(chunk, meta);
-        allow.scheduleIdleFlush();
-      }
-    }
-    if (rawData && rawData !== '\r') readyNotified = false;
+    const handled = allow.handleOwnerInject(frame);
+    if (handled.rawData && handled.rawData !== '\r') readyNotified = false;
   }
   let injectSeq = 0;
   function daemonInject(text) {
@@ -297,11 +272,15 @@ test('#136 F1 fixture control: raw tail never matches; the real rendered frame s
   }, 'PRECONDITION: synthetic fixture mechanism (real registry + real VT) must hold');
 });
 
-test('#136 F1: a rendered idle composer drains body+CR exactly once within 3 s of the repaint, before any stall threshold', { timeout: 30000 }, async t => {
+// Task 1215 hotfix 0.10.1 (replaces #136 F1, which asserted nothing is written before the composer repaint and the
+// drain is qualified by the VT frame): a rendered composer is no longer an admission condition. The pair is written at
+// once, before any repaint, and later repaints add no second write.
+test('#136 F1 / hotfix: body+CR are written at once before any repaint; later idle repaints write nothing more', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b136-vt-ready' });
   const { body, submit } = b.daemonInject('VT-READY-BODY');
   b.injectFrame(body);
   b.injectFrame(submit);
+  const atOnce = b.writes.slice();
   await b.clock.advance(3000); // nothing rendered yet
   const beforeRepaint = b.writes.slice();
   b.feed(IDLE);
@@ -311,34 +290,29 @@ test('#136 F1: a rendered idle composer drains body+CR exactly once within 3 s o
   b.feed(repaintCycles('codex-differential-idle.json', 6));
   await settleVt();
   await b.clock.advance(5000);
-  const q = b.shared.readyQualification || {};
-  assert.deepEqual({
-    beforeRepaint,
-    afterRepaint,
-    afterFurtherRepaint: b.writes,
-    readyKind: q.ready_kind || null,
-    vtFrameDetector: typeof q.detector === 'string' && q.detector.startsWith('vt_frame'),
-  }, {
-    beforeRepaint: [],
+  assert.deepEqual({ atOnce, beforeRepaint, afterRepaint, afterFurtherRepaint: b.writes }, {
+    atOnce: ['VT-READY-BODY', '\r'],
+    beforeRepaint: ['VT-READY-BODY', '\r'],
     afterRepaint: ['VT-READY-BODY', '\r'],
     afterFurtherRepaint: ['VT-READY-BODY', '\r'],
-    readyKind: 'composer_surface_observed',
-    vtFrameDetector: true,
   });
 });
 
-test('#136 guard: busy frame (composer visible + esc to interrupt) is never written to', { timeout: 30000 }, async t => {
+// Task 1215 hotfix 0.10.1 (replaces the #136 busy guard "never written to" and F2 "withheld busy_indicator"): a busy /
+// working frame is output, not a permission modal. The pair is written at once, exactly once; no withheld receipt.
+test('#136 busy / hotfix: a busy frame (composer visible + esc to interrupt) receives body+CR at once, exactly once', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b136-vt-busy-guard' });
   b.feed(BUSY);
   await settleVt();
   const { body, submit } = b.daemonInject('VT-BUSY-BODY');
   b.injectFrame(body);
   b.injectFrame(submit);
+  const atOnce = b.writes.slice();
   await b.clock.advance(20000);
-  assert.deepEqual(b.writes, []);
+  assert.deepEqual({ atOnce, writes: b.writes }, { atOnce: ['VT-BUSY-BODY', '\r'], writes: ['VT-BUSY-BODY', '\r'] });
 });
 
-test('#136 F2: busy frame is reported withheld with reason busy_indicator', { timeout: 30000 }, async t => {
+test('#136 F2 / hotfix: a busy frame is never reported withheld (no busy_indicator receipt); the body is written', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b136-vt-busy-reason' });
   b.feed(BUSY);
   await settleVt();
@@ -349,7 +323,7 @@ test('#136 F2: busy frame is reported withheld with reason busy_indicator', { ti
     writes: b.writes,
     withheld: b.receipts(injectId, 'withheld').map(r => ({ part: r.msg.part, reason: r.msg.reason })),
     violations: b.receiptViolations(['VT-BUSY-REASON']),
-  }, { writes: [], withheld: [{ part: 'body', reason: 'busy_indicator' }], violations: [] });
+  }, { writes: ['VT-BUSY-REASON'], withheld: [], violations: [] });
 });
 
 test('#136 guard: modal frame (directory trust) is never written to', { timeout: 30000 }, async t => {
@@ -382,6 +356,7 @@ test('#136 guard: recent user input blocks writes even on a ready composer frame
   b.feed(IDLE);
   await settleVt();
   const { body, submit } = b.daemonInject('VT-USER-BODY');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the user is typing when the inject arrives (typing, not readiness, is the gate)
   b.injectFrame(body);
   b.injectFrame(submit);
   for (let i = 0; i < 20; i++) { b.shared.lastUserInputTime = b.clock.now(); await b.clock.advance(500); }
@@ -393,6 +368,7 @@ test('#136 F1: once the user stops typing, the ready composer frame drains body+
   b.feed(IDLE);
   await settleVt();
   const { body, submit } = b.daemonInject('VT-USER-THEN-IDLE');
+  b.shared.lastUserInputTime = b.clock.now(); // Task 1215 hotfix 0.10.1: the user is typing when the inject arrives (typing, not readiness, is the gate)
   b.injectFrame(body);
   b.injectFrame(submit);
   for (let i = 0; i < 20; i++) { b.shared.lastUserInputTime = b.clock.now(); await b.clock.advance(500); }
@@ -403,7 +379,10 @@ test('#136 F1: once the user stops typing, the ready composer frame drains body+
   });
 });
 
-test('#136 guard: VT unavailable -> nothing is written on the differential stream', { timeout: 30000 }, async t => {
+// Task 1215 hotfix 0.10.1 (replaces the #136 VT-unavailable guard "nothing is written" and its F2 bridge_queue report,
+// which only existed while a record was withheld): VT unavailability is not a withholding cause. The pair is written at
+// once; the unavailable VT is still visible on the bounded queue summary.
+test('#136 VT unavailable / hotfix: the differential stream receives body+CR at once', { timeout: 30000 }, async t => {
   vt.__setTerminalCtorForTest(null);
   t.after(() => vt.__setTerminalCtorForTest(undefined));
   const b = createBridge(t, { sid: 'b136-vt-unavailable-guard' });
@@ -412,10 +391,10 @@ test('#136 guard: VT unavailable -> nothing is written on the differential strea
   b.injectFrame(body);
   b.injectFrame(submit);
   await b.clock.advance(30000);
-  assert.deepEqual(b.writes, []);
+  assert.deepEqual(b.writes, ['VT-UNAVAILABLE-BODY', '\r']);
 });
 
-test('#136 F2: VT unavailable is reported on bridge_queue (vt: unavailable:<reason>)', { timeout: 30000 }, async t => {
+test('#136 F2 / hotfix: VT unavailable is still reported on the queue summary (vt: unavailable:<reason>) while the body is written', { timeout: 30000 }, async t => {
   vt.__setTerminalCtorForTest(null);
   t.after(() => vt.__setTerminalCtorForTest(undefined));
   const b = createBridge(t, { sid: 'b136-vt-unavailable-report' });
@@ -423,8 +402,9 @@ test('#136 F2: VT unavailable is reported on bridge_queue (vt: unavailable:<reas
   const { body } = b.daemonInject('VT-UNAVAILABLE-REPORT');
   b.injectFrame(body);
   await b.clock.advance(16000);
+  const vtLabel = b.allow.bridgeQueueSummary().vt;
   assert.deepEqual({
     writes: b.writes,
-    vtUnavailableReported: b.framesOf('bridge_queue').some(f => typeof f.msg.vt === 'string' && f.msg.vt.startsWith('unavailable:')),
-  }, { writes: [], vtUnavailableReported: true });
+    vtUnavailableReported: typeof vtLabel === 'string' && vtLabel.startsWith('unavailable:'),
+  }, { writes: ['VT-UNAVAILABLE-REPORT'], vtUnavailableReported: true });
 });

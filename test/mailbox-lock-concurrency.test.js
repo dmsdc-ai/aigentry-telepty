@@ -40,7 +40,7 @@ function diagnostic(probe, self) {
 // duplicate, malformed, out-of-range or non-milestone records never re-arm it. Bound: at most floor(iterations / 10)
 // re-arms, so a worker is given at most (floor(iterations / 10) + 1) × stallMs in total — 50 s for 40 iterations.
 const PROGRESS_PREFIX = 'lock-diag ', PROGRESS_EVERY = 10;
-function progressGuard(iterations) {
+function progressGuard(iterations, kind = 'progress') {
   let pending = '', last = -1;
   const milestones = Math.floor(iterations / PROGRESS_EVERY);
   return {
@@ -53,7 +53,7 @@ function progressGuard(iterations) {
         const line = raw.replace(/\r$/, '');
         if (!line.startsWith(PROGRESS_PREFIX)) continue;
         let record; try { record = JSON.parse(line.slice(PROGRESS_PREFIX.length)); } catch { continue; }
-        const i = record && record.kind === 'progress' ? record.iteration : undefined;
+        const i = record && record.kind === kind ? record.iteration : undefined;
         if (!Number.isSafeInteger(i) || i < 0 || i >= iterations || (i + 1) % PROGRESS_EVERY !== 0 || i <= last) continue;
         last = i; advanced++;
       }
@@ -61,10 +61,11 @@ function progressGuard(iterations) {
     },
   };
 }
+const guardFor = (mode, iterations) => mode === 'sweep' ? progressGuard(iterations, 'sweep_tick') : progressGuard(mode === 'contend' ? iterations : 0);
 function worker(t, dir, mode, iterations = 1, probe = () => ({}), { stallMs = 10000 } = {}) {
   const forked = performance.now();
   const child = fork(path.join(__dirname, '../test-support/mailbox-lock-worker.js'), [dir, mode, String(iterations)], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
-  const guard = progressGuard(mode === 'contend' ? iterations : 0);
+  const guard = guardFor(mode, iterations);
   let output = '', onProgress = null;
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', b => { output += b; if (guard.feed(b) > 0 && onProgress) onProgress(); });
@@ -143,7 +144,7 @@ test('#1215 guard control: only valid, strictly advancing milestone records coun
   assert.equal(g.feed(rec({kind: 'progress', iteration: 39})), 1);
   assert.equal(g.last, 39);
   assert.equal(g.feed(rec({kind: 'progress', iteration: 39})), 0, 'no record re-arms after the last milestone');
-  assert.equal(progressGuard(1).milestones, 0, 'non-contend workers get exactly one stall window');
+  assert.equal(progressGuard(1).milestones, 0, 'hold and choose workers get exactly one stall window');
 });
 test('#1215 guard negative control: a real worker that stops making progress is rejected within its own stall window', async t => {
   const {root, dir} = fixture(t), stallMs = 500;
@@ -203,6 +204,61 @@ test('a ticket released while its descriptor is read is a departure, not corrupt
   finally { successor(); }
   assert.equal(departed, true);
 });
+// #1215 lock525 — measured on win32 Node 26 (native524 M4, 5/20): the peer's `number` descriptor reported 0 links at OPEN
+// (4x) or at READ (1x) while lstat still saw the delete-pending file; every other predicate held. Four re-lists showed the
+// DEPARTED marker, one was a directory EPERM. Simulated here ONLY: that descriptor link count (fstat), the retiring owner's
+// marker and a ticket-directory EPERM, around the REAL acquireLock/release. RED on 524: (a)/(b) throw MAILBOX_LOCK_STORAGE.
+const lockCounters = () => require('../src/mailbox/lock').lockDiagnostics();
+function deletePending(t, dir, { at = 'open', marker = true, eperm = 0, size = null, markOnEperm = false } = {}) {
+  const ticket = path.join(dir, '.lock', fs.readdirSync(path.join(dir, '.lock'))[0]), number = path.join(ticket, 'number');
+  const s = { fd: null, fstats: 0, armed: false, epermLeft: eperm };
+  const open = fs.openSync, fstat = fs.fstatSync, readdir = fs.readdirSync;
+  t.mock.method(fs, 'openSync', function(file, ...args) { const fd = open.call(fs, file, ...args); if (file === number && s.fd === null) s.fd = fd; return fd; });
+  t.mock.method(fs, 'fstatSync', function(fd, ...args) {
+    const st = fstat.call(fs, fd, ...args);
+    if (fd !== s.fd || s.armed || ++s.fstats < (at === 'open' ? 1 : 2)) return st;
+    s.armed = true;
+    if (marker) fs.writeFileSync(path.join(ticket, 'departed'), '');   // the owner's marker precedes its unlink
+    return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { nlink: 0 }, size === null ? {} : { size });
+  });
+  t.mock.method(fs, 'readdirSync', function(file, ...args) {
+    if (s.armed && file === ticket && s.epermLeft !== 0) {
+      if (s.epermLeft > 0) s.epermLeft--;
+      if (markOnEperm) fs.writeFileSync(path.join(ticket, 'departed'), '');   // the owner then proceeds to depart
+      throw Object.assign(new Error(`EPERM: operation not permitted, scandir '${file}'`), { code: 'EPERM' });
+    }
+    return readdir.call(fs, file, ...args);
+  });
+  return { number, disarm() { s.epermLeft = 0; }, armed: () => s.armed };
+}
+const delta = (before, key) => lockCounters()[key] - before[key];
+const lockDir = dir => fs.readdirSync(path.join(dir, '.lock'));
+// One registered case each (exact CI names `lock525 (a)`..`(f)`); a new counter is read only AFTER a functional success.
+for (const [id, opts, key] of [['a', { at: 'open' }, 'nlink0_departed'], ['b', { at: 'read' }, 'nlink0_departed'],
+  ['c', { marker: false, eperm: 1, markOnEperm: true }, 'nlink0_unresolved']]) {
+  test(`lock525 (${id}) a retiring peer whose descriptor reports 0 links (${JSON.stringify(opts)}) is admitted only after a proved departure`, t => {
+    const {dir} = fixture(t), release = acquireLock(dir), sim = deletePending(t, dir, opts), before = lockCounters();
+    const successor = acquireLock(dir);
+    try { release(); } finally { successor(); }
+    assert.deepEqual([sim.armed(), lockDir(dir)], [true, []]);
+    assert.equal(delta(before, key), 1);
+  });
+}
+test('lock525 (d) a permanent ticket-directory EPERM is never admitted: TIMEOUT, holder evidence kept', t => {
+  const {dir} = fixture(t), release = acquireLock(dir), sim = deletePending(t, dir, { marker: false, eperm: -1 });
+  try { assert.throws(() => acquireLock(dir, { timeoutMs: 200 }), { code: 'MAILBOX_LOCK_TIMEOUT' }); assert.equal(fs.readFileSync(sim.number, 'utf8'), '1'); }
+  finally { sim.disarm(); release(); }
+  assert.deepEqual(lockDir(dir), []);
+});
+// (e)/(f): functional negative controls with the SAME outcome on older and current code (refusal, evidence kept, cleanup).
+for (const [id, opts] of [['e', { marker: false }], ['f', { marker: true, size: 64 }]]) {
+  test(`lock525 (${id}) a 0-link descriptor (${JSON.stringify(opts)}): unmarked or otherwise corrupt stays MAILBOX_LOCK_STORAGE`, t => {
+    const {dir} = fixture(t), release = acquireLock(dir), sim = deletePending(t, dir, opts);
+    try { assert.throws(() => acquireLock(dir), { code: 'MAILBOX_LOCK_STORAGE' }); assert.equal(fs.readFileSync(sim.number, 'utf8'), '1'); }
+    finally { release(); }
+    assert.deepEqual([sim.armed(), lockDir(dir)], [true, []]);
+  });
+}
 test('corrupt live tickets and unknown entries are refused without deleting evidence', t => {
   const {root, dir} = fixture(t), release = acquireLock(dir), lock = path.join(dir, '.lock');
   const name = fs.readdirSync(lock)[0], number = path.join(lock, name, 'number');
@@ -397,6 +453,137 @@ test('#1215 control: EPERM on a published live peer number that the re-list stil
   } finally { mock.mock.restore(); release(); }
   assert.deepEqual(fs.readdirSync(lock), []);
 });
+// #1215 mailbox592 — measured on win32 (diagnostic run 42737861005, contend worker iteration 35): the FIRST lstat of a
+// peer's published `number` (checkTicketFiles <- readTicket) raised EPERM, the re-list showed the ticket directory with
+// neither `number` nor the marker, and onEperm rethrew (eperm_unmarked_throw_entry_absent). Same lock10 departure state
+// (empty ticket before rmdir), reached one site earlier. Only the EPERM and the rmdir timing are injected.
+test('#1215: first-stat EPERM on a published peer number whose departure has removed its marker (empty ticket before rmdir) is a departure; the successor acquires and stays exclusive', t => {
+  const {dir} = fixture(t), lock = path.join(dir, '.lock'), release = acquireLock(dir);
+  const name = fs.readdirSync(lock)[0], ticket = path.join(lock, name), number = path.join(ticket, 'number');
+  const lstat = fs.lstatSync, readdir = fs.readdirSync, rmdir = fs.rmdirSync;
+  let stage = 'armed';
+  t.mock.method(fs, 'rmdirSync', function(p, ...args) {
+    if (p === ticket && stage === 'releasing') { stage = 'rmdir_deferred'; return undefined; } // the owner's rmdir, later
+    return rmdir.call(fs, p, ...args);
+  });
+  t.mock.method(fs, 'lstatSync', function(file, ...args) {
+    if (file === number && stage === 'armed') { // checkTicketFiles' FIRST stat: the owner departs during this lstat
+      stage = 'releasing'; release();
+      assert.equal(stage, 'rmdir_deferred', 'the real release reached its rmdir');
+      assert.deepEqual(readdir.call(fs, ticket), [], 'number and marker are both gone; only the rmdir is outstanding');
+      stage = 'emptied'; throw epermLstat(file);
+    }
+    return lstat.call(fs, file, ...args);
+  });
+  t.mock.method(fs, 'readdirSync', function(p, ...args) {
+    const listed = readdir.call(fs, p, ...args);
+    if (p === ticket && stage === 'emptied') { stage = 'relisted'; rmdir.call(fs, ticket); } // the owner's rmdir lands after the re-list
+    return listed;
+  });
+  const keys = ['eperm_relist_number_gone', 'eperm_unmarked_throw_entry_absent', 'eperm_unmarked_throw_entry_listed', 'eperm_read_throw'];
+  const before = keys.map(lockCounter);
+  const successor = acquireLock(dir); // ORIGINAL (581): throws this first-stat EPERM. CANDIDATE: the departure is recognised.
+  try {
+    assert.equal(stage, 'relisted', 'the first-stat EPERM and the re-list of the emptied ticket both happened');
+    assert.deepEqual(keys.map((key, i) => lockCounter(key) - before[i]), [1, 0, 0, 0]);
+    assert.equal(fs.readdirSync(lock).length, 1, 'only the successor ticket remains');
+    release(); // the old release is a no-op
+    assert.throws(() => acquireLock(dir), /lock timeout/i); // Safety: the successor stays exclusive.
+  } finally { successor(); }
+  assert.deepEqual(fs.readdirSync(lock), []);
+});
+// #1215 mailbox592 review C2 — the fresh-lstat arms of the empty-ticket departure rule. The real holder releases inside the
+// reader's FIRST lstat of its published `number` with the owner's rmdir deferred; that lstat throws EPERM; the reader re-lists
+// the emptied ticket ([]) and then takes its fresh lstat of the ticket directory, which each case below drives.
+// armOnPublish: arm only once the successor has published its own `number`, so the EPERM lands in its ADMISSION scan (an empty
+// ticket re-read later would read as choosing; admission returns without re-reading it).
+const c2Keys = ['eperm_relist_number_gone', 'eperm_unmarked_throw_entry_absent', 'dir_unresolved'];
+function emptiedTicketWindow(t, dir, { armOnPublish = false, onRelist = () => {}, onFreshStat = read => read() } = {}) {
+  const lock = path.join(dir, '.lock'), release = acquireLock(dir);
+  const name = fs.readdirSync(lock)[0], ticket = path.join(lock, name), number = path.join(ticket, 'number');
+  const lstat = fs.lstatSync, readdir = fs.readdirSync, rmdir = fs.rmdirSync, rename = fs.renameSync;
+  const s = { lock, name, ticket, release, stage: armOnPublish ? 'idle' : 'armed', original: lstat.call(fs, ticket),
+    injected: null, fresh: null, finishRmdir: () => rmdir.call(fs, ticket) };
+  if (armOnPublish) t.mock.method(fs, 'renameSync', function(from, to, ...args) {
+    const out = rename.call(fs, from, to, ...args);
+    if (s.stage === 'idle' && path.basename(to) === 'number' && path.dirname(to) !== ticket) s.stage = 'armed'; // successor published
+    return out;
+  });
+  t.mock.method(fs, 'rmdirSync', function(p, ...args) {
+    if (p === ticket && s.stage === 'releasing') { s.stage = 'rmdir_deferred'; return undefined; } // the owner's rmdir, later
+    return rmdir.call(fs, p, ...args);
+  });
+  t.mock.method(fs, 'lstatSync', function(file, ...args) {
+    if (file === number && s.stage === 'armed') { // checkTicketFiles' FIRST stat: the owner departs during this lstat
+      s.stage = 'releasing'; release();
+      assert.equal(s.stage, 'rmdir_deferred', 'the real release reached its rmdir');
+      assert.deepEqual(readdir.call(fs, ticket), [], 'number and marker are both gone; only the rmdir is outstanding');
+      s.stage = 'emptied'; throw (s.injected = epermLstat(file));
+    }
+    if (file === ticket && s.stage === 'relisted') { s.stage = 'fresh_stat'; return (s.fresh = onFreshStat(() => lstat.call(fs, file, ...args))); }
+    return lstat.call(fs, file, ...args);
+  });
+  t.mock.method(fs, 'readdirSync', function(p, ...args) {
+    const listed = readdir.call(fs, p, ...args);
+    if (p === ticket && s.stage === 'emptied') { assert.deepEqual(listed, [], 'the re-list is the emptied ticket'); s.stage = 'relisted'; onRelist(s); }
+    return listed;
+  });
+  return s;
+}
+test('#1215 mailbox592 C2: admission-scan first-stat EPERM on an emptied ticket whose rmdir is deferred past the acquisition; the fresh lstat sees the SAME real directory, the departure is recognised and the successor acquires and stays exclusive', t => {
+  const {dir} = fixture(t), s = emptiedTicketWindow(t, dir, { armOnPublish: true });
+  const before = c2Keys.map(lockCounter);
+  const successor = acquireLock(dir);
+  try {
+    assert.equal(s.stage, 'fresh_stat', 'after publishing, the successor re-listed the emptied ticket and took its fresh lstat');
+    assert.ok(s.fresh && s.fresh.isDirectory() && !s.fresh.isSymbolicLink(), 'the fresh lstat saw a real directory, not an absent one');
+    assert.deepEqual([s.fresh.dev, s.fresh.ino], [s.original.dev, s.original.ino], 'the fresh lstat saw the SAME directory');
+    assert.deepEqual(c2Keys.map((key, i) => lockCounter(key) - before[i]), [1, 0, 0]);
+    assert.deepEqual(fs.readdirSync(s.ticket), [], 'the peer directory still exists when the successor returns (rmdir deferred)');
+    s.finishRmdir(); // the owner's deferred rmdir lands only now
+    assert.equal(fs.readdirSync(s.lock).length, 1, 'only the successor ticket remains');
+    s.release(); // the old release is a no-op
+    assert.throws(() => acquireLock(dir), /lock timeout/i); // Safety: the successor stays exclusive.
+  } finally { successor(); }
+  assert.deepEqual(fs.readdirSync(s.lock), []);
+});
+test('#1215 mailbox592 C2 control: an emptied ticket path replaced after the re-list by a DIFFERENT real empty directory keeps the original first-stat EPERM; the replacement is neither admitted past nor deleted', t => {
+  const {root, dir} = fixture(t), replacement = path.join(root, 'replacement');
+  fs.mkdirSync(replacement, {mode: 0o700}); // created OUTSIDE .lock while the original ticket exists: no inode reuse
+  const s = emptiedTicketWindow(t, dir, { onRelist: w => { fs.rmdirSync(w.ticket); fs.renameSync(replacement, w.ticket); } });
+  const rep = fs.lstatSync(replacement);
+  assert.notDeepEqual([rep.dev, rep.ino], [s.original.dev, s.original.ino], 'PRECONDITION: the host gives the replacement a distinct real identity');
+  const before = c2Keys.map(lockCounter);
+  let refused;
+  assert.throws(() => acquireLock(dir), error => { refused = error; return true; });
+  assert.equal(s.stage, 'fresh_stat', 'the re-list, the replacement and the fresh lstat all happened');
+  assert.deepEqual([s.fresh.dev, s.fresh.ino], [rep.dev, rep.ino], 'the fresh lstat saw the replacement');
+  assert.equal(refused, s.injected, 'the refusal is the ORIGINAL first-stat EPERM on number');
+  assert.deepEqual(c2Keys.map((key, i) => lockCounter(key) - before[i]), [0, 1, 0]);
+  assert.deepEqual(fs.readdirSync(s.lock), [s.name], 'no admission: only the replacement remains under the peer name');
+  const kept = fs.lstatSync(s.ticket);
+  assert.deepEqual([kept.isDirectory(), kept.dev, kept.ino, fs.readdirSync(s.ticket)], [true, rep.dev, rep.ino, []], 'the replacement is kept unchanged');
+  fs.rmdirSync(s.ticket); // test cleanup of the injected replacement
+  assert.deepEqual(fs.readdirSync(s.lock), []);
+});
+test('#1215 mailbox592 C2 control: an EPERM on the fresh lstat of the emptied ticket directory is unresolved; the original first-stat EPERM is rethrown and nothing is admitted or removed', t => {
+  const {dir} = fixture(t);
+  let dirEperm = null;
+  const s = emptiedTicketWindow(t, dir, { onFreshStat: () => { throw (dirEperm = epermLstat(s.ticket)); } });
+  const before = c2Keys.map(lockCounter);
+  let refused;
+  assert.throws(() => acquireLock(dir), error => { refused = error; return true; });
+  assert.equal(s.stage, 'fresh_stat', 'the re-list and the fresh lstat of the ticket directory both happened');
+  assert.ok(dirEperm, 'the fresh lstat raised its own, distinct EPERM');
+  assert.equal(refused, s.injected, 'the refusal is the ORIGINAL first-stat EPERM on number');
+  assert.notEqual(refused, dirEperm);
+  assert.deepEqual(c2Keys.map((key, i) => lockCounter(key) - before[i]), [0, 1, 1]);
+  assert.deepEqual(fs.readdirSync(s.lock), [s.name], 'no admission and no removal of the peer ticket');
+  const kept = fs.lstatSync(s.ticket);
+  assert.deepEqual([kept.dev, kept.ino, fs.readdirSync(s.ticket)], [s.original.dev, s.original.ino, []], 'custody unchanged');
+  s.finishRmdir(); // the owner's deferred rmdir
+  assert.deepEqual(fs.readdirSync(s.lock), []);
+});
 
 // Task 1215 repro141 (RED by design against 55568519; a reproduction, not a product fix). FIRST .lock creation race in
 // the actual acquireLock -> lockDirectory -> resolveSessionDir path. resolveSessionDir observes .lock with one lstat
@@ -482,7 +669,8 @@ for (const kind of ['symlink', 'hardlink']) test(`[1215-red141] control: a ${kin
 // A sweep worker is given progressGuard(0): it carries NO milestones, so its 10 s timer is a whole-work budget that no
 // stderr line re-arms. Neither the existing `sweep` lines nor the diagnostic `sweep_tick` / `sweep_done` lines are progress,
 // so the "(last milestone -1)" a sweep timeout reports is the budget's expiry, not a lost or rejected milestone.
-test('[win164] a sweep worker carries no milestones: no sweep, sweep_tick or sweep_done record re-arms its guard', () => {
+// fix664 (option A) supersedes this for the sweep worker: guardFor('sweep', n) re-arms on each advancing `sweep_tick`; progressGuard(0) stays the hold/choose guard.
+test('[win164] a milestone-free guard (hold/choose; the pre-fix664 sweeper): no sweep, sweep_tick or sweep_done record re-arms it', () => {
   const g = progressGuard(0), rec = value => `${PROGRESS_PREFIX}${JSON.stringify(value)}\n`;
   assert.equal(g.milestones, 0, 'one budget of (0 + 1) x stallMs, never re-armed');
   for (const record of [{ kind: 'sweep', iteration: 49 }, { kind: 'sweep_tick', iteration: 9 }, { kind: 'sweep_done', iteration: 349 },
@@ -490,4 +678,10 @@ test('[win164] a sweep worker carries no milestones: no sweep, sweep_tick or swe
     assert.equal(g.feed(rec(record)), 0, `${record.kind} is not a sweep milestone`);
   }
   assert.equal(g.last, -1);
+});
+test('[fix664] the actual selector re-arms a sweeper only on valid, strictly advancing sweep_tick records, at most floor(n / 10) times', () => {
+  const g = guardFor('sweep', 350), rec = (kind, iteration) => `${PROGRESS_PREFIX}${JSON.stringify({kind, iteration})}\n`, ticks = Array.from({length: 35}, (_, k) => rec('sweep_tick', 10 * k + 9)).join('');
+  assert.equal(g.feed(rec('sweep_tick', 9)), 1, 'an advancing sweeper tick re-arms the actual sweep guard');
+  assert.equal(g.feed([['sweep_tick', 9], ['sweep_tick', 344], ['sweep_tick', 359], ['sweep_tick', '349'], ['sweep', 349], ['progress', 349], ['sweep_done', 349]].map(r => rec(...r)).join('') + ticks + ticks), 34, 'duplicate, mid-chunk, out-of-range, non-integer and unrelated records never re-arm; a repeated (decreasing) flood re-arms once per remaining milestone');
+  assert.deepEqual([g.milestones, g.last, guardFor('contend', 40).milestones, guardFor('hold', 1).milestones, guardFor('choose', 1).milestones], [35, 349, 4, 0, 0], '(35 + 1) x stallMs = 360000 ms for 350 sweeps');
 });

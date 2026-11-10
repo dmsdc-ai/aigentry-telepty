@@ -35,18 +35,35 @@ function fixture(root, address) {
   return { mailbox, engine, context, session, events };
 }
 for (const mode of ['oversize', 'timeout', 'empty', 'malformed', 'no-ack']) {
-  test(`UDS ${mode}: source reports unknown, repeated ticks/restart never repeat body or submit`, { skip: process.platform === 'win32', timeout: 10000 }, async () => {
+  test(`UDS ${mode}: source reports unknown, repeated ticks/restart never repeat body or submit`, { skip: process.platform === 'win32', timeout: 10000 }, async (t) => {
+    // Task 1215 533: the 60 ms UDS deadline runs on the test's VIRTUAL clock (enabled BEFORE fixture() creates the context,
+    // which captures globalThis.setTimeout as a default parameter); the socket, peer and responses stay real UNIX I/O.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 't-uds-unknown-')), address = path.join(root, 'sock'), sockets = new Set();
-    let bodies = 0; const texts = [];
+    let bodies = 0; const texts = []; let cleaned = null;
     const server = net.createServer({ allowHalfOpen: true }, socket => {
       sockets.add(socket); socket.on('error', () => {}); socket.on('close', () => sockets.delete(socket));
       let input = '';
       socket.on('data', chunk => { input += chunk.toString(); if (input.includes('\n')) { bodies++; texts.push(JSON.parse(input).text); if (mode === 'oversize') socket.end(Buffer.alloc(70000, 'x')); else if (mode === 'empty') socket.end(); else if (mode === 'malformed') socket.end('not-json'); else if (mode === 'no-ack') socket.end('{}'); } });
     });
-    await new Promise(resolve => server.listen(address, resolve));
-    try {
+    const cleanup = () => cleaned || (cleaned = (async () => { t.mock.timers.reset(); for (const socket of sockets) socket.destroy();
+      await new Promise(resolve => server.close(resolve)); fs.rmSync(root, { recursive: true, force: true }); })());
+    t.after(cleanup);   // also after an outer timeout/abort, when finally never runs
+    try {   // 534: listen inside try (cleanup already registered); a listen error rejects, the one-shot listener is removed on success
+      await new Promise((resolve, reject) => { server.once('error', reject); server.listen(address, () => { server.off('error', reject); resolve(); }); });
+      t.signal.throwIfAborted();   // an outer abort during listen fails here, before FileMailbox/delivery are created
       const f = fixture(path.join(root, 'mailbox'), address);
-      const result = await f.context.deliverInjectionToSession('fixture', f.session, 'PRIVATE_BODY', { noEnter: false, from: 'fixture-source' });
+      let settled = false; const pending = f.context.deliverInjectionToSession('fixture', f.session, 'PRIVATE_BODY', { noEnter: false, from: 'fixture-source' });
+      pending.then(() => { settled = true; }, () => { settled = true; });
+      const turns = async () => { for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve)); };
+      if (mode === 'timeout') {   // the REAL peer counts the body first (bounded real wait), then the virtual deadline is crossed
+        for (const until = Date.now() + 5000; bodies === 0 && !settled && Date.now() < until;) await new Promise(resolve => setImmediate(resolve));
+        assert.equal(bodies, 1, 'PRECONDITION: the peer received the body before the virtual deadline was advanced');
+        t.mock.timers.tick(59); await turns(); assert.equal(settled, false, 'not settled at 59 virtual ms');
+        t.mock.timers.tick(1);
+      }
+      const result = await pending;
+      assert.equal(result.httpStatus, mode === 'timeout' ? 504 : 502, 'timeout path only in timeout mode; responding modes settle on the response');
       assert.equal(result.success, false); assert.equal(result.code, 'DELIVERY_UNCERTAIN'); assert.equal(result.delivery_uncertain, true);
       assert.equal(result.retryable, false); assert.equal(result.submit, 'skipped'); assert.equal(bodies, 1); assert.deepEqual(texts, ['PRIVATE_BODY']);
       assert.equal(f.mailbox.messageState('fixture', result.msg_id), 'dead_letter');
@@ -59,7 +76,7 @@ for (const mode of ['oversize', 'timeout', 'empty', 'malformed', 'no-ack']) {
       const restarted = fixture(path.join(root, 'mailbox'), address);
       for (let i = 0; i < 4; i++) await restarted.engine.tick();
       assert.equal(bodies, 1); assert.equal(restarted.mailbox.messageState('fixture', result.msg_id), 'dead_letter');
-    } finally { for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { await cleanup(); }
   });
 }
 test('fsynced attempt fence survives restart before a response/outcome is recorded', () => {

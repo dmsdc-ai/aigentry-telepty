@@ -325,6 +325,7 @@ function createAllowSecurityContext(shared, {
 } = {}) {
     // This fence belongs to this context, even if another context resets shared state.
     let closed = false;
+    let teardown = null;   // hotfix523: { startedAt, done } of the ONE teardown DELETE this context's close started
     const deliveryTimers = new Set();
     function isClosed() {
       if (shared.allowSessionClosed) closed = true;
@@ -364,6 +365,27 @@ function createAllowSecurityContext(shared, {
     // whose output/exit handlers are attached.
     let childSeq = 0;
     let subscribedChild = null;
+    // Task 1215 hotfix 0.10.1: children whose exit this context observed (restart window). Never written to.
+    const exitedChildren = new WeakSet();
+    // Task 1215 hotfix 0.10.1 (immediate-submit-v1): at most ONE submit CR per inject_id and per pair, per owner
+    // generation. Each key maps to one shared state: admitted (queued or about to be written), attempted (child.write
+    // entered), written, unknown (the write threw or exit custody could not tell), or not_written (refused or
+    // quarantined unwritten). A later CR for any of its keys is refused with that state and is never written. An id-less
+    // legacy CR has no key and is never deduped.
+    const SUBMIT_GUARD_MAX = 4096;
+    const submitGuard = new Map();
+    // hotfix480 F4: a body frame's keys are entered as 'open' when it arrives, so its CR finds them. Owner generations
+    // that lost keys to the bound (at most 64 remembered) refuse a named CR with no keys: it may repeat an evicted one.
+    const guardEvicted = new Set();
+    function guardKeys(keys, guard) {
+      for (const key of keys) submitGuard.set(key, guard);
+      while (submitGuard.size > SUBMIT_GUARD_MAX) {
+        const evicted = submitGuard.keys().next().value;
+        submitGuard.delete(evicted);
+        guardEvicted.delete(evicted.split('\0')[0]); guardEvicted.add(evicted.split('\0')[0]);
+        if (guardEvicted.size > 64) guardEvicted.delete(guardEvicted.values().next().value);
+      }
+    }
     // Task 1215 G1: the subscribed child whose announcement waits for its real pid (see announceTransportReady).
     let pidPendingChild = null;
     let relayOnReady = null;
@@ -410,6 +432,7 @@ function createAllowSecurityContext(shared, {
       catch { return null; }
       if (record) { record.state = moved ? 'quarantined' : 'gone'; bridgeRecords.delete(msgId); }
       if (!moved) return false;
+      if (record && record.guard) record.guard.state = certainty === 'not_written' ? 'not_written' : 'unknown';
       if (record && !record.isCr) rememberUnwritten(meta.daemon_msg_id);
       if (record && !record.isCr && certainty === 'not_written') unwrittenBodyAdjacentAt = now();
       sendReceipt(msgId, meta, 'quarantined', certainty, reason);
@@ -468,20 +491,43 @@ function createAllowSecurityContext(shared, {
       return { ready: false, reason: unobservedReason() };
     }
     function userInputRecent() { return now() - shared.lastUserInputTime <= shared.IDLE_THRESHOLD; }
+    // Task 1215 hotfix 0.10.1: the only screen-derived withholding cause left for a guarded owner is a TRUE modal
+    // (an interaction surface whose Enter is not "submit my message"). Output, working/thinking, loading, a missing
+    // composer or an incomplete frame are never a modal. Rendered frame first (existing detectFrame modal_ui, then the
+    // daemon's positional detectSurfaceModal on the rows); with no usable frame (VT unavailable / kill switch) the same
+    // detectSurfaceModal on the bridge's own output tail. Supervised owners read no screen at all (unchanged).
+    function bridgeModalReason() {
+      if (supervised() || !shared.knownAiCli || shared.sshPlan) return null;
+      const registry = shared.readyRegistry;
+      const surfaceModal = text => typeof registry?.detectSurfaceModal === 'function'
+        && registry.detectSurfaceModal(shared.command, text).blocked === true;
+      if (VT_READY_ENABLED && bridgeScreen && !bridgeScreenUnavailable()) {
+        const verdict = frameVerdict();
+        if (verdict && verdict.reason === 'modal_ui') return 'modal_ui';
+        let frame = null;
+        try { frame = bridgeScreen ? bridgeScreen.readFrameSync() : null; } catch { frame = null; }
+        if (frame && frame.observation_basis !== 'unavailable' && Array.isArray(frame.rows_text)) {
+          return surfaceModal(frame.rows_text.join('\n')) ? 'modal_ui' : null;
+        }
+      }
+      return surfaceModal(shared.outputTail || '') ? 'modal_ui' : null;
+    }
+    function childExited(child) { return !!child && exitedChildren.has(child); }
+    // 507 C2: this child printed while the owner was supervised (fed to neither grid nor tail), so for a guarded known
+    // CLI a modal drawn then cannot be seen: fail closed until a new child resets the stream origin (resetBridgeScreen).
+    function modalUnobservable() { return !supervised() && shared.knownAiCli && !shared.sshPlan && vtSkippedOutput; }
     function withholdReason() {
       if (shared.handoffPending) return 'handoff_pending';
       // Task 1215 F6: the reason is read from actual state, never a fixed label.
-      if (supervised()) {
-        if (userInputRecent()) return 'user_input_recent';
-        if (isClosed()) return 'session_closed';
-        if (!shared.child || !canWrite(shared.child)) return 'child_unavailable';
-        if (!shared.wsReady || shared.daemonWs?.readyState !== 1) return 'owner_transport_unavailable';
-        return 'delivery_pending';
-      }
-      const verdict = frameVerdict();
-      if (verdict && !verdict.ready) return verdict.reason;
-      if ((verdict || shared.promptReady) && userInputRecent()) return 'user_input_recent';
-      return unobservedReason();
+      // Task 1215 hotfix 0.10.1: the same state-derived reasons for every policy; readiness is no longer a cause.
+      if (userInputRecent()) return 'user_input_recent';
+      if (isClosed()) return 'session_closed';
+      if (childExited(shared.child)) return 'child_restarting';
+      if (modalUnobservable()) return 'modal_unobservable';
+      if (!supervised() && bridgeModalReason()) return 'modal_ui';
+      if (!shared.child || !canWrite(shared.child)) return 'child_unavailable';
+      if (!shared.wsReady || shared.daemonWs?.readyState !== 1) return 'owner_transport_unavailable';
+      return 'delivery_pending';
     }
     // Called only from the tick while records are pending. Fails closed on every gate.
     function probeFrameReady() {
@@ -614,15 +660,30 @@ function createAllowSecurityContext(shared, {
     function idlessCrAdjacentToUnwritten() {
       return unwrittenBodyAdjacentAt !== null && !(shared.lastUserInputTime > unwrittenBodyAdjacentAt);
     }
-    function writeDirectInject(text, meta) {
+    function writeDirectInject(text, meta, guard = null) {
       const child = shared.child;
-      if (!canWrite(child)) return false;
+      if (!canWrite(child)) { if (guard) guard.state = 'not_written'; return false; }
       const ids = bridgeStage.frameMeta(meta);
       if (text === '\r' && (ids.pair ? unwrittenBodies.has(ids.pair) : idlessCrAdjacentToUnwritten())) {
+        if (guard) guard.state = 'not_written';
         sendReceipt(null, ids, 'refused', 'not_written', 'pair_unwritten');
         return false;
       }
-      child.write(text);
+      // Task 1215 hotfix 0.10.1: never into a child whose exit was observed (restart window); said, not written.
+      if (childExited(child)) {
+        if (guard) guard.state = 'not_written';
+        sendReceipt(null, ids, 'refused', 'not_written', 'child_exited');
+        return false;
+      }
+      // Task 1215 hotfix 0.10.1: the attempt is recorded before the effect, so a throw can never read as "not written".
+      if (guard) guard.state = 'attempted';
+      try { child.write(text); }
+      catch (error) {
+        if (guard) guard.state = 'unknown';
+        sendReceipt(null, ids, 'unknown', 'unknown', 'write_threw');
+        throw error;
+      }
+      if (guard) guard.state = 'written';
       unwrittenBodyAdjacentAt = null;
       adjacentQueuedBody = null;
       refusedIdlessBodyAt = null;
@@ -644,6 +705,37 @@ function createAllowSecurityContext(shared, {
       let textWritten = false;
       if (!rawData) return { rawData, textWritten };
       const isCr = rawData === '\r';
+      // Task 1215 hotfix 0.10.1: one submit CR per inject_id / pair per owner generation (repeat /submit calls, retries
+      // of an older daemon, a paired CR plus a terminal-level CR). The refusal names THIS frame's ids and the state of
+      // the CR already admitted. It never restates that CR, so a written or unknown CR is never relabelled not_written.
+      let guard = null;
+      if (isCr) {
+        const ids = bridgeStage.frameMeta(meta);
+        const generation = ids.owner_generation || shared.interactionBinding?.owner_generation || '';
+        const keys = ids.part === 'submit'
+          ? [ids.inject_id && `${generation}\0inject:${ids.inject_id}`, ids.pair && `${generation}\0pair:${ids.pair}`].filter(Boolean) : [];
+        const prior = keys.map(key => submitGuard.get(key)).find(Boolean);
+        if (prior && prior.state !== 'open') {
+          sendReceipt(null, ids, 'refused', 'not_written', `duplicate_submit:${prior.state}`);
+          return { rawData, textWritten };
+        }
+        if (!prior && keys.length && guardEvicted.has(generation)) {   // hotfix480 F4: cannot prove it is not a repeat
+          sendReceipt(null, ids, 'refused', 'not_written', 'submit_guard_evicted');
+          return { rawData, textWritten };
+        }
+        if (keys.length) {
+          guard = prior || {};
+          guard.state = 'admitted';
+          guardKeys(keys.filter(key => submitGuard.get(key) !== guard), guard);
+        }
+      } else {
+        // hotfix480 F4: this body's keys, entered before its CR can arrive; an existing entry is never reset.
+        const ids = bridgeStage.frameMeta(meta);
+        const generation = ids.owner_generation || shared.interactionBinding?.owner_generation || '';
+        const keys = ids.part === 'body'
+          ? [ids.inject_id && `${generation}\0inject:${ids.inject_id}`, ids.daemon_msg_id && `${generation}\0pair:${ids.daemon_msg_id}`].filter(Boolean) : [];
+        if (keys.length && !keys.some(key => submitGuard.has(key))) guardKeys(keys, { state: 'open' });
+      }
       // Task 1215 O1: flush lowers the pending count while its writes still wait on delivery timers. A CR with only
       // in-flight writes ahead is queued and flushed at once (a CR is never idle-gated) behind them, never written first.
       const inFlightAhead = isCr && shared.bridgePendingCount === 0 && deliveryTimers.size > 0;
@@ -653,10 +745,11 @@ function createAllowSecurityContext(shared, {
         // path's adjacency and typing rule, in arrival order); a CR with ids is paired at flush by unwrittenBodies.
         if (!bridgeStage.frameMeta(meta).pair && refusedIdlessBodyAt !== null && !(shared.lastUserInputTime > refusedIdlessBodyAt)) {
           refusedIdlessBodyAt = null;
+          if (guard) guard.state = 'not_written';
           sendReceipt(null, bridgeStage.frameMeta(meta), 'refused', 'not_written', 'pair_unwritten');
           return { rawData, textWritten };
         }
-        enqueueBridgeMessage(rawData, meta);
+        enqueueBridgeMessage(rawData, meta, guard);
         if (inFlightAhead || isIdle()) {
           if (shared.queueFlushTimer) { clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
           flushBridgeMailbox();
@@ -665,7 +758,7 @@ function createAllowSecurityContext(shared, {
         }
       } else if (isCr) {
         // CR is never idle-gated, but never for a body that was quarantined unwritten (#136, F5).
-        writeDirectInject(rawData, meta);
+        writeDirectInject(rawData, meta, guard);
       } else if (isIdle() && shared.bridgePendingCount === 0 && deliveryTimers.size === 0) {
         // Task 1215 O5: a body is written directly only when nothing earlier is queued or still on a delivery timer
         // (supervised isIdle() is typing quiet only); otherwise it queues behind that work and drains in order.
@@ -700,8 +793,17 @@ function createAllowSecurityContext(shared, {
     }
 
     function updateDaemonProcessMetadata() {
+      // hotfix524: a metadata refresh is never a create/recovery authority. It names THIS bridge's accepted instance, the
+      // current owner claim's binding (epoch + credential generation), captured now, before any async work, through the
+      // register route's existing instance preconditions: a destroyed or replaced instance is refused before any create
+      // or update. Closed, unbound or unproven: withheld. A refusal is never retried, and no bare sid is ever sent.
+      const binding = shared.interactionBinding;
+      if (isClosed() || !binding || binding.sid !== shared.sessionId || !/^[A-Za-z0-9_-]{22}$/.test(binding.session_epoch || '')
+        || !Number.isSafeInteger(binding.credential_generation) || binding.credential_generation < 1) return;
       const body = {
         session_id: shared.sessionId,
+        expected_epoch: binding.session_epoch,
+        expected_credential_generation: binding.credential_generation,
         command: shared.command,
         ...(shared.sshPlan ? { ssh_remote: shared.sshPlan.metadata } : {}),
         cwd: process.cwd(),
@@ -746,6 +848,7 @@ function createAllowSecurityContext(shared, {
         if (subscribedChild === child) subscribedChild = null;
         if (!current()) return;
         exited = true;
+        exitedChildren.add(child); // Task 1215 hotfix 0.10.1: queued work waits for the successor, never this child
         onExit(event);
       });
       subscribedChild = child;
@@ -780,8 +883,8 @@ function createAllowSecurityContext(shared, {
 
     // #137: `meta` is the daemon ids of the inject frame (daemon_msg_id, inject_id, part, pair,
     // owner_generation). It is indexed with the record for receipts; it is not a payload field.
-    function enqueueBridgeMessage(text, meta) {
-      if (isClosed() || shared.handoffPending) return;
+    function enqueueBridgeMessage(text, meta, guard = null) {
+      if (isClosed() || shared.handoffPending) { if (guard) guard.state = 'not_written'; return; }
       const child = shared.child;
       const msgId = `${shared.sessionId}:${now()}:${++shared.bridgeMsgSeq}`;
       const ids = bridgeStage.frameMeta(meta);
@@ -791,6 +894,7 @@ function createAllowSecurityContext(shared, {
           payload: text, created_at: Math.floor(now() / 1000), attempt: 0,
         });
       } catch (err) {
+        if (guard) guard.state = 'not_written';
         if (!canWrite(child)) return;
         // Task 1215 C1/C2 (measured: Windows MAILBOX_LOCK_TIMEOUT wrote a lone CR under the kill switch, and body+CR
         // on a guarded MODAL frame). Every caller enqueues only because a direct write is not permitted now (gate
@@ -806,6 +910,7 @@ function createAllowSecurityContext(shared, {
         return;
       }
       rememberRecord(msgId, ids, text === '\r');
+      if (guard) bridgeRecords.get(msgId).guard = guard;   // Task 1215 hotfix 0.10.1
       adjacentQueuedBody = text !== '\r' && !ids.daemon_msg_id ? msgId : null;
       refusedIdlessBodyAt = null;
       if (!canWrite(child)) return;
@@ -813,10 +918,14 @@ function createAllowSecurityContext(shared, {
       sendReceipt(msgId, ids, 'queued', 'not_written');
     }
 
+    // Task 1215 hotfix 0.10.1: admission never waits for output quietness, ready/idle detection, a rendered composer,
+    // thinking completion or a settle timer (promptReady is no longer consulted). It waits only for real causes: the
+    // local user's own typing (unchanged 2 s window), an exited child (restart window) and, for guarded owners, a true modal.
     function isIdle() {
       if(shared.handoffPending)return false;
-      if (supervised()) return now() - shared.lastUserInputTime > shared.IDLE_THRESHOLD;
-      return shared.promptReady && (now() - shared.lastUserInputTime > shared.IDLE_THRESHOLD);
+      if (now() - shared.lastUserInputTime <= shared.IDLE_THRESHOLD) return false;
+      if (childExited(shared.child)) return false;
+      return supervised() || (!modalUnobservable() && !bridgeModalReason());
     }
 
     function observePromptReady(data) {
@@ -847,6 +956,10 @@ function createAllowSecurityContext(shared, {
     function flushBridgeMailbox() {
       if (isClosed() || shared.handoffPending) return;
       const child = shared.child;
+      // Task 1215 hotfix 0.10.1: restart window — nothing is dequeued for an exited child; the records stay pending
+      // (custody, order) and the still-armed tick drains them once into the successor.
+      if (childExited(child)) return;
+      if (modalUnobservable()) return; // 507 C2: also on a tail-ready onReady route; records stay pending (custody, TTL)
       if (shared.queueFlushTimer) { clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
       if (shared.idleCheckTimer) { clearInterval(shared.idleCheckTimer); shared.idleCheckTimer = null; }
       if (shared.bridgePendingCount === 0) return;
@@ -876,7 +989,8 @@ function createAllowSecurityContext(shared, {
         // #136 F4: a dropped inject was never written. Dead-letter it with its payload; an ack
         // here would relabel "never written" as delivered.
         quarantine(msg.msg_id, reason === 'duplicate' ? 'bridge_duplicate' : 'expired_unwritten', 'not_written', { inFlight: true });
-        console.warn(`\x1b[33m[BRIDGE] dropped ${reason} inject ${msg.msg_id} (age=${nowSecs - msg.created_at}s)\x1b[0m`);
+        // hotfix480 quiet: a dropped duplicate is silent (its quarantine/receipt above is unchanged); other reasons warn.
+        if (reason !== 'duplicate') console.warn(`\x1b[33m[BRIDGE] dropped ${reason} inject ${msg.msg_id} (age=${nowSecs - msg.created_at}s)\x1b[0m`);
       }
       const delivering = new Set(deliver);
       const droppedIds = new Set(dropped.map(({ msg }) => msg.msg_id));
@@ -904,15 +1018,21 @@ function createAllowSecurityContext(shared, {
           deliveryTimers.delete(timer);
           if (!canWrite(child)) return;
           if (bridgeRecords.get(msgId)?.pairRefused) { quarantine(msgId, 'pair_refused', 'not_written', { inFlight: true }); return; }
+          // Task 1215 hotfix 0.10.1: its child exited after the flush; dead-letter with payload, never written, never acked.
+          if (childExited(child)) { quarantine(msgId, 'child_exited', 'not_written', { inFlight: true }); return; }
           invalidateBridgeInteraction('automated_input');
           if (!canWrite(child)) return;
+          const guard = bridgeRecords.get(msgId)?.guard || null;   // Task 1215 hotfix 0.10.1
+          if (guard) guard.state = 'attempted';
           try { child.write(text); }
           catch (error) {
             const record = bridgeRecords.get(msgId);
             if (record) record.state = 'unknown';
+            if (guard) guard.state = 'unknown';
             sendReceipt(msgId, meta, 'unknown', 'unknown', 'write_threw');
             throw error;
           }
+          if (guard) guard.state = 'written';
           bridgeRecords.delete(msgId);
           unwrittenBodyAdjacentAt = null;
           // PTY master write only; never consumption, turn acceptance or completion.
@@ -1012,7 +1132,10 @@ function createAllowSecurityContext(shared, {
         const deleteUrl = shared.currentOwnerToken
           ? `${shared.DAEMON_URL}/api/sessions/${encodeURIComponent(shared.sessionId)}?owner_token=${encodeURIComponent(shared.currentOwnerToken)}`
           : `${shared.DAEMON_URL}/api/sessions/${encodeURIComponent(shared.sessionId)}`;
-        (0, shared.fetchWithAuth)(deleteUrl, { method: 'DELETE' }).catch(() => {});
+        // hotfix523: still started exactly once here; its settlement is kept so an explicit exit can wait for it
+        // (settleTeardown) instead of process.exit discarding it. A refusal or error is recorded as not ok, never as deleted.
+        teardown = { startedAt: now(), done: (0, shared.fetchWithAuth)(deleteUrl, { method: 'DELETE' })
+          .then(res => ({ ok: !!(res && res.ok), status: res && Number.isInteger(res.status) ? res.status : null }), () => ({ ok: false, status: null })) };
       }
       try {
         shared.daemonWs.close();
@@ -1021,6 +1144,15 @@ function createAllowSecurityContext(shared, {
         removeSignalHandler(signalName, handler);
       }
       return true;
+    }
+    // hotfix523: settles with the teardown DELETE this context's close started, or at ONE budget measured from its start
+    // ({ ok: false, status: null, timed_out: true }). null when no DELETE was started. Never a new request or a retry.
+    function settleTeardown(budgetMs = 2500) {
+      if (!teardown) return null;
+      let timer = null;
+      const bound = new Promise(resolve => { timer = setTimeout(() => resolve({ ok: false, status: null, timed_out: true }),
+        Math.max(0, teardown.startedAt + budgetMs - now())); });
+      return Promise.race([teardown.done, bound]).finally(() => clearTimeout(timer));
     }
 
     function createBridgeMailbox() {
@@ -1056,8 +1188,32 @@ function cooperativeQueueEmpty(){
       if(deliveryTimers.size || shared.bridgePendingCount || shared.queueFlushTimer)return false;
       try{return shared.bridgeMailbox.snapshotCustody(shared.bridgeTarget).length===0;}catch{return false;}
     }
-return { cooperativeQueueEmpty, updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, createBridgeMailbox, recoverBridgeMailbox,
+return { cooperativeQueueEmpty, updateDaemonProcessMetadata, createOutputRelay, subscribeChild, spawnChild, enqueueBridgeMessage, isIdle, observePromptReady, flushBridgeMailbox, scheduleIdleFlush, invalidateBridgeInteraction, closeAllowSession, settleTeardown, createBridgeMailbox, recoverBridgeMailbox,
   noteBridgeGeometry, writeDirectInject, bridgeQueueSummary, reportBridgeQueue, handleOwnerInject, announceTransportReady };
 }
 
-module.exports = { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken, credentialOrigin };
+// Task 1215 hotfix 0.10.1 — `telepty inject --submit` outcome for a daemon that answered on the immediate-submit path.
+// It names the stage the daemon actually knows. sent_to_bridge means the CR frame reached the owner bridge; the bridge
+// receipt reports the PTY write. queued means it was parked behind a real fence. not_written means it was refused or
+// cancelled. unknown means the write outcome is unknown. It never claims consumption, and it never suggests a forced
+// Enter. null means a legacy response, so cli.js keeps its existing wording.
+function describeImmediateSubmit(status, data, { injectId = null } = {}) {
+  if (!data || data.immediate_submit !== true) return null;
+  const why = typeof data.reason === 'string' && /^[a-z0-9_.:-]{1,64}$/i.test(data.reason) ? data.reason : null;
+  const ref = injectId ? ` for inject_id ${injectId}` : '';
+  const forced = data.forced ? ' [forced]' : '';
+  if (status >= 200 && status < 300 && data.submit_stage === 'sent_to_bridge') {
+    return { failed: false, text: `✅ Enter sent to the session bridge (stage: sent_to_bridge)${forced} — the PTY write is reported by the bridge receipt${ref}; consumption=unknown.` };
+  }
+  if (status >= 200 && status < 300 && data.submit_stage === 'queued') {
+    return { failed: false, text: `⏸  Enter QUEUED (stage: queued${why ? `, reason: ${why}` : ''})${forced} — not written yet; it is written once, in order, when that clears, or dropped with a recorded outcome.` };
+  }
+  if (data.submit_stage === 'not_written') {
+    // hotfix480 F4: a refusal speaks for this request only; an earlier Enter for the same inject stays unknown.
+    const prior = data.prior_submit === 'unknown' ? ' by this request; an earlier Enter for this inject, if any, is unknown' : '';
+    return { failed: true, text: `❌ Enter NOT written${prior} (stage: not_written${why ? `, reason: ${why}` : ''})${forced}.` };
+  }
+  return { failed: true, text: `⚠️  Enter outcome unknown (stage: ${data.submit_stage === 'unknown' ? 'unknown' : 'unreported'}, HTTP ${Number(status) || 0})${forced} — do not assume it was written or not written.` };
+}
+
+module.exports = { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken, credentialOrigin, describeImmediateSubmit };

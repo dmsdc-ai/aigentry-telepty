@@ -145,37 +145,12 @@ function createBridge(t, { sid }) {
   function feed(stream, chunk = 1024) {
     for (let i = 0; i < stream.length; i += chunk) relay(stream.slice(i, i + chunk));
   }
-  // Mirror of cli.js:3160-3196 (owner-WS 'inject' frame). The optional frame fields are
-  // forwarded as the proposed second argument (design F3); the current code ignores it.
+  // Task 1215 hotfix 0.10.1: the PRODUCTION owner-WS inject handler (cli.js calls allowSecurity.handleOwnerInject),
+  // replacing the former line-for-line mirror of the pre-F4 cli.js branch so this test gate cannot diverge from production.
+  // Only cli.js's own closure state (readyNotified) is kept here.
   function injectFrame(frame) {
-    allow.invalidateBridgeInteraction('automated_input');
-    const rawData = typeof frame.data === 'string' ? frame.data : String(frame.data ?? '');
-    const meta = {};
-    for (const key of ['daemon_msg_id', 'inject_id', 'part', 'pair', 'owner_generation']) {
-      if (frame[key] !== undefined) meta[key] = frame[key];
-    }
-    for (const chunk of [rawData]) {
-      if (!chunk) continue;
-      const isCr = chunk === '\r';
-      if (isCr && shared.bridgePendingCount > 0) {
-        allow.enqueueBridgeMessage(chunk, meta);
-        if (allow.isIdle()) {
-          if (shared.queueFlushTimer) { clock.clearTimeout(shared.queueFlushTimer); shared.queueFlushTimer = null; }
-          allow.flushBridgeMailbox();
-        } else {
-          allow.scheduleIdleFlush();
-        }
-      } else if (isCr) {
-        shared.child.write(chunk);
-      } else if (allow.isIdle()) {
-        shared.child.write(chunk);
-        shared.promptReady = false;
-      } else {
-        allow.enqueueBridgeMessage(chunk, meta);
-        allow.scheduleIdleFlush();
-      }
-    }
-    if (rawData && rawData !== '\r') readyNotified = false;
+    const handled = allow.handleOwnerInject(frame);
+    if (handled.rawData && handled.rawData !== '\r') readyNotified = false;
   }
   let injectSeq = 0;
   function daemonInject(text) {
@@ -231,6 +206,9 @@ function createBridge(t, { sid }) {
 const IDLE = loadStream('codex-differential-idle.json');
 const LOADING = loadStream('codex-loading-no-composer.json');
 const LEGACY = loadStream('codex-legacy-composer.json');
+// Task 1215 hotfix 0.10.1: a TRUE modal is the remaining frame-based withholding cause, so the TTL/custody cases below
+// (formerly held open by a never-ready LOADING screen, which no longer withholds) are held open by this modal.
+const MODAL = loadStream('codex-differential-modal.json');
 
 function tailVerdicts(stream, chunk = 1024) {
   // Exactly what observePromptReady computes per chunk (security-actions.js:408-409).
@@ -243,7 +221,9 @@ function tailVerdicts(stream, chunk = 1024) {
   return found;
 }
 
-test('#136 H (VT-unavailable control): differential stream, 120 ticks -> 0 writes, records pending, no 5 s compat timer', { timeout: 30000 }, async t => {
+// Task 1215 hotfix 0.10.1 (replaces the #136 H busy-wait assertion: 0 writes, records pending): VT unavailable is not a
+// withholding cause; the pair is handed off at once, nothing is queued, and still no 5 s compat timer is armed.
+test('#136 H / hotfix: VT unavailable on the differential stream -> body+CR written at once, nothing queued, no 5 s compat timer', { timeout: 30000 }, async t => {
   assert.ok(IDLE.length > 20000 && !/[\r\n]/.test(IDLE), 'PRECONDITION: differential fixture is >20k with no LF/CR');
   assert.ok(tailVerdicts(IDLE).every(found => found === false), 'PRECONDITION: raw-tail detector never matches the differential stream');
   vt.__setTerminalCtorForTest(null); // existing seam: VT library unavailable
@@ -258,7 +238,7 @@ test('#136 H (VT-unavailable control): differential stream, 120 ticks -> 0 write
     writes: b.writes,
     states: b.entries().map(e => e.state),
     compatFlushTimers: b.clock.calls.timeouts.filter(ms => ms === 5000).length,
-  }, { writes: [], states: ['pending', 'pending'], compatFlushTimers: 0 });
+  }, { writes: ['H-CONTROL-BODY', '\r'], states: [], compatFlushTimers: 0 });
 });
 
 test('#136 P1 (legacy positive control): a tail-matching composer drains body+CR exactly once', { timeout: 30000 }, async t => {
@@ -290,12 +270,33 @@ test('#136 P1-receipt: a written body and submit each get exactly one bounded pt
   }, { writes: ['P1-RECEIPT-BODY', '\r'], ptyWritten: ['body', 'submit'], violations: [] });
 });
 
-test('#136 N1: a never-ready known CLI becomes visibly stalled by 15 s (one withheld receipt per reason, bounded queue frames), still 0 writes', { timeout: 30000 }, async t => {
+// Task 1215 hotfix 0.10.1 (replaces #136 N1, which asserted a never-ready known CLI is withheld first_ready_unobserved
+// with 0 writes): a never-ready LOADING screen is not a withholding cause. The body is written at once, no withheld
+// receipt is ever sent and the queue never stalls. Stall visibility for a REAL cause is covered by N1-modal below.
+test('#136 N1 / hotfix: a never-ready known CLI (loading, no composer) receives the body at once; no withheld receipt, never stalled', { timeout: 30000 }, async t => {
   assert.ok(tailVerdicts(LOADING).every(found => found === false), 'PRECONDITION: loading fixture never matches the tail detector');
   const b = createBridge(t, { sid: 'b136-n1-stall' });
   b.feed(LOADING);
   await settleVt();
   const { injectId, body } = b.daemonInject('N1-STALL-BODY');
+  b.injectFrame(body);
+  const atOnce = b.writes.slice();
+  await b.clock.advance(60000);
+  assert.deepEqual({
+    atOnce,
+    writes: b.writes,
+    withheld: b.receipts(injectId, 'withheld').length,
+    stalled: b.framesOf('bridge_queue').some(q => q.msg.phase === 'stalled'),
+    firstReady: b.shared.firstReadyObserved,
+    violations: b.receiptViolations(['N1-STALL-BODY']),
+  }, { atOnce: ['N1-STALL-BODY'], writes: ['N1-STALL-BODY'], withheld: 0, stalled: false, firstReady: false, violations: [] });
+});
+
+test('#136 N1-modal: a known CLI held by a TRUE modal becomes visibly stalled by 15 s (one withheld receipt per reason, bounded queue frames), still 0 writes', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b136-n1-modal-stall' });
+  b.feed(MODAL);
+  await settleVt();
+  const { injectId, body } = b.daemonInject('N1-MODAL-BODY');
   b.injectFrame(body);
   await b.clock.advance(16000);
   const withheldBy16s = b.receipts(injectId, 'withheld').map(r => ({ part: r.msg.part, reason: r.msg.reason }));
@@ -312,10 +313,10 @@ test('#136 N1: a never-ready known CLI becomes visibly stalled by 15 s (one with
     stalledBy16s,
     withheldBy60s: b.receipts(injectId, 'withheld').length,
     queueFramesAtMostOnePerSecond: [...perSecond.values()].every(n => n <= 1),
-    violations: b.receiptViolations(['N1-STALL-BODY']),
+    violations: b.receiptViolations(['N1-MODAL-BODY']),
   }, {
     writes: [],
-    withheldBy16s: [{ part: 'body', reason: 'first_ready_unobserved' }],
+    withheldBy16s: [{ part: 'body', reason: 'modal_ui' }],
     stalledBy16s: true,
     withheldBy60s: 1,
     queueFramesAtMostOnePerSecond: true,
@@ -325,7 +326,7 @@ test('#136 N1: a never-ready known CLI becomes visibly stalled by 15 s (one with
 
 test('#136 N2: past the 600 s TTL the tick quarantines the record (dead_letter expired_unwritten, payload kept, never acked, never written)', { timeout: 60000 }, async t => {
   const b = createBridge(t, { sid: 'b136-n2-ttl' });
-  b.feed(LOADING);
+  b.feed(MODAL); // Task 1215 hotfix 0.10.1: held open by a true modal (a loading screen no longer withholds)
   await settleVt();
   const { injectId, body } = b.daemonInject('N2-TTL-BODY');
   b.injectFrame(body);
@@ -356,7 +357,7 @@ test('#136 N2: past the 600 s TTL the tick quarantines the record (dead_letter e
 
 test('#136 N3: the submit CR is withdrawn with its expired body (pair_unwritten); a later ready writes no lone CR', { timeout: 60000 }, async t => {
   const b = createBridge(t, { sid: 'b136-n3-pair' });
-  b.feed(LOADING);
+  b.feed(MODAL); // Task 1215 hotfix 0.10.1: held open by a true modal (a loading screen no longer withholds)
   await settleVt();
   const { injectId, body, submit } = b.daemonInject('N3-PAIR-BODY');
   b.injectFrame(body);

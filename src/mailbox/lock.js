@@ -27,7 +27,11 @@ const COUNTERS = ['doorway_rescans', 'admission_polls', 'pauses', 'pause_request
   'eperm_read_number_gone', 'read_throw_number_listed',
   // #1215 lock227: a REAP's own listing of the ticket directory (removeTicket's first listing / post-unlink re-list)
   // refused with EPERM; the cleanup is left pending for the remover finishing it (counted, never claimed removed).
-  'eperm_reap_list_unresolved', 'eperm_reap_relist_unresolved'];
+  'eperm_reap_list_unresolved', 'eperm_reap_relist_unresolved',
+  // #1215 lock525: a `number` descriptor reporting 0 links (win32 delete-pending) classified by the ticket's retirement state.
+  'nlink0_departed', 'nlink0_unresolved', 'nlink0_throw',
+  // #1215 mailbox592: a first-stat / re-stat EPERM on a published `number` whose re-list is the same, now EMPTY ticket directory.
+  'eperm_relist_number_gone', 'eperm_restat_relist_number_gone'];
 const MAXIMA = ['pause_actual_max_ms', 'peers_seen_max'];
 const counters = () => Object.fromEntries([...COUNTERS, ...MAXIMA].map(key => [key, 0]));
 const totals = {acquired: 0, timeouts: 0, errors: 0, wait_ms_total: 0, wait_ms_max: 0, ...counters()};
@@ -115,7 +119,7 @@ function dirState(read) {
 function deletePending(file) { // An entry lstat cannot read (EPERM) or that is already gone.
   try { return statOptional(file) === null; } catch (e) { if (e.code === 'EPERM') return true; throw e; }
 }
-function checkTicketFiles(dir, names = ticketNames(dir)) {
+function checkTicketFiles(dir, names = ticketNames(dir), enumerated = null) { // enumerated: readTicket's lstat of dir
   if (names === null) return null;
   const marked = names.includes(DEPARTED);
   // One EPERM rule for the first stat and the nlink0 re-stat (#1215 correction5). Returns SKIP_ENTRY or
@@ -127,6 +131,10 @@ function checkTicketFiles(dir, names = ticketNames(dir)) {
     const again = dirState(() => ticketNames(dir));
     if (again === UNRESOLVED || again === null) { note(again === null ? `${prefix}relist_dir_gone` : `${prefix}relist_unresolved`); return {value: again}; }
     if (again.includes(DEPARTED)) { note(`${prefix}relist_departed`); return {value: checkTicketFiles(dir, again)}; }
+    // #1215 mailbox592 (win32 run 42737861005): the published `number` and its marker are gone and the SAME directory (or none:
+    // its rmdir landed) remains, i.e. lock10's empty ticket before rmdir. A draft, any entry, or another/unreadable dir still throws.
+    const now = name === 'number' && again.length === 0 && enumerated ? dirState(() => statOptional(dir)) : UNRESOLVED;
+    if (now === null || (now !== UNRESOLVED && now.isDirectory() && !now.isSymbolicLink() && now.dev === enumerated.dev && now.ino === enumerated.ino)) { note(`${prefix}relist_number_gone`); return {value: null}; }
     note(again.includes(name) ? `${prefix}unmarked_throw_entry_listed` : `${prefix}unmarked_throw_entry_absent`); // diagnostic split only
     throw e;
   };
@@ -189,6 +197,16 @@ function removeTicket(dir, reap = false) {
   catch (e) { if (e.code === 'ENOENT' || (marked && e.code === 'EPERM' && deletePending(marker))) return; throw e; }
   try { fs.rmdirSync(dir); } catch (e) { if (e.code !== 'ENOENT') throw e; }
 }
+// #1215 lock525: ONE retirement rule for a ticket whose `number` this read can no longer trust, from its CURRENT listing
+// (ticketNames: unknown entries refused; dirState: directory EPERM = UNRESOLVED, never absence). Departed = listing gone or
+// the DEPARTED marker present; lock10 = a published number now unlisted without marker. Anything else proves nothing.
+function retirement(dir, published) {
+  const again = dirState(() => ticketNames(dir));
+  if (again === UNRESOLVED) return UNRESOLVED;
+  if (again === null || again.includes(DEPARTED)) return 'departed';
+  if (published && !again.includes('number')) return 'number_gone';
+  return again.includes('number') ? 'listed' : 'absent';
+}
 function readTicket(parent, name, reap) {
   const match = TICKET.exec(name), dir = path.join(parent, name);
   const pid = Number(match[1]);
@@ -199,7 +217,7 @@ function readTicket(parent, name, reap) {
   if (!st) return null;
   if (!st.isDirectory() || st.isSymbolicLink()) throw failure('MAILBOX_UNSAFE_PATH');
   const listed = dirState(() => ticketNames(dir));
-  const names = listed === UNRESOLVED ? listed : checkTicketFiles(dir, listed);
+  const names = listed === UNRESOLVED ? listed : checkTicketFiles(dir, listed, st);
   if (names === UNRESOLVED) return unresolved;
   if (names === null) return null; // This unique participant has left.
   if (names.includes(DEPARTED)) { // Departed, not a stale lock: only its owner or a dead-owner reap finishes it.
@@ -216,13 +234,31 @@ function readTicket(parent, name, reap) {
       const gone = dirState(() => departed(dir));
       return gone === UNRESOLVED ? unresolved : gone ? null : {name, number: 0};
     }
+    // #1215 lock525 (win32 native524): a delete-pending `number` stays lstat-able while its descriptor reports 0 links. Only
+    // when that is the ONLY failed predicate does the retirement rule decide; otherwise the refusal below stands unchanged.
+    const retired = intact => {
+      if (!intact) return undefined;
+      const state = retirement(dir, published);
+      if (state === UNRESOLVED) { note('nlink0_unresolved'); return unresolved; }
+      if (state === 'departed' || state === 'number_gone') { note('nlink0_departed'); return null; }
+      note('nlink0_throw'); return undefined;
+    };
     fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
     const opened = fs.fstatSync(fd);
     if (opened.nlink === 0 && !statOptional(file)) return null; // The unique ticket was released after open.
+    if (opened.nlink === 0) {
+      const r = retired(opened.isFile() && opened.size <= 32 && opened.dev === before.dev && opened.ino === before.ino);
+      if (r !== undefined) return r;
+    }
     if (!opened.isFile() || opened.nlink !== 1 || opened.size > 32 || opened.dev !== before.dev || opened.ino !== before.ino) throw failure();
     const bytes = Buffer.alloc(33), count = fs.readSync(fd, bytes, 0, bytes.length, 0);
     const after = fs.fstatSync(fd);
     if (after.nlink === 0 && !statOptional(file)) return null;
+    if (after.nlink === 0) {
+      const r = retired(count === opened.size && count <= 32 && after.size === opened.size
+        && after.mtimeMs === opened.mtimeMs && after.ctimeMs === opened.ctimeMs);
+      if (r !== undefined) return r;
+    }
     if (count !== opened.size || count > 32 || after.nlink !== 1 || after.size !== opened.size
       || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) throw failure();
     const value = bytes.subarray(0, count).toString('utf8');

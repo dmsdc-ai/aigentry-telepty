@@ -10,6 +10,38 @@ const projectRoot = path.resolve(__dirname, '..');
 
 let sessionCounter = 0;
 
+// Task 1215 CI609 (MEASUREMENT ONLY): opt-in exactly TELEPTY_CI_OBSERVE607=1; unset, every CI609 path is skipped. Records
+// are JSONL under the fixed literal <repo>/ci-observe607/, one file per process, bounded. Labels come from closed sets;
+// env values, headers, bodies, prompts and command lines are never recorded. Recording never changes an outcome.
+const OBSERVE607 = process.env.TELEPTY_CI_OBSERVE607 === '1';
+const OBSERVE607_DIR = path.join(projectRoot, 'ci-observe607');
+const OBS_LABELS = { arm: /^[ABCD]$/.test(process.env.TELEPTY_CI_OBSERVE607_ARM || '') ? process.env.TELEPTY_CI_OBSERVE607_ARM : 'unknown',
+  iter: /^[0-9]{1,2}$/.test(process.env.TELEPTY_CI_OBSERVE607_ITER || '') ? Number(process.env.TELEPTY_CI_OBSERVE607_ITER) : 'unknown' };
+const OBS_MAX_LINES = 4000, OBS_MAX_BYTES = 4 * 1024 * 1024, obsState = { lines: 0, bytes: 0, dropped: 0 };
+const OBS_SESSION = /^[A-Za-z0-9_.-]{1,128}$/, obsSession = (v) => (typeof v === 'string' && OBS_SESSION.test(v) ? v : null);
+function observe607(role, record) {
+  if (!OBSERVE607) return;
+  try {
+    const line = JSON.stringify({ schema: 'telepty.ci-observe607/v1', utc: new Date().toISOString(), t_ms: Date.now(), pid: process.pid,
+      ...OBS_LABELS, dropped_before: obsState.dropped, ...record }) + '\n';
+    if (obsState.lines >= OBS_MAX_LINES || obsState.bytes + Buffer.byteLength(line) > OBS_MAX_BYTES) { obsState.dropped++; return; }
+    fs.mkdirSync(OBSERVE607_DIR, { recursive: true });
+    fs.appendFileSync(path.join(OBSERVE607_DIR, `${role === 'test' ? 'test' : 'harness'}-${process.pid}.jsonl`), line);
+    obsState.lines++; obsState.bytes += Buffer.byteLength(line);
+  } catch { /* measurement only */ }
+}
+// Fixed-shape copy of a daemon [telepty-diag] JSON body: lower-case keys, numbers/booleans/null and code-shaped tokens only.
+function obsSanitize(v, depth = 0) {
+  if (v === null || typeof v === 'boolean' || Number.isFinite(v)) return v;
+  if (typeof v === 'string') return diagToken(v);
+  if (depth >= 3 || typeof v !== 'object') return null;
+  if (Array.isArray(v)) return v.slice(0, 8).map((x) => obsSanitize(x, depth + 1));
+  const out = {};
+  for (const [k, x] of Object.entries(v).slice(0, 48)) if (/^[a-z][a-z0-9_]{0,47}$/.test(k)) out[k] = obsSanitize(x, depth + 1);
+  return out;
+}
+const obsRoute = (p) => p.split('/').map((s) => (s === '' || /^[a-z][A-Za-z_-]{0,40}$/.test(s) ? s : ':id')).join('/');
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -207,7 +239,7 @@ function diagProbeShape(p, pick) {
   return { answered: true, http_status: p.http_status, headers_ms: p.headers_ms, total_ms: p.total_ms, ...pick(p.body) };
 }
 
-async function boundedRequest(url, init = {}, { timeoutMs, signal } = {}) {
+async function boundedRequest(url, init = {}, { timeoutMs, signal, observe } = {}) {
   const method = String(init.method || 'GET').toUpperCase();
   const route = new URL(url).pathname;
   const budget = requestBudget(timeoutMs);
@@ -216,20 +248,35 @@ async function boundedRequest(url, init = {}, { timeoutMs, signal } = {}) {
   // observe148: `stage` says whether headers or the body were still pending, and `timerLateMs` how late this
   // process's own timer fired. Both are added to the ORIGINAL timeout error only.
   let outcome = null, stage = 'headers', timerLateMs = null;
+  // CI609 (only when request() passes `observe`): the timeout is DECIDED at the unchanged instant, but the original
+  // request is left running while `observe` records (bounded); it is then aborted and that ORIGINAL error is thrown.
+  let decide = null, observedTimeout = null;
+  const decision = observe ? new Promise((resolve) => { decide = resolve; }) : null;
   const onAbort = () => { if (!outcome) outcome = 'HARNESS_REQUEST_ABORTED'; controller.abort(); };
   const timer = setTimeout(() => {
     if (!outcome) { outcome = 'HARNESS_REQUEST_TIMEOUT'; timerLateMs = Math.max(0, Date.now() - begun - budget); }
-    controller.abort();
+    if (decide && outcome === 'HARNESS_REQUEST_TIMEOUT') decide(); else controller.abort();
   }, budget);
   if (signal) {
     if (signal.aborted) onAbort();
     else signal.addEventListener('abort', onAbort, { once: true });
   }
   try {
+    if (decision) {
+      const op = (async () => { const response = await fetch(url, { ...init, signal: controller.signal }); stage = 'body'; return parseResponse(response); })();
+      const first = await Promise.race([op.then((value) => ({ value }), (error) => ({ error })), decision.then(() => null)]);
+      if (first) { if ('value' in first) return first.value; throw first.error; }
+      observedTimeout = Object.assign(harnessRequestError(outcome, method, route, Date.now() - begun),
+        { budget_ms: budget, stage, timer_late_ms: timerLateMs });
+      try { await observe(observedTimeout, op, begun); } catch { /* measurement only */ }
+      controller.abort(); op.catch(() => {});
+      throw observedTimeout;
+    }
     const response = await fetch(url, { ...init, signal: controller.signal });
     stage = 'body';
     return await parseResponse(response);
   } catch (error) {
+    if (observedTimeout && error === observedTimeout) throw error;
     if (outcome) {
       throw Object.assign(harnessRequestError(outcome, method, route, Date.now() - begun),
         outcome === 'HARNESS_REQUEST_TIMEOUT' ? { budget_ms: budget, stage, timer_late_ms: timerLateMs } : {});
@@ -286,12 +333,32 @@ async function startTestDaemon(options = {}) {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc']
   });
 
+  // CI609 (opt-in): receive time of each `[EXIT] Session <sid>` line (M2) and sanitized `[telepty-diag]` lines (M3).
+  const exitLineAt = new Map(), lineTail = { stdout: '', stderr: '' };
+  function observeLines(stream, chunk) {
+    const lines = (lineTail[stream] + chunk).split(/\r?\n/), at = Date.now();
+    lineTail[stream] = lines.pop().slice(-8192);
+    for (const line of lines) {
+      const exit = /^\[EXIT\] Session (\S{1,128}) exited with code/.exec(line), session = exit && obsSession(exit[1]);
+      if (session && !exitLineAt.has(session)) exitLineAt.set(session, at);
+      if (exit) observe607('harness', { stage: 'daemon_exit_line', session, received_ms: at });
+      const slow = /^\[HTTP_SLOW\] (GET|POST|DELETE|PUT|PATCH|OPTIONS|HEAD|OTHER) (\S{1,200}) (\d{1,9})ms status=(\d{3})$/.exec(line); // probe656: the daemon's existing slowRequestObserver line, bounded fields only
+      if (slow) observe607('harness', { stage: 'daemon_slow_line', stream, method: slow[1], route: slow[2], duration_ms: Number(slow[3]), status: Number(slow[4]), received_ms: at });
+      const diag = /^\[telepty-diag\] (submit_barrier|http_delivery) (\{.*\})$/.exec(line);
+      if (!diag) continue;
+      let fields; try { fields = obsSanitize(JSON.parse(diag[2])); } catch { fields = 'unparsed'; }
+      observe607('harness', { stage: 'daemon_diag_line', stream, category: diag[1], received_ms: at, fields });
+    }
+  }
+
   child.stdout.on('data', (chunk) => {
     stdout += chunk.toString();
+    if (OBSERVE607) observeLines('stdout', chunk.toString());
   });
 
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString();
+    if (OBSERVE607) observeLines('stderr', chunk.toString());
   });
 
   // #879 — exit is a FACT recorded from the 'exit' event, never inferred from `child.exitCode`.
@@ -399,7 +466,47 @@ async function startTestDaemon(options = {}) {
     }
 
     return boundedRequest(`http://${host}:${port}${pathname}`, init,
-      { timeoutMs: options.timeoutMs ?? requestTimeoutMs, signal: options.signal });
+      { timeoutMs: options.timeoutMs ?? requestTimeoutMs, signal: options.signal,
+        // CI609: only a signal-free POST is observed. A GET poll inside waitFor, or a cleanup request under its own signal,
+        // keeps the unchanged abort, so a held request can never move a waitFor/cleanup deadline or re-type a failure.
+        ...(OBSERVE607 && init.method === 'POST' && !options.signal
+          ? { observe: (error, op, begun) => observeRequestTimeout(error, op, begun, pathname, init.method) } : {}) });
+  }
+
+  // CI609 (opt-in): fresh bounded probes at a request-timeout decision instant. /api/meta via the existing event_loop and
+  // audit_writer pickers (M1). For a POST /api/sessions/:id/inject, also that session's pendingReports entry: present,
+  // injected_at relative to the request start (the tracked begin commit), and tracking_state / last observation kind (M3).
+  // The ORIGINAL request is observed for at most OBS_EVENTUAL_MS more (eventual status). Nothing is re-sent or retried.
+  const OBS_PROBE_MS = 2000, OBS_EVENTUAL_MS = 12000;
+  async function obsProbe(pathname) {
+    const at = Date.now();
+    try {
+      const token = authToken();
+      const r = await fetch(`http://${host}:${port}${pathname}`, { headers: token ? { 'x-telepty-token': token } : {}, signal: AbortSignal.timeout(OBS_PROBE_MS) });
+      let body = null; try { body = JSON.parse(await r.text()); } catch { body = null; }
+      return { http_status: r.status, ms: Date.now() - at, body };
+    } catch (e) { return { unavailable: e && e.name === 'TimeoutError' ? 'probe_bound' : (diagToken(e && e.cause && e.cause.code) || 'error'), ms: Date.now() - at }; }
+  }
+  async function observeMeta() {
+    const p = await obsProbe('/api/meta');
+    return p.body ? { http_status: p.http_status, ms: p.ms, event_loop: diagEventLoop(p.body.event_loop), audit_writer: diagAuditWriter(p.body.audit_writer) }
+      : { http_status: p.http_status ?? null, ms: p.ms, unavailable: p.unavailable || 'no_body' };
+  }
+  async function observeRequestTimeout(error, op, begun, pathname, method) {
+    const decidedMs = Date.now() - begun;
+    const inject = String(method || 'GET').toUpperCase() === 'POST' ? /^\/api\/sessions\/([^/?]{1,200})\/inject$/.exec(pathname) : null;
+    let boundTimer = null;
+    const eventual = Promise.race([op.then((r) => ({ outcome: 'answered', http_status: r.status, at_ms: Date.now() - begun }),
+      (e) => ({ outcome: 'error', code: diagToken(e && (e.code || e.name)), at_ms: Date.now() - begun })),
+    new Promise((resolve) => { boundTimer = setTimeout(() => resolve({ outcome: 'unsettled_at_bound', bound_ms: OBS_EVENTUAL_MS }), OBS_EVENTUAL_MS); })]);
+    const pending = inject ? obsProbe(`/api/pendingReports/${inject[1]}`).then((p) => (p.body ? { http_status: p.http_status, ms: p.ms, present: p.http_status === 200,
+      injected_at_ms: Number.isFinite(Date.parse(p.body.injected_at)) ? Date.parse(p.body.injected_at) - begun : null,
+      tracking_state: diagToken(p.body.tracking_state), last_observation_kind: diagToken(p.body.last_observation && p.body.last_observation.kind) } : p)) : null;
+    const [meta, pend, ev] = await Promise.all([observeMeta(), pending, eventual]);
+    clearTimeout(boundTimer);
+    let session = null; try { session = inject ? obsSession(decodeURIComponent(inject[1])) : null; } catch { session = null; }
+    observe607('harness', { stage: 'request_timeout', method: diagToken(String(method || 'GET').toUpperCase()), route: obsRoute(pathname), session,
+      decided_ms: decidedMs, budget_ms: error.budget_ms, http_stage: error.stage, timer_late_ms: error.timer_late_ms, meta, pending: pend, eventual: ev });
   }
 
   await waitFor(async () => {
@@ -664,7 +771,10 @@ async function startTestDaemon(options = {}) {
       }
     } finally {
       if (ownsHome) {
-        fs.rmSync(homeDir, { recursive: true, force: true });
+        // Task 1215 CI612 U3: bounded retry for THIS harness-owned temp HOME only (Windows handle-release race). Node
+        // documents retries of EBUSY/EMFILE/ENFILE/ENOTEMPTY/EPERM with linear backoff (100+200+300 = 600 ms; the JS
+        // implementation retries each nested operation). A persistent refusal still throws; nothing is caught or ignored.
+        fs.rmSync(homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
       }
     }
   }
@@ -810,11 +920,16 @@ async function startTestDaemon(options = {}) {
     kill,
     waitFor,
     isAlive: () => !exitState.exited,
-    getLogs: () => ({ stdout, stderr })
+    getLogs: () => ({ stdout, stderr }),
+    // CI609 (opt-in measurement reads; null / 'unavailable' when the opt-in is unset)
+    observedExitLineAt: (sid) => (OBSERVE607 ? exitLineAt.get(sid) ?? null : null),
+    observeMeta: () => (OBSERVE607 ? observeMeta() : Promise.resolve('unavailable'))
   };
 }
 
 module.exports = {
+  OBSERVE607,
+  observe607,
   HARNESS_OBSERVATION_MARGIN_MS,
   HARNESS_REQUEST_MAX_MS,
   boundedRequest,

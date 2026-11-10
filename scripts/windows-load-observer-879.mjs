@@ -15,6 +15,11 @@
 //       powershell: powershell.exe -NoLogo -NoProfile -NonInteractive -Command exit
 //       schtasks  : schtasks.exe /query /tn <deliberately nonexistent task>   (a nonzero exit is the EXPECTED result)
 // Never recorded: environment values, any process command line, host or user names, probe output bytes.
+// Task 1215 CI609 (MEASUREMENT ONLY, opt-in `--host-sample on`, used by observation-timing-1215.yml; default unchanged): one
+// more probe per set, `host`, a fixed literal PowerShell script whose stdout is parsed into a CLOSED numeric shape only:
+// aggregate process counts, node/bash/powershell/conhost/openconsole counts, the count of node processes whose command line
+// contains each of five literal test-file names (matched inside PowerShell; the runner parent listing them all counts too),
+// and PhysicalDisk(_Total) sec/read, sec/write, queue length and bytes/s. Anything unsupported is 'unavailable'.
 //
 // Ownership and cleanup limits, stated honestly (task 1215 windows103):
 //   - A probe child is terminated ONLY through its own ChildProcess handle, during this observer's lifetime. If its
@@ -59,6 +64,13 @@ const STOP_WAIT_MS = PROBE_TIMEOUT_MS + CLOSURE_MS + 10000;
 const MISSING_TASK = '\\telepty-879-observer-nonexistent-task';
 const INSTANCE = /^[0-9a-f]{32}$/;
 const SELF = fileURLToPath(import.meta.url);
+const HOST_SAMPLE_PS = "$ErrorActionPreference='Stop';$o=@{};try{$p=@(Get-CimInstance Win32_Process -Property Name,CommandLine);$o.processes=$p.Count;foreach($n in 'node','bash','powershell','conhost','openconsole'){$o[$n]=@($p|Where-Object{$_.Name -eq ($n+'.exe')}).Count};$f=@{f_observation='observation-tracking-endpoint-60.test.js';f_1273_main='ledger-job-count-removal-1273.test.js';f_1273_f1='ledger-job-count-removal-1273-f1-live-destinations.test.js';f_1273_f3='ledger-job-count-removal-1273-f3-relief-batches.test.js';f_1273_identity='ledger-job-count-removal-1273-identity-fail-closed.test.js'};foreach($k in @($f.Keys)){$o[$k]=@($p|Where-Object{$_.Name -eq 'node.exe' -and $_.CommandLine -and $_.CommandLine.Contains($f[$k])}).Count}}catch{};try{foreach($s in (Get-Counter -Counter '\\PhysicalDisk(_Total)\\Avg. Disk sec/Read','\\PhysicalDisk(_Total)\\Avg. Disk sec/Write','\\PhysicalDisk(_Total)\\Current Disk Queue Length','\\PhysicalDisk(_Total)\\Disk Bytes/sec' -MaxSamples 1).CounterSamples){if($s.Path -like '*sec/read'){$o.disk_sec_read=$s.CookedValue}elseif($s.Path -like '*sec/write'){$o.disk_sec_write=$s.CookedValue}elseif($s.Path -like '*queue length'){$o.disk_queue=$s.CookedValue}elseif($s.Path -like '*bytes/sec'){$o.disk_bytes_s=$s.CookedValue}}}catch{};$o|ConvertTo-Json -Compress";
+const HOST_KEYS = ['processes', 'node', 'bash', 'powershell', 'conhost', 'openconsole', 'f_observation', 'f_1273_main', 'f_1273_f1',
+  'f_1273_f3', 'f_1273_identity', 'disk_sec_read', 'disk_sec_write', 'disk_queue', 'disk_bytes_s'];
+function parseHost(text) {
+  let v; try { v = JSON.parse(text.trim()); } catch { return 'unparsed'; }
+  return Object.fromEntries(HOST_KEYS.map((k) => [k, v && Number.isFinite(v[k]) ? v[k] : 'unavailable']));
+}
 
 function usage(message) {
   process.stderr.write(`windows-load-observer-879: ${message}\nusage: node ${path.basename(SELF)} start|stop --out <dir> [--max-ms <ms>]\n`);
@@ -67,13 +79,14 @@ function usage(message) {
 
 function parse(argv) {
   const [cmd, ...rest] = argv;
-  const o = { cmd, out: null, maxMs: DEFAULT_MAX_MS, instance: null };
+  const o = { cmd, out: null, maxMs: DEFAULT_MAX_MS, instance: null, hostSample: false };
   for (let i = 0; i < rest.length; i += 2) {
     const k = rest[i], v = rest[i + 1];
     if (v === undefined) usage(`missing value for ${k}`);
     if (k === '--out') o.out = path.resolve(v);
     else if (k === '--max-ms') { o.maxMs = Number(v); if (!Number.isSafeInteger(o.maxMs) || o.maxMs < 60000 || o.maxMs > CAP_MAX_MS) usage(`--max-ms must be 60000..${CAP_MAX_MS}`); }
     else if (k === '--instance' && cmd === 'run') { if (!INSTANCE.test(v)) usage('bad --instance'); o.instance = v; }
+    else if (k === '--host-sample' && cmd !== 'stop') { if (v !== 'on') usage('--host-sample takes only: on'); o.hostSample = true; }
     else usage(`unknown argument ${k}`);
   }
   if (!['start', 'stop', 'run'].includes(cmd)) usage('missing or unknown command');
@@ -116,13 +129,13 @@ async function run(o) {
 
   // Resolves with the probe record. closure_confirmed is true only when 'close' was observed (or nothing was spawned).
   // On closure expiry the record is resolved with closure_confirmed:false and the child stays listed in `unclosed`.
-  function probe(label, file, args) {
+  function probe(label, file, args, keep = false) {
     return new Promise((resolve) => {
       const r = { label, timeout_ms: PROBE_TIMEOUT_MS, spawned: false, spawn_error: null, errors: [], exit_code: null, signal: null,
         exit_ms: null, close_ms: null, timed_out: false, killed: null, stdout_bytes: 0, stderr_bytes: 0,
         closure_wait_expired: false, closure_confirmed: false };
       const started = performance.now();
-      let child, settled = false, timer = null, closureTimer = null;
+      let child, settled = false, timer = null, closureTimer = null, kept = '';
       const settle = () => { if (settled) return; settled = true; clearTimeout(timer); clearTimeout(closureTimer); inflight = null; resolve(r); };
       const killOwn = (why) => { if (!r.killed) r.killed = why; try { child.kill(); } catch { /* the handle reports it gone */ } armClosure(); };
       const armClosure = () => {
@@ -143,10 +156,10 @@ async function run(o) {
         if (!r.spawned && r.exit_code === null) { r.spawn_error = code; r.closure_confirmed = true; settle(); return; }   // never started
         r.errors.push(code); armClosure();   // a started child: keep waiting (bounded) for its closure, never forget it
       });
-      child.stdout.on('data', (d) => { r.stdout_bytes += d.length; });   // counted, never kept
+      child.stdout.on('data', (d) => { r.stdout_bytes += d.length; if (keep && kept.length < 16384) kept += d.toString('utf8'); });   // kept only for `host`
       child.stderr.on('data', (d) => { r.stderr_bytes += d.length; });
       child.on('exit', (code, signal) => { r.exit_code = code; r.signal = signal; r.exit_ms = ms3(performance.now() - started); armClosure(); });
-      child.on('close', () => { r.close_ms = ms3(performance.now() - started); r.closure_confirmed = true; settle(); });
+      child.on('close', () => { r.close_ms = ms3(performance.now() - started); r.closure_confirmed = true; if (keep) r.host = parseHost(kept); settle(); });
       timer = setTimeout(() => { r.timed_out = true; killOwn('timeout'); }, PROBE_TIMEOUT_MS);
     });
   }
@@ -155,6 +168,7 @@ async function run(o) {
     ['node', process.execPath, ['-e', '0']],
     ['powershell', 'powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit']],
     ['schtasks', 'schtasks.exe', ['/query', '/tn', MISSING_TASK]],
+    ...(o.hostSample ? [['host', 'powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', HOST_SAMPLE_PS], true]] : []),
   ];
 
   // External triggers only REQUEST the end; the loop below finalizes, so an interrupted set is written first.
@@ -192,9 +206,9 @@ async function run(o) {
     if (stopping) return finalize(stopping, null);
     const setStart = performance.now();
     const set = { type: 'set', n: ++sets, ...nowRec(t0), probes: [], interrupted: null };
-    for (const [label, file, args] of PROBES) {
+    for (const [label, file, args, keep] of PROBES) {
       if (stopping) { set.interrupted = stopping; break; }
-      const r = await probe(label, file, args);
+      const r = await probe(label, file, args, keep);
       if (label === 'schtasks') r.missing_task_result = r.exit_code === null ? null : (r.exit_code !== 0 ? 'nonzero_expected' : 'zero_unexpected');
       set.probes.push(r);   // every probe record is kept, including an incomplete one
       if (!r.closure_confirmed) { set.interrupted = 'probe_closure_unconfirmed'; break; }
@@ -225,7 +239,7 @@ async function start(o) {
   fs.mkdirSync(o.out, { recursive: true });
   for (const p of Object.values(f)) if (fs.existsSync(p)) usage(`refusing to reuse existing evidence: ${path.basename(p)}`);
   const instance = crypto.randomBytes(16).toString('hex');
-  const child = spawn(process.execPath, [SELF, 'run', '--out', o.out, '--max-ms', String(o.maxMs), '--instance', instance],
+  const child = spawn(process.execPath, [SELF, 'run', '--out', o.out, '--max-ms', String(o.maxMs), '--instance', instance, ...(o.hostSample ? ['--host-sample', 'on'] : [])],
     { detached: true, stdio: 'ignore', windowsHide: true, shell: false });
   let exited = null;
   child.on('exit', (code, signal) => { exited = { code, signal }; });

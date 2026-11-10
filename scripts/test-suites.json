@@ -150,6 +150,7 @@
         "test/ready-frame-qualification-60.test.js",
         "test/state-start-phase-cause-60.test.js",
         "test/release-version-invariant-844.test.js",
+        "test/package-version-hotfix-1215.test.js",
         "test/target-token-refusal-844.test.js",
         "test/refused-claim-not-a-teardown-844.test.js",
         "test/refusal-classification-844.test.js",
@@ -259,6 +260,8 @@
         "test/bridge-first-ready-stall-136.test.js",
         "test/bridge-vt-frame-ready-136.test.js",
         "test/bridge-recovery-quarantine-136.test.js",
+        "test/bridge-busy-handoff-1215.test.js",
+        "test/immediate-submit-1215.test.js",
         "test/bridge-stage-receipts-137.test.js",
         "test/bridge-actual-wiring-137.test.js",
         "test/supervision-readiness-1215.test.js",
@@ -272,7 +275,13 @@
         "test/supervision-preflight-lifecycle-1215.test.js",
         "test/allow-admission-1215.test.js",
         "test/queue-deadline-admission-1215.test.js",
-        "test/submit-public-error-contract.test.js"
+        "test/submit-public-error-contract.test.js",
+        "test/ledger-job-count-removal-1273.test.js",
+        "test/ledger-job-count-removal-1273-f1-live-destinations.test.js",
+        "test/ledger-job-count-removal-1273-f3-relief-batches.test.js",
+        "test/ledger-job-count-removal-1273-identity-fail-closed.test.js",
+        "test/observe607-positive-control.test.js",
+        "test/daemon-harness-cleanup-1215.test.js"
       ]
     },
     "test:watch": {
@@ -421,6 +430,7 @@
         "test/ready-frame-qualification-60.test.js",
         "test/state-start-phase-cause-60.test.js",
         "test/release-version-invariant-844.test.js",
+        "test/package-version-hotfix-1215.test.js",
         "test/target-token-refusal-844.test.js",
         "test/refused-claim-not-a-teardown-844.test.js",
         "test/refusal-classification-844.test.js",
@@ -475,6 +485,8 @@
         "test/bridge-first-ready-stall-136.test.js",
         "test/bridge-vt-frame-ready-136.test.js",
         "test/bridge-recovery-quarantine-136.test.js",
+        "test/bridge-busy-handoff-1215.test.js",
+        "test/immediate-submit-1215.test.js",
         "test/bridge-stage-receipts-137.test.js",
         "test/bridge-actual-wiring-137.test.js",
         "test/supervision-readiness-1215.test.js",
@@ -635,6 +647,7 @@
         "test/ready-frame-qualification-60.test.js",
         "test/state-start-phase-cause-60.test.js",
         "test/release-version-invariant-844.test.js",
+        "test/package-version-hotfix-1215.test.js",
         "test/target-token-refusal-844.test.js",
         "test/refused-claim-not-a-teardown-844.test.js",
         "test/refusal-classification-844.test.js",
@@ -744,6 +757,8 @@
         "test/bridge-first-ready-stall-136.test.js",
         "test/bridge-vt-frame-ready-136.test.js",
         "test/bridge-recovery-quarantine-136.test.js",
+        "test/bridge-busy-handoff-1215.test.js",
+        "test/immediate-submit-1215.test.js",
         "test/bridge-stage-receipts-137.test.js",
         "test/bridge-actual-wiring-137.test.js",
         "test/supervision-readiness-1215.test.js",
@@ -757,7 +772,13 @@
         "test/supervision-preflight-lifecycle-1215.test.js",
         "test/allow-admission-1215.test.js",
         "test/queue-deadline-admission-1215.test.js",
-        "test/submit-public-error-contract.test.js"
+        "test/submit-public-error-contract.test.js",
+        "test/ledger-job-count-removal-1273.test.js",
+        "test/ledger-job-count-removal-1273-f1-live-destinations.test.js",
+        "test/ledger-job-count-removal-1273-f3-relief-batches.test.js",
+        "test/ledger-job-count-removal-1273-identity-fail-closed.test.js",
+        "test/observe607-positive-control.test.js",
+        "test/daemon-harness-cleanup-1215.test.js"
       ]
     },
     "test:ci:pty": {

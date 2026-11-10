@@ -59,8 +59,8 @@ package currently owns the command. To migrate:
 ```bash
 telepty service stop                                  # only if a service is installed
 npm rm -g aigentry-telepty
-npm i -g @dmsdc-ai/aigentry-telepty@0.10.0 --force   # --force relinks the shared command
-telepty --version                                     # must print 0.10.0
+npm i -g @dmsdc-ai/aigentry-telepty@0.10.1 --force   # --force relinks the shared command
+telepty --version                                     # must print 0.10.1
 ```
 
 **Windows is BETA.** It installs and the cross-machine demo below is a real Windows box, but
@@ -504,7 +504,7 @@ telepty runs **standalone** — it needs none of the other aigentry modules and 
 
 | Module | Package | Version | Role | Maturity |
 | --- | --- | --- | --- | --- |
-| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.10.0 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
+| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.10.1 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
 | **brain** | `@dmsdc-ai/aigentry-brain` | 0.3.1 | Persistent cross-session memory (MCP server) | Early |
 | **deliberation** | `@dmsdc-ai/aigentry-deliberation` | 0.0.47 | Multi-AI structured debate + synthesis (MCP server) | Early |
 | **devkit** | `@dmsdc-ai/aigentry-devkit` | 0.1.14 | Installer/scaffold for the AI dev environment | Early |

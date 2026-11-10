@@ -2,6 +2,106 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.10.1 (hotfix candidate)
+
+- **Mailbox locking handles a peer that finishes retiring its published ticket during a read.**
+  If the numbered ticket has become empty, the reader accepts only a missing directory or the same
+  real directory it enumerated. A replaced or unreadable directory still refuses the acquisition.
+  The tracked-job regressions are split into four files so each runs within the existing Windows
+  diagnostic deadline; their 16 case bodies are unchanged.
+
+- **Tracked injects no longer stop after 512 (#1273).** A daemon could answer
+  `503 TRACKING_CAPACITY tracking_capacity_exhausted` to every new `--from` inject once 512 tracked
+  records had been admitted, even with a healthy ledger and nothing in flight: a record superseded
+  by a newer inject kept its job slot until a checkpoint. The admitted-job count is no longer an
+  admission limit and a superseded record releases its slot. The hot tier's 576-record figure is a
+  soft residency target, not a limit: live sessions can retain current tracked injects beyond that
+  target while the byte budget fits. Finished records move to the cold tier in batches (same files).
+  Records stay queryable and updatable after demotion and restart. Real failures are still refused
+  by name: disk full, I/O errors, an unavailable store, the 64 MiB hot byte budget, and more than
+  512 begins in flight at the same instant. `telepty ledger status` reports `job_count_limit: null`
+  and `resident.soft_target_records`; `r_max`, `over_cap` and `resident.max_records` are gone.
+
+- **A `telepty allow` bridge no longer holds an authorized inject while the wrapped CLI is busy.**
+  In 0.10.0 a guarded bridge wrote an inject only after it had observed a ready prompt or composer
+  frame. A CLI that kept printing output (working, thinking, loading) left the body and its Enter
+  queued (`stalled`, `ready_unobserved`) until the screen went quiet. The bridge now hands the body
+  and then its Enter to the CLI at once, in order and exactly once. Any queueing of a message
+  while the CLI is busy is left to the CLI's own input handling. These conditions still hold an
+  inject, and the bridge reports them: a real modal or permission prompt on screen (`modal_ui`), the
+  local user typing in the last 2 s (`user_input_recent`), and a child that has exited and is being
+  restarted (`child_restarting`). An Enter sent into an exited child is refused with
+  `child_exited` and is not written. A held inject keeps its existing time limit and is
+  dead-lettered with its payload when that runs out. A `pty_written` receipt still means only a
+  PTY write, never consumption.
+- **`telepty inject --submit` now sends exactly one Enter at once to a 0.10.1 bridge.** In 0.10.0
+  the daemon's `/submit` waited for a prompt symbol (up to 8 s), a ready REPL (up to 10 s) and
+  settled input (1.2 s). It then re-sent the Enter on an unconfirmed submit and redelivered it when
+  the CLI looked busy. A 0.10.1 bridge declares `immediate-submit-v1` on its owner claim, and the
+  daemon binds that to the owner generation. For such a session `/submit` keeps the real fences:
+  closing, protected input or handoff, ssh, an unwired child (input-transport queue), the modal gate,
+  held interaction and the owner socket and generation. It then sends ONE CR frame, naming the body
+  it submits (`pair`). It does no waits, no confirm retry and no redeliver, with or without
+  `--submit-force`. Old bridges keep the previous path
+  (`transport.immediate_submit: unsupported_by_bridge`).
+- **At most one Enter per message at the bridge.** A second submit CR for the same `inject_id` or
+  `pair` in one owner generation is refused, not written, with `duplicate_submit:<state of the first>`.
+  The first CR's state is recorded before it is written, so a written or unknown Enter is never
+  reported as not written. A direct PTY write that throws is now receipted `unknown`/`write_threw`.
+- **`telepty inject --submit` reports the actual stage.** The stages are `sent_to_bridge` (the PTY
+  write is reported by the bridge receipt and consumption is unknown), `queued`, `not_written` (exit 1)
+  and `unknown` (exit 1). The CLI no longer prints "gated-timeout" for a session on the immediate path.
+- Records queued by a 0.10.0 bridge are never replayed, purged or acked. A 0.10.1 bridge started on
+  that queue dead-letters them with their payload. See docs/bridge-delivery.md, "Immediate delivery
+  and a single Enter", for read-only reconciliation.
+- **The Enter never overtakes its body.** If `/submit` arrives while the body is still in the daemon
+  mailbox (the delivery tick was busy, or an earlier message was ahead), the one CR is queued behind that
+  exact body and released on its handoff. That wait is bounded by `gate_timeout_ms`. If the bound
+  passes first, or the body leaves without being handed, the response is `not_written`
+  (`body_custody_pending` / `body_not_handed`) and nothing is written later. A queued `/submit` keeps
+  the owner generation and capability that admitted it. After a change it is refused before any effect
+  (`owner_generation_changed`) and never retried on the old path. Its stage comes from its actual progress.
+- **No id-less Enter for a named inject (fail-closed).** If the body went to another owner generation, or
+  its pair is no longer known, the response is `not_written` (`owner_generation_changed` /
+  `submit_pair_unavailable`, `prior_submit: unknown`) instead of a bare CR. Past the bridge's
+  4096-key single-CR guard, a CR that may repeat an evicted one is refused `submit_guard_evicted`.
+  The bounds and lifetimes are listed in docs/bridge-delivery.md.
+- A body that expires or is recovered in the daemon mailbox no longer holds back a later Enter: a waiting
+  `/submit` is answered at once (`body_not_handed`, or `body_outcome_unknown` for a recovered attempt), and a manual
+  Enter is not blocked. With 256 bodies still waiting in one session, a new inject is refused before it is queued
+  (`BODY_CUSTODY_FULL`, nothing written) instead of dropping an accepted body's Enter. A modal that appears while the
+  Enter waits for its body is checked again before the write: the Enter is parked behind it or refused.
+- A guarded bridge that lost user supervision mid-child no longer writes blind. The output that child printed while
+  supervised was never read, so a modal on screen cannot be seen. Body and Enter stay queued (`modal_unobservable`)
+  until a new child starts.
+- An inject is not held until the wrapped application has started. A CLI that is still starting may drop it,
+  and the report says only that it reached the PTY (consumption unknown). A caller that needs its first instruction
+  applied waits once for the application's own ready signal first. Output or busy later never delays an inject.
+- A dropped consecutive duplicate at the bridge flush no longer prints a warning. Its dead-letter and
+  receipt are unchanged.
+- On exit, `telepty allow` waits at most 2.5 s for the one teardown DELETE it already started (the
+  budget counts from that DELETE's start). It sends no second request and does not retry. If the
+  teardown is not confirmed (refused, failed or timed out), the bridge prints
+  `Session teardown not confirmed (...)` and never reports the session as deleted.
+- A bridge metadata refresh (`POST /api/sessions/register`) names this bridge's accepted instance:
+  the session epoch and credential generation of its current owner claim. If that instance was
+  destroyed or replaced, the daemon refuses with `409 REGISTRATION_INSTANCE_CHANGED` before anything
+  is created or updated. A closed bridge, or one without a valid binding, sends no refresh. A refusal
+  is not retried.
+- An untracked `telepty inject --submit` (no `--from`) also pairs its body with exactly one Enter:
+  `/submit` with the returned `inject_id` sends one CR for that body. The id only pairs them; no
+  tracked ledger record is created. An id that was never issued, belongs to another session or comes
+  from an earlier owner generation is refused `not_written`, and no CR is written.
+- Windows: a mailbox lock ticket whose `number` file is still listed but reports zero links
+  (delete-pending) is treated as retired only when its retirement is proven AND every other identity
+  check still passes. Retirement is proven when the ticket directory is gone or holds its departure
+  marker, or when a number this read saw published is no longer listed. The other checks are file
+  type, size and device/inode, plus size and timestamps after the read. If the ticket directory cannot
+  be listed, the ticket stays unresolved and blocks the lock; it is never read as gone. In every other
+  case the existing refusal stands.
+- Restart every running `telepty allow` bridge to pick this up. A bridge keeps the code it was
+  started with.
+
 ## 0.10.0
 
 Two lines of work ship together in this release:

@@ -179,7 +179,7 @@ let cachedAuthToken = null;
 // TELEPTY_AUTH_TOKEN for a client but not for the daemon produces a 401 that looks like a
 // credential bug; the variable is therefore documented (BOUNDARY.md) as something you set for
 // BOTH ends or neither, and never silently preferred at one end only.
-const { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken } = require('./src/cli/security-actions');
+const { createCliSecurityActions, createAllowSecurityContext, adoptRegistrationCredential, scopedSessionToken, describeImmediateSubmit } = require('./src/cli/security-actions');
 const cliSecurity = createCliSecurityActions({
   get cachedAuthToken() { return cachedAuthToken; },
   get cachedPeerTokens() { return cachedPeerTokens; },
@@ -3040,6 +3040,7 @@ async function main() {
     // current owner generation (owner_token). Anything else, including a disconnect, is guarded.
     let inputPolicy = 'guarded';
     let allowSessionClosed = false;
+    let exitStarted = false;   // hotfix523: exactly one exit, with the first code
     let cleanupTerminal = () => {};
     const allowSignalHandlers = new Map();
     // #137: identity of the code this bridge actually loaded — read once, at bridge start.
@@ -3375,7 +3376,7 @@ async function main() {
       }
       if (allowSessionClosed) return;
       const ownerSocket = new WebSocket(wsUrl, {headers:{...(ownerBearer ? {'x-telepty-session-token':ownerBearer} : {}),
-        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY, ...policyCapabilityHeaders(),
+        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', ' + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY, ...policyCapabilityHeaders(),
         ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
       const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
       daemonWs = ownerSocket;
@@ -3652,10 +3653,18 @@ async function main() {
 
 
     function exitAllowSession(code, exitCtx) {
+      if (exitStarted) return;
+      exitStarted = true;
       if (exitCtx) {
         logSessionDeath(exitCtx.exitCode, exitCtx.signal, exitCtx.duration);
       }
-      process.exit(code);
+      // hotfix523: let the teardown DELETE that closeAllowSession already started settle (ONE 2500 ms total budget) before
+      // process.exit discards it. No new request or retry; an unconfirmed teardown is said, never claimed as deleted.
+      const settling = allowSecurity.settleTeardown(2500);
+      if (!settling) { process.exit(code); return; }
+      settling.then(result => {
+        if (!result.ok) console.error(`[allow] Session teardown not confirmed (${result.timed_out ? 'timed out' : result.status ? `HTTP ${result.status}` : 'request failed'}).`);
+      }).finally(() => process.exit(code));
     }
 
     // Intercept terminal title escape sequences and prefix with session ID
@@ -3988,7 +3997,7 @@ async function main() {
   if (cmd === 'diagnose') {
     try {
       const { diagnoseTarget, formatDiagnostics } = require('./src/diagnostics/client');
-      const option = (name) => { const i = args.indexOf(name); if (i < 0) return undefined; if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error(name + ' requires a value'); return args[i + 1]; };
+      const option = (name) => { const i = args.indexOf(name); if (i < 0) return undefined; if (!args[i + 1] || ['--json', '--machine-id', '--epoch', '--inject-id', '--tcp', '--process-state'].includes(args[i + 1])) throw new Error(name + ' requires a value'); return args[i + 1]; };
       const report = await diagnoseTarget(args[1], { fetchWithAuth, daemonUrl,
         machineId: option('--machine-id'), sessionEpoch: option('--epoch'), injectId: option('--inject-id'),
         includeTcp: args.includes('--tcp'), includeProcessState: args.includes('--process-state') });
@@ -4218,12 +4227,19 @@ async function main() {
           submitRes = null;
           submitData = null;
         }
+        // Task 1215 hotfix 0.10.1: a daemon on the immediate-submit path says what happened to the Enter
+        // (sent_to_bridge / queued / not_written / unknown). Print exactly that; never "gated-timeout".
+        const immediateOutcome = !lastError && submitRes
+          ? describeImmediateSubmit(submitRes.status, submitData, { injectId: data && data.inject_id }) : null;
         if (lastError) {
           console.error(`⚠️  Submit failed: ${lastError.message}`);
           // #840: the text landed but no turn fired, and nothing else will fire it. The caller
           // cannot claim this dispatch was delivered — dispatch.sh's non-zero arm records the
           // transport result as `unknown`, which is exactly the honest word for it.
           markCommandFailed();
+        } else if (immediateOutcome) {
+          if (immediateOutcome.failed) { console.error(immediateOutcome.text); markCommandFailed(); }
+          else console.log(immediateOutcome.text);
         } else if (submitRes && submitRes.ok) {
           const gateNote = submitData.gated && submitData.gate_wait_ms > 0
             ? ` [gate ${submitData.gate_wait_ms}ms]`
