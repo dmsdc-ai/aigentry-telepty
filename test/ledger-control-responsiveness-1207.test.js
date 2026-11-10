@@ -41,6 +41,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const H = require('./fixtures/ledger-1207/control-harness');
+const { performance, PerformanceObserver } = require('node:perf_hooks');   // Task 1215 perf614 opt-in only (see perf614Mode)
 // Task 1215 / #1207: bounded gap diagnostics on the F2/R1 WORKLOAD samplers only (controls stay uninstrumented, so they
 // remain an uninstrumented same-process reference). Diagnostic evidence only; no assertion consumes it.
 const GapDiag = require('./fixtures/ledger-1207/heartbeat-gap-diagnostics');
@@ -80,9 +81,37 @@ const r1ByTier = new Map();
 // idle_pre / idle_post bracket the workload (1500 ms total idle per tier ≤ 2000 ms); `block` is a deliberate
 // ≤ 100 ms busy-wait confined to this test process, labelled separately, proving the sampler can see a stall.
 const CONTROLS = Object.freeze({ idlePreMs: 750, idlePostMs: 750, blockLeadMs: 100, blockMs: 100, blockRecoveryMs: 300 });
-async function heartbeatControl(label, { idleMs = 0, blockMs = 0 } = {}) {
-  const hb = H.startHeartbeat({ periodMs: 1 });
+// Task 1215 perf614 — OPT-IN idle-control attribution, enabled ONLY by TELEPTY_CI_PERF614 exactly "1" (unset/empty = off;
+// anything else is refused, like TELEPTY_LEDGER_PERF_GATE). When off, every control, sample, verdict and exit is as before.
+// When on, ONLY the idle_pre / idle_post controls attach the EXISTING gap collector (GapDiag) to their own sampler, so the
+// idle windows get the same bounded top_gaps (performance.now clock) the workload already has. Not consumed by any assertion.
+const PERF614_ENV = 'TELEPTY_CI_PERF614';
+function perf614Mode(env = process.env) {
+  const raw = env[PERF614_ENV];
+  if (raw === undefined || raw === '') return false;
+  if (raw === '1') return true;
+  throw new Error(`${PERF614_ENV} must be unset or exactly "1" (got ${JSON.stringify(String(raw).slice(0, 16))})`);
+}
+const PERF614 = perf614Mode();
+const GC_ENTRY_SUPPORTED = PERF614 && Array.isArray(PerformanceObserver.supportedEntryTypes) && PerformanceObserver.supportedEntryTypes.includes('gc');
+function perf614Attribution(label, startMs, d) {
+  return { schema: 'telepty.ci-perf614.idle-attribution/v1', enabled_by: `${PERF614_ENV}=1`, phase: label,
+    clock: 'performance.now ms (same clock as the workload top_gaps); top_gaps start_ms/end_ms are relative to this control tracker start',
+    window_perf_now_ms: { start: startMs, end: performance.now() },
+    top_gaps: d ? d.top_gaps : null, main_isolate_gc: d ? { ...d.main_isolate_gc, gc_entry_type_supported: GC_ENTRY_SUPPORTED } : null,
+    window_aggregate: d ? d.measured_phase_aggregate : null,
+    limits: ['measured: gap bounds, main-loop idle per gap, main-isolate GC overlap, worker->main message counts, window process CPU/ELU/context switches',
+      'hypotheses only: busy_or_descheduled_ms (gap - loop idle) or a wall-vs-CPU difference alone does NOT prove OS descheduling or GC',
+      'process CPU and context switches are WHOLE-process (main + worker threads), never main-thread',
+      'GC: main isolate only (worker GC invisible); 0 observed with gc_entry_type_supported=false means unavailable, not absent',
+      'per-gap `phase` is the control sampler window name "measured"; `phase` here and label_start/label_end carry the idle label',
+      'opt-in cost: one collector tick per idle heartbeat tick; instrumented idle windows are not byte-comparable with default-mode controls'] };
+}
+async function heartbeatControl(label, { idleMs = 0, blockMs = 0, messages = null } = {}) {
+  const attrib = PERF614 && blockMs === 0 ? { startMs: performance.now(), diag: GapDiag.createGapDiagnostics({ messages }) } : null;   // perf614 opt-in only
+  const hb = H.startHeartbeat({ periodMs: 1, ...(attrib ? { diag: attrib.diag } : {}) });
   hb.mark('measured');
+  if (attrib) hb.label(label);
   const t0 = process.hrtime.bigint();
   let blockActualMs = null;
   if (blockMs > 0) {
@@ -100,7 +129,8 @@ async function heartbeatControl(label, { idleMs = 0, blockMs = 0 } = {}) {
   return { label, kind: blockMs > 0 ? 'deliberate_block' : 'idle', wall_ms: wallMs, period_ms: s.period_ms, n: m.n,
     mean_ms: m.n ? m.sum_ms / m.n : null, sum_ms: m.sum_ms, p50_ms: m.p50_ms, p90_ms: m.p90_ms, p99_ms: m.p99_ms, max_ms: m.max_ms,
     over_10ms: m.over_10ms, over_50ms: m.over_50ms, dropped: s.dropped, n_vs_half_wall: m.n >= Math.floor(wallMs / 2),
-    ...(blockMs > 0 ? { block_requested_ms: blockMs, block_actual_ms: blockActualMs, stall_visible: m.max_ms != null && m.max_ms >= blockMs * 0.9 } : {}) };
+    ...(blockMs > 0 ? { block_requested_ms: blockMs, block_actual_ms: blockActualMs, stall_visible: m.max_ms != null && m.max_ms >= blockMs * 0.9 } : {}),
+    ...(attrib ? { perf614: perf614Attribution(label, attrib.startMs, s.diagnostics) } : {}) };
 }
 const runtimeIdentity = () => ({ platform: process.platform, arch: process.arch, node: process.version, runtime: process.release && process.release.name });
 
@@ -156,7 +186,7 @@ for (const tier of TIERS) {
     const R = H.recorders();
     const messages = { inbound: [], outbound: [] };
     const { shared, runtime, actions, injectHandler, ledgerClient, sessionStateManager } = H.buildShared(store, R, { messages });
-    const controlPre = await heartbeatControl('idle_pre', { idleMs: CONTROLS.idlePreMs });   // W5 diagnostic, before the F2 sampler starts
+    const controlPre = await heartbeatControl('idle_pre', { idleMs: CONTROLS.idlePreMs, messages });   // W5 diagnostic, before the F2 sampler starts
     const hb = H.startHeartbeat({ periodMs: 1, ...gapDiagOptions(messages) });
     let failed = true;
     const evidence = { case: 'F2', tier_mib: tier, seeded: { records: seeded.count, bytes: seeded.bytes, sha256: seeded.sha256 }, counts: F2, started_at: new Date().toISOString(), node: process.version, platform: process.platform };
@@ -226,7 +256,7 @@ for (const tier of TIERS) {
       evidence.messages = H.messageSizeReport(messages);
       // W5 diagnostic controls AFTER every workload metric above is captured and BEFORE any assertion, so they are
       // retained in the evidence file even when an assertion below fails. Not consumed by any assertion.
-      evidence.heartbeat_controls.idle_post = await heartbeatControl('idle_post', { idleMs: CONTROLS.idlePostMs });
+      evidence.heartbeat_controls.idle_post = await heartbeatControl('idle_post', { idleMs: CONTROLS.idlePostMs, messages });
       evidence.heartbeat_controls.block = await heartbeatControl('block', { blockMs: CONTROLS.blockMs });
       evidence.heartbeat_controls.measured_reference = { n: heartbeat.measured.n, wall_ms: measuredWall, mean_ms: heartbeat.measured.n ? heartbeat.measured.sum_ms / heartbeat.measured.n : null,
         p50_ms: heartbeat.measured.p50_ms, p90_ms: heartbeat.measured.p90_ms, p99_ms: heartbeat.measured.p99_ms, max_ms: heartbeat.measured.max_ms, n_vs_half_wall: heartbeat.measured.n >= Math.floor(measuredWall / 2) };
@@ -290,7 +320,7 @@ for (const tier of TIERS) {
     const { shared, runtime, injectHandler, ledgerClient } = H.buildShared(store, R, { messages, clientOptions: { fs: timedSyncFs(openSync) } });
     // W5: R1's OWN same-process controls (never borrowed from F2). idle_pre runs before the R1 sampler and before the
     // open; idle_post + block run after every workload metric is captured. Same budget as F2: 1500 ms idle + 100 ms block.
-    const controlPre = await heartbeatControl('idle_pre', { idleMs: CONTROLS.idlePreMs });
+    const controlPre = await heartbeatControl('idle_pre', { idleMs: CONTROLS.idlePreMs, messages });
     const hb = H.startHeartbeat({ periodMs: 1, ...gapDiagOptions(messages) });
     let failed = true; let pollTimer = null;
     const evidence = { case: 'R1', tier_mib: tier, seeded: { records: seeded.count, bytes: seeded.bytes, sha256: seeded.sha256 }, counts: R1, started_at: new Date().toISOString(), node: process.version, platform: process.platform,
@@ -354,7 +384,7 @@ for (const tier of TIERS) {
         heartbeat_max_vs_F2_1MiB: { proposed: 'heartbeat max <= F2 1 MiB bound', observed_heartbeat_max_ms: heartbeat.measured.max_ms, f2_1mib_measured_max_ms: f2ByTier.has(1) ? f2ByTier.get(1).heartbeat.measured.max_ms : null, status: f2ByTier.has(1) ? 'comparison_recorded' : 'incomplete (F2 1 MiB not in this run)' },
       };
       // W5: R1's own post-workload controls, after every workload metric above and before any assertion.
-      evidence.heartbeat_controls.idle_post = await heartbeatControl('idle_post', { idleMs: CONTROLS.idlePostMs });
+      evidence.heartbeat_controls.idle_post = await heartbeatControl('idle_post', { idleMs: CONTROLS.idlePostMs, messages });
       evidence.heartbeat_controls.block = await heartbeatControl('block', { blockMs: CONTROLS.blockMs });
       evidence.heartbeat_acceptance = heartbeatAcceptance({ wall_ms: phaseWall, n: heartbeat.measured.n, sum_ms: heartbeat.measured.sum_ms, max_ms: heartbeat.measured.max_ms }, evidence.heartbeat_controls);
 

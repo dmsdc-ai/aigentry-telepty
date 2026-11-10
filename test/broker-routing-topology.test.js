@@ -33,7 +33,7 @@ const SUCCESS_OBSERVATION_MS = SUCCESS_LOCAL_TIMEOUT_MS + HARNESS_OBSERVATION_MA
 const OUTCOME_LIMIT = 32, CODE_TOKEN = /^[A-Z][A-Z0-9_]{1,63}$/, ERROR_NAMES = ['TypeError', 'AbortError', 'TimeoutError', 'SyntaxError', 'Error'];
 function requestOutcomes() {
   const records = []; let issued = 0;
-  const kind = (url) => { const text = String(url); return text.includes('/v1/challenge') ? 'challenge' : text.includes('/results/') ? 'results' : /\/stream$/.test(text) ? 'stream' : 'other'; };
+  const kind = (url) => { const text = String(url); return text.includes('/api/forwarded/') ? 'forwarded' : text.includes('/v1/challenge') ? 'challenge' : text.includes('/results/') ? 'results' : /\/stream$/.test(text) ? 'stream' : 'other'; };
   const token = (value) => (typeof value === 'string' && CODE_TOKEN.test(value) ? value : null);
   return { kind,
     observe(url, pending) {
@@ -229,7 +229,9 @@ test('owned broker broadcast and reply preserve durable exact routing, scopes, a
 // before it. It holds that request until the hub's own 500 ms result timer has recorded outcome_unknown/BROKER_RESULT_TIMEOUT,
 // then rejects it with a coded socket TypeError. Holding keeps node a's stream open, so the hub's stream-loss path
 // (BROKER_STREAM_LOST, hub.js close handler) cannot pre-empt the timer. The ordering is event-driven, with no added clock constant.
-for (const stage of ['results', 'challenge']) test(`a lost reply result (${stage === 'results' ? 'result POST' : 'challenge GET before it'}) stays one frame and a truthful bounded unknown, never retried`, async () => {
+// Task 1215 broker613: node a's real local forwarded RESPONSE is also held 0 ms (control) or 600 ms (> its 500 ms local
+// deadline, after delivery). Its own signal stays live, so the node's real timeout fires on that leg only.
+for (const stage of ['results', 'challenge']) for (const localResponseMs of [0, 600]) test(`a lost reply result (${stage === 'results' ? 'result POST' : 'challenge GET before it'}; local response held ${localResponseMs} ms) stays one frame and a truthful bounded unknown, never retried`, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-uncertain-'));
   const daemon = await startTestDaemon();
   const a = pair(), b = pair(), h = pair();
@@ -260,8 +262,13 @@ for (const stage of ['results', 'challenge']) test(`a lost reply result (${stage
         if (String(url).includes('/api/forwarded/')) localInjected = true;
         if (localInjected && (kind === 'challenge' || kind === 'results')) attempts[kind] += 1;
         const held = localInjected && kind === stage && attempts[kind] === 1;
+        const real = kind === 'forwarded' && localResponseMs > 0 ? fetch(url, options).then((response) => new Promise((resolve, reject) => {
+          const abort = () => { clearTimeout(timer); reject(options.signal.reason); }; // the node's real local deadline, as fetch would
+          const timer = setTimeout(() => { options.signal.removeEventListener('abort', abort); resolve(response); }, localResponseMs);
+          if (options.signal.aborted) abort(); else options.signal.addEventListener('abort', abort, { once: true });
+        })) : fetch(url, options);
         return requests.observe(url, held ? released.then(() => { throw new TypeError('fetch failed',
-          { cause: Object.assign(new Error('synthetic'), { code: 'UND_ERR_SOCKET' }) }); }) : fetch(url, options));
+          { cause: Object.assign(new Error('synthetic'), { code: 'UND_ERR_SOCKET' }) }); }) : real);
       }, privateKey: keys.privateKey, localToken: daemon.authToken(), config: {
         schema: 'telepty.broker-node/v1', principal_id: node, key_id: node, hub_url: origin, hub_audience: 'hub',
         hub_principal_id: 'hub', audience: node, local_daemon_url: `http://127.0.0.1:${daemon.port}`,
@@ -287,8 +294,12 @@ for (const stage of ['results', 'challenge']) test(`a lost reply result (${stage
     assert.ok(reason instanceof TypeError && reason.cause && reason.cause.code === 'UND_ERR_SOCKET', 'node a completion rejects with the coded socket failure');
     await waitFor(() => count('worker') >= 1 && count('return-worker') >= 1);
     assert.deepEqual(attempts, stage === 'results' ? { challenge: 1, results: 1 } : { challenge: 1, results: 0 }, 'the result path ran once and was never retried');
-    assert.deepEqual(requests.snapshot().records.filter((r) => r.error !== null).map(({ seq, ...rest }) => rest),
-      [{ kind: stage, settled: true, status: null, error: 'TypeError', code: null, cause_code: 'UND_ERR_SOCKET' }]);
+    // broker613: besides the stage failure, only node a's own local forwarded timeout (after delivery, counted above) is
+    // allowed: that exact record, at most once, first; required when the response was held past the deadline.
+    const localTimeout = { kind: 'forwarded', settled: true, status: null, error: 'TimeoutError', code: null, cause_code: null };
+    const errors = requests.snapshot().records.filter((r) => r.error !== null).map(({ seq, ...rest }) => rest);
+    assert.deepEqual(errors, [...(localResponseMs > 0 || errors.length > 1 ? [localTimeout] : []),
+      { kind: stage, settled: true, status: null, error: 'TypeError', code: null, cause_code: 'UND_ERR_SOCKET' }]);
     const after = (await responder.receipt(replyBody.idempotency_key)).body;
     assert.deepEqual({ state: after.state, code: after.code }, { state: 'outcome_unknown', code: 'BROKER_RESULT_TIMEOUT' }, 'node a stopping later does not rewrite the bounded unknown');
     assert.deepEqual({ worker: count('worker'), 'return-worker': count('return-worker') }, { worker: 1, 'return-worker': 1 }, 'exactly one local frame per leg; no duplicate');

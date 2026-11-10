@@ -1,0 +1,120 @@
+name: Ledger idle-baseline measurement (task 1215 perf614, non-shipping)
+
+# Task 1215 perf614 — MEASUREMENT ONLY. Not a release gate, not a fix, not a reproduction verdict, and it does not change
+# test-install.yml (which keeps the primary verdict). Native macOS, Node 20 and 26.13.0, runs the EXACT maintained dedicated
+# ledger performance gate command (test-install.yml "Run ledger performance gate"): the same file, --test-concurrency=1,
+# TELEPTY_LEDGER_PERF_GATE=1, same workload, controls and 50 ms bound — plus the opt-in TELEPTY_CI_PERF614=1, which adds
+# idle_pre/idle_post gap attribution to the evidence (see the test file). TELEPTY_LEDGER_1207_EVIDENCE_DIR (an existing option)
+# only relocates the evidence files so they can be uploaded.
+# Ten PREDECLARED iterations per Node. Every iteration runs; every exit code, UTC start/end, duration, per-case acceptance
+# verdict and temp-dir leftover count is kept, inconclusive ones included. The step fails if ANY iteration exited non-zero.
+# Evidence is always uploaded. Limits: each job is a fresh runner that did NOT first run `npm run test:ci` (unlike
+# test-install.yml), so it does not reproduce that job's runner state; ten repeated trials on one runner are not independent
+# proof of anything, and the opt-in instrumentation itself may perturb the idle windows.
+# Pull requests only, guarded to PR #143 from this repository on its exact head branch. No tags, release, publish,
+# default-branch or live-host steps.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/perf-baseline-1215.yml'
+      - 'test/ledger-control-responsiveness-1207.test.js'
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: ledger perf gate x10 (macos-latest, node ${{ matrix.node }}, perf614 idle attribution)
+    if: ${{ github.event.pull_request.number == 143 && github.event.pull_request.head.ref == 'hotfix/1215-immediate-input-0.10.1-20261108' && github.event.pull_request.head.repo.full_name == github.repository }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '26.13.0']
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      PERF614_ITERATIONS: '10'
+      PERF614_OUT: perf614
+      PERF614_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Record runner, toolchain and source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PERF614_OUT"
+          {
+            echo "iterations=$PERF614_ITERATIONS"
+            echo "checkout_sha=$(git rev-parse HEAD) pr_head_sha=$PERF614_HEAD_SHA"
+            echo "node=$(node -v) npm=$(npm -v)"
+            echo "image_os=${ImageOS:-unset} image_version=${ImageVersion:-unset} runner_os=$RUNNER_OS runner_arch=$RUNNER_ARCH"
+            shasum -a 256 test/ledger-control-responsiveness-1207.test.js test/fixtures/ledger-1207/control-harness.js \
+              test/fixtures/ledger-1207/heartbeat-gap-diagnostics.js test-support/setup-env.js \
+              .github/workflows/perf-baseline-1215.yml .github/workflows/test-install.yml package-lock.json
+          } | tee "$PERF614_OUT/identity.txt"
+
+      - name: Ledger performance gate, ten predeclared iterations (every iteration kept)
+        timeout-minutes: 18
+        shell: bash
+        env:
+          TELEPTY_LEDGER_PERF_GATE: '1'
+          TELEPTY_CI_PERF614: '1'
+        run: |
+          set -uo pipefail
+          set +e   # GitHub runs bash with -e; every iteration must run and its exit code be kept, so each check stays explicit
+          T="${TMPDIR:-/tmp}"; T="${T%/}"; CAP=4194304; failed=0
+          leftovers() { find "$T" -maxdepth 1 -type d \( -name 'telepty-1207-*' -o -name 'telepty-test-home-*' \) | wc -l | tr -d ' '; }
+          printf 'iteration\tstart_utc\tend_utc\tseconds\texit\tverdicts\ttmp_before\ttmp_after\tlog_bytes\n' > "$PERF614_OUT/iterations.tsv"
+          for i in $(seq 1 "$PERF614_ITERATIONS"); do
+            D="$PERF614_OUT/iter-$i"; mkdir -p "$D/evidence"
+            before=$(leftovers); start=$(date -u +%Y-%m-%dT%H:%M:%SZ); s0=$(date +%s)
+            echo "=== iteration $i start $start ==="
+            TELEPTY_LEDGER_1207_EVIDENCE_DIR="$PWD/$D/evidence" \
+              node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=spec test/ledger-control-responsiveness-1207.test.js \
+              > "$D/stdout.log" 2>&1
+            code=$?
+            end=$(date -u +%Y-%m-%dT%H:%M:%SZ); secs=$(( $(date +%s) - s0 )); after=$(leftovers)
+            bytes=$(wc -c < "$D/stdout.log" | tr -d ' ')
+            if [ "$bytes" -gt "$CAP" ]; then head -c "$CAP" "$D/stdout.log" > "$D/stdout.cap" && mv "$D/stdout.cap" "$D/stdout.log" && echo "TRUNCATED at $CAP of $bytes bytes" >> "$D/stdout.log"; fi
+            verdicts=$(grep -oE '\[ledger-1207 (F2|R1) [0-9]+ MiB\].*heartbeat_acceptance=(\{"verdict":"[a-z]+"|null)' "$D/stdout.log" \
+              | sed -E -e 's/heartbeat_acceptance=null$/heartbeat_acceptance={"verdict":"null"/' -e 's/^\[ledger-1207 ([A-Z0-9]+) ([0-9]+) MiB\].*heartbeat_acceptance=(\{"verdict":"([a-z]+)"|null)$/\1-\2MiB=\4/' | tr '\n' ';')
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$start" "$end" "$secs" "$code" "${verdicts:-none}" "$before" "$after" "$bytes" >> "$PERF614_OUT/iterations.tsv"
+            echo "=== iteration $i end $end exit=$code seconds=$secs verdicts=${verdicts:-none} tmp_leftovers=$before->$after ==="
+            grep -E '#1215 peer235 heartbeat_gate|not ok |^ℹ (tests|pass|fail) ' "$D/stdout.log" || true
+            if [ "$code" -ne 0 ]; then failed=$((failed + 1)); fi
+          done
+          cat "$PERF614_OUT/iterations.tsv"
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::$failed of $PERF614_ITERATIONS iteration(s) exited nonzero; every exit code and verdict is in $PERF614_OUT/iterations.tsv"
+            exit 1
+          fi
+
+      - name: Record own temp-dir leftovers (cleanup evidence)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          mkdir -p "$PERF614_OUT"
+          T="${TMPDIR:-/tmp}"; T="${T%/}"
+          echo "leftover_ledger1207_tempdirs=$(find "$T" -maxdepth 1 -type d -name 'telepty-1207-*' | wc -l | tr -d ' ') leftover_test_homes=$(find "$T" -maxdepth 1 -type d -name 'telepty-test-home-*' | wc -l | tr -d ' ')" \
+            | tee "$PERF614_OUT/cleanup.txt"
+
+      - name: Upload bounded measurement evidence (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-baseline-1215-node${{ matrix.node }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: perf614
+          if-no-files-found: error
+          retention-days: 14

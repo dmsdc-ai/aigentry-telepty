@@ -769,7 +769,10 @@ async function startTestDaemon(options = {}) {
       }
     } finally {
       if (ownsHome) {
-        fs.rmSync(homeDir, { recursive: true, force: true });
+        // Task 1215 CI612 U3: bounded retry for THIS harness-owned temp HOME only (Windows handle-release race). Node
+        // documents retries of EBUSY/EMFILE/ENFILE/ENOTEMPTY/EPERM with linear backoff (100+200+300 = 600 ms; the JS
+        // implementation retries each nested operation). A persistent refusal still throws; nothing is caught or ignored.
+        fs.rmSync(homeDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
       }
     }
   }
