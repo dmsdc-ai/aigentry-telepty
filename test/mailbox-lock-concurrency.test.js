@@ -61,7 +61,7 @@ function progressGuard(iterations, kind = 'progress') {
     },
   };
 }
-const guardFor = (mode, iterations) => mode === 'sweep' ? progressGuard(iterations, 'sweep_tick') : progressGuard(mode === 'contend' ? iterations : 0);
+const guardFor = (mode, iterations) => progressGuard(mode === 'contend' ? iterations : 0); // NONSHIPPING old-mode variant: pre-fix664 selection
 function worker(t, dir, mode, iterations = 1, probe = () => ({}), { stallMs = 10000 } = {}) {
   const forked = performance.now();
   const child = fork(path.join(__dirname, '../test-support/mailbox-lock-worker.js'), [dir, mode, String(iterations)], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
