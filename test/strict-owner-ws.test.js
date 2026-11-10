@@ -2,15 +2,20 @@
 const {test}=require('node:test');const assert=require('node:assert/strict');const crypto=require('node:crypto');
 const {validateTrustConfiguration,createSignedAssertion}=require('../src/principal/proof');
 const {createPrincipalAuthentication}=require('../src/principal/http');
-function fixture(authority='principal') {
+const SHORT_TTL_SECONDS=2; // fix639: expiry is whole-second (proof.js), so a 2 s TTL stays valid >=1 s after signing and still expires within the 5 s wait
+function fixture(authority='principal',now) {
  const pair=crypto.generateKeyPairSync('ed25519');const session={type:'wrapped',sessionEpoch:'epoch',credentialGeneration:1,owningPrincipal:{id:'owner',source:'ed25519',audience:'fixture'}};
  const trust=validateTrustConfiguration({schema:'telepty.principals/v1',audience:'fixture',keys:[{key_id:'owner',principal_id:'owner',authority,public_key_spki:pair.publicKey.export({type:'spki',format:'pem'}),grants:[{action:'session.owner',targets:['mine']}]}]});
- const auth=createPrincipalAuthentication({trust,sessions:{mine:session}});const sign=extra=>createSignedAssertion({privateKey:pair.privateKey,keyId:'owner',principalId:'owner',audience:'fixture',challenge:auth.verifier.challenge,method:'GET',target:'/api/owner/sessions/mine',body:{},action:'session.owner',sessionEpoch:'epoch',transport:'websocket',...extra});
+ const auth=createPrincipalAuthentication({trust,sessions:{mine:session},now});const sign=extra=>createSignedAssertion({privateKey:pair.privateKey,keyId:'owner',principalId:'owner',audience:'fixture',challenge:auth.verifier.challenge,method:'GET',target:'/api/owner/sessions/mine',body:{},action:'session.owner',sessionEpoch:'epoch',transport:'websocket',...extra});
  const req=extra=>({method:'GET',url:'/api/owner/sessions/mine',headers:{'x-telepty-principal':sign()},rawHeaders:[],...extra});return{auth,session,sign,req};
 }
 test('strict owner requires exact epoch/current stored principal, even for operator',()=>{
  for(const authority of ['principal','operator']) {const f=fixture(authority);assert.equal(f.auth.authorizeOwner(f.req()).ok,true);f.session.owningPrincipal.id='foreign';assert.equal(f.auth.authorizeOwner(f.req()).ok,false);}
  const f=fixture();for(const extra of [{sessionEpoch:'old'},{transport:'http'},{target:'/api/owner/sessions/mine?owner=1'}])assert.equal(f.auth.authorizeOwner(f.req({headers:{'x-telepty-principal':f.sign(extra)}})).ok,false);
+});
+test('fix639: a SHORT_TTL_SECONDS owner proof signed in the last ms of a second is accepted at the next boundary and expires at its TTL',()=>{
+ let clock=1700000000999;const T=Math.floor(clock/1000),f=fixture('principal',()=>clock),owner=()=>{const r=f.auth.authorizeOwner(f.req({headers:{'x-telepty-principal':f.sign({issuedAt:T,ttlSeconds:SHORT_TTL_SECONDS})}}));return [r.ok,r.code,r.status];};
+ clock=(T+1)*1000;assert.deepEqual(owner(),[true,undefined,undefined]);clock=(T+SHORT_TTL_SECONDS)*1000;assert.deepEqual(owner(),[false,'PRINCIPAL_PROOF_INVALID',401]);
 });
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');const WebSocket=require('ws');
 const {startTestDaemon,waitFor}=require('../test-support/daemon-harness');
@@ -40,7 +45,7 @@ test('actual strict daemon owner claim is bearer-bound, sequenced and rejects vi
  assert.ok(!JSON.stringify((await inspect()).body).includes('replayed-owner-output'));
  for(const type of ['input','resize','subscribe','session_state_report']){c=await claim();ack=c.frames[0];c.ws.send(JSON.stringify({type,data:'forbidden',connection_id:ack.connection_id,sequence:1}));await waitFor(()=>c.ws.readyState===3);}
  c=await claim();ack=c.frames[0];c.ws.send(JSON.stringify({type:'output',data:'wrong-connection',connection_id:crypto.randomUUID(),sequence:1}));await waitFor(()=>c.ws.readyState===3);
- c=await claim();const short=await connect(url,{'x-telepty-principal':f.sign({sessionEpoch:epoch,ttlSeconds:1}),'x-telepty-session-token':bearer});t.after(()=>short.ws?.terminate());await waitFor(()=>short.ws.readyState===3);
+ c=await claim();const short=await connect(url,{'x-telepty-principal':f.sign({sessionEpoch:epoch,ttlSeconds:SHORT_TTL_SECONDS}),'x-telepty-session-token':bearer});t.after(()=>short.ws?.terminate());assert.ok(short.ws,'short-ttl owner upgrade refused: HTTP '+short.status);await waitFor(()=>short.ws.readyState===3);
  const incumbent=await claim();const destroyProof=()=>f.sign({method:'DELETE',target:'/api/sessions/mine',body:undefined,action:'session.destroy',transport:'http',sessionEpoch:epoch});
  const stale=await f.daemon.request('/api/sessions/mine',{method:'DELETE',headers:{'x-telepty-principal':destroyProof(),'x-telepty-session-token':bearer,'x-telepty-owner-token':'stale-owner'}});
  assert.equal(stale.body.status,'stale-detached');assert.equal(incumbent.ws.readyState,1);

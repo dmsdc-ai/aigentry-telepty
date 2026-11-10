@@ -3997,7 +3997,7 @@ async function main() {
   if (cmd === 'diagnose') {
     try {
       const { diagnoseTarget, formatDiagnostics } = require('./src/diagnostics/client');
-      const option = (name) => { const i = args.indexOf(name); if (i < 0) return undefined; if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error(name + ' requires a value'); return args[i + 1]; };
+      const option = (name) => { const i = args.indexOf(name); if (i < 0) return undefined; if (!args[i + 1] || ['--json', '--machine-id', '--epoch', '--inject-id', '--tcp', '--process-state'].includes(args[i + 1])) throw new Error(name + ' requires a value'); return args[i + 1]; };
       const report = await diagnoseTarget(args[1], { fetchWithAuth, daemonUrl,
         machineId: option('--machine-id'), sessionEpoch: option('--epoch'), injectId: option('--inject-id'),
         includeTcp: args.includes('--tcp'), includeProcessState: args.includes('--process-state') });

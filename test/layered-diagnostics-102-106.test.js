@@ -127,6 +127,12 @@ test('hermetic daemon HTTP diagnostics are authenticated, exact and leave sessio
     const cli = await harness.runCli(['diagnose', 'diagnostic-fixture@127.0.0.1', '--json', '--machine-id', meta.body.machine_id, '--epoch', created.body.session_epoch]);
     assert.equal(cli.code, 0, cli.stderr);
     assert.equal(JSON.parse(cli.stdout).identity.session_epoch, created.body.session_epoch);
+    // fix639: a valid opaque epoch may begin with '--'; a wrong one reaches the daemon's exact epoch refusal, not the parser.
+    const dashed = await harness.runCli(['diagnose', 'diagnostic-fixture@127.0.0.1', '--json', '--machine-id', meta.body.machine_id, '--epoch', '--' + 'A'.repeat(20)]);
+    assert.doesNotMatch(dashed.stderr, /requires a value/, 'a leading-dash epoch is a value, not a missing one');
+    const refused = JSON.parse(dashed.stdout).layers.daemon_api;
+    assert.deepEqual([dashed.code, refused.status, refused.phase, refused.http_status], [1, 'identity_mismatch', 'session', 409]);
+    for (const tail of [['--epoch', '--json'], ['--json', '--epoch']]) { const missing = await harness.runCli(['diagnose', 'diagnostic-fixture@127.0.0.1', ...tail]); assert.equal(missing.code, 1); assert.match(missing.stderr, /^--epoch requires a value$/m); }
     const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
     const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
     const client = new Client({ name: 'diagnostics-fixture', version: '1' });
