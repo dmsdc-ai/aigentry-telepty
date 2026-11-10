@@ -198,7 +198,7 @@ test('C5: inflight_entries(c)+prospective <= POOL_entries(c) and bytes likewise,
     const st = acct.status();
     for (const c of ['T', 'R', 'L', 'O', 'I']) assert.ok(st.inflight[c].entries <= F.POOLS[c].entries && st.inflight[c].bytes <= F.POOLS[c].bytes, `pool ${c} within bounds`);
     assert.ok(check.totalEntries <= F.POOL_TOTALS.entries && check.totalBytes <= F.POOL_TOTALS.bytes);
-    assert.ok(st.admitted_jobs <= F.R_MAX_JOBS);
+    assert.equal(st.job_count_limit, null);   // #1273: the admitted-job count is not bounded
   }
   assert.ok(admitted > 0 && rejected > 0, 'the random walk must exercise both admission and rejection');
   // a job may never consume more than its 2 reserved R units from the reservation; the third is shared
@@ -207,11 +207,11 @@ test('C5: inflight_entries(c)+prospective <= POOL_entries(c) and bytes likewise,
   assert.equal(a2.admit('R', 100, { jobId: 'j' }).reserved, true);
   assert.equal(a2.admit('R', 100, { jobId: 'j' }).reserved, true);
   assert.equal(a2.admit('R', 100, { jobId: 'j' }).reserved, false, 'third result draws on the shared pool');
-  // T without a job reservation is never admitted; begin at R_MAX is refused
+  // T without a job reservation is never admitted; #1273: no job-count ceiling refuses a begin (512 + 1 reserve)
   assert.equal(a2.admit('T', 10, { jobId: 'nope' }).ok, false);
   const a3 = F.createAccounting({ now: () => 0 });
-  for (let i = 0; i < F.R_MAX_JOBS; i++) assert.equal(a3.reserveJob(`j${i}`).ok, true);
-  assert.deepEqual(a3.reserveJob('one-more'), { ok: false, reason: 'tracking_capacity_exhausted' });
+  for (let i = 0; i < 512; i++) assert.equal(a3.reserveJob(`j${i}`).ok, true);
+  assert.deepEqual(a3.reserveJob('one-more'), { ok: true });
   // sustained exhaustion: a pool that rejected within 5 s and is still full refuses new begins.
   // Fixture arithmetic (resume3 correction): the O pool declares 1024 entries AND 4 MiB of bytes; at
   // one cap-sized unit (16384 B) per admission the BYTE budget binds first, so the pool holds
@@ -297,12 +297,14 @@ test('capacity T: one terminal unit per admitted job — a second concurrent T f
   assert.equal(a.reserveJob('j2').ok, true);
   const bj2 = snapshot(a);
   assert.equal(a.admit('T', p.unit + 1, { jobId: 'j2' }).ok, false); assertNoMutation(a, bj2, 'T above the unit');
-  // 512 jobs each with one terminal inflight fill exactly the T pool; nothing exceeds it
+  // p.entries jobs each with one terminal inflight fill exactly the T in-flight pool; nothing exceeds it
   const full = F.createAccounting();
-  for (let i = 0; i < F.R_MAX_JOBS; i++) { assert.equal(full.reserveJob(`j${i}`).ok, true); assert.equal(full.admit('T', p.unit, { jobId: `j${i}` }).ok, true); }
+  for (let i = 0; i < p.entries; i++) { assert.equal(full.reserveJob(`j${i}`).ok, true); assert.equal(full.admit('T', p.unit, { jobId: `j${i}` }).ok, true); }
   assert.equal(full.status().inflight.T.entries, p.entries); assert.equal(full.status().inflight.T.bytes, p.bytes);
   assert.ok(full.check().ok, 'T at exactly the pool is within bounds');
-  assert.equal(full.reserveJob('one-more').ok, false);
+  // #1273: one more JOB is not refused (no count gate); its terminal frame waits for in-flight room
+  assert.equal(full.reserveJob('one-more').ok, true);
+  assert.equal(full.admit('T', p.unit, { jobId: 'one-more' }).ok, false, 'the in-flight T pool still binds per operation');
 });
 
 test('capacity R: two reserved units per job are consumed, not returned; the shared pool is bounded at 128 entries / 2 MiB with refusal tracking_capacity_result and no mutation; a new job\'s reserved units are honoured while the shared pool is full', () => {

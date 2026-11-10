@@ -4,6 +4,18 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## 0.10.1 (hotfix candidate)
 
+- **Tracked injects no longer stop after 512 (#1273).** A daemon could answer
+  `503 TRACKING_CAPACITY tracking_capacity_exhausted` to every new `--from` inject once 512 tracked
+  records had been admitted, even with a healthy ledger and nothing in flight: a record superseded
+  by a newer inject kept its job slot until a checkpoint. The admitted-job count is no longer an
+  admission limit and a superseded record releases its slot. The hot tier's 576-record figure is a
+  soft residency target, not a limit: live sessions can retain current tracked injects beyond that
+  target while the byte budget fits. Finished records move to the cold tier in batches (same files).
+  Records stay queryable and updatable after demotion and restart. Real failures are still refused
+  by name: disk full, I/O errors, an unavailable store, the 64 MiB hot byte budget, and more than
+  512 begins in flight at the same instant. `telepty ledger status` reports `job_count_limit: null`
+  and `resident.soft_target_records`; `r_max`, `over_cap` and `resident.max_records` are gone.
+
 - **A `telepty allow` bridge no longer holds an authorized inject while the wrapped CLI is busy.**
   In 0.10.0 a guarded bridge wrote an inject only after it had observed a ready prompt or composer
   frame. A CLI that kept printing output (working, thinking, loading) left the body and its Enter
@@ -61,6 +73,26 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   applied waits once for the application's own ready signal first. Output or busy later never delays an inject.
 - A dropped consecutive duplicate at the bridge flush no longer prints a warning. Its dead-letter and
   receipt are unchanged.
+- On exit, `telepty allow` waits at most 2.5 s for the one teardown DELETE it already started (the
+  budget counts from that DELETE's start). It sends no second request and does not retry. If the
+  teardown is not confirmed (refused, failed or timed out), the bridge prints
+  `Session teardown not confirmed (...)` and never reports the session as deleted.
+- A bridge metadata refresh (`POST /api/sessions/register`) names this bridge's accepted instance:
+  the session epoch and credential generation of its current owner claim. If that instance was
+  destroyed or replaced, the daemon refuses with `409 REGISTRATION_INSTANCE_CHANGED` before anything
+  is created or updated. A closed bridge, or one without a valid binding, sends no refresh. A refusal
+  is not retried.
+- An untracked `telepty inject --submit` (no `--from`) also pairs its body with exactly one Enter:
+  `/submit` with the returned `inject_id` sends one CR for that body. The id only pairs them; no
+  tracked ledger record is created. An id that was never issued, belongs to another session or comes
+  from an earlier owner generation is refused `not_written`, and no CR is written.
+- Windows: a mailbox lock ticket whose `number` file is still listed but reports zero links
+  (delete-pending) is treated as retired only when its retirement is proven AND every other identity
+  check still passes. Retirement is proven when the ticket directory is gone or holds its departure
+  marker, or when a number this read saw published is no longer listed. The other checks are file
+  type, size and device/inode, plus size and timestamps after the read. If the ticket directory cannot
+  be listed, the ticket stays unresolved and blocks the lock; it is never read as gone. In every other
+  case the existing refusal stands.
 - Restart every running `telepty allow` bridge to pick this up. A bridge keeps the code it was
   started with.
 

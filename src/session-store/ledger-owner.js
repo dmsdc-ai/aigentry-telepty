@@ -196,7 +196,9 @@ function createStore(options) {
       actions: S.actions.size, pending: S.pending.size, segments: S.segments.length, unapplied: S.unapplied.length,
       cold_offline: S.cold.filter((c) => c.offline).length };
   }
-  function resident() { return { records: S.hot.size, bytes: S.hotBytes, max_records: hotMaxRecords, max_bytes: hotMaxBytes }; }
+  // #1273 correction: the record count is a SOFT target (relief trigger, never an admission limit); the
+  // hard resident bound is the encoded bytes.
+  function resident() { return { records: S.hot.size, bytes: S.hotBytes, soft_target_records: hotMaxRecords, max_bytes: hotMaxBytes }; }
   function encodedBytes(record) { return Buffer.byteLength(JSON.stringify(record), 'utf8'); }
   function sendChunks(req, type, items, extra = {}) {
     const chunks = []; let cur = []; let bytes = 2;
@@ -770,7 +772,43 @@ function createStore(options) {
   }
   function nack(txn, reason, extra = {}) { post({ type: 'nack', txn, reason, ...extra }); }
 
-  function submit(msg) {
+  // #1273 — resident admission is relieved through the EXISTING checkpoint/demotion path (immutable cold
+  // file, MANIFEST, `demoted` to the client), then the same submit is evaluated ONCE more.
+  // #1273 correction (review559 F1–F4):
+  //  * the hot RECORD count (hotMaxRecords) is a soft target, never an admission limit: past it a
+  //    begin/reheat is admitted when there is no relief batch; only the hot BYTE bound refuses
+  //    (`hot_capacity`, bound `hot_bytes`), after relief when one is possible.
+  //  * routine relief demotes TERMINAL records only — a tracked record stays hot (supersession and submit
+  //    correlation read the hot tier, and not every registration path sends the live hint);
+  //    demotionEligible stays the rule of the manual / threshold / close checkpoints.
+  //  * relief runs only for a batch (hysteresis), so a hot set held by live work does not checkpoint per begin.
+  //  * a checkpoint that failed AFTER changing owner memory (its MANIFEST did not publish) fails the store
+  //    closed (`unavailable_write` + errno, before the nack) — no write is accepted from divergent state.
+  //    A failure before any in-memory change stays an honest `hot_demotion_failed` on an available store.
+  function isTerminalRecord(record) { return F.TERMINAL_STATES.includes(record.tracking_state); }
+  function reliefBatchResident() {
+    const need = Math.max(F.HOT_RELIEF_MIN_BATCH, Math.ceil(S.hot.size / F.HOT_RELIEF_FRACTION));
+    let n = 0;
+    for (const record of S.hot.values()) if (isTerminalRecord(record) && ++n >= need) return true;
+    return false;
+  }
+  function hotAdmission(record, relieved) {
+    const overBytes = S.hotBytes + encodedBytes(record) > hotMaxBytes;
+    if (!overBytes && S.hot.size + 1 <= hotMaxRecords) return 'admit';
+    if (!relieved && reliefBatchResident()) return 'relieve';
+    return overBytes ? 'refuse' : 'admit';
+  }
+  function relieveHotPressure(msg) {
+    const { txn } = msg;
+    if (S.group && S.group.frames.length) flushGroup();
+    if (S.state !== 'available') return submit(msg, true);   // the store's own state answers (e.g. unavailable_write)
+    try { checkpoint('hot_pressure', isTerminalRecord); } catch (error) {
+      if (error && error.unpublishedCheckpoint) postState('unavailable_write', classifyIoError(error), { code: codeOf(error), stage: 'checkpoint_manifest', checkpoint: error.unpublishedCheckpoint });
+      return nack(txn, 'hot_demotion_failed', { code: codeOf(error), resident: resident() });
+    }
+    return submit(msg, true);
+  }
+  function submit(msg, relieved = false) {
     const { txn, kind, delta } = msg;
     if (!txn || !kind || !delta) return nack(txn, 'invalid', { code: 'malformed_submit' });
     if (S.state === 'recovering') return nack(txn, 'recovering');
@@ -789,7 +827,9 @@ function createStore(options) {
           if (!id || !sid || !isObject(record) || record.inject_id !== id || record.session_id !== sid) return nack(txn, 'invalid', { code: 'begin_shape' });
           if (ctx.get(id)) return noopVerdict(g, txn, 'already_exists', g.touched.has(id), at);
           if (coldLookup(id)) return noopVerdict(g, txn, 'already_exists', false, at);   // durable in the cold tier: idempotent by key
-          if (S.hot.size + 1 > hotMaxRecords || S.hotBytes + encodedBytes(record) > hotMaxBytes) return nack(txn, 'hot_capacity', { resident: resident() });
+          const hot = hotAdmission(record, relieved);
+          if (hot === 'relieve') return relieveHotPressure(msg);
+          if (hot === 'refuse') return nack(txn, 'hot_capacity', { bound: 'hot_bytes', resident: resident() });
           const supersede = [];
           for (const hid of S.hotBySession.get(sid) || []) {
             const r = ctx.get(hid);
@@ -837,7 +877,9 @@ function createStore(options) {
           const cold = found.record;
           if (cold.tracking_state === 'tracked' && delta.job_reserved !== true) return nack(txn, 'tracking_capacity_exhausted', { code: 'reheat_requires_job_reservation' });
           const record = F.materialize(cold, F.pendingFactsFor(cold, g.facts, at), at);
-          if (S.hot.size + 1 > hotMaxRecords || S.hotBytes + encodedBytes(record) > hotMaxBytes) return nack(txn, 'hot_capacity', { resident: resident() });
+          const hot = hotAdmission(record, relieved);
+          if (hot === 'relieve') return relieveHotPressure(msg);
+          if (hot === 'refuse') return nack(txn, 'hot_capacity', { bound: 'hot_bytes', resident: resident() });
           frame = { t: 'reheat', epoch: at.epoch, seq: at.seq, txn, id, record };
           break;
         }
@@ -919,7 +961,12 @@ function createStore(options) {
     }
     for (const n of g.noops) post({ type: 'ack', txn: n.txn, seq: null, epoch: S.epoch, result: n.result, basis: 'pending', group: n.group });
     if (S.receipts.size > F.RECEIPTS_MAX * 2) trimReceipts();
-    if (S.framesSinceCheckpoint >= compactFrames) { try { checkpoint('threshold'); } catch (error) { post({ type: 'progress', phase: 'compact', error: codeOf(error) }); } }
+    // #1273 correction570 (review566 F4-threshold): this checkpoint runs on the admission write path (every flush,
+    // including the relief path's); a MANIFEST failure after its in-memory changes fails the store closed, as relief does.
+    if (S.framesSinceCheckpoint >= compactFrames) { try { checkpoint('threshold'); } catch (error) {
+      if (error && error.unpublishedCheckpoint) postState('unavailable_write', classifyIoError(error), { code: codeOf(error), stage: 'checkpoint_manifest', checkpoint: error.unpublishedCheckpoint });
+      post({ type: 'progress', phase: 'compact', error: codeOf(error) });
+    } }
     if (S.seg && S.seg.bytes >= F.SEGMENT_ROLL_BYTES) { try { closeSegment(); openSegment(S.epoch, nextSegmentN()); } catch { /* next write retries a new segment */ } }
   }
   function tryWrite(bytes) {
@@ -949,13 +996,13 @@ function createStore(options) {
     }
     return false;
   }
-  function checkpoint(reason = 'manual') {
+  function checkpoint(reason = 'manual', eligible = demotionEligible) {
     if (S.group && S.group.frames.length) flushGroup();
     const n = reserveGeneration('hot');   // #1207 never S.checkpointN + 1: that reuses an unpublished generation after recovery
     const hotDir = path.join(dir, 'hot'); const coldDir = path.join(dir, 'cold'); const factsDir = path.join(dir, 'facts');
     for (const d of [hotDir, coldDir, factsDir]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
     // 1. demote eligible hot records into a new immutable cold file (+ indexes)
-    const demote = [...S.hot.values()].filter(demotionEligible);
+    const demote = [...S.hot.values()].filter(eligible);
     let coldMeta = null;
     if (demote.length) {
       const coldN = reserveGeneration('cold');   // #1207 never max(published cold)+1
@@ -979,14 +1026,18 @@ function createStore(options) {
     for (const action of S.actions.values()) hotLines.push(JSON.stringify({ t: 'action', action }));
     for (const pending of S.pending.values()) hotLines.push(JSON.stringify({ t: 'pending', pending }));
     createFileDurable(path.join(hotDir, `${n}.jsonl`), Buffer.from(hotLines.length ? hotLines.join('\n') + '\n' : ''));
-    const receiptLines = [];
-    for (const [txn, r] of S.receipts) if (r.ckpt === 'open' || r.ckpt === 'replay') { receiptLines.push(JSON.stringify({ txn, pos: r.pos, kind: r.kind, id: r.id })); r.ckpt = n; }
+    const receiptLines = []; const tagged = [];   // #1273 correction (F4): tagged with n in step 3, after every member is durable
+    for (const [txn, r] of S.receipts) if (r.ckpt === 'open' || r.ckpt === 'replay') { receiptLines.push(JSON.stringify({ txn, pos: r.pos, kind: r.kind, id: r.id })); tagged.push(r); }
     createFileDurable(path.join(hotDir, `${n}.receipts.jsonl`), Buffer.from(receiptLines.length ? receiptLines.join('\n') + '\n' : ''));
     createFileDurable(path.join(factsDir, `${n}.jsonl`), Buffer.from(S.facts.length ? S.facts.map((f) => JSON.stringify(f)).join('\n') + '\n' : ''));
     const sidFactEntries = S.facts.map((f, i) => ({ key: F.keyPrefix(f.scope === 'session' ? String(f.sid) : '*global*'), file: n, offset: i, len: 0, flags: f.scope === 'global' ? 1 : 0 }));
     createFileDurable(path.join(factsDir, `${n}.sid.idx`), F.buildIndex(sidFactEntries));
     fsyncDir(hotDir); fsyncDir(factsDir);
     // 3. MANIFEST referencing them — only now does residency release (errata C6 rule 2).
+    // #1273 correction (F4): everything above only created new files; from here owner memory changes
+    // ahead of the MANIFEST. A MANIFEST failure is tagged `unpublishedCheckpoint` for the caller (the
+    // admission-path relief fails the store closed; manual / threshold / close keep their semantics).
+    for (const r of tagged) r.ckpt = n;
     if (coldMeta) { S.cold.push(coldMeta); S.coldIndexBytes += coldMeta.idIdx.length + coldMeta.sidIdx.length; }
     for (const record of demote) removeHot(record.inject_id);
     S.receiptCkpts.push(n); if (S.receiptCkpts.length > 2) S.receiptCkpts = S.receiptCkpts.slice(-2);
@@ -994,7 +1045,10 @@ function createStore(options) {
     S.checkpointN = n; S.checkpointPos = F.pos(S.epoch, S.seqCommitted); S.framesSinceCheckpoint = 0;
     for (const s of S.segments) if (s.closed) s.checkpointed = true;
     S.appliedPos.clear(); for (const [k] of S.txnHash) if (k.includes(':')) S.txnHash.delete(k);
-    writeManifest({ clean_close: false, last_checkpoint: { n, reason, at: nowIso(), demoted: demote.length } });
+    try { writeManifest({ clean_close: false, last_checkpoint: { n, reason, at: nowIso(), demoted: demote.length } }); } catch (error) {
+      if (error && typeof error === 'object') error.unpublishedCheckpoint = n;
+      throw error;
+    }
     // The client mirrors residency: demoted ids leave its read model (reads go to the cold tier).
     if (demote.length) post({ type: 'demoted', ids: demote.map((r) => r.inject_id), checkpoint: n });
     post({ type: 'progress', phase: 'compact', done: n, total: null, demoted: demote.length, reason });

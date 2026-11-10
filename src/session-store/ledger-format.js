@@ -27,9 +27,18 @@ const COLD_INDEX_MAX_BYTES = 67108864;
 const FREE_SPACE_HINT_BYTES = 67108864;
 
 // Capacity (errata C5/C6, CONTRACT-PATCH capacity.*). All proposed until measured.
-const R_MAX_JOBS = 512;
+// #1273 — there is NO limit on the number of admitted (persistent, unresolved) jobs: the former
+// R_MAX_JOBS = 512 gate is removed. POOLS below bound IN-FLIGHT frames per class (released at
+// ACK / nack / indeterminate), never the population of tracked records.
+// #1273 correction — HOT_MAX_RECORDS is the hot tier's SOFT residency target (the trigger for relief),
+// not an admission limit: past it a begin/reheat is admitted unless a relief batch exists. The hard
+// resident bound is HOT_MAX_ENCODED_BYTES. Routine (`hot_pressure`) relief demotes terminal records only,
+// and only when at least max(HOT_RELIEF_MIN_BATCH, ceil(hot / HOT_RELIEF_FRACTION)) of them are resident,
+// so one relief checkpoint (which rewrites the hot snapshot) serves a batch of terminal records.
 const HOT_MAX_RECORDS = 576;
 const HOT_MAX_ENCODED_BYTES = 67108864;
+const HOT_RELIEF_MIN_BATCH = 64;    // = GROUP.frames
+const HOT_RELIEF_FRACTION = 8;      // a relief demotes >= 1/8 of the hot set: <= 8 snapshot records rewritten per demoted record
 const POOLS = Object.freeze({
   T: { entries: 512, bytes: 8388608, unit: 16384 },                 // 1 per admitted job (reserved at begin)
   R: { entries: 2 * 512 + 128, bytes: 18874368, unit: 16384, reservedPerJob: 2, shared: 128 },
@@ -341,7 +350,7 @@ function classify(kind, observation, opts = {}) {
  * `check()` additionally verifies the shared-R sub-budget. Serialization, recovery and index
  * formats are untouched by this correction.
  */
-function createAccounting({ now = Date.now, pools = POOLS, rMax = R_MAX_JOBS } = {}) {
+function createAccounting({ now = Date.now, pools = POOLS } = {}) {
   const inflight = { T: { entries: 0, bytes: 0 }, R: { entries: 0, bytes: 0 }, L: { entries: 0, bytes: 0 }, O: { entries: 0, bytes: 0 }, I: { entries: 0, bytes: 0 } };
   const shared = { entries: 0, bytes: 0 };   // the R sub-pool not covered by job reservations
   const jobs = new Map();          // id -> { tUsed:bool (terminal unit inflight), rUsed:number (reserved results consumed) }
@@ -355,7 +364,10 @@ function createAccounting({ now = Date.now, pools = POOLS, rMax = R_MAX_JOBS } =
     return inflight[c].entries + entries <= p.entries && inflight[c].bytes + bytes <= p.bytes;
   }
   // "Full" for the sustained-exhaustion rule: the budget a NEW admission of that class would draw
-  // on — the shared sub-pool for R (job reservations are never exhausted by traffic), the pool for O/L.
+  // on — the shared sub-pool for R, the pool for O/L. #1273: with no job-count cap a job's reserved R
+  // units are no longer guaranteed room — they too need in-flight room in the R pool (`admit`), so more
+  // than POOLS.R.entries concurrently in-flight result frames are refused: an in-flight bound, released
+  // at ACK / nack / indeterminate, like the T pool (512 concurrent begin/terminal frames, detail `pool`).
   function poolFull(c) {
     if (c === 'R') return shared.entries + 1 > pools.R.shared || shared.bytes + pools.R.unit > pools.R.shared * pools.R.unit;
     return !room(c, 1, pools[c].unit);
@@ -369,15 +381,16 @@ function createAccounting({ now = Date.now, pools = POOLS, rMax = R_MAX_JOBS } =
     }
     return null;
   }
-  /** Reserve 1 T + 2 R units for a job. Reservations are counted against the pools once (no double count with inflight). */
+  /**
+   * Open a job's per-job bookkeeping: its one terminal unit (at most one T frame in flight at a time)
+   * and its two reserved result units. #1273 — the NUMBER of open jobs is not an admission gate (the
+   * former `jobs.size` checks against 512 / the T pool / the reserved R sub-pool all encoded the same
+   * persistent count); every frame is still bounded where it is admitted (`admit`: in-flight pools).
+   */
   function reserveJob(id, t = now()) {
     if (jobs.has(id)) return { ok: true, already: true };
-    if (jobs.size + 1 > rMax) return { ok: false, reason: 'tracking_capacity_exhausted' };
     const sustained = sustainedExhaustion(t);
     if (sustained) return { ok: false, reason: 'sustained_exhaustion', class: sustained };
-    const pT = pools.T; const pR = pools.R;
-    if (jobs.size + 1 > pT.entries || (jobs.size + 1) * pT.unit > pT.bytes) return { ok: false, reason: 'tracking_capacity_exhausted' };
-    if ((jobs.size + 1) * pR.reservedPerJob > pR.entries - pR.shared || (jobs.size + 1) * pR.reservedPerJob * pR.unit > pR.bytes - pR.shared * pR.unit) return { ok: false, reason: 'tracking_capacity_exhausted' };
     jobs.set(id, { rUsed: 0, tUsed: false });
     return { ok: true };
   }
@@ -458,7 +471,7 @@ function createAccounting({ now = Date.now, pools = POOLS, rMax = R_MAX_JOBS } =
   function status() {
     return { inflight: JSON.parse(JSON.stringify(inflight)), shared_r: { ...shared }, admitted_jobs: jobs.size, acts: acts.size,
       terminal_units_inflight: [...jobs.values()].filter((j) => j.tUsed).length,
-      r_max: rMax, pools: { T: pools.T.entries, R: pools.R.entries, L: pools.L.entries, O: pools.O.entries, I: pools.I.entries },
+      job_count_limit: null, pools: { T: pools.T.entries, R: pools.R.entries, L: pools.L.entries, O: pools.O.entries, I: pools.I.entries },
       sustained_exhaustion: sustainedExhaustion(), last_rejection: { ...lastRejection } };
   }
   return { reserveJob, releaseJob, hasJob, admit, release, reserveAct, releaseAct, sustainedExhaustion, check, status, jobs };
@@ -473,8 +486,8 @@ function toLegacyRecord(record) {
 
 module.exports = {
   STORE_FORMAT_VERSION, MAX_OBSERVATIONS_PER_RECORD, FRAME_CAPS, GROUP, SEGMENT_ROLL_BYTES, COMPACT_FRAMES,
-  RECEIPTS_MAX, MESSAGE_MAX_BYTES, COLD_INDEX_MAX_BYTES, FREE_SPACE_HINT_BYTES, R_MAX_JOBS, HOT_MAX_RECORDS,
-  HOT_MAX_ENCODED_BYTES, POOLS, POOL_TOTALS, SUSTAINED_EXHAUSTION_MS, TERMINAL_STATES, INDEX_ENTRY_BYTES,
+  RECEIPTS_MAX, MESSAGE_MAX_BYTES, COLD_INDEX_MAX_BYTES, FREE_SPACE_HINT_BYTES, HOT_MAX_RECORDS,
+  HOT_MAX_ENCODED_BYTES, HOT_RELIEF_MIN_BATCH, HOT_RELIEF_FRACTION, POOLS, POOL_TOTALS, SUSTAINED_EXHAUSTION_MS, TERMINAL_STATES, INDEX_ENTRY_BYTES,
   sha256Hex, frameHash, encodeFrame, frameBytes, decodeFrames, groupFrames,
   pos, comparePos, posKey,
   observationIdentity, capObservations, appendObservation, factApplies, pendingFactsFor, materialize, overlay,

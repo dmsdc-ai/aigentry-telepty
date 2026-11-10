@@ -527,10 +527,12 @@ test('X1: the installed 0.9.1 persistence cannot write over or read the director
   assert.deepEqual(fs.readdirSync(s.parent).filter((n) => n.startsWith('.tracked-injections.') && n.endsWith('.tmp')), [], 'no tmp residue');
 }));
 
-test('R4 / E6-lite / C8: a cold record is reheated by a write (facts materialized, seq continues); resident admission refuses begins beyond HOT_MAX_RECORDS; residency releases only after a checkpoint demoted terminal records', () => withStore(async (s) => {
+test('R4 / E6-lite / C8: a cold record is reheated by a write (facts materialized, seq continues); the hot record count is a soft target: a begin beyond HOT_MAX_RECORDS is admitted (#1273); residency releases only after a checkpoint demoted terminal records', () => withStore(async (s) => {
   const legacy = writeLegacyLedger(s.dir, { count: 3, obsPerRecord: 3 });
   let h = createOwnerHarness({ dir: s.dir, hotMaxRecords: 2 });
-  h.open();
+  // #1273: the residents here belong to LIVE sessions (w1, w2, the reheated record's session), so the
+  // manual compact below demotes only the aborted record (demotionEligible, unchanged).
+  h.open(['w1', 'w2', legacy.ledger.injections[legacy.ids[0]].session_id]);
   await h.submit('fact', { scope: 'global', observation: { kind: 'daemon_restart_observed', trigger: 'daemon_restart', at: nowIso() } }, { cls: 'L' });
   await h.submit('fact', { scope: 'global', observation: { kind: 'daemon_restart_observed', trigger: 'daemon_restart', at: nowIso() } }, { cls: 'L' });
   const cold = legacy.ids[0];
@@ -546,10 +548,12 @@ test('R4 / E6-lite / C8: a cold record is reheated by a write (facts materialize
   const view = h.read('get', { id: cold }).items[0];
   assert.equal(view.observation_seq, 6); assert.equal(view.tier === undefined, true);
   assert.equal(h.read('get', { id: cold }).tier, 'hot');
-  // resident cap: 2 hot records max (1 reheated + 1 begin); the third is rejected by the OWNER, named
+  // #1273 correction (review559 F1) — before: hotMaxRecords 2 was a resident cap and the third begin was
+  // refused 'hot_capacity' (records 2). After: it is a SOFT target; with no batch of terminal records to
+  // relieve, the third begin is admitted past it (the hard bound is the hot byte budget).
   assert.equal((await begin(h, 'n1', 'w1')).type, 'ack');
-  const full = await begin(h, 'n2', 'w2');
-  assert.equal(full.type, 'nack'); assert.equal(full.reason, 'hot_capacity'); assert.equal(full.resident.records, 2);
+  const past = await begin(h, 'n2', 'w2');
+  assert.equal(past.type, 'ack', JSON.stringify(past)); assert.equal(h.read('status').items[0].resident.records, 3);
   // the cold records and the facts stay readable
   assert.equal(h.read('get', { id: legacy.ids[1] }).items[0].observation_seq, 5);
   // terminal + checkpoint ⇒ demotion ⇒ residency released ⇒ further begins admitted

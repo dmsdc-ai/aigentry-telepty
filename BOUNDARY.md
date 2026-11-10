@@ -499,6 +499,31 @@ What holds:
   begins with `503 TRACKING_CAPACITY sustained_exhaustion`. There is no lossy coalescing, no
   suppression record, and no unbounded main-thread retry queue. Encoded-byte caps bound resident
   encoded state only; heap and RSS are measured, not implied.
+- **No tracked-job count limit (#1273).** The number of tracked (persistent, unresolved) injects
+  never gates a new identified inject: the former 512 admitted-job ceiling is removed, and a job's
+  reservation is released when its record turns terminal — including when a newer begin supersedes
+  it. The class pools bound in-flight frames only (released at ACK / nack / indeterminate): a burst
+  of more than 512 concurrently in-flight begin/terminal frames can still answer
+  `tracking_capacity_exhausted` (client detail `pool`; the route does not yet carry the detail) —
+  a finite concurrency bound, not the removed persistent ceiling. The hot tier's record count
+  (576) is a **soft residency target**, never an admission limit: past it a begin or reheat is
+  admitted, and the owner relieves residency through the same checkpoint into the cold tier only
+  when a batch of at least max(64, hot/8) **terminal** records is resident (routine relief never
+  demotes a `tracked` record; the manual, threshold and close checkpoints keep their rule). The hard
+  resident bound is the hot **byte** budget (64 MiB): a begin that would exceed it after relief is
+  refused `hot_capacity` (owner detail `bound: hot_bytes`). A relief failure before any in-memory
+  change is `hot_demotion_failed` with the errno on a still-available store; a MANIFEST failure after
+  it — in a relief checkpoint or in the threshold checkpoint a group flush runs — fails the store
+  closed (`unavailable_write`, stage `checkpoint_manifest`) until a restart. The restart uses the
+  MANIFEST that is on disk: the previous one when the rename failed (the segments replay the
+  acknowledged work), or the new one when the rename succeeded and only the directory flush failed
+  (its members were already durable). An operator `compact` that fails the same way keeps the store
+  available, as before. A write that finds its record demoted under it (`record_cold`, nothing
+  persisted) is reheated and resubmitted once. `/api/ledger/status` shows
+  `accounting.job_count_limit: null` and `resident.soft_target_records` / `resident.max_bytes`.
+  Each relief adds one cold generation (3 files) and one checkpoint generation (4 files) and one
+  MANIFEST `cold[]` entry; these grow with history (format 4 has no cold merge) and are bounded by
+  disk and the cold-index byte budget, not by a count.
 
 Named deltas and limits: the hot/cold tier means a new tracked begin supersedes only the session's
 **hot** `tracked` records (cold ones remain `tracked`, completion unknown, exactly as a poll answered

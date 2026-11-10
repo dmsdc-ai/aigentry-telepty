@@ -246,6 +246,29 @@ They are never replayed, purged or acked. To reconcile, use the existing read-on
 Re-issuing is a new inject with a new `inject_id`. Never send a bare Enter for a record whose outcome
 is unknown. Do not hand-edit or purge a queue directory.
 
+## Teardown, instance identity, untracked submit and lock tickets (0.10.1)
+
+- **Teardown on exit.** `telepty allow` waits at most 2.5 s for the one teardown DELETE its close
+  already started. The budget counts from that DELETE's start. No second request and no retry are
+  sent. A refused, failed or timed-out teardown is printed as `Session teardown not confirmed (...)`
+  and is never reported as deleted.
+- **Metadata refresh.** A refresh (`POST /api/sessions/register`) carries `expected_epoch` and
+  `expected_credential_generation` from the bridge's current owner claim. If the named instance was
+  destroyed or replaced, the daemon refuses with `409 REGISTRATION_INSTANCE_CHANGED` before any create
+  or update. A closed bridge, or one without a valid binding, withholds the refresh. A refusal is not
+  retried, and a bare sid is never sent.
+- **Untracked submit.** An inject without `--from` gets its `inject_id` back but opens no tracked ledger
+  record. `/submit` with that id writes exactly one CR, paired with that body. An id that was never
+  issued or belongs to another session is refused `not_written` (`submit_pair_unavailable`). An id from
+  an earlier owner generation is refused `not_written` (`owner_generation_changed`). Neither writes a CR.
+- **Windows zero-link lock ticket.** A mailbox lock ticket whose `number` file is still listed but reports
+  zero links (delete-pending) is retired only when its retirement is proven AND every other identity
+  check still passes. Retirement is proven when the ticket directory is gone or holds its departure
+  marker, or when a number this read saw published is no longer listed. The other checks are file type,
+  size and device/inode, plus size and timestamps after the read. A ticket directory that cannot be
+  listed leaves the ticket unresolved, which blocks the lock. It is never treated as gone. Every other
+  case keeps the existing refusal.
+
 ## Recipient input policy: user-supervised orchestrator vs guarded worker
 
 Workers can show interaction and permission prompts, so they keep every screen gate above. The
