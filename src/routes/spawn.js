@@ -35,7 +35,9 @@ function buildSessionEnv(sessionId) {
 function registerSpawnRoute(app, {
   sessions, sessionStateManager, pty, persistSessions, appendToOutputRing,
   revokeSessionCredential, busClients, os, buildSessionEnv, admission = defaultSpawnAdmission,
-  ledgerLive = null   // #1207 — optional: tells the ledger owner which sessions are live
+  ledgerLive = null,   // #1207 — optional: tells the ledger owner which sessions are live
+  // Issue #144 CF2: the active client-profile registry (null when the feature is off). Injectable for tests.
+  clientProfiles = () => require('../protocol/client-profiles').activeClientProfiles()
 }) {
   app.post('/api/sessions/spawn', (req, res) => {
     const invalid = (field, code) => res.status(400).json({ error: `Invalid ${field}.`, ...(code ? { code } : {}) });
@@ -91,6 +93,12 @@ function registerSpawnRoute(app, {
     }
     if (['__proto__', 'constructor', 'prototype'].includes(session_id) || session_id in sessions) {
       return invalid('session_id');
+    }
+    // Issue #144 CF2 (configured only): no spawn INTO a configured client-profile namespace — refused before the
+    // admission token, the PTY, the session record and persistence (same rule as register/rename).
+    const profileRegistry = clientProfiles();
+    if (profileRegistry && profileRegistry.reservesSessionId(session_id)) {
+      return res.status(403).json({ code: 'PROFILE_NAMESPACE_RESERVED', error: 'This id is reserved for a configured client profile.' });
     }
 
     const admitted = admission.take();

@@ -20,8 +20,11 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   - **Rotation and revocation.** The file is re-read and hashed on every profile request, so rotation and
     revocation need no restart. A broken file is `503 PROFILE_REGISTRY_UNAVAILABLE` for profiles only.
   - **Startup.** A configured but invalid file, strict principal mode, or native Windows refuses daemon start.
-  - **Effect on host-token callers.** While configured, the only change is that they cannot register a new id,
-    or rename one, into a configured namespace (`403 PROFILE_NAMESPACE_RESERVED`).
+  - **Effect on host-token callers.** While configured, the only change is that they cannot create an id inside a
+    configured namespace by register, rename, spawn or WebSocket auto-register (`403 PROFILE_NAMESPACE_RESERVED`).
+  - **Re-granted prefixes.** A previous holder's still-live inbox is refused for audit reads
+    (`403 PROFILE_READ_DENIED`), including rows written after the re-grant. A grant whose `not_before` lies in the
+    future cannot create an inbox yet (`403 PROFILE_CREATE_DENIED`).
   - **CLI.** `telepty client-profile mint|check` mints tokens and validates the file locally.
   - **Limits.** Same-uid credential theft, shared daemon capacity and revocation of already-admitted requests are
     stated limits, not fixed (docs/client-profiles.md, BOUNDARY.md). No persistence, ledger or audit format

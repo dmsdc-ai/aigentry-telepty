@@ -551,7 +551,8 @@ What it separates is **assistants that hold different credentials** on one OS us
 - Revocation is linearized at the gate: an already-admitted request completes. Shared daemon capacity (audit
   workers, tracking, the hot budget) is not per-profile. A captured inject request replays as a new inject.
 - Host-token holders remain admin. While profiles are configured, the one change to them is that they cannot
-  register a new id, or rename, into a configured namespace (`403 PROFILE_NAMESPACE_RESERVED`).
+  create an id inside a configured namespace by register, rename, spawn or WebSocket auto-register
+  (`403 PROFILE_NAMESPACE_RESERVED`, before any effect).
 - Native Windows: unsupported; the daemon refuses to start with profiles configured.
 
 ## Design principle

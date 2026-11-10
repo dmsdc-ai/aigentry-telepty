@@ -186,7 +186,13 @@ function resolveClientProfilesFile({ env = process.env, config, loadConfig } = {
 
 // Daemon boot. Unconfigured ⇒ null (feature off). Configured but unusable ⇒ throws a coded refusal so the daemon
 // does not start without the enforcement it was told to perform (dispatch F8 decision: refuse start).
+// The registry the daemon-boot factory below last returned (null when off or refused). Read-only accessor for
+// creation routes the daemon does not hand the registry to explicitly (issue #144 CF2: src/routes/spawn.js).
+let activeRegistry = null;
+function activeClientProfiles() { return activeRegistry; }
+
 function createClientProfilesFromEnvironment({ env = process.env, config, loadConfig, platform = process.platform, readFile = readAuthorityFile } = {}) {
+  activeRegistry = null;
   const { file } = resolveClientProfilesFile({ env, config, loadConfig });
   if (file === null) return null;
   const reason = invalidPathReason(file);
@@ -195,6 +201,7 @@ function createClientProfilesFromEnvironment({ env = process.env, config, loadCo
   if (env.TELEPTY_PRINCIPAL_MODE === 'strict') throw refusal('CLIENT_PROFILES_MODE_CONFLICT');
   const registry = createClientProfileRegistry({ file, platform, readFile });
   registry.load();   // throws CLIENT_PROFILES_UNAVAILABLE/<reason> (incl. darwin_native_reader_unavailable)
+  activeRegistry = registry;
   return registry;
 }
 
@@ -300,10 +307,12 @@ const MESSAGES_HTTP = Object.freeze({
   PROFILE_TARGET_DENIED: 'The target is not granted to this profile.',
   PROFILE_SENDER_DENIED: 'The sender is not this profile\'s live, credentialed inbox.',
   PROFILE_READ_DENIED: 'The audit query is outside this profile\'s scope.',
+  PROFILE_CREATE_DENIED: 'This grant is not yet in force (not_before is in the future); nothing was created.',
 });
 
 // Pure decision for one request (no effects). `sessions()` and `credentials` are the daemon's live maps.
-function createClientProfileGate({ registry, sessions, credentials }) {
+// `now` is injectable for deterministic tests only; the daemon uses the default clock.
+function createClientProfileGate({ registry, sessions, credentials, now = Date.now }) {
   if (!registry || typeof registry.load !== 'function' || typeof sessions !== 'function' || !credentials) {
     throw new Error('client profile gate requires registry, sessions() and credentials');
   }
@@ -346,6 +355,9 @@ function createClientProfileGate({ registry, sessions, credentials }) {
             || (Object.prototype.hasOwnProperty.call(body, 'command') && (typeof body.command !== 'string' || !COMMAND_RE.test(body.command)))) {
           return deny(403, 'PROFILE_REQUEST_FIELD_DENIED');
         }
+        // A grant that is not yet in force cannot create: an inbox created before not_before would be invisible to,
+        // and undeletable by, its own profile (every own-namespace check requires createdAt >= not_before).
+        if (now() < caller.notBeforeMs) return deny(403, 'PROFILE_CREATE_DENIED');
         return { ok: true, caller };
       }
       case 'inject': {
@@ -376,6 +388,15 @@ function createClientProfileGate({ registry, sessions, credentials }) {
         const permitted = ownsSessionId(caller, q.to)
           || (ownsSessionId(caller, q.from) && (q.to === undefined || caller.targetSet.has(q.to)));
         if (!permitted) return deny(403, 'PROFILE_READ_DENIED');
+        // CF1: an own-namespace id that names a LIVE session created before this grant's not_before belongs to a
+        // previous holder of the prefix. Its later rows (e.g. a late reply) are not this caller's history, so the
+        // query is refused outright rather than only clamped by `since`. Missing createdAt ⇒ refused (fail closed).
+        const live = sessions();
+        for (const id of [q.to, q.from]) {
+          if (ownsSessionId(caller, id) && ownSession(live, id) && !freshSince(caller, ownSession(live, id).createdAt)) {
+            return deny(403, 'PROFILE_READ_DENIED');
+          }
+        }
         return { ok: true, caller };
       }
       case 'observe':
@@ -408,6 +429,7 @@ module.exports = {
   SCHEMA, CAPABILITY, ENV_KEY, CONFIG_KEY, MAX_FILE_BYTES, RESERVED_SEGMENTS, CLIENT_TOKEN_HEADER, FORBIDDEN_CARRIERS,
   TOKEN_RE, VERIFIER_RE, NOT_BEFORE_RE,
   parseClientProfiles, readClientProfilesFile, createClientProfileRegistry, resolveClientProfilesFile, createClientProfilesFromEnvironment,
+  activeClientProfiles,
   invalidPathReason, notBeforeMs,
   createClientProfileGate, presentsClientToken, rawHeaderCount,
   ownsSessionId, ownsFreshSession, ownsObservationRecord, listForCaller, clampSince, callerView,

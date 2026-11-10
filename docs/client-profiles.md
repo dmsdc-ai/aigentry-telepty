@@ -43,7 +43,7 @@ When configured, the daemon **refuses to start**, with a fixed code and reason t
 | macOS without the bundled authority reader | `CLIENT_PROFILES_UNAVAILABLE` / `darwin_native_reader_unavailable` |
 | file unreadable, unsafe or invalid | `CLIENT_PROFILES_UNAVAILABLE` / `<reason>` |
 
-There is one exception to refusing start. If `TELEPTY_AUTH_TOKEN` supplied the secret and `~/.telepty/config.json` then cannot be read, the daemon starts with profiles **OFF**. It logs `[CLIENT-PROFILES] … UNAVAILABLE`. This is the same recovery shape as `supervisionTrustFile`. In that state a profile token gets the legacy `401 PERMISSION_DENIED`, so the fail-closed property holds.
+There is one exception to refusing start. If `TELEPTY_AUTH_TOKEN` supplied the secret and `~/.telepty/config.json` then cannot be read, the daemon starts with profiles **OFF**. It logs `[CLIENT-PROFILES] … UNAVAILABLE`. This is the same recovery shape as `supervisionTrustFile`. In that state a profile token gets the legacy `401 PERMISSION_DENIED`, so the fail-closed property holds. This carve-out is deliberate: an unreadable config alone cannot prove that profile mode was configured, and it preserves the existing root-token recovery path. If profile activation must fail closed without ambiguity, set `TELEPTY_CLIENT_PROFILES_FILE` explicitly; with an explicit value, every refusal above still applies. A profile client still refuses a daemon without the capability.
 
 ## The profiles file (`telepty.client-profiles/v1`)
 
@@ -154,9 +154,9 @@ Paths match `req.path` exactly and case-sensitively, with no trailing slash. A `
 |---|---|---|
 | meta | `GET /api/meta`, no query | adds `caller` (below) |
 | list | `GET /api/sessions`, no query | answers `[{id}]` only: granted targets that exist, plus own-namespace sessions with `createdAt ≥ not_before`. Never `deliveryEndpoint`/`delivery` |
-| create | `POST /api/sessions/register`, no query | keys ⊆ {`session_id`,`delivery_type`,`delivery_endpoint`,`command`,`create_only`}; `session_id` in own namespace (`PROFILE_NAMESPACE_DENIED`); `delivery_type:"aterm"`, `create_only:true`; `delivery_endpoint` `http://127.0.0.1:<1–65535>/<43 base64url>`; optional `command` printable ASCII ≤ 128 B (`PROFILE_REQUEST_FIELD_DENIED`). An existing id gets the unchanged `409 SESSION_EXISTS` |
+| create | `POST /api/sessions/register`, no query | keys ⊆ {`session_id`,`delivery_type`,`delivery_endpoint`,`command`,`create_only`}; `session_id` in own namespace (`PROFILE_NAMESPACE_DENIED`); `delivery_type:"aterm"`, `create_only:true`; `delivery_endpoint` `http://127.0.0.1:<1–65535>/<43 base64url>`; optional `command` printable ASCII ≤ 128 B (`PROFILE_REQUEST_FIELD_DENIED`). While the grant's `not_before` is still in the future, `403 PROFILE_CREATE_DENIED`: nothing is created, because such an inbox would be invisible to, and undeletable by, its own profile. An existing id gets the unchanged `409 SESSION_EXISTS` |
 | inject | `POST /api/sessions/:id/inject`, no query | keys ⊆ {`prompt`,`from`,`reply_to`,`exact_target`,`expected_epoch`}, `exact_target:true` (`PROFILE_REQUEST_FIELD_DENIED`); `:id` exactly one of the granted targets (`PROFILE_TARGET_DENIED`); `from` in own namespace, `reply_to === from`, exactly one `x-telepty-session-token` that verifies to `from` **with the live session's epoch and generation**, session not closing, `createdAt ≥ not_before` (`PROFILE_SENDER_DENIED`). `verified_sender_sid` is recorded as before |
-| audit | `GET /api/injects` | query ⊆ {`to`,`from`,`since`,`until`,`limit`,`cursor`}, each a single non-empty string; `to` in own namespace, or `from` in own namespace with `to` absent or granted (`PROFILE_READ_DENIED`). Rows are **exact**: `to` ⇒ the resolved sid only (no alias row), `from` ⇒ `verified_sender_sid` only (never a claimed sender). `since := max(since, not_before)`. `cursor` is an offset into the caller's own filtered list |
+| audit | `GET /api/injects` | query ⊆ {`to`,`from`,`since`,`until`,`limit`,`cursor`}, each a single non-empty string; `to` in own namespace, or `from` in own namespace with `to` absent or granted (`PROFILE_READ_DENIED`). A `to`/`from` own-namespace id that names a **live** session created before `not_before` (or with no `createdAt`) is also `PROFILE_READ_DENIED`. That id belongs to a previous holder of the prefix, so even rows written after the re-grant (a late reply) are refused, not just clamped. Rows are **exact**: `to` ⇒ the resolved sid only (no alias row), `from` ⇒ `verified_sender_sid` only (never a claimed sender). `since := max(since, not_before)`. `cursor` is an offset into the caller's own filtered list |
 | observe | `GET /api/inject-observations/:id`, no query | the record is the caller's only if `transport_source` is a string in its namespace **and** `created_at ≥ not_before`. Foreign, unknown, cold-offline and pre-`not_before` ids all get one uniform `tracking_unavailable` body with `reason:"not_observed_by_daemon_epoch"`. `consumption.active_inject_id` is never shown to a profile caller. The ledger-unhealthy reason stays global |
 | delete | `DELETE /api/sessions/:id?owned=true` (the only query key) | `:id` in own namespace and an existing session with `createdAt ≥ not_before` (`PROFILE_NAMESPACE_DENIED`), then the unchanged #815 bearer + epoch + generation check (`403 OWNED_DELETE_FORBIDDEN`) |
 
@@ -172,7 +172,13 @@ The value is never echoed from the request.
 
 ### What changes for host-token callers when configured
 
-One thing only: a non-profile `POST /api/sessions/register` of a **new** id, or a `PATCH` rename, **into** a configured namespace is refused with `403 PROFILE_NAMESPACE_RESERVED`. This stops a legacy holder from planting an inbox and history that a (re-)granted profile would then read. Everything else is unchanged.
+One thing only: creating an id **inside** a configured namespace without a profile credential is refused with `403 PROFILE_NAMESPACE_RESERVED`, before any effect. That covers every creation route:
+- `POST /api/sessions/register` of a **new** id;
+- `PATCH` rename into a namespace;
+- `POST /api/sessions/spawn` (refused before the spawn admission token, the PTY and persistence);
+- a WebSocket upgrade on `/api/sessions/<id>` for an absent id, which would otherwise auto-register it (refused before the 101).
+
+This stops a legacy holder from planting an inbox and history that a (re-)granted profile would then read. Attaching to an **existing** session, and everything outside the namespaces, is unchanged. Sessions restored from `sessions.json` at boot are not new creations; the `not_before` checks keep them out of a later grant's view.
 
 ## Boundary and residuals (stated, not fixed)
 
@@ -180,8 +186,9 @@ One thing only: a non-profile `POST /api/sessions/register` of a **new** id, or 
 - **Shared capacity.** The two audit-query workers (`429 AUDIT_QUERY_BUSY`), tracking capacity (`503 TRACKING_CAPACITY`) and the 64 MiB hot budget are per-daemon, not per-profile. One profile can degrade another's reads and injects. Clients must treat these as retryable, not as enforcement failures.
 - **Admitted requests are not revoked** (see the linearization point above).
 - **Replay.** A captured inject request (client token plus inbox bearer) replays as a new inject. This is the bearer model, and same-host capture is out of scope.
-- **Host-token holders stay admin.** They still see every session's `deliveryEndpoint`. An E1 inject with a claimed `from` in a profile namespace sets that record's `transport_source`, so the profile can observe it. It never appears in the profile's exact `from=` audit rows.
-- **Other host-token creation paths** (spawn, handoff/takeover) are not namespace-reserved in v1. They are admin-originated.
+- **Host-token holders stay admin.** They still see every session's `deliveryEndpoint`. An E1 inject with a claimed `from` in a profile namespace sets that record's `transport_source`, so the profile can observe it. It never appears in the profile's exact `from=` audit rows. This keying on the claimed `transport_source` is safe for **profile** operations only because the gate admits a profile inject solely when `from` is in its exact namespace and the live bearer of that instance is presented. Host-admin attribution is outside the profile adversary scope.
+- **Deleted pre-grant ids.** Only a **live** pre-`not_before` id is refused for audit reads. Audit rows that were addressed to an old inbox after the re-grant, where the inbox was deleted afterwards, stay readable by the new holder of the prefix (the ids are 128-bit and not listable).
+- **Observation timing.** Hot, cold and unknown observation reads take different times. The ids are random UUIDs, so this is residual only; no constant-time property is claimed or benchmarked.
 - **Push primitive.** A profile inbox's `delivery_endpoint` makes the daemon POST `{text, session_id}` to a loopback port at one 43-character path. It uses `redirect:'error'` and sends no credentials.
 - **Port squatting.** Something listening on the daemon port before it starts can capture whatever token a client sends. This is pre-existing for the host token too.
 - **Native Windows: unsupported.** The daemon refuses to start with profiles configured. Shared-control mode is unchanged there.

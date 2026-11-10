@@ -386,6 +386,80 @@ test('delete/observe/list helpers: own fresh namespace only; observation shape f
   assert.deepEqual(profiles.callerView(null), { kind: 'shared-control', enforcement: 'none', shared_token: true });
 });
 
+test('CF1: an own-namespace id naming a LIVE pre-not_before session is refused for audit reads; fresh and absent ids keep positives', () => {
+  const w = world();
+  const fresh = `exa-i${hex32()}`, stale = `exa-i${hex32()}`, noCreatedAt = `exa-i${hex32()}`, absent = `exa-i${hex32()}`;
+  w.addSession(fresh);
+  w.addSession(stale, { createdAt: iso(Date.now() - 2 * HOUR) });
+  w.addSession(noCreatedAt);
+  delete w.sessions[noCreatedAt].createdAt;
+  const read = (q) => w.gate.authorize(req({ url: `/api/injects?${q}`, headers: as(w.tokA) }));
+  assert.deepEqual(read(`to=${stale}`), { ok: false, status: 403, code: 'PROFILE_READ_DENIED' }, 'CF1 to=<stale live>');
+  assert.deepEqual(read(`from=${stale}&to=target-a`), { ok: false, status: 403, code: 'PROFILE_READ_DENIED' }, 'CF1 from=<stale live>');
+  assert.deepEqual(read(`to=${fresh}&from=${stale}`), { ok: false, status: 403, code: 'PROFILE_READ_DENIED' }, 'CF1 either selector');
+  assert.equal(read(`to=${noCreatedAt}`).code, 'PROFILE_READ_DENIED', 'CF1 missing createdAt fails closed');
+  assert.equal(read(`to=${fresh}`).ok, true, 'fresh own inbox');
+  assert.equal(read(`from=${fresh}&to=target-a`).ok, true, 'fresh own sender + granted target');
+  assert.equal(read(`to=${absent}`).ok, true, 'an absent id is not live (since clamp still applies in the handler)');
+});
+
+test('item 5: a register before a future not_before is PROFILE_CREATE_DENIED (injected clock, no sleep); a due grant creates', () => {
+  const w = world();
+  const caller = w.registry.load().byVerifier.get(verifierOf(w.tokA));
+  const body = { session_id: `exa-i${hex32()}`, delivery_type: 'aterm', create_only: true,
+    delivery_endpoint: `http://127.0.0.1:43123/${crypto.randomBytes(32).toString('base64url')}` };
+  const at = (ms) => profiles.createClientProfileGate({ registry: w.registry, sessions: () => w.sessions, credentials: w.credentials, now: () => ms })
+    .authorize(req({ method: 'POST', url: '/api/sessions/register', headers: as(w.tokA), body }));
+  assert.deepEqual(at(caller.notBeforeMs - 1), { ok: false, status: 403, code: 'PROFILE_CREATE_DENIED' });
+  assert.equal(at(caller.notBeforeMs).ok, true, 'exactly at not_before');
+  assert.equal(at(caller.notBeforeMs + HOUR).ok, true);
+  const early = profiles.createClientProfileGate({ registry: w.registry, sessions: () => w.sessions, credentials: w.credentials, now: () => caller.notBeforeMs - 1 });
+  assert.equal(early.authorize(req({ headers: as(w.tokA) })).ok, true, 'meta is unaffected by a not-yet-due grant');
+});
+
+test('CF2 spawn: a namespace id is refused before the admission token; outside ids and feature-off pass through unchanged', () => {
+  const { registerSpawnRoute } = require('../src/routes/spawn');
+  const w = world();
+  w.registry.load();
+  function route(clientProfiles) {
+    let handler = null, taken = 0;
+    const sessions = Object.create(null);
+    const fail = () => { throw new Error('no effect may run in this unit row'); };
+    registerSpawnRoute({ post(p, h) { if (p === '/api/sessions/spawn') handler = h; } }, {
+      sessions, sessionStateManager: {}, pty: { spawn: fail }, persistSessions: fail, appendToOutputRing: fail,
+      revokeSessionCredential: fail, busClients: new Set(), os, buildSessionEnv: fail,
+      admission: { take() { taken++; return { allowed: false, reason: 'unavailable' }; } }, clientProfiles });
+    const call = (session_id) => {
+      const out = { status: null, body: null };
+      handler({ body: { session_id, command: 'sh' } }, { status(c) { out.status = c; return this; }, json(b) { out.body = b; return this; }, setHeader() {} });
+      return out;
+    };
+    return { call, taken: () => taken, sessions };
+  }
+  const on = route(() => w.registry);
+  const denied = on.call(`exa-i${hex32()}`);
+  assert.deepEqual([denied.status, denied.body.code], [403, 'PROFILE_NAMESPACE_RESERVED']);
+  assert.equal(on.taken(), 0, 'refused before the spawn admission token');
+  assert.equal(Object.keys(on.sessions).length, 0);
+  const outside = on.call('cp-outside');
+  assert.deepEqual([outside.status, outside.body.code], [503, 'SPAWN_ADMISSION_UNAVAILABLE'], 'outside ids reach admission unchanged');
+  assert.equal(on.taken(), 1);
+  const off = route(() => null);
+  assert.equal(off.call(`exa-i${hex32()}`).status, 503, 'feature off: no reservation');
+});
+
+test('CF2 wiring: activeClientProfiles is the registry the boot factory last returned, null when off or refused', () => {
+  const good = fileBytes([entry('a', 'exa', ['t1'], mintToken())]);
+  const registry = profiles.createClientProfilesFromEnvironment({ env: { TELEPTY_CLIENT_PROFILES_FILE: ABS }, config: null, platform: 'linux', readFile: () => good });
+  assert.equal(profiles.activeClientProfiles(), registry);
+  assert.equal(profiles.activeClientProfiles().reservesSessionId(`exa-i${hex32()}`), true);
+  assert.throws(() => profiles.createClientProfilesFromEnvironment({ env: { TELEPTY_CLIENT_PROFILES_FILE: ABS, TELEPTY_PRINCIPAL_MODE: 'strict' }, config: null, platform: 'linux', readFile: () => good }));
+  assert.equal(profiles.activeClientProfiles(), null, 'a refused boot leaves no active registry');
+  profiles.createClientProfilesFromEnvironment({ env: { TELEPTY_CLIENT_PROFILES_FILE: ABS }, config: null, platform: 'linux', readFile: () => good });
+  assert.equal(profiles.createClientProfilesFromEnvironment({ env: {}, config: null }), null);
+  assert.equal(profiles.activeClientProfiles(), null, 'feature off ⇒ null');
+});
+
 test('U6 guard: the #1273 ledger record shape still carries transport_source and created_at on hot, legacy and minimal records', () => {
   const runtime = fs.readFileSync(path.join(ROOT, 'src', 'mailbox', 'delivery-runtime.js'), 'utf8');
   assert.match(runtime, /transport_source: source \|\| null,\s*\n\s*created_at: nowIso,/, 'hot begin record');

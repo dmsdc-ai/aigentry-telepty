@@ -153,11 +153,11 @@ const as = (token, extra = {}) => ({ 'x-telepty-client-token': token, ...extra }
 function preq(pathname, token, options = {}) {
   return ctx.daemon.request(pathname, { ...options, noAuth: true, headers: { ...as(token), ...(options.headers || {}) } });
 }
-async function createInbox(token, prefix) {
-  const id = `${prefix}-i${hex32()}`;
+async function createInbox(token, prefix, id = `${prefix}-i${hex32()}`) {
+  const endpointPath = secretPath();
   const res = await preq('/api/sessions/register', token, { method: 'POST', body: { session_id: id, delivery_type: 'aterm',
-    delivery_endpoint: `http://127.0.0.1:${ctx.rx.port}/${secretPath()}`, command: 'telesession-inbox', create_only: true } });
-  return { id, res, bearer: res.body && res.body.session_token };
+    delivery_endpoint: `http://127.0.0.1:${ctx.rx.port}/${endpointPath}`, command: 'telesession-inbox', create_only: true } });
+  return { id, res, bearer: res.body && res.body.session_token, endpointPath };
 }
 function injectAs(token, bearer, target, from, extra = {}) {
   return preq(`/api/sessions/${encodeURIComponent(target)}/inject`, token, { method: 'POST',
@@ -544,9 +544,12 @@ test('D34: a re-granted prefix with a fresh not_before sees none of the previous
     assert.equal((await preq('/api/meta', ctx.tok.a)).status, 401, 'the previous holder is revoked');
     const list = await preq('/api/sessions', tokD);
     assert.ok(!list.body.some((item) => item.id === old.id), 'D34 leftover inbox not listed');
-    const rows = await preq(`/api/injects?from=${old.id}&to=${TARGETS.a}`, tokD);
-    assert.equal(rows.status, 200);
-    assert.equal(rows.body.injects.length, 0, 'D34 history before not_before is clamped away');
+    // CF1: a late reply addressed to the previous holder's still-LIVE inbox after the re-grant is not D's history.
+    const late = await ctx.daemon.request(`/api/sessions/${old.id}/inject`, { method: 'POST', body: { prompt: 'late reply' } });
+    assert.equal(late.status, 200, 'E1 late reply reaches the old live inbox');
+    await auditLine((l) => l.inject_id === late.body.inject_id);
+    await assertDeniedUnchanged('D34/CF1 to=<old live inbox> (post-grant late reply)', () => preq(`/api/injects?to=${old.id}`, tokD), 403, 'PROFILE_READ_DENIED');
+    await assertDeniedUnchanged('D34/CF1 from=<old live inbox>', () => preq(`/api/injects?from=${old.id}&to=${TARGETS.a}`, tokD), 403, 'PROFILE_READ_DENIED');
     const obs = await preq(`/api/inject-observations/${oldInject.body.inject_id}`, tokD);
     assert.equal(obs.body.reason, 'not_observed_by_daemon_epoch', 'D34 uniform body');
     await assertDeniedUnchanged('D34 delete leftover', () => preq(`/api/sessions/${old.id}?owned=true`, tokD, { method: 'DELETE',
@@ -554,8 +557,127 @@ test('D34: a re-granted prefix with a fresh not_before sees none of the previous
     await assertDeniedUnchanged('D34 send as leftover', () => injectAs(tokD, old.bearer, TARGETS.a, old.id), 403, 'PROFILE_SENDER_DENIED');
     const fresh = await createInbox(tokD, 'exa');
     assert.equal(fresh.res.status, 201, 'the new holder operates its own fresh inbox');
-    assert.equal((await injectAs(tokD, fresh.bearer, TARGETS.a, fresh.id)).status, 200);
+    const freshSend = await injectAs(tokD, fresh.bearer, TARGETS.a, fresh.id);
+    assert.equal(freshSend.status, 200);
+    const reply = await ctx.daemon.request(`/api/sessions/${fresh.id}/inject`, { method: 'POST', body: { prompt: 'reply to fresh' } });
+    assert.equal(reply.status, 200);
+    const replies = await waitFor(async () => {
+      const res = await preq(`/api/injects?to=${fresh.id}`, tokD);
+      return res.status === 200 && res.body.injects.some((r) => r.inject_id === reply.body.inject_id) ? res : null;
+    }, { timeoutMs: 5000, description: 'fresh own reply row' });
+    assert.ok(replies.body.injects.every((r) => r.to === fresh.id), 'CF1 positive: fresh own inbox rows stay readable');
+    const sent = await preq(`/api/injects?from=${fresh.id}&to=${TARGETS.a}`, tokD);
+    assert.equal(sent.status, 200, 'CF1 positive: fresh own sender + granted target');
   } finally { writeProfiles(ctx.file, baseGrants()); }
+});
+
+// ── CF2: every creation route honours namespace reservation ──────────────────────────────────────────────────────
+
+test('CF2: E1 spawn and owner/viewer WS auto-register into a profile namespace are refused before any effect', { skip: SKIP }, async () => {
+  const root = ctx.daemon.authToken();
+  const spawnId = `exa-i${hex32()}`, ownerId = `exb-i${hex32()}`, viewerId = `exa-i${hex32()}`;
+  await assertDeniedUnchanged('CF2 spawn', () => ctx.daemon.spawnSession(spawnId), 403, 'PROFILE_NAMESPACE_RESERVED');
+  await assertDeniedUnchanged('CF2 WS owner auto-register', () => rawRequest(ctx.daemon.port, { target: `/api/sessions/${ownerId}?owner=1`,
+    upgrade: true, headers: [['x-telepty-token', root]] }), 403, 'PROFILE_NAMESPACE_RESERVED');
+  await assertDeniedUnchanged('CF2 WS viewer auto-register', () => rawRequest(ctx.daemon.port, { target: `/api/sessions/${viewerId}`,
+    upgrade: true, headers: [['x-telepty-token', root]] }), 403, 'PROFILE_NAMESPACE_RESERVED');
+  const listed = (await ctx.daemon.request('/api/sessions')).body.map((item) => item.id);
+  for (const id of [spawnId, ownerId, viewerId]) assert.ok(!listed.includes(id), `CF2 ${id} never created`);
+  for (const token of [ctx.tok.a, ctx.tok.b]) {
+    const own = (await preq('/api/sessions', token)).body.map((item) => item.id);
+    for (const id of [spawnId, ownerId, viewerId]) assert.ok(!own.includes(id), 'CF2 nothing planted in a profile view');
+  }
+  // Outside every namespace both routes keep their legacy behaviour.
+  const outsideSpawn = `cp-spawn-${hex32().slice(0, 8)}`;
+  assert.equal((await ctx.daemon.spawnSession(outsideSpawn)).status, 201, 'CF2 outside-namespace spawn unchanged');
+  const outsideWs = `cp-ws-${hex32().slice(0, 8)}`;
+  const ws = await rawRequest(ctx.daemon.port, { target: `/api/sessions/${outsideWs}?owner=1`, upgrade: true, headers: [['x-telepty-token', root]] });
+  assert.equal(ws.status, 101, 'CF2 outside-namespace WS auto-register unchanged');
+  // An EXISTING namespace session is not "created" by an attach, so the reservation does not apply to it.
+  const A = await createInbox(ctx.tok.a, 'exa');
+  const attach = await rawRequest(ctx.daemon.port, { target: `/api/sessions/${A.id}`, upgrade: true, headers: [['x-telepty-token', root]] });
+  assert.equal(attach.status, 101, 'CF2 E1 attach to an existing session unchanged');
+});
+
+// ── C1: the profile carrier never replaces the live #815 bearer checks ─────────────────────────────────────────
+
+test('C1: stale-epoch, forged-epoch, tampered, missing and foreign bearers are refused for inject and delete; fresh own positives', { skip: SKIP }, async () => {
+  const B = await createInbox(ctx.tok.b, 'exb');
+  const X = await createInbox(ctx.tok.a, 'exa');
+  assert.equal(X.res.status, 201);
+  const [epoch, secret] = X.bearer.split('.');
+  const bearers = [
+    ['forged epoch', `${crypto.randomBytes(16).toString('base64url')}.${secret}`],
+    ['tampered secret', `${epoch}.${crypto.randomBytes(32).toString('base64url')}`],
+    ['missing', null],
+    ['foreign (B inbox)', B.bearer],
+  ];
+  const del = (bearer) => () => preq(`/api/sessions/${X.id}?owned=true`, ctx.tok.a, { method: 'DELETE',
+    headers: bearer ? { 'x-telepty-session-token': bearer } : {} });
+  for (const [label, bearer] of bearers) {
+    await assertDeniedUnchanged(`C1 inject ${label}`, () => injectAs(ctx.tok.a, bearer, TARGETS.a, X.id), 403, 'PROFILE_SENDER_DENIED');
+    await assertDeniedUnchanged(`C1 delete ${label}`, del(bearer), 403, 'OWNED_DELETE_FORBIDDEN');
+  }
+  // Stale epoch: the SAME id recreated is a new instance; the predecessor's bearer is dead for both operations.
+  assert.equal((await del(X.bearer)()).status, 200, 'C1 positive: owned delete with the live bearer');
+  await waitFor(async () => !(await preq('/api/sessions', ctx.tok.a)).body.some((item) => item.id === X.id), { timeoutMs: 5000, description: 'inbox gone' });
+  const again = await createInbox(ctx.tok.a, 'exa', X.id);
+  assert.equal(again.res.status, 201, 'same id recreated');
+  assert.notEqual(again.res.body.session_epoch, epoch, 'a new instance epoch');
+  await assertDeniedUnchanged('C1 inject stale epoch', () => injectAs(ctx.tok.a, X.bearer, TARGETS.a, X.id), 403, 'PROFILE_SENDER_DENIED');
+  await assertDeniedUnchanged('C1 delete stale epoch', () => preq(`/api/sessions/${X.id}?owned=true`, ctx.tok.a, { method: 'DELETE',
+    headers: { 'x-telepty-session-token': X.bearer } }), 403, 'OWNED_DELETE_FORBIDDEN');
+  assert.equal((await injectAs(ctx.tok.a, again.bearer, TARGETS.a, X.id)).status, 200, 'C1 positive: fresh own inject');
+  assert.equal((await preq(`/api/sessions/${X.id}?owned=true`, ctx.tok.a, { method: 'DELETE',
+    headers: { 'x-telepty-session-token': again.bearer } })).status, 200, 'C1 positive: fresh own delete');
+  // Generation-only mismatch cannot be produced for an aterm inbox on a real daemon (generation moves only through
+  // mailbox takeover / cooperative handoff); the gate's generation check is a unit row in client-profile-scope.test.js.
+});
+
+// ── C2: the registration response discloses only the caller's own bearer ───────────────────────────────────────
+
+test('C2: register/meta/list bodies carry no host, profile or other-inbox credential, verifier or endpoint path', { skip: SKIP }, async () => {
+  const B = await createInbox(ctx.tok.b, 'exb');
+  const A = await createInbox(ctx.tok.a, 'exa');
+  assert.equal(A.res.status, 201);
+  assert.deepEqual(Object.keys(A.res.body).sort(), ['command', 'credential_generation', 'cwd', 'provenance_capable', 'session_epoch',
+    'session_id', 'session_nonce', 'session_token', 'type'], 'C2 exact register response shape');
+  assert.equal(A.res.body.session_id, A.id);
+  assert.ok(A.res.body.session_token.startsWith(`${A.res.body.session_epoch}.`), 'C2 the bearer is this instance\'s own');
+  assert.equal((await injectAs(ctx.tok.a, A.bearer, TARGETS.a, A.id)).status, 200, 'C2 the returned bearer is usable by its owner');
+  const meta = await preq('/api/meta', ctx.tok.a);
+  const list = await preq('/api/sessions', ctx.tok.a);
+  const stored = readOrNull(ctx.sessionsPath).toString('utf8');
+  const storedVerifiers = [...stored.matchAll(/"credentialVerifier"\s*:\s*"([0-9a-f]{64})"/g)].map((m) => m[1]);
+  assert.ok(storedVerifiers.length > 0, 'fixture: persisted verifiers exist to check against');
+  const forbidden = [
+    ['host token', ctx.daemon.authToken()], ['profile A token', ctx.tok.a], ['profile B token', ctx.tok.b], ['profile C token', ctx.tok.c],
+    ['B inbox bearer', B.bearer], ['own endpoint path', A.endpointPath], ['B endpoint path', B.endpointPath],
+    ...baseGrants().map((g) => [`${g.profile} verifier`, g.token_verifier.slice(7)]),
+    ...storedVerifiers.map((v) => ['stored credentialVerifier', v]),
+    ...Object.values(TARGETS).map((id) => ['target endpoint path', `/t-${id}`]),
+    ['field deliveryEndpoint', 'deliveryEndpoint'], ['field delivery_endpoint', 'delivery_endpoint'], ['field credentialVerifier', 'credentialVerifier'],
+    ['verifier prefix', 'sha256:'],
+  ];
+  for (const [where, res] of [['register', A.res], ['meta', meta], ['list', list]]) {
+    for (const [label, secret] of forbidden) assert.ok(!res.text.includes(secret), `C2 ${where} must not disclose ${label}`);
+  }
+  assert.ok(!meta.text.includes(A.bearer) && !list.text.includes(A.bearer), 'C2 the own bearer is returned once, at creation only');
+});
+
+// ── a grant that is not yet in force cannot create (item 5) ───────────────────────────────────────────────────────
+
+test('future not_before: register is refused with PROFILE_CREATE_DENIED before any mutation; due grants keep positives', { skip: SKIP }, async () => {
+  try {
+    writeProfiles(ctx.file, [grant('example-a', 'exa', [TARGETS.a, TARGETS.shared], ctx.tok.a, { notBefore: iso(Date.now() + 86_400_000) }),
+      ...baseGrants().slice(1)]);
+    await assertDeniedUnchanged('future not_before register', () => preq('/api/sessions/register', ctx.tok.a, { method: 'POST', body: {
+      session_id: `exa-i${hex32()}`, delivery_type: 'aterm', delivery_endpoint: `http://127.0.0.1:${ctx.rx.port}/${secretPath()}`, create_only: true } }),
+    403, 'PROFILE_CREATE_DENIED');
+    assert.equal((await preq('/api/meta', ctx.tok.a)).status, 200, 'the credential itself is valid');
+    assert.equal((await createInbox(ctx.tok.b, 'exb')).res.status, 201, 'another, due grant is unaffected');
+  } finally { writeProfiles(ctx.file, baseGrants()); }
+  assert.equal((await createInbox(ctx.tok.a, 'exa')).res.status, 201, 'due again ⇒ create positive');
 });
 
 // ── loopback only on a shared non-loopback listener (D40) ───────────────────────────────────────────────────────
@@ -602,6 +724,8 @@ test('U3: unconfigured daemon — no capability, no caller, the profile header m
     const rootToken = JSON.parse(fs.readFileSync(path.join(daemon.homeDir, '.telepty', 'config.json'), 'utf8')).authToken;
     const ws = await rawRequest(daemon.port, { target: '/api/bus', upgrade: true, headers: [['x-telepty-client-token', tok], ['x-telepty-token', rootToken]] });
     assert.equal(ws.status, 101, 'legacy WebSocket admission unchanged');
+    const nsWs = await rawRequest(daemon.port, { target: `/api/sessions/exa-i${hex32()}?owner=1`, upgrade: true, headers: [['x-telepty-token', rootToken]] });
+    assert.equal(nsWs.status, 101, 'CF2 feature off: no namespace reservation on WS auto-register');
   } finally { await daemon.stop(); }
 });
 

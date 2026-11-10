@@ -973,6 +973,14 @@ function installWebSocketTransport(deps) {
     }
 
     if (url.pathname.startsWith('/api/sessions/')) {
+      // Issue #144 CF2 (configured only): an upgrade naming an ABSENT id would auto-register it on connect. Inside a
+      // configured client-profile namespace that is refused here, before the 101 — the same raw id expression the
+      // connection handler uses, so nothing is registered, attached or hinted to the ledger.
+      const upgradeId = url.pathname.split('/').pop();
+      if (deps.clientProfiles && !Object.prototype.hasOwnProperty.call(sessions, upgradeId) && deps.clientProfiles.reservesSessionId(upgradeId)) {
+        refuseUpgrade(socket, 403, 'Forbidden', 'PROFILE_NAMESPACE_RESERVED', 'This id is reserved for a configured client profile.');
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit('connection', ws, req);
       });
