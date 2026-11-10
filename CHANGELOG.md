@@ -25,10 +25,16 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   - **Re-granted prefixes.** A previous holder's still-live inbox is refused for audit reads
     (`403 PROFILE_READ_DENIED`), including rows written after the re-grant. A grant whose `not_before` lies in the
     future cannot create an inbox yet (`403 PROFILE_CREATE_DENIED`).
+  - **Observations.** A profile's own observation omits `superseded_by` from its current and every history entry,
+    so a later inject by another caller on a shared target never discloses that inject's id. The supersession
+    entry itself (`kind`, `trigger`, `seq`, `at`) stays visible; the host-token view and the ledger are unchanged.
   - **CLI.** `telepty client-profile mint|check` mints tokens and validates the file locally.
   - **Limits.** Same-uid credential theft, shared daemon capacity and revocation of already-admitted requests are
     stated limits, not fixed (docs/client-profiles.md, BOUNDARY.md). No persistence, ledger or audit format
     changes.
+- **Release metadata.** The packaged-consumer check (`scripts/check-package.mjs`) now pins `0.11.0`. The
+  version-identity test is re-based to 0.10.1 → 0.11.0; it still requires that only the version lines differ from
+  0.10.1, so no dependency or lockfile resolution changed.
 
 ## 0.10.1 (hotfix candidate)
 

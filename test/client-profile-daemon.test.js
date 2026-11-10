@@ -440,12 +440,29 @@ test('D36: a profile\'s own observation never carries another caller\'s active_i
   const mine = await preq(`/api/inject-observations/${aInject.body.inject_id}`, ctx.tok.a);
   assert.equal(mine.body.inject_id, aInject.body.inject_id);
   assert.ok(!Object.prototype.hasOwnProperty.call(mine.body.consumption, 'active_inject_id'), 'D36 stripped');
-  assert.ok(!mine.text.includes(bInject.body.inject_id), 'B\'s inject id appears nowhere in A\'s body');
+  // ci708: the inputs are real ids, so the absence check below cannot pass or fail on an empty/undefined needle.
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  assert.match(aInject.body.inject_id, UUID); assert.match(bInject.body.inject_id, UUID);
+  assert.notEqual(aInject.body.inject_id, bInject.body.inject_id);
+  const pathsOf = (value, needle, at = '') => (value === needle ? [at || '(root)']
+    : value && typeof value === 'object' ? Object.entries(value).flatMap(([k, v]) => pathsOf(v, needle, Array.isArray(value) ? `${at}[${k}]` : (at ? `${at}.${k}` : k))) : []);
+  assert.ok(!mine.text.includes(bInject.body.inject_id),
+    `B's inject id appears nowhere in A's body; found at: ${JSON.stringify(pathsOf(mine.body, bInject.body.inject_id))}`);
+  const supersededOf = (body) => (body.observations || []).find((o) => o && o.kind === 'tracking_superseded');
+  const mineSuperseded = supersededOf(mine.body);
   const admin = await ctx.daemon.request(`/api/inject-observations/${aInject.body.inject_id}`);
   if (admin.body.consumption.basis === 'pending_report_belongs_to_other_inject') {
     assert.equal(admin.body.consumption.active_inject_id, bInject.body.inject_id, 'control: the E1 view is unchanged');
   } else {
     t.diagnostic(`control not reached: admin consumption basis = ${admin.body.consumption.basis}`);
+  }
+  if (mineSuperseded) {
+    assert.ok(!Object.prototype.hasOwnProperty.call(mineSuperseded, 'superseded_by'), 'profile history entry has no superseded_by');
+    assert.equal(mineSuperseded.trigger, 'superseded_by_new_tracked_inject', 'the supersession itself stays visible');
+    assert.ok(Number.isInteger(mineSuperseded.seq) && typeof mineSuperseded.at === 'string', 'seq/at kept');
+    assert.equal(supersededOf(admin.body).superseded_by, bInject.body.inject_id, 'control: the E1 history is unchanged');
+  } else {
+    t.diagnostic('supersession control not reached: no tracking_superseded entry in A\'s history');
   }
 });
 

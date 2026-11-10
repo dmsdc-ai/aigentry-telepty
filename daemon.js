@@ -1989,6 +1989,13 @@ app.get('/api/inject-observations/:inject_id', async (req, res) => {
       ...(activePendingReport && !req.clientProfile ? { active_inject_id: activePendingReport.injectId || null } : {}),
     };
   const last = record.last_observation || { kind: 'tracking_started', trigger: 'inject_accepted' };
+  // Issue #144 (ci708 D36): a profile caller's supersession entries omit `superseded_by` (another inject's id). Copies
+  // only — the ledger record is never mutated; kind/trigger/seq/at stay. The E1 view is the record as stored.
+  const profileEntry = (entry) => {
+    if (!entry || typeof entry !== 'object' || !Object.prototype.hasOwnProperty.call(entry, 'superseded_by')) return entry;
+    const { superseded_by: _supersededBy, ...rest } = entry;
+    return rest;
+  };
 
   return res.status(200).json({
     type: 'task_completion_unknown',
@@ -2000,9 +2007,9 @@ app.get('/api/inject-observations/:inject_id', async (req, res) => {
     // #843 — `aborted` travels too. Collapsing it into `tracked` would put a dispatch that
     // delivered zero bytes back into the in-flight bucket the abort exists to take it out of.
     tracking_state: ['superseded', 'aborted'].includes(record.tracking_state) ? record.tracking_state : 'tracked',
-    observation: last,
+    observation: req.clientProfile ? profileEntry(last) : last,
     observation_seq: record.observation_seq,
-    observations: record.observations || [],
+    observations: req.clientProfile ? (record.observations || []).map(profileEntry) : (record.observations || []),
     consumption,
     session_epoch: record.session_epoch,
     session_epoch_reason: record.session_epoch_reason,

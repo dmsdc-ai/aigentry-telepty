@@ -1,9 +1,9 @@
 'use strict';
 
-// Task 1215 hotfix 0.10.1 — release metadata identity for the patch release.
-// Authored BEFORE the version delta; the coder did not execute it.
-// RED on BASE (556a4ba, 0.10.0): the version assertions below fail with '0.10.0' (files readable, not a setup failure).
-// GREEN with the delta: package.json, both package-lock.json fields and the scripts/check-package.mjs pin all say 0.10.1,
+// Release metadata identity for 0.11.0 (task 1272, ci708 re-base of the task 1215 hotfix 0.10.1 check).
+// The coder did not execute it.
+// RED on BASE (c905e85, 0.10.1): the version assertions below fail with '0.10.1' (files readable, not a setup failure).
+// GREEN with the delta: package.json, both package-lock.json fields and the scripts/check-package.mjs pin all say 0.11.0,
 // and each file is byte-identical to BASE once its version lines are put back, so no dependency, resolution, integrity,
 // lockfileVersion or engines field moved. Pure file reads: no npm, no network, no product code.
 // CHANGELOG/README identity stays owned by test/release-version-invariant-844.test.js.
@@ -15,13 +15,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..');
-const RELEASE = '0.10.1';
-const BASE_VERSION = '0.10.0';
-// sha256 of the BASE files (input manifest d6ec979d…, commit 556a4ba).
+const RELEASE = '0.11.0';
+const BASE_VERSION = '0.10.1';
+// sha256 of the BASE files (0.10.1, commit c905e85ee065e55aeff4b51494f07c825b433f99).
 const BASE_SHA256 = {
-  'package.json': '974f5d7faf603108385277055e7407b7977c283bcf7bda8d07244fce10e109c9',
-  'package-lock.json': '16eb17fc9cdd8a9aa09e1e7cca0248efa72b6cadf25a9bd142e431efa4d7ad61',
-  'scripts/check-package.mjs': '8a7312c9fd141bbeaf492aa0064019e27fe8e488b1514e7640a1b358e32ba5db',
+  'package.json': 'fabc2de88ddd00e47174db2166126e3277a16d3e0a344ec5557ce0dbded67cc2',
+  'package-lock.json': '6d9496edf921f6db2fcc63ed3a3b8451a3a1a3501aba60a426606c5ed201e9b6',
+  'scripts/check-package.mjs': '139c30edceb52a4374ab9cfbe3120bde56e7af1e2f2b7708f3b5566deb507fe8',
 };
 // The only lines the release delta may change (0-based), each with its exact BASE and release text.
 const VERSION_LINES = {
@@ -44,7 +44,7 @@ function assertOneRelease(versions, expected) {
   assert.deepEqual(versions, { pkg: expected, lockRoot: expected, lockPackage: expected, checkPin: expected });
 }
 
-test('hotfix 1215: package.json, both package-lock.json fields and the check-package pin all name 0.10.1', () => {
+test('hotfix 1215: package.json, both package-lock.json fields and the check-package pin all name 0.11.0', () => {
   const versions = releaseVersions({ pkg: JSON.parse(read('package.json')), lock: JSON.parse(read('package-lock.json')),
     checkScript: read('scripts/check-package.mjs') });
   assertOneRelease(versions, RELEASE);

@@ -69,7 +69,7 @@ function ptyProcessState(sessions, sid, daemonPid) {
   return { ...base, state: m[1].startsWith('Z') ? 'zombie' : 'live', stat: m[1], ppid, ppid_is_daemon: Number.isSafeInteger(daemonPid) ? ppid === daemonPid : null };
 }
 assert.equal(pkg.name, '@dmsdc-ai/aigentry-telepty');
-assert.equal(pkg.version, '0.10.1');
+assert.equal(pkg.version, '0.11.0');
 const DARWIN_READER = 'src/principal/native/prebuilt/darwin/authority-darwin.node';
 const DARWIN_PROVENANCE = DARWIN_READER + '.provenance.json';
 const DARWIN_LOADER = 'src/principal/authority-file-darwin.js';
