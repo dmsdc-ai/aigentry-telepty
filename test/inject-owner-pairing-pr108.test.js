@@ -66,6 +66,8 @@ test('TP1: a same-bearer owner takeover inside the submit delay gets no CR; the 
   assert.equal(inj.status, 200, JSON.stringify(inj.body));
   const second = await ownerSocket(sid); // same bearer: same record, same epoch
   t.after(() => { try { second.ws.close(); } catch {} });
+  const stallUntil = Date.now() + 1200; // fix649 NON-SHIPPING seam: deterministic 1200 ms test-thread stall (the daemon is another process)
+  while (Date.now() < stallUntil) { /* busy: no event-loop turn, so pending bus frames stay unread */ }
   // fix649: inject_failed is emitted by the same CR-timer callback that decides the CR, so it is the causal barrier for the
   // no-CR judgement. Wait for it (unchanged harness bound) instead of a fixed sleep; record emission vs local receipt timing.
   const failed = await waitFor(() => events.find((e) => e.type === 'inject_failed' && e.session_id === sid), { description: 'typed inject_failed' }).catch(() => null);
