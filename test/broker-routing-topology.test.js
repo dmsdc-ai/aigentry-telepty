@@ -262,13 +262,13 @@ for (const stage of ['results', 'challenge']) for (const localResponseMs of [0, 
         if (String(url).includes('/api/forwarded/')) localInjected = true;
         if (localInjected && (kind === 'challenge' || kind === 'results')) attempts[kind] += 1;
         const held = localInjected && kind === stage && attempts[kind] === 1;
-        const real = kind === 'forwarded' && localResponseMs > 0 ? fetch(url, options).then((response) => new Promise((resolve, reject) => {
+        const real = () => kind === 'forwarded' && localResponseMs > 0 ? fetch(url, options).then((response) => new Promise((resolve, reject) => {
           const abort = () => { clearTimeout(timer); reject(options.signal.reason); }; // the node's real local deadline, as fetch would
           const timer = setTimeout(() => { options.signal.removeEventListener('abort', abort); resolve(response); }, localResponseMs);
           if (options.signal.aborted) abort(); else options.signal.addEventListener('abort', abort, { once: true });
         })) : fetch(url, options);
         return requests.observe(url, held ? released.then(() => { throw new TypeError('fetch failed',
-          { cause: Object.assign(new Error('synthetic'), { code: 'UND_ERR_SOCKET' }) }); }) : real);
+          { cause: Object.assign(new Error('synthetic'), { code: 'UND_ERR_SOCKET' }) }); }) : real()); // broker623: a held request is never sent
       }, privateKey: keys.privateKey, localToken: daemon.authToken(), config: {
         schema: 'telepty.broker-node/v1', principal_id: node, key_id: node, hub_url: origin, hub_audience: 'hub',
         hub_principal_id: 'hub', audience: node, local_daemon_url: `http://127.0.0.1:${daemon.port}`,
