@@ -29,7 +29,9 @@ const COUNTERS = ['doorway_rescans', 'admission_polls', 'pauses', 'pause_request
   // refused with EPERM; the cleanup is left pending for the remover finishing it (counted, never claimed removed).
   'eperm_reap_list_unresolved', 'eperm_reap_relist_unresolved',
   // #1215 lock525: a `number` descriptor reporting 0 links (win32 delete-pending) classified by the ticket's retirement state.
-  'nlink0_departed', 'nlink0_unresolved', 'nlink0_throw'];
+  'nlink0_departed', 'nlink0_unresolved', 'nlink0_throw',
+  // #1215 mailbox592: a first-stat / re-stat EPERM on a published `number` whose re-list is the same, now EMPTY ticket directory.
+  'eperm_relist_number_gone', 'eperm_restat_relist_number_gone'];
 const MAXIMA = ['pause_actual_max_ms', 'peers_seen_max'];
 const counters = () => Object.fromEntries([...COUNTERS, ...MAXIMA].map(key => [key, 0]));
 const totals = {acquired: 0, timeouts: 0, errors: 0, wait_ms_total: 0, wait_ms_max: 0, ...counters()};
@@ -117,7 +119,7 @@ function dirState(read) {
 function deletePending(file) { // An entry lstat cannot read (EPERM) or that is already gone.
   try { return statOptional(file) === null; } catch (e) { if (e.code === 'EPERM') return true; throw e; }
 }
-function checkTicketFiles(dir, names = ticketNames(dir)) {
+function checkTicketFiles(dir, names = ticketNames(dir), enumerated = null) { // enumerated: readTicket's lstat of dir
   if (names === null) return null;
   const marked = names.includes(DEPARTED);
   // One EPERM rule for the first stat and the nlink0 re-stat (#1215 correction5). Returns SKIP_ENTRY or
@@ -129,6 +131,10 @@ function checkTicketFiles(dir, names = ticketNames(dir)) {
     const again = dirState(() => ticketNames(dir));
     if (again === UNRESOLVED || again === null) { note(again === null ? `${prefix}relist_dir_gone` : `${prefix}relist_unresolved`); return {value: again}; }
     if (again.includes(DEPARTED)) { note(`${prefix}relist_departed`); return {value: checkTicketFiles(dir, again)}; }
+    // #1215 mailbox592 (win32 run 42737861005): the published `number` and its marker are gone and the SAME directory (or none:
+    // its rmdir landed) remains, i.e. lock10's empty ticket before rmdir. A draft, any entry, or another/unreadable dir still throws.
+    const now = name === 'number' && again.length === 0 && enumerated ? dirState(() => statOptional(dir)) : UNRESOLVED;
+    if (now === null || (now !== UNRESOLVED && now.isDirectory() && !now.isSymbolicLink() && now.dev === enumerated.dev && now.ino === enumerated.ino)) { note(`${prefix}relist_number_gone`); return {value: null}; }
     note(again.includes(name) ? `${prefix}unmarked_throw_entry_listed` : `${prefix}unmarked_throw_entry_absent`); // diagnostic split only
     throw e;
   };
@@ -211,7 +217,7 @@ function readTicket(parent, name, reap) {
   if (!st) return null;
   if (!st.isDirectory() || st.isSymbolicLink()) throw failure('MAILBOX_UNSAFE_PATH');
   const listed = dirState(() => ticketNames(dir));
-  const names = listed === UNRESOLVED ? listed : checkTicketFiles(dir, listed);
+  const names = listed === UNRESOLVED ? listed : checkTicketFiles(dir, listed, st);
   if (names === UNRESOLVED) return unresolved;
   if (names === null) return null; // This unique participant has left.
   if (names.includes(DEPARTED)) { // Departed, not a stale lock: only its owner or a dead-owner reap finishes it.

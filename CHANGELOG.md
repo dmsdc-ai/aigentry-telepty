@@ -4,6 +4,12 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 ## 0.10.1 (hotfix candidate)
 
+- **Mailbox locking handles a peer that finishes retiring its published ticket during a read.**
+  If the numbered ticket has become empty, the reader accepts only a missing directory or the same
+  real directory it enumerated. A replaced or unreadable directory still refuses the acquisition.
+  The tracked-job regressions are split into four files so each runs within the existing Windows
+  diagnostic deadline; their 16 case bodies are unchanged.
+
 - **Tracked injects no longer stop after 512 (#1273).** A daemon could answer
   `503 TRACKING_CAPACITY tracking_capacity_exhausted` to every new `--from` inject once 512 tracked
   records had been admitted, even with a healthy ledger and nothing in flight: a record superseded

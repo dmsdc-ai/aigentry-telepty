@@ -276,7 +276,10 @@
         "test/allow-admission-1215.test.js",
         "test/queue-deadline-admission-1215.test.js",
         "test/submit-public-error-contract.test.js",
-        "test/ledger-job-count-removal-1273.test.js"
+        "test/ledger-job-count-removal-1273.test.js",
+        "test/ledger-job-count-removal-1273-f1-live-destinations.test.js",
+        "test/ledger-job-count-removal-1273-f3-relief-batches.test.js",
+        "test/ledger-job-count-removal-1273-identity-fail-closed.test.js"
       ]
     },
     "test:watch": {
@@ -768,7 +771,10 @@
         "test/allow-admission-1215.test.js",
         "test/queue-deadline-admission-1215.test.js",
         "test/submit-public-error-contract.test.js",
-        "test/ledger-job-count-removal-1273.test.js"
+        "test/ledger-job-count-removal-1273.test.js",
+        "test/ledger-job-count-removal-1273-f1-live-destinations.test.js",
+        "test/ledger-job-count-removal-1273-f3-relief-batches.test.js",
+        "test/ledger-job-count-removal-1273-identity-fail-closed.test.js"
       ]
     },
     "test:ci:pty": {
