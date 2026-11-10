@@ -342,6 +342,8 @@ async function startTestDaemon(options = {}) {
       const exit = /^\[EXIT\] Session (\S{1,128}) exited with code/.exec(line), session = exit && obsSession(exit[1]);
       if (session && !exitLineAt.has(session)) exitLineAt.set(session, at);
       if (exit) observe607('harness', { stage: 'daemon_exit_line', session, received_ms: at });
+      const slow = /^\[HTTP_SLOW\] (GET|POST|DELETE|PUT|PATCH|OPTIONS|HEAD|OTHER) (\S{1,200}) (\d{1,9})ms status=(\d{3})$/.exec(line); // probe656: the daemon's existing slowRequestObserver line, bounded fields only
+      if (slow) observe607('harness', { stage: 'daemon_slow_line', stream, method: slow[1], route: slow[2], duration_ms: Number(slow[3]), status: Number(slow[4]), received_ms: at });
       const diag = /^\[telepty-diag\] (submit_barrier|http_delivery) (\{.*\})$/.exec(line);
       if (!diag) continue;
       let fields; try { fields = obsSanitize(JSON.parse(diag[2])); } catch { fields = 'unparsed'; }
