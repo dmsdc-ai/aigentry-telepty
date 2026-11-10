@@ -1,0 +1,136 @@
+name: Observation timing measurement (task 1215 CI609, non-shipping)
+
+# Task 1215 CI609 — MEASUREMENT ONLY. Not a release gate, not a fix, and not a reproduction verdict. Four native Windows
+# arms run test/observation-tracking-endpoint-60.test.js with the opt-in TELEPTY_CI_OBSERVE607=1 measurements (see
+# test-support/daemon-harness.js) plus the existing TELEPTY_QUEUE_DIAGNOSTICS=1 daemon diagnostic, under the existing
+# load observer with its opt-in `--host-sample on`:
+#   A: Node 26.13.0, the observation file alone (--test-concurrency=1)
+#   B: Node 26.13.0, co-scheduled with the four 1273 ledger files (test:ci argv, node --test default concurrency)
+#   C: Node 20, alone            D: Node 20, co-scheduled
+# Every iteration runs; every exit code is kept and the step fails if ANY iteration failed. Evidence is always uploaded.
+# Iterations: 2 per arm validate the instrumentation only. 20 per arm needs a separate, controller-admitted change.
+# Pull requests only, guarded to PR #143 from this repository. No tags, release, publish, default-branch or live-host steps.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/observation-timing-1215.yml'
+      - 'test/observation-tracking-endpoint-60.test.js'
+      - 'test-support/daemon-harness.js'
+      - 'scripts/windows-load-observer-879.mjs'
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: observation timing ${{ matrix.arm }} (windows-latest, node ${{ matrix.node }}, ${{ matrix.mode }})
+    if: ${{ github.event.pull_request.number == 143 && github.event.pull_request.head.repo.full_name == github.repository }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arm: A, node: '26.13.0', mode: alone }
+          - { arm: B, node: '26.13.0', mode: cosched }
+          - { arm: C, node: '20', mode: alone }
+          - { arm: D, node: '20', mode: cosched }
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      OBS_ITERATIONS: '2'
+      OBS_MODE: ${{ matrix.mode }}
+      OBS_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      TELEPTY_CI_OBSERVE607: '1'
+      TELEPTY_CI_OBSERVE607_ARM: ${{ matrix.arm }}
+      TELEPTY_QUEUE_DIAGNOSTICS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Record runner, toolchain and source identity
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path observe607 | Out-Null
+          $files = @('test/observation-tracking-endpoint-60.test.js', 'test-support/daemon-harness.js', 'scripts/windows-load-observer-879.mjs',
+            '.github/workflows/observation-timing-1215.yml', 'src/mailbox/lock.js', 'scripts/test-suites.json', 'package-lock.json',
+            'test/ledger-job-count-removal-1273.test.js', 'test/ledger-job-count-removal-1273-f1-live-destinations.test.js',
+            'test/ledger-job-count-removal-1273-f3-relief-batches.test.js', 'test/ledger-job-count-removal-1273-identity-fail-closed.test.js')
+          $hashes = [ordered]@{}
+          foreach ($f in $files) { $hashes[$f] = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant() }
+          $id = [ordered]@{ arm = $env:TELEPTY_CI_OBSERVE607_ARM; mode = $env:OBS_MODE; iterations = $env:OBS_ITERATIONS
+            checkout_sha = (git rev-parse HEAD); pr_head_sha = $env:OBS_HEAD_SHA; node = (node -v); npm = (npm -v)
+            image_os = $env:ImageOS; image_version = $env:ImageVersion; runner_os = $env:RUNNER_OS; runner_arch = $env:RUNNER_ARCH
+            number_of_processors = $env:NUMBER_OF_PROCESSORS; files = $hashes }
+          $id | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath observe607/identity.json
+          Get-Content -LiteralPath observe607/identity.json
+
+      - name: Start load observer (host sample on)
+        id: observer
+        run: node scripts/windows-load-observer-879.mjs start --out "${{ runner.temp }}/observe607-observer" --max-ms 1140000 --host-sample on
+
+      - name: Run the observation file (every iteration kept)
+        timeout-minutes: 24
+        shell: pwsh
+        run: |
+          $files = @('test/observation-tracking-endpoint-60.test.js')
+          $concurrency = @()
+          if ($env:OBS_MODE -eq 'cosched') {
+            $files += @('test/ledger-job-count-removal-1273.test.js', 'test/ledger-job-count-removal-1273-f1-live-destinations.test.js',
+              'test/ledger-job-count-removal-1273-f3-relief-batches.test.js', 'test/ledger-job-count-removal-1273-identity-fail-closed.test.js')
+            Write-Output "mode=cosched: test:ci argv (no concurrency flag = node --test default); NUMBER_OF_PROCESSORS=$env:NUMBER_OF_PROCESSORS"
+          } else {
+            $concurrency = @('--test-concurrency=1')
+            Write-Output "mode=alone: --test-concurrency=1; NUMBER_OF_PROCESSORS=$env:NUMBER_OF_PROCESSORS"
+          }
+          $failed = 0
+          for ($i = 1; $i -le [int]$env:OBS_ITERATIONS; $i++) {
+            $env:TELEPTY_CI_OBSERVE607_ITER = "$i"
+            $start = [DateTime]::UtcNow.ToString('o')
+            Write-Output "=== iteration $i start $start ==="
+            & node --require ./test-support/setup-env.js --test @concurrency --test-reporter=spec --test-reporter-destination=stdout `
+              --test-reporter=tap "--test-reporter-destination=observe607/iter-$i.tap" @files
+            $code = $LASTEXITCODE
+            $end = [DateTime]::UtcNow.ToString('o')
+            Write-Output "=== iteration $i end $end exit=$code ==="
+            [ordered]@{ iteration = $i; mode = $env:OBS_MODE; start_utc = $start; end_utc = $end; exit_code = $code } |
+              ConvertTo-Json -Compress | Add-Content -Encoding utf8 -LiteralPath observe607/iterations.jsonl
+            if ($code -ne 0) { $failed++ }
+          }
+          if ($failed -gt 0) {
+            Write-Output "::error::$failed of $env:OBS_ITERATIONS iteration(s) exited nonzero; every exit code is in observe607/iterations.jsonl"
+            exit 1
+          }
+
+      - name: Stop load observer
+        if: ${{ always() && steps.observer.outcome != 'skipped' }}
+        run: node scripts/windows-load-observer-879.mjs stop --out "${{ runner.temp }}/observe607-observer"
+
+      - name: Record own measurement temp-dir leftovers (cleanup evidence)
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path observe607 | Out-Null
+          $roots = @($env:RUNNER_TEMP, [IO.Path]::GetTempPath()) | Select-Object -Unique
+          $left = @($roots | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter 'telepty-obs607-*' -Directory -ErrorAction SilentlyContinue })
+          "leftover_obs607_tempdirs=$($left.Count)" | Tee-Object -FilePath observe607/cleanup.txt
+
+      - name: Upload bounded measurement evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: observation-timing-1215-${{ matrix.arm }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            observe607
+            ci-observe607
+            ${{ runner.temp }}/observe607-observer
+          if-no-files-found: warn
+          retention-days: 14
