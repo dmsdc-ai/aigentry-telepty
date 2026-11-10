@@ -1,137 +1,176 @@
-name: Windows CI diagnostic (#879)
+name: Observation timing measurement (task 1215 CI612, non-shipping)
 
-# Opt-in, bounded, per-file diagnostic of the Windows regression job (telepty #879).
-# Does NOT replace test-install.yml. It runs the SAME inventory (read at runtime from
-# scripts/test-suites.json, which `npm run test:ci` / `test:ci:pty` execute through
-# scripts/run-tests.mjs) one process per file with a per-file deadline, records
-# exit-vs-stream-close timing and the descendant process tree on any deadline, and always
-# uploads the per-file logs + summary. A timeout, a lost process or a stream that never closes
-# is a job failure — it is never reported as green.
-#
-# Triggers: manual dispatch, and pull_request filtered to this workflow's own files so the
-# workflow can run on the PR that introduces it. Nothing here runs on push to main.
+# Task 1215 CI612 — MEASUREMENT ONLY. Not a release gate, not a fix, and not a reproduction verdict.
+#   positive-control: test/observe607-positive-control.test.js then test/daemon-harness-cleanup-1215.test.js (serial), OBSERVE607=1, once on
+#     ubuntu-latest Node 20 and once on windows-latest Node 26.13.0. It proves the failure-only request_timeout record
+#     (M1 meta.event_loop, M3 pending/injected_at_ms, eventual) executes. A skipped control is a FAILED control.
+#   full-suite (needs BOTH positive-control runs to pass): windows-latest Node 26.13.0, ONE diagnostic round of the
+#     EXACT `npm run test:ci` (unchanged list, flags and node --test default concurrency), with TELEPTY_CI_OBSERVE607=1,
+#     the existing TELEPTY_QUEUE_DIAGNOSTICS=1 and the existing load observer with `--host-sample on`. Each round keeps
+#     its exit, identity, metrics and cleanup. Any failed round is red. Zero failures = not reproduced in ONE, NOT fixed.
+# Labelled perturbations (opt-in only): a timed-out POST is held up to 12 s before its ORIGINAL error is thrown; host
+# sampling runs PowerShell about every 10 s. No continue-on-error on a measured step, no rerun, no 20-arm scaling.
+# Manual NONSHIPPING branch only; numeric diagnostic overlay, no candidate update. No tags, release, publish, default-branch or live-host steps.
 
 on:
   workflow_dispatch:
-    inputs:
-      concurrency:
-        description: 'Files run in parallel in the main phase (1-4). 3 matches node --test on the 4-vCPU runner.'
-        required: false
-        default: '3'
-      file_timeout_ms:
-        description: 'Per-file deadline in ms (1000-120000). Evidence-based exceptions for cli.test.js and daemon.test.js are fixed at 120000 in the runner.'
-        required: false
-        default: '60000'
-      filter:
-        description: 'Substring of a test path to run only matching files (empty = whole inventory).'
-        required: false
-        default: ''
-      git_autocrlf:
-        description: 'runner-default reproduces the regression job; "false" disables CRLF conversion at checkout to falsify the CRLF hypotheses (init.test.js, consumer-vocabulary-matrix-60).'
-        required: false
-        type: choice
-        options:
-          - runner-default
-          - 'false'
-        default: runner-default
-  pull_request:
-    paths:
-      - '.github/workflows/windows-diagnostic-879.yml'
-      - 'scripts/windows-ci-diagnostic.mjs'
-      - 'scripts/run-tests.mjs'
-      - 'scripts/test-suites.json'
-      - 'docs/reports/windows-ci-879.md'
-      # #879 phase 2: the harness/fixture candidate lives in these paths; a change there must
-      # trigger the next Windows per-file run (and the non-main regression job below).
-      - 'test/**'
-      - 'test-support/**'
-      - 'tests/snippet-protocol/**'
-      - '.gitattributes'
 
 permissions:
   contents: read
 
 jobs:
-  diagnose:
-    name: per-file diagnostic (windows-latest, node 20)
-    runs-on: windows-latest
-    # Hard cap for the whole job. The runner's own budget is 10 minutes; the remaining 5 cover
-    # npm ci, the bounded kill/verify steps and the artifact upload. Deliberately BELOW the
-    # 20-minute cap of test-install.yml, which is left unchanged.
-    timeout-minutes: 15
-    env:
-      # Inputs are empty on pull_request; the runner receives the dispatch defaults instead.
-      DIAG_CONCURRENCY: ${{ inputs.concurrency || '3' }}
-      DIAG_FILE_TIMEOUT_MS: ${{ inputs.file_timeout_ms || '60000' }}
-      DIAG_FILTER: ${{ inputs.filter || '' }}
-    steps:
-      - name: Disable git CRLF conversion (only when requested)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.git_autocrlf == 'false' }}
-        run: git config --global core.autocrlf false
-
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Record checkout line-ending state
-        shell: pwsh
-        run: |
-          git config --get core.autocrlf
-          git ls-files --eol src/init/snippets src/routes/session-inspection.js tests/snippet-protocol/v1
-
-      - name: Print derived inventory
-        run: node scripts/windows-ci-diagnostic.mjs --list
-
-      - name: Per-file diagnostic (main phase, then serialized PTY phase)
-        shell: pwsh
-        run: >-
-          node scripts/windows-ci-diagnostic.mjs
-          --phase all
-          --out diag-879
-          --concurrency "$env:DIAG_CONCURRENCY"
-          --timeout-ms "$env:DIAG_FILE_TIMEOUT_MS"
-          --budget-ms 600000
-          --filter "$env:DIAG_FILTER"
-
-      - name: Upload per-file logs and summary
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-diagnostic-879-${{ github.run_id }}-${{ github.run_attempt }}
-          path: diag-879
-          if-no-files-found: warn
-          retention-days: 14
-
-  # #879 phase 2 — independent Linux/macOS regression of the SAME candidate, so a harness change
-  # made for Windows is never merged on Windows evidence alone. Runs the real package commands
-  # (test:ci, then the serialized PTY file, with test:ci's trailing fixture diff gate intact).
-  # Gated to pull requests whose base is NOT main (the diagnostic branch stack) and to manual
-  # dispatch: a PR against main already gets this matrix from test-install.yml, and running it
-  # twice there would only duplicate the trustworthy gate. Windows stays with `diagnose` above.
-  regression-posix:
-    name: regression (${{ matrix.os }}, node 20) — non-main PR base only
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref != 'main') }}
+  positive-control:
+    name: observe607 positive control (${{ matrix.os }}, node ${{ matrix.node }})
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - { os: ubuntu-latest, node: '20' }
+          - { os: windows-latest, node: '26.13.0' }
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 15
+    env:
+      TELEPTY_CI_OBSERVE607: '1'
+      TELEPTY_QUEUE_DIAGNOSTICS: '1'
+      OBS_HEAD_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
           cache: npm
+
       - name: Install dependencies
         run: npm ci
-      - name: Run regression suite (includes the snippet fixture diff gate)
-        run: npm run test:ci
-      - name: Run PTY-serialized regression tests
-        run: npm run test:ci:pty
+
+      - name: Record runner, toolchain and source identity
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path observe607 | Out-Null
+          $files = @('test/observe607-positive-control.test.js', 'test/daemon-harness-cleanup-1215.test.js', 'test-support/daemon-harness.js', 'src/diagnostics/event-loop.js', 'daemon.js', 'scripts/test-suites.json',
+            '.github/workflows/observation-timing-1215.yml', 'package-lock.json')
+          $hashes = [ordered]@{}
+          foreach ($f in $files) { $hashes[$f] = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant() }
+          $id = [ordered]@{ job = 'positive-control'; checkout_sha = (git rev-parse HEAD); pr_head_sha = $env:OBS_HEAD_SHA
+            node = (node -v); npm = (npm -v); image_os = $env:ImageOS; image_version = $env:ImageVersion; runner_os = $env:RUNNER_OS
+            runner_arch = $env:RUNNER_ARCH; processors = [Environment]::ProcessorCount; files = $hashes }
+          $id | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath observe607/identity.json
+          Get-Content -LiteralPath observe607/identity.json
+
+      - name: Run the positive control and the cleanup control, serially (an unexpected skip is a failure)
+        shell: pwsh
+        run: |
+          & node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout `
+            --test-reporter=tap --test-reporter-destination=observe607/positive-control.tap test/observe607-positive-control.test.js test/daemon-harness-cleanup-1215.test.js
+          $code = $LASTEXITCODE
+          $tap = Get-Content -Raw -LiteralPath observe607/positive-control.tap
+          $want = if ($IsWindows) { @(4, 0) } else { @(1, 3) }   # Linux: the cleanup cases' declared platform skip, not Windows proof
+          $ran = ($tap -match "(?m)^# pass $($want[0])\s*$") -and ($tap -match '(?m)^# fail 0\s*$') -and ($tap -match "(?m)^# skipped $($want[1])\s*$")
+          [ordered]@{ exit_code = $code; executed_and_passed = $ran } | ConvertTo-Json -Compress |
+            Set-Content -Encoding utf8 -LiteralPath observe607/positive-control.json
+          if ($code -ne 0) { exit $code }
+          if (-not $ran) { Write-Output "::error::controls did not execute with the exact shape pass=$($want[0]) skipped=$($want[1]) fail=0"; exit 1 }
+
+      - name: Upload positive-control evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: observe607-positive-control-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            observe607
+            ci-observe607
+          if-no-files-found: warn
+          retention-days: 14
+
+  full-suite:
+    name: test:ci measurement round ${{ matrix.round }} (windows-latest, node 26.13.0)
+    needs: positive-control
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      TELEPTY_CI_OBSERVE607: '1'
+      TELEPTY_CI_OBSERVE607_ARM: 'A'
+      TELEPTY_CI_OBSERVE607_ITER: ${{ matrix.round }}
+      TELEPTY_QUEUE_DIAGNOSTICS: '1'
+      OBS_HEAD_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.13.0'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Record runner, toolchain and source identity
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path observe607 | Out-Null
+          $files = @('test-support/daemon-harness.js', 'src/diagnostics/event-loop.js', 'daemon.js', 'test/observe607-positive-control.test.js', 'test/daemon-harness-cleanup-1215.test.js',
+            'scripts/test-suites.json', 'scripts/run-tests.mjs', 'scripts/windows-load-observer-879.mjs', '.github/workflows/observation-timing-1215.yml',
+            'test/observation-tracking-endpoint-60.test.js', 'src/mailbox/lock.js', 'package.json', 'package-lock.json')
+          $hashes = [ordered]@{}
+          foreach ($f in $files) { $hashes[$f] = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant() }
+          $id = [ordered]@{ job = 'full-suite'; round = $env:TELEPTY_CI_OBSERVE607_ITER; checkout_sha = (git rev-parse HEAD)
+            pr_head_sha = $env:OBS_HEAD_SHA; node = (node -v); npm = (npm -v); image_os = $env:ImageOS; image_version = $env:ImageVersion
+            runner_os = $env:RUNNER_OS; runner_arch = $env:RUNNER_ARCH; number_of_processors = $env:NUMBER_OF_PROCESSORS
+            processors = [Environment]::ProcessorCount; files = $hashes }
+          $id | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath observe607/identity.json
+          Get-Content -LiteralPath observe607/identity.json
+
+      - name: Start load observer (host sample on)
+        id: observer
+        run: node scripts/windows-load-observer-879.mjs start --out "${{ runner.temp }}/observe612-observer" --max-ms 1140000 --host-sample on
+
+      - name: Run the EXACT regression suite (npm run test:ci)
+        timeout-minutes: 22
+        shell: pwsh
+        run: |
+          $start = [DateTime]::UtcNow.ToString('o')
+          Write-Output "round $env:TELEPTY_CI_OBSERVE607_ITER start $start; npm run test:ci unchanged (node --test default concurrency); NUMBER_OF_PROCESSORS=$env:NUMBER_OF_PROCESSORS"
+          npm run test:ci
+          $code = $LASTEXITCODE
+          $end = [DateTime]::UtcNow.ToString('o')
+          [ordered]@{ round = $env:TELEPTY_CI_OBSERVE607_ITER; start_utc = $start; end_utc = $end; exit_code = $code } | ConvertTo-Json -Compress |
+            Set-Content -Encoding utf8 -LiteralPath observe607/suite-exit.json
+          Write-Output "round $env:TELEPTY_CI_OBSERVE607_ITER end $end exit=$code (failed tests: the spec reporter's failing-tests summary in this log)"
+          exit $code
+
+      - name: Stop load observer
+        if: ${{ always() && steps.observer.outcome != 'skipped' }}
+        run: node scripts/windows-load-observer-879.mjs stop --out "${{ runner.temp }}/observe612-observer"
+
+      - name: Record own temp-dir leftovers (cleanup evidence)
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path observe607 | Out-Null
+          $roots = @($env:RUNNER_TEMP, [IO.Path]::GetTempPath()) | Select-Object -Unique
+          $count = { param($filter) @($roots | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter $filter -Directory -ErrorAction SilentlyContinue }).Count }
+          @("leftover_telepty_home_dirs=$(& $count 'telepty-home-*')", "leftover_obs607_tempdirs=$(& $count 'telepty-obs607-*')",
+            "leftover_hold612_dirs=$(& $count 'telepty-hold612-*')") | Tee-Object -FilePath observe607/cleanup.txt
+
+      - name: Upload bounded measurement evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: observation-timing-1215-round${{ matrix.round }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            observe607
+            ci-observe607
+            ${{ runner.temp }}/observe612-observer
+          if-no-files-found: warn
+          retention-days: 14

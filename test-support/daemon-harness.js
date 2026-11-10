@@ -342,8 +342,8 @@ async function startTestDaemon(options = {}) {
       const exit = /^\[EXIT\] Session (\S{1,128}) exited with code/.exec(line), session = exit && obsSession(exit[1]);
       if (session && !exitLineAt.has(session)) exitLineAt.set(session, at);
       if (exit) observe607('harness', { stage: 'daemon_exit_line', session, received_ms: at });
-      const slow = /^\[HTTP_SLOW\] (GET|POST|DELETE|PUT|PATCH|OPTIONS|HEAD|OTHER) (\S{1,200}) (\d{1,9})ms status=(\d{3})$/.exec(line); // probe656: the daemon's existing slowRequestObserver line, bounded fields only
-      if (slow) observe607('harness', { stage: 'daemon_slow_line', stream, method: slow[1], route: slow[2], duration_ms: Number(slow[3]), status: Number(slow[4]), received_ms: at });
+      const slow = /^\[HTTP_SLOW\] (GET|POST|DELETE|PUT|PATCH|OPTIONS|HEAD|OTHER) (\S{1,200}) (\d{1,9})ms status=(\d{3})(?: arrive_ms=(\d{1,9}|na) cpu_user_ms=(\d{1,9}|na) cpu_sys_ms=(\d{1,9}|na) elu=([01]\.\d{3}|na) lock_acq=(\d{1,9}|na) lock_wait_ms=(\d{1,9}|na) lock_pauses=(\d{1,9}|na))?$/.exec(line); // probe656: the daemon's existing slowRequestObserver line, bounded fields only; diag685 NONSHIPPING optional numeric tail
+      if (slow) observe607('harness', { stage: 'daemon_slow_line', stream, method: slow[1], route: slow[2], duration_ms: Number(slow[3]), status: Number(slow[4]), received_ms: at, diag685: slow[5] === undefined ? null : Object.fromEntries(['arrive_ms', 'cpu_user_ms', 'cpu_sys_ms', 'elu', 'lock_acq', 'lock_wait_ms', 'lock_pauses'].map((key, i) => [key, slow[5 + i] === 'na' ? null : Number(slow[5 + i])])) });
       const diag = /^\[telepty-diag\] (submit_barrier|http_delivery) (\{.*\})$/.exec(line);
       if (!diag) continue;
       let fields; try { fields = obsSanitize(JSON.parse(diag[2])); } catch { fields = 'unparsed'; }

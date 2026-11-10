@@ -442,7 +442,7 @@ function loadPersistedSessions() {
 const app = createHttpApp({ express, cors });
 const { createEventLoopTelemetry, slowRequestObserver } = require('./src/diagnostics/event-loop');
 const eventLoopTelemetry = createEventLoopTelemetry();
-app.use(slowRequestObserver());
+app.use(slowRequestObserver({ lockTotals: require('./src/mailbox/lock').lockDiagnostics })); // diag685 NONSHIPPING: read-only lock totals
 if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') eventLoopTelemetry.start();
 
 // Peer allowlist: comma-separated IPs/CIDRs in TELEPTY_PEER_ALLOWLIST env
@@ -2118,6 +2118,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
       runStartupBootstrapRestore();
     });
   }
+  for (const listener of [server, tailnetServer]) listener?.prependListener('request', require('./src/diagnostics/event-loop').markArrival); // diag685 NONSHIPPING arrival timestamp
 }
 
 // #470 (0.4.5): when the daemon restarts under existing telepty allow workers,

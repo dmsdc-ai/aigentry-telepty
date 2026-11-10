@@ -27,15 +27,19 @@ function createEventLoopTelemetry({ histogram = monitorEventLoopDelay({ resoluti
       latest: latest ? { ...latest } : null, last_stall: lastStall ? { ...lastStall } : null }; }
   };
 }
-function slowRequestObserver({ now = () => performance.now(), thresholdMs = 2000, log = console.warn } = {}) {
+const ARRIVED = Symbol('arrived'), markArrival = req => { req[ARRIVED] = performance.now(); }; // diag685 NONSHIPPING numeric HTTP_SLOW tail; CPU process-wide, ELU main-thread, lock totals process-module: overlapping, not per-request proof
+const slowSample = lockTotals => { let lock = null; try { lock = lockTotals && lockTotals(); } catch { /* lock fields stay na */ } return { t: performance.now(), cpu: process.cpuUsage(), elu: performance.eventLoopUtilization(), lock }; };
+function slowTail(a, b, arrived) { const n = v => Number.isFinite(v) && v >= 0 ? Math.round(v) : 'na', l = k => n(a.lock && b.lock ? b.lock[k] - a.lock[k] : NaN), u = performance.eventLoopUtilization(b.elu, a.elu).utilization;
+  return ` arrive_ms=${n(a.t - arrived)} cpu_user_ms=${n((b.cpu.user - a.cpu.user) / 1000)} cpu_sys_ms=${n((b.cpu.system - a.cpu.system) / 1000)} elu=${u >= 0 && u <= 1 ? u.toFixed(3) : 'na'} lock_acq=${l('acquired')} lock_wait_ms=${l('wait_ms_total')} lock_pauses=${l('pauses')}`; }
+function slowRequestObserver({ now = () => performance.now(), thresholdMs = 2000, log = console.warn, lockTotals = null } = {}) {
   return (req, res, next) => {
-    const started = now();
+    const started = now(), base = slowSample(lockTotals);
     res.once('finish', () => {
       const duration = now() - started;
       // Only static route templates are logged: never URLs, IDs, headers, bodies, or query strings.
-      if (duration >= thresholdMs) log(`[HTTP_SLOW] ${['GET','POST','DELETE','PUT','PATCH','OPTIONS','HEAD'].includes(req.method) ? req.method : 'OTHER'} ${req.route?.path || 'middleware'} ${Math.round(duration)}ms status=${res.statusCode}`);
+      if (duration >= thresholdMs) log(`[HTTP_SLOW] ${['GET','POST','DELETE','PUT','PATCH','OPTIONS','HEAD'].includes(req.method) ? req.method : 'OTHER'} ${req.route?.path || 'middleware'} ${Math.round(duration)}ms status=${res.statusCode}${slowTail(base, slowSample(lockTotals), req[ARRIVED])}`);
     });
     next();
   };
 }
-module.exports = { createEventLoopTelemetry, slowRequestObserver };
+module.exports = { createEventLoopTelemetry, slowRequestObserver, markArrival };
