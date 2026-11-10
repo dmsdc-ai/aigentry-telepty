@@ -263,7 +263,7 @@ for (const stage of ['results', 'challenge']) for (const localResponseMs of [0, 
         if (localInjected && (kind === 'challenge' || kind === 'results')) attempts[kind] += 1;
         const held = localInjected && kind === stage && attempts[kind] === 1;
         const real = kind === 'forwarded' && localResponseMs > 0 ? fetch(url, options).then((response) => new Promise((resolve, reject) => {
-          const abort = () => { clearTimeout(timer); reject(options.signal.reason); }; // the node's real local deadline, as fetch would
+          const abort = () => { clearTimeout(timer); reject(new TypeError('fetch failed')); }; // the node's real local deadline, as fetch would
           const timer = setTimeout(() => { options.signal.removeEventListener('abort', abort); resolve(response); }, localResponseMs);
           if (options.signal.aborted) abort(); else options.signal.addEventListener('abort', abort, { once: true });
         })) : fetch(url, options);
