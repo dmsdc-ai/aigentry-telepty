@@ -280,8 +280,9 @@ function matchInjects(records, filters = {}) {
   const until = toMs(filters.until);
   if (since != null) out = out.filter((r) => { const t = toMs(r.ts); return t != null && t >= since; });
   if (until != null) out = out.filter((r) => { const t = toMs(r.ts); return t != null && t <= until; });
-  if (filters.to) out = out.filter((r) => r.to === filters.to || r.to_alias === filters.to);
-  if (filters.from) out = out.filter((r) => r.claimed_from === filters.from || r.verified_sender_sid === filters.from);
+  // Issue #144 exact mode (daemon-set for client-profile callers only): the resolved sid and the VERIFIED sender only.
+  if (filters.to) out = out.filter((r) => r.to === filters.to || (filters.exact !== true && r.to_alias === filters.to));
+  if (filters.from) out = out.filter((r) => (filters.exact !== true && r.claimed_from === filters.from) || r.verified_sender_sid === filters.from);
   if (filters.spoof) out = out.filter((r) => r.spoof_suspected === true);
   return out;
 }
@@ -309,5 +310,6 @@ module.exports = {
   buildAuditLine,
   createAuditWriter,
   readInjectLog,
-  matchInjects
+  matchInjects,
+  toMs   // issue #144: the audit filter's own time coercion, reused for the client-profile since clamp
 };

@@ -77,6 +77,20 @@ fallback and all WebSocket upgrades are refused in that mode. Existing session
 credential and approval checks still apply. See the [implemented contract and
 limits](docs/security/principal-http-132.md); no OS-account or OIDC identity is claimed.
 
+## Optional client profiles (0.11.0)
+
+Off by default. When `TELEPTY_CLIENT_PROFILES_FILE` (or the `clientProfilesFile` config key) names a private
+`telepty.client-profiles/v1` file, each assistant on the host can hold its own `x-telepty-client-token`. The daemon
+then enforces, per credential:
+- one inbox namespace;
+- exact targets;
+- create / list / exact inject / exact audit / observation / owned delete only.
+
+Each profile's operations on another profile's namespace are refused before any effect. Profile tokens are minted
+locally with `telepty client-profile mint`. Rotation and revocation need no restart. Native Windows is unsupported,
+and the shared host token is unchanged. This separates credentials, not OS users. See
+[docs/client-profiles.md](docs/client-profiles.md) and BOUNDARY.md.
+
 ## Quick Start
 
 The installer already started the daemon, so `telepty list` answers immediately. (If it does

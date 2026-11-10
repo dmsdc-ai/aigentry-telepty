@@ -30,6 +30,8 @@ function createAuditReader({ path: auditPath, timeoutMs = 10000,
     if (closed) return Promise.resolve(result('AUDIT_QUERY_CLOSED'));
     const filters = scalarFilters(options);
     if (!filters) return Promise.resolve(result('AUDIT_QUERY_INVALID_FILTER', 400, 'scalar_filters_required'));
+    // Issue #144: exact mode is set only by daemon code (never from a query key): to ⇒ r.to, from ⇒ r.verified_sender_sid.
+    if (options.exact === true) filters.exact = true;
     if (active.size >= 2) return Promise.resolve(result('AUDIT_QUERY_BUSY', 429, 'worker_capacity'));
     return new Promise(resolve => {
       let worker;
@@ -88,8 +90,12 @@ function registerAuditQueryRoute(app, { reader, resolveSessionAlias }) {
     const q = req.query || {};
     const filters = scalarFilters(q);
     if (!filters) return res.status(400).json(result('AUDIT_QUERY_INVALID_FILTER', 400, 'scalar_filters_required'));
-    if (filters.to) filters.to = resolveSessionAlias(filters.to) || filters.to;
-    const query = await reader.read({ ...filters, spoof: q.spoof === '1' || q.spoof === 'true' });
+    // Issue #144: a client-profile caller (already scoped by the gate) reads exact rows only — no alias resolution,
+    // no claimed attribution — and never before its grant's not_before.
+    const caller = req.clientProfile;
+    if (caller) filters.since = require('../protocol/client-profiles').clampSince(filters.since, caller, require('./inject-log').toMs);
+    else if (filters.to) filters.to = resolveSessionAlias(filters.to) || filters.to;
+    const query = await reader.read(caller ? { ...filters, spoof: false, exact: true } : { ...filters, spoof: q.spoof === '1' || q.spoof === 'true' });
     if (!query.ok) return res.status(query.status).json({ success: false, code: query.code, error: query.error, reason: query.reason });
     // The bounded result was serialized in the worker. Never JSON.parse/stringify it here.
     res.type('application/json').send(query.json);

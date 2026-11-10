@@ -59,8 +59,8 @@ package currently owns the command. To migrate:
 ```bash
 telepty service stop                                  # only if a service is installed
 npm rm -g aigentry-telepty
-npm i -g @dmsdc-ai/aigentry-telepty@0.10.1 --force   # --force relinks the shared command
-telepty --version                                     # must print 0.10.1
+npm i -g @dmsdc-ai/aigentry-telepty@0.11.0 --force   # --force relinks the shared command
+telepty --version                                     # must print 0.11.0
 ```
 
 **Windows is BETA.** It installs and the cross-machine demo below is a real Windows box, but
@@ -76,6 +76,20 @@ Missing/unsafe trust configuration refuses startup; shared-token/JWT/session-tok
 fallback and all WebSocket upgrades are refused in that mode. Existing session
 credential and approval checks still apply. See the [implemented contract and
 limits](docs/security/principal-http-132.md); no OS-account or OIDC identity is claimed.
+
+## Optional client profiles (0.11.0)
+
+Off by default. When `TELEPTY_CLIENT_PROFILES_FILE` (or the `clientProfilesFile` config key) names a private
+`telepty.client-profiles/v1` file, each assistant on the host can hold its own `x-telepty-client-token`. The daemon
+then enforces, per credential:
+- one inbox namespace;
+- exact targets;
+- create / list / exact inject / exact audit / observation / owned delete only.
+
+Each profile's operations on another profile's namespace are refused before any effect. Profile tokens are minted
+locally with `telepty client-profile mint`. Rotation and revocation need no restart. Native Windows is unsupported,
+and the shared host token is unchanged. This separates credentials, not OS users. See
+[docs/client-profiles.md](docs/client-profiles.md) and BOUNDARY.md.
 
 ## Quick Start
 
@@ -504,7 +518,7 @@ telepty runs **standalone** — it needs none of the other aigentry modules and 
 
 | Module | Package | Version | Role | Maturity |
 | --- | --- | --- | --- | --- |
-| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.10.1 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
+| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.11.0 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
 | **brain** | `@dmsdc-ai/aigentry-brain` | 0.3.1 | Persistent cross-session memory (MCP server) | Early |
 | **deliberation** | `@dmsdc-ai/aigentry-deliberation` | 0.0.47 | Multi-AI structured debate + synthesis (MCP server) | Early |
 | **devkit** | `@dmsdc-ai/aigentry-devkit` | 0.1.14 | Installer/scaffold for the AI dev environment | Early |

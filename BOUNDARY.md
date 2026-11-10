@@ -533,6 +533,27 @@ cold index memory is capped at 64 MiB after which the oldest cold files answer `
 memory (operator command, not on the observation path). Not done: archival/eviction, cold-index
 demotion, task/attempt bundles, automatic replay of indeterminate work.
 
+## Client profiles separate credentials, not OS users (0.11.0, opt-in, issue #144)
+
+`client-profile-scope-v1` is off unless `TELEPTY_CLIENT_PROFILES_FILE` or the `clientProfilesFile` config key is set
+(docs/client-profiles.md). When it is on, a request carrying `x-telepty-client-token` is decided only by the profile gate:
+- exactly one own namespace, exact granted targets;
+- meta / list / create / exact inject / exact audit / observation / owned delete;
+- loopback socket only;
+- no fallthrough to the host token, JWT or session bearer.
+
+What it separates is **assistants that hold different credentials** on one OS user. It does not separate OS users, and it claims nothing beyond that:
+
+- A same-uid process can read another profile's token file, the profiles file and any process environment, and can
+  **write** the profiles file. Unlike the host token, that file is re-read on every profile request, so a write
+  grants profile scopes without a restart. It never grants admin, which stays with the frozen host token
+  described above. Selecting a profile by environment variable is configuration, not authentication.
+- Revocation is linearized at the gate: an already-admitted request completes. Shared daemon capacity (audit
+  workers, tracking, the hot budget) is not per-profile. A captured inject request replays as a new inject.
+- Host-token holders remain admin. While profiles are configured, the one change to them is that they cannot
+  register a new id, or rename, into a configured namespace (`403 PROFILE_NAMESPACE_RESERVED`).
+- Native Windows: unsupported; the daemon refuses to start with profiles configured.
+
 ## Design principle
 
 > **telepty = stateless dumb pipe**

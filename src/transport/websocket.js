@@ -956,6 +956,14 @@ function installWebSocketTransport(deps) {
       return;
     }
 
+    // Issue #144 (configured only): a client-profile credential never opens a WebSocket, whatever else rides along —
+    // refused on raw-header PRESENCE (an empty value counts) before the host-token / JWT comparison below.
+    if (deps.clientProfiles && require('../protocol/client-profiles').presentsClientToken(req)) {
+      refuseUpgrade(socket, 401, 'Unauthorized', 'PROFILE_WEBSOCKET_UNSUPPORTED',
+        'Client-profile credentials cannot open a WebSocket.');
+      return;
+    }
+
     const wsAuthHeader = req.headers['authorization'] || '';
     const wsJwtValid = wsAuthHeader.startsWith('Bearer ') && verifyJwt(wsAuthHeader.slice(7));
     if (token !== expectedToken && !wsJwtValid) {
