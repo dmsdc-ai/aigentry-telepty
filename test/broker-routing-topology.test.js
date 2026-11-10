@@ -294,12 +294,8 @@ for (const stage of ['results', 'challenge']) for (const localResponseMs of [0, 
     assert.ok(reason instanceof TypeError && reason.cause && reason.cause.code === 'UND_ERR_SOCKET', 'node a completion rejects with the coded socket failure');
     await waitFor(() => count('worker') >= 1 && count('return-worker') >= 1);
     assert.deepEqual(attempts, stage === 'results' ? { challenge: 1, results: 1 } : { challenge: 1, results: 0 }, 'the result path ran once and was never retried');
-    // broker613: besides the stage failure, only node a's own local forwarded timeout (after delivery, counted above) is
-    // allowed: that exact record, at most once, first; required when the response was held past the deadline.
-    const localTimeout = { kind: 'forwarded', settled: true, status: null, error: 'TimeoutError', code: null, cause_code: null };
-    const errors = requests.snapshot().records.filter((r) => r.error !== null).map(({ seq, ...rest }) => rest);
-    assert.deepEqual(errors, [...(localResponseMs > 0 || errors.length > 1 ? [localTimeout] : []),
-      { kind: stage, settled: true, status: null, error: 'TypeError', code: null, cause_code: 'UND_ERR_SOCKET' }]);
+    assert.deepEqual(requests.snapshot().records.filter((r) => r.error !== null).map(({ seq, ...rest }) => rest),
+      [{ kind: stage, settled: true, status: null, error: 'TypeError', code: null, cause_code: 'UND_ERR_SOCKET' }]);
     const after = (await responder.receipt(replyBody.idempotency_key)).body;
     assert.deepEqual({ state: after.state, code: after.code }, { state: 'outcome_unknown', code: 'BROKER_RESULT_TIMEOUT' }, 'node a stopping later does not rewrite the bounded unknown');
     assert.deepEqual({ worker: count('worker'), 'return-worker': count('return-worker') }, { worker: 1, 'return-worker': 1 }, 'exactly one local frame per leg; no duplicate');
