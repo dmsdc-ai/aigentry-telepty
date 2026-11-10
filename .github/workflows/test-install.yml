@@ -1,147 +1,153 @@
-name: Regression Tests
+name: Task1272 paired Windows diagnostic and strict Mac perf supplement
+
+# NONSHIPPING. One base/current Windows26 pair under the maintained full-suite load,
+# with the SAME author-owned diagnostic test overlay, plus one exact strict Mac gate.
+# No retries, publication, secrets, live host control or relaxed product/test budget.
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
+permissions:
+  contents: read
 
 jobs:
-  test:
+  windows-pair:
+    name: Windows26 full-load diagnostic (${{ matrix.source }})
+    runs-on: windows-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        node: [20, '26.13.0']
-    runs-on: ${{ matrix.os }}
-    # Belt against a hung test never exiting (#645): green mac/ubuntu runs finish in ~2min,
-    # so a 20min cap fails a hang fast instead of burning the 6h job ceiling. This is a
-    # backstop, NOT the fix — the root cause (undisposed state-machine poll timer holding the
-    # test worker open) is fixed in test/submit-gate-restore-register-678.test.js.
-    timeout-minutes: 20
-    # telepty #879: windows-latest is a release gate like ubuntu/macOS. The former #577
-    # continue-on-error quarantine hid that `npm run test:ci` never started on Windows.
+        include:
+          - source: baseline
+            sha: c905e85ee065e55aeff4b51494f07c825b433f99
+            tree: e36f6c32a63b3e82b8674d3a20b3e5f580610ee3
+          - source: candidate
+            sha: 6eebf71a574551cfa5c35fc3d017b45d6b94b029
+            tree: 2307c1a3b6650b1d14cf1bc54bf867392b0abe01
+    env:
+      MEASURED_SHA: ${{ matrix.sha }}
+      MEASURED_TREE: ${{ matrix.tree }}
+      MEASURED_SOURCE: ${{ matrix.source }}
+      TELEPTY_QUEUE_DIAGNOSTICS: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          path: subject
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
-          cache: npm
-      - name: Install dependencies
+          node-version: '26.13.0'
+      - name: Verify source and install the same immutable diagnostic overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C subject rev-parse HEAD)" = "$MEASURED_SHA"
+          test "$(git -C subject rev-parse 'HEAD^{tree}')" = "$MEASURED_TREE"
+          test -z "${OBSERVE607:-}"
+          FILE=test/inject-barrier-identity-109.test.js
+          node -e 'const f=require("node:fs"),c=require("node:crypto");for(const [p,h] of [["subject/"+process.argv[1],"7a284cceda4f555dee236e2924beb3dcb3c606c0fb1b2e4e38e61e81453976e2"],["control/.ci/task1272/diag735.test.js","12d7b22481973a8b009eff7bcd513aff98941e5730daed17a0774811110e4f8f"]]){if(c.createHash("sha256").update(f.readFileSync(p)).digest("hex")!==h)throw Error("fixture identity mismatch "+p)}' "$FILE"
+          cp control/.ci/task1272/diag735.test.js "subject/$FILE"
+          test "$(git -C subject diff --name-only)" = "$FILE"
+          EVIDENCE="$RUNNER_TEMP/server740-$MEASURED_SOURCE"
+          mkdir -p "$EVIDENCE"
+          echo "EVIDENCE=$EVIDENCE" >> "$GITHUB_ENV"
+          {
+            echo "task1272; NONSHIPPING diagnostic; one attempt; source=$MEASURED_SOURCE; no performance comparison claim"
+            git -C subject rev-parse HEAD 'HEAD^{tree}'
+            git -C control rev-parse HEAD 'HEAD^{tree}'
+            git -C subject diff --stat
+            node --version
+            npm --version
+          } | tee "$EVIDENCE/identity.txt"
+      - name: Install dependencies (maintained npm ci)
+        working-directory: subject
         run: npm ci
-      - name: Run typecheck
+      - name: Typecheck (maintained command)
+        working-directory: subject
         run: npm run typecheck
-      # Task 1215: the Darwin authority-file reader is a bundled native binary. Build it from the
-      # first-party source with the runner's own Apple toolchain and Node-API headers BEFORE the suite,
-      # so test/authority-file-darwin-1215.test.js exercises the real native reader (it fails, never
-      # skips, when the binary is absent). Nothing is downloaded and no npm lifecycle compiles it.
-      - name: Build the bundled Darwin authority reader (task 1215)
-        if: runner.os == 'macOS'
+      - name: Start existing Windows load observer (diagnostic only)
+        id: observer
+        continue-on-error: true
+        working-directory: subject
+        run: node scripts/windows-load-observer-879.mjs start --out "${{ runner.temp }}/server740-${{ matrix.source }}/load-observer" --max-ms 1080000
+      - name: Run the maintained full regression load once, preserve its original exit
+        shell: bash
+        working-directory: subject
+        run: |
+          set +e
+          npm run test:ci 2>&1 | tee "$EVIDENCE/full-regression.log"
+          result=${PIPESTATUS[0]}
+          echo "$result" > "$EVIDENCE/full-regression.exit"
+          exit "$result"
+      - name: Stop existing observer (diagnostic only)
+        if: always() && steps.observer.outcome != 'skipped'
+        continue-on-error: true
+        working-directory: subject
+        run: node scripts/windows-load-observer-879.mjs stop --out "${{ runner.temp }}/server740-${{ matrix.source }}/load-observer"
+      - name: Preserve exact post-run source diff
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/server740-$MEASURED_SOURCE"
+          git -C subject status --porcelain > "$RUNNER_TEMP/server740-$MEASURED_SOURCE/status-after.txt"
+          git -C subject diff --stat > "$RUNNER_TEMP/server740-$MEASURED_SOURCE/diff-after.txt"
+      - name: Upload all diagnostic evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server740-windows-${{ matrix.source }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/server740-${{ matrix.source }}
+          if-no-files-found: error
+          retention-days: 7
+
+  mac-perf:
+    name: Mac26 strict ledger gate, one isolated supplement
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6eebf71a574551cfa5c35fc3d017b45d6b94b029
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.13.0'
+      - name: Record exact unchanged measured source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 6eebf71a574551cfa5c35fc3d017b45d6b94b029
+          test "$(git rev-parse 'HEAD^{tree}')" = 2307c1a3b6650b1d14cf1bc54bf867392b0abe01
+          mkdir -p "$RUNNER_TEMP/server740-mac-perf"
+          { git rev-parse HEAD 'HEAD^{tree}'; node --version; npm --version; } | tee "$RUNNER_TEMP/server740-mac-perf/identity.txt"
+      - name: Install dependencies (maintained npm ci)
+        run: npm ci
+      - name: Build Darwin authority reader (maintained command)
+        shell: bash
         run: |
           set -euo pipefail
           NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
           node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
-      # Task 1215 lock525 versioned regression witness (Linux + Node 26.13.0 only; NOT acceptance of old code, NOT native
-      # Windows proof). The SAME six lock525 tests run against the old lock.js (fixed public commit 27e4fd1c, blob a9ce9d7a)
-      # and must fail exactly (a)-(d) on genuine MAILBOX_LOCK_STORAGE with (e)/(f) passing, then against the restored
-      # current lock.js where all six must pass. Only src/mailbox/lock.js is swapped, and it is restored on every exit.
-      - name: lock525 RED/GREEN witness (Linux, Node 26.13.0)
-        if: runner.os == 'Linux' && matrix.node == '26.13.0'
-        timeout-minutes: 2
-        shell: bash
-        run: |
-          set -uo pipefail
-          set +e   # GitHub runs bash with -e; the expected OLD rc 1 and no-match greps must be captured, every check stays explicit
-          W="$RUNNER_TEMP/lock525-witness"; LOCK=src/mailbox/lock.js; mkdir -p "$W"
-          OLD_COMMIT=27e4fd1cea7fdb1226c902757ad662f89eac89d8; OLD_BLOB=a9ce9d7a7e8f062df35777f931107ba6ebaa4f47
-          cp -p "$LOCK" "$W/current-lock.js" || exit 1
-          trap 'cp -p "$W/current-lock.js" "$LOCK"' EXIT INT TERM
-          CUR_BLOB=$(git hash-object "$LOCK") || exit 1
-          echo "head=$(git rev-parse HEAD) current_lock_blob=$CUR_BLOB old_commit=$OLD_COMMIT old_lock_blob=$OLD_BLOB" | tee "$W/summary.txt"
-          git fetch --no-tags --depth=1 origin "$OLD_COMMIT" || { echo "::error::fetch of $OLD_COMMIT failed"; exit 1; }
-          [ "$(git rev-parse "$OLD_COMMIT:$LOCK")" = "$OLD_BLOB" ] || { echo "::error::old lock blob mismatch"; exit 1; }
-          git cat-file blob "$OLD_BLOB" > "$LOCK" && [ "$(git hash-object "$LOCK")" = "$OLD_BLOB" ] || { echo "::error::old lock not in place"; exit 1; }
-          run() {   # $1 label: the identical command for both runs; rc and TAP kept
-            node --require ./test-support/setup-env.js --test --test-reporter=tap --test-name-pattern='^lock525 ' \
-              test/mailbox-lock-concurrency.test.js > "$W/$1.tap" 2>&1
-            echo $? > "$W/$1.rc"
-          }
-          letters() {   # $1 label, $2 'ok' | 'not ok': matching case letters, sorted, no SKIP/TODO lines
-            grep -E "^ *$2 [0-9]+ - lock525 \([a-f]\)" "$W/$1.tap" | grep -vE '# (SKIP|TODO)' \
-              | sed -E 's/.* - lock525 \(([a-f])\).*/\1/' | sort | tr -d '\n'
-          }
-          storage() {   # $1 label: letters of not-ok cases whose own TAP block names MAILBOX_LOCK_STORAGE
-            awk '/^ *(not )?ok [0-9]+ - /{cur=""; if (match($0, /^ *not ok [0-9]+ - lock525 \([a-f]\)/)) cur=substr($0, RLENGTH-1, 1)}
-                 cur != "" && /MAILBOX_LOCK_STORAGE/ {seen[cur]=1} END {for (k in seen) print k}' "$W/$1.tap" | sort | tr -d '\n'
-          }
-          marks() { grep -cE "lock525 \([a-f]\).*# (SKIP|TODO)" "$W/$1.tap"; }
-          fail=0
-          run old
-          o="rc=$(cat "$W/old.rc") notok=$(letters old 'not ok') ok=$(letters old ok) storage=$(storage old) marks=$(marks old)"
-          echo "OLD $o" | tee -a "$W/summary.txt"
-          [ "$o" = "rc=1 notok=abcd ok=ef storage=abcd marks=0" ] || { echo "::error::old lock.js did not give the exact RED"; fail=1; }
-          cp -p "$W/current-lock.js" "$LOCK" && cmp -s "$W/current-lock.js" "$LOCK" && [ "$(git hash-object "$LOCK")" = "$CUR_BLOB" ] \
-            || { echo "::error::current lock.js not restored"; exit 1; }
-          run new
-          n="rc=$(cat "$W/new.rc") notok=$(letters new 'not ok') ok=$(letters new ok) marks=$(marks new)"
-          echo "NEW $n" | tee -a "$W/summary.txt"
-          [ "$n" = "rc=0 notok= ok=abcdef marks=0" ] || { echo "::error::current lock.js did not give the exact GREEN"; fail=1; }
-          [ -s "$W/summary.txt" ] || { echo "::error::witness summary missing"; fail=1; }
-          exit "$fail"
-      - name: Upload lock525 witness records
-        if: always() && runner.os == 'Linux' && matrix.node == '26.13.0'
-        uses: actions/upload-artifact@v4
-        with:
-          name: lock525-witness-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/lock525-witness
-          if-no-files-found: error
-          retention-days: 7
-      # Task 1215 / #879 (DIAGNOSTIC ONLY, Windows only): a bounded load observer brackets ONLY the regression suite step
-      # below, which stays the unchanged `npm run test:ci` with its own exit. The observer measures (CPU-time deltas,
-      # event-loop timer delay, sparse process-start probes) and decides nothing; its own failure is a visible step
-      # failure that never changes the job result. Mac/Linux skip these steps.
-      - name: Start Windows load observer (diagnostic only, task 1215 / #879)
-        id: load_observer_start
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        run: node scripts/windows-load-observer-879.mjs start --out "${{ runner.temp }}/windows-load-observer-879" --max-ms 1080000
-      - name: Run regression suite
-        run: npm run test:ci
-      - name: Stop Windows load observer (diagnostic only)
-        if: always() && runner.os == 'Windows' && steps.load_observer_start.outcome != 'skipped'
-        continue-on-error: true
-        run: node scripts/windows-load-observer-879.mjs stop --out "${{ runner.temp }}/windows-load-observer-879"
-      - name: Upload Windows load observer evidence (diagnostic only)
-        if: always() && runner.os == 'Windows'
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-load-observer-879-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/windows-load-observer-879
-          if-no-files-found: warn
-          retention-days: 14
-      # Task 1215 peer235: the dedicated ledger PERFORMANCE gate on every OS. `npm run test:ci` above co-schedules files and
-      # gates the ledger file's FUNCTIONAL assertions and any valid-control stall; an invalid idle baseline there is reported
-      # as performance NOT-MEASURED, never as a pass. This step runs the SAME file (same workload, controls and 50 ms bound)
-      # once, alone, with --test-concurrency=1 and TELEPTY_LEDGER_PERF_GATE=1, where only a VALID pass succeeds: an
-      # inconclusive or a fail verdict fails this step. Mandatory: no continue-on-error, no retry.
-      - name: Run ledger performance gate (single file, no co-scheduled tests; task 1215)
+      - name: Same strict eight-test ledger gate, no control or limit changes
         env:
           TELEPTY_LEDGER_PERF_GATE: '1'
-        run: node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=spec test/ledger-control-responsiveness-1207.test.js
-      # #768: this one file drives a real daemon + a real `telepty allow` bridge + a real PTY
-      # with a deliberately delayed WS handshake. Inside the parallel list it lands on a worker
-      # alongside whatever else node --test schedules there, and on the 3-core macOS runner that
-      # pairing pushed test/enforce-report.test.js:359 from 1.2s to its 10s ceiling — a test that
-      # only waits for a bus event and loses nothing, so the honest fix is to stop contending
-      # rather than to raise its budget. Measured: dropping this file from the parallel list
-      # restores macOS to green (run 30204629841). `npm test` still includes it; a dev machine
-      # has the cores. Give it its own step so it runs alone and gates just the same.
-      - name: Run PTY-serialized regression tests
-        run: npm run test:ci:pty
-      # Task 1215 G2: self-pack consumer check on every supported OS, Windows included (npm-cli.js under
-      # this node, .cmd/.ps1 shim relations, private APPDATA/LOCALAPPDATA/TMP/TEMP), plus npm ls identity,
-      # the macOS installed native authority read and an installed daemon + PTY smoke. The release
-      # workflow runs the same helper against ONE canonical archive (--pack-only / --tarball).
-      - name: Check packaged consumer
-        run: node scripts/check-package.mjs
+        shell: bash
+        run: |
+          set +e
+          node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=spec test/ledger-control-responsiveness-1207.test.js 2>&1 | tee "$RUNNER_TEMP/server740-mac-perf/strict-ledger.log"
+          result=${PIPESTATUS[0]}
+          echo "$result" > "$RUNNER_TEMP/server740-mac-perf/strict-ledger.exit"
+          exit "$result"
+      - name: Upload strict gate evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server740-mac-perf-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/server740-mac-perf
+          if-no-files-found: error
+          retention-days: 7
