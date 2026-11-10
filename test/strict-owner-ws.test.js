@@ -2,7 +2,7 @@
 const {test}=require('node:test');const assert=require('node:assert/strict');const crypto=require('node:crypto');
 const {validateTrustConfiguration,createSignedAssertion}=require('../src/principal/proof');
 const {createPrincipalAuthentication}=require('../src/principal/http');
-const SHORT_TTL_SECONDS=2; // fix639: expiry is whole-second (proof.js), so a 2 s TTL stays valid >=1 s after signing and still expires within the 5 s wait
+const SHORT_TTL_SECONDS=1; // fix639: expiry is whole-second (proof.js), so a 2 s TTL stays valid >=1 s after signing and still expires within the 5 s wait
 function fixture(authority='principal',now) {
  const pair=crypto.generateKeyPairSync('ed25519');const session={type:'wrapped',sessionEpoch:'epoch',credentialGeneration:1,owningPrincipal:{id:'owner',source:'ed25519',audience:'fixture'}};
  const trust=validateTrustConfiguration({schema:'telepty.principals/v1',audience:'fixture',keys:[{key_id:'owner',principal_id:'owner',authority,public_key_spki:pair.publicKey.export({type:'spki',format:'pem'}),grants:[{action:'session.owner',targets:['mine']}]}]});
