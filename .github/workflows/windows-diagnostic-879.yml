@@ -73,7 +73,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '26.13.0'
           cache: npm
 
       - name: Install dependencies
@@ -116,7 +116,7 @@ jobs:
   # twice there would only duplicate the trustworthy gate. Windows stays with `diagnose` above.
   regression-posix:
     name: regression (${{ matrix.os }}, node 20) — non-main PR base only
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref != 'main') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.filter == '') || (github.event_name == 'pull_request' && github.base_ref != 'main') }}
     strategy:
       fail-fast: false
       matrix:
