@@ -1,4 +1,4 @@
-name: Task1272 paired Windows diagnostic and strict Mac perf supplement
+name: Task1272 corrected paired Windows diagnostic, exact Git bytes
 
 # NONSHIPPING. One base/current Windows26 pair under the maintained full-suite load,
 # with the SAME author-owned diagnostic test overlay, plus one exact strict Mac gate.
@@ -50,12 +50,14 @@ jobs:
           test "$(git -C subject rev-parse 'HEAD^{tree}')" = "$MEASURED_TREE"
           test -z "${OBSERVE607:-}"
           FILE=test/inject-barrier-identity-109.test.js
-          node -e 'const f=require("node:fs"),c=require("node:crypto");for(const [p,h] of [["subject/"+process.argv[1],"7a284cceda4f555dee236e2924beb3dcb3c606c0fb1b2e4e38e61e81453976e2"],["control/.ci/task1272/diag735.test.js","12d7b22481973a8b009eff7bcd513aff98941e5730daed17a0774811110e4f8f"]]){if(c.createHash("sha256").update(f.readFileSync(p)).digest("hex")!==h)throw Error("fixture identity mismatch "+p)}' "$FILE"
-          cp control/.ci/task1272/diag735.test.js "subject/$FILE"
-          test "$(git -C subject diff --name-only)" = "$FILE"
           EVIDENCE="$RUNNER_TEMP/server740-$MEASURED_SOURCE"
           mkdir -p "$EVIDENCE"
           echo "EVIDENCE=$EVIDENCE" >> "$GITHUB_ENV"
+          git -C subject show "HEAD:$FILE" > "$EVIDENCE/original-test.git.js"
+          git -C control show HEAD:.ci/task1272/diag735.test.js > "$EVIDENCE/overlay-test.git.js"
+          EVIDENCE="$EVIDENCE" node -e 'const f=require("node:fs"),c=require("node:crypto"),h=b=>c.createHash("sha256").update(b).digest("hex");for(const [rawPath,gitPath,want] of [["subject/"+process.argv[1],process.env.EVIDENCE+"/original-test.git.js","7a284cceda4f555dee236e2924beb3dcb3c606c0fb1b2e4e38e61e81453976e2"],["control/.ci/task1272/diag735.test.js",process.env.EVIDENCE+"/overlay-test.git.js","12d7b22481973a8b009eff7bcd513aff98941e5730daed17a0774811110e4f8f"]]){const raw=f.readFileSync(rawPath),git=f.readFileSync(gitPath),normalized=Buffer.from(raw.toString().replace(/\r\n/g,"\n"));console.log(JSON.stringify({path:rawPath,checkout_sha256:h(raw),git_sha256:h(git),checkout_bytes:raw.length,git_bytes:git.length,only_crlf_conversion:!raw.equals(git)&&normalized.equals(git)}));if(h(git)!==want||(!raw.equals(git)&&!normalized.equals(git)))throw Error("unexplained source difference "+rawPath)}' "$FILE" 2>&1 | tee "$EVIDENCE/source-serialization.txt"
+          cp "$EVIDENCE/overlay-test.git.js" "subject/$FILE"
+          test "$(git -C subject diff --name-only)" = "$FILE"
           {
             echo "task1272; NONSHIPPING diagnostic; one attempt; source=$MEASURED_SOURCE; no performance comparison claim"
             git -C subject rev-parse HEAD 'HEAD^{tree}'
@@ -105,49 +107,3 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  mac-perf:
-    name: Mac26 strict ledger gate, one isolated supplement
-    runs-on: macos-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 6eebf71a574551cfa5c35fc3d017b45d6b94b029
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '26.13.0'
-      - name: Record exact unchanged measured source
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = 6eebf71a574551cfa5c35fc3d017b45d6b94b029
-          test "$(git rev-parse 'HEAD^{tree}')" = 2307c1a3b6650b1d14cf1bc54bf867392b0abe01
-          mkdir -p "$RUNNER_TEMP/server740-mac-perf"
-          { git rev-parse HEAD 'HEAD^{tree}'; node --version; npm --version; } | tee "$RUNNER_TEMP/server740-mac-perf/identity.txt"
-      - name: Install dependencies (maintained npm ci)
-        run: npm ci
-      - name: Build Darwin authority reader (maintained command)
-        shell: bash
-        run: |
-          set -euo pipefail
-          NODE_HEADERS="$(dirname "$(dirname "$(command -v node)")")/include/node"
-          node scripts/build-authority-darwin.mjs --cc "$(xcrun --find clang)" --sdk "$(xcrun --show-sdk-path)" --node-headers "$NODE_HEADERS"
-      - name: Same strict eight-test ledger gate, no control or limit changes
-        env:
-          TELEPTY_LEDGER_PERF_GATE: '1'
-        shell: bash
-        run: |
-          set +e
-          node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=spec test/ledger-control-responsiveness-1207.test.js 2>&1 | tee "$RUNNER_TEMP/server740-mac-perf/strict-ledger.log"
-          result=${PIPESTATUS[0]}
-          echo "$result" > "$RUNNER_TEMP/server740-mac-perf/strict-ledger.exit"
-          exit "$result"
-      - name: Upload strict gate evidence even on failure
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: server740-mac-perf-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/server740-mac-perf
-          if-no-files-found: error
-          retention-days: 7
