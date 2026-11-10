@@ -44,7 +44,7 @@ async function wrappedOwner(sid) {
 
 function busEvents(bus) {
   const events = [];
-  bus.on('message', (raw) => { try { events.push(JSON.parse(raw)); } catch { /* ignore */ } });
+  bus.on('message', (raw) => { try { events.push({ ...JSON.parse(raw), received_at: new Date().toISOString() }); } catch { /* ignore */ } });
   return events;
 }
 
@@ -62,15 +62,19 @@ test('TP1: a same-bearer owner takeover inside the submit delay gets no CR; the 
   const events = busEvents(bus);
 
   const inj = await inject(sid, 'hello');
+  const answeredAt = new Date().toISOString();
   assert.equal(inj.status, 200, JSON.stringify(inj.body));
   const second = await ownerSocket(sid); // same bearer: same record, same epoch
   t.after(() => { try { second.ws.close(); } catch {} });
-  await sleep(1200);
+  // fix649: inject_failed is emitted by the same CR-timer callback that decides the CR, so it is the causal barrier for the
+  // no-CR judgement. Wait for it (unchanged harness bound) instead of a fixed sleep; record emission vs local receipt timing.
+  const failed = await waitFor(() => events.find((e) => e.type === 'inject_failed' && e.session_id === sid), { description: 'typed inject_failed' }).catch(() => null);
+  const timing = () => JSON.stringify({ answered_at: answeredAt, judged_at: new Date().toISOString(), events: events.map((e) => [e.type, e.timestamp, e.received_at]) });
+  t.diagnostic(`fix649 TP1 timing: ${timing()}`);
 
   assert.deepEqual(second.frames, [], `the replacement owner received: ${JSON.stringify(second.frames)}`);
   assert.deepEqual(first.frames, ['hello'], JSON.stringify(first.frames));
-  const failed = events.find((e) => e.type === 'inject_failed' && e.session_id === sid);
-  assert.ok(failed, `no inject_failed event: ${JSON.stringify(events.map((e) => e.type))}`);
+  assert.ok(failed, `no inject_failed event: ${timing()}`);
   assert.equal((failed.code || (failed.extra && failed.extra.code)), 'SESSION_GONE', JSON.stringify(failed));
 });
 
