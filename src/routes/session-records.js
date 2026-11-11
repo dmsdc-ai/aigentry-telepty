@@ -117,12 +117,19 @@ function createSessionRecordContext({ sessions, sessionCredentials, sidNonces, s
 
 // Task 1215 R1: user-supervised authority is the verified strict operator principal only
 // (src/mailbox/input-policy.js); no host-token or header-shape verifier is consulted here.
-function registerSessionRegisterRoute(app, { context, sessionStateManager, busClients, getMailbox = () => new (require('../mailbox').FileMailbox)() }) {
+function registerSessionRegisterRoute(app, { context, sessionStateManager, busClients, getMailbox = () => new (require('../mailbox').FileMailbox)(), clientProfiles = null }) {
   const { sessions, sessionCredentials, issueSessionCredential, persistSessions } = context;
   app.post('/api/sessions/register', (req, res) => {
     const identity = readIdentity(req.body, 'session_id');
     if (identity.error) return res.status(400).json({ error: identity.error });
     const session_id = identity.value;
+    // Issue #144 (configured only): a non-profile caller may not create a NEW id inside any configured profile
+    // namespace — otherwise a legacy holder could plant history a (re-)granted profile would then read. Re-register
+    // of an existing id is unchanged; a profile caller was already confined to its own namespace by the gate.
+    if (clientProfiles && !req.clientProfile && !Object.prototype.hasOwnProperty.call(sessions, session_id)
+        && clientProfiles.reservesSessionId(session_id)) {
+      return res.status(403).json({ code: 'PROFILE_NAMESPACE_RESERVED', error: 'This id is reserved for a configured client profile.' });
+    }
     const conditionalInstance = Object.hasOwn(req.body, 'expected_epoch') || Object.hasOwn(req.body, 'expected_credential_generation');
     if (conditionalInstance) {
       if (!/^[A-Za-z0-9_-]{22}$/.test(req.body.expected_epoch || '')
@@ -440,7 +447,7 @@ function registerSessionRegisterRoute(app, { context, sessionStateManager, busCl
   });
 }
 
-function registerSessionRenameRoute(app, { context, sessionStateManager, busClients, getMailbox=()=>null }) {
+function registerSessionRenameRoute(app, { context, sessionStateManager, busClients, getMailbox=()=>null, clientProfiles = null }) {
   const { sessions, sessionCredentials, sidNonces, resolveSessionAlias, persistSessions } = context;
   app.patch('/api/sessions/:id', (req, res) => {
     const requestedId = req.params.id;
@@ -464,6 +471,10 @@ function registerSessionRenameRoute(app, { context, sessionStateManager, busClie
     if (identity.error) return res.status(400).json({ error: identity.error });
     const new_id = identity.value;
     if (Object.prototype.hasOwnProperty.call(sessions, new_id)) return res.status(409).json({ error: `Session ID '${new_id}' is already in use.` });
+    // Issue #144 (configured only): no rename INTO a configured client-profile namespace (profiles cannot PATCH at all).
+    if (clientProfiles && clientProfiles.reservesSessionId(new_id)) {
+      return res.status(403).json({ code: 'PROFILE_NAMESPACE_RESERVED', error: 'This id is reserved for a configured client profile.' });
+    }
 
     // Move session to new key (including state machine)
     Object.defineProperty(sessions, new_id, { value: session, enumerable: true, writable: true, configurable: true });

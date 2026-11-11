@@ -281,7 +281,9 @@
         "test/ledger-job-count-removal-1273-f3-relief-batches.test.js",
         "test/ledger-job-count-removal-1273-identity-fail-closed.test.js",
         "test/observe607-positive-control.test.js",
-        "test/daemon-harness-cleanup-1215.test.js"
+        "test/daemon-harness-cleanup-1215.test.js",
+        "test/client-profile-scope.test.js",
+        "test/client-profile-daemon.test.js"
       ]
     },
     "test:watch": {
@@ -778,7 +780,9 @@
         "test/ledger-job-count-removal-1273-f3-relief-batches.test.js",
         "test/ledger-job-count-removal-1273-identity-fail-closed.test.js",
         "test/observe607-positive-control.test.js",
-        "test/daemon-harness-cleanup-1215.test.js"
+        "test/daemon-harness-cleanup-1215.test.js",
+        "test/client-profile-scope.test.js",
+        "test/client-profile-daemon.test.js"
       ]
     },
     "test:ci:pty": {

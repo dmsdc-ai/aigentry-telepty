@@ -2411,6 +2411,9 @@ async function main() {
   // printing its own usage. Deliberately below the version check, which takes no argv.
   if (interceptHelp(cmd, args.slice(1))) return;
 
+  // Issue #144: local mint/check for client-profile-scope-v1. Never contacts a daemon, never edits the profiles file.
+  if (cmd === 'client-profile') { process.exitCode = require('./src/cli/client-profile').runClientProfileCommand(args.slice(1)); return; }
+
   if (cmd === 'approval-challenge' || (cmd === 'inject' && require('./src/cli/external-approval').approvalOptionRequested(args.slice(1)))) {
     process.exitCode = await require('./src/cli/external-approval').runApprovalCommand(cmd, args.slice(1), {
       daemonUrl, remoteHost: REMOTE_HOST, fetchWithAuth

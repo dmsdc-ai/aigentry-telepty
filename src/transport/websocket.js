@@ -956,6 +956,14 @@ function installWebSocketTransport(deps) {
       return;
     }
 
+    // Issue #144 (configured only): a client-profile credential never opens a WebSocket, whatever else rides along —
+    // refused on raw-header PRESENCE (an empty value counts) before the host-token / JWT comparison below.
+    if (deps.clientProfiles && require('../protocol/client-profiles').presentsClientToken(req)) {
+      refuseUpgrade(socket, 401, 'Unauthorized', 'PROFILE_WEBSOCKET_UNSUPPORTED',
+        'Client-profile credentials cannot open a WebSocket.');
+      return;
+    }
+
     const wsAuthHeader = req.headers['authorization'] || '';
     const wsJwtValid = wsAuthHeader.startsWith('Bearer ') && verifyJwt(wsAuthHeader.slice(7));
     if (token !== expectedToken && !wsJwtValid) {
@@ -965,6 +973,14 @@ function installWebSocketTransport(deps) {
     }
 
     if (url.pathname.startsWith('/api/sessions/')) {
+      // Issue #144 CF2 (configured only): an upgrade naming an ABSENT id would auto-register it on connect. Inside a
+      // configured client-profile namespace that is refused here, before the 101 — the same raw id expression the
+      // connection handler uses, so nothing is registered, attached or hinted to the ledger.
+      const upgradeId = url.pathname.split('/').pop();
+      if (deps.clientProfiles && !Object.prototype.hasOwnProperty.call(sessions, upgradeId) && deps.clientProfiles.reservesSessionId(upgradeId)) {
+        refuseUpgrade(socket, 403, 'Forbidden', 'PROFILE_NAMESPACE_RESERVED', 'This id is reserved for a configured client profile.');
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit('connection', ws, req);
       });

@@ -178,6 +178,9 @@ function runSubmitAll(sessionsMap) {
 
 function registerListRoute(app) {
 app.get('/api/sessions', (req, res) => {
+  // Issue #144: a client-profile caller gets `[{id}]` for its granted targets and its own fresh namespace only —
+  // never another session, and never deliveryEndpoint/delivery or any other field.
+  if (req.clientProfile) return res.json(require('../protocol/client-profiles').listForCaller(req.clientProfile, shared.sessions));
   const idleGt = req.query.idle_gt ? Number(req.query.idle_gt) : null;
   const now = Date.now();
   let list = Object.entries(shared.sessions).map(([id, session]) => serializeSession(id, session, { nowMs: now }));

@@ -2,6 +2,40 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.11.0 (candidate — not released)
+
+- **Opt-in client profiles (`client-profile-scope-v1`, issue #144 / Telesession issue16).** Off by default. With
+  nothing configured, every response is byte-identical to 0.10.1.
+  - **Enabling.** Set `TELEPTY_CLIENT_PROFILES_FILE`, or `clientProfilesFile` in `~/.telepty/config.json`, to a
+    private `telepty.client-profiles/v1` file. It is read with the existing authority-file reader: 64 KiB,
+    same-owner, no symlinks.
+  - **What it enforces.** Each assistant gets its own `x-telepty-client-token`. The daemon then enforces, per
+    credential and on a loopback socket only:
+    - one inbox namespace and exact granted targets;
+    - `GET /api/meta` (with a server-computed `caller`), a `[{id}]`-only session list, create-only aterm inbox
+      registration, exact-target inject with the live inbox bearer, exact audit reads (verified sender, no alias,
+      clamped to `not_before`), owned observations and owned delete.
+  - **Refusals.** Everything else, and every WebSocket, is refused before any effect. Mixed or duplicate
+    credential carriers are `400 CREDENTIAL_AMBIGUOUS`.
+  - **Rotation and revocation.** The file is re-read and hashed on every profile request, so rotation and
+    revocation need no restart. A broken file is `503 PROFILE_REGISTRY_UNAVAILABLE` for profiles only.
+  - **Startup.** A configured but invalid file, strict principal mode, or native Windows refuses daemon start.
+  - **Effect on host-token callers.** While configured, the only change is that they cannot create an id inside a
+    configured namespace by register, rename, spawn or WebSocket auto-register (`403 PROFILE_NAMESPACE_RESERVED`).
+  - **Re-granted prefixes.** A previous holder's still-live inbox is refused for audit reads
+    (`403 PROFILE_READ_DENIED`), including rows written after the re-grant. A grant whose `not_before` lies in the
+    future cannot create an inbox yet (`403 PROFILE_CREATE_DENIED`).
+  - **Observations.** A profile's own observation omits `superseded_by` from its current and every history entry,
+    so a later inject by another caller on a shared target never discloses that inject's id. The supersession
+    entry itself (`kind`, `trigger`, `seq`, `at`) stays visible; the host-token view and the ledger are unchanged.
+  - **CLI.** `telepty client-profile mint|check` mints tokens and validates the file locally.
+  - **Limits.** Same-uid credential theft, shared daemon capacity and revocation of already-admitted requests are
+    stated limits, not fixed (docs/client-profiles.md, BOUNDARY.md). No persistence, ledger or audit format
+    changes.
+- **Release metadata.** The packaged-consumer check (`scripts/check-package.mjs`) now pins `0.11.0`. The
+  version-identity test is re-based to 0.10.1 → 0.11.0; it still requires that only the version lines differ from
+  0.10.1, so no dependency or lockfile resolution changed.
+
 ## 0.10.1 (hotfix candidate)
 
 - **Mailbox locking handles a peer that finishes retiring its published ticket during a read.**

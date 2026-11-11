@@ -10,7 +10,7 @@ function createHttpApp({ express, cors }) {
 }
 
 function registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin, authorizeSessionRequest, principalAuthentication,
-  supervisionAuthentication = null }) {
+  supervisionAuthentication = null, clientProfileGate = null }) {
   // Health check – no auth required
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', version: pkg.version });
@@ -23,7 +23,8 @@ function registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, 
 
   // Authentication Middleware
   app.use(createAuthMiddleware({ isAllowedPeer, expectedToken: EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin, authorizeSessionRequest, principalAuthentication,
-    supervisionAuthentication: principalAuthentication ? null : supervisionAuthentication }));
+    supervisionAuthentication: principalAuthentication ? null : supervisionAuthentication,
+    ...(clientProfileGate ? { clientProfileGate } : {}) }));   // issue #144, opt-in only
 }
 
 module.exports = { createHttpApp, registerHealthAndAuth };

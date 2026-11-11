@@ -362,6 +362,24 @@ const supervisionAuthentication = require('./src/principal/http').createSupervis
 // Neither supervision variable may reach a spawned session (src/routes/spawn.js copies process.env).
 delete process.env.TELEPTY_SUPERVISION_TRUST_FILE;
 delete process.env.TELEPTY_SUPERVISION_CLIENT_FILE;
+// Issue #144 — opt-in `client-profile-scope-v1` (src/protocol/client-profiles.js). Unset ⇒ null, and nothing below
+// changes (no gate, no capability, no `caller`, no namespace reservation, no WebSocket check). Configured but unusable
+// (path, win32, strict-mode conflict, Darwin reader, unreadable/unsafe/invalid file) ⇒ throws here, so the daemon does
+// not start without the enforcement it was told to perform. Same env-then-config precedence as supervisionTrustFile.
+// Only when TELEPTY_AUTH_TOKEN skipped the config read and the config then cannot be read does the daemon start with
+// profiles OFF, saying the setting is UNAVAILABLE (a profile token then gets the legacy 401 — fail closed).
+const clientProfilesModule = require('./src/protocol/client-profiles');
+let clientProfiles;
+try {
+  clientProfiles = clientProfilesModule.createClientProfilesFromEnvironment({ env: process.env,
+    config: config === null ? undefined : config, loadConfig: () => supervisionConfig.readOperatorConfig() });
+} catch (err) {
+  if (err.code !== 'SUPERVISION_CONFIG_UNREADABLE') throw err;
+  console.error('[CLIENT-PROFILES] The telepty config could not be read and TELEPTY_AUTH_TOKEN supplied the secret, so the '
+    + 'daemon is starting with client profiles OFF: the clientProfilesFile setting is UNAVAILABLE, not absent.');
+  clientProfiles = null;
+}
+delete process.env.TELEPTY_CLIENT_PROFILES_FILE;
 const net = require('net');
 const fs = require('fs');
 const SESSION_PERSIST_PATH = sessionPersistence.defaultSessionPersistPath();
@@ -556,6 +574,9 @@ const isForbiddenOrigin = createOriginGuard(ALLOWED_ORIGINS);
 
 registerHealthAndAuth(app, { pkg, createAuthMiddleware, isAllowedPeer, EXPECTED_TOKEN, verifyJwt, isForbiddenOrigin, principalAuthentication,
   supervisionAuthentication,   // Task 1215 combined mode (HTTP only; WebSocket transport unchanged)
+  // Issue #144: only when configured. `sessions` is read lazily (declared below; requests arrive after listen).
+  ...(clientProfiles ? { clientProfileGate: clientProfilesModule.createClientProfileGate({ registry: clientProfiles,
+    sessions: () => sessions, credentials: sessionCredentials }) } : {}),
   authorizeSessionRequest: req => require('./src/mailbox/poll-session').authorizeMailboxRequest(req, sessions, sessionCredentials) });
 
 const { resolveBindPort } = require('./src/bind-port');
@@ -1650,7 +1671,7 @@ registerSpawnRoute(app, {
   ledgerLive: (sid, on) => ledgerClient.live(sid, on)   // #1207
 });
 
-registerSessionRegisterRoute(app, { context: sessionRecordContext, sessionStateManager, busClients, getMailbox: () => mailbox });
+registerSessionRegisterRoute(app, { context: sessionRecordContext, sessionStateManager, busClients, getMailbox: () => mailbox, clientProfiles });
 require('./src/routes/external-approval').registerExternalApprovalRoutes(app, { sessions });
 
 sessionInspection.registerListRoute(app);
@@ -1744,7 +1765,10 @@ app.get('/api/meta', (req, res) => {
     terminal: DETECTED_TERMINAL,
     // #137: bridge-stage-receipts-v1 = this daemon accepts owner-bound bridge_receipt/bridge_queue
     // frames and threads inject ids to the bridge. It says nothing about any one bridge's support.
-    capabilities: ['ssh-child-write-receipts-v1', 'bridge-stage-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session', 'daemon-graceful-stop-v1']
+    capabilities: ['ssh-child-write-receipts-v1', 'bridge-stage-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session', 'daemon-graceful-stop-v1',
+      ...(clientProfiles ? [clientProfilesModule.CAPABILITY] : [])],
+    // Issue #144 (configured only): server-computed from the verified credential, never echoed from the request.
+    ...(clientProfiles ? { caller: clientProfilesModule.callerView(req.clientProfile || null) } : {})
   });
 });
 
@@ -1930,6 +1954,12 @@ app.get('/api/inject-observations/:inject_id', async (req, res) => {
   // log order — identical to what the per-record append used to produce. Reads never reheat.
   const fetched = await fetchTrackedInjection(injectId);
   const record = fetched.record;
+  // Issue #144 (client-profile callers only): a record is the caller's iff its transport_source is a string in the
+  // caller's namespace AND it was created at/after the grant's not_before (missing field ⇒ foreign). Foreign, unknown,
+  // cold-offline and pre-not_before ids all get ONE byte-identical body — no existence oracle.
+  if (req.clientProfile && (!record || !clientProfilesModule.ownsObservationRecord(req.clientProfile, record))) {
+    return unavailable('not_observed_by_daemon_epoch');
+  }
   if (!record) {
     // Either it was never tracked here, or it predates this daemon's schema-v2 store, or its cold
     // file is beyond the resident index cap (`cold_offline`). All explicit, never by omission.
@@ -1955,9 +1985,17 @@ app.get('/api/inject-observations/:inject_id', async (req, res) => {
     : {
       status: 'not_established',
       basis: activePendingReport ? 'pending_report_belongs_to_other_inject' : 'no_active_pending_report',
-      ...(activePendingReport ? { active_inject_id: activePendingReport.injectId || null } : {}),
+      // Issue #144: a profile caller never learns another caller's inject id on a shared target (basis stays).
+      ...(activePendingReport && !req.clientProfile ? { active_inject_id: activePendingReport.injectId || null } : {}),
     };
   const last = record.last_observation || { kind: 'tracking_started', trigger: 'inject_accepted' };
+  // Issue #144 (ci708 D36): a profile caller's supersession entries omit `superseded_by` (another inject's id). Copies
+  // only — the ledger record is never mutated; kind/trigger/seq/at stay. The E1 view is the record as stored.
+  const profileEntry = (entry) => {
+    if (!entry || typeof entry !== 'object' || !Object.prototype.hasOwnProperty.call(entry, 'superseded_by')) return entry;
+    const { superseded_by: _supersededBy, ...rest } = entry;
+    return rest;
+  };
 
   return res.status(200).json({
     type: 'task_completion_unknown',
@@ -1969,9 +2007,9 @@ app.get('/api/inject-observations/:inject_id', async (req, res) => {
     // #843 — `aborted` travels too. Collapsing it into `tracked` would put a dispatch that
     // delivered zero bytes back into the in-flight bucket the abort exists to take it out of.
     tracking_state: ['superseded', 'aborted'].includes(record.tracking_state) ? record.tracking_state : 'tracked',
-    observation: last,
+    observation: req.clientProfile ? profileEntry(last) : last,
     observation_seq: record.observation_seq,
-    observations: record.observations || [],
+    observations: req.clientProfile ? (record.observations || []).map(profileEntry) : (record.observations || []),
     consumption,
     session_epoch: record.session_epoch,
     session_epoch_reason: record.session_epoch_reason,
@@ -2045,7 +2083,7 @@ app.delete('/api/pendingReports/:id', (req, res) => {
 // GET /api/sessions/:id/screen — read current screen buffer
 app.get('/api/sessions/:id/screen', require('./src/routes/session-screen').createScreenHandler({ sessions, resolveSessionAlias }));
 
-registerSessionRenameRoute(app, { context: sessionRecordContext, sessionStateManager, busClients,getMailbox:()=>mailbox });
+registerSessionRenameRoute(app, { context: sessionRecordContext, sessionStateManager, busClients,getMailbox:()=>mailbox, clientProfiles });
 
 sessionActions.registerKillRoute(app);
 
@@ -2552,6 +2590,7 @@ if (server) server.on('error', async (error) => {
 
 const websocketTransport = installWebSocketTransport({
   principalAuthentication,
+  clientProfiles,   // issue #144: null unless configured
   server,
   tailnetServer,
   sessions,

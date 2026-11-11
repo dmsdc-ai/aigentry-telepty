@@ -207,6 +207,13 @@ function createAuthMiddleware(options) {
       return res.status(403).json(PEER_DENIED);
     }
 
+    // Issue #144 client-profile-scope-v1 (opt-in; absent ⇒ this branch does not exist). A request that presents
+    // the profile carrier is decided ONLY by the profile gate (src/protocol/client-profiles.js): it never reaches
+    // the strict, host-token, JWT, session-bearer or admitOrdinary branches below.
+    if (options.clientProfileGate && options.clientProfileGate.presentsClientToken(req)) {
+      return options.clientProfileGate.handle(req, res, next);
+    }
+
     if (options.principalAuthentication) {
       const result = options.principalAuthentication.authorize(req);
       if (result.ok) return next();
