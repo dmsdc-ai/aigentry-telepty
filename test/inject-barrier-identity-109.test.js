@@ -196,7 +196,12 @@ test('#109(b): queued callers are delivered in arrival order, each text followed
         queue_wait_ms: r.body && Number.isSafeInteger(r.body.queue_wait_ms) ? r.body.queue_wait_ms : null });
       return r;
     }));
-    await sleep(30);
+    // Arrival order must be known, not assumed: the daemon's pre-barrier work (modal check) varies per request and took
+    // ~100 ms on loaded macOS runners, so 30 ms spacing let f3 overtake f2. f2 is issued only once f1's text frame shows
+    // f1 holds the barrier (its CR follows after the 500 ms submit delay); f3 follows 200 ms later, which exceeds f2's
+    // pre-barrier latency yet stays well inside f1's submit delay, so both still queue behind f1's CR.
+    if (p === 'f1') await waitFor(() => frames.includes('f1'), { timeoutMs: 5000, description: "f1's text (barrier held)" });
+    else if (p === 'f2') await sleep(200);
   }
   const results = await Promise.all(pending);
   if (results.some((r) => r.status !== 200)) diagnose('fifo_results');
