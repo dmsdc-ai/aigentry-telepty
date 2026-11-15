@@ -285,6 +285,20 @@ function installWebSocketTransport(deps) {
     }
 
     const activeSession = sessions[sessionId];
+    // Task 1270: this socket is bound to the record OBJECT it was admitted to, not to the URL name.
+    // A supported rename (PATCH /api/sessions/:id) files that same object under a new key and sets
+    // its id; follow it only while the object is filed there, and never resolve the old name again.
+    let boundRecord = activeSession;
+    let boundId = sessionId;
+    function liveRecord() {
+      if (typeof boundRecord.id === 'string' && boundRecord.id !== boundId) {
+        if (Object.getOwnPropertyDescriptor(sessions, boundRecord.id)?.value !== boundRecord) return null;
+        boundId = boundRecord.id;
+      }
+      const live = Object.hasOwn(sessions, boundId) ? sessions[boundId] : null;
+      if (live) boundRecord = live;   // #732 H5: a record replaced under this name stays the routing authority
+      return live;
+    }
     if (activeSession.isClosing) {
       activeSession.clients.delete(ws);
       clearInterval(pingInterval);
@@ -553,8 +567,9 @@ function installWebSocketTransport(deps) {
         // injects keep routing to the live record's ownerWs. That is a silent upstream death
         // with a working downstream, i.e. #732 again by a different route. Re-resolve the
         // live record on every frame so the snapshot can never become the routing authority.
-        const activeSession = sessions[sessionId];
+        const activeSession = liveRecord();   // Task 1270: follows a supported rename of the admitted record
         if (!activeSession || activeSession.isClosing) return;   // no owner reclaims or writes during teardown
+        const sessionId = boundId;   // Task 1270: the record's current name for every use below
 
         // An owner whose record was swapped re-adopts a FREE owner slot rather than silently
         // degrading into a viewer (the viewer branch drops 'output' entirely). Same
@@ -771,8 +786,9 @@ function installWebSocketTransport(deps) {
       // re-resolves it — cleaning only the connect-time snapshot would leave a replaced
       // record holding a closed ownerWs forever. The `ws === ownerWs` check below still
       // guarantees a stale socket can never tear down an owner it does not own.
-      const activeSession = sessions[sessionId];
+      const activeSession = liveRecord();   // Task 1270: same binding as the message handler
       if (!activeSession) return;
+      const sessionId = boundId;
       activeSession.clients.delete(ws);
 
       // #60 Stage A §3 item 3 — a DISPLACED owner closing is the assignee going away. It cannot

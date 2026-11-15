@@ -148,7 +148,13 @@ function fakeWorld(options = {}) {
         files.set(p, String(contents));
       },
       mkdirSync: (p) => { calls.mkdirs.push(p); },
-      rmSync: (p) => { calls.removals.push(p); files.delete(p); }
+      rmSync: (p) => { calls.removals.push(p); files.delete(p); },
+      // #1270 FAKE realpath (labeled fixture, not the host fs): only paths the case maps resolve; others are ENOENT.
+      realpathSync: (p) => {
+        const map = options.realpaths || {};
+        if (Object.hasOwn(map, p)) return map[p];
+        throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+      }
     },
     execFileSync: (cmd, argv) => {
       const record = [cmd, ...(argv || [])];
@@ -1487,4 +1493,71 @@ test('confirmation: Windows task XML is queried again and a replacement is never
   assert.equal(result.reason, 'plan-changed');
   assert.ok(world.calls.exec.filter(call => call[1] === '/query').length >= 2);
   assert.ok(!world.calls.exec.some(call => ['/end', '/delete'].includes(call[1])));
+});
+
+// ── #1270: the legacy install.sh LaunchAgent [<prefix>/bin/telepty, daemon] ──────
+// FIXTURE ONLY: the plist, realpath map and launchctl are fakes. These cases prove the classification and the
+// commands we would issue; they are not evidence that a native launchd accepts or runs the job.
+
+const BIN_LINK = '/opt/prefix/bin/telepty';
+function legacyPlist(args, label = 'com.aigentry.telepty') {
+  return `<?xml version="1.0"?><plist><dict><key>Label</key><string>${label}</string>
+<key>ProgramArguments</key><array>${args.map((a) => `<string>${a}</string>`).join('')}</array>
+<key>KeepAlive</key><true/></dict></plist>`;
+}
+const OWN_LINK = { [BIN_LINK]: CLI_JS, [CLI_JS]: CLI_JS };
+
+test('#1270: a two-argument plist whose executable resolves to THIS cli.js is ours (drifted) and controllable', async () => {
+  const plist = legacyPlist([BIN_LINK, 'daemon']);
+  const fsSeam = fakeWorld({ realpaths: OWN_LINK }).deps.fs;
+  assert.equal(classifyDescriptor(plist, 'launchd', { nodeBin: NODE_BIN, cliJs: CLI_JS, fs: fsSeam }), 'drifted');
+  // The three-argument forms keep their exact prior verdicts.
+  assert.equal(classifyDescriptor(expectedPlist(), 'launchd', { nodeBin: NODE_BIN, cliJs: CLI_JS, text: expectedPlist(), fs: fsSeam }), 'managed');
+  assert.equal(classifyDescriptor(expectedPlist({ nodeBin: '/usr/bin/node' }), 'launchd', { nodeBin: NODE_BIN, cliJs: CLI_JS, fs: fsSeam }), 'drifted');
+
+  const statusWorld = macWorld({ plist, loaded: false, realpaths: OWN_LINK, deps: { getDaemonMeta: silent() } });
+  const status = await getServiceStatus(statusWorld.deps);
+  assert.equal(status.descriptor.ownership, 'drifted');
+  assert.ok(status.remedies.includes('telepty service restart'));
+  assert.ok(status.remedies.includes('telepty service install'));
+  assert.equal(status.exitCode, SERVICE_EXIT.DEGRADED);
+
+  // The remedy the status names must be an action the product will actually take (no foreign-descriptor refusal).
+  const expectedCalls = {
+    start: [['launchctl', 'kickstart', TARGET]],
+    stop: [['launchctl', 'bootout', TARGET]],
+    restart: [['launchctl', 'kickstart', '-k', TARGET]]
+  };
+  for (const verb of ['start', 'stop', 'restart']) {
+    const world = macWorld({ plist, loaded: true, realpaths: OWN_LINK, deps: { getDaemonMeta: answering() } });
+    const result = await runServiceVerb(verb, CONSENTED, world.deps);
+    assert.notEqual(result.reason, 'foreign-descriptor', verb);
+    assert.deepEqual(mutatingCalls(world.calls), expectedCalls[verb], verb);
+    assert.equal(world.files.get(PLIST_PATH), plist, `${verb} must not rewrite the descriptor`);
+  }
+});
+
+test('#1270: same basename, wrong target, label or shape stays foreign and every verb is refused before launchctl', async () => {
+  const cases = {
+    'basename telepty resolving to another cli.js': [legacyPlist([BIN_LINK, 'daemon']), { [BIN_LINK]: '/opt/foreign/cli.js', [CLI_JS]: CLI_JS }],
+    'symlink chain into a lookalike package path': [legacyPlist([BIN_LINK, 'daemon']), { [BIN_LINK]: '/tmp/x/aigentry-telepty/cli.js', [CLI_JS]: CLI_JS }],
+    'unresolvable executable': [legacyPlist([BIN_LINK, 'daemon']), { [CLI_JS]: CLI_JS }],
+    'own entrypoint under a different label': [legacyPlist([BIN_LINK, 'daemon'], 'com.example.other'), OWN_LINK],
+    'own entrypoint, extra argument': [legacyPlist([BIN_LINK, 'daemon', '--x']), OWN_LINK],
+    'own entrypoint, different subcommand': [legacyPlist([BIN_LINK, 'serve']), OWN_LINK],
+    'relative executable path': [legacyPlist(['telepty', 'daemon']), { telepty: CLI_JS, [CLI_JS]: CLI_JS }]
+  };
+  for (const [name, [plist, realpaths]] of Object.entries(cases)) {
+    const fsSeam = fakeWorld({ realpaths }).deps.fs;
+    assert.equal(classifyDescriptor(plist, 'launchd', { nodeBin: NODE_BIN, cliJs: CLI_JS, fs: fsSeam }), 'foreign', name);
+    for (const verb of ['start', 'stop', 'restart', 'uninstall']) {
+      const world = macWorld({ plist, loaded: true, realpaths });
+      const result = await runServiceVerb(verb, CONSENTED, world.deps);
+      assert.equal(result.reason, 'foreign-descriptor', `${name}: ${verb}`);
+      assert.deepEqual(mutatingCalls(world.calls), [], `${name}: ${verb} drove a job it does not own`);
+      assert.deepEqual(world.calls.removals, [], `${name}: ${verb}`);
+    }
+  }
+  // No fs seam (e.g. src/uninstall.js's call) cannot establish provenance: still foreign.
+  assert.equal(classifyDescriptor(legacyPlist([BIN_LINK, 'daemon']), 'launchd', { cliJs: CLI_JS }), 'foreign');
 });
