@@ -151,6 +151,111 @@ function api(port, home) {
   };
 }
 
+// Task 1270 — opt-in request observation for startProxy (`observe: true`; absent ⇒ the proxy is unchanged).
+// Each client→daemon connection is framed as HTTP/1.1: a request head is buffered to its CRLFCRLF (≤ 16 KiB), then forwarded
+// unchanged; the body is framed by Content-Length. Recorded per request: { conn, method, path (query stripped), upgrade } —
+// never headers, bodies, tokens or prompt data. An Upgrade request turns the connection into opaque pass-through (WS frames are
+// never parsed); Transfer-Encoding, a bad Content-Length or an oversize/malformed head do too and count in unparsed(), so a test
+// can require that framing never fell back. Two single-shot, exactly-one-request seams:
+//   holdNextRequest({method, path})  — the next matching request (and every later byte of its connection) is queued at the proxy
+//                                       until releaseHeldRequests(); heldCount() counts requests ever held.
+//   failNextResponse({method, path}) — once the next matching request has been fully forwarded, the first daemon→client bytes on
+//                                       that connection are its response: only the status code is read, the bytes are NOT
+//                                       forwarded, and that connection pair is destroyed (the daemon answered, the client never
+//                                       learns how). Recorded in faults().
+const OBSERVE_HEAD_MAX = 16 * 1024;
+const OBSERVE_RECORDS_MAX = 1000;
+function createRequestObserver() {
+  const records = [];
+  const faults = [];
+  const taps = new Set();
+  let overflow = false; let unparsed = 0; let heldTotal = 0; let nextConn = 0;
+  let holdArm = null; let faultArm = null;
+  const matches = (arm, entry) => !!arm && arm.method === entry.method && arm.path === entry.path;
+  const arm = (spec) => {
+    if (!spec || typeof spec.method !== 'string' || typeof spec.path !== 'string') throw new TypeError('startProxy observe: {method, path} strings required');
+    return { method: spec.method, path: spec.path };
+  };
+  function connection(forward, destroyPair) {
+    const conn = ++nextConn;
+    let mode = 'head'; let head = Buffer.alloc(0); let remaining = 0;
+    let holding = false; let disposed = false; const queue = [];
+    let faultPending = null; let faultArmed = null;
+    const emit = (b) => { if (b.length === 0) return; if (holding) queue.push(b); else forward(b); };
+    const complete = () => { if (faultPending) { faultArmed = faultPending; faultPending = null; } mode = 'head'; };
+    const opaque = (rest, fallback) => { if (fallback) unparsed++; mode = 'opaque'; emit(rest); };
+    function feed(chunk) {
+      let buf = chunk;
+      while (buf.length > 0) {
+        if (mode === 'opaque') { emit(buf); return; }
+        if (mode === 'body') {
+          const n = Math.min(remaining, buf.length);
+          emit(buf.subarray(0, n)); remaining -= n; buf = buf.subarray(n);
+          if (remaining === 0) complete();
+          continue;
+        }
+        const joined = head.length ? Buffer.concat([head, buf]) : buf;
+        const end = joined.indexOf('\r\n\r\n');
+        if (end === -1) {
+          if (joined.length > OBSERVE_HEAD_MAX) { head = Buffer.alloc(0); opaque(joined, true); return; }
+          head = Buffer.from(joined); return;
+        }
+        const headBytes = joined.subarray(0, end + 4);
+        buf = joined.subarray(end + 4);
+        head = Buffer.alloc(0);
+        const lines = headBytes.toString('latin1').split('\r\n');
+        const line = /^([A-Z]+) (\S+) HTTP\/1\.[01]$/.exec(lines[0]);
+        if (!line) { opaque(Buffer.concat([headBytes, buf]), true); return; }
+        let length = 0; let framed = true; let upgrade = false;
+        for (const h of lines.slice(1)) {
+          const i = h.indexOf(':');
+          if (i <= 0) continue;
+          const name = h.slice(0, i).trim().toLowerCase(); const value = h.slice(i + 1).trim();
+          if (name === 'content-length') { if (/^\d+$/.test(value)) length = Number(value); else framed = false; }
+          else if (name === 'transfer-encoding') framed = false;
+          else if (name === 'upgrade') upgrade = true;
+        }
+        const entry = { conn, method: line[1], path: line[2].split('?')[0], upgrade };
+        if (records.length < OBSERVE_RECORDS_MAX) records.push(entry); else overflow = true;
+        if (matches(holdArm, entry)) { holdArm = null; holding = true; heldTotal++; }
+        if (matches(faultArm, entry)) { faultArm = null; faultPending = entry; }
+        emit(headBytes);
+        if (upgrade) { opaque(buf, false); return; }
+        if (!framed) { opaque(buf, true); return; }
+        if (length > 0) { mode = 'body'; remaining = length; } else complete();
+      }
+    }
+    function intercept(chunk) {
+      if (!faultArmed) return false;
+      const entry = faultArmed; faultArmed = null;
+      const status = /^HTTP\/1\.[01] (\d{3})/.exec(chunk.subarray(0, 32).toString('latin1'));
+      faults.push({ conn, method: entry.method, path: entry.path, status: status ? Number(status[1]) : null });
+      destroyPair();
+      return true;
+    }
+    const tap = {
+      feed, intercept,
+      release() { if (!holding) return; holding = false; if (!disposed) for (const b of queue.splice(0)) forward(b); },
+      dispose() { disposed = true; queue.length = 0; taps.delete(tap); }
+    };
+    taps.add(tap);
+    return tap;
+  }
+  return {
+    connection,
+    api: {
+      requests: () => records.map(r => ({ ...r })),
+      faults: () => faults.map(f => ({ ...f })),
+      unparsed: () => unparsed,
+      overflow: () => overflow,
+      heldCount: () => heldTotal,
+      holdNextRequest(spec) { holdArm = arm(spec); },
+      failNextResponse(spec) { faultArm = arm(spec); },
+      releaseHeldRequests() { for (const tap of [...taps]) tap.release(); }
+    }
+  };
+}
+
 // Controllable TCP proxy for socket-level levers (blackhole a direction without
 // FIN/RST, drop connections while staying bound, or delay one direction).
 //
@@ -164,8 +269,9 @@ function api(port, home) {
 // It has to be upgrade-only: holding the whole bridge->daemon direction also starves the
 // CLI's own HTTP health/version probes, and the CLI then concludes the daemon is broken and
 // goes off to restart it — which tests daemon management, not this pipe.
-function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0, manualHoldWsUpgrade = false }) {
+function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0, manualHoldWsUpgrade = false, observe = false }) {
   const pairs = new Set();
+  const observer = observe ? createRequestObserver() : null;   // Task 1270 (see createRequestObserver)
   const upgradeReleases = [];
   let upgradesReleased = false;
   const state = { up: true, down: true }; // up = bridge->daemon, down = daemon->bridge
@@ -177,6 +283,8 @@ function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0,
     // and null once it is a straight pass-through (either plain HTTP or the hold expired).
     let held = null;
     let sniffed = !manualHoldWsUpgrade && holdWsUpgradeMs <= 0;
+    const forward = (c) => { if (held) held.push(c); else upstream.write(c); };
+    const tap = observer ? observer.connection(forward, () => bye()) : null;
     client.on('data', (c) => {
       if (!state.up) return;
       if (!sniffed) {
@@ -193,10 +301,11 @@ function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0,
           else setTimeout(release, holdWsUpgradeMs).unref();
         }
       }
-      if (held) held.push(c); else upstream.write(c);
+      if (tap) tap.feed(c); else forward(c);
     });
-    upstream.on('data', (c) => { if (state.down) client.write(c); });
+    upstream.on('data', (c) => { if (state.down && !(tap && tap.intercept(c))) client.write(c); });
     const bye = () => {
+      if (tap) tap.dispose();
       pairs.delete(pair);
       try { client.destroy(); } catch { /* already gone */ }
       try { upstream.destroy(); } catch { /* already gone */ }
@@ -220,7 +329,8 @@ function startProxy({ targetPort, targetHost = '127.0.0.1', holdWsUpgradeMs = 0,
       }
       pairs.clear();
     },
-    close() { this.dropConnections(); server.close(); }
+    close() { this.dropConnections(); server.close(); },
+    ...(observer ? observer.api : {})
   };
 }
 

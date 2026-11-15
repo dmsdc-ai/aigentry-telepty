@@ -4,22 +4,24 @@
 // (canonical loopback only, one authenticated /api/meta check, first register create_only:true, NEVER ensureDaemonRunning),
 // and non-deleting viewer detach for wrapped sessions on both attach paths. Contract: output/SPEC.md.
 //
-// Written BEFORE the production change; the coder did not execute it. The tester runs it: RED on 352d2dd (the exports and
-// verbs do not exist; attach DELETEs a wrapped record), GREEN on the candidate.
+//
+// Written BEFORE the production change; the coder did not execute it. A failure on 352d2dd that is only a missing export or
+// an unknown verb is NOT product evidence; the meaningful checks are the observable CLI/daemon effects in Part 2.
 //
 // Part 1 (in-process) drives the real production exports of cli.js with injected fetch/writers — no listener, no process.
-// Part 2 (process + local fake daemon, CI only) runs the real cli.js against a recording 127.0.0.1 http/ws fake: every request
-// the CLI makes is recorded, so "zero requests", "only GET /api/meta", "no DELETE" and "no daemon repair path" are observed on
-// the wire, not inferred. Declared fakes: the daemon (http + ws), the wrapped application (a node one-liner that writes a
-// marker file), HOME (mkdtemp). No real daemon, provider, model or service is touched.
+// Part 2 (process, CI only) runs the real cli.js against a REAL isolated daemon (test-support/daemon-harness startTestDaemon:
+// daemon.js on 127.0.0.1 PORT=0, mkdtemp HOME, daemon-minted synthetic token) and, where a connection has to be cut or
+// silenced, the existing byte pass-through test-support/bridge-pipe-harness startProxy. No test-owned HTTP/WS server.
+// With `observe: true` that proxy records each CLI request's method + path (query stripped; no headers/bodies/tokens) and offers
+// two per-request seams: hold one matching request, or swallow one matching request's response after the daemon answered it.
+// Observable evidence: the CLI's requests on the wire, CLI exit/stdout/stderr, the app marker file, the daemon's own session
+// records and register log lines, and the daemon's instance_id (never restarted). Declared fakes: the wrapped application only.
 // This slice cannot prove native identity, custody or full no-kill acceptance.
-
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const http = require('node:http');
 const { spawn } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -156,80 +158,58 @@ test('1270 viewer close decision: wrapped / absent / untyped are never deleted; 
   assert.equal(d([{ id: 'a', type: 'aterm', active_clients: 0 }], 'a'), 'destroy');
 });
 
-// ── Part 2: process + local fake daemon (CI only; not executed by the coder) ──────────────────────────────────────────
+// ── Part 2: process + real isolated daemon (CI only; not executed by the coder) ────────────────────────────────────────
 
-let WebSocketServer = null;
-try { ({ WebSocketServer } = require('ws')); } catch { /* reported as skip below */ }
+const { startTestDaemon, waitFor } = require('../test-support/daemon-harness');
+const { startProxy } = require('../test-support/bridge-pipe-harness');
 let pty = null;
 try { pty = require('node-pty'); } catch { /* reported as skip below */ }
-const PROCESS_SKIP = WebSocketServer ? false : 'ws not installed';
-const PTY_SKIP = WebSocketServer && pty && process.platform !== 'win32' ? false : 'requires ws + node-pty on a POSIX host';
+const PTY_SKIP = pty && process.platform !== 'win32' ? false : 'requires node-pty on a POSIX host';
 
-// A recording fake daemon. `opts.meta` → /api/meta reply; `opts.register(body, state)` → { status, body } or 'drop';
-// `opts.sessions(state)` → GET /api/sessions body. WS upgrades are recorded; owner claims receive owner_token.
-async function startFakeDaemon(t, opts = {}) {
-  const seen = []; const registers = []; const upgrades = []; const ownerSockets = []; const viewerSockets = [];
-  const state = { exists: new Set() };
-  const server = http.createServer((req, res) => {
-    let raw = '';
-    req.on('data', c => { raw += c; });
-    req.on('end', () => {
-      const url = new URL(req.url, 'http://127.0.0.1');
-      seen.push([req.method, url.pathname]);
-      res.setHeader('Content-Type', 'application/json');
-      if (req.method === 'GET' && url.pathname === '/api/meta') {
-        const meta = typeof opts.meta === 'function' ? opts.meta() : (opts.meta || { status: 200, body: { version: '0.11.0', capabilities: REQUIRED_CAPS } });
-        if (meta === 'hang') return;   // never answers: the CLI's own bound must end it
-        res.statusCode = meta.status; res.end(typeof meta.body === 'string' ? meta.body : JSON.stringify(meta.body)); return;
-      }
-      if (req.method === 'POST' && url.pathname === '/api/sessions/register') {
-        const body = JSON.parse(raw);
-        registers.push(body);
-        const r = opts.register ? opts.register(body, state) : (() => {
-          if (body.create_only === true && state.exists.has(body.session_id)) {
-            return { status: 409, body: { success: false, code: 'SESSION_EXISTS', error: 'Session already exists; create_only refused it unchanged.', session_id: body.session_id } };
-          }
-          state.exists.add(body.session_id);
-          return { status: 200, body: { success: true, session_id: body.session_id } };
-        })();
-        if (r === 'drop') { req.socket.destroy(); return; }
-        res.statusCode = r.status; res.end(JSON.stringify(r.body)); return;
-      }
-      if (req.method === 'GET' && url.pathname === '/api/sessions') {
-        res.statusCode = 200; res.end(JSON.stringify(opts.sessions ? opts.sessions(state) : [])); return;
-      }
-      res.statusCode = 404; res.end(JSON.stringify({ error: 'not in fake' }));
-    });
-  });
-  const wss = WebSocketServer ? new WebSocketServer({ noServer: true }) : null;
-  server.on('upgrade', (req, socket, head) => {
-    const url = new URL(req.url, 'http://127.0.0.1');
-    const owner = url.searchParams.get('owner') === '1';
-    upgrades.push({ path: url.pathname, owner });
-    wss.handleUpgrade(req, socket, head, ws => {
-      if (owner) { ownerSockets.push(ws); ws.send(JSON.stringify({ type: 'owner_token', token: `owner-${ownerSockets.length}` })); }
-      else { viewerSockets.push(ws); if (opts.onViewer) opts.onViewer(ws); }
-      ws.on('error', () => {});
-    });
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(async () => {
-    for (const ws of [...ownerSockets, ...viewerSockets]) { try { ws.terminate(); } catch {} }
-    if (wss) wss.close();
-    server.closeAllConnections?.();
-    await new Promise(resolve => server.close(resolve));
-  });
-  return { port: server.address().port, seen, registers, upgrades, ownerSockets, viewerSockets, state };
+async function realDaemon(t) {
+  const daemon = await startTestDaemon();
+  t.after(() => daemon.stop());
+  return daemon;
 }
+// The existing pass-through proxy in front of the real daemon, observing (method + path per request, per connection).
+async function proxyTo(t, daemon) {
+  const proxy = startProxy({ targetPort: daemon.port, targetHost: daemon.host, observe: true });
+  const port = await proxy.listen();
+  t.after(() => proxy.close());
+  return { proxy, port };
+}
+// What the CLI put on the wire through this proxy: [[METHOD, path], ...] in arrival order; framing must never have fallen back.
+function wire(proxy) {
+  assert.equal(proxy.unparsed(), 0, 'PRECONDITION: every connection was framed (no opaque fallback)');
+  assert.equal(proxy.overflow(), false, 'PRECONDITION: observation not truncated');
+  return proxy.requests().map(r => [r.method, r.path]);
+}
+const META = ['GET', '/api/meta'];
+const REGISTER = ['POST', '/api/sessions/register'];
+const countOf = (proxy, [method, p]) => wire(proxy).filter(([m, x]) => m === method && x === p).length;
+async function daemonInstance(daemon) {
+  const meta = await daemon.request('/api/meta');
+  assert.equal(meta.status, 200, 'PRECONDITION: the harness daemon answers its own meta');
+  return { pid: meta.body.pid, instance_id: meta.body.instance_id };
+}
+async function sessionRecord(daemon, sid) {
+  const r = await daemon.request(`/api/sessions/${encodeURIComponent(sid)}`);
+  return r.status === 200 ? r.body : null;
+}
+const daemonOut = daemon => daemon.getLogs().stdout;
+const occurrences = (text, needle) => text.split(needle).length - 1;
+const registeredLine = sid => `[REGISTER] Registered wrapped session ${sid} `;
+const reregisteredLine = sid => `[REGISTER] Re-registered session ${sid} `;
 
 function tmpHome(t, tag) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), `telepty-1270-${tag}-`));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   return home;
 }
-function cliEnv(home, port, extra = {}) {
-  const env = { ...process.env, HOME: home, USERPROFILE: home, TELEPTY_AUTH_TOKEN: 'private-fixture-token-1270',
-    TELEPTY_PORT: String(port), NO_UPDATE_NOTIFIER: '1', TELEPTY_DISABLE_UPDATE_NOTIFIER: '1', ...extra };
+// The CLI uses the daemon's HOME (its daemon-minted config token), as test/cli.test.js does, unless a test overrides it.
+function cliEnv(daemon, port, extra = {}) {
+  const env = { ...process.env, HOME: daemon.homeDir, USERPROFILE: daemon.homeDir, TELEPTY_PORT: String(port),
+    NO_UPDATE_NOTIFIER: '1', TELEPTY_DISABLE_UPDATE_NOTIFIER: '1', ...extra };
   for (const k of ['TELEPTY_HOST', 'TELEPTY_SESSION_ID', 'TELEPTY_SESSION_TOKEN', 'TELEPTY_PRINCIPAL_CLIENT_FILE', 'TELEPTY_SUPERVISION_CLIENT_FILE',
     'TELEPTY_HANDOFF_CREDENTIAL_FILE', 'TELEPTY_SESSION_CREDENTIAL_REFRESH', 'TELEPTY_COOPERATIVE_HANDOFF']) if (!(k in extra)) delete env[k];
   return env;
@@ -248,167 +228,219 @@ function runCli(argv, env, { timeoutMs = 15000 } = {}) {
 function appArgs(marker) {
   return [process.execPath, '-e', `require('fs').appendFileSync(${JSON.stringify(marker)}, 'started\\n'); setInterval(() => {}, 1000);`];
 }
-async function waitFor(fn, { timeoutMs = 10000, description = 'condition' } = {}) {
-  const end = Date.now() + timeoutMs;
-  for (;;) {
-    const v = await fn();
-    if (v) return v;
-    if (Date.now() > end) throw new Error(`timed out waiting for ${description}`);
-    await new Promise(r => setTimeout(r, 50));
-  }
-}
-const FORBIDDEN_DAEMON_MANAGEMENT = ['/api/health', '/api/daemon/stop', '/api/daemon/graceful-stop', '/api/shutdown'];
-function assertNoDaemonManagement(seen) {
-  for (const [method, p] of seen) {
-    assert.ok(!FORBIDDEN_DAEMON_MANAGEMENT.includes(p) && !p.includes('stop') && !p.includes('restart') && !p.includes('purge'),
-      `no daemon repair/stop/purge request: ${method} ${p}`);
-    assert.notEqual(method, 'DELETE', `no DELETE: ${p}`);
-  }
-}
+function uniqueSid(tag) { return `boot1270-${tag}-${process.pid}-${Date.now().toString(36)}`; }
 
-test('1270 process: `telepty boot-capabilities` prints the sealed line, exit 0, zero requests, no HOME writes', { skip: PROCESS_SKIP }, async t => {
-  const daemon = await startFakeDaemon(t);
+test('1270 process: `telepty boot-capabilities` puts zero requests on the wire and touches no HOME', async t => {
+  const daemon = await realDaemon(t);
+  const before = await daemonInstance(daemon);
+  const { proxy, port } = await proxyTo(t, daemon);
   const home = tmpHome(t, 'caps');
-  const r = await runCli(['boot-capabilities'], cliEnv(home, daemon.port));
+  const r = await runCli(['boot-capabilities'], cliEnv(daemon, port, { HOME: home, USERPROFILE: home }));
   assert.equal(r.code, 0, r.stderr);
   assert.equal(r.stdout, `${SEALED_LINE}\n`);
   assert.equal(cli.parseBootCapabilities(r.stdout, r.code).supported, true);
-  assert.deepEqual(daemon.seen, []);
-  assert.deepEqual(daemon.upgrades, []);
   assert.deepEqual(fs.readdirSync(home), [], 'no config, credential or state file created');
-  const bad = await runCli(['boot-capabilities', '--json'], cliEnv(home, daemon.port));
+  const bad = await runCli(['boot-capabilities', '--json'], cliEnv(daemon, port, { HOME: home, USERPROFILE: home }));
   assert.equal(bad.code, 2);
   assert.equal(bad.stdout, '');
   assert.equal(cli.parseBootCapabilities(bad.stdout, bad.code).supported, false);
+  assert.deepEqual(wire(proxy), [], 'zero requests');
+  assert.deepEqual(await daemonInstance(daemon), before, 'daemon not restarted');
 });
 
-test('1270 process: an unknown verb answers with help + exit 0 (the old-CLI shape) and the validator calls it unsupported', { skip: PROCESS_SKIP }, async t => {
-  const daemon = await startFakeDaemon(t);
-  const home = tmpHome(t, 'oldhelp');
+test('1270 process: an unknown verb answers with help + exit 0 (the old-CLI shape) and the validator calls it unsupported', async t => {
+  const daemon = await realDaemon(t);
   // This is exactly what a pre-1270 CLI does for `telepty boot-capabilities`: fall through main() to the global help.
-  const r = await runCli(['boot-capabilities-unknown-1270'], cliEnv(home, daemon.port));
+  const r = await runCli(['boot-capabilities-unknown-1270'], cliEnv(daemon, daemon.port));
   assert.equal(r.code, 0, 'PRECONDITION: the help fallthrough exits 0 — the hazard the discriminator exists for');
   assert.match(r.stdout, /Session Management/);
   assert.equal(cli.parseBootCapabilities(r.stdout, r.code).supported, false);
 });
 
-test('1270 process: allow-create-v1 refuses a non-canonical / remote TELEPTY_HOST with zero requests and no app', { skip: PROCESS_SKIP }, async t => {
-  const daemon = await startFakeDaemon(t);
+test('1270 process: allow-create-v1 refuses a non-canonical / remote TELEPTY_HOST with zero requests; nothing registered, no app', async t => {
+  const daemon = await realDaemon(t);
+  const before = await daemonInstance(daemon);
+  const { proxy, port } = await proxyTo(t, daemon);
   const home = tmpHome(t, 'remote');
   const marker = path.join(home, 'app-marker');
-  for (const host of [`localhost:${daemon.port}`, `[::1]:${daemon.port}`, '192.0.2.1', `http://192.0.2.1:${daemon.port}`, '100.64.0.1']) {
-    const r = await runCli(['allow-create-v1', '--id', 'remote-1270', ...appArgs(marker)], cliEnv(home, daemon.port, { TELEPTY_HOST: host }));
+  const sid = uniqueSid('remote');
+  // The two loopback spellings point at the observing proxy: had the CLI dialled, its request would be recorded there.
+  for (const host of [`localhost:${port}`, `[::1]:${port}`, '192.0.2.1', `http://192.0.2.1:${port}`, '100.64.0.1']) {
+    const r = await runCli(['allow-create-v1', '--id', sid, ...appArgs(marker)], cliEnv(daemon, port, { TELEPTY_HOST: host }));
     assert.equal(r.code, 1, `${host}: ${r.stderr}`);
     assert.match(r.stderr, /allow-create-v1 refuses non-canonical daemon host/);
-    assert.ok(r.ms < 5000, `${host}: refused before any network wait (${r.ms} ms)`);
+    assert.doesNotMatch(r.stderr, /requires a running local daemon/, `${host}: refused before the meta check`);
   }
-  assert.deepEqual(daemon.seen, [], 'zero requests (the localhost spelling would have reached this listener)');
+  assert.deepEqual(wire(proxy), [], 'zero requests');
   assert.equal(fs.existsSync(marker), false, 'no application started');
+  assert.equal(await sessionRecord(daemon, sid), null, 'nothing registered');
+  assert.equal(occurrences(daemonOut(daemon), registeredLine(sid)), 0);
+  assert.deepEqual(await daemonInstance(daemon), before, 'daemon not restarted');
 });
 
-for (const [label, meta] of [
-  ['missing register-create-only', { status: 200, body: { version: '0.10.0', capabilities: ['sessions', 'wrapped-sessions'] } }],
-  ['missing wrapped-sessions', { status: 200, body: { version: '0.10.0', capabilities: ['register-create-only'] } }],
-  ['no capabilities (old daemon)', { status: 200, body: { version: '0.9.2' } }],
-  ['401 credential refusal', { status: 401, body: { error: 'Unauthorized' } }],
-  ['non-JSON meta', { status: 200, body: '<html></html>' }],
-  ['meta never answers (timeout)', 'hang'],
-]) {
-  test(`1270 process: allow-create-v1 with ${label} → exit 1, only GET /api/meta, no register, no app, no daemon repair`, { skip: PROCESS_SKIP }, async t => {
-    const daemon = await startFakeDaemon(t, { meta: () => meta });
-    const home = tmpHome(t, 'meta');
-    const marker = path.join(home, 'app-marker');
-    const r = await runCli(['allow-create-v1', '--id', 'meta-1270', ...appArgs(marker)], cliEnv(home, daemon.port));
-    assert.equal(r.code, 1, r.stderr);
-    assert.match(r.stderr, /allow-create-v1 requires a running local daemon advertising wrapped-sessions and register-create-only/);
-    assert.deepEqual(daemon.seen, [['GET', '/api/meta']],
-      'exactly one meta request — no ensureDaemonRunning re-probe, start, restart or register');
-    assert.deepEqual(daemon.registers, []);
-    assert.deepEqual(daemon.upgrades, []);
-    assert.equal(fs.existsSync(marker), false, 'no application started');
-    if (meta === 'hang') assert.ok(r.ms < 8000, `bounded meta wait (${r.ms} ms)`);
-  });
-}
+test('1270 process: allow-create-v1 with a refused credential (401 on /api/meta) → exactly one meta request, no register, no app, no repair', async t => {
+  const daemon = await realDaemon(t);
+  const before = await daemonInstance(daemon);
+  const { proxy, port } = await proxyTo(t, daemon);
+  const home = tmpHome(t, 'auth');
+  const marker = path.join(home, 'app-marker');
+  const sid = uniqueSid('auth');
+  const r = await runCli(['allow-create-v1', '--id', sid, ...appArgs(marker)],
+    cliEnv(daemon, port, { TELEPTY_AUTH_TOKEN: 'synthetic-wrong-token-1270' }));
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, /allow-create-v1 requires a running local daemon advertising wrapped-sessions and register-create-only \(HTTP 401\)/);
+  assert.deepEqual(wire(proxy), [META], 'one meta check; no ensureDaemonRunning re-probe/health/stop, no register');
+  assert.equal(fs.existsSync(marker), false, 'no application started');
+  assert.equal(await sessionRecord(daemon, sid), null, 'nothing registered');
+  assert.deepEqual(await daemonInstance(daemon), before, 'no start/restart/repair of the daemon');
+  assert.equal(daemon.isAlive(), true);
+});
 
-test('1270 process: a lost first-register result is not replayed; the rerun gets 409 SESSION_EXISTS and starts no app', { skip: PROCESS_SKIP }, async t => {
-  let calls = 0;
-  const daemon = await startFakeDaemon(t, {
-    register: (body, state) => {
-      calls++;
-      if (body.create_only === true && state.exists.has(body.session_id)) {
-        return { status: 409, body: { success: false, code: 'SESSION_EXISTS', error: 'Session already exists; create_only refused it unchanged.', session_id: body.session_id } };
-      }
-      state.exists.add(body.session_id);   // the effect happened …
-      return calls === 1 ? 'drop' : { status: 200, body: { success: true } };   // … but the first result is lost
-    }
-  });
+test('1270 process: allow-create-v1 whose /api/meta is never answered → bounded exit 1 after exactly one meta request; no register/app/repair', async t => {
+  const daemon = await realDaemon(t);
+  const before = await daemonInstance(daemon);
+  const { proxy, port } = await proxyTo(t, daemon);
+  proxy.holdNextRequest({ method: 'GET', path: '/api/meta' });   // only this request is withheld; never released
+  const home = tmpHome(t, 'timeout');
+  const marker = path.join(home, 'app-marker');
+  const sid = uniqueSid('timeout');
+  const r = await runCli(['allow-create-v1', '--id', sid, ...appArgs(marker)], cliEnv(daemon, port));
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, /allow-create-v1 requires a running local daemon advertising wrapped-sessions and register-create-only/);
+  assert.ok(r.ms < 8000, `bounded meta wait (${r.ms} ms)`);
+  assert.equal(proxy.heldCount(), 1, 'PRECONDITION: the meta request was the one withheld');
+  assert.deepEqual(wire(proxy), [META], 'no retry, no re-probe, no register');
+  assert.equal(fs.existsSync(marker), false, 'no application started');
+  assert.equal(await sessionRecord(daemon, sid), null, 'nothing registered');
+  assert.deepEqual(await daemonInstance(daemon), before, 'an unanswered probe never led to a start, restart or stop');
+  assert.equal(daemon.isAlive(), true);
+});
+
+test('1270 process: a create-only register the daemon accepted but whose answer never reached the CLI → no app, no retry; the explicit rerun gets 409 with no second effect', async t => {
+  const daemon = await realDaemon(t);
+  const before = await daemonInstance(daemon);
+  const { proxy, port } = await proxyTo(t, daemon);
   const home = tmpHome(t, 'lost');
   const marker = path.join(home, 'app-marker');
-  const first = await runCli(['allow-create-v1', '--id', 'lost-1270', ...appArgs(marker)], cliEnv(home, daemon.port));
+  const sid = uniqueSid('lost');
+  proxy.failNextResponse({ method: 'POST', path: '/api/sessions/register' });
+  const first = await runCli(['allow-create-v1', '--id', sid, ...appArgs(marker)], cliEnv(daemon, port));
   assert.notEqual(first.code, 0, first.stderr);
-  assert.equal(daemon.registers.length, 1, 'the uncertain register is not retried');
-  assert.equal(fs.existsSync(marker), false, 'no app after an uncertain register');
+  const faults = proxy.faults();
+  assert.equal(faults.length, 1, 'PRECONDITION: the fault fired on that exact request');
+  assert.deepEqual([faults[0].method, faults[0].path, faults[0].status], ['POST', '/api/sessions/register', 200],
+    'the daemon accepted the create (its 200 was withheld from the CLI)');
+  assert.deepEqual(wire(proxy), [META, REGISTER], 'exactly one register: the uncertain result was not retried; no owner claim');
+  const custody = await sessionRecord(daemon, sid);
+  assert.ok(custody, 'the record the daemon created is held by the daemon');
+  assert.equal(custody.type, 'wrapped');
+  assert.equal(occurrences(daemonOut(daemon), registeredLine(sid)), 1);
+  assert.equal(fs.existsSync(marker), false, 'no application on an uncertain client result');
 
-  const second = await runCli(['allow-create-v1', '--id', 'lost-1270', ...appArgs(marker)], cliEnv(home, daemon.port));
+  const second = await runCli(['allow-create-v1', '--id', sid, ...appArgs(marker)], cliEnv(daemon, port));
   assert.equal(second.code, 1, second.stderr);
-  assert.match(second.stderr, /Session 'lost-1270' already exists; allow-create-v1 refused it unchanged\. No application was started\./);
-  assert.equal(fs.existsSync(marker), false, 'duplicate → zero new apps');
-  assert.equal(daemon.registers.length, 2);
-  for (const body of daemon.registers) {
-    assert.equal(body.create_only, true);
-    assert.equal(body.session_id, 'lost-1270');
-  }
-  assert.deepEqual(daemon.seen, [['GET', '/api/meta'], ['POST', '/api/sessions/register'], ['GET', '/api/meta'], ['POST', '/api/sessions/register']]);
-  assert.deepEqual(daemon.upgrades, [], 'no owner claim, no takeover');
+  assert.match(second.stderr, new RegExp(`Session '${sid}' already exists; allow-create-v1 refused it unchanged\\. No application was started\\.`));
+  assert.deepEqual(wire(proxy), [META, REGISTER, META, REGISTER], 'the rerun made one meta check and one register, nothing else');
+  assert.equal(proxy.faults().length, 1, 'the fault was single-shot');
+  assert.equal(fs.existsSync(marker), false, 'zero applications across both invocations');
+  const after = await sessionRecord(daemon, sid);
+  assert.equal(after.session_epoch, custody.session_epoch, 'no second effect: same instance');
+  assert.equal(occurrences(daemonOut(daemon), registeredLine(sid)), 1);
+  assert.equal(occurrences(daemonOut(daemon), reregisteredLine(sid)), 0, 'the 409 did not fall through to re-register');
+  assert.deepEqual(await daemonInstance(daemon), before);
 });
 
-test('1270 process (pty): create_only only on the first register; owner reconnect re-registers without it; viewer close on the wrapped record sends zero DELETE', { skip: PTY_SKIP, timeout: 60000 }, async t => {
-  const SID = 'boot-1270';
-  const CONTROL = 'spawned-1270';
-  const daemon = await startFakeDaemon(t, {
-    // The reconnecting owner is not counted: active_clients 0 is exactly the case that used to destroy the record.
-    sessions: () => [
-      { id: SID, type: 'wrapped', command: 'node', active_clients: 0 },
-      { id: CONTROL, type: 'spawned', command: 'bash', active_clients: 0 }
-    ],
-    onViewer: ws => setTimeout(() => { try { ws.close(1000, 'viewer done'); } catch {} }, 300)
-  });
-  const home = tmpHome(t, 'pty');
+test('1270 process: a rerun after an effect made by another client gets 409 SESSION_EXISTS and starts no app', async t => {
+  const daemon = await realDaemon(t);
+  const sid = uniqueSid('dup');
+  const created = await daemon.registerSession(sid, { command: 'node', create_only: true });
+  assert.equal(created.status, 200, `PRECONDITION: ${JSON.stringify(created.body)}`);
+  const epoch = (await sessionRecord(daemon, sid)).session_epoch;
+  const { proxy, port } = await proxyTo(t, daemon);
+  const home = tmpHome(t, 'dup');
   const marker = path.join(home, 'app-marker');
+  const r = await runCli(['allow-create-v1', '--id', sid, ...appArgs(marker)], cliEnv(daemon, port));
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, new RegExp(`Session '${sid}' already exists; allow-create-v1 refused it unchanged\\. No application was started\\.`));
+  assert.deepEqual(wire(proxy), [META, REGISTER], 'no owner claim, no retry');
+  assert.equal(fs.existsSync(marker), false, 'duplicate → zero new apps');
+  const after = await sessionRecord(daemon, sid);
+  assert.equal(after.session_epoch, epoch, 'record unchanged (no takeover)');
+  assert.equal(after.active_clients, 0, 'no owner claim was made');
+  assert.equal(occurrences(daemonOut(daemon), reregisteredLine(sid)), 0, 'the create_only register did not fall through to re-register');
+});
+
+// Viewer leave with a causal boundary: the close handler's session-list request is withheld at the proxy until the daemon has
+// itself dropped the viewer from `clients` (active_clients back to 0); only then is it released. The decision the CLI makes is
+// therefore always taken on the post-removal list, and what it does next is read off the wire.
+async function viewerLeaves(t, daemon, sid) {
+  const viewerPath = await proxyTo(t, daemon);
+  const viewer = runCli(['attach', sid], cliEnv(daemon, viewerPath.port), { timeoutMs: 30000 });
+  await waitFor(async () => { const s = await sessionRecord(daemon, sid); return s && s.active_clients >= 1; },
+    { timeoutMs: 15000, description: 'PRECONDITION: the viewer really attached' });
+  assert.ok(viewerPath.proxy.requests().some(r => r.upgrade && r.path === `/api/sessions/${encodeURIComponent(sid)}`), 'PRECONDITION: attach upgrade observed');
+  const beforeLeave = viewerPath.proxy.requests().length;
+  viewerPath.proxy.holdNextRequest({ method: 'GET', path: '/api/sessions' });
+  viewerPath.proxy.dropConnections();
+  await waitFor(() => viewerPath.proxy.heldCount() === 1, { timeoutMs: 15000, description: 'the close handler issued its session list' });
+  await waitFor(async () => { const s = await sessionRecord(daemon, sid); return s && s.active_clients === 0; },
+    { timeoutMs: 15000, description: 'the daemon removed the viewer' });
+  viewerPath.proxy.releaseHeldRequests();
+  const left = await viewer;
+  assert.equal(left.code, 0, left.stderr);
+  return wire(viewerPath.proxy).slice(beforeLeave);
+}
+
+test('1270 process (pty): create_only only on the first register; owner reconnect re-registers; a viewer leaving a wrapped session whose owner is away sends no DELETE', { skip: PTY_SKIP, timeout: 90000 }, async t => {
+  const daemon = await realDaemon(t);
+  const before = await daemonInstance(daemon);
+  const SID = uniqueSid('pty');
+  const marker = path.join(daemon.homeDir, `${SID}.marker`);
+  const ownerPath = await proxyTo(t, daemon);    // the bridge's only route to the daemon
   const bridge = pty.spawn(process.execPath, ['--require', './test-support/setup-env.js', 'cli.js', 'allow-create-v1', '--id', SID, ...appArgs(marker)], {
-    cwd: ROOT, cols: 80, rows: 24, name: 'xterm', env: cliEnv(home, daemon.port) });
+    cwd: ROOT, cols: 80, rows: 24, name: 'xterm', env: cliEnv(daemon, ownerPath.port) });
   let bridgeExit = null; let bridgeOut = '';
   bridge.onData(d => { bridgeOut += d; });
   bridge.onExit(({ exitCode }) => { bridgeExit = exitCode; });
   t.after(() => { try { bridge.kill(); } catch {} });
 
-  await waitFor(() => fs.existsSync(marker), { timeoutMs: 15000, description: `the wrapped app to start (bridge output: ${JSON.stringify(bridgeOut.slice(-400))})` });
-  assert.equal(daemon.registers.length, 1);
-  assert.equal(daemon.registers[0].create_only, true, 'first register is create-only');
-  assert.equal(daemon.ownerSockets.length, 1);
+  await waitFor(() => fs.existsSync(marker), { timeoutMs: 15000, description: `the wrapped app to start (bridge: ${JSON.stringify(bridgeOut.slice(-300))})` });
+  assert.equal(occurrences(daemonOut(daemon), registeredLine(SID)), 1, 'first register created the record');
+  assert.equal(countOf(ownerPath.proxy, REGISTER), 1);
+  const epoch = (await sessionRecord(daemon, SID)).session_epoch;
 
-  // Owner WS drop (1006, as on a daemon blip) → the normal reconnect flow re-registers WITHOUT create_only and reclaims.
-  daemon.ownerSockets[0].terminate();
-  await waitFor(() => daemon.ownerSockets.length >= 2, { timeoutMs: 15000, description: 'owner reconnect' });
-  assert.ok(daemon.registers.length >= 2);
-  for (const body of daemon.registers.slice(1)) {
-    assert.equal(Object.prototype.hasOwnProperty.call(body, 'create_only'), false, 'reconnect register never repeats create_only');
-    assert.equal(body.session_id, SID);
-  }
+  // Owner connection cut → the normal reconnect flow re-registers. A create_only re-register would be refused 409 and never
+  // log a re-registration, so this daemon log line is the observable proof that only the first register carried it.
+  ownerPath.proxy.dropConnections();
+  await waitFor(() => occurrences(daemonOut(daemon), reregisteredLine(SID)) >= 1, { timeoutMs: 20000, description: 'owner reconnect re-register' });
+  await waitFor(async () => { const s = await sessionRecord(daemon, SID); return s && s.disconnectedSeconds === null; },
+    { timeoutMs: 20000, description: 'owner reclaimed' });
+  assert.equal(countOf(ownerPath.proxy, REGISTER), 2, 'first register + exactly one reconnect register');
+  assert.equal(countOf(ownerPath.proxy, META), 1, 'one meta check for the whole bridge life: no ensureDaemonRunning');
   assert.equal(fs.readFileSync(marker, 'utf8'), 'started\n', 'the application was started exactly once (no replay on reconnect)');
 
-  // A viewer attaches to the wrapped session and leaves while active_clients is 0 → no DELETE, owner untouched.
-  const viewer = await runCli(['attach', SID], cliEnv(home, daemon.port), { timeoutMs: 15000 });
-  assert.equal(viewer.code, 0, viewer.stderr);
-  assert.ok(daemon.upgrades.some(u => !u.owner && u.path === `/api/sessions/${SID}`), 'PRECONDITION: the viewer really attached');
-  assert.equal(bridgeExit, null, 'the owner bridge keeps running');
-  const deletes = daemon.seen.filter(([m]) => m === 'DELETE');
-  assert.deepEqual(deletes, [], 'zero DELETE (no kill/unregister/purge of the wrapped record, credential custody or mailbox)');
-  assertNoDaemonManagement(daemon.seen);
-  assert.equal(daemon.seen.filter(([m, p]) => m === 'GET' && p === '/api/meta').length, 1, 'one meta check, no ensureDaemonRunning re-probe');
+  // Owner away and staying away (its route silenced): exactly the window in which a viewer close used to destroy the record.
+  ownerPath.proxy.blackhole('both');
+  ownerPath.proxy.dropConnections();
+  await waitFor(async () => { const s = await sessionRecord(daemon, SID); return s && s.disconnectedSeconds !== null; },
+    { timeoutMs: 20000, description: 'daemon sees the owner disconnected' });
 
-  // Control (non-wrapped semantics unchanged): the same viewer close on a spawned record with no clients still destroys it.
-  const control = await runCli(['attach', CONTROL], cliEnv(home, daemon.port), { timeoutMs: 15000 });
-  assert.equal(control.code, 0, control.stderr);
-  assert.deepEqual(daemon.seen.filter(([m]) => m === 'DELETE'), [['DELETE', `/api/sessions/${CONTROL}`]]);
+  const leaveWire = await viewerLeaves(t, daemon, SID);
+  assert.deepEqual(leaveWire, [['GET', '/api/sessions']], 'the viewer listed sessions and sent no DELETE/kill/unregister/purge');
+  const kept = await sessionRecord(daemon, SID);
+  assert.ok(kept, 'the wrapped record survives the viewer leaving');
+  assert.equal(kept.type, 'wrapped');
+  assert.equal(kept.session_epoch, epoch, 'same instance: credential custody untouched');
+  assert.equal(bridgeExit, null, 'the owner bridge keeps running');
+  assert.deepEqual(await daemonInstance(daemon), before, 'one daemon instance throughout: no ensureDaemonRunning start/restart/repair');
+});
+
+test('1270 process: control — a viewer leaving a SPAWNED session with no other clients still destroys it (non-wrapped unchanged)', { skip: PTY_SKIP, timeout: 60000 }, async t => {
+  const daemon = await realDaemon(t);
+  const sid = uniqueSid('spawned');
+  const spawned = await daemon.spawnSession(sid);
+  assert.ok(spawned.status === 200 || spawned.status === 201, `PRECONDITION: ${JSON.stringify(spawned.body)}`);
+  const leaveWire = await viewerLeaves(t, daemon, sid);
+  assert.deepEqual(leaveWire, [['GET', '/api/sessions'], ['DELETE', `/api/sessions/${encodeURIComponent(sid)}`]], 'list, then exactly one DELETE');
+  await waitFor(async () => (await sessionRecord(daemon, sid)) === null, { timeoutMs: 15000, description: 'the spawned session destroyed by that DELETE' });
 });
