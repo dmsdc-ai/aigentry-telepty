@@ -72,6 +72,7 @@ function createClock() {
     },
   };
 }
+async function settleVt() { for (let i = 0; i < 10; i++) await new Promise(resolve => setTimeout(resolve, 20)); }
 
 function childDouble(clock, name) {
   const handlers = { data: null, exit: null };
@@ -184,6 +185,7 @@ test('R1 modal: CR refused modal_ui at wake; after the modal is answered a later
   const p1 = await bodyThenHeldCr(b, 'S-MODAL-ONE');
   await b.clock.advance(95);
   b.feed(MODAL);                                   // a TRUE modal owns the surface during the hold
+  await settleVt();
   await b.clock.advance(1000);
   assert.deepEqual(b.stages(p1.submit.daemon_msg_id), [['refused', 'not_written', 'modal_ui']], 'CHECKPOINT: CR refused at wake');
   b.shared.lastUserInputTime = b.clock.now();      // the user answers the modal …
