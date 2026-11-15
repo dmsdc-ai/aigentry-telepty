@@ -425,16 +425,43 @@ test('1270 process (pty): create_only only on the first register; owner reconnec
   await waitOrExplain(() => fs.existsSync(marker), { timeoutMs: 15000, description: 'the wrapped app to start' },
     () => `bridge exit=${bridgeExit} output=${tail(bridgeOut)}`);
   assert.equal(occurrences(daemonOut(daemon), registeredLine(SID)), 1, 'first register created the record');
-  assert.equal(countOf(ownerPath.proxy, REGISTER), 1);
+  // fix2 (CI 43732266654, line 428: 2 !== 1): the second POST before any cut is NOT a second create. spawnChild() calls
+  // updateDaemonProcessMetadata() (src/cli/security-actions.js:964 → :879-908, hotfix524): a fire-and-forget register WITHOUT
+  // create_only, conditioned on expected_epoch + expected_credential_generation (the daemon 409s it if that instance is gone,
+  // so it can never create — src/routes/session-records.js:133-143), carrying owner_pid/pty_pid. The daemon handles it on the
+  // existing-record branch and logs one re-registration (session-records.js:320). Being fire-and-forget, it is awaited by its
+  // daemon EFFECT, not by time; then the exact request sequence is asserted.
+  const OWNER_WS = ['GET', `/api/sessions/${encodeURIComponent(SID)}`, true];
+  const ownerWire = () => { wire(ownerPath.proxy); return ownerPath.proxy.requests().map(r => [r.method, r.path, r.upgrade]); };
+  // The waits stop at the first effect (>=); the EXACT counts and sequence are asserted right after, so a retry that pushed
+  // the count past the target fails as a precise assertion instead of an unexplained timeout.
+  await waitOrExplain(() => occurrences(daemonOut(daemon), reregisteredLine(SID)) >= 1,
+    { timeoutMs: 15000, description: "the app spawn's process-metadata update (one re-registration)" },
+    () => `owner wire=${JSON.stringify(ownerWire())} bridge exit=${bridgeExit}`);
+  assert.deepEqual(ownerWire(), [[...META, false], [...REGISTER, false], OWNER_WS, [...REGISTER, false]],
+    'exactly: one meta check, the create, the owner claim, the metadata update — nothing else');
+  assert.equal(occurrences(daemonOut(daemon), registeredLine(SID)), 1, 'still exactly one record created');
+  // A second create_only register would have been a silent 409 (no log line); one re-registration proves it did not carry it.
+  assert.equal(occurrences(daemonOut(daemon), reregisteredLine(SID)), 1, 'the second POST was accepted as a non-create update');
   const epoch = (await sessionRecord(daemon, SID)).session_epoch;
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'started\n', 'one application');
 
-  // Owner connection cut → the normal reconnect flow re-registers. A create_only re-register would be refused 409 and never
-  // log a re-registration, so this daemon log line is the observable proof that only the first register carried it.
+  // Owner connection cut → the normal reconnect flow re-registers (cli.js: BEFORE its new owner WS). A create_only
+  // re-register would be refused 409 and never log a re-registration, so the NEXT (second) re-registration line is the
+  // observable proof that only the first register carried create_only. (Waiting for "≥ 1" — as before fix2 — was already
+  // satisfied by the metadata update above and proved nothing about the reconnect.)
   ownerPath.proxy.dropConnections();
-  await waitFor(() => occurrences(daemonOut(daemon), reregisteredLine(SID)) >= 1, { timeoutMs: 20000, description: 'owner reconnect re-register' });
+  await waitOrExplain(() => occurrences(daemonOut(daemon), reregisteredLine(SID)) >= 2,
+    { timeoutMs: 20000, description: 'owner reconnect re-register (the second re-registration)' },
+    () => `owner wire=${JSON.stringify(ownerWire())} bridge exit=${bridgeExit}`);
   await waitFor(async () => { const s = await sessionRecord(daemon, SID); return s && s.disconnectedSeconds === null; },
     { timeoutMs: 20000, description: 'owner reclaimed' });
-  assert.equal(countOf(ownerPath.proxy, REGISTER), 2, 'first register + exactly one reconnect register');
+  assert.deepEqual(ownerWire(),
+    [[...META, false], [...REGISTER, false], OWNER_WS, [...REGISTER, false], [...REGISTER, false], OWNER_WS],
+    'create, claim, metadata update, then exactly one reconnect register and one re-claim: no retry, no second create');
+  assert.equal(occurrences(daemonOut(daemon), registeredLine(SID)), 1, 'still exactly one record created');
+  assert.equal(occurrences(daemonOut(daemon), reregisteredLine(SID)), 2, 'metadata update + exactly one reconnect re-registration');
+  assert.equal((await sessionRecord(daemon, SID)).session_epoch, epoch, 'the same instance across the reconnect');
   assert.equal(countOf(ownerPath.proxy, META), 1, 'one meta check for the whole bridge life: no ensureDaemonRunning');
   assert.equal(fs.readFileSync(marker, 'utf8'), 'started\n', 'the application was started exactly once (no replay on reconnect)');
 
