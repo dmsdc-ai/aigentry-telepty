@@ -1,0 +1,177 @@
+name: Bridge submit gap 1270 (RED/GREEN)
+
+# Task 1270 — body→submit ordering floor at the bridge PTY writer (src/cli/security-actions.js).
+# Runs ONE focused test, test/bridge-submit-gap-1270.test.js (20 cases), in two separate node
+# processes per OS, on the exact PR head:
+#   RED   — with ONLY src/cli/security-actions.js overlaid from the frozen baseline commit
+#           1a51d30a81fb0ad5a3e64d363dea72e84151da77 (blob sha256 pinned below). Test body, fixtures
+#           and installed dependencies stay the PR head's, byte-identical in both runs. RED requires
+#           exit 1, all 20 cases reported, at least one failure, EVERY failure a semantic assertion
+#           (testCodeFailure + ERR_ASSERTION, no PRECONDITION), the named early-CR/floor case among
+#           them, and nothing skipped, cancelled or todo. The exact baseline failure count has not been
+#           executed and is therefore printed, not pre-asserted. Module/import/setup/EACCES/EPERM/
+#           syntax/timeout failures are NOT accepted as RED. (The 15 pass / 5 fail observed against
+#           the initial 408bb source is a different baseline and is not asserted here.)
+#   GREEN — after restoring and verifying the PR head source: exit 0, 20/20 pass, nothing
+#           skipped, cancelled or todo.
+# Timer/fake-child test: proves the bridge's master-write ORDER/TIMING only — never that a native
+# CLI treats the CR as Enter, nor anything about the current Root or a live upgrade.
+#
+# Security posture: no secrets; read-only token; checkout credentials not persisted; dependencies
+# from the frozen lockfile via `npm ci --ignore-scripts` (no lifecycle/publication hooks); no
+# publish, no artifact upload, no service or live operation.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/bridge-submit-gap-1270.yml'
+      - 'scripts/test-suites.json'
+      - 'src/cli/security-actions.js'
+      - 'test/bridge-submit-gap-1270.test.js'
+      - 'test/fixtures/bridge-136/**'
+      - 'package-lock.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridge-submit-gap-1270-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  red-green:
+    name: submit gap RED/GREEN (${{ matrix.os }}, node 26.13.0)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      BASELINE_SHA: 1a51d30a81fb0ad5a3e64d363dea72e84151da77
+      BASELINE_MODULE_SHA256: b2fcf098f47730dd2dc4171dd2b282eb35534cb6ea13f6407bfaf8a3a768415f
+      TELEPTY_NO_TAILNET_AUTO: '1'
+      TELEPTY_SKIP_POSTINSTALL: '1'
+      NO_UPDATE_NOTIFIER: '1'
+    steps:
+      # SHAs as pinned in bridge-contract-1215.yml (actions/checkout v4.2.2, actions/setup-node v4.4.0).
+      # Full history so the frozen baseline commit can be read from the same checkout.
+      - name: Check out the PR head with history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '26.13.0'
+
+      - name: Preconditions (exact Node, exact head, exact baseline module)
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          sha256() { node -e "process.stdout.write(require('crypto').createHash('sha256').update(require('fs').readFileSync(process.argv[1])).digest('hex'))" "$1"; }
+          test "$(node --version)" = "v26.13.0"
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          git cat-file -e "${BASELINE_SHA}^{commit}"
+          git show "${BASELINE_SHA}:src/cli/security-actions.js" > "$RUNNER_TEMP/baseline-security-actions.js"
+          test "$(sha256 "$RUNNER_TEMP/baseline-security-actions.js")" = "$BASELINE_MODULE_SHA256"
+          if cmp -s "$RUNNER_TEMP/baseline-security-actions.js" src/cli/security-actions.js; then
+            echo "::error::PR head security-actions.js equals the baseline module; nothing to compare"; exit 1
+          fi
+          test -f test/bridge-submit-gap-1270.test.js
+          test -d test/fixtures/bridge-136
+          test -z "$(git diff --name-only)"
+          if git merge-base --is-ancestor "$BASELINE_SHA" HEAD; then echo "baseline is an ancestor of HEAD"; else echo "baseline is NOT an ancestor of HEAD (recorded, not required)"; fi
+          echo "preconditions ok"
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npm-cache"
+          npm ci --ignore-scripts --no-audit --no-fund --cache "$RUNNER_TEMP/npm-cache"
+
+      - name: RED — focused test with ONLY the baseline security-actions.js overlaid
+        run: |
+          set -euo pipefail
+          sha256() { node -e "process.stdout.write(require('crypto').createHash('sha256').update(require('fs').readFileSync(process.argv[1])).digest('hex'))" "$1"; }
+          tap="$RUNNER_TEMP/red-baseline.tap"
+          test_sha_before="$(sha256 test/bridge-submit-gap-1270.test.js)"
+          cp "$RUNNER_TEMP/baseline-security-actions.js" src/cli/security-actions.js
+          test "$(sha256 src/cli/security-actions.js)" = "$BASELINE_MODULE_SHA256"
+          test "$(git diff --name-only)" = "src/cli/security-actions.js"
+          # Actions runs bash with errexit; an `if` condition is exempt, so the expected nonzero exit
+          # is captured, then the candidate module is restored before anything is judged.
+          if node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=tap \
+            test/bridge-submit-gap-1270.test.js > "$tap" 2>&1; then rc=0; else rc=$?; fi
+          git checkout -- src/cli/security-actions.js
+          cat "$tap"
+          echo "baseline exit=$rc"
+          bad=0
+          die() { echo "::error::RED not proven: $1"; bad=1; }
+          test -z "$(git diff --name-only)" || die "candidate source not restored"
+          [ "$(sha256 test/bridge-submit-gap-1270.test.js)" = "$test_sha_before" ] || die "test file changed during RED"
+          block() {
+            awk -v want="$2" -v st="$1" '
+              !inb { l = $0; sub(/^[ \t]+/, "", l); pre = st " "
+                     if (substr(l, 1, length(pre)) == pre) { t = l; sub(/^(not ok|ok) [0-9]+ - /, "", t); if (t == want) inb = 1 } }
+              inb  { print; if ($0 ~ /^[ \t]*\.\.\.[ \t]*$/) exit }' "$tap"
+          }
+          # Every `not ok` block must be a semantic assertion failure; prints "<failures> <non-semantic>".
+          failures() {
+            awk '
+              { l = $0; sub(/^[ \t]+/, "", l) }
+              !inb && l ~ /^not ok [0-9]+ - / { inb = 1; n++; f = 0; e = 0; p = 0; next }
+              inb { if (l ~ /^failureType: .?testCodeFailure/) f = 1
+                    if (l ~ /^code: .?ERR_ASSERTION/) e = 1
+                    if (l ~ /PRECONDITION/) p = 1
+                    if (l ~ /^\.\.\.$/) { if (!(f && e && !p)) bad++; inb = 0 } }
+              END { if (inb) bad++; printf "%d %d\n", n + 0, bad + 0 }' "$tap"
+          }
+          [ "$rc" -eq 1 ] || die "exit $rc, expected 1"
+          read -r nfail nbad <<<"$(failures)"
+          echo "baseline failures: $nfail (non-semantic: $nbad) — count observed here, not pre-asserted"
+          [ "$nfail" -ge 1 ] || die "no failing case"
+          [ "$nbad" -eq 0 ] || die "$nbad failure(s) are not semantic assertion failures"
+          early='1270: a CR arriving +5 ms after a direct body write is written once, no sooner than 250 ms after that body write'
+          b="$(block 'not ok' "$early")"
+          [ -n "$b" ] || die "named early-CR/floor case did not fail: $early"
+          for want in '# tests 20' "# pass $((20 - nfail))" "# fail $nfail" '# cancelled 0' '# skipped 0' '# todo 0'; do
+            grep -qx "$want" "$tap" || die "summary line missing: $want"
+          done
+          ! grep -Eq 'MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND|EACCES|EPERM|SyntaxError|PRECONDITION|testTimeoutFailure' "$tap" || die "setup/module/permission/syntax/timeout/precondition error present"
+          [ "$bad" -eq 0 ] || exit 1
+          echo "RED proven: baseline fails $nfail semantic assertion(s), including the early-CR/floor case"
+
+      - name: GREEN — same focused test on the restored PR head
+        run: |
+          set -euo pipefail
+          test -z "$(git diff --name-only)"
+          tap="$RUNNER_TEMP/green-candidate.tap"
+          if node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=tap \
+            test/bridge-submit-gap-1270.test.js > "$tap" 2>&1; then rc=0; else rc=$?; fi
+          cat "$tap"
+          echo "candidate exit=$rc"
+          bad=0
+          die() { echo "::error::GREEN not proven: $1"; bad=1; }
+          okline() {
+            awk -v want="$1" '{ l = $0; sub(/^[ \t]+/, "", l)
+              if (substr(l, 1, 3) == "ok ") { t = l; sub(/^ok [0-9]+ - /, "", t); if (t == want) { print; exit } } }' "$tap"
+          }
+          [ "$rc" -eq 0 ] || die "exit $rc, expected 0"
+          early='1270: a CR arriving +5 ms after a direct body write is written once, no sooner than 250 ms after that body write'
+          [ -n "$(okline "$early")" ] || die "named early-CR/floor case is not a plain ok"
+          plain_ok="$(awk '{ l = $0; sub(/^[ \t]+/, "", l) } l ~ /^ok [0-9]+ - / && l !~ /# (SKIP|TODO)/ { n++ } END { print n + 0 }' "$tap")"
+          [ "$plain_ok" -eq 20 ] || die "plain ok results: $plain_ok, expected 20"
+          for want in '# tests 20' '# pass 20' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+            grep -qx "$want" "$tap" || die "summary line missing: $want"
+          done
+          ! grep -Eq '^[[:space:]]*not ok ' "$tap" || die "a 'not ok' result is present"
+          [ "$bad" -eq 0 ] || exit 1
+          echo "GREEN proven: 20/20 pass, 0 skipped/todo/cancelled"
