@@ -1,0 +1,103 @@
+name: Boot create-only 1270 (focused)
+
+# Task 1270 — focused CI feedback for test/boot-create-only-1270.test.js: the sealed `telepty
+# boot-capabilities` document, the versioned `allow-create-v1` verb (canonical loopback, one meta
+# check, create_only first register, no daemon repair) and non-deleting viewer detach.
+# It runs the ENTIRE file — every case, no name pattern — serially on Linux, macOS and Windows with
+# Node 26.13.0, prints the raw TAP, records the tests/pass/fail/skipped/todo/cancelled summary, and
+# exits with the test runner's real status. Platform skips stay visible as `# SKIP` in the TAP
+# (the two node-pty cases are POSIX-only by the test's own existing condition).
+#
+# This is a DIAGNOSTIC, not a gate: it does not replace the full OS/Node regression
+# (test-install.yml) or independent review, and a green run proves only these cases on these runners.
+#
+# Security posture, copied from bridge-contract-1215.yml / wrapped-rename-1270.yml:
+# - no secrets; `contents: read` only; checkout credentials not persisted;
+# - dependencies from the frozen lockfile with `npm ci --ignore-scripts` (no root lifecycle hooks),
+#   then ONLY node-pty's own build, because daemon.js and this test require it;
+# - private HOME/TMPDIR/npm cache under RUNNER_TEMP; loopback-only daemons (TELEPTY_NO_TAILNET_AUTO=1);
+# - no publish, no artifact upload, no service or live operation.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/boot-create-only-1270.yml'
+      - 'cli.js'
+      - 'test/boot-create-only-1270.test.js'
+      - 'test-support/bridge-pipe-harness.js'
+      - 'test-support/daemon-harness.js'
+      - 'test-support/setup-env.js'
+      - 'package-lock.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boot-create-only-1270-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  boot-create-only:
+    name: boot create-only (${{ matrix.os }}, node 26.13.0)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    # TELEPTY_SKIP_DAEMON_REPAIR / TELEPTY_CLIENT_RESTART are deliberately NOT set (unlike bridge-contract-1215): the test
+    # asserts that allow-create-v1 never repairs or restarts the daemon, and a suppressing env could mask exactly that.
+    # The reference full suite (test-install.yml) does not set them either.
+    env:
+      TELEPTY_NO_TAILNET_AUTO: '1'
+      TELEPTY_SKIP_POSTINSTALL: '1'
+      NO_UPDATE_NOTIFIER: '1'
+      TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
+    steps:
+      # SHAs as pinned in bridge-contract-1215.yml (actions/checkout v4.2.2, actions/setup-node v4.4.0).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '26.13.0'
+      - name: Verify exact Node
+        run: |
+          test "$(node --version)" = "v26.13.0"
+      - name: Private HOME, TMPDIR and npm cache
+        run: |
+          base="$RUNNER_TEMP/boot-1270"
+          mkdir -p "$base/home" "$base/tmp" "$base/npm-cache"
+          chmod 700 "$base" "$base/home" "$base/tmp" "$base/npm-cache"
+          {
+            echo "HOME=$base/home"
+            echo "USERPROFILE=$base/home"
+            echo "TMPDIR=$base/tmp"
+            echo "npm_config_cache=$base/npm-cache"
+          } >> "$GITHUB_ENV"
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      # NOTE: this --ignore-scripts + `npm rebuild node-pty` pair is the existing focused-workflow convention
+      # (bridge-contract-1215.yml), proven there on ubuntu only. On macOS/Windows it runs node-pty's own install script,
+      # the same one plain `npm ci` (test-install.yml) runs. If that leg fails at this step, it is a setup failure,
+      # not a test result.
+      - name: Build node-pty only (required by daemon.js and the test)
+        run: |
+          npm rebuild node-pty --foreground-scripts
+          node -e "require('node-pty'); require('ws'); require('@xterm/headless'); console.log('deps ok')"
+      - name: Run the whole boot create-only file serially (raw TAP, real exit)
+        run: |
+          set -uo pipefail
+          tap="$RUNNER_TEMP/boot-create-only-1270.tap"
+          if node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=tap \
+            test/boot-create-only-1270.test.js > "$tap" 2>&1; then rc=0; else rc=$?; fi
+          cat "$tap"
+          echo "---- summary (${{ matrix.os }}) ----"
+          grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' "$tap" || echo "no TAP summary lines found"
+          echo "skipped cases:"; grep -E '# SKIP' "$tap" || echo "(none)"
+          echo "test exit=$rc"
+          exit "$rc"

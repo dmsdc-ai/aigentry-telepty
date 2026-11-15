@@ -214,9 +214,14 @@ function cliEnv(daemon, port, extra = {}) {
     'TELEPTY_HANDOFF_CREDENTIAL_FILE', 'TELEPTY_SESSION_CREDENTIAL_REFRESH', 'TELEPTY_COOPERATIVE_HANDOFF']) if (!(k in extra)) delete env[k];
   return env;
 }
+// fix1: the CLI child is spawned WITHOUT `--require ./test-support/setup-env.js`. That preload sets HOME to a fresh
+// mkdtemp unconditionally (setup-env.js:49-51), so the CLI read its credential from an EMPTY HOME instead of the harness
+// daemon's: the read-only meta check then failed closed before any request (CI 43728552002: heldCount 0, faults 0, the
+// bridge and the viewer never started). Same convention as test/cli.test.js:895 — HOME is always passed explicitly and is
+// always a mkdtemp (the daemon harness's, or the test's own), so real-HOME isolation is unchanged.
 function runCli(argv, env, { timeoutMs = 15000 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['--require', './test-support/setup-env.js', 'cli.js', ...argv], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, ['cli.js', ...argv], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = '';
     child.stdout.on('data', b => { stdout += b; }); child.stderr.on('data', b => { stderr += b; });
     const started = Date.now();
@@ -224,6 +229,14 @@ function runCli(argv, env, { timeoutMs = 15000 } = {}) {
     child.once('error', reject);
     child.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal, stdout, stderr, ms: Date.now() - started }); });
   });
+}
+// fix1: bounded, non-secret diagnostics for a failed first precondition (exit + the tail of what the CLI printed).
+const tail = text => JSON.stringify(String(text).slice(-400));
+const cliSaid = r => `exit=${r.code} signal=${r.signal} stderr=${tail(r.stderr)}`;
+// A wait whose timeout message is built WHEN IT TIMES OUT, so it carries the state at that moment (the eager template
+// in the CI run printed the bridge output as it was before the bridge had written anything: "bridge: \"\"").
+async function waitOrExplain(check, opts, explain) {
+  try { return await waitFor(check, opts); } catch (error) { throw new Error(`${error.message} — ${explain()}`); }
 }
 function appArgs(marker) {
   return [process.execPath, '-e', `require('fs').appendFileSync(${JSON.stringify(marker)}, 'started\\n'); setInterval(() => {}, 1000);`];
@@ -308,7 +321,7 @@ test('1270 process: allow-create-v1 whose /api/meta is never answered → bounde
   assert.equal(r.code, 1, r.stderr);
   assert.match(r.stderr, /allow-create-v1 requires a running local daemon advertising wrapped-sessions and register-create-only/);
   assert.ok(r.ms < 8000, `bounded meta wait (${r.ms} ms)`);
-  assert.equal(proxy.heldCount(), 1, 'PRECONDITION: the meta request was the one withheld');
+  assert.equal(proxy.heldCount(), 1, `PRECONDITION: the meta request was the one withheld (${cliSaid(r)})`);
   assert.deepEqual(wire(proxy), [META], 'no retry, no re-probe, no register');
   assert.equal(fs.existsSync(marker), false, 'no application started');
   assert.equal(await sessionRecord(daemon, sid), null, 'nothing registered');
@@ -327,8 +340,9 @@ test('1270 process: a create-only register the daemon accepted but whose answer 
   const first = await runCli(['allow-create-v1', '--id', sid, ...appArgs(marker)], cliEnv(daemon, port));
   assert.notEqual(first.code, 0, first.stderr);
   const faults = proxy.faults();
-  assert.equal(faults.length, 1, 'PRECONDITION: the fault fired on that exact request');
-  assert.deepEqual([faults[0].method, faults[0].path, faults[0].status], ['POST', '/api/sessions/register', 200],
+  assert.equal(faults.length, 1, `PRECONDITION: the fault fired on that exact request (${cliSaid(first)})`);
+  // 201: the daemon's answer to a FIRST registration (src/routes/session-records.js:446) — the create took effect.
+  assert.deepEqual([faults[0].method, faults[0].path, faults[0].status], ['POST', '/api/sessions/register', 201],
     'the daemon accepted the create (its 200 was withheld from the CLI)');
   assert.deepEqual(wire(proxy), [META, REGISTER], 'exactly one register: the uncertain result was not retried; no owner claim');
   const custody = await sessionRecord(daemon, sid);
@@ -354,7 +368,8 @@ test('1270 process: a rerun after an effect made by another client gets 409 SESS
   const daemon = await realDaemon(t);
   const sid = uniqueSid('dup');
   const created = await daemon.registerSession(sid, { command: 'node', create_only: true });
-  assert.equal(created.status, 200, `PRECONDITION: ${JSON.stringify(created.body)}`);
+  // 201: a first registration (src/routes/session-records.js:446; test/telesession-capabilities-1215.test.js:121).
+  assert.equal(created.status, 201, `PRECONDITION: register answered ${created.status}`);
   const epoch = (await sessionRecord(daemon, sid)).session_epoch;
   const { proxy, port } = await proxyTo(t, daemon);
   const home = tmpHome(t, 'dup');
@@ -376,8 +391,11 @@ test('1270 process: a rerun after an effect made by another client gets 409 SESS
 async function viewerLeaves(t, daemon, sid) {
   const viewerPath = await proxyTo(t, daemon);
   const viewer = runCli(['attach', sid], cliEnv(daemon, viewerPath.port), { timeoutMs: 30000 });
-  await waitFor(async () => { const s = await sessionRecord(daemon, sid); return s && s.active_clients >= 1; },
-    { timeoutMs: 15000, description: 'PRECONDITION: the viewer really attached' });
+  let viewerEnded = null;
+  viewer.then(v => { viewerEnded = v; }, e => { viewerEnded = { code: null, signal: null, stderr: e.message }; });
+  await waitOrExplain(async () => { const s = await sessionRecord(daemon, sid); return s && s.active_clients >= 1; },
+    { timeoutMs: 15000, description: 'PRECONDITION: the viewer really attached' },
+    () => (viewerEnded ? `viewer ended: ${cliSaid(viewerEnded)}` : 'viewer still running'));
   assert.ok(viewerPath.proxy.requests().some(r => r.upgrade && r.path === `/api/sessions/${encodeURIComponent(sid)}`), 'PRECONDITION: attach upgrade observed');
   const beforeLeave = viewerPath.proxy.requests().length;
   viewerPath.proxy.holdNextRequest({ method: 'GET', path: '/api/sessions' });
@@ -397,14 +415,15 @@ test('1270 process (pty): create_only only on the first register; owner reconnec
   const SID = uniqueSid('pty');
   const marker = path.join(daemon.homeDir, `${SID}.marker`);
   const ownerPath = await proxyTo(t, daemon);    // the bridge's only route to the daemon
-  const bridge = pty.spawn(process.execPath, ['--require', './test-support/setup-env.js', 'cli.js', 'allow-create-v1', '--id', SID, ...appArgs(marker)], {
+  const bridge = pty.spawn(process.execPath, ['cli.js', 'allow-create-v1', '--id', SID, ...appArgs(marker)], {
     cwd: ROOT, cols: 80, rows: 24, name: 'xterm', env: cliEnv(daemon, ownerPath.port) });
   let bridgeExit = null; let bridgeOut = '';
   bridge.onData(d => { bridgeOut += d; });
   bridge.onExit(({ exitCode }) => { bridgeExit = exitCode; });
   t.after(() => { try { bridge.kill(); } catch {} });
 
-  await waitFor(() => fs.existsSync(marker), { timeoutMs: 15000, description: `the wrapped app to start (bridge: ${JSON.stringify(bridgeOut.slice(-300))})` });
+  await waitOrExplain(() => fs.existsSync(marker), { timeoutMs: 15000, description: 'the wrapped app to start' },
+    () => `bridge exit=${bridgeExit} output=${tail(bridgeOut)}`);
   assert.equal(occurrences(daemonOut(daemon), registeredLine(SID)), 1, 'first register created the record');
   assert.equal(countOf(ownerPath.proxy, REGISTER), 1);
   const epoch = (await sessionRecord(daemon, SID)).session_epoch;
@@ -439,7 +458,7 @@ test('1270 process: control — a viewer leaving a SPAWNED session with no other
   const daemon = await realDaemon(t);
   const sid = uniqueSid('spawned');
   const spawned = await daemon.spawnSession(sid);
-  assert.ok(spawned.status === 200 || spawned.status === 201, `PRECONDITION: ${JSON.stringify(spawned.body)}`);
+  assert.equal(spawned.status, 201, `PRECONDITION: spawn answered ${spawned.status}`);
   const leaveWire = await viewerLeaves(t, daemon, sid);
   assert.deepEqual(leaveWire, [['GET', '/api/sessions'], ['DELETE', `/api/sessions/${encodeURIComponent(sid)}`]], 'list, then exactly one DELETE');
   await waitFor(async () => (await sessionRecord(daemon, sid)) === null, { timeoutMs: 15000, description: 'the spawned session destroyed by that DELETE' });
