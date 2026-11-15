@@ -17,7 +17,7 @@
 // Observable evidence: the CLI's requests on the wire, CLI exit/stdout/stderr, the app marker file, the daemon's own session
 // records and register log lines, and the daemon's instance_id (never restarted). Declared fakes: the wrapped application only.
 // This slice cannot prove native identity, custody or full no-kill acceptance.
-const { test } = require('node:test');
+const { test, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -26,6 +26,26 @@ const { spawn } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const cli = require(path.join(ROOT, 'cli.js'));
+
+// Task 1270 round 3 — immediate, FIXED-LABEL progress for locating a hang (CI 43734266367: POSIX cancelled at the 15-min budget
+// with no TAP printed). Written synchronously to this process's stderr AND appended to one fixed file under os.tmpdir() that the
+// focused workflow tails live, so it survives a cancelled job. t.diagnostic is NOT used: it may be buffered until a test ends.
+// Content is limited to fixed labels, the file's own fixed test titles and resource TYPE counts — never paths, env, headers,
+// bodies, prompts or tokens.
+const PROGRESS_FILE = path.join(os.tmpdir(), 'boot-create-only-1270.progress');
+function progress(label, detail = '') {
+  const line = `[boot-1270] ${new Date().toISOString()} ${label}${detail ? ` ${detail}` : ''}\n`;
+  try { fs.writeSync(2, line); } catch { /* progress is best effort */ }
+  try { fs.appendFileSync(PROGRESS_FILE, line); } catch { /* progress is best effort */ }
+}
+const resourceCounts = () => JSON.stringify(process.getActiveResourcesInfo().reduce((m, k) => { m[k] = (m[k] || 0) + 1; return m; }, {}));
+beforeEach(t => progress('test:start', JSON.stringify(t.name)));
+afterEach(t => progress('test:end', JSON.stringify(t.name)));
+// What would keep this FILE's process alive after its last test (a leaked owned child, socket or timer shows up here by type).
+after(() => {
+  progress('file:all-tests-done active-resources', resourceCounts());
+  setTimeout(() => progress('file:still-alive-after-20s active-resources', resourceCounts()), 20000).unref();
+});
 
 const SEALED_LINE = '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}';
 const REQUIRED_CAPS = ['wrapped-sessions', 'register-create-only'];
@@ -168,14 +188,18 @@ const PTY_SKIP = pty && process.platform !== 'win32' ? false : 'requires node-pt
 
 async function realDaemon(t) {
   const daemon = await startTestDaemon();
-  t.after(() => daemon.stop());
+  t.after(async () => {
+    progress('cleanup:daemon-stop:begin');
+    await daemon.stop();
+    progress('cleanup:daemon-stop:end');
+  });
   return daemon;
 }
 // The existing pass-through proxy in front of the real daemon, observing (method + path per request, per connection).
 async function proxyTo(t, daemon) {
   const proxy = startProxy({ targetPort: daemon.port, targetHost: daemon.host, observe: true });
   const port = await proxy.listen();
-  t.after(() => proxy.close());
+  t.after(() => { proxy.close(); progress('cleanup:proxy-closed'); });
   return { proxy, port };
 }
 // What the CLI put on the wire through this proxy: [[METHOD, path], ...] in arrival order; framing must never have fallen back.
@@ -390,6 +414,7 @@ test('1270 process: a rerun after an effect made by another client gets 409 SESS
 // therefore always taken on the post-removal list, and what it does next is read off the wire.
 async function viewerLeaves(t, daemon, sid) {
   const viewerPath = await proxyTo(t, daemon);
+  progress('stage:viewer-attach:begin');
   const viewer = runCli(['attach', sid], cliEnv(daemon, viewerPath.port), { timeoutMs: 30000 });
   let viewerEnded = null;
   viewer.then(v => { viewerEnded = v; }, e => { viewerEnded = { code: null, signal: null, stderr: e.message }; });
@@ -397,14 +422,19 @@ async function viewerLeaves(t, daemon, sid) {
     { timeoutMs: 15000, description: 'PRECONDITION: the viewer really attached' },
     () => (viewerEnded ? `viewer ended: ${cliSaid(viewerEnded)}` : 'viewer still running'));
   assert.ok(viewerPath.proxy.requests().some(r => r.upgrade && r.path === `/api/sessions/${encodeURIComponent(sid)}`), 'PRECONDITION: attach upgrade observed');
+  progress('stage:viewer-attached');
   const beforeLeave = viewerPath.proxy.requests().length;
   viewerPath.proxy.holdNextRequest({ method: 'GET', path: '/api/sessions' });
   viewerPath.proxy.dropConnections();
+  progress('stage:viewer-cut');
   await waitFor(() => viewerPath.proxy.heldCount() === 1, { timeoutMs: 15000, description: 'the close handler issued its session list' });
+  progress('stage:viewer-list-held');
   await waitFor(async () => { const s = await sessionRecord(daemon, sid); return s && s.active_clients === 0; },
     { timeoutMs: 15000, description: 'the daemon removed the viewer' });
   viewerPath.proxy.releaseHeldRequests();
+  progress('stage:viewer-list-released');
   const left = await viewer;
+  progress('stage:viewer-exited', `code=${left.code}`);
   assert.equal(left.code, 0, left.stderr);
   return wire(viewerPath.proxy).slice(beforeLeave);
 }
@@ -420,10 +450,32 @@ test('1270 process (pty): create_only only on the first register; owner reconnec
   let bridgeExit = null; let bridgeOut = '';
   bridge.onData(d => { bridgeOut += d; });
   bridge.onExit(({ exitCode }) => { bridgeExit = exitCode; });
-  t.after(() => { try { bridge.kill(); } catch {} });
+  // Round 3 (CI 43734266367, POSIX cancelled at the 15-min budget): this teardown used to be `bridge.kill()` — node-pty's
+  // DEFAULT signal is SIGHUP (documented in test/delete-death-observation-60.test.js:135), and the allow bridge installs an
+  // explicit no-op SIGHUP handler by design (cli.js:3925-3929). Once this test has silenced the owner route (blackhole below),
+  // the daemon's destroy close during daemon.stop() cannot reach the bridge either, so it kept reconnecting and its pty kept
+  // this test FILE's process alive. The bridge's documented terminate path is SIGTERM (cli.js:3931-3947: close session, kill
+  // its own app child, exit with a bounded 2.5 s teardown settle). Bounded wait; if this test-owned child still does not exit,
+  // it alone is SIGKILLed and the test FAILS — a leaked bridge is a finding, never a hidden hang.
+  t.after(async () => {
+    if (bridgeExit !== null) { progress('cleanup:bridge-already-exited', `code=${bridgeExit}`); return; }
+    progress('cleanup:bridge-sigterm');
+    try { bridge.kill('SIGTERM'); } catch { /* already gone */ }
+    const exited = await new Promise(resolve => {
+      const timer = setTimeout(() => resolve(false), 10000);
+      bridge.onExit(() => { clearTimeout(timer); resolve(true); });
+      if (bridgeExit !== null) { clearTimeout(timer); resolve(true); }
+    });
+    if (exited) { progress('cleanup:bridge-exited', `code=${bridgeExit}`); return; }
+    progress('cleanup:bridge-sigkill');
+    try { bridge.kill('SIGKILL'); } catch { /* already gone */ }
+    throw new Error('the test-owned allow bridge did not exit within 10 s of SIGTERM (its documented terminate path); it was SIGKILLed');
+  });
 
+  progress('stage:bridge-spawned');
   await waitOrExplain(() => fs.existsSync(marker), { timeoutMs: 15000, description: 'the wrapped app to start' },
     () => `bridge exit=${bridgeExit} output=${tail(bridgeOut)}`);
+  progress('stage:app-started');
   assert.equal(occurrences(daemonOut(daemon), registeredLine(SID)), 1, 'first register created the record');
   // fix2 (CI 43732266654, line 428: 2 !== 1): the second POST before any cut is NOT a second create. spawnChild() calls
   // updateDaemonProcessMetadata() (src/cli/security-actions.js:964 → :879-908, hotfix524): a fire-and-forget register WITHOUT
@@ -445,12 +497,14 @@ test('1270 process (pty): create_only only on the first register; owner reconnec
   assert.equal(occurrences(daemonOut(daemon), reregisteredLine(SID)), 1, 'the second POST was accepted as a non-create update');
   const epoch = (await sessionRecord(daemon, SID)).session_epoch;
   assert.equal(fs.readFileSync(marker, 'utf8'), 'started\n', 'one application');
+  progress('stage:metadata-update-asserted');
 
   // Owner connection cut → the normal reconnect flow re-registers (cli.js: BEFORE its new owner WS). A create_only
   // re-register would be refused 409 and never log a re-registration, so the NEXT (second) re-registration line is the
   // observable proof that only the first register carried create_only. (Waiting for "≥ 1" — as before fix2 — was already
   // satisfied by the metadata update above and proved nothing about the reconnect.)
   ownerPath.proxy.dropConnections();
+  progress('stage:owner-cut');
   await waitOrExplain(() => occurrences(daemonOut(daemon), reregisteredLine(SID)) >= 2,
     { timeoutMs: 20000, description: 'owner reconnect re-register (the second re-registration)' },
     () => `owner wire=${JSON.stringify(ownerWire())} bridge exit=${bridgeExit}`);
@@ -464,12 +518,15 @@ test('1270 process (pty): create_only only on the first register; owner reconnec
   assert.equal((await sessionRecord(daemon, SID)).session_epoch, epoch, 'the same instance across the reconnect');
   assert.equal(countOf(ownerPath.proxy, META), 1, 'one meta check for the whole bridge life: no ensureDaemonRunning');
   assert.equal(fs.readFileSync(marker, 'utf8'), 'started\n', 'the application was started exactly once (no replay on reconnect)');
+  progress('stage:owner-reclaimed-asserted');
 
   // Owner away and staying away (its route silenced): exactly the window in which a viewer close used to destroy the record.
   ownerPath.proxy.blackhole('both');
   ownerPath.proxy.dropConnections();
+  progress('stage:owner-silenced');
   await waitFor(async () => { const s = await sessionRecord(daemon, SID); return s && s.disconnectedSeconds !== null; },
     { timeoutMs: 20000, description: 'daemon sees the owner disconnected' });
+  progress('stage:owner-disconnect-seen');
 
   const leaveWire = await viewerLeaves(t, daemon, SID);
   assert.deepEqual(leaveWire, [['GET', '/api/sessions']], 'the viewer listed sessions and sent no DELETE/kill/unregister/purge');

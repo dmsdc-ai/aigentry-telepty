@@ -89,13 +89,27 @@ jobs:
         run: |
           npm rebuild node-pty --foreground-scripts
           node -e "require('node-pty'); require('ws'); require('@xterm/headless'); console.log('deps ok')"
-      - name: Run the whole boot create-only file serially (raw TAP, real exit)
+      # Round 3 (CI 43734266367: POSIX cancelled at this job's 15-min budget with NOTHING printed, because the TAP went to a
+      # file that was only cat'ed after Node exited). Now the raw TAP STREAMS to the log through tee as it is produced, and the
+      # test's fixed-label progress file is tailed live in the background, so a cancelled job still shows the last stage
+      # reached. The node exit status is taken from PIPESTATUS[0] (not tee's); a tee failure fails the step on its own.
+      - name: Run the whole boot create-only file serially (raw TAP streamed, real exit)
         run: |
           set -uo pipefail
           tap="$RUNNER_TEMP/boot-create-only-1270.tap"
-          if node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=tap \
-            test/boot-create-only-1270.test.js > "$tap" 2>&1; then rc=0; else rc=$?; fi
-          cat "$tap"
+          progress="$(node -p "require('path').join(require('os').tmpdir(), 'boot-create-only-1270.progress')")"
+          : > "$progress"
+          # One background process (no pipeline), so $! is exactly the tailer and it is killed and reaped below; a leftover
+          # holder of this step's stdout would itself stall the step. Every progress line already starts with "[boot-1270]".
+          tail -n +1 -F "$progress" 2>/dev/null &
+          tailer=$!
+          node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=tap \
+            test/boot-create-only-1270.test.js 2>&1 | tee "$tap"
+          statuses=("${PIPESTATUS[@]}")
+          rc="${statuses[0]}"; tee_rc="${statuses[1]}"
+          kill "$tailer" 2>/dev/null || true
+          wait "$tailer" 2>/dev/null || true
+          if [ "$tee_rc" -ne 0 ]; then echo "::error::tee failed (exit $tee_rc); the TAP log may be incomplete"; [ "$rc" -ne 0 ] || rc="$tee_rc"; fi
           echo "---- summary (${{ matrix.os }}) ----"
           grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' "$tap" || echo "no TAP summary lines found"
           echo "skipped cases:"; grep -E '# SKIP' "$tap" || echo "(none)"
