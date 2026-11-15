@@ -1847,8 +1847,11 @@ async function manageInteractiveAttach(sessionId, targetHost) {
         const res = await fetchWithAuth(`${daemonUrl(targetHost)}/api/sessions`);
         if (res.ok) {
           const sessions = await res.json();
-          const session = sessions.find(s => s.id === sessionId);
-          if (session && session.active_clients > 0) {
+          // Task 1270: a viewer never destroys a wrapped (or unprovable) record — see viewerCloseDecision.
+          const decision = viewerCloseDecision(sessions, sessionId);
+          if (decision === 'keep-wrapped' || decision === 'keep-unknown') {
+            console.log(`\n\x1b[33mLeft room '${sessionId}'. Session left to its owner — not destroyed.\x1b[0m\n`);
+          } else if (decision === 'keep-clients') {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. Other clients still attached — session kept alive.\x1b[0m\n`);
           } else {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. No other clients — destroying session.\x1b[0m\n`);
@@ -2354,6 +2357,69 @@ function runAllowCheck(argv, { env = process.env } = {}) {
   return 0;
 }
 
+// Task 1270: sealed, pure-local boot capability document (SPEC §1). An old CLI answers an unknown verb with help and
+// exit 0, so only this exact JSON shape (validated by parseBootCapabilities) may ever count as support.
+const BOOT_CAPABILITIES_SCHEMA = 'telepty-boot-capabilities-v1';
+function bootCapabilitiesLine() {
+  return JSON.stringify({ schema: BOOT_CAPABILITIES_SCHEMA, verbs: ['allow-create-v1'], viewer_detach: 'nondeleting-v1' });
+}
+function runBootCapabilities(argv, { stdout = process.stdout, stderr = process.stderr } = {}) {
+  if (!Array.isArray(argv) || argv.length !== 1 || argv[0] !== 'boot-capabilities') {
+    stderr.write('Usage: telepty boot-capabilities\n');
+    return 2;
+  }
+  stdout.write(`${bootCapabilitiesLine()}\n`);
+  return 0;
+}
+function parseBootCapabilities(stdoutText, exitCode) {
+  const unsupported = reason => ({ supported: false, reason });
+  if (exitCode !== 0) return unsupported('exit');
+  if (typeof stdoutText !== 'string' && !Buffer.isBuffer(stdoutText)) return unsupported('stdout');
+  const text = String(stdoutText);
+  if (!text.endsWith('\n') || text.indexOf('\n') !== text.length - 1) return unsupported('not-one-line');
+  let doc;
+  try { doc = JSON.parse(text); } catch { return unsupported('not-json'); }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return unsupported('not-object');
+  const keys = Object.keys(doc).sort();
+  if (keys.length !== 3 || keys[0] !== 'schema' || keys[1] !== 'verbs' || keys[2] !== 'viewer_detach') return unsupported('shape');
+  if (doc.schema !== BOOT_CAPABILITIES_SCHEMA) return unsupported('schema');
+  if (!Array.isArray(doc.verbs) || !doc.verbs.every(v => typeof v === 'string') || new Set(doc.verbs).size !== doc.verbs.length
+      || !doc.verbs.includes('allow-create-v1')) return unsupported('verbs');
+  if (doc.viewer_detach !== 'nondeleting-v1') return unsupported('viewer_detach');
+  return { supported: true, verbs: doc.verbs.slice(), viewer_detach: doc.viewer_detach };
+}
+
+// Task 1270 allow-create-v1 (SPEC §2): only the canonical local daemon host; decided before any network.
+function createTargetRefusal(remoteHost) {
+  if (remoteHost === '127.0.0.1') return null;
+  return `allow-create-v1 refuses non-canonical daemon host ${JSON.stringify(String(remoteHost ?? ''))}; only 127.0.0.1 is supported. No request was sent and no application was started.`;
+}
+// Exactly one bounded, read-only authenticated GET /api/meta; both capabilities must be in the existing `capabilities` array.
+async function checkCreateDaemonSupport(fetchFn, daemonBaseUrl, { timeoutMs = 2000 } = {}) {
+  let meta;
+  try {
+    const response = await fetchFn(`${daemonBaseUrl}/api/meta`, { readOnlyAuth: true, signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) return { ok: false, reason: `HTTP ${response.status}` };
+    meta = await response.json();
+  } catch (error) {
+    return { ok: false, reason: (error && error.name === 'TimeoutError') ? 'timeout' : 'unreachable or unreadable' };
+  }
+  const caps = meta && Array.isArray(meta.capabilities) ? meta.capabilities : null;
+  if (!caps) return { ok: false, reason: 'no capability list' };
+  const missing = ['wrapped-sessions', 'register-create-only'].filter(cap => !caps.includes(cap));
+  return missing.length ? { ok: false, reason: `missing ${missing.join(', ')}` } : { ok: true };
+}
+
+// Task 1270 (SPEC §3): what a closing viewer may do. A wrapped session's lifetime belongs to its owner bridge (it may be
+// mid-reconnect with active_clients 0), and an absent/untyped record cannot be proven non-wrapped — never DELETE those.
+function viewerCloseDecision(sessions, sessionId) {
+  const session = Array.isArray(sessions) ? sessions.find(s => s && s.id === sessionId) : undefined;
+  if (!session || typeof session.type !== 'string') return 'keep-unknown';
+  if (session.type === 'wrapped') return 'keep-wrapped';
+  if (session.active_clients > 0) return 'keep-clients';
+  return 'destroy';
+}
+
 // Task 1215 W3 (R2): the interactive menu's `daemon` action (the menu calls this). Graceful stop of the addressed
 // daemon and a start only on a confirmed outcome (win32); POSIX keeps its sweep + start. → true when started.
 async function interactiveDaemonStart(deps = {}) {
@@ -2406,6 +2472,8 @@ async function main() {
   // Task 1215 service41: ahead of Guard A on purpose — allow-check accepts exactly one argv shape and answers every
   // other one (including --help) with usage and exit 2, so it never acts on its way to usage either.
   if (cmd === 'allow-check') { process.exitCode = runAllowCheck(args); return; }
+  // Task 1270: same placement and rule as allow-check — pure local, exact argv, usage (exit 2) for anything else.
+  if (cmd === 'boot-capabilities') { process.exitCode = runBootCapabilities(args); return; }
 
   // tp941 Guard A: before ANY command branch, so no subcommand can execute on its way to
   // printing its own usage. Deliberately below the version check, which takes no argv.
@@ -2859,7 +2927,9 @@ async function main() {
     return;
   }
 
-  if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap' || cmd === 'ssh') {
+  if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap' || cmd === 'ssh' || cmd === 'allow-create-v1') {
+    // Task 1270: versioned create-only boot verb (SPEC §2). No alias; never ensureDaemonRunning on this verb.
+    const createOnly = cmd === 'allow-create-v1';
     const sshSupport = require('./src/ssh-session');
     let sshPlan = null;
     if (cmd === 'ssh') {
@@ -2870,6 +2940,10 @@ async function main() {
       ? parseAllowInvocation('allow', ['allow', '--id', sshPlan.id, 'ssh', ...sshPlan.args])
       : parseAllowInvocation(cmd, args);
     if (!allowInvocation) return;
+    if (createOnly) {
+      const refusal = createTargetRefusal(REMOTE_HOST);
+      if (refusal) { console.error(refusal); process.exitCode = 1; return; }
+    }
     const { sessionId, command, cmdArgs, idleTtl, autoRestart, inputPolicy: requestedInputPolicy = null } = allowInvocation;
     // Task 1215: bridge-memory-only authority/readiness material (see readiness-handshake.js).
     let inputPolicyCapability = null;
@@ -2947,6 +3021,12 @@ async function main() {
         console.error('SSH requires a running daemon advertising ssh-child-write-receipts-v1. Start or upgrade it explicitly; no registration or command was started.');
         process.exitCode = 1; return;
       }
+    } else if (createOnly) {
+      const support = await checkCreateDaemonSupport(allowFetchWithAuth, DAEMON_URL);
+      if (!support.ok) {
+        console.error(`allow-create-v1 requires a running local daemon advertising wrapped-sessions and register-create-only (${support.reason}). It was not started, restarted or repaired; no registration or application was started.`);
+        process.exitCode = 1; return;
+      }
     } else if (!strictOwnerClient) await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
     // Detect terminal backend for session registration
@@ -2967,8 +3047,11 @@ async function main() {
       const res = await allowFetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // Task 1270: the create-only first register is bounded; a lost/uncertain result is never retried (exit below).
+        ...(createOnly ? { signal: AbortSignal.timeout(10000) } : {}),
         body: JSON.stringify({
           session_id: sessionId,
+          ...(createOnly ? { create_only: true } : {}),
           ...(cooperativeEnabled ? {cooperative_handoff:true} : {}),
           ...(handoffAdoption || {}),
           command,
@@ -2999,6 +3082,10 @@ async function main() {
           || data.session_epoch !== handoffAdoption.expected_epoch || data.credential_generation !== handoffAdoption.expected_credential_generation)) {
         console.error('Daemon did not confirm the exact handoff instance; successor child was not started.');
         process.exitCode = 1; return;
+      }
+      if (createOnly && res.status === 409 && data && data.code === 'SESSION_EXISTS') {
+        console.error(`Session '${sessionId}' already exists; allow-create-v1 refused it unchanged. No application was started.`);
+        process.exit(1);
       }
       if (res.ok && strictOwnerClient) strictOwnerEpoch = data.session_epoch;
       if (res.ok && supervisionClient && typeof data.session_epoch === 'string') supervisionEpoch = data.session_epoch;
@@ -3965,8 +4052,11 @@ async function main() {
         const res = await fetchWithAuth(`${daemonUrl(targetHost)}/api/sessions`);
         if (res.ok) {
           const allSessions = await res.json();
-          const session = allSessions.find(s => s.id === sessionId);
-          if (session && session.active_clients > 0) {
+          // Task 1270: a viewer never destroys a wrapped (or unprovable) record — see viewerCloseDecision.
+          const decision = viewerCloseDecision(allSessions, sessionId);
+          if (decision === 'keep-wrapped' || decision === 'keep-unknown') {
+            console.log(`\n\x1b[33mLeft room '${sessionId}'. Session left to its owner — not destroyed.\x1b[0m`);
+          } else if (decision === 'keep-clients') {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. Other clients still attached — session kept alive.\x1b[0m`);
           } else {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. No other clients — destroying session.\x1b[0m`);
@@ -5912,4 +6002,10 @@ module.exports = {
   probeDaemonHealth,      // gh#82 (A/B): unauthenticated /api/health liveness re-confirmation
   resolveTargetToken,     // #844 F1: which credential belongs to THIS address — refuses, never assumes
   fetchWithAuth,          // #844 F1: the wire itself, so a test can assert what would have been sent
+  bootCapabilitiesLine,   // Task 1270: the sealed boot-capabilities document (pure)
+  runBootCapabilities,    // Task 1270: main()'s `boot-capabilities` dispatch (injectable writers, no I/O)
+  parseBootCapabilities,  // Task 1270: reference validator for the Orchestrator writer (old help/exit 0 ≠ support)
+  createTargetRefusal,    // Task 1270: allow-create-v1 canonical-host gate (pure, pre-network)
+  checkCreateDaemonSupport, // Task 1270: allow-create-v1 one-shot /api/meta capability check (injectable fetch)
+  viewerCloseDecision,    // Task 1270: viewer detach never deletes a wrapped/unprovable record (pure)
 };
