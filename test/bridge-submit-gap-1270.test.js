@@ -8,7 +8,8 @@
 // real prompt registry and bridge-flush-filter. Declared fakes: the clock/timers, child doubles (write log with the fake
 // clock time), the owner-WS send recorder, the 80x24 stdout. No listener, network, provider, native PTY or model.
 // A timer test proves only the bridge's master-write ORDER/TIMING; it never proves a native CLI treats the CR as Enter.
-// "PRECONDITION:" means the setup is invalid (an INVALID run), not a product finding.
+// "PRECONDITION:" means the setup is invalid (an INVALID run), not a product finding. "CHECKPOINT:" is an intermediate PRODUCT
+// state (it differs on the pre-1270 base, where the CR is written at once) and is a semantic assertion like any other.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -85,7 +86,7 @@ function childDouble(clock, name) {
   return child;
 }
 
-function createBridge(t, { sid, command = 'codex', inputPolicy } = {}) {
+function createBridge(t, { sid, command = 'codex', inputPolicy, readyRegistry = registry } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-1270-'));
   const clock = createClock();
   const sends = [];
@@ -98,7 +99,7 @@ function createBridge(t, { sid, command = 'codex', inputPolicy } = {}) {
     DAEMON_URL: 'http://127.0.0.1:9', fetchWithAuth: () => Promise.reject(new Error('no network in fixture')),
     sessionCwd: root, sessionEnv: {}, bridgeTarget: sid, bridgeMsgSeq: 0, bridgePendingCount: 0,
     promptReady: false, lastUserInputTime: 0, IDLE_THRESHOLD: 2000,
-    knownAiCli: registry.isKnownAiCli(command), outputTail: '', readyRegistry: registry, readyQualification: null,
+    knownAiCli: registry.isKnownAiCli(command), outputTail: '', readyRegistry, readyQualification: null,
     promptPattern: /[❯>$#%]\s*$/, firstReadyObserved: false, queueFlushTimer: null, idleCheckTimer: null,
     reconnectTimer: null, heartbeatTimer: null,
     filterBridgeBatch: flushFilter.filterBridgeBatch, bridgeInjectTtlSecs: flushFilter.bridgeInjectTtlSecs,
@@ -162,7 +163,7 @@ test('1270: a CR arriving +5 ms after a direct body write is written once, no so
   });
   assert.equal(gaps.length, 1);
   assert.ok(gaps[0] >= GAP_MS, `CR gap ${gaps[0]} ms must be >= ${GAP_MS}`);
-  assert.ok(b.stages(p.submit.daemon_msg_id).some(([stage, certainty]) => stage === 'pty_written' && certainty === 'written'));
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['pty_written', 'written', null]], 'held in memory: no queued receipt, one pty_written');
 });
 
 test('1270: a late CR (gap already elapsed) is written immediately in the same turn', { timeout: 30000 }, async t => {
@@ -180,7 +181,7 @@ test('1270: queued flush (local typing) writes body then CR with a body→CR off
   b.shared.lastUserInputTime = b.clock.now();
   b.frame(p.body);
   b.frame(p.submit);
-  assert.deepEqual({ writes: b.child.writes, pending: b.shared.bridgePendingCount }, { writes: [], pending: 2 }, 'PRECONDITION: both queued while typing');
+  assert.deepEqual({ writes: b.child.writes, pending: b.shared.bridgePendingCount }, { writes: [], pending: 2 }, 'CHECKPOINT: both queued while typing');
   await b.clock.advance(10000);
   assert.deepEqual(b.child.writes, ['B1270-QUEUED', '\r']);
   const gap = crTimes(b.child)[0] - bodyTime(b.child, 'B1270-QUEUED');
@@ -230,7 +231,7 @@ test('1270: a duplicate CR while the first waits is refused duplicate_submit:adm
   });
 });
 
-test('1270: child exit during the wait — zero CR, the CR is quarantined not_written', { timeout: 30000 }, async t => {
+test('1270: child exit during the hold — zero CR, the held CR is refused not_written child_exited (never enqueued)', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1270-exit' });
   const p = b.pair('B1270-EXIT');
   b.frame(p.body);
@@ -238,9 +239,7 @@ test('1270: child exit during the wait — zero CR, the CR is quarantined not_wr
   b.child.exit();
   await b.clock.advance(5000);
   assert.deepEqual(b.child.writes, ['B1270-EXIT']);
-  const crStages = b.stages(p.submit.daemon_msg_id);
-  assert.ok(crStages.some(([stage, certainty]) => stage === 'quarantined' && certainty === 'not_written'), JSON.stringify(crStages));
-  assert.ok(!crStages.some(([stage]) => stage === 'pty_written'));
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['refused', 'not_written', 'child_exited']]);
 });
 
 test('1270: child replaced during the wait — zero CR to either child, truthful not_written child_replaced', { timeout: 30000 }, async t => {
@@ -252,8 +251,7 @@ test('1270: child replaced during the wait — zero CR to either child, truthful
   b.shared.child = successor;
   await b.clock.advance(5000);
   assert.deepEqual({ old: b.child.writes, successor: successor.writes }, { old: ['B1270-REPL'], successor: [] });
-  assert.deepEqual(b.stages(p.submit.daemon_msg_id).filter(([stage]) => stage !== 'queued'),
-    [['quarantined', 'not_written', 'child_replaced']]);
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['refused', 'not_written', 'child_replaced']]);
 });
 
 test('1270: owner generation changed during the wait — zero CR, not_written owner_changed', { timeout: 30000 }, async t => {
@@ -264,11 +262,10 @@ test('1270: owner generation changed during the wait — zero CR, not_written ow
   b.shared.interactionBinding = { ...b.shared.interactionBinding, owner_generation: 'owner-gen-1270-next' };
   await b.clock.advance(5000);
   assert.deepEqual(b.child.writes, ['B1270-OWNER']);
-  assert.deepEqual(b.stages(p.submit.daemon_msg_id).filter(([stage]) => stage !== 'queued'),
-    [['quarantined', 'not_written', 'owner_changed']]);
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['refused', 'not_written', 'owner_changed']]);
 });
 
-test('1270: close during the wait clears the timer — zero CR, custody kept as not_written', { timeout: 30000 }, async t => {
+test('1270: close during the hold clears the timer — zero CR, the held CR is refused not_written session_closed', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1270-close' });
   const p = b.pair('B1270-CLOSE');
   b.frame(p.body);
@@ -276,7 +273,7 @@ test('1270: close during the wait clears the timer — zero CR, custody kept as 
   b.allow.closeAllowSession({ destroySession: true });
   await b.clock.advance(5000);
   assert.deepEqual(b.child.writes, ['B1270-CLOSE']);
-  assert.ok(b.stages(p.submit.daemon_msg_id).some(([stage, certainty]) => stage === 'quarantined' && certainty === 'not_written'));
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['refused', 'not_written', 'session_closed']]);
 });
 
 test('1270: a deferred CR whose write throws is unknown/write_threw, not rethrown out of the timer, never written again', { timeout: 30000 }, async t => {
@@ -290,7 +287,7 @@ test('1270: a deferred CR whose write throws is unknown/write_threw, not rethrow
   b.frame(again);
   await b.clock.advance(5000);
   assert.deepEqual({ attempts: b.child.attempts, writes: b.child.writes,
-    cr: b.stages(p.submit.daemon_msg_id).filter(([stage]) => stage !== 'queued'), again: b.stages('submit:again') }, {
+    cr: b.stages(p.submit.daemon_msg_id), again: b.stages('submit:again') }, {
     attempts: 2, writes: ['B1270-THROW'],
     cr: [['unknown', 'unknown', 'write_threw']],
     again: [['refused', 'not_written', 'duplicate_submit:unknown']],
@@ -302,7 +299,7 @@ test('1270: a body whose write threw (effect unknown) still imposes the floor on
   const p = b.pair('B1270-BODYTHROW');
   b.child.throwOn = data => data === 'B1270-BODYTHROW';
   const thrownAt = b.clock.now();
-  assert.throws(() => b.frame(p.body), /EIO fixture write/, 'PRECONDITION: direct body write error escapes as before');
+  assert.throws(() => b.frame(p.body), /EIO fixture write/, 'CHECKPOINT: direct body write error escapes as before');
   b.frame(p.submit);
   assert.deepEqual(b.child.writes, [], 'CR not written in the same turn as an unknown body write');
   await b.clock.advance(5000);
@@ -331,12 +328,12 @@ for (const arm of [{ name: 'guarded', inputPolicy: undefined }, { name: 'supervi
     const p2 = b.pair('B1270-FIFO-2');
     b.shared.lastUserInputTime = b.clock.now();   // local typing: all four queue
     b.frame(p1.body); b.frame(p1.submit); b.frame(p2.body); b.frame(p2.submit);
-    assert.deepEqual({ writes: b.child.writes, pending: b.shared.bridgePendingCount }, { writes: [], pending: 4 }, 'PRECONDITION: all queued');
+    assert.deepEqual({ writes: b.child.writes, pending: b.shared.bridgePendingCount }, { writes: [], pending: 4 }, 'CHECKPOINT: all queued');
     await b.clock.advance(20000);
     assert.deepEqual(order(b.child), ['B1270-FIFO-1', 'CR', 'B1270-FIFO-2', 'CR']);
     assertOwnGaps(b.child, ['B1270-FIFO-1', 'B1270-FIFO-2']);
     for (const p of [p1, p2]) {
-      assert.deepEqual(b.stages(p.submit.daemon_msg_id).filter(([stage]) => stage !== 'queued'), [['pty_written', 'written', null]]);
+      assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['queued', 'not_written', null], ['pty_written', 'written', null]]);
     }
   });
 }
@@ -357,18 +354,18 @@ test('1270 F1: a direct body, its deferred CR, then a second pair arriving durin
 });
 
 // ── Task 1270 correction (F2): admission re-read when the deferred CR wakes ─────────────────────────────────────────
-test('1270 F2: a modal drawn during the hold (guarded) — zero CR, quarantined not_written modal_ui', { timeout: 30000 }, async t => {
+test('1270 F2: a modal drawn during the hold (guarded) — zero CR, refused not_written modal_ui', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1270-modal-hold' });
   const p = b.pair('B1270-MODAL-HOLD');
   b.frame(p.body);
   b.frame(p.submit);
-  assert.deepEqual(b.child.writes, ['B1270-MODAL-HOLD'], 'PRECONDITION: body written, CR held');
+  assert.deepEqual(b.child.writes, ['B1270-MODAL-HOLD'], 'CHECKPOINT: body written, CR held');
   await b.clock.advance(100);
   b.feed(MODAL);
   await settleVt();
   await b.clock.advance(5000);
   assert.deepEqual(b.child.writes, ['B1270-MODAL-HOLD']);
-  assert.deepEqual(b.stages(p.submit.daemon_msg_id).filter(([stage]) => stage !== 'queued'), [['quarantined', 'not_written', 'modal_ui']]);
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['refused', 'not_written', 'modal_ui']]);
 });
 
 test('1270 F2: modal evidence unavailable at wake (guarded after supervised output) — refused modal_unobservable, not a modal verdict', { timeout: 30000 }, async t => {
@@ -380,7 +377,7 @@ test('1270 F2: modal evidence unavailable at wake (guarded after supervised outp
   b.shared.inputPolicy = 'guarded';      // same owner generation, policy now guarded
   await b.clock.advance(5000);
   assert.deepEqual(b.child.writes, ['B1270-UNOBS']);
-  assert.deepEqual(b.stages(p.submit.daemon_msg_id).filter(([stage]) => stage !== 'queued'), [['quarantined', 'not_written', 'modal_unobservable']]);
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['refused', 'not_written', 'modal_unobservable']]);
 });
 
 test('1270 F2: a supervised owner keeps its policy — a modal-looking screen during the hold does not gate the CR', { timeout: 30000 }, async t => {
@@ -394,7 +391,7 @@ test('1270 F2: a supervised owner keeps its policy — a modal-looking screen du
   assert.deepEqual(b.child.writes, ['B1270-SUP-MODAL', '\r']);
 });
 
-test('1270 F2: local typing AFTER the body write, during the hold — zero CR, quarantined not_written user_input_after_body', { timeout: 30000 }, async t => {
+test('1270 F2: local typing AFTER the body write, during the hold — zero CR, refused not_written user_input_after_body', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1270-typing-hold' });
   const p = b.pair('B1270-TYPED');
   b.frame(p.body);
@@ -403,7 +400,7 @@ test('1270 F2: local typing AFTER the body write, during the hold — zero CR, q
   b.shared.lastUserInputTime = b.clock.now();   // a local keystroke into the same composer
   await b.clock.advance(5000);
   assert.deepEqual(b.child.writes, ['B1270-TYPED']);
-  assert.deepEqual(b.stages(p.submit.daemon_msg_id).filter(([stage]) => stage !== 'queued'), [['quarantined', 'not_written', 'user_input_after_body']]);
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['refused', 'not_written', 'user_input_after_body']]);
 });
 
 test('1270 F2 positive control: typing that ended BEFORE the body write is not intervening input — the CR is written once at the floor', { timeout: 30000 }, async t => {
@@ -413,8 +410,156 @@ test('1270 F2 positive control: typing that ended BEFORE the body write is not i
   const p = b.pair('B1270-QUIET');
   b.frame(p.body);
   b.frame(p.submit);
-  assert.deepEqual(b.child.writes, ['B1270-QUIET'], 'PRECONDITION: body written directly, CR held');
+  assert.deepEqual(b.child.writes, ['B1270-QUIET'], 'CHECKPOINT: body written directly, CR held');
   await b.clock.advance(5000);
   assert.deepEqual(b.child.writes, ['B1270-QUIET', '\r']);
   assert.ok(crTimes(b.child)[0] - bodyTime(b.child, 'B1270-QUIET') >= GAP_MS);
+});
+
+test('1270 F2 (queued path): local typing after the flushed body write, before its queued CR — zero CR, quarantined not_written user_input_after_body', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1270-typing-queued' });
+  const p = b.pair('B1270-TYPED-QUEUED');
+  b.shared.lastUserInputTime = b.clock.now();   // held by typing: body and CR queue
+  b.frame(p.body);
+  b.frame(p.submit);
+  for (let i = 0; i < 60 && b.child.writes.length === 0; i++) await b.clock.advance(50);   // until the idle tick flushes the body
+  assert.deepEqual(b.child.writes, ['B1270-TYPED-QUEUED'], 'CHECKPOINT: body flushed, its CR still on its delivery timer');
+  await b.clock.advance(100);
+  b.shared.lastUserInputTime = b.clock.now();   // a keystroke after the body landed
+  await b.clock.advance(5000);
+  assert.deepEqual(b.child.writes, ['B1270-TYPED-QUEUED']);
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['queued', 'not_written', null], ['quarantined', 'not_written', 'user_input_after_body']]);
+});
+
+// ── Task 1270 I1: the floor never depends on mailbox availability once the body is written ────────────────────────
+// The in-gap CR is held in memory (volatile, no durable custody): it is never enqueued, so a failing mailbox cannot refuse
+// it, and no 'queued' receipt or mailbox ack is produced for it. Enqueue/ack calls are counted on the real FileMailbox.
+function failMailbox(b) {
+  const calls = { enqueue: 0, ack: 0 };
+  const mailbox = b.shared.bridgeMailbox;
+  mailbox.enqueue = () => { calls.enqueue++; throw Object.assign(new Error('fixture mailbox unavailable'), { code: 'EIO' }); };
+  const realAck = mailbox.ack.bind(mailbox);
+  mailbox.ack = (...args) => { calls.ack++; return realAck(...args); };
+  return calls;
+}
+
+for (const arm of [{ name: 'guarded idle', inputPolicy: undefined }, { name: 'supervised', inputPolicy: 'user-supervised' }]) {
+  test(`1270 I1 (${arm.name}, mailbox failing): body at once, no CR at +249, exactly one CR at +250 while output streams; never enqueued, no ack, no queued receipt`, { timeout: 30000 }, async t => {
+    const b = createBridge(t, { sid: `b1270-i1-${arm.inputPolicy ? 'sup' : 'guarded'}`, inputPolicy: arm.inputPolicy });
+    const calls = failMailbox(b);
+    const p = b.pair('B1270-I1');
+    b.frame(p.body);
+    await b.clock.advance(5);
+    b.frame(p.submit);
+    const atOnce = b.child.writes.slice();
+    await b.clock.advance(100);
+    b.feed(BUSY);                                   // output inside the hold: neither delays nor gates the CR
+    await b.clock.advance(250 - 5 - 100 - 1);
+    const beforeFloor = b.child.writes.slice();
+    await b.clock.advance(1);
+    const atFloor = b.child.writes.slice();
+    await b.clock.advance(5000);
+    assert.deepEqual({ atOnce, beforeFloor, atFloor, writes: b.child.writes, calls,
+      body: b.stages(p.body.daemon_msg_id), submit: b.stages(p.submit.daemon_msg_id) }, {
+      atOnce: ['B1270-I1'], beforeFloor: ['B1270-I1'], atFloor: ['B1270-I1', '\r'], writes: ['B1270-I1', '\r'],
+      calls: { enqueue: 0, ack: 0 },
+      body: [['pty_written', 'written', null]], submit: [['pty_written', 'written', null]],
+    });
+    assert.equal(crTimes(b.child)[0] - bodyTime(b.child, 'B1270-I1'), GAP_MS);
+  });
+}
+
+test('1270 I1 (mailbox failing): two successive pairs drain [body1, CR, body2, CR] — no concatenation, each own gap, never enqueued', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1270-i1-two' });
+  const calls = failMailbox(b);
+  const p1 = b.pair('B1270-I1-ONE');
+  const p2 = b.pair('B1270-I1-TWO');
+  b.frame(p1.body);
+  await b.clock.advance(5);
+  b.frame(p1.submit);
+  await b.clock.advance(300);                     // CR1 written at its floor; the next pair arrives after it
+  b.frame(p2.body);
+  b.frame(p2.submit);
+  await b.clock.advance(5000);
+  assert.deepEqual({ order: order(b.child), calls }, { order: ['B1270-I1-ONE', 'CR', 'B1270-I1-TWO', 'CR'], calls: { enqueue: 0, ack: 0 } });
+  assertOwnGaps(b.child, ['B1270-I1-ONE', 'B1270-I1-TWO']);
+});
+
+test('1270 I1 (mailbox failing): a second pair arriving INSIDE the first CR\'s hold has no durable custody — refused mailbox_unavailable (C1/C2 unchanged), never appended', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1270-i1-inside' });
+  const calls = failMailbox(b);
+  const p1 = b.pair('B1270-I1-FIRST');
+  const p2 = b.pair('B1270-I1-INSIDE');
+  b.frame(p1.body);
+  b.frame(p1.submit);
+  await b.clock.advance(10);
+  b.frame(p2.body);                                // a write is not permitted now (delivery ahead): durable custody required
+  b.frame(p2.submit);
+  await b.clock.advance(5000);
+  assert.deepEqual({ writes: b.child.writes, calls,
+    first: b.stages(p1.submit.daemon_msg_id),
+    body2: b.stages(p2.body.daemon_msg_id), submit2: b.stages(p2.submit.daemon_msg_id) }, {
+    writes: ['B1270-I1-FIRST', '\r'], calls: { enqueue: 2, ack: 0 },
+    first: [['pty_written', 'written', null]],
+    body2: [['refused', 'not_written', 'mailbox_unavailable']], submit2: [['refused', 'not_written', 'mailbox_unavailable']],
+  });
+});
+
+test('1270 I1 (guarded, mailbox failing): a modal at wake refuses the held CR (modal_ui), zero CR; that refusal is never re-sent or relabelled later', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1270-i1-modal' });
+  const calls = failMailbox(b);
+  const p = b.pair('B1270-I1-MODAL');
+  b.frame(p.body);
+  b.frame(p.submit);
+  await b.clock.advance(100);
+  b.feed(MODAL);
+  await settleVt();
+  await b.clock.advance(5000);
+  const after = { writes: b.child.writes.slice(), submit: b.stages(p.submit.daemon_msg_id) };
+  const repeat = { ...p.submit, daemon_msg_id: 'submit:i1-modal-repeat' };
+  b.frame(repeat);                                 // a repeated /submit for the same inject
+  await b.clock.advance(5000);
+  assert.deepEqual({ after, writes: b.child.writes, submit: b.stages(p.submit.daemon_msg_id), repeat: b.stages('submit:i1-modal-repeat'), calls }, {
+    after: { writes: ['B1270-I1-MODAL'], submit: [['refused', 'not_written', 'modal_ui']] },
+    writes: ['B1270-I1-MODAL'],
+    submit: [['refused', 'not_written', 'modal_ui']],
+    repeat: [['refused', 'not_written', 'duplicate_submit:not_written']],
+    calls: { enqueue: 0, ack: 0 },
+  });
+});
+
+test('1270 I1 (supervised, mailbox failing): local typing during the hold refuses the held CR (user_input_after_body), zero CR — supervision does not bypass the typing guard', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1270-i1-typing', inputPolicy: 'user-supervised' });
+  const calls = failMailbox(b);
+  const p = b.pair('B1270-I1-TYPED');
+  b.frame(p.body);
+  b.frame(p.submit);
+  await b.clock.advance(100);
+  b.shared.lastUserInputTime = b.clock.now();
+  await b.clock.advance(5000);
+  assert.deepEqual({ writes: b.child.writes, submit: b.stages(p.submit.daemon_msg_id), calls },
+    { writes: ['B1270-I1-TYPED'], submit: [['refused', 'not_written', 'user_input_after_body']], calls: { enqueue: 0, ack: 0 } });
+});
+
+// ── Task 1270 I3: generic (unknown) CLI — the floor and typing bound apply; no modal classifier is consulted ──────────
+test('1270 I3: a generic CLI with a modal-looking tail gets body at once and CR at +250; no registry modal/ready read during the hold', { timeout: 30000 }, async t => {
+  const counts = {};
+  const proxy = new Proxy(registry, { get(target, key) {
+    const value = target[key];
+    if (typeof value !== 'function') return value;
+    return (...args) => { counts[key] = (counts[key] || 0) + 1; return value.apply(target, args); };
+  } });
+  const b = createBridge(t, { sid: 'b1270-i3-generic', command: 'generic-tool', readyRegistry: proxy });
+  assert.equal(b.shared.knownAiCli, false, 'PRECONDITION: generic-tool is not a known AI CLI');
+  b.feed(MODAL);                                   // modal-looking text, but not a known CLI
+  const p = b.pair('B1270-I3');
+  b.frame(p.body);
+  b.frame(p.submit);
+  const atOnce = b.child.writes.slice();
+  const before = JSON.stringify(counts);
+  await b.clock.advance(249);
+  const beforeFloor = b.child.writes.slice();
+  await b.clock.advance(1);
+  assert.deepEqual({ atOnce, beforeFloor, atFloor: b.child.writes, readsDuringHold: JSON.stringify(counts) === before },
+    { atOnce: ['B1270-I3'], beforeFloor: ['B1270-I3'], atFloor: ['B1270-I3', '\r'], readsDuringHold: true });
 });
