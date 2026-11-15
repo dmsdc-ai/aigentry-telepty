@@ -956,20 +956,20 @@ test('c5d raw exception, suffixed, NaN and exponent strings are not accepted as 
 });
 
 // ── c6 real callers through the admitted factories ────────────────────────────────────────────────────
-test('c6 /inject real delivery-return boundary keeps actionable UPSTREAM_STALLED and SURFACE_MODAL texts', { timeout: 10000 }, async (t) => {
-  await t.test('c6-1 UPSTREAM_STALLED exact text via /inject', async () => {
+test('c6 /inject real delivery-return boundary: UPSTREAM_STALLED suspended (task1270), SURFACE_MODAL text kept', { timeout: 10000 }, async (t) => {
+  // Task 1270 contract update: the pre-1270 expectation (503 UPSTREAM_STALLED exact text) is preserved
+  // verbatim in the task1270 VALIDATION.md RED evidence; output silence no longer rejects /inject.
+  await t.test('c6-1 unanswered upstream probe does not reject /inject (UPSTREAM_STALLED suspended)', async () => {
     const session = H.registerSession(SIDS.us);
     // Owner observation stub only: an upstream probe left unanswered for longer than UPSTREAM_STALL_SECONDS (30).
     session.upstreamProbeAt = Date.now() - 31000;
     session.upstreamProbeWatermark = 0;
     session.outputRingTotalBytes = 0;
-    const r = await H.call('/api/sessions/:id/inject', SIDS.us, { prompt: 'PROBE-US tpub', no_enter: true, from: FROM });
-    console.log(`# C6 ${JSON.stringify({ case: 'upstream', status: r.status, body: r.body })}`);
-    assert.equal(r.status, 503, 'REGRESSION: status 503 preserved');
-    assert.match(String(r.body.inject_id), /^[a-f0-9-]{36}$/, 'PRECONDITION: tracked inject id returned');
-    assert.deepEqual(r.body, { success: false, code: 'UPSTREAM_STALLED',
-      error: 'Session output pipe is dead: the owner is connected but has returned no output since the last delivery.',
-      inject_id: r.body.inject_id, tracking_state: 'aborted' }, 'REGRESSION: /inject UPSTREAM_STALLED public body with exact actionable text');
+    const accepted = await H.inject(SIDS.us, 'PROBE-US tpub');   // asserts 200 + inject_id + exactly one body frame
+    console.log(`# C6 ${JSON.stringify({ case: 'upstream', status: accepted.response.status, body: accepted.response.body })}`);
+    assert.notEqual(accepted.response.body.code, 'UPSTREAM_STALLED', 'REGRESSION: output silence is not an inject refusal');
+    assert.equal(H.runtime.getSessionHealthStatus(session), 'CONNECTED', 'REGRESSION: open owner stays CONNECTED');
+    assert.ok(H.runtime.buildSessionTransportBlock(session).upstream_silent_seconds >= 31, 'REGRESSION: silence still measured');
   });
 
   await t.test('c6-2 SURFACE_MODAL reject exact reason + daemon hint via /inject', async () => {

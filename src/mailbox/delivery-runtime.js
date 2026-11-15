@@ -7,6 +7,13 @@ const readinessHandshake = require('../transport/readiness-handshake');
 const { ptyInputFailure } = require('../pty-input-lifecycle');
 const { validInjectId } = require('../diagnostics/correlation');
 
+// Task 1270 (user-directed): output silence after an input/submit is not evidence of a dead
+// pipe — a prompt whose Enter never landed is silent too, and refusing the recovery input
+// strands the session. UPSTREAM_STALLED classification, and the inject rejection derived from
+// it, stays suspended until the missing-Enter defect is conclusively fixed; re-enabling needs a
+// user-approved source patch. isUpstreamStalled() and upstream_* telemetry remain diagnostic.
+const UPSTREAM_STALL_CLASSIFICATION_SUSPENDED = true;
+
 // Task 1215 hotfix 0.10.1 — immediate-submit-v1. A 0.10.1 bridge declares it on its authenticated owner-WS handshake
 // header (x-telepty-bridge-capabilities, next to input-transport-ready-v1). It means the bridge writes an authorized
 // inject at once (no ready/idle/output gate) and admits at most ONE submit CR per inject_id/pair per owner generation.
@@ -840,6 +847,7 @@ function createDeliveryRuntime(shared, {
       if (shared.isOpenWebSocket(session.ownerWs)) {
         // #732: an open owner socket is necessary, not sufficient. A session that has
         // returned nothing since we last wrote to it is unobservable, not healthy.
+        if (UPSTREAM_STALL_CLASSIFICATION_SUSPENDED) return 'CONNECTED';
         return isUpstreamStalled(session, nowMs, options) ? 'UPSTREAM_STALLED' : 'CONNECTED';
       }
       if (disconnectedMs !== null && disconnectedMs >= staleMs) {
