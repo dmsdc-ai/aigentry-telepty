@@ -88,12 +88,13 @@ jobs:
       - name: RED — same test against the frozen baseline (expected semantic failure)
         working-directory: candidate
         run: |
-          set -uo pipefail
+          set -euo pipefail
           tap="$RUNNER_TEMP/red-baseline.tap"
-          TELEPTY_REPO_ROOT="$GITHUB_WORKSPACE/baseline" node --require ./test-support/setup-env.js \
+          # The runner shell already has errexit; an `if` condition is exempt, so the expected
+          # nonzero exit is captured and the TAP is printed before anything is judged.
+          if TELEPTY_REPO_ROOT="$GITHUB_WORKSPACE/baseline" node --require ./test-support/setup-env.js \
             --test --test-concurrency=1 --test-timeout=120000 --test-reporter=tap \
-            test/upstream-stall-suspended-1270.test.js > "$tap" 2>&1
-          rc=$?
+            test/upstream-stall-suspended-1270.test.js > "$tap" 2>&1; then rc=0; else rc=$?; fi
           cat "$tap"
           echo "baseline exit=$rc"
           bad=0
@@ -128,13 +129,13 @@ jobs:
       - name: GREEN — same test against the PR head
         working-directory: candidate
         run: |
-          set -uo pipefail
+          set -euo pipefail
           unset TELEPTY_REPO_ROOT
           tap="$RUNNER_TEMP/green-candidate.tap"
-          node --require ./test-support/setup-env.js \
+          # Same capture as RED: a failing run still prints its TAP and exit before the verdict.
+          if node --require ./test-support/setup-env.js \
             --test --test-concurrency=1 --test-timeout=120000 --test-reporter=tap \
-            test/upstream-stall-suspended-1270.test.js > "$tap" 2>&1
-          rc=$?
+            test/upstream-stall-suspended-1270.test.js > "$tap" 2>&1; then rc=0; else rc=$?; fi
           cat "$tap"
           echo "candidate exit=$rc"
           bad=0
