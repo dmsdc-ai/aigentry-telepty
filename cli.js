@@ -3486,9 +3486,17 @@ async function main() {
         // working/thinking state), and a CR is never idle-gated, with one admitted CR per inject_id/pair. It is
         // declared by the corrected candidate only — an older bridge binary never sends it, and the daemon must
         // not infer it from a version string, a probe or timing.
-        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', '
-          + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY + ', '
-          + require('./src/mailbox/delivery-runtime').BUSY_INPUT_CAPABILITY, ...policyCapabilityHeaders(),
+        //
+        // r4: the first two terms stay on ONE line, in the exact textual form the pre-existing wiring test
+        // asserts (test/immediate-submit-1215.test.js:323 does `cli.includes(...)` on that literal expression,
+        // "the bridge declares immediate-submit-v1 next to input-transport-ready-v1"). busy-input-v1 is
+        // appended AFTER the matched text, so the assertion holds verbatim and the wire value is unchanged.
+        // Order does not matter to any reader of this header — both parsers split on ',', trim and `includes`:
+        // readiness-handshake.js:29 `declaresCapability` and delivery-runtime.js `declaredBridgeCapabilities`
+        // / `bindImmediateSubmitCapability` — but the adjacency the test pins is kept anyway, because the test
+        // is about the wiring staying visible in one place, not about the wire format.
+        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', ' + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY
+          + ', ' + require('./src/mailbox/delivery-runtime').BUSY_INPUT_CAPABILITY, ...policyCapabilityHeaders(),
         ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
       const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
       daemonWs = ownerSocket;
