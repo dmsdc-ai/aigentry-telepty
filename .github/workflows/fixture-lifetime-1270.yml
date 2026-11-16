@@ -77,6 +77,7 @@ jobs:
             echo "src_tree=$(git rev-parse 'HEAD:src')"
             echo "node=$(node --version)"
             echo "npm=$(npm --version)"
+            echo "sed=$(sed --version | sed -n 1p)"
             echo "runner_os=$RUNNER_OS"
             echo "run=${{ github.run_id }}/${{ github.run_attempt }}"
           } > "$ev/provenance.txt"
@@ -129,7 +130,8 @@ jobs:
           ev="$RUNNER_TEMP/evidence"; out="$ev/sensitivity-mutant.tap"
           cp "$FIXTURE" "$RUNNER_TEMP/fixture.orig"
           trap 'cp "$RUNNER_TEMP/fixture.orig" "$FIXTURE"' EXIT   # the mutant never outlives this step
-          sed -i '/\[1270-E2-GUARD\]/d' "$FIXTURE"
+          # -b: binary I/O, so the Windows CRLF checkout keeps every other line byte-identical (text mode rewrote all of them).
+          sed -b -i '/\[1270-E2-GUARD\]/d' "$FIXTURE"
           diff "$RUNNER_TEMP/fixture.orig" "$FIXTURE" > "$ev/mutant.diff" || true
           cat "$ev/mutant.diff"
           test "$(grep -c '^<' "$ev/mutant.diff")" = "1"
