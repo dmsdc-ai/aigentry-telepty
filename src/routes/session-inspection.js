@@ -1,4 +1,9 @@
 const { protectedInputFailure } = require('../external-approval');
+// Task 1270 r2 — the shared stranded-composer boundary, required directly as the other producer files do
+// (src/mailbox/session-delivery.js, src/transport/websocket.js). This file holds the ONE Enter producer that
+// does not write bytes itself: `submitViaOsascript` presses Return in a GUI window, so it reaches neither
+// `writeDataToSession` nor `submitViaPty` and was the last input path with no strand check.
+const { strandedInputFailure } = require('../mailbox/delivery-runtime');
 const { normalizeAuthorityAudit } = require('../principal/authority-audit');
 const { storedOwningPrincipal } = require('../principal/http');
 // Production session inspection and batch-submit operations.
@@ -105,6 +110,12 @@ function submitViaOsascript(sessionId, keyCombo) {
   const execFileSync = nativeExecFileSync === undefined ? require('child_process').execFileSync : nativeExecFileSync;
   const session = shared.sessions[sessionId];
   if (protectedInputFailure(session)) return false;
+  // Task 1270 r2 — beside the existing protected-input gate, for the same reason the viewer adapter carries it
+  // at one place: this is the gate EVERY caller of this function passes through, so a future caller cannot
+  // reintroduce the hole. A stranded composer holds an earlier delivery's unsubmitted text, and `key code 36`
+  // is a Return into whatever window it raised — the one keystroke that would submit somebody else's
+  // half-message. Refused exactly as the shared boundary refuses it: no key is pressed, nothing is written.
+  if (strandedInputFailure(session)) return false;
   // Build fallback search terms: session ID, project dir name, CLI-specific patterns
   const searchTerms = [sessionId];
   if (session) {
@@ -158,6 +169,17 @@ function runSubmitAll(sessionsMap) {
 
   for (const [id, session] of Object.entries(sessionsMap)) {
     const strategy = getSubmitStrategy(session.command);
+    // Task 1270 r2 — one check at the top of the loop covers BOTH strategies, and reports the SAME failure the
+    // shared boundary returns (code COMPOSER_STRANDED) instead of the generic text: a batch submit is exactly
+    // the operation an operator reaches for when sessions have gone quiet, which is also when a stranded
+    // composer is most likely to be holding unsubmitted text. `submitViaPty` already refuses a strand on its
+    // own (so the pty_cr arm was never at risk); this makes the batch SAY why, and it is the only guard the
+    // osascript arm can have, because that arm presses a key instead of writing bytes.
+    const stranded = strandedInputFailure(session);
+    if (stranded) {
+      results.failed.push({ id, strategy, code: stranded.code, error: stranded.error });
+      continue;
+    }
     let success = false;
 
     if (strategy === 'pty_cr') {

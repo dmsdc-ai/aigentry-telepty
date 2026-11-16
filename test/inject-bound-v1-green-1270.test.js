@@ -926,3 +926,83 @@ test('B1270R M3 strict principal mode: the bound path resolves to no action, so 
   assert.equal(principalHttp.resolveAction({ method: 'POST', url: '/api/sessions/b1270/inject-bound-v1' }), null,
     'CHECKPOINT: the bound path resolves to no action — PRINCIPAL_ACTION_DENIED, never an unchecked write');
 });
+
+// ── Part 7: the last Enter producer — the osascript/AppleScript submit arm (r2, finding m5) ─────────────────────
+//
+// `submitViaOsascript` does not write bytes: it raises a GUI window and presses Return (`key code 36`). So it
+// reaches neither `writeDataToSession` nor `submitViaPty`, which is why the strand boundary missed it. Both
+// cases below drive the REAL production context (`createSessionInspectionContext`) with the real
+// `submitViaPty`, and both FAIL without the guard — the proof is that the injected `execFileSync` seam is never
+// called, i.e. no AppleScript process is spawned and no key is pressed.
+function inspectionContext(sessions, execFileSync) {
+  const { createSessionInspectionContext } = load('src/routes/session-inspection.js');
+  // SUBMIT_STRATEGIES is the daemon's own map; the shipped default has no `osascript_cmd_enter` entry at all, so
+  // this fixture supplies one deliberately — the guard has to hold for ANY configuration that enables that arm.
+  return createSessionInspectionContext({
+    sessions,
+    submitViaPty: H.runtime.submitViaPty,
+    SUBMIT_STRATEGIES: { claude: 'pty_cr', stable: 'osascript_cmd_enter' },
+  }, { execFileSync });
+}
+
+test('B1270R m5 osascript arm: a stranded composer gets no Return keystroke, and a new instance does', () => {
+  const sid = 'b1270g-osascript';
+  const session = { id: sid, type: 'wrapped', command: 'stable', cwd: '/tmp/b1270-project',
+    sessionEpoch: 'osa-epoch-1', clients: new Set(), ownerWs: { readyState: 1, frames: [], send() {} } };
+  const sessions = Object.create(null);
+  sessions[sid] = session;
+  const calls = [];
+  const { submitViaOsascript } = inspectionContext(sessions, (file, args) => {
+    calls.push({ file, args }); return Buffer.from('ok:window');
+  });
+
+  assert.equal(submitViaOsascript(sid, 'cmd_enter'), true, 'PRECONDITION: a healthy session does get its keystroke');
+  assert.equal(calls.length, 1, 'PRECONDITION: exactly one osascript invocation');
+  assert.equal(calls[0].file, 'osascript');
+  assert.match(calls[0].args[1], /key code 36 using command down/, 'PRECONDITION: that invocation really presses Return');
+
+  runtimeModule.strandComposer(session, { epoch: 'osa-epoch-1', injectId: crypto.randomUUID(), reason: 'submit_outcome_unknown' });
+  assert.equal(submitViaOsascript(sid, 'cmd_enter'), false, 'CHECKPOINT: refused for a stranded composer');
+  assert.equal(calls.length, 1, 'CHECKPOINT: NO osascript process was spawned — the Return was never pressed');
+
+  // Keyed on the instance here too: a new epoch is a new composer and must not inherit the refusal.
+  session.sessionEpoch = 'osa-epoch-2';
+  assert.equal(submitViaOsascript(sid, 'cmd_enter'), true, 'CHECKPOINT: a NEW instance submits normally');
+  assert.equal(calls.length, 2, 'CHECKPOINT: and that one did spawn its keystroke');
+});
+
+test('B1270R m5 submit-all: a batch submit skips every stranded identity with the shared failure, on BOTH strategies', { timeout: 30000 }, async () => {
+  // A real wrapped session that is stranded (pty_cr strategy), a GUI-strategy record that is stranded, and a
+  // healthy wrapped session as the control. One batch, one pass.
+  const strandedPty = H.registerSession('b1270g-submitall-stranded');
+  const healthy = H.registerSession('b1270g-submitall-ok');
+  H.sessionStateManager.feed('b1270g-submitall-ok', WORKING);
+  runtimeModule.strandComposer(strandedPty, { epoch: strandedPty.sessionEpoch, injectId: crypto.randomUUID(),
+    reason: 'submit_outcome_unknown' });
+  const osaId = 'b1270g-submitall-osa';
+  const osa = { id: osaId, type: 'wrapped', command: 'stable', cwd: '/tmp/b1270-project',
+    sessionEpoch: 'osa-batch-epoch', clients: new Set(), ownerWs: { readyState: 1, frames: [], send() {} } };
+  runtimeModule.strandComposer(osa, { epoch: 'osa-batch-epoch', injectId: crypto.randomUUID(), reason: 'cr_outcome_unknown' });
+
+  const sessions = Object.create(null);
+  sessions[strandedPty.id] = strandedPty;
+  sessions[healthy.id] = healthy;
+  sessions[osaId] = osa;
+  const calls = [];
+  const { runSubmitAll } = inspectionContext(sessions, (file, args) => { calls.push({ file, args }); return Buffer.from('ok:window'); });
+
+  const before = { stranded: injects(strandedPty.ownerWs).length, healthy: injects(healthy.ownerWs).length };
+  const results = runSubmitAll(sessions);
+
+  assert.deepEqual(results.successful.map(r => r.id), [healthy.id],
+    `CHECKPOINT: only the healthy session was submitted ${JSON.stringify(results)}`);
+  assert.deepEqual(results.failed.map(f => [f.id, f.strategy, f.code]).sort(),
+    [[osaId, 'osascript_cmd_enter', 'COMPOSER_STRANDED'], [strandedPty.id, 'pty_cr', 'COMPOSER_STRANDED']].sort(),
+    `CHECKPOINT: both stranded identities are refused with the SHARED failure code, not a generic "Submit failed" ${JSON.stringify(results.failed)}`);
+  assert.deepEqual(calls, [], 'CHECKPOINT: the osascript arm never ran at all — no window raised, no key pressed');
+  assert.equal(injects(strandedPty.ownerWs).length, before.stranded,
+    'CHECKPOINT: not one CR reached the stranded owner socket');
+  const healthyFrames = injects(healthy.ownerWs).slice(before.healthy);
+  assert.deepEqual(healthyFrames.map(f => f.data), ['\r'],
+    `CHECKPOINT: the control session still got exactly its one bare CR ${JSON.stringify(healthyFrames)}`);
+});

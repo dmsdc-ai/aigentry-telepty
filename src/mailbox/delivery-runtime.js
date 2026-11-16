@@ -2185,13 +2185,12 @@ function createDeliveryRuntime(shared, {
     // into a composer holding an earlier delivery's unsubmitted text would submit THAT text, so none of them
     // may fire.
     //
-    // Two producers do NOT pass through here and are gated at their own door: the viewer input frame
-    // (src/transport/websocket.js `viewerInputDeliverer`, which writes to the owner socket or the PTY directly)
-    // and `deliverApprovedInjection`'s two direct owner writes (src/mailbox/session-delivery.js). Review
-    // finding m5 names one more: `runSubmitAll`'s `osascript_cmd_enter` strategy
-    // (src/routes/session-inspection.js) submits by a keystroke event instead of a PTY write and is therefore
-    // NOT covered by this check — that file is outside this unit's write set, so it is reported rather than
-    // edited. See API-MAP.md §6 for the full producer table.
+    // Three producers do NOT pass through here and are gated at their own door, each with the same predicate:
+    // the viewer input frame (`viewerInputDeliverer`, src/transport/websocket.js — it writes to the owner socket
+    // or the PTY directly), `deliverApprovedInjection`'s two direct owner writes (src/mailbox/session-delivery.js)
+    // and the GUI submit arm (`submitViaOsascript`, src/routes/session-inspection.js — it presses Return in a
+    // window instead of writing bytes, so no byte boundary can cover it). See API-MAP.md §6 for the measured
+    // producer table, including the one producer that is NOT guarded yet and why.
     if (strandedComposer(session)) return false;
     shared.interaction.invalidateInteraction(session, 'submit');
     if (session.type === 'wrapped') {

@@ -51,6 +51,8 @@ on:
       # r1: the two files the review round added to the change set.
       - 'src/transport/websocket.js'
       - 'src/session-store/persistence.js'
+      # r2: the GUI submit arm (the last Enter producer that writes no bytes).
+      - 'src/routes/session-inspection.js'
 
 permissions:
   contents: read
@@ -115,7 +117,7 @@ jobs:
             for f in $TEST_FILES test/boot-create-only-1270.test.js scripts/test-suites.json \
               cli.js src/routes/session-actions.js src/mailbox/delivery-runtime.js \
               src/mailbox/session-delivery.js src/protocol/bound-inject.js src/cli/inject-bound-v1.js \
-              src/transport/websocket.js src/session-store/persistence.js \
+              src/transport/websocket.js src/session-store/persistence.js src/routes/session-inspection.js \
               src/cli/security-actions.js src/protocol/http-auth.js \
               src/protocol/client-profiles.js src/principal/http.js src/audit/provenance.js \
               daemon.js package-lock.json; do
