@@ -57,7 +57,7 @@ jobs:
       TEST_FILE: test/service-lifecycle-1227.test.js
       BASELINE_SVC_SHA256: baef4e4ce84ca4aab6f29e6562cb75c891ea82cea10c764056d14a1098b44b7d
       FIXED_SVC_SHA256: b91d3fc0bc95ebcddc8f7d8754c864a39a398e159892b8ce9927bfa758142cb5
-      TEST_SHA256: 1f040e5002babd1ba140ee5d774c1cbf76d8386681a6aa5affbd6be74c629374
+      TEST_SHA256: 4e5c1846133e715d1e93060ebb760e35b36ebc40cc8fd9c8c10d00ddecfc2627
       EXPECT_TESTS: '71'
       RED_TITLES: |
         #1270: a two-argument systemd unit whose executable resolves to THIS cli.js is ours (drifted) on both unit kinds

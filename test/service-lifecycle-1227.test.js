@@ -1587,11 +1587,14 @@ test('#1270: a two-argument systemd unit whose executable resolves to THIS cli.j
     for (const [name, unit] of Object.entries(own)) {
       assert.equal(classifyDescriptor(unit, kind, expected), 'drifted', `${kind}: ${name}`);
     }
-    // The three-element node form keeps its exact prior verdicts with the fs seam present.
-    assert.equal(classifyDescriptor(expectedUnit(), kind, { ...expected, text: expectedUnit() }), 'managed', kind);
-    assert.equal(classifyDescriptor(expectedUnit({ nodeBin: '/usr/bin/node' }), kind, expected), 'drifted', kind);
-    assert.equal(classifyDescriptor(expectedUnit({ cliJs: '/opt/foreign/cli.js' }), kind, expected), 'foreign', kind);
-    assert.equal(classifyDescriptor('[Service]\nExecStart=/usr/bin/redis-server\n', kind, expected), 'foreign', kind);
+    // The three-element node form keeps its exact prior verdicts with the fs seam present. Like A-U2 (#879), the unit
+    // and its expectation name the POSIX cli.js: a win32 host's path.join CLI_JS is escaped by the unit builder.
+    const unitExpected = { ...expected, cliJs: UNIT_OWN_CLI_JS };
+    const ownUnit = (overrides = {}) => expectedUnit({ cliJs: UNIT_OWN_CLI_JS, ...overrides });
+    assert.equal(classifyDescriptor(ownUnit(), kind, { ...unitExpected, text: ownUnit() }), 'managed', kind);
+    assert.equal(classifyDescriptor(ownUnit({ nodeBin: '/usr/bin/node' }), kind, unitExpected), 'drifted', kind);
+    assert.equal(classifyDescriptor(ownUnit({ cliJs: '/opt/foreign/cli.js' }), kind, unitExpected), 'foreign', kind);
+    assert.equal(classifyDescriptor('[Service]\nExecStart=/usr/bin/redis-server\n', kind, unitExpected), 'foreign', kind);
   }
 });
 
