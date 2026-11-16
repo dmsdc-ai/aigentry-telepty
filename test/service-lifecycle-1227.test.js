@@ -1561,3 +1561,136 @@ test('#1270: same basename, wrong target, label or shape stays foreign and every
   // No fs seam (e.g. src/uninstall.js's call) cannot establish provenance: still foreign.
   assert.equal(classifyDescriptor(legacyPlist([BIN_LINK, 'daemon']), 'launchd', { cliJs: CLI_JS }), 'foreign');
 });
+
+// ── #1270: the legacy install.sh unit ExecStart=<prefix>/bin/telepty daemon ───────────────────────────
+// FIXTURE ONLY: the unit text, realpath map and systemctl are fakes. These cases prove the classification and the
+// commands we would issue; they are not evidence that a native systemd accepts or runs the unit.
+// Baseline (a734ea8): the systemd branch accepted only [node, cli.js, daemon], so every own two-element case below
+// read 'foreign' and every own-unit verb was refused — expected RED there, GREEN with the shared isOwnEntry proof.
+
+// A systemd unit always names POSIX paths (#879); the fake realpath maps it onto the host's own CLI_JS.
+const UNIT_OWN_CLI_JS = path.posix.join(PKG_ROOT, 'cli.js');
+const OWN_UNIT_PATHS = { [UNIT_OWN_CLI_JS]: CLI_JS, [BIN_LINK]: CLI_JS, [CLI_JS]: CLI_JS };
+function legacyUnit(execStart) {
+  return `[Unit]\nDescription=Telepty Daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=${execStart}\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n`;
+}
+
+test('#1270: a two-argument systemd unit whose executable resolves to THIS cli.js is ours (drifted) on both unit kinds', () => {
+  const own = {
+    'canonical own entrypoint': legacyUnit(`${UNIT_OWN_CLI_JS} daemon`),
+    'npm bin symlink resolving to the own entrypoint': legacyUnit(`${BIN_LINK} daemon`),
+    'quoted npm bin symlink': legacyUnit(`"${BIN_LINK}" daemon`)
+  };
+  const fsSeam = fakeWorld({ realpaths: OWN_UNIT_PATHS }).deps.fs;
+  const expected = { nodeBin: NODE_BIN, cliJs: CLI_JS, fs: fsSeam };
+  for (const kind of ['systemd', 'systemd-user']) {
+    for (const [name, unit] of Object.entries(own)) {
+      assert.equal(classifyDescriptor(unit, kind, expected), 'drifted', `${kind}: ${name}`);
+    }
+    // The three-element node form keeps its exact prior verdicts with the fs seam present.
+    assert.equal(classifyDescriptor(expectedUnit(), kind, { ...expected, text: expectedUnit() }), 'managed', kind);
+    assert.equal(classifyDescriptor(expectedUnit({ nodeBin: '/usr/bin/node' }), kind, expected), 'drifted', kind);
+    assert.equal(classifyDescriptor(expectedUnit({ cliJs: '/opt/foreign/cli.js' }), kind, expected), 'foreign', kind);
+    assert.equal(classifyDescriptor('[Service]\nExecStart=/usr/bin/redis-server\n', kind, expected), 'foreign', kind);
+  }
+});
+
+test('#1270: a two-argument unit that is not provably this install, or not exactly [entry, daemon], stays foreign', () => {
+  const own = OWN_UNIT_PATHS;
+  const cases = {
+    'basename telepty resolving to another cli.js': [legacyUnit(`${BIN_LINK} daemon`), { [BIN_LINK]: '/opt/foreign/cli.js', [CLI_JS]: CLI_JS }],
+    'symlink into a lookalike package path': [legacyUnit(`${BIN_LINK} daemon`), { [BIN_LINK]: '/tmp/x/aigentry-telepty/cli.js', [CLI_JS]: CLI_JS }],
+    'same file name in another telepty install': [legacyUnit('/usr/local/bin/telepty daemon'),
+      { ...own, '/usr/local/bin/telepty': '/usr/local/lib/node_modules/@dmsdc-ai/aigentry-telepty/cli.js' }],
+    'unresolvable executable': [legacyUnit(`${BIN_LINK} daemon`), { [CLI_JS]: CLI_JS }],
+    'own entrypoint, different subcommand': [legacyUnit(`${BIN_LINK} serve`), own],
+    'own entrypoint, no subcommand': [legacyUnit(`${BIN_LINK}`), own],
+    'own entrypoint, surplus argument': [legacyUnit(`${BIN_LINK} daemon --x`), own],
+    'subcommand before entrypoint': [legacyUnit(`daemon ${BIN_LINK}`), own],
+    'relative executable path': [legacyUnit('telepty daemon'), { ...own, telepty: CLI_JS }],
+    'dot-relative executable path': [legacyUnit('./bin/telepty daemon'), { ...own, './bin/telepty': CLI_JS }],
+    'node executable instead of the entrypoint': [legacyUnit(`${NODE_BIN} daemon`), { ...own, [NODE_BIN]: NODE_BIN }],
+    'node wrapper around the bin link': [legacyUnit(`${NODE_BIN} ${BIN_LINK} daemon`), { ...own, [NODE_BIN]: NODE_BIN }],
+    'env wrapper': [legacyUnit(`/usr/bin/env ${BIN_LINK} daemon`), { ...own, '/usr/bin/env': '/usr/bin/env' }],
+    'shell wrapper': [legacyUnit(`/bin/sh -c "${BIN_LINK} daemon"`), { ...own, '/bin/sh': '/bin/sh' }]
+  };
+  for (const kind of ['systemd', 'systemd-user']) {
+    for (const [name, [unit, realpaths]] of Object.entries(cases)) {
+      const fsSeam = fakeWorld({ realpaths }).deps.fs;
+      assert.equal(classifyDescriptor(unit, kind, { nodeBin: NODE_BIN, cliJs: CLI_JS, fs: fsSeam }), 'foreign', `${kind}: ${name}`);
+    }
+    // No fs seam (e.g. src/uninstall.js's call) cannot establish provenance: still foreign.
+    assert.equal(classifyDescriptor(legacyUnit(`${BIN_LINK} daemon`), kind, { cliJs: CLI_JS }), 'foreign', kind);
+  }
+});
+
+test('#1270: an own two-argument user unit is reported drifted and every verb drives it as ours', async () => {
+  const unit = legacyUnit(`${BIN_LINK} daemon`);
+
+  const statusWorld = linuxWorld({ unit, realpaths: OWN_UNIT_PATHS, deps: { getDaemonMeta: answering() } });
+  const status = await getServiceStatus(statusWorld.deps);
+  assert.equal(status.kind, 'systemd-user');
+  assert.equal(status.descriptor.ownership, 'drifted');
+  assert.deepEqual(status.descriptor.drift, ['nodeBin', 'cliJs']);
+  assert.ok(status.remedies.includes('telepty service install'));
+  assert.equal(status.exitCode, SERVICE_EXIT.DEGRADED);
+
+  // The remedy the status names must be an action the product will actually take (no foreign-descriptor refusal).
+  for (const verb of ['start', 'stop', 'restart']) {
+    const world = linuxWorld({ unit, realpaths: OWN_UNIT_PATHS, deps: { getDaemonMeta: answering() } });
+    const result = await runServiceVerb(verb, CONSENTED, world.deps);
+    assert.notEqual(result.reason, 'foreign-descriptor', verb);
+    assert.equal(result.exitCode, SERVICE_EXIT.OK, verb);
+    assert.deepEqual(mutatingCalls(world.calls), [['systemctl', '--user', verb, 'telepty']], verb);
+    assert.equal(world.files.get(UNIT_PATH), unit, `${verb} must not rewrite the descriptor`);
+  }
+
+  // install upgrades the legacy unit in place without --replace.
+  const installWorld = linuxWorld({ unit, realpaths: OWN_UNIT_PATHS, deps: { getDaemonMeta: answering() } });
+  const installed = await runServiceVerb('install', CONSENTED, installWorld.deps);
+  assert.equal(installed.exitCode, SERVICE_EXIT.OK, JSON.stringify(installed.steps));
+  assert.deepEqual(installWorld.calls.writes, [[UNIT_PATH, expectedUnit(), 0o644]]);
+
+  // uninstall removes our own legacy unit.
+  const uninstallWorld = linuxWorld({ unit, realpaths: OWN_UNIT_PATHS, deps: { getDaemonMeta: answering() } });
+  const removed = await runServiceVerb('uninstall', CONSENTED, uninstallWorld.deps);
+  assert.equal(removed.exitCode, SERVICE_EXIT.OK, JSON.stringify(removed.steps));
+  assert.deepEqual(uninstallWorld.calls.removals, [UNIT_PATH]);
+  assert.ok(uninstallWorld.calls.exec.some((c) => c.join(' ') === 'systemctl --user disable --now telepty'));
+});
+
+test('#1270: a foreign two-argument user unit is refused by every verb before systemctl', async () => {
+  const unit = legacyUnit(`${BIN_LINK} daemon`);
+  const foreignLink = { [BIN_LINK]: '/opt/foreign/cli.js', [CLI_JS]: CLI_JS };
+  for (const verb of ['install', 'start', 'stop', 'restart', 'uninstall']) {
+    const world = linuxWorld({ unit, realpaths: foreignLink, deps: { getDaemonMeta: answering() } });
+    const result = await runServiceVerb(verb, CONSENTED, world.deps);
+    assert.equal(result.reason, 'foreign-descriptor', verb);
+    assert.equal(result.exitCode, SERVICE_EXIT.CONSENT, verb);
+    assert.deepEqual(mutatingCalls(world.calls), [], `${verb} drove a unit it does not own`);
+    assert.deepEqual(world.calls.writes, [], verb);
+    assert.deepEqual(world.calls.removals, [], verb);
+    assert.equal(result.status.descriptor.ownership, 'foreign', verb);
+  }
+});
+
+test('#1270: install.sh\'s root system unit is classified by provenance but stays read-only', async () => {
+  const unit = legacyUnit(`${BIN_LINK} daemon`);
+  for (const [realpaths, ownership] of [[OWN_UNIT_PATHS, 'drifted'], [{ [BIN_LINK]: '/opt/foreign/cli.js', [CLI_JS]: CLI_JS }, 'foreign']]) {
+    const statusWorld = linuxWorld({ files: { [SYSTEM_UNIT_PATH]: unit }, realpaths });
+    const status = await getServiceStatus(statusWorld.deps);
+    assert.equal(status.kind, 'systemd');
+    assert.equal(status.descriptor.ownership, ownership);
+    assert.deepEqual(statusWorld.calls.exec.filter(([cmd, first]) => cmd === 'systemctl' && first !== '--user'), []);
+    for (const verb of ['install', 'start', 'stop', 'restart', 'uninstall']) {
+      const world = linuxWorld({ files: { [SYSTEM_UNIT_PATH]: unit }, realpaths });
+      const result = await runServiceVerb(verb, CONSENTED, world.deps);
+      assert.equal(result.reason, 'requires-owner', `${ownership}: ${verb}`);
+      assert.equal(result.exitCode, SERVICE_EXIT.NEEDS_ADMIN, `${ownership}: ${verb}`);
+      assert.deepEqual(mutatingCalls(world.calls), [], `${ownership}: ${verb}`);
+      assert.deepEqual(world.calls.exec.filter(([cmd, first]) => cmd === 'systemctl' && first !== '--user'), [], `${ownership}: ${verb}`);
+      assert.deepEqual(world.calls.writes, [], `${ownership}: ${verb}`);
+      assert.deepEqual(world.calls.removals, [], `${ownership}: ${verb}`);
+    }
+  }
+});

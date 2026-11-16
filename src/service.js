@@ -180,7 +180,9 @@ function recognizesTelepty(text, kind, expected) {
   }
   if (kind === 'systemd' || kind === 'systemd-user') {
     const args = systemdExecParts(text);
-    return args.length === 3 && isCli(args[1]) && args[2] === 'daemon';
+    // #1270: install.sh's unit is ExecStart=<prefix>/bin/telepty daemon — the same realpath proof as launchd.
+    return (args.length === 3 && isCli(args[1]) && args[2] === 'daemon')
+      || (args.length === 2 && args[1] === 'daemon' && isOwnEntry(args[0]));
   }
   if (kind === 'schtasks') {
     const args = (xmlTag(text, 'Arguments') || '').match(/^"([^"\r\n]+)"\s+daemon$/)

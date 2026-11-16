@@ -1,0 +1,235 @@
+name: Service two-argument classifier 1270 (paired RED/GREEN)
+
+# Task 1270 U5 — src/service.js recognizes install.sh's systemd unit ExecStart=<prefix>/bin/telepty daemon by the
+# shared isOwnEntry realpath proof. The WHOLE test/service-lifecycle-1227.test.js (exact PR-head bytes, no name or skip
+# filter) runs twice in every cell, with the maintained test-support/setup-env.js preload:
+#   RED   — src/service.js replaced by the exact Git blob of the frozen baseline a734ea88. It must fail for the semantic
+#           reason only: exit 1, 71 results, exactly the three named own-unit cases failing with an ERR_ASSERTION of
+#           actual 'foreign' / expected 'drifted'; every other case (all old ones, both new negatives) passes.
+#   GREEN — the PR head's src/service.js restored: exit 0, 71/71 pass, nothing skipped, cancelled or todo.
+# A setup, module, syntax or EPERM failure, a timeout, a different failing set or an unregistered case is a FAIL,
+# never a valid RED. All service-manager branches here are in-memory FIXTURES: this is not native acceptance.
+#
+# Security posture (bridge-submit-gap-1270.yml / boot-create-only-1270.yml): no secrets; `contents: read`; checkout
+# credentials not persisted; locked dependencies via `npm ci --ignore-scripts` (no lifecycle hooks, no native build —
+# the file loads only pure-JS modules; node-pty is required lazily and never here); private npm cache; no publish.
+# Network: the job's normal CI operations use it (history checkout, the locked npm fetch, artifact upload). The tests
+# themselves start no daemon or service and make no live network call: the service managers, the daemon probe and
+# fetch they exercise are in-memory fakes. Uploaded artifact = this job's test logs and provenance only.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/service-twoarg-1270.yml'
+      - 'src/service.js'
+      - 'test/service-lifecycle-1227.test.js'
+      - 'test-support/setup-env.js'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: service-twoarg-1270-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  red-green:
+    name: service two-arg RED/GREEN (${{ matrix.os }}, node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['20.20.0', '26.13.0']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      NODE_EXPECTED: ${{ matrix.node }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      BASELINE_SHA: a734ea887944e9b90182432fb7fcc33bdcad066e
+      SVC: src/service.js
+      TEST_FILE: test/service-lifecycle-1227.test.js
+      BASELINE_SVC_SHA256: baef4e4ce84ca4aab6f29e6562cb75c891ea82cea10c764056d14a1098b44b7d
+      FIXED_SVC_SHA256: b91d3fc0bc95ebcddc8f7d8754c864a39a398e159892b8ce9927bfa758142cb5
+      TEST_SHA256: 1f040e5002babd1ba140ee5d774c1cbf76d8386681a6aa5affbd6be74c629374
+      EXPECT_TESTS: '71'
+      RED_TITLES: |
+        #1270: a two-argument systemd unit whose executable resolves to THIS cli.js is ours (drifted) on both unit kinds
+        #1270: an own two-argument user unit is reported drifted and every verb drives it as ours
+        #1270: install.sh's root system unit is classified by provenance but stays read-only
+      NEG_TITLES: |
+        #1270: a two-argument unit that is not provably this install, or not exactly [entry, daemon], stays foreign
+        #1270: a foreign two-argument user unit is refused by every verb before systemctl
+      # One row per TOP-LEVEL TAP result: status<TAB>title<TAB>testCodeFailure<TAB>ERR_ASSERTION<TAB>actual foreign<TAB>expected drifted.
+      # The TAP reporter escapes '#' in titles as '\#'; it is unescaped before matching. Keys are read at the result's own indent.
+      PARSE_AWK: |
+        function flush() { if (st != "") printf "%s\t%s\t%d\t%d\t%d\t%d\n", st, ti, f, e, a, x; st = "" }
+        { raw = $0; sub(/\r$/, "", raw) }
+        raw ~ /^(not ok|ok) [0-9]+ - / { flush(); st = (raw ~ /^not ok/) ? "not ok" : "ok"; ti = raw
+          sub(/^(not ok|ok) [0-9]+ - /, "", ti); gsub(/\\#/, "#", ti); f = 0; e = 0; a = 0; x = 0; y = 0; next }
+        st != "" && raw == "  ---" { y = 1; next }
+        st != "" && y && raw == "  ..." { y = 0; flush(); next }
+        st != "" && y { if (raw ~ /^  failureType: .testCodeFailure.$/) f = 1
+                        if (raw ~ /^  code: .ERR_ASSERTION.$/) e = 1
+                        if (raw ~ /^  actual: .foreign.$/) a = 1
+                        if (raw ~ /^  expected: .drifted.$/) x = 1 }
+        END { flush() }
+      TELEPTY_NO_TAILNET_AUTO: '1'
+      TELEPTY_SKIP_POSTINSTALL: '1'
+      NO_UPDATE_NOTIFIER: '1'
+      TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
+    steps:
+      # SHAs as pinned in bridge-contract-1215.yml (actions/checkout v4.2.2, actions/setup-node v4.4.0).
+      # Full history so the frozen baseline blob is read from the same history as the PR head.
+      - name: Check out the exact PR head with history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+
+      # Windows checkouts may rewrite line endings; the two declared bodies are restored from their canonical Git blobs
+      # (no global git configuration is changed) and proven by SHA-256 before anything runs.
+      - name: Preconditions and provenance (exact head, baseline blob, canonical bodies, versions)
+        run: |
+          set -euo pipefail
+          sha256() { { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } < "$1" \
+            | awk 'NR == 1 && length($1) == 64 && $1 !~ /[^0-9a-f]/ { print $1; ok = 1 } END { exit !ok }'; }
+          log="$RUNNER_TEMP/service-twoarg-1270-logs"; mkdir -p "$log"; echo "LOG_DIR=$log" >> "$GITHUB_ENV"
+          test "$(node --version)" = "v$NODE_EXPECTED"
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          git cat-file -e "${BASELINE_SHA}^{commit}"
+          git merge-base --is-ancestor "$BASELINE_SHA" HEAD
+          test ! -e node_modules
+          test "$(grep -c '^test(' "$TEST_FILE")" = "$EXPECT_TESTS"
+          git cat-file blob "HEAD:$SVC" > "$RUNNER_TEMP/candidate-service.js"
+          git cat-file blob "HEAD:$TEST_FILE" > "$RUNNER_TEMP/candidate-test.js"
+          git cat-file blob "$BASELINE_SHA:$SVC" > "$RUNNER_TEMP/baseline-service.js"
+          cp "$RUNNER_TEMP/candidate-service.js" "$SVC"
+          cp "$RUNNER_TEMP/candidate-test.js" "$TEST_FILE"
+          test "$(sha256 "$SVC")" = "$FIXED_SVC_SHA256"
+          test "$(sha256 "$TEST_FILE")" = "$TEST_SHA256"
+          test "$(sha256 "$RUNNER_TEMP/baseline-service.js")" = "$BASELINE_SVC_SHA256"
+          # Plain assignments, so a failing digest stops the step under errexit instead of printing an empty value.
+          setup_sha="$(sha256 test-support/setup-env.js)"; pkg_sha="$(sha256 package.json)"; lock_sha="$(sha256 package-lock.json)"
+          {
+            echo "os=$RUNNER_OS arch=$RUNNER_ARCH node=$(node --version) npm=$(npm --version) $(git --version)"
+            echo "sha256 tool=$(command -v sha256sum || command -v shasum)"
+            echo "head=$(git rev-parse HEAD) baseline=$BASELINE_SHA (ancestor of head)"
+            echo "sha256 $SVC (head)=$FIXED_SVC_SHA256 (verified)"
+            echo "sha256 $SVC (baseline blob)=$BASELINE_SVC_SHA256 (verified)"
+            echo "sha256 $TEST_FILE=$TEST_SHA256 (verified)"
+            echo "sha256 test-support/setup-env.js=$setup_sha"
+            echo "sha256 package.json=$pkg_sha"
+            echo "sha256 package-lock.json=$lock_sha"
+            echo "registered top-level tests=$(grep -c '^test(' "$TEST_FILE")"
+            echo "changed paths baseline..head:"; git diff --name-only "$BASELINE_SHA" HEAD
+          } | tee "$log/provenance.txt"
+
+      - name: Install locked dependencies without lifecycle scripts
+        id: install
+        run: |
+          set -euo pipefail
+          sha256() { { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } < "$1" \
+            | awk 'NR == 1 && length($1) == 64 && $1 !~ /[^0-9a-f]/ { print $1; ok = 1 } END { exit !ok }'; }
+          lock="$(sha256 package-lock.json)"
+          mkdir -p "$RUNNER_TEMP/npm-cache"
+          npm ci --ignore-scripts --no-audit --no-fund --cache "$RUNNER_TEMP/npm-cache" 2>&1 | tee "$LOG_DIR/npm-ci.log"
+          test "$(sha256 package-lock.json)" = "$lock"
+          # Read-only: npm ls exits nonzero when either top-level dependency is missing or invalid; pipefail keeps that exit.
+          npm ls --depth=0 ws prompts 2>&1 | tee -a "$LOG_DIR/npm-ci.log"
+
+      - name: RED — whole file against the exact a734ea88 src/service.js blob (expected semantic failure)
+        id: red
+        run: |
+          set -euo pipefail
+          sha256() { { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } < "$1" \
+            | awk 'NR == 1 && length($1) == 64 && $1 !~ /[^0-9a-f]/ { print $1; ok = 1 } END { exit !ok }'; }
+          tap="$LOG_DIR/red.tap"; err="$LOG_DIR/red.stderr"; rows="$LOG_DIR/red.rows.tsv"
+          cp "$RUNNER_TEMP/baseline-service.js" "$SVC"
+          test "$(sha256 "$SVC")" = "$BASELINE_SVC_SHA256"
+          # errexit exempts an `if` condition: the expected nonzero exit is captured, and the fixed module is restored
+          # before anything is judged.
+          if node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-timeout=120000 \
+            --test-reporter=tap "$TEST_FILE" > "$tap" 2> "$err"; then rc=0; else rc=$?; fi
+          echo "$rc" > "$LOG_DIR/red.exit"
+          cp "$RUNNER_TEMP/candidate-service.js" "$SVC"
+          echo "=== TAP"; cat "$tap"; echo "=== stderr"; cat "$err"; echo "baseline src/service.js exit=$rc"
+          bad=0
+          die() { echo "::error::RED not proven: $1"; bad=1; }
+          [ "$(sha256 "$SVC")" = "$FIXED_SVC_SHA256" ] || die "fixed src/service.js not restored"
+          [ "$(sha256 "$TEST_FILE")" = "$TEST_SHA256" ] || die "$TEST_FILE changed during RED"
+          [ "$rc" -eq 1 ] || die "exit $rc, expected 1"
+          awk "$PARSE_AWK" "$tap" > "$rows"
+          [ "$(wc -l < "$rows" | tr -d ' ')" = "$EXPECT_TESTS" ] || die "top-level results $(wc -l < "$rows" | tr -d ' '), expected $EXPECT_TESTS"
+          [ -z "$(cut -f2 "$rows" | LC_ALL=C sort | uniq -d)" ] || die "duplicate result titles"
+          failing="$(awk -F'\t' '$1 == "not ok" { print $2 }' "$rows" | LC_ALL=C sort)"
+          [ "$failing" = "$(sed '/^$/d' <<<"$RED_TITLES" | LC_ALL=C sort)" ] || die "failing set differs: $failing"
+          while IFS= read -r title; do
+            [ -n "$title" ] || continue
+            row="$(awk -F'\t' -v t="$title" '$2 == t' "$rows")"
+            [ "$row" = "$(printf 'not ok\t%s\t1\t1\t1\t1' "$title")" ] || die "not an ERR_ASSERTION foreign!=drifted failure: $title"
+          done <<<"$RED_TITLES"
+          while IFS= read -r title; do
+            [ -n "$title" ] || continue
+            [ "$(awk -F'\t' -v t="$title" '$2 == t { print $1 }' "$rows")" = "ok" ] || die "new negative case did not pass: $title"
+          done <<<"$NEG_TITLES"
+          for want in "# tests $EXPECT_TESTS" '# pass 68' '# fail 3' '# cancelled 0' '# skipped 0' '# todo 0'; do
+            grep -qx "$want" "$tap" || die "summary line missing: $want"
+          done
+          ! grep -Eq '^(not )?ok [0-9]+ - .*# (SKIP|TODO)' "$tap" || die "a skipped or todo result is present"
+          ! grep -Eq 'MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND|EPERM|SyntaxError' "$tap" "$err" || die "setup/module/EPERM/syntax error present"
+          [ "$bad" -eq 0 ] || exit 1
+          echo "RED proven: 71 results, 68 pass, only the 3 own-unit cases fail with foreign != drifted"
+
+      - name: GREEN — same whole file against the PR head src/service.js
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          sha256() { { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } < "$1" \
+            | awk 'NR == 1 && length($1) == 64 && $1 !~ /[^0-9a-f]/ { print $1; ok = 1 } END { exit !ok }'; }
+          tap="$LOG_DIR/green.tap"; err="$LOG_DIR/green.stderr"; rows="$LOG_DIR/green.rows.tsv"
+          test "$(sha256 "$SVC")" = "$FIXED_SVC_SHA256"
+          test "$(sha256 "$TEST_FILE")" = "$TEST_SHA256"
+          if node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-timeout=120000 \
+            --test-reporter=tap "$TEST_FILE" > "$tap" 2> "$err"; then rc=0; else rc=$?; fi
+          echo "$rc" > "$LOG_DIR/green.exit"
+          echo "=== TAP"; cat "$tap"; echo "=== stderr"; cat "$err"; echo "fixed src/service.js exit=$rc"
+          bad=0
+          die() { echo "::error::GREEN not proven: $1"; bad=1; }
+          [ "$rc" -eq 0 ] || die "exit $rc, expected 0"
+          awk "$PARSE_AWK" "$tap" > "$rows"
+          [ "$(wc -l < "$rows" | tr -d ' ')" = "$EXPECT_TESTS" ] || die "top-level results $(wc -l < "$rows" | tr -d ' '), expected $EXPECT_TESTS"
+          [ -z "$(awk -F'\t' '$1 != "ok"' "$rows")" ] || die "a result is not ok"
+          while IFS= read -r title; do
+            [ -n "$title" ] || continue
+            [ "$(awk -F'\t' -v t="$title" '$2 == t { print $1 }' "$rows")" = "ok" ] || die "no plain 'ok' result for: $title"
+          done <<<"$RED_TITLES$NEG_TITLES"
+          for want in "# tests $EXPECT_TESTS" "# pass $EXPECT_TESTS" '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+            grep -qx "$want" "$tap" || die "summary line missing: $want"
+          done
+          ! grep -Eq '^(not )?ok [0-9]+ - .*# (SKIP|TODO)' "$tap" || die "a skipped or todo result is present"
+          [ "$bad" -eq 0 ] || exit 1
+          echo "GREEN proven: 71/71 pass, 0 skipped/todo/cancelled"
+
+      # Bounded scope: only this job's provenance, npm ci output and test logs — never HOME, config or caches.
+      # actions/upload-artifact pinned to the v4 tag's commit ea165f8d65b6e75b540449e92b4886f43607fa02, as measured by the
+      # controller (read-only `git ls-remote https://github.com/actions/upload-artifact.git refs/tags/v4`, 2026-11-16).
+      - name: Upload test logs and provenance
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: service-twoarg-1270-${{ matrix.os }}-node${{ matrix.node }}
+          path: ${{ runner.temp }}/service-twoarg-1270-logs
+          retention-days: 14
+          if-no-files-found: warn
