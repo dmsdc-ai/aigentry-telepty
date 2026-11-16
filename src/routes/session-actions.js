@@ -1927,10 +1927,16 @@ function createSessionActions(shared, effects = {}) {
         from: claimedFrom, to: requestedId, prompt: req.body.prompt, orchestratorSids: shared.ORCHESTRATOR_SIDS
       });
       if (peerVerdict.decision === 'block') {
-        // r3 (finding RR-m4): the SAME bus event the legacy route emits for the same verdict, with the same
-        // extra fields, so a subscriber reading `peer_inject_blocked` as THE enforcement record sees bound
-        // blocks too. `broadcastSessionEvent` is an existing `shared` seam and is synchronous — it adds no
-        // await, and this arm has no effect to precede.
+        // r3 (finding RR-m4): the SAME bus event type the legacy route emits for the same verdict, with the
+        // same extra field SET, so a subscriber reading `peer_inject_blocked` as THE enforcement record sees
+        // bound blocks too. One field's VALUE cannot match and that is deliberate (r5, finding D2):
+        // `inject_id` is null here because this door mints no transport identity before this gate — the
+        // legacy route mints its UUID above its own #533 check, this one only below. So bound blocks
+        // correlate by `(target_agent, from, reason)`, not by `inject_id`. Minting one early would
+        // contradict this route's own closed result, which gives a refusal no identity at all (see the
+        // `injectId` comment on the answer below) and would put an id in the audit log for a request that
+        // never had one. `broadcastSessionEvent` is an existing `shared` seam and is synchronous — it adds
+        // no await, and this arm has no effect to precede.
         (0, shared.broadcastSessionEvent)('peer_inject_blocked', id, session, {
           extra: {
             target_agent: id,

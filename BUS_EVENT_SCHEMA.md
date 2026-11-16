@@ -256,6 +256,36 @@ This event measures elapsed time since `lastActivityAt`, once per inactivity per
   `x-telepty-session-token`), or `null` when unverifiable (operator/human shell). `spoof_suspected`
   = `from && verified_sender_sid && from !== verified_sender_sid`. (telepty #43 P2.)
 
+**The bound transport's variant of this event (task 1270 candidate — acceptance pending).** The
+`POST /api/sessions/:id/inject-bound-v1` door emits the same event type on its `accepted` stage only,
+and the field set is NOT identical to the one above. Measured against the emitter
+(`src/routes/session-actions.js` accepted arm) rather than intended — same convention as the block
+above, which also leaves the common envelope keys `event_type`, `session_id` and `semantic` implicit:
+
+```json
+{ "type": "inject_written", "inject_id": "UUID", "sender": "daemon", "target_agent": "string", "content_sha256": "string", "content_length": "number", "from": "string|null", "verified_sender_sid": "string|null", "verified_sender_epoch": "string|null", "verified_sender_generation": "number|null", "spoof_suspected": "boolean", "origin": "trusted-local", "transport": "inject-bound-v1", "body_stage": "string", "submit_stage": "string", "timestamp": "ISO 8601" }
+```
+
+- `body_stage` and `submit_stage` are **additive** and appear on this transport only. They carry the
+  honest stage vocabulary of the bound result (`sent_to_bridge` is not `pty_written`, and neither is
+  consumption), so a subscriber learns how far the pair got, not that it was consumed.
+- `transport` is **not additive, it SHADOWS the envelope's own `transport` block.** Every session
+  event carries `transport: { session_epoch, owner_generation, busy_input, … }` from
+  `buildSessionEvent`, and that builder spreads the per-event `extra` **last**
+  (`src/mailbox/delivery-runtime.js`), so on a bound `inject_written` — and on no other event — the
+  key holds the **string** `"inject-bound-v1"` instead of that object. A subscriber reading
+  `event.transport.busy_input` on this one event type gets `undefined` rather than a value. Nothing
+  throws (the trusted session-event projection reads `event?.transport?.health_status` and only for
+  `session_health`, which this is not), and no in-tree subscriber reads it; it is recorded here
+  because the shape is what it is, not what the name suggests. Discriminate on
+  `typeof event.transport === 'string'`, or read the transport block from another event.
+- `reply_to`, `thread_id` and `reply_expected` are **absent** on this transport — not null, absent.
+  The bound request schema is closed and has no such fields, so there is nothing to report. A
+  subscriber that requires them must treat this door as a different producer.
+- There is **no `inject_queued` counterpart** for the bound door: that transport never parks, so the
+  `queued` arm above cannot arise. A bound delivery that cannot be handed to the owner is refused in
+  the response instead, and emits nothing here.
+
 ### `audit_overflow` (telepty #43)
 ```json
 { "type": "audit_overflow", "sender": "daemon", "dropped": "number", "queue_max": "number", "timestamp": "ISO 8601" }

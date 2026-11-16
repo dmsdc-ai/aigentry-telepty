@@ -1286,6 +1286,15 @@ function createDeliveryRuntime(shared, {
     // inside writeDataToSession RETURNS a result (session-delivery.js:53-66) rather than throwing, and every
     // exit of this function before the marker below is a `return refuse(...)`, so the catch is reached only when
     // the write genuinely threw — which is by definition not a provable zero.
+    // That argument covers the pre-send REFUSALS; the pre-send STATEMENTS are the remaining step (r5, finding
+    // D3). On the wrapped path this route admits, the statements evaluated before `ownerWs.send` are
+    // activeHandoff, protectedInputFailure, strandedInputFailure, sshInputFailure, the type checks,
+    // hasHeldInteraction, invalidateInteraction, isOpenWebSocket, the sshRemote read and injectFrame itself —
+    // read one by one: property reads, Map/Set lookups, three field assignments, and a JSON.stringify of a
+    // string plus a plain meta object whose builder drops malformed values rather than raising. None throws on
+    // any path in this tree, so the strand is unreachable from them. If one ever did, this marker would strand a
+    // session whose zero was provable: over-refusal of further input, never a write — the safe direction, and
+    // the reason the marker is worth having even though its claim rests on reading those statements.
     let bodyHanded = false;
     let bodyAttempted = false;
     // The strand, plus its durability. `strandComposer` is idempotent for one epoch, so one bound request
