@@ -1899,10 +1899,13 @@ function createSessionActions(shared, effects = {}) {
       };
       // A refusal is always 4xx: nothing was written, and the caller may act on that with certainty. 5xx is
       // reserved for outcome_unknown, where it may not.
-      const refuse = (status, reason) => {
-        recordAudit(`refused:${boundInject.boundedReason(reason)}`, null);
-        return answer(status, { stage: 'refused', reason });
-      };
+      //
+      // Task 1270 r3 (re-review finding RR-m2): a route refusal writes NO audit line, which is exactly what the
+      // legacy /inject route does — it audits the #533 block and the terminal delivery outcomes, and a legacy
+      // 404 or 400 leaves no record at all. The r1 version audited every refusal, so an authenticated caller
+      // could append unbounded full-prompt records to the inject log by POSTing to ids that do not exist. The
+      // audit calls now sit on the outcome classes legacy audits, and nowhere else.
+      const refuse = (status, reason) => answer(status, { stage: 'refused', reason });
 
       const id = exactOwnSessionId(requestedId);
       if (!id) return refuse(404, 'session_not_found');
@@ -1924,6 +1927,20 @@ function createSessionActions(shared, effects = {}) {
         from: claimedFrom, to: requestedId, prompt: req.body.prompt, orchestratorSids: shared.ORCHESTRATOR_SIDS
       });
       if (peerVerdict.decision === 'block') {
+        // r3 (finding RR-m4): the SAME bus event the legacy route emits for the same verdict, with the same
+        // extra fields, so a subscriber reading `peer_inject_blocked` as THE enforcement record sees bound
+        // blocks too. `broadcastSessionEvent` is an existing `shared` seam and is synchronous — it adds no
+        // await, and this arm has no effect to precede.
+        (0, shared.broadcastSessionEvent)('peer_inject_blocked', id, session, {
+          extra: {
+            target_agent: id,
+            from: claimedFrom,
+            reason: peerVerdict.reason,
+            attempted_kind: peerVerdict.kind,
+            envelope_present: peerVerdict.envelopePresent,
+            inject_id: null   // no transport identity is minted for a request that is blocked before delivery
+          }
+        });
         console.warn(`[PEER-GUARD] blocked bound inject ${claimedFrom} → ${requestedId} (${peerVerdict.reason})`);
         // One audit line with the legacy `blocked:<reason>` vocabulary — the #533 gate logic itself is unchanged.
         recordAudit(`blocked:${peerVerdict.reason}`, null);
@@ -1987,13 +2004,45 @@ function createSessionActions(shared, effects = {}) {
         return answer(500, { stage: 'outcome_unknown', reason: 'delivery_threw', injectId: inject_id,
           bodyStage: 'unknown', submitStage: 'unknown', bytesWritten: null });
       }
-      const status = outcome.stage === 'accepted' ? 200 : outcome.stage === 'refused' ? 409 : 500;
+      // r3 (finding RR-m10): the one reason the shared predicate can return AFTER an await that the route would
+      // itself have answered 403 keeps that status, so a mid-flight protected-input enrolment reads the same to
+      // a caller whether it was caught before or during the delivery. Every other refusal stays 409.
+      const status = outcome.stage === 'accepted' ? 200
+        : outcome.stage === 'refused' ? (outcome.reason === 'protected_input' ? 403 : 409)
+          : 500;
       console.log(`[INJECT-BOUND-V1] ${id} ${outcome.stage}${outcome.reason ? ` (${outcome.reason})` : ''} inject_id=${inject_id}`);
-      // The terminal audit line for the delivery itself. `forwarded` ONLY for accepted (both frames handed to
-      // the pinned owner); a refusal and an unknown each say so, with the bounded reason the caller also gets.
+      // The terminal audit line for the delivery itself — the outcome classes the legacy route audits
+      // (RR-m2). `forwarded` ONLY for accepted (both frames handed to the pinned owner); a delivery-returned
+      // refusal and an unknown each say so, with the bounded reason the caller also gets.
       recordAudit(outcome.stage === 'accepted' ? 'forwarded'
         : `${outcome.stage === 'refused' ? 'refused' : 'outcome_unknown'}:${boundInject.boundedReason(outcome.reason)}`,
       outcome.stage === 'refused' ? null : inject_id);
+      if (outcome.stage === 'accepted') {
+        // r3 (finding RR-m3): the legacy route sets `session.lastInjectFrom = from` on its delivered arm, and
+        // `transport.last_inject_from` is read from it — so without this the view named an older legacy sender
+        // while the most recent write to that composer was a bound one. A plain field assignment on the record
+        // this request is pinned to; no seam, no await, and it runs AFTER both frames are already handed.
+        if (claimedFrom) session.lastInjectFrom = claimedFrom;
+        // …and the same bus event the legacy route emits for a written delivery, with the same non-secret
+        // metadata (never the prompt itself — #815). `broadcastSessionEvent` is an existing `shared` seam and is
+        // synchronous, so this adds no await anywhere, let alone before an effect. `inject_queued` has no bound
+        // counterpart on purpose: this transport never parks, so `accepted` is only ever "handed to the owner".
+        (0, shared.broadcastSessionEvent)('inject_written', id, session, {
+          extra: {
+            inject_id,
+            target_agent: id,
+            content_sha256: shared.crypto.createHash('sha256').update(req.body.prompt).digest('hex'),
+            content_length: Buffer.byteLength(req.body.prompt),
+            from: claimedFrom,
+            ...verifiedSender,
+            spoof_suspected: !!(claimedFrom && verifiedPrincipal && claimedFrom !== verifiedPrincipal.sid),
+            origin: 'trusted-local',
+            transport: 'inject-bound-v1',
+            body_stage: outcome.bodyStage,
+            submit_stage: outcome.submitStage
+          }
+        });
+      }
       return answer(status, {
         stage: outcome.stage,
         reason: outcome.reason,

@@ -58,7 +58,7 @@ const REASONS = Object.freeze(new Set([
   // delivery (deliverBoundInjection)
   'binding_changed', 'submit_barrier_busy', 'submit_barrier_rejected', 'body_refused', 'body_outcome_unknown',
   'binding_changed_after_body', 'admission_changed_after_body', 'submit_refused_after_body',
-  'submit_outcome_unknown', 'delivery_threw_after_body', 'cr_outcome_unknown',
+  'submit_outcome_unknown', 'delivery_threw_after_body', 'delivery_threw_during_body', 'cr_outcome_unknown',
   // the strict CLI's own classification of a response
   'route_unsupported', 'response_unparseable',
 ]));

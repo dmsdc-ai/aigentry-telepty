@@ -476,6 +476,19 @@ function createSessionDeliveryContext({
       ? deliverApprovedInjection(id, session, prompt, options) : denied;
     const sshFailure = sshInputFailure(session, prompt);
     if (sshFailure) return sshFailure;
+    // Task 1270 r3 (re-review finding RR-m11) — refuse at the DOOR when this instance's composer is stranded,
+    // not at the drain. Nothing was ever corrupted: the bootstrap-queue and modal-park branches below enqueue
+    // and answer `queued: true`, and the shared boundary then refuses each op when the drain reaches it. But
+    // `queued: true` told the caller its work was accepted for delivery when it can never be written for this
+    // instance, which is the one honesty gap left on the legacy path. The refusal is the shared one (zero bytes,
+    // nothing attempted).
+    //
+    // Placed HERE, after the approval and protected-input branches, so the answers those two give are
+    // untouched: an enrolled or SSH session keeps its exact existing refusal, and `deliverApprovedInjection`
+    // keeps its own strand gate for the signed path. It fires for a STRANDED SESSION ONLY — for every other
+    // session this is a null check and the legacy path is byte-identical, park/queue answers included.
+    const strandedDoor = strandedInputFailure(session);
+    if (strandedDoor) return strandedDoor;
     const sshGeneration = session.sshState?.generation;
     const now = Date.now();
     const sessionEpoch = session.sessionEpoch || null;
@@ -860,6 +873,16 @@ function createSessionDeliveryContext({
       if (!session) return { success: false, error: 'Session not found' };
       const consent=msg.cooperative_handoff;
       if(consent && consent.origin_epoch!==session.sessionEpoch){
+        // Task 1270 r3 (re-review finding RR-M3) — this branch RETURNS its own result and never reaches
+        // writeDataToSession, so the shared strand gate at the top of this file never runs for it. The bridge
+        // writes the frame with `child.write(data)`, which would CONCATENATE this retained text into a composer
+        // that still holds an earlier delivery's unsubmitted line (it cannot submit it: the frame rejects
+        // control characters, so no CR can ride along). Refused FIRST, before `pending_dispatch_started` is
+        // recorded, before the store commit and before `injectionTargets.set` — so a stranded session leaves no
+        // dispatch trace and no persistence churn. Zero is provable here: nothing has been handed to anyone.
+        // In this branch's own vocabulary, with the shared code every other producer reports.
+        const strandedHandoff=strandedInputFailure(session);
+        if(strandedHandoff)return {success:false,delivery_uncertain:false,bytes_written:0,code:strandedHandoff.code,error:strandedHandoff.error,retryable:false};
         const helper=require('../principal/pending-handoff'),event=helper.transferredRecord(session,msg);
         if(!event || event.pending_dispatch_started?.includes(msg.msg_id))return {success:false,delivery_uncertain:true,bytes_written:null,code:'HANDOFF_DISPATCH_UNKNOWN',retryable:false};
         const oldTarget=injectionTargets.get(msg.msg_id);
