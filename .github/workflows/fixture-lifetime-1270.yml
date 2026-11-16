@@ -1,0 +1,168 @@
+name: Fixture lifetime 1270 (c6 ownership, Windows)
+
+# Task 1270 E2 — test-only. One finite run per cell (windows-latest x node 20.20.0 / 26.13.0) on the exact PR head:
+#   NORMAL      the WHOLE maintained file test/submit-public-error-contract.test.js, fault hook unset, every
+#               assertion active: exit 0, 93/93 pass, nothing failed/cancelled/skipped/todo, no lifetime/abort line.
+#   REGRESSION  test/submit-fixture-lifetime-1270.test.js: runs that same file in a child FOCUSED by node:test's own
+#               --test-name-pattern=^c6 (c6 parent, children, c6 fanout; all other cases deliberately excluded — NORMAL
+#               above is the full acceptance) with the test-only controlled fault TELEPTY_FIXTURE_1270_C6_HOLD_MS (real
+#               node:test timeout of the unchanged 10 000 ms c6 deadline), child bound 45 s, test bound 50 s. The child
+#               run is an EXPECTED FAILURE judged by the regression; it is never a fixture green.
+#   SENSITIVITY clearly-labelled mutant: the one [1270-E2-GUARD] line deleted in place; the regression MUST then fail on
+#               its REGRESSION assertion (not a PRECONDITION). Restored and re-hashed afterwards. Not an old-baseline RED.
+# Proves only the c6 fixture lifetime/ownership. Does NOT prove the cause of the Windows/20 10 s overrun, product
+# performance, native/no-kill behaviour or any acceptance gate.
+#
+# Security posture: contents:read only; no secrets; checkout credentials not persisted; npm ci --ignore-scripts with a
+# private per-job cache (no lifecycle script, no native build); no publish; evidence uploaded as an artifact only.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/fixture-lifetime-1270.yml'
+      - 'test/submit-public-error-contract.test.js'
+      - 'test/submit-fixture-lifetime-1270.test.js'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fixture-lifetime-1270-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifetime:
+    name: c6 lifetime (windows-latest, node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20.20.0', '26.13.0']
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      TELEPTY_NO_TAILNET_AUTO: '1'
+      FIXTURE: test/submit-public-error-contract.test.js
+      REGRESSION: test/submit-fixture-lifetime-1270.test.js
+    steps:
+      - name: Check out the exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies (no lifecycle scripts, private cache)
+        run: npm ci --ignore-scripts --no-audit --no-fund --cache "$RUNNER_TEMP/npm-cache-private"
+
+      - name: Provenance (exact head, Node, digests)
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          ev="$RUNNER_TEMP/evidence"; mkdir -p "$ev"
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          test "$(node --version)" = "v${{ matrix.node }}"
+          test -z "${TELEPTY_FIXTURE_1270_C6_HOLD_MS+x}"
+          test "$(grep -c '\[1270-E2-GUARD\]' "$FIXTURE")" = "1"
+          {
+            echo "head_sha=$(git rev-parse HEAD)"
+            echo "head_tree=$(git rev-parse 'HEAD^{tree}')"
+            echo "src_tree=$(git rev-parse 'HEAD:src')"
+            echo "node=$(node --version)"
+            echo "npm=$(npm --version)"
+            echo "runner_os=$RUNNER_OS"
+            echo "run=${{ github.run_id }}/${{ github.run_attempt }}"
+          } > "$ev/provenance.txt"
+          sha256sum "$FIXTURE" "$REGRESSION" .github/workflows/fixture-lifetime-1270.yml test-support/setup-env.js \
+            scripts/test-suites.json package.json package-lock.json >> "$ev/provenance.txt"
+          git status --porcelain > "$ev/status-before.txt"
+          cat "$ev/provenance.txt"
+
+      - name: NORMAL — whole maintained file, fault unset (must be 93/93 green)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/evidence/normal.tap"
+          if node --require ./test-support/setup-env.js --test --test-reporter=tap "$FIXTURE" > "$out" 2>&1; then rc=0; else rc=$?; fi
+          cat "$out"; echo "normal exit=$rc"
+          bad=0; die() { echo "::error::NORMAL not green: $1"; bad=1; }
+          [ "$rc" -eq 0 ] || die "exit $rc"
+          for want in '# tests 93' '# pass 93' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+            grep -qx "$want" "$out" || die "summary line missing: $want"
+          done
+          ! grep -Eq '^[[:space:]]*not ok ' "$out" || die "a 'not ok' result is present"
+          ! grep -q 'C6_LIFETIME' "$out" || die "lifetime guard fired on the normal path"
+          ! grep -q 'C6_DIAG' "$out" || die "cancellation diagnostic emitted on the normal path"
+          grep -q 'route_ms' "$out" || die "c6 phase diagnostics missing from the C6 line"
+          [ "$bad" -eq 0 ] || exit 1
+          echo "NORMAL green: 93/93"
+
+      - name: REGRESSION — real lifetime regression (its faulted child run is an expected failure)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/evidence/regression.tap"
+          if node --require ./test-support/setup-env.js --test --test-reporter=tap "$REGRESSION" > "$out" 2>&1; then rc=0; else rc=$?; fi
+          cat "$out"; echo "regression exit=$rc"
+          bad=0; die() { echo "::error::REGRESSION not green: $1"; bad=1; }
+          [ "$rc" -eq 0 ] || die "exit $rc"
+          for want in '# tests 1' '# pass 1' '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+            grep -qx "$want" "$out" || die "summary line missing: $want"
+          done
+          grep -q 'test timed out after 10000ms' "$out" || die "the probe did not reach the real 10000 ms parent timeout"
+          grep -q 'C6_LIFETIME' "$out" || die "guard line absent from the probe evidence"
+          grep -qF '"focus":"^c6","bound_ms":45000' "$out" || die "probe child was not the focused, 45 s-bounded run"
+          [ "$bad" -eq 0 ] || exit 1
+          echo "REGRESSION green (focused probe child failed as expected)"
+
+      - name: SENSITIVITY — guard-removed mutant must fail the regression (expected failure, not a green)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          ev="$RUNNER_TEMP/evidence"; out="$ev/sensitivity-mutant.tap"
+          cp "$FIXTURE" "$RUNNER_TEMP/fixture.orig"
+          trap 'cp "$RUNNER_TEMP/fixture.orig" "$FIXTURE"' EXIT   # the mutant never outlives this step
+          sed -i '/\[1270-E2-GUARD\]/d' "$FIXTURE"
+          diff "$RUNNER_TEMP/fixture.orig" "$FIXTURE" > "$ev/mutant.diff" || true
+          cat "$ev/mutant.diff"
+          test "$(grep -c '^<' "$ev/mutant.diff")" = "1"
+          test "$(grep -c '^>' "$ev/mutant.diff" || true)" = "0"
+          test "$(grep -c '\[1270-E2-GUARD\]' "$FIXTURE" || true)" = "0"
+          if node --require ./test-support/setup-env.js --test --test-reporter=tap "$REGRESSION" > "$out" 2>&1; then rc=0; else rc=$?; fi
+          cp "$RUNNER_TEMP/fixture.orig" "$FIXTURE"
+          cat "$out"; echo "mutant exit=$rc"
+          bad=0; die() { echo "::error::SENSITIVITY not shown: $1"; bad=1; }
+          [ "$(sha256sum < "$FIXTURE")" = "$(sha256sum < "$RUNNER_TEMP/fixture.orig")" ] || die "fixture not restored"
+          [ -z "$(git status --porcelain -- "$FIXTURE")" ] || die "fixture differs from the PR head after restore"
+          [ "$rc" -eq 1 ] || die "exit $rc, expected 1"
+          for want in '# tests 1' '# pass 0' '# fail 1'; do grep -qx "$want" "$out" || die "summary line missing: $want"; done
+          block="$(awk '/^not ok [0-9]+ - c6 lifetime: /{f=1} f{print} f&&/^[ \t]*\.\.\.[ \t]*$/{exit}' "$out")"
+          printf '%s\n' "$block"
+          grep -qF 'REGRESSION: no c6-2 result' <<<"$block" || die "mutant did not fail on the c6-2 lifetime assertion"
+          ! grep -q 'PRECONDITION' <<<"$block" || die "mutant failed on a precondition, not on the guard"
+          [ "$bad" -eq 0 ] || exit 1
+          echo "SENSITIVITY shown: removing the guard fails the regression on the c6-2 lifetime assertion"
+
+      - name: Evidence checksums
+        if: ${{ always() }}
+        run: |
+          ev="$RUNNER_TEMP/evidence"; mkdir -p "$ev"
+          git status --porcelain > "$ev/status-after.txt" || true
+          (cd "$ev" && sha256sum $(ls | grep -v '^CHECKSUMS$') > CHECKSUMS) || true
+          cat "$ev/CHECKSUMS" || true
+
+      - name: Upload raw logs and provenance
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fixture-lifetime-1270-node${{ matrix.node }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 14
