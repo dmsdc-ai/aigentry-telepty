@@ -4,7 +4,10 @@ const { protectedInputFailure, externalApprovalVerifier } = require('../external
 const { sshInputFailure, requestSshWrite } = require('../ssh-session');
 const { frameMeta: bridgeFrameMeta } = require('./bridge-stage');
 const { ptyInputFailure } = require('../pty-input-lifecycle');
-const { rememberSubmitPair, holdBodyCustody, settleBodyCustody, bodyCustodyFull } = require('./delivery-runtime');   // Task 1215 hotfix 0.10.1 / hotfix480 F1 / hotfix492
+// Task 1215 hotfix 0.10.1 / hotfix480 F1 / hotfix492, plus Task 1270's shared stranded-composer boundary
+// (checked on every write below). One require, as everywhere else in this file.
+const { rememberSubmitPair, holdBodyCustody, settleBodyCustody, bodyCustodyFull,
+  strandedInputFailure } = require('./delivery-runtime');
 
 // #137: the ids a wrapped owner inject frame carries so the bridge can file receipts against them.
 // owner_generation is always the CURRENT owner's; the rest is what the caller actually knows.
@@ -50,6 +53,11 @@ function createSessionDeliveryContext({
     if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return denied;
+    // Task 1270: SHARED WRITE boundary. Every body (legacy /inject, the mailbox drain's deliverFn, fanout,
+    // the bootstrap/modal drains, the direct fallback) and every deferred CR passes through here, so one check
+    // keeps all of them out of a composer that holds an earlier delivery's unsubmitted text. Nothing is written.
+    const stranded = strandedInputFailure(session);
+    if (stranded) return stranded;
     const sshFailure = sshInputFailure(session, data);
     if (sshFailure) return sshFailure;
     if (session.type === 'mailbox') return { success: false, httpStatus: 409, code: 'POLL_ONLY', error: 'Mailbox sessions accept queued text only.' };
@@ -388,6 +396,11 @@ function createSessionDeliveryContext({
     const reject = (code, error, httpStatus = 403) => ({ success: false, code, error, httpStatus, bytes_written: 0 });
     if (session.sshRemote) return reject('SSH_APPROVAL_TRANSPORT_UNSUPPORTED', 'Protected SSH inject requires a bound SSH write receipt adapter.');
     if (session.type !== 'wrapped') return reject('APPROVAL_INGRESS_UNSUPPORTED', 'Signed inject currently supports wrapped sessions only.');
+    // Task 1270: this path writes to ownerWs DIRECTLY (its signature covers the exact bytes, so it cannot go
+    // through the mailbox), which means it bypasses writeDataToSession's boundary and needs the same check.
+    // An approved inject into a stranded composer is refused unspent; the approval is not consumed below.
+    const strandedApproval = strandedInputFailure(session);
+    if (strandedApproval) return reject('COMPOSER_STRANDED', strandedApproval.error, 409);
     const deadline = Date.now() + SUBMIT_QUEUE_TIMEOUT_MS;
     while (session.pendingSubmit) {
       const remaining = deadline - Date.now();
@@ -434,7 +447,8 @@ function createSessionDeliveryContext({
       armUpstreamProbe(session);
       if (!options.noEnter) setTimeout(() => {
         try {
-          if (gone() || !isOpenWebSocket(ownerWs) || Date.now() >= approval.document.expires_at) {
+          // Task 1270: ...and the same boundary again at the deferred CR, which is a second direct owner write.
+          if (gone() || !isOpenWebSocket(ownerWs) || Date.now() >= approval.document.expires_at || strandedInputFailure(session)) {
             emitInjectFailureEvent(id, 'SESSION_GONE', 'Protected submit binding or approval expired.', { phase: 'submit' }, session);
           } else {
             ownerWs.send(injectFrame(session, '\r', { daemon_msg_id: `${bodyIds.daemon_msg_id}:submit`,
@@ -462,6 +476,19 @@ function createSessionDeliveryContext({
       ? deliverApprovedInjection(id, session, prompt, options) : denied;
     const sshFailure = sshInputFailure(session, prompt);
     if (sshFailure) return sshFailure;
+    // Task 1270 r3 (re-review finding RR-m11) — refuse at the DOOR when this instance's composer is stranded,
+    // not at the drain. Nothing was ever corrupted: the bootstrap-queue and modal-park branches below enqueue
+    // and answer `queued: true`, and the shared boundary then refuses each op when the drain reaches it. But
+    // `queued: true` told the caller its work was accepted for delivery when it can never be written for this
+    // instance, which is the one honesty gap left on the legacy path. The refusal is the shared one (zero bytes,
+    // nothing attempted).
+    //
+    // Placed HERE, after the approval and protected-input branches, so the answers those two give are
+    // untouched: an enrolled or SSH session keeps its exact existing refusal, and `deliverApprovedInjection`
+    // keeps its own strand gate for the signed path. It fires for a STRANDED SESSION ONLY — for every other
+    // session this is a null check and the legacy path is byte-identical, park/queue answers included.
+    const strandedDoor = strandedInputFailure(session);
+    if (strandedDoor) return strandedDoor;
     const sshGeneration = session.sshState?.generation;
     const now = Date.now();
     const sessionEpoch = session.sessionEpoch || null;
@@ -846,6 +873,16 @@ function createSessionDeliveryContext({
       if (!session) return { success: false, error: 'Session not found' };
       const consent=msg.cooperative_handoff;
       if(consent && consent.origin_epoch!==session.sessionEpoch){
+        // Task 1270 r3 (re-review finding RR-M3) — this branch RETURNS its own result and never reaches
+        // writeDataToSession, so the shared strand gate at the top of this file never runs for it. The bridge
+        // writes the frame with `child.write(data)`, which would CONCATENATE this retained text into a composer
+        // that still holds an earlier delivery's unsubmitted line (it cannot submit it: the frame rejects
+        // control characters, so no CR can ride along). Refused FIRST, before `pending_dispatch_started` is
+        // recorded, before the store commit and before `injectionTargets.set` — so a stranded session leaves no
+        // dispatch trace and no persistence churn. Zero is provable here: nothing has been handed to anyone.
+        // In this branch's own vocabulary, with the shared code every other producer reports.
+        const strandedHandoff=strandedInputFailure(session);
+        if(strandedHandoff)return {success:false,delivery_uncertain:false,bytes_written:0,code:strandedHandoff.code,error:strandedHandoff.error,retryable:false};
         const helper=require('../principal/pending-handoff'),event=helper.transferredRecord(session,msg);
         if(!event || event.pending_dispatch_started?.includes(msg.msg_id))return {success:false,delivery_uncertain:true,bytes_written:null,code:'HANDOFF_DISPATCH_UNKNOWN',retryable:false};
         const oldTarget=injectionTargets.get(msg.msg_id);

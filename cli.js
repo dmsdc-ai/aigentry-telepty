@@ -2361,7 +2361,10 @@ function runAllowCheck(argv, { env = process.env } = {}) {
 // exit 0, so only this exact JSON shape (validated by parseBootCapabilities) may ever count as support.
 const BOOT_CAPABILITIES_SCHEMA = 'telepty-boot-capabilities-v1';
 function bootCapabilitiesLine() {
-  return JSON.stringify({ schema: BOOT_CAPABILITIES_SCHEMA, verbs: ['allow-create-v1'], viewer_detach: 'nondeleting-v1' });
+  // Task 1270: `inject-bound-v1` joins the EXISTING verbs array. The document's schema, shape and
+  // viewer_detach value are unchanged, parseBootCapabilities already accepts extra verbs, and this query stays
+  // purely local — printing it starts, restarts, repairs or contacts nothing.
+  return JSON.stringify({ schema: BOOT_CAPABILITIES_SCHEMA, verbs: ['allow-create-v1', 'inject-bound-v1'], viewer_detach: 'nondeleting-v1' });
 }
 function runBootCapabilities(argv, { stdout = process.stdout, stderr = process.stderr } = {}) {
   if (!Array.isArray(argv) || argv.length !== 1 || argv[0] !== 'boot-capabilities') {
@@ -2474,6 +2477,16 @@ async function main() {
   if (cmd === 'allow-check') { process.exitCode = runAllowCheck(args); return; }
   // Task 1270: same placement and rule as allow-check — pure local, exact argv, usage (exit 2) for anything else.
   if (cmd === 'boot-capabilities') { process.exitCode = runBootCapabilities(args); return; }
+  // Task 1270: the bound busy-input send. Placed with the other exact-argv verbs and ABOVE Guard A for the same
+  // reason: it accepts one argv shape and answers every other one with usage and exit 2, acting on none of them.
+  // It resolves nothing — no alias/sibling/peer lookup, no discovery, no autostart/repair — and sends exactly one
+  // POST to the canonical local daemon. Exit 0 accepted, 1 refused/unsupported, 2 usage, 3 outcome UNKNOWN (hold).
+  if (cmd === 'inject-bound-v1') {
+    process.exitCode = await require('./src/cli/inject-bound-v1').runInjectBoundV1(args.slice(1), {
+      fetchWithAuth, daemonUrl: daemonUrl('127.0.0.1'), remoteHost: REMOTE_HOST,
+    });
+    return;
+  }
 
   // tp941 Guard A: before ANY command branch, so no subcommand can execute on its way to
   // printing its own usage. Deliberately below the version check, which takes no argv.
@@ -3466,7 +3479,24 @@ async function main() {
       }
       if (allowSessionClosed) return;
       const ownerSocket = new WebSocket(wsUrl, {headers:{...(ownerBearer ? {'x-telepty-session-token':ownerBearer} : {}),
-        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', ' + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY, ...policyCapabilityHeaders(),
+        // Task 1270: busy-input-v1 is declared in the SAME header value, so the daemon binds both capabilities
+        // at the one claim-time binder call and neither can outlive this owner generation. THIS bridge declares
+        // it because THIS bridge's measured handleOwnerInject behaviour backs it: an authorized body is written
+        // directly once the human is not typing (isIdle() consults typing/modal state, never the child's
+        // working/thinking state), and a CR is never idle-gated, with one admitted CR per inject_id/pair. It is
+        // declared by the corrected candidate only — an older bridge binary never sends it, and the daemon must
+        // not infer it from a version string, a probe or timing.
+        //
+        // r4: the first two terms stay on ONE line, in the exact textual form the pre-existing wiring test
+        // asserts (test/immediate-submit-1215.test.js:323 does `cli.includes(...)` on that literal expression,
+        // "the bridge declares immediate-submit-v1 next to input-transport-ready-v1"). busy-input-v1 is
+        // appended AFTER the matched text, so the assertion holds verbatim and the wire value is unchanged.
+        // Order does not matter to any reader of this header — both parsers split on ',', trim and `includes`:
+        // readiness-handshake.js:29 `declaresCapability` and delivery-runtime.js `declaredBridgeCapabilities`
+        // / `bindImmediateSubmitCapability` — but the adjacency the test pins is kept anyway, because the test
+        // is about the wiring staying visible in one place, not about the wire format.
+        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', ' + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY
+          + ', ' + require('./src/mailbox/delivery-runtime').BUSY_INPUT_CAPABILITY, ...policyCapabilityHeaders(),
         ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
       const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
       daemonWs = ownerSocket;
@@ -6008,4 +6038,9 @@ module.exports = {
   createTargetRefusal,    // Task 1270: allow-create-v1 canonical-host gate (pure, pre-network)
   checkCreateDaemonSupport, // Task 1270: allow-create-v1 one-shot /api/meta capability check (injectable fetch)
   viewerCloseDecision,    // Task 1270: viewer detach never deletes a wrapped/unprovable record (pure)
+  // Task 1270 bound busy input: the strict argv parser / canonical-host gate / one-POST runner of the
+  // `inject-bound-v1` verb, re-exported from src/cli/inject-bound-v1.js so a test asserts the SHIPPED verb.
+  parseBoundInjectArgv: (...args) => require('./src/cli/inject-bound-v1').parseBoundInjectArgv(...args),
+  boundTargetRefusal: (...args) => require('./src/cli/inject-bound-v1').boundTargetRefusal(...args),
+  runInjectBoundV1: (...args) => require('./src/cli/inject-bound-v1').runInjectBoundV1(...args),
 };
