@@ -3,6 +3,9 @@ const { claimedReturnMetadata } = require('../claimed-return');
 const { validInjectId } = require('../diagnostics/correlation');
 // Task 1215 hotfix 0.10.1: immediate-submit-v1 support (current owner generation) and its honest response shape.
 const { immediateSubmitSupport, immediateSubmitOutcome, immediateSubmitAttempt, immediateAttemptFields } = require('../mailbox/delivery-runtime');
+// Task 1270: busy-input-v1 binding view and the stranded-composer boundary, plus the two CLOSED bound schemas.
+const { busyInputSupport, bodyCustodyBusy, strandedComposer } = require('../mailbox/delivery-runtime');
+const boundInject = require('../protocol/bound-inject');
 const readinessHandshake = require('../transport/readiness-handshake');
 // #1215 pipe200 S24: the stable public text for an inject delivery that threw (details are in the daemon log only).
 const INJECT_DELIVERY_FAILED_TEXT = 'Delivery failed; see daemon log.';
@@ -1842,6 +1845,114 @@ function createSessionActions(shared, effects = {}) {
     });
   }
 
+  // Task 1270 — POST /api/sessions/:id/inject-bound-v1 (telepty.bound-inject/v1).
+  //
+  // ONE versioned route for the bound busy-input transport. Everything below the schema check is a REFUSAL
+  // BEFORE ANY EFFECT, in a fixed order, and every answer — refusal, acceptance or outcome_unknown — is the
+  // one closed telepty.bound-inject-result/v1 object, so a caller parses a single shape and never guesses.
+  //
+  // Authorization is NOT re-implemented here: the request reaches this handler only through the SAME
+  // createAuthMiddleware chain as /inject (origin guard → peer reachability → client-profile gate → strict
+  // principal / host token / JWT / session bearer). Two consequences are deliberate and must stay:
+  //   • the client-profile gate classifies paths exactly and default-DENIES anything it does not name, so a
+  //     profile-scoped caller is refused on this route — it is not widened to a new grant, and cross-profile
+  //     denial is unchanged (src/protocol/client-profiles.js is untouched);
+  //   • the mailbox session-bearer scope is an exact path match and does not reach here either.
+  // The target is the EXACT OWN record only — no alias, no `-N` sibling, no resolveSessionAlias fallback — so
+  // a bound body can never land in a session the caller did not name.
+  function registerInjectBoundV1Route(app, routePath = '/api/sessions/:id/inject-bound-v1') {
+    app.post(routePath, async (req, res) => {
+      const requestedId = req.params.id;
+      // Every answer reports the DAEMON's current identity, never the values the request claimed.
+      const answer = (status, fields) => {
+        const session = shared.sessions[requestedId];
+        return res.status(status).json(boundInject.boundResult({
+          sessionId: requestedId,
+          sessionEpoch: session ? (session.sessionEpoch || null) : null,
+          ownerGeneration: session ? (session.interactionOwnerGeneration || null) : null,
+          ...fields,
+        }));
+      };
+      // A refusal is always 4xx: nothing was written, and the caller may act on that with certainty. 5xx is
+      // reserved for outcome_unknown, where it may not.
+      const refuse = (status, reason) => answer(status, { stage: 'refused', reason });
+
+      const id = exactOwnSessionId(requestedId);
+      if (!id) return refuse(404, 'session_not_found');
+      const session = shared.sessions[id];
+      if (session.isClosing) return refuse(409, 'session_closing');
+
+      // 1. The CLOSED request schema, before anything looks at the session's state.
+      const invalid = boundInject.validateBoundRequest(req.body);
+      if (invalid) return refuse(400, invalid);
+
+      // 2. The binding the caller pinned must be the daemon's CURRENT one. An epoch or generation mismatch is a
+      //    refusal, never a "close enough" delivery: the whole point of the schema is that a body cannot land on
+      //    an owner the caller did not verify. Compared as opaque strings.
+      if (req.body.expected_epoch !== session.sessionEpoch) return refuse(409, 'epoch_mismatch');
+      if (req.body.expected_owner_generation !== session.interactionOwnerGeneration) return refuse(409, 'owner_generation_mismatch');
+
+      // 3. Transport shape and BOTH required capabilities, for the current owner generation only. An old bridge
+      //    (one that never declared busy-input-v1 on its own claim) is refused here, before any effect — its
+      //    silence about the capability is not permission to write into a busy composer.
+      if (session.type !== 'wrapped' || session.sshRemote) return refuse(409, 'transport_not_applicable');
+      if (busyInputSupport(session) !== 'supported') return refuse(409, 'busy_input_unsupported');
+      if (immediateSubmitSupport(session) !== 'supported') return refuse(409, 'immediate_submit_unsupported');
+      if (!(0, shared.isOpenWebSocket)(session.ownerWs)) return refuse(409, 'owner_disconnected');
+
+      // 4. Every existing input fence that applies to a wrapped delivery, unchanged and none of them removed.
+      const denied = protectedInputFailure(session);
+      if (denied) return refuse(403, 'protected_input');
+      if (strandedComposer(session)) return refuse(409, 'composer_stranded');
+      if ((0, shared.hasHeldInteraction)(session)) return refuse(409, 'interaction_held');
+      const failure = (0, shared.getInjectFailure)(session, { nowMs: Date.now() });
+      if (failure) return refuse(409, failure.code);
+      // The input-transport fence: a CR or body handed to an unwired bridge would be buffered, not written.
+      if (readinessHandshake.awaitingInputTransport(session)) return refuse(409, 'input_transport_not_ready');
+      if ((0, shared.isBootstrapGatedSession)(session) && !(0, shared.isBootstrapReady)(session)) return refuse(409, 'bootstrap_not_ready');
+      // FIFO: anything already parked for this session is ahead of this request; the bound path does not park
+      // and must not overtake it.
+      if ((0, shared.hasBootstrapBacklog)(session) || session.bootstrapDraining === true) return refuse(409, 'bootstrap_backlog');
+      if (bodyCustodyBusy(session)) return refuse(409, 'body_custody_pending');
+      // #737: never write into a surface whose Enter is wired to something other than "submit my message".
+      // The decision is read synchronously (no modal park/hold wait on this immediate-only path).
+      const modal = (0, shared.modalDeliveryDecision)(session, { force: false });
+      if (!modal || modal.action !== 'deliver') return refuse(409, modal && modal.reason ? modal.reason : 'surface_modal');
+
+      // 5. The single bound delivery. The inject_id names THIS pair (body frame and its CR) for the bridge and
+      //    for the caller's own durable record; it is not a tracked-ledger observation, and this route creates
+      //    no pendingReports entry — the closed result has no tracking field and the controller disposition
+      //    keeps the caller's registry fact mapping outside this unit.
+      const inject_id = shared.crypto.randomUUID();
+      let outcome;
+      try {
+        outcome = await (0, shared.deliverBoundInjection)(id, session, req.body.prompt, {
+          expectedEpoch: req.body.expected_epoch,
+          expectedOwnerGeneration: req.body.expected_owner_generation,
+          injectId: inject_id,
+        });
+      } catch (err) {
+        // The delivery threw after it may already have handed the body: that is unknown, never a refusal and
+        // never a retry. The raw exception stays a LOCAL operator diagnostic (#1215 pipe200 S24).
+        console.error('[INJECT-BOUND-V1] delivery threw for %s inject_id=%s:', id, inject_id, err && err.stack ? err.stack : err);
+        return answer(500, { stage: 'outcome_unknown', reason: 'delivery_threw', injectId: inject_id,
+          bodyStage: 'unknown', submitStage: 'unknown', bytesWritten: null });
+      }
+      const status = outcome.stage === 'accepted' ? 200 : outcome.stage === 'refused' ? 409 : 500;
+      console.log(`[INJECT-BOUND-V1] ${id} ${outcome.stage}${outcome.reason ? ` (${outcome.reason})` : ''} inject_id=${inject_id}`);
+      return answer(status, {
+        stage: outcome.stage,
+        reason: outcome.reason,
+        // A refused request has no transport identity to correlate; an accepted or unknown one does, and the
+        // caller needs it precisely because the unknown case must be held rather than replayed.
+        injectId: outcome.stage === 'refused' ? null : inject_id,
+        bodyStage: outcome.bodyStage,
+        submitStage: outcome.submitStage,
+        bytesWritten: outcome.bytesWritten,
+      });
+    });
+  }
+
   function registerKillRoute(app) {
     app.post('/api/sessions/:id/kill', async (req, res) => {
       const requestedId = req.params.id;
@@ -2138,6 +2249,7 @@ function createSessionActions(shared, effects = {}) {
     registerStateRoute,
     registerSubmitRoute,
     registerInjectRoute,
+    registerInjectBoundV1Route,   // Task 1270: POST /api/sessions/:id/inject-bound-v1
     registerKillRoute,
     registerDeleteRoute,
     registerBusPublishRoute,

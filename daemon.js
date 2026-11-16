@@ -90,6 +90,7 @@ const sessionActions = createSessionActions({
   get completionObservation() { return completionObservation; },
   get confirmSubmitAfterDispatch() { return confirmSubmitAfterDispatch; },
   get crypto() { return crypto; },
+  get deliverBoundInjection() { return deliverBoundInjection; },
   get deliverInjectionToSession() { return deliverInjectionToSession; },
   get deliveredAbsenceIdentities() { return deliveredAbsenceIdentities; },
   get deliveryAuditResult() { return deliveryAuditResult; },
@@ -252,6 +253,7 @@ const {
   resolveBootstrapSubmit,
   bootstrapQueuedResponse,
   executeBootstrapInject,
+  deliverBoundInjection,        // Task 1270: bound busy-input body+paired-CR delivery
   parseSubmitRetryOptions,
   buildSubmitVerify,
   buildSubmitConfirmOptions,
@@ -1882,6 +1884,9 @@ require('./src/peer-forwarding').registerPeerForwardRoutes(app, {
 });
 sessionActions.registerInjectRoute(app, '/api/forwarded/sessions/:id/inject');
 sessionActions.registerInjectRoute(app);
+// Task 1270: the bound busy-input transport. ONE versioned route, same auth middleware chain as /inject,
+// exact-own record only; no forwarded/alias variant is registered (a bound body must never be rerouted).
+sessionActions.registerInjectBoundV1Route(app);
 
 // #826 — the OTHER write path, kept next to the route above because they are twins and were
 // diverging silently.

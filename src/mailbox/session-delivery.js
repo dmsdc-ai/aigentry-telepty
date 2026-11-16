@@ -5,6 +5,8 @@ const { sshInputFailure, requestSshWrite } = require('../ssh-session');
 const { frameMeta: bridgeFrameMeta } = require('./bridge-stage');
 const { ptyInputFailure } = require('../pty-input-lifecycle');
 const { rememberSubmitPair, holdBodyCustody, settleBodyCustody, bodyCustodyFull } = require('./delivery-runtime');   // Task 1215 hotfix 0.10.1 / hotfix480 F1 / hotfix492
+// Task 1270: the shared stranded-composer boundary (checked on every write below).
+const { strandedInputFailure } = require('./delivery-runtime');
 
 // #137: the ids a wrapped owner inject frame carries so the bridge can file receipts against them.
 // owner_generation is always the CURRENT owner's; the rest is what the caller actually knows.
@@ -50,6 +52,11 @@ function createSessionDeliveryContext({
     if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return denied;
+    // Task 1270: SHARED WRITE boundary. Every body (legacy /inject, the mailbox drain's deliverFn, fanout,
+    // the bootstrap/modal drains, the direct fallback) and every deferred CR passes through here, so one check
+    // keeps all of them out of a composer that holds an earlier delivery's unsubmitted text. Nothing is written.
+    const stranded = strandedInputFailure(session);
+    if (stranded) return stranded;
     const sshFailure = sshInputFailure(session, data);
     if (sshFailure) return sshFailure;
     if (session.type === 'mailbox') return { success: false, httpStatus: 409, code: 'POLL_ONLY', error: 'Mailbox sessions accept queued text only.' };
@@ -388,6 +395,11 @@ function createSessionDeliveryContext({
     const reject = (code, error, httpStatus = 403) => ({ success: false, code, error, httpStatus, bytes_written: 0 });
     if (session.sshRemote) return reject('SSH_APPROVAL_TRANSPORT_UNSUPPORTED', 'Protected SSH inject requires a bound SSH write receipt adapter.');
     if (session.type !== 'wrapped') return reject('APPROVAL_INGRESS_UNSUPPORTED', 'Signed inject currently supports wrapped sessions only.');
+    // Task 1270: this path writes to ownerWs DIRECTLY (its signature covers the exact bytes, so it cannot go
+    // through the mailbox), which means it bypasses writeDataToSession's boundary and needs the same check.
+    // An approved inject into a stranded composer is refused unspent; the approval is not consumed below.
+    const strandedApproval = strandedInputFailure(session);
+    if (strandedApproval) return reject('COMPOSER_STRANDED', strandedApproval.error, 409);
     const deadline = Date.now() + SUBMIT_QUEUE_TIMEOUT_MS;
     while (session.pendingSubmit) {
       const remaining = deadline - Date.now();
@@ -434,7 +446,8 @@ function createSessionDeliveryContext({
       armUpstreamProbe(session);
       if (!options.noEnter) setTimeout(() => {
         try {
-          if (gone() || !isOpenWebSocket(ownerWs) || Date.now() >= approval.document.expires_at) {
+          // Task 1270: ...and the same boundary again at the deferred CR, which is a second direct owner write.
+          if (gone() || !isOpenWebSocket(ownerWs) || Date.now() >= approval.document.expires_at || strandedInputFailure(session)) {
             emitInjectFailureEvent(id, 'SESSION_GONE', 'Protected submit binding or approval expired.', { phase: 'submit' }, session);
           } else {
             ownerWs.send(injectFrame(session, '\r', { daemon_msg_id: `${bodyIds.daemon_msg_id}:submit`,

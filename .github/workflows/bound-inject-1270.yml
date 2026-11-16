@@ -1,14 +1,22 @@
 name: Bound inject 1270 (diagnostic)
 
-# Task 1270 — private diagnostic for test/inject-bound-v1-1270.test.js (bound busy input: inject-bound-v1 verb,
+# Task 1270 — dedicated non-default diagnostic for the bound busy-input transport (inject-bound-v1 verb,
 # POST /api/sessions/:id/inject-bound-v1, telepty.bound-inject/v1 -> telepty.bound-inject-result/v1).
-# Runs ONLY that file, serially, on ubuntu with Node 26.13.0, prints the raw TAP and exits with the test runner's real
-# numeric status. No validator, skip, retry or name filter: on the 21f13ca1 baseline this job is expected to be RED on the
-# file's own CHECKPOINT assertions, and that RED must stay visible. A green run proves only these in-process cases on this
-# runner — never a PTY write, native busy queueing, auto-submit or model consumption.
+# Runs ONLY the two 1270 bound files, serially, on ubuntu with Node 26.13.0, prints the raw TAP and exits with the test
+# runner's real numeric status. No validator, skip, retry or name filter.
 #
-# Trigger: push to the dedicated private diagnostic branch only, and only when this workflow or the test changes.
-# No pull_request, default-branch, tag or release trigger.
+# Phase A (21f13ca1 baseline): run 43823980085 / job 133153310367 was RED exactly as intended — exit 1, 6 top-level,
+# 0 pass / 6 FAIL, every failure an ERR_ASSERTION at a named CHECKPOINT, no setup/import/module failure.
+# Phase B (this source change) expects BOTH files green, and that must be the job's own numeric exit, not a claim.
+# A green run proves only these in-process cases on this runner: frames handed to a recorder are DAEMON HAND-OFF only
+# (sent_to_bridge) — never a PTY write, native busy queueing, auto-submit or model consumption, which remain a
+# separately reviewed actual-native gate.
+#
+# Trigger: push to the dedicated non-default diagnostic branch only, and only when this workflow, one of the two test
+# files, the suite registry, or one of the production/helper files the change actually touches is modified — so the
+# phase-B push that carries the implementation triggers it instead of silently skipping.
+# No pull_request, default-branch, tag or release trigger. (Branch visibility is the repository's; this workflow is
+# non-default, not private.)
 #
 # Security posture (as in boot-create-only-1270.yml / service-twoarg-1270.yml):
 # - no secrets; `contents: read` only; checkout credentials not persisted;
@@ -26,6 +34,16 @@ on:
     paths:
       - '.github/workflows/bound-inject-1270.yml'
       - 'test/inject-bound-v1-1270.test.js'
+      - 'test/inject-bound-v1-green-1270.test.js'
+      - 'test/boot-create-only-1270.test.js'
+      - 'scripts/test-suites.json'
+      - 'cli.js'
+      - 'daemon.js'
+      - 'src/routes/session-actions.js'
+      - 'src/mailbox/delivery-runtime.js'
+      - 'src/mailbox/session-delivery.js'
+      - 'src/protocol/bound-inject.js'
+      - 'src/cli/inject-bound-v1.js'
 
 permissions:
   contents: read
@@ -43,7 +61,8 @@ jobs:
       run:
         shell: bash
     env:
-      TEST_FILE: test/inject-bound-v1-1270.test.js
+      # The frozen phase-A file first, then the phase-B additions. Serial, one process, one numeric exit.
+      TEST_FILES: test/inject-bound-v1-1270.test.js test/inject-bound-v1-green-1270.test.js
       TELEPTY_NO_TAILNET_AUTO: '1'
       TELEPTY_SKIP_POSTINSTALL: '1'
       NO_UPDATE_NOTIFIER: '1'
@@ -80,14 +99,16 @@ jobs:
           sha256() { node -e "process.stdout.write(require('crypto').createHash('sha256').update(require('fs').readFileSync(process.argv[1])).digest('hex'))" "$1"; }
           test "$(node --version)" = "v26.13.0"
           test "$(git rev-parse HEAD)" = "$PUSHED_SHA"
-          test -f "$TEST_FILE"
+          for f in $TEST_FILES; do test -f "$f"; done
           test -z "$(git status --porcelain)"
           {
             echo "node=$(node --version)"
             echo "head=$(git rev-parse HEAD)"
             echo "tree=$(git rev-parse 'HEAD^{tree}')"
-            for f in "$TEST_FILE" cli.js src/routes/session-actions.js src/mailbox/delivery-runtime.js \
-              src/mailbox/session-delivery.js src/transport/websocket.js src/protocol/http-auth.js \
+            for f in $TEST_FILES test/boot-create-only-1270.test.js scripts/test-suites.json \
+              cli.js src/routes/session-actions.js src/mailbox/delivery-runtime.js \
+              src/mailbox/session-delivery.js src/protocol/bound-inject.js src/cli/inject-bound-v1.js \
+              src/cli/security-actions.js src/transport/websocket.js src/protocol/http-auth.js \
               src/protocol/client-profiles.js daemon.js package-lock.json; do
               if [ -f "$f" ]; then echo "sha256 $(sha256 "$f") $f"; else echo "sha256 MISSING $f"; fi
             done
@@ -99,13 +120,14 @@ jobs:
           set -euo pipefail
           npm ci --ignore-scripts --no-audit --no-fund 2>&1 | tee "$EVIDENCE/npm-ci.log"
 
-      - name: Run the bound inject file alone (raw TAP streamed, real exit, 60 s bound)
+      - name: Run the bound inject files alone (raw TAP streamed, real exit, 60 s bound)
         run: |
           set +e
           set -uo pipefail
           tap="$EVIDENCE/inject-bound-v1-1270.tap"
+          # Unquoted on purpose: TEST_FILES is this workflow's own fixed, space-separated, glob-free literal.
           timeout --kill-after=5s 60s node --require ./test-support/setup-env.js --test --test-concurrency=1 \
-            --test-timeout=60000 --test-reporter=tap "$TEST_FILE" 2>&1 | tee "$tap"
+            --test-timeout=60000 --test-reporter=tap $TEST_FILES 2>&1 | tee "$tap"
           statuses=("${PIPESTATUS[@]}")
           rc="${statuses[0]}"; tee_rc="${statuses[1]}"
           if [ "$tee_rc" -ne 0 ]; then echo "::error::tee failed (exit $tee_rc); the TAP log may be incomplete"; [ "$rc" -ne 0 ] || rc="$tee_rc"; fi
