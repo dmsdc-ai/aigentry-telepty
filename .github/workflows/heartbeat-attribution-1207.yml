@@ -1,55 +1,158 @@
-name: Heartbeat attribution probe (#1207, diagnostic only)
+name: Heartbeat attribution probe (#1207 / task 1270, diagnostic only)
 
-# Task 1215 native55 — DIAGNOSTIC-ONLY paired hosted experiment. NOT a test gate and NOT release acceptance.
-# Runs scripts/heartbeat-attribution-1207.mjs once per OS: 20 arms in a fixed alternating CONTENDED/SOLO order (N = 10 per
-# arm, fixed in the script) over the UNCHANGED frozen test/ledger-control-responsiveness-1207.test.js, selecting only the
-# 1 MiB F2 and R1 cases, with an idle sibling sampler in both arms. The job is red only when the EXPERIMENT is incomplete
-# (timeout, overflow, cleanup failure, missing artifact, node mismatch); test failures and inconclusive verdicts are data.
-# The primary verdict stays with test-install.yml, which this workflow does not change. Evidence is always uploaded as an
-# ordinary GitHub Actions artifact. Triggers mirror windows-diagnostic-879.yml: manual dispatch, and pull_request filtered
-# to this probe's own files. Nothing here runs on push to main.
+# Task 1270 (related 1207/1215/879) — DIAGNOSTIC ONLY, manual dispatch only; replaces the old 20-arm script experiment.
+# NOT a test gate, NOT release/whole-suite/native acceptance; cannot erase recorded failures or prove source causality alone.
+# Per cell: the UNCHANGED maintained test file, focused by --test-name-pattern to F2 [1 MiB] + R1 [1 MiB] (all else NOT_RUN),
+# run twice in fixed order, each a fresh node process, no retry: arm1 ordinary control (TELEPTY_CI_PERF614 unset), arm2
+# TELEPTY_CI_PERF614=1 (the test's existing opt-in idle-control attribution). Both keep the dedicated gate
+# TELEPTY_LEDGER_PERF_GATE=1 and the test's own tier, controls, workload and 50 ms bound. Each arm keeps its exact exit; the
+# verdict fails the job if either arm failed or any TAP/metric/provenance is missing. Security: contents:read, no secrets,
+# credentials not persisted, pinned actions, npm ci --ignore-scripts with a private cache, artifact upload only.
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - '.github/workflows/heartbeat-attribution-1207.yml'
-      - 'scripts/heartbeat-attribution-1207.mjs'
-      - 'test/fixtures/ledger-1207/heartbeat-gap-diagnostics.js'
-      - 'test/fixtures/ledger-1207/heartbeat-sibling-sampler.js'
+    inputs:
+      expected_sha:
+        description: 'Exact 40-hex commit expected at checkout (must equal the dispatched ref head)'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   probe:
-    name: paired heartbeat probe (${{ matrix.os }}, node 20.20.0) — diagnostic only
+    name: perf614 attribution (${{ matrix.os }}, node ${{ matrix.node }}) — diagnostic only
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
+        node: ['20.20.2', '26.13.0']
     runs-on: ${{ matrix.os }}
-    # <= 25 min per OS (dispatch bound). The script's own budget is 20 min of arms; the rest covers checkout, npm ci and upload.
-    timeout-minutes: 25
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: test/ledger-control-responsiveness-1207.test.js
+      NAME_PATTERN: '^(F2|R1) \[1 MiB\]: '
+      ARM_KEYS: TELEPTY_LEDGER_PERF_GATE TELEPTY_CI_PERF614 TELEPTY_LEDGER_1207_TIERS TELEPTY_LEDGER_1207_EVIDENCE_DIR TELEPTY_LEDGER_1207_HB_DIAG TELEPTY_LEDGER_1207_HB_ATTRIB NODE_OPTIONS
+      TELEPTY_LEDGER_PERF_GATE: '1'   # both arms: the existing dedicated gate
+      TELEPTY_LEDGER_1207_TIERS: '1'  # both arms: the test's own default tier, stated explicitly
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - name: Validate dispatch input (strict 40-hex commit; never the default branch)
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::expected_sha must be exactly 40 lowercase hex characters"; exit 1; }
+          [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ] || { echo "::error::refusing to run on the default branch"; exit 1; }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          node-version: '20.20.0'
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Paired CONTENDED/SOLO probe (N=10 per arm, fixed; diagnostic only)
-        run: node scripts/heartbeat-attribution-1207.mjs --out heartbeat-attribution-1207 --expect-node v20.20.0
-
-      - name: Upload probe evidence (always)
-        if: always()
-        uses: actions/upload-artifact@v4
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          name: heartbeat-attribution-1207-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: heartbeat-attribution-1207
-          if-no-files-found: warn
+          node-version: ${{ matrix.node }}
+
+      - name: Provenance (expected vs checkout HEAD, Node/npm/OS, raw checkout bytes vs canonical Git blobs)
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          MATRIX_NODE: ${{ matrix.node }}
+          FILES: >-
+            test/ledger-control-responsiveness-1207.test.js test/fixtures/ledger-1207/control-harness.js
+            test/fixtures/ledger-1207/heartbeat-gap-diagnostics.js test/fixtures/ledger-1207/legacy-fixture.js
+            test-support/setup-env.js .github/workflows/heartbeat-attribution-1207.yml scripts/test-suites.json
+            package.json package-lock.json
+        run: |
+          set -euo pipefail
+          ev="$RUNNER_TEMP/evidence"; mkdir -p "$ev"; p="$ev/provenance.txt"
+          if command -v sha256sum >/dev/null; then H=sha256sum; else H="shasum -a 256"; fi
+          {
+            echo "expected_sha=$EXPECTED_SHA head_sha=$(git rev-parse HEAD)"
+            echo "head_tree=$(git rev-parse 'HEAD^{tree}') src_tree=$(git rev-parse 'HEAD:src')"
+            echo "github_sha=$GITHUB_SHA github_ref=$GITHUB_REF event=$GITHUB_EVENT_NAME run=$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+            echo "matrix_node=$MATRIX_NODE node=$(node --version) node_path=$(command -v node) npm=$(npm --version)"
+            echo "runner_os=$RUNNER_OS runner_arch=$RUNNER_ARCH image=${ImageOS:-unknown}/${ImageVersion:-unknown} uname=$(uname -srm)"
+            echo "hash_tool=$H core.autocrlf=$(git config --get core.autocrlf || echo unset)"
+            echo "# path sha256(raw checkout bytes) raw_blob(--no-filters) head_blob(canonical) bytes eol(git ls-files --eol)"
+            for f in $FILES; do
+              raw=$(git hash-object --no-filters -- "$f"); canon=$(git rev-parse "HEAD:$f")
+              if [ "$raw" = "$canon" ]; then same=identical; else same=DIFFERS_FROM_GIT_BLOB; fi
+              echo "$f sha256=$($H "$f" | cut -d' ' -f1) raw_blob=$raw head_blob=$canon bytes=$same eol=[$(git ls-files --eol -- "$f" | tr '\t' ' ')]"
+            done
+          } > "$p"
+          git status --porcelain > "$ev/status-before-install.txt"
+          cat "$p"
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ] || { echo "::error::checkout HEAD differs from expected_sha"; exit 1; }
+          [ "$(node --version)" = "v$MATRIX_NODE" ] || { echo "::error::node is not v$MATRIX_NODE"; exit 1; }
+
+      - name: Install locked dependencies (no lifecycle scripts, private cache)
+        id: install
+        run: npm ci --ignore-scripts --no-audit --no-fund --cache "$RUNNER_TEMP/npm-cache-private"
+
+      - name: Arm 1/2 — ordinary control (TELEPTY_CI_PERF614 unset)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail; unset TELEPTY_CI_PERF614 TELEPTY_LEDGER_1207_HB_DIAG TELEPTY_LEDGER_1207_HB_ATTRIB
+          d="$RUNNER_TEMP/evidence/arm1-control"; mkdir -p "$d/evidence"; export TELEPTY_LEDGER_1207_EVIDENCE_DIR="$d/evidence"
+          args=(--require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=tap "--test-name-pattern=$NAME_PATTERN" "$TARGET")
+          { printf 'argv=node'; printf ' %q' "${args[@]}"; echo; for k in $ARM_KEYS; do echo "env $k=${!k-<unset>}"; done; date -u +started=%Y-%m-%dT%H:%M:%SZ; } > "$d/arm.txt"
+          if node "${args[@]}" > "$d/stdout.tap" 2> "$d/stderr.txt"; then rc=0; else rc=$?; fi
+          { date -u +finished=%Y-%m-%dT%H:%M:%SZ; echo "exit=$rc"; } >> "$d/arm.txt"
+          cat "$d/arm.txt"; exit "$rc"
+
+      - name: Arm 2/2 — TELEPTY_CI_PERF614=1 idle-control attribution (runs even if arm 1 failed)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        env:
+          TELEPTY_CI_PERF614: '1'
+        run: |
+          set -euo pipefail; unset TELEPTY_LEDGER_1207_HB_DIAG TELEPTY_LEDGER_1207_HB_ATTRIB
+          d="$RUNNER_TEMP/evidence/arm2-perf614"; mkdir -p "$d/evidence"; export TELEPTY_LEDGER_1207_EVIDENCE_DIR="$d/evidence"
+          args=(--require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=tap "--test-name-pattern=$NAME_PATTERN" "$TARGET")
+          { printf 'argv=node'; printf ' %q' "${args[@]}"; echo; for k in $ARM_KEYS; do echo "env $k=${!k-<unset>}"; done; date -u +started=%Y-%m-%dT%H:%M:%SZ; } > "$d/arm.txt"
+          if node "${args[@]}" > "$d/stdout.tap" 2> "$d/stderr.txt"; then rc=0; else rc=$?; fi
+          { date -u +finished=%Y-%m-%dT%H:%M:%SZ; echo "exit=$rc"; } >> "$d/arm.txt"
+          cat "$d/arm.txt"; exit "$rc"
+
+      - name: Verdict + checksums — FAIL if either arm failed or any TAP/metric/provenance is missing
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail   # no -e: every check is recorded, checksums are written, then the step fails once if any check failed
+          ev="$RUNNER_TEMP/evidence"; mkdir -p "$ev"; s="$ev/summary.txt"; bad=0
+          fail() { echo "FAIL: $1" >> "$s"; bad=1; }
+          { echo "scope=FOCUSED DIAGNOSTIC $TARGET --test-name-pattern=$NAME_PATTERN; not whole-suite acceptance, not native behaviour"
+            echo "NOT_RUN=F2/R1 [8 MiB] and [64 MiB]; F2/R1 cross-tier comparison; W5 heartbeat acceptance predicate; [peer235 G1]..[peer235 G4]"; } > "$s"
+          [ -s "$ev/provenance.txt" ] || fail "provenance missing"
+          for arm in arm1-control arm2-perf614; do
+            d="$ev/$arm"; rc=$(sed -n 's/^exit=//p' "$d/arm.txt" 2>/dev/null)
+            [ -n "$rc" ] || { fail "$arm: no recorded exit (not run, setup failure or step timeout)"; continue; }
+            [ "$rc" = 0 ] || fail "$arm: exit $rc"
+            { grep -q '^TAP version' "$d/stdout.tap" && grep -Eq '^1\.\.[0-9]+' "$d/stdout.tap"; } || fail "$arm: TAP header/plan missing"
+            for c in F2 R1; do
+              [ -s "$d/evidence/$c-1MiB.json" ] || fail "$arm: $c-1MiB.json metric missing"
+              v=$(grep -F "[ledger-1207 $c 1 MiB]" "$d/stdout.tap" | grep -o 'heartbeat_acceptance=[^,]*' | head -n 1)
+              case "$v" in *'"pass"') perf=PASS ;; *'"fail"') perf=FAIL ;; *'"inconclusive"') perf=NOT-MEASURED ;; *) perf=MISSING; fail "$arm: $c heartbeat_acceptance missing" ;; esac
+              n=$(grep -c 'telepty.ci-perf614.idle-attribution/v1' "$d/evidence/$c-1MiB.json" 2>/dev/null); n=${n:-0}
+              echo "$arm $c exit=$rc performance=$perf perf614_idle_blocks=$n" >> "$s"
+              if [ "$arm" = arm2-perf614 ]; then [ "$n" = 2 ] || fail "$arm: $c expected 2 perf614 idle blocks, got $n"
+              else [ "$n" = 0 ] || fail "$arm: $c perf614 attribution present in the control arm"; fi
+            done
+          done
+          git status --porcelain > "$ev/status-after.txt" || fail "git status failed"
+          [ "$bad" = 0 ] && echo "verdict=COMPLETE (both arms exit 0, all files present)" >> "$s" || echo "verdict=FAIL" >> "$s"
+          if command -v sha256sum >/dev/null; then H=sha256sum; else H="shasum -a 256"; fi
+          (cd "$ev" && find . -type f ! -name CHECKSUMS | LC_ALL=C sort | while IFS= read -r f; do $H "$f"; done > CHECKSUMS) || bad=1
+          cat "$s" "$ev/CHECKSUMS"; [ "$bad" = 0 ] || exit 1
+
+      - name: Upload raw arm outputs, metrics, provenance and checksums (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: heartbeat-attribution-1207-perf614-${{ matrix.os }}-node${{ matrix.node }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
           retention-days: 14
