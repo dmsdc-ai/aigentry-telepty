@@ -34,6 +34,11 @@ const readinessHandshake = load('src/transport/readiness-handshake');
 const boundInject = load('src/protocol/bound-inject.js');
 const clientProfiles = load('src/protocol/client-profiles.js');
 const cli = load('cli.js');
+// r1: the real viewer-input gate (module scope in websocket.js — requiring it starts no server, socket or
+// listener), the real session-store serializer/restorer, and strict mode's action table.
+const wsTransport = load('src/transport/websocket.js');
+const persistence = load('src/session-store/persistence.js');
+const principalHttp = load('src/principal/http.js');
 
 const BOUND_ROUTE = '/api/sessions/:id/inject-bound-v1';
 const RESULT_SCHEMA = 'telepty.bound-inject-result/v1';
@@ -248,9 +253,13 @@ async function compose() {
   const pendingReports = Object.create(null);
   const busClients = new Set([{ readyState: 1, send() {} }]);
   const sessionStateManager = new SessionStateManager();
+  // r1: the audit lines this door writes (#47 P5), captured instead of discarded, and the orchestrator-sid list
+  // as a MUTABLE array so the #533 peer-lane cases can configure it for themselves and restore it after.
+  const auditLines = [];
+  const orchestratorSids = [];
   const rshared = {
     sessions, crypto, fs, sessionPersistence, sessionCredentials: createCredentialStore(),
-    auditWriter: { append() {} },
+    auditWriter: { append(record) { auditLines.push(record); } },
     ledgerClient, trackedLedgerHealthy: false, trackedLedgerUnavailableReason: 'not_opened',
     TRACKED_INJECTIONS_PATH: ledgerDir, pendingReports, busClients,
     interaction, interactionWaiters: new Map(), readyRegistry: registry, sessionStateManager,
@@ -286,7 +295,7 @@ async function compose() {
     isBootstrapGatedSession: metadata.isBootstrapGatedSession,
     isOpenWebSocket,
     resolveSessionAlias: id => (typeof id === 'string' && Object.hasOwn(sessions, id) ? id : null),
-    ORCHESTRATOR_SIDS: [], MACHINE_ID: 'b1270-green-machine',
+    ORCHESTRATOR_SIDS: orchestratorSids, MACHINE_ID: 'b1270-green-machine',
     NON_TERMINAL_GATE_REASONS: new Set(['timeout', 'no_state', 'no_state_manager', 'busy_settled']),
     SUBMIT_BUSY_DISPATCH_ENABLED: true, SUBMIT_BUSY_GRACE_MS: 250,
     REDELIVER_ENABLED: true, REDELIVER_MAX_ATTEMPTS: 3, REDELIVER_TOTAL_TIMEOUT_MS: 600000, REDELIVER_IDLE_WAIT_MS: 120000,
@@ -366,7 +375,7 @@ async function compose() {
     fs.rmSync(root, { recursive: true, force: true });
   }
   return { sessions, pendingReports, runtime, routes, registerSession, negotiate, transportReady, claimOwner, ownerSocket, call,
-    dispose, gateCalls, sessionStateManager,
+    dispose, gateCalls, sessionStateManager, auditLines, orchestratorSids,
     writeDataToSession: context.writeDataToSession, deliverInjectionToSession: context.deliverInjectionToSession };
 }
 
@@ -584,4 +593,336 @@ test('B1270G non-wrapped and unknown targets are refused in the closed shape wit
   assert.equal(H.runtime.buildSessionTransportBlock(H.sessions[sid]).busy_input, 'not_applicable',
     'CHECKPOINT: the view says not_applicable for a record with no owner bridge');
   delete H.sessions[sid];
+});
+
+// ── Part 6: the r1 review findings, each as its own decisive case ────────────────────────────────────────────────
+//
+// Added for the independent review's REJECT (2 blockers, 8 majors, 8 minors). Every case below drives REAL
+// production code — the exported viewer gate, the real route, the real persistence serializer, the real audit
+// seam — and asserts the property the finding named, not the implementation's shape.
+
+// B1270R-B1 (blocker): the viewer input adapter is a FOURTH input producer. It reaches the owner socket (wrapped)
+// or the PTY (spawned) directly, bypassing writeDataToSession and submitViaPty, so an attached operator pressing
+// Enter on a quiet session would have submitted an earlier delivery's unsubmitted text.
+test('B1270R B1 viewer input: both adapter arms refuse a stranded composer, and nothing reaches the socket or the PTY', () => {
+  const sid = 'b1270g-viewer';
+  const session = H.registerSession(sid);
+  const ownerWs = session.ownerWs;
+  const before = injects(ownerWs).length;
+  assert.equal(typeof wsTransport.viewerInputDeliverer(session), 'function',
+    'PRECONDITION: a healthy wrapped session has a viewer write adapter');
+
+  runtimeModule.strandComposer(session, { epoch: session.sessionEpoch, injectId: crypto.randomUUID(), reason: 'submit_outcome_unknown' });
+  assert.equal(wsTransport.viewerInputDeliverer(session), null,
+    'CHECKPOINT: the WRAPPED arm hands back no writer for a stranded composer');
+  assert.equal(injects(ownerWs).length, before, 'CHECKPOINT: no viewer frame reached the pinned owner');
+
+  // The spawned twin: the same ONE gate, so neither arm can be fixed without the other.
+  const wrote = [];
+  const spawned = { id: 'b1270g-viewer-spawned', type: 'spawned', sessionEpoch: 'viewer-epoch',
+    clients: new Set(), ptyProcess: { write: data => wrote.push(data) } };
+  const writer = wsTransport.viewerInputDeliverer(spawned);
+  assert.equal(typeof writer, 'function', 'PRECONDITION: a spawned session with a live PTY has one too');
+  let completed = false;
+  writer('\r', () => { completed = true; });
+  assert.deepEqual([wrote, completed], [['\r'], true], 'PRECONDITION: that adapter really writes to the PTY');
+
+  runtimeModule.strandComposer(spawned, { epoch: 'viewer-epoch', injectId: crypto.randomUUID(), reason: 'cr_outcome_unknown' });
+  assert.equal(wsTransport.viewerInputDeliverer(spawned), null, 'CHECKPOINT: the SPAWNED arm refuses the same way');
+  assert.deepEqual(wrote, ['\r'], 'CHECKPOINT: not one further byte reached the PTY');
+
+  // Keyed on the instance, here too: a new epoch is a new child and a new composer.
+  spawned.sessionEpoch = 'viewer-epoch-2';
+  assert.equal(typeof wsTransport.viewerInputDeliverer(spawned), 'function',
+    'CHECKPOINT: a NEW instance is never blocked by the old strand');
+});
+
+// B1270R-B2 (blocker): the #533 peer-lane hard block applies to this door too — `from` is policy-checked, not
+// merely schema-validated, so a credential blocked from raw peer→peer delegation on /inject is blocked here.
+test('B1270R B2 peer lane: an off-policy peer→peer bound inject is blocked 403 before any effect; the orchestrator lane and a sanctioned envelope still deliver', { timeout: 30000 }, async () => {
+  const sid = 'b1270g-peer';
+  const session = H.registerSession(sid);
+  H.sessionStateManager.feed(sid, WORKING);
+  const ws = session.ownerWs;
+  H.orchestratorSids.push('orchestrator');   // configured, so the guardrail is ACTIVE rather than fail-open
+  try {
+    const auditAt = H.auditLines.length;
+    const blocked = await post(sid, boundRequest(session, 'please do my work for me', { from: 'peer-a' }));
+    assert.equal(blocked.status, 403, `CHECKPOINT: a blocked peer-lane bound inject is 403 (${blocked.status})`);
+    assertResultShape(blocked.body, sid);
+    assert.deepEqual({ stage: blocked.body.stage, reason: blocked.body.reason, bytes: blocked.body.bytes_written,
+      inject: blocked.body.inject_id },
+    { stage: 'refused', reason: 'peer_inject_blocked', bytes: 0, inject: null },
+    `CHECKPOINT: refused with a provable zero ${JSON.stringify(blocked.body)}`);
+    assert.equal(injects(ws).length, 0, 'CHECKPOINT: zero frames — the block is before any effect');
+    const blockedLines = H.auditLines.slice(auditAt);
+    assert.equal(blockedLines.length, 1, `CHECKPOINT: exactly one audit line for the blocked attempt ${JSON.stringify(blockedLines)}`);
+    assert.deepEqual({ source: blockedLines[0].source, from: blockedLines[0].claimed_from, to: blockedLines[0].to,
+      result: blockedLines[0].delivery_result },
+    { source: 'inject-bound-v1', from: 'peer-a', to: sid, result: 'blocked:malformed-envelope' },
+    `CHECKPOINT: the blocked attempt is auditable with the legacy vocabulary ${JSON.stringify(blockedLines[0])}`);
+
+    // Control 1: the orchestrator lane is untouched.
+    const orch = await post(sid, boundRequest(session, 'orchestrator dispatch', { from: 'orchestrator' }));
+    assert.equal(orch.body.stage, 'accepted', `CHECKPOINT: the orchestrator lane still delivers ${JSON.stringify(orch.body)}`);
+
+    // Control 2: a sanctioned peer envelope is allowed, so this is the #533 verdict and not a blanket peer ban.
+    const envelope = JSON.stringify({ kind: 'ask-request', from: 'peer-a', to: sid, thread_id: 'b1270-thread', round: 1,
+      question: 'is the bound transport policy-checked?' });
+    const sanctioned = await post(sid, boundRequest(session, envelope, { from: 'peer-a' }));
+    assert.equal(sanctioned.body.stage, 'accepted', `CHECKPOINT: a sanctioned ask-request is delivered ${JSON.stringify(sanctioned.body)}`);
+    assert.deepEqual(injects(ws).map(f => f.part), ['body', 'submit', 'body', 'submit'],
+      'CHECKPOINT: only the two allowed requests produced frames, each a body and its own CR');
+  } finally {
+    H.orchestratorSids.length = 0;
+  }
+});
+
+// B1270R-M1 (major): one audit line per terminal outcome, in the EXISTING record shape, with the honest word for
+// a frame handed to the owner bridge — `forwarded`, never `success` (which in this log means bytes measured).
+test('B1270R M1 audit: an accepted and a refused bound delivery each write exactly one line, naming this door', { timeout: 30000 }, async () => {
+  const sid = 'b1270g-audit';
+  const session = H.registerSession(sid);
+  H.sessionStateManager.feed(sid, WORKING);
+
+  const acceptedAt = H.auditLines.length;
+  const accepted = await post(sid, boundRequest(session, 'B1270R-AUDIT body', { from: 'audited-sender' }));
+  assert.equal(accepted.body.stage, 'accepted', `PRECONDITION: accepted ${JSON.stringify(accepted.body)}`);
+  const acceptedLines = H.auditLines.slice(acceptedAt);
+  assert.equal(acceptedLines.length, 1, `CHECKPOINT: exactly one line per delivery ${JSON.stringify(acceptedLines)}`);
+  assert.deepEqual({ kind: acceptedLines[0].kind, source: acceptedLines[0].source, from: acceptedLines[0].claimed_from,
+    to: acceptedLines[0].to, result: acceptedLines[0].delivery_result, payload: acceptedLines[0].payload,
+    inject: acceptedLines[0].inject_id === accepted.body.inject_id, verified: acceptedLines[0].verified_sender_sid },
+  { kind: 'inject', source: 'inject-bound-v1', from: 'audited-sender', to: sid, result: 'forwarded',
+    payload: 'B1270R-AUDIT body', inject: true, verified: null },
+  `CHECKPOINT: the accepted line is the existing shape, says forwarded (not success) and carries no unverified sender claim ${JSON.stringify(acceptedLines[0])}`);
+
+  const refusedAt = H.auditLines.length;
+  const refused = await post(sid, boundRequest(session, 'B1270R-AUDIT refused', { expected_epoch: crypto.randomUUID() }));
+  assert.equal(refused.body.stage, 'refused', `PRECONDITION: refused ${JSON.stringify(refused.body)}`);
+  const refusedLines = H.auditLines.slice(refusedAt);
+  assert.equal(refusedLines.length, 1, `CHECKPOINT: a refusal is auditable too, exactly once ${JSON.stringify(refusedLines)}`);
+  assert.deepEqual({ result: refusedLines[0].delivery_result, inject: refusedLines[0].inject_id, source: refusedLines[0].source },
+    { result: 'refused:epoch_mismatch', inject: null, source: 'inject-bound-v1' },
+    `CHECKPOINT: the refusal names its bounded reason and correlates no transport identity ${JSON.stringify(refusedLines[0])}`);
+});
+
+// B1270R-M2 (major): a provenance-capable session was promised a nonce-gated banner on injected text. A bound
+// body is injected text, and the banner is applied BEFORE the paste framing exactly as on the legacy path.
+test('B1270R M2 provenance: a capable session gets the nonce-gated banner on the bound body; a default session gets byte-exact text', { timeout: 30000 }, async () => {
+  const sid = 'b1270g-provenance';
+  const session = H.registerSession(sid);
+  H.sessionStateManager.feed(sid, WORKING);
+  session.provenanceCapable = true;
+  session.provenanceNonce = 'B1270RNONCE';
+  const capable = await post(sid, boundRequest(session, 'B1270R-PROV body', { from: 'prov-sender' }));
+  assert.equal(capable.body.stage, 'accepted', `PRECONDITION: accepted ${JSON.stringify(capable.body)}`);
+  const frames = injects(session.ownerWs);
+  assert.deepEqual(frames.map(f => f.part), ['body', 'submit'], 'PRECONDITION: one body and its CR');
+  assert.ok(frames[0].data.includes('⟦telepty:provenance v=1 from=claimed:prov-sender? origin=trusted-local nonce=B1270RNONCE⟧'),
+    `CHECKPOINT: the banner names the claimed (unverified) sender and the minted nonce ${JSON.stringify(frames[0].data)}`);
+  assert.ok(frames[0].data.includes('⟦telepty:end nonce=B1270RNONCE⟧'), 'CHECKPOINT: and it is fenced at both ends');
+  assert.ok(frames[0].data.includes('B1270R-PROV body'), 'CHECKPOINT: the payload itself is carried byte-for-byte inside the fence');
+  assert.equal(frames[1].data, '\r', 'CHECKPOINT: the CR is still a bare Enter, outside any banner or paste envelope');
+
+  // Default-OFF regression guard: a session that never registered the capability receives exactly what it did before.
+  const plainSid = 'b1270g-provenance-off';
+  const plain = H.registerSession(plainSid);
+  H.sessionStateManager.feed(plainSid, WORKING);
+  const off = await post(plainSid, boundRequest(plain, 'B1270R-PROV plain', { from: 'prov-sender' }));
+  assert.equal(off.body.stage, 'accepted', `PRECONDITION: accepted ${JSON.stringify(off.body)}`);
+  const plainFrames = injects(plain.ownerWs);
+  assert.ok(!plainFrames[0].data.includes('telepty:provenance'),
+    `CHECKPOINT: no banner for a non-capable session ${JSON.stringify(plainFrames[0].data)}`);
+});
+
+// B1270R-M5 (major): a THROW after the body was handed is the same hazard as a refused CR. The three explicit
+// strand branches could not see it, so the composer stayed open to every later append and Enter.
+test('B1270R M5 throw after the body: the identity is stranded on the way out and the answer is an honest unknown', { timeout: 30000 }, async () => {
+  const sid = 'b1270g-throw';
+  // The socket stops being writable by THROWING, not by changing state: the exception leaves the delivery.
+  const session = H.registerSession(sid, { onSend: (ws, frame) => {
+    if (frame.part === 'body') ws.send = () => { throw new Error('owner socket went away mid-pair'); };
+  } });
+  H.sessionStateManager.feed(sid, WORKING);
+  const auditAt = H.auditLines.length;
+  const response = await post(sid, boundRequest(session, 'B1270R-THROW body'));
+  assertResultShape(response.body, sid);
+  assert.ok(response.status >= 500, `CHECKPOINT: a throw after a handed body is not a 4xx refusal (${response.status})`);
+  assert.deepEqual({ stage: response.body.stage, reason: response.body.reason, bytes: response.body.bytes_written },
+    { stage: 'outcome_unknown', reason: 'delivery_threw', bytes: null },
+    `CHECKPOINT: unknown, never zero bytes and never accepted ${JSON.stringify(response.body)}`);
+  const strand = runtimeModule.strandedComposer(session);
+  assert.ok(strand, 'CHECKPOINT: the exact identity IS stranded even though no branch returned');
+  assert.deepEqual({ reason: strand.reason, epoch: strand.epoch === session.sessionEpoch, inject: strand.inject_id === response.body.inject_id },
+    { reason: 'delivery_threw_after_body', epoch: true, inject: true },
+    `CHECKPOINT: the strand names the throw and the exact instance ${JSON.stringify(strand)}`);
+  assert.equal(H.runtime.submitViaPty(session), false, 'CHECKPOINT: every later bare CR is refused for that instance');
+  const lines = H.auditLines.slice(auditAt);
+  assert.deepEqual(lines.map(l => l.delivery_result), ['outcome_unknown:delivery_threw'],
+    `CHECKPOINT: one honest audit line for the unknown outcome ${JSON.stringify(lines)}`);
+  assert.equal(session.pendingSubmit, null, 'CHECKPOINT: the submit barrier was released despite the throw');
+});
+
+// B1270R-M6 (major): the post-await recheck covered identity only. A modal, a bootstrap drain, an unwired input
+// transport or a stale session during the barrier wait still got the body and its Enter.
+test('B1270R M6 admission at the await: a state change while the request waits refuses it, and one after the body withholds the CR', { timeout: 30000 }, async () => {
+  const sid = 'b1270g-admission';
+  const session = H.registerSession(sid);
+  H.sessionStateManager.feed(sid, WORKING);
+  const ws = session.ownerWs;
+
+  // The one predicate, shared by the route and the delivery — the route's refusal proves which one it is.
+  session.bootstrapDraining = true;
+  assert.equal(H.runtime.boundAdmissionRefusal(session), 'bootstrap_backlog', 'PRECONDITION: the predicate names the gate');
+  const upfront = await post(sid, boundRequest(session, 'B1270R-ADMISSION upfront'));
+  assert.deepEqual({ status: upfront.status, stage: upfront.body.stage, reason: upfront.body.reason, bytes: upfront.body.bytes_written },
+    { status: 409, stage: 'refused', reason: 'bootstrap_backlog', bytes: 0 }, JSON.stringify(upfront.body));
+  session.bootstrapDraining = false;
+  assert.equal(H.runtime.boundAdmissionRefusal(session), null, 'PRECONDITION: admissible again');
+
+  // DURING the barrier wait: the gate is re-read after the await, not taken from the route's snapshot.
+  let release;
+  session.pendingSubmit = new Promise(resolve => { release = () => { session.pendingSubmit = null; resolve(); }; });
+  const waiting = post(sid, boundRequest(session, 'B1270R-ADMISSION during the wait'));
+  await sleep(50);
+  session.bootstrapDraining = true;
+  release();
+  const waited = await waiting;
+  assert.deepEqual({ stage: waited.body.stage, reason: waited.body.reason, bytes: waited.body.bytes_written },
+    { stage: 'refused', reason: 'bootstrap_backlog', bytes: 0 },
+    `CHECKPOINT: a gate that closed during the wait refuses with a provable zero ${JSON.stringify(waited.body)}`);
+  assert.equal(injects(ws).length, 0, 'CHECKPOINT: nothing was written for either refusal');
+  session.bootstrapDraining = false;
+
+  // AFTER the body is handed: the Enter is withheld (#737's rule) and, because the text exists, that is a strand.
+  const afterSid = 'b1270g-admission-after';
+  const hook = { session: null };
+  const after = H.registerSession(afterSid, { onSend: (socket, frame) => {
+    if (frame.part === 'body' && hook.session) hook.session.bootstrapDraining = true;
+  } });
+  hook.session = after;
+  H.sessionStateManager.feed(afterSid, WORKING);
+  const response = await post(afterSid, boundRequest(after, 'B1270R-ADMISSION after the body'));
+  assert.deepEqual({ stage: response.body.stage, reason: response.body.reason, body: response.body.body_stage,
+    submit: response.body.submit_stage, bytes: response.body.bytes_written },
+  { stage: 'outcome_unknown', reason: 'admission_changed_after_body', body: 'sent_to_bridge', submit: 'not_sent', bytes: null },
+  `CHECKPOINT: the body stays reported as handed and the CR is withheld, never claimed ${JSON.stringify(response.body)}`);
+  assert.deepEqual(injects(after.ownerWs).map(f => f.part), ['body'], 'CHECKPOINT: exactly one frame — no Enter into a changed surface');
+  assert.ok(runtimeModule.strandedComposer(after), 'CHECKPOINT: the unsubmitted text is stranded, not left open to the next writer');
+});
+
+// B1270R-M7 (major): the strand was in memory while the epoch it keys on was persisted, so a restart silently
+// un-stranded the same instance while the bridge went on quarantining every delivery to it.
+test('B1270R M7 durability: the strand serializes with its epoch and restores onto the same instance; a tampered or epoch-less record is dropped', () => {
+  const epoch = crypto.randomUUID();
+  const injectId = crypto.randomUUID();
+  const nowIso = new Date().toISOString();
+  const record = { id: 'b1270g-persisted', type: 'wrapped', command: 'claude', cwd: '/tmp/b1270',
+    sessionEpoch: epoch, credentialVerifier: 'opaque-verifier', credentialGeneration: 1,
+    createdAt: nowIso, lastActivityAt: nowIso, clients: new Set() };
+  runtimeModule.strandComposer(record, { epoch, injectId, reason: 'submit_outcome_unknown' });
+
+  const serialized = persistence.serializePersistedSessions({ [record.id]: record });
+  const meta = serialized[record.id];
+  assert.deepEqual(meta.strandedComposer, { epoch, inject_id: injectId, reason: 'submit_outcome_unknown', at: record.strandedComposer.at },
+    `CHECKPOINT: exactly the four bounded fields are written, with the epoch they key on ${JSON.stringify(meta.strandedComposer)}`);
+  assert.equal(meta.sessionEpoch, epoch, 'PRECONDITION: the epoch itself is persisted, which is why the strand must be');
+
+  const restored = persistence.buildRestoredWrappedSession(record.id, meta);
+  assert.ok(runtimeModule.strandedComposer(restored),
+    'CHECKPOINT: the restored instance is still stranded — a restart cannot un-strand a composer that holds text');
+  assert.equal(runtimeModule.strandedInputFailure(restored).code, 'COMPOSER_STRANDED', 'CHECKPOINT: and every input path refuses it');
+
+  // A hand-edited record naming a DIFFERENT epoch is dropped, so an edited file cannot block another instance.
+  const tampered = { ...meta, strandedComposer: { ...meta.strandedComposer, epoch: crypto.randomUUID() } };
+  assert.equal(persistence.buildRestoredWrappedSession(record.id, tampered).strandedComposer, undefined,
+    'CHECKPOINT: a strand that does not name the restored epoch is not adopted');
+  // Free text in a stored reason cannot travel either.
+  const dirty = { ...meta, strandedComposer: { ...meta.strandedComposer, reason: '/Users/me/secret.txt: ENOENT' } };
+  assert.equal(persistence.buildRestoredWrappedSession(record.id, dirty).strandedComposer.reason, 'refused',
+    'CHECKPOINT: a reason outside the allow-list degrades to the generic code');
+  // No credential verifier → no epoch is persisted → there is nothing for a strand to key on.
+  const credentialless = { ...record, credentialVerifier: undefined };
+  const withoutEpoch = persistence.serializePersistedSessions({ [record.id]: credentialless })[record.id];
+  assert.deepEqual([withoutEpoch.sessionEpoch, withoutEpoch.strandedComposer], [undefined, undefined],
+    'CHECKPOINT: both-or-neither — a strand is never written without the epoch it belongs to');
+});
+
+// B1270R-M8(a) (major): make the refusal VISIBLE. Without this an operator sees a live, healthy, connected
+// session that silently refuses every input. Read-only: there is no clear, force, timeout or recovery anywhere.
+test('B1270R M8a view: the transport block shows the strand next to busy_input, in one closed shape', () => {
+  const sid = 'b1270g-view-strand';
+  const session = H.registerSession(sid);
+  const clear = H.runtime.buildSessionTransportBlock(session).stranded_composer;
+  assert.deepEqual(clear, { stranded: false, inject_id: null, reason: null, at: null },
+    `CHECKPOINT: the same four keys when nothing is stranded ${JSON.stringify(clear)}`);
+  const injectId = crypto.randomUUID();
+  runtimeModule.strandComposer(session, { epoch: session.sessionEpoch, injectId, reason: 'submit_outcome_unknown' });
+  const view = H.runtime.buildSessionTransportBlock(session);
+  assert.deepEqual({ stranded: view.stranded_composer.stranded, inject_id: view.stranded_composer.inject_id,
+    reason: view.stranded_composer.reason, at: typeof view.stranded_composer.at },
+  { stranded: true, inject_id: injectId, reason: 'submit_outcome_unknown', at: 'string' },
+  `CHECKPOINT: an operator can see WHY the session refuses ${JSON.stringify(view.stranded_composer)}`);
+  assert.equal(view.busy_input, 'supported', 'CHECKPOINT: the capability view is unchanged by the strand — they are different facts');
+});
+
+// B1270R-m7 (minor): the barrier ahead can end in two non-normal ways. Neither may become an outcome_unknown the
+// caller must hold for ever, because nothing of this request was handed to anyone.
+test('B1270R m7 barrier: a rejected and a settled-but-unreleased barrier are refusals with a provable zero, not unknowns', { timeout: 30000 }, async () => {
+  const sid = 'b1270g-barrier';
+  const session = H.registerSession(sid);
+  H.sessionStateManager.feed(sid, WORKING);
+  const ws = session.ownerWs;
+
+  const rejected = Promise.reject(new Error('the holder ahead failed'));
+  rejected.catch(() => {});   // the test's own handler; the delivery attaches its own
+  session.pendingSubmit = rejected;
+  const afterReject = await post(sid, boundRequest(session, 'B1270R-BARRIER rejected'));
+  assertResultShape(afterReject.body, sid);
+  assert.deepEqual({ status: afterReject.status, stage: afterReject.body.stage, reason: afterReject.body.reason,
+    bytes: afterReject.body.bytes_written },
+  { status: 409, stage: 'refused', reason: 'submit_barrier_rejected', bytes: 0 }, JSON.stringify(afterReject.body));
+
+  // Settled but never released: refused instead of re-awaited, so the wait cannot spin on a dead promise.
+  session.pendingSubmit = Promise.resolve();
+  const started = Date.now();
+  const afterStale = await post(sid, boundRequest(session, 'B1270R-BARRIER stale'));
+  const elapsedMs = Date.now() - started;
+  assert.deepEqual({ stage: afterStale.body.stage, reason: afterStale.body.reason, bytes: afterStale.body.bytes_written },
+    { stage: 'refused', reason: 'submit_barrier_busy', bytes: 0 }, JSON.stringify(afterStale.body));
+  assert.ok(elapsedMs < 1000, `CHECKPOINT: answered at once rather than spinning to the barrier deadline (${elapsedMs} ms)`);
+  assert.equal(injects(ws).length, 0, 'CHECKPOINT: neither case wrote anything');
+
+  session.pendingSubmit = null;
+  const control = await post(sid, boundRequest(session, 'B1270R-BARRIER control'));
+  assert.equal(control.body.stage, 'accepted', `CHECKPOINT: a released barrier still delivers ${JSON.stringify(control.body)}`);
+});
+
+// B1270R-m2 / m3 (minors): the bounded reason field is an ALLOW-LIST, and the token bound is measured in bytes.
+test('B1270R m2/m3 bounded fields: a reason outside the allow-list degrades to `refused`, and a token bound in bytes', () => {
+  assert.equal(boundInject.boundedReason('ENOENT: no such file or directory, open /Users/me/secret.txt'), 'refused',
+    'CHECKPOINT: an exception message cannot become a 64-character reason code');
+  assert.equal(boundInject.boundedReason('Session epoch 3f2ad963 of /home/op/.telepty/config.json'), 'refused',
+    'CHECKPOINT: nor can a path or an identifier fragment');
+  assert.equal(boundInject.boundedReason('STALE'), 'stale', 'CHECKPOINT: the real shared codes still travel, lowercased');
+  assert.equal(boundInject.boundedReason('claude_modal_ui'), 'claude_modal_ui', 'CHECKPOINT: and the modal gate keeps its own CLI-keyed reason');
+  assert.equal(boundInject.boundedReason('codex_modal_ui'), 'codex_modal_ui', 'CHECKPOINT: for any registry CLI key');
+  assert.equal(boundInject.boundedReason(null), null, 'CHECKPOINT: an accepted delivery still has no reason at all');
+
+  assert.equal(boundInject.boundedToken('a'.repeat(256)), true, 'PRECONDITION: 256 bytes is the bound');
+  assert.equal(boundInject.boundedToken('a'.repeat(257)), false, 'CHECKPOINT: one byte over is refused');
+  assert.equal(boundInject.boundedToken('あ'.repeat(100)), false,
+    'CHECKPOINT: 100 multi-byte characters are 300 bytes and are refused — the bound is bytes, as the name says');
+  assert.equal(boundInject.boundedToken('あ'.repeat(80)), true, 'CHECKPOINT: 240 bytes of the same characters are fine');
+});
+
+// B1270R-M3 (major, Root decision): strict principal mode has no action for this path, so the route is
+// fail-closed there. Asserted rather than assumed, because the decision is to SHIP it that way.
+test('B1270R M3 strict principal mode: the bound path resolves to no action, so strict mode denies it (documented unsupported configuration)', () => {
+  assert.deepEqual(principalHttp.resolveAction({ method: 'POST', url: '/api/sessions/b1270/inject' }),
+    { action: 'session.inject', target: 'b1270', explicitInject: true },
+    'PRECONDITION: the legacy inject path IS a known strict-mode action');
+  assert.equal(principalHttp.resolveAction({ method: 'POST', url: '/api/sessions/b1270/inject-bound-v1' }), null,
+    'CHECKPOINT: the bound path resolves to no action — PRINCIPAL_ACTION_DENIED, never an unchecked write');
 });

@@ -4,9 +4,10 @@ const { protectedInputFailure, externalApprovalVerifier } = require('../external
 const { sshInputFailure, requestSshWrite } = require('../ssh-session');
 const { frameMeta: bridgeFrameMeta } = require('./bridge-stage');
 const { ptyInputFailure } = require('../pty-input-lifecycle');
-const { rememberSubmitPair, holdBodyCustody, settleBodyCustody, bodyCustodyFull } = require('./delivery-runtime');   // Task 1215 hotfix 0.10.1 / hotfix480 F1 / hotfix492
-// Task 1270: the shared stranded-composer boundary (checked on every write below).
-const { strandedInputFailure } = require('./delivery-runtime');
+// Task 1215 hotfix 0.10.1 / hotfix480 F1 / hotfix492, plus Task 1270's shared stranded-composer boundary
+// (checked on every write below). One require, as everywhere else in this file.
+const { rememberSubmitPair, holdBodyCustody, settleBodyCustody, bodyCustodyFull,
+  strandedInputFailure } = require('./delivery-runtime');
 
 // #137: the ids a wrapped owner inject frame carries so the bridge can file receipts against them.
 // owner_generation is always the CURRENT owner's; the rest is what the caller actually knows.

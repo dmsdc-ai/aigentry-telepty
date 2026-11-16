@@ -8,6 +8,10 @@ name: Bound inject 1270 (diagnostic)
 # Phase A (21f13ca1 baseline): run 43823980085 / job 133153310367 was RED exactly as intended — exit 1, 6 top-level,
 # 0 pass / 6 FAIL, every failure an ERR_ASSERTION at a named CHECKPOINT, no setup/import/module failure.
 # Phase B (this source change) expects BOTH files green, and that must be the job's own numeric exit, not a claim.
+# Phase B r1 (review repair): the green file gained a Part 6 for the review findings — the viewer-input gate, the
+# #533 peer-lane block, the audit line, the provenance banner, admission at the await, a throw after the body, and
+# the persisted strand. Two more production files are in the change set (src/transport/websocket.js,
+# src/session-store/persistence.js) and are therefore in the path filter and the provenance hashes below.
 # A green run proves only these in-process cases on this runner: frames handed to a recorder are DAEMON HAND-OFF only
 # (sent_to_bridge) — never a PTY write, native busy queueing, auto-submit or model consumption, which remain a
 # separately reviewed actual-native gate.
@@ -44,6 +48,9 @@ on:
       - 'src/mailbox/session-delivery.js'
       - 'src/protocol/bound-inject.js'
       - 'src/cli/inject-bound-v1.js'
+      # r1: the two files the review round added to the change set.
+      - 'src/transport/websocket.js'
+      - 'src/session-store/persistence.js'
 
 permissions:
   contents: read
@@ -108,8 +115,10 @@ jobs:
             for f in $TEST_FILES test/boot-create-only-1270.test.js scripts/test-suites.json \
               cli.js src/routes/session-actions.js src/mailbox/delivery-runtime.js \
               src/mailbox/session-delivery.js src/protocol/bound-inject.js src/cli/inject-bound-v1.js \
-              src/cli/security-actions.js src/transport/websocket.js src/protocol/http-auth.js \
-              src/protocol/client-profiles.js daemon.js package-lock.json; do
+              src/transport/websocket.js src/session-store/persistence.js \
+              src/cli/security-actions.js src/protocol/http-auth.js \
+              src/protocol/client-profiles.js src/principal/http.js src/audit/provenance.js \
+              daemon.js package-lock.json; do
               if [ -f "$f" ]; then echo "sha256 $(sha256 "$f") $f"; else echo "sha256 MISSING $f"; fi
             done
           } | tee "$EVIDENCE/provenance.txt"

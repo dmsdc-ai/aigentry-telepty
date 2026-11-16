@@ -2,9 +2,11 @@ const { protectedInputFailure } = require('../external-approval');
 const { claimedReturnMetadata } = require('../claimed-return');
 const { validInjectId } = require('../diagnostics/correlation');
 // Task 1215 hotfix 0.10.1: immediate-submit-v1 support (current owner generation) and its honest response shape.
-const { immediateSubmitSupport, immediateSubmitOutcome, immediateSubmitAttempt, immediateAttemptFields } = require('../mailbox/delivery-runtime');
-// Task 1270: busy-input-v1 binding view and the stranded-composer boundary, plus the two CLOSED bound schemas.
-const { busyInputSupport, bodyCustodyBusy, strandedComposer } = require('../mailbox/delivery-runtime');
+// Task 1270: the busy-input-v1 binding view (one require, as elsewhere in this file). The stranded-composer and
+// body-custody gates are inside `shared.boundAdmissionRefusal`, the one predicate the delivery re-evaluates.
+const { immediateSubmitSupport, immediateSubmitOutcome, immediateSubmitAttempt, immediateAttemptFields,
+  busyInputSupport } = require('../mailbox/delivery-runtime');
+// Task 1270: the two CLOSED bound schemas.
 const boundInject = require('../protocol/bound-inject');
 const readinessHandshake = require('../transport/readiness-handshake');
 // #1215 pipe200 S24: the stable public text for an inject delivery that threw (details are in the daemon log only).
@@ -1863,9 +1865,31 @@ function createSessionActions(shared, effects = {}) {
   function registerInjectBoundV1Route(app, routePath = '/api/sessions/:id/inject-bound-v1') {
     app.post(routePath, async (req, res) => {
       const requestedId = req.params.id;
-      // Every answer reports the DAEMON's current identity, never the values the request claimed.
+      // #43 P1/P2 / #815 — the daemon-verified sender (from the presented bearer, never body.from), resolved
+      // ONCE here because two different seams need it: the audit line below and the delivery provenance banner.
+      const verifiedPrincipal = (0, shared.verifiedPrincipalFromReq)(req);
+      const verifiedSender = (0, shared.verifiedSenderFields)(verifiedPrincipal);
+      const claimedFrom = req.body && typeof req.body.from === 'string' ? req.body.from : null;
+      const promptText = req.body && typeof req.body.prompt === 'string' ? req.body.prompt : null;
+      // #47 P5 (review finding M1) — ONE audit line per terminal outcome of this door, in the EXISTING record
+      // shape with no new field: a bound delivery is a write into somebody's terminal with exactly the authority
+      // of POST /inject, and an operator reads the inject log as THE record of who typed into a session. The
+      // vocabulary is this door's own and deliberately avoids `success`, which in this log means bytes measured
+      // as written: `forwarded` is the honest word for frames handed to the owner bridge (the same word the
+      // ws-viewer door uses for the same kind of handoff).
+      const recordAudit = (deliveryResult, injectId) => (0, shared.auditAppend)({
+        ts: new Date().toISOString(), inject_id: injectId || null, kind: 'inject', source: 'inject-bound-v1',
+        claimed_from: claimedFrom, ...verifiedSender,
+        to: requestedId,   // the exact own id; this route resolves no alias, so there is never a to_alias
+        origin: 'trusted-local', origin_host: shared.MACHINE_ID,
+        payload: promptText, delivery_result: deliveryResult
+      });
+      // Every answer reports the DAEMON's current identity, never the values the request claimed. The record is
+      // resolved through the same exact-own-id helper the route's target resolution uses (#1215), so a prototype
+      // key such as `__proto__` can never present an inherited object as a session (review finding m4).
       const answer = (status, fields) => {
-        const session = shared.sessions[requestedId];
+        const ownId = exactOwnSessionId(requestedId);
+        const session = ownId ? shared.sessions[ownId] : null;
         return res.status(status).json(boundInject.boundResult({
           sessionId: requestedId,
           sessionEpoch: session ? (session.sessionEpoch || null) : null,
@@ -1875,7 +1899,10 @@ function createSessionActions(shared, effects = {}) {
       };
       // A refusal is always 4xx: nothing was written, and the caller may act on that with certainty. 5xx is
       // reserved for outcome_unknown, where it may not.
-      const refuse = (status, reason) => answer(status, { stage: 'refused', reason });
+      const refuse = (status, reason) => {
+        recordAudit(`refused:${boundInject.boundedReason(reason)}`, null);
+        return answer(status, { stage: 'refused', reason });
+      };
 
       const id = exactOwnSessionId(requestedId);
       if (!id) return refuse(404, 'session_not_found');
@@ -1885,6 +1912,26 @@ function createSessionActions(shared, effects = {}) {
       // 1. The CLOSED request schema, before anything looks at the session's state.
       const invalid = boundInject.validateBoundRequest(req.body);
       if (invalid) return refuse(400, invalid);
+
+      // 1b. #533 Phase 2 — the peer-lane inject guardrail, the SAME verdict with the SAME inputs the legacy
+      //     /inject route computes, before any of this session's transport state is inspected and before any
+      //     effect (review finding B2). A new write door with the authority of /inject may not have less
+      //     accountability than /inject: `from` is not merely schema-validated here, it is POLICY-CHECKED, so a
+      //     credential that is blocked from raw peer→peer work delegation on /inject is blocked here too.
+      //     Same keying (the CLAIMED sender), so this stays a policy guardrail and not an authentication
+      //     boundary, and the same fail-open-with-warning behaviour when no orchestrator sid is configured.
+      const peerVerdict = (0, shared.classifyPeerLaneInject)({
+        from: claimedFrom, to: requestedId, prompt: req.body.prompt, orchestratorSids: shared.ORCHESTRATOR_SIDS
+      });
+      if (peerVerdict.decision === 'block') {
+        console.warn(`[PEER-GUARD] blocked bound inject ${claimedFrom} → ${requestedId} (${peerVerdict.reason})`);
+        // One audit line with the legacy `blocked:<reason>` vocabulary — the #533 gate logic itself is unchanged.
+        recordAudit(`blocked:${peerVerdict.reason}`, null);
+        return answer(403, { stage: 'refused', reason: 'peer_inject_blocked' });
+      }
+      if (peerVerdict.lane === 'disabled') {
+        console.warn('[PEER-GUARD] orchestrator sid unconfigured (AIGENTRY_ORCHESTRATOR_SIDS empty) — peer guardrail disabled (fail-open)');
+      }
 
       // 2. The binding the caller pinned must be the daemon's CURRENT one. An epoch or generation mismatch is a
       //    refusal, never a "close enough" delivery: the whole point of the schema is that a body cannot land on
@@ -1901,23 +1948,17 @@ function createSessionActions(shared, effects = {}) {
       if (!(0, shared.isOpenWebSocket)(session.ownerWs)) return refuse(409, 'owner_disconnected');
 
       // 4. Every existing input fence that applies to a wrapped delivery, unchanged and none of them removed.
+      //
+      //    Review finding M6: these gates are evaluated HERE for the caller's refusal, and the SAME predicate
+      //    (`boundAdmissionRefusal`, one synchronous function in the delivery runtime) is re-evaluated inside the
+      //    delivery after every await and immediately before each write. One function, so the two sites cannot
+      //    drift: the state the route admitted on is the state the body is written on, not a 10-second-old
+      //    snapshot. The ORDER is the pre-existing one — stranded composer, held interaction, session health,
+      //    input transport, bootstrap readiness, bootstrap backlog, body custody, surface modal.
       const denied = protectedInputFailure(session);
       if (denied) return refuse(403, 'protected_input');
-      if (strandedComposer(session)) return refuse(409, 'composer_stranded');
-      if ((0, shared.hasHeldInteraction)(session)) return refuse(409, 'interaction_held');
-      const failure = (0, shared.getInjectFailure)(session, { nowMs: Date.now() });
-      if (failure) return refuse(409, failure.code);
-      // The input-transport fence: a CR or body handed to an unwired bridge would be buffered, not written.
-      if (readinessHandshake.awaitingInputTransport(session)) return refuse(409, 'input_transport_not_ready');
-      if ((0, shared.isBootstrapGatedSession)(session) && !(0, shared.isBootstrapReady)(session)) return refuse(409, 'bootstrap_not_ready');
-      // FIFO: anything already parked for this session is ahead of this request; the bound path does not park
-      // and must not overtake it.
-      if ((0, shared.hasBootstrapBacklog)(session) || session.bootstrapDraining === true) return refuse(409, 'bootstrap_backlog');
-      if (bodyCustodyBusy(session)) return refuse(409, 'body_custody_pending');
-      // #737: never write into a surface whose Enter is wired to something other than "submit my message".
-      // The decision is read synchronously (no modal park/hold wait on this immediate-only path).
-      const modal = (0, shared.modalDeliveryDecision)(session, { force: false });
-      if (!modal || modal.action !== 'deliver') return refuse(409, modal && modal.reason ? modal.reason : 'surface_modal');
+      const inadmissible = (0, shared.boundAdmissionRefusal)(session);
+      if (inadmissible) return refuse(409, inadmissible);
 
       // 5. The single bound delivery. The inject_id names THIS pair (body frame and its CR) for the bridge and
       //    for the caller's own durable record; it is not a tracked-ledger observation, and this route creates
@@ -1930,16 +1971,29 @@ function createSessionActions(shared, effects = {}) {
           expectedEpoch: req.body.expected_epoch,
           expectedOwnerGeneration: req.body.expected_owner_generation,
           injectId: inject_id,
+          // #47 P4 (review finding M2) — the claimed and the daemon-verified sender, so the capability-gated
+          // provenance banner a provenance-capable session was promised is applied to a bound body too. For a
+          // non-capable session (the default) the transform is a documented no-op and the bytes are unchanged.
+          from: claimedFrom,
+          verifiedSenderSid: verifiedPrincipal ? verifiedPrincipal.sid : null,
         });
       } catch (err) {
         // The delivery threw after it may already have handed the body: that is unknown, never a refusal and
-        // never a retry. The raw exception stays a LOCAL operator diagnostic (#1215 pipe200 S24).
+        // never a retry. The raw exception stays a LOCAL operator diagnostic (#1215 pipe200 S24). The delivery
+        // itself strands the exact identity on its way out when the body was already handed, so the composer is
+        // protected before this answer is written (review finding M5).
         console.error('[INJECT-BOUND-V1] delivery threw for %s inject_id=%s:', id, inject_id, err && err.stack ? err.stack : err);
+        recordAudit('outcome_unknown:delivery_threw', inject_id);
         return answer(500, { stage: 'outcome_unknown', reason: 'delivery_threw', injectId: inject_id,
           bodyStage: 'unknown', submitStage: 'unknown', bytesWritten: null });
       }
       const status = outcome.stage === 'accepted' ? 200 : outcome.stage === 'refused' ? 409 : 500;
       console.log(`[INJECT-BOUND-V1] ${id} ${outcome.stage}${outcome.reason ? ` (${outcome.reason})` : ''} inject_id=${inject_id}`);
+      // The terminal audit line for the delivery itself. `forwarded` ONLY for accepted (both frames handed to
+      // the pinned owner); a refusal and an unknown each say so, with the bounded reason the caller also gets.
+      recordAudit(outcome.stage === 'accepted' ? 'forwarded'
+        : `${outcome.stage === 'refused' ? 'refused' : 'outcome_unknown'}:${boundInject.boundedReason(outcome.reason)}`,
+      outcome.stage === 'refused' ? null : inject_id);
       return answer(status, {
         stage: outcome.stage,
         reason: outcome.reason,

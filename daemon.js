@@ -76,6 +76,7 @@ const sessionActions = createSessionActions({
   get auditAppend() { return auditAppend; },
   get beginTrackedInjection() { return beginTrackedInjection; },
   get bootstrapQueuedResponse() { return bootstrapQueuedResponse; },
+  get boundAdmissionRefusal() { return boundAdmissionRefusal; },
   get broadcastSessionEvent() { return broadcastSessionEvent; },
   get buildAutoSummary() { return buildAutoSummary; },
   get buildCompletionUnknown() { return buildCompletionUnknown; },
@@ -187,6 +188,9 @@ const deliveryRuntime = createDeliveryRuntime({
   get initializeBootstrapState() { return initializeBootstrapState; },
   get WRAPPED_SUBMIT_DELAY_MS() { return WRAPPED_SUBMIT_DELAY_MS; },
   get writeDataToSession() { return writeDataToSession; },
+  // Task 1270 r1 (finding M7): the strand record is keyed on the persisted sessionEpoch, so the delivery asks
+  // for one save when it strands an identity. Lazy getter, exactly like the session-actions shared object.
+  get persistSessions() { return persistSessions; },
   get stripAnsiState() { return stripAnsiState; },
   get sessionStateManager() { return sessionStateManager; },
   get submitGate() { return submitGate; },
@@ -254,6 +258,7 @@ const {
   bootstrapQueuedResponse,
   executeBootstrapInject,
   deliverBoundInjection,        // Task 1270: bound busy-input body+paired-CR delivery
+  boundAdmissionRefusal,        // Task 1270 r1: the ONE admission predicate the route and the delivery share
   parseSubmitRetryOptions,
   buildSubmitVerify,
   buildSubmitConfirmOptions,

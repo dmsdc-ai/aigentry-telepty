@@ -17,7 +17,7 @@
 // The transport outcome is reported, never interpreted: `accepted` means the daemon handed both frames to the
 // pinned owner bridge. It is NOT a PTY write, native queueing, auto-submit or model receipt.
 
-const { REQUEST_SCHEMA, REQUIRE, TOKEN_MAX_BYTES, boundedToken, classifyBoundResponse } = require('../protocol/bound-inject');
+const { REQUEST_SCHEMA, REQUIRE, boundedToken, classifyBoundResponse } = require('../protocol/bound-inject');
 
 const USAGE = 'Usage: telepty inject-bound-v1 --from FROM --expected-epoch E --expected-owner-generation G -- EXACT_SID PROMPT\n';
 // Exit codes. 3 is its own code on purpose: `outcome_unknown` means input MAY have reached the composer, so
@@ -27,9 +27,11 @@ const FLAGS = Object.freeze({ '--from': 'from', '--expected-epoch': 'expected_ep
 
 // A session id is used verbatim in the path, so it must be an exact own id and nothing that could re-address:
 // no `@host` qualifier, no path separator, no whitespace, no control character.
+// Bounded in BYTES through the shared `boundedToken` (r1 finding m3), so the CLI and the daemon bound the id
+// identically, then the re-addressing characters on top.
 function exactSessionId(value) {
-  return typeof value === 'string' && value.length > 0 && value.length <= TOKEN_MAX_BYTES
-    && !/[@/\\\s\u0000-\u001f\u007f]/.test(value) && value !== '.' && value !== '..';
+  return boundedToken(value)
+    && !/[@/\\\s]/.test(value) && value !== '.' && value !== '..';
 }
 
 // Pure. → { ok: true, sid, request } or { ok: false, code } with a bounded code. No env, clock or I/O.
