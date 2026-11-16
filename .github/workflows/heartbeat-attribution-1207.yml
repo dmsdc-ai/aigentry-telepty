@@ -76,6 +76,7 @@ jobs:
             echo "matrix_node=$MATRIX_NODE node=$(node --version) node_path=$(command -v node) npm=$(npm --version)"
             echo "runner_os=$RUNNER_OS runner_arch=$RUNNER_ARCH image=${ImageOS:-unknown}/${ImageVersion:-unknown} uname=$(uname -srm)"
             echo "hash_tool=$H core.autocrlf=$(git config --get core.autocrlf || echo unset)"
+            echo "jq_path=$(command -v jq || echo MISSING) jq_version=$(jq --version 2>/dev/null | tr -d '\r' || echo MISSING)"
             echo "# path sha256(raw checkout bytes) raw_blob(--no-filters) head_blob(canonical) bytes eol(git ls-files --eol)"
             for f in $FILES; do
               raw=$(git hash-object --no-filters -- "$f"); canon=$(git rev-parse "HEAD:$f")
@@ -87,6 +88,7 @@ jobs:
           cat "$p"
           [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ] || { echo "::error::checkout HEAD differs from expected_sha"; exit 1; }
           [ "$(node --version)" = "v$MATRIX_NODE" ] || { echo "::error::node is not v$MATRIX_NODE"; exit 1; }
+          command -v jq >/dev/null && [ "$(echo '{"v":"pass"}' | jq -bsce '.[0].v')" = '"pass"' ] || { echo "::error::jq missing or unsupported (verdict needs jq -bsce); no install or fallback"; exit 1; }
 
       - name: Install locked dependencies (no lifecycle scripts, private cache)
         id: install
@@ -121,7 +123,7 @@ jobs:
       - name: Verdict + checksums — FAIL if either arm failed or any TAP/metric/provenance is missing
         if: ${{ always() }}
         run: |
-          set -uo pipefail   # no -e: every check is recorded, checksums are written, then the step fails once if any check failed
+          set +e; set -uo pipefail   # +e drops the runner's inherited bash -e: every check is recorded, checksums are written, then the step fails once if any check failed
           ev="$RUNNER_TEMP/evidence"; mkdir -p "$ev"; s="$ev/summary.txt"; bad=0
           fail() { echo "FAIL: $1" >> "$s"; bad=1; }
           { echo "scope=FOCUSED DIAGNOSTIC $TARGET --test-name-pattern=$NAME_PATTERN; not whole-suite acceptance, not native behaviour"
@@ -134,7 +136,8 @@ jobs:
             { grep -q '^TAP version' "$d/stdout.tap" && grep -Eq '^1\.\.[0-9]+' "$d/stdout.tap"; } || fail "$arm: TAP header/plan missing"
             for c in F2 R1; do
               [ -s "$d/evidence/$c-1MiB.json" ] || fail "$arm: $c-1MiB.json metric missing"
-              v=$(grep -F "[ledger-1207 $c 1 MiB]" "$d/stdout.tap" | grep -o 'heartbeat_acceptance=[^,]*' | head -n 1)
+              # verdict from the required metric JSON (Node 20 TAP splits long lines at 8192): one JSON value, exact enum, else MISSING
+              v=$(jq -bsce 'select(length == 1) | .[0].heartbeat_acceptance.verdict | select(. == "pass" or . == "fail" or . == "inconclusive")' "$d/evidence/$c-1MiB.json" 2>/dev/null)
               case "$v" in *'"pass"') perf=PASS ;; *'"fail"') perf=FAIL ;; *'"inconclusive"') perf=NOT-MEASURED ;; *) perf=MISSING; fail "$arm: $c heartbeat_acceptance missing" ;; esac
               n=$(grep -c 'telepty.ci-perf614.idle-attribution/v1' "$d/evidence/$c-1MiB.json" 2>/dev/null); n=${n:-0}
               echo "$arm $c exit=$rc performance=$perf perf614_idle_blocks=$n" >> "$s"
