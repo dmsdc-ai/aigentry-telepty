@@ -187,8 +187,15 @@ const builtLine = record => JSON.parse(auditLog.buildAuditLine(record));
 
 // A code-shape assertion must read CODE, not prose: an implementation comment that says "no await here" is not
 // an await. Block and line comments are removed first (a `//` preceded by `:` is left alone, so a URL survives).
+//
+// r4: line endings are normalised FIRST, and that is not cosmetic. `.` in a JS regex never matches a
+// LineTerminator, and `\r` is one — so on a CRLF checkout (both Windows legs of the full matrix) the
+// line-comment pattern's `.*$` could not reach the end of a `split('\n')` element that still ended in `\r`,
+// NOTHING was stripped, and every needle that appears in a comment was reported as code. That is exactly how
+// E10 failed on Windows while passing on Linux with byte-identical source.
 function sourceWithoutComments(value) {
   return String(value)
+    .replace(/\r\n?/g, '\n')
     .replace(/\/\*[\s\S]*?\*\//g, ' ')
     .split('\n')
     .map(line => line.replace(/(^|[^:\\])\/\/.*$/, '$1'))
@@ -637,7 +644,13 @@ test('A5 host token: hostTokenMatches is timing-safe, equal-length only, and nev
   const matches = clearProtocolFn('hostTokenMatches', 'the host-token comparison');
   const expected = crypto.randomBytes(24).toString('base64url');
   assert.equal(matches(expected, expected), true, 'CHECKPOINT: the exact token matches');
-  assert.equal(matches(`${expected.slice(0, -1)}X`, expected), false, 'CHECKPOINT: one byte wrong does not match');
+  // r4: the mutation uses a character OUTSIDE base64url, so it is wrong in every run. Replacing the last
+  // character with 'X' (which is inside the alphabet) made this row a 1-in-64 coin flip asserting that the
+  // real token does not match itself — the same defect that broke B9 on one leg of run ced661c.
+  const wrong = `${expected.slice(0, -1)}.`;
+  assert.notEqual(wrong, expected, 'PRECONDITION: the mutation really differs');
+  assert.equal(wrong.length, expected.length, 'PRECONDITION: and keeps the length, so it reaches the compare');
+  assert.equal(matches(wrong, expected), false, 'CHECKPOINT: one byte wrong does not match');
   assert.equal(matches(`${expected}x`, expected), false, 'CHECKPOINT: a longer token is refused without throwing');
   assert.equal(matches(expected.slice(0, -1), expected), false, 'CHECKPOINT: a shorter token is refused without throwing');
   for (const supplied of [undefined, null, 42, {}, [], Buffer.from(expected)]) {
@@ -1298,10 +1311,23 @@ test('B9/B10/B11/B12/B13 credential: only the host token in the HEADER authorise
   const jwt = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: 'operator' })).toString('base64url')}.sig`;
   const bearer = H.sessionCredentials.issue('E-peer-session').bearer;
   const profileToken = `tpc1.1.${crypto.randomBytes(32).toString('base64url')}`;
+  // r4 — the one-byte mutation must be DETERMINISTICALLY wrong. It used to replace the last character with
+  // 'X', which is itself in the token's alphabet (`c1270-` + base64url, i.e. [A-Za-z0-9_-]): when the random
+  // token happened to END in 'X' — 1 in 64 runs, the final base64url character of 18 random bytes being six
+  // fully random bits — the "wrong" token was byte-identical to the real one, the request was correctly
+  // authorised, and the row CLEARED the fixture instead of being refused. That is exactly the 200 `cleared`
+  // one ubuntu leg of run ced661c reported (B9-ROOT-CAUSE.md). `.` can never occur in the token, so this
+  // mutation always differs, and it keeps the LENGTH identical — which is the point of the row: it is the
+  // input that must reach `crypto.timingSafeEqual` and come back false.
+  const oneByteWrong = `${H.TOKEN.slice(0, -1)}.`;
+  assert.notEqual(oneByteWrong, H.TOKEN,
+    'PRECONDITION: the one-byte mutation differs from the real token (`.` is outside its alphabet)');
+  assert.equal(oneByteWrong.length, H.TOKEN.length,
+    'PRECONDITION: and it is the same length, so this row exercises the equal-length timing-safe compare');
   const rows = {
     'query token only': { dropHeaders: ['x-telepty-token'], query: { token: H.TOKEN } },
     'no token at all': { dropHeaders: ['x-telepty-token'] },
-    'one byte wrong': { headers: { 'x-telepty-token': `${H.TOKEN.slice(0, -1)}X` } },
+    'one byte wrong': { headers: { 'x-telepty-token': oneByteWrong } },
     'a different length': { headers: { 'x-telepty-token': `${H.TOKEN}extra` } },
     'empty token': { headers: { 'x-telepty-token': '' } },
     'array token': { headers: { 'x-telepty-token': [H.TOKEN] } },
@@ -1312,6 +1338,11 @@ test('B9/B10/B11/B12/B13 credential: only the host token in the HEADER authorise
   for (const [label, options] of Object.entries(rows)) {
     const audits = H.auditLines.length; const events = H.busEvents.length;
     const answer = invokeClear(H.clearReq(session.id, body, options));
+    // The label is in the message on purpose (r4): when one of nine rows is answered differently, the next
+    // reader must not have to guess which input produced it.
+    assert.deepEqual({ status: answer.status, stage: answer.body.stage, reason: answer.body.reason },
+      { status: 401, stage: 'refused', reason: 'clear_auth_required' },
+      `CHECKPOINT: ${label} is refused 401 clear_auth_required ${JSON.stringify(answer.body)}`);
     assertRefusal(session, strand, answer, 'clear_auth_required', { beforeStep4: true });
     assert.deepEqual([H.auditLines.length - audits, H.busEvents.length - events], [0, 0],
       `CHECKPOINT: ${label} writes no record`);
@@ -1773,9 +1804,16 @@ test('D10/D11/D12/D13 identity: a wrong epoch, an absent or wrong generation and
 });
 
 test('D14 inject id: a wrong, absent, surplus or case-folded stranded_inject_id is a mismatch, never an equivalence', () => {
-  const withId = H.strandedFixture('c1270-d14-with-id');
+  // r4: the inject id is FIXED rather than random, because one row below asserts that the UPPER-CASED spelling
+  // is a mismatch — and a random v4 uuid can in principle contain no letter at all, in which case
+  // `toUpperCase()` returns the same string and the row would assert that the stored id does not match itself.
+  // The probability is ~3e-7 rather than B9's 1-in-64, but it is the same class of defect, so it is removed the
+  // same way: a fixture value that provably contains letters, asserted below.
+  const withId = H.strandedFixture('c1270-d14-with-id', { injectId: 'c1270abc-0d14-4a66-ba9d-0782b7963696' });
   const stored = withId.strand.inject_id;
   assert.ok(UUID.test(String(stored)), `PRECONDITION: the stored id is a lowercase uuid (${stored})`);
+  assert.notEqual(String(stored).toUpperCase(), stored,
+    'PRECONDITION: the stored id contains letters, so its upper-cased spelling is a DIFFERENT string');
   for (const [label, value] of Object.entries({
     'a different id': crypto.randomUUID(),
     'null against a non-null record': null,
@@ -2202,7 +2240,25 @@ test('E9 a hand-planted strand: the previously permanent denial is now recoverab
 test('E10 synchrony and silence: the handler\'s own source has no await, no timer and no key or byte anywhere', () => {
   assert.equal(typeof H.actions.registerClearStrandV1Route, 'function',
     'CHECKPOINT: createSessionActions must expose the clear registrar (CLEAR-INTERFACE §8)');
+  // r4: the extractor is proved BEFORE it is trusted, on both line endings. A stripper that removes nothing
+  // reports every needle that appears in a comment (the Windows failure of run ced661c: `.` never matches the
+  // `\r` a CRLF checkout leaves behind); a stripper that removes everything would make the whole scan below
+  // vacuous and hide a real `await`. Both directions are asserted here, so the scan means the same thing on
+  // every platform.
+  const lfFixture = 'const keep = 1;\n// await  nothing here\nconst alsoKeep = 2;\n';
+  const crlfFixture = lfFixture.replace(/\n/g, '\r\n');
+  assert.equal(sourceWithoutComments(crlfFixture), sourceWithoutComments(lfFixture),
+    'CHECKPOINT: the comment stripper is line-ending independent — CRLF and LF source strip identically');
+  for (const [label, fixture] of Object.entries({ LF: lfFixture, CRLF: crlfFixture })) {
+    const stripped = sourceWithoutComments(fixture);
+    assert.equal(stripped.includes('await '), false,
+      `CHECKPOINT: a comment that merely MENTIONS a forbidden token is removed (${label})`);
+    assert.ok(stripped.includes('const keep = 1;') && stripped.includes('const alsoKeep = 2;'),
+      `CHECKPOINT: and the code around it survives, so the scan is not vacuous (${label})`);
+  }
   const source = sourceWithoutComments(String(H.actions.registerClearStrandV1Route));
+  assert.ok(source.includes('verifyHostToken(req) !== true') && source.includes('clearStrandedComposer'),
+    'CHECKPOINT: the extracted source really is the handler (its credential check and its one effect are in it)');
   for (const needle of ['await ', 'await(', '.then(', 'setTimeout', 'setInterval', 'setImmediate',
     'process.nextTick', 'queueMicrotask', 'async ']) {
     assert.equal(source.includes(needle), false,
