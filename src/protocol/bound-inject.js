@@ -169,6 +169,11 @@ const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
 // `owner_generation` through `boundedToken`, and `child` only as a whole `{child_seq, pid}` pair of safe
 // positive integers. A malformed half is dropped entirely rather than partially adopted, because a
 // half-remembered child would make `child_replaced_observed` decidable on garbage.
+// Review note CSR-n4: the `> 0` bounds below are unreachable in practice — an ACCEPTED `process_started`
+// milestone always carries `child_seq >= 1` and `pid >= 1` (readiness-handshake.js:80,:86) — and they are kept
+// anyway, because this function also adopts records that came off DISK, where a hand-edited `{child_seq: 0}`
+// would otherwise survive in memory and be dropped on the next save, making `childEvidence` answer differently
+// before and after a restart.
 function strandChildRecord(child) {
   if (!child || typeof child !== 'object' || Array.isArray(child)) return null;
   const { child_seq: seq, pid } = child;

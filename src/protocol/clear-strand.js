@@ -53,8 +53,24 @@ const RESULT_KEYS = Object.freeze(['schema', 'stage', 'reason', 'session_id', 's
 // imported so this module keeps its two-dependency surface (bound-inject.js:35 is the same rule; a control
 // character in an identity token is never legitimate and would travel into logs and frames).
 const TOKEN_MAX_BYTES = 256;
-// The raw request body bound of the /api/daemon/stop guard, scaled to this slightly larger closed object.
-const BODY_MAX_BYTES = 512;
+// The raw request body bound of the /api/daemon/stop guard, scaled to this larger closed object.
+//
+// r2 erratum (review finding CSR-m4): 1100, not 512. §3 declares three 1..256-BYTE identity fields, and at
+// that declared maximum the serialised request is 959 bytes — so with a 512-byte gate the upper half of every
+// declared field range was unsendable, and the caller got 413 `clear_body_bytes` with no indication of WHICH
+// field was too long. 1100 is the smallest round number that admits every field at its own maximum
+// (959 + headroom for the schema and basis literals) while staying two orders of magnitude below
+// express.json's 100 kB default, so it is still a tight smuggling bound: there is no payload on this door and
+// nothing legitimate to put in the slack.
+const BODY_MAX_BYTES = 1100;
+// r2 erratum (review finding CSR-m2): step 1.3 is an EXACT media-type test, not a prefix test. A prefix test
+// admitted `application/jsonx`, and its safety then rested on an unstated coupling in another module —
+// `express.json()` is installed with no `type` option (src/protocol/http-app.js:8), so its exact-match default
+// never parses such a request, `principalRawBody` is never assigned and step 1.4 refuses it instead. That is a
+// safe outcome for the wrong reason: widen `express.json`'s `type`, or add a raw-body middleware for all
+// types, and `application/jsonx` would silently become a working content type on this door. The media type is
+// decided here, by this door, and a parameter (`; charset=utf-8`) still works.
+const JSON_MEDIA_TYPE_RE = /^application\/json(?:[;\s]|$)/;
 const REASON_RE = /^[a-z0-9_]{1,64}$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
 // Loopback SOCKET PEERS only (CLEAR-INTERFACE §5 step 1.1). Forwarded headers are never consulted anywhere in
@@ -132,7 +148,7 @@ function authorizeClearStrandTransport(req) {
   // caller (the CLI) never sends one.
   if (headers.origin !== undefined) return { status: 403, reason: 'clear_origin_refused' };
   const contentType = String(headers['content-type']).toLowerCase();
-  if (!contentType.startsWith('application/json')) return { status: 415, reason: 'clear_content_type' };
+  if (!JSON_MEDIA_TYPE_RE.test(contentType)) return { status: 415, reason: 'clear_content_type' };
   const raw = req ? req.principalRawBody : null;
   if (!Buffer.isBuffer(raw) || raw.length < 1 || raw.length > BODY_MAX_BYTES) {
     return { status: 413, reason: 'clear_body_bytes' };
@@ -228,6 +244,19 @@ function classifyClearResponse(status, body) {
   if (closed) return { outcome: body.stage, reason: boundedClearReason(body.reason), result: body };
   if (status === 404 && (body === null || body === undefined || typeof body !== 'object' || !('schema' in body))) {
     return { outcome: 'unsupported', reason: 'route_unsupported', result: null };
+  }
+  // r2 erratum (review finding CSR-m1): a 401/403 that is NOT this route's closed object came from the shared
+  // auth middleware, which is installed BEFORE this route (daemon.js) and answers
+  // `{error, code: 'PERMISSION_DENIED'}`. Such an answer never reached the handler, so NOTHING happened — and
+  // an operator must not be told to hold an identity and re-read a view for a provable no-effect. It is a
+  // refusal with the no-effect exit code.
+  //
+  // This is the ONE place where the status, not the body, decides, and §2.4's "classifies on the body" rule is
+  // amended for exactly this case: a 401/403 can only be produced before the effect (the route's own 401/403
+  // carries the closed object and is handled above), so the inference is sound in both directions. The line
+  // still reports `http_status`, so nothing about the answer is hidden from the caller.
+  if (status === 401 || status === 403) {
+    return { outcome: 'refused', reason: 'clear_auth_required', result: null };
   }
   return { outcome: 'outcome_unknown', reason: 'response_unparseable', result: null };
 }

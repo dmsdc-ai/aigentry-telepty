@@ -149,6 +149,14 @@ function view(session) {
 // (acceptMilestone returns before writing it), so it cannot be observed here either.
 // Used by the stranded-composer record (so a strand remembers WHICH child held the text) and by the operator
 // clear's `child_replaced_observed` basis. It validates nothing new and changes nothing.
+//
+// Review note CSR-n3: there is deliberately no `state.capable` test here, and none is needed:
+// `acceptMilestone` refuses with `not_negotiated` BEFORE writing `process_started` when the current
+// generation is not capable (:75), so a non-null `process_started` already implies a negotiated generation. A
+// legacy bridge therefore yields null here, and `child_replaced_observed` is refused `basis_contradicted` for
+// it — the fail-closed direction §5 step 4.11 wants. Review note CSR-n4: the `> 0` bounds that
+// `serializeStrandRecord` applies to the same pair are likewise unreachable-but-harmless, because an accepted
+// milestone always has `child_seq >= 1` (`> retired_child_seq`, which starts at 0) and `pid >= 1` (`:86`).
 function observedChild(session) {
   const state = current(session);
   const started = state && state.process_started;

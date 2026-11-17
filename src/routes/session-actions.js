@@ -2107,8 +2107,8 @@ function createSessionActions(shared, effects = {}) {
   // (`child_replaced_observed`) is verified against the daemon's own milestone.
   //
   // Authority is the /api/daemon/stop guard, not this file's own invention: a loopback SOCKET peer (forwarded
-  // headers are never consulted), NO Origin header, `application/json`, a 1..512-byte raw body, and the local
-  // administrative token in the `x-telepty-token` HEADER under a timing-safe equal-length compare. A query
+  // headers are never consulted), NO Origin header, an exact `application/json` media type, a 1..1100-byte raw
+  // body, and the local administrative token in the `x-telepty-token` HEADER under a timing-safe compare. A query
   // token, a JWT, a session bearer and a client-profile carrier satisfy NONE of it. The expected secret never
   // enters this module: step 1.5 is the injected `verifyHostToken(req)`, which daemon.js closes over
   // EXPECTED_TOKEN. A request that ALSO carries a session bearer is not refused — `fetchWithAuth` attaches one
@@ -2143,7 +2143,7 @@ function createSessionActions(shared, effects = {}) {
       }));
       try {
         // ── Step 1 — transport authority ────────────────────────────────────────────────────────────────────
-        // 1.1 loopback peer · 1.2 no Origin · 1.3 application/json · 1.4 a 1..512-byte raw body: one pure
+        // 1.1 loopback peer · 1.2 no Origin · 1.3 exact application/json · 1.4 a 1..1100-byte raw body: one
         // decision that never sees the token, then 1.5, the injected comparison, which is the ONLY credential
         // this door accepts. Strict `!== true` so a seam that returns something truthy-but-not-true fails closed.
         const transport = clearStrand.authorizeClearStrandTransport(req);
@@ -2255,8 +2255,17 @@ function createSessionActions(shared, effects = {}) {
         if (!removed) return refuse(409, 'not_stranded', strand, evidence);
         // Memory-only, and deliberately NOT in the persistence whitelist: it tells the NEXT operator that this
         // instance was already cleared once. `by` is the VERIFIED sender or null — never the claimed `from`.
+        //
+        // r2 erratum (review finding CSR-m3): the record carries the EPOCH it was written for, and the view
+        // emits it only while that epoch is still the live one. `src/principal/takeover.js` reassigns
+        // `sessionEpoch` on the SAME session object, so without the epoch the next instance's view would
+        // report a clear performed against an instance that no longer exists, with nothing in the field to
+        // reveal the staleness. The emitted key set stays the five fields of §7.3 — `epoch` is a key of the
+        // RECORD, not of the view — and the durable record (the audit line's `clear_session_epoch`) was
+        // already correct.
         session.lastStrandClear = {
           at: new Date().toISOString(),
+          epoch: session.sessionEpoch || null,
           basis: body.basis,
           stranded_inject_id: removed.inject_id,
           child_evidence: evidence,
@@ -2282,6 +2291,11 @@ function createSessionActions(shared, effects = {}) {
           // No store seam in this composition at all: nothing was attempted, and nothing is claimed.
           persistReason = 'not_attempted';
         }
+        // Review note CSR-n7: this call is deliberately NOT individually wrapped. §6's justification for
+        // answering a caught exception 409 `refused` requires that every step after the delete either cannot
+        // throw or has already answered, and this one cannot: `shared.auditAppend` is the delivery-runtime
+        // wrapper whose whole body is `try { auditWriter.append(record) } catch {}` ("audit must never throw
+        // into a handler"). If this is ever pointed at a raw writer, wrap it here.
         recordAudit('cleared', removed, evidence, persisted);
         // The bus event the operator's own tooling reads. `extra` carries NO key named `transport`, so the
         // envelope's transport block is not shadowed (the defect recorded for the bound `inject_written`
@@ -2326,7 +2340,12 @@ function createSessionActions(shared, effects = {}) {
         // happened (the answer is honest as a refusal) or has happened and been reported by the answer above —
         // so a caught exception is answered 409 `refused`, with the exception text staying a LOCAL operator
         // diagnostic. If an answer was already sent, the throw came after it and nothing more is said.
-        console.error('[CLEAR-STRAND-V1] %s handler threw:', requestedId,
+        // r2 erratum (review finding CSR-m7): the id is logged through JSON.stringify. express percent-decodes
+        // `:id`, so a caller could put a newline in it and forge an extra line in the daemon's own log. Narrow
+        // — step 3 refuses control characters before any other use, so only a throw raised in step 1.5 or
+        // step 2 reaches this line — but a log an operator reads during an incident is exactly where a forged
+        // line costs the most. The refusal warn above uses `id`, which step 3 has already bounded.
+        console.error('[CLEAR-STRAND-V1] %s handler threw:', JSON.stringify(requestedId),
           error && error.stack ? error.stack : error);
         if (answered) return undefined;
         return blind(409, 'refused');

@@ -318,6 +318,23 @@ test('A2 refusals: every other argv shape is refused with a bounded code and bui
       assert.ok(REASON_CODES.includes(parsed.code), `CHECKPOINT: ${parsed.code} is in the §6 allow-list`);
     }
   }
+  // r2 erratum (review finding CSR-m5): the FLAG rules are evaluated before the exact-sid check, so an argv
+  // that is wrong in both ways reports the flag code — the order of §2.1's numbered list. The dangerous
+  // direction is the old order, under which each of these reported `target_not_exact_sid` and an operator
+  // fixing only the sid would hit a second, different refusal.
+  for (const [code, argv] of [
+    ['flag_count', ['--from', 'E-operator', '--expected-epoch', 'E1', '--', 'E-target@10.0.0.4']],
+    ['unknown_flag', ['--force', 'yes', '--expected-epoch', 'E1', '--expected-owner-generation', 'G1',
+      '--stranded-inject-id', 'none', '--basis', 'composer_emptied_by_operator', '--', 'api/sessions/E-target']],
+    ['duplicate_flag', ['--from', 'E-operator', '--from', 'E-other', '--expected-owner-generation', 'G1',
+      '--stranded-inject-id', 'none', '--basis', 'composer_emptied_by_operator', '--', '..']],
+    ['flag_value_missing', ['--from', '--basis', '--expected-epoch', 'E1', '--expected-owner-generation', 'G1',
+      '--stranded-inject-id', 'none', '--basis', 'composer_emptied_by_operator', '--', 'E target']],
+  ]) {
+    const parsed = parse(argv);
+    assert.deepEqual([parsed.ok, parsed.code], [false, code],
+      `CHECKPOINT: argv wrong in BOTH ways reports the flag code ${code}, not target_not_exact_sid ${JSON.stringify(parsed)}`);
+  }
   // Refused, with a bounded code that this file deliberately does not pin: `--flag=value` satisfies §2.1.4
   // (unknown_flag) and §2.1.3 (flag_count) at once — one token short of ten — and the shipped bound verb leaves
   // the same overlap unpinned. What matters is that no spelling of a flag is ever silently accepted.
@@ -417,6 +434,37 @@ test('A2 transport: ONE post, the canonical host only, and five outcomes with th
   const remote = await invoke(json(200, result()), { host: '10.0.0.4' });
   assert.deepEqual([remote.code, remote.calls.length, remote.lines[0].reason], [2, 0, 'non_canonical_daemon_host'],
     'CHECKPOINT: a non-canonical host opens no socket');
+
+  // r2 erratum (review finding CSR-m1): the SHARED auth middleware is installed before this route, so a
+  // caller it refuses gets `{error, code}` and never reaches the handler — nothing happened. That must be the
+  // no-effect exit code with a bounded reason, NOT exit 3; the dangerous direction is telling an operator to
+  // hold an identity and re-read a view for a clear that provably did not occur, which is what the
+  // outcome_unknown classification did.
+  for (const status of [401, 403]) {
+    const denied = await invoke(json(status, { error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED' }));
+    assert.deepEqual([denied.code, denied.calls.length, denied.lines[0].transport, denied.lines[0].reason,
+      denied.lines[0].http_status, denied.lines[0].result],
+    [1, 1, 'refused', 'clear_auth_required', status, null],
+    `CHECKPOINT: a non-closed ${status} is a refusal at the no-effect exit code ${JSON.stringify(denied.lines)}`);
+    assert.equal(/re-read the session view/.test(denied.err), false,
+      `CHECKPOINT: and the hold hint is NOT printed for a provable no-effect (${status})`);
+  }
+
+  // r2 erratum (review finding CSR-m6): ONE line shape. Every stdout line of this verb — including the three
+  // decided locally, with no HTTP answer at all — carries the same four keys, so a consumer reading
+  // `line.http_status` gets `null` rather than `undefined`.
+  const everyLine = [cleared, refused, old, notFound, lost, garbage, badArgv, remote];
+  for (const run of everyLine) {
+    assert.equal(run.lines.length, 1, `PRECONDITION: exactly one stdout line ${JSON.stringify(run.lines)}`);
+    assert.deepEqual(Object.keys(run.lines[0]).sort(), ['http_status', 'reason', 'result', 'transport'],
+      `CHECKPOINT: one four-key line shape, always ${JSON.stringify(run.lines[0])}`);
+    assert.ok(run.lines[0].http_status === null || Number.isSafeInteger(run.lines[0].http_status),
+      `CHECKPOINT: http_status is an int or null, never absent ${JSON.stringify(run.lines[0])}`);
+  }
+  for (const local of [badArgv, remote, lost]) {
+    assert.equal(local.lines[0].http_status, null,
+      `CHECKPOINT: a line decided without an HTTP answer reports http_status null ${JSON.stringify(local.lines[0])}`);
+  }
 });
 
 test('A3 registrar: the clear route is registered exactly once, at exactly one path, with no alias twin', () => {
@@ -549,6 +597,23 @@ test('A5 classify: classifyClearResponse is the mirror of the bound classifier, 
     'CHECKPOINT: the schema-less 404 is the ONE proven "nothing happened"');
   assert.equal(classify(404, { schema: 'something.else/v1' }).outcome, 'outcome_unknown',
     'CHECKPOINT: a 404 carrying some other schema is NOT read as unsupported');
+  // r2 erratum (review finding CSR-m1): a 401/403 that is NOT the closed object came from the shared auth
+  // middleware, which is installed BEFORE this route, so the handler never ran and NOTHING happened. It is a
+  // proven no-effect refusal, not an ambiguity — the dangerous direction is calling it `outcome_unknown` and
+  // telling an operator to hold an identity and re-read a view for a clear that provably did not occur.
+  for (const [status, body] of [
+    [401, { error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED' }],
+    [403, { error: 'Forbidden origin', code: 'ORIGIN_DENIED' }],
+    [401, null], [403, undefined], [401, 'Unauthorized'], [403, { schema: 'something.else/v1' }],
+  ]) {
+    assert.deepEqual(classify(status, body), { outcome: 'refused', reason: 'clear_auth_required', result: null },
+      `CHECKPOINT: a non-closed ${status} is a proven no-effect refusal ${JSON.stringify(body)}`);
+  }
+  // ...and the route's OWN 401/403, which does carry the closed object, is still read from the body.
+  assert.equal(classify(403, closed('refused')).outcome, 'refused',
+    'CHECKPOINT: the route\'s own 403 is still classified on its closed body');
+  assert.equal(classify(403, { ...closed('cleared') }).outcome, 'cleared',
+    'CHECKPOINT: and a closed object always wins over the status, in either direction');
   for (const body of [null, undefined, 'text', [], { ok: true }, { schema: RESULT_SCHEMA, stage: 'invented' }]) {
     assert.deepEqual(classify(200, body), { outcome: 'outcome_unknown', reason: 'response_unparseable', result: null },
       `CHECKPOINT: ${JSON.stringify(body)} at 200 is unknown and never retried`);
@@ -740,19 +805,44 @@ test('A10 view: transport.last_strand_clear is emitted only when a clear happene
   assert.equal(JSON.stringify(H.runtime.buildSessionTransportBlock(session, { nowMs })), baseline,
     'PRECONDITION: the transport block of this fixture is deterministic at a pinned clock');
 
-  session.lastStrandClear = { at: '2026-11-17T09:00:00.000Z', basis: 'composer_emptied_by_operator',
-    stranded_inject_id: crypto.randomUUID(), child_evidence: 'same_child', by: 'E-operator' };
+  // The RECORD carries the epoch it was written for (r2 erratum, review finding CSR-m3); the VIEW emits the
+  // five §7.3 fields and never the epoch itself.
+  const record = { at: '2026-11-17T09:00:00.000Z', epoch: session.sessionEpoch,
+    basis: 'composer_emptied_by_operator', stranded_inject_id: crypto.randomUUID(),
+    child_evidence: 'same_child', by: 'E-operator' };
+  session.lastStrandClear = record;
   const after = H.runtime.buildSessionTransportBlock(session, { nowMs });
   assert.equal(Object.hasOwn(after, VIEW_KEY), true,
     `CHECKPOINT: an operator can see that somebody already cleared this instance (${VIEW_KEY})`);
   assert.deepEqual(Object.keys(after[VIEW_KEY]).sort(), [...VIEW_KEYS].sort(),
-    `CHECKPOINT: exactly the five keys of §7.3 ${JSON.stringify(after[VIEW_KEY])}`);
-  assert.deepEqual(after[VIEW_KEY], session.lastStrandClear,
-    'CHECKPOINT: reported as recorded — the VERIFIED sender in `by`, never the claimed `from`');
+    `CHECKPOINT: exactly the five keys of §7.3, and the epoch is not one of them ${JSON.stringify(after[VIEW_KEY])}`);
+  assert.deepEqual(after[VIEW_KEY], { at: record.at, basis: record.basis,
+    stranded_inject_id: record.stranded_inject_id, child_evidence: record.child_evidence, by: record.by },
+  'CHECKPOINT: reported as recorded — the VERIFIED sender in `by`, never the claimed `from`');
   const withoutNewKey = { ...after };
   delete withoutNewKey[VIEW_KEY];
   assert.equal(JSON.stringify(withoutNewKey), baseline,
     'CHECKPOINT: the rest of the block is byte-identical — the new key is a conditional spread, nothing else moved');
+
+  // The staleness guard, in the dangerous direction: `src/principal/takeover.js` reassigns `sessionEpoch` on
+  // the SAME session object, so a clear performed against the previous instance must STOP being reported the
+  // moment that instance is gone. Without the epoch guard this block would still describe it.
+  const liveEpoch = session.sessionEpoch;
+  session.sessionEpoch = crypto.randomUUID();
+  const afterTakeover = H.runtime.buildSessionTransportBlock(session, { nowMs });
+  assert.equal(Object.hasOwn(afterTakeover, VIEW_KEY), false,
+    `CHECKPOINT: a clear belonging to a superseded instance is NOT reported for the new one ${JSON.stringify(afterTakeover[VIEW_KEY])}`);
+  assert.equal(session.lastStrandClear, record,
+    'CHECKPOINT: and the record itself is left alone — the view decides what it reports, nothing is rewritten');
+  session.sessionEpoch = liveEpoch;
+  assert.equal(Object.hasOwn(H.runtime.buildSessionTransportBlock(session, { nowMs }), VIEW_KEY), true,
+    'CHECKPOINT: the instance the clear belongs to still sees it');
+  // A record with no epoch at all (a pre-erratum record restored into memory) is not reported either.
+  session.lastStrandClear = { at: record.at, basis: record.basis, stranded_inject_id: record.stranded_inject_id,
+    child_evidence: record.child_evidence, by: record.by };
+  assert.equal(Object.hasOwn(H.runtime.buildSessionTransportBlock(session, { nowMs }), VIEW_KEY), false,
+    'CHECKPOINT: an epoch-less record names no instance, so the view reports nothing');
+
   delete session.lastStrandClear;
   assert.equal(JSON.stringify(H.runtime.buildSessionTransportBlock(session, { nowMs })), baseline,
     'CHECKPOINT: and removing the record returns the block to its pre-change bytes');
@@ -1130,26 +1220,42 @@ test('B4/B5 origin: any Origin header at all is refused 403, including the daemo
 test('B6/B7/B8 content type and body bounds: a non-JSON type is 415 and an absent/oversize raw body is 413', () => {
   const { session, strand } = H.strandedFixture('c1270-b-bounds');
   const authorize = clearProtocolFn('authorizeClearStrandTransport', 'the pure content/bounds gate');
-  for (const contentType of ['text/plain', 'application/x-www-form-urlencoded', 'application/octet-stream', '', undefined]) {
+  // `application/jsonx` is in this list BY ERRATUM (review finding CSR-m2): §5 step 1.3 is an EXACT media-type
+  // test — lower-cased `application/json` followed by end of string, `;` or whitespace — not a prefix test. A
+  // prefix test admitted it, and its safety then rested on an unstated coupling in another module
+  // (`express.json()` is installed with no `type`, so its exact-match default never parses such a request and
+  // step 1.4 refuses it instead). This row is the regression guard for that: a prefix test makes it 200/400
+  // instead of 415, and this case fails.
+  for (const contentType of ['text/plain', 'application/x-www-form-urlencoded', 'application/octet-stream',
+    'application/jsonx', 'application/json-patch+json', 'text/application/json', '', undefined]) {
     const req = H.clearReq(session.id, H.clearBody(session),
       contentType === undefined ? { dropHeaders: ['content-type'] } : { headers: { 'content-type': contentType } });
     assert.deepEqual(authorize(req), { status: 415, reason: 'clear_content_type' },
-      `CHECKPOINT: content-type ${JSON.stringify(contentType)} is refused 415`);
+      `CHECKPOINT: content-type ${JSON.stringify(contentType)} is refused 415 by the EXACT media-type test`);
     assertRefusal(session, strand, invokeClear(req), 'clear_content_type', { beforeStep4: true });
   }
-  // The rule of CLEAR-INTERFACE §5 step 1.3 is a lower-cased PREFIX test, exactly as the /api/daemon/stop
-  // guard's is, so a parameterised JSON type is accepted — and so is a type that merely starts that way. The
-  // bound is not the discriminator here: the body still has to BE the closed object (step 2).
+  // The media types the door takes: the bare type, and the type with a parameter after `;` or whitespace.
   for (const contentType of ['application/json', 'APPLICATION/JSON; charset=utf-8', 'application/json;charset=utf-8',
-    'application/jsonx']) {
+    'application/json; charset=utf-8', 'application/json ;charset=utf-8', 'application/json ']) {
     assert.equal(authorize(H.clearReq(session.id, H.clearBody(session), { headers: { 'content-type': contentType } })), null,
-      `CHECKPOINT: ${contentType} starts with application/json, which is the rule this door states`);
+      `CHECKPOINT: ${JSON.stringify(contentType)} IS application/json, parameters and casing included`);
   }
+  // The raw-body bound is 1100 BY ERRATUM (review finding CSR-m4): §3 declares three 1..256-byte identity
+  // fields, and at that maximum the request is 959 bytes — with the old 512-byte gate the upper half of every
+  // declared field range was unsendable and answered 413 with no indication of which field was too long. The
+  // two rows below are the regression guard in the dangerous direction: lower the bound again and
+  // `at the §3 maximum` fails.
   const body = H.clearBody(session);
-  const padded = `${JSON.stringify(body)}${' '.repeat(600)}`;
+  const maximal = { ...body, from: 'f'.repeat(256), expected_epoch: 'e'.repeat(256),
+    expected_owner_generation: 'g'.repeat(256) };
+  assert.ok(Buffer.byteLength(JSON.stringify(maximal), 'utf8') <= 1100,
+    `PRECONDITION: every field at its §3 maximum is ${Buffer.byteLength(JSON.stringify(maximal), 'utf8')} bytes`);
+  assert.equal(authorize(H.clearReq(session.id, maximal)), null,
+    'CHECKPOINT: at the §3 maximum every field fits the raw-body bound and reaches the schema step');
+  const padded = `${JSON.stringify(body)}${' '.repeat(900)}`;
   for (const [label, raw] of Object.entries({
     'oversize but valid JSON': Buffer.from(padded, 'utf8'),
-    'exactly one byte over': Buffer.alloc(513, 0x20),
+    'exactly one byte over': Buffer.alloc(1101, 0x20),
     empty: Buffer.alloc(0),
     absent: undefined,
     'not a Buffer': JSON.stringify(body),
@@ -1160,8 +1266,8 @@ test('B6/B7/B8 content type and body bounds: a non-JSON type is 415 and an absen
       `CHECKPOINT: a raw body that is ${label} is refused 413 before anything parses it`);
     assertRefusal(session, strand, invokeClear(req), 'clear_body_bytes', { beforeStep4: true });
   }
-  assert.equal(authorize(H.clearReq(session.id, body, { principalRawBody: Buffer.alloc(512, 0x20) })), null,
-    'CHECKPOINT: 512 bytes is the bound, not one less');
+  assert.equal(authorize(H.clearReq(session.id, body, { principalRawBody: Buffer.alloc(1100, 0x20) })), null,
+    'CHECKPOINT: 1100 bytes is the bound, not one less');
   assert.equal(authorize(H.clearReq(session.id, body, { principalRawBody: Buffer.alloc(1, 0x20) })), null,
     'CHECKPOINT: and one byte is enough to pass the bound (the shape check comes later)');
 });
@@ -1317,15 +1423,19 @@ test('C5/C6/C7/C8/C9 fields: each identity field has its own code, and nothing i
   for (const [reason, override] of rows) {
     const body = { ...valid, ...override };
     assert.equal(validate(body), reason, `CHECKPOINT: ${JSON.stringify(override)} is ${reason}`);
-    // §5 step 1.4 is decided BEFORE step 2, and the two bounds are independent: a token may be up to 256
-    // BYTES while the whole raw body may be at most 512. A maximal `from` replaces a 10-byte value in a
-    // ~278-byte body, so it cannot fit beside the other five fields and is answered 413 `clear_body_bytes`
-    // without ever being parsed — whereas a maximal epoch/generation replaces a 36-byte UUID and still fits.
-    // The schema code for every row is asserted on the pure validator above (that is the field's contract);
-    // the ROUTE's answer is whatever the frozen order dictates, which is what this line measures.
-    const answered = Buffer.byteLength(JSON.stringify(body), 'utf8') > 512 ? 'clear_body_bytes' : reason;
-    assertRefusal(session, strand, invokeClear(H.clearReq(session.id, body)), answered, { beforeStep4: true });
+    // Every row reaches the SCHEMA step and gets its own 400, including the rows one byte over §3's 256-byte
+    // field bound: the raw-body gate is 1100 BY ERRATUM (review finding CSR-m4), so a field at or just past
+    // its own maximum is no longer swallowed by a 413 that names no field. Lower that gate again and these
+    // rows answer `clear_body_bytes` instead — this loop is the guard in the dangerous direction.
+    assertRefusal(session, strand, invokeClear(H.clearReq(session.id, body)), reason, { beforeStep4: true });
   }
+  // And the raw-body gate still exists: a body past 1100 bytes is 413 before anything is parsed, and the
+  // schema code for the same body is still what the pure validator says.
+  const huge = { ...valid, from: 'x'.repeat(900) };
+  assert.ok(Buffer.byteLength(JSON.stringify(huge), 'utf8') > 1100,
+    `PRECONDITION: the oversize row is ${Buffer.byteLength(JSON.stringify(huge), 'utf8')} bytes`);
+  assert.equal(validate(huge), 'from_invalid', 'CHECKPOINT: the schema still has its own verdict on that body');
+  assertRefusal(session, strand, invokeClear(H.clearReq(session.id, huge)), 'clear_body_bytes', { beforeStep4: true });
   // The accepted edges of the same bounds.
   for (const override of [{ from: 'x'.repeat(256) }, { from: 'あ'.repeat(80) },
     { stranded_inject_id: null }, { basis: 'child_replaced_observed' }]) {
@@ -2075,6 +2185,10 @@ test('E10 synchrony and silence: the handler\'s own source has no await, no time
     assert.equal(source.includes(needle), false,
       `CHECKPOINT: the clear's code contains no ${JSON.stringify(needle)} — nothing may run between the strand read and the delete`);
   }
+  // Scope (review note CSR-n6): this scan is over the DAEMON-side handler, which is where §9.3's invariant
+  // bites — the clear's own code paths into a session. The CLI module matches `write(` only because it writes
+  // its own JSON line to `process.stdout` and its hint to `process.stderr`, neither of which is a session
+  // input path; scanning it here would measure the wrong thing.
   for (const needle of ['\\r', '\\u0003', '\\u0015', '\\u001b', 'key code', 'send-key', 'ownerWs.send', 'write(']) {
     assert.equal(source.includes(needle), false,
       `CHECKPOINT: the clear's code contains no ${JSON.stringify(needle)} — this door never types, submits or interrupts`);
@@ -2083,6 +2197,14 @@ test('E10 synchrony and silence: the handler\'s own source has no await, no time
     'CHECKPOINT: the one effect is the shared keyed delete, not an inline `delete session.strandedComposer`');
   assert.equal(source.includes('delete session.strandedComposer'), false,
     'CHECKPOINT: and the route never deletes the record itself, bypassing the key check');
+  // r2 erratum (review finding CSR-m7): express percent-decodes `:id`, so a caller can put a newline in it.
+  // Step 3 refuses control characters before any other use, which leaves exactly one reachable log of an
+  // unvalidated id — the catch arm — and that one escapes it. The dangerous direction is a raw `%s` of a
+  // caller-controlled value forging a line in the log an operator reads during an incident.
+  assert.ok(source.includes('JSON.stringify(requestedId)'),
+    'CHECKPOINT: the catch arm logs the caller-controlled id ESCAPED');
+  assert.equal(/console\.(error|warn|log)\([^)]*%s[^)]*', requestedId/.test(source), false,
+    'CHECKPOINT: and no log statement interpolates the raw requested id');
   // The keyed delete itself: it may only remove the record it was given the key for.
   assert.equal(typeof runtimeModule.clearStrandedComposer, 'function',
     'CHECKPOINT: delivery-runtime must export clearStrandedComposer (CLEAR-INTERFACE §8)');

@@ -183,6 +183,13 @@ function strandComposer(session, { epoch = null, injectId = null, reason = 'cr_o
     // replaces the child, and both are exactly the cases an operator clear has to tell apart. Non-secret, two
     // bounded facts, read-only: `owner_generation` is the opaque token the daemon already holds, and `child`
     // is the CURRENT generation's accepted process_started milestone or null (never invented).
+    //
+    // Review note CSR-n1: `owner_generation` has no production READER today — the clear compares the request
+    // against the LIVE `session.interactionOwnerGeneration` (§5 step 4.8) and `childEvidence` reads only
+    // `child`. It is recorded because it is the only place the generation that held the text is preserved: the
+    // audit line and a post-mortem need it, and it survives a restart with the rest of the record. Making
+    // step 4.8 also refuse when a non-null `strand.owner_generation` differs from the live generation would
+    // give it a reader, but that is a behaviour change and does not belong in a hotfix.
     owner_generation: typeof session.interactionOwnerGeneration === 'string' && session.interactionOwnerGeneration
       ? session.interactionOwnerGeneration : null,
     child: readinessHandshake.observedChild(session),
@@ -1940,7 +1947,12 @@ function createDeliveryRuntime(shared, {
       // MEMORY-ONLY: `lastStrandClear` is deliberately absent from the persistence whitelist
       // (src/session-store/persistence.js) and must not survive a restart; `by` is the VERIFIED sender sid or
       // null, never the claimed `from`, so no caller can write a name of its choosing into a session view.
+      // EPOCH-GUARDED, exactly like `stranded_composer` above (r2 erratum, review finding CSR-m3): a takeover
+      // reassigns `sessionEpoch` on the SAME session object (src/principal/takeover.js), so a clear performed
+      // against the previous instance must stop being reported the moment that instance is gone. The record
+      // carries the epoch it was written for; the view emits the five §7.3 fields and never the epoch itself.
       ...(session.lastStrandClear && typeof session.lastStrandClear === 'object'
+        && session.lastStrandClear.epoch === (session.sessionEpoch || null)
         ? { last_strand_clear: {
           at: session.lastStrandClear.at || null,
           basis: session.lastStrandClear.basis || null,

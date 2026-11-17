@@ -57,8 +57,12 @@ function parseClearStrandArgv(argv) {
   // Exactly ONE positional: this verb takes one target and no payload. There is nothing to type.
   if (positional.length !== 1) return { ok: false, code: 'positional_count' };
   const [sid] = positional;
-  if (!exactSessionId(sid)) return { ok: false, code: 'target_not_exact_sid' };
   // Space-separated flag/value pairs only. `--flag=value` is NOT silently accepted: one spelling, one parse.
+  //
+  // r2 erratum (review finding CSR-m5): the flag rules are evaluated BEFORE the exact-sid check, so an argv
+  // that is wrong in both ways reports the flag code — the order of §2.1's numbered list (rule 3 and rule 4
+  // precede rule 5). Both outcomes are usage + exit 2 with no request built and no socket opened, so only the
+  // reported code differs; it now matches the code a reader of the list would pin.
   if (flags.length !== Object.keys(FLAGS).length * 2) return { ok: false, code: 'flag_count' };
   const seen = new Map();
   for (let index = 0; index < flags.length; index += 2) {
@@ -69,6 +73,7 @@ function parseClearStrandArgv(argv) {
     if (typeof value !== 'string' || value.startsWith('--')) return { ok: false, code: 'flag_value_missing' };
     seen.set(flag, value);
   }
+  if (!exactSessionId(sid)) return { ok: false, code: 'target_not_exact_sid' };
   const from = seen.get('--from');
   const expectedEpoch = seen.get('--expected-epoch');
   const expectedOwnerGeneration = seen.get('--expected-owner-generation');
@@ -109,6 +114,11 @@ function clearTargetRefusal(remoteHost) {
 
 // One bounded JSON line, so a caller scrapes instead of parsing prose. `transport` is this CLI's own
 // classification of the answer; `result` is the daemon's closed object verbatim when it sent one.
+//
+// r2 erratum (review finding CSR-m6): ONE shape, always four keys. The locally-decided lines (a usage
+// refusal, a non-canonical host, a transport that threw) now carry `http_status: null` rather than omitting
+// the key, so a consumer reading `line.http_status` gets `null` — "there was no HTTP answer" — instead of
+// `undefined`, which is indistinguishable from "this consumer misread the shape".
 function line(payload) { return `${JSON.stringify(payload)}\n`; }
 
 // `deps`: { fetchWithAuth, daemonUrl, remoteHost, timeoutMs, stdout, stderr }. No default daemon URL and no
@@ -119,14 +129,14 @@ async function runClearStrandV1(argv, deps) {
   const parsed = parseClearStrandArgv(argv);
   if (!parsed.ok) {
     stderr.write(USAGE);
-    stdout.write(line({ transport: 'refused_locally', reason: parsed.code, result: null }));
+    stdout.write(line({ transport: 'refused_locally', reason: parsed.code, http_status: null, result: null }));
     return EXIT.usage;
   }
   // Decided BEFORE the network: a non-loopback TELEPTY_HOST means this operation is not addressed here at all.
   const refusal = clearTargetRefusal(deps.remoteHost);
   if (refusal) {
     stderr.write(`${refusal}\n`);
-    stdout.write(line({ transport: 'refused_locally', reason: 'non_canonical_daemon_host', result: null }));
+    stdout.write(line({ transport: 'refused_locally', reason: 'non_canonical_daemon_host', http_status: null, result: null }));
     return EXIT.usage;
   }
   const url = `${deps.daemonUrl}/api/sessions/${encodeURIComponent(parsed.sid)}/clear-strand-v1`;
@@ -145,7 +155,7 @@ async function runClearStrandV1(argv, deps) {
   } catch {
     // A lost response is NOT evidence that nothing was cleared. Unknown, held, never replayed.
     stderr.write(HOLD_HINT);
-    stdout.write(line({ transport: 'outcome_unknown', reason: 'response_unavailable', result: null }));
+    stdout.write(line({ transport: 'outcome_unknown', reason: 'response_unavailable', http_status: null, result: null }));
     return EXIT.unknown;
   }
   const verdict = classifyClearResponse(status, body);
