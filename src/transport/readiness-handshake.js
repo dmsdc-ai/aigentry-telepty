@@ -143,6 +143,19 @@ function view(session) {
     meaning: 'transport_only_not_instruction_receipt' };
 }
 
+// Task 1270 — the child the CURRENT owner generation announced, or null. Read-only over the state above: only
+// the current generation's state (`current`), only from an ACCEPTED `process_started` milestone, and only the
+// two fields that identify a child. A refused frame never reached `state.process_started`
+// (acceptMilestone returns before writing it), so it cannot be observed here either.
+// Used by the stranded-composer record (so a strand remembers WHICH child held the text) and by the operator
+// clear's `child_replaced_observed` basis. It validates nothing new and changes nothing.
+function observedChild(session) {
+  const state = current(session);
+  const started = state && state.process_started;
+  if (!started || !Number.isSafeInteger(started.child_seq) || !Number.isSafeInteger(started.pid)) return null;
+  return { child_seq: started.child_seq, pid: started.pid };
+}
+
 // Bridge side: the frame for one milestone, or null when the binding is incomplete.
 function milestoneFrame(type, { sessionId, binding, nonce, childSeq, pid }) {
   if (!MILESTONES.includes(type) || !binding || typeof binding.owner_generation !== 'string'
@@ -156,4 +169,6 @@ function milestoneFrame(type, { sessionId, binding, nonce, childSeq, pid }) {
 }
 
 module.exports = { CAPABILITY, CAPABILITY_HEADER, SCHEMA, MILESTONES, declaresCapability, beginOwnerGeneration, clearReadiness,
-  acceptMilestone, noteRefusedMilestone, negotiated, inputTransportReady, awaitingInputTransport, view, milestoneFrame };
+  acceptMilestone, noteRefusedMilestone, negotiated, inputTransportReady, awaitingInputTransport, view, milestoneFrame,
+  // Task 1270: the current generation's accepted child, for the strand record and the operator clear.
+  observedChild };

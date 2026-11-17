@@ -286,6 +286,48 @@ above, which also leaves the common envelope keys `event_type`, `session_id` and
   `queued` arm above cannot arise. A bound delivery that cannot be handed to the owner is refused in
   the response instead, and emits nothing here.
 
+### `composer_strand_cleared` (task 1270 candidate — acceptance pending)
+
+Emitted by `POST /api/sessions/:id/clear-strand-v1` on its `cleared` stage only — never on a refusal, and
+never by any other producer. One event per removed strand record. Measured against the emitter
+(`src/routes/session-actions.js`, the `registerClearStrandV1Route` success arm) rather than intended, same
+convention as the blocks above, which also leave the common envelope keys `event_type`, `session_id`,
+`transport` and `semantic` implicit:
+
+```json
+{ "type": "composer_strand_cleared", "sender": "daemon", "target_agent": "string", "stranded_inject_id": "UUID|null", "strand_reason": "string|null", "strand_at": "ISO 8601|null", "basis": "composer_emptied_by_operator|child_replaced_observed", "child_evidence": "replaced|same_child|unobservable", "persisted": "boolean", "from": "string|null", "verified_sender_sid": "string|null", "verified_sender_epoch": "string|null", "verified_sender_generation": "number|null", "spoof_suspected": "boolean", "origin": "trusted-local", "timestamp": "ISO 8601" }
+```
+
+- **What it reports**: an operator removed the refusal record that held one session instance's input shut. The
+  session had been refusing every body and key for that instance because an earlier bound delivery handed a
+  body and could not hand its paired CR, leaving unsubmitted text in a real composer.
+- **What it does NOT report**: anything being typed, submitted or interrupted. This door writes no byte and
+  sends no key; `basis` is the operator's own **claim** about the composer, which the daemon cannot observe
+  (`child_replaced_observed` is the one basis it checks, against its own `process_started` milestone). A cleared
+  strand means "the daemon no longer refuses this instance's input" and nothing more.
+- `strand_reason` / `strand_at` come from the record that was **removed** (its `submit_*`/`cr_*`/`delivery_*`
+  code and its ISO timestamp), so a subscriber learns WHY the instance was stranded, not why it was cleared.
+- `child_evidence` is the daemon's own comparison of the child recorded at strand time with the current owner
+  generation's accepted `process_started` milestone. `unobservable` is the honest answer for a legacy bridge
+  that announces no milestone and for a strand written before the field existed.
+- `persisted` is whether the session store accepted the save of the removed record. `false` means the clear
+  stands in memory and a daemon restart may restore the strand; it is **not** rolled back, because re-adding
+  the record would deny input to a composer the operator has just emptied.
+- `from` is the **claimed** sender; `verified_sender_sid` is the daemon-verified identity (from the presented
+  `x-telepty-session-token`, when there is one), and `spoof_suspected` is the same derivation as above. The
+  clear is authorised by the host token in the `x-telepty-token` HEADER on a loopback socket peer with no
+  `Origin`; a request that also carries a session bearer is recorded, not refused.
+- `extra` contains **no key named `transport`**, so unlike the bound `inject_written` above this event's
+  envelope `transport` block is the usual object — the shadowing defect recorded there is deliberately not
+  repeated here.
+- The type is **not** in `APPROVED_TYPES` (`src/transport/session-events.js`), so the scoped read-only
+  session-event transport (`/api/events/…`) does **not** carry it: `projectSessionEvent` returns `null` and
+  only `/api/bus` subscribers see it. Widening that list would be a grant change and is out of scope.
+- The durable record of the same action is one line in `~/.telepty/logs/injects.jsonl` with
+  `kind: "operator-clear"`, `source: "clear-strand-v1"` and the seven `clear_*` fields (see the inject audit
+  log section below). The audit line is written for every outcome from the target check onward; this event only
+  for the clear that happened.
+
 ### `audit_overflow` (telepty #43)
 ```json
 { "type": "audit_overflow", "sender": "daemon", "dropped": "number", "queue_max": "number", "timestamp": "ISO 8601" }
@@ -335,6 +377,29 @@ that two lines naming the same sid came from the same *instance*. Both are `null
 sender is unverified, so an absent epoch never reads as "verified, epoch unknown". They are derived
 in `src/audit/inject-log.js`, which is the authoritative shape of a line — as are `payload_sha256`,
 `payload_bytes` and `spoof_suspected`, none of which any caller passes.
+
+**The operator clear writes a line here too, and it is not a write into a PTY (task 1270 candidate —
+acceptance pending).** `POST /api/sessions/:id/clear-strand-v1` appends `kind: "operator-clear"`,
+`source: "clear-strand-v1"` for **every** outcome from the target check onward — the clear itself as
+`delivery_result: "cleared"`, and each identity/state refusal as `delivery_result: "refused:<reason>"`. It is in
+this log, which otherwise records writes, because an operator reads it as THE record of who touched a session's
+input, and removing the record that holds a session's input shut is exactly such an act. `payload` is the empty
+string on that door (there is nothing to type), so `payload_sha256` is the empty digest, `payload_bytes` is `0`
+and `payload_preview` is forced to `null` even with `TELEPTY_AUDIT_PREVIEW=1`. Seven additive fields, inside a
+`kind === "operator-clear" && clear` guard in `src/audit/inject-log.js`, so every other line — including the
+broker line and every ordinary inject — is byte-identical to before:
+
+```jsonc
+{ "clear_session_epoch": "string|null", "clear_owner_generation": "string|null",
+  "clear_basis": "composer_emptied_by_operator|child_replaced_observed|null",
+  "clear_strand_reason": "bounded code|null", "clear_strand_at": "ISO 8601|null",
+  "clear_child_evidence": "replaced|same_child|unobservable", "clear_persisted": "boolean" }
+```
+
+Every value is a bounded code, an opaque identity token, an ISO timestamp or a boolean: no screen, prompt or
+composer text exists anywhere in that door's inputs, so none can reach this file. Refusals **before** the
+target check (authority and request-shape refusals) write **no line at all**, which is what keeps an
+authenticated caller from appending records by POSTing to ids that do not exist.
 
 #### Which writes into a PTY this log records, by name (0.8.0, #843)
 

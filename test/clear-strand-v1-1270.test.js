@@ -1115,16 +1115,20 @@ test('B4/B5 origin: any Origin header at all is refused 403, including the daemo
 test('B6/B7/B8 content type and body bounds: a non-JSON type is 415 and an absent/oversize raw body is 413', () => {
   const { session, strand } = H.strandedFixture('c1270-b-bounds');
   const authorize = clearProtocolFn('authorizeClearStrandTransport', 'the pure content/bounds gate');
-  for (const contentType of ['text/plain', 'application/x-www-form-urlencoded', 'application/jsonx', '', undefined]) {
+  for (const contentType of ['text/plain', 'application/x-www-form-urlencoded', 'application/octet-stream', '', undefined]) {
     const req = H.clearReq(session.id, H.clearBody(session),
       contentType === undefined ? { dropHeaders: ['content-type'] } : { headers: { 'content-type': contentType } });
     assert.deepEqual(authorize(req), { status: 415, reason: 'clear_content_type' },
       `CHECKPOINT: content-type ${JSON.stringify(contentType)} is refused 415`);
     assertRefusal(session, strand, invokeClear(req), 'clear_content_type', { beforeStep4: true });
   }
-  for (const contentType of ['application/json', 'APPLICATION/JSON; charset=utf-8', 'application/json;charset=utf-8']) {
+  // The rule of CLEAR-INTERFACE §5 step 1.3 is a lower-cased PREFIX test, exactly as the /api/daemon/stop
+  // guard's is, so a parameterised JSON type is accepted — and so is a type that merely starts that way. The
+  // bound is not the discriminator here: the body still has to BE the closed object (step 2).
+  for (const contentType of ['application/json', 'APPLICATION/JSON; charset=utf-8', 'application/json;charset=utf-8',
+    'application/jsonx']) {
     assert.equal(authorize(H.clearReq(session.id, H.clearBody(session), { headers: { 'content-type': contentType } })), null,
-      `CHECKPOINT: ${contentType} is the JSON this door takes`);
+      `CHECKPOINT: ${contentType} starts with application/json, which is the rule this door states`);
   }
   const body = H.clearBody(session);
   const padded = `${JSON.stringify(body)}${' '.repeat(600)}`;
@@ -1791,20 +1795,30 @@ test('D22 closed result: every answer carries the frozen key set, and identity i
 
 test('E1 clear mid-pair: a clear issued between a body and its CR cannot un-strand the pair being handed', { timeout: 30000 }, async () => {
   const sid = 'c1270-e1-mid-pair';
-  const observed = { answer: null };
+  // The handler is resolved BEFORE the delivery runs. Inside the owner-WS hook below, an assertion failure
+  // would be swallowed by the delivery's own try/catch (it would be reported as a throwing socket), so the
+  // absence of the route is asserted here, where it can fail as itself, and any error raised inside the hook is
+  // carried out and re-thrown verbatim afterwards.
+  const handler = clearHandler('the mid-pair clear');
+  const observed = { answer: null, error: null };
   const hook = { session: null };
   const session = H.registerSession(sid, { onSend: (ws, frame) => {
     if (frame.part !== 'body' || !hook.session) return;
     // Exactly the window a preflight-only check misses: the body has been handed, the CR has not, and no strand
     // record exists yet. A clear issued here must not be able to declare the composer clean.
-    observed.answer = invokeClear(H.clearReq(sid, H.clearBody(hook.session, { stranded_inject_id: null })),
-      { what: 'the mid-pair clear' });
+    try {
+      observed.answer = invokeClear(H.clearReq(sid, H.clearBody(hook.session, { stranded_inject_id: null })),
+        { handler, what: 'the mid-pair clear' });
+    } catch (error) {
+      observed.error = error;
+    }
     hook.session.bootstrapDraining = true;   // and the CR that follows cannot be handed
   } });
   hook.session = session;
   H.sessionStateManager.feed(sid, WORKING);
   const response = await H.call(BOUND_ROUTE_KEY, sid, boundRequest(session, 'c1270-e1 unsubmitted text'));
   session.bootstrapDraining = false;
+  if (observed.error) throw observed.error;   // the real assertion, not a precondition about the harness
   assert.ok(observed.answer, 'PRECONDITION: the clear really ran inside the delivery\'s own write');
   assert.deepEqual([observed.answer.status, observed.answer.body.stage, observed.answer.body.reason],
     [409, 'refused', 'not_stranded'],

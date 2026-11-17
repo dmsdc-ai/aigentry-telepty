@@ -178,6 +178,14 @@ function strandComposer(session, { epoch = null, injectId = null, reason = 'cr_o
     inject_id: validInjectId(injectId) ? injectId : null,
     reason: typeof reason === 'string' && reason ? reason : 'cr_outcome_unknown',
     at: new Date().toISOString(),
+    // Task 1270 operator clear: WHO held the composer and WHICH child it was typed into, recorded at strand
+    // time because neither can be reconstructed afterwards — a reclaim mints a new generation and a restart
+    // replaces the child, and both are exactly the cases an operator clear has to tell apart. Non-secret, two
+    // bounded facts, read-only: `owner_generation` is the opaque token the daemon already holds, and `child`
+    // is the CURRENT generation's accepted process_started milestone or null (never invented).
+    owner_generation: typeof session.interactionOwnerGeneration === 'string' && session.interactionOwnerGeneration
+      ? session.interactionOwnerGeneration : null,
+    child: readinessHandshake.observedChild(session),
   };
   return session.strandedComposer;
 }
@@ -198,6 +206,35 @@ function strandedInputFailure(session) {
     error: 'An earlier delivery left unsubmitted text in this session\'s composer; no further input is admitted for this session instance.',
     reason: strand.reason, stranded_inject_id: strand.inject_id,
   };
+}
+
+// Task 1270 — THE operator clear's one effect, and the exact mirror of `strandComposer`'s add-only guard.
+//
+// `strandComposer` may only ever ADD (re-review finding RR-m5: an un-keyed call used to overwrite an active
+// record with `{epoch: null}`, which reads as "not stranded"). This function may only ever REMOVE THE ONE
+// RECORD IT WAS GIVEN THE KEY FOR, for the same reason read backwards: a call that does not name the epoch and
+// the inject id of the live record must change nothing, because the only thing it could otherwise do is
+// re-admit every producer to a composer that still holds somebody's unsubmitted text.
+//
+// So all four of these must hold, or the return is null and the record stays exactly where it is:
+//   • `session.strandedComposer` exists at all;
+//   • `strandedComposer(session)` is non-null — the record applies to the LIVE epoch. An INERT record (the
+//     epoch moved on) is not removable: it belongs to an instance this call does not name, and a later restore
+//     of that epoch must still find it;
+//   • the epoch key matches that record's epoch;
+//   • the inject-id key matches that record's inject_id, strictly, `null === null` included.
+// A missing or non-string epoch is refused up front, so an argument-less call can never clear anything.
+//
+// Pure apart from the one `delete`: no clock, no I/O, no persistence call, no event, no frame. The route
+// performs the save, the audit line and the bus event around it; this is only the deletion.
+// → the removed record, or null when there was nothing this call was entitled to remove.
+function clearStrandedComposer(session, { epoch = null, injectId = null } = {}) {
+  if (!session || !epoch || typeof epoch !== 'string') return null;
+  const strand = strandedComposer(session);
+  if (!strand || strand.epoch !== epoch) return null;
+  if (strand.inject_id !== injectId) return null;
+  delete session.strandedComposer;
+  return strand;
 }
 
 // hotfix480 F1-F4 — THE immediate single-CR attempt (the /submit route and the queued drain). In order: wait behind a
@@ -1894,6 +1931,24 @@ function createDeliveryRuntime(shared, {
         const strand = strandedComposer(session);
         return strand ? { stranded_composer: { stranded: true, inject_id: strand.inject_id, reason: strand.reason, at: strand.at } } : {};
       })(),
+      // Task 1270 operator clear (CLEAR-INTERFACE §7.3; the view key the user granted with the architect's
+      // stated default, OPEN-QUESTIONS Q1). WHY it is here: an operator who cannot see that somebody already
+      // cleared this instance reads a clean view and concludes nothing ever happened — and the audit log,
+      // which is durable, is not what an operator or an orchestrator reads when a session misbehaves.
+      // CONDITIONAL, like the strand above: a session that was never cleared — every session, until an
+      // operator clears one — serializes its transport block byte-identically to the pre-change shape.
+      // MEMORY-ONLY: `lastStrandClear` is deliberately absent from the persistence whitelist
+      // (src/session-store/persistence.js) and must not survive a restart; `by` is the VERIFIED sender sid or
+      // null, never the claimed `from`, so no caller can write a name of its choosing into a session view.
+      ...(session.lastStrandClear && typeof session.lastStrandClear === 'object'
+        ? { last_strand_clear: {
+          at: session.lastStrandClear.at || null,
+          basis: session.lastStrandClear.basis || null,
+          stranded_inject_id: session.lastStrandClear.stranded_inject_id ?? null,
+          child_evidence: session.lastStrandClear.child_evidence || null,
+          by: session.lastStrandClear.by ?? null,
+        } }
+        : {}),
       // Task 1215: effective recipient input policy (bound to the current owner generation).
       input_policy: inputPolicies.effectiveInputPolicy(session),
       input_policy_source: inputPolicies.userSupervised(session) ? session.inputPolicy.source : null,
@@ -2412,4 +2467,8 @@ module.exports = { createDeliveryRuntime,
   // stranded-composer boundary, checked at every producer that can reach the composer: session-delivery.js on
   // every write and at the two direct owner writes, submitViaPty above for every bare CR, and
   // src/transport/websocket.js `viewerInputDeliverer` for viewer input (r1 finding B1).
-  BUSY_INPUT_CAPABILITY, busyInputSupport, bodyCustodyBusy, strandComposer, strandedComposer, strandedInputFailure };
+  BUSY_INPUT_CAPABILITY, busyInputSupport, bodyCustodyBusy, strandComposer, strandedComposer, strandedInputFailure,
+  // Task 1270 operator clear: the keyed removal of ONE strand record. Exactly one production call site (the
+  // registerClearStrandV1Route handler in src/routes/session-actions.js) — never a timer, an event handler, a
+  // drain, a receipt path or a lifecycle hook.
+  clearStrandedComposer };
