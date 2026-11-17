@@ -1386,9 +1386,26 @@ function createDeliveryRuntime(shared, {
         // held interaction, disconnected owner) is decided BEFORE the send, so zero is provable there. Anything
         // that marks itself uncertain, or declines to state zero bytes, is reported unknown instead — the zero
         // is never inferred from a timeout, a lost response or a queued frame.
-        return textResult.delivery_uncertain === true || textResult.bytes_written === null
-          ? { stage: 'outcome_unknown', reason: 'body_outcome_unknown', bodyStage: 'unknown', submitStage: 'not_sent', bytesWritten: null }
-          : refuse('body_refused');
+        // r6 (caller-side review finding CSR3-M1): an uncertain body is STRANDED, for the same reason the catch
+        // arm strands a body write that threw (`delivery_threw_during_body`, :1446). The two are the same fact
+        // reached two ways — the write may have put the text in that child's composer and declines to say — and
+        // leaving this one un-stranded meant NOBODY reported it: `strandedComposer(session)` stayed null, so
+        // `boundAdmissionRefusal` (:1215) kept admitting and the NEXT body would be appended to text that may
+        // still be sitting there and submitted as one message, and the operator's clear answered `not_stranded`
+        // because there was no record to clear. The reason string is the SAME code the result carries, so the
+        // record, the view, the audit line and the clear's `cleared_strand_reason` all name one fact; it is
+        // already in the bound allow-list (bound-inject.js:59), so it survives serialize/restore verbatim.
+        // Direction: this can only ever REFUSE more input, never write any (:158-161).
+        if (textResult.delivery_uncertain === true || textResult.bytes_written === null) {
+          strandIdentity('body_outcome_unknown');
+          return { stage: 'outcome_unknown', reason: 'body_outcome_unknown', bodyStage: 'unknown', submitStage: 'not_sent', bytesWritten: null };
+        }
+        // UNCHANGED, and deliberately not widened: the discriminator is still exactly those two fields of the
+        // write's own result. A refusal that states a byte count (every pre-send refusal inside
+        // writeDataToSession — closing/handoff, stranded composer, protected input, held interaction,
+        // disconnected owner — reports `bytes_written: 0`) is a PROVABLE zero and must not strand: nothing is in
+        // that composer, so a strand would deny input for an instance nothing ever wrote to.
+        return refuse('body_refused');
       }
       bodyHanded = true;
       session.lastActivityAt = new Date().toISOString();
