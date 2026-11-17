@@ -1246,31 +1246,39 @@ test('B4/B5 origin: any Origin header at all is refused 403, including the daemo
 test('B6/B7/B8 content type and body bounds: a non-JSON type is 415 and an absent/oversize raw body is 413', () => {
   const { session, strand } = H.strandedFixture('c1270-b-bounds');
   const authorize = clearProtocolFn('authorizeClearStrandTransport', 'the pure content/bounds gate');
-  // `application/jsonx` is in this list BY ERRATUM (review finding CSR-m2): §5 step 1.3 is an EXACT media-type
-  // test — lower-cased `application/json` followed by end of string, `;` or whitespace — not a prefix test. A
-  // prefix test admitted it, and its safety then rested on an unstated coupling in another module
-  // (`express.json()` is installed with no `type`, so its exact-match default never parses such a request and
-  // step 1.4 refuses it instead). This row is the regression guard for that: a prefix test makes it 200/400
-  // instead of 415, and this case fails.
+  // `application/jsonx` is in this list BY ERRATUM (review finding CSR-m2), and the two trailing-garbage forms
+  // by its r5 tightening (CSR2-m1): §5 step 1.3 is an EXACT media-type test — the lower-cased value must be
+  // `application/json`, then optional HTTP OWS (SP/HTAB only, not JS `\s`, which also matches CR, LF, NBSP and
+  // the BOM), then the END of the string or `;` and the parameters. The r2 form `(?:[;\s]|$)` was a separator
+  // class with an UNANCHORED remainder, so `application/json bogus` passed it and the door's safety for such a
+  // request still rested on the unstated `express.json()` coupling the erratum exists to remove (that module
+  // is installed with no `type`, so its exact-match default never parses such a request and step 1.4 refuses
+  // it instead). These rows are the regression guard: under a prefix test, or with `\s` instead of OWS, each is
+  // admitted and this case fails.
   for (const contentType of ['text/plain', 'application/x-www-form-urlencoded', 'application/octet-stream',
-    'application/jsonx', 'application/json-patch+json', 'text/application/json', '', undefined]) {
+    'application/jsonx', 'application/json-patch+json', 'text/application/json',
+    'application/json bogus', 'application/json\tbogus', '', undefined]) {
     const req = H.clearReq(session.id, H.clearBody(session),
       contentType === undefined ? { dropHeaders: ['content-type'] } : { headers: { 'content-type': contentType } });
     assert.deepEqual(authorize(req), { status: 415, reason: 'clear_content_type' },
       `CHECKPOINT: content-type ${JSON.stringify(contentType)} is refused 415 by the EXACT media-type test`);
     assertRefusal(session, strand, invokeClear(req), 'clear_content_type', { beforeStep4: true });
   }
-  // The media types the door takes: the bare type, and the type with a parameter after `;` or whitespace.
+  // The media types the door takes: the bare type, the type with trailing OWS, and the type with a parameter
+  // after `;` (with or without OWS before or after it) — every one of these was accepted before the r5
+  // tightening too, which is what that tightening had to preserve.
   for (const contentType of ['application/json', 'APPLICATION/JSON; charset=utf-8', 'application/json;charset=utf-8',
     'application/json; charset=utf-8', 'application/json ;charset=utf-8', 'application/json ']) {
     assert.equal(authorize(H.clearReq(session.id, H.clearBody(session), { headers: { 'content-type': contentType } })), null,
       `CHECKPOINT: ${JSON.stringify(contentType)} IS application/json, parameters and casing included`);
   }
   // The raw-body bound is 1100 BY ERRATUM (review finding CSR-m4): §3 declares three 1..256-byte identity
-  // fields, and at that maximum the request is 959 bytes — with the old 512-byte gate the upper half of every
-  // declared field range was unsendable and answered 413 with no indication of which field was too long. The
-  // two rows below are the regression guard in the dangerous direction: lower the bound again and
-  // `at the §3 maximum` fails.
+  // fields, and at that maximum the request is 964 bytes IN ESCAPE-FREE FORM — with the old 512-byte gate the
+  // upper half of every declared field range was unsendable and answered 413 with no indication of which field
+  // was too long. The caveat (r5, CSR2-m2, Root: the bound stays at 1100): `boundedToken` admits `"` and `\`,
+  // which `JSON.stringify` doubles, so a declared-legal request CAN still be refused 413 before the schema
+  // step — three fields of 256 quotes are 1732 bytes. The rows below are the regression guard in the dangerous
+  // direction: lower the bound again and `at the §3 maximum` fails.
   // THE one place that pins erratum E4's number: the module's bound and this case's literals must agree, so a
   // change to either without the other fails here instead of silently weakening an "oversize" fixture
   // elsewhere (r3; every other case derives its size from the module through `clearBodyBound`).
@@ -1281,9 +1289,10 @@ test('B6/B7/B8 content type and body bounds: a non-JSON type is 415 and an absen
   const maximal = { ...body, from: 'f'.repeat(256), expected_epoch: 'e'.repeat(256),
     expected_owner_generation: 'g'.repeat(256) };
   assert.ok(Buffer.byteLength(JSON.stringify(maximal), 'utf8') <= bound,
-    `PRECONDITION: every field at its §3 maximum is ${Buffer.byteLength(JSON.stringify(maximal), 'utf8')} bytes`);
+    `PRECONDITION: every field at its §3 maximum, escape-free, is ${
+      Buffer.byteLength(JSON.stringify(maximal), 'utf8')} bytes`);
   assert.equal(authorize(H.clearReq(session.id, maximal)), null,
-    'CHECKPOINT: at the §3 maximum every field fits the raw-body bound and reaches the schema step');
+    'CHECKPOINT: at the §3 maximum in ESCAPE-FREE form every field fits the raw-body bound and reaches the schema step');
   // Padding derived from the bound, so this body is over it whatever the bound becomes.
   const padded = `${JSON.stringify(body)}${' '.repeat(bound)}`;
   for (const [label, raw] of Object.entries({

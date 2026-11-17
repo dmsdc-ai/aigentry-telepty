@@ -56,21 +56,34 @@ const TOKEN_MAX_BYTES = 256;
 // The raw request body bound of the /api/daemon/stop guard, scaled to this larger closed object.
 //
 // r2 erratum (review finding CSR-m4): 1100, not 512. §3 declares three 1..256-BYTE identity fields, and at
-// that declared maximum the serialised request is 959 bytes — so with a 512-byte gate the upper half of every
+// that declared maximum the serialised request is 964 bytes — so with a 512-byte gate the upper half of every
 // declared field range was unsendable, and the caller got 413 `clear_body_bytes` with no indication of WHICH
-// field was too long. 1100 is the smallest round number that admits every field at its own maximum
-// (959 + headroom for the schema and basis literals) while staying two orders of magnitude below
-// express.json's 100 kB default, so it is still a tight smuggling bound: there is no payload on this door and
-// nothing legitimate to put in the slack.
+// field was too long. 1100 admits every field at its declared maximum in ESCAPE-FREE form (964 bytes measured,
+// with the longer of the two basis literals; 136 bytes of headroom) while staying two orders of magnitude
+// below express.json's 100 kB default, so it is still a tight smuggling bound: there is no payload on this
+// door and nothing legitimate to put in the slack.
+//
+// The caveat, recorded rather than fixed (r5, review finding CSR2-m2): `boundedToken` bans control characters
+// but admits `"` and `\`, and `JSON.stringify` doubles each of them, so a request whose fields are declared-
+// legal can still serialise past 1100 and be refused 413 BEFORE the schema step — three fields of 256 quotes
+// are 1732 bytes (measured). Making the whole declared range sendable would mean a 1732-byte bound, which is a
+// deliberate decision and not a round number; Root's decision for this round is that the bound stays at 1100
+// and the claim is stated accurately here instead.
 const BODY_MAX_BYTES = 1100;
-// r2 erratum (review finding CSR-m2): step 1.3 is an EXACT media-type test, not a prefix test. A prefix test
-// admitted `application/jsonx`, and its safety then rested on an unstated coupling in another module —
-// `express.json()` is installed with no `type` option (src/protocol/http-app.js:8), so its exact-match default
-// never parses such a request, `principalRawBody` is never assigned and step 1.4 refuses it instead. That is a
-// safe outcome for the wrong reason: widen `express.json`'s `type`, or add a raw-body middleware for all
-// types, and `application/jsonx` would silently become a working content type on this door. The media type is
-// decided here, by this door, and a parameter (`; charset=utf-8`) still works.
-const JSON_MEDIA_TYPE_RE = /^application\/json(?:[;\s]|$)/;
+// r2 erratum (review finding CSR-m2), tightened in r5 (review finding CSR2-m1): step 1.3 is an EXACT
+// media-type test. A prefix test admitted `application/jsonx`, and its safety then rested on an unstated
+// coupling in another module — `express.json()` is installed with no `type` option
+// (src/protocol/http-app.js:8), so its exact-match default never parses such a request, `principalRawBody` is
+// never assigned and step 1.4 refuses it instead. That is a safe outcome for the wrong reason: widen
+// `express.json`'s `type`, or add a raw-body middleware for all types, and `application/jsonx` would silently
+// become a working content type on this door.
+//
+// The rule, verbatim: the lower-cased header value must be `application/json`, then optional HTTP OWS
+// (SP/HTAB only — NOT JS `\s`, which also matches CR, LF, NBSP and the BOM), then either the end of the string
+// or `;` and the parameters. So `application/json`, `application/json ` and `application/json; charset=utf-8`
+// are the door's type, while `application/json bogus` and `application/json\tbogus` are 415: the r2 form was
+// unanchored after the separator class, which admitted any remainder.
+const JSON_MEDIA_TYPE_RE = /^application\/json[ \t]*(?:;|$)/;
 const REASON_RE = /^[a-z0-9_]{1,64}$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
 // Loopback SOCKET PEERS only (CLEAR-INTERFACE §5 step 1.1). Forwarded headers are never consulted anywhere in
