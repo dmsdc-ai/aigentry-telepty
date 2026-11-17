@@ -84,6 +84,13 @@ function clearProtocolFn(name, what) {
     `CHECKPOINT: src/protocol/clear-strand.js must export ${name}() (CLEAR-INTERFACE §8), for ${what}`);
   return module[name];
 }
+// readiness-handshake's new export, guarded the same way: a case that needs the observed child asserts its
+// existence first, so its absence is an ERR_ASSERTION and never a TypeError on an undefined function.
+function observedChildFn(what) {
+  assert.equal(typeof readinessHandshake.observedChild, 'function',
+    `CHECKPOINT: ${what} needs src/transport/readiness-handshake.js to export observedChild(session) (CLEAR-INTERFACE §8)`);
+  return readinessHandshake.observedChild;
+}
 function clearCliFn(name, what) {
   assert.equal(clearCliLoad.ok, true,
     `CHECKPOINT: ${what} needs src/cli/clear-strand-v1.js (WRITE-SET §1.2); require failed with: ${
@@ -557,11 +564,10 @@ test('A5 host token: hostTokenMatches is timing-safe, equal-length only, and nev
 });
 
 test('A6 strand record: strandComposer writes owner_generation and the observed child beside the existing four fields', () => {
-  assert.equal(typeof readinessHandshake.observedChild, 'function',
-    'CHECKPOINT: readiness-handshake must export observedChild(session) (CLEAR-INTERFACE §8)');
+  const observedChild = observedChildFn('the strand record');
   const sid = 'c1270-a6-record';
   const session = H.registerSession(sid);
-  assert.deepEqual(readinessHandshake.observedChild(session), { child_seq: 1, pid: 4242 },
+  assert.deepEqual(observedChild(session), { child_seq: 1, pid: 4242 },
     'CHECKPOINT: the accepted process_started milestone of the CURRENT generation is the observed child');
   const injectId = crypto.randomUUID();
   const strand = runtimeModule.strandComposer(session, { epoch: session.sessionEpoch, injectId, reason: 'submit_outcome_unknown' });
@@ -579,13 +585,14 @@ test('A6 strand record: strandComposer writes owner_generation and the observed 
   const bareStrand = runtimeModule.strandComposer(bare, { epoch: 'epoch-bare', injectId: null, reason: 'cr_outcome_unknown' });
   assert.deepEqual([bareStrand.owner_generation, bareStrand.child], [null, null],
     `CHECKPOINT: a session with no generation and no accepted milestone records two nulls ${JSON.stringify(bareStrand)}`);
-  assert.equal(readinessHandshake.observedChild(bare), null, 'CHECKPOINT: observedChild invents nothing');
+  assert.equal(observedChild(bare), null, 'CHECKPOINT: observedChild invents nothing');
   // Idempotence per epoch is unchanged: a second call returns the existing record untouched.
   assert.deepEqual(runtimeModule.strandComposer(session, { epoch: session.sessionEpoch, injectId: crypto.randomUUID(),
     reason: 'cr_outcome_unknown' }), strand, 'CHECKPOINT: one record per epoch, unchanged by a second call');
 });
 
 test('A7 strand round-trip: the two new fields survive serialize/restore, and a malformed half is dropped', () => {
+  observedChildFn('the persisted strand record');
   const epoch = crypto.randomUUID();
   const injectId = crypto.randomUUID();
   const nowIso = new Date().toISOString();
@@ -597,7 +604,7 @@ test('A7 strand round-trip: the two new fields survive serialize/restore, and a 
       input_transport_ready: null, retired_child_seq: 0, cleared_reason: null } };
   runtimeModule.strandComposer(record, { epoch, injectId, reason: 'submit_outcome_unknown' });
   assert.deepEqual(record.strandedComposer.child, { child_seq: 3, pid: 777 },
-    'PRECONDITION: the in-memory record carries the observed child');
+    'CHECKPOINT: the in-memory record must carry the observed child before a round-trip can preserve it (A6)');
 
   const meta = persistence.serializePersistedSessions({ [record.id]: record })[record.id];
   assert.deepEqual(meta.strandedComposer, { epoch, inject_id: injectId, reason: 'submit_outcome_unknown',
@@ -1629,8 +1636,10 @@ test('D14 inject id: a wrong, absent, surplus or case-folded stranded_inject_id 
 
 test('D15/D16/D17/D18 basis: child_replaced_observed is CHECKED, and only an accepted new milestone corroborates it', () => {
   // D15 — the child is demonstrably the same one: the claim contradicts the daemon's own observation.
+  const observedChild = observedChildFn('the checkable basis');
   const same = H.strandedFixture('c1270-d15-same-child');
-  assert.deepEqual(same.strand.child, { child_seq: 1, pid: 4242 }, 'PRECONDITION: the strand recorded the child');
+  assert.deepEqual(same.strand.child, { child_seq: 1, pid: 4242 },
+    'CHECKPOINT: the strand must record the child it was typed into, or no basis can be checked against it (A6)');
   assertRefusal(same.session, same.strand,
     invokeClear(H.clearReq(same.session.id, H.clearBody(same.session, { basis: 'child_replaced_observed' }))),
     'basis_contradicted');
@@ -1639,7 +1648,7 @@ test('D15/D16/D17/D18 basis: child_replaced_observed is CHECKED, and only an acc
   const replaced = H.strandedFixture('c1270-d16-replaced');
   const accepted = H.milestone(replaced.session, { type: 'process_started', childSeq: 2, pid: 222 });
   assert.equal(accepted.ok, true, `PRECONDITION: the new milestone was accepted ${JSON.stringify(accepted)}`);
-  assert.deepEqual(readinessHandshake.observedChild(replaced.session), { child_seq: 2, pid: 222 },
+  assert.deepEqual(observedChild(replaced.session), { child_seq: 2, pid: 222 },
     'PRECONDITION: the daemon now observes a different child');
   H.setPersist(() => ({ ok: true }));
   const answer = invokeClear(H.clearReq(replaced.session.id, H.clearBody(replaced.session, { basis: 'child_replaced_observed' })));
@@ -1653,7 +1662,7 @@ test('D15/D16/D17/D18 basis: child_replaced_observed is CHECKED, and only an acc
   const staleSeq = H.milestone(refusedFrame.session, { type: 'process_started', childSeq: 1, pid: 444 });
   assert.deepEqual([wrongNonce.ok, staleSeq.ok], [false, false],
     `PRECONDITION: both frames were refused ${JSON.stringify([wrongNonce, staleSeq])}`);
-  assert.deepEqual(readinessHandshake.observedChild(refusedFrame.session), { child_seq: 1, pid: 4242 },
+  assert.deepEqual(observedChild(refusedFrame.session), { child_seq: 1, pid: 4242 },
     'PRECONDITION: the observed child is unchanged by a refused frame');
   assertRefusal(refusedFrame.session, refusedFrame.strand,
     invokeClear(H.clearReq(refusedFrame.session.id, H.clearBody(refusedFrame.session, { basis: 'child_replaced_observed' }))),
@@ -1661,8 +1670,9 @@ test('D15/D16/D17/D18 basis: child_replaced_observed is CHECKED, and only an acc
 
   // D18 — a legacy bridge announces no milestone at all: the operator basis still works, the checkable one cannot.
   const legacy = H.strandedFixture('c1270-d18-legacy', { options: { capable: false, header: '' } });
-  assert.equal(readinessHandshake.observedChild(legacy.session), null, 'PRECONDITION: no milestone, no observed child');
-  assert.equal(legacy.strand.child, null, 'PRECONDITION: and the strand recorded none');
+  assert.equal(observedChild(legacy.session), null,
+    'CHECKPOINT: a legacy bridge announces no milestone, so there is no observed child');
+  assert.equal(legacy.strand.child, null, 'CHECKPOINT: and the strand recorded none for it');
   assertRefusal(legacy.session, legacy.strand,
     invokeClear(H.clearReq(legacy.session.id, H.clearBody(legacy.session, { basis: 'child_replaced_observed' }))),
     'basis_contradicted');
