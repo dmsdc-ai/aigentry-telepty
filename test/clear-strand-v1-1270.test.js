@@ -84,6 +84,19 @@ function clearProtocolFn(name, what) {
     `CHECKPOINT: src/protocol/clear-strand.js must export ${name}() (CLEAR-INTERFACE §8), for ${what}`);
   return module[name];
 }
+// The raw-body bound of §5 step 1.4, read from the module that owns it rather than copied into every case.
+// r3: an oversize fixture built from a LITERAL goes stale the moment the bound moves — erratum E4 (CSR-m4)
+// raised it from 512 to 1100 and one row in E12 kept building a 600-byte "oversize" body, which the new bound
+// accepts. Anything that needs to be *over* the bound derives its size from here; the two assertions that pin
+// the bound's VALUE (and the number itself) live in exactly one place, the B6/B7/B8 case.
+function clearBodyBound(what) {
+  const module = clearProtocol(what);
+  assert.ok(Number.isSafeInteger(module.BODY_MAX_BYTES) && module.BODY_MAX_BYTES > 0,
+    `CHECKPOINT: ${what} needs BODY_MAX_BYTES on the pure module (CLEAR-INTERFACE §5 step 1.4), got ${
+      JSON.stringify(module.BODY_MAX_BYTES)}`);
+  return module.BODY_MAX_BYTES;
+}
+
 // readiness-handshake's new export, guarded the same way: a case that needs the observed child asserts its
 // existence first, so its absence is an ERR_ASSERTION and never a TypeError on an undefined function.
 function observedChildFn(what) {
@@ -1245,17 +1258,24 @@ test('B6/B7/B8 content type and body bounds: a non-JSON type is 415 and an absen
   // declared field range was unsendable and answered 413 with no indication of which field was too long. The
   // two rows below are the regression guard in the dangerous direction: lower the bound again and
   // `at the §3 maximum` fails.
+  // THE one place that pins erratum E4's number: the module's bound and this case's literals must agree, so a
+  // change to either without the other fails here instead of silently weakening an "oversize" fixture
+  // elsewhere (r3; every other case derives its size from the module through `clearBodyBound`).
+  const bound = clearBodyBound('the raw-body bound rows');
+  assert.equal(bound, 1100,
+    `CHECKPOINT: the raw-body bound is 1100 bytes (r2 erratum E4 / CSR-m4), not ${bound}`);
   const body = H.clearBody(session);
   const maximal = { ...body, from: 'f'.repeat(256), expected_epoch: 'e'.repeat(256),
     expected_owner_generation: 'g'.repeat(256) };
-  assert.ok(Buffer.byteLength(JSON.stringify(maximal), 'utf8') <= 1100,
+  assert.ok(Buffer.byteLength(JSON.stringify(maximal), 'utf8') <= bound,
     `PRECONDITION: every field at its §3 maximum is ${Buffer.byteLength(JSON.stringify(maximal), 'utf8')} bytes`);
   assert.equal(authorize(H.clearReq(session.id, maximal)), null,
     'CHECKPOINT: at the §3 maximum every field fits the raw-body bound and reaches the schema step');
-  const padded = `${JSON.stringify(body)}${' '.repeat(900)}`;
+  // Padding derived from the bound, so this body is over it whatever the bound becomes.
+  const padded = `${JSON.stringify(body)}${' '.repeat(bound)}`;
   for (const [label, raw] of Object.entries({
     'oversize but valid JSON': Buffer.from(padded, 'utf8'),
-    'exactly one byte over': Buffer.alloc(1101, 0x20),
+    'exactly one byte over': Buffer.alloc(bound + 1, 0x20),
     empty: Buffer.alloc(0),
     absent: undefined,
     'not a Buffer': JSON.stringify(body),
@@ -1266,8 +1286,8 @@ test('B6/B7/B8 content type and body bounds: a non-JSON type is 415 and an absen
       `CHECKPOINT: a raw body that is ${label} is refused 413 before anything parses it`);
     assertRefusal(session, strand, invokeClear(req), 'clear_body_bytes', { beforeStep4: true });
   }
-  assert.equal(authorize(H.clearReq(session.id, body, { principalRawBody: Buffer.alloc(1100, 0x20) })), null,
-    'CHECKPOINT: 1100 bytes is the bound, not one less');
+  assert.equal(authorize(H.clearReq(session.id, body, { principalRawBody: Buffer.alloc(bound, 0x20) })), null,
+    `CHECKPOINT: ${bound} bytes is the bound, not one less`);
   assert.equal(authorize(H.clearReq(session.id, body, { principalRawBody: Buffer.alloc(1, 0x20) })), null,
     'CHECKPOINT: and one byte is enough to pass the bound (the shape check comes later)');
 });
@@ -1431,9 +1451,12 @@ test('C5/C6/C7/C8/C9 fields: each identity field has its own code, and nothing i
   }
   // And the raw-body gate still exists: a body past 1100 bytes is 413 before anything is parsed, and the
   // schema code for the same body is still what the pure validator says.
-  const huge = { ...valid, from: 'x'.repeat(900) };
-  assert.ok(Buffer.byteLength(JSON.stringify(huge), 'utf8') > 1100,
-    `PRECONDITION: the oversize row is ${Buffer.byteLength(JSON.stringify(huge), 'utf8')} bytes`);
+  // Sized from the module's own bound (r3), so it cannot go stale the way E12's row did when erratum E4 moved
+  // the bound: a `from` of the whole bound guarantees the serialised body is over it.
+  const bodyBound = clearBodyBound('the oversize row of C5-C9');
+  const huge = { ...valid, from: 'x'.repeat(bodyBound) };
+  assert.ok(Buffer.byteLength(JSON.stringify(huge), 'utf8') > bodyBound,
+    `PRECONDITION: the oversize row is ${Buffer.byteLength(JSON.stringify(huge), 'utf8')} bytes against a ${bodyBound}-byte bound`);
   assert.equal(validate(huge), 'from_invalid', 'CHECKPOINT: the schema still has its own verdict on that body');
   assertRefusal(session, strand, invokeClear(H.clearReq(session.id, huge)), 'clear_body_bytes', { beforeStep4: true });
   // The accepted edges of the same bounds.
@@ -2284,11 +2307,16 @@ test('E11 no keys, no bytes: across the whole run the owner sockets, the PTY and
 test('E12 silence before step 4: no authority or schema refusal writes an audit line or a bus event', () => {
   const { session, strand } = H.strandedFixture('c1270-e12-silence');
   const body = H.clearBody(session);
+  // r3: the oversize body is sized from the module's exported bound, not from a literal. This row carried a
+  // 600-byte buffer written for the pre-erratum 512-byte bound; after erratum E4 (CSR-m4) raised the bound to
+  // 1100 that body was ACCEPTED, so the row cleared the fixture instead of being refused — the one failure of
+  // CI run 44099451026. Deriving the size is what keeps it honest when the bound moves again.
+  const oversize = Buffer.alloc(clearBodyBound('the oversize row of E12') + 1, 0x20);
   const rows = [
     ['clear_local_only', { socket: { remoteAddress: '203.0.113.12' } }, body],
     ['clear_origin_refused', { headers: { origin: 'http://evil.test' } }, body],
     ['clear_content_type', { headers: { 'content-type': 'text/plain' } }, body],
-    ['clear_body_bytes', { principalRawBody: Buffer.alloc(600, 0x20) }, body],
+    ['clear_body_bytes', { principalRawBody: oversize }, body],
     ['clear_auth_required', { dropHeaders: ['x-telepty-token'] }, body],
     ['request_not_object', {}, null],
     ['request_keys', {}, { ...body, extra: 1 }],
