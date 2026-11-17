@@ -52,6 +52,9 @@ const {
 } = require('./src/session-store/route-metadata');
 
 const { createSessionActions } = require('./src/routes/session-actions');
+// Task 1270: the operator clear's PURE module. Required here only for its timing-safe host-token comparison,
+// so the expected token stays in this file and never reaches the routes module.
+const clearStrand = require('./src/protocol/clear-strand');
 const sessionActions = createSessionActions({
   get AUTO_REPORT_MIN_REAL_SECONDS() { return AUTO_REPORT_MIN_REAL_SECONDS; },
   get CAPABILITY_STAGE_A() { return CAPABILITY_STAGE_A; },
@@ -1892,6 +1895,13 @@ sessionActions.registerInjectRoute(app);
 // Task 1270: the bound busy-input transport. ONE versioned route, same auth middleware chain as /inject,
 // exact-own record only; no forwarded/alias variant is registered (a bound body must never be rerouted).
 sessionActions.registerInjectBoundV1Route(app);
+// Task 1270 — the operator clear for a stranded composer, registered next to the door that can strand one.
+// Host-token HEADER only (never a query token, JWT, session bearer or client profile), a loopback socket peer
+// and no Origin: the /api/daemon/stop guard, applied by the pure module so EXPECTED_TOKEN never enters the
+// routes module. `requireInteractionController` is deliberately NOT reused or modified here.
+sessionActions.registerClearStrandV1Route(app, {
+  verifyHostToken: req => clearStrand.hostTokenMatches(req.headers['x-telepty-token'], EXPECTED_TOKEN)
+});
 
 // #826 — the OTHER write path, kept next to the route above because they are twins and were
 // diverging silently.

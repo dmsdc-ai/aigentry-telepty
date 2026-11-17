@@ -2361,10 +2361,11 @@ function runAllowCheck(argv, { env = process.env } = {}) {
 // exit 0, so only this exact JSON shape (validated by parseBootCapabilities) may ever count as support.
 const BOOT_CAPABILITIES_SCHEMA = 'telepty-boot-capabilities-v1';
 function bootCapabilitiesLine() {
-  // Task 1270: `inject-bound-v1` joins the EXISTING verbs array. The document's schema, shape and
-  // viewer_detach value are unchanged, parseBootCapabilities already accepts extra verbs, and this query stays
-  // purely local — printing it starts, restarts, repairs or contacts nothing.
-  return JSON.stringify({ schema: BOOT_CAPABILITIES_SCHEMA, verbs: ['allow-create-v1', 'inject-bound-v1'], viewer_detach: 'nondeleting-v1' });
+  // Task 1270: `inject-bound-v1` joins the EXISTING verbs array, and `clear-strand-v1` joins it in the same
+  // way. The document's schema, shape, key order and viewer_detach value are unchanged, parseBootCapabilities
+  // already accepts extra verbs (it requires allow-create-v1 and rejects only duplicates), and this query
+  // stays purely local — printing it starts, restarts, repairs or contacts nothing.
+  return JSON.stringify({ schema: BOOT_CAPABILITIES_SCHEMA, verbs: ['allow-create-v1', 'inject-bound-v1', 'clear-strand-v1'], viewer_detach: 'nondeleting-v1' });
 }
 function runBootCapabilities(argv, { stdout = process.stdout, stderr = process.stderr } = {}) {
   if (!Array.isArray(argv) || argv.length !== 1 || argv[0] !== 'boot-capabilities') {
@@ -2483,6 +2484,16 @@ async function main() {
   // POST to the canonical local daemon. Exit 0 accepted, 1 refused/unsupported, 2 usage, 3 outcome UNKNOWN (hold).
   if (cmd === 'inject-bound-v1') {
     process.exitCode = await require('./src/cli/inject-bound-v1').runInjectBoundV1(args.slice(1), {
+      fetchWithAuth, daemonUrl: daemonUrl('127.0.0.1'), remoteHost: REMOTE_HOST,
+    });
+    return;
+  }
+  // Task 1270: the operator clear for a stranded composer — same placement rule and same strictness as the verb
+  // above, and the same five outcomes (0 cleared, 1 refused/unsupported, 2 usage, 3 outcome UNKNOWN: hold and
+  // re-read the view). It sends no text and presses no key; it removes ONE strand record for ONE exactly-named
+  // session instance, pinned to that instance's epoch, owner generation and stranded inject id.
+  if (cmd === 'clear-strand-v1') {
+    process.exitCode = await require('./src/cli/clear-strand-v1').runClearStrandV1(args.slice(1), {
       fetchWithAuth, daemonUrl: daemonUrl('127.0.0.1'), remoteHost: REMOTE_HOST,
     });
     return;
@@ -5908,6 +5919,8 @@ function printGlobalHelp() {
   telepty approval-challenge [--no-enter] <exact-id[@host]> -- "<prompt>"  Digest-only signing document
   telepty inject --approval-file <private-file> [--no-enter] <exact-id[@host]> -- "<prompt>"  Signed direct inject
   telepty enter <id[@host]>                      Send Enter/Return
+  telepty clear-strand-v1 --from F --expected-epoch E --expected-owner-generation G --stranded-inject-id (UUID|none) --basis B -- <exact-id>
+    Clear ONE stranded composer after an operator assertion; sends no text and no key (see docs)
   telepty reply "<text>"                         Reply to last injector
   telepty multicast <id1,id2> "<prompt>"         Inject into multiple sessions
   telepty broadcast [--ref [file]] "<prompt>"    Inject into ALL sessions
@@ -6043,4 +6056,9 @@ module.exports = {
   parseBoundInjectArgv: (...args) => require('./src/cli/inject-bound-v1').parseBoundInjectArgv(...args),
   boundTargetRefusal: (...args) => require('./src/cli/inject-bound-v1').boundTargetRefusal(...args),
   runInjectBoundV1: (...args) => require('./src/cli/inject-bound-v1').runInjectBoundV1(...args),
+  // Task 1270 operator clear: the strict argv parser / canonical-host gate / one-POST runner of the
+  // `clear-strand-v1` verb, re-exported from src/cli/clear-strand-v1.js so a test asserts the SHIPPED verb.
+  parseClearStrandArgv: (...args) => require('./src/cli/clear-strand-v1').parseClearStrandArgv(...args),
+  clearTargetRefusal: (...args) => require('./src/cli/clear-strand-v1').clearTargetRefusal(...args),
+  runClearStrandV1: (...args) => require('./src/cli/clear-strand-v1').runClearStrandV1(...args),
 };

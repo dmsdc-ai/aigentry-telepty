@@ -162,6 +162,25 @@ function classifyBoundResponse(status, body) {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
 
+// Task 1270 operator clear: the record gained `owner_generation` and `child`, and they travel with it for the
+// same reason the first four fields do — a restored strand that has forgotten WHO held the composer and WHICH
+// child it was typed into cannot be cleared on the checkable basis, so the restart would leave the operator
+// with only the unverifiable one. Both are adopted with the same strictness as the existing fields:
+// `owner_generation` through `boundedToken`, and `child` only as a whole `{child_seq, pid}` pair of safe
+// positive integers. A malformed half is dropped entirely rather than partially adopted, because a
+// half-remembered child would make `child_replaced_observed` decidable on garbage.
+// Review note CSR-n4: the `> 0` bounds below are unreachable in practice — an ACCEPTED `process_started`
+// milestone always carries `child_seq >= 1` and `pid >= 1` (readiness-handshake.js:80,:86) — and they are kept
+// anyway, because this function also adopts records that came off DISK, where a hand-edited `{child_seq: 0}`
+// would otherwise survive in memory and be dropped on the next save, making `childEvidence` answer differently
+// before and after a restart.
+function strandChildRecord(child) {
+  if (!child || typeof child !== 'object' || Array.isArray(child)) return null;
+  const { child_seq: seq, pid } = child;
+  if (!Number.isSafeInteger(seq) || seq <= 0 || !Number.isSafeInteger(pid) || pid <= 0) return null;
+  return { child_seq: seq, pid };
+}
+
 function serializeStrandRecord(session) {
   const strand = session && session.strandedComposer;
   if (!strand || typeof strand !== 'object') return {};
@@ -173,6 +192,13 @@ function serializeStrandRecord(session) {
       inject_id: UUID_RE.test(String(strand.inject_id)) ? strand.inject_id : null,
       reason: boundedReason(strand.reason),
       at: ISO_RE.test(String(strand.at)) ? strand.at : null,
+      // Emitted ONLY when there is something to say, which is this file's own convention for an additive fact
+      // and the strongest form of neutrality for an existing reader: a strand whose session never announced a
+      // generation or a child (a restored, never-re-claimed instance, or a legacy bridge) serializes
+      // BYTE-IDENTICALLY to the pre-change record. On the way back in, both keys are always present (null when
+      // absent), because the clear compares them field-wise and `undefined` is not an answer.
+      ...(boundedToken(strand.owner_generation) ? { owner_generation: strand.owner_generation } : {}),
+      ...(strandChildRecord(strand.child) ? { child: strandChildRecord(strand.child) } : {}),
     }
   };
 }
@@ -188,6 +214,11 @@ function restoreStrandRecord(meta) {
       inject_id: UUID_RE.test(String(strand.inject_id)) ? strand.inject_id : null,
       reason: boundedReason(strand.reason) || 'composer_stranded',
       at: ISO_RE.test(String(strand.at)) ? strand.at : null,
+      // Task 1270: adopted exactly as strictly as the four above. sessions.json is a plain file a human can
+      // edit, so an edited generation token or a half/odd child restores as null and the strand itself — which
+      // can only ever cause MORE refusal — is kept.
+      owner_generation: boundedToken(strand.owner_generation) ? strand.owner_generation : null,
+      child: strandChildRecord(strand.child),
     }
   };
 }

@@ -53,6 +53,13 @@ on:
       - 'src/session-store/persistence.js'
       # r2: the GUI submit arm (the last Enter producer that writes no bytes).
       - 'src/routes/session-inspection.js'
+      # Task 1270 operator clear: the RED seal for clear-strand-v1 (phase A) and the files its implementation
+      # touches, so the push that carries either one triggers this diagnostic instead of silently skipping.
+      - 'test/clear-strand-v1-1270.test.js'
+      - 'src/protocol/clear-strand.js'
+      - 'src/cli/clear-strand-v1.js'
+      - 'src/transport/readiness-handshake.js'
+      - 'src/audit/inject-log.js'
 
 permissions:
   contents: read
@@ -152,6 +159,35 @@ jobs:
             echo "head=$(git rev-parse HEAD)"
             echo "node=$(node --version)"
           } | tee "$EVIDENCE/summary.txt"
+          exit "$rc"
+
+      # Task 1270 operator clear — the clear-strand file alone, with its own TAP and its own numeric exit.
+      # `!cancelled()` on purpose: this file is an independent diagnostic, so its RED (phase A) or GREEN (phase B)
+      # is MEASURED even when the bound step above exited non-zero, instead of being hidden by it.
+      - name: Run the clear-strand file alone (raw TAP streamed, real exit, 60 s bound)
+        if: ${{ !cancelled() }}
+        env:
+          CLEAR_TEST_FILES: test/clear-strand-v1-1270.test.js
+        run: |
+          set +e
+          set -uo pipefail
+          tap="$EVIDENCE/clear-strand-v1-1270.tap"
+          # Unquoted on purpose: CLEAR_TEST_FILES is this workflow's own fixed, space-separated, glob-free literal.
+          timeout --kill-after=5s 60s node --require ./test-support/setup-env.js --test --test-concurrency=1 \
+            --test-timeout=60000 --test-reporter=tap $CLEAR_TEST_FILES 2>&1 | tee "$tap"
+          statuses=("${PIPESTATUS[@]}")
+          rc="${statuses[0]}"; tee_rc="${statuses[1]}"
+          if [ "$tee_rc" -ne 0 ]; then echo "::error::tee failed (exit $tee_rc); the TAP log may be incomplete"; [ "$rc" -ne 0 ] || rc="$tee_rc"; fi
+          if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then echo "::error::clear-strand test process hit the 60 s bound (exit $rc)"; fi
+          {
+            echo "---- clear-strand summary ----"
+            grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' "$tap" || echo "no TAP summary lines found"
+            echo "top-level results:"
+            grep -E '^(not )?ok [0-9]+ - ' "$tap" || echo "(none)"
+            echo "clear-strand exit=$rc"
+            echo "head=$(git rev-parse HEAD)"
+            echo "node=$(node --version)"
+          } | tee "$EVIDENCE/clear-strand-summary.txt"
           exit "$rc"
 
       # actions/upload-artifact pinned to the v4 tag's commit ea165f8d65b6e75b540449e92b4886f43607fa02, as recorded in

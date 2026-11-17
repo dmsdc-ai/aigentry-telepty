@@ -50,7 +50,7 @@ after(() => {
 // Task 1270 phase B: the sealed document now advertises the bound busy-input verb too. Schema, shape,
 // viewer_detach and every refusal/near-miss assertion below are unchanged — only the verbs array grew, which is
 // exactly what parseBootCapabilities was written to tolerate (it requires allow-create-v1, not an exact list).
-const SEALED_LINE = '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1","inject-bound-v1"],"viewer_detach":"nondeleting-v1"}';
+const SEALED_LINE = '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1","inject-bound-v1","clear-strand-v1"],"viewer_detach":"nondeleting-v1"}';
 const REQUIRED_CAPS = ['wrapped-sessions', 'register-create-only'];
 
 // ── Part 1: in-process, production exports ─────────────────────────────────────────────────────────────────────────
@@ -58,10 +58,10 @@ const REQUIRED_CAPS = ['wrapped-sessions', 'register-create-only'];
 test('1270 boot-capabilities: the sealed line is exact and the reference validator accepts it only with exit 0', () => {
   assert.equal(cli.bootCapabilitiesLine(), SEALED_LINE);
   assert.deepEqual(JSON.parse(cli.bootCapabilitiesLine()), {
-    schema: 'telepty-boot-capabilities-v1', verbs: ['allow-create-v1', 'inject-bound-v1'], viewer_detach: 'nondeleting-v1' });
+    schema: 'telepty-boot-capabilities-v1', verbs: ['allow-create-v1', 'inject-bound-v1', 'clear-strand-v1'], viewer_detach: 'nondeleting-v1' });
   const ok = cli.parseBootCapabilities(`${SEALED_LINE}\n`, 0);
   assert.equal(ok.supported, true);
-  assert.deepEqual(ok.verbs, ['allow-create-v1', 'inject-bound-v1']);
+  assert.deepEqual(ok.verbs, ['allow-create-v1', 'inject-bound-v1', 'clear-strand-v1']);
   assert.equal(ok.viewer_detach, 'nondeleting-v1');
   assert.equal(cli.parseBootCapabilities(`${SEALED_LINE}\n`, 1).supported, false, 'non-zero exit is never support');
   assert.equal(cli.parseBootCapabilities(`${SEALED_LINE}\n`, null).supported, false, 'signal/unknown exit is never support');
