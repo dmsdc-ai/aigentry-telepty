@@ -422,6 +422,19 @@ test('A2 transport: ONE post, the canonical host only, and five outcomes with th
 test('A3 registrar: the clear route is registered exactly once, at exactly one path, with no alias twin', () => {
   assert.equal(typeof H.actions.registerClearStrandV1Route, 'function',
     'CHECKPOINT: createSessionActions must expose the clear registrar (CLEAR-INTERFACE §8)');
+  // r1 regression guard. The registrar MUST throw without an authenticator (A4, §8), so it must not be part of
+  // the generically enumerated surface: several existing harnesses compose this module blind
+  // (`for (const [name, fn] of Object.entries(actions)) if (/^register\w*Route$/.test(name)) fn(app)`), and a
+  // one-argument call on this one is a TypeError by contract. Reachable by name, invisible to enumeration.
+  assert.equal(Object.keys(H.actions).includes('registerClearStrandV1Route'), false,
+    'CHECKPOINT: the clear registrar is reachable by name but NOT enumerable, so a blind composer cannot call it');
+  assert.doesNotThrow(() => {
+    const blind = { use() {} };
+    for (const method of ['get', 'post', 'put', 'patch', 'delete']) blind[method] = () => {};
+    for (const [name, fn] of Object.entries(H.actions)) {
+      if (/^register\w*Route$/.test(name) && typeof fn === 'function') fn(blind);
+    }
+  }, 'CHECKPOINT: a harness that registers every registrar it can see still composes this module');
   const made = H.makeClear();
   assert.deepEqual(made.registered, [{ method: 'POST', route: ROUTE }],
     `CHECKPOINT: ONE registration, the exact versioned path, no forwarded/alias/query-parameter twin ${JSON.stringify(made.registered)}`);
@@ -882,7 +895,9 @@ async function compose() {
   }
   for (const [name, fn] of Object.entries(actions)) {
     // The clear registrar takes required options (verifyHostToken) and MUST throw without them (A4), so it is
-    // registered explicitly below instead of through this loop.
+    // registered explicitly below instead of through this loop. Since r1 it is also a NON-ENUMERABLE property
+    // of the actions object, so this loop cannot reach it even without the guard — which is what keeps the
+    // existing blind harnesses (inject-bound-v1-1270, inject-bound-v1-green-1270) composing this module.
     if (name === 'registerClearStrandV1Route') continue;
     if (/^register\w*Route$/.test(name) && typeof fn === 'function') fn(app);
   }
@@ -1302,7 +1317,14 @@ test('C5/C6/C7/C8/C9 fields: each identity field has its own code, and nothing i
   for (const [reason, override] of rows) {
     const body = { ...valid, ...override };
     assert.equal(validate(body), reason, `CHECKPOINT: ${JSON.stringify(override)} is ${reason}`);
-    assertRefusal(session, strand, invokeClear(H.clearReq(session.id, body)), reason, { beforeStep4: true });
+    // §5 step 1.4 is decided BEFORE step 2, and the two bounds are independent: a token may be up to 256
+    // BYTES while the whole raw body may be at most 512. A maximal `from` replaces a 10-byte value in a
+    // ~278-byte body, so it cannot fit beside the other five fields and is answered 413 `clear_body_bytes`
+    // without ever being parsed — whereas a maximal epoch/generation replaces a 36-byte UUID and still fits.
+    // The schema code for every row is asserted on the pure validator above (that is the field's contract);
+    // the ROUTE's answer is whatever the frozen order dictates, which is what this line measures.
+    const answered = Buffer.byteLength(JSON.stringify(body), 'utf8') > 512 ? 'clear_body_bytes' : reason;
+    assertRefusal(session, strand, invokeClear(H.clearReq(session.id, body)), answered, { beforeStep4: true });
   }
   // The accepted edges of the same bounds.
   for (const override of [{ from: 'x'.repeat(256) }, { from: 'あ'.repeat(80) },
@@ -1418,7 +1440,12 @@ test('D2 the gates reopen: after the clear all seven producers admit input again
   const osaSid = 'c1270-d2-osa';
   const osa = { id: osaSid, type: 'wrapped', command: 'stable', cwd: '/tmp/c1270',
     sessionEpoch: 'osa-epoch-d2', clients: new Set(), ownerWs: { readyState: 1, frames: [], send() {} },
-    interactionOwnerGeneration: crypto.randomUUID() };
+    interactionOwnerGeneration: crypto.randomUUID(), outputRing: [], outputRingTotalBytes: 0,
+    createdAt: new Date().toISOString(), lastActivityAt: new Date().toISOString() };
+  // The GUI-strategy record has to be in the DAEMON's store as well as in the inspection context's own map:
+  // the clear resolves its target through `shared.sessions` (the exact-own-property lookup of §5 step 4.1), so
+  // a fixture that only the inspection context knows about is correctly a 404 `session_not_found`.
+  H.sessions[osaSid] = osa;
   const osaStrand = runtimeModule.strandComposer(osa, { epoch: 'osa-epoch-d2', injectId: crypto.randomUUID(),
     reason: 'cr_outcome_unknown' });
   const calls = [];
@@ -1453,6 +1480,7 @@ test('D2 the gates reopen: after the clear all seven producers admit input again
   const legacyAfter = await H.deliverInjectionToSession(session.id, session, 'c1270-d2 legacy after', { from: 'fixture-sender' });
   assert.notEqual(legacyAfter.code, 'COMPOSER_STRANDED',
     `CHECKPOINT: and the legacy door no longer refuses at the door ${JSON.stringify(legacyAfter)}`);
+  delete H.sessions[osaSid];   // the GUI fixture is this case's own; later cases must not inherit it
 });
 
 test('D3 nothing else moved: the clear touches no queue, no custody, no socket and no timer', { timeout: 30000 }, async () => {

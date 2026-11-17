@@ -2602,7 +2602,7 @@ function createSessionActions(shared, effects = {}) {
     });
   }
 
-  return {
+  const actions = {
     buildAutoSummaryWithDefaults,
     observationIdentity,
     markAbsenceDeliveredToSource,
@@ -2631,12 +2631,32 @@ function createSessionActions(shared, effects = {}) {
     registerSubmitRoute,
     registerInjectRoute,
     registerInjectBoundV1Route,   // Task 1270: POST /api/sessions/:id/inject-bound-v1
-    registerClearStrandV1Route,   // Task 1270: POST /api/sessions/:id/clear-strand-v1 (requires verifyHostToken)
     registerKillRoute,
     registerDeleteRoute,
     registerBusPublishRoute,
     registerStateObserver,
   };
+  // Task 1270 — the clear registrar is reachable BY NAME and invisible to ENUMERATION, on purpose.
+  //
+  // Every other registrar here can be composed blind: a harness that knows nothing about a particular route
+  // can do `for (const [name, fn] of Object.entries(actions)) if (/^register\w*Route$/.test(name)) fn(app)`
+  // and get a working app. Several existing test harnesses do exactly that (test/inject-bound-v1-1270.test.js
+  // `compose`, test/inject-bound-v1-green-1270.test.js `compose`, both descended from
+  // test/immediate-submit-1215.test.js). This registrar CANNOT be composed blind, because
+  // CLEAR-INTERFACE-V1.md §8 requires it to THROW when it is handed no authenticator — a route that cannot
+  // authenticate must not exist — so a one-argument generic call is a TypeError by contract, not by accident.
+  //
+  // Those two requirements are only compatible if the clear is NOT part of the generically enumerated surface.
+  // It is therefore defined as a non-enumerable own property: `sessionActions.registerClearStrandV1Route(app,
+  // { verifyHostToken })` works exactly as §8's daemon.js snippet writes it (property access is unaffected,
+  // and so is destructuring), while `Object.entries`/`Object.keys`/`for…in`/spread do not see it — so a blind
+  // composer registers every route it knows about and simply never asks for this one. The registration is
+  // explicit and single (daemon.js), which is what §1 ("registered exactly once, with no second path") and §8
+  // (the daemon snippet passes the seam) already describe. The throw itself is unchanged.
+  Object.defineProperty(actions, 'registerClearStrandV1Route', {
+    value: registerClearStrandV1Route, enumerable: false, writable: false, configurable: true,
+  });
+  return actions;
 }
 
 module.exports = { createSessionActions };
