@@ -300,13 +300,16 @@ convention as the blocks above, which also leave the common envelope keys `event
 
 - **What it reports**: an operator removed the refusal record that held one session instance's input shut. The
   session had been refusing every body and key for that instance because an earlier bound delivery handed a
-  body and could not hand its paired CR, leaving unsubmitted text in a real composer.
+  body and could not hand its paired CR — or (r6) could not say whether its body landed at all — leaving
+  unsubmitted text, possibly, in a real composer.
 - **What it does NOT report**: anything being typed, submitted or interrupted. This door writes no byte and
   sends no key; `basis` is the operator's own **claim** about the composer, which the daemon cannot observe
   (`child_replaced_observed` is the one basis it checks, against its own `process_started` milestone). A cleared
   strand means "the daemon no longer refuses this instance's input" and nothing more.
-- `strand_reason` / `strand_at` come from the record that was **removed** (its `submit_*`/`cr_*`/`delivery_*`
-  code and its ISO timestamp), so a subscriber learns WHY the instance was stranded, not why it was cleared.
+- `strand_reason` / `strand_at` come from the record that was **removed** (its `body_*`/`submit_*`/`cr_*`/
+  `delivery_*` code and its ISO timestamp), so a subscriber learns WHY the instance was stranded, not why it was
+  cleared. `body_outcome_unknown` is the r6 addition to that vocabulary: the body write itself returned without
+  stating an outcome, so the composer's content is unknown rather than known-dirty.
 - `child_evidence` is the daemon's own comparison of the child recorded at strand time with the current owner
   generation's accepted `process_started` milestone. `unobservable` is the honest answer for a legacy bridge
   that announces no milestone and for a strand written before the field existed.

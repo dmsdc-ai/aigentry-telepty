@@ -971,7 +971,13 @@ async function compose() {
     isOpenWebSocket, DELIVERY_TIMEOUT_MS: 1000,
     getMailbox: () => mailbox, getMailboxDelivery: () => engine,
     getMailboxNotifier: () => ({ notify() { throw new Error('PRECONDITION: wrapped fixture must not notify UDS'); } }) });
-  rshared.writeDataToSession = context.writeDataToSession;
+  // The ONE write boundary every delivery goes through. Default: the REAL `writeDataToSession` of the real
+  // delivery context, so every existing case is unchanged. E15-E18 (r6) install an override for one call to
+  // produce the one result a real owner write can return that no other fixture can reach — a write that comes
+  // back `success: false` while declining to state a byte count — which is the input of the uncertain-body
+  // branch (delivery-runtime.js:1399). Restored by each case that sets it.
+  let writeOverride = null;
+  rshared.writeDataToSession = (...args) => (writeOverride ? writeOverride(...args) : context.writeDataToSession(...args));
   engine = new DeliveryEngine(mailbox, context.mailboxDeliveryOptions);
 
   const ashared = {
@@ -1156,6 +1162,7 @@ async function compose() {
     clearBody, clearReq, call, dispose, sessionStateManager, sessionCredentials, auditLines, auditFile,
     auditWriter, busEvents, orchestratorSids, persistCalls,
     setPersist: behaviour => { persistBehaviour = behaviour; },
+    setWrite: behaviour => { writeOverride = behaviour; },
     writeDataToSession: context.writeDataToSession,
     deliverInjectionToSession: context.deliverInjectionToSession,
     clearHandler: typeof actions.registerClearStrandV1Route === 'function' ? routes[ROUTE_KEY] : undefined,
@@ -2496,4 +2503,196 @@ test('E14 bus event: composer_strand_cleared carries the §7.2 fields, shadows n
   // And strict principal mode still has no action for this path, so the route is fail-closed there.
   assert.equal(principalHttp.resolveAction({ method: 'POST', url: `/api/sessions/${session.id}/${VERB}` }), null,
     'CHECKPOINT: strict mode resolves no action for the clear path — PRINCIPAL_ACTION_DENIED, never an unchecked clear');
+});
+
+// ── Part 6: RED-F (r6, review finding CSR3-M1) — an UNCERTAIN body is the same hazard as an uncertain Enter ───
+//
+// The one input no other fixture in this file can reach: a BODY write that returns `success: false` while
+// declining to say whether the bytes landed (`delivery_uncertain: true`, or a `bytes_written` of null). The real
+// `writeDataToSession` reaches that result only through an owner socket whose send neither completed nor failed
+// cleanly, which is not producible in-process — so the ONE write boundary is overridden for exactly one call
+// through `H.setWrite`. That is the same seam the delivery itself reads (`shared.writeDataToSession`,
+// delivery-runtime.js:1383), so the function under test is the real `deliverBoundInjection` driven through the
+// real bound route; only the write's ANSWER is supplied.
+//
+// Before the r6 change these four cases fail at their first CHECKPOINT: the branch returned
+// `body_outcome_unknown` WITHOUT a strand, so `strandedComposer(session)` was null, every producer stayed
+// admitted, and the operator's clear answered `not_stranded` for a composer that may hold their text.
+const UNCERTAIN_WRITE = Object.freeze({ success: false, httpStatus: 502, code: 'OWNER_WRITE_UNCERTAIN',
+  error: 'the owner bridge neither acknowledged nor refused this frame' });
+// `deliveryFields` is the part that decides the branch, and it is given per row so each disjunct of
+// `delivery_uncertain === true || bytes_written === null` is pinned on its own.
+async function deliverWithBodyResult(sid, deliveryFields, { prompt = `${sid} unsubmitted text`, calls = [] } = {}) {
+  const session = H.registerSession(sid);
+  H.sessionStateManager.feed(sid, WORKING);
+  H.setPersist(() => ({ ok: true }));
+  H.setWrite((sessionId, target, data, options) => {
+    calls.push({ sessionId, data: String(data),
+      part: options && options.frameMeta ? options.frameMeta.part : null });
+    return { ...UNCERTAIN_WRITE, ...deliveryFields };
+  });
+  let response;
+  try {
+    response = await H.call(BOUND_ROUTE_KEY, sid, boundRequest(session, prompt));
+  } finally {
+    H.setWrite(null);
+  }
+  assert.equal(calls.length, 1,
+    `PRECONDITION: exactly one write was attempted for ${sid} — a failed body is never followed by an Enter ${JSON.stringify(calls.map(call => call.part))}`);
+  assert.deepEqual([calls[0].part, calls[0].data.includes(prompt)], ['body', true],
+    `PRECONDITION: and that one write was the BODY, carrying this request's own text ${JSON.stringify(calls[0].part)}`);
+  assert.deepEqual(injects(session.ownerWs).map(frame => frame.part), [],
+    'PRECONDITION: the override stands in for the write itself, so no frame reached the owner socket');
+  return { session, response, calls };
+}
+// The exact §4 answer of the uncertain-body branch, which the strand must NOT change: a caller that was holding
+// this identity before r6 reads byte-identical fields after it.
+function assertUncertainAnswer(response, what) {
+  assert.deepEqual({ status: response.status, stage: response.body.stage, reason: response.body.reason,
+    body: response.body.body_stage, submit: response.body.submit_stage, bytes: response.body.bytes_written },
+  { status: 500, stage: 'outcome_unknown', reason: 'body_outcome_unknown', body: 'unknown', submit: 'not_sent', bytes: null },
+  `CHECKPOINT: ${what} answers the unchanged outcome_unknown shape ${JSON.stringify(response.body)}`);
+}
+
+test('E15 an uncertain body strands: both ways a body write can decline to state its outcome leave the exact identity stranded with body_outcome_unknown', { timeout: 30000 }, async () => {
+  // Row 1 — the explicit uncertainty flag, with a STATED zero beside it: the flag alone must be enough, because
+  // a write that says "uncertain, 0 bytes" is saying the count is not a proof.
+  const first = await deliverWithBodyResult('c1270-e15-flag', { delivery_uncertain: true, bytes_written: 0 });
+  assertUncertainAnswer(first.response, 'the delivery_uncertain row');
+  const strand = runtimeModule.strandedComposer(first.session);
+  assert.ok(strand,
+    'CHECKPOINT: the instance IS stranded after an uncertain body — the text may be in that composer and only a strand refuses the next delivery (CSR3-M1)');
+  assert.deepEqual({ epoch: strand.epoch, inject_id: strand.inject_id, reason: strand.reason, at: ISO.test(String(strand.at)) },
+    { epoch: first.session.sessionEpoch, inject_id: first.response.body.inject_id, reason: 'body_outcome_unknown', at: true },
+    `CHECKPOINT: keyed on this instance's epoch, naming THIS delivery's inject id, with the same code the result carries ${JSON.stringify(strand)}`);
+  assert.deepEqual(Object.keys(strand).sort(), ['at', 'child', 'epoch', 'inject_id', 'owner_generation', 'reason'],
+    `CHECKPOINT: and it is the ordinary six-field record, not a new shape ${JSON.stringify(strand)}`);
+  assert.deepEqual([strand.owner_generation, strand.child],
+    [first.session.interactionOwnerGeneration, { child_seq: 1, pid: 4242 }],
+    `CHECKPOINT: WHO held the composer and WHICH child it was typed into are recorded here too ${JSON.stringify(strand)}`);
+  // The operator-visible half: the transport view names the state and its reason.
+  const view = H.runtime.buildSessionTransportBlock(first.session, { nowMs: Date.now() });
+  assert.deepEqual(view.stranded_composer,
+    { stranded: true, inject_id: strand.inject_id, reason: 'body_outcome_unknown', at: strand.at },
+    `CHECKPOINT: the view reports it, with the reason verbatim ${JSON.stringify(view.stranded_composer)}`);
+
+  // Row 2 — no flag at all, only a refusal to state the count. The OTHER disjunct, pinned on its own.
+  const second = await deliverWithBodyResult('c1270-e15-nobytes', { bytes_written: null });
+  assertUncertainAnswer(second.response, 'the bytes_written-null row');
+  const noBytes = runtimeModule.strandedComposer(second.session);
+  assert.ok(noBytes,
+    'CHECKPOINT: a write that declines to state a byte count strands too — the zero is never inferred from silence');
+  assert.deepEqual([noBytes.reason, noBytes.inject_id], ['body_outcome_unknown', second.response.body.inject_id],
+    `CHECKPOINT: same code, its own inject id ${JSON.stringify(noBytes)}`);
+
+  // A strand that is recorded and then REJECTED on restore would be a new defect: the reason must survive both
+  // directions of sessions.json verbatim, through the same allow-list the wire field uses (bound-inject.js:59).
+  assert.equal(boundInject.boundedReason('body_outcome_unknown'), 'body_outcome_unknown',
+    'CHECKPOINT: the code is in the bound allow-list, so neither end degrades it to the generic `refused`');
+  // A7's own persistable fixture shape (a live harness session carries no credentialVerifier, and the store is
+  // not this case's subject), with the r6 reason on it.
+  const epoch = crypto.randomUUID();
+  const nowIso = new Date().toISOString();
+  const record = { id: 'c1270-e15-store', type: 'wrapped', command: 'claude', cwd: '/tmp/c1270',
+    sessionEpoch: epoch, credentialVerifier: 'opaque-verifier', credentialGeneration: 1,
+    interactionOwnerGeneration: 'GEN-E15', createdAt: nowIso, lastActivityAt: nowIso, clients: new Set() };
+  runtimeModule.strandComposer(record, { epoch, injectId: crypto.randomUUID(), reason: 'body_outcome_unknown' });
+  const meta = persistence.serializePersistedSessions({ [record.id]: record })[record.id];
+  assert.equal(meta.strandedComposer.reason, 'body_outcome_unknown',
+    `CHECKPOINT: it is written to the store verbatim ${JSON.stringify(meta.strandedComposer)}`);
+  const restored = persistence.buildRestoredWrappedSession(record.id, meta);
+  assert.equal(restored.strandedComposer.reason, 'body_outcome_unknown',
+    `CHECKPOINT: and restored verbatim — the record is adopted, never dropped ${JSON.stringify(restored.strandedComposer)}`);
+  assert.ok(runtimeModule.strandedComposer(restored),
+    'CHECKPOINT: so a restart comes back STRANDED, not re-admitting input to a composer whose content is unknown');
+});
+
+test('E16 the next delivery is refused: after an uncertain body every producer is shut, which is the whole point of the record', { timeout: 30000 }, async () => {
+  const { session, response } = await deliverWithBodyResult('c1270-e16-producers', { delivery_uncertain: true, bytes_written: null });
+  assertUncertainAnswer(response, 'the fixture delivery');
+  assert.ok(runtimeModule.strandedComposer(session),
+    'PRECONDITION: the uncertain body stranded this instance (E15) — without that, nothing below refuses');
+  // The same producer set D2 proves the clear reopens. Every one of them was ADMITTING before r6.
+  assert.equal(runtimeModule.strandedInputFailure(session).code, 'COMPOSER_STRANDED',
+    'CHECKPOINT: the shared write refusal fires — legacy /inject, the mailbox drain, fanout, every deferred CR');
+  assert.equal(H.runtime.boundAdmissionRefusal(session), 'composer_stranded',
+    'CHECKPOINT: the bound door itself refuses (delivery-runtime.js:1215)');
+  assert.equal(H.runtime.submitViaPty(session), false, 'CHECKPOINT: every bare CR the daemon writes itself is refused');
+  assert.equal(wsTransport.viewerInputDeliverer(session), null, 'CHECKPOINT: an attached viewer has no writer');
+  // …and the case the finding describes concretely: a SECOND bound request, which before r6 was admitted and
+  // would have appended its body to text that may still be sitting unsubmitted in that composer.
+  const second = await H.call(BOUND_ROUTE_KEY, session.id, boundRequest(session, 'c1270-e16 the appending body'));
+  assert.deepEqual({ status: second.status, stage: second.body.stage, reason: second.body.reason,
+    bytes: second.body.bytes_written, inject: second.body.inject_id },
+  { status: 409, stage: 'refused', reason: 'composer_stranded', bytes: 0, inject: null },
+  `CHECKPOINT: the next body is refused with a PROVABLE zero, never glued onto the first ${JSON.stringify(second.body)}`);
+  assert.deepEqual(injects(session.ownerWs).map(frame => frame.part), [],
+    'CHECKPOINT: and the owner socket still saw no frame at all');
+  assert.equal(runtimeModule.strandedComposer(session).inject_id, response.body.inject_id,
+    'CHECKPOINT: the record still names the FIRST delivery — a refused second request strands nothing of its own');
+});
+
+test('E17 the clear removes exactly that strand: the id the record holds is the id the operator passes to --stranded-inject-id', { timeout: 30000 }, async () => {
+  const { session, response } = await deliverWithBodyResult('c1270-e17-clear', { delivery_uncertain: true, bytes_written: null });
+  const strand = runtimeModule.strandedComposer(session);
+  assert.ok(strand, 'PRECONDITION: the uncertain body stranded this instance');
+  // What the operator actually has: the inject id of the unknown answer they were told to HOLD. It is the
+  // record's id, so the clear is nameable from the response alone — no view read is required to find it.
+  assert.equal(strand.inject_id, response.body.inject_id,
+    'CHECKPOINT: the record is named by the very inject id the unknown answer returned');
+  const parse = clearCliFn('parseClearStrandArgv', 'the clear of an uncertain-body strand');
+  const parsed = parse(['--from', 'E-operator', '--expected-epoch', session.sessionEpoch,
+    '--expected-owner-generation', session.interactionOwnerGeneration,
+    '--stranded-inject-id', response.body.inject_id,
+    '--basis', 'composer_emptied_by_operator', '--', session.id]);
+  assert.equal(parsed.ok, true, `CHECKPOINT: that argv parses ${JSON.stringify(parsed)}`);
+  assert.equal(parsed.request.stranded_inject_id, strand.inject_id,
+    'CHECKPOINT: and the built request names the record exactly (§5 step 4.10 is strict ===)');
+  H.setPersist(() => ({ ok: true }));
+  const audits = H.auditLines.length; const events = H.busEvents.length;
+  const answer = invokeClear(H.clearReq(parsed.sid, parsed.request));
+  assert.deepEqual([answer.status, answer.body.stage, answer.body.reason], [200, 'cleared', null],
+    `CHECKPOINT: the clear succeeds on the CLI's own request object ${JSON.stringify(answer.body)}`);
+  assertClosedResult(answer.body, session.id);
+  assert.deepEqual([answer.body.cleared_inject_id, answer.body.cleared_strand_reason, answer.body.cleared_strand_at],
+    [strand.inject_id, 'body_outcome_unknown', strand.at],
+    `CHECKPOINT: and it NAMES the reason — the clear can report a body_outcome_unknown strand, not just a submit_* one ${JSON.stringify(answer.body)}`);
+  assert.equal(session.strandedComposer, undefined, 'CHECKPOINT: the record is gone, once');
+  assert.equal(H.runtime.boundAdmissionRefusal(session), null,
+    'CHECKPOINT: and the producers admit again — the hazard is recoverable through the documented door');
+  // Both records carry the reason verbatim, so a post-mortem can tell this strand from a withheld-CR one.
+  const line = builtLine(H.auditLines.at(-1));
+  assert.deepEqual([line.delivery_result, line.clear_strand_reason, line.inject_id],
+    ['cleared', 'body_outcome_unknown', strand.inject_id],
+    `CHECKPOINT: the audit line names it ${JSON.stringify(line)}`);
+  const event = H.busEvents.slice(events).filter(each => each.type === BUS_EVENT);
+  assert.equal(event.length, 1, `CHECKPOINT: exactly one bus event ${JSON.stringify(event.map(each => each.type))}`);
+  assert.deepEqual([event[0].strand_reason, event[0].stranded_inject_id], ['body_outcome_unknown', strand.inject_id],
+    `CHECKPOINT: and the bus event names it too ${JSON.stringify(event[0])}`);
+  assert.equal(H.auditLines.length - audits, 1, 'CHECKPOINT: one audit line for the clear');
+});
+
+test('E18 a PROVABLE zero still strands nothing: a body refused with a stated count is not widened into a strand', { timeout: 30000 }, async () => {
+  // The discriminator is only those two fields: this row says `success: false` AND states that zero bytes were
+  // written — which is what every pre-send refusal inside writeDataToSession reports. Nothing is in that
+  // composer, so a strand here would deny input for an instance nothing ever wrote to.
+  const { session, response } = await deliverWithBodyResult('c1270-e18-refused',
+    { code: 'COMPOSER_PROTECTED', error: 'protected input', bytes_written: 0 });
+  assert.deepEqual({ status: response.status, stage: response.body.stage, reason: response.body.reason,
+    body: response.body.body_stage, submit: response.body.submit_stage, bytes: response.body.bytes_written,
+    inject: response.body.inject_id },
+  { status: 409, stage: 'refused', reason: 'body_refused', body: 'not_sent', submit: 'not_sent', bytes: 0, inject: null },
+  `CHECKPOINT: a stated zero is still a REFUSAL with a provable zero ${JSON.stringify(response.body)}`);
+  assert.equal(session.strandedComposer, undefined,
+    'CHECKPOINT: and it strands NOTHING — the r6 change did not widen the branch it sits beside');
+  assert.equal(runtimeModule.strandedComposer(session), null, 'CHECKPOINT: the instance is not stranded');
+  assert.equal(H.runtime.boundAdmissionRefusal(session), null,
+    'CHECKPOINT: so every producer still admits input to a composer nothing was written to');
+  const view = H.runtime.buildSessionTransportBlock(session, { nowMs: Date.now() });
+  assert.equal(Object.hasOwn(view, 'stranded_composer'), false,
+    `CHECKPOINT: and the view gains no strand key ${JSON.stringify(Object.keys(view))}`);
+  // The operator's clear says so plainly rather than inventing a record to remove.
+  const refused = invokeClear(H.clearReq(session.id, H.clearBody(session)));
+  assert.deepEqual([refused.status, refused.body.stage, refused.body.reason], [409, 'refused', 'not_stranded'],
+    `CHECKPOINT: the clear answers not_stranded for it ${JSON.stringify(refused.body)}`);
 });
