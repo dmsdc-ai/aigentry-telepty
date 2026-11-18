@@ -94,6 +94,28 @@ function buildAuditLine(record = {}) {
     line.broker_code = broker.code;
     line.delivery_result = 'not-a-physical-delivery-receipt';
   }
+  // Task 1270 — the operator clear of a stranded composer (CLEAR-INTERFACE §7.1). An operator reads this log as
+  // THE record of who typed into a session; removing the refusal record that holds a session's input shut is an
+  // operator action with the same accountability need, so it writes one line per outcome here.
+  //
+  // Everything this block adds is a bounded code, an opaque identity token, an ISO timestamp or a boolean —
+  // there is NO payload on that door (`payload` is the empty string, so `payload_sha256` is the empty digest and
+  // `payload_bytes` is 0), and no screen, prompt or composer text exists anywhere in the clear's inputs to leak.
+  // `payload_preview` is forced to null so even an enabled preview cannot put an empty-string artefact in the
+  // field. Guarded on BOTH the kind and the block, so every other line — including the broker line above and
+  // every ordinary inject — is byte-identical to the pre-change build.
+  if (record.kind === 'operator-clear' && record.clear) {
+    const clear = record.clear;
+    const code = (value) => (typeof value === 'string' && value ? value : null);
+    line.payload_preview = null;
+    line.clear_session_epoch = code(clear.session_epoch);
+    line.clear_owner_generation = code(clear.owner_generation);
+    line.clear_basis = code(clear.basis);
+    line.clear_strand_reason = code(clear.strand_reason);
+    line.clear_strand_at = code(clear.strand_at);
+    line.clear_child_evidence = code(clear.child_evidence) || 'unobservable';
+    line.clear_persisted = clear.persisted === true;
+  }
   return JSON.stringify(line);
 }
 

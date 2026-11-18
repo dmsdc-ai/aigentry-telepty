@@ -1847,8 +1847,11 @@ async function manageInteractiveAttach(sessionId, targetHost) {
         const res = await fetchWithAuth(`${daemonUrl(targetHost)}/api/sessions`);
         if (res.ok) {
           const sessions = await res.json();
-          const session = sessions.find(s => s.id === sessionId);
-          if (session && session.active_clients > 0) {
+          // Task 1270: a viewer never destroys a wrapped (or unprovable) record — see viewerCloseDecision.
+          const decision = viewerCloseDecision(sessions, sessionId);
+          if (decision === 'keep-wrapped' || decision === 'keep-unknown') {
+            console.log(`\n\x1b[33mLeft room '${sessionId}'. Session left to its owner — not destroyed.\x1b[0m\n`);
+          } else if (decision === 'keep-clients') {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. Other clients still attached — session kept alive.\x1b[0m\n`);
           } else {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. No other clients — destroying session.\x1b[0m\n`);
@@ -2354,6 +2357,73 @@ function runAllowCheck(argv, { env = process.env } = {}) {
   return 0;
 }
 
+// Task 1270: sealed, pure-local boot capability document (SPEC §1). An old CLI answers an unknown verb with help and
+// exit 0, so only this exact JSON shape (validated by parseBootCapabilities) may ever count as support.
+const BOOT_CAPABILITIES_SCHEMA = 'telepty-boot-capabilities-v1';
+function bootCapabilitiesLine() {
+  // Task 1270: `inject-bound-v1` joins the EXISTING verbs array, and `clear-strand-v1` joins it in the same
+  // way. The document's schema, shape, key order and viewer_detach value are unchanged, parseBootCapabilities
+  // already accepts extra verbs (it requires allow-create-v1 and rejects only duplicates), and this query
+  // stays purely local — printing it starts, restarts, repairs or contacts nothing.
+  return JSON.stringify({ schema: BOOT_CAPABILITIES_SCHEMA, verbs: ['allow-create-v1', 'inject-bound-v1', 'clear-strand-v1'], viewer_detach: 'nondeleting-v1' });
+}
+function runBootCapabilities(argv, { stdout = process.stdout, stderr = process.stderr } = {}) {
+  if (!Array.isArray(argv) || argv.length !== 1 || argv[0] !== 'boot-capabilities') {
+    stderr.write('Usage: telepty boot-capabilities\n');
+    return 2;
+  }
+  stdout.write(`${bootCapabilitiesLine()}\n`);
+  return 0;
+}
+function parseBootCapabilities(stdoutText, exitCode) {
+  const unsupported = reason => ({ supported: false, reason });
+  if (exitCode !== 0) return unsupported('exit');
+  if (typeof stdoutText !== 'string' && !Buffer.isBuffer(stdoutText)) return unsupported('stdout');
+  const text = String(stdoutText);
+  if (!text.endsWith('\n') || text.indexOf('\n') !== text.length - 1) return unsupported('not-one-line');
+  let doc;
+  try { doc = JSON.parse(text); } catch { return unsupported('not-json'); }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return unsupported('not-object');
+  const keys = Object.keys(doc).sort();
+  if (keys.length !== 3 || keys[0] !== 'schema' || keys[1] !== 'verbs' || keys[2] !== 'viewer_detach') return unsupported('shape');
+  if (doc.schema !== BOOT_CAPABILITIES_SCHEMA) return unsupported('schema');
+  if (!Array.isArray(doc.verbs) || !doc.verbs.every(v => typeof v === 'string') || new Set(doc.verbs).size !== doc.verbs.length
+      || !doc.verbs.includes('allow-create-v1')) return unsupported('verbs');
+  if (doc.viewer_detach !== 'nondeleting-v1') return unsupported('viewer_detach');
+  return { supported: true, verbs: doc.verbs.slice(), viewer_detach: doc.viewer_detach };
+}
+
+// Task 1270 allow-create-v1 (SPEC §2): only the canonical local daemon host; decided before any network.
+function createTargetRefusal(remoteHost) {
+  if (remoteHost === '127.0.0.1') return null;
+  return `allow-create-v1 refuses non-canonical daemon host ${JSON.stringify(String(remoteHost ?? ''))}; only 127.0.0.1 is supported. No request was sent and no application was started.`;
+}
+// Exactly one bounded, read-only authenticated GET /api/meta; both capabilities must be in the existing `capabilities` array.
+async function checkCreateDaemonSupport(fetchFn, daemonBaseUrl, { timeoutMs = 2000 } = {}) {
+  let meta;
+  try {
+    const response = await fetchFn(`${daemonBaseUrl}/api/meta`, { readOnlyAuth: true, signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) return { ok: false, reason: `HTTP ${response.status}` };
+    meta = await response.json();
+  } catch (error) {
+    return { ok: false, reason: (error && error.name === 'TimeoutError') ? 'timeout' : 'unreachable or unreadable' };
+  }
+  const caps = meta && Array.isArray(meta.capabilities) ? meta.capabilities : null;
+  if (!caps) return { ok: false, reason: 'no capability list' };
+  const missing = ['wrapped-sessions', 'register-create-only'].filter(cap => !caps.includes(cap));
+  return missing.length ? { ok: false, reason: `missing ${missing.join(', ')}` } : { ok: true };
+}
+
+// Task 1270 (SPEC §3): what a closing viewer may do. A wrapped session's lifetime belongs to its owner bridge (it may be
+// mid-reconnect with active_clients 0), and an absent/untyped record cannot be proven non-wrapped — never DELETE those.
+function viewerCloseDecision(sessions, sessionId) {
+  const session = Array.isArray(sessions) ? sessions.find(s => s && s.id === sessionId) : undefined;
+  if (!session || typeof session.type !== 'string') return 'keep-unknown';
+  if (session.type === 'wrapped') return 'keep-wrapped';
+  if (session.active_clients > 0) return 'keep-clients';
+  return 'destroy';
+}
+
 // Task 1215 W3 (R2): the interactive menu's `daemon` action (the menu calls this). Graceful stop of the addressed
 // daemon and a start only on a confirmed outcome (win32); POSIX keeps its sweep + start. → true when started.
 async function interactiveDaemonStart(deps = {}) {
@@ -2406,6 +2476,28 @@ async function main() {
   // Task 1215 service41: ahead of Guard A on purpose — allow-check accepts exactly one argv shape and answers every
   // other one (including --help) with usage and exit 2, so it never acts on its way to usage either.
   if (cmd === 'allow-check') { process.exitCode = runAllowCheck(args); return; }
+  // Task 1270: same placement and rule as allow-check — pure local, exact argv, usage (exit 2) for anything else.
+  if (cmd === 'boot-capabilities') { process.exitCode = runBootCapabilities(args); return; }
+  // Task 1270: the bound busy-input send. Placed with the other exact-argv verbs and ABOVE Guard A for the same
+  // reason: it accepts one argv shape and answers every other one with usage and exit 2, acting on none of them.
+  // It resolves nothing — no alias/sibling/peer lookup, no discovery, no autostart/repair — and sends exactly one
+  // POST to the canonical local daemon. Exit 0 accepted, 1 refused/unsupported, 2 usage, 3 outcome UNKNOWN (hold).
+  if (cmd === 'inject-bound-v1') {
+    process.exitCode = await require('./src/cli/inject-bound-v1').runInjectBoundV1(args.slice(1), {
+      fetchWithAuth, daemonUrl: daemonUrl('127.0.0.1'), remoteHost: REMOTE_HOST,
+    });
+    return;
+  }
+  // Task 1270: the operator clear for a stranded composer — same placement rule and same strictness as the verb
+  // above, and the same five outcomes (0 cleared, 1 refused/unsupported, 2 usage, 3 outcome UNKNOWN: hold and
+  // re-read the view). It sends no text and presses no key; it removes ONE strand record for ONE exactly-named
+  // session instance, pinned to that instance's epoch, owner generation and stranded inject id.
+  if (cmd === 'clear-strand-v1') {
+    process.exitCode = await require('./src/cli/clear-strand-v1').runClearStrandV1(args.slice(1), {
+      fetchWithAuth, daemonUrl: daemonUrl('127.0.0.1'), remoteHost: REMOTE_HOST,
+    });
+    return;
+  }
 
   // tp941 Guard A: before ANY command branch, so no subcommand can execute on its way to
   // printing its own usage. Deliberately below the version check, which takes no argv.
@@ -2859,7 +2951,9 @@ async function main() {
     return;
   }
 
-  if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap' || cmd === 'ssh') {
+  if (cmd === 'allow' || cmd === 'enable' || cmd === 'wrap' || cmd === 'ssh' || cmd === 'allow-create-v1') {
+    // Task 1270: versioned create-only boot verb (SPEC §2). No alias; never ensureDaemonRunning on this verb.
+    const createOnly = cmd === 'allow-create-v1';
     const sshSupport = require('./src/ssh-session');
     let sshPlan = null;
     if (cmd === 'ssh') {
@@ -2870,6 +2964,10 @@ async function main() {
       ? parseAllowInvocation('allow', ['allow', '--id', sshPlan.id, 'ssh', ...sshPlan.args])
       : parseAllowInvocation(cmd, args);
     if (!allowInvocation) return;
+    if (createOnly) {
+      const refusal = createTargetRefusal(REMOTE_HOST);
+      if (refusal) { console.error(refusal); process.exitCode = 1; return; }
+    }
     const { sessionId, command, cmdArgs, idleTtl, autoRestart, inputPolicy: requestedInputPolicy = null } = allowInvocation;
     // Task 1215: bridge-memory-only authority/readiness material (see readiness-handshake.js).
     let inputPolicyCapability = null;
@@ -2947,6 +3045,12 @@ async function main() {
         console.error('SSH requires a running daemon advertising ssh-child-write-receipts-v1. Start or upgrade it explicitly; no registration or command was started.');
         process.exitCode = 1; return;
       }
+    } else if (createOnly) {
+      const support = await checkCreateDaemonSupport(allowFetchWithAuth, DAEMON_URL);
+      if (!support.ok) {
+        console.error(`allow-create-v1 requires a running local daemon advertising wrapped-sessions and register-create-only (${support.reason}). It was not started, restarted or repaired; no registration or application was started.`);
+        process.exitCode = 1; return;
+      }
     } else if (!strictOwnerClient) await ensureDaemonRunning({ requiredCapabilities: ['wrapped-sessions'] });
 
     // Detect terminal backend for session registration
@@ -2967,8 +3071,11 @@ async function main() {
       const res = await allowFetchWithAuth(`${DAEMON_URL}/api/sessions/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // Task 1270: the create-only first register is bounded; a lost/uncertain result is never retried (exit below).
+        ...(createOnly ? { signal: AbortSignal.timeout(10000) } : {}),
         body: JSON.stringify({
           session_id: sessionId,
+          ...(createOnly ? { create_only: true } : {}),
           ...(cooperativeEnabled ? {cooperative_handoff:true} : {}),
           ...(handoffAdoption || {}),
           command,
@@ -2999,6 +3106,10 @@ async function main() {
           || data.session_epoch !== handoffAdoption.expected_epoch || data.credential_generation !== handoffAdoption.expected_credential_generation)) {
         console.error('Daemon did not confirm the exact handoff instance; successor child was not started.');
         process.exitCode = 1; return;
+      }
+      if (createOnly && res.status === 409 && data && data.code === 'SESSION_EXISTS') {
+        console.error(`Session '${sessionId}' already exists; allow-create-v1 refused it unchanged. No application was started.`);
+        process.exit(1);
       }
       if (res.ok && strictOwnerClient) strictOwnerEpoch = data.session_epoch;
       if (res.ok && supervisionClient && typeof data.session_epoch === 'string') supervisionEpoch = data.session_epoch;
@@ -3379,7 +3490,24 @@ async function main() {
       }
       if (allowSessionClosed) return;
       const ownerSocket = new WebSocket(wsUrl, {headers:{...(ownerBearer ? {'x-telepty-session-token':ownerBearer} : {}),
-        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', ' + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY, ...policyCapabilityHeaders(),
+        // Task 1270: busy-input-v1 is declared in the SAME header value, so the daemon binds both capabilities
+        // at the one claim-time binder call and neither can outlive this owner generation. THIS bridge declares
+        // it because THIS bridge's measured handleOwnerInject behaviour backs it: an authorized body is written
+        // directly once the human is not typing (isIdle() consults typing/modal state, never the child's
+        // working/thinking state), and a CR is never idle-gated, with one admitted CR per inject_id/pair. It is
+        // declared by the corrected candidate only — an older bridge binary never sends it, and the daemon must
+        // not infer it from a version string, a probe or timing.
+        //
+        // r4: the first two terms stay on ONE line, in the exact textual form the pre-existing wiring test
+        // asserts (test/immediate-submit-1215.test.js:323 does `cli.includes(...)` on that literal expression,
+        // "the bridge declares immediate-submit-v1 next to input-transport-ready-v1"). busy-input-v1 is
+        // appended AFTER the matched text, so the assertion holds verbatim and the wire value is unchanged.
+        // Order does not matter to any reader of this header — both parsers split on ',', trim and `includes`:
+        // readiness-handshake.js:29 `declaresCapability` and delivery-runtime.js `declaredBridgeCapabilities`
+        // / `bindImmediateSubmitCapability` — but the adjacency the test pins is kept anyway, because the test
+        // is about the wiring staying visible in one place, not about the wire format.
+        'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', ' + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY
+          + ', ' + require('./src/mailbox/delivery-runtime').BUSY_INPUT_CAPABILITY, ...policyCapabilityHeaders(),
         ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
       const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
       daemonWs = ownerSocket;
@@ -3965,8 +4093,11 @@ async function main() {
         const res = await fetchWithAuth(`${daemonUrl(targetHost)}/api/sessions`);
         if (res.ok) {
           const allSessions = await res.json();
-          const session = allSessions.find(s => s.id === sessionId);
-          if (session && session.active_clients > 0) {
+          // Task 1270: a viewer never destroys a wrapped (or unprovable) record — see viewerCloseDecision.
+          const decision = viewerCloseDecision(allSessions, sessionId);
+          if (decision === 'keep-wrapped' || decision === 'keep-unknown') {
+            console.log(`\n\x1b[33mLeft room '${sessionId}'. Session left to its owner — not destroyed.\x1b[0m`);
+          } else if (decision === 'keep-clients') {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. Other clients still attached — session kept alive.\x1b[0m`);
           } else {
             console.log(`\n\x1b[33mLeft room '${sessionId}'. No other clients — destroying session.\x1b[0m`);
@@ -5788,6 +5919,8 @@ function printGlobalHelp() {
   telepty approval-challenge [--no-enter] <exact-id[@host]> -- "<prompt>"  Digest-only signing document
   telepty inject --approval-file <private-file> [--no-enter] <exact-id[@host]> -- "<prompt>"  Signed direct inject
   telepty enter <id[@host]>                      Send Enter/Return
+  telepty clear-strand-v1 --from F --expected-epoch E --expected-owner-generation G --stranded-inject-id (UUID|none) --basis B -- <exact-id>
+    Clear ONE stranded composer after an operator assertion; sends no text and no key (see docs)
   telepty reply "<text>"                         Reply to last injector
   telepty multicast <id1,id2> "<prompt>"         Inject into multiple sessions
   telepty broadcast [--ref [file]] "<prompt>"    Inject into ALL sessions
@@ -5912,4 +6045,20 @@ module.exports = {
   probeDaemonHealth,      // gh#82 (A/B): unauthenticated /api/health liveness re-confirmation
   resolveTargetToken,     // #844 F1: which credential belongs to THIS address — refuses, never assumes
   fetchWithAuth,          // #844 F1: the wire itself, so a test can assert what would have been sent
+  bootCapabilitiesLine,   // Task 1270: the sealed boot-capabilities document (pure)
+  runBootCapabilities,    // Task 1270: main()'s `boot-capabilities` dispatch (injectable writers, no I/O)
+  parseBootCapabilities,  // Task 1270: reference validator for the Orchestrator writer (old help/exit 0 ≠ support)
+  createTargetRefusal,    // Task 1270: allow-create-v1 canonical-host gate (pure, pre-network)
+  checkCreateDaemonSupport, // Task 1270: allow-create-v1 one-shot /api/meta capability check (injectable fetch)
+  viewerCloseDecision,    // Task 1270: viewer detach never deletes a wrapped/unprovable record (pure)
+  // Task 1270 bound busy input: the strict argv parser / canonical-host gate / one-POST runner of the
+  // `inject-bound-v1` verb, re-exported from src/cli/inject-bound-v1.js so a test asserts the SHIPPED verb.
+  parseBoundInjectArgv: (...args) => require('./src/cli/inject-bound-v1').parseBoundInjectArgv(...args),
+  boundTargetRefusal: (...args) => require('./src/cli/inject-bound-v1').boundTargetRefusal(...args),
+  runInjectBoundV1: (...args) => require('./src/cli/inject-bound-v1').runInjectBoundV1(...args),
+  // Task 1270 operator clear: the strict argv parser / canonical-host gate / one-POST runner of the
+  // `clear-strand-v1` verb, re-exported from src/cli/clear-strand-v1.js so a test asserts the SHIPPED verb.
+  parseClearStrandArgv: (...args) => require('./src/cli/clear-strand-v1').parseClearStrandArgv(...args),
+  clearTargetRefusal: (...args) => require('./src/cli/clear-strand-v1').clearTargetRefusal(...args),
+  runClearStrandV1: (...args) => require('./src/cli/clear-strand-v1').runClearStrandV1(...args),
 };

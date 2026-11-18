@@ -31,6 +31,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { setTimeout: holdFor } = require('node:timers/promises');
 
 const ROOT = process.env.TELEPTY_REPO_ROOT ? path.resolve(process.env.TELEPTY_REPO_ROOT) : path.resolve(__dirname, '..');
 if (!fs.existsSync(path.join(ROOT, 'src/mailbox/delivery-runtime.js'))) {
@@ -43,6 +44,7 @@ const SIDS = { c1: 'tpub-orch-c1', c2: 'tpub-orch-c2', a: 'tpub-orch-a', b: 'tpu
   ep: 'tpub-orch-epoch', ow: 'tpub-orch-owner', bad: 'tpub-orch-badid' };
 
 let H = null;
+const round1 = value => Math.round(value * 10) / 10;
 
 function isOpenWebSocket(ws) { return Boolean(ws && ws.readyState === 1); }
 
@@ -214,12 +216,16 @@ async function compose() {
     await new Promise(resolve => setImmediate(resolve));
   }
 
-  async function inject(sid, prompt) {
+  async function inject(sid, prompt, timing = {}) {
     const ws = sessions[sid].ownerWs;
     const seen = ws.frames.length;
     // cli.js buildInjectRequestBody(prompt, { fromId, noEnter: useSubmit })
+    const t0 = performance.now();
     const r = await call('/api/sessions/:id/inject', sid, { prompt, no_enter: true, from: FROM });
+    const t1 = performance.now();
+    timing.route_ms = round1(t1 - t0);   // task1270 E2: the /inject handler (ledger begin, modal gate, mailbox tick)
     await drain();
+    timing.drain_ms = round1(performance.now() - t1);   // task1270 E2: the fixture's bridge-receipt drain
     assert.equal(r.status, 200, `PRECONDITION: inject accepted ${JSON.stringify(r.body)}`);
     assert.match(String(r.body.inject_id), /^[a-f0-9-]{36}$/, 'PRECONDITION: inject_id returned');
     const bodyFrames = ws.frames.slice(seen).filter(f => f.type === 'inject' && f.data !== '\r');
@@ -955,22 +961,51 @@ test('c5d raw exception, suffixed, NaN and exponent strings are not accepted as 
   }
 });
 
+// Task1270 E2 c6 diagnostics, passive and numeric only (no await, RPC, id, path, token, config or body): route_ms/drain_ms
+// from compose().inject; ledger_inflight = ledgerClient.status().inflight (in-memory: submissions awaiting the owner, e.g.
+// the tracked begin); lock = lock.js lockDiagnostics() deltas (in-memory process-wide mailbox lock acquisitions/wait inside
+// the tick). Ledger owner io (ownerStatus().io) is only reachable by a worker RPC, so it is not sampled here: UNKNOWN.
+const LOCK_KEYS = ['acquired', 'timeouts', 'errors', 'wait_ms_total', 'pauses', 'pause_actual_ms', 'pauses_over_2x'];
+const pick = (src, keys) => (src ? Object.fromEntries(keys.map(k => [k, src[k]])) : null);
+const delta = (a, b) => (a && b ? Object.fromEntries(Object.keys(b).map(k => [k, round1(b[k] - a[k])])) : null);
+const lockNow = () => pick(load('src/mailbox/lock.js').lockDiagnostics(), LOCK_KEYS);
+// Task1270 E2 test-only controlled fault, unset in every ordinary run (0: no effect). Only the lifetime regression
+// test/submit-fixture-lifetime-1270.test.js sets it, to hold c6-1 past the parent's UNCHANGED 10 000 ms deadline where
+// Windows/20 job 133048676602 stalled. The hold is c6-1's own abortable timer: its cancellation clears it.
+const C6_HOLD_MS = Math.min(Number(process.env.TELEPTY_FIXTURE_1270_C6_HOLD_MS) || 0, 60000);
+
 // ── c6 real callers through the admitted factories ────────────────────────────────────────────────────
-test('c6 /inject real delivery-return boundary keeps actionable UPSTREAM_STALLED and SURFACE_MODAL texts', { timeout: 10000 }, async (t) => {
-  await t.test('c6-1 UPSTREAM_STALLED exact text via /inject', async () => {
+test('c6 /inject real delivery-return boundary: UPSTREAM_STALLED suspended (task1270), SURFACE_MODAL text kept', { timeout: 10000 }, async (t) => {
+  // Task 1270 contract update: the pre-1270 expectation (503 UPSTREAM_STALLED exact text) is preserved
+  // verbatim in the task1270 VALIDATION.md RED evidence; output silence no longer rejects /inject.
+  await t.test('c6-1 unanswered upstream probe does not reject /inject (UPSTREAM_STALLED suspended)', async (st) => {
     const session = H.registerSession(SIDS.us);
     // Owner observation stub only: an upstream probe left unanswered for longer than UPSTREAM_STALL_SECONDS (30).
     session.upstreamProbeAt = Date.now() - 31000;
     session.upstreamProbeWatermark = 0;
     session.outputRingTotalBytes = 0;
-    const r = await H.call('/api/sessions/:id/inject', SIDS.us, { prompt: 'PROBE-US tpub', no_enter: true, from: FROM });
-    console.log(`# C6 ${JSON.stringify({ case: 'upstream', status: r.status, body: r.body })}`);
-    assert.equal(r.status, 503, 'REGRESSION: status 503 preserved');
-    assert.match(String(r.body.inject_id), /^[a-f0-9-]{36}$/, 'PRECONDITION: tracked inject id returned');
-    assert.deepEqual(r.body, { success: false, code: 'UPSTREAM_STALLED',
-      error: 'Session output pipe is dead: the owner is connected but has returned no output since the last delivery.',
-      inject_id: r.body.inject_id, tracking_state: 'aborted' }, 'REGRESSION: /inject UPSTREAM_STALLED public body with exact actionable text');
+    const timing = {};
+    const from = { t: performance.now(), lock: lockNow() };
+    const diag = () => ({ elapsed_ms: round1(performance.now() - from.t), ...timing,
+      ledger_inflight: H.rshared.ledgerClient.status().inflight, lock: delta(from.lock, lockNow()) });
+    // On cancellation, report synchronously how far c6-1 got (phases present = phases completed).
+    const onAbort = () => console.log(`# C6_DIAG ${JSON.stringify({ case: 'upstream', aborted: true, ...diag() })}`);
+    st.signal.addEventListener('abort', onAbort, { once: true });
+    let accepted;
+    try {
+      if (C6_HOLD_MS > 0) await holdFor(C6_HOLD_MS, undefined, { signal: st.signal });   // test-only fault, see C6_HOLD_MS
+      accepted = await H.inject(SIDS.us, 'PROBE-US tpub', timing);   // asserts 200 + inject_id + exactly one body frame
+    } finally { st.signal.removeEventListener('abort', onAbort); }
+    console.log(`# C6 ${JSON.stringify({ case: 'upstream', status: accepted.response.status, body: accepted.response.body, diag: diag() })}`);
+    assert.notEqual(accepted.response.body.code, 'UPSTREAM_STALLED', 'REGRESSION: output silence is not an inject refusal');
+    assert.equal(H.runtime.getSessionHealthStatus(session), 'CONNECTED', 'REGRESSION: open owner stays CONNECTED');
+    assert.ok(H.runtime.buildSessionTransportBlock(session).upstream_silent_seconds >= 31, 'REGRESSION: silence still measured');
   });
+
+  // Task1270 E2 ownership: a parent that timed out or was cancelled while c6-1 was pending resumes here, and node:test
+  // would still run a late c6-2 (re-parented to the root) against the shared H and process.env. The parent's own
+  // failure is already recorded; nothing further starts.
+  if (t.signal.aborted) { console.log('# C6_LIFETIME {"c6_2":"not_started","parent_aborted":true}'); return; }   // [1270-E2-GUARD]
 
   await t.test('c6-2 SURFACE_MODAL reject exact reason + daemon hint via /inject', async () => {
     const sid = SIDS.md;
@@ -1041,6 +1076,9 @@ test('c6 fanout real route propagates requested/cap into the public cap text', {
       'REGRESSION: fractional cap public body exact');
   });
   await t.test('c6-5 broadcast all sessions > cap 2', async () => {
+    // Task1270 E2: self-contained setup for the focused (^c6) lifetime probe, where no earlier case registered sessions.
+    // Deterministic fanout-only fixture sessions via the existing seam, only while n <= 2: a no-op on the whole-file run.
+    for (let i = 0; Object.keys(H.sessions).length <= 2; i++) H.registerSession(`tpub-orch-fanout-${i}`);
     const n = Object.keys(H.sessions).length;
     assert.ok(n > 2, 'PRECONDITION: more than 2 registered sessions');
     const r = await fanoutApp(2)('/api/sessions/broadcast/inject', { prompt: 'x' });

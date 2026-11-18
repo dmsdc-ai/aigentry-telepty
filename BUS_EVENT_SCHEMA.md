@@ -256,6 +256,81 @@ This event measures elapsed time since `lastActivityAt`, once per inactivity per
   `x-telepty-session-token`), or `null` when unverifiable (operator/human shell). `spoof_suspected`
   = `from && verified_sender_sid && from !== verified_sender_sid`. (telepty #43 P2.)
 
+**The bound transport's variant of this event (task 1270 candidate — acceptance pending).** The
+`POST /api/sessions/:id/inject-bound-v1` door emits the same event type on its `accepted` stage only,
+and the field set is NOT identical to the one above. Measured against the emitter
+(`src/routes/session-actions.js` accepted arm) rather than intended — same convention as the block
+above, which also leaves the common envelope keys `event_type`, `session_id` and `semantic` implicit:
+
+```json
+{ "type": "inject_written", "inject_id": "UUID", "sender": "daemon", "target_agent": "string", "content_sha256": "string", "content_length": "number", "from": "string|null", "verified_sender_sid": "string|null", "verified_sender_epoch": "string|null", "verified_sender_generation": "number|null", "spoof_suspected": "boolean", "origin": "trusted-local", "transport": "inject-bound-v1", "body_stage": "string", "submit_stage": "string", "timestamp": "ISO 8601" }
+```
+
+- `body_stage` and `submit_stage` are **additive** and appear on this transport only. They carry the
+  honest stage vocabulary of the bound result (`sent_to_bridge` is not `pty_written`, and neither is
+  consumption), so a subscriber learns how far the pair got, not that it was consumed.
+- `transport` is **not additive, it SHADOWS the envelope's own `transport` block.** Every session
+  event carries `transport: { session_epoch, owner_generation, busy_input, … }` from
+  `buildSessionEvent`, and that builder spreads the per-event `extra` **last**
+  (`src/mailbox/delivery-runtime.js`), so on a bound `inject_written` — and on no other event — the
+  key holds the **string** `"inject-bound-v1"` instead of that object. A subscriber reading
+  `event.transport.busy_input` on this one event type gets `undefined` rather than a value. Nothing
+  throws (the trusted session-event projection reads `event?.transport?.health_status` and only for
+  `session_health`, which this is not), and no in-tree subscriber reads it; it is recorded here
+  because the shape is what it is, not what the name suggests. Discriminate on
+  `typeof event.transport === 'string'`, or read the transport block from another event.
+- `reply_to`, `thread_id` and `reply_expected` are **absent** on this transport — not null, absent.
+  The bound request schema is closed and has no such fields, so there is nothing to report. A
+  subscriber that requires them must treat this door as a different producer.
+- There is **no `inject_queued` counterpart** for the bound door: that transport never parks, so the
+  `queued` arm above cannot arise. A bound delivery that cannot be handed to the owner is refused in
+  the response instead, and emits nothing here.
+
+### `composer_strand_cleared` (task 1270 candidate — acceptance pending)
+
+Emitted by `POST /api/sessions/:id/clear-strand-v1` on its `cleared` stage only — never on a refusal, and
+never by any other producer. One event per removed strand record. Measured against the emitter
+(`src/routes/session-actions.js`, the `registerClearStrandV1Route` success arm) rather than intended, same
+convention as the blocks above, which also leave the common envelope keys `event_type`, `session_id`,
+`transport` and `semantic` implicit:
+
+```json
+{ "type": "composer_strand_cleared", "sender": "daemon", "target_agent": "string", "stranded_inject_id": "UUID|null", "strand_reason": "string|null", "strand_at": "ISO 8601|null", "basis": "composer_emptied_by_operator|child_replaced_observed", "child_evidence": "replaced|same_child|unobservable", "persisted": "boolean", "from": "string|null", "verified_sender_sid": "string|null", "verified_sender_epoch": "string|null", "verified_sender_generation": "number|null", "spoof_suspected": "boolean", "origin": "trusted-local", "timestamp": "ISO 8601" }
+```
+
+- **What it reports**: an operator removed the refusal record that held one session instance's input shut. The
+  session had been refusing every body and key for that instance because an earlier bound delivery handed a
+  body and could not hand its paired CR — or (r6) could not say whether its body landed at all — leaving
+  unsubmitted text, possibly, in a real composer.
+- **What it does NOT report**: anything being typed, submitted or interrupted. This door writes no byte and
+  sends no key; `basis` is the operator's own **claim** about the composer, which the daemon cannot observe
+  (`child_replaced_observed` is the one basis it checks, against its own `process_started` milestone). A cleared
+  strand means "the daemon no longer refuses this instance's input" and nothing more.
+- `strand_reason` / `strand_at` come from the record that was **removed** (its `body_*`/`submit_*`/`cr_*`/
+  `delivery_*` code and its ISO timestamp), so a subscriber learns WHY the instance was stranded, not why it was
+  cleared. `body_outcome_unknown` is the r6 addition to that vocabulary: the body write itself returned without
+  stating an outcome, so the composer's content is unknown rather than known-dirty.
+- `child_evidence` is the daemon's own comparison of the child recorded at strand time with the current owner
+  generation's accepted `process_started` milestone. `unobservable` is the honest answer for a legacy bridge
+  that announces no milestone and for a strand written before the field existed.
+- `persisted` is whether the session store accepted the save of the removed record. `false` means the clear
+  stands in memory and a daemon restart may restore the strand; it is **not** rolled back, because re-adding
+  the record would deny input to a composer the operator has just emptied.
+- `from` is the **claimed** sender; `verified_sender_sid` is the daemon-verified identity (from the presented
+  `x-telepty-session-token`, when there is one), and `spoof_suspected` is the same derivation as above. The
+  clear is authorised by the host token in the `x-telepty-token` HEADER on a loopback socket peer with no
+  `Origin`; a request that also carries a session bearer is recorded, not refused.
+- `extra` contains **no key named `transport`**, so unlike the bound `inject_written` above this event's
+  envelope `transport` block is the usual object — the shadowing defect recorded there is deliberately not
+  repeated here.
+- The type is **not** in `APPROVED_TYPES` (`src/transport/session-events.js`), so the scoped read-only
+  session-event transport (`/api/events/…`) does **not** carry it: `projectSessionEvent` returns `null` and
+  only `/api/bus` subscribers see it. Widening that list would be a grant change and is out of scope.
+- The durable record of the same action is one line in `~/.telepty/logs/injects.jsonl` with
+  `kind: "operator-clear"`, `source: "clear-strand-v1"` and the seven `clear_*` fields (see the inject audit
+  log section below). The audit line is written for every outcome from the target check onward; this event only
+  for the clear that happened.
+
 ### `audit_overflow` (telepty #43)
 ```json
 { "type": "audit_overflow", "sender": "daemon", "dropped": "number", "queue_max": "number", "timestamp": "ISO 8601" }
@@ -305,6 +380,29 @@ that two lines naming the same sid came from the same *instance*. Both are `null
 sender is unverified, so an absent epoch never reads as "verified, epoch unknown". They are derived
 in `src/audit/inject-log.js`, which is the authoritative shape of a line — as are `payload_sha256`,
 `payload_bytes` and `spoof_suspected`, none of which any caller passes.
+
+**The operator clear writes a line here too, and it is not a write into a PTY (task 1270 candidate —
+acceptance pending).** `POST /api/sessions/:id/clear-strand-v1` appends `kind: "operator-clear"`,
+`source: "clear-strand-v1"` for **every** outcome from the target check onward — the clear itself as
+`delivery_result: "cleared"`, and each identity/state refusal as `delivery_result: "refused:<reason>"`. It is in
+this log, which otherwise records writes, because an operator reads it as THE record of who touched a session's
+input, and removing the record that holds a session's input shut is exactly such an act. `payload` is the empty
+string on that door (there is nothing to type), so `payload_sha256` is the empty digest, `payload_bytes` is `0`
+and `payload_preview` is forced to `null` even with `TELEPTY_AUDIT_PREVIEW=1`. Seven additive fields, inside a
+`kind === "operator-clear" && clear` guard in `src/audit/inject-log.js`, so every other line — including the
+broker line and every ordinary inject — is byte-identical to before:
+
+```jsonc
+{ "clear_session_epoch": "string|null", "clear_owner_generation": "string|null",
+  "clear_basis": "composer_emptied_by_operator|child_replaced_observed|null",
+  "clear_strand_reason": "bounded code|null", "clear_strand_at": "ISO 8601|null",
+  "clear_child_evidence": "replaced|same_child|unobservable", "clear_persisted": "boolean" }
+```
+
+Every value is a bounded code, an opaque identity token, an ISO timestamp or a boolean: no screen, prompt or
+composer text exists anywhere in that door's inputs, so none can reach this file. Refusals **before** the
+target check (authority and request-shape refusals) write **no line at all**, which is what keeps an
+authenticated caller from appending records by POSTing to ids that do not exist.
 
 #### Which writes into a PTY this log records, by name (0.8.0, #843)
 

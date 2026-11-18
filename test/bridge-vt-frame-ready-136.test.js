@@ -275,13 +275,18 @@ test('#136 F1 fixture control: raw tail never matches; the real rendered frame s
 // Task 1215 hotfix 0.10.1 (replaces #136 F1, which asserted nothing is written before the composer repaint and the
 // drain is qualified by the VT frame): a rendered composer is no longer an admission condition. The pair is written at
 // once, before any repaint, and later repaints add no second write.
-test('#136 F1 / hotfix: body+CR are written at once before any repaint; later idle repaints write nothing more', { timeout: 30000 }, async t => {
+test('#136 F1 / hotfix 1270: the body is written at once and its CR at the 250 ms floor, before any repaint; later idle repaints write nothing more', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b136-vt-ready' });
   const { body, submit } = b.daemonInject('VT-READY-BODY');
   b.injectFrame(body);
   b.injectFrame(submit);
   const atOnce = b.writes.slice();
-  await b.clock.advance(3000); // nothing rendered yet
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249);
+  const beforeFloor = b.writes.slice();
+  await b.clock.advance(1);
+  const atFloor = b.writes.slice();
+  await b.clock.advance(3000 - 250); // nothing rendered yet
   const beforeRepaint = b.writes.slice();
   b.feed(IDLE);
   await settleVt();
@@ -290,8 +295,10 @@ test('#136 F1 / hotfix: body+CR are written at once before any repaint; later id
   b.feed(repaintCycles('codex-differential-idle.json', 6));
   await settleVt();
   await b.clock.advance(5000);
-  assert.deepEqual({ atOnce, beforeRepaint, afterRepaint, afterFurtherRepaint: b.writes }, {
-    atOnce: ['VT-READY-BODY', '\r'],
+  assert.deepEqual({ atOnce, beforeFloor, atFloor, beforeRepaint, afterRepaint, afterFurtherRepaint: b.writes }, {
+    atOnce: ['VT-READY-BODY'],
+    beforeFloor: ['VT-READY-BODY'],
+    atFloor: ['VT-READY-BODY', '\r'],
     beforeRepaint: ['VT-READY-BODY', '\r'],
     afterRepaint: ['VT-READY-BODY', '\r'],
     afterFurtherRepaint: ['VT-READY-BODY', '\r'],
@@ -300,7 +307,7 @@ test('#136 F1 / hotfix: body+CR are written at once before any repaint; later id
 
 // Task 1215 hotfix 0.10.1 (replaces the #136 busy guard "never written to" and F2 "withheld busy_indicator"): a busy /
 // working frame is output, not a permission modal. The pair is written at once, exactly once; no withheld receipt.
-test('#136 busy / hotfix: a busy frame (composer visible + esc to interrupt) receives body+CR at once, exactly once', { timeout: 30000 }, async t => {
+test('#136 busy / hotfix 1270: a busy frame (composer visible + esc to interrupt) gets the body at once and its CR at the 250 ms floor, exactly once', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b136-vt-busy-guard' });
   b.feed(BUSY);
   await settleVt();
@@ -308,8 +315,14 @@ test('#136 busy / hotfix: a busy frame (composer visible + esc to interrupt) rec
   b.injectFrame(body);
   b.injectFrame(submit);
   const atOnce = b.writes.slice();
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249);
+  const beforeFloor = b.writes.slice();
+  await b.clock.advance(1);
+  const atFloor = b.writes.slice();
   await b.clock.advance(20000);
-  assert.deepEqual({ atOnce, writes: b.writes }, { atOnce: ['VT-BUSY-BODY', '\r'], writes: ['VT-BUSY-BODY', '\r'] });
+  assert.deepEqual({ atOnce, beforeFloor, atFloor, writes: b.writes },
+    { atOnce: ['VT-BUSY-BODY'], beforeFloor: ['VT-BUSY-BODY'], atFloor: ['VT-BUSY-BODY', '\r'], writes: ['VT-BUSY-BODY', '\r'] });
 });
 
 test('#136 F2 / hotfix: a busy frame is never reported withheld (no busy_indicator receipt); the body is written', { timeout: 30000 }, async t => {

@@ -75,7 +75,13 @@ function serializePersistedSessions(sessions) {
       ...(s.bracketedPasteCapable === undefined ? {} : { bracketedPasteCapable: s.bracketedPasteCapable }),
       // Task 1215 G6: "supervision granted and not explicitly revoked" (non-secret; no capability).
       // Emitted only when true, so other sessions serialize byte-identically.
-      ...(s.supervisionRestorable === true ? { supervisionRestorable: true } : {})
+      ...(s.supervisionRestorable === true ? { supervisionRestorable: true } : {}),
+      // Task 1270 — the stranded-composer REFUSAL record, which is keyed on the `sessionEpoch` written just
+      // above and therefore has to travel with it: a restart that restored the epoch without it resumed
+      // admitting input to a composer still holding unsubmitted text. Bounded, non-secret, four fields, and it
+      // can only ever cause a refusal — never authority (contrast #860 F1's `sessionEpochProved`). Emitted only
+      // for a session that actually has one, so every other session serializes byte-identically.
+      ...require('../protocol/bound-inject').serializeStrandRecord(s)
     } });
   }
   return data;
@@ -249,6 +255,10 @@ function buildRestoredWrappedSession(id, meta, options = {}) {
       ? { bracketedPasteCapable: meta.bracketedPasteCapable }
       : {}),
     ...(meta.supervisionRestorable === true ? { supervisionRestorable: true } : {}),
+    // Task 1270 — the stranded-composer refusal, adopted ONLY when the stored record names exactly the epoch
+    // restored above (both-or-neither, like the credential pair) and with every field re-validated, so a
+    // hand-edited file can neither plant a strand on a different instance nor smuggle free text into a reason.
+    ...require('../protocol/bound-inject').restoreStrandRecord(meta),
     // Task 1215 G6: memory-only "rebuilt from disk in this daemon lifetime"; never serialized.
     restoredFromPersistence: true,
     clients: new Set(), isClosing: false, outputRing: [], ready: true,     };

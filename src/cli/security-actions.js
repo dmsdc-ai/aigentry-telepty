@@ -361,6 +361,33 @@ function createAllowSecurityContext(shared, {
     let refusedIdlessBodyAt = null;
     // Task 1215 O1: due time of the latest scheduled delivery timer; a new flush batch starts after it (FIFO).
     let deliveryTailAt = -Infinity;
+    // Task 1270: a submit CR reaches a child no sooner than SUBMIT_GAP_MS after this context's latest body write attempt to
+    // that same child (same value as the daemon's #730 FORCE_CR_GAP_DEFAULT_MS). Origin = the actual child.write, never receipt.
+    const SUBMIT_GAP_MS = 250;
+    let lastBodyWrite = null; // { child, atMs, id, submitted }
+    // Task 1270 R1: children whose composer holds a written (or unknown) body whose CR was refused or is unknown. Every
+    // later bridge body/CR to that child is refused not_written composer_stranded. Keyed by the child object: only a new
+    // child (exit/replacement) clears it. UNSUPPORTED-RECOVERY boundary: no timer, repaint, ready, typing or owner clear.
+    const strandedChildren = new WeakSet();
+    function strandComposer(child, pairId) {
+      if (lastBodyWrite && lastBodyWrite.child === child && !lastBodyWrite.submitted && (!pairId || lastBodyWrite.id === pairId)) {
+        strandedChildren.add(child);
+      }
+    }
+    // Task 1270 F1: delivery timers in FIFO order; a timer that fires before every earlier one is done waits behind it.
+    const deliveryOrder = [];
+    const heldSubmits = new Set(); // Task 1270: CRs held in memory for their body's gap (direct path: never enqueued)
+    // Task 1270 F2: admission re-read when a held CR wakes. Local typing after its own body's write (else after the CR's
+    // admission), or for a guarded owner a modal / unobservable modal now, refuses it unwritten. Supervised reads no screen.
+    function heldSubmitRefusal(child, pairId, admittedAt) {
+      const since = lastBodyWrite && lastBodyWrite.child === child && (!pairId || lastBodyWrite.id === pairId) ? lastBodyWrite.atMs : admittedAt;
+      if (shared.lastUserInputTime > since) return 'user_input_after_body';
+      if (supervised()) return null;
+      return modalUnobservable() ? 'modal_unobservable' : bridgeModalReason();
+    }
+    function submitGapRemaining(child) {
+      return lastBodyWrite && lastBodyWrite.child === child ? Math.max(0, lastBodyWrite.atMs + SUBMIT_GAP_MS - now()) : 0;
+    }
     // Task 1215 F2: child sequence for spawn-readiness milestones; the subscribed child is the one
     // whose output/exit handlers are attached.
     let childSeq = 0;
@@ -405,13 +432,13 @@ function createAllowSecurityContext(shared, {
     // the user's own typing quiet only: no tail, VT, busy/modal or glyph classifier is consulted.
     function supervised() { return shared.inputPolicy === 'user-supervised' && !shared.sshPlan; }
 
-    function sendBridgeFrame(raw) {
-      if (!raw || isClosed() || !shared.wsReady || shared.daemonWs?.readyState !== 1) return false;
+    function sendBridgeFrame(raw, closing = false) {
+      if (!raw || (isClosed() && !closing) || !shared.wsReady || shared.daemonWs?.readyState !== 1) return false;
       try { shared.daemonWs.send(raw); return true; } catch { return false; }
     }
-    function sendReceipt(msgId, meta, stage, certainty, reason = null) {
+    function sendReceipt(msgId, meta, stage, certainty, reason = null, closing = false) {
       return sendBridgeFrame(bridgeStage.receiptFrame({ meta: meta || {}, bridgeMsgId: msgId, stage, reason, certainty,
-        bridgeSeq: ++receiptSeq, atMs: now(), ownerGeneration: shared.interactionBinding?.owner_generation ?? null }));
+        bridgeSeq: ++receiptSeq, atMs: now(), ownerGeneration: shared.interactionBinding?.owner_generation ?? null }), closing);
     }
     function rememberRecord(msgId, meta, isCr) {
       if (bridgeRecords.size >= RECORD_INDEX_MAX) bridgeRecords.delete(bridgeRecords.keys().next().value);
@@ -664,6 +691,12 @@ function createAllowSecurityContext(shared, {
       const child = shared.child;
       if (!canWrite(child)) { if (guard) guard.state = 'not_written'; return false; }
       const ids = bridgeStage.frameMeta(meta);
+      if (strandedChildren.has(child)) {   // Task 1270 R1: never appended to / submitted with a stranded body
+        if (guard) guard.state = 'not_written';
+        if (text !== '\r') { rememberUnwritten(ids.daemon_msg_id); unwrittenBodyAdjacentAt = now(); }
+        sendReceipt(null, ids, 'refused', 'not_written', 'composer_stranded');
+        return false;
+      }
       if (text === '\r' && (ids.pair ? unwrittenBodies.has(ids.pair) : idlessCrAdjacentToUnwritten())) {
         if (guard) guard.state = 'not_written';
         sendReceipt(null, ids, 'refused', 'not_written', 'pair_unwritten');
@@ -677,18 +710,67 @@ function createAllowSecurityContext(shared, {
       }
       // Task 1215 hotfix 0.10.1: the attempt is recorded before the effect, so a throw can never read as "not written".
       if (guard) guard.state = 'attempted';
+      if (text !== '\r') lastBodyWrite = { child, atMs: now(), id: ids.daemon_msg_id || null };   // Task 1270: a thrown body write is unknown, not absent
       try { child.write(text); }
       catch (error) {
         if (guard) guard.state = 'unknown';
         sendReceipt(null, ids, 'unknown', 'unknown', 'write_threw');
+        if (text === '\r') strandComposer(child, ids.pair);   // Task 1270 R1
         throw error;
       }
       if (guard) guard.state = 'written';
+      if (text === '\r' && lastBodyWrite && lastBodyWrite.child === child) lastBodyWrite.submitted = true;   // Task 1270 R1
       unwrittenBodyAdjacentAt = null;
       adjacentQueuedBody = null;
       refusedIdlessBodyAt = null;
       sendReceipt(null, ids, 'pty_written', 'written');
       return true;
+    }
+
+    // Task 1270: a direct CR that arrives inside its body's submit gap waits in memory on the delivery-timer FIFO (a later
+    // body or CR queues behind it; it never overtakes or is overtaken), then goes through writeDirectInject. No mailbox,
+    // no idle/ready wait, no retry: identity, owner, gap and admission are re-read at wake; a refusal is said not_written.
+    function holdSubmit(text, meta, guard) {
+      const child = shared.child;
+      const ids = bridgeStage.frameMeta(meta);
+      const generation = shared.interactionBinding?.owner_generation ?? null;
+      const admittedAt = now();
+      const held = { token: { dueAt: now() }, timer: null, ids, guard };
+      heldSubmits.add(held);
+      deliveryOrder.push(held.token);
+      const arm = ms => {
+        held.token.dueAt = now() + ms;
+        held.timer = setTimeout(fire, ms);
+        deliveryTimers.add(held.timer);
+        deliveryTailAt = Math.max(deliveryTailAt, held.token.dueAt);
+      };
+      const done = () => { heldSubmits.delete(held); const i = deliveryOrder.indexOf(held.token); if (i >= 0) deliveryOrder.splice(i, 1); };
+      const refuse = reason => {
+        done(); if (guard) guard.state = 'not_written';
+        sendReceipt(null, ids, 'refused', 'not_written', reason, reason === 'session_closed');
+        if (!['child_exited', 'child_replaced', 'session_closed'].includes(reason)) strandComposer(child, ids.pair);   // Task 1270 R1
+      };
+      function fire() {
+        deliveryTimers.delete(held.timer);
+        if (!heldSubmits.has(held)) return;   // already settled (session close)
+        if (deliveryOrder[0] !== held.token) { arm(Math.max(1, deliveryOrder[0].dueAt - now() + 1)); return; }
+        if (isClosed()) { refuse('session_closed'); return; }   // Task 1270 R2: never a silent exit
+        if (shared.handoffPending) { refuse('handoff_pending'); return; }
+        if (childExited(child) || child !== shared.child || (shared.interactionBinding?.owner_generation ?? null) !== generation) {
+          refuse(childExited(child) ? 'child_exited' : child !== shared.child ? 'child_replaced' : 'owner_changed');
+          return;
+        }
+        const gapMs = submitGapRemaining(child);
+        if (gapMs > 0) { arm(gapMs); return; }
+        const reason = heldSubmitRefusal(child, ids.pair, admittedAt);
+        if (reason) { refuse(reason); return; }
+        done();
+        // writeDirectInject keeps its own checks/receipts (incl. composer_stranded); a throw is already receipted unknown and
+        // strands the composer — never out of a timer.
+        try { writeDirectInject(text, meta, guard); }
+        catch (error) { console.error(`[BRIDGE] submit write threw, outcome unknown: ${error && error.message}`); }
+      }
+      arm(submitGapRemaining(child));
     }
 
     // Task 1215 F4 — THE owner-WS inject handler (cli.js calls this; tests call this). Keeps text
@@ -756,6 +838,8 @@ function createAllowSecurityContext(shared, {
         } else {
           scheduleIdleFlush();
         }
+      } else if (isCr && !childExited(shared.child) && submitGapRemaining(shared.child) > 0) {
+        holdSubmit(rawData, meta, guard);   // Task 1270: inside its body's submit gap — held, then the same direct write
       } else if (isCr) {
         // CR is never idle-gated, but never for a body that was quarantined unwritten (#136, F5).
         writeDirectInject(rawData, meta, guard);
@@ -965,6 +1049,8 @@ function createAllowSecurityContext(shared, {
       if (shared.bridgePendingCount === 0) return;
       // Task 1215 O1: a batch flushed while earlier writes still wait on delivery timers starts after the latest of them.
       let delay = deliveryTimers.size > 0 ? Math.max(0, deliveryTailAt - now()) + 1 : 0;
+      const generation = shared.interactionBinding?.owner_generation ?? null;   // Task 1270: CR fire re-checks the owner
+      let bodyDelay = null;
       const batch = [];
       // Dequeue all pending messages
       while (true) {
@@ -1014,32 +1100,74 @@ function createAllowSecurityContext(shared, {
           quarantine(msgId, 'pair_refused', 'not_written', { inFlight: true });
           continue;
         }
-        const timer = setTimeout(() => {
-          deliveryTimers.delete(timer);
-          if (!canWrite(child)) return;
-          if (bridgeRecords.get(msgId)?.pairRefused) { quarantine(msgId, 'pair_refused', 'not_written', { inFlight: true }); return; }
+        if (text === '\r') delay = Math.max(delay, bodyDelay === null ? 0 : bodyDelay + SUBMIT_GAP_MS, submitGapRemaining(child));
+        else bodyDelay = delay;
+        const admittedAt = bridgeRecords.get(msgId)?.createdMs ?? now();   // Task 1270 F2
+        const token = { dueAt: now() + delay };   // Task 1270 F1: this delivery's place in the FIFO
+        deliveryOrder.push(token);
+        let timer = null;
+        const arm = ms => {
+          token.dueAt = now() + ms;
+          timer = setTimeout(fire, ms);
+          deliveryTimers.add(timer);
+          deliveryTailAt = Math.max(deliveryTailAt, token.dueAt);
+        };
+        // Returns true only when this delivery re-armed itself (it keeps its FIFO place).
+        const deliverOne = () => {
+          // Task 1270: a CR never reaches a replacement child or a changed owner; said not_written, never written.
+          if (text === '\r' && !isClosed() && !shared.handoffPending && (child !== shared.child
+            || (shared.interactionBinding?.owner_generation ?? null) !== generation)) {
+            quarantine(msgId, childExited(child) ? 'child_exited' : child !== shared.child ? 'child_replaced' : 'owner_changed', 'not_written', { inFlight: true });
+            if (child === shared.child && !childExited(child)) strandComposer(child, meta.pair);   // Task 1270 R1: owner_changed
+            return false;
+          }
+          if (!canWrite(child)) return false;
+          if (bridgeRecords.get(msgId)?.pairRefused) { quarantine(msgId, 'pair_refused', 'not_written', { inFlight: true }); return false; }
           // Task 1215 hotfix 0.10.1: its child exited after the flush; dead-letter with payload, never written, never acked.
-          if (childExited(child)) { quarantine(msgId, 'child_exited', 'not_written', { inFlight: true }); return; }
+          if (childExited(child)) { quarantine(msgId, 'child_exited', 'not_written', { inFlight: true }); return false; }
+          if (strandedChildren.has(child)) { quarantine(msgId, 'composer_stranded', 'not_written', { inFlight: true }); return false; }   // Task 1270 R1
+          if (text === '\r' && meta.pair && unwrittenBodies.has(meta.pair)) { quarantine(msgId, 'pair_unwritten', 'not_written', { inFlight: true }); return false; }
+          if (text === '\r') {
+            // Task 1270: the body landed later than scheduled — wait out the rest of its gap (a wait, never a write retry).
+            const gapMs = submitGapRemaining(child);
+            if (gapMs > 0) { arm(gapMs); return true; }
+            const held = heldSubmitRefusal(child, meta.pair, admittedAt);   // Task 1270 F2
+            if (held) { quarantine(msgId, held, 'not_written', { inFlight: true }); strandComposer(child, meta.pair); return false; }
+          }
           invalidateBridgeInteraction('automated_input');
-          if (!canWrite(child)) return;
+          if (!canWrite(child)) return false;
           const guard = bridgeRecords.get(msgId)?.guard || null;   // Task 1215 hotfix 0.10.1
           if (guard) guard.state = 'attempted';
+          if (text !== '\r') lastBodyWrite = { child, atMs: now(), id: meta.daemon_msg_id || null };   // Task 1270
           try { child.write(text); }
           catch (error) {
             const record = bridgeRecords.get(msgId);
             if (record) record.state = 'unknown';
             if (guard) guard.state = 'unknown';
             sendReceipt(msgId, meta, 'unknown', 'unknown', 'write_threw');
+            if (text === '\r') strandComposer(child, meta.pair);   // Task 1270 R1
+            if (text === '\r') { console.error(`[BRIDGE] submit write threw, outcome unknown: ${error && error.message}`); return false; } // Task 1270: never out of a timer
             throw error;
           }
           if (guard) guard.state = 'written';
+          if (text === '\r' && lastBodyWrite && lastBodyWrite.child === child) lastBodyWrite.submitted = true;   // Task 1270 R1
           bridgeRecords.delete(msgId);
           unwrittenBodyAdjacentAt = null;
           // PTY master write only; never consumption, turn acceptance or completion.
           sendReceipt(msgId, meta, 'pty_written', 'written');
-          if (!canWrite(child)) return;
+          if (!canWrite(child)) return false;
           try { shared.bridgeMailbox.ack(shared.bridgeTarget, msgId); } catch {}
-        }, delay);
+          return false;
+        };
+        const fire = () => {
+          deliveryTimers.delete(timer);
+          // Task 1270 F1: head-of-line — never overtake an earlier delivery still waiting (e.g. a CR finishing its gap).
+          if (deliveryOrder[0] !== token && deliveryOrder.includes(token)) { arm(Math.max(1, deliveryOrder[0].dueAt - now() + 1)); return; }
+          let rearmed = false;
+          try { rearmed = deliverOne(); }
+          finally { if (!rearmed) { const i = deliveryOrder.indexOf(token); if (i >= 0) deliveryOrder.splice(i, 1); } }
+        };
+        timer = setTimeout(fire, delay);
         deliveryTimers.add(timer);
         deliveryTailAt = Math.max(deliveryTailAt, now() + delay);
         delay += text === '\r' ? 0 : 100;
@@ -1103,6 +1231,11 @@ function createAllowSecurityContext(shared, {
     function closeAllowSession({ destroySession = true } = {}) {
       if (closed) return false;
       const custodyKept = destroySession ? quarantineAtExit() : false;
+      for (const held of heldSubmits) {   // Task 1270: a CR held for its gap was never written
+        if (held.guard) held.guard.state = 'not_written';
+        sendReceipt(null, held.ids, 'refused', 'not_written', 'session_closed');
+      }
+      heldSubmits.clear();
       closed = true;
       shared.allowSessionClosed = true;
       shared.credentialChannel?.close();

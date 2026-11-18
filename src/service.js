@@ -166,15 +166,23 @@ function recognizesTelepty(text, kind, expected) {
   // both. Require this install's entrypoint or an explicit telepty package path.
   const isCli = value => value === expected.cliJs
     || /(?:^|[\\/])(?:@dmsdc-ai[\\/])?aigentry-telepty[\\/]cli\.js$/.test(value);
+  // #1270: install.sh's legacy [<prefix>/bin/telepty, daemon] is ours only when the executable's REAL path is
+  // this install's cli.js (the npm bin link). A basename, PATH or substring match is not provenance.
+  const isOwnEntry = (value) => {
+    if (!expected.fs || !expected.cliJs || !path.posix.isAbsolute(value)) return false;
+    try { return expected.fs.realpathSync(value) === expected.fs.realpathSync(expected.cliJs); } catch { return false; }
+  };
   if (kind === 'launchd') {
     const args = plistProgramArguments(text);
     const label = String(text).match(/<key>\s*Label\s*<\/key>\s*<string>([^<]+)<\/string>/);
-    return label?.[1] === 'com.aigentry.telepty' && args.length === 3
-      && isCli(args[1]) && args[2] === 'daemon';
+    return label?.[1] === 'com.aigentry.telepty' && ((args.length === 3
+      && isCli(args[1]) && args[2] === 'daemon') || (args.length === 2 && args[1] === 'daemon' && isOwnEntry(args[0])));
   }
   if (kind === 'systemd' || kind === 'systemd-user') {
     const args = systemdExecParts(text);
-    return args.length === 3 && isCli(args[1]) && args[2] === 'daemon';
+    // #1270: install.sh's unit is ExecStart=<prefix>/bin/telepty daemon — the same realpath proof as launchd.
+    return (args.length === 3 && isCli(args[1]) && args[2] === 'daemon')
+      || (args.length === 2 && args[1] === 'daemon' && isOwnEntry(args[0]));
   }
   if (kind === 'schtasks') {
     const args = (xmlTag(text, 'Arguments') || '').match(/^"([^"\r\n]+)"\s+daemon$/)
@@ -533,7 +541,7 @@ async function getServiceStatus(deps = {}) {
   const ctx = ctxOf(deps);
   const target = resolveServiceTarget({ ...deps, __ctx: ctx });
   const observed = observe(ctx, target);
-  const expected = { nodeBin: target.nodeBin, cliJs: target.cliJs, text: target.contents };
+  const expected = { nodeBin: target.nodeBin, cliJs: target.cliJs, text: target.contents, fs: ctx.fs };
   const ownership = observed.installed
     ? classifyDescriptor(observed.text, target.kind, expected)
     : 'absent';
@@ -615,7 +623,7 @@ function planShell(verb, deps, opts) {
   const ctx = ctxOf(deps);
   const target = resolveServiceTarget({ ...deps, __ctx: ctx });
   const observed = observe(ctx, target);
-  const expected = { nodeBin: target.nodeBin, cliJs: target.cliJs, text: target.contents };
+  const expected = { nodeBin: target.nodeBin, cliJs: target.cliJs, text: target.contents, fs: ctx.fs };
   const ownership = observed.installed ? classifyDescriptor(observed.text, target.kind, expected) : 'absent';
 
   const planned = {

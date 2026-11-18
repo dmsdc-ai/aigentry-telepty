@@ -14,6 +14,9 @@
 //     amount of re-arming brings them back. The daemon cannot repair this, so the
 //     contract is that it must NOTICE: health degrades to UPSTREAM_STALLED and
 //     inject stops reporting plain success.
+//     Task 1270 (user-directed) suspends that classification: silence is also what a
+//     prompt with a lost Enter looks like, so the daemon now MEASURES it (telemetry) but
+//     neither degrades health nor refuses inject on it until a user-approved re-enable.
 //   * RECOVERABLE (fault mode `pause`) — the PTY read side merely stopped flowing.
 //     The bridge's own watchdog must re-arm it and upstream must resume.
 //
@@ -99,7 +102,7 @@ async function bothLegsUp(t, { faultMode }) {
   return { home, sid, daemon, bridge, A };
 }
 
-test('#732 REPRO + DETECT: an unrecoverable upstream death is caught, not silently served', { skip: SKIP }, async (t) => {
+test('#732 REPRO + task1270: an unrecoverable upstream death is measured, not classified or refused', { skip: SKIP }, async (t) => {
   const { home, sid, daemon, bridge, A } = await bothLegsUp(t, { faultMode: 'mute' });
   const ringBeforeFault = (await A.screen(sid)).screen;
   const proofFile = path.join(home, 'c732-downstream-proof.txt');
@@ -122,20 +125,20 @@ test('#732 REPRO + DETECT: an unrecoverable upstream death is caught, not silent
   assert.equal(screen, ringBeforeFault,
     'read-screen returns pre-death content, byte-identical (live: "read-screen returned old content")');
 
-  // --- was RED: health must stop calling an unobservable session healthy ---
-  await H.waitFor(async () => (await A.session(sid)).healthStatus === 'UPSTREAM_STALLED', {
+  // --- task1270 contract update (pre-1270 UPSTREAM_STALLED/503 expectation kept in VALIDATION.md) ---
+  // Wait past the compressed 5s stall window plus health polls; silence is measured, not classified.
+  await H.waitFor(async () => ((await A.session(sid)).transport?.upstream_silent_seconds ?? -1) >= 7, {
     timeoutMs: 30000, intervalMs: 250,
-    description: 'health to degrade once the owner is connected but has returned no bytes'
+    description: 'upstream silence to be measured beyond the old stall threshold'
   });
   const s = await A.session(sid);
-  assert.equal(s.healthStatus, 'UPSTREAM_STALLED');
-  assert.equal(s.healthReason, 'OWNER_CONNECTED_UPSTREAM_STALLED');
+  assert.equal(s.healthStatus, 'CONNECTED', 'output silence alone no longer degrades health (task1270)');
+  assert.equal(s.healthReason, 'OWNER_CONNECTED');
 
-  // --- was RED: inject must not look like an ordinary success ---
+  // --- task1270: a later (recovery) inject is not refused on the basis of silence ---
   const blind = await A.inject(sid, 'echo C732_BLIND\n');
-  assert.equal(blind.status, 503, 'inject into an unobservable session must hard-fail');
-  assert.equal(blind.body.code, 'UPSTREAM_STALLED',
-    'and must say WHICH failure it is, so a caller can tell it apart from a disconnected owner');
+  assert.notEqual(blind.body && blind.body.code, 'UPSTREAM_STALLED', 'silence is not an inject refusal');
+  assert.equal(blind.status, 200, 'the owner is connected, so the inject is accepted');
 
   // --- the diagnosis the operator needs: which leg broke? ---
   const tr = s.transport;
@@ -150,8 +153,8 @@ test('#732 REPRO + DETECT: an unrecoverable upstream death is caught, not silent
   assert.notEqual(after.transport.bridge_heartbeat_at, tr.bridge_heartbeat_at,
     'heartbeats are still flowing (silent PIPE, not silent SESSION)');
 
-  assert.match(daemon.log(), /\[UPSTREAM\] Session .* output pipe is dead/,
-    'the daemon must announce the stall instead of waiting for a human to read the screen');
+  assert.doesNotMatch(daemon.log(), /\[UPSTREAM\] Session .* output pipe is dead/,
+    'task1270: no stall verdict is announced while the classification is suspended');
 });
 
 test('#732 SELF-HEAL: a recoverable PTY read-side stall re-arms and upstream resumes', { skip: SKIP }, async (t) => {

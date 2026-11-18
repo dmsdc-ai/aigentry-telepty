@@ -1,0 +1,117 @@
+name: Boot create-only 1270 (focused)
+
+# Task 1270 — focused CI feedback for test/boot-create-only-1270.test.js: the sealed `telepty
+# boot-capabilities` document, the versioned `allow-create-v1` verb (canonical loopback, one meta
+# check, create_only first register, no daemon repair) and non-deleting viewer detach.
+# It runs the ENTIRE file — every case, no name pattern — serially on Linux, macOS and Windows with
+# Node 26.13.0, prints the raw TAP, records the tests/pass/fail/skipped/todo/cancelled summary, and
+# exits with the test runner's real status. Platform skips stay visible as `# SKIP` in the TAP
+# (the two node-pty cases are POSIX-only by the test's own existing condition).
+#
+# This is a DIAGNOSTIC, not a gate: it does not replace the full OS/Node regression
+# (test-install.yml) or independent review, and a green run proves only these cases on these runners.
+#
+# Security posture, copied from bridge-contract-1215.yml / wrapped-rename-1270.yml:
+# - no secrets; `contents: read` only; checkout credentials not persisted;
+# - dependencies from the frozen lockfile with `npm ci --ignore-scripts` (no root lifecycle hooks),
+#   then ONLY node-pty's own build, because daemon.js and this test require it;
+# - private HOME/TMPDIR/npm cache under RUNNER_TEMP; loopback-only daemons (TELEPTY_NO_TAILNET_AUTO=1);
+# - no publish, no artifact upload, no service or live operation.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/boot-create-only-1270.yml'
+      - 'cli.js'
+      - 'test/boot-create-only-1270.test.js'
+      - 'test-support/bridge-pipe-harness.js'
+      - 'test-support/daemon-harness.js'
+      - 'test-support/setup-env.js'
+      - 'package-lock.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boot-create-only-1270-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  boot-create-only:
+    name: boot create-only (${{ matrix.os }}, node 26.13.0)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    # TELEPTY_SKIP_DAEMON_REPAIR / TELEPTY_CLIENT_RESTART are deliberately NOT set (unlike bridge-contract-1215): the test
+    # asserts that allow-create-v1 never repairs or restarts the daemon, and a suppressing env could mask exactly that.
+    # The reference full suite (test-install.yml) does not set them either.
+    env:
+      TELEPTY_NO_TAILNET_AUTO: '1'
+      TELEPTY_SKIP_POSTINSTALL: '1'
+      NO_UPDATE_NOTIFIER: '1'
+      TELEPTY_DISABLE_UPDATE_NOTIFIER: '1'
+    steps:
+      # SHAs as pinned in bridge-contract-1215.yml (actions/checkout v4.2.2, actions/setup-node v4.4.0).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '26.13.0'
+      - name: Verify exact Node
+        run: |
+          test "$(node --version)" = "v26.13.0"
+      - name: Private HOME, TMPDIR and npm cache
+        run: |
+          base="$RUNNER_TEMP/boot-1270"
+          mkdir -p "$base/home" "$base/tmp" "$base/npm-cache"
+          chmod 700 "$base" "$base/home" "$base/tmp" "$base/npm-cache"
+          {
+            echo "HOME=$base/home"
+            echo "USERPROFILE=$base/home"
+            echo "TMPDIR=$base/tmp"
+            echo "npm_config_cache=$base/npm-cache"
+          } >> "$GITHUB_ENV"
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      # NOTE: this --ignore-scripts + `npm rebuild node-pty` pair is the existing focused-workflow convention
+      # (bridge-contract-1215.yml), proven there on ubuntu only. On macOS/Windows it runs node-pty's own install script,
+      # the same one plain `npm ci` (test-install.yml) runs. If that leg fails at this step, it is a setup failure,
+      # not a test result.
+      - name: Build node-pty only (required by daemon.js and the test)
+        run: |
+          npm rebuild node-pty --foreground-scripts
+          node -e "require('node-pty'); require('ws'); require('@xterm/headless'); console.log('deps ok')"
+      # Round 3 (CI 43734266367: POSIX cancelled at this job's 15-min budget with NOTHING printed, because the TAP went to a
+      # file that was only cat'ed after Node exited). Now the raw TAP STREAMS to the log through tee as it is produced, and the
+      # test's fixed-label progress file is tailed live in the background, so a cancelled job still shows the last stage
+      # reached. The node exit status is taken from PIPESTATUS[0] (not tee's); a tee failure fails the step on its own.
+      - name: Run the whole boot create-only file serially (raw TAP streamed, real exit)
+        run: |
+          set -uo pipefail
+          tap="$RUNNER_TEMP/boot-create-only-1270.tap"
+          progress="$(node -p "require('path').join(require('os').tmpdir(), 'boot-create-only-1270.progress')")"
+          : > "$progress"
+          # One background process (no pipeline), so $! is exactly the tailer and it is killed and reaped below; a leftover
+          # holder of this step's stdout would itself stall the step. Every progress line already starts with "[boot-1270]".
+          tail -n +1 -F "$progress" 2>/dev/null &
+          tailer=$!
+          node --require ./test-support/setup-env.js --test --test-concurrency=1 --test-reporter=tap \
+            test/boot-create-only-1270.test.js 2>&1 | tee "$tap"
+          statuses=("${PIPESTATUS[@]}")
+          rc="${statuses[0]}"; tee_rc="${statuses[1]}"
+          kill "$tailer" 2>/dev/null || true
+          wait "$tailer" 2>/dev/null || true
+          if [ "$tee_rc" -ne 0 ]; then echo "::error::tee failed (exit $tee_rc); the TAP log may be incomplete"; [ "$rc" -ne 0 ] || rc="$tee_rc"; fi
+          echo "---- summary (${{ matrix.os }}) ----"
+          grep -E '^# (tests|suites|pass|fail|cancelled|skipped|todo) ' "$tap" || echo "no TAP summary lines found"
+          echo "skipped cases:"; grep -E '# SKIP' "$tap" || echo "(none)"
+          echo "test exit=$rc"
+          exit "$rc"

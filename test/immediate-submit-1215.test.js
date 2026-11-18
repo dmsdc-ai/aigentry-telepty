@@ -167,6 +167,7 @@ test('463 bridge: busy output, body + CR written at once; a repeated /submit CR 
   const p = b.pair('B463-DUP');
   b.frame(p.body);
   b.frame(p.submit);
+  await b.clock.advance(250);   // Task 1270: the bridge holds a CR until 250 ms after its body's PTY write (SUBMIT_GAP_MS); the fake clock passes that floor here.
   const atOnce = b.child.writes.slice();
   const repeat = b.terminalCr(p.injectId);                       // repeated API call: new daemon_msg_id, same inject_id
   const pairOnly = b.terminalCr(null, { pairId: p.body.daemon_msg_id }); // same pair, no inject_id
@@ -206,6 +207,7 @@ test('463 bridge: a CR whose child.write throws is receipted unknown/write_threw
   const b = createBridge(t, { sid: 'b463-throw' });
   const p = b.pair('B463-THROW');
   b.frame(p.body);
+  await b.clock.advance(250);   // Task 1270: the bridge holds a CR until 250 ms after its body's PTY write (SUBMIT_GAP_MS); the fake clock passes that floor here.
   b.child.throwOn = data => data === '\r';
   assert.throws(() => b.frame(p.submit), /EIO fixture write/, 'the write error escapes to the owner-message handler, as before');
   const attemptsAfterThrow = b.child.attempts;
@@ -225,6 +227,7 @@ test('463 bridge: the single-CR guard is per owner generation; legacy id-less CR
   const p = b.pair('B463-GEN');
   b.frame(p.body);
   b.frame(p.submit);
+  await b.clock.advance(250);   // Task 1270: the bridge holds a CR until 250 ms after its body's PTY write (SUBMIT_GAP_MS); the fake clock passes that floor here.
   b.frame(b.terminalCr(p.injectId, { generation: 'owner-gen-463-next' }));   // a NEW owner generation: one CR allowed
   const dupNext = b.terminalCr(p.injectId, { generation: 'owner-gen-463-next' });
   b.frame(dupNext);                                                              // ...and only one
@@ -560,6 +563,7 @@ test('463 daemon + REAL bridge end to end: repeated /submit for one inject write
   // hotfix480 (VALIDATION469): crFrames() is an open-ended slice; observe the first call's effects once that call is over,
   // before the second call adds its own frame.
   const firstCrs = first.crFrames().length;
+  await b.clock.advance(250);   // Task 1270: the bridge holds a CR until 250 ms after its body's PTY write (SUBMIT_GAP_MS); the fake clock passes that floor here.
   const second = await H.submit(sid, { injected_body: 'D463-E2E body', retries: 0, inject_id: injectId });
   b.feed(BUSY);
   await b.clock.advance(5000);
@@ -790,14 +794,17 @@ test('480 F4 daemon: a named pair evicted from the bounded pair history (>256 ne
 
 test('480 F4 bridge: past the 4096-key single-CR guard, a repeated CR for an evicted pair is refused submit_guard_evicted (never written again); a fresh pair still gets its one CR', { timeout: 60000 }, async t => {
   const b = createBridge(t, { sid: 'b480-guard' });
+  // Task 1270: each pair's CR is framed after the 250 ms body→CR floor (SUBMIT_GAP_MS), so it is written directly as before.
   const old = b.pair('B480-OLD');
   b.frame(old.body);
+  await b.clock.advance(250);
   b.frame(old.submit);
-  for (let i = 0; i < 2100; i++) { const p = b.pair(`B480-FILL-${i}`); b.frame(p.body); b.frame(p.submit); }  // > 4096 guard keys
+  for (let i = 0; i < 2100; i++) { const p = b.pair(`B480-FILL-${i}`); b.frame(p.body); await b.clock.advance(250); b.frame(p.submit); }  // > 4096 guard keys
   const repeat = b.terminalCr(old.injectId, { pairId: old.body.daemon_msg_id });
   b.frame(repeat);
   const fresh = b.pair('B480-FRESH');
   b.frame(fresh.body);
+  await b.clock.advance(250);
   b.frame(fresh.submit);
   await b.clock.advance(3000);
   assert.deepEqual({ crs: b.child.writes.filter(w => w === '\r').length, tail: b.child.writes.slice(-2), refused: b.refused() }, {

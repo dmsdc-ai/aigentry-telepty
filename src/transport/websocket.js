@@ -11,7 +11,8 @@ const { applySshState, acceptSshWriteReceipt } = require('../ssh-session');
 const bridgeStage = require('../mailbox/bridge-stage');
 const inputPolicies = require('../mailbox/input-policy');
 const readinessHandshake = require('./readiness-handshake');
-const { bindImmediateSubmitCapability } = require('../mailbox/delivery-runtime');   // Task 1215 hotfix 0.10.1
+// Task 1215 hotfix 0.10.1 (capability binding) and Task 1270 (the stranded-composer input boundary).
+const { bindImmediateSubmitCapability, strandedInputFailure } = require('../mailbox/delivery-runtime');
 const { WebSocketServer } = require('ws');
 const { createOriginGuard } = require('../protocol/http-auth');
 
@@ -33,6 +34,56 @@ function outputRingReplay(outputRing) {
   if (start >= 3 && all.startsWith('\x1b[H', start - 3)) start -= 3;
   start = Math.max(start, all.lastIndexOf('\x1bc'), all.lastIndexOf('\x1b[?1049h'));
   return start > 0 ? all.slice(start) : all;
+}
+
+// #843 B — the delivery adapters behind the ONE viewer-write gate.
+//
+// #826 put policy + audit on the wrapped viewer path and left the spawned one alone, because
+// the check was written INSIDE `if (type === 'wrapped')`. The `else` arm below it —
+// `activeSession.ptyProcess.write(data)` — is the same write with the same authority into a
+// session type that is real and viewer-reachable (daemon.js POST /api/sessions/spawn), and it
+// kept every property #826 removed: no `classifyPeerLaneInject`, no `ws-viewer` audit record,
+// no provenance. The comment one branch up still called the wrapped path "the one write path
+// with no accountability" while this one was.
+//
+// The shape is what prevents the recurrence: authorization is decided ONCE for every viewer
+// input frame, and only then does a session-type-specific adapter carry the bytes. A future
+// third session type gets an adapter, not another copy of the gate to forget.
+//
+// Returns null when there is nothing writable to deliver to — the pre-existing behaviour at
+// both doors (a wrapped viewer whose owner socket is closed was already dropped silently).
+// Checked BEFORE authorizing so the audit line's `forwarded` keeps meaning that the bytes were
+// actually handed over, rather than becoming a claim about a write that had no target.
+//
+// Task 1270 r1 (review blocker B1): this function captures NOTHING from `deps` — it reads the
+// session record and the module-level input gates only — so it lives at module scope and is
+// exported, exactly like `isOpenWebSocket` and `outputRingReplay`. That makes the gate below
+// drivable by a test against a real session record without constructing a transport, which is
+// what the earlier audit of input producers lacked: the hole was in this adapter and the suite
+// could not see it.
+function viewerInputDeliverer(session) {
+  if (protectedInputFailure(session)) return null;
+  // Task 1270 — the stranded-composer boundary, at the SAME single gate as the protected-input
+  // refusal so BOTH the wrapped and the spawned adapter are covered by one check (the shape #843 B
+  // introduced to stop a per-arm omission).
+  //
+  // Why a viewer matters here specifically: an earlier bound delivery can have left UNSUBMITTED
+  // text in this child's composer, and the most likely operator reaction to a session that has
+  // gone quiet is to attach and press Enter. That bare CR would submit somebody else's
+  // half-message — the exact corruption the strand exists to prevent — and `{type:'input'}` is a
+  // viewer frame that reaches the owner socket (wrapped) or the PTY (spawned) DIRECTLY, bypassing
+  // both writeDataToSession and submitViaPty. Returning null drops the frame the way a closed
+  // owner socket already does, so the audit line's `forwarded` keeps meaning bytes were handed
+  // over, and no new refusal frame shape is invented here.
+  if (strandedInputFailure(session)) return null;
+  if (session.sshRemote) return null; // SSH requires a current-child write receipt, never raw viewer bytes.
+  if (session.type === 'wrapped') {
+    const owner = session.ownerWs;
+    if (!isOpenWebSocket(owner)) return null;
+    return (data, complete) => owner.send(JSON.stringify({ type: 'inject', data }), complete);
+  }
+  if (session.ptyProcess && !ptyInputFailure(session)) return (data, complete) => { session.ptyProcess.write(data); complete(); };
+  return null;
 }
 
 function installWebSocketTransport(deps) {
@@ -164,36 +215,6 @@ function installWebSocketTransport(deps) {
     return results;
   }
 
-  // #843 B — the delivery adapters behind the ONE viewer-write gate.
-  //
-  // #826 put policy + audit on the wrapped viewer path and left the spawned one alone, because
-  // the check was written INSIDE `if (type === 'wrapped')`. The `else` arm below it —
-  // `activeSession.ptyProcess.write(data)` — is the same write with the same authority into a
-  // session type that is real and viewer-reachable (daemon.js POST /api/sessions/spawn), and it
-  // kept every property #826 removed: no `classifyPeerLaneInject`, no `ws-viewer` audit record,
-  // no provenance. The comment one branch up still called the wrapped path "the one write path
-  // with no accountability" while this one was.
-  //
-  // The shape is what prevents the recurrence: authorization is decided ONCE for every viewer
-  // input frame, and only then does a session-type-specific adapter carry the bytes. A future
-  // third session type gets an adapter, not another copy of the gate to forget.
-  //
-  // Returns null when there is nothing writable to deliver to — the pre-existing behaviour at
-  // both doors (a wrapped viewer whose owner socket is closed was already dropped silently).
-  // Checked BEFORE authorizing so the audit line's `forwarded` keeps meaning that the bytes were
-  // actually handed over, rather than becoming a claim about a write that had no target.
-  function viewerInputDeliverer(session) {
-    if (protectedInputFailure(session)) return null;
-    if (session.sshRemote) return null; // SSH requires a current-child write receipt, never raw viewer bytes.
-    if (session.type === 'wrapped') {
-      const owner = session.ownerWs;
-      if (!isOpenWebSocket(owner)) return null;
-      return (data, complete) => owner.send(JSON.stringify({ type: 'inject', data }), complete);
-    }
-    if (session.ptyProcess && !ptyInputFailure(session)) return (data, complete) => { session.ptyProcess.write(data); complete(); };
-    return null;
-  }
-
   // Geometry, deliberately NOT behind the inject gate — see the resize note in the message
   // handler below.
   function viewerResizeDeliverer(session) {
@@ -285,6 +306,20 @@ function installWebSocketTransport(deps) {
     }
 
     const activeSession = sessions[sessionId];
+    // Task 1270: this socket is bound to the record OBJECT it was admitted to, not to the URL name.
+    // A supported rename (PATCH /api/sessions/:id) files that same object under a new key and sets
+    // its id; follow it only while the object is filed there, and never resolve the old name again.
+    let boundRecord = activeSession;
+    let boundId = sessionId;
+    function liveRecord() {
+      if (typeof boundRecord.id === 'string' && boundRecord.id !== boundId) {
+        if (Object.getOwnPropertyDescriptor(sessions, boundRecord.id)?.value !== boundRecord) return null;
+        boundId = boundRecord.id;
+      }
+      const live = Object.hasOwn(sessions, boundId) ? sessions[boundId] : null;
+      if (live) boundRecord = live;   // #732 H5: a record replaced under this name stays the routing authority
+      return live;
+    }
     if (activeSession.isClosing) {
       activeSession.clients.delete(ws);
       clearInterval(pingInterval);
@@ -553,8 +588,9 @@ function installWebSocketTransport(deps) {
         // injects keep routing to the live record's ownerWs. That is a silent upstream death
         // with a working downstream, i.e. #732 again by a different route. Re-resolve the
         // live record on every frame so the snapshot can never become the routing authority.
-        const activeSession = sessions[sessionId];
+        const activeSession = liveRecord();   // Task 1270: follows a supported rename of the admitted record
         if (!activeSession || activeSession.isClosing) return;   // no owner reclaims or writes during teardown
+        const sessionId = boundId;   // Task 1270: the record's current name for every use below
 
         // An owner whose record was swapped re-adopts a FREE owner slot rather than silently
         // degrading into a viewer (the viewer branch drops 'output' entirely). Same
@@ -771,8 +807,9 @@ function installWebSocketTransport(deps) {
       // re-resolves it — cleaning only the connect-time snapshot would leave a replaced
       // record holding a closed ownerWs forever. The `ws === ownerWs` check below still
       // guarantees a stale socket can never tear down an owner it does not own.
-      const activeSession = sessions[sessionId];
+      const activeSession = liveRecord();   // Task 1270: same binding as the message handler
       if (!activeSession) return;
+      const sessionId = boundId;
       activeSession.clients.delete(ws);
 
       // #60 Stage A §3 item 3 — a DISPLACED owner closing is the assignee going away. It cannot
@@ -1003,5 +1040,6 @@ function installWebSocketTransport(deps) {
 module.exports = {
   installWebSocketTransport,
   isOpenWebSocket,
-  outputRingReplay
+  outputRingReplay,
+  viewerInputDeliverer   // Task 1270 r1: the ONE viewer-write gate, drivable without a transport
 };
