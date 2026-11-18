@@ -1,10 +1,11 @@
 'use strict';
 
-// Release metadata identity for 0.11.1 (task 1270, re-base of the task 1272/ci708 0.11.0 check, which was itself
-// a re-base of the task 1215 hotfix 0.10.1 check). The filename is kept so the re-base history stays one file.
+// Release metadata identity for 0.11.2 (task 1282, re-base of the task 1270 0.11.1 check, itself a re-base of the
+// task 1272/ci708 0.11.0 check and before that of the task 1215 hotfix 0.10.1 check). The filename is kept so the
+// re-base history stays one file.
 // The coder did not execute it.
-// RED on BASE (the 0.11.0 release tree): the version assertions below fail with '0.11.0' (files readable, not a setup failure).
-// GREEN with the delta: package.json, both package-lock.json fields and the scripts/check-package.mjs pin all say 0.11.1,
+// RED on BASE (the 0.11.1 release tree): the version assertions below fail with '0.11.1' (files readable, not a setup failure).
+// GREEN with the delta: package.json, both package-lock.json fields and the scripts/check-package.mjs pin all say 0.11.2,
 // and each file is byte-identical to BASE once its version lines are put back, so no dependency, resolution, integrity,
 // lockfileVersion or engines field moved. Pure file reads: no npm, no network, no product code.
 // CHANGELOG/README identity stays owned by test/release-version-invariant-844.test.js.
@@ -16,15 +17,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..');
-const RELEASE = '0.11.1';
-const BASE_VERSION = '0.11.0';
-// sha256 of the BASE files (the released 0.11.0 tree, LF bytes). No commit sha is recorded here because the
-// re-base inputs did not carry the v0.11.0 commit id; these three files are the ones the 0.11.1 branch does not
-// otherwise touch, so the pre-delta bytes ARE the 0.11.0 bytes.
+const RELEASE = '0.11.2';
+const BASE_VERSION = '0.11.1';
+// sha256 of the BASE files (LF bytes) as they stand in the released 0.11.1 tree this re-base read,
+// origin/main c9da8caf278fab88835cbdda936b8c1b1667de06; these three files are the ones the 0.11.2 branch does not
+// otherwise touch, so the pre-delta bytes ARE the 0.11.1 bytes.
 const BASE_SHA256 = {
-  'package.json': '66787c319f8d298c7d3fbde7f0bafa1e0f5729f78977dd2720101130414f4ba2',
-  'package-lock.json': 'd6d896b9e5556237f59fdda1941c0be7cf673e5dbd2f77693462d0dbf850f56e',
-  'scripts/check-package.mjs': 'd65efebe6e0347510f574f92f42bf6ed7e726c90fa76d9f29ac2816bc8da4b13',
+  'package.json': 'ae2b6615b89141cdb713e08b28a859296d796251bc27c77dd79ce2bce6505797',
+  'package-lock.json': '08ac97ee0a08a53fb1785c40408a0346268207e69b108c1b056c3620d17bc6f6',
+  'scripts/check-package.mjs': '0325d704ad600d1afd136d1a7dba06891cfd11285a36f33f497d82f70a11c06a',
 };
 // The only lines the release delta may change (0-based), each with its exact BASE and release text.
 const VERSION_LINES = {
@@ -47,7 +48,7 @@ function assertOneRelease(versions, expected) {
   assert.deepEqual(versions, { pkg: expected, lockRoot: expected, lockPackage: expected, checkPin: expected });
 }
 
-test('hotfix 1215: package.json, both package-lock.json fields and the check-package pin all name 0.11.1', () => {
+test('hotfix 1215: package.json, both package-lock.json fields and the check-package pin all name 0.11.2', () => {
   const versions = releaseVersions({ pkg: JSON.parse(read('package.json')), lock: JSON.parse(read('package-lock.json')),
     checkScript: read('scripts/check-package.mjs') });
   assertOneRelease(versions, RELEASE);
