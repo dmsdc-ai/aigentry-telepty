@@ -256,7 +256,7 @@ This event measures elapsed time since `lastActivityAt`, once per inactivity per
   `x-telepty-session-token`), or `null` when unverifiable (operator/human shell). `spoof_suspected`
   = `from && verified_sender_sid && from !== verified_sender_sid`. (telepty #43 P2.)
 
-**The bound transport's variant of this event (task 1270 candidate — acceptance pending).** The
+**The bound transport's variant of this event (task 1270, released in 0.11.1).** The
 `POST /api/sessions/:id/inject-bound-v1` door emits the same event type on its `accepted` stage only,
 and the field set is NOT identical to the one above. Measured against the emitter
 (`src/routes/session-actions.js` accepted arm) rather than intended — same convention as the block
@@ -286,7 +286,7 @@ above, which also leaves the common envelope keys `event_type`, `session_id` and
   `queued` arm above cannot arise. A bound delivery that cannot be handed to the owner is refused in
   the response instead, and emits nothing here.
 
-### `composer_strand_cleared` (task 1270 candidate — acceptance pending)
+### `composer_strand_cleared` (task 1270, released in 0.11.1)
 
 Emitted by `POST /api/sessions/:id/clear-strand-v1` on its `cleared` stage only — never on a refusal, and
 never by any other producer. One event per removed strand record. Measured against the emitter
@@ -381,8 +381,8 @@ sender is unverified, so an absent epoch never reads as "verified, epoch unknown
 in `src/audit/inject-log.js`, which is the authoritative shape of a line — as are `payload_sha256`,
 `payload_bytes` and `spoof_suspected`, none of which any caller passes.
 
-**The operator clear writes a line here too, and it is not a write into a PTY (task 1270 candidate —
-acceptance pending).** `POST /api/sessions/:id/clear-strand-v1` appends `kind: "operator-clear"`,
+**The operator clear writes a line here too, and it is not a write into a PTY (task 1270,
+released in 0.11.1).** `POST /api/sessions/:id/clear-strand-v1` appends `kind: "operator-clear"`,
 `source: "clear-strand-v1"` for **every** outcome from the target check onward — the clear itself as
 `delivery_result: "cleared"`, and each identity/state refusal as `delivery_result: "refused:<reason>"`. It is in
 this log, which otherwise records writes, because an operator reads it as THE record of who touched a session's

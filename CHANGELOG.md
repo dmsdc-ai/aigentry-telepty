@@ -2,6 +2,42 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.11.2
+
+A publication-only release. The package contents are functionally identical to 0.11.1 — nothing under
+`src/`, no `cli.js`, no `daemon.js` and no test other than the version-identity test changed, so there is
+no behaviour to re-learn and nothing to restart for. What changed is how the package reaches npm.
+
+- **Publication moved from a stored npm token to npm Trusted Publishing (OIDC).**
+  `.github/workflows/release.yml` no longer reads a publish credential anywhere: the `publish` job alone
+  declares `id-token: write`, and npm exchanges the GitHub OIDC token that permission enables for its own
+  short-lived publish credential.
+  - That job now runs Node 24, because trusted publishing requires npm >= 11.5.1, and a new step fails the
+    run — printing the npm version it measured — when the toolchain is below that floor. No other job's Node
+    moved, and the published archive is still the one the `pack` job builds on Node 20: the publish job packs
+    and builds nothing.
+  - `registry-url` is gone from that job's `setup-node`, so no `_authToken` npmrc is written; the publish step
+    declares no credential environment; and the publish command runs with `npm_config_userconfig` pointed at a
+    file it creates empty. With no credential reachable, a failed OIDC exchange fails the release instead of
+    quietly publishing with the old token.
+  - The `NPM_TOKEN must be present` gate in the `Gate` job is deleted — there is no credential left to test
+    for. Its purpose is kept in the publish job, twice: the npm >= 11.5.1 floor refuses the run before
+    `npm publish`, and the existing registry readback still fails any run in which npm does not end up serving
+    the bytes this tag packed.
+  - The workflow header now documents the npm-side registration this depends on (organization or user
+    `dmsdc-ai`, repository `aigentry-telepty`, workflow filename `release.yml`, no environment, `npm publish`
+    explicitly allowed), that the registration has to be created on the day of the release because it expires
+    unless a publish succeeds within 2 days, and the rollback.
+- **This release is the proof run.** Every version up to and including 0.11.1 was published with a stored
+  token, so whether trusted publishing works for this package is not established until 0.11.2 is on npm and
+  the registry serves these bytes. The repository secret `NPM_TOKEN` is deliberately kept until that is
+  verified; the workflow references no secret, so it cannot be what made the run pass. npm attaches
+  provenance by itself when the repository and the package are both public.
+- **Release metadata.** The packaged-consumer check (`scripts/check-package.mjs`) now pins `0.11.2`.
+  The version-identity test is re-based to 0.11.1 → 0.11.2; it still requires that only the version
+  lines differ from 0.11.1, so no dependency, resolution, integrity, lockfile-format or engines field
+  moved.
+
 ## 0.11.1
 
 A hotfix release on top of 0.11.0. It adds two strict local verbs and their routes, the delivery
