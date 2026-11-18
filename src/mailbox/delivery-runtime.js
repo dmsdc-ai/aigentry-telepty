@@ -6,6 +6,17 @@ const inputPolicies = require('./input-policy');
 const readinessHandshake = require('../transport/readiness-handshake');
 const { ptyInputFailure } = require('../pty-input-lifecycle');
 const { validInjectId } = require('../diagnostics/correlation');
+// #47 P4 — the capability-gated delivery provenance banner. Pure (node crypto only, no I/O, no daemon state),
+// required directly like every other first-party helper in this file: the bound delivery below lives in this
+// runtime, and the legacy path receives the same function through its own construction seam.
+const { applyProvenance } = require('../audit/provenance');
+
+// Task 1270 (user-directed): output silence after an input/submit is not evidence of a dead
+// pipe — a prompt whose Enter never landed is silent too, and refusing the recovery input
+// strands the session. UPSTREAM_STALLED classification, and the inject rejection derived from
+// it, stays suspended until the missing-Enter defect is conclusively fixed; re-enabling needs a
+// user-approved source patch. isUpstreamStalled() and upstream_* telemetry remain diagnostic.
+const UPSTREAM_STALL_CLASSIFICATION_SUSPENDED = true;
 
 // Task 1215 hotfix 0.10.1 — immediate-submit-v1. A 0.10.1 bridge declares it on its authenticated owner-WS handshake
 // header (x-telepty-bridge-capabilities, next to input-transport-ready-v1). It means the bridge writes an authorized
@@ -13,12 +24,39 @@ const { validInjectId } = require('../diagnostics/correlation');
 // websocket.js binds it at the single owner-generation mint, so every claim resets it. An old bridge never declares it,
 // and it is never inferred from a receipt or from timing.
 const IMMEDIATE_SUBMIT_CAPABILITY = 'immediate-submit-v1';
+// Task 1270 — busy-input-v1. Declared by the corrected candidate bridge in the SAME authenticated owner-WS
+// handshake header, next to immediate-submit-v1. It means the bridge accepts a body while the child is
+// mid-turn (a busy composer) and still admits at most one paired CR for it. It is bound to the owner
+// generation at claim/reclaim exactly as immediate-submit-v1 is, and it is NEVER inferred from a probe, a
+// receipt, a version string or timing: a capability seen by an earlier probe does not bind a later body to
+// this target or this owner.
+const BUSY_INPUT_CAPABILITY = 'busy-input-v1';
+// Task 1270: how long a bound request may wait for the existing per-session submit barrier before refusing
+// without writing anything. Same bound and same operator override as the barrier wait in session-delivery.js,
+// so tuning one tunes both; it is kept here because session-delivery requires THIS module (not the reverse).
+const BOUND_SUBMIT_BARRIER_WAIT_MS = (() => {
+  const configured = Number(process.env.TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS || 10000);
+  return Number.isFinite(configured) && configured > 0 ? configured : 10000;
+})();
+// Task 1270 r3 (RR-m8): how many times the bound barrier wait may observe a replaced, already-settled holder
+// before it refuses. Not a timeout and not configurable: it bounds CPU inside the wall-clock deadline above.
+// A legitimate chain of holders clears one per pass, so 64 is far beyond any real FIFO depth.
+const BOUND_SUBMIT_BARRIER_MAX_PASSES = 64;
 const SUBMIT_PAIR_MAX = 256;
+// The bridge's declared capability list for THIS claim. One parse, one bound, used by both bindings.
+function declaredBridgeCapabilities(headerValue) {
+  if (typeof headerValue !== 'string' || headerValue.length > 256) return [];
+  return headerValue.split(',').map(part => part.trim());
+}
+// Task 1270: ONE claim-time binder for both owner-generation-scoped input capabilities (Root disposition:
+// extend this call rather than add a second WS binder, so there is exactly one place a claim can bind them
+// and no way for the two to disagree about which generation declared what). websocket.js is unchanged, and
+// the RETURN VALUE stays immediate-submit-only so every existing caller keeps its meaning.
 function bindImmediateSubmitCapability(session, headerValue) {
-  const declared = typeof headerValue === 'string' && headerValue.length <= 256
-    && headerValue.split(',').map(part => part.trim()).includes(IMMEDIATE_SUBMIT_CAPABILITY);
-  session.immediateSubmitGeneration = declared && typeof session.interactionOwnerGeneration === 'string'
-    ? session.interactionOwnerGeneration : null;
+  const declared = declaredBridgeCapabilities(headerValue);
+  const generation = typeof session.interactionOwnerGeneration === 'string' ? session.interactionOwnerGeneration : null;
+  session.immediateSubmitGeneration = declared.includes(IMMEDIATE_SUBMIT_CAPABILITY) ? generation : null;
+  session.busyInputGeneration = declared.includes(BUSY_INPUT_CAPABILITY) ? generation : null;
   return session.immediateSubmitGeneration !== null;
 }
 // Honoured only for the CURRENT owner generation, and only together with that generation's negotiated
@@ -27,6 +65,14 @@ function immediateSubmitSupport(session) {
   if (!session || session.type !== 'wrapped' || session.sshRemote) return 'not_applicable';
   return typeof session.immediateSubmitGeneration === 'string'
     && session.immediateSubmitGeneration === session.interactionOwnerGeneration
+    && readinessHandshake.negotiated(session) ? 'supported' : 'unsupported_by_bridge';
+}
+// Task 1270: same conventions and the same fence as immediate-submit. A generation that did not re-declare
+// busy-input-v1 on ITS OWN claim does not inherit it from the generation before it, even at the same epoch.
+function busyInputSupport(session) {
+  if (!session || session.type !== 'wrapped' || session.sshRemote) return 'not_applicable';
+  return typeof session.busyInputGeneration === 'string'
+    && session.busyInputGeneration === session.interactionOwnerGeneration
     && readinessHandshake.negotiated(session) ? 'supported' : 'unsupported_by_bridge';
 }
 // The body daemon_msg_id this daemon handed to the current owner for an inject_id, so the immediate CR can name its
@@ -75,6 +121,129 @@ function awaitBodyCustody(session, injectId, timeoutMs) {
   const timeout = new Promise(resolve => { timer = setTimeout(resolve, timeoutMs, { timed_out: true }); });
   return Promise.race([settled, timeout]).finally(() => clearTimeout(timer));
 }
+// hotfix492 N4 companion (Task 1270): is ANY body of this session still in daemon custody right now? The bound
+// path refuses rather than appending a second body into a composer whose first body has not resolved — it has no
+// queue of its own and must not create one by writing twice.
+function bodyCustodyBusy(session) {
+  return !!session && session.bodyCustody instanceof Map && session.bodyCustody.size > 0;
+}
+
+// Task 1270 — STRANDED COMPOSER custody.
+//
+// A body that was handed to the owner (or may still be queued toward it) whose paired CR was then refused or
+// left unknown has put TEXT INTO THE CHILD'S COMPOSER THAT WAS NEVER SUBMITTED. Anything written afterwards
+// appends to that text: a later body concatenates into the same line, and a later bare CR submits somebody
+// else's half-message. Both are silent corruption, and the second is how a stranded REPORT becomes a sent one.
+//
+// So the exact identity is stranded, and from then on NO input path may touch that composer. The flag cannot
+// live in the bound endpoint: the appending write usually arrives on a different path (legacy /inject, the
+// mailbox drain, /submit, send-key --force, the #617 idle redeliver, a fanout). It is therefore checked at the
+// two SHARED boundaries every one of those funnels through — writeDataToSession (session-delivery) and
+// submitViaPty (here) — plus the one direct owner write that bypasses both (deliverApprovedInjection).
+//
+// This is the DAEMON half of the strand the bridge already enforces (Task 1270 R1, src/cli/security-actions.js:
+// `strandedChildren`, same `composer_stranded` reason). The bridge keys on the CHILD object, which the daemon
+// cannot observe; the daemon keys on what it owns. The daemon half is not redundant: without it the daemon keeps
+// accepting and queueing work for a composer whose every write the bridge will refuse.
+//
+// Keyed on the SESSION EPOCH, because the epoch is the identity of the instance whose composer holds the text:
+//   • an owner reclaim at the same epoch is the same child and the same composer → still stranded;
+//   • a destroy/recreate mints a new epoch → a brand-new composer that this strand must NOT block.
+// One record per session.
+//
+// Review finding M7 — the record travels WITH that epoch into sessions.json. The epoch is itself persisted and
+// restored (#815), so an in-memory-only strand meant a daemon restart brought the same instance back
+// UN-STRANDED: the daemon would resume admitting bodies and CRs for a composer that still holds unsubmitted
+// text (and, because the bridge half keys on the child object in a WeakSet that outlives the daemon, would
+// answer `accepted` for deliveries the bridge quarantines). It is a bounded, non-secret, four-field refusal
+// record — never a credential and never a proof — and restoring it can only ever REFUSE more, which is the
+// direction #860 F1's rule about `sessionEpochProved` protects: a fact read out of a file may not manufacture
+// authority, and this one manufactures none.
+//
+// There is deliberately NO automatic clear, force or recovery here. Clearing a composer means deciding what to
+// do with a human-visible half-typed line, and the controller disposition keeps operator-clear/recovery as a
+// separately OPEN full-goal requirement. This unit refuses honestly; it does not invent a repair.
+function strandComposer(session, { epoch = null, injectId = null, reason = 'cr_outcome_unknown' } = {}) {
+  if (!session) return null;
+  // Re-review finding RR-m5: this function may only ever ADD a strand. Called without an epoch — the parameter
+  // default, and this is an exported function — it used to OVERWRITE an active record with `{epoch: null}`,
+  // which `strandedComposer` then reads as "not stranded" because it compares against the live
+  // `session.sessionEpoch`. One un-keyed call would therefore have re-admitted every producer. Unreachable
+  // today (one production call site, which always passes the pinned epoch), so this is the guard that keeps it
+  // unreachable rather than a bug fix: without a usable epoch key, the existing verdict stands unchanged.
+  if (!epoch || typeof epoch !== 'string') return session.strandedComposer || null;
+  if (session.strandedComposer && session.strandedComposer.epoch === epoch) return session.strandedComposer;
+  session.strandedComposer = {
+    epoch,
+    inject_id: validInjectId(injectId) ? injectId : null,
+    reason: typeof reason === 'string' && reason ? reason : 'cr_outcome_unknown',
+    at: new Date().toISOString(),
+    // Task 1270 operator clear: WHO held the composer and WHICH child it was typed into, recorded at strand
+    // time because neither can be reconstructed afterwards — a reclaim mints a new generation and a restart
+    // replaces the child, and both are exactly the cases an operator clear has to tell apart. Non-secret, two
+    // bounded facts, read-only: `owner_generation` is the opaque token the daemon already holds, and `child`
+    // is the CURRENT generation's accepted process_started milestone or null (never invented).
+    //
+    // Review note CSR-n1: `owner_generation` has no production READER today — the clear compares the request
+    // against the LIVE `session.interactionOwnerGeneration` (§5 step 4.8) and `childEvidence` reads only
+    // `child`. It is recorded because it is the only place the generation that held the text is preserved: the
+    // audit line and a post-mortem need it, and it survives a restart with the rest of the record. Making
+    // step 4.8 also refuse when a non-null `strand.owner_generation` differs from the live generation would
+    // give it a reader, but that is a behaviour change and does not belong in a hotfix.
+    owner_generation: typeof session.interactionOwnerGeneration === 'string' && session.interactionOwnerGeneration
+      ? session.interactionOwnerGeneration : null,
+    child: readinessHandshake.observedChild(session),
+  };
+  return session.strandedComposer;
+}
+// The strand IF it still applies to this session's current instance; null once the epoch moved on.
+function strandedComposer(session) {
+  const strand = session && session.strandedComposer ? session.strandedComposer : null;
+  if (!strand) return null;
+  return strand.epoch === (session.sessionEpoch || null) ? strand : null;
+}
+// The shared refusal body for an input write into a stranded composer. Shaped like every other
+// writeDataToSession/getInjectFailure refusal (bytes_written 0 — nothing was attempted) so each existing caller
+// reports it through the path it already has for a pre-write refusal.
+function strandedInputFailure(session) {
+  const strand = strandedComposer(session);
+  if (!strand) return null;
+  return {
+    success: false, httpStatus: 409, code: 'COMPOSER_STRANDED', bytes_written: 0,
+    error: 'An earlier delivery left unsubmitted text in this session\'s composer; no further input is admitted for this session instance.',
+    reason: strand.reason, stranded_inject_id: strand.inject_id,
+  };
+}
+
+// Task 1270 — THE operator clear's one effect, and the exact mirror of `strandComposer`'s add-only guard.
+//
+// `strandComposer` may only ever ADD (re-review finding RR-m5: an un-keyed call used to overwrite an active
+// record with `{epoch: null}`, which reads as "not stranded"). This function may only ever REMOVE THE ONE
+// RECORD IT WAS GIVEN THE KEY FOR, for the same reason read backwards: a call that does not name the epoch and
+// the inject id of the live record must change nothing, because the only thing it could otherwise do is
+// re-admit every producer to a composer that still holds somebody's unsubmitted text.
+//
+// So all four of these must hold, or the return is null and the record stays exactly where it is:
+//   • `session.strandedComposer` exists at all;
+//   • `strandedComposer(session)` is non-null — the record applies to the LIVE epoch. An INERT record (the
+//     epoch moved on) is not removable: it belongs to an instance this call does not name, and a later restore
+//     of that epoch must still find it;
+//   • the epoch key matches that record's epoch;
+//   • the inject-id key matches that record's inject_id, strictly, `null === null` included.
+// A missing or non-string epoch is refused up front, so an argument-less call can never clear anything.
+//
+// Pure apart from the one `delete`: no clock, no I/O, no persistence call, no event, no frame. The route
+// performs the save, the audit line and the bus event around it; this is only the deletion.
+// → the removed record, or null when there was nothing this call was entitled to remove.
+function clearStrandedComposer(session, { epoch = null, injectId = null } = {}) {
+  if (!session || !epoch || typeof epoch !== 'string') return null;
+  const strand = strandedComposer(session);
+  if (!strand || strand.epoch !== epoch) return null;
+  if (strand.inject_id !== injectId) return null;
+  delete session.strandedComposer;
+  return strand;
+}
+
 // hotfix480 F1-F4 — THE immediate single-CR attempt (the /submit route and the queued drain). In order: wait behind a
 // body still in daemon custody; re-check owner instance, ADMITTING generation and capability; a named inject needs this
 // generation's pair (never an id-less CR for it); `beforeEffect` may still refuse; then ONE CR. A refusal writes nothing.
@@ -198,6 +367,18 @@ function createDeliveryRuntime(shared, {
     const s = shared.sessions[sid];
     if (!s) return Promise.resolve(shared.interaction.refusal('wrong_owner'));
     if (protectedInputFailure(s)) return Promise.resolve(shared.interaction.refusal('unsupported_capability'));
+    // Task 1270 r3 (re-review finding RR-M2) — the stranded-composer boundary, beside the protected-input
+    // refusal and in this path's OWN vocabulary: `unsupported_capability` is already in the frozen REFUSALS
+    // list (src/interaction.js:12-15), so no new code, schema or receipt stage appears, and the refusal is
+    // produced before the owner send exactly as the two refusals above it are.
+    //
+    // Why this path needs its own gate: an interaction request becomes `child.write(bytes)` in the bridge
+    // (cli.js writeInteraction), which is neither writeDataToSession nor submitViaPty, and `KEYS.enter` is
+    // `'\r'` — so `operation:'key', value:'enter'` is a bare Enter that would submit an earlier delivery's
+    // unsubmitted text, and `operation:'text'` would concatenate into it. The bridge half cannot cover it: its
+    // `strandedChildren` set is private to createAllowSecurityContext and is consulted only for `inject`
+    // frames. A stranded composer admits no interaction until its instance is replaced.
+    if (strandedComposer(s)) return Promise.resolve(shared.interaction.refusal('unsupported_capability'));
     if (s.type !== 'wrapped' || !shared.isOpenWebSocket(s.ownerWs)) {
       return Promise.resolve(shared.interaction.refusal('unsupported_capability'));
     }
@@ -840,6 +1021,7 @@ function createDeliveryRuntime(shared, {
       if (shared.isOpenWebSocket(session.ownerWs)) {
         // #732: an open owner socket is necessary, not sufficient. A session that has
         // returned nothing since we last wrote to it is unobservable, not healthy.
+        if (UPSTREAM_STALL_CLASSIFICATION_SUSPENDED) return 'CONNECTED';
         return isUpstreamStalled(session, nowMs, options) ? 'UPSTREAM_STALLED' : 'CONNECTED';
       }
       if (disconnectedMs !== null && disconnectedMs >= staleMs) {
@@ -1008,6 +1190,264 @@ function createDeliveryRuntime(shared, {
       strategy: 'bootstrap_direct',
       submit: op.noEnter ? 'skipped' : 'sent'
     };
+  }
+
+  // Task 1270 r1 (review finding M6) — THE admission state of a bound delivery, as ONE synchronous predicate.
+  //
+  // The route decided these gates and then made one await (the submit barrier, bounded by
+  // TELEPTY_SUBMIT_QUEUE_TIMEOUT_MS — up to 10 s by default). Identity was re-pinned across that window but
+  // SURFACE STATE was not, so a modal that appeared, a bootstrap drain that started, an input transport that
+  // went unwired or a session that turned stale during the wait still got the body and its Enter. The legacy
+  // path re-runs its own health check after its barrier wait; this one must not be weaker than the path it sits
+  // beside.
+  //
+  // Every call here is an already-synchronous, side-effect-free read (modalDeliveryDecision classifies the
+  // rendered screen; it neither parks nor holds), so re-evaluating it costs no await and cannot itself create an
+  // effect before a refusal. Returns a BOUNDED reason code, or null when the session is admissible right now.
+  //
+  // Re-review finding RR-m10: `protectedInputFailure` IS here now. It was excluded on the argument that it is
+  // the route's own 403 and that writeDataToSession re-checks it anyway — both true, and the write was never at
+  // risk — but the consequence was that an enrolment landing during the barrier wait surfaced as a late
+  // `body_refused` instead of the named `protected_input`. It is first in the order so the reason a caller sees
+  // is the same one the route would have given it, and the route still maps that single reason to 403.
+  function boundAdmissionRefusal(session) {
+    if (protectedInputFailure(session)) return 'protected_input';
+    if (strandedComposer(session)) return 'composer_stranded';
+    if (hasHeldInteraction(session)) return 'interaction_held';
+    const failure = getInjectFailure(session, { nowMs: Date.now() });
+    if (failure) return failure.code;
+    // The input-transport fence: a CR or body handed to an unwired bridge would be buffered, not written.
+    if (readinessHandshake.awaitingInputTransport(session)) return 'input_transport_not_ready';
+    if ((0, shared.isBootstrapGatedSession)(session) && !isBootstrapReady(session)) return 'bootstrap_not_ready';
+    // FIFO: anything already parked for this session is ahead of this request; the bound path does not park and
+    // must not overtake it.
+    if (hasBootstrapBacklog(session) || session.bootstrapDraining === true) return 'bootstrap_backlog';
+    // The bound path owns no queue. Rather than writing a second body into a composer whose first body has not
+    // resolved (one glued line out of two messages), it refuses.
+    if (bodyCustodyBusy(session)) return 'body_custody_pending';
+    // #737: never write into a surface whose Enter is wired to something other than "submit my message".
+    // Read synchronously — no modal park/hold wait on this immediate-only path.
+    const modal = modalDeliveryDecision(session, { force: false });
+    if (!modal || modal.action !== 'deliver') return modal && modal.reason ? modal.reason : 'surface_modal';
+    return null;
+  }
+
+  // Task 1270 — THE bound busy-input delivery. ONE request performs exactly one body handoff and then exactly
+  // one PAIRED CR to ONE pinned identity: no mailbox queue, no deferred timer, no output/idle gate, no
+  // prompt-symbol/REPL/settle wait, no legacy second /submit, no #617 redeliver, no retry and no fallback.
+  //
+  // It is a separate function from deliverInjectionToSession on purpose. The legacy path's value IS its queue
+  // and its deferred CR, and those two are exactly what may not re-order or outlive a bound pair. It writes
+  // through the SAME shared boundary (shared.writeDataToSession) as every other delivery — which is also where
+  // the stranded-composer check lives — exactly as executeBootstrapInject above does.
+  //
+  // `options`: { expectedEpoch, expectedOwnerGeneration, injectId }. Returns the delivery half of
+  // telepty.bound-inject-result/v1 (stage/reason/bodyStage/submitStage/bytesWritten); the route adds identity
+  // and schema. A refusal is never an exception, and no stage ever claims consumption.
+  async function deliverBoundInjection(sessionId, session, prompt, options = {}) {
+    const expectedEpoch = options.expectedEpoch;
+    const expectedOwnerGeneration = options.expectedOwnerGeneration;
+    const injectId = options.injectId || null;
+    // The exact owner socket this request is admitted against, captured once.
+    const ownerWs = session.ownerWs;
+    // THE PIN. Re-read from the LIVE store on every call — never cached and never passed as a snapshot:
+    //   • shared.sessions[sessionId] === session: destroy/recreate and rename leave the id pointing at a
+    //     different object (or nothing), so this is the ABA check that a preflight alone cannot give;
+    //   • epoch: catches an in-place re-key of the same object;
+    //   • generation AND socket: a reclaim mints a new generation and MAY hand the same socket object back, so
+    //     neither one alone identifies the owner this request was bound to;
+    //   • both capabilities: a reclaim REBINDS them, so a generation that did not re-declare busy-input-v1
+    //     never inherits this request's admission.
+    const bound = () => shared.sessions[sessionId] === session
+      && !session.isClosing
+      && (session.sessionEpoch || null) === expectedEpoch
+      && (session.interactionOwnerGeneration || null) === expectedOwnerGeneration
+      && session.ownerWs === ownerWs && shared.isOpenWebSocket(ownerWs)
+      && busyInputSupport(session) === 'supported' && immediateSubmitSupport(session) === 'supported';
+    // A refusal is PROVEN to have written nothing; bytes_written 0 is authoritative only here.
+    const refuse = reason => ({ stage: 'refused', reason, bodyStage: 'not_sent', submitStage: 'not_sent', bytesWritten: 0 });
+
+    if (!bound()) return refuse('binding_changed');
+    // Every surface/health/custody gate the route admitted on, re-read from the live record (finding M6).
+    const inadmissible = boundAdmissionRefusal(session);
+    if (inadmissible) return refuse(inadmissible);
+
+    // FIFO — the EXISTING per-session submit barrier, the same `session.pendingSubmit` the legacy deferred CR
+    // claims. Waiting on it keeps a bound pair behind an unfinished legacy submit; HOLDING it across this body
+    // AND this CR is what stops a concurrent bound request slipping its body between them, so every request
+    // keeps its own body→own CR order. The wait is bounded; a caller that times out has written nothing.
+    const queueDeadline = Date.now() + BOUND_SUBMIT_BARRIER_WAIT_MS;
+    // Re-review finding RR-m8: the wait cannot deadlock and always makes progress, but if another actor keeps
+    // replacing `session.pendingSubmit` with a DIFFERENT already-settled promise, each pass settles in a
+    // microtask and the loop re-enters without ever arming the timer — bounded in wall-clock by the deadline,
+    // unbounded in CPU inside it. A pass cap makes the CPU bound explicit; the answer is the same refusal the
+    // deadline gives, with the same provable zero.
+    let passes = 0;
+    while (session.pendingSubmit) {
+      const remaining = queueDeadline - Date.now();
+      if (remaining <= 0 || ++passes > BOUND_SUBMIT_BARRIER_MAX_PASSES) return refuse('submit_barrier_busy');
+      const held = session.pendingSubmit;
+      let timer;
+      // Review finding m7 — the two non-normal ways the barrier ahead can end are answered as REFUSALS with a
+      // provable zero, never as an outcome_unknown the caller then has to hold for ever: nothing of this request
+      // has been handed to anyone yet.
+      //   • `then(ok, fail)`: a holder whose promise REJECTS used to make the rejection leave this function and
+      //     surface as a 500 unknown.
+      //   • a settled-but-not-released barrier (the holder is gone, or never clears its own slot) is refused
+      //     rather than re-awaited, so this loop always makes progress instead of spinning on a dead promise.
+      const barrier = await Promise.race([
+        held.then(() => 'cleared', () => 'rejected'),
+        new Promise(resolve => { timer = setTimeout(resolve, remaining, 'timeout'); }),
+      ]);
+      clearTimeout(timer);
+      if (barrier === 'timeout') return refuse('submit_barrier_busy');
+      if (barrier === 'rejected') return refuse('submit_barrier_rejected');
+      if (session.pendingSubmit === held) return refuse('submit_barrier_busy');
+      if (!bound()) return refuse('binding_changed');            // re-checked after EVERY await
+      const changed = boundAdmissionRefusal(session);             // …and so is every surface/health gate
+      if (changed) return refuse(changed);
+    }
+    if (!bound()) return refuse('binding_changed');
+    const stillAdmissible = boundAdmissionRefusal(session);
+    if (stillAdmissible) return refuse(stillAdmissible);
+    let release = () => {};
+    // Claimed SYNCHRONOUSLY after the last check, so a third request queues behind this whole pair.
+    // Re-review finding RR-m9: the release clears the barrier ONLY while it is still this request's own
+    // promise. The unconditional version would have cleared a barrier installed by someone else in between —
+    // precisely the way a third party's body and its CR could be separated, which is what the barrier exists to
+    // prevent. `mine` is captured from the assignment, so the identity compared is this promise object.
+    const mine = session.pendingSubmit = new Promise(resolve => {
+      release = () => { if (session.pendingSubmit === mine) session.pendingSubmit = null; resolve(); };
+    });
+    // TWO markers, because "handed" and "attempted" are different facts and only one of them is knowable from
+    // inside a throw (re-review finding RR-M1):
+    //   • bodyHanded  — the write RETURNED success, so the frame is definitely on its way;
+    //   • bodyAttempted — the write was ENTERED. A throw from inside it (the socket transitioning to CLOSING
+    //     under `ownerWs.send`, or `armUpstreamProbe` which runs AFTER the send and before the return —
+    //     session-delivery.js:182-187) unwinds with bodyHanded still false, and the body may well be gone.
+    // The r1 repair only looked at bodyHanded, so exactly the two sources its own comment named were the two it
+    // did not cover. Stranding on the attempt cannot turn a provable zero into a strand: every pre-send refusal
+    // inside writeDataToSession RETURNS a result (session-delivery.js:53-66) rather than throwing, and every
+    // exit of this function before the marker below is a `return refuse(...)`, so the catch is reached only when
+    // the write genuinely threw — which is by definition not a provable zero.
+    // That argument covers the pre-send REFUSALS; the pre-send STATEMENTS are the remaining step (r5, finding
+    // D3). On the wrapped path this route admits, the statements evaluated before `ownerWs.send` are
+    // activeHandoff, protectedInputFailure, strandedInputFailure, sshInputFailure, the type checks,
+    // hasHeldInteraction, invalidateInteraction, isOpenWebSocket, the sshRemote read and injectFrame itself —
+    // read one by one: property reads, Map/Set lookups, three field assignments, and a JSON.stringify of a
+    // string plus a plain meta object whose builder drops malformed values rather than raising. None throws on
+    // any path in this tree, so the strand is unreachable from them. If one ever did, this marker would strand a
+    // session whose zero was provable: over-refusal of further input, never a write — the safe direction, and
+    // the reason the marker is worth having even though its claim rests on reading those statements.
+    let bodyHanded = false;
+    let bodyAttempted = false;
+    // The strand, plus its durability. `strandComposer` is idempotent for one epoch, so one bound request
+    // performs at most one of these saves, on a failure path only. Best-effort BY DESIGN: `persistSessions` is
+    // an optional construction seam here (a harness without it keeps the in-memory strand, which is what
+    // actually refuses the next write), and persistence must never throw into a delivery.
+    const strandIdentity = reason => {
+      const record = strandComposer(session, { epoch: expectedEpoch, injectId, reason });
+      if (typeof shared.persistSessions === 'function') {
+        try { (0, shared.persistSessions)(); } catch { /* the in-memory refusal stands regardless */ }
+      }
+      return record;
+    };
+    try {
+      const bodyMeta = { daemon_msg_id: `bound:${shared.crypto.randomUUID()}`, inject_id: injectId, part: 'body' };
+      // #47 P4 (review finding M2) — the capability-gated provenance banner, applied BEFORE the paste framing
+      // exactly as the legacy path applies it: a session that registered as provenance-capable was promised a
+      // nonce-gated banner naming the verified and the claimed sender on injected text, and a bound body is
+      // injected text. Default-OFF: with no capability or no minted nonce this returns the payload byte-for-byte,
+      // so nothing any existing session receives changes. `from`='daemon'/'inject' are routing sentinels rather
+      // than real claimed senders (the legacy rule, unchanged). The origin is always trusted-local: this door has
+      // no forwarded variant and no remote caller can reach it.
+      const claimedSender = (options.from && options.from !== 'daemon' && options.from !== 'inject') ? options.from : null;
+      const delivered = applyProvenance(prompt, {
+        capable: !!session.provenanceCapable,
+        nonce: session.provenanceNonce,
+        verified: options.verifiedSenderSid || null,
+        claimed: claimedSender,
+        origin: 'trusted-local',
+      }).payload;
+      // #716/#730: the paste envelope is what keeps the separately-written CR from being swallowed into the
+      // paste burst on a paste-capable CLI. Same framing the mailbox and bootstrap-direct bodies get.
+      const body = maybeBracketedPaste(delivered, session);
+
+      // Last gate before the effect, SYNCHRONOUS with it: for a wrapped owner writeDataToSession reaches
+      // ownerWs.send with no await in between, so no destroy/reclaim can land between this line and the frame.
+      if (!bound()) return refuse('binding_changed');
+      const admittedNow = boundAdmissionRefusal(session);
+      if (admittedNow) return refuse(admittedNow);
+      // LAST statement before the effect: everything above returns a refusal, nothing above throws.
+      bodyAttempted = true;
+      const textResult = await shared.writeDataToSession(sessionId, session, body, { frameMeta: bodyMeta });
+      if (!textResult.success) {
+        // Every wrapped refusal inside writeDataToSession (closing/handoff, stranded composer, protected input,
+        // held interaction, disconnected owner) is decided BEFORE the send, so zero is provable there. Anything
+        // that marks itself uncertain, or declines to state zero bytes, is reported unknown instead — the zero
+        // is never inferred from a timeout, a lost response or a queued frame.
+        // r6 (caller-side review finding CSR3-M1): an uncertain body is STRANDED, for the same reason the catch
+        // arm strands a body write that threw (`delivery_threw_during_body`, :1446). The two are the same fact
+        // reached two ways — the write may have put the text in that child's composer and declines to say — and
+        // leaving this one un-stranded meant NOBODY reported it: `strandedComposer(session)` stayed null, so
+        // `boundAdmissionRefusal` (:1215) kept admitting and the NEXT body would be appended to text that may
+        // still be sitting there and submitted as one message, and the operator's clear answered `not_stranded`
+        // because there was no record to clear. The reason string is the SAME code the result carries, so the
+        // record, the view, the audit line and the clear's `cleared_strand_reason` all name one fact; it is
+        // already in the bound allow-list (bound-inject.js:59), so it survives serialize/restore verbatim.
+        // Direction: this can only ever REFUSE more input, never write any (:158-161).
+        if (textResult.delivery_uncertain === true || textResult.bytes_written === null) {
+          strandIdentity('body_outcome_unknown');
+          return { stage: 'outcome_unknown', reason: 'body_outcome_unknown', bodyStage: 'unknown', submitStage: 'not_sent', bytesWritten: null };
+        }
+        // UNCHANGED, and deliberately not widened: the discriminator is still exactly those two fields of the
+        // write's own result. A refusal that states a byte count (every pre-send refusal inside
+        // writeDataToSession — closing/handoff, stranded composer, protected input, held interaction,
+        // disconnected owner — reports `bytes_written: 0`) is a PROVABLE zero and must not strand: nothing is in
+        // that composer, so a strand would deny input for an instance nothing ever wrote to.
+        return refuse('body_refused');
+      }
+      bodyHanded = true;
+      session.lastActivityAt = new Date().toISOString();
+
+      // THE BODY NOW EXISTS in that child's composer, unsubmitted. From here zero bytes is no longer sayable and
+      // a failure is never a refusal: it is outcome_unknown, and the exact identity is STRANDED so no later
+      // path — bound, legacy, mailbox drain, fanout, manual, force or the #617 redeliver — can append to that
+      // text or submit it. Deliberately no automatic clear/recovery: that remains an open full-goal item.
+      const strand = (reason, submitStage) => {
+        strandIdentity(reason);
+        return { stage: 'outcome_unknown', reason, bodyStage: 'sent_to_bridge', submitStage, bytesWritten: null };
+      };
+      if (!bound()) return strand('binding_changed_after_body', 'not_sent');
+      // A surface that changed between the body and its Enter (a modal appeared, the session went stale, a
+      // bootstrap drain started): the CR is withheld, because #737's rule is that Enter may not be sent to a
+      // surface wired to something else — and the body is already in the composer, so withholding it is a strand
+      // and never a refusal.
+      const admittedForSubmit = boundAdmissionRefusal(session);
+      if (admittedForSubmit) return strand('admission_changed_after_body', 'not_sent');
+      const submitResult = await shared.writeDataToSession(sessionId, session, '\r',
+        { frameMeta: { daemon_msg_id: `${bodyMeta.daemon_msg_id}:submit`, inject_id: injectId, part: 'submit', pair: bodyMeta.daemon_msg_id } });
+      if (!submitResult.success) {
+        return submitResult.delivery_uncertain === true || submitResult.bytes_written === null
+          ? strand('submit_outcome_unknown', 'unknown')
+          : strand('submit_refused_after_body', 'not_sent');
+      }
+      session.lastActivityAt = new Date().toISOString();
+      // Accepted = BOTH frames handed to the pinned owner. NOT a PTY write, native queueing, auto-submit or
+      // model consumption: bytes_written stays null and consumption stays unknown.
+      return { stage: 'accepted', reason: null, bodyStage: 'sent_to_bridge', submitStage: 'sent_to_bridge', bytesWritten: null };
+    } catch (err) {
+      // First-review M5 + re-review RR-M1 — a THROW is the same hazard as a refused CR, and the three explicit
+      // strand branches above cannot see it. Both markers are honoured, and they are DIFFERENT facts, so they
+      // get different reasons: after a returned success the body is definitely in that composer; after a bare
+      // attempt its fate is unknown, which is exactly the case that must not be read as "nothing happened".
+      // Either way the route still answers the honest 500 outcome_unknown and the exception is never swallowed.
+      if (bodyHanded) strandIdentity('delivery_threw_after_body');
+      else if (bodyAttempted) strandIdentity('delivery_threw_during_body');
+      throw err;
+    } finally {
+      release();
+    }
   }
 
   function parseSubmitRetryOptions(body = {}, injectedBody = null) {
@@ -1491,6 +1931,53 @@ function createDeliveryRuntime(shared, {
       bridge_queue: bridgeStage.bridgeQueueView(session),
       // Task 1215 hotfix 0.10.1: whether /submit takes the single-CR immediate path for the current owner generation.
       immediate_submit: immediateSubmitSupport(session),
+      // Task 1270: the DAEMON-AUTHORITATIVE binding identity a bound-inject caller must pin, read from the live
+      // record in the same snapshot as the capability itself. A caller that derives epoch/generation from
+      // anywhere else (an older view, its own cache, a probe) can bind a body to an owner that is already gone.
+      session_epoch: session.sessionEpoch || null,
+      owner_generation: session.interactionOwnerGeneration || null,
+      // busy-input-v1 for the CURRENT owner generation only (supported | unsupported_by_bridge | not_applicable).
+      busy_input: busyInputSupport(session),
+      // Task 1270 r1 (review finding M8a): WHY a session refuses every input, visible instead of inferred. A
+      // stranded composer holds unsubmitted text, so the daemon admits no further body or CR for that instance
+      // — without this, an operator sees a live, healthy, connected session that silently refuses everything.
+      // READ-ONLY. Deliberately NOT a control: there is no clear, force, timeout or recovery here or anywhere
+      // else in this unit — operator clear/recovery remains a separately OPEN requirement.
+      //
+      // Task 1270 r3 (re-review finding RR-m1, Root decision: the key STAYS, because an operator must be able
+      // to see why a session refuses — and it is recorded in API-MAP.md §3 as an explicit addition beyond the
+      // three view keys the frozen contract enumerates, not as licence for further view growth).
+      // Emitted CONDITIONALLY, which is this file's own convention for a fact that does not apply (see
+      // `lease_expires_at` for mailbox sessions): a session that is not stranded — every session, until one
+      // bound delivery loses its CR — serializes its transport block BYTE-IDENTICALLY to the pre-1270 shape, so
+      // no existing reader sees a new key at all, and `view.stranded_composer` is falsy-absent for them.
+      ...(() => {
+        const strand = strandedComposer(session);
+        return strand ? { stranded_composer: { stranded: true, inject_id: strand.inject_id, reason: strand.reason, at: strand.at } } : {};
+      })(),
+      // Task 1270 operator clear (CLEAR-INTERFACE §7.3; the view key the user granted with the architect's
+      // stated default, OPEN-QUESTIONS Q1). WHY it is here: an operator who cannot see that somebody already
+      // cleared this instance reads a clean view and concludes nothing ever happened — and the audit log,
+      // which is durable, is not what an operator or an orchestrator reads when a session misbehaves.
+      // CONDITIONAL, like the strand above: a session that was never cleared — every session, until an
+      // operator clears one — serializes its transport block byte-identically to the pre-change shape.
+      // MEMORY-ONLY: `lastStrandClear` is deliberately absent from the persistence whitelist
+      // (src/session-store/persistence.js) and must not survive a restart; `by` is the VERIFIED sender sid or
+      // null, never the claimed `from`, so no caller can write a name of its choosing into a session view.
+      // EPOCH-GUARDED, exactly like `stranded_composer` above (r2 erratum, review finding CSR-m3): a takeover
+      // reassigns `sessionEpoch` on the SAME session object (src/principal/takeover.js), so a clear performed
+      // against the previous instance must stop being reported the moment that instance is gone. The record
+      // carries the epoch it was written for; the view emits the five §7.3 fields and never the epoch itself.
+      ...(session.lastStrandClear && typeof session.lastStrandClear === 'object'
+        && session.lastStrandClear.epoch === (session.sessionEpoch || null)
+        ? { last_strand_clear: {
+          at: session.lastStrandClear.at || null,
+          basis: session.lastStrandClear.basis || null,
+          stranded_inject_id: session.lastStrandClear.stranded_inject_id ?? null,
+          child_evidence: session.lastStrandClear.child_evidence || null,
+          by: session.lastStrandClear.by ?? null,
+        } }
+        : {}),
       // Task 1215: effective recipient input policy (bound to the current owner generation).
       input_policy: inputPolicies.effectiveInputPolicy(session),
       input_policy_source: inputPolicies.userSupervised(session) ? session.inputPolicy.source : null,
@@ -1839,6 +2326,19 @@ function createDeliveryRuntime(shared, {
     if (protectedInputFailure(session)) return false;
     if (session.sshRemote) return false; // SSH submit is admitted by the receipt protocol only.
     if (hasHeldInteraction(session)) return false;
+    // Task 1270: SHARED CR boundary. Every bare-CR producer that writes the CR ITSELF reaches the owner through
+    // here — terminalLevelSubmit/gatedTerminalSubmit (the immediate and gated /submit paths, the bootstrap and
+    // modal drains, `send-key` force) and the #617 idle redeliver, plus session-inspection's direct call. A CR
+    // into a composer holding an earlier delivery's unsubmitted text would submit THAT text, so none of them
+    // may fire.
+    //
+    // Three producers do NOT pass through here and are gated at their own door, each with the same predicate:
+    // the viewer input frame (`viewerInputDeliverer`, src/transport/websocket.js — it writes to the owner socket
+    // or the PTY directly), `deliverApprovedInjection`'s two direct owner writes (src/mailbox/session-delivery.js)
+    // and the GUI submit arm (`submitViaOsascript`, src/routes/session-inspection.js — it presses Return in a
+    // window instead of writing bytes, so no byte boundary can cover it). See API-MAP.md §6 for the measured
+    // producer table, including the one producer that is NOT guarded yet and why.
+    if (strandedComposer(session)) return false;
     shared.interaction.invalidateInteraction(session, 'submit');
     if (session.type === 'wrapped') {
       if (session.ownerWs && session.ownerWs.readyState === 1) {
@@ -1943,6 +2443,8 @@ function createDeliveryRuntime(shared, {
     resolveBootstrapSubmit,
     bootstrapQueuedResponse,
     executeBootstrapInject,
+    deliverBoundInjection,          // Task 1270: the bound busy-input body+paired-CR delivery
+    boundAdmissionRefusal,          // Task 1270 r1: the ONE admission predicate the route and the delivery share
     parseSubmitRetryOptions,
     buildSubmitVerify,
     buildSubmitConfirmOptions,
@@ -1989,4 +2491,13 @@ module.exports = { createDeliveryRuntime,
   // Task 1215 hotfix 0.10.1: immediate-submit-v1 (pure; websocket.js, session-actions.js, session-delivery.js, cli.js).
   IMMEDIATE_SUBMIT_CAPABILITY, bindImmediateSubmitCapability, immediateSubmitSupport, rememberSubmitPair, immediateSubmitOutcome,
   // hotfix480: body custody (session-delivery) and the shared immediate attempt (session-actions, bootstrap drain).
-  holdBodyCustody, settleBodyCustody, immediateSubmitAttempt, immediateAttemptFields, bodyCustodyFull };
+  holdBodyCustody, settleBodyCustody, immediateSubmitAttempt, immediateAttemptFields, bodyCustodyFull,
+  // Task 1270: busy-input-v1 (pure; cli.js declares it, session-actions.js gates on it) and the shared
+  // stranded-composer boundary, checked at every producer that can reach the composer: session-delivery.js on
+  // every write and at the two direct owner writes, submitViaPty above for every bare CR, and
+  // src/transport/websocket.js `viewerInputDeliverer` for viewer input (r1 finding B1).
+  BUSY_INPUT_CAPABILITY, busyInputSupport, bodyCustodyBusy, strandComposer, strandedComposer, strandedInputFailure,
+  // Task 1270 operator clear: the keyed removal of ONE strand record. Exactly one production call site (the
+  // registerClearStrandV1Route handler in src/routes/session-actions.js) — never a timer, an event handler, a
+  // drain, a receipt path or a lifecycle hook.
+  clearStrandedComposer };

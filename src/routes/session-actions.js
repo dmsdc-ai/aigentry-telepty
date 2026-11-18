@@ -2,7 +2,16 @@ const { protectedInputFailure } = require('../external-approval');
 const { claimedReturnMetadata } = require('../claimed-return');
 const { validInjectId } = require('../diagnostics/correlation');
 // Task 1215 hotfix 0.10.1: immediate-submit-v1 support (current owner generation) and its honest response shape.
-const { immediateSubmitSupport, immediateSubmitOutcome, immediateSubmitAttempt, immediateAttemptFields } = require('../mailbox/delivery-runtime');
+// Task 1270: the busy-input-v1 binding view (one require, as elsewhere in this file). The stranded-composer and
+// body-custody gates are inside `shared.boundAdmissionRefusal`, the one predicate the delivery re-evaluates.
+const { immediateSubmitSupport, immediateSubmitOutcome, immediateSubmitAttempt, immediateAttemptFields,
+  busyInputSupport, strandedComposer, clearStrandedComposer } = require('../mailbox/delivery-runtime');
+// Task 1270: the two CLOSED bound schemas.
+const boundInject = require('../protocol/bound-inject');
+// Task 1270 operator clear: the CLOSED clear schemas and its PURE decisions (the expected host token never
+// enters this module — the route receives a `verifyHostToken(req)` seam instead).
+const clearStrand = require('../protocol/clear-strand');
+const { activeHandoff } = require('../principal/cooperative-handoff');
 const readinessHandshake = require('../transport/readiness-handshake');
 // #1215 pipe200 S24: the stable public text for an inject delivery that threw (details are in the daemon log only).
 const INJECT_DELIVERY_FAILED_TEXT = 'Delivery failed; see daemon log.';
@@ -1842,6 +1851,508 @@ function createSessionActions(shared, effects = {}) {
     });
   }
 
+  // Task 1270 — POST /api/sessions/:id/inject-bound-v1 (telepty.bound-inject/v1).
+  //
+  // ONE versioned route for the bound busy-input transport. Everything below the schema check is a REFUSAL
+  // BEFORE ANY EFFECT, in a fixed order, and every answer — refusal, acceptance or outcome_unknown — is the
+  // one closed telepty.bound-inject-result/v1 object, so a caller parses a single shape and never guesses.
+  //
+  // Authorization is NOT re-implemented here: the request reaches this handler only through the SAME
+  // createAuthMiddleware chain as /inject (origin guard → peer reachability → client-profile gate → strict
+  // principal / host token / JWT / session bearer). Two consequences are deliberate and must stay:
+  //   • the client-profile gate classifies paths exactly and default-DENIES anything it does not name, so a
+  //     profile-scoped caller is refused on this route — it is not widened to a new grant, and cross-profile
+  //     denial is unchanged (src/protocol/client-profiles.js is untouched);
+  //   • the mailbox session-bearer scope is an exact path match and does not reach here either.
+  // The target is the EXACT OWN record only — no alias, no `-N` sibling, no resolveSessionAlias fallback — so
+  // a bound body can never land in a session the caller did not name.
+  function registerInjectBoundV1Route(app, routePath = '/api/sessions/:id/inject-bound-v1') {
+    app.post(routePath, async (req, res) => {
+      const requestedId = req.params.id;
+      // #43 P1/P2 / #815 — the daemon-verified sender (from the presented bearer, never body.from), resolved
+      // ONCE here because two different seams need it: the audit line below and the delivery provenance banner.
+      const verifiedPrincipal = (0, shared.verifiedPrincipalFromReq)(req);
+      const verifiedSender = (0, shared.verifiedSenderFields)(verifiedPrincipal);
+      const claimedFrom = req.body && typeof req.body.from === 'string' ? req.body.from : null;
+      const promptText = req.body && typeof req.body.prompt === 'string' ? req.body.prompt : null;
+      // #47 P5 (review finding M1) — ONE audit line per terminal outcome of this door, in the EXISTING record
+      // shape with no new field: a bound delivery is a write into somebody's terminal with exactly the authority
+      // of POST /inject, and an operator reads the inject log as THE record of who typed into a session. The
+      // vocabulary is this door's own and deliberately avoids `success`, which in this log means bytes measured
+      // as written: `forwarded` is the honest word for frames handed to the owner bridge (the same word the
+      // ws-viewer door uses for the same kind of handoff).
+      const recordAudit = (deliveryResult, injectId) => (0, shared.auditAppend)({
+        ts: new Date().toISOString(), inject_id: injectId || null, kind: 'inject', source: 'inject-bound-v1',
+        claimed_from: claimedFrom, ...verifiedSender,
+        to: requestedId,   // the exact own id; this route resolves no alias, so there is never a to_alias
+        origin: 'trusted-local', origin_host: shared.MACHINE_ID,
+        payload: promptText, delivery_result: deliveryResult
+      });
+      // Every answer reports the DAEMON's current identity, never the values the request claimed. The record is
+      // resolved through the same exact-own-id helper the route's target resolution uses (#1215), so a prototype
+      // key such as `__proto__` can never present an inherited object as a session (review finding m4).
+      const answer = (status, fields) => {
+        const ownId = exactOwnSessionId(requestedId);
+        const session = ownId ? shared.sessions[ownId] : null;
+        return res.status(status).json(boundInject.boundResult({
+          sessionId: requestedId,
+          sessionEpoch: session ? (session.sessionEpoch || null) : null,
+          ownerGeneration: session ? (session.interactionOwnerGeneration || null) : null,
+          ...fields,
+        }));
+      };
+      // A refusal is always 4xx: nothing was written, and the caller may act on that with certainty. 5xx is
+      // reserved for outcome_unknown, where it may not.
+      //
+      // Task 1270 r3 (re-review finding RR-m2): a route refusal writes NO audit line, which is exactly what the
+      // legacy /inject route does — it audits the #533 block and the terminal delivery outcomes, and a legacy
+      // 404 or 400 leaves no record at all. The r1 version audited every refusal, so an authenticated caller
+      // could append unbounded full-prompt records to the inject log by POSTing to ids that do not exist. The
+      // audit calls now sit on the outcome classes legacy audits, and nowhere else.
+      const refuse = (status, reason) => answer(status, { stage: 'refused', reason });
+
+      const id = exactOwnSessionId(requestedId);
+      if (!id) return refuse(404, 'session_not_found');
+      const session = shared.sessions[id];
+      if (session.isClosing) return refuse(409, 'session_closing');
+
+      // 1. The CLOSED request schema, before anything looks at the session's state.
+      const invalid = boundInject.validateBoundRequest(req.body);
+      if (invalid) return refuse(400, invalid);
+
+      // 1b. #533 Phase 2 — the peer-lane inject guardrail, the SAME verdict with the SAME inputs the legacy
+      //     /inject route computes, before any of this session's transport state is inspected and before any
+      //     effect (review finding B2). A new write door with the authority of /inject may not have less
+      //     accountability than /inject: `from` is not merely schema-validated here, it is POLICY-CHECKED, so a
+      //     credential that is blocked from raw peer→peer work delegation on /inject is blocked here too.
+      //     Same keying (the CLAIMED sender), so this stays a policy guardrail and not an authentication
+      //     boundary, and the same fail-open-with-warning behaviour when no orchestrator sid is configured.
+      const peerVerdict = (0, shared.classifyPeerLaneInject)({
+        from: claimedFrom, to: requestedId, prompt: req.body.prompt, orchestratorSids: shared.ORCHESTRATOR_SIDS
+      });
+      if (peerVerdict.decision === 'block') {
+        // r3 (finding RR-m4): the SAME bus event type the legacy route emits for the same verdict, with the
+        // same extra field SET, so a subscriber reading `peer_inject_blocked` as THE enforcement record sees
+        // bound blocks too. One field's VALUE cannot match and that is deliberate (r5, finding D2):
+        // `inject_id` is null here because this door mints no transport identity before this gate — the
+        // legacy route mints its UUID above its own #533 check, this one only below. So bound blocks
+        // correlate by `(target_agent, from, reason)`, not by `inject_id`. Minting one early would
+        // contradict this route's own closed result, which gives a refusal no identity at all (see the
+        // `injectId` comment on the answer below) and would put an id in the audit log for a request that
+        // never had one. `broadcastSessionEvent` is an existing `shared` seam and is synchronous — it adds
+        // no await, and this arm has no effect to precede.
+        (0, shared.broadcastSessionEvent)('peer_inject_blocked', id, session, {
+          extra: {
+            target_agent: id,
+            from: claimedFrom,
+            reason: peerVerdict.reason,
+            attempted_kind: peerVerdict.kind,
+            envelope_present: peerVerdict.envelopePresent,
+            inject_id: null   // no transport identity is minted for a request that is blocked before delivery
+          }
+        });
+        console.warn(`[PEER-GUARD] blocked bound inject ${claimedFrom} → ${requestedId} (${peerVerdict.reason})`);
+        // One audit line with the legacy `blocked:<reason>` vocabulary — the #533 gate logic itself is unchanged.
+        recordAudit(`blocked:${peerVerdict.reason}`, null);
+        return answer(403, { stage: 'refused', reason: 'peer_inject_blocked' });
+      }
+      if (peerVerdict.lane === 'disabled') {
+        console.warn('[PEER-GUARD] orchestrator sid unconfigured (AIGENTRY_ORCHESTRATOR_SIDS empty) — peer guardrail disabled (fail-open)');
+      }
+
+      // 2. The binding the caller pinned must be the daemon's CURRENT one. An epoch or generation mismatch is a
+      //    refusal, never a "close enough" delivery: the whole point of the schema is that a body cannot land on
+      //    an owner the caller did not verify. Compared as opaque strings.
+      if (req.body.expected_epoch !== session.sessionEpoch) return refuse(409, 'epoch_mismatch');
+      if (req.body.expected_owner_generation !== session.interactionOwnerGeneration) return refuse(409, 'owner_generation_mismatch');
+
+      // 3. Transport shape and BOTH required capabilities, for the current owner generation only. An old bridge
+      //    (one that never declared busy-input-v1 on its own claim) is refused here, before any effect — its
+      //    silence about the capability is not permission to write into a busy composer.
+      if (session.type !== 'wrapped' || session.sshRemote) return refuse(409, 'transport_not_applicable');
+      if (busyInputSupport(session) !== 'supported') return refuse(409, 'busy_input_unsupported');
+      if (immediateSubmitSupport(session) !== 'supported') return refuse(409, 'immediate_submit_unsupported');
+      if (!(0, shared.isOpenWebSocket)(session.ownerWs)) return refuse(409, 'owner_disconnected');
+
+      // 4. Every existing input fence that applies to a wrapped delivery, unchanged and none of them removed.
+      //
+      //    Review finding M6: these gates are evaluated HERE for the caller's refusal, and the SAME predicate
+      //    (`boundAdmissionRefusal`, one synchronous function in the delivery runtime) is re-evaluated inside the
+      //    delivery after every await and immediately before each write. One function, so the two sites cannot
+      //    drift: the state the route admitted on is the state the body is written on, not a 10-second-old
+      //    snapshot. The ORDER is the pre-existing one — stranded composer, held interaction, session health,
+      //    input transport, bootstrap readiness, bootstrap backlog, body custody, surface modal.
+      const denied = protectedInputFailure(session);
+      if (denied) return refuse(403, 'protected_input');
+      const inadmissible = (0, shared.boundAdmissionRefusal)(session);
+      if (inadmissible) return refuse(409, inadmissible);
+
+      // 5. The single bound delivery. The inject_id names THIS pair (body frame and its CR) for the bridge and
+      //    for the caller's own durable record; it is not a tracked-ledger observation, and this route creates
+      //    no pendingReports entry — the closed result has no tracking field and the controller disposition
+      //    keeps the caller's registry fact mapping outside this unit.
+      const inject_id = shared.crypto.randomUUID();
+      let outcome;
+      try {
+        outcome = await (0, shared.deliverBoundInjection)(id, session, req.body.prompt, {
+          expectedEpoch: req.body.expected_epoch,
+          expectedOwnerGeneration: req.body.expected_owner_generation,
+          injectId: inject_id,
+          // #47 P4 (review finding M2) — the claimed and the daemon-verified sender, so the capability-gated
+          // provenance banner a provenance-capable session was promised is applied to a bound body too. For a
+          // non-capable session (the default) the transform is a documented no-op and the bytes are unchanged.
+          from: claimedFrom,
+          verifiedSenderSid: verifiedPrincipal ? verifiedPrincipal.sid : null,
+        });
+      } catch (err) {
+        // The delivery threw after it may already have handed the body: that is unknown, never a refusal and
+        // never a retry. The raw exception stays a LOCAL operator diagnostic (#1215 pipe200 S24). The delivery
+        // itself strands the exact identity on its way out when the body was already handed, so the composer is
+        // protected before this answer is written (review finding M5).
+        console.error('[INJECT-BOUND-V1] delivery threw for %s inject_id=%s:', id, inject_id, err && err.stack ? err.stack : err);
+        recordAudit('outcome_unknown:delivery_threw', inject_id);
+        return answer(500, { stage: 'outcome_unknown', reason: 'delivery_threw', injectId: inject_id,
+          bodyStage: 'unknown', submitStage: 'unknown', bytesWritten: null });
+      }
+      // r3 (finding RR-m10): the one reason the shared predicate can return AFTER an await that the route would
+      // itself have answered 403 keeps that status, so a mid-flight protected-input enrolment reads the same to
+      // a caller whether it was caught before or during the delivery. Every other refusal stays 409.
+      const status = outcome.stage === 'accepted' ? 200
+        : outcome.stage === 'refused' ? (outcome.reason === 'protected_input' ? 403 : 409)
+          : 500;
+      console.log(`[INJECT-BOUND-V1] ${id} ${outcome.stage}${outcome.reason ? ` (${outcome.reason})` : ''} inject_id=${inject_id}`);
+      // The terminal audit line for the delivery itself — the outcome classes the legacy route audits
+      // (RR-m2). `forwarded` ONLY for accepted (both frames handed to the pinned owner); a delivery-returned
+      // refusal and an unknown each say so, with the bounded reason the caller also gets.
+      recordAudit(outcome.stage === 'accepted' ? 'forwarded'
+        : `${outcome.stage === 'refused' ? 'refused' : 'outcome_unknown'}:${boundInject.boundedReason(outcome.reason)}`,
+      outcome.stage === 'refused' ? null : inject_id);
+      if (outcome.stage === 'accepted') {
+        // r3 (finding RR-m3): the legacy route sets `session.lastInjectFrom = from` on its delivered arm, and
+        // `transport.last_inject_from` is read from it — so without this the view named an older legacy sender
+        // while the most recent write to that composer was a bound one. A plain field assignment on the record
+        // this request is pinned to; no seam, no await, and it runs AFTER both frames are already handed.
+        if (claimedFrom) session.lastInjectFrom = claimedFrom;
+        // …and the same bus event the legacy route emits for a written delivery, with the same non-secret
+        // metadata (never the prompt itself — #815). `broadcastSessionEvent` is an existing `shared` seam and is
+        // synchronous, so this adds no await anywhere, let alone before an effect. `inject_queued` has no bound
+        // counterpart on purpose: this transport never parks, so `accepted` is only ever "handed to the owner".
+        (0, shared.broadcastSessionEvent)('inject_written', id, session, {
+          extra: {
+            inject_id,
+            target_agent: id,
+            content_sha256: shared.crypto.createHash('sha256').update(req.body.prompt).digest('hex'),
+            content_length: Buffer.byteLength(req.body.prompt),
+            from: claimedFrom,
+            ...verifiedSender,
+            spoof_suspected: !!(claimedFrom && verifiedPrincipal && claimedFrom !== verifiedPrincipal.sid),
+            origin: 'trusted-local',
+            transport: 'inject-bound-v1',
+            body_stage: outcome.bodyStage,
+            submit_stage: outcome.submitStage
+          }
+        });
+      }
+      return answer(status, {
+        stage: outcome.stage,
+        reason: outcome.reason,
+        // A refused request has no transport identity to correlate; an accepted or unknown one does, and the
+        // caller needs it precisely because the unknown case must be held rather than replayed.
+        injectId: outcome.stage === 'refused' ? null : inject_id,
+        bodyStage: outcome.bodyStage,
+        submitStage: outcome.submitStage,
+        bytesWritten: outcome.bytesWritten,
+      });
+    });
+  }
+
+  // Task 1270 operator clear — the daemon's own observation about the child the stranded text was typed into.
+  // 'replaced' needs BOTH records (the strand's `child`, written at strand time, and the current generation's
+  // accepted milestone) and a difference in `child_seq` or `pid`; 'same_child' needs both and no difference;
+  // 'unobservable' is the honest answer whenever either side is missing — a legacy bridge announces no
+  // milestone at all, and a strand written before this field existed carries none. The comparison is only
+  // valid inside ONE epoch, which step 4.6 has already pinned.
+  function childEvidence(session, strand) {
+    const recorded = strand && strand.child && typeof strand.child === 'object' ? strand.child : null;
+    const observed = readinessHandshake.observedChild(session);
+    if (!recorded || !observed) return 'unobservable';
+    if (!Number.isSafeInteger(recorded.child_seq) || !Number.isSafeInteger(observed.child_seq)) return 'unobservable';
+    if (recorded.child_seq !== observed.child_seq || recorded.pid !== observed.pid) return 'replaced';
+    return 'same_child';
+  }
+
+  // The two counts the clear REPORTS and never acts on. Read defensively: a session object whose accessor
+  // throws must not be able to turn an honest answer into a 5xx (there is no 5xx on this route), and these are
+  // read on the error path too.
+  function clearQueueDepth(session) {
+    try { return Array.isArray(session.bootstrapQueue) ? session.bootstrapQueue.length : 0; } catch { return 0; }
+  }
+  function clearCustodyDepth(session) {
+    try { return session.bodyCustody instanceof Map ? session.bodyCustody.size : 0; } catch { return 0; }
+  }
+
+  // Task 1270 — POST /api/sessions/:id/clear-strand-v1 (telepty.clear-strand/v1).
+  //
+  // THE operator clear for a stranded composer, and the ONLY way out of the strand short of re-registering the
+  // session. A bound delivery that handed a body and then could not hand its CR leaves unsubmitted text in a
+  // real composer and STRANDS that instance: every later body and key from every producer is refused, by
+  // design, because appending to or submitting that half-written line is worse than refusing. Until this route
+  // existed the only exit was to destroy the session — so the hotfix could not ship.
+  //
+  // What it does: deletes ONE strand record for ONE exactly-named session instance, after a four-part identity
+  // pin (epoch + owner generation + the stranded inject id + an operator basis). What it NEVER does: write a
+  // byte, send a key, touch a queue, settle custody, release a barrier, close a socket, arm a timer or hand a
+  // bridge frame. There is no force flag and no automatic variant. `basis` is an operator CLAIM — the daemon
+  // cannot observe composer contents (CLEAR-DESIGN §2.1) — so it is recorded, and only the checkable basis
+  // (`child_replaced_observed`) is verified against the daemon's own milestone.
+  //
+  // Authority is the /api/daemon/stop guard, not this file's own invention: a loopback SOCKET peer (forwarded
+  // headers are never consulted), NO Origin header, an exact `application/json` media type, a 1..1100-byte raw
+  // body, and the local administrative token in the `x-telepty-token` HEADER under a timing-safe compare. A query
+  // token, a JWT, a session bearer and a client-profile carrier satisfy NONE of it. The expected secret never
+  // enters this module: step 1.5 is the injected `verifyHostToken(req)`, which daemon.js closes over
+  // EXPECTED_TOKEN. A request that ALSO carries a session bearer is not refused — `fetchWithAuth` attaches one
+  // automatically inside any registered session, and any session can read the host token from HOME anyway, so
+  // refusing buys nothing against an adversary while blocking a legitimate operator; the verified sender is
+  // RECORDED instead (CLEAR-DESIGN §1.2, OPEN-QUESTIONS Q4).
+  //
+  // Every refusal precedes every effect, in the frozen order of CLEAR-INTERFACE §5, and every answer — refusal,
+  // clear, or caught exception — is the one closed telepty.clear-strand-result/v1 object. The handler is
+  // deliberately NOT async: between reading the strand and deleting it there is no await, no .then, no timer
+  // and no microtask, so no reclaim, destroy, delivery or second clear can interleave with the decision.
+  function registerClearStrandV1Route(app, { verifyHostToken, routePath = '/api/sessions/:id/clear-strand-v1' } = {}) {
+    // A route that cannot authenticate MUST NOT exist. Construction-time, not request-time: a daemon wired
+    // without the token check must fail to start rather than serve an unauthenticated clear.
+    if (typeof verifyHostToken !== 'function') {
+      throw new TypeError('registerClearStrandV1Route requires a verifyHostToken(req) function');
+    }
+    // Registered exactly ONCE, at exactly one path: no forwarded twin, no alias form, no query-parameter
+    // variant (contrast registerInjectRoute, which is deliberately registered twice).
+    app.post(routePath, function (req, res) {
+      const requestedId = req.params ? req.params.id : null;
+      let answered = false;
+      const send = (status, result) => {
+        answered = true;
+        return res.status(status).json(result);
+      };
+      // Steps 1-3 answer with NO identity at all: before the credential check passed, and before the target is
+      // known to exist, this daemon says nothing about any session — not its epoch, not its owner generation,
+      // not whether it is stranded. An unauthenticated caller learns only that it was refused.
+      const blind = (status, reason) => send(status, clearStrand.clearResult({
+        stage: 'refused', reason, sessionId: requestedId,
+      }));
+      try {
+        // ── Step 1 — transport authority ────────────────────────────────────────────────────────────────────
+        // 1.1 loopback peer · 1.2 no Origin · 1.3 exact application/json · 1.4 a 1..1100-byte raw body: one
+        // decision that never sees the token, then 1.5, the injected comparison, which is the ONLY credential
+        // this door accepts. Strict `!== true` so a seam that returns something truthy-but-not-true fails closed.
+        const transport = clearStrand.authorizeClearStrandTransport(req);
+        if (transport) return blind(transport.status, transport.reason);
+        if (verifyHostToken(req) !== true) return blind(401, 'clear_auth_required');
+
+        // ── Step 2 — the closed request shape, before anything looks at a session ────────────────────────────
+        const invalid = clearStrand.validateClearRequest(req.body);
+        if (invalid) return blind(400, invalid);
+        const body = req.body;
+
+        // ── Step 3 — the target's own shape ─────────────────────────────────────────────────────────────────
+        if (!clearStrand.boundedToken(requestedId)) return blind(400, 'clear_target_invalid');
+
+        // ── Step 4 — target identity and state, in the frozen order ─────────────────────────────────────────
+        // 4.1 The EXACT OWN record and nothing else: no alias, no `-N` sibling, no resolveSessionAlias
+        // fallback, no prototype adoption (`__proto__`, `constructor` and `toString` are 404s here).
+        const id = exactOwnSessionId(requestedId);
+        if (!id) return blind(404, 'session_not_found');
+        const session = shared.sessions[id];
+
+        // From 4.1 onward every answer names the DAEMON's own current identity — never the values the request
+        // claimed — echoes the validated basis, and reports the two queues it did not touch.
+        const answer = (status, fields) => send(status, clearStrand.clearResult({
+          sessionId: requestedId,
+          sessionEpoch: session.sessionEpoch || null,
+          ownerGeneration: typeof session.interactionOwnerGeneration === 'string' && session.interactionOwnerGeneration
+            ? session.interactionOwnerGeneration : null,
+          basis: body.basis,
+          pendingBootstrapOps: clearQueueDepth(session),
+          bodyCustody: clearCustodyDepth(session),
+          ...fields,
+        }));
+        // The DAEMON-verified sender (from the presented bearer, never body.from), resolved once: the audit
+        // line, the bus event and the view's `by` all name it, and the claimed `from` is recorded beside it.
+        const verifiedPrincipal = (0, shared.verifiedPrincipalFromReq)(req);
+        const verifiedSender = (0, shared.verifiedSenderFields)(verifiedPrincipal);
+        const claimedFrom = typeof body.from === 'string' ? body.from : null;
+        // ONE audit line per outcome from 4.1 onward (CLEAR-INTERFACE §7.1). `payload` is the empty string
+        // because there IS no payload on this door; every value below is a bounded code, an opaque identity
+        // token, an ISO timestamp or a boolean. No screen, prompt or composer text exists here to leak.
+        const recordAudit = (deliveryResult, strand, evidence, persisted) => (0, shared.auditAppend)({
+          ts: new Date().toISOString(),
+          inject_id: strand && strand.inject_id ? strand.inject_id : null,
+          kind: 'operator-clear', source: 'clear-strand-v1',
+          claimed_from: claimedFrom, ...verifiedSender,
+          to: id,   // the exact own id; this route resolves no alias, so there is never a to_alias
+          origin: 'trusted-local', origin_host: shared.MACHINE_ID,
+          payload: '',
+          delivery_result: deliveryResult,
+          clear: {
+            session_epoch: session.sessionEpoch || null,
+            owner_generation: typeof session.interactionOwnerGeneration === 'string' ? session.interactionOwnerGeneration : null,
+            basis: body.basis,
+            strand_reason: strand ? strand.reason : null,
+            strand_at: strand ? strand.at : null,
+            child_evidence: evidence,
+            persisted: persisted === true,
+          },
+        });
+        const refuse = (status, reason, strand = null, evidence = 'unobservable') => {
+          recordAudit(`refused:${reason}`, strand, evidence, false);
+          console.warn('[CLEAR-STRAND-V1] %s refused (%s) stranded_inject_id=%s', id, reason,
+            body.stranded_inject_id === null ? 'null' : body.stranded_inject_id);
+          return answer(status, { stage: 'refused', reason, childEvidence: evidence });
+        };
+
+        if (session.isClosing) return refuse(409, 'session_closing');
+        // A cooperative handoff is mid-flight: its own retained text may still be written, so the composer's
+        // state is not this operator's to assert about yet.
+        if (activeHandoff(session)) return refuse(409, 'handoff_active');
+        // Only a local wrapped session has an owner bridge whose composer can hold text. A mailbox, a spawned
+        // and an SSH record have no strand this door could be clearing.
+        if (!(session.type === 'wrapped' && !session.sshRemote)) return refuse(409, 'transport_not_applicable');
+        // 4.5 A LIVE strand, i.e. one that applies to this session's current instance. A record left behind by
+        // a superseded epoch is already inert and is NOT removed here: it belongs to an instance this request
+        // does not name, and a later restore of that epoch must still find it.
+        const strand = strandedComposer(session);
+        if (!strand) return refuse(409, 'not_stranded');
+        // Computed once, before any answer that needs it. There is no await between here and the deletion, so
+        // this value cannot go stale: it is the same observation step 5.1 would make.
+        const evidence = childEvidence(session, strand);
+        if (body.expected_epoch !== session.sessionEpoch) return refuse(409, 'epoch_mismatch', strand, evidence);
+        if (!(typeof session.interactionOwnerGeneration === 'string' && session.interactionOwnerGeneration)) {
+          return refuse(409, 'owner_generation_unavailable', strand, evidence);
+        }
+        if (body.expected_owner_generation !== session.interactionOwnerGeneration) {
+          return refuse(409, 'owner_generation_mismatch', strand, evidence);
+        }
+        // The owner that holds the composer must still be here: with no live owner there is no composer this
+        // clear could be about, and the next claim will mint a new generation anyway.
+        if (!(0, shared.isOpenWebSocket)(session.ownerWs)) return refuse(409, 'owner_disconnected', strand, evidence);
+        // 4.10 Strict `===`, `null === null` included: no case folding, no regex-derived equivalence, no
+        // prefix match. An operator who quotes a DIFFERENT delivery's id has not read this session's view.
+        if (body.stranded_inject_id !== strand.inject_id) {
+          return refuse(409, 'stranded_inject_id_mismatch', strand, evidence);
+        }
+        // 4.11 The one checkable basis is CHECKED. A refused milestone frame had no effect, so it cannot
+        // corroborate anything, and a legacy bridge that announces nothing cannot either.
+        if (body.basis === 'child_replaced_observed' && evidence !== 'replaced') {
+          return refuse(409, 'basis_contradicted', strand, evidence);
+        }
+
+        // ── Step 5 — the effect: ONE synchronous in-memory deletion, then the records ────────────────────────
+        // The keyed removal: it can only remove THIS record, for THIS epoch and THIS inject id. A null return
+        // is unreachable here (nothing above awaited), and it answers `not_stranded` rather than claiming a
+        // clear the daemon did not perform.
+        const removed = clearStrandedComposer(session, { epoch: strand.epoch, injectId: strand.inject_id });
+        if (!removed) return refuse(409, 'not_stranded', strand, evidence);
+        // Memory-only, and deliberately NOT in the persistence whitelist: it tells the NEXT operator that this
+        // instance was already cleared once. `by` is the VERIFIED sender or null — never the claimed `from`.
+        //
+        // r2 erratum (review finding CSR-m3): the record carries the EPOCH it was written for, and the view
+        // emits it only while that epoch is still the live one. `src/principal/takeover.js` reassigns
+        // `sessionEpoch` on the SAME session object, so without the epoch the next instance's view would
+        // report a clear performed against an instance that no longer exists, with nothing in the field to
+        // reveal the staleness. The emitted key set stays the five fields of §7.3 — `epoch` is a key of the
+        // RECORD, not of the view — and the durable record (the audit line's `clear_session_epoch`) was
+        // already correct.
+        session.lastStrandClear = {
+          at: new Date().toISOString(),
+          epoch: session.sessionEpoch || null,
+          basis: body.basis,
+          stranded_inject_id: removed.inject_id,
+          child_evidence: evidence,
+          by: verifiedPrincipal ? verifiedPrincipal.sid : null,
+        };
+        // The one fallible step. Reported, never swallowed and never rolled back: a clear that happened in
+        // memory but could not be saved is told the truth, because re-adding the strand would deny input to a
+        // composer the operator has just emptied.
+        let persisted = false;
+        let persistReason = 'session_store_write_failed';
+        if (typeof shared.persistSessions === 'function') {
+          try {
+            const saved = (0, shared.persistSessions)();
+            persisted = !!(saved && (saved.ok || saved.committed));
+            persistReason = persisted ? null : 'session_store_write_failed';
+          } catch (error) {
+            persisted = false;
+            persistReason = 'session_store_write_threw';
+            console.warn('[CLEAR-STRAND-V1] %s cleared in memory but the session store write threw:', id,
+              error && error.message ? error.message : error);
+          }
+        } else {
+          // No store seam in this composition at all: nothing was attempted, and nothing is claimed.
+          persistReason = 'not_attempted';
+        }
+        // Review note CSR-n7: this call is deliberately NOT individually wrapped. §6's justification for
+        // answering a caught exception 409 `refused` requires that every step after the delete either cannot
+        // throw or has already answered, and this one cannot: `shared.auditAppend` is the delivery-runtime
+        // wrapper whose whole body is `try { auditWriter.append(record) } catch {}` ("audit must never throw
+        // into a handler"). If this is ever pointed at a raw writer, wrap it here.
+        recordAudit('cleared', removed, evidence, persisted);
+        // The bus event the operator's own tooling reads. `extra` carries NO key named `transport`, so the
+        // envelope's transport block is not shadowed (the defect recorded for the bound `inject_written`
+        // event), and the type is deliberately absent from APPROVED_TYPES, so the scoped read-only
+        // session-event transport does not carry it. Wrapped: a throwing subscriber must not be able to turn an
+        // honest 200 into a refusal for a clear that already happened.
+        try {
+          (0, shared.broadcastSessionEvent)('composer_strand_cleared', id, session, {
+            extra: {
+              target_agent: id,
+              stranded_inject_id: removed.inject_id,
+              strand_reason: removed.reason,
+              strand_at: removed.at,
+              basis: body.basis,
+              child_evidence: evidence,
+              persisted,
+              from: claimedFrom,
+              verified_sender_sid: verifiedSender.verified_sender_sid,
+              verified_sender_epoch: verifiedSender.verified_sender_epoch,
+              verified_sender_generation: verifiedSender.verified_sender_generation,
+              spoof_suspected: !!(claimedFrom && verifiedSender.verified_sender_sid
+                && claimedFrom !== verifiedSender.verified_sender_sid),
+              origin: 'trusted-local',
+            },
+          });
+        } catch (error) {
+          console.warn('[CLEAR-STRAND-V1] %s cleared but the bus event threw:', id,
+            error && error.message ? error.message : error);
+        }
+        console.log('[CLEAR-STRAND-V1] %s cleared basis=%s child_evidence=%s persisted=%s', id, body.basis,
+          evidence, persisted);
+        return answer(200, {
+          stage: 'cleared', reason: null,
+          clearedInjectId: removed.inject_id,
+          clearedStrandReason: removed.reason,
+          clearedStrandAt: removed.at,
+          childEvidence: evidence,
+          persisted, persistReason,
+        });
+      } catch (error) {
+        // There is NO 5xx on this route. At every point where a throw is reachable the effect has either not
+        // happened (the answer is honest as a refusal) or has happened and been reported by the answer above —
+        // so a caught exception is answered 409 `refused`, with the exception text staying a LOCAL operator
+        // diagnostic. If an answer was already sent, the throw came after it and nothing more is said.
+        // r2 erratum (review finding CSR-m7): the id is logged through JSON.stringify. express percent-decodes
+        // `:id`, so a caller could put a newline in it and forge an extra line in the daemon's own log. Narrow
+        // — step 3 refuses control characters before any other use, so only a throw raised in step 1.5 or
+        // step 2 reaches this line — but a log an operator reads during an incident is exactly where a forged
+        // line costs the most. The refusal warn above uses `id`, which step 3 has already bounded.
+        console.error('[CLEAR-STRAND-V1] %s handler threw:', JSON.stringify(requestedId),
+          error && error.stack ? error.stack : error);
+        if (answered) return undefined;
+        return blind(409, 'refused');
+      }
+    });
+  }
+
   function registerKillRoute(app) {
     app.post('/api/sessions/:id/kill', async (req, res) => {
       const requestedId = req.params.id;
@@ -2110,7 +2621,7 @@ function createSessionActions(shared, effects = {}) {
     });
   }
 
-  return {
+  const actions = {
     buildAutoSummaryWithDefaults,
     observationIdentity,
     markAbsenceDeliveredToSource,
@@ -2138,11 +2649,33 @@ function createSessionActions(shared, effects = {}) {
     registerStateRoute,
     registerSubmitRoute,
     registerInjectRoute,
+    registerInjectBoundV1Route,   // Task 1270: POST /api/sessions/:id/inject-bound-v1
     registerKillRoute,
     registerDeleteRoute,
     registerBusPublishRoute,
     registerStateObserver,
   };
+  // Task 1270 — the clear registrar is reachable BY NAME and invisible to ENUMERATION, on purpose.
+  //
+  // Every other registrar here can be composed blind: a harness that knows nothing about a particular route
+  // can do `for (const [name, fn] of Object.entries(actions)) if (/^register\w*Route$/.test(name)) fn(app)`
+  // and get a working app. Several existing test harnesses do exactly that (test/inject-bound-v1-1270.test.js
+  // `compose`, test/inject-bound-v1-green-1270.test.js `compose`, both descended from
+  // test/immediate-submit-1215.test.js). This registrar CANNOT be composed blind, because
+  // CLEAR-INTERFACE-V1.md §8 requires it to THROW when it is handed no authenticator — a route that cannot
+  // authenticate must not exist — so a one-argument generic call is a TypeError by contract, not by accident.
+  //
+  // Those two requirements are only compatible if the clear is NOT part of the generically enumerated surface.
+  // It is therefore defined as a non-enumerable own property: `sessionActions.registerClearStrandV1Route(app,
+  // { verifyHostToken })` works exactly as §8's daemon.js snippet writes it (property access is unaffected,
+  // and so is destructuring), while `Object.entries`/`Object.keys`/`for…in`/spread do not see it — so a blind
+  // composer registers every route it knows about and simply never asks for this one. The registration is
+  // explicit and single (daemon.js), which is what §1 ("registered exactly once, with no second path") and §8
+  // (the daemon snippet passes the seam) already describe. The throw itself is unchanged.
+  Object.defineProperty(actions, 'registerClearStrandV1Route', {
+    value: registerClearStrandV1Route, enumerable: false, writable: false, configurable: true,
+  });
+  return actions;
 }
 
 module.exports = { createSessionActions };

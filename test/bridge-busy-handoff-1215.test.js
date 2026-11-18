@@ -193,7 +193,7 @@ const typing = b => { b.shared.lastUserInputTime = b.clock.now(); };
 
 // --- continuous output / working / loading: handed off at once --------------------------------------------------
 
-test('hotfix: under CONTINUOUS busy output, body and CR are written at once, in order, exactly once', { timeout: 30000 }, async t => {
+test('hotfix 1270: under CONTINUOUS busy output, the body is written at once and its CR at the 250 ms floor, in order, exactly once', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'hf-continuous' });
   const { injectId, body, submit } = b.daemonInject('HF-CONTINUOUS');
   const third = Math.floor(BUSY.length / 3);
@@ -205,14 +205,19 @@ test('hotfix: under CONTINUOUS busy output, body and CR are written at once, in 
   const atOnce = b.writes();
   b.feed(BUSY.slice(2 * third));
   await settleVt();
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249);
+  const beforeFloor = b.writes();
+  await b.clock.advance(1);
+  const atFloor = b.writes();
   await b.clock.advance(30000);
-  assert.deepEqual({ atOnce, final: b.writes(), stages: b.stages(injectId), inbox: b.leaf('inbox.jsonl').length,
+  assert.deepEqual({ atOnce, beforeFloor, atFloor, final: b.writes(), stages: b.stages(injectId), inbox: b.leaf('inbox.jsonl').length,
     firstReady: b.shared.firstReadyObserved },
-  { atOnce: ['HF-CONTINUOUS', '\r'], final: ['HF-CONTINUOUS', '\r'], stages: ['body:pty_written', 'submit:pty_written'], inbox: 0,
+  { atOnce: ['HF-CONTINUOUS'], beforeFloor: ['HF-CONTINUOUS'], atFloor: ['HF-CONTINUOUS', '\r'], final: ['HF-CONTINUOUS', '\r'], stages: ['body:pty_written', 'submit:pty_written'], inbox: 0,
     firstReady: false });
 });
 
-test('hotfix: a rendered WORKING frame (esc to interrupt) receives body and CR at once; no withheld receipt', { timeout: 30000 }, async t => {
+test('hotfix 1270: a rendered WORKING frame (esc to interrupt) gets the body at once and its CR at the 250 ms floor; no withheld or queued receipt', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'hf-working' });
   b.feed(BUSY);
   await settleVt();
@@ -220,9 +225,14 @@ test('hotfix: a rendered WORKING frame (esc to interrupt) receives body and CR a
   b.injectFrame(body);
   b.injectFrame(submit);
   const atOnce = b.writes();
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249);
+  const beforeFloor = b.writes();
+  await b.clock.advance(1);
+  const atFloor = b.writes();
   await b.clock.advance(20000);
-  assert.deepEqual({ atOnce, final: b.writes(), withheld: b.receipts(injectId, 'withheld').length, queued: b.receipts(injectId, 'queued').length },
-    { atOnce: ['HF-WORKING', '\r'], final: ['HF-WORKING', '\r'], withheld: 0, queued: 0 });
+  assert.deepEqual({ atOnce, beforeFloor, atFloor, final: b.writes(), withheld: b.receipts(injectId, 'withheld').length, queued: b.receipts(injectId, 'queued').length },
+    { atOnce: ['HF-WORKING'], beforeFloor: ['HF-WORKING'], atFloor: ['HF-WORKING', '\r'], final: ['HF-WORKING', '\r'], withheld: 0, queued: 0 });
 });
 
 test('hotfix: a never-ready LOADING child (first ready unobserved) receives body and CR at once; no ready is invented', { timeout: 30000 }, async t => {
@@ -238,17 +248,22 @@ test('hotfix: a never-ready LOADING child (first ready unobserved) receives body
   { writes: ['HF-LOADING', '\r'], stages: ['body:pty_written', 'submit:pty_written'], firstReady: false, readyFrames: 0, phase: 'open' });
 });
 
-test('hotfix: an IDLE composer control still receives body and CR at once', { timeout: 30000 }, async t => {
+test('hotfix 1270: an IDLE composer control gets the body at once and its CR at the 250 ms floor', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'hf-idle' });
   b.feed(IDLE);
   await settleVt();
   const { body, submit } = b.daemonInject('HF-IDLE');
   b.injectFrame(body);
   b.injectFrame(submit);
-  assert.deepEqual(b.writes(), ['HF-IDLE', '\r']);
+  const atOnce = b.writes();
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249);
+  const beforeFloor = b.writes();
+  await b.clock.advance(1);
+  assert.deepEqual({ atOnce, beforeFloor, atFloor: b.writes() }, { atOnce: ['HF-IDLE'], beforeFloor: ['HF-IDLE'], atFloor: ['HF-IDLE', '\r'] });
 });
 
-test('hotfix: VT unavailable and the VT kill switch no longer withhold a known CLI', { timeout: 30000 }, async t => {
+test('hotfix 1270: VT unavailable and the VT kill switch do not withhold a known CLI; body at once, CR at the 250 ms floor', { timeout: 30000 }, async t => {
   vt.__setTerminalCtorForTest(null);
   t.after(() => vt.__setTerminalCtorForTest(undefined));
   const b = createBridge(t, { sid: 'hf-vt-unavailable' });
@@ -265,18 +280,30 @@ test('hotfix: VT unavailable and the VT kill switch no longer withhold a known C
   const ks = k.daemonInject('HF-KILL-SWITCH');
   k.injectFrame(ks.body);
   k.injectFrame(ks.submit);
-  assert.deepEqual({ unavailable: b.writes(), killSwitch: k.writes(), killVt: k.allow.bridgeQueueSummary().vt },
-    { unavailable: ['HF-VT-UNAVAILABLE', '\r'], killSwitch: ['HF-KILL-SWITCH', '\r'], killVt: 'disabled' });
+  const atOnce = { unavailable: b.writes(), killSwitch: k.writes() };
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249); await k.clock.advance(249);
+  const beforeFloor = { unavailable: b.writes(), killSwitch: k.writes() };
+  await b.clock.advance(1); await k.clock.advance(1);
+  assert.deepEqual({ atOnce, beforeFloor, unavailable: b.writes(), killSwitch: k.writes(), killVt: k.allow.bridgeQueueSummary().vt },
+    { atOnce: { unavailable: ['HF-VT-UNAVAILABLE'], killSwitch: ['HF-KILL-SWITCH'] },
+      beforeFloor: { unavailable: ['HF-VT-UNAVAILABLE'], killSwitch: ['HF-KILL-SWITCH'] },
+      unavailable: ['HF-VT-UNAVAILABLE', '\r'], killSwitch: ['HF-KILL-SWITCH', '\r'], killVt: 'disabled' });
 });
 
-test('hotfix: a generic (unknown) CLI without any prompt receives body and CR at once', { timeout: 30000 }, async t => {
+test('hotfix 1270: a generic (unknown) CLI without any prompt gets the body at once and its CR at the 250 ms floor', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'hf-generic', command: 'generic-tool' });
   assert.equal(b.shared.knownAiCli, false, 'PRECONDITION: generic-tool is not a known AI CLI');
   b.feed('compiling... 12%\r\n');
   const { body, submit } = b.daemonInject('HF-GENERIC');
   b.injectFrame(body);
   b.injectFrame(submit);
-  assert.deepEqual(b.writes(), ['HF-GENERIC', '\r']);
+  const atOnce = b.writes();
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249);
+  const beforeFloor = b.writes();
+  await b.clock.advance(1);
+  assert.deepEqual({ atOnce, beforeFloor, atFloor: b.writes() }, { atOnce: ['HF-GENERIC'], beforeFloor: ['HF-GENERIC'], atFloor: ['HF-GENERIC', '\r'] });
 });
 
 // --- FIFO and exactly-once ---------------------------------------------------------------------------------------

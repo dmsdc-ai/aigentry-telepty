@@ -240,7 +240,7 @@ test('#137 validator: every forged/stale/forbidden receipt shape is refused; gen
 // Task 1215 hotfix 0.10.1 (replaces the #136 post-first-ready busy safety assertion: busy frame -> no write, withheld
 // busy_indicator): a busy frame after a drained ready is output, not a modal. The second pair is written at once, exactly
 // once, and the compatibility 5 s blind flush is still never armed.
-test('#136 post-first-ready busy / hotfix: after a drained ready, a busy frame receives the next pair at once; no 5 s blind flush', { timeout: 30000 }, async t => {
+test('#136 post-first-ready busy / hotfix 1270: after a drained ready, a busy frame gets the next body at once and its CR at the 250 ms floor; no 5 s blind flush', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b137w-busy-after-ready' });
   b.feed(IDLE);
   await settleVt();
@@ -256,13 +256,19 @@ test('#136 post-first-ready busy / hotfix: after a drained ready, a busy frame r
   b.injectFrame(second.body);
   b.injectFrame(second.submit);
   const atOnce = b.writes.slice();
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249);
+  const beforeFloor = b.writes.slice();
+  await b.clock.advance(1);
+  const atFloor = b.writes.slice();
   await b.clock.advance(20000);
   assert.deepEqual({
-    atOnce,
+    atOnce, beforeFloor, atFloor,
     writes: b.writes,
     blindFlushTimers: b.clock.calls.timeouts.slice(timersBefore).filter(ms => ms === 5000).length,
     withheld: b.receipts(second.injectId, 'withheld').filter(r => r.msg.part === 'body').map(r => r.msg.reason),
-  }, { atOnce: ['FIRST-READY-BODY', '\r', 'SECOND-WHILE-BUSY', '\r'],
+  }, { atOnce: ['FIRST-READY-BODY', '\r', 'SECOND-WHILE-BUSY'], beforeFloor: ['FIRST-READY-BODY', '\r', 'SECOND-WHILE-BUSY'],
+    atFloor: ['FIRST-READY-BODY', '\r', 'SECOND-WHILE-BUSY', '\r'],
     writes: ['FIRST-READY-BODY', '\r', 'SECOND-WHILE-BUSY', '\r'], blindFlushTimers: 0, withheld: [] });
 });
 
@@ -672,7 +678,7 @@ test('#1215 O1 neighbours: with an earlier pair and the next body in one flushed
   { writes: ['O1-PAIR-A', '\r', 'O1-PAIR-B', '\r'], a: ['body', 'submit'], b: ['body', 'submit'] });
 });
 
-test('#1215 O1 control: with nothing pending or in flight, an ordinary pair is still written at once (no enqueue; a CR is never idle-gated)', { timeout: 30000 }, async t => {
+test('#1215 O1 control / 1270: with nothing pending or in flight, an ordinary body is written at once and its CR at the 250 ms floor (no enqueue; a CR is never idle-gated)', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1215-o1-direct', readyRegistry: promptOnlyRegistry });
   b.feed('fixture $ '); // the prompt first: the gate is open and nothing is queued
   const { injectId, body, submit } = b.daemonInject('O1-DIRECT');
@@ -681,8 +687,13 @@ test('#1215 O1 control: with nothing pending or in flight, an ordinary pair is s
   b.shared.bridgeMailbox.enqueue = message => { enqueues++; return realEnqueue(message); };
   b.injectFrame(body);
   b.injectFrame(submit);
-  assert.deepEqual({ writes: b.writes, enqueues, written: b.receipts(injectId, 'pty_written').map(r => r.msg.part) },
-    { writes: ['O1-DIRECT', '\r'], enqueues: 0, written: ['body', 'submit'] });
+  const atOnce = b.writes.slice();
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249);
+  const beforeFloor = b.writes.slice();
+  await b.clock.advance(1);
+  assert.deepEqual({ atOnce, beforeFloor, writes: b.writes, enqueues, written: b.receipts(injectId, 'pty_written').map(r => r.msg.part) },
+    { atOnce: ['O1-DIRECT'], beforeFloor: ['O1-DIRECT'], writes: ['O1-DIRECT', '\r'], enqueues: 0, written: ['body', 'submit'] });
 });
 
 // Task 1215 order39: in both O2 fixtures the refused submit's predecessor in the queue is a BODY (not another CR), so the
@@ -775,7 +786,7 @@ test('#1215 O5 supervised in flight: a body arriving while earlier writes still 
   { beforeAdvance: [], writes: ['O5-FLIGHT-ONE', '\r', 'O5-FLIGHT-TWO', '\r'], first: ['body', 'submit'], second: ['body', 'submit'] });
 });
 
-test('#1215 O5 control: with nothing pending or in flight, a supervised body and CR are still written at once (no enqueue)', { timeout: 30000 }, async t => {
+test('#1215 O5 control / 1270: with nothing pending or in flight, a supervised body is written at once and its CR at the 250 ms floor (no enqueue)', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1215-o5-direct', inputPolicy: 'user-supervised' });
   const { injectId, body, submit } = b.daemonInject('O5-DIRECT');
   const realEnqueue = b.shared.bridgeMailbox.enqueue.bind(b.shared.bridgeMailbox);
@@ -783,8 +794,13 @@ test('#1215 O5 control: with nothing pending or in flight, a supervised body and
   b.shared.bridgeMailbox.enqueue = message => { enqueues++; return realEnqueue(message); };
   b.injectFrame(body);
   b.injectFrame(submit);
-  assert.deepEqual({ writes: b.writes, enqueues, written: b.receipts(injectId, 'pty_written').map(r => r.msg.part) },
-    { writes: ['O5-DIRECT', '\r'], enqueues: 0, written: ['body', 'submit'] });
+  const atOnce = b.writes.slice();
+  // Task 1270: the body is written at once; its CR is held exactly to the 250 ms submit floor (SUBMIT_GAP_MS), no idle/ready wait.
+  await b.clock.advance(249);
+  const beforeFloor = b.writes.slice();
+  await b.clock.advance(1);
+  assert.deepEqual({ atOnce, beforeFloor, writes: b.writes, enqueues, written: b.receipts(injectId, 'pty_written').map(r => r.msg.part) },
+    { atOnce: ['O5-DIRECT'], beforeFloor: ['O5-DIRECT'], writes: ['O5-DIRECT', '\r'], enqueues: 0, written: ['body', 'submit'] });
 });
 
 test('#1215 positive control: a trusted supervised orchestrator still receives body then CR directly while the mailbox is failing', { timeout: 30000 }, async t => {
