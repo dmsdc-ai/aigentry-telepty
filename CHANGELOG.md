@@ -2,7 +2,169 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
-## 0.11.0 (candidate — not released)
+## 0.11.1
+
+A hotfix release on top of 0.11.0. It adds two strict local verbs and their routes, the delivery
+boundary that makes them safe, and the boot, reconnect, submit-ordering and service-descriptor fixes
+that travelled with them. To pick everything up, restart the daemon and every running `telepty allow`
+bridge: a bridge keeps the code it was started with, and a bridge that is already running cannot
+declare a capability this release added.
+
+- **Create-only local boot that never repairs the daemon.** An explicit create-only local entry
+  (`allow-create-v1`) creates one exactly-named session and **never repairs, stops, kickstarts or
+  restarts the daemon**; a second `allow-create-v1` on an id the daemon already holds is refused. It
+  is answered from a pure local versioned capability response, and the local boot-capabilities answer
+  now names the verbs this CLI supports — `allow-create-v1`, `inject-bound-v1`, `clear-strand-v1`. A
+  reader of that answer requires `allow-create-v1` and tolerates further unique verbs, so the array
+  may grow in a later release without breaking it.
+- **A viewer that leaves no longer costs a wrapped session its custody,** and a renamed session keeps
+  its owner output stream.
+- **A body and its Enter keep their order.** The body-then-submit FIFO is preserved; a delayed Enter's
+  admission is re-checked immediately before the write instead of being taken from the moment it was
+  admitted; a submit stays paired with its body when the mailbox fails; and an unresolved composer is
+  no longer concatenated with the next body.
+- **Silence-based upstream-stall rejection is suspended,** pending the Enter-recovery work. The output
+  diagnostics are kept; the silence-derived classification no longer refuses a delivery.
+- **`telepty` recognises its own two-argument systemd service entries,** proven by the existing
+  realpath provenance check, and accepts a legitimate legacy service descriptor again. A foreign or
+  default descriptor is still refused.
+- **Bound busy-input delivery — `telepty inject-bound-v1` and `POST /api/sessions/:id/inject-bound-v1`.**
+  One versioned route and one strict local verb deliver **one body and one paired Enter to one pinned
+  owner identity**, or refuse before any effect, or report `outcome_unknown` and strand that exact
+  session instance.
+  - The request is a closed `telepty.bound-inject/v1` object of exactly six keys, validated by key
+    count **and** membership before any session state is read, so neither an added nor a removed field
+    passes. The caller pins `expected_epoch` and `expected_owner_generation` (a string — a number is
+    refused, never coerced) and requires both `immediate-submit-v1` and `busy-input-v1`.
+  - The pin is re-evaluated after every await and synchronously before each write: the live session
+    object, the epoch, the owner generation, the owner socket and both capabilities.
+  - The answer is a closed `telepty.bound-inject-result/v1` object with the same key set on every
+    stage. **Every refusal is 4xx and means nothing was written**; `outcome_unknown` is 5xx and means
+    a body may exist; `bytes_written` is `0` only where zero is provable and `null` from the moment a
+    body may exist. `consumption` is the constant `unknown`. A 409 on this route does not mean
+    "retryable later" — read 4xx as "nothing was written", 5xx as "a body may exist", and `reason`
+    for what to do next.
+  - The verb sends **exactly one POST** to `127.0.0.1` and the port it already selected — no alias,
+    `-N` sibling, peer or registered-machine resolution, no discovery, autostart, repair, retry,
+    redelivery or fallback. A non-canonical `TELEPTY_HOST` is refused before any socket is opened.
+    Unknown and duplicate flags are refused rather than turned into prompt text, and `--flag=value`
+    is not accepted.
+  - Exit codes: `0` accepted, `1` refused or route-unsupported, `2` usage or host, `3`
+    `outcome_unknown`. **3 is its own code on purpose: hold that `inject_id`, re-read the session
+    view, and never replay it.** A schema-less 404 is the one answer that proves the route is
+    unsupported and nothing was sent.
+  - `accepted` means both frames were handed to the pinned owner bridge. It is **not** a PTY write,
+    not native queueing, not auto-submit and not model receipt.
+  - An SSH session is refused `transport_not_applicable` before any effect, so no SSH session can be
+    stranded by this transport.
+- **The stranded-composer boundary.** When a bound delivery hands a body and then cannot hand its
+  paired Enter, it marks that exact session instance (epoch) as stranded instead of leaving the
+  half-written line to be appended to. A stranded instance then **refuses every later body and every
+  key from every producer** — the legacy `/inject` route and its forwarded twin, the mailbox drain,
+  fanout, the bootstrap and modal drains, every deferred Enter, `/submit` and `send-key`, attached
+  viewer input, the GUI Return keystroke, the session `interaction` route and the cooperative-handoff
+  pending write — until the session is re-registered or the strand is cleared. While stranded the
+  session view shows `transport.stranded_composer` with the failing `inject_id`, its reason and its
+  time, so an operator can see why a session refuses everything.
+  - **A body write whose outcome is uncertain now strands too.** Previously only a body write that
+    *threw* stranded the instance; a write that returned "uncertain" answered `outcome_unknown`
+    without a strand, so the next delivery could append to text that may still have been in the
+    composer. Both forms now strand. This is refuse-more only, and the new strand can be named and
+    removed by the operator clear below.
+  - The strand is **best-effort durable**: it is written to the session store on the failure path and
+    a failed save is not retried, so a daemon restart can resume un-stranded. The in-memory record is
+    what refuses the next write, so a failed save never admits a write in that daemon's lifetime.
+- **Operator clear for a stranded composer — `telepty clear-strand-v1` and
+  `POST /api/sessions/:id/clear-strand-v1`.** It removes **one** strand record for **one** exactly-named
+  session instance, and **it never writes a byte or presses a key into a session** — not as an option,
+  not behind a flag. The daemon cannot observe whether a composer is empty, so the clear is the
+  operator's assertion, and the surface is built so that assertion cannot be made blindly:
+  - **Authority:** the loopback socket peer only (never a forwarded header), **no `Origin` header**,
+    the host token in the `x-telepty-token` **header only** and compared timing-safely, an exact JSON
+    media type and a bounded closed JSON body. A session bearer, a client-profile token and a
+    `?token=` URL therefore cannot clear anything, and a remote tailnet caller is refused
+    `clear_local_only`. A session bearer that the CLI attaches automatically is not a refusal — it is
+    **recorded**, so the audit line names the session that issued the clear.
+  - **Identity pin:** the exact own session id used verbatim (no alias, `-N` sibling, prefix,
+    wildcard or `clear all`), `expected_epoch`, `expected_owner_generation` and the
+    `stranded_inject_id` — all four read from one session view and all four compared against the
+    daemon's live record. Every mismatch is a refusal **before any effect**.
+  - **A required `basis`,** one of two closed codes: `composer_emptied_by_operator` (the honest
+    default — unverifiable by construction) or `child_replaced_observed`, which is **machine-checked**
+    against the daemon's verified `process_started` milestone and refused `basis_contradicted` if the
+    daemon's own record disagrees.
+  - **Effect:** the strand record for that epoch is deleted and nothing else is touched — no queue is
+    dropped, no custody entry evicted, no barrier held, no bridge contacted. The bootstrap queue depth
+    and the outstanding body-custody count are **reported** rather than changed. The following store
+    write's outcome is reported (`persisted`, `persist_reason`) and never swallowed, so an operator
+    knows whether the strand will come back after a restart.
+  - **Idempotency:** effect-idempotent, result-distinguishable. A repeat clear refuses `not_stranded`
+    (409) rather than answering 200, and the verb never retries: exactly one POST, and a lost response
+    is reported `outcome_unknown` with the instruction to re-read the view.
+  - **Order matters.** While a session is stranded, `telepty attach` keystrokes are silently dropped;
+    after a clear they are not. Empty the composer yourself, at the terminal where that bridge runs —
+    your own keyboard is the only input that session accepts while stranded — and clear second. Do not
+    attach and press Enter first.
+  - A strand planted by a hand-edited session store, previously a permanent denial of input to that
+    instance, is now recoverable without re-registering the session.
+  - One `composer_strand_cleared` bus event and one audit line are written per removed strand. The
+    audit line carries no prompt content by construction, and it correlates with the failed bound
+    delivery by `inject_id`.
+
+**What changes for a caller that does not use the new verbs.**
+
+- The session transport block — in `GET /api/sessions/:id` and in every session bus event — gains
+  three keys: `session_epoch`, `owner_generation` and `busy_input`. They are additive; no existing key
+  changed.
+- `transport.stranded_composer` and `transport.last_strand_clear` are emitted **only** for a session
+  that is actually stranded, or that was cleared in this daemon's lifetime. Every other session's
+  transport block is otherwise byte-identical to 0.11.0.
+- A `telepty allow` bridge declares `busy-input-v1` on its owner claim. An older bridge never sends
+  it, and the daemon never infers it from a version, a probe or timing.
+- The new refusals fire for a stranded session only; every other session's delivery, park and queue
+  answers are unchanged. The strand has exactly one producer — a bound delivery — so a caller that
+  never uses `inject-bound-v1` cannot be stranded by it.
+- No `/api/meta` capability was added, no credential, grant, trust table, client profile, allowlist or
+  security setting changed, and the immediate-submit capability binder's return value is unchanged, so
+  every existing caller of it keeps its meaning.
+
+**Known limits.**
+
+- **The bridge's own strand cannot be cleared.** The `telepty allow` bridge keeps its own
+  child-keyed strand, which the daemon can neither name nor observe, and nothing but a **new child**
+  clears it — no timer, repaint, ready frame, typing or operator clear. Where the bridge refused the
+  Enter itself, a daemon-side clear removes the daemon's refusal and restores nothing: the next
+  delivery is refused `composer_stranded` by the bridge, and the worker has to be restarted. The
+  clear's result reports this as `bridge_strand: not_observable_by_daemon`.
+- **Strict principal mode and client-profile callers are unsupported for the bound route.** With
+  `TELEPTY_PRINCIPAL_MODE=strict`, `inject-bound-v1` answers `403 PRINCIPAL_ACTION_DENIED` for every
+  caller and every grant, because the action table does not name it and adding it would be a grant
+  change. Client-profile credentials cannot reach the route at all. Both are fail-closed and both are
+  deliberate for this release; the clear is unavailable in strict mode for the same reason, which is
+  coherent because no bound delivery can create a strand there either.
+- **No automated test proves native busy queueing or model receipt.** One manual run against an
+  isolated daemon on 2026-11-18 showed a busy Claude session queue and answer a bound-delivered
+  prompt. That is a single manual observation, not a gate, and `accepted` still claims only that both
+  frames were handed to the pinned owner bridge.
+- **A real strand followed by a successful clear has not been measured outside mocks.** The sequence
+  of a real bound delivery that strands a real session and a clear that restores input to it has not
+  been run.
+- **On a bound `inject_written` bus event, `transport` holds the string `inject-bound-v1`** instead of
+  the usual transport block, because the per-event fields are spread last. No in-tree subscriber reads
+  it as an object and nothing throws, but a subscriber reading `event.transport.busy_input` gets
+  `undefined` on this one event type. Discriminate on `typeof event.transport === 'string'`, or read
+  the transport block from another event. Recorded in `BUS_EVENT_SCHEMA.md`; renaming the key is left
+  to a later release.
+- **A downgrade un-strands silently.** An older daemon reading a session store written by this release
+  ignores the strand record and restores the session with no strand. Nothing in the file can make an
+  older binary honour it.
+
+- **Release metadata.** The packaged-consumer check (`scripts/check-package.mjs`) now pins `0.11.1`.
+  The version-identity test is re-based to 0.11.0 → 0.11.1; it still requires that only the version
+  lines differ from 0.11.0, so no dependency, resolution, integrity, lockfile-format or engines field
+  moved.
+
+## 0.11.0
 
 - **Opt-in client profiles (`client-profile-scope-v1`, issue #144 / Telesession issue16).** Off by default. With
   nothing configured, every response is byte-identical to 0.10.1.
