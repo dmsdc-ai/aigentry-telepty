@@ -25,9 +25,13 @@ async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 20
   if (injectId !== undefined && !validInjectId(injectId)) throw new Error('invalid exact inject ID');
   const started = monotonic(), observed = new Date(now()).toISOString();
   let networkProbe = { status: 'unknown', reason: 'tcp_probe_not_requested' };
+  // This records an observation, not a durable claim about the host now.
+  // Network loss, daemon exit and authentication failure never prove power-off.
+  let hostPower = { status: 'unknown', reason: 'no_verified_peer_response', source: null, observed_at: null };
   const failure = (status, phase, httpStatus = null) => ({ schema_version: 1, observed_at: observed, read_only: true,
     target: { session_id: parsed.id, host: parsed.host }, identity: null,
     layers: { host_network: { status: httpStatus ? 'http_path_responded' : 'unknown', reason: 'no_independent_host_or_tcp_probe' },
+      host_power: hostPower,
       daemon_api: { status, phase, http_status: httpStatus, elapsed_ms: Math.max(0, Math.round(monotonic() - started)), source: 'client_http_probe' },
       authentication: { status: httpStatus === 401 || httpStatus === 403 ? 'refused' : status === 'credentials_unavailable' ? 'unavailable' : 'unknown' },
       agent_responsiveness: { status: 'unknown', reason: 'daemon_probe_does_not_probe_agent' } },
@@ -36,10 +40,16 @@ async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 20
   try {
     const base = daemonUrl(parsed.host);
     if (includeTcp) networkProbe = await tcpProbe(base, { timeoutMs: Math.min(timeoutMs, 1000), now, monotonic });
-    const response = await fetchWithAuth(`${base}/api/meta`, { signal: AbortSignal.timeout(timeoutMs), readOnlyAuth: true });
+    const response = await fetchWithAuth(`${base}/api/meta`, { cache: "no-store", signal: AbortSignal.timeout(timeoutMs), readOnlyAuth: true });
     if (!response.ok) return failure(response.status === 401 || response.status === 403 ? 'authentication_refused' : 'http_error', phase, response.status);
     const meta = await boundedJson(response);
-    if (typeof meta.machine_id !== 'string' || (machineId && meta.machine_id !== machineId)) return failure('machine_mismatch', phase, response.status);
+    if (typeof meta?.machine_id !== 'string' || !meta.machine_id || (machineId && meta.machine_id !== machineId)) return failure('machine_mismatch', phase, response.status);
+    // Only correlate a response to the intended machine when its identity was supplied.
+    // A responding daemon on an unpinned address is not proof about the intended laptop.
+    hostPower = machineId
+      ? { status: 'running_at_observation', reason: 'expected_machine_responded',
+        source: 'matched_daemon_meta', observed_at: new Date(now()).toISOString() }
+      : { status: 'unknown', reason: 'expected_machine_identity_not_supplied', source: null, observed_at: null };
     phase = 'session';
     const query = new URLSearchParams({ machine_id: meta.machine_id });
     if (sessionEpoch) query.set('session_epoch', sessionEpoch);
@@ -50,6 +60,7 @@ async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 20
     const report = await boundedJson(result);
     if (report?.identity?.machine_id !== meta.machine_id || report?.identity?.session_id !== parsed.id || (sessionEpoch && report.identity.session_epoch !== sessionEpoch)) return failure('identity_mismatch', phase, result.status);
     if (injectId && report.messaging?.inject_id !== injectId) return failure('correlation_mismatch', phase, result.status);
+    report.layers = { ...report.layers, host_power: hostPower };
     report.network_probe = networkProbe;
     report.target = { host: parsed.host, session_id: parsed.id };
     report.client_probe = { source: 'authenticated_http_requests', observed_at: new Date(now()).toISOString(),
