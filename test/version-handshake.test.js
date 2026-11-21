@@ -62,23 +62,21 @@ test('daemon newer minor → noop', () => {
   assert.equal(r.action, ACTIONS.NOOP);
 });
 
-test('non-semver equal strings → noop', () => {
-  const r = decideVersionAction({ daemonVersion: 'dev', cliVersion: 'dev' });
-  assert.equal(r.action, ACTIONS.NOOP);
-  assert.equal(r.reason, 'versions-equal-nonsemver');
+test('unparseable daemon version leaves the daemon running', () => {
+  for (const version of ['dev', '1.2.3junk', '01.2.3', '1.2.3-01']) {
+    const result = decideVersionAction({ daemonVersion: version, cliVersion: '1.2.3' });
+    assert.deepEqual(result, { action: ACTIONS.NOOP, reason: 'version-unknown' });
+  }
 });
 
-test('non-semver differing strings → restart', () => {
-  const r = decideVersionAction({ daemonVersion: 'dev', cliVersion: 'prod' });
-  assert.equal(r.action, ACTIONS.RESTART);
-  assert.equal(r.reason, 'version-mismatch-nonsemver');
-});
-
-test('semver with prerelease tag ignores suffix (truncates to numeric core)', () => {
-  // parseSemver only reads leading x.y.z; this is sufficient for telepty#15
-  // because npm version always emits canonical x.y.z without suffix.
-  const r = decideVersionAction({ daemonVersion: '0.4.3-rc.1', cliVersion: '0.4.3' });
-  assert.equal(r.action, ACTIONS.NOOP);
+test('SemVer precedence includes prereleases and ignores build metadata', () => {
+  const versions = ['1.0.0-alpha', '1.0.0-alpha.1', '1.0.0-alpha.beta', '1.0.0-beta',
+    '1.0.0-beta.2', '1.0.0-beta.11', '1.0.0-rc.1', '1.0.0'];
+  for (let i = 1; i < versions.length; i++) {
+    assert.equal(compareSemver(versions[i - 1], versions[i]), -1);
+    assert.equal(compareSemver(versions[i], versions[i - 1]), 1);
+  }
+  assert.equal(compareSemver('1.0.0+old', '1.0.0+new'), 0);
 });
 
 test('parseSemver: valid', () => {

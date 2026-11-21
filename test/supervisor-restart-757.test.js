@@ -153,11 +153,13 @@ test('postinstall: supervised stale daemon restarts through supervisor, not deta
   let supervisorRestarts = 0;
 
   await postinstall.main({
+    packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
     env: { npm_config_global: 'true' },
     logger: log,
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: launchd,
-    cleanupDaemonProcesses: () => ({ stopped: [{ pid: 222 }], failed: [] }),
+    ownsLifecycleTarget: () => true,
+    stopRecordedDaemon: () => true,
     restartSupervisorDaemon: () => { supervisorRestarts += 1; return { success: true }; },
     waitForDaemonVersion: async () => ({ pid: 333, version: pkg.version }),
     spawnDetachedDaemon: () => { detachedStarts += 1; }
@@ -173,11 +175,13 @@ test('postinstall: unsupervised stale daemon keeps detached fallback', async () 
   let detachedStarts = 0;
 
   await postinstall.main({
+    packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
     env: { npm_config_global: 'true' },
     logger: log,
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: absent,
-    cleanupDaemonProcesses: () => ({ stopped: [{ pid: 222 }], failed: [] }),
+    ownsLifecycleTarget: () => true,
+    stopRecordedDaemon: () => true,
     resolveTeleptyBin: () => 'telepty',
     spawnDetachedDaemon: () => { detachedStarts += 1; }
   });

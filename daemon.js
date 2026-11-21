@@ -698,7 +698,7 @@ if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1')
 // singleton guard, postinstall's daemon upgrade (it gates on the state file), and #902's
 // state-file port gate, which had nothing to read.
 if (require.main === module || process.env.AIGENTRY_TELEPTY_DAEMON_MAIN === '1') {
-  const daemonClaim = claimDaemonState({ host: HOST, port: Number(PORT), version: pkg.version });
+  const daemonClaim = claimDaemonState({ host: HOST, port: Number(PORT), version: pkg.version, instanceId: DAEMON_INSTANCE_ID });
   if (!daemonClaim.claimed) {
     const current = daemonClaim.current;
     console.log(`[DAEMON] telepty daemon already running (pid ${current.pid}, port ${current.port}). Exiting.`);

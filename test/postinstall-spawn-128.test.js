@@ -20,10 +20,12 @@ test('#128: installed CLI is launched via Node, independent of PATH shims', asyn
 test('#128: async respawn failure is reported without success or rollback exception', async () => {
   const logs = [];
   await hook.main({
+    packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
     env: { npm_config_global: 'true' },
-    readDaemonState: () => ({ pid: 123, version: 'old' }),
+    readDaemonState: () => ({ pid: 123, version: '0.0.1' }),
     detectSupervisor: () => ({ present: false }),
-    cleanupDaemonProcesses: () => ({ stopped: [123], failed: [] }),
+    ownsLifecycleTarget: () => true,
+    stopRecordedDaemon: () => true,
     spawnDetachedDaemon: async () => { throw new Error('ENOENT'); },
     logger: { log: s => logs.push(s), warn: s => logs.push(s) }
   });
@@ -84,11 +86,13 @@ test('#1215 F2: a supervised upgrade confirms the new version on the protected /
 
   const logs = [];
   await hook.main({
+    packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
     env: { npm_config_global: 'true' },
     homeDir: home,
-    readDaemonState: () => ({ pid: 123, version: 'old', port: PORT }),
+    readDaemonState: () => ({ pid: 123, version: '0.0.1', port: PORT }),
     detectSupervisor: () => ({ present: true, kind: 'launchd' }),
-    cleanupDaemonProcesses: () => ({ stopped: [123], failed: [] }),
+    ownsLifecycleTarget: () => true,
+    stopRecordedDaemon: () => true,
     restartSupervisorDaemon: () => ({ success: true }),
     waitTimeoutMs: 2000,
     logger: { log: (s) => logs.push(String(s)), warn: (s) => logs.push(String(s)) }

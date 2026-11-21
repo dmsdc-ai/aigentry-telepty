@@ -96,7 +96,7 @@ function connectionRefused(error) {
 }
 
 // CLI side. Every dependency is injected so the decision logic is testable without a daemon.
-async function requestGracefulStop({ port, token, fetchImpl, isProcessRunning, confirmCmdline, probeHealth, readLockPid,
+async function requestGracefulStop({ port, expectedState, token, fetchImpl, isProcessRunning, confirmCmdline, probeHealth, readLockPid,
   deadlineMs = DEFAULT_STOP_DEADLINE_MS, pollMs = DEFAULT_POLL_MS, now = () => Date.now(),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), signRequest = null }) {
   if (!Number.isInteger(port) || port <= 0) return { status: 'unidentified', reason: 'no_port' };
@@ -136,6 +136,11 @@ async function requestGracefulStop({ port, token, fetchImpl, isProcessRunning, c
   if (meta.status !== 200) return { status: 'unidentified', reason: 'meta_status' };
   const identity = await readJson(meta);
   const pid = identity && identity.pid;
+  if (expectedState && (!identity || pid !== expectedState.pid || identity.port !== port
+      || identity.version !== expectedState.version || identity.host !== expectedState.host
+      || (expectedState.instanceId != null && identity.instance_id !== expectedState.instanceId))) {
+    return { status: 'unidentified', reason: 'state_changed' };
+  }
   const instanceId = identity && identity.instance_id;
   if (!Number.isSafeInteger(pid) || pid <= 0) return { status: 'unidentified', reason: 'meta_without_pid' };
   if (typeof instanceId !== 'string' || !INSTANCE_ID.test(instanceId)) return { status: 'unsupported', pid, reason: 'daemon_without_graceful_stop' };
@@ -158,7 +163,8 @@ async function requestGracefulStop({ port, token, fetchImpl, isProcessRunning, c
   const deadline = now() + deadlineMs;
   for (;;) {
     const exited = !isProcessRunning(pid);
-    const silent = exited ? !(await probeHealth()) : false;
+    // A verified supervisor can already have brought the replacement online.
+    const silent = exited && (expectedState?.supervised === true || !(await probeHealth()));
     if (exited && silent) {
       const lockPid = readLockPid();
       return { status: 'stopped', pid, lockRetained: lockPid === pid };

@@ -538,7 +538,7 @@ function resolveTeleptyEntryPoint(deps = {}) {
 // Task 1215 W3 (F4): with TELEPTY_PRINCIPAL_CLIENT_FILE set (strict principal mode) the identity read and the
 // stop are additionally signed by that existing principal client (`daemon.inspect`, `daemon.stop`); a client
 // configuration that cannot be loaded or names another daemon is an explicit refusal, never an unsigned stop.
-async function gracefulWindowsStop(port) {
+async function gracefulWindowsStop(port, expectedState) {
   const shutdownClient = require('./src/daemon-shutdown');
   const { pidMatchesTeleptyCmdline } = require('./daemon-control');
   const persistence = require('./src/session-store/persistence');
@@ -555,12 +555,17 @@ async function gracefulWindowsStop(port) {
   }
   const lockPath = persistence.defaultTrackedInjectionsLockPath(process.env.TELEPTY_TRACKED_INJECTIONS_PATH || persistence.defaultTrackedInjectionsPath());
   const result = await shutdownClient.requestGracefulStop({
-    port, token: existingAuthToken(), fetchImpl: (url, options) => fetch(url, { ...options, redirect: 'error' }),
+    port, expectedState, token: existingAuthToken(), fetchImpl: (url, options) => fetch(url, { ...options, redirect: 'error' }),
     isProcessRunning, confirmCmdline: pidMatchesTeleptyCmdline,
     probeHealth: () => probeDaemonHealth(port, 1000),
     readLockPid: () => { try { const pid = JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid; return Number.isSafeInteger(pid) ? pid : null; } catch { return null; } },
     signRequest
   });
+  // Lifecycle callers require a confirmed stop of their recorded PID. An empty
+  // port never authorizes starting a replacement, and needs no process census.
+  if (expectedState && result.status === 'no_answer') {
+    return shutdownClient.decideStopOutcome({ status: 'unidentified', reason: 'recorded_instance_unavailable' });
+  }
   const dryRun = result.status === 'no_answer' ? (stopDaemon({ port, dryRun: true }).targets || []) : [];
   return shutdownClient.decideStopOutcome(result, dryRun);
 }
@@ -1453,12 +1458,15 @@ function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessi
     if (decision.action === 'restart') {
       return { action: 'restart', reason: `version-${decision.reason}` };
     }
+    if (decision.reason !== 'versions-equal') return decision;
     const missingCap = requiredCapabilities.find((cap) => !(meta.capabilities || []).includes(cap));
     if (missingCap) {
       return { action: 'restart', reason: `capability-missing:${missingCap}` };
     }
     return { action: 'noop', reason: 'healthy' };
   }
+
+  if (meta && !isMissingMetaRoute) return { action: 'noop', reason: 'version-unknown' };
 
   // No meta after probing. An older daemon (answers /api/sessions, lacks /api/meta)
   // gets a legit restart; a genuinely absent/unreachable daemon gets auto-started.

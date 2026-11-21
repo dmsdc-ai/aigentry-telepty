@@ -115,7 +115,8 @@ function claimDaemonState(details) {
     host: details.host,
     port: details.port,
     startedAt: new Date().toISOString(),
-    version: details.version
+    version: details.version,
+    ...(details.instanceId ? { instanceId: details.instanceId } : {})
   };
   writeDaemonState(state);
   return { claimed: true, state };

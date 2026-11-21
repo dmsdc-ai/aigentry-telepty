@@ -22,21 +22,45 @@ const ACTIONS = Object.freeze({
   START: 'start'
 });
 
-function parseSemver(value) {
+function parseVersion(value) {
   if (typeof value !== 'string') return null;
-  const match = value.trim().match(/^(\d+)\.(\d+)\.(\d+)/);
-  if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(value);
+  if (!match || match[0] !== value) return null;
+  const prerelease = match[4] ? match[4].split('.') : [];
+  if (prerelease.some(id => /^0\d+$/.test(id))) return null;
+  return { core: match.slice(1, 4), prerelease };
+}
+
+function parseSemver(value) {
+  const parsed = parseVersion(value);
+  return parsed ? parsed.core.map(Number) : null;
+}
+
+function compareIdentifier(a, b) {
+  if (a === b) return 0;
+  const numericA = /^\d+$/.test(a);
+  const numericB = /^\d+$/.test(b);
+  if (numericA !== numericB) return numericA ? -1 : 1;
+  if (numericA && a.length !== b.length) return a.length < b.length ? -1 : 1;
+  return a < b ? -1 : 1;
 }
 
 function compareSemver(a, b) {
-  const left = parseSemver(a);
-  const right = parseSemver(b);
+  const left = parseVersion(a);
+  const right = parseVersion(b);
   if (!left || !right) return null;
-  for (let i = 0; i < 3; i += 1) {
-    if (left[i] !== right[i]) return left[i] < right[i] ? -1 : 1;
+  for (let i = 0; i < 3; i++) {
+    const order = compareIdentifier(left.core[i], right.core[i]);
+    if (order) return order;
   }
-  return 0;
+  const x = left.prerelease;
+  const y = right.prerelease;
+  if (!x.length || !y.length) return Math.sign(y.length - x.length);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) {
+    const order = compareIdentifier(x[i], y[i]);
+    if (order) return order;
+  }
+  return Math.sign(x.length - y.length);
 }
 
 function decideVersionAction(input) {
@@ -53,13 +77,7 @@ function decideVersionAction(input) {
 
   const cmp = compareSemver(daemonVersion, cliVersion);
 
-  // Non-semver values: fall back to string compare so dev/test tags still flow.
-  if (cmp === null) {
-    if (daemonVersion === cliVersion) {
-      return { action: ACTIONS.NOOP, reason: 'versions-equal-nonsemver' };
-    }
-    return { action: ACTIONS.RESTART, reason: 'version-mismatch-nonsemver' };
-  }
+  if (cmp === null) return { action: ACTIONS.NOOP, reason: 'version-unknown' };
 
   if (cmp === 0) {
     return { action: ACTIONS.NOOP, reason: 'versions-equal' };

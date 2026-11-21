@@ -2,6 +2,14 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.11.3
+
+**Behaviour changes**
+
+A direct global npm upgrade now replaces only the daemon identified by the current user's state file and its live PID, port and version. A supervised upgrade also verifies the service's loaded command. If the instance or service cannot be identified, the hook defers the upgrade. Nested and local installations leave running daemons alone.
+
+The installer preserves newer daemons, including prereleases, and daemons with unknown versions. For a deliberate downgrade to a release with this guard, set `TELEPTY_ALLOW_DAEMON_DOWNGRADE=1` for the direct global installation. Package removal hooks leave supervised daemons running. To remove a service, run `telepty uninstall` before removing the package.
+
 ## 0.11.2
 
 A publication-only release. The package contents are functionally identical to 0.11.1 — nothing under

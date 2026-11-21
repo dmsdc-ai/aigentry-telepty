@@ -159,9 +159,13 @@ test('#470: restored session with dead ownerPid stays unready', async () => {
 // #469 (Bug #A) — postinstall hook lifecycle wiring
 // ---------------------------------------------------------------------------
 
-function runPostinstall(envOverrides) {
+function runPostinstall(envOverrides, globalLayout = false) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.join(projectRoot, 'scripts', 'postinstall.js')], {
+    const script = path.join(projectRoot, 'scripts', 'postinstall.js');
+    const args = globalLayout
+      ? ['-e', "require('./scripts/postinstall').main({packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty'})"]
+      : [script];
+    const child = spawn(process.execPath, args, {
       cwd: projectRoot,
       env: { ...process.env, ...envOverrides },
       stdio: ['ignore', 'pipe', 'pipe']
@@ -199,8 +203,8 @@ test('#469: postinstall is a no-op when no daemon-state.json exists', async () =
     const result = await runPostinstall({
       TELEPTY_SKIP_POSTINSTALL: '',
       npm_config_global: 'true',
-      ...homeEnv(tmpHome) // #879: postinstall reads os.homedir() → USERPROFILE on win32
-    });
+      npm_command: 'install', npm_config_prefix: '', npm_package_json: '', ...homeEnv(tmpHome) // #879: postinstall reads os.homedir() → USERPROFILE on win32
+    }, true);
     assert.equal(result.code, 0);
     assert.match(result.stdout, /No running daemon detected/);
   } finally {
@@ -220,8 +224,8 @@ test('#469: postinstall no-ops when running daemon already matches package versi
     const result = await runPostinstall({
       TELEPTY_SKIP_POSTINSTALL: '',
       npm_config_global: 'true',
-      ...homeEnv(tmpHome) // #879: postinstall reads os.homedir() → USERPROFILE on win32
-    });
+      npm_command: 'install', npm_config_prefix: '', npm_package_json: '', ...homeEnv(tmpHome) // #879: postinstall reads os.homedir() → USERPROFILE on win32
+    }, true);
     assert.equal(result.code, 0);
     assert.match(result.stdout, new RegExp(`already at ${pkg.version.replace(/\./g, '\\.')}`));
   } finally {

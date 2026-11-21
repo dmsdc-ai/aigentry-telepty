@@ -343,10 +343,11 @@ test('T4 postinstall: an invalid setting + a stale daemon ⇒ no cleanup, restar
   const run = async (r, home, supervisor, extraEnv = null) => {
     const lines = [];
     const logger = { log: (m) => lines.push(m), warn: (m) => lines.push(m) };
-    await postinstall.main({ env: { npm_config_global: 'true', ...(extraEnv || {}) }, logger, homeDir: home, platform: extraEnv ? process.platform : 'linux',
+    await postinstall.main({ packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
+      env: { npm_config_global: 'true', ...(extraEnv || {}) }, logger, homeDir: home, platform: extraEnv ? process.platform : 'linux',
       diagnoseBinOwnership: () => null,
       detectSupervisor: () => supervisor, readDaemonState: () => ({ pid: 4242, version: '0.0.1', port: 3848 }),
-      cleanupDaemonProcesses: r.fn('cleanupDaemonProcesses', { stopped: [{ pid: 4242 }], failed: [] }),
+      ownsLifecycleTarget: () => true, stopRecordedDaemon: r.fn('stopRecordedDaemon', true),
       restartSupervisorDaemon: r.fn('restartSupervisorDaemon', { success: true }), spawnDetachedDaemon: r.fn('spawnDetachedDaemon', {}),
       waitForDaemonVersion: r.fn('waitForDaemonVersion', null), waitTimeoutMs: 1 });
     return lines.join('\n');
@@ -366,10 +367,10 @@ test('T4 postinstall: an invalid setting + a stale daemon ⇒ no cleanup, restar
     }
     const ok = recorder();
     await run(ok, root(t), supervisor);
-    assert.equal(ok.events[0], 'cleanupDaemonProcesses', `positive control supervised=${supervisor.present}`);
+    assert.equal(ok.events[0], 'stopRecordedDaemon', `positive control supervised=${supervisor.present}`);
     const envOk = recorder();
     await run(envOk, root(t), supervisor, envOverride);
-    assert.equal(envOk.events[0], WIN ? undefined : 'cleanupDaemonProcesses', `positive control env valid + config absent supervised=${supervisor.present}`);
+    assert.equal(envOk.events[0], WIN ? undefined : 'stopRecordedDaemon', `positive control env valid + config absent supervised=${supervisor.present}`);
   }
 });
 
