@@ -128,6 +128,7 @@ const sessionActions = createSessionActions({
   get pendingReports() { return pendingReports; },
   get persistSessions() { return persistSessions; },
   get readyRegistry() { return readyRegistry; },
+  get replyCapabilityStore() { return principalAuthentication ? null : replyCapabilityStore; },
   get resolveModalGate() { return resolveModalGate; },
   get resolveSessionAlias() { return resolveSessionAlias; },
   get resolveSessionForDestroy() { return resolveSessionForDestroy; },
@@ -346,6 +347,11 @@ const MACHINE_ID = process.env.TELEPTY_MACHINE_ID || os.hostname();
 // Task 1215 W3B: identifies THIS daemon process for a bound graceful stop (exposed only through the
 // authenticated /api/meta). An identity, not a credential: the stop also requires the local admin token.
 const DAEMON_INSTANCE_ID = require('./src/daemon-shutdown').newInstanceId();
+const replyCapability = require('./src/reply-capability');
+const replyCapabilityStore = replyCapability.createReplyCapabilityStore({
+  daemonInstanceId: DAEMON_INSTANCE_ID,
+  daemonStartedAt: new Date(require('node:perf_hooks').performance.timeOrigin).toISOString()
+});
 const principalAuthentication = require('./src/principal/http').createPrincipalAuthenticationFromEnvironment({ machineId: MACHINE_ID, sessions: () => sessions });
 // Task 1215 combined mode: ordinary transport auth plus a separately configured operator verifier for
 // user-supervised registrations. Configured-but-invalid trust (or a strict-mode conflict) throws here,
@@ -1776,6 +1782,7 @@ app.get('/api/meta', (req, res) => {
     // #137: bridge-stage-receipts-v1 = this daemon accepts owner-bound bridge_receipt/bridge_queue
     // frames and threads inject ids to the bridge. It says nothing about any one bridge's support.
     capabilities: ['ssh-child-write-receipts-v1', 'bridge-stage-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer', 'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only', 'delete-owned-session', 'daemon-graceful-stop-v1',
+      ...(principalAuthentication ? [] : [replyCapability.CAPABILITY]),
       ...(clientProfiles ? [clientProfilesModule.CAPABILITY] : [])],
     // Issue #144 (configured only): server-computed from the verified credential, never echoed from the request.
     ...(clientProfiles ? { caller: clientProfilesModule.callerView(req.clientProfile || null) } : {})
@@ -1901,6 +1908,16 @@ sessionActions.registerInjectBoundV1Route(app);
 // routes module. `requireInteractionController` is deliberately NOT reused or modified here.
 sessionActions.registerClearStrandV1Route(app, {
   verifyHostToken: req => clearStrand.hostTokenMatches(req.headers['x-telepty-token'], EXPECTED_TOKEN)
+});
+require('./src/routes/reply-capability').registerReplyCapabilityV1Route(app, {
+  shared: {
+    replyCapabilityStore: principalAuthentication ? null : replyCapabilityStore,
+    sessions, sessionCredentials, classifyPeerLaneInject, ORCHESTRATOR_SIDS,
+    deliverInjectionToSession, deliveryAuditResult, auditAppend, broadcastSessionEvent, MACHINE_ID
+  },
+  verifyHostToken(req) {
+    return clearStrand.hostTokenMatches(req.headers['x-telepty-token'], EXPECTED_TOKEN);
+  }
 });
 
 // #826 — the OTHER write path, kept next to the route above because they are twins and were
