@@ -1,0 +1,305 @@
+'use strict';
+
+// Task 1292 W6 — reply-capability-v1, daemon-side integration (TEST-PLAN §2: I1, I2, I5, I6, daemon side only).
+//
+// Written by the coder, NOT executed by the coder.
+// One REAL isolated daemon for the file (test-support/daemon-harness), started in before() and stopped in after(). Sessions
+// are registered through the real route and claimed by owner WebSockets that present their bearer, so each epoch is PROVED
+// (SPEC M7). Every frame the daemon writes to a session is recorded. The token is taken only from the trailer delivered to
+// the responder, which is how a responder gets it. The requester sids are the configured orchestrator lane
+// (AIGENTRY_ORCHESTRATOR_SIDS), so the unchanged peer-lane guard admits the request and both kinds of reply. It is not
+// disabled.
+// No sleeps. Every wait is a harness bound: waitFor, bounded requests, or audit completion under the case signal. "Exactly
+// one write" is counted after a no-Enter sentinel inject has reached the same owner socket. WebSocket frames arrive in
+// order, so every earlier write has been received by then.
+const { test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+const WebSocket = require('ws');
+
+const { startTestDaemon, createSessionId, waitFor, HARNESS_OBSERVATION_MARGIN_MS } = require('../test-support/daemon-harness');
+const { beginAuditCompletion } = require('../test-support/audit-completion');
+const { RESULT_SCHEMA } = require('../src/reply-capability');
+const { REQUEST_TIMEOUT_MS } = require('../src/cli/reply-v1');
+
+const ROOT = path.resolve(__dirname, '..');
+const CASE = { timeout: 60000 };
+// Harness OBSERVATION budgets, not product deadlines. Text into a wrapped owner may wait behind the submit barrier
+// (SUBMIT_QUEUE_TIMEOUT_MS, product default 10000) and then for its text (MAILBOX_TEXT_WAIT_MS = 2 x 5000). The same holds
+// for the consume route, which delivers through the same function. A CLI process is bounded by its own 30 s deadline.
+const DELIVERY_BOUND_MS = 10000 + 2 * 5000 + HARNESS_OBSERVATION_MARGIN_MS;
+const CLI_BOUND_MS = REQUEST_TIMEOUT_MS + HARNESS_OBSERVATION_MARGIN_MS;
+const TOKEN_RE = /rc1\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}/;
+const TRAFFIC = 300;
+const BATCH = 10;
+
+const REQUESTERS = { i1: createSessionId('w6-req-i1'), i2: createSessionId('w6-req-i2'), i5: createSessionId('w6-req-i5'),
+  i5control: createSessionId('w6-req-i5c'), i6: createSessionId('w6-req-i6') };
+
+let harness;
+const sockets = [];
+before(async () => {
+  harness = await startTestDaemon({ env: { TELEPTY_AUDIT_FLUSH_MS: '10', AIGENTRY_ORCHESTRATOR_SIDS: Object.values(REQUESTERS).join(' ') } });
+});
+after(async () => {
+  for (const ws of sockets) { try { ws.close(); } catch { /* already closed */ } }
+  if (harness) await harness.stop();
+});
+
+// A registered wrapped session whose owner socket proved the registered epoch. texts() lists every inject frame written to it.
+async function wrapped(sid) {
+  const reg = await harness.registerSession(sid, { command: 'test-wrap' });
+  assert.ok([200, 201].includes(reg.status) && typeof reg.body.session_token === 'string', `PRECONDITION: register ${sid} -> ${reg.status}`);
+  const frames = [];
+  const ws = new WebSocket(`ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sid)}`
+    + `?owner=1&owner_pid=${process.pid}&command=test-wrap&token=${encodeURIComponent(harness.authToken())}`, harness.ownerAuth(sid));
+  sockets.push(ws);
+  ws.on('message', (raw) => { try { frames.push(JSON.parse(raw)); } catch { /* not a frame we record */ } });
+  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  const claim = await waitFor(() => frames.find((f) => f.type === 'owner_token'), { timeoutMs: 5000, description: `${sid} owner_token` });
+  assert.equal(claim.interaction_binding.session_epoch, reg.body.session_epoch, 'PRECONDITION: the owner claim proved the registered epoch');
+  return { sid, bearer: reg.body.session_token, epoch: reg.body.session_epoch, generation: reg.body.credential_generation,
+    texts: () => frames.filter((f) => f.type === 'inject').map((f) => f.data) };
+}
+
+const inject = (sid, body, headers) => harness.request(`/api/sessions/${encodeURIComponent(sid)}/inject`,
+  { method: 'POST', body, ...(headers ? { headers } : {}), timeoutMs: DELIVERY_BOUND_MS });
+const consume = (token, body, headers) => harness.request('/api/reply-capability-v1',
+  { method: 'POST', body: { v: 1, capability: token, body }, ...(headers ? { headers } : {}), timeoutMs: DELIVERY_BOUND_MS });
+
+// The requester mints on its own verified inject. The token is read from the responder's delivered text, nowhere else.
+async function mint(requester, responder, prompt) {
+  const replyPrefix = `REPLY ${crypto.randomBytes(16).toString('hex')}\n`;
+  const res = await inject(responder.sid, { prompt, from: requester.sid, exact_target: true,
+    reply_capability: { v: 1, not_after_ms: Date.now() + 10 * 60 * 1000, reply_prefix: replyPrefix } },
+  { 'x-telepty-session-token': requester.bearer });
+  assert.equal(res.status, 200, `PRECONDITION: mint ${JSON.stringify(res.body)}`);
+  const cap = res.body.reply_capability;
+  assert.deepEqual(cap.responder, { session_id: responder.sid, epoch: responder.epoch, generation: responder.generation });
+  const delivered = await waitFor(() => responder.texts().find((text) => text.includes(`id=${cap.id} `)),
+    { timeoutMs: 5000, description: 'the reply-capability trailer at the responder' });
+  const token = TOKEN_RE.exec(delivered)[0];
+  assert.ok(delivered.includes(prompt) && token.startsWith(`rc1.${cap.id}.`));
+  assert.equal(JSON.stringify(res.body).includes(token.split('.')[2]), false, 'the secret is never in the requester response');
+  return { id: cap.id, token, secret: token.split('.')[2], replyPrefix, inboundInjectId: res.body.inject_id };
+}
+
+// Every inject frame the owner has received, read once a later no-Enter sentinel has arrived on the same socket.
+async function drained(owner) {
+  const mark = `w6-sentinel-${crypto.randomUUID()}`;
+  const res = await inject(owner.sid, { prompt: mark, no_enter: true });
+  assert.equal(res.status, 200, `PRECONDITION: sentinel ${JSON.stringify(res.body)}`);
+  await waitFor(() => owner.texts().some((text) => text.includes(mark)), { timeoutMs: 5000, description: 'the sentinel at the owner' });
+  return owner.texts();
+}
+
+function readAudit() {
+  const file = path.join(harness.homeDir, '.telepty', 'logs', 'injects.jsonl');
+  return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function pick(row, keys) { return Object.fromEntries(keys.map((key) => [key, row[key]])); }
+const REPLY_ROW_KEYS = ['kind', 'source', 'claimed_from', 'verified_sender_sid', 'verified_sender_epoch', 'spoof_suspected', 'to',
+  'delivery_result', 'sender_proof', 'reply_capability_id', 'reply_to_inject_id', 'payload_preview'];
+function replyRow(cap, requester, responder) {
+  return { kind: 'inject', source: 'reply-capability-v1', claimed_from: responder.sid, verified_sender_sid: responder.sid,
+    verified_sender_epoch: responder.epoch, spoof_suspected: false, to: requester.sid, delivery_result: 'success',
+    sender_proof: 'reply-capability-v1', reply_capability_id: cap.id, reply_to_inject_id: cap.inboundInjectId, payload_preview: null };
+}
+
+// A real `telepty reply-v1` process. Its env is {PATH, HOME} plus the daemon port and host token, so its HOME is its own state
+// root. 'close' (not 'exit') is awaited so stdout is complete.
+function replyCli(token, body, { home, env = {} }) {
+  const childEnv = { PATH: process.env.PATH, HOME: home, TELEPTY_PORT: String(harness.port), TELEPTY_AUTH_TOKEN: harness.authToken(),
+    NO_UPDATE_NOTIFIER: '1', TELEPTY_DISABLE_UPDATE_NOTIFIER: '1', ...env };
+  if (process.platform === 'win32') { childEnv.USERPROFILE = home; childEnv.SystemRoot = process.env.SystemRoot; }
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['cli.js', 'reply-v1', token], { cwd: ROOT, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = '';
+    child.stdout.on('data', (b) => { stdout += b; }); child.stderr.on('data', (b) => { stderr += b; });
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`reply-v1 did not exit within ${CLI_BOUND_MS} ms`)); }, CLI_BOUND_MS);
+    child.once('error', (error) => { clearTimeout(timer); reject(error); });
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      const lines = stdout.split('\n').filter(Boolean);
+      let result = null;
+      try { result = lines.length === 1 ? JSON.parse(lines[0]) : null; } catch { result = null; }
+      resolve({ code, stdout, stderr, result });
+    });
+    child.stdin.end(body);
+  });
+}
+
+function tempHome(t, label) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), `w6-${label}-home-`));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  return home;
+}
+
+test('I1 two CLIs, two state roots: one token presented at once by two processes → exactly one write at the receiver, one success audit line', CASE, async (t) => {
+  const requester = await wrapped(REQUESTERS.i1);
+  const responder = await wrapped(createSessionId('w6-resp-i1'));
+  const cap = await mint(requester, responder, 'w6 I1 request: answer once');
+  const body = `w6 I1 reply ${crypto.randomUUID()}`;
+  const homes = [tempHome(t, 'i1a'), tempHome(t, 'i1b')];
+  const audit = await beginAuditCompletion(harness, t.signal);
+
+  const runs = await Promise.all(homes.map((home) => replyCli(cap.token, body, { home })));
+  for (const r of runs) {
+    assert.equal(r.result && r.result.schema, RESULT_SCHEMA, `one closed result line: ${r.stdout} ${r.stderr}`);
+    assert.equal(`${r.stdout}${r.stderr}`.includes(cap.secret), false, 'the token is never printed');
+  }
+  const fresh = runs.filter((r) => r.code === 0 && r.result.stage === 'accepted' && r.result.replayed === false);
+  assert.equal(fresh.length, 1, `exactly one process wrote: ${JSON.stringify(runs.map((r) => r.result))}`);
+  assert.deepEqual(pick(fresh[0].result, ['outcome', 'capability_id', 'destination_session_id']),
+    { outcome: 'delivered', capability_id: cap.id, destination_session_id: requester.sid });
+  const other = runs.find((r) => r !== fresh[0]).result;
+  assert.ok((other.stage === 'refused' && other.reason === 'REPLY_CAPABILITY_IN_FLIGHT' && other.retryable === true)
+    || (other.stage === 'accepted' && other.replayed === true && other.reply_inject_id === fresh[0].result.reply_inject_id),
+  `the other process met the in-flight record or replayed the recorded answer: ${JSON.stringify(other)}`);
+
+  const texts = await drained(requester);
+  assert.equal(texts.filter((text) => text.includes(cap.replyPrefix + body)).length, 1, 'exactly one write at the receiver');
+  const rows = await audit.settledRows({ read: readAudit,
+    match: (row) => row.reply_capability_id === cap.id && row.source === 'reply-capability-v1' && row.delivery_result === 'success' });
+  const successes = rows.filter((row) => row.reply_capability_id === cap.id && row.source === 'reply-capability-v1' && row.delivery_result === 'success');
+  assert.equal(successes.length, 1, 'one success audit line');
+  assert.deepEqual(pick(successes[0], REPLY_ROW_KEYS), replyRow(cap, requester, responder));
+  for (const home of homes) assert.deepEqual(fs.readdirSync(home), [], 'the CLI wrote nothing under its own HOME');
+});
+
+test('I2 ordinary traffic never blocks: 300 unrelated injects to the responder and 300 ordinary messages to the requester in the request window; the reply is accepted and attributed', CASE, async (t) => {
+  const requester = await wrapped(REQUESTERS.i2);
+  const responder = await wrapped(createSessionId('w6-resp-i2'));
+  const cap = await mint(requester, responder, 'w6 I2 request');
+  const body = `w6 I2 reply ${crypto.randomUUID()}`;
+  const audit = await beginAuditCompletion(harness, t.signal);
+
+  // No-Enter traffic: it neither claims the per-session submit barrier nor waits 500 ms for a CR (see W6-GAPS.md).
+  let halfway;
+  const reachedHalf = new Promise((resolve) => { halfway = resolve; });
+  const traffic = async (sid, label) => {
+    const statuses = [];
+    for (let i = 0; i < TRAFFIC; i += BATCH) {
+      if (i >= TRAFFIC / 2) halfway();
+      const batch = Array.from({ length: Math.min(BATCH, TRAFFIC - i) }, (_, k) => inject(sid, { prompt: `${label} ${i + k}`, no_enter: true }));
+      for (const res of await Promise.all(batch)) statuses.push(res.status);
+    }
+    return statuses;
+  };
+  const [unrelated, ordinary, reply] = await Promise.all([
+    traffic(responder.sid, 'w6-i2-unrelated'),
+    traffic(requester.sid, 'w6-i2-ordinary'),
+    reachedHalf.then(() => consume(cap.token, body)),
+  ]);
+
+  assert.deepEqual({ unrelated: unrelated.filter((s) => s === 200).length, ordinary: ordinary.filter((s) => s === 200).length },
+    { unrelated: TRAFFIC, ordinary: TRAFFIC }, 'PRECONDITION: all ordinary traffic was delivered');
+  assert.equal(reply.status, 200, JSON.stringify(reply.body));
+  assert.deepEqual(pick(reply.body, ['schema', 'stage', 'outcome', 'reason', 'capability_id', 'destination_session_id', 'replayed', 'retryable']),
+    { schema: RESULT_SCHEMA, stage: 'accepted', outcome: 'delivered', reason: null, capability_id: cap.id,
+      destination_session_id: requester.sid, replayed: false, retryable: false });
+  const texts = await drained(requester);
+  assert.equal(texts.filter((text) => text.includes(cap.replyPrefix + body)).length, 1, 'the reply was written once');
+  assert.equal(texts.filter((text) => text.includes('w6-i2-ordinary')).length, TRAFFIC, 'and the ordinary messages beside it');
+  assert.equal((await drained(responder)).filter((text) => text.includes('w6-i2-unrelated')).length, TRAFFIC);
+  const rows = await audit.settledRows({ read: readAudit,
+    match: (row) => row.reply_capability_id === cap.id && row.source === 'reply-capability-v1' && row.delivery_result === 'success' });
+  const success = rows.filter((row) => row.reply_capability_id === cap.id && row.source === 'reply-capability-v1' && row.delivery_result === 'success');
+  assert.equal(success.length, 1);
+  assert.deepEqual(pick(success[0], REPLY_ROW_KEYS), replyRow(cap, requester, responder));
+});
+
+test('I5 rollback (daemon side): no new field in sessions.json and nothing in the tracked ledger; audit rows parse and differ from a run without the feature only by the additive fields', CASE, async (t) => {
+  const requester = await wrapped(REQUESTERS.i5);
+  const responder = await wrapped(createSessionId('w6-resp-i5'));
+  const controlRequester = await wrapped(REQUESTERS.i5control);
+  const controlResponder = await wrapped(createSessionId('w6-resp-i5c'));
+  const audit = await beginAuditCompletion(harness, t.signal);
+
+  // With the feature: mint on the inject, spend through the consume route.
+  const cap = await mint(requester, responder, 'w6 I5 request');
+  const consumed = await consume(cap.token, 'w6 I5 answer');
+  assert.equal(consumed.status, 200, JSON.stringify(consumed.body));
+  assert.equal(consumed.body.stage, 'accepted');
+  // Without it: the same inject, and an ordinary bearer reply.
+  const controlInbound = await inject(controlResponder.sid, { prompt: 'w6 I5 request', from: controlRequester.sid, exact_target: true },
+    { 'x-telepty-session-token': controlRequester.bearer });
+  const controlReply = await inject(controlRequester.sid, { prompt: 'w6 I5 answer', from: controlResponder.sid, exact_target: true },
+    { 'x-telepty-session-token': controlResponder.bearer });
+  assert.deepEqual([controlInbound.status, controlReply.status], [200, 200], 'PRECONDITION: the control run delivered');
+
+  // Audit: every line parses (readAudit), and each feature row differs from its control row by the additive fields only.
+  const rows = await audit.settledRows({ read: readAudit, match: (row) => row.inject_id === consumed.body.reply_inject_id });
+  const byId = (id) => { const row = rows.find((r) => r.inject_id === id); assert.ok(row, `audit row ${id}`); return row; };
+  const extra = (a, b) => Object.keys(a).filter((key) => !Object.hasOwn(b, key)).sort();
+  const [inbound, reply] = [byId(cap.inboundInjectId), byId(consumed.body.reply_inject_id)];
+  const [baseInbound, baseReply] = [byId(controlInbound.body.inject_id), byId(controlReply.body.inject_id)];
+  assert.deepEqual(extra(inbound, baseInbound), ['reply_capability_id', 'reply_capability_not_after']);
+  assert.deepEqual(extra(baseInbound, inbound), []);
+  assert.deepEqual(extra(reply, baseReply), ['reply_attempt', 'reply_capability_id', 'reply_to_inject_id', 'sender_proof']);
+  // The ordinary reply carries `from`, so it has the claimed-return locator. The capability row names none.
+  assert.deepEqual(extra(baseReply, reply), ['claimed_cross_host', 'claimed_return_locator', 'return_locator_verification']);
+
+  // A registration persists every live session synchronously before it answers, so this snapshot follows both runs.
+  const flush = await harness.registerSession(createSessionId('w6-i5-flush'), { command: 'test-wrap' });
+  assert.ok([200, 201].includes(flush.status), `PRECONDITION: flush register -> ${flush.status}`);
+  const stateDir = path.join(harness.homeDir, '.config', 'aigentry-telepty');
+  const sessionsText = fs.readFileSync(path.join(stateDir, 'sessions.json'), 'utf8');
+  const stored = JSON.parse(sessionsText);
+  const keys = (sid) => { assert.ok(stored[sid], `PRECONDITION: ${sid} persisted`); return Object.keys(stored[sid]).sort(); };
+  assert.deepEqual(keys(requester.sid), keys(controlRequester.sid), 'requester record schema unchanged');
+  assert.deepEqual(keys(responder.sid), keys(controlResponder.sid), 'responder record schema unchanged');
+
+  const ledgerRoot = path.join(stateDir, 'tracked-injections.json');
+  const files = [];
+  const walk = (p) => { const st = fs.statSync(p); if (st.isDirectory()) for (const name of fs.readdirSync(p)) walk(path.join(p, name)); else if (st.isFile()) files.push(p); };
+  walk(ledgerRoot);
+  const ledgerText = files.map((file) => fs.readFileSync(file).toString('latin1')).join('\n');
+  assert.ok(ledgerText.includes(cap.inboundInjectId) && ledgerText.includes(controlInbound.body.inject_id),
+    'PRECONDITION: both tracked inbound injects are in the ledger files read here');
+  for (const needle of [cap.id, cap.secret, consumed.body.reply_inject_id, 'reply_capability', 'reply-capability', 'sender_proof']) {
+    assert.equal(ledgerText.includes(needle), false, `tracked ledger: no reply-capability frame or field (${needle === cap.secret ? 'secret' : needle})`);
+    assert.equal(sessionsText.includes(needle), false, `sessions.json: no reply-capability field (${needle === cap.secret ? 'secret' : needle})`);
+  }
+});
+
+test('I6 direct reply plus capability reply: the responder answers once with its bearer and once with the capability → two writes, each separately attributed', CASE, async (t) => {
+  const requester = await wrapped(REQUESTERS.i6);
+  const responder = await wrapped(createSessionId('w6-resp-i6'));
+  const cap = await mint(requester, responder, 'w6 I6 request');
+  const home = tempHome(t, 'i6');
+  const origin = `http://127.0.0.1:${harness.port}`;
+  const direct = `w6 I6 direct ${crypto.randomUUID()}`;
+  const viaCapability = `w6 I6 capability ${crypto.randomUUID()}`;
+
+  // The CLI attaches a shell's session bearer, as an unfiltered shell does. Another session's bearer is refused, nothing spent.
+  const foreign = await replyCli(cap.token, viaCapability, { home, env: { TELEPTY_SESSION_TOKEN: requester.bearer, TELEPTY_SESSION_ORIGIN: origin } });
+  assert.deepEqual({ code: foreign.code, reason: foreign.result && foreign.result.reason }, { code: 2, reason: 'REPLY_SENDER_MISMATCH' }, foreign.stderr);
+
+  const audit = await beginAuditCompletion(harness, t.signal);
+  const directRes = await inject(requester.sid, { prompt: direct, from: responder.sid, exact_target: true },
+    { 'x-telepty-session-token': responder.bearer });
+  assert.equal(directRes.status, 200, JSON.stringify(directRes.body));
+  const capRun = await replyCli(cap.token, viaCapability, { home, env: { TELEPTY_SESSION_TOKEN: responder.bearer, TELEPTY_SESSION_ORIGIN: origin } });
+  assert.equal(capRun.code, 0, capRun.stderr);
+  assert.deepEqual(pick(capRun.result, ['stage', 'outcome', 'capability_id', 'replayed']),
+    { stage: 'accepted', outcome: 'delivered', capability_id: cap.id, replayed: false });
+
+  const texts = await drained(requester);
+  assert.equal(texts.filter((text) => text.includes(direct)).length, 1, 'the direct reply was written once');
+  assert.equal(texts.filter((text) => text.includes(cap.replyPrefix + viaCapability)).length, 1, 'the capability reply was written once');
+  const rows = await audit.settledRows({ read: readAudit, match: (row) => row.inject_id === capRun.result.reply_inject_id });
+  assert.notEqual(directRes.body.inject_id, capRun.result.reply_inject_id);
+  const directRow = rows.find((row) => row.inject_id === directRes.body.inject_id);
+  assert.ok(directRow, 'the direct reply has its own audit line');
+  assert.deepEqual(pick(directRow, ['kind', 'source', 'claimed_from', 'verified_sender_sid', 'verified_sender_epoch', 'spoof_suspected', 'to', 'delivery_result']),
+    { kind: 'inject', source: 'inject', claimed_from: responder.sid, verified_sender_sid: responder.sid, verified_sender_epoch: responder.epoch,
+      spoof_suspected: false, to: requester.sid, delivery_result: 'success' });
+  assert.equal(Object.hasOwn(directRow, 'sender_proof') || Object.hasOwn(directRow, 'reply_capability_id'), false, 'the direct reply is not a capability reply');
+  assert.deepEqual(pick(rows.find((row) => row.inject_id === capRun.result.reply_inject_id), REPLY_ROW_KEYS), replyRow(cap, requester, responder));
+});

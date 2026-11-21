@@ -286,6 +286,34 @@ test('U17 no response: a rejected fetch, a timeout, headers then a body read err
   assert.equal(capOut.exit, 2, 'a response of exactly 16 KiB is read');
 });
 
+// task1292 rc-fix2: the deadline is the CLI's own. Neither fake below holds a handle or honours the abort, so only the
+// CLI's timer can end the call; with an unref'd timer the event loop empties and the call never settles.
+test('U17 deadline: a fetch that never settles and a body that never ends are exit 4 at the deadline; no timer outlives a call', async () => {
+  const t = makeToken();
+  const rows = [
+    { label: 'fetch never settles, signal ignored', answer: () => new Promise(() => {}), http: null },
+    { label: '200 headers, then a body that never ends and ignores cancel', http: 200,
+      answer: () => Promise.resolve(new Response(new ReadableStream({
+        pull() { return new Promise(() => {}); }, cancel() { return new Promise(() => {}); },
+      }), { status: 200 })) },
+  ];
+  for (const row of rows) {
+    const out = await run({ argv: [t.token], answer: row.answer, timeoutMs: 20 });
+    assert.equal(out.exit, 4, row.label);
+    assert.equal(out.calls.length, 1, `${row.label}: no retry`);
+    assert.deepEqual(out.result, { ...closed({ stage: 'outcome_unknown', reason: 'REPLY_CLI_NO_RESPONSE', retryable: true }),
+      http_status: row.http }, row.label);
+    assert.match(out.stderr, /SAME command again is safe/);
+    assertTokenAbsent(t, out, row.label);
+  }
+  const liveTimers = () => process.getActiveResourcesInfo().filter(name => name === 'Timeout').length;
+  const before = liveTimers();
+  assert.equal((await run({ argv: [t.token] })).exit, 0);
+  assert.equal((await run({ argv: [t.token], answer: () => { throw new Error('no host token'); } })).exit, 2);
+  assert.equal((await run({ argv: [t.token], answer: () => new Promise(() => {}), timeoutMs: 20 })).exit, 4);
+  assert.equal(liveTimers(), before, 'the deadline timer is cleared on every return path');
+});
+
 test('U17 host token: a synchronous fetchWithAuth throw (no token) is exit 2 HOST_TOKEN_UNAVAILABLE before any socket', async () => {
   const t = makeToken();
   const stdout = writer();
@@ -315,8 +343,9 @@ function runCliProcess(argv, env, stdinText, timeoutMs = 60000) {
     let stdout = ''; let stderr = '';
     child.stdout.on('data', b => { stdout += b; }); child.stderr.on('data', b => { stderr += b; });
     const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`reply-v1 did not exit within ${timeoutMs} ms`)); }, timeoutMs);
-    child.once('error', reject);
-    child.once('exit', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    child.once('error', (error) => { clearTimeout(timer); reject(error); });
+    // 'close', not 'exit': at 'exit' the child's stdout may still hold unread data (Node child_process docs).
+    child.once('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
     child.stdin.end(stdinText);
   });
 }

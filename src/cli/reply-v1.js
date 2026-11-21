@@ -123,8 +123,27 @@ function validateBody(bytes) {
   return { ok: true, text };
 }
 
+// What `deadline.expired` resolves to. Never a fetch result.
+const NO_ANSWER = Symbol('reply-v1 deadline');
+
+// The CLI owns its 30 s deadline (W4-D6). The timer is deliberately NOT unref'd: it keeps the process alive
+// until the deadline, so a request that never settles still ends in exit 4 with its closed line printed.
+// (AbortSignal.timeout's timer is unref'd: with nothing else holding the event loop, the caller's promise stayed
+// pending forever and a real process exited 0 with no output.) `expired` resolves at the deadline even if the
+// transport ignores the abort. The caller clears it on every return path.
+function startDeadline(ms) {
+  const controller = new AbortController();
+  let fire;
+  const expired = new Promise(resolve => { fire = resolve; });
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+    fire(NO_ANSWER);
+  }, ms);
+  return { signal: controller.signal, expired, clear: () => clearTimeout(timer) };
+}
+
 // → { ok:true, bytes } or { ok:false } (read error, abort/timeout, missing reader, or more than `max` bytes).
-async function readResponseCapped(response, max) {
+async function readResponseCapped(response, max, expired) {
   const body = response.body;
   if (body === null) return { ok: true, bytes: Buffer.alloc(0) };
   if (!body || typeof body.getReader !== 'function') return { ok: false };
@@ -133,7 +152,12 @@ async function readResponseCapped(response, max) {
   let total = 0;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const step = await Promise.race([reader.read(), expired]);
+      if (step === NO_ANSWER) {
+        reader.cancel().catch(() => {});
+        return { ok: false };
+      }
+      const { done, value } = step;
       if (done) break;
       total += value.byteLength;
       if (total > max) {
@@ -232,36 +256,41 @@ async function runReplyV1(argv, deps) {
   const payload = JSON.stringify({ v: 1, capability: parsed.token, body: body.text });
   if (Buffer.byteLength(payload) > REQUEST_MAX_BYTES) return refuseLocally(LOCAL.BODY_TOO_LARGE);
 
-  const signal = AbortSignal.timeout(Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : REQUEST_TIMEOUT_MS);
-  let pending;
+  const deadline = startDeadline(Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : REQUEST_TIMEOUT_MS);
   try {
-    // A synchronous throw happens before any socket: the host token could not be resolved.
-    pending = deps.fetchWithAuth(`${deps.daemonUrl}${ROUTE}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, redirect: 'error',
-      readOnlyAuth: true, body: payload, signal,
-    });
-  } catch {
-    return refuseLocally(LOCAL.HOST_TOKEN_UNAVAILABLE);
+    let pending;
+    try {
+      // A synchronous throw happens before any socket: the host token could not be resolved.
+      pending = deps.fetchWithAuth(`${deps.daemonUrl}${ROUTE}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, redirect: 'error',
+        readOnlyAuth: true, body: payload, signal: deadline.signal,
+      });
+    } catch {
+      return refuseLocally(LOCAL.HOST_TOKEN_UNAVAILABLE);
+    }
+    let response = NO_ANSWER;
+    try {
+      response = await Promise.race([pending, deadline.expired]);
+    } catch { /* rejected: no response */ }
+    if (response === NO_ANSWER) {
+      stderr.write(RETRY_SAME_HINT);
+      stdout.write(jsonLine(localResult('outcome_unknown', LOCAL.NO_RESPONSE, null, true)));
+      return EXIT.noResponse;
+    }
+    const status = response.status;
+    const read = await readResponseCapped(response, RESPONSE_MAX_BYTES, deadline.expired);
+    if (!read.ok) {
+      stderr.write(RETRY_SAME_HINT);
+      stdout.write(jsonLine(localResult('outcome_unknown', LOCAL.NO_RESPONSE, status, true)));
+      return EXIT.noResponse;
+    }
+    const verdict = classifyReplyResponse(status, read.bytes);
+    if (verdict.hint) stderr.write(verdict.hint);
+    stdout.write(jsonLine(verdict.line));
+    return verdict.exit;
+  } finally {
+    deadline.clear();
   }
-  let response;
-  try {
-    response = await pending;
-  } catch {
-    stderr.write(RETRY_SAME_HINT);
-    stdout.write(jsonLine(localResult('outcome_unknown', LOCAL.NO_RESPONSE, null, true)));
-    return EXIT.noResponse;
-  }
-  const status = response.status;
-  const read = await readResponseCapped(response, RESPONSE_MAX_BYTES);
-  if (!read.ok) {
-    stderr.write(RETRY_SAME_HINT);
-    stdout.write(jsonLine(localResult('outcome_unknown', LOCAL.NO_RESPONSE, status, true)));
-    return EXIT.noResponse;
-  }
-  const verdict = classifyReplyResponse(status, read.bytes);
-  if (verdict.hint) stderr.write(verdict.hint);
-  stdout.write(jsonLine(verdict.line));
-  return verdict.exit;
 }
 
 module.exports = {
