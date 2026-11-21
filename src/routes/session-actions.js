@@ -1536,6 +1536,8 @@ function createSessionActions(shared, effects = {}) {
   }
 
   function registerInjectRoute(app, routePath = '/api/sessions/:id/inject') {
+    // Task 1292 reply-capability-v1 M1: the forwarded twin is decided once, by the path it was registered at.
+    const replyCapabilityForwardedRoute = routePath !== '/api/sessions/:id/inject';
     app.post(routePath, async (req, res) => {
       const requestedId = req.params.id;
       // #1215 inject-exact-target — opt-in exact routing. With boolean `exact_target:true` the
@@ -1584,6 +1586,54 @@ function createSessionActions(shared, effects = {}) {
       const verifiedSenderSid = verifiedPrincipal ? verifiedPrincipal.sid : null;
       const verifiedSender = (0, shared.verifiedSenderFields)(verifiedPrincipal);
 
+      // Task 1292 reply-capability-v1 — mint admission M1–M9 (SPEC §2.2), in order, every refusal BEFORE any effect.
+      // Entered only when the request carries the field: absent ⇒ none of this runs and the route is unchanged.
+      // Synchronous from here to the mint below (the peer-lane guard in between does not await).
+      const replyCapabilityRequested = Object.hasOwn(req.body, 'reply_capability');
+      let replyCapabilityMint = null;
+      if (replyCapabilityRequested) {
+        const rc = require('../reply-capability');
+        const refuse = (code, error) => (0, shared.respondWithError)(res, rc.ERROR_STATUS[code], code, error);
+        const store = shared.replyCapabilityStore;   // null/absent ⇒ unavailable (strict principal mode or not constructed)
+        if (!store || req.clientProfile || replyCapabilityForwardedRoute) {
+          return refuse('REPLY_CAPABILITY_UNAVAILABLE', 'Reply capabilities are not available on this request path.');
+        }
+        const request = req.body.reply_capability;
+        const keys = request && typeof request === 'object' && !Array.isArray(request) ? Object.keys(request) : null;
+        if (!keys || keys.length !== 3 || !['v', 'not_after_ms', 'reply_prefix'].every(key => keys.includes(key))
+          || request.v !== 1 || !Number.isSafeInteger(request.not_after_ms) || !rc.validReplyPrefix(request.reply_prefix)) {
+          return refuse('REPLY_CAPABILITY_REQUEST_INVALID', 'reply_capability must be exactly {v:1, not_after_ms, reply_prefix}.');
+        }
+        if (!clearStrand.isLoopbackPeer(req.socket ? req.socket.remoteAddress : null)
+          || (req.headers && req.headers.origin !== undefined) || req.body.forwarding) {
+          return refuse('REPLY_CAPABILITY_SENDER_UNVERIFIED', 'A reply capability is minted only for a local, unforwarded request.');
+        }
+        if (!verifiedPrincipal || from !== verifiedPrincipal.sid) {
+          return refuse('REPLY_CAPABILITY_SENDER_UNVERIFIED', 'A reply capability requires a verified sender session equal to from.');
+        }
+        const requesterId = exactOwnSessionId(verifiedPrincipal.sid);
+        const requesterRecord = requesterId ? shared.sessions[requesterId] : null;
+        if (!requesterRecord || requesterRecord.isClosing || requesterRecord.sessionEpoch !== verifiedPrincipal.epoch
+          || (requesterRecord.credentialGeneration || 1) !== verifiedPrincipal.generation) {
+          return refuse('REPLY_CAPABILITY_REQUESTER_STALE', 'The requesting session instance is not the live instance.');
+        }
+        if (!exactTarget) return refuse('REPLY_CAPABILITY_REQUEST_INVALID', 'A reply capability requires exact_target:true.');
+        const responderGeneration = session.credentialGeneration || 1;
+        if (typeof session.sessionEpoch !== 'string' || !session.sessionEpoch
+          || !((session.type === 'wrapped' && session.sessionEpochProved === session.sessionEpoch) || session.type === 'mailbox')
+          || session.sshRemote || session.isClosing || id === verifiedPrincipal.sid
+          || !Number.isSafeInteger(responderGeneration) || responderGeneration < 1) {
+          return refuse('REPLY_CAPABILITY_TARGET_UNSUPPORTED', 'The target cannot receive a reply capability.');
+        }
+        const deadlineCode = store.deadlineRefusal(request.not_after_ms);
+        if (deadlineCode) return refuse(deadlineCode, 'not_after_ms must be 30 s to 1 h from now.');
+        const responder = { sid: id, epoch: session.sessionEpoch, generation: responderGeneration };
+        const requester = { sid: verifiedPrincipal.sid, epoch: verifiedPrincipal.epoch, generation: verifiedPrincipal.generation };
+        const capacityCode = store.capacityRefusal(responder, requester);
+        if (capacityCode) return refuse(capacityCode, 'Reply capability capacity is exhausted.');
+        replyCapabilityMint = { rc, store, request, responder, requester, id: null, not_after_ms: null, trailer: null };
+      }
+
       // #533 Phase 2 — peer-lane inject guardrail (in-band hard block, before delivery).
       // Out-of-policy peer→peer injects (no sanctioned ask-request/ask-reply envelope)
       // are blocked here so raw work-delegation bypass is prevented, not just detected.
@@ -1620,6 +1670,20 @@ function createSessionActions(shared, effects = {}) {
         console.warn('[PEER-GUARD] orchestrator sid unconfigured (AIGENTRY_ORCHESTRATOR_SIDS empty) — peer guardrail disabled (fail-open)');
       }
 
+      // Task 1292 §2.2: the mint, after the peer-lane guard and before beginTrackedInjection, in the same synchronous
+      // turn as M1–M9. The token lives only in the trailer string handed to the delivery; it is never logged or returned.
+      if (replyCapabilityRequested) {
+        const minted = replyCapabilityMint.store.mint({ responder: replyCapabilityMint.responder,
+          requester: replyCapabilityMint.requester, inbound_inject_id: inject_id,
+          reply_prefix: replyCapabilityMint.request.reply_prefix, not_after_ms: replyCapabilityMint.request.not_after_ms });
+        if (!minted.ok) {
+          return (0, shared.respondWithError)(res, replyCapabilityMint.rc.ERROR_STATUS[minted.code], minted.code, 'Reply capability was not minted.');
+        }
+        replyCapabilityMint.id = minted.id;
+        replyCapabilityMint.not_after_ms = minted.not_after_ms;
+        replyCapabilityMint.trailer = replyCapabilityMint.rc.replyCapabilityTrailer({ id: minted.id, token: minted.token, not_after_ms: minted.not_after_ms });
+      }
+
       // #60 Stage A / §3 item 1 — DURABLY RECORD ABSENCE BEFORE DELIVERY.
       //
       // This used to run after the delivery call, as a best-effort in-memory assignment. That
@@ -1637,6 +1701,7 @@ function createSessionActions(shared, effects = {}) {
         // store or an indeterminate outcome stays the existing 500 branch with its reason.
         const begun = await (0, shared.beginTrackedInjection)({ injectId: inject_id, sessionId: id, source: from, session });
         if (!begun.ok) {
+          if (replyCapabilityMint) replyCapabilityMint.store.revoke(replyCapabilityMint.id, 'inbound_refused');   // Task 1292 §2.2
           if (begun.capacity) {
             (0, shared.emitInjectFailureEvent)(id, 'TRACKING_CAPACITY',
               'Observation tracking capacity is not available; no task bytes were delivered.',
@@ -1681,9 +1746,12 @@ function createSessionActions(shared, effects = {}) {
           // Task 1215 519: the inject_id returned to THIS caller names its body pair even when untracked (no ledger use).
           pairInjectId: inject_id,
           // #47 P4 — the daemon-verified sender (never body.from) labels the provenance banner.
-          verifiedSenderSid
+          verifiedSenderSid,
+          ...(replyCapabilityMint ? { replyCapabilityTrailer: replyCapabilityMint.trailer } : {})   // Task 1292 §2.3
         });
         if (!delivery.success) {
+          // Task 1292 §2.4: a definitive inbound refusal revokes the capability; an uncertain one keeps it issued.
+          if (replyCapabilityMint && !delivery.delivery_uncertain) replyCapabilityMint.store.revoke(replyCapabilityMint.id, 'inbound_refused');
           (0, shared.emitInjectFailureEvent)(id, delivery.code, delivery.error, {
             inject_id,
             from: from || null,
@@ -1695,7 +1763,8 @@ function createSessionActions(shared, effects = {}) {
             to: id, to_alias: requestedId !== resolvedId ? requestedId : null,
             origin: req.body.forwarding ? 'untrusted-remote' : 'trusted-local',
             origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
-            payload: finalPrompt, delivery_result: `failed:${delivery.code || 'DELIVERY_FAILED'}`
+            payload: finalPrompt, delivery_result: `failed:${delivery.code || 'DELIVERY_FAILED'}`,
+            ...(replyCapabilityMint ? { reply_capability: { id: replyCapabilityMint.id, not_after_ms: replyCapabilityMint.not_after_ms } } : {})
           });
           // #843 — close the write-ahead record. Without this the refusal is recorded in the AUDIT log
           // (above) and contradicted in the OBSERVATION ledger, which keeps saying `tracked` /
@@ -1714,7 +1783,9 @@ function createSessionActions(shared, effects = {}) {
                 text_bytes_written: delivery.text_bytes_written ?? null, bytes_written: delivery.bytes_written ?? null,
                 retry_safe: delivery.bytes_written === 0 && delivery.text_written !== true } : {}),
 
-              ...(delivery.delivery_uncertain ? { delivery_uncertain: true, retryable: false, bytes_written: null, submit: 'skipped' } : {}) },
+              ...(delivery.delivery_uncertain ? { delivery_uncertain: true, retryable: false, bytes_written: null, submit: 'skipped' } : {}),
+              // Task 1292 §2.5: an uncertain answer may have reached the responder, so the requester learns the capability.
+              ...(replyCapabilityMint && delivery.delivery_uncertain ? { reply_capability: replyCapabilityMint.store.publicView(replyCapabilityMint.id) } : {}) },
             // Task 1215: a numeric public text travels as its internal (non-enumerable) context, never re-parsed.
             delivery.publicErrorContext);
         }
@@ -1741,7 +1812,8 @@ function createSessionActions(shared, effects = {}) {
           origin_host: req.body.forwarding ? null : shared.MACHINE_ID, ref_path: req.body.ref_path || null,
           // #860 F2 — `queued` when the delivery was parked on the bootstrap / modal queue with zero
           // bytes written, `success` only for a delivery the machinery reported as written.
-          payload: finalPrompt, delivery_result: (0, shared.deliveryAuditResult)(delivery)
+          payload: finalPrompt, delivery_result: (0, shared.deliveryAuditResult)(delivery),
+          ...(replyCapabilityMint ? { reply_capability: { id: replyCapabilityMint.id, not_after_ms: replyCapabilityMint.not_after_ms } } : {})
         });
         (0, shared.broadcastSessionEvent)((0, shared.deliveryAuditResult)(delivery) === 'queued' ? 'inject_queued' : 'inject_written', id, session, {
           timestamp: injectTimestamp,
@@ -1837,7 +1909,8 @@ function createSessionActions(shared, effects = {}) {
             bootstrap_queued: true,
             bootstrap_op_id: delivery.bootstrap_op_id || delivery.msg_id,
             pending: delivery.pending
-          } : {})
+          } : {}),
+          ...(replyCapabilityMint ? { reply_capability: replyCapabilityMint.store.publicView(replyCapabilityMint.id) } : {})   // Task 1292 §2.5
         });
       } catch (err) {
         // #1215 pipe200 S24 (disclosure197 P1): a strict-mode non-owner holding only session.inject reaches this catch,

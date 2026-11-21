@@ -128,4 +128,4 @@ function createCredentialStore() {
   return { issue, adopt, verify, matches, hasCredential, revoke, rename, size: () => byEpoch.size };
 }
 
-module.exports = { createCredentialStore, verifierFor };
+module.exports = { createCredentialStore, verifierFor, verifierMatches };

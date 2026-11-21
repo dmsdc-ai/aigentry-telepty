@@ -223,6 +223,32 @@ function createSessionDeliveryContext({
       error: 'Session was destroyed or replaced while this write was pending; it was not written.' };
   }
 
+  // Task 1292 reply-capability-v1 (SPEC §6.4) — the write-time deadline. ONE predicate over an object carrying
+  // `notAfterMs` (the delivery options, or the `injectionTargets` entry). Absent ⇒ false, so every existing producer
+  // skips it. Present but not a safe integer ⇒ passed (fail closed). Checked only BEFORE a text write, never between
+  // a written text and its CR.
+  function replyDeadlinePassed(holder) {
+    if (!holder || holder.notAfterMs === undefined) return false;
+    return !(Number.isSafeInteger(holder.notAfterMs) && Date.now() <= holder.notAfterMs);
+  }
+
+  function replyDeadlineResult() {
+    return { success: false, httpStatus: 410, code: 'REPLY_DEADLINE_PASSED', bytes_written: 0,
+      error: 'The reply deadline passed before this write; it was not written.' };
+  }
+
+  // Task 1292 (SPEC-DEVIATIONS W2-D1, Root H1): a branch that cannot carry the trailer or honour the deadline (the
+  // bootstrap queue, the modal park and the external-approval write keep the RAW prompt; a `mailbox` target is read
+  // by poll after the enqueue) refuses a reply-capability delivery before any enqueue or write.
+  function replyDeliveryUnsupportedResult() {
+    return { success: false, httpStatus: 409, code: 'REPLY_CAPABILITY_DELIVERY_UNSUPPORTED', bytes_written: 0,
+      error: 'This delivery path cannot carry a reply capability; it was not written.' };
+  }
+
+  function carriesReplyCapability(options) {
+    return options.replyCapabilityTrailer !== undefined || options.notAfterMs !== undefined;
+  }
+
   // PR #108 TP2: an inject that owes a CR waits for ITS msg_id to be written, not for "a tick".
   // getMailboxDelivery().tick() returns at once while another tick is in flight (e.g. one stuck on a slow
   // session), so the CR used to be scheduled — and written — before the text. The deliverFn settles
@@ -469,9 +495,11 @@ function createSessionDeliveryContext({
   }
 
   async function deliverInjectionToSession(id, session, prompt, options = {}) {
+    if (replyDeadlinePassed(options)) return replyDeadlineResult();   // Task 1292 §6.4: at delivery entry
     if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     if (options.externalApproval && !session.externalApprovalPolicy) return { success: false, httpStatus: 403, code: 'APPROVAL_POLICY_REQUIRED', error: 'Signed inject requires the enrolled target policy.', bytes_written: 0 };
     const denied = protectedInputFailure(session);
+    if (denied && options.externalApproval && carriesReplyCapability(options)) return replyDeliveryUnsupportedResult();   // Task 1292 W2-D1
     if (denied) return options.externalApproval
       ? deliverApprovedInjection(id, session, prompt, options) : denied;
     const sshFailure = sshInputFailure(session, prompt);
@@ -496,6 +524,7 @@ function createSessionDeliveryContext({
     // record and the epoch but replaces ownerWs, and that replacement never saw this inject.
     const entryOwnerWs = session.ownerWs;
     if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
+      if (carriesReplyCapability(options)) return replyDeliveryUnsupportedResult();   // Task 1292 W2-D1: before the enqueue
       const healthStatus = getSessionHealthStatus(session, { nowMs: now });
       if (healthStatus === 'STALE') {
         return { success: false, httpStatus: 410, code: 'STALE', error: 'Session is stale and awaiting cleanup.' };
@@ -535,6 +564,7 @@ function createSessionDeliveryContext({
     // screen (shouldApplyOwnerAliveFloor).
     const modalDecision = session.type === 'mailbox' ? null : await resolveModalGate(id, session, options);
     if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
+    if (replyDeadlinePassed(options)) return replyDeadlineResult();   // Task 1292 §6.4
     const currentFailure = getInjectFailure(session, { nowMs: Date.now() });
     if (currentFailure) return { success: false, ...currentFailure };
 
@@ -555,6 +585,7 @@ function createSessionDeliveryContext({
       // re-inject, and re-injecting into a modal that is still up is how #743 turned one
       // blocked REPORT into three lost ones.
       if (injectParkDecision.action === 'park') {
+        if (carriesReplyCapability(options)) return replyDeliveryUnsupportedResult();   // Task 1292 W2-D1: before the park
         const op = parkOperationOnModal(id, session, {
           type: 'inject',
           prompt,
@@ -588,13 +619,17 @@ function createSessionDeliveryContext({
     // wrapper, not a content change. `from`='daemon'/'inject' are routing sentinels, not real
     // claimed senders, so they are not surfaced as a `claimed:` label.
     const claimedSender = (from && from !== 'daemon' && from !== 'inject') ? from : null;
-    const deliveredPrompt = applyProvenance(prompt, {
+    const provenancePayload = applyProvenance(prompt, {
       capable: !!(session && session.provenanceCapable),
       nonce: session && session.provenanceNonce,
       verified: options.verifiedSenderSid || null,
       claimed: claimedSender,
       origin: options.origin
     }).payload;
+    // Task 1292 §2.3: the reply-capability trailer goes AFTER the provenance fence, into the delivered text only (the
+    // audit, viewer, bus and pending-report preview keep the raw prompt). Absent ⇒ the provenance payload unchanged.
+    const deliveredPrompt = typeof options.replyCapabilityTrailer === 'string'
+      ? provenancePayload + options.replyCapabilityTrailer : provenancePayload;
 
     // #716: wrap the delivered text in bracketed paste for paste-capable CLIs so the
     // deferred/gated submit CR (written separately, outside the 200~/201~ envelope)
@@ -602,6 +637,7 @@ function createSessionDeliveryContext({
     const deliveredBody = session.type === 'mailbox' ? deliveredPrompt : maybeBracketedPaste(deliveredPrompt, session);
 
     if (session.type === 'mailbox') {
+      if (options.notAfterMs !== undefined) return replyDeliveryUnsupportedResult();   // Task 1292 W2-D1 (a1): read by poll
       let ack;
       try {
         ack = getMailbox().enqueue({ msg_id: msgId, from, to: id, payload: deliveredBody,
@@ -651,6 +687,7 @@ function createSessionDeliveryContext({
       if (timedOut) return queueTimeoutRefusal();
     }
     if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
+    if (replyDeadlinePassed(options)) return replyDeadlineResult();   // Task 1292 §6.4
     const liveFailure = getInjectFailure(session, { nowMs: Date.now() });
     if (liveFailure) return { success: false, ...liveFailure };
     // Task 1215 queue80 (P1, reproduced on win32 run 41252716256): the bound is enforced AT ADMISSION too, not only by
@@ -706,7 +743,8 @@ function createSessionDeliveryContext({
       if (QUEUE_DIAG) markQueueDiag(barrier, 'enqueue_done');
       const immediate = { result: null }; immediateAttempts.set(msgId, immediate);
       if (QUEUE_DIAG) immediate.barrier = barrier;
-      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || options.pairInjectId || null });
+      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || options.pairInjectId || null,
+        ...(options.notAfterMs !== undefined ? { notAfterMs: options.notAfterMs } : {}) });   // Task 1292 §6.4: only when supplied
       if (session.type === 'wrapped') holdBodyCustody(session, msgId, options.injectId || options.pairInjectId || null);   // hotfix480 F1
       // Registered synchronously after the enqueue: no tick can run in between.
       const owesSubmit = !options.noEnter && session.type !== 'aterm';
@@ -816,6 +854,7 @@ function createSessionDeliveryContext({
       // Fallback only when the mailbox could not even be obtained: enqueue was never called.
       injectionTargets.delete(msgId);
       if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) { releaseSubmit(); return sessionGoneResult(); }
+      if (replyDeadlinePassed(options)) { releaseSubmit(); return replyDeadlineResult(); }   // Task 1292 §6.4
       const textOwnerWs = session.ownerWs;
       const textResult = await writeDataToSession(id, session, deliveredBody,
         { frameMeta: { daemon_msg_id: msgId, inject_id: options.injectId || null, part: 'body' } });
@@ -913,6 +952,14 @@ function createSessionDeliveryContext({
         const waiter = mailboxTextWaiters.get(msg.msg_id);
         if (waiter) waiter.lastFailure = sessionGoneResult();
         return sessionGoneResult();
+      }
+      // Task 1292 §6.4: a message carrying a reply deadline is withdrawn after it, by the same call as `session_gone`.
+      if (target && replyDeadlinePassed(target)) {
+        injectionTargets.delete(msg.msg_id);
+        getMailbox().withdraw(sessionId, msg.msg_id, 'reply_deadline_passed', { inFlight: true });
+        const waiter = mailboxTextWaiters.get(msg.msg_id);
+        if (waiter) waiter.lastFailure = replyDeadlineResult();
+        return replyDeadlineResult();
       }
       const ownerWs = session.ownerWs;
       const beforeWrite = session.type === 'aterm'

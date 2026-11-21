@@ -116,6 +116,21 @@ function buildAuditLine(record = {}) {
     line.clear_child_evidence = code(clear.child_evidence) || 'unobservable';
     line.clear_persisted = clear.persisted === true;
   }
+  // Task 1292 reply-capability-v1 (SPEC §2.5, §8) — additive fields on a line that minted or used a reply capability.
+  // Guarded on a plain `record.reply_capability` object, so every other line is byte-identical. WHITELIST: only the
+  // keys below are read, and only in their validated type, so no token or secret placed in that object can reach a line.
+  const replyCapability = record.reply_capability;
+  if (replyCapability && typeof replyCapability === 'object' && !Array.isArray(replyCapability)) {
+    line.reply_capability_id = typeof replyCapability.id === 'string' ? replyCapability.id : null;
+    // Also inside the Date range (±8.64e15 ms): `toISOString` throws outside it, and this builder must never throw.
+    if (Number.isSafeInteger(replyCapability.not_after_ms) && Math.abs(replyCapability.not_after_ms) <= 8.64e15) {
+      line.reply_capability_not_after = new Date(replyCapability.not_after_ms).toISOString();
+    }
+    if (replyCapability.sender_proof === 'reply-capability-v1') line.sender_proof = 'reply-capability-v1';
+    if (typeof replyCapability.reply_to_inject_id === 'string') line.reply_to_inject_id = replyCapability.reply_to_inject_id;
+    if (Number.isSafeInteger(replyCapability.reply_attempt)) line.reply_attempt = replyCapability.reply_attempt;
+    if (Number.isSafeInteger(replyCapability.suppressed_count)) line.suppressed_count = replyCapability.suppressed_count;
+  }
   return JSON.stringify(line);
 }
 

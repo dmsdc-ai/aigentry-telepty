@@ -25,7 +25,7 @@ const SKIP = WIN ? 'win32: client-profile-scope-v1 is unsupported on native Wind
 const SCHEMA = 'telepty.client-profiles/v1';
 const LEGACY_CAPABILITIES = ['ssh-child-write-receipts-v1', 'bridge-stage-receipts-v1', 'sessions', 'wrapped-sessions', 'skill-installer',
   'singleton-daemon', 'handoff-inbox', 'deliberation-threads', 'cross-machine', 'mailbox', 'inject-exact-target', 'register-create-only',
-  'delete-owned-session', 'daemon-graceful-stop-v1'];
+  'delete-owned-session', 'daemon-graceful-stop-v1', 'reply-capability-v1'];
 const TARGETS = { a: 'cpa-target', b: 'cpb-target', c: 'cpc-target', shared: 'cp-shared' };
 const BASE_ENV = { TELEPTY_AUDIT_FLUSH_MS: '10', TELEPTY_PRINCIPAL_MODE: '', TELEPTY_SUPERVISION_TRUST_FILE: '',
   TELEPTY_NO_TAILNET_AUTO: '1', TELEPTY_NO_SUPERVISOR_DEFER: '1',
