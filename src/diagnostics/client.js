@@ -1,7 +1,7 @@
 'use strict';
 const { probeTcp } = require('./tcp-probe');
 const { validInjectId } = require('./correlation');
-const { parseSessionReference, routingError } = require('../../session-routing');
+const { parseSessionReference } = require('../../session-routing');
 async function boundedJson(response, maxBytes = 32768) {
   if (!response.body) throw new Error('invalid_response');
   const reader = response.body.getReader();
@@ -18,13 +18,9 @@ async function boundedJson(response, maxBytes = 32768) {
   } finally { await reader.cancel().catch(() => {}); }
 }
 async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 2000, machineId, sessionEpoch, injectId, includeProcessState = false, includeTcp = false, tcpProbe = probeTcp,
-  now = Date.now, monotonic = () => performance.now(), resolveAddress, defaultHost = null }) {
+  now = Date.now, monotonic = () => performance.now() }) {
   const parsed = parseSessionReference(target);
-  const requestedHost = parsed.host || defaultHost;
-  if (!requestedHost || !parsed.id || parsed.id.length > 256 || requestedHost.length > 256) throw routingError('INVALID_SESSION_REFERENCE', 'diagnose requires an exact session_id@host or TELEPTY_HOST');
-  const address = resolveAddress ? await resolveAddress(target) : { host: requestedHost };
-  if (address.remote) throw routingError('UNSUPPORTED_SESSION_TRANSPORT', 'diagnose requires an HTTP daemon endpoint.');
-  parsed.host = requestedHost;
+  if (!parsed.host || !parsed.id || parsed.id.length > 256 || parsed.host.length > 256) throw new Error('diagnose requires an exact session_id@host');
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 5000) throw new Error('timeout must be 1..5000ms per request');
   if (injectId !== undefined && !validInjectId(injectId)) throw new Error('invalid exact inject ID');
   const started = monotonic(), observed = new Date(now()).toISOString();
@@ -38,7 +34,7 @@ async function diagnoseTarget(target, { fetchWithAuth, daemonUrl, timeoutMs = 20
     network_probe: networkProbe, confirmed_causes: [], completion_fact: null, next_read_only_observation: 'Verify the exact configured host and existing credentials; repeat the read-only probe.' });
   let phase = 'meta';
   try {
-    const base = daemonUrl(address.host);
+    const base = daemonUrl(parsed.host);
     if (includeTcp) networkProbe = await tcpProbe(base, { timeoutMs: Math.min(timeoutMs, 1000), now, monotonic });
     const response = await fetchWithAuth(`${base}/api/meta`, { signal: AbortSignal.timeout(timeoutMs), readOnlyAuth: true });
     if (!response.ok) return failure(response.status === 401 || response.status === 403 ? 'authentication_refused' : 'http_error', phase, response.status);

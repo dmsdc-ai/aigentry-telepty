@@ -2,11 +2,6 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const { resolveSessionTarget, runSessionInfo, printSessionList } = require('../cli');
-const { createPeerContext } = require('../cross-machine');
 
 const {
   formatHostLabel,
@@ -73,210 +68,459 @@ test('pickSessionTarget matches `<id>@<peerName>` against session.peerName alias
   assert.equal(resolved.remote, true);
 });
 
-const emptyDiscovery = { sessions: [], failures: [] };
-const endpoint = { transport: 'http', machineId: 'machine-a', host: 'node-a.example', port: 4888 };
-const remote = { id: 'shared', host: 'node-a.example:4888', peerName: 'saved-a', peerPort: 4888 };
+// telepty#1288 — target resolution when every machine runs a session with the same id.
+//
+// Every CLI case below drives the real `cli.js` against a real local daemon (PORT=0, temp HOME).
+// Peers are in-test HTTP servers registered in that temp HOME's peers.json; each counts the
+// requests it receives, so "no peer was consulted" is a counter reading zero, not a stopwatch.
+// The harness sets TELEPTY_HOST=127.0.0.1 for every CLI run, so the bare-id cases are also the
+// FACT B case (an explicitly loopback TELEPTY_HOST). Nothing touches a production daemon or the
+// real ~/.telepty.
 
-function fixture({ local = [], peers = {}, discovered = [], errors = [], entries = {} } = {}) {
-  const calls = [];
-  const session = { id: 'shared', command: 'codex' };
+const { after } = require('node:test');
+const fs = require('node:fs');
+const http = require('node:http');
+const net = require('node:net');
+const os = require('node:os');
+const path = require('node:path');
+const { startTestDaemon, createSessionId } = require('../test-support/daemon-harness');
+const { resolvePeerByAddress, isLocalMachineName, registeredPeerUsesName } = require('../session-routing');
+const { createPeerContext } = require('../cross-machine');
+
+const LOCAL_MACHINE = 'tp1288-local-machine';
+const PEER_TOKEN = 'tp1288-fake-peer-token';
+const NO_ENV_TOKEN = { TELEPTY_AUTH_TOKEN: '' };
+
+let daemon;
+const servers = [];
+
+// Started by the first test that needs it, so the pure tests above never wait on a daemon.
+async function ensureDaemon() {
+  if (!daemon) daemon = await startTestDaemon({ env: { TELEPTY_AUTH_TOKEN: '', TELEPTY_MACHINE_ID: LOCAL_MACHINE } });
+  return daemon;
+}
+after(async () => {
+  await Promise.all(servers.map((server) => server.close()));
+  if (daemon) await daemon.stop();
+});
+
+function peersPath() {
+  return path.join(daemon.homeDir, '.telepty', 'peers.json');
+}
+
+function writePeers(peers) {
+  fs.mkdirSync(path.dirname(peersPath()), { recursive: true });
+  fs.writeFileSync(peersPath(), JSON.stringify({ peers }, null, 2));
+}
+
+// A peer daemon stand-in: lists `ids`, answers `/api/sessions/<id>` for them, counts every request.
+async function fakePeer(ids, { refuse = false } = {}) {
+  const state = { hits: 0 };
+  const server = http.createServer((req, res) => {
+    state.hits += 1;
+    res.setHeader('content-type', 'application/json');
+    if (refuse) { res.statusCode = 401; res.end(JSON.stringify({ error: 'fake peer refuses' })); return; }
+    const pathname = new URL(req.url, 'http://fake-peer').pathname;
+    if (pathname === '/api/sessions') {
+      res.end(JSON.stringify(ids.map((id) => ({ id, command: 'fake-peer', cwd: '/', active_clients: 0 }))));
+      return;
+    }
+    const match = /^\/api\/sessions\/([^/]+)$/.exec(pathname);
+    if (match && ids.includes(decodeURIComponent(match[1]))) {
+      res.end(JSON.stringify({ id: decodeURIComponent(match[1]), command: 'fake-peer' }));
+      return;
+    }
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: 'not on the fake peer' }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  state.port = server.address().port;
+  state.close = () => new Promise((resolve) => server.close(() => resolve()));
+  servers.push(state);
+  return state;
+}
+
+function peerEntry(peer, extra = {}) {
   return {
-    calls,
-    options: {
-      port: 3848,
-      envHost: '',
-      localIdentity: { hostname: 'local.example', interfaces: () => ({ lan: [{ address: '192.0.2.12' }] }) },
-      _fetchWithAuth: async (url) => {
-        calls.push(url);
-        const pathname = new URL(url).pathname;
-        if (entries[pathname]) return entries[pathname];
-        return { ok: true, json: async () => pathname === '/api/sessions' ? local : session };
-      },
-      _ensureDaemonRunning: () => assert.fail('the injected daemon answered'),
-      _peers: {
-        loadPeers: () => { calls.push('registry'); return { peers }; },
-        discoverAllRemoteSessions: () => { calls.push('ssh'); return emptyDiscovery; },
-        discoverHttpRemoteSessions: async () => {
-          calls.push('http'); return { sessions: discovered, failures: errors };
-        },
-        discoverBrokerRemoteSessions: async () => { calls.push('broker'); return emptyDiscovery; }
-      },
-      lookupAddress: async () => assert.fail('unexpected DNS lookup')
-    }
+    transport: 'http', host: '127.0.0.1', port: peer.port, target: `127.0.0.1:${peer.port}`,
+    machineId: `tp1288-peer-${peer.port}`, token: PEER_TOKEN, ...extra
   };
 }
 
-async function sessionInfo(ref, options) {
-  let stdout = '', stderr = '';
-  const exitCode = await runSessionInfo(ref, {
-    ...options, json: true,
-    stdout: { write: (text) => { stdout += text; } },
-    stderr: { write: (text) => { stderr += text; } }
-  });
-  return { exitCode, stdout, stderr };
+async function closedPort() {
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
 }
 
-test('#1288 exact local hit ignores all registered peers and discovery', async () => {
-  const { calls, options } = fixture({ local: [{ id: 'shared' }], peers: { 'saved-a': endpoint }, discovered: [remote] });
-  assert.deepEqual(await resolveSessionTarget('shared', options), { id: 'shared', host: '127.0.0.1' });
-  assert.deepEqual(calls, ['http://127.0.0.1:3848/api/sessions']);
-  const result = await sessionInfo('shared', options);
-  assert.equal(result.exitCode, 0);
-  assert.equal(JSON.parse(result.stdout).host, '127.0.0.1');
-  assert.ok(calls.every((call) => call.startsWith('http://127.0.0.1:3848/')));
+async function cli(args, env = {}) {
+  return daemon.runCli(args, { timeoutMs: 30000, env: { ...NO_ENV_TOKEN, ...env } });
+}
+
+async function registerLocal(prefix) {
+  const sid = createSessionId(prefix);
+  const reg = await daemon.registerSession(sid);
+  assert.equal(reg.status, 201, `register failed: ${JSON.stringify(reg.body)}`);
+  return sid;
+}
+
+test('#1288 D1/FACT A+B: an id on the local daemon resolves locally and no peer is consulted', async () => {
+  await ensureDaemon();
+  const sid = await registerLocal('tp1288-d1-shared');
+  const peer = await fakePeer([sid]);
+  writePeers({ 'peer-a': peerEntry(peer) });
+
+  const info = await cli(['session', 'info', sid, '--json']);
+  assert.equal(info.code, 0, info.stderr);
+  const doc = JSON.parse(info.stdout);
+  assert.equal(doc.host, '127.0.0.1');
+  assert.equal(doc.id, sid);
+  assert.equal(peer.hits, 0, 'a peer was consulted for an id the local daemon has');
+
+  const text = await cli(['session', 'info', sid]);
+  assert.equal(text.code, 0, text.stderr);
+  assert.doesNotMatch(text.stderr, /multiple hosts/);
+  assert.equal(peer.hits, 0);
 });
 
-test('#1288 bare-id miss discovers peers and retains exact remote ambiguity', async () => {
-  const only = fixture({ local: [{ id: 'shared-local' }], discovered: [remote] });
-  assert.deepEqual(await resolveSessionTarget('shared', only.options), remote);
-  assert.deepEqual(only.calls, ['http://127.0.0.1:3848/api/sessions', 'ssh', 'http', 'broker']);
-  const second = { ...remote, host: 'node-b.example:4888', peerName: 'saved-b' };
-  const multiple = fixture({ discovered: [remote, second] });
-  await assert.rejects(resolveSessionTarget('shared', multiple.options), { code: 'AMBIGUOUS_SESSION' });
-  assert.equal(pickSessionTarget('shared', [remote, { id: 'shared', host: '127.0.0.1' }]).host, '127.0.0.1');
+test('#1288 D1: a bare id absent locally still reaches the single peer that has it', async () => {
+  await ensureDaemon();
+  const rid = createSessionId('tp1288-d1-remote-only');
+  const peer = await fakePeer([rid]);
+  writePeers({ 'peer-a': peerEntry(peer) });
+
+  const info = await cli(['session', 'info', rid, '--json']);
+  assert.equal(info.code, 0, info.stderr);
+  assert.equal(JSON.parse(info.stdout).host, `127.0.0.1:${peer.port}`);
+  assert.ok(peer.hits > 0);
 });
 
-test('#1288 TELEPTY_HOST restricts selection even when explicitly loopback, with qualifier precedence', async () => {
-  const { calls, options } = fixture({ peers: { 'saved-a': endpoint }, discovered: [remote] });
-  assert.deepEqual(await resolveSessionTarget('shared', { ...options, envHost: '127.0.0.1' }), { id: 'shared', host: '127.0.0.1' });
-  assert.deepEqual(calls.splice(0), ['http://127.0.0.1:3848/api/sessions']);
-  const selected = { ...options, envHost: 'http://node-a.example:4888', port: 4888 };
-  assert.deepEqual(await resolveSessionTarget('shared', selected), remote);
-  assert.deepEqual(calls, ['registry']);
-  assert.deepEqual(await resolveSessionTarget('shared@localhost', selected), { id: 'shared', host: '127.0.0.1' });
-  assert.deepEqual(calls, ['registry', 'http://127.0.0.1:4888/api/sessions']);
-  const direct = { ...options, envHost: 'other.example:9111', port: 9111 };
-  assert.deepEqual(await resolveSessionTarget('shared', direct), { id: 'shared', host: 'other.example:9111' });
-});
+test('#1288 D3: cross-host ambiguity is a JSON refusal under --json, and unchanged text otherwise', async () => {
+  await ensureDaemon();
+  const did = createSessionId('tp1288-d3-dup');
+  const peerA = await fakePeer([did]);
+  const peerB = await fakePeer([did]);
+  writePeers({ 'peer-a': peerEntry(peerA), 'peer-b': peerEntry(peerB) });
 
-test('#1288 local name and assigned addresses use the local daemon with zero DNS lookups', async () => {
-  const { calls, options } = fixture({ local: [{ id: 'shared' }], peers: { 'saved-a': endpoint } });
-  for (const identity of ['localhost', 'local.example', '192.0.2.12:3848', '[::1]:3848']) {
-    assert.deepEqual(await resolveSessionTarget('shared@' + identity, options), { id: 'shared', host: '127.0.0.1' });
+  for (const args of [['session', 'info', did, '--json'], ['read-screen', did, '--json']]) {
+    const result = await cli(args);
+    assert.notEqual(result.code, 0, `${args[0]}: a refusal exited 0 under --json`);
+    const doc = JSON.parse(result.stdout);
+    assert.deepEqual(Object.keys(doc), ['success', 'code', 'error']);
+    assert.equal(doc.success, false);
+    assert.equal(doc.code, 'AMBIGUOUS_SESSION');
+    assert.match(doc.error, new RegExp(`Session '${did}' exists on multiple hosts`));
+    assert.equal(result.stderr, `❌ ${doc.error}\n`, 'the human diagnostic stays on stderr');
   }
-  assert.deepEqual(await resolveSessionTarget('shared@192.0.2.12:4888', options),
-    { id: 'shared', host: '127.0.0.1:4888' });
-  assert.equal(calls.length, 4);
-  assert.ok(calls.every((url) => url === 'http://127.0.0.1:3848/api/sessions'));
+
+  // Text mode keeps its 0.11.3 bytes and exit code (session info never set a failure status here).
+  const text = await cli(['session', 'info', did]);
+  assert.equal(text.stdout, '');
+  const hosts = [`127.0.0.1:${peerA.port}`, `127.0.0.1:${peerB.port}`].sort().join(', ');
+  assert.equal(text.stderr, `❌ Session '${did}' exists on multiple hosts: ${hosts}. Use <session_id>@<host> or set TELEPTY_HOST.\n`);
+  assert.equal(text.code, 0);
 });
 
-test('#1288 registered aliases and resolved IPs use the same stored endpoint', async () => {
-  const { options } = fixture({ peers: { 'saved-a': endpoint, elsewhere: { ...endpoint, port: 4999 } } });
-  // Use the unique registration for identities shared by the two ports.
-  const single = fixture({ peers: { 'saved-a': endpoint } }).options;
-  for (const identity of ['saved-a', 'machine-a', 'node-a.example', 'node-a.example:4888']) {
-    assert.deepEqual(await resolveSessionTarget('shared@' + identity, single), remote);
+test('#1288 D3: an unregistered peer qualifier is a JSON refusal under --json, text unchanged', async () => {
+  await ensureDaemon();
+  const sid = await registerLocal('tp1288-d3-unreg');
+  const peer = await fakePeer([]);
+  writePeers({ 'peer-a': peerEntry(peer, { machineId: 'tp1288-peer-a' }) });
+  const host = 'tp1288-unregistered.invalid';
+  const message = `No peer registered with machine id or address '${host}'; known: tp1288-peer-a. `
+    + 'Use telepty connect-http or telepty connect to register it.';
+
+  for (const args of [['session', 'info', `${sid}@${host}`, '--json'], ['read-screen', `${sid}@${host}`, '--json']]) {
+    const result = await cli(args);
+    assert.equal(result.code, 1, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { success: false, code: 'PEER_NOT_REGISTERED', error: message });
+    assert.equal(result.stderr, `❌ ${message}\n`);
   }
-  const lookups = [];
-  const lookupAddress = async (name, lookupOptions) => {
-    lookups.push(name);
-    assert.equal(lookupOptions.all, true);
-    return [{ address: '192.0.2.25' }, { address: '2001:db8::25' }];
-  };
-  assert.deepEqual(await resolveSessionTarget('shared@192.0.2.25:4888', { ...options, lookupAddress }), remote);
-  assert.deepEqual(await resolveSessionTarget('shared@[2001:db8::25]:4888', { ...options, lookupAddress }), remote);
-  assert.deepEqual(lookups.splice(0), ['node-a.example', 'node-a.example']);
-  await assert.rejects(resolveSessionTarget('shared@192.0.2.25', { ...options, lookupAddress }), { code: 'AMBIGUOUS_PEER' });
-  assert.deepEqual(lookups, ['node-a.example'], 'each distinct hostname is looked up once per resolution');
+  const text = await cli(['session', 'info', `${sid}@${host}`]);
+  assert.equal(text.code, 1);
+  assert.equal(text.stdout, '');
+  assert.equal(text.stderr, `❌ ${message}\n`);
 });
 
-test('#1288 JSON refusal documents, diagnostic stderr and non-zero dispatch result', async (t) => {
-  const peerSet = { 'saved-a': endpoint };
-  const missing = fixture().options;
-  const entries = { '/api/sessions': { ok: false, status: 401 } };
-  const scenarios = [
-    ['INVALID_SESSION_REFERENCE', '', missing, /Usage/],
-    ['SESSION_NOT_FOUND', 'absent', missing, /not found/],
-    ['AMBIGUOUS_SESSION', 'shared', fixture({ discovered: [remote, { ...remote, host: 'node-b.example:4888' }] }).options, /multiple hosts/],
-    ['PEER_NOT_REGISTERED', 'shared@unknown.example', fixture({ peers: peerSet }).options, /No peer registered/],
-    ['AMBIGUOUS_PEER', 'shared@machine-a', fixture({ peers: { ...peerSet, 'saved-b': { ...endpoint, port: 4999 } } }).options, /ambiguous/],
-    ['PEER_ENDPOINT_MISSING', 'shared@incomplete', fixture({ peers: { incomplete: { transport: 'http' } } }).options, /no registered HTTP endpoint/],
-    ['PEER_DNS_FAILED', 'shared@192.0.2.99:4888', { ...fixture({ peers: peerSet }).options,
-      lookupAddress: async () => { throw Object.assign(new Error('fixture'), { code: 'ENOTFOUND' }); } }, /node-a\.example.*ENOTFOUND/],
-    ['PEER_DNS_FAILED', 'shared@192.0.2.99:4888', { ...fixture({ peers: peerSet }).options,
-      lookupAddress: () => new Promise(() => {}), timeoutMs: 5 }, /PEER_DNS_TIMEOUT/],
-    ['PEER_DISCOVERY_INCOMPLETE', 'shared', fixture({ errors: [new Error('peer refused')] }).options, /peer refused/],
-    ['DAEMON_REFUSED', 'shared', fixture({ entries }).options, /HTTP 401/],
-    ['DAEMON_RESPONSE_ERROR', 'shared', fixture({ entries: { '/api/sessions': { ok: false, status: 503 } } }).options, /HTTP 503/],
-    ['DAEMON_NOT_ANSWERING', 'shared', { ...missing, _fetchWithAuth: async () => { throw new Error('fixture timeout'); } }, /did not answer/],
-    ['SESSION_NOT_FOUND', 'shared@localhost', fixture({ entries: {
-      '/api/sessions/shared': { ok: false, status: 404, json: async () => ({ error: 'Session not found' }) }
-    } }).options, /Session not found/],
-    ['NO_TARGET_CREDENTIAL', 'shared', { ...missing, envHost: 'foreign.example', _fetchWithAuth: async () => {
-      throw Object.assign(new Error('credential unavailable'), { code: 'NO_TARGET_CREDENTIAL' });
-    } }, /credential unavailable/]
+test('#1288 D3/FACT D: an IP qualifier finds the peer registered by host name, at its registered endpoint', async () => {
+  await ensureDaemon();
+  const rid = createSessionId('tp1288-d3-dns');
+  const peer = await fakePeer([rid]);
+  // Registered by NAME; `localhost` is the one host name every CI OS resolves to 127.0.0.1.
+  writePeers({ 'peer-dns': peerEntry(peer, { host: 'localhost', target: `localhost:${peer.port}`, machineId: 'peer-dns' }) });
+
+  const result = await cli(['session', 'info', `${rid}@127.0.0.1:${peer.port}`, '--json']);
+  assert.doesNotMatch(result.stderr + result.stdout, /No peer registered/,
+    'the address of a registered peer was refused as unregistered (FACT D)');
+  // The request went to the REGISTERED endpoint `localhost:<port>`. Whether this runner's `localhost`
+  // connects over IPv4 is not what is under test, so either outcome names that endpoint.
+  if (result.stdout.trim()) {
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).host, `localhost:${peer.port}`);
+  } else {
+    assert.match(result.stderr, new RegExp(`localhost:${peer.port}`));
+  }
+});
+
+test('#1288 D2/F10: <id>@<this machine name> is the local daemon when no peer uses the name', async () => {
+  await ensureDaemon();
+  const sid = await registerLocal('tp1288-d2-own');
+  const peer = await fakePeer([sid]);
+  writePeers({ 'peer-a': peerEntry(peer, { machineId: 'tp1288-peer-a' }) });
+
+  const byHostname = await cli(['session', 'info', `${sid}@${os.hostname()}`, '--json']);
+  assert.equal(byHostname.code, 0, byHostname.stderr);
+  assert.equal(JSON.parse(byHostname.stdout).host, '127.0.0.1');
+
+  // F10: the CLI does not know TELEPTY_MACHINE_ID; the daemon reports it on /api/meta.
+  for (const name of [LOCAL_MACHINE, LOCAL_MACHINE.toUpperCase()]) {
+    const byMachineId = await cli(['session', 'info', `${sid}@${name}`, '--json'], { TELEPTY_MACHINE_ID: '' });
+    assert.equal(byMachineId.code, 0, byMachineId.stderr);
+    assert.equal(JSON.parse(byMachineId.stdout).host, '127.0.0.1');
+  }
+  assert.equal(peer.hits, 0);
+});
+
+test('#1288 F5: a registered peer always wins over the local-name alias, and is never silently replaced', async () => {
+  await ensureDaemon();
+  const sid = await registerLocal('tp1288-f5-shadow');
+  const peer = await fakePeer([sid]);
+
+  writePeers({ [os.hostname()]: peerEntry(peer, { machineId: 'tp1288-peer-a' }) });
+  const byName = await cli(['session', 'info', `${sid}@${os.hostname()}`, '--json']);
+  assert.equal(byName.code, 0, byName.stderr);
+  assert.equal(JSON.parse(byName.stdout).host, `127.0.0.1:${peer.port}`, 'a peer named like this host was replaced by the local daemon');
+
+  writePeers({ 'tp1288-other': peerEntry(peer, { machineId: LOCAL_MACHINE }) });
+  const byMachineId = await cli(['session', 'info', `${sid}@${LOCAL_MACHINE}`, '--json'], { TELEPTY_MACHINE_ID: '' });
+  assert.equal(byMachineId.code, 0, byMachineId.stderr);
+  assert.equal(JSON.parse(byMachineId.stdout).host, `127.0.0.1:${peer.port}`);
+
+  // A peer that uses the name in another case is not matched as a peer (aliases are exact), and the
+  // local alias does not take its place either: the qualifier is refused.
+  writePeers({ 'tp1288-other': peerEntry(peer, { machineId: LOCAL_MACHINE.toUpperCase() }) });
+  const caseVariant = await cli(['session', 'info', `${sid}@${LOCAL_MACHINE}`, '--json'], { TELEPTY_MACHINE_ID: '' });
+  assert.equal(caseVariant.code, 1);
+  assert.equal(JSON.parse(caseVariant.stdout).code, 'PEER_NOT_REGISTERED');
+});
+
+test('#1288 F4/#837: a local session addressed by prefix resolves locally, even against a peer exact id', async () => {
+  await ensureDaemon();
+  const base = createSessionId('tp1288-f4-pfx');
+  const sid = `${base}-001`;
+  const reg = await daemon.registerSession(sid);
+  assert.equal(reg.status, 201, `register failed: ${JSON.stringify(reg.body)}`);
+  const peer = await fakePeer([base]);
+  writePeers({ 'peer-a': peerEntry(peer) });
+
+  const info = await cli(['session', 'info', base, '--json']);
+  assert.equal(info.code, 0, info.stderr);
+  const doc = JSON.parse(info.stdout);
+  assert.equal(doc.id, sid);
+  assert.equal(doc.host, '127.0.0.1');
+
+  const multicast = await cli(['multicast', base, 'tp1288 prefix probe']);
+  assert.doesNotMatch(multicast.stderr, /multiple hosts|was not found/);
+  assert.equal(peer.hits, 0, 'a prefix-addressed local session fanned out to a peer');
+});
+
+test('#1288 F1: list --json keeps printing the session array when a peer refuses; the warning is stderr only', async () => {
+  await ensureDaemon();
+  const sid = await registerLocal('tp1288-f1-list');
+  const refusing = await fakePeer([], { refuse: true });
+  writePeers({ refusing: peerEntry(refusing) });
+
+  const list = await cli(['list', '--json']);
+  const sessions = JSON.parse(list.stdout);
+  assert.ok(Array.isArray(sessions), `list --json printed a non-array: ${list.stdout}`);
+  assert.ok(sessions.some((session) => session.id === sid && session.host === '127.0.0.1'));
+  assert.match(list.stderr, /INCOMPLETE/);
+  assert.equal(list.code, 1, 'an incomplete list still exits non-zero (#835)');
+
+  // The consumer of FACT A: probing its own local session is not affected by the refusing peer.
+  const info = await cli(['session', 'info', sid, '--json']);
+  assert.equal(info.code, 0, info.stderr);
+  assert.equal(JSON.parse(info.stdout).id, sid);
+});
+
+test('#1288 F2: readiness and wait-ready keep the documented daemon statuses', async () => {
+  await ensureDaemon();
+  writePeers({});
+  const missing = createSessionId('tp1288-f2-missing');
+  for (const verb of ['readiness', 'wait-ready']) {
+    const result = await cli([verb, missing, '--json', '--timeout-ms', '0']);
+    assert.equal(result.code, 1);
+    const doc = JSON.parse(result.stdout);
+    assert.equal(doc.status, 'not_found', `${verb} replaced the daemon status: ${result.stdout}`);
+    assert.equal(doc.reason, 'exact_session_not_found');
+    assert.equal(doc.ready, false);
+  }
+});
+
+test('#1288 F3: an unrelated peer whose host name does not resolve never blocks a direct target', async () => {
+  await ensureDaemon();
+  const port = await closedPort();
+  writePeers({ 'old-box': { transport: 'http', host: 'tp1288-old-box.invalid', port, target: `tp1288-old-box.invalid:${port}`, machineId: 'old-box' } });
+  const env = { TELEPTY_HOST: '0.0.0.0', TELEPTY_PORT: String(port), TELEPTY_AUTH_TOKEN: 'not-the-point' };
+
+  for (const ref of ['no-such-session', `no-such-session@0.0.0.0:${port}`]) {
+    const result = await cli(['inject', ref, 'hello'], env);
+    assert.match(result.stderr, new RegExp(`0\\.0\\.0\\.0:${port}`),
+      `${ref}: the direct target was not attempted: ${JSON.stringify(result.stderr)}`);
+    assert.doesNotMatch(result.stderr, /No peer registered|ambiguous|Could not match/);
+    assert.notEqual(result.code, 0);
+  }
+});
+
+test('#1288 golden: with no registered peers the resolving commands print what 0.11.3 printed', async () => {
+  await ensureDaemon();
+  fs.rmSync(peersPath(), { force: true });
+  const sid = await registerLocal('tp1288-golden');
+  const missing = createSessionId('tp1288-golden-missing');
+  const notFound = `❌ Session '${missing}' was not found on any discovered host.\n`;
+  const unregistered = "❌ No peer registered with machine id or address 'tp1288-nowhere.invalid'; known: (none). "
+    + 'Use telepty connect-http or telepty connect to register it.\n';
+  const cases = [
+    [['session', 'info', missing], { code: 1, stdout: '', stderr: notFound }],
+    [['session', 'info', missing, '--json'], { code: 1, stdout: '', stderr: notFound }],
+    [['session', 'info', `${sid}@tp1288-nowhere.invalid`], { code: 1, stdout: '', stderr: unregistered }],
+    [['read-screen', missing], { code: 1, stdout: '', stderr: notFound }],
+    [['read-screen', missing, '--json'], { code: 1, stdout: '', stderr: notFound }],
+    [['read-screen', `${sid}@tp1288-nowhere.invalid`], { code: 1, stdout: '', stderr: unregistered }],
+    [['multicast', missing, 'hello'], { code: 0, stdout: '', stderr: notFound }]
   ];
-  const previous = process.env.TELEPTY_AUTH_TOKEN;
-  delete process.env.TELEPTY_AUTH_TOKEN;
-  t.after(() => { if (previous !== undefined) process.env.TELEPTY_AUTH_TOKEN = previous; });
-  for (const [code, ref, options, diagnostic] of scenarios) {
-    const result = await sessionInfo(ref, options);
-    assert.equal(result.exitCode, 1, ref);
-    const parsed = JSON.parse(result.stdout);
-    assert.deepEqual(parsed, { success: false, code, error: parsed.error });
-    assert.match(parsed.error, diagnostic);
-    assert.equal(result.stderr, '❌ ' + parsed.error + '\n');
+  for (const [args, expected] of cases) {
+    const result = await cli(args);
+    assert.deepEqual({ code: result.code, stdout: result.stdout, stderr: result.stderr }, expected, args.join(' '));
   }
+
+  const info = await cli(['session', 'info', sid, '--json']);
+  assert.equal(info.code, 0, info.stderr);
+  assert.equal(info.stderr, '');
+  const doc = JSON.parse(info.stdout);
+  assert.equal(info.stdout, `${JSON.stringify(doc, null, 2)}\n`);
+  assert.equal(Object.keys(doc)[0], 'host');
+  assert.equal(doc.host, '127.0.0.1');
+  assert.equal(doc.id, sid);
+
+  const list = await cli(['list', '--json']);
+  assert.equal(list.code, 0, list.stderr);
+  assert.equal(list.stderr, '');
+  assert.ok(JSON.parse(list.stdout).some((session) => session.id === sid));
 });
 
-test('#1288 list disambiguates text IDs and the no-peer session info JSON matches the 0.11.3 golden bytes', async () => {
-  const { options } = fixture({ local: [{ id: 'shared' }] });
-  const local = await resolveSessionTarget('shared', options);
-  const lines = [];
-  printSessionList([local, remote, { id: 'shared', host: 'node-b.example:4888' }], (line) => lines.push(line));
-  assert.deepEqual(lines.filter((line) => line?.includes('  - ID:')), [
-    '  - ID: \x1b[36mshared\x1b[0m',
-    '  - ID: \x1b[36mshared@saved-a\x1b[0m',
-    '  - ID: \x1b[36mshared@node-b.example:4888\x1b[0m'
-  ]);
-  const empty = [];
-  printSessionList([], (line) => empty.push(line + '\n'));
-  assert.equal(empty.join(''), 'No active sessions found.\n');
-  assert.deepEqual(await sessionInfo('shared', options), {
-    exitCode: 0, stderr: '',
-    stdout: '{\n  "host": "127.0.0.1",\n  "id": "shared",\n  "command": "codex"\n}\n'
+test('#1288 resolvePeerByAddress: exact registered endpoint, bounded lookup, failure is no match', async () => {
+  const peers = {
+    'peer-linux': { transport: 'http', host: 'peer-linux', port: 3848, target: 'peer-linux:3848', machineId: 'peer-linux', token: 'T' },
+    'by-ip': { transport: 'http', host: '100.64.0.9', port: 3848, target: '100.64.0.9:3848', machineId: 'by-ip' },
+    'ssh-box': { target: 'me@ssh-box', machineId: 'ssh-box' }
+  };
+  const lookups = [];
+  const answers = { 'peer-linux': ['100.64.0.7', 'fd7a:115c::7'], 'ssh-box': ['10.0.0.9'] };
+  const lookup = async (host, options) => {
+    lookups.push(host);
+    assert.equal(options.all, true);
+    return (answers[host] || []).map((address) => ({ address }));
+  };
+
+  assert.deepEqual(await resolvePeerByAddress('orchestrator@100.64.0.7:3848', peers, { lookup }),
+    { id: 'orchestrator', host: 'peer-linux:3848', peerName: 'peer-linux', peerPort: 3848 });
+  assert.deepEqual(await resolvePeerByAddress('orchestrator@100.64.0.7', peers, { lookup }),
+    { id: 'orchestrator', host: 'peer-linux:3848', peerName: 'peer-linux', peerPort: 3848 });
+  assert.deepEqual(await resolvePeerByAddress('orchestrator@[fd7a:115c::7]:3848', peers, { lookup }),
+    { id: 'orchestrator', host: 'peer-linux:3848', peerName: 'peer-linux', peerPort: 3848 });
+  assert.deepEqual(await resolvePeerByAddress('worker@10.0.0.9', peers, { lookup }),
+    { id: 'worker', host: 'me@ssh-box', peerName: 'ssh-box', remote: true });
+  assert.ok(!lookups.includes('100.64.0.9'), 'a peer registered by IP is never looked up');
+
+  lookups.length = 0;
+  assert.equal(await resolvePeerByAddress('orchestrator@100.64.0.7:4000', peers, { lookup }), null);
+  assert.deepEqual(lookups, [], 'no HTTP peer on that port, and an SSH peer never matches a port');
+  assert.equal(await resolvePeerByAddress('orchestrator@peer-linux', peers, { lookup }), null);
+  assert.equal(await resolvePeerByAddress('orchestrator', peers, { lookup }), null);
+  assert.deepEqual(lookups, [], 'only IP-literal qualifiers are looked up');
+  assert.equal(await resolvePeerByAddress('orchestrator@100.64.0.7', { 'by-ip': peers['by-ip'] }, { lookup }), null);
+  assert.deepEqual(lookups, [], 'a host without name-registered peers performs no lookup');
+
+  // F3: a failed or slow lookup is "no match", never a refusal.
+  const failing = async () => { throw Object.assign(new Error('fixture'), { code: 'ENOTFOUND' }); };
+  assert.equal(await resolvePeerByAddress('orchestrator@100.64.0.7', peers, { lookup: failing }), null);
+  const hanging = () => new Promise(() => {});
+  assert.equal(await resolvePeerByAddress('orchestrator@100.64.0.7', peers, { lookup: hanging, timeoutMs: 20 }), null);
+
+  const twins = { a: { ...peers['peer-linux'] }, b: { ...peers['peer-linux'], host: 'peer-linux-alias' } };
+  const twinLookup = async () => [{ address: '100.64.0.7' }];
+  await assert.rejects(resolvePeerByAddress('orchestrator@100.64.0.7', twins, { lookup: twinLookup }),
+    /Peer '100\.64\.0\.7' is ambiguous: a, b\. Use the registered peer name\./);
+});
+
+test('#1288 local-name predicates are exact and case-insensitive', () => {
+  assert.equal(isLocalMachineName('MAC-MINI', ['mac-mini', undefined]), true);
+  assert.equal(isLocalMachineName('mac', ['mac-mini']), false);
+  assert.equal(isLocalMachineName('', ['']), false);
+  assert.equal(registeredPeerUsesName('Ubuntu', { other: { machineId: 'ubuntu' } }), true);
+  assert.equal(registeredPeerUsesName('UBUNTU', { ubuntu: {} }), true);
+  assert.equal(registeredPeerUsesName('ubuntu', { other: { host: 'other.example' } }), false);
+});
+
+test('#1288 D3/FACT E: connect-http names an IP peer after the whole address and keeps legacy keys', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-1288-http-names-'));
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(req.url === '/api/meta' ? { machine_id: 'tp1288-meta-id' } : { ok: true }));
   });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    await new Promise((resolve) => server.close(() => resolve()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const { port } = server.address();
+  const peersFile = path.join(dir, 'peers.json');
+  const context = () => createPeerContext({ PEERS_PATH: peersFile, CONTROL_DIR: dir });
+
+  const fresh = await context().connectHttp(`127.0.0.1:${port}`);
+  assert.equal(fresh.success, true, fresh.error);
+  assert.equal(fresh.name, '127.0.0.1', 'an IP address was cut at its first dot');
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(peersFile, 'utf8')).peers), ['127.0.0.1']);
+
+  // F9: a legacy fragment key for the same endpoint is reused, never duplicated.
+  fs.writeFileSync(peersFile, JSON.stringify({ peers: { 127: { transport: 'http', host: '127.0.0.1', port, target: `127.0.0.1:${port}`, machineId: 'old' } } }));
+  const legacy = await context().connectHttp(`127.0.0.1:${port}`);
+  assert.equal(legacy.success, true, legacy.error);
+  assert.equal(legacy.name, '127');
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(peersFile, 'utf8')).peers), ['127']);
+
+  // A different endpoint already holding the IP name is refused, not overwritten.
+  const taken = JSON.stringify({ peers: { '127.0.0.1': { transport: 'http', host: '127.0.0.1', port: port + 1, target: `127.0.0.1:${port + 1}`, machineId: 'other' } } });
+  fs.writeFileSync(peersFile, taken);
+  const collision = await context().connectHttp(`127.0.0.1:${port}`);
+  assert.equal(collision.success, false);
+  assert.match(collision.error, /already registered for a different endpoint; pass --name/);
+  assert.equal(fs.readFileSync(peersFile, 'utf8'), taken);
+
+  const named = await context().connectHttp(`127.0.0.1:${port}`, { name: 'explicit' });
+  assert.equal(named.name, 'explicit');
 });
 
-test('#1288 HTTP registrations use the handshake machine ID or full IP and preserve old keys', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-peer-names-'));
+test('#1288 D3/FACT E: connect (SSH) names an IP peer after the whole address and keeps legacy keys', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-1288-ssh-names-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const peersPath = path.join(dir, 'peers.json');
-  const legacy = { transport: 'http', host: '192.0.2.2', port: 3848, machineId: 'older-host' };
-  const initial = JSON.stringify({ peers: { '192': legacy } });
-  fs.writeFileSync(peersPath, initial);
-  const peerContext = createPeerContext({
-    PEERS_PATH: peersPath,
-    fetch: async (url) => {
-      if (url.endsWith('/api/health')) return { ok: true };
-      if (new URL(url).hostname === '192.0.2.3') return { ok: true, json: async () => ({ machine_id: 'named-peer' }) };
-      return { ok: false };
-    }
+  const peersFile = path.join(dir, 'peers.json');
+  const context = () => createPeerContext({
+    PEERS_PATH: peersFile, CONTROL_DIR: dir, getUsername: () => 'worker', execFileSync: () => ''
   });
-  const options = { ...fixture().options, _peers: peerContext };
-  assert.equal((await resolveSessionTarget('shared@192', options)).host, '192.0.2.2:3848');
-  assert.equal((await resolveSessionTarget('shared@192.0.2.2:3848', options)).peerName, '192');
-  assert.equal(fs.readFileSync(peersPath, 'utf8'), initial);
-  assert.equal((await peerContext.connectHttp('192.0.2.3')).name, 'named-peer');
-  assert.equal((await peerContext.connectHttp('192.0.2.4')).name, '192.0.2.4');
-  assert.equal((await peerContext.connectHttp('[2001:db8::1]:3881')).name, '2001:db8::1');
-  assert.deepEqual(peerContext.loadPeers().peers['192'], legacy);
-});
 
-test('#1288 SSH IP registration uses the reported host or the full IP', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-ssh-peer-names-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const peerContext = createPeerContext({
-    PEERS_PATH: path.join(dir, 'peers.json'),
-    CONTROL_DIR: dir,
-    getUsername: () => 'worker',
-    execFileSync: (_cmd, args) => {
-      if (args.at(-1) !== 'hostname') return '';
-      if (args.includes('worker@192.0.2.3')) return 'ssh-machine\n';
-      throw new Error('fixture hostname unavailable');
-    }
-  });
-  assert.equal((await peerContext.connect('192.0.2.3')).name, 'ssh-machine');
-  assert.equal((await peerContext.connect('192.0.2.4')).name, '192.0.2.4');
-  assert.equal((await resolveSessionTarget('shared@192.0.2.3:22', { ...fixture().options, _peers: peerContext })).peerName, 'ssh-machine');
+  const one = context();
+  assert.equal((await one.connect('192.0.2.3')).name, '192.0.2.3');
+  const second = await one.connect('192.0.2.4');
+  assert.equal(second.success, true, second.error);
+  assert.equal(second.name, '192.0.2.4', 'two IP peers collided on their first label');
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(peersFile, 'utf8')).peers).sort(), ['192.0.2.3', '192.0.2.4']);
+  assert.equal((await one.connect('build-box.example')).name, 'build-box', 'host names keep their 0.11.3 default');
+
+  fs.writeFileSync(peersFile, JSON.stringify({ peers: { 192: { target: 'worker@192.0.2.5', machineId: 'old' } } }));
+  assert.equal((await context().connect('192.0.2.5')).name, '192');
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(peersFile, 'utf8')).peers), ['192']);
 });

@@ -203,10 +203,7 @@ test('#835 a refused CLI reports the refusal and kills nothing', async (t) => {
 
   assert.equal(blockedSignals(log).length, 0, `a 401 reached the kill path: ${blockedSignals(log).slice(0, 3).join(' | ')}`);
   assert.notEqual(result.code, 0, 'a refused command exited 0 — every script reads that as success');
-  const refusal = JSON.parse(result.stdout);
-  assert.equal(refusal.success, false);
-  assert.equal(refusal.code, 'DAEMON_REFUSED');
-  assert.match(refusal.error, /401/);
+  assert.equal(result.stdout.trim(), '', 'a refusal must not print a session list of any shape');
   assert.match(result.stderr, /401/);
 });
 

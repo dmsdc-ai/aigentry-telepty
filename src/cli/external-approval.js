@@ -15,7 +15,7 @@ function approvalOptionRequested(argv, names = ['--approval-file']) {
     const arg = argv[i];
     if (arg === '--') return false;
     if (names.includes(arg)) return true;
-    if (['--from', '--reply-to', '--submit-retry', '--ref', '--approval-file'].includes(arg)) { i++; continue; }
+    if (['--from', '--reply-to', '--submit-retry', '--ref'].includes(arg)) { i++; continue; }
     if (!arg.startsWith('-') && ++positionals > 1) return false;
   }
   return false;
@@ -102,7 +102,7 @@ function readApprovalFile(file, expected, { filesystem = fs, platform = process.
 const SERVER_CODES = new Set(['APPROVAL_DENIED', 'APPROVAL_EXPIRED', 'EXTERNAL_APPROVAL_REQUIRED', 'APPROVAL_TARGET_NOT_READY',
   'QUEUE_TIMEOUT', 'QUEUE_BUSY', 'SESSION_GONE', 'DISCONNECTED', 'STALE', 'PERMISSION_DENIED', 'APPROVAL_CAPACITY',
   'INVALID_APPROVAL_REQUEST', 'APPROVAL_POLICY_REQUIRED', 'APPROVAL_INGRESS_UNSUPPORTED', 'SSH_APPROVAL_TRANSPORT_UNSUPPORTED', 'DELIVERY_UNCERTAIN']);
-async function runApprovalCommand(command, argv, { daemonUrl, remoteHost = '127.0.0.1', fetchWithAuth, resolveAddress,
+async function runApprovalCommand(command, argv, { daemonUrl, remoteHost = '127.0.0.1', fetchWithAuth,
   print = console.log, printError = console.error }) {
   try {
     const input = parseApprovalArgs(command, argv);
@@ -110,10 +110,7 @@ async function runApprovalCommand(command, argv, { daemonUrl, remoteHost = '127.
     const suffix = command === 'inject' ? 'inject' : 'approval-challenge';
     const body = command === 'inject' ? { prompt: input.prompt, no_enter: input.noEnter, exact_target: true, external_approval: externalApproval }
       : { operation: 'inject', no_enter: input.noEnter, payload_sha256: input.payloadSha256 };
-    const address = resolveAddress ? await resolveAddress(input.host ? `${input.id}@${input.host}` : input.id)
-      : { host: input.host || remoteHost };
-    if (address.remote) fail('SSH_APPROVAL_TRANSPORT_UNSUPPORTED');
-    const response = await fetchWithAuth(`${daemonUrl(address.host)}/api/sessions/${encodeURIComponent(input.id)}/${suffix}`, {
+    const response = await fetchWithAuth(`${daemonUrl(input.host || remoteHost)}/api/sessions/${encodeURIComponent(input.id)}/${suffix}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), readOnlyAuth: true,
       signal: AbortSignal.timeout(command === 'inject' ? 65000 : 5000), redirect: 'error' });
     const result = await boundedJson(response, MAX_FILE_BYTES);
@@ -126,11 +123,10 @@ async function runApprovalCommand(command, argv, { daemonUrl, remoteHost = '127.
     return 0;
   } catch (error) {
     const localCodes = new Set(['INVALID_APPROVAL_ARGUMENTS', 'UNSUPPORTED_APPROVAL_OPTION', 'INVALID_APPROVAL_TARGET',
-      'INVALID_APPROVAL_DOCUMENT', 'APPROVAL_EXPIRED', 'APPROVAL_FILE_PLATFORM_UNSUPPORTED', 'UNSAFE_APPROVAL_FILE', 'INVALID_APPROVAL_FILE', 'INVALID_APPROVAL_RESPONSE', 'PEER_DNS_FAILED', 'AMBIGUOUS_PEER', 'PEER_ENDPOINT_MISSING']);
+      'INVALID_APPROVAL_DOCUMENT', 'APPROVAL_EXPIRED', 'APPROVAL_FILE_PLATFORM_UNSUPPORTED', 'UNSAFE_APPROVAL_FILE', 'INVALID_APPROVAL_FILE', 'INVALID_APPROVAL_RESPONSE']);
     const code = SERVER_CODES.has(error.code) || localCodes.has(error.code) ? error.code
       : error.code === 'TELEPTY_CONFIG_UNREADABLE' || error.name === 'CredentialRefusalError' ? 'CREDENTIALS_UNAVAILABLE' : 'APPROVAL_REQUEST_FAILED';
-    const json = approvalOptionRequested(argv, ['--json']);
-    (json ? print : printError)(JSON.stringify({ success: false, code })); return 1;
+    printError(JSON.stringify({ success: false, code })); return 1;
   }
 }
 module.exports = { approvalOptionRequested, parseApprovalArgs, readApprovalFile, validateDocument, runApprovalCommand };

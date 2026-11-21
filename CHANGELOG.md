@@ -6,16 +6,29 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 **Behaviour changes**
 
-- A bare session ID selects an exact match on the local daemon first. If the ID
-  is absent locally and more than one peer has it, specify `<id>@<peer>` or set
-  `TELEPTY_HOST` to select a daemon.
-- In JSON mode, session-routing refusals write a JSON document with a stable
-  error code to stdout and exit non-zero. Human diagnostics go to stderr.
-
-Session references accept registered peer names, machine IDs, hostnames and
-addresses, including addresses resolved from a registered hostname. New
-IP-based registrations use the reported machine ID or the full IP address as
-the default name. Text session listings show the peer alongside each remote ID.
+- `session info` and `multicast` now resolve a bare session ID on the local daemon first, like
+  every other command already did (#837): an ID that exists locally — exactly, or by its project
+  prefix — is answered locally without consulting any peer, even when a peer runs a session with the
+  same ID. That includes `TELEPTY_HOST=127.0.0.1`, which used to report the same cross-host
+  ambiguity it names as the remedy. To address the remote copy of an ID that also exists locally,
+  qualify it: `<id>@<peer>`. A bare ID absent locally still reaches a single peer, and is still
+  refused when several peers have it.
+- `<id>@<this machine's name>` (its host name, or the machine ID its daemon reports) addresses the
+  local daemon instead of being refused as an unregistered peer. A registered peer with that name,
+  machine ID or host always wins; the local meaning applies only when no peer uses the name.
+- `<id>@<ip>[:port]` finds a peer that was registered by host name when that host name resolves to
+  the address. The registered endpoint and its stored credential are used, never the typed address.
+  The lookup runs only for an IP qualifier that matches no registered alias, is capped at one
+  second, and a failed lookup changes nothing: the command continues exactly as before.
+- `connect` and `connect-http` without `--name` name a peer registered by IP address after the whole
+  address (`100.64.0.7`), not its first dot-separated label (`100`), so two such peers no longer
+  overwrite each other. Re-registering an endpoint that already has an entry keeps that entry's key;
+  an IP name already taken by a different endpoint is refused with a hint to pass `--name`. Existing
+  entries are not rewritten.
+- With `--json`, `session info` and `read-screen` print the cross-host ambiguity refusal and the
+  unregistered-peer refusal as `{"success":false,"code":"AMBIGUOUS_SESSION"|"PEER_NOT_REGISTERED","error":…}`
+  on stdout, keep the same `❌` line on stderr, and exit 1. Text mode and every other failure are
+  unchanged.
 
 ## 0.11.3
 

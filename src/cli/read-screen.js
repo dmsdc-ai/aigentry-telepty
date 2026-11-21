@@ -1,5 +1,4 @@
 'use strict';
-const { routingError } = require('../../session-routing');
 const { parseBudget } = require('../screen-observation');
 function screenQuery(args) {
   const json = args.includes('--json');
@@ -26,11 +25,10 @@ async function readScreen(args, { resolveTarget, daemonUrl, fetchWithAuth, print
   const query = screenQuery(args);
   const sessionId = args[1];
   const target = await resolveTarget(sessionId);
-  if (!target) throw routingError('SESSION_NOT_FOUND', `Session '${sessionId}' was not found on any discovered host.`);
+  if (!target) throw new Error(`Session '${sessionId}' was not found on any discovered host.`);
   const response = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/screen?${query}`);
   const data = await response.json();
-  if (!response.ok) throw routingError(data.code || (response.status === 404 ? 'SESSION_NOT_FOUND'
-    : response.status === 401 || response.status === 403 ? 'DAEMON_REFUSED' : 'SCREEN_REQUEST_FAILED'), data.error);
+  if (!response.ok) throw new Error(data.error);
   print(args.includes('--json') ? JSON.stringify(data) : data.screen || '(empty screen)');
 }
 module.exports = { screenQuery, readScreen };

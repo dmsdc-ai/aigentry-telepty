@@ -366,6 +366,13 @@ have not registered as a peer — append `@<host>` to the session ID. `<host>` c
 hostname, LAN IP, or Tailnet name. This needs no `connect`/`connect-http` first: the target
 is resolved directly, which is why the relay demo above works between fresh machines.
 
+A bare ID resolves to the session on **this** machine first. Because every machine can run a
+session with the same ID (for example `orchestrator`), `telepty inject orchestrator "…"` reaches
+the local `orchestrator` even when a peer has one too; the remote copy of the same ID needs
+`<id>@<peer>`, where `<peer>` is the peer's registered name, machine ID or address. A bare ID that
+does not exist locally is looked up on the registered peers and refused if several have it.
+`<id>@<this machine's name>` addresses the local daemon unless a registered peer uses that name.
+
 ```bash
 # Hostname / Tailnet name
 telepty inject my-session@macbook "hello"

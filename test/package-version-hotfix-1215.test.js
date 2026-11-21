@@ -18,7 +18,7 @@ const BASE_SHA256 = {
   'package-lock.json': '3a855f5f9d0311ec7af684dc0a8d0cc525ef7697c42c76c4d2622984b7ff6c75',
   'scripts/check-package.mjs': 'ebbce915d1ad09f60d7af724b8cd62b67315eee9f75f3a1a9d1ba010e8171e0c',
 };
-// Lines containing the version pins, each with its exact BASE and release text.
+// The only lines the release delta may change (0-based), each with its exact BASE and release text.
 const VERSION_LINES = {
   'package.json': [[2, '  "version": "%s",']],
   'package-lock.json': [[2, '  "version": "%s",'], [8, '      "version": "%s",']],

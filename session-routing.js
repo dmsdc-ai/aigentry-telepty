@@ -1,29 +1,7 @@
 'use strict';
 
-const os = require('node:os');
-const { lookup } = require('node:dns').promises;
-const { isIP } = require('node:net');
-const { parseHostSpec, formatHostForUrl } = require('./host-spec');
-
-function routingError(code, message) {
-  return Object.assign(new Error(message), { code });
-}
-
-function addressKey(host) {
-  if (!isIP(host)) return host.toLowerCase().replace(/\.$/, '');
-  if (isIP(host) === 4) return host;
-  return new URL('http://' + formatHostForUrl(host.split('%')[0])).hostname;
-}
-
-function isLocalAddress(locator, port, { hostname = os.hostname(), interfaces = os.networkInterfaces } = {}) {
-  const spec = parseHostSpec(locator, port);
-  if (spec.port !== port) return false;
-  const key = addressKey(spec.host);
-  if (key === 'localhost' || key === addressKey(hostname)
-    || key === '[::1]' || (isIP(key) === 4 && key.startsWith('127.'))) return true;
-  return Boolean(isIP(spec.host)) && Object.values(interfaces()).some((entries) =>
-    entries?.some(({ address }) => addressKey(address) === key));
-}
+const { isIP } = require('net');
+const { parseHostSpec } = require('./host-spec');
 
 function formatHostLabel(host) {
   return host === '127.0.0.1' ? 'Local' : host;
@@ -43,84 +21,37 @@ function parseSessionReference(sessionRef) {
   };
 }
 
-function peerTarget(parsed, matches) {
-  if (matches.length > 1) {
-    throw routingError('AMBIGUOUS_PEER', `Peer '${parsed.host}' is ambiguous: ${matches.map(([name]) => name).sort().join(', ')}. Use a registered address:port.`);
-  }
-  if (matches.length === 0) return null;
-  const [name, peer] = matches[0];
-  if (peer.transport === 'http') {
-    if (!peer.host || !peer.port) throw routingError('PEER_ENDPOINT_MISSING', `Peer '${name}' has no registered HTTP endpoint.`);
-    return { id: parsed.id, host: `${formatHostForUrl(peer.host)}:${peer.port}`, peerName: name, peerPort: peer.port };
-  }
-  if (!peer.transport || peer.transport === 'ssh') {
-    return { id: parsed.id, host: peer.target, peerName: name, remote: true };
-  }
-  return null;
-}
-
-function peerHost(peer) {
-  if (typeof peer.host === 'string' && peer.host) return peer.host;
-  if ((!peer.transport || peer.transport === 'ssh') && typeof peer.target === 'string') return peer.target.split('@').pop();
-  return null;
-}
-
-// Keep the endpoint and credential lane from registration.
+// Resolve only identities explicitly recorded by connect/connect-http. Never infer trust
+// from DNS, a session advertisement, or a partial hostname match.
 function resolveRegisteredPeerTarget(sessionRef, peers = {}) {
   const parsed = parseSessionReference(sessionRef);
   if (!parsed.id || !parsed.host) return null;
   const matches = Object.entries(peers).filter(([name, peer]) => {
     if (!peer || typeof peer !== 'object') return false;
-    const host = peerHost(peer);
-    const port = peer.port || ((!peer.transport || peer.transport === 'ssh') ? 22 : null);
-    const endpoint = host && port ? `${formatHostForUrl(host)}:${port}` : null;
-    return [name, peer.machineId, host, endpoint, peer.target,
+    const host = typeof peer.host === 'string' && peer.host.includes(':') && !peer.host.startsWith('[') ? `[${peer.host}]` : peer.host;
+    const endpoint = host && peer.port ? `${host}:${peer.port}` : null;
+    return [name, peer.machineId, peer.host, endpoint, peer.target,
       peer.dnsName, peer.magicDnsName].some((alias) => typeof alias === 'string' && alias === parsed.host);
   });
-  return peerTarget(parsed, matches);
+  if (matches.length > 1) {
+    throw new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(([name]) => name).sort().join(', ')}. Use a registered address:port.`);
+  }
+  if (matches.length === 0) return null;
+  const [name, peer] = matches[0];
+  return registeredPeerTarget(parsed.id, name, peer);
 }
 
-async function resolvePeerAddress(id, locator, peers, { lookupAddress = lookup, timeoutMs = 1000 } = {}) {
-  const { host, port } = parseHostSpec(locator, null);
-  if (!isIP(host)) return null;
-
-  const lookups = new Map();
-  let timer;
-  const deadline = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(routingError('PEER_DNS_TIMEOUT', 'lookup timed out')), timeoutMs);
-  });
-  try {
-    const candidates = Object.entries(peers).filter(([, peer]) => peer && (!peer.transport || ['ssh', 'http'].includes(peer.transport)) &&
-      (port === null || port === (peer.port || (peer.transport === 'http' ? null : 22))));
-    const results = await Promise.all(candidates.map(async (entry) => {
-      const [name, peer] = entry;
-      const recorded = peerHost(peer);
-      if (!recorded) return {};
-      const { host: registered } = parseHostSpec(recorded);
-      if (isIP(registered)) return { match: addressKey(registered) === addressKey(host) ? entry : null };
-      if (!lookups.has(registered)) {
-        lookups.set(registered, Promise.race([
-          Promise.resolve().then(() => lookupAddress(registered, { all: true })),
-          deadline
-        ]));
-      }
-      try {
-        const addresses = await lookups.get(registered);
-        return { match: addresses.some(({ address }) => addressKey(address) === addressKey(host)) ? entry : null };
-      } catch (error) {
-        return { failure: `${name} (${registered}): ${error.code || 'lookup failed'}` };
-      }
-    }));
-    const match = peerTarget({ id, host: locator }, results.map(({ match }) => match).filter(Boolean));
-    if (match) return match;
-    const failures = results.map(({ failure }) => failure).filter(Boolean).sort();
-    if (failures.length) {
-      throw routingError('PEER_DNS_FAILED', `Could not match '${locator}' to a registered peer. Address lookup failed for ${failures.join(', ')}.`);
-    }
-    return null;
-  } finally {
-    clearTimeout(timer);
+function registeredPeerTarget(id, name, peer) {
+  const parsed = { id };
+  if (peer.transport === 'http') {
+    if (!peer.host || !peer.port) throw new Error(`Peer '${name}' has no registered HTTP endpoint.`);
+    const host = peer.host.includes(':') && !peer.host.startsWith('[') ? `[${peer.host}]` : peer.host;
+    return { id: parsed.id, host: `${host}:${peer.port}`, peerName: name, peerPort: peer.port };
   }
+  if (!peer.transport || peer.transport === 'ssh') {
+    return { id: parsed.id, host: peer.target, peerName: name, remote: true };
+  }
+  return null;
 }
 
 function groupSessionsByHost(sessions) {
@@ -177,24 +108,98 @@ function pickSessionTarget(sessionRef, sessions, defaultHost = '127.0.0.1') {
     return null;
   }
 
-  const local = matches.find((session) => session.host === '127.0.0.1');
-  if (local) return local;
-
   if (matches.length === 1) {
     return matches[0];
   }
 
   const hosts = matches.map((session) => session.host).sort().join(', ');
-  throw routingError('AMBIGUOUS_SESSION', `Session '${parsed.id}' exists on multiple hosts: ${hosts}. Use <session_id>@<host> or set TELEPTY_HOST.`);
+  // #1288: the code lets a --json caller print this refusal as a document; the text is unchanged.
+  throw Object.assign(new Error(`Session '${parsed.id}' exists on multiple hosts: ${hosts}. Use <session_id>@<host> or set TELEPTY_HOST.`),
+    { code: 'AMBIGUOUS_SESSION' });
+}
+
+// #1288 (FACT C): is `name` this machine's own name? Case-insensitive, because Windows reports
+// upper-case host names. The caller decides precedence: a registered peer always wins (F5).
+function isLocalMachineName(name, localNames = []) {
+  if (typeof name !== 'string' || !name) return false;
+  const wanted = name.toLowerCase();
+  return localNames.some((local) => typeof local === 'string' && local !== '' && local.toLowerCase() === wanted);
+}
+
+// #1288 (F5): does any registered peer use `name` as its name, machine id or host, ignoring case?
+// A local-name match must never shadow such a peer, not even one that differs only in case.
+function registeredPeerUsesName(name, peers = {}) {
+  const wanted = String(name || '').toLowerCase();
+  return Object.entries(peers).some(([peerName, peer]) => [peerName, peer && peer.machineId, peer && peer.host]
+    .some((alias) => typeof alias === 'string' && alias.toLowerCase() === wanted));
+}
+
+const PEER_ADDRESS_LOOKUP_MS = 1000;
+
+function ipAddressKey(address) {
+  return String(address || '').replace(/^\[|\]$/g, '').split('%')[0].toLowerCase();
+}
+
+// #1288 (FACT D): `<id>@<ip>[:port]` names a peer that was registered by HOSTNAME when that
+// hostname resolves to the address. Only an IP-literal qualifier that matched no registered alias
+// reaches here, and only peers registered by name are looked up — so a host without peers never
+// performs a lookup. The registered endpoint and its stored credential are what is returned, never
+// the typed address. A lookup that fails or misses the deadline is "no match" (F3): the caller then
+// takes exactly the path it took before this function existed. Two matching peers are refused.
+async function resolvePeerByAddress(sessionRef, peers = {}, options = {}) {
+  const parsed = parseSessionReference(sessionRef);
+  if (!parsed.id || !parsed.host) return null;
+  const spec = parseHostSpec(parsed.host, null);
+  const address = ipAddressKey(spec.host);
+  if (!isIP(address)) return null;
+  const candidates = [];
+  for (const [name, peer] of Object.entries(peers)) {
+    if (!peer || typeof peer !== 'object') continue;
+    let host = null;
+    if (peer.transport === 'http') {
+      if (spec.port !== null && Number(peer.port) !== spec.port) continue;
+      host = peer.host;
+    } else if (!peer.transport || peer.transport === 'ssh') {
+      if (spec.port !== null || typeof peer.target !== 'string') continue;
+      host = peer.target.split('@').pop();
+    }
+    if (typeof host !== 'string' || !host || isIP(ipAddressKey(host))) continue;
+    candidates.push({ name, peer, host });
+  }
+  if (candidates.length === 0) return null;
+  const lookup = options.lookup || ((host, lookupOptions) => require('dns').promises.lookup(host, lookupOptions));
+  const timeoutMs = options.timeoutMs || PEER_ADDRESS_LOOKUP_MS;
+  const answers = new Map();
+  for (const { host } of candidates) {
+    const key = host.toLowerCase();
+    if (answers.has(key)) continue;
+    answers.set(key, new Promise((resolve) => {
+      const timer = setTimeout(() => resolve([]), timeoutMs);
+      Promise.resolve()
+        .then(() => lookup(host, { all: true }))
+        .then((found) => resolve(Array.isArray(found) ? found.map((entry) => ipAddressKey(entry && entry.address)) : []),
+          () => resolve([]))
+        .finally(() => clearTimeout(timer));
+    }));
+  }
+  const matches = [];
+  for (const candidate of candidates) {
+    if ((await answers.get(candidate.host.toLowerCase())).includes(address)) matches.push(candidate);
+  }
+  if (matches.length > 1) {
+    throw new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(({ name }) => name).sort().join(', ')}. Use the registered peer name.`);
+  }
+  if (matches.length === 0) return null;
+  return registeredPeerTarget(parsed.id, matches[0].name, matches[0].peer);
 }
 
 module.exports = {
   formatHostLabel,
-  isLocalAddress,
-  resolvePeerAddress,
-  routingError,
   groupSessionsByHost,
+  isLocalMachineName,
   parseSessionReference,
   pickSessionTarget,
+  registeredPeerUsesName,
+  resolvePeerByAddress,
   resolveRegisteredPeerTarget
 };

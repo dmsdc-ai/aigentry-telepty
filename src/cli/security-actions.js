@@ -161,13 +161,13 @@ return {
     '  telepty allow -- claude --help'
   ],
   inject: [
-    'Usage: telepty inject [--json] [--ref [file]] [--from <id>] [--reply-to <id>] [--submit] [--submit-force] [--submit-retry N] <session_id> "<prompt text>"',
+    'Usage: telepty inject [--ref [file]] [--from <id>] [--reply-to <id>] [--submit] [--submit-force] [--submit-retry N] <session_id> "<prompt text>"',
     '',
     'Inject prompt text into a session. Use `--` before the prompt to send a payload',
     'that starts with a hyphen: telepty inject my-session -- --help'
   ],
   multicast: [
-    'Usage: telepty multicast [--json] <id1,id2,...> "<prompt text>"',
+    'Usage: telepty multicast <id1,id2,...> "<prompt text>"',
     '',
     'Inject prompt text into multiple sessions. Use `--` before the prompt to send',
     'a payload that starts with a hyphen: telepty multicast id1,id2 -- --help'
