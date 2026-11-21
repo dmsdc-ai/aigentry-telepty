@@ -1,6 +1,7 @@
 'use strict';
 
-// Check the 0.11.3 release metadata against the supplied 0.11.2 release bytes.
+// Task 1293 rebases the 1282 release metadata check (previously 1270, 1272 and 1215).
+// BASE_SHA256 pins the supplied unmodified 0.11.2 repository bytes before this version bump.
 // CHANGELOG/README identity stays owned by test/release-version-invariant-844.test.js.
 
 const { test } = require('node:test');

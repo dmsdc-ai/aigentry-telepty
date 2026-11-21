@@ -96,7 +96,7 @@ test('decideDaemonAction: no meta and /api/sessions refused → start', () => {
 
 test('decideDaemonAction: daemon newer than CLI → noop (do not clobber)', () => {
   const d = decideDaemonAction({
-    meta: { version: '999.0.0', capabilities: [] },
+    meta: { version: '999.0.0', capabilities: [CAP] },
     requiredCapabilities: [CAP],
     cliVersion: pkg.version,
     sessionsReachable: false

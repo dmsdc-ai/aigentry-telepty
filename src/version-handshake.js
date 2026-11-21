@@ -32,8 +32,10 @@ function parseVersion(value) {
 }
 
 function parseSemver(value) {
-  const parsed = parseVersion(value);
-  return parsed ? parsed.core.map(Number) : null;
+  if (typeof value !== 'string') return null;
+  const match = value.trim().match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
 
 function compareIdentifier(a, b) {
@@ -77,7 +79,9 @@ function decideVersionAction(input) {
 
   const cmp = compareSemver(daemonVersion, cliVersion);
 
-  if (cmp === null) return { action: ACTIONS.NOOP, reason: 'version-unknown' };
+  if (cmp === null) {
+    return { action: ACTIONS.NOOP, reason: daemonVersion === cliVersion ? 'versions-equal-nonsemver' : 'version-unknown' };
+  }
 
   if (cmp === 0) {
     return { action: ACTIONS.NOOP, reason: 'versions-equal' };

@@ -561,11 +561,8 @@ async function gracefulWindowsStop(port, expectedState) {
     readLockPid: () => { try { const pid = JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid; return Number.isSafeInteger(pid) ? pid : null; } catch { return null; } },
     signRequest
   });
-  // Lifecycle callers require a confirmed stop of their recorded PID. An empty
-  // port never authorizes starting a replacement, and needs no process census.
-  if (expectedState && result.status === 'no_answer') {
-    return shutdownClient.decideStopOutcome({ status: 'unidentified', reason: 'recorded_instance_unavailable' });
-  }
+  // A lifecycle hook never broadens a recorded stop with a host census.
+  if (expectedState) return { ...shutdownClient.decideStopOutcome(result), result };
   const dryRun = result.status === 'no_answer' ? (stopDaemon({ port, dryRun: true }).targets || []) : [];
   return shutdownClient.decideStopOutcome(result, dryRun);
 }
@@ -1465,8 +1462,6 @@ function decideDaemonAction({ meta, requiredCapabilities = [], cliVersion, sessi
     }
     return { action: 'noop', reason: 'healthy' };
   }
-
-  if (meta && !isMissingMetaRoute) return { action: 'noop', reason: 'version-unknown' };
 
   // No meta after probing. An older daemon (answers /api/sessions, lacks /api/meta)
   // gets a legit restart; a genuinely absent/unreachable daemon gets auto-started.

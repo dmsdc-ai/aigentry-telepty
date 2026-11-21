@@ -121,7 +121,7 @@ test('#910: postinstall reaches its upgrade path once a state file exists', asyn
     logger: { log: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m) },
     readDaemonState: () => ({ pid: 4242, port: 3848, version: '0.0.1-stale' }),
     detectSupervisor: () => ({ present: false, kind: null, detail: null }),
-    stopRecordedDaemon: () => { cleanupCalled += 1; return true; },
+    stopRecordedDaemon: () => { cleanupCalled += 1; return { startReplacement: true }; },
     // The spawn seam is the load-bearing injection: without it the real
     // spawn helper runs, postinstall.main() returns while a REAL detached daemon it
     // spawned is still starting — a process this test has no business creating (it would target
@@ -129,12 +129,14 @@ test('#910: postinstall reaches its upgrade path once a state file exists', asyn
     // ends. The bin seam below is deliberately INERT: #1228 stopped main() from consulting the
     // PATH `telepty` at all, so it is kept only to DETECT a regression back to it.
     resolveTeleptyBin: () => { resolveBinCalls += 1; return '/nonexistent/telepty'; },
+    waitForDaemonVersion: async () => ({ version: require('../package.json').version, pid: 333 }),
     spawnDetachedDaemon: (...args) => { respawnCalls += 1; respawnArgs = args; },
   });
 
   assert.equal(cleanupCalled, 1, 'a stale running daemon is what postinstall exists to replace');
   assert.equal(respawnCalls, 1, 'the upgrade path ran to its respawn — through the seam, spawning nothing');
-  // The binary stays internal to the hook. The replacement inherits the verified port.
+  // #1228: the default binary launches THIS package's cli.js regardless of PATH.
+  // The replacement inherits the verified port.
   assert.deepEqual(respawnArgs, [undefined, { port: 3848 }]);
   assert.equal(resolveBinCalls, 0, 'resolving the PATH `telepty` is exactly the #1228 regression this discriminates');
   assert.equal(

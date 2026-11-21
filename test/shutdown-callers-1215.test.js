@@ -146,5 +146,6 @@ test('R1/R2 source: main(), the interactive menu and the npm hook call exactly t
   }, { daemon: true, daemonNoDirectStop: true, service: true, uninstall: true, menu: true });
   const hook = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'preuninstall.js'), 'utf8');
   assert.match(hook, /await \(options.stopRecordedDaemon \|\| stopRecordedDaemon\)\(state, false\)/);
+  assert.ok(hook.includes('process.exit(0);'));
   assert.doesNotMatch(hook, /cleanupDaemonProcesses|runPreuninstall/);
 });

@@ -62,6 +62,12 @@ test('daemon newer minor → noop', () => {
   assert.equal(r.action, ACTIONS.NOOP);
 });
 
+test('non-semver equal strings → noop', () => {
+  const r = decideVersionAction({ daemonVersion: 'dev', cliVersion: 'dev' });
+  assert.equal(r.action, ACTIONS.NOOP);
+  assert.equal(r.reason, 'versions-equal-nonsemver');
+});
+
 test('unparseable daemon version leaves the daemon running', () => {
   for (const version of ['dev', '1.2.3junk', '01.2.3', '1.2.3-01']) {
     const result = decideVersionAction({ daemonVersion: version, cliVersion: '1.2.3' });
@@ -70,6 +76,8 @@ test('unparseable daemon version leaves the daemon running', () => {
 });
 
 test('SemVer precedence includes prereleases and ignores build metadata', () => {
+  const decision = decideVersionAction({ daemonVersion: '0.4.3-rc.1', cliVersion: '0.4.3' });
+  assert.deepEqual(decision, { action: ACTIONS.RESTART, reason: 'daemon-older' });
   const versions = ['1.0.0-alpha', '1.0.0-alpha.1', '1.0.0-alpha.beta', '1.0.0-beta',
     '1.0.0-beta.2', '1.0.0-beta.11', '1.0.0-rc.1', '1.0.0'];
   for (let i = 1; i < versions.length; i++) {

@@ -328,9 +328,9 @@ test('B-U5: postinstall warns about a legacy install and still runs the restart 
     platform: 'linux',
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: () => ({ present: false, kind: null, detail: null }),
-    ownsLifecycleTarget: () => true,
-    stopRecordedDaemon: () => true,
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     diagnoseBinOwnership: () => diagnoseBinOwnership({ pkgRoot: POSIX_PKG_ROOT, platform: 'linux', env: {}, fs }),
+    waitForDaemonVersion: async () => ({ version: pkg.version, pid: 333 }),
     spawnDetachedDaemon: () => { detachedStarts += 1; }
   });
 
@@ -353,9 +353,9 @@ test('B-U5: a diagnosis that throws cannot break npm install', async () => {
     platform: 'linux',
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: () => ({ present: false, kind: null, detail: null }),
-    ownsLifecycleTarget: () => true,
-    stopRecordedDaemon: () => true,
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     diagnoseBinOwnership: () => { throw new Error('prefix unreadable'); },
+    waitForDaemonVersion: async () => ({ version: pkg.version, pid: 333 }),
     spawnDetachedDaemon: () => { detachedStarts += 1; }
   });
 
@@ -405,7 +405,7 @@ test('A-U17: a supervised host gets no hint, and the #757 output is unchanged', 
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: () => ({ present: true, kind: 'launchd', detail: '/tmp/x.plist' }),
     ownsLifecycleTarget: () => true,
-    stopRecordedDaemon: () => true,
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     restartSupervisorDaemon: () => ({ success: true }),
     waitForDaemonVersion: async () => ({ pid: 333, version: pkg.version }),
     diagnoseBinOwnership: () => ({ legacy: { present: false }, bins: {} }),
@@ -544,10 +544,10 @@ test('B-U7: main() no longer resolves the daemon through the `telepty` bin owner
     platform: 'linux',
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: () => ({ present: false, kind: null, detail: null }),
-    ownsLifecycleTarget: () => true,
-    stopRecordedDaemon: () => true,
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     diagnoseBinOwnership: () => ({ legacy: { present: false }, bins: {} }),
     resolveTeleptyBin: () => { resolvedBin += 1; return '/opt/prefix/bin/telepty'; },
+    waitForDaemonVersion: async () => ({ version: pkg.version, pid: 333 }),
     spawnDetachedDaemon: (arg) => { spawnedWith = arg; }
   });
 

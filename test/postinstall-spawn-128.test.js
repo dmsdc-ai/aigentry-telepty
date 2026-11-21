@@ -24,8 +24,7 @@ test('#128: async respawn failure is reported without success or rollback except
     env: { npm_config_global: 'true' },
     readDaemonState: () => ({ pid: 123, version: '0.0.1' }),
     detectSupervisor: () => ({ present: false }),
-    ownsLifecycleTarget: () => true,
-    stopRecordedDaemon: () => true,
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     spawnDetachedDaemon: async () => { throw new Error('ENOENT'); },
     logger: { log: s => logs.push(s), warn: s => logs.push(s) }
   });
@@ -92,7 +91,7 @@ test('#1215 F2: a supervised upgrade confirms the new version on the protected /
     readDaemonState: () => ({ pid: 123, version: '0.0.1', port: PORT }),
     detectSupervisor: () => ({ present: true, kind: 'launchd' }),
     ownsLifecycleTarget: () => true,
-    stopRecordedDaemon: () => true,
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     restartSupervisorDaemon: () => ({ success: true }),
     waitTimeoutMs: 2000,
     logger: { log: (s) => logs.push(String(s)), warn: (s) => logs.push(String(s)) }

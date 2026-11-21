@@ -347,7 +347,7 @@ test('T4 postinstall: an invalid setting + a stale daemon ⇒ no cleanup, restar
       env: { npm_config_global: 'true', ...(extraEnv || {}) }, logger, homeDir: home, platform: extraEnv ? process.platform : 'linux',
       diagnoseBinOwnership: () => null,
       detectSupervisor: () => supervisor, readDaemonState: () => ({ pid: 4242, version: '0.0.1', port: 3848 }),
-      ownsLifecycleTarget: () => true, stopRecordedDaemon: r.fn('stopRecordedDaemon', true),
+      ownsLifecycleTarget: () => true, stopRecordedDaemon: r.fn('stopRecordedDaemon', { startReplacement: true }),
       restartSupervisorDaemon: r.fn('restartSupervisorDaemon', { success: true }), spawnDetachedDaemon: r.fn('spawnDetachedDaemon', {}),
       waitForDaemonVersion: r.fn('waitForDaemonVersion', null), waitTimeoutMs: 1 });
     return lines.join('\n');

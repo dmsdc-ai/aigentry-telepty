@@ -159,7 +159,7 @@ test('postinstall: supervised stale daemon restarts through supervisor, not deta
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: launchd,
     ownsLifecycleTarget: () => true,
-    stopRecordedDaemon: () => true,
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     restartSupervisorDaemon: () => { supervisorRestarts += 1; return { success: true }; },
     waitForDaemonVersion: async () => ({ pid: 333, version: pkg.version }),
     spawnDetachedDaemon: () => { detachedStarts += 1; }
@@ -181,8 +181,9 @@ test('postinstall: unsupervised stale daemon keeps detached fallback', async () 
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: absent,
     ownsLifecycleTarget: () => true,
-    stopRecordedDaemon: () => true,
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     resolveTeleptyBin: () => 'telepty',
+    waitForDaemonVersion: async () => ({ version: pkg.version, pid: 333 }),
     spawnDetachedDaemon: () => { detachedStarts += 1; }
   });
 
