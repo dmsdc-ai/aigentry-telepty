@@ -185,7 +185,9 @@ test('1215: /api/meta retains each consumer-required capability alongside SSH re
   assert.equal(caps.filter((c) => c === 'bridge-stage-receipts-v1').length, 1, 'bridge-stage-receipts-v1 advertised exactly once');
   // Task 1215 W3B: the authenticated graceful local stop (POST /api/daemon/stop) is advertised exactly once.
   assert.equal(caps.filter((c) => c === 'daemon-graceful-stop-v1').length, 1, 'daemon-graceful-stop-v1 advertised exactly once');
-  assert.equal(caps.length, BASELINE.length + REQUIRED.length + 3, 'only the explicit SSH receipt, #137 bridge-stage receipt and 1215 graceful-stop capabilities were added');
+  // Task 1292: the reply capability (POST /api/reply-capability-v1) is advertised exactly once outside strict principal mode.
+  assert.equal(caps.filter((c) => c === 'reply-capability-v1').length, 1, 'reply-capability-v1 advertised exactly once');
+  assert.equal(caps.length, BASELINE.length + REQUIRED.length + 4, 'only the explicit SSH receipt, #137 bridge-stage receipt, 1215 graceful-stop and 1292 reply-capability capabilities were added');
 });
 
 // --- inject-exact-target ------------------------------------------------------------------------

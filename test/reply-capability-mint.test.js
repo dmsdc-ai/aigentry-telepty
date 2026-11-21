@@ -36,7 +36,7 @@ function mockClock(t) {
 
 function routeFixture(t, { store = 'real', limits, deliver, begin, peer } = {}) {
   mockClock(t);
-  const calls = { begin: [], deliver: [], abort: [], audit: [], events: [], failures: [], bus: [], store: [], peer: [], mintedIds: [] };
+  const calls = { begin: [], deliver: [], abort: [], audit: [], events: [], failures: [], bus: [], store: [], peer: [], mintedIds: [], errorReplies: [] };
   const requester = { id: 'requester-q', type: 'aterm', sessionEpoch: 'epoch-q', credentialGeneration: 1, isClosing: false, clients: new Set() };
   const responder = { id: 'responder-a', type: 'wrapped', sessionEpoch: 'epoch-r', sessionEpochProved: 'epoch-r',
     credentialGeneration: 1, isClosing: false, clients: new Set() };
@@ -58,8 +58,15 @@ function routeFixture(t, { store = 'real', limits, deliver, begin, peer } = {}) 
     crypto: { randomUUID: () => uuid(++uuids), createHash: (...args) => crypto.createHash(...args) },
     busClients: [{ readyState: 1, send: frame => calls.bus.push(JSON.parse(String(frame))) }],
     resolveSessionAlias: id => (Object.hasOwn(sessions, id) ? id : null),
-    respondWithError: (res, status, code, error, extra = {}) => res.status(status).json({ success: false, code, error, ...extra }),
-    buildErrorBody: (code, error, extra = {}) => ({ success: false, code, error, ...extra }),
+    // The fake response carries the status and code only: the error text is recorded in the call log, never sent back.
+    respondWithError: (res, status, code, error, extra = {}) => {
+      calls.errorReplies.push({ status, code, error });
+      return res.status(status).json({ success: false, code, ...extra });
+    },
+    buildErrorBody: (code, error, extra = {}) => {
+      calls.errorReplies.push({ code, error });
+      return { success: false, code, ...extra };
+    },
     verifiedPrincipalFromReq: req => principals[req.headers && req.headers['x-telepty-session-token']] || null,
     verifiedSenderFields: p => ({ verified_sender_sid: p ? p.sid : null, verified_sender_epoch: p ? p.epoch : null,
       verified_sender_generation: p ? p.generation : null }),
@@ -317,7 +324,8 @@ test('U3 golden definitive refusal, field absent: the error body and the failed 
   const { f, res } = await goldenOutputs(t, TOUCH_TRAP, () => refusal);
   const U1 = uuid(1);
   assert.equal(res.statusCode, 409);
-  assert.deepEqual(res.body, { success: false, code: 'COMPOSER_STRANDED', error: 'stranded', inject_id: U1, tracking_state: 'aborted' });
+  assert.deepEqual(res.body, { success: false, code: 'COMPOSER_STRANDED', inject_id: U1, tracking_state: 'aborted' });
+  assert.deepEqual(f.calls.errorReplies, [{ status: 409, code: 'COMPOSER_STRANDED', error: 'stranded' }]);
   assert.equal(f.calls.audit.length, 1);
   assert.equal(f.calls.audit[0].delivery_result, 'failed:COMPOSER_STRANDED');
   assert.equal(Object.hasOwn(f.calls.audit[0], 'reply_capability'), false);
@@ -417,7 +425,8 @@ test('U14 route catch (delivery threw) → capability stays issued; the 500 body
   const f = routeFixture(t, { deliver: () => { throw new Error('boom'); } });
   const { result: res } = await quietly(() => f.call('responder-a', mintBody()));
   assert.equal(res.statusCode, 500);
-  assert.deepEqual(res.body, { success: false, code: 'DELIVERY_FAILED', error: 'Delivery failed; see daemon log.' });
+  assert.deepEqual(res.body, { success: false, code: 'DELIVERY_FAILED' });
+  assert.deepEqual(f.calls.errorReplies, [{ code: 'DELIVERY_FAILED', error: 'Delivery failed; see daemon log.' }]);
   assert.equal(f.realStore.get(f.calls.mintedIds[0]).state, 'issued');
 });
 
@@ -462,10 +471,10 @@ function deliveryFixture(t, over = {}) {
     bootstrapQueuedResponse: (op, extra) => ({ success: true, strategy: 'bootstrap_queue', queued: true, bootstrap_queued: true, bootstrap_op_id: op.op_id, ...extra }),
     parkOperationOnModal: (_id, target, op) => { parkedOps.push(op); (target.bootstrapQueue ||= []).push(op); return { op_id: 'park-1', ...op }; },
     modalParkResponse: (op, _decision, extra) => ({ success: true, strategy: 'bootstrap_queue', queued: true, ...extra }),
-    modalRejectionResponse: decision => ({ code: 'MODAL', error: decision.reason }),
+    modalRejectionResponse: () => ({ code: 'MODAL' }),
     resolveModalGate: async () => null, modalRemedy: () => 'reject', hasBootstrapBacklog: () => false,
     applyProvenance, maybeBracketedPaste: payload => payload, emitInjectFailureEvent() {},
-    buildErrorBody: (code, error, extra) => ({ success: false, code, error, ...extra }),
+    buildErrorBody: (code, _error, extra) => ({ success: false, code, ...extra }),
     getMailbox: () => mailbox, getMailboxNotifier: () => ({ notify() {} }),
     getMailboxDelivery: () => ({ tick: async () => {} }),
     broadcastSessionEvent() {},

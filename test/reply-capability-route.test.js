@@ -453,7 +453,7 @@ test('U11 delivery audit and bus correlate the bound sender and never expose the
     });
     assert.equal(h.audits.length, 1);
     const row = h.audits[0];
-    const line = buildAuditLine({ ...row, preview: row.preview ?? true });
+    const line = JSON.parse(buildAuditLine({ ...row, preview: row.preview ?? true }));
     assert.equal(line.kind, 'inject');
     assert.equal(line.source, rc.CAPABILITY);
     assert.equal(line.inject_id, answer.result.reply_inject_id);
@@ -495,7 +495,7 @@ test('U11 budgets refusals by held id or monotonic bucket and reports suppressio
   for (let i = 0; i < 10; i++) await fire(h, req);
   assert.equal(h.audits.length, 8);
   for (const row of h.audits) {
-    const line = buildAuditLine(row);
+    const line = JSON.parse(buildAuditLine(row));
     assert.equal(line.kind, 'reply-capability');
     assert.equal(line.source, rc.CAPABILITY);
     assert.equal(line.to, null);
@@ -510,21 +510,21 @@ test('U11 budgets refusals by held id or monotonic bucket and reports suppressio
   }
   for (let i = 0; i < 11; i++) await fire(h, request('malformed'));
   assert.equal(h.audits.length, 18);
-  assert.equal(buildAuditLine(h.audits[8]).suppressed_count, 2);
-  assert.equal(buildAuditLine(h.audits[9]).suppressed_count, 0);
-  assert.equal(buildAuditLine(h.audits[8]).reply_capability_id, null);
+  assert.equal(JSON.parse(buildAuditLine(h.audits[8])).suppressed_count, 2);
+  assert.equal(JSON.parse(buildAuditLine(h.audits[9])).suppressed_count, 0);
+  assert.equal(JSON.parse(buildAuditLine(h.audits[8])).reply_capability_id, null);
   h.clock.wall += 60000;
   await fire(h, request('malformed'));
   assert.equal(h.audits.length, 18);
   h.clock.mono += 60000;
   await fire(h, request('malformed'));
   assert.equal(h.audits.length, 19);
-  assert.equal(buildAuditLine(h.audits[18]).suppressed_count, 2);
+  assert.equal(JSON.parse(buildAuditLine(h.audits[18])).suppressed_count, 2);
   await fire(h, request('malformed'));
-  assert.equal(buildAuditLine(h.audits[19]).suppressed_count, 0);
+  assert.equal(JSON.parse(buildAuditLine(h.audits[19])).suppressed_count, 0);
 
   assert.equal((await fire(h, request(cap.token))).status, 200);
-  assert.equal(buildAuditLine(h.audits.at(-1)).delivery_result, 'success');
+  assert.equal(JSON.parse(buildAuditLine(h.audits.at(-1))).delivery_result, 'success');
 });
 
 test('U12 held records are capped and retention forgets terminal results exactly at its boundary', async () => {
@@ -693,7 +693,7 @@ test('U20 peer-lane blocks the prefixed prompt once per refusal within the per-i
   assert.equal(h.deliveries.length, 0);
   assert.equal(h.bus.length, 0);
   assert.equal(h.ledgerCalls, 0);
-  const blocked = h.audits.slice(previousAudits).map(buildAuditLine);
+  const blocked = h.audits.slice(previousAudits).map(row => JSON.parse(buildAuditLine(row)));
   assert.equal(blocked.length, 8);
   assert.equal(blocked[0].suppressed_count, 1);
   assert.equal(blocked[1].suppressed_count, 0);
