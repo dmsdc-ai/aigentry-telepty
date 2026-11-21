@@ -26,7 +26,7 @@ const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = req
 const interaction = require('./src/interaction');
 const { formatTerminalTitle } = require('./src/session-id');   // PR #108 C7: controls stripped from OSC titles
 const { getRuntimeInfo } = require('./runtime-info');
-const { formatHostLabel, groupSessionsByHost, parseSessionReference, pickSessionTarget, resolveRegisteredPeerTarget } = require('./session-routing');
+const { formatHostLabel, groupSessionsByHost, parseSessionReference, pickSessionTarget, resolveRegisteredPeerTarget, isLocalAddress, resolvePeerAddress, routingError } = require('./session-routing');
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const {
@@ -287,8 +287,8 @@ function daemonAnswer(status, endpoint) {
 
 // The error for a daemon answer that is not a result. Tolerates a null answer (see
 // daemonAnswer) so an unclassifiable response still fails loudly instead of throwing here.
-function daemonAnswerError(answer, host = '127.0.0.1') {
-  const where = host === '127.0.0.1' ? `Local telepty daemon (port ${PORT})` : `Daemon at ${host}`;
+function daemonAnswerError(answer, host = '127.0.0.1', port = PORT) {
+  const where = host === '127.0.0.1' ? `Local telepty daemon (port ${port})` : `Daemon at ${host}`;
   let message;
   if (!answer) {
     message = `${where} returned a response this CLI could not read. Treating it as a failure, not as an empty result.`;
@@ -301,6 +301,7 @@ function daemonAnswerError(answer, host = '127.0.0.1') {
   }
   const error = new Error(message);
   error.name = 'DaemonResponseError';
+  error.code = answer?.refused ? 'DAEMON_REFUSED' : 'DAEMON_RESPONSE_ERROR';
   error.status = answer ? answer.status : null;
   error.refused = Boolean(answer && answer.refused);
   markCommandFailed();
@@ -1217,33 +1218,19 @@ function getDiscoveryHosts() {
   return Array.from(hosts);
 }
 
-async function discoverSessions(options = {}) {
-  // Injectable seams (default to the real implementations), as in ensureDaemonRunning.
-  const ensure = options._ensureDaemonRunning || ensureDaemonRunning;
-  const fetchAuth = options._fetchWithAuth || fetchWithAuth;
-  await ensure();
-  const allSessions = [];
-  const peerFailures = [];
-
-  if (!options.silent) {
-    process.stdout.write('\x1b[36m🔍 Discovering active sessions across connected machines...\x1b[0m\n');
-  }
-
-  // Local daemon sessions
+async function discoverLocalSessions(fetchAuth, port = PORT) {
   try {
-    const res = await fetchAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
+    const res = await fetchAuth(`${buildDaemonUrl('127.0.0.1', port)}/api/sessions`, {
       signal: AbortSignal.timeout(probeTimeoutMs())
     });
     // #835: the local daemon is the authority for local sessions. A refusal or a 5xx from it
     // means we do not KNOW what is running — which is not the same as knowing nothing is. Every
     // command is built on this list, so an unknown must fail the command, not shrink the list.
-    if (!res.ok) throw daemonAnswerError(daemonAnswer(res.status, '/api/sessions'));
+    if (!res.ok) throw daemonAnswerError(daemonAnswer(res.status, '/api/sessions'), '127.0.0.1', port);
     const sessions = await res.json();
-    sessions.forEach((session) => {
-      allSessions.push({ host: '127.0.0.1', ...session });
-    });
+    return sessions.map((session) => ({ host: '127.0.0.1', ...session }));
   } catch (error) {
-    if (isDaemonAnswerError(error)) throw error;
+    if (isDaemonAnswerError(error) || error.name === 'CredentialRefusalError') throw error;
     // connect error / timeout only: the daemon is genuinely unreachable, so "no local
     // sessions" is an honest answer.
     //
@@ -1252,25 +1239,31 @@ async function discoverSessions(options = {}) {
     // any discovered host" for sessions that were live and producing output.
     if (!isConnectionRefused(error)) {
       const failure = new Error(
-        `Local telepty daemon (port ${PORT}) did not answer /api/sessions within ${probeTimeoutMs()}ms `
+        `Local telepty daemon (port ${port}) did not answer /api/sessions within ${probeTimeoutMs()}ms `
         + `(${error && error.message ? error.message : 'no answer'}). Its sessions are unknown, not absent — `
         + 'retry the command; raise TELEPTY_PROBE_TIMEOUT_MS if it keeps timing out.'
       );
       failure.name = 'DaemonNotAnsweringError';
+      failure.code = 'DAEMON_NOT_ANSWERING';
       failure.cause = error;
       markCommandFailed();
       throw failure;
     }
   }
+  return null;
+}
 
+async function discoverPeerSessions(peerClient, { json = false } = {}) {
+  const allSessions = [];
+  const peerFailures = [];
   // Remote peer sessions via SSH direct
-  const remoteSessions = crossMachine.discoverAllRemoteSessions();
+  const remoteSessions = peerClient.discoverAllRemoteSessions();
   allSessions.push(...remoteSessions.sessions);
   peerFailures.push(...remoteSessions.failures);
 
   // Remote peer sessions via HTTP (no SSH)
   try {
-    const httpSessions = await crossMachine.discoverHttpRemoteSessions();
+    const httpSessions = await peerClient.discoverHttpRemoteSessions();
     allSessions.push(...httpSessions.sessions);
     peerFailures.push(...httpSessions.failures);
   } catch (error) {
@@ -1280,7 +1273,7 @@ async function discoverSessions(options = {}) {
   // Remote peer sessions via broker relay. Default-OFF: without a
   // transport='broker' peer in peers.json, this performs no broker call.
   try {
-    const brokerSessions = await crossMachine.discoverBrokerRemoteSessions();
+    const brokerSessions = await peerClient.discoverBrokerRemoteSessions();
     allSessions.push(...brokerSessions.sessions);
     peerFailures.push(...brokerSessions.failures);
   } catch (error) {
@@ -1292,6 +1285,9 @@ async function discoverSessions(options = {}) {
   // list is incomplete, so say which peer is missing and never let it exit 0. stderr, not
   // stdout: the banner must not contaminate `telepty list --json` (task #400).
   if (peerFailures.length > 0) {
+    if (json) {
+      throw routingError('PEER_DISCOVERY_INCOMPLETE', peerFailures.map((failure) => failure.message).join('\n') + ' The session list is INCOMPLETE.');
+    }
     markCommandFailed();
     for (const failure of peerFailures) {
       process.stderr.write(`\x1b[31m⚠️ ${failure.message} The session list is INCOMPLETE.\x1b[0m\n`);
@@ -1301,101 +1297,138 @@ async function discoverSessions(options = {}) {
   return allSessions;
 }
 
+async function discoverSessions(options = {}) {
+  const ensure = options._ensureDaemonRunning || ensureDaemonRunning;
+  const fetchAuth = options._fetchWithAuth || fetchWithAuth;
+  await ensure();
+  if (!options.silent) {
+    process.stdout.write('\x1b[36m🔍 Discovering active sessions across connected machines...\x1b[0m\n');
+  }
+  const local = await discoverLocalSessions(fetchAuth, options.port);
+  return [...(local || []), ...await discoverPeerSessions(options._peers || crossMachine, options)];
+}
+
 function isRemoteSession(session) {
   return session.remote === true || (session.host && session.host !== '127.0.0.1' && session.host.includes('@'));
 }
 
-// #837 — resolve against the LOCAL daemon alone, or return null and let the caller fan out.
-//
-// The property this exists to hold: an operation addressed to the LOCAL daemon must never depend
-// on any peer's reachability. `discoverSessions()` fans out to every peer before it answers, and
-// its SSH arm is a SYNCHRONOUS `spawnSync('ssh', …, {timeout: 10000})` — so one unreachable peer
-// blocks the event loop for 10s between the session read and the write that follows it. undici's
-// keep-alive socket to the local daemon is closed by the daemon's idle timeout during that block
-// and undici cannot notice (its timers cannot run either), so the local write reused a dead
-// socket and reported `fetch failed`. That is the whole reported defect: a local write made
-// undiagnosable by a peer it never needed to ask.
-//
-// Hardening the socket would not have been the fix. The 10s wait is itself the dependency, and a
-// local session's address does not become more or less true because some other machine is down.
-//
-// Deliberately conservative — this only SHORT-CIRCUITS, it never decides a failure:
-//   • TELEPTY_HOST pointed elsewhere means the operation is not addressed here at all.
-//   • `<id>@<host>` naming a non-local host is the operator addressing a peer explicitly.
-//   • anything other than a hit (unreachable, refused, non-list, no match) returns null, so
-//     `discoverSessions()` remains the single authority on classifying those — including #835's
-//     rule that a refusing daemon must fail the command rather than shrink the list.
-// The cost is one extra local round-trip (~2ms, measured) on the miss path, where the fan-out
-// that follows dwarfs it.
-async function resolveLocalSessionTarget(sessionRef) {
-  if (REMOTE_HOST !== '127.0.0.1') return null;
+function sessionListId(session) {
+  return session.host && session.host !== '127.0.0.1'
+    ? `${session.id}@${session.peerName || session.host}`
+    : session.id;
+}
+
+function printSessionList(sessions, print = console.log) {
+  if (sessions.length === 0) { print('No active sessions found.'); return; }
+  print('\x1b[1mActive Sessions:\x1b[0m');
+  sessions.forEach(s => {
+    print(`  - ID: \x1b[36m${sessionListId(s)}\x1b[0m`);
+    print(`    Host: ${formatHostLabel(s.host)}`);
+    print(`    Command: ${s.command}`);
+    if (s.type === 'mailbox') print(`    Mailbox lease expires: ${new Date(s.lease_expires_at).toISOString()}`);
+    print(`    Status: ${formatSessionStatusWithIdle(s)}`);
+    // #60 Stage A: separate lines, because they are separate domains. Status is transport
+    // connectivity; the activity observation is what the PTY was measured doing. Collapsing
+    // them onto one line is how "connected + quiet" came to be read as "finished".
+    print(`    Activity observation: ${formatActivityObservation(s.activityObservation)}`);
+    print(`    Terminal: ${formatSessionTerminal(s)}`);
+    print(`    CWD: ${s.cwd}`);
+    print(`    Clients: ${s.active_clients}`);
+    print(`    Started: ${new Date(s.createdAt).toLocaleString()}`);
+    print('');
+  });
+}
+
+function reportSessionRefusal(error, { json = false, stdout = process.stdout, stderr = process.stderr } = {}) {
+  const message = error?.message || 'Failed to connect to the target daemon.';
+  const code = typeof error?.code === 'string' ? error.code : 'SESSION_REQUEST_FAILED';
+  if (json) stdout.write(`${JSON.stringify({ success: false, code, error: message })}\n`);
+  stderr.write(`❌ ${message}\n`);
+  return 1;
+}
+
+function sessionNotFound(ref) {
+  return routingError('SESSION_NOT_FOUND', `Session '${ref}' was not found on any discovered host.`);
+}
+
+function sessionHttpRefusal(response, data) {
+  const code = data?.code || (response.status === 404 ? 'SESSION_NOT_FOUND'
+    : response.status === 401 || response.status === 403 ? 'DAEMON_REFUSED' : 'SESSION_REQUEST_FAILED');
+  return routingError(code, formatApiError(data));
+}
+
+function selectedSessionHost(parsed, { envHost = process.env.TELEPTY_HOST, port = PORT } = {}) {
+  if (parsed.host) return parsed.host;
+  if (envHost?.trim()) return `${formatHostForUrl(parseHostSpec(envHost, port).host)}:${port}`;
+  return null;
+}
+
+// Exact verbs use the same host selection without probing session lists or
+// applying the legacy session prefix match.
+async function resolveSessionAddress(sessionRef, options = {}) {
   const parsed = parseSessionReference(sessionRef);
   if (!parsed.id) return null;
-  if (parsed.host && !isLocalHostname(parsed.host)) return null;
-
-  let sessions;
-  try {
-    const res = await fetchWithAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
-      signal: AbortSignal.timeout(probeTimeoutMs())
-    });
-    if (!res.ok) return null;
-    sessions = await res.json();
-  } catch { return null; }
-  if (!Array.isArray(sessions)) return null;
-
-  // The same matcher discovery uses, over the local list only — so exact ids AND the project
-  // prefix fallback both resolve here, and a local session never reaches the fan-out by having
-  // been spelled shorter. The list is one daemon's, so the multi-host arm cannot fire.
-  return pickSessionTarget(parsed.id, sessions.map((s) => ({ host: '127.0.0.1', ...s })), '127.0.0.1');
+  const port = options.port ?? PORT;
+  const host = selectedSessionHost(parsed, options);
+  if (!host || isLocalAddress(host, port, options.localIdentity)) {
+    return { id: parsed.id, host: '127.0.0.1' };
+  }
+  const spec = parseHostSpec(host, null);
+  if (spec.port !== null && isLocalAddress(host, spec.port, options.localIdentity)) {
+    return { id: parsed.id, host: `127.0.0.1:${spec.port}` };
+  }
+  const peers = (options._peers || crossMachine).loadPeers().peers || {};
+  const endpoint = spec.port === null ? host : `${formatHostForUrl(spec.host)}:${spec.port}`;
+  const ref = `${parsed.id}@${endpoint}`;
+  const configured = parseHostSpec(options.envHost ?? process.env.TELEPTY_HOST, null);
+  const useEnvAlias = !parsed.host && configured.port === null && !process.env.TELEPTY_PORT;
+  const registered = resolveRegisteredPeerTarget(ref, peers)
+    || (useEnvAlias && resolveRegisteredPeerTarget(`${parsed.id}@${configured.host}`, peers))
+    || await resolvePeerAddress(parsed.id, endpoint, peers, options);
+  if (registered) return registered;
+  // An explicit configured origin still uses the ordinary target-token checks.
+  // A loopback port can designate a separate local daemon.
+  if (!parsed.host || isLocalHostname(spec.host) || process.env.TELEPTY_AUTH_TOKEN || options.allowDirect) {
+    return { id: parsed.id, host: endpoint };
+  }
+  const known = Object.entries(peers).map(([name, peer]) => peer?.machineId || name).sort();
+  throw routingError('PEER_NOT_REGISTERED', `No peer registered with machine id or address '${host}'; known: ${known.join(', ') || '(none)'}. Use telepty connect-http or telepty connect to register it.`);
 }
 
 async function resolveSessionTarget(sessionRef, options = {}) {
-  // Qualified registered identities retain the peer's endpoint and credential lane,
-  // even when discovery cannot list the session. Never shorten the requested id.
-  const registeredPeers = crossMachine.loadPeers().peers || {};
-  let registered;
-  try { registered = resolveRegisteredPeerTarget(sessionRef, registeredPeers); }
-  catch (error) { markCommandFailed(); throw error; }
-  if (registered) {
-    const discovered = (options.sessions || []).find((session) =>
-      session.id === registered.id && session.peerName === registered.peerName);
-    return { ...discovered, ...registered };
-  }
-  const qualified = parseSessionReference(sessionRef);
-  if (qualified.host && !isLocalHostname(qualified.host) && !process.env.TELEPTY_AUTH_TOKEN) {
-    markCommandFailed();
-    const known = Object.entries(registeredPeers).map(([name, peer]) => (peer && peer.machineId) || name).sort();
-    throw new Error(`No peer registered with machine id or address '${qualified.host}'; known: ${known.join(', ') || '(none)'}. Use telepty connect-http or telepty connect to register it.`);
-  }
-  if (!options.sessions) {
-    // #837: a hit here means no peer was consulted. A caller that already did its own discovery
-    // (and paid for the fan-out) passes `sessions` and keeps its list as the authority.
-    const local = await resolveLocalSessionTarget(sessionRef);
-    if (local) return local;
-  }
-  const sessions = options.sessions || await discoverSessions({ silent: true });
-  const target = pickSessionTarget(sessionRef, sessions, REMOTE_HOST);
-  // When <id>@<peerName> uses an SSH peer alias (e.g. `winserver`) and the
-  // session is not in `sessions` (discovery missed it, ControlMaster expired,
-  // or remote has no such session), pickSessionTarget returns a synthetic
-  // target with no peerName/remote flag. Detect SSH peer alias here so the
-  // caller routes through cross-machine.remoteInject (SSH path) rather than
-  // falling into the HTTP fetch path with `http://winserver:3848/...`. #411
-  if (
-    target &&
-    !target.peerName &&
-    target.host &&
-    target.host !== '127.0.0.1' &&
-    !target.host.includes(':') &&
-    !target.host.includes('@')
-  ) {
-    const sshPeer = crossMachine.getSshPeerHandle(target.host);
-    if (sshPeer) {
-      target.peerName = target.host;
-      target.remote = true;
+  const parsed = parseSessionReference(sessionRef);
+  if (!parsed.id) return null;
+  const host = selectedSessionHost(parsed, options);
+  if (host && !isLocalAddress(host, options.port ?? PORT, options.localIdentity)) {
+    const target = await resolveSessionAddress(sessionRef, options);
+    if (isRemoteSession(target) && options.includeRemoteMetadata) {
+      const found = (options._peers || crossMachine).listRemoteSessions(target.peerName)
+        .find((session) => session.id === target.id);
+      if (!found) throw sessionNotFound(sessionRef);
+      return { ...found, ...target };
     }
+    return target;
   }
-  return target;
+
+  const discovery = options.discovery || {};
+  const fetchAuth = options._fetchWithAuth || fetchWithAuth;
+  if (!discovery.local) {
+    discovery.local = discoverLocalSessions(fetchAuth, options.port).then(async (local) => {
+      if (local !== null) return local;
+      await (options._ensureDaemonRunning || ensureDaemonRunning)();
+      return await discoverLocalSessions(fetchAuth, options.port) || [];
+    });
+  }
+  const local = await discovery.local;
+  const exact = local.find((session) => session.id === parsed.id);
+  if (exact) return exact;
+  if (host) return parsed.host ? { id: parsed.id, host: '127.0.0.1' }
+    : pickSessionTarget(parsed.id, local) || { id: parsed.id, host: '127.0.0.1' };
+
+  // An operation addressed to the local daemon must never depend on peer reachability.
+  discovery.peers ??= discoverPeerSessions(options._peers || crossMachine, options);
+  const peers = await discovery.peers;
+  return pickSessionTarget(parsed.id, [...local, ...peers]);
 }
 
 // #567: pure restart-decision policy. Separates a "slow-but-healthy" daemon from a
@@ -2464,8 +2497,45 @@ function decideDaemonVerbRoute(supervisor, sub) {
 }
 
 
+async function runSessionInfo(sessionRef, options = {}) {
+  const { json, stdout = process.stdout } = options;
+  try {
+    if (!sessionRef || sessionRef === '--json') {
+      throw routingError('INVALID_SESSION_REFERENCE', 'Usage: telepty session info <id[@host]>');
+    }
+    const target = await resolveSessionTarget(sessionRef, { ...options, includeRemoteMetadata: true });
+    if (!target) throw sessionNotFound(sessionRef);
+    let data = target;
+    if (!isRemoteSession(target)) {
+      const fetchAuth = options._fetchWithAuth || fetchWithAuth;
+      const response = await fetchAuth(`${buildDaemonUrl(target.host, options.port ?? PORT)}/api/sessions/${encodeURIComponent(target.id)}`);
+      data = await response.json();
+      if (!response.ok) {
+        if (!json) {
+          (options.stderr || process.stderr).write(`❌ Error: ${data.error}\n`);
+          return 1;
+        }
+        throw sessionHttpRefusal(response, data);
+      }
+    }
+    if (json) {
+      const view = isRemoteSession(target) ? data : { host: target.host, ...data };
+      stdout.write(`${JSON.stringify(view, null, 2)}\n`);
+    }
+    else printSessionInfo(data, { host: target.host });
+    // Human discovery can report a partial peer list and still find a target.
+    return process.exitCode || 0;
+  } catch (error) {
+    return reportSessionRefusal(error, options);
+  }
+}
+
 async function main() {
   const cmd = args[0];
+  const json = args.includes('--json');
+  const refuse = (error, asJson = json) => {
+    process.exitCode = reportSessionRefusal(error, { json: asJson });
+  };
 
   if (!cmd) {
     return manageInteractive();
@@ -2511,19 +2581,24 @@ async function main() {
 
   if (cmd === 'approval-challenge' || (cmd === 'inject' && require('./src/cli/external-approval').approvalOptionRequested(args.slice(1)))) {
     process.exitCode = await require('./src/cli/external-approval').runApprovalCommand(cmd, args.slice(1), {
-      daemonUrl, remoteHost: REMOTE_HOST, fetchWithAuth
+      daemonUrl, remoteHost: REMOTE_HOST, fetchWithAuth,
+      resolveAddress: (ref) => resolveSessionAddress(ref, { allowDirect: true })
     });
     return;
   }
   if (['multicast', 'broadcast'].includes(cmd) && require('./src/cli/external-approval').approvalOptionRequested(args.slice(1), ['--approval-file', '--approval-map'])) {
-    console.error(JSON.stringify({ success: false, code: 'APPROVAL_FANOUT_UNSUPPORTED' }));
-    process.exitCode = 1;
+    if (args[1] === '--json') refuse(routingError('APPROVAL_FANOUT_UNSUPPORTED', 'External approval does not support fan-out.'));
+    else {
+      console.error(JSON.stringify({ success: false, code: 'APPROVAL_FANOUT_UNSUPPORTED' }));
+      process.exitCode = 1;
+    }
     return;
   }
 
   if (cmd === 'readiness' || cmd === 'wait-ready') {
     process.exitCode = await require('./src/cli/readiness').runReadinessCommand(cmd, args.slice(1), {
-      remoteHost: REMOTE_HOST, daemonUrl, fetchWithAuth
+      remoteHost: REMOTE_HOST, daemonUrl, fetchWithAuth,
+      resolveAddress: (ref) => resolveSessionAddress(ref, { allowDirect: true })
     });
     return;
   }
@@ -2796,39 +2871,23 @@ async function main() {
 
   if (cmd === 'list') {
     try {
-      let sessions = await discoverSessions({ silent: true });
+      let sessions = await discoverSessions({ silent: true, json });
       const nowMs = Date.now();
       sessions = sessions.map((session) => enrichSessionIdle(session, nowMs));
       if (args.includes('--json')) {
         console.log(JSON.stringify(sessions, null, 2));
         return;
       }
-      if (sessions.length === 0) { console.log('No active sessions found.'); return; }
-      console.log('\x1b[1mActive Sessions:\x1b[0m');
-      sessions.forEach(s => {
-        console.log(`  - ID: \x1b[36m${s.id}\x1b[0m`);
-        console.log(`    Host: ${formatHostLabel(s.host)}`);
-        console.log(`    Command: ${s.command}`);
-        if (s.type === 'mailbox') console.log(`    Mailbox lease expires: ${new Date(s.lease_expires_at).toISOString()}`);
-        console.log(`    Status: ${formatSessionStatusWithIdle(s)}`);
-        // #60 Stage A: separate lines, because they are separate domains. Status is transport
-        // connectivity; the activity observation is what the PTY was measured doing. Collapsing
-        // them onto one line is how "connected + quiet" came to be read as "finished".
-        console.log(`    Activity observation: ${formatActivityObservation(s.activityObservation)}`);
-        console.log(`    Terminal: ${formatSessionTerminal(s)}`);
-        console.log(`    CWD: ${s.cwd}`);
-        console.log(`    Clients: ${s.active_clients}`);
-        console.log(`    Started: ${new Date(s.createdAt).toLocaleString()}`);
-        console.log('');
-      });
+      printSessionList(sessions);
     } catch (e) {
-      console.error(`❌ ${e.message || 'Failed to discover sessions.'}`);
+      if (json) refuse(e);
+      else console.error(`❌ ${e.message || 'Failed to discover sessions.'}`);
     }
     return;
   }
 
   if (cmd === 'mailbox') {
-    await require('./src/cli/mailbox').runMailboxCommand(args.slice(1), { daemonUrl: DAEMON_URL, fetchWithAuth });
+    await require('./src/cli/mailbox').runMailboxCommand(args.slice(1), { daemonUrl: DAEMON_URL, fetchWithAuth, resolveTarget: resolveSessionAddress, targetUrl: daemonUrl });
     return;
   }
 
@@ -4009,10 +4068,11 @@ async function main() {
   }
 
   if (cmd === 'attach') {
-    let sessionId = args[1];
+    let sessionId = args.slice(1).find((arg) => arg !== '--json');
     let targetHost = REMOTE_HOST;
 
     if (!sessionId) {
+      if (json) { refuse(routingError('INVALID_SESSION_REFERENCE', 'An exact session reference is required for JSON attach.')); return; }
       const sessions = await discoverSessions();
       if (sessions.length === 0) {
         console.log('❌ No active sessions found on any known networks.');
@@ -4039,21 +4099,19 @@ async function main() {
       targetHost = sessions[idx].host;
     } else {
       try {
-        const target = await resolveSessionTarget(sessionId);
-        if (!target) {
-          console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
-          process.exit(1);
-        }
+        const target = await resolveSessionTarget(sessionId, { json });
+        if (!target) throw sessionNotFound(sessionId);
         sessionId = target.id;
         targetHost = target.host;
       } catch (error) {
-        console.error(`❌ ${error.message}`);
-        process.exit(1);
+        refuse(error); return;
       }
     }
 
     const wsAttachBase = `${daemonWsUrl(targetHost)}/api/sessions/${encodeURIComponent(sessionId)}`;
-    const wsUrl = `${wsAttachBase}?token=${encodeURIComponent(resolveTargetToken(wsAttachBase))}`;
+    let wsUrl;
+    try { wsUrl = `${wsAttachBase}?token=${encodeURIComponent(resolveTargetToken(wsAttachBase))}`; }
+    catch (error) { refuse(error); return; }
     const ws = new WebSocket(wsUrl);
     let cleanupTerminal = null;
 
@@ -4124,8 +4182,8 @@ async function main() {
     });
 
     ws.on('error', (err) => {
-      console.error('❌ WebSocket Error:', err.message);
-      process.exit(1);
+      if (json) refuse(err);
+      else { console.error('❌ WebSocket Error:', err.message); process.exitCode = 1; }
     });
 
     return;
@@ -4135,29 +4193,38 @@ async function main() {
     try {
       const { diagnoseTarget, formatDiagnostics } = require('./src/diagnostics/client');
       const option = (name) => { const i = args.indexOf(name); if (i < 0) return undefined; if (!args[i + 1] || ['--json', '--machine-id', '--epoch', '--inject-id', '--tcp', '--process-state'].includes(args[i + 1])) throw new Error(name + ' requires a value'); return args[i + 1]; };
-      const report = await diagnoseTarget(args[1], { fetchWithAuth, daemonUrl,
+      const report = await diagnoseTarget(args[1] === '--json' ? undefined : args[1], { fetchWithAuth, daemonUrl,
+        resolveAddress: (ref) => resolveSessionAddress(ref, { allowDirect: true }),
+        defaultHost: process.env.TELEPTY_HOST ? selectedSessionHost({ host: null }) : null,
         machineId: option('--machine-id'), sessionEpoch: option('--epoch'), injectId: option('--inject-id'),
         includeTcp: args.includes('--tcp'), includeProcessState: args.includes('--process-state') });
-      console.log(args.includes('--json') ? JSON.stringify(report) : formatDiagnostics(report));
+      console.log(json ? JSON.stringify(report.identity ? report : { ...report, code: report.layers.daemon_api.status.toUpperCase() }) : formatDiagnostics(report));
       if (!report.identity) process.exitCode = 1;
-    } catch (error) { console.error(error.message); process.exitCode = 1; }
+    } catch (error) { if (json) refuse(error); else { console.error(error.message); process.exitCode = 1; } }
     return;
   }
 
   if (cmd === 'read-screen') {
     const sessionId = args[1];
-    if (!sessionId) { console.error('❌ Usage: telepty read-screen <session_id> [--lines N] [--raw] [--json --max-bytes N --since CURSOR]'); process.exit(1); }
+    if (!sessionId || sessionId === '--json') {
+      refuse(routingError('INVALID_SESSION_REFERENCE', 'Usage: telepty read-screen <session_id> [--lines N] [--raw] [--json --max-bytes N --since CURSOR]')); return;
+    }
 
     try {
       await require('./src/cli/read-screen').readScreen(args, {
-        resolveTarget: resolveSessionTarget, daemonUrl, fetchWithAuth
+        resolveTarget: (ref) => resolveSessionTarget(ref, { json }), daemonUrl, fetchWithAuth
       });
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); process.exitCode = 1; }
+    } catch (e) { refuse(e); }
     return;
   }
 
   if (cmd === 'inject') {
     if (interceptSubcommandHelp(cmd, args.slice(1))) return; // telepty#51: help must never become the injected prompt
+    // Before the target, --json is a CLI option. After it, it can be literal text.
+    const injectJson = args[1] === '--json';
+    if (injectJson) args.splice(1, 1);
+    const failInject = (error) => refuse(error, injectJson);
+    const printInject = injectJson ? console.error : console.log;
     // telepty#51: an explicit `--` separator marks the rest as literal payload
     // (e.g. `telepty inject my-session -- --help` sends the literal text).
     const injectSepIndex = args.indexOf('--');
@@ -4165,8 +4232,7 @@ async function main() {
     const { useRef, refFilePath } = parseRefOption(args);
 
     if (args.includes('--no-enter')) {
-      console.error('❌ telepty inject always submits after text. Use `telepty enter <session_id>` to send Enter only.');
-      process.exit(1);
+      failInject(routingError('INVALID_INJECT_OPTIONS', 'telepty inject always submits after text. Use `telepty enter <session_id>` to send Enter only.')); return;
     }
 
     // Extract --submit flag (terminal-level submit instead of deferred PTY CR)
@@ -4232,19 +4298,19 @@ async function main() {
     const sessionId = args[1];
     const hasPromptArgument = args.length >= 3;
     const prompt = args.slice(2).join(' ');
-    if (!sessionId || (!refFilePath && !hasPromptArgument)) { console.error('❌ Usage: telepty inject [--ref [file]] [--from <id>] [--reply-to <id>] <session_id> "<prompt text>"'); process.exit(1); }
+    if (!sessionId || (!refFilePath && !hasPromptArgument)) {
+      failInject(routingError('INVALID_INJECT_OPTIONS', 'Usage: telepty inject [--json] [--ref [file]] [--from <id>] [--reply-to <id>] <session_id> "<prompt text>"')); return;
+    }
     try {
-      const target = await resolveSessionTarget(sessionId);
+      const target = await resolveSessionTarget(sessionId, { json: injectJson });
       if (!target) {
-        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
         // #691: drain-exit, do NOT process.exit() here. resolveSessionTarget →
         // discoverSessions() leaves undici keep-alive sockets and AbortSignal.timeout
         // timers still mid-close; a hard process.exit() races that teardown and trips a
         // libuv double-close assertion (src/win/async.c:76 UV_HANDLE_CLOSING) on Windows,
         // which wedges the session. Setting exitCode + returning lets the event loop close
         // each handle exactly once. Same exit code (1); success path unchanged.
-        process.exitCode = 1;
-        return;
+        failInject(sessionNotFound(sessionId)); return;
       }
 
       let injectPrompt = prompt;
@@ -4256,8 +4322,11 @@ async function main() {
         const { checkEntitlement } = require('./entitlement');
         const ent = checkEntitlement({ feature: 'telepty.remote_sessions' });
         if (!ent.allowed) {
-          console.error(`⚠️  ${ent.reason}\n   Upgrade: ${ent.upgrade_url}`);
-          process.exitCode = 1; // #691: drain-exit (see not-found above), not process.exit() mid-teardown
+          if (injectJson) failInject(routingError('REMOTE_ENTITLEMENT_REQUIRED', ent.reason));
+          else {
+            console.error(`⚠️  ${ent.reason}\n   Upgrade: ${ent.upgrade_url}`);
+            process.exitCode = 1;
+          }
           return;
         }
 
@@ -4274,14 +4343,14 @@ async function main() {
         });
         if (result.success) {
           const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
-          console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m' @ ${target.peerName}.${refSuffix}`);
+          printInject(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m' @ ${target.peerName}.${refSuffix}`);
           // #60: same contract on the remote arm, when the SSH hop returns an id. Note that a
           // remote inject_id is a TRANSPORT id only — cross-machine sender identity is #817 and
           // remains unavailable, so correlating one still proves nothing about who sent it.
-          if (result.inject_id) console.log(`   inject_id: ${result.inject_id}`);
+          if (result.inject_id) printInject(`   inject_id: ${result.inject_id}`);
+          if (injectJson) console.log(JSON.stringify({ success: true, inject_id: result.inject_id ?? null }));
         } else {
-          console.error(`❌ ${result.error}`);
-          markCommandFailed(); // #840: the SSH hop reported the delivery did not happen
+          failInject(routingError('REMOTE_INJECT_REFUSED', result.error));
         }
         return;
       }
@@ -4311,9 +4380,9 @@ async function main() {
       // not happen, and until now every one of them exited 0. A PARKED delivery is not among
       // them: `queued` answers 200 (#860), so it keeps the success path and exit 0 — it was
       // accepted, and a caller that retried it would double-deliver.
-      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); markCommandFailed(); return; }
+      if (!res.ok) { failInject(sessionHttpRefusal(res, data)); return; }
       const refSuffix = referencePath ? ` (ref: ${referencePath})` : '';
-      console.log(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'.${refSuffix}`);
+      printInject(`✅ Context injected successfully into '\x1b[36m${target.id}\x1b[0m'.${refSuffix}`);
       // #60 Stage A: SURFACE THE TRANSPORT inject_id.
       //
       // The daemon has always returned it and this command has always thrown it away, so the
@@ -4321,7 +4390,7 @@ async function main() {
       // poll resolved to `no_transport_inject_id` every time. Own line, stable `inject_id: `
       // prefix, plain text before any decoration, so a caller can scrape it without parsing the
       // decorated success line above.
-      if (data && data.inject_id) console.log(`   inject_id: ${data.inject_id}`);
+      if (data && data.inject_id) printInject(`   inject_id: ${data.inject_id}`);
 
       // Terminal-level submit: POST /submit after text injection.
       // Daemon-side render-gate handles timing (waits for REPL readiness),
@@ -4369,14 +4438,18 @@ async function main() {
         const immediateOutcome = !lastError && submitRes
           ? describeImmediateSubmit(submitRes.status, submitData, { injectId: data && data.inject_id }) : null;
         if (lastError) {
+          if (injectJson) { failInject(routingError('SUBMIT_UNCONFIRMED', lastError.message)); return; }
           console.error(`⚠️  Submit failed: ${lastError.message}`);
           // #840: the text landed but no turn fired, and nothing else will fire it. The caller
           // cannot claim this dispatch was delivered — dispatch.sh's non-zero arm records the
           // transport result as `unknown`, which is exactly the honest word for it.
           markCommandFailed();
         } else if (immediateOutcome) {
-          if (immediateOutcome.failed) { console.error(immediateOutcome.text); markCommandFailed(); }
-          else console.log(immediateOutcome.text);
+          if (immediateOutcome.failed) {
+            if (injectJson) { failInject(routingError('SUBMIT_REFUSED', immediateOutcome.text)); return; }
+            console.error(immediateOutcome.text); markCommandFailed();
+          }
+          else printInject(immediateOutcome.text);
         } else if (submitRes && submitRes.ok) {
           const gateNote = submitData.gated && submitData.gate_wait_ms > 0
             ? ` [gate ${submitData.gate_wait_ms}ms]`
@@ -4393,15 +4466,15 @@ async function main() {
           const consumption = submitData.consumption
             || (submitData.verify && submitData.verify.consumption) || null;
           if (consumption === 'queued') {
-            console.log(`⚠️  Submitted via ${submitData.strategy}${tail}, but recipient is BUSY — text QUEUED, NOT consumed as a new turn. It will be processed after the current turn ends; if a reply is expected, fall back to pulling the recipient's state.`);
+            printInject(`⚠️  Submitted via ${submitData.strategy}${tail}, but recipient is BUSY — text QUEUED, NOT consumed as a new turn. It will be processed after the current turn ends; if a reply is expected, fall back to pulling the recipient's state.`);
           } else if (consumption === 'consumed') {
-            console.log(`✅ Submitted via ${submitData.strategy}${tail} — consumed as a new turn.`);
+            printInject(`✅ Submitted via ${submitData.strategy}${tail} — consumed as a new turn.`);
           } else if (consumption === 'unknown') {
-            console.log(`✅ Submitted via ${submitData.strategy}${tail} (consumption=unknown — delivered to PTY; turn-consumption not observable).`);
+            printInject(`✅ Submitted via ${submitData.strategy}${tail} (consumption=unknown — delivered to PTY; turn-consumption not observable).`);
           } else {
             // Task 1215: a submit handed to a wrapped session's owner bridge is not a PTY write
             // and not consumption; the bridge may still hold its body. Receipts tell (inject_id).
-            console.log(`✅ Submitted via ${submitData.strategy}${tail} (handed to the session transport; PTY write and consumption unconfirmed by this response).`);
+            printInject(`✅ Submitted via ${submitData.strategy}${tail} (handed to the session transport; PTY write and consumption unconfirmed by this response).`);
           }
         } else if (submitRes && submitRes.status === 504) {
           // Soft failure: REPL never readied. Orchestrator scripts depend on
@@ -4421,8 +4494,9 @@ async function main() {
           const hint = submitForce
             ? ''
             : ` Try \`telepty inject --submit --submit-force ${target.id} ...\` or manual \`telepty send-key ${target.id} enter\`.`;
-          console.log(`⚠️  Submit gated-timeout (${reason}, last_state=${lastState})${retriesNote}.${hint}`);
+          printInject(`⚠️  Submit gated-timeout (${reason}, last_state=${lastState})${retriesNote}.${hint}`);
         } else {
+          if (injectJson) { failInject(sessionHttpRefusal(submitRes, submitData)); return; }
           console.error(`⚠️  Submit failed: ${formatApiError(submitData)}`);
           markCommandFailed(); // #840: not the 504 above — this arm has no dispatch-after-timeout
         }
@@ -4430,32 +4504,35 @@ async function main() {
       // #840: a transport failure here is the arm the operator actually hit — `fetch failed`
       // printed, exit 0, so `$?` said the dispatch landed. The origin is named by
       // namedTransportError (#837); the exit code is what a script can read.
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); markCommandFailed(); }
+      if (injectJson) console.log(JSON.stringify({ success: true, inject_id: data?.inject_id ?? null }));
+    } catch (e) { failInject(e); }
     return;
   }
 
   if (cmd === 'enter') {
-    const sessionId = args[1];
-    if (!sessionId) { console.error('❌ Usage: telepty enter <session_id>'); process.exit(1); }
+    const sessionId = (args[1] === '--json' ? undefined : args[1]);
+    if (!sessionId) { refuse(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty enter <session_id>')); return; }
 
     try {
-      const target = await resolveSessionTarget(sessionId);
-      if (!target) {
-        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
-        process.exit(1);
-      }
+      const target = await resolveSessionTarget(sessionId, { json });
+      if (!target) throw sessionNotFound(sessionId);
 
       if (isRemoteSession(target)) {
         const { checkEntitlement } = require('./entitlement');
         const ent = checkEntitlement({ feature: 'telepty.remote_sessions' });
         if (!ent.allowed) {
+          if (json) { refuse(routingError('REMOTE_ENTITLEMENT_REQUIRED', ent.reason)); return; }
           console.error(`⚠️  ${ent.reason}\n   Upgrade: ${ent.upgrade_url}`);
           process.exit(1);
         }
 
         const result = crossMachine.remoteInject(target.peerName, target.id, '', {});
-        if (result.success) {
+        if (result.success && json) {
+          console.log(JSON.stringify(result));
+        } else if (result.success) {
           console.log(`✅ Enter sent successfully into '\x1b[36m${target.id}\x1b[0m' @ ${target.peerName}.`);
+        } else if (json) {
+          refuse(routingError('REMOTE_ENTER_REFUSED', result.error));
         } else {
           console.error(`❌ ${result.error}`);
         }
@@ -4468,10 +4545,11 @@ async function main() {
         body: JSON.stringify(buildInjectRequestBody('', {}))
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
+      if (!res.ok) { if (json) { refuse(sessionHttpRefusal(res, data)); return; } console.error(`❌ ${formatApiError(data)}`); return; }
+      if (json) { console.log(JSON.stringify(data)); return; }
       console.log(`✅ Enter sent successfully into '\x1b[36m${target.id}\x1b[0m'.`);
     } catch (e) {
-      console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`);
+      refuse(e);
     }
     return;
   }
@@ -4501,7 +4579,7 @@ async function main() {
       if (!response.ok || result.stage === 'refused' || result.stage === 'outcome_unknown'
           || result.available === false) process.exitCode = 1;
     } catch (error) {
-      console.error(JSON.stringify(interaction.refusal('invalid_request', { detail: error.message })));
+      console.log(JSON.stringify(interaction.refusal('invalid_request', { detail: error.message })));
       process.exitCode = 1;
     }
     return;
@@ -4565,20 +4643,16 @@ async function main() {
   }
 
   if (cmd === 'send-key') {
-    const sessionId = args[1];
+    const sessionId = (args[1] === '--json' ? undefined : args[1]);
     const key = (args[2] || '').toLowerCase();
-    if (!sessionId || !key) { console.error('❌ Usage: telepty send-key <session_id> <key>\n   Supported keys: enter'); process.exit(1); }
+    if (!sessionId || !key) { refuse(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty send-key <session_id> <key>\n   Supported keys: enter')); return; }
     if (key !== 'enter' && key !== 'return') {
-      console.error(`❌ Unsupported key: '${key}'. Supported keys: enter`);
-      process.exit(1);
+      refuse(routingError('UNSUPPORTED_KEY', `Unsupported key: '${key}'. Supported keys: enter`)); return;
     }
 
     try {
-      const target = await resolveSessionTarget(sessionId);
-      if (!target) {
-        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
-        process.exit(1);
-      }
+      const target = await resolveSessionTarget(sessionId, { json });
+      if (!target) throw sessionNotFound(sessionId);
 
       // send-key is a manual override — bypass the render gate via force=true.
       // See: docs/superpowers/specs/2026-04-26-submit-gate-fixes-v2.md §3.1
@@ -4588,69 +4662,75 @@ async function main() {
         body: JSON.stringify({ force: true }),
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); return; }
+      if (!res.ok) { if (json) { refuse(sessionHttpRefusal(res, data)); return; } console.error(`❌ ${formatApiError(data)}`); return; }
+      if (json) { console.log(JSON.stringify(data)); return; }
       console.log(`✅ Key '${key}' sent to '\x1b[36m${target.id}\x1b[0m'. (strategy: ${data.strategy})`);
     } catch (e) {
-      console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`);
+      refuse(e);
     }
     return;
   }
 
   if (cmd === 'reply') {
+    const replyJson = args[1] === '--json';
+    const refuseReply = (error) => refuse(error, replyJson);
     const mySessionId = process.env.TELEPTY_SESSION_ID;
-    if (!mySessionId) { console.error('❌ TELEPTY_SESSION_ID env var is required for reply command'); process.exit(1); }
-    const replyText = args.slice(1).join(' ');
-    if (!replyText) { console.error('❌ Usage: telepty reply "<text>"'); process.exit(1); }
+    if (!mySessionId) { refuseReply(routingError('REPLY_SOURCE_MISSING', 'TELEPTY_SESSION_ID env var is required for reply command')); return; }
+    const replyText = args.slice(replyJson ? 2 : 1).join(' ');
+    if (!replyText) { refuseReply(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty reply "<text>"')); return; }
     try {
-      const metaRes = await fetchWithAuth(`${DAEMON_URL}/api/sessions/${encodeURIComponent(mySessionId)}`);
-      if (!metaRes.ok) { console.error(`❌ Could not fetch session metadata for '${mySessionId}'`); process.exit(1); }
+      const self = await resolveSessionAddress(mySessionId);
+      const metaRes = await fetchWithAuth(`${daemonUrl(self.host)}/api/sessions/${encodeURIComponent(self.id)}`);
+      if (!metaRes.ok) {
+        throw routingError('REPLY_METADATA_UNAVAILABLE', `Could not fetch session metadata for '${mySessionId}'`);
+      }
       const meta = await metaRes.json();
       const replyTo = meta.lastInjectReplyTo;
-      if (!replyTo) { console.error(`❌ No pending reply-to found for session '${mySessionId}'`); process.exit(1); }
+      if (!replyTo) throw routingError('REPLY_TARGET_MISSING', `No pending reply-to found for session '${mySessionId}'`);
       const claimedReturn = meta.lastInjectReturn;
       const parsedReturn = parseSessionReference(replyTo);
       if (claimedReturn && claimedReturn.claimed_cross_host === true) {
         if (!parsedReturn.host) {
-          throw new Error('REPLY_AMBIGUOUS_SENDER: cross-host return has no host-qualified locator. Supply an explicit registered peer return locator.');
+          throw routingError('REPLY_AMBIGUOUS_SENDER', 'REPLY_AMBIGUOUS_SENDER: cross-host return has no host-qualified locator. Supply an explicit registered peer return locator.');
         }
         if (!resolveRegisteredPeerTarget(replyTo, crossMachine.loadPeers().peers || {})) {
-          throw new Error('REPLY_UNKNOWN_CLAIMED_PEER: the unverified return locator does not name a registered peer.');
+          throw routingError('REPLY_UNKNOWN_CLAIMED_PEER', 'REPLY_UNKNOWN_CLAIMED_PEER: the unverified return locator does not name a registered peer.');
         }
       }
-      const target = await resolveSessionTarget(replyTo);
-      if (!target) { console.error(`❌ Session '${replyTo}' was not found on any discovered host.`); process.exit(1); }
+      const target = await resolveSessionTarget(replyTo, { json: replyJson });
+      if (!target) throw sessionNotFound(replyTo);
       const body = { prompt: replyText, from: mySessionId, reply_to: mySessionId, exact_target: true,
         ...(target.host !== '127.0.0.1' ? { claimed_cross_host: true } : {}) };
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/inject`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ ${formatApiError(data)}`); markCommandFailed(); return; }
+      if (!res.ok) { if (replyJson) { refuseReply(sessionHttpRefusal(res, data)); return; } console.error(`❌ ${formatApiError(data)}`); markCommandFailed(); return; }
+      if (replyJson) { console.log(JSON.stringify(data)); return; }
       console.log(`✅ Reply sent to claimed return locator '\x1b[36m${replyTo}\x1b[0m' (unverified).`);
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); markCommandFailed(); }
+    } catch (e) { refuseReply(e); }
     return;
   }
 
   if (cmd === 'status') {
-    const statusSessionId = args[1] || process.env.TELEPTY_SESSION_ID;
+    const statusSessionId = (args[1] === '--json' ? undefined : args[1]) || process.env.TELEPTY_SESSION_ID;
     if (!statusSessionId) {
-      console.error('❌ Usage: telepty status <session_id>');
-      process.exit(1);
+      refuse(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty status <session_id>')); return;
     }
 
     try {
-      const target = await resolveSessionTarget(statusSessionId);
-      if (!target) {
-        console.error(`❌ Session '${statusSessionId}' was not found on any discovered host.`);
-        process.exit(1);
-      }
+      const target = await resolveSessionTarget(statusSessionId, { json });
+      if (!target) throw sessionNotFound(statusSessionId);
 
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/state`);
       const data = await res.json();
       if (!res.ok) {
+        if (json) { refuse(sessionHttpRefusal(res, data)); return; }
         console.error(`❌ ${formatApiError(data)}`);
         process.exit(1);
       }
+
+      if (json) { console.log(JSON.stringify(data)); return; }
 
       // #60 Stage A §8.5.2 — `auto.state` is gone from the daemon; what ships is the measured
       // observation plus a SEPARATE completion block that is permanently null in 0.8.0. The old
@@ -4705,8 +4785,7 @@ async function main() {
       }
       console.log('');
     } catch (e) {
-      console.error(`❌ ${e.message || 'Failed to get session state.'}`);
-      process.exit(1);
+      refuse(e);
     }
     return;
   }
@@ -4718,8 +4797,7 @@ async function main() {
     const idIndex = reportArgs.indexOf('--id');
     if (idIndex !== -1) {
       if (!reportArgs[idIndex + 1]) {
-        console.error('❌ Usage: telepty status-report [--id <session_id>] --phase <phase> [--task <text>] [--blocker <text>] [--needs-input] [--thread-id <id>] [--seq <n>]');
-        process.exit(1);
+        refuse(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty status-report [--id <session_id>] --phase <phase> [--task <text>] [--blocker <text>] [--needs-input] [--thread-id <id>] [--seq <n>]')); return;
       }
       sessionId = reportArgs[idIndex + 1];
       reportArgs.splice(idIndex, 2);
@@ -4729,8 +4807,7 @@ async function main() {
       const index = reportArgs.indexOf(flag);
       if (index === -1) return undefined;
       if (!reportArgs[index + 1]) {
-        console.error(`❌ ${flag} requires a value.`);
-        process.exit(1);
+        refuse(routingError('INVALID_SESSION_ARGUMENTS', `${flag} requires a value.`)); return;
       }
       const value = reportArgs[index + 1];
       reportArgs.splice(index, 2);
@@ -4748,24 +4825,18 @@ async function main() {
     if (needsInput) reportArgs.splice(needsInputIndex, 1);
 
     if (!sessionId || !phase || reportArgs.length > 0) {
-      console.error('❌ Usage: telepty status-report [--id <session_id>] --phase <phase> [--task <text>] [--blocker <text>] [--needs-input] [--thread-id <id>] [--seq <n>]');
-      process.exit(1);
+      refuse(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty status-report [--id <session_id>] --phase <phase> [--task <text>] [--blocker <text>] [--needs-input] [--thread-id <id>] [--seq <n>]')); return;
     }
 
     if (seqRaw !== undefined && (!Number.isInteger(Number(seqRaw)) || Number(seqRaw) < 0)) {
-      console.error('❌ --seq must be a non-negative integer.');
-      process.exit(1);
+      refuse(routingError('INVALID_SESSION_ARGUMENTS', '--seq must be a non-negative integer.')); return;
     }
 
     try {
-      const target = await resolveSessionTarget(sessionId);
-      if (!target) {
-        console.error(`❌ Session '${sessionId}' was not found on any discovered host.`);
-        process.exit(1);
-      }
+      const target = await resolveSessionTarget(sessionId, { json });
+      if (!target) throw sessionNotFound(sessionId);
       if (isRemoteSession(target)) {
-        console.error('❌ telepty status-report currently supports local daemon sessions only.');
-        process.exit(1);
+        refuse(routingError('UNSUPPORTED_SESSION_TRANSPORT', 'telepty status-report currently supports local daemon sessions only.')); return;
       }
 
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/state`, {
@@ -4783,38 +4854,43 @@ async function main() {
       });
       const data = await res.json();
       if (!res.ok) {
+        if (json) { refuse(sessionHttpRefusal(res, data)); return; }
         console.error(`❌ ${formatApiError(data)}`);
         return;
       }
+      if (json) { console.log(JSON.stringify(data)); return; }
       console.log(`✅ Session state reported for '\x1b[36m${target.id}\x1b[0m' (${phase}).`);
     } catch (e) {
-      console.error(`❌ ${e.message || 'Failed to report session state.'}`);
+      refuse(e);
     }
     return;
   }
 
   if (cmd === 'multicast') {
     if (interceptSubcommandHelp(cmd, args.slice(1))) return; // telepty#51: help must never fan out as data
+    const multicastJson = args[1] === '--json';
+    if (multicastJson) args.splice(1, 1);
     const multicastSepIndex = args.indexOf('--');
     const multicastHadSeparator = multicastSepIndex !== -1;
     if (multicastHadSeparator) args.splice(multicastSepIndex, 1);
     const sessionIdsRaw = args[1]; const prompt = args.slice(2).join(' ');
-    if (!sessionIdsRaw || !prompt) { console.error('❌ Usage: telepty multicast <id1,id2,...> "<prompt text>"'); process.exit(1); }
+    if (!sessionIdsRaw || !prompt) {
+      refuse(routingError('INVALID_MULTICAST_OPTIONS', 'Usage: telepty multicast <id1,id2,...> "<prompt text>"'), multicastJson); return;
+    }
     // telepty#51 defense-in-depth: a payload that is exactly a help flag is almost
     // certainly a swallowed `--help`, never a real prompt. Refuse unless the caller
     // opted into the literal send with an explicit `--`.
     if (!multicastHadSeparator && isHelpLikePayload(prompt)) {
-      console.error('❌ Refusing to multicast a bare help flag. Use `telepty multicast --help` for usage, or `telepty multicast <ids> -- --help` to send the literal text.');
-      process.exit(1);
+      refuse(routingError('INVALID_MULTICAST_OPTIONS', 'Refusing to multicast a bare help flag. Use `telepty multicast --help` for usage, or `telepty multicast <ids> -- --help` to send the literal text.'), multicastJson); return;
     }
     const sessionRefs = sessionIdsRaw.split(',').map(s => s.trim()).filter(s => s);
     try {
-      const discovered = await discoverSessions({ silent: true });
       const groupedTargets = new Map();
+      const discovery = {};
       for (const sessionRef of sessionRefs) {
-        const target = await resolveSessionTarget(sessionRef, { sessions: discovered });
+        const target = await resolveSessionTarget(sessionRef, { json: multicastJson, discovery });
         if (!target) {
-          throw new Error(`Session '${sessionRef}' was not found on any discovered host.`);
+          throw sessionNotFound(sessionRef);
         }
         if (!groupedTargets.has(target.host)) {
           groupedTargets.set(target.host, []);
@@ -4831,17 +4907,22 @@ async function main() {
         });
         const data = await res.json();
         if (!res.ok) {
-          throw new Error(formatApiError(data, `Multicast failed on ${host}`));
+          throw sessionHttpRefusal(res, data);
         }
         aggregate.successful.push(...data.results.successful.map((id) => `${id}@${host}`));
         aggregate.failed.push(...data.results.failed.map((item) => ({ ...item, host })));
       }
 
+      if (multicastJson) {
+        if (aggregate.failed.length) refuse(routingError('MULTICAST_PARTIAL', 'One or more multicast targets refused the request.'), true);
+        else console.log(JSON.stringify(aggregate));
+        return;
+      }
       console.log(`✅ Context multicasted successfully to ${aggregate.successful.length} session(s).`);
       if (aggregate.failed.length > 0) {
         console.warn(`⚠️ Failed to inject into ${aggregate.failed.length} session(s):`, aggregate.failed.map((item) => `${item.id}@${item.host} [${item.code || 'UNKNOWN'}] ${item.error || ''}`.trim()).join(', '));
       }
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    } catch (e) { refuse(e, multicastJson); }
     return;
   }
 
@@ -4930,43 +5011,42 @@ async function main() {
   }
 
   if (cmd === 'delete') {
-    const sessionRef = args[1];
-    if (!sessionRef) { console.error('❌ Usage: telepty delete <session-id>'); process.exit(1); }
+    const sessionRef = (args[1] === '--json' ? undefined : args[1]);
+    if (!sessionRef) { refuse(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty delete <session-id>')); return; }
     try {
-      const target = await resolveSessionTarget(sessionRef);
-      if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exit(1); }
+      const target = await resolveSessionTarget(sessionRef, { json });
+      if (!target) throw routingError('SESSION_NOT_FOUND', `Session '${sessionRef}' not found.`);
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}`, { method: 'DELETE' });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      if (!res.ok) { if (json) { refuse(sessionHttpRefusal(res, data)); return; } console.error(`❌ Error: ${data.error}`); return; }
+      if (json) { console.log(JSON.stringify(data)); return; }
       console.log(`✅ Session '\x1b[36m${target.id}\x1b[0m' deleted.`);
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to delete session.'}`); }
+    } catch (e) { refuse(e); }
     return;
   }
 
   if (cmd === 'kill') {
-    const killArgs = args.slice(1);
+    const killArgs = args.slice(1).filter((arg) => arg !== '--json');
     const force = killArgs.includes('--force');
     const timeoutIndex = killArgs.indexOf('--timeout');
     let timeout = 5;
     if (timeoutIndex !== -1) {
       if (!killArgs[timeoutIndex + 1]) {
-        console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]');
-        process.exitCode = 1; return;
+        refuse(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty kill <session-id> [--force] [--timeout <sec>]')); return;
       }
       timeout = Number(killArgs[timeoutIndex + 1]);
       if (!Number.isFinite(timeout) || timeout < 0) {
-        console.error('❌ --timeout must be a non-negative number of seconds.');
-        process.exitCode = 1; return;
+        refuse(routingError('INVALID_SESSION_ARGUMENTS', '--timeout must be a non-negative number of seconds.')); return;
       }
       killArgs.splice(timeoutIndex, 2);
     }
     const filtered = killArgs.filter((item) => item !== '--force');
     const sessionRef = filtered[0];
-    if (!sessionRef) { console.error('❌ Usage: telepty kill <session-id> [--force] [--timeout <sec>]'); process.exitCode = 1; return; }
+    if (!sessionRef) { refuse(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty kill <session-id> [--force] [--timeout <sec>]')); return; }
 
     try {
-      const target = await resolveSessionTarget(sessionRef);
-      if (!target) { console.error(`❌ Session '${sessionRef}' not found.`); process.exitCode = 1; return; }
+      const target = await resolveSessionTarget(sessionRef, { json });
+      if (!target) throw routingError('SESSION_NOT_FOUND', `Session '${sessionRef}' not found.`);
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}/kill${args.includes('--owned') ? '?owned=true' : ''}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4974,13 +5054,14 @@ async function main() {
       });
       const data = await res.json();
       if (!res.ok) {
+        if (json) { refuse(sessionHttpRefusal(res, data)); return; }
         console.error(`❌ Error: ${data.error || 'Failed to kill session.'}`);
         process.exitCode = 1; return;
       }
+      if (json) { console.log(JSON.stringify(data)); return; }
       console.log(`✅ Session '\x1b[36m${target.id}\x1b[0m' killed${data.kill && data.kill.escalated ? ' (escalated)' : ''}.`);
     } catch (e) {
-      console.error(`❌ ${e.message || 'Failed to kill session.'}`);
-      process.exitCode = 1; return;
+      refuse(e);
     }
     return;
   }
@@ -5095,73 +5176,26 @@ async function main() {
   }
 
   if (cmd === 'rename') {
-    const oldId = args[1]; const newId = args[2];
-    if (!oldId || !newId) { console.error('❌ Usage: telepty rename <old_id> <new_id>'); process.exit(1); }
+    const oldId = (args[1] === '--json' ? undefined : args[1]); const newId = args[2];
+    if (!oldId || !newId) { refuse(routingError('INVALID_SESSION_ARGUMENTS', 'Usage: telepty rename <old_id> <new_id>')); return; }
     try {
-      const target = await resolveSessionTarget(oldId);
-      if (!target) {
-        console.error(`❌ Session '${oldId}' was not found on any discovered host.`);
-        process.exit(1);
-      }
+      const target = await resolveSessionTarget(oldId, { json });
+      if (!target) throw sessionNotFound(oldId);
 
       const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_id: newId })
       });
       const data = await res.json();
-      if (!res.ok) { console.error(`❌ Error: ${data.error}`); return; }
+      if (!res.ok) { if (json) { refuse(sessionHttpRefusal(res, data)); return; } console.error(`❌ Error: ${data.error}`); return; }
       const hostSuffix = target.host === '127.0.0.1' ? '' : ` @ ${target.host}`;
+      if (json) { console.log(JSON.stringify(data)); return; }
       console.log(`✅ Session renamed: '\x1b[36m${target.id}\x1b[0m' → '\x1b[36m${newId}\x1b[0m'${hostSuffix}`);
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); }
+    } catch (e) { refuse(e); }
     return;
   }
 
   if (cmd === 'session' && args[1] === 'info') {
-    const sessionRef = args[2];
-    if (!sessionRef) {
-      console.error('❌ Usage: telepty session info <id[@host]>');
-      process.exit(1);
-    }
-
-    try {
-      const sessions = await discoverSessions({ silent: true });
-      const target = await resolveSessionTarget(sessionRef, { sessions });
-      if (!target) {
-        console.error(`❌ Session '${sessionRef}' was not found on any discovered host.`);
-        process.exit(1);
-      }
-
-      if (args.includes('--json')) {
-        if (isRemoteSession(target)) {
-          console.log(JSON.stringify(target, null, 2));
-          return;
-        }
-
-        const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}`);
-        const data = await res.json();
-        if (!res.ok) {
-          console.error(`❌ Error: ${data.error}`);
-          process.exit(1);
-        }
-        console.log(JSON.stringify({ host: target.host, ...data }, null, 2));
-        return;
-      }
-
-      if (isRemoteSession(target)) {
-        printSessionInfo(target, { host: target.host });
-        return;
-      }
-
-      const res = await fetchWithAuth(`${daemonUrl(target.host)}/api/sessions/${encodeURIComponent(target.id)}`);
-      const data = await res.json();
-      if (!res.ok) {
-        console.error(`❌ Error: ${data.error}`);
-        process.exit(1);
-      }
-
-      printSessionInfo(data, { host: target.host });
-    } catch (e) {
-      console.error(`❌ ${e.message || 'Failed to fetch session info.'}`);
-    }
+    process.exitCode = await runSessionInfo(args[2], { json });
     return;
   }
 
@@ -5918,14 +5952,14 @@ function printGlobalHelp() {
   telepty session interaction <sid> act <JSON>  Bound opt-in action; JSON response, no legacy force
 
 \x1b[1mInject & Communicate:\x1b[0m
-  telepty inject [--ref [file]] [--from <id>] <id[@host]> "<prompt>"  Inject text
+  telepty inject [--json] [--ref [file]] [--from <id>] <id[@host]> "<prompt>"  Inject text
   telepty approval-challenge [--no-enter] <exact-id[@host]> -- "<prompt>"  Digest-only signing document
   telepty inject --approval-file <private-file> [--no-enter] <exact-id[@host]> -- "<prompt>"  Signed direct inject
   telepty enter <id[@host]>                      Send Enter/Return
   telepty clear-strand-v1 --from F --expected-epoch E --expected-owner-generation G --stranded-inject-id (UUID|none) --basis B -- <exact-id>
     Clear ONE stranded composer after an operator assertion; sends no text and no key (see docs)
   telepty reply "<text>"                         Reply to last injector
-  telepty multicast <id1,id2> "<prompt>"         Inject into multiple sessions
+  telepty multicast [--json] <id1,id2> "<prompt>"         Inject into multiple sessions
   telepty broadcast [--ref [file]] "<prompt>"    Inject into ALL sessions
   telepty diagnose <exact-id@host> [--json] [--machine-id ID] [--epoch EPOCH]
     --inject-id UUID correlates ledger facts; --tcp adds one bounded connection probe
@@ -5936,8 +5970,8 @@ function printGlobalHelp() {
     --lines N selects last N lines before byte limiting; --raw preserves ANSI
     Cursors are scoped to session instance and raw/lines mode; reset requires refresh
     Delta splice indices use Unicode code points; truncated snapshots are partial
-  telepty mailbox <id> [--json] [--since msg_id] Read a local mailbox
-  telepty mailbox ack <id> <msg_id>            Acknowledge one local mailbox message
+  telepty mailbox <id[@host]> [--json] [--since msg_id] Read a mailbox
+  telepty mailbox ack <id[@host]> <msg_id>      Acknowledge one mailbox message
 
 \x1b[1mCross-Machine:\x1b[0m
   telepty ssh <user@host> --id <id> [--persistent] [--remote-command <agent>] [--cwd <path>] [--resume <id>]
@@ -6028,6 +6062,9 @@ module.exports = {
   deferToSupervisor,      // #738: supervisor-aware defer (injectable detect/probe/marker seams)
   ensureDaemonRunning,    // #567: orchestrator (injectable probes for unit-testing)
   repairLocalDaemon,      // gh#82 round 2 (c): update/repair stop path (injectable stop/restart/detect)
+  resolveSessionTarget,
+  runSessionInfo,
+  printSessionList,
   discoverSessions,       // gh#82 round 2 (d): local timeout ≠ no sessions (injectable ensure/fetch)
   helpRequested,          // telepty#51: bare -h/--help before `--` → show help, not payload
   isHelpLikePayload,      // telepty#51: defense-in-depth payload guard for broadcast/multicast

@@ -2,6 +2,21 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.11.4
+
+**Behaviour changes**
+
+- A bare session ID selects an exact match on the local daemon first. If the ID
+  is absent locally and more than one peer has it, specify `<id>@<peer>` or set
+  `TELEPTY_HOST` to select a daemon.
+- In JSON mode, session-routing refusals write a JSON document with a stable
+  error code to stdout and exit non-zero. Human diagnostics go to stderr.
+
+Session references accept registered peer names, machine IDs, hostnames and
+addresses, including addresses resolved from a registered hostname. New
+IP-based registrations use the reported machine ID or the full IP address as
+the default name. Text session listings show the peer alongside each remote ID.
+
 ## 0.11.3
 
 **Behaviour changes**

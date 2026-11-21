@@ -1,7 +1,7 @@
 'use strict';
 
-// Task 1293 rebases the 1282 release metadata check (previously 1270, 1272 and 1215).
-// BASE_SHA256 pins the supplied unmodified 0.11.2 repository bytes before this version bump.
+// Task 1288 advances the release identity check for the session routing patch.
+// BASE_SHA256 pins the supplied unmodified 0.11.3 release metadata.
 // CHANGELOG/README identity stays owned by test/release-version-invariant-844.test.js.
 
 const { test } = require('node:test');
@@ -11,14 +11,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..');
-const RELEASE = '0.11.3';
-const BASE_VERSION = '0.11.2';
+const RELEASE = '0.11.4';
+const BASE_VERSION = '0.11.3';
 const BASE_SHA256 = {
-  'package.json': 'c223d3638be5739c42e0e39ab317736f7d5406cf3966a9d0c044d3bfc3685338',
-  'package-lock.json': 'd84fdcf818f3cb4e3771631aed9e4aef3a9ac9c0d09993bf52e891dced662281',
-  'scripts/check-package.mjs': '7375c2a917e36918127d19af43385e5c4d67f6d031f6ff13cc94745267700c1d',
+  'package.json': '2a1ebd0d87c78a56a9400630629c7935be6bf78a8c23721df874c0ac05e61867',
+  'package-lock.json': '3a855f5f9d0311ec7af684dc0a8d0cc525ef7697c42c76c4d2622984b7ff6c75',
+  'scripts/check-package.mjs': 'ebbce915d1ad09f60d7af724b8cd62b67315eee9f75f3a1a9d1ba010e8171e0c',
 };
-// The only lines the release delta may change (0-based), each with its exact BASE and release text.
+// Lines containing the version pins, each with its exact BASE and release text.
 const VERSION_LINES = {
   'package.json': [[2, '  "version": "%s",']],
   'package-lock.json': [[2, '  "version": "%s",'], [8, '      "version": "%s",']],
@@ -39,7 +39,7 @@ function assertOneRelease(versions, expected) {
   assert.deepEqual(versions, { pkg: expected, lockRoot: expected, lockPackage: expected, checkPin: expected });
 }
 
-test('hotfix 1215: package.json, both package-lock.json fields and the check-package pin all name 0.11.3', () => {
+test('hotfix 1215: package.json, both package-lock.json fields and the check-package pin all name 0.11.4', () => {
   const versions = releaseVersions({ pkg: JSON.parse(read('package.json')), lock: JSON.parse(read('package-lock.json')),
     checkScript: read('scripts/check-package.mjs') });
   assertOneRelease(versions, RELEASE);

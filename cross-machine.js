@@ -6,7 +6,7 @@ const path = require('path');
 const os = require('os');
 const { isIP } = require('net');
 const { getSharedContextPromptPath } = require('./shared-context');
-const { parseHostSpec } = require('./host-spec');
+const { parseHostSpec, formatHostForUrl, buildDaemonUrl } = require('./host-spec');
 
 const PEERS_PATH = path.join(os.homedir(), '.telepty', 'peers.json');
 const BROKER_CONFIG_PATH = path.join(os.homedir(), '.telepty', 'broker.json');
@@ -17,6 +17,7 @@ function createPeerContext({
   execFileSync = defaultExecFileSync,
   spawn = defaultSpawn,
   spawnSync = defaultSpawnSync,
+  fetch = (...args) => globalThis.fetch(...args),
   PEERS_PATH: peersPath = PEERS_PATH,
   CONTROL_DIR: controlDir = CONTROL_DIR,
   getUsername = () => os.userInfo().username
@@ -218,9 +219,11 @@ async function connect(target, options = {}) {
     sshTarget = `${username}@${target}`;
   }
 
-  const name = options.name || target.split('@').pop().split('.')[0];
+  const { host } = parseHostSpec(target.split('@').pop());
+  const ipHost = isIP(host);
+  let name = options.name || (ipHost ? host : host.split('.')[0]);
 
-  if (activePeers.has(name)) {
+  if (activePeers.has(name) || (ipHost && [...activePeers.values()].some((peer) => peer.target === sshTarget))) {
     return { success: false, error: `Already connected to ${name}` };
   }
 
@@ -255,6 +258,20 @@ async function connect(target, options = {}) {
     ).trim();
     if (output) machineId = output;
   } catch {}
+  if (!options.name && ipHost && machineId !== name) {
+    name = machineId;
+    if (activePeers.has(name)) {
+      try { execFileSync('ssh', ['-O', 'exit', '-S', ctrlPath, sshTarget], { stdio: 'pipe' }); } catch {}
+      return { success: false, error: `Already connected to ${name}` };
+    }
+  }
+
+  const peers = loadPeers();
+  const previous = Object.hasOwn(peers.peers, name) ? peers.peers[name] : null;
+  if (!options.name && ipHost && previous && (previous.target !== sshTarget || getPeerTransport(previous) !== 'ssh')) {
+    try { execFileSync('ssh', ['-O', 'exit', '-S', ctrlPath, sshTarget], { stdio: 'pipe' }); } catch {}
+    return { success: false, error: `Peer name '${name}' is already registered for a different endpoint. Use --name.` };
+  }
 
   // Verify telepty CLI is available on remote
   try {
@@ -279,12 +296,11 @@ async function connect(target, options = {}) {
   activePeers.set(name, peerInfo);
 
   // Persist peer
-  const peers = loadPeers();
-  peers.peers[name] = {
+  peers.peers = { ...peers.peers, [name]: {
     target: sshTarget,
     lastConnected: peerInfo.connectedAt,
     machineId
-  };
+  } };
   savePeers(peers);
 
   return { success: true, name, machineId };
@@ -502,7 +518,9 @@ async function connectHttp(target, options = {}) {
     return { success: false, error: 'connect-http requires a host (got empty value).' };
   }
 
-  const name = options.name || spec.host.split('.')[0] || spec.host;
+  const ipHost = isIP(spec.host);
+  const defaultName = ipHost ? spec.host : spec.host.split('.')[0] || spec.host;
+  const base = buildDaemonUrl(target);
 
   const headers = {};
   // #823 — /api/meta is auth-gated, so discovery needs whichever token this operator has for the
@@ -512,10 +530,10 @@ async function connectHttp(target, options = {}) {
   const metaToken = options.token || process.env.TELEPTY_AUTH_TOKEN;
   if (metaToken) headers['x-telepty-token'] = metaToken;
 
-  let machineId = name;
+  let machineId = options.name || defaultName;
   let healthOk = false;
   try {
-    const healthUrl = `http://${spec.host}:${spec.port}/api/health`;
+    const healthUrl = `${base}/api/health`;
     const res = await fetch(healthUrl, { redirect: 'error', signal: AbortSignal.timeout(5000) });
     if (!res.ok) {
       return { success: false, error: `Daemon at ${spec.host}:${spec.port} returned HTTP ${res.status} on /api/health.` };
@@ -526,13 +544,13 @@ async function connectHttp(target, options = {}) {
   }
 
   try {
-    const metaUrl = `http://${spec.host}:${spec.port}/api/meta`;
+    const metaUrl = `${base}/api/meta`;
     const res = await fetch(metaUrl, { redirect: 'error', signal: AbortSignal.timeout(3000), headers });
     if (res.ok) {
       const meta = await res.json();
       if (meta && typeof meta.machine_id === 'string' && meta.machine_id) {
         machineId = meta.machine_id;
-      } else if (meta && typeof meta.host === 'string' && meta.host) {
+      } else if (!ipHost && meta && typeof meta.host === 'string' && meta.host) {
         machineId = meta.host;
       }
     }
@@ -540,15 +558,21 @@ async function connectHttp(target, options = {}) {
     // /api/meta is auth-gated; failure is not fatal — health passed.
   }
 
+  const name = options.name || (ipHost ? machineId : defaultName);
   const peers = loadPeers();
-  peers.peers[name] = {
+  const previous = Object.hasOwn(peers.peers, name) ? peers.peers[name] : null;
+  if (!options.name && ipHost && previous &&
+      (previous.transport !== 'http' || previous.host !== spec.host || previous.port !== spec.port)) {
+    return { success: false, error: `Peer name '${name}' is already registered for a different endpoint. Use --name.` };
+  }
+  peers.peers = { ...peers.peers, [name]: {
     transport: 'http',
     host: spec.host,
     port: spec.port,
-    target: `${spec.host}:${spec.port}`,
+    target: `${formatHostForUrl(spec.host)}:${spec.port}`,
     machineId,
     lastConnected: new Date().toISOString()
-  };
+  } };
   if (options.token) {
     peers.peers[name].token = options.token;
   }
@@ -589,9 +613,9 @@ async function listHttpRemoteSessions(name, options = {}) {
   const token = options.token || process.env.TELEPTY_AUTH_TOKEN || entry.token;
   if (token) headers['x-telepty-token'] = token;
 
-  const target = `${entry.host}:${entry.port}`;
+  const target = `${formatHostForUrl(entry.host)}:${entry.port}`;
   try {
-    const url = `http://${entry.host}:${entry.port}/api/sessions`;
+    const url = `http://${target}/api/sessions`;
     const res = await fetch(url, {
       redirect: 'error',
       signal: AbortSignal.timeout(options.timeoutMs || 3000),

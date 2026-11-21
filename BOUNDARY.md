@@ -149,14 +149,12 @@ recipient use it against the daemon that sent it. A refusal that names `connect-
 the operator one command; the send cost them the daemon, silently.
 
 What does **not** exist: any discovery, rotation, revocation, or per-peer scoping of those tokens.
-Step 2 only helps an operator who has already run `connect-http --token`, and addressing forms with
-no `peers.json` entry (`<sid>@<tailnet-ip>`, `TELEPTY_HOST`) must use the env variable or are
-refused. Note the consequence worth stating: addressing **your own** daemon by a non-loopback name —
-its tailnet IP, its hostname — is refused as well, because `isLocalHostname` recognises loopback
-literals and nothing else. That is a deliberate false positive. The predicate is a syntactic check on
-the address, and widening it to "any address this host happens to answer on" would make the boundary
-depend on interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the escape hatch.
-This is a named limitation, not a solved problem.
+Step 2 requires a registration with a stored token. Session routing also accepts a registered
+identity or an address resolved from a registered peer hostname. It uses the stored endpoint for
+the request. An unregistered remote origin requires `TELEPTY_AUTH_TOKEN`.
+Session references to the local hostname or an address assigned to a local interface at the
+configured daemon port use the loopback endpoint. The credential selection rule still applies to
+the actual HTTP or WebSocket destination.
 
 ### `TELEPTY_AUTH_TOKEN` must be set at every end, or at none
 
