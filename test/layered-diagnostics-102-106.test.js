@@ -178,3 +178,52 @@ test('fresh-HOME diagnose refuses authentication without creating config or stat
     assert.equal(requests, 0); assert.deepEqual(fs.readdirSync(home), []);
   } finally { await new Promise(resolve => server.close(resolve)); fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+test('power observation distinguishes a matching live peer from a missing session', async () => {
+  const now = () => 100000;
+  const report = await diagnoseTarget('session@mac-peer', {
+    machineId: 'mac-id', now, daemonUrl: () => 'http://mac-peer',
+    fetchWithAuth: async (url, { readOnlyAuth, cache }) => {
+      assert.equal(readOnlyAuth, true);
+      if (url.endsWith('/api/meta')) assert.equal(cache, 'no-store');
+      return url.endsWith('/api/meta') ? Response.json({ machine_id: 'mac-id' }) : new Response('', { status: 404 });
+    }
+  });
+  assert.deepEqual(report.layers.host_power, { status: 'running_at_observation', reason: 'expected_machine_responded',
+    source: 'matched_daemon_meta', observed_at: new Date(now()).toISOString() });
+  assert.equal(report.layers.daemon_api.status, 'not_registered');
+  assert.equal(report.identity, null);
+  assert.equal(report.completion_fact, null);
+});
+
+test('power stays unknown on timeout, TCP refusal, auth refusal or wrong peer', async () => {
+  for (const [result, daemonStatus] of [
+    [() => { throw Object.assign(new Error('timeout'), { name: 'TimeoutError' }); }, 'timeout'],
+    [() => { throw Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }); }, 'unavailable'],
+    [() => new Response('', { status: 401 }), 'authentication_refused'],
+    [() => new Response('', { status: 403 }), 'authentication_refused'],
+    [() => Response.json({ machine_id: 'other-machine' }), 'machine_mismatch'],
+    [() => Response.json({}), 'machine_mismatch']
+  ]) {
+    const report = await diagnoseTarget('session@mac-peer', {
+      machineId: 'mac-id', daemonUrl: () => 'http://mac-peer',
+      fetchWithAuth: async () => result(), includeTcp: true,
+      tcpProbe: async () => ({ status: 'connected' })
+    });
+    assert.equal(report.layers.host_power.status, 'unknown');
+    assert.equal(report.layers.host_power.observed_at, null);
+    assert.equal(report.layers.daemon_api.status, daemonStatus);
+    assert.deepEqual(report.confirmed_causes, []);
+  }
+});
+
+test('power observation is client evidence, not a server-supplied label or an unpinned match', async () => {
+  const run = (machineId) => diagnoseTarget('session@mac-peer', {
+    machineId, daemonUrl: () => 'http://mac-peer',
+    fetchWithAuth: async url => url.endsWith('/api/meta') ? Response.json({ machine_id: 'mac-id' })
+      : Response.json({ identity: { machine_id: 'mac-id', session_id: 'session' },
+        layers: { host_power: { status: 'off' } } })
+  });
+  assert.equal((await run('mac-id')).layers.host_power.status, 'running_at_observation');
+  assert.equal((await run(undefined)).layers.host_power.reason, 'expected_machine_identity_not_supplied');
+});
