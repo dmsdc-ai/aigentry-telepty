@@ -160,8 +160,19 @@ test('#470: restored session with dead ownerPid stays unready', async () => {
 // ---------------------------------------------------------------------------
 
 function runPostinstall(envOverrides) {
+  let root = projectRoot;
+  if (envOverrides.npm_config_global === 'true' && !envOverrides.TELEPTY_SKIP_POSTINSTALL) {
+    const prefix = path.join(process.platform === 'win32' ? envOverrides.USERPROFILE : envOverrides.HOME, 'npm');
+    root = path.join(prefix, process.platform === 'win32' ? '' : 'lib', 'node_modules', pkg.name);
+    fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+    for (const file of ['package.json', 'scripts/postinstall.js']) {
+      fs.copyFileSync(path.join(projectRoot, file), path.join(root, file));
+    }
+    fs.symlinkSync(path.join(projectRoot, 'src'), path.join(root, 'src'), 'junction');
+    Object.assign(envOverrides, { npm_config_prefix: prefix, npm_package_json: path.join(root, 'package.json'), npm_command: 'install' });
+  }
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.join(projectRoot, 'scripts', 'postinstall.js')], {
+    const child = spawn(process.execPath, [path.join(root, 'scripts', 'postinstall.js')], {
       cwd: projectRoot,
       env: { ...process.env, ...envOverrides },
       stdio: ['ignore', 'pipe', 'pipe']

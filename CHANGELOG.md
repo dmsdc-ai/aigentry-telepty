@@ -2,6 +2,14 @@
 
 All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
+## 0.11.3
+
+**Behaviour changes**
+
+A direct global npm install or update of telepty can replace an older recorded daemon. Local and nested installs skip daemon management. The hook compares SemVer precedence, including prereleases. Set `TELEPTY_ALLOW_DAEMON_DOWNGRADE=1` on the direct global install to deliberately replace a known newer version. An unparseable version always defers. A client also preserves a newer or unparseable daemon version when a capability is missing.
+
+The hook asks one matching live instance to exit. Daemons without the instance-bound graceful-stop endpoint require a manual restart. A refused connection during a standalone upgrade permits a fresh start on the recorded port. With no usable PID record the hook does nothing. For managed installations it verifies service ownership before requesting a start. If identity, shutdown, or the replacement version cannot be confirmed, the hook reports the outcome. Older package managers that run preuninstall may stop a matching standalone daemon. For service removal run `telepty uninstall` before removing the package.
+
 ## 0.11.2
 
 A publication-only release. The package contents are functionally identical to 0.11.1 — nothing under

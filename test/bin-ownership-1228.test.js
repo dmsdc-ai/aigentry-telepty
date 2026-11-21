@@ -322,13 +322,15 @@ test('B-U5: postinstall warns about a legacy install and still runs the restart 
   const fs = posixTree({ linkTarget: '../lib/node_modules/aigentry-telepty/cli.js' });
 
   await postinstall.main({
+    packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
     env: { npm_config_global: 'true' },
     logger: log,
     platform: 'linux',
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: () => ({ present: false, kind: null, detail: null }),
-    cleanupDaemonProcesses: () => ({ stopped: [{ pid: 222 }], failed: [] }),
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     diagnoseBinOwnership: () => diagnoseBinOwnership({ pkgRoot: POSIX_PKG_ROOT, platform: 'linux', env: {}, fs }),
+    waitForDaemonVersion: async () => ({ version: pkg.version, pid: 333 }),
     spawnDetachedDaemon: () => { detachedStarts += 1; }
   });
 
@@ -345,13 +347,15 @@ test('B-U5: a diagnosis that throws cannot break npm install', async () => {
   let detachedStarts = 0;
 
   await postinstall.main({
+    packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
     env: { npm_config_global: 'true' },
     logger: log,
     platform: 'linux',
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: () => ({ present: false, kind: null, detail: null }),
-    cleanupDaemonProcesses: () => ({ stopped: [{ pid: 222 }], failed: [] }),
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     diagnoseBinOwnership: () => { throw new Error('prefix unreadable'); },
+    waitForDaemonVersion: async () => ({ version: pkg.version, pid: 333 }),
     spawnDetachedDaemon: () => { detachedStarts += 1; }
   });
 
@@ -367,6 +371,7 @@ test('A-U17: unsupervised postinstall prints exactly one service hint naming the
   for (const [platform, extra] of [['darwin', false], ['linux', true], ['win32', false]]) {
     const log = logger();
     await postinstall.main({
+      packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
       env: { npm_config_global: 'true' },
       logger: log,
       platform,
@@ -393,12 +398,14 @@ test('A-U17: a supervised host gets no hint, and the #757 output is unchanged', 
   let detachedStarts = 0;
 
   await postinstall.main({
+    packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
     env: { npm_config_global: 'true' },
     logger: log,
     platform: 'darwin',
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: () => ({ present: true, kind: 'launchd', detail: '/tmp/x.plist' }),
-    cleanupDaemonProcesses: () => ({ stopped: [{ pid: 222 }], failed: [] }),
+    ownsLifecycleTarget: () => true,
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     restartSupervisorDaemon: () => ({ success: true }),
     waitForDaemonVersion: async () => ({ pid: 333, version: pkg.version }),
     diagnoseBinOwnership: () => ({ legacy: { present: false }, bins: {} }),
@@ -531,14 +538,16 @@ test('B-U7: main() no longer resolves the daemon through the `telepty` bin owner
   let spawnedWith = null;
 
   await postinstall.main({
+    packageRoot: '/opt/npm/lib/node_modules/@dmsdc-ai/aigentry-telepty',
     env: { npm_config_global: 'true' },
     logger: log,
     platform: 'linux',
     readDaemonState: () => ({ pid: 222, port: 49152, version: '0.0.1' }),
     detectSupervisor: () => ({ present: false, kind: null, detail: null }),
-    cleanupDaemonProcesses: () => ({ stopped: [{ pid: 222 }], failed: [] }),
+    stopRecordedDaemon: () => ({ startReplacement: true }),
     diagnoseBinOwnership: () => ({ legacy: { present: false }, bins: {} }),
     resolveTeleptyBin: () => { resolvedBin += 1; return '/opt/prefix/bin/telepty'; },
+    waitForDaemonVersion: async () => ({ version: pkg.version, pid: 333 }),
     spawnDetachedDaemon: (arg) => { spawnedWith = arg; }
   });
 

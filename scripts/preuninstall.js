@@ -1,33 +1,37 @@
 #!/usr/bin/env node
 'use strict';
 
-// telepty#49 — npm preuninstall hook: stop the running daemon and unload the
-// launchd plist QUIETLY before the package files disappear, so `npm rm -g`
-// does not leave a live daemon answering on 3848 or a plist that launchd keeps
-// trying to resurrect. State directories and the plist file itself are left to
-// the explicit `telepty uninstall [--purge]` path.
-//
-// NOTE: npm 7+ no longer executes uninstall lifecycle scripts — this hook
-// covers npm 6 and package managers that still honor it. The documented,
-// reliable cleanup path is `telepty uninstall` (run it BEFORE `npm rm -g`).
-//
-// HARD RULE: this script must never fail — a broken preuninstall would break
-// `npm rm` itself, which is strictly worse than leaving a daemon running.
-
-// Task 1215 W3 (R1): on Windows the daemon is first asked to stop itself through the same exact-instance graceful
-// gate as `telepty daemon stop` (bounded; it never kills). The synchronous pass below proceeds only with a
-// confirmed outcome and otherwise leaves the daemon running — never a forced kill. POSIX is unchanged. The HARD
-// RULE still holds: every path, including a rejected or thrown gate, exits 0.
-(async () => {
-  try {
-    const { runPreuninstall } = require('../src/uninstall');
-    let windowsStop = null;
-    if (process.platform === 'win32') {
-      try { windowsStop = await require('../cli').gracefulWindowsStop(require('../daemon-control').DEFAULT_PORT); } catch { windowsStop = null; }
-    }
-    runPreuninstall(windowsStop ? { windowsStop } : {});
-  } catch {
-    // Swallow everything — see HARD RULE above.
+// npm 7+ removed uninstall hooks. Older managers may invoke this before removal.
+async function main(options = {}) {
+  const path = require('path');
+  const pkg = require('../package.json');
+  const { installScope, readDaemonState, stopRecordedDaemon } = require('./postinstall');
+  const { detectSupervisor } = require('../src/supervisor');
+  const { compareSemver } = require('../src/version-handshake');
+  const logger = options.logger || console;
+  const skip = installScope(options.env || process.env, options.packageRoot || path.dirname(__dirname));
+  if (skip) {
+    logger.log(`[telepty preuninstall] Skipped (${skip}).`);
+    return;
   }
+  const state = (options.readDaemonState || readDaemonState)();
+  if (!state || compareSemver(state.version, pkg.version) !== 0) {
+    logger.log('[telepty preuninstall] No matching package version in daemon state. Skipping stop.');
+    return;
+  }
+  const supervisor = (options.detectSupervisor || detectSupervisor)();
+  if (supervisor?.present || supervisor?.detail === 'disabled-by-env') {
+    logger.log('[telepty preuninstall] Automatic service teardown skipped. To remove it deliberately, run telepty uninstall before removing the package.');
+    return;
+  }
+  if (!(await (options.stopRecordedDaemon || stopRecordedDaemon)(state, false)).startReplacement) {
+    logger.log('[telepty preuninstall] Automatic teardown deferred. Check telepty service status.');
+  }
+}
+
+// HARD RULE: even missing dependencies must never break npm removal.
+if (require.main === module) (async () => {
+  try { await main(); } catch { /* best effort */ }
   process.exit(0);
 })();
+module.exports = { main };

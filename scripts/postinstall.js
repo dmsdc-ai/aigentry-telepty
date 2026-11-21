@@ -14,18 +14,68 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const pkg = require('../package.json');
-const { detectSupervisor, restartSupervisorDaemon } = require('../src/supervisor');
+const { detectSupervisor, ownsLifecycleTarget, restartSupervisorDaemon } = require('../src/supervisor');
 
-function shouldSkip(env = process.env) {
-  if (env.TELEPTY_SKIP_POSTINSTALL === '1') {
-    return 'TELEPTY_SKIP_POSTINSTALL=1';
+const { compareSemver } = require('../src/version-handshake');
+
+function topLevelPackage(root, prefix) {
+  // npm's prefix can be a symlink even when Node resolved the hook filename.
+  const canonical = value => { try { return fs.realpathSync(value); } catch { return null; } };
+  const parts = root.replace(/\\/g, '/').split('/');
+  const windows = /^[A-Za-z]:[\\/]|^\\\\/.test(root);
+  if (!windows && !path.posix.isAbsolute(root)) return false;
+  if (prefix) {
+    const paths = windows ? path.win32 : path.posix;
+    const modules = windows ? 'node_modules' : 'lib/node_modules';
+    const modulesRoot = paths.join(prefix, modules);
+    const expected = canonical(paths.join(modulesRoot, pkg.name));
+    const physical = canonical(root);
+    if (!physical || !expected || paths.relative(expected, physical) !== '') return false;
+    // Resolve the containing node_modules separately: a nested symlink can point
+    // to the top-level copy without being the package npm selected directly.
+    const parent = canonical(paths.dirname(paths.dirname(root)));
+    const globalModules = canonical(modulesRoot);
+    return Boolean(parent && globalModules && paths.relative(globalModules, parent) === ''
+      && parts.slice(-2).join('/') === pkg.name);
+  } else if (!windows && parts.at(-4) !== 'lib') {
+    return false;
   }
-  // Only act on global installs. Local `npm install` (CI, dev) must not
-  // restart a user's daemon.
-  if (env.npm_config_global !== 'true') {
-    return 'non-global install';
+  return parts.filter(p => p.toLowerCase() === 'node_modules').length === 1
+    && parts.slice(-3).join('/') === 'node_modules/' + pkg.name;
+}
+
+function installScope(env, root) {
+  if (env.npm_config_global !== 'true') return 'non-global install';
+  // Check npm's manifest as well as the physical hook location for nested links.
+  if (!topLevelPackage(root, env.npm_config_prefix) || (env.npm_package_json &&
+      !topLevelPackage(env.npm_package_json.replace(/[\\/]package\.json$/, ''), env.npm_config_prefix))) {
+    return 'top-level global package could not be verified; daemon left alone';
   }
   return null;
+}
+
+function shouldSkip(env = process.env, root = path.dirname(__dirname)) {
+  if (env.TELEPTY_SKIP_POSTINSTALL === '1') return 'TELEPTY_SKIP_POSTINSTALL=1';
+  const scope = installScope(env, root);
+  if (scope) return scope;
+  if (env.npm_command && !['install', 'update'].includes(env.npm_command)) return 'outside npm install';
+  return null;
+}
+
+function restartCommand(port, platform) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return 'telepty daemon restart';
+  return platform === 'win32'
+    ? `PowerShell: $env:TELEPTY_PORT='${port}'; telepty daemon restart (cmd.exe: set "TELEPTY_PORT=${port}" && telepty daemon restart)`
+    : `TELEPTY_PORT=${port} telepty daemon restart`;
+}
+
+async function stopRecordedDaemon(state, supervised, homeDir = os.homedir()) {
+  const current = readDaemonState(homeDir);
+  if (!Number.isInteger(state.port) || state.port < 1 || state.port > 65535 || !state.host ||
+      !current || ['pid', 'port', 'host', 'version', 'startedAt', 'instanceId'].some(field => current[field] !== state[field])) {
+    return { startReplacement: false, message: 'Recorded identity is incomplete or changed before the stop.' };
+  }
+  return require('../cli').gracefulWindowsStop(state.port, { ...state, supervised });
 }
 
 function readDaemonState(homeDir = os.homedir()) {
@@ -45,7 +95,8 @@ function resolveTeleptyBin() {
 function spawnDetachedDaemon(bin = process.execPath, options = {}) {
   return new Promise((resolve, reject) => {
     const child = (options.spawn || spawn)(bin, [path.resolve(__dirname, '../cli.js'), 'daemon'], {
-      detached: true, stdio: 'ignore', windowsHide: true
+      detached: true, stdio: 'ignore', windowsHide: true,
+      ...(options.port ? { env: { ...process.env, TELEPTY_PORT: String(options.port) } } : {})
     });
     child.once('error', reject);
     child.once('spawn', () => {
@@ -56,13 +107,13 @@ function spawnDetachedDaemon(bin = process.execPath, options = {}) {
 }
 
 function printServiceHint(logger, supervisor, platform = process.platform) {
-  if (supervisor && supervisor.present) return false;
+  if (supervisor?.present || supervisor?.detail === 'disabled-by-env') return false;
   const linger = platform === 'darwin' || platform === 'win32'
     ? ''
     : ' (boot without login also needs: loginctl enable-linger $USER)';
   logger.log(
-    '[telepty postinstall] No OS service manages the telepty daemon; it will not start after '
-    + `reboot/login. To enable: telepty service install${linger}`
+    '[telepty postinstall] No OS service manages the telepty daemon according to service detection. A standalone daemon will not start after '
+    + `reboot/login by itself. To enable: telepty service install${linger}`
   );
   return true;
 }
@@ -114,7 +165,7 @@ async function main(options = {}) {
   const env = options.env || process.env;
   const logger = options.logger || console;
   const platform = options.platform || process.platform;
-  const skip = shouldSkip(env);
+  const skip = shouldSkip(env, options.packageRoot);
   if (skip) {
     logger.log(`[telepty postinstall] Skipped (${skip}).`);
     return;
@@ -125,87 +176,92 @@ async function main(options = {}) {
 
   const state = (options.readDaemonState || readDaemonState)(options.homeDir || os.homedir());
   if (!state || !Number.isInteger(state.pid) || state.pid <= 0) {
-    logger.log('[telepty postinstall] No running daemon detected — nothing to restart.');
+    logger.log('[telepty postinstall] No running daemon detected in the state file — nothing to restart.');
     printServiceHint(logger, supervisor, platform);
     return;
   }
 
-  if (state.version === pkg.version) {
-    logger.log(`[telepty postinstall] Running daemon already at ${pkg.version} (pid ${state.pid}). No restart needed.`);
+  const order = compareSemver(state.version, pkg.version);
+  if (order === null) {
+    logger.log('[telepty postinstall] Daemon left alone because its version could not be compared. For a deliberate downgrade, verify the running version and run telepty daemon restart.');
+    return;
+  }
+  if (order > 0 && env.TELEPTY_ALLOW_DAEMON_DOWNGRADE !== '1') {
+    logger.log(`[telepty postinstall] Newer daemon ${state.version} in state file left alone. To downgrade deliberately, set TELEPTY_ALLOW_DAEMON_DOWNGRADE=1 and reinstall ${pkg.name}@${pkg.version} globally.`);
+    return;
+  }
+  if (order === 0) {
+    logger.log(`[telepty postinstall] Recorded daemon already at ${pkg.version} (pid ${state.pid}). Skipping restart.`);
     printServiceHint(logger, supervisor, platform);
     return;
   }
-
-  logger.log(`[telepty postinstall] Detected stale daemon ${state.version || 'unknown'} (pid ${state.pid}); upgrading in-place to ${pkg.version}.`);
 
   // Task 1215 service36: a replacement daemon that would refuse its supervision setting must not replace a running
   // one. Preflight BEFORE the stop; on a refusal skip both stop and restart, so the old daemon keeps running, and
-  // name the code only (no path, no config content). Lazy require, as for daemon-control below.
+  // name the code only (no path, no config content).
   try {
     const supervision = require('../src/principal/supervision-config');
     try {
       supervision.preflightSupervision({ env, platform, configPath: supervision.defaultConfigPath(options.homeDir || os.homedir()) });
     } catch (err) {
-      logger.warn(`[telepty postinstall] Supervision preflight refused (${supervision.refusalCode(err)}); the running `
-        + `${state.version || 'unknown'} daemon was NOT stopped or restarted. Fix the supervisionTrustFile setting, then run: telepty daemon restart`);
+      logger.warn(`[telepty postinstall] Supervision preflight refused (${supervision.refusalCode(err)}); no daemon stop or restart was requested.`
+        + ` Fix the supervisionTrustFile setting, then run: telepty daemon restart`);
       return;
     }
   } catch {
-    logger.warn('[telepty postinstall] Supervision preflight unavailable (SUPERVISION_PREFLIGHT_FAILED); the running daemon was NOT stopped or restarted.');
+    logger.warn('[telepty postinstall] Supervision preflight unavailable (SUPERVISION_PREFLIGHT_FAILED); no daemon stop or restart was requested.');
     return;
   }
 
-  let stopped = 0;
-  try {
-    // Lazy require so a malformed install of daemon-control.js doesn't abort
-    // postinstall before the skip-check runs.
-    const daemonControl = require('../daemon-control');
-    const cleanupDaemonProcesses = options.cleanupDaemonProcesses || daemonControl.cleanupDaemonProcesses;
-    // #902: postinstall replaces the installed daemon machine-wide; the default port is now
-    // named, not assumed by the sweep.
-    const result = cleanupDaemonProcesses({ port: daemonControl.DEFAULT_PORT });
-    stopped = result.stopped.length;
-    if (result.failed.length > 0) {
-      logger.warn(`[telepty postinstall] Could not stop ${result.failed.length} daemon process(es).`);
-    }
-  } catch (err) {
-    logger.warn(`[telepty postinstall] cleanupDaemonProcesses failed: ${err.message}`);
+  const supervised = Boolean(supervisor?.present);
+  const ownsTarget = options.ownsLifecycleTarget || ownsLifecycleTarget;
+  if (supervised && !ownsTarget(supervisor, state)) {
+    logger.warn(`[telepty postinstall] Daemon upgrade deferred because service ownership could not be verified. Check telepty service status, then run ${restartCommand(state.port, platform)}.`);
+    return;
   }
-
-  // If an OS supervisor is installed, it must own the replacement daemon. Spawning a
-  // detached process here creates the first-pass orphan fixed by #757.
-  if (supervisor && supervisor.present) {
-    const restart = (options.restartSupervisorDaemon || restartSupervisorDaemon)(supervisor);
-    if (!restart || restart.success !== true) {
-      logger.warn(
-        `[telepty postinstall] Stopped ${stopped} stale daemon(s), but ${supervisor.kind} restart failed: ` +
-        `${(restart && restart.error) || 'unknown error'}. Not spawning a detached daemon for a supervisor-managed install.`
-      );
+  const recovery = restartCommand(state.port, platform);
+  const stop = options.stopRecordedDaemon || stopRecordedDaemon;
+  try {
+    const outcome = await stop(state, supervised, options.homeDir);
+    if (!outcome.startReplacement) {
+      const result = outcome.result;
+      let reason = outcome.message;
+      if (result?.status === 'stopped' && result.lockRetained) {
+        reason = `Recorded PID ${result.pid} exited but the ledger lock still names it.`;
+      } else if (result?.reason === 'stop_request_failed') {
+        reason = 'The stop request returned no response. The daemon may already be stopping.';
+      } else if (result?.status === 'timeout') {
+        reason = result.exited ? 'Recorded PID exited but the port still answered at the deadline.'
+          : 'Recorded PID was still present at the stop deadline.';
+      } else if (result && !['stopped', 'no_answer'].includes(result.status)) {
+        reason = `Stop result: ${result.status} (${result.reason || result.httpStatus || 'no further detail'}).`;
+      }
+      logger.warn(`[telepty postinstall] ${reason} Check telepty service status, then run ${recovery}.`);
       return;
     }
 
-    const waitForVersion = options.waitForDaemonVersion || waitForDaemonVersion;
-    const meta = await waitForVersion({
-      port: Number(state.port) || 3848,
-      version: pkg.version,
-      timeoutMs: options.waitTimeoutMs || 8000,
-      token: localDaemonToken(env)
+    if (supervised) {
+      const restart = (options.restartSupervisorDaemon || restartSupervisorDaemon)(supervisor, {}, { startOnly: true });
+      if (!restart?.success) {
+        logger.warn(`[telepty postinstall] ${supervisor.kind} start failed: ${restart?.error || 'unknown error'}. Run ${recovery}.`);
+        return;
+      }
+    } else {
+      await (options.spawnDetachedDaemon || spawnDetachedDaemon)(undefined, { port: state.port });
+      logger.log('[telepty postinstall] spawned fresh daemon process; checking its version.');
+    }
+    const meta = await (options.waitForDaemonVersion || waitForDaemonVersion)({
+      port: state.port, version: pkg.version, timeoutMs: options.waitTimeoutMs || 8000, token: localDaemonToken(env)
     });
     if (meta) {
-      logger.log(`[telepty postinstall] Stopped ${stopped} stale daemon(s); ${supervisor.kind} started ${pkg.version} daemon (pid ${meta.pid}).`);
+      const source = supervised && ownsTarget(supervisor, meta) ? supervisor.kind + ' started' : 'Confirmed';
+      logger.log(`[telepty postinstall] ${source} ${pkg.version} daemon (pid ${meta.pid}).`);
     } else {
-      logger.warn(`[telepty postinstall] Stopped ${stopped} stale daemon(s); requested ${supervisor.kind} restart, but daemon did not report ${pkg.version} yet.`);
+      logger.warn(`[telepty postinstall] Port ${state.port} did not report ${pkg.version} before the deadline. Run ${recovery}.`);
     }
-    return;
-  }
-
-  // No supervisor installed: keep the pre-#757 fallback so upgrades do not leave
-  // standalone/non-root installs without a daemon.
-  try {
-    await (options.spawnDetachedDaemon || spawnDetachedDaemon)();
-    logger.log(`[telepty postinstall] Stopped ${stopped} stale daemon(s); spawned fresh ${pkg.version} daemon.`);
   } catch (err) {
-    logger.warn(`[telepty postinstall] Daemon respawn failed: ${err.message}.`);
+    logger.warn(`[telepty postinstall] Stop or respawn failed: ${err.message}. Check telepty service status, then run ${recovery}.`);
+    return;
   }
   printServiceHint(logger, supervisor, platform);
 }
@@ -218,6 +274,8 @@ if (require.main === module) {
 
 module.exports = {
   main,
+  installScope,
+  stopRecordedDaemon,
   printServiceHint,
   readDaemonState,
   resolveTeleptyBin,

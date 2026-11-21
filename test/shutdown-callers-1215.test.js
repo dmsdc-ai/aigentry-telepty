@@ -145,7 +145,7 @@ test('R1/R2 source: main(), the interactive menu and the npm hook call exactly t
     menu: src.includes('      if (!(await interactiveDaemonStart())) continue;'),
   }, { daemon: true, daemonNoDirectStop: true, service: true, uninstall: true, menu: true });
   const hook = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'preuninstall.js'), 'utf8');
-  assert.deepEqual({ awaitsGate: /await require\('\.\.\/cli'\)\.gracefulWindowsStop\(/.test(hook), win32Only: hook.includes("if (process.platform === 'win32')"),
-    passesOutcome: hook.includes('runPreuninstall(windowsStop ? { windowsStop } : {})'), exitsZero: hook.includes('process.exit(0);') },
-  { awaitsGate: true, win32Only: true, passesOutcome: true, exitsZero: true });
+  assert.match(hook, /await \(options.stopRecordedDaemon \|\| stopRecordedDaemon\)\(state, false\)/);
+  assert.ok(hook.includes('process.exit(0);'));
+  assert.doesNotMatch(hook, /cleanupDaemonProcesses|runPreuninstall/);
 });

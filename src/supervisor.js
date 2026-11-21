@@ -171,7 +171,82 @@ function clearSupervisorDeferMarker(opts) {
   }
 }
 
-function restartSupervisorDaemon(supervisor, deps = {}) {
+// Bind the manager's live PID and loaded command to the package running this hook.
+function ownsLifecycleTarget(supervisor, state, deps = {}) {
+  const exec = deps.execFileSync || execFileSync;
+  const realpath = deps.realpathSync || fs.realpathSync;
+  const cli = deps.cli || path.resolve(__dirname, '../cli.js');
+  const options = { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] };
+  try {
+    let args;
+    let pid;
+    if (supervisor.kind === 'launchd') {
+      const uid = (deps.getuid || process.getuid)();
+      const info = exec('launchctl', ['print', 'gui/' + uid + '/' + LAUNCHD_LABEL], options);
+      pid = /^\tpid = (\d+)$/m.exec(info)?.[1];
+      const block = /^\targuments = \{\n((?:\t\t[^\n]+\n)+)\t\}$/m.exec(info);
+      args = block?.[1].trimEnd().split('\n').map(line => line.slice(2));
+      const program = /^\tprogram = (.+)$/m.exec(info)?.[1];
+      if (!args || !program || realpath(program) !== realpath(args[0])) return false;
+    } else if (['systemd', 'systemd-user'].includes(supervisor.kind)) {
+      const scope = supervisor.kind === 'systemd-user' ? ['--user'] : [];
+      const info = exec('systemctl', [...scope, 'show', SYSTEMD_SERVICE_NAME,
+        '-p', 'MainPID', '-p', 'ExecStart'], options);
+      pid = /^MainPID=(\d+)$/m.exec(info)?.[1];
+      const command = /^ExecStart=\{ path=([^;{}]+) ; argv\[\]=([^;{}]+) ; [^{}]+\}$/m.exec(info);
+      if (Number(pid) !== state.pid) return false;
+      args = command?.[2].split(' ');
+      if (!args || args.length > 3 || args[0] !== command[1] || /["\\]/.test(command[2])) {
+        // systemctl's human-readable argv loses argument boundaries on paths with spaces.
+        const property = exec('busctl', [...scope, '--json=short', 'get-property',
+          'org.freedesktop.systemd1', '/org/freedesktop/systemd1/unit/telepty_2eservice',
+          'org.freedesktop.systemd1.Service', 'ExecStart'], options);
+        const entries = JSON.parse(property).data;
+        if (entries.length !== 1) return false;
+        const [program, loadedArgs] = entries[0];
+        if (program !== loadedArgs[0]) return false;
+        args = loadedArgs;
+      }
+    } else if (supervisor.kind === 'schtasks') {
+      if (!Number.isSafeInteger(state.pid) || state.pid <= 0) return false;
+      // The task name alone does not identify its daemon. Correlate the registered
+      // action and running task engine with the recorded process and its image.
+      const script = [
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)",
+        "$ErrorActionPreference='Stop'", "$scheduler=New-Object -ComObject Schedule.Service",
+        "$scheduler.Connect()", "$task=$scheduler.GetFolder('\\').GetTask('telepty-daemon')",
+        "$instances=$task.GetInstances(0)", "$actions=$task.Definition.Actions",
+        "if ($instances.Count -ne 1 -or $actions.Count -ne 1) { exit 1 }",
+        "$action=$actions.Item(1)", "if ($action.Type -ne 0) { exit 1 }",
+        "$process=Get-CimInstance Win32_Process -Filter 'ProcessId=" + state.pid + "'",
+        "$engine=$instances.Item(1).EnginePID",
+        "if ($engine -ne $process.ProcessId -and ($engine -ne $process.ParentProcessId -or " +
+          "@(Get-CimInstance Win32_Process -Filter (\"ParentProcessId=\" + $engine)).Count -ne 1)) { exit 1 }",
+        "@{engine=$engine;pid=$process.ProcessId;parent=$process.ParentProcessId;" +
+          "line=$process.CommandLine;image=$process.ExecutablePath;program=$action.Path;arguments=$action.Arguments} | ConvertTo-Json -Compress"
+      ].join('; ');
+      const task = JSON.parse(exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { ...options, timeout: 10000 }));
+      if (task.pid !== state.pid || !task.engine || (task.engine !== task.pid && task.engine !== task.parent)) return false;
+      const entry = /^(?:"([^"\r\n]+)"|([^\s"]+))\s+daemon$/.exec(task.arguments);
+      const program = task.program.replace(/^"(.*)"$/, '$1');
+      if (!entry || realpath(program) !== realpath(task.image)) return false;
+      const worker = /^(?:"([^"]+)"|([^\s"]+))\s+(?:"([^"]+)"|([^\s"]+))\s+daemon\s*$/.exec(task.line);
+      if (!worker || realpath(worker[3] || worker[4]) !== realpath(cli)) return false;
+      args = [program, entry[1] || entry[2], 'daemon'];
+      pid = task.pid;
+    } else {
+      return false;
+    }
+    if (Number(pid) !== state.pid || args?.at(-1) !== 'daemon') return false;
+    if (args.length === 3 && !/^(?:node|nodejs)(?:\.exe)?$/i.test(path.win32.basename(args[0]))
+        && realpath(args[0]) !== realpath(process.execPath)) return false;
+    return (args.length === 2 || args.length === 3) && realpath(args.at(-2)) === realpath(cli);
+  } catch {
+    return false;
+  }
+}
+
+function restartSupervisorDaemon(supervisor, deps = {}, { startOnly = false } = {}) {
   if (!supervisor || !supervisor.present) {
     return { success: false, error: 'no supervisor detected' };
   }
@@ -185,21 +260,21 @@ function restartSupervisorDaemon(supervisor, deps = {}) {
       if (!Number.isInteger(uid) || uid < 0) {
         return { success: false, error: 'cannot resolve uid for launchd kickstart' };
       }
-      execFile('launchctl', ['kickstart', '-k', `gui/${uid}/${LAUNCHD_LABEL}`], {
+      execFile('launchctl', ['kickstart', ...(startOnly ? [] : ['-k']), `gui/${uid}/${LAUNCHD_LABEL}`], {
         stdio: ['ignore', 'ignore', 'ignore']
       });
       return { success: true, kind: supervisor.kind };
     }
 
     if (supervisor.kind === 'systemd') {
-      execFile('systemctl', ['restart', SYSTEMD_SERVICE_NAME], {
+      execFile('systemctl', [startOnly ? 'start' : 'restart', SYSTEMD_SERVICE_NAME], {
         stdio: ['ignore', 'ignore', 'ignore']
       });
       return { success: true, kind: supervisor.kind };
     }
 
     if (supervisor.kind === 'systemd-user') {
-      execFile('systemctl', ['--user', 'restart', SYSTEMD_SERVICE_NAME], {
+      execFile('systemctl', ['--user', startOnly ? 'start' : 'restart', SYSTEMD_SERVICE_NAME], {
         stdio: ['ignore', 'ignore', 'ignore']
       });
       return { success: true, kind: supervisor.kind };
@@ -230,6 +305,7 @@ module.exports = {
   clearSupervisorDeferMarker,
   detectSupervisor,
   isDeferMarkerFresh,
+  ownsLifecycleTarget,
   readSupervisorDeferMarker,
   restartSupervisorDaemon,
   supervisedPort,
