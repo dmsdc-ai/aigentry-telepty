@@ -151,17 +151,17 @@ the operator one command; the send cost them the daemon, silently.
 What does **not** exist: any discovery, rotation, revocation, or per-peer scoping of those tokens.
 Step 2 only helps an operator who has already run `connect-http --token`, and addressing forms with
 no `peers.json` entry (`<sid>@<tailnet-ip>`, `TELEPTY_HOST`) must use the env variable or are
-refused. Since 0.11.4 a `<sid>@<ip>` that a registered peer's host name resolves to is that peer: the
-request goes to the peer's REGISTERED endpoint with its stored token, never to the typed address, so
-no credential is chosen by DNS. Note the consequence worth stating: addressing **your own** daemon by
-its tailnet IP is refused as well, because `isLocalHostname` recognises loopback literals and nothing
-else. That is a deliberate false positive. The predicate is a syntactic check on the address, and
-widening it to "any address this host happens to answer on" would make the boundary depend on
-interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the escape hatch. This is a
-named limitation, not a solved problem. Session routing (not this predicate) treats
-`<sid>@<this machine's name>` — its host name or the machine ID its daemon reports — as
-`<sid>@127.0.0.1` when no registered peer uses that name, so the request and the local token still
-go to loopback only.
+refused. Note the consequence worth stating: addressing **your own** daemon by a non-loopback name —
+its tailnet IP, its LAN IP — is refused as well, because `isLocalHostname` recognises loopback
+literals and nothing else. That is a deliberate false positive. The predicate is a syntactic check on
+the address, and widening it to "any address this host happens to answer on" would make the boundary
+depend on interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the escape hatch.
+This is a named limitation, not a solved problem.
+Since 0.11.4, without `TELEPTY_AUTH_TOKEN`, session routing (not this predicate) treats
+`<sid>@<this machine's name>` as `<sid>@127.0.0.1` when no registered peer uses that name in any
+letter case, so the local token still goes to loopback only. Routing resolves no names: `<sid>@<address>`
+is a registered peer only when it equals that peer's registered name, machine ID, host, `host:port`
+or target.
 
 ### `TELEPTY_AUTH_TOKEN` must be set at every end, or at none
 

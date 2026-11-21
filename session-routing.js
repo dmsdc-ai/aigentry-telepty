@@ -1,8 +1,5 @@
 'use strict';
 
-const { isIP } = require('net');
-const { parseHostSpec } = require('./host-spec');
-
 function formatHostLabel(host) {
   return host === '127.0.0.1' ? 'Local' : host;
 }
@@ -34,15 +31,12 @@ function resolveRegisteredPeerTarget(sessionRef, peers = {}) {
       peer.dnsName, peer.magicDnsName].some((alias) => typeof alias === 'string' && alias === parsed.host);
   });
   if (matches.length > 1) {
-    throw new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(([name]) => name).sort().join(', ')}. Use a registered address:port.`);
+    // #1288 (R5): the code lets a --json caller print this refusal as a document; the text is unchanged.
+    throw Object.assign(new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(([name]) => name).sort().join(', ')}. Use a registered address:port.`),
+      { code: 'AMBIGUOUS_PEER' });
   }
   if (matches.length === 0) return null;
   const [name, peer] = matches[0];
-  return registeredPeerTarget(parsed.id, name, peer);
-}
-
-function registeredPeerTarget(id, name, peer) {
-  const parsed = { id };
   if (peer.transport === 'http') {
     if (!peer.host || !peer.port) throw new Error(`Peer '${name}' has no registered HTTP endpoint.`);
     const host = peer.host.includes(':') && !peer.host.startsWith('[') ? `[${peer.host}]` : peer.host;
@@ -134,65 +128,6 @@ function registeredPeerUsesName(name, peers = {}) {
     .some((alias) => typeof alias === 'string' && alias.toLowerCase() === wanted));
 }
 
-const PEER_ADDRESS_LOOKUP_MS = 1000;
-
-function ipAddressKey(address) {
-  return String(address || '').replace(/^\[|\]$/g, '').split('%')[0].toLowerCase();
-}
-
-// #1288 (FACT D): `<id>@<ip>[:port]` names a peer that was registered by HOSTNAME when that
-// hostname resolves to the address. Only an IP-literal qualifier that matched no registered alias
-// reaches here, and only peers registered by name are looked up — so a host without peers never
-// performs a lookup. The registered endpoint and its stored credential are what is returned, never
-// the typed address. A lookup that fails or misses the deadline is "no match" (F3): the caller then
-// takes exactly the path it took before this function existed. Two matching peers are refused.
-async function resolvePeerByAddress(sessionRef, peers = {}, options = {}) {
-  const parsed = parseSessionReference(sessionRef);
-  if (!parsed.id || !parsed.host) return null;
-  const spec = parseHostSpec(parsed.host, null);
-  const address = ipAddressKey(spec.host);
-  if (!isIP(address)) return null;
-  const candidates = [];
-  for (const [name, peer] of Object.entries(peers)) {
-    if (!peer || typeof peer !== 'object') continue;
-    let host = null;
-    if (peer.transport === 'http') {
-      if (spec.port !== null && Number(peer.port) !== spec.port) continue;
-      host = peer.host;
-    } else if (!peer.transport || peer.transport === 'ssh') {
-      if (spec.port !== null || typeof peer.target !== 'string') continue;
-      host = peer.target.split('@').pop();
-    }
-    if (typeof host !== 'string' || !host || isIP(ipAddressKey(host))) continue;
-    candidates.push({ name, peer, host });
-  }
-  if (candidates.length === 0) return null;
-  const lookup = options.lookup || ((host, lookupOptions) => require('dns').promises.lookup(host, lookupOptions));
-  const timeoutMs = options.timeoutMs || PEER_ADDRESS_LOOKUP_MS;
-  const answers = new Map();
-  for (const { host } of candidates) {
-    const key = host.toLowerCase();
-    if (answers.has(key)) continue;
-    answers.set(key, new Promise((resolve) => {
-      const timer = setTimeout(() => resolve([]), timeoutMs);
-      Promise.resolve()
-        .then(() => lookup(host, { all: true }))
-        .then((found) => resolve(Array.isArray(found) ? found.map((entry) => ipAddressKey(entry && entry.address)) : []),
-          () => resolve([]))
-        .finally(() => clearTimeout(timer));
-    }));
-  }
-  const matches = [];
-  for (const candidate of candidates) {
-    if ((await answers.get(candidate.host.toLowerCase())).includes(address)) matches.push(candidate);
-  }
-  if (matches.length > 1) {
-    throw new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(({ name }) => name).sort().join(', ')}. Use the registered peer name.`);
-  }
-  if (matches.length === 0) return null;
-  return registeredPeerTarget(parsed.id, matches[0].name, matches[0].peer);
-}
-
 module.exports = {
   formatHostLabel,
   groupSessionsByHost,
@@ -200,6 +135,5 @@ module.exports = {
   parseSessionReference,
   pickSessionTarget,
   registeredPeerUsesName,
-  resolvePeerByAddress,
   resolveRegisteredPeerTarget
 };

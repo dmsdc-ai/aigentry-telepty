@@ -219,19 +219,18 @@ async function connect(target, options = {}) {
   }
 
   // #1288 (FACT E): an IP address is not split at its first dot — `100.64.0.7` and `100.70.1.2` both
-  // became `100`, and the second registration overwrote the first. A legacy entry for the same
-  // target keeps its key (F9) instead of gaining a duplicate; a different target under the IP
-  // name is refused rather than overwritten.
+  // became `100`, and the second registration overwrote the first. A target that already has an
+  // entry keeps that entry's key, with or without --name (F9, R7); a different target under the IP
+  // name is refused rather than overwritten. Nothing below awaits before the write, so this check
+  // and the write are one step.
   const targetHost = target.split('@').pop();
   let name = options.name || (isIP(targetHost) ? targetHost : targetHost.split('.')[0]);
-  if (!options.name && isIP(targetHost)) {
-    const registered = loadPeers().peers || {};
-    const existing = Object.entries(registered).find(([, peer]) =>
-      peer && (!peer.transport || peer.transport === 'ssh') && peer.target === sshTarget);
-    if (existing) name = existing[0];
-    else if (registered[name]) {
-      return { success: false, error: `Peer name '${name}' is already registered for a different target; pass --name <name> to register ${sshTarget}.` };
-    }
+  const registered = loadPeers().peers || {};
+  const existing = Object.entries(registered).find(([, peer]) =>
+    peer && (!peer.transport || peer.transport === 'ssh') && peer.target === sshTarget);
+  if (existing) name = existing[0];
+  else if (!options.name && isIP(targetHost) && registered[name]) {
+    return { success: false, error: `Peer name '${name}' is already registered for a different target; pass --name <name> to register ${sshTarget}.` };
   }
 
   if (activePeers.has(name)) {
@@ -516,18 +515,8 @@ async function connectHttp(target, options = {}) {
     return { success: false, error: 'connect-http requires a host (got empty value).' };
   }
 
-  // #1288 (FACT E): an IP address is not split at its first dot (see connect above). A legacy entry
-  // for the same endpoint keeps its key (F9); a different endpoint under the IP name is refused.
+  // #1288 (FACT E): an IP address is not split at its first dot (see connect above).
   let name = options.name || (isIP(spec.host) ? spec.host : spec.host.split('.')[0]) || spec.host;
-  if (!options.name && isIP(spec.host)) {
-    const registered = loadPeers().peers || {};
-    const existing = Object.entries(registered).find(([, peer]) =>
-      peer && peer.transport === 'http' && peer.host === spec.host && Number(peer.port) === spec.port);
-    if (existing) name = existing[0];
-    else if (registered[name]) {
-      return { success: false, error: `Peer name '${name}' is already registered for a different endpoint; pass --name <name> to register ${spec.host}:${spec.port}.` };
-    }
-  }
 
   const headers = {};
   // #823 — /api/meta is auth-gated, so discovery needs whichever token this operator has for the
@@ -566,6 +555,17 @@ async function connectHttp(target, options = {}) {
   }
 
   const peers = loadPeers();
+  // #1288 (F9, R7): decided against the file as it is now, in the same synchronous step as the write.
+  // An endpoint that already has an entry keeps that entry's key, with or without --name; a
+  // different endpoint under the IP name is refused rather than overwritten.
+  const existing = Object.entries(peers.peers || {}).find(([, peer]) =>
+    peer && peer.transport === 'http' && peer.host === spec.host && Number(peer.port) === spec.port);
+  if (existing) {
+    if (machineId === name) machineId = existing[0]; // no /api/meta answer: the fallback is the key, as before
+    name = existing[0];
+  } else if (!options.name && isIP(spec.host) && peers.peers[name]) {
+    return { success: false, error: `Peer name '${name}' is already registered for a different endpoint; pass --name <name> to register ${spec.host}:${spec.port}.` };
+  }
   peers.peers[name] = {
     transport: 'http',
     host: spec.host,

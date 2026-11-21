@@ -26,7 +26,7 @@ const { attachInteractiveTerminal, getTerminalSize, restoreTerminalModes } = req
 const interaction = require('./src/interaction');
 const { formatTerminalTitle } = require('./src/session-id');   // PR #108 C7: controls stripped from OSC titles
 const { getRuntimeInfo } = require('./runtime-info');
-const { formatHostLabel, groupSessionsByHost, isLocalMachineName, parseSessionReference, pickSessionTarget, registeredPeerUsesName, resolvePeerByAddress, resolveRegisteredPeerTarget } = require('./session-routing');
+const { formatHostLabel, groupSessionsByHost, isLocalMachineName, parseSessionReference, pickSessionTarget, registeredPeerUsesName, resolveRegisteredPeerTarget } = require('./session-routing');
 const { buildSharedContextPrompt, createSharedContextDescriptor, ensureSharedContextFile } = require('./shared-context');
 const { runInteractiveSkillInstaller } = require('./skill-installer');
 const {
@@ -1327,11 +1327,18 @@ function isRemoteSession(session) {
 //     rule that a refusing daemon must fail the command rather than shrink the list.
 // The cost is one extra local round-trip (~2ms, measured) on the miss path, where the fan-out
 // that follows dwarfs it.
-async function resolveLocalSessionTarget(sessionRef) {
-  if (REMOTE_HOST !== '127.0.0.1') return null;
+//
+// #1288: every TELEPTY_HOST spelling isLocalHostname() accepts is this machine (R3). `exactOnly`
+// (session info, multicast — and any spelling other than 127.0.0.1) short-circuits a bare id the
+// local daemon has EXACTLY, and returns the target 0.11.3 picked for it after the fan-out; a
+// prefix or a qualified id keeps the 0.11.3 path.
+async function resolveLocalSessionTarget(sessionRef, { exactOnly = false } = {}) {
+  if (!isLocalHostname(REMOTE_HOST)) return null;
   const parsed = parseSessionReference(sessionRef);
   if (!parsed.id) return null;
   if (parsed.host && !isLocalHostname(parsed.host)) return null;
+  exactOnly = exactOnly || REMOTE_HOST !== '127.0.0.1';
+  if (exactOnly && parsed.host) return null;
 
   let sessions;
   try {
@@ -1342,6 +1349,10 @@ async function resolveLocalSessionTarget(sessionRef) {
     sessions = await res.json();
   } catch { return null; }
   if (!Array.isArray(sessions)) return null;
+  if (exactOnly) {
+    const exact = sessions.filter((s) => s && s.id === parsed.id).map((s) => ({ host: '127.0.0.1', ...s }));
+    return exact.length ? pickSessionTarget(parsed.id, exact, REMOTE_HOST) : null;
+  }
 
   // The same matcher discovery uses, over the local list only — so exact ids AND the project
   // prefix fallback both resolve here, and a local session never reaches the fan-out by having
@@ -1366,10 +1377,10 @@ async function isThisMachineName(host, registeredPeers) {
   } catch { return false; }
 }
 
-// #1288 (D3): under --json, the two routing refusals (cross-host ambiguity, unregistered peer) are a
-// JSON document on stdout with a non-zero exit; stderr keeps the same human line text mode prints.
-// Every other failure keeps its 0.11.3 output.
-const ROUTING_REFUSAL_CODES = new Set(['AMBIGUOUS_SESSION', 'PEER_NOT_REGISTERED']);
+// #1288 (D3): under --json, the three routing refusals (cross-host ambiguity, unregistered peer,
+// ambiguous peer identity) are a JSON document on stdout with a non-zero exit; stderr keeps the same
+// human line text mode prints. Every other failure keeps its 0.11.3 output.
+const ROUTING_REFUSAL_CODES = new Set(['AMBIGUOUS_SESSION', 'PEER_NOT_REGISTERED', 'AMBIGUOUS_PEER']);
 function printRoutingRefusalJson(error, json) {
   if (!json || !error || !ROUTING_REFUSAL_CODES.has(error.code)) return false;
   console.log(JSON.stringify({ success: false, code: error.code, error: error.message }));
@@ -1383,20 +1394,10 @@ async function resolveSessionTarget(sessionRef, options = {}) {
   // even when discovery cannot list the session. Never shorten the requested id.
   const registeredPeers = crossMachine.loadPeers().peers || {};
   let registered;
-  try {
-    registered = resolveRegisteredPeerTarget(sessionRef, registeredPeers);
-    // #1288 (FACT D): a non-loopback IP qualifier that a peer's registered HOSTNAME resolves to is
-    // that peer. Bounded; a failed lookup is no match, never a refusal (F3).
-    const addressed = parseSessionReference(sessionRef);
-    if (!registered && addressed.host && !isLocalHostname(addressed.host)) {
-      registered = await resolvePeerByAddress(sessionRef, registeredPeers);
-    }
-  }
+  try { registered = resolveRegisteredPeerTarget(sessionRef, registeredPeers); }
   catch (error) { markCommandFailed(); throw error; }
   if (registered) {
-    // #1288: a caller that discovers lazily (`discover`) gets the same discovered metadata merged.
-    const known = options.sessions || (options.discover ? await options.discover() : []);
-    const discovered = known.find((session) =>
+    const discovered = (options.sessions || []).find((session) =>
       session.id === registered.id && session.peerName === registered.peerName);
     return { ...discovered, ...registered };
   }
@@ -1419,7 +1420,7 @@ async function resolveSessionTarget(sessionRef, options = {}) {
     const local = await resolveLocalSessionTarget(sessionRef);
     if (local) return local;
   }
-  const sessions = options.sessions || (options.discover ? await options.discover() : await discoverSessions({ silent: true }));
+  const sessions = options.sessions || await discoverSessions({ silent: true });
   const target = pickSessionTarget(sessionRef, sessions, REMOTE_HOST);
   // When <id>@<peerName> uses an SSH peer alias (e.g. `winserver`) and the
   // session is not in `sessions` (discovery missed it, ControlMaster expired,
@@ -4858,14 +4859,14 @@ async function main() {
     }
     const sessionRefs = sessionIdsRaw.split(',').map(s => s.trim()).filter(s => s);
     try {
-      // #1288 (D1): local ids resolve on the local daemon alone; the peer fan-out runs at most once,
-      // and only for a reference that needs it.
+      // #1288 (D1): a bare id the local daemon has EXACTLY resolves there without the peer fan-out;
+      // every other reference resolves exactly as in 0.11.3, against one fan-out.
       await ensureDaemonRunning();
       let discovered = null;
-      const discover = async () => (discovered = discovered || await discoverSessions({ silent: true, _ensureDaemonRunning: async () => {} }));
       const groupedTargets = new Map();
       for (const sessionRef of sessionRefs) {
-        const target = await resolveSessionTarget(sessionRef, { discover });
+        const target = await resolveLocalSessionTarget(sessionRef, { exactOnly: true })
+          || await resolveSessionTarget(sessionRef, { sessions: discovered = discovered || await discoverSessions({ silent: true, _ensureDaemonRunning: async () => {} }) });
         if (!target) {
           throw new Error(`Session '${sessionRef}' was not found on any discovered host.`);
         }
@@ -5176,12 +5177,11 @@ async function main() {
     }
 
     try {
-      // #1288 (D1, FACTS A/B): resolve before discovering, so an id on the local daemon (exact, or by
-      // the #837 prefix fallback) is answered without consulting any peer.
+      // #1288 (D1, FACTS A/B): a bare id the local daemon has EXACTLY is answered without consulting
+      // any peer; every other reference (a prefix, a qualified id) resolves exactly as in 0.11.3.
       await ensureDaemonRunning();
-      const target = await resolveSessionTarget(sessionRef, {
-        discover: () => discoverSessions({ silent: true, _ensureDaemonRunning: async () => {} })
-      });
+      const target = await resolveLocalSessionTarget(sessionRef, { exactOnly: true })
+        || await resolveSessionTarget(sessionRef, { sessions: await discoverSessions({ silent: true, _ensureDaemonRunning: async () => {} }) });
       if (!target) {
         console.error(`❌ Session '${sessionRef}' was not found on any discovered host.`);
         process.exit(1);
