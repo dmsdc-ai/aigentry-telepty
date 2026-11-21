@@ -12,6 +12,9 @@
 // No sleeps. Every wait is a harness bound: waitFor, bounded requests, or audit completion under the case signal. "Exactly
 // one write" is counted after a no-Enter sentinel inject has reached the same owner socket. WebSocket frames arrive in
 // order, so every earlier write has been received by then.
+// Every request a case sends carries that case's t.signal. node:test aborts it when the case ends or times out, and the harness
+// then aborts the request (HARNESS_REQUEST_ABORTED). So a slow or failed case leaves no traffic running into the next case on
+// the shared daemon.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -23,7 +26,7 @@ const WebSocket = require('ws');
 
 const { startTestDaemon, createSessionId, waitFor, HARNESS_OBSERVATION_MARGIN_MS } = require('../test-support/daemon-harness');
 const { beginAuditCompletion } = require('../test-support/audit-completion');
-const { RESULT_SCHEMA } = require('../src/reply-capability');
+const { RESULT_SCHEMA, LIMITS } = require('../src/reply-capability');
 const { REQUEST_TIMEOUT_MS } = require('../src/cli/reply-v1');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -34,8 +37,19 @@ const CASE = { timeout: 60000 };
 const DELIVERY_BOUND_MS = 10000 + 2 * 5000 + HARNESS_OBSERVATION_MARGIN_MS;
 const CLI_BOUND_MS = REQUEST_TIMEOUT_MS + HARNESS_OBSERVATION_MARGIN_MS;
 const TOKEN_RE = /rc1\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}/;
-const TRAFFIC = 300;
-const BATCH = 10;
+// I2 volume. Each group exists to kill a named mutation; none of them is a load figure (CI-ROOT-CAUSE.md).
+//   BEFORE (maxAttempts + 1 per side, all answered before the consume is sent). Two mutations are killed this way. If an
+//   inject to the responder superseded or revoked the capability, the consume would be refused. If ordinary traffic to
+//   either side were charged as a reply attempt, the capability would be void after maxAttempts.
+//   DURING (per side, sent in the same turn as the consume). Two more are killed. A consume that refused or waited on a
+//   requester with ordinary messages pending or in flight. An in-flight capability that refused ordinary traffic.
+//   AFTER (1 per side, sent once the consume has answered). A reply that left the submit barrier held, or a consumed capability
+//   that blocked later traffic, would make this inject answer 503 QUEUE_TIMEOUT instead of 200.
+const BEFORE = LIMITS.maxAttempts + 1;
+const DURING = 4;
+const AFTER = 1;
+const TRAFFIC = BEFORE + DURING + AFTER;
+const IN_FLIGHT = 4; // at most this many ordinary injects per side in flight at once
 
 const REQUESTERS = { i1: createSessionId('w6-req-i1'), i2: createSessionId('w6-req-i2'), i5: createSessionId('w6-req-i5'),
   i5control: createSessionId('w6-req-i5c'), i6: createSessionId('w6-req-i6') };
@@ -66,17 +80,32 @@ async function wrapped(sid) {
     texts: () => frames.filter((f) => f.type === 'inject').map((f) => f.data) };
 }
 
-const inject = (sid, body, headers) => harness.request(`/api/sessions/${encodeURIComponent(sid)}/inject`,
-  { method: 'POST', body, ...(headers ? { headers } : {}), timeoutMs: DELIVERY_BOUND_MS });
-const consume = (token, body, headers) => harness.request('/api/reply-capability-v1',
-  { method: 'POST', body: { v: 1, capability: token, body }, ...(headers ? { headers } : {}), timeoutMs: DELIVERY_BOUND_MS });
+const inject = (sid, body, headers, signal) => harness.request(`/api/sessions/${encodeURIComponent(sid)}/inject`,
+  { method: 'POST', body, ...(headers ? { headers } : {}), timeoutMs: DELIVERY_BOUND_MS, signal });
+const consume = (token, body, headers, signal) => harness.request('/api/reply-capability-v1',
+  { method: 'POST', body: { v: 1, capability: token, body }, ...(headers ? { headers } : {}), timeoutMs: DELIVERY_BOUND_MS, signal });
+
+// `count` ordinary no-Enter injects `${label} #${i}#` (i = from, from + 1, ...) to one session. At most IN_FLIGHT are in flight at
+// once, and each is bounded by the harness. Nothing new is sent once `signal` has aborted. Returns the HTTP statuses.
+async function ordinary(sid, label, from, count, signal) {
+  const statuses = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < count && !signal.aborted) {
+      const i = from + next++;
+      statuses.push((await inject(sid, { prompt: `${label} #${i}#`, no_enter: true }, undefined, signal)).status);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(IN_FLIGHT, count) }, worker));
+  return statuses;
+}
 
 // The requester mints on its own verified inject. The token is read from the responder's delivered text, nowhere else.
-async function mint(requester, responder, prompt) {
+async function mint(requester, responder, prompt, signal) {
   const replyPrefix = `REPLY ${crypto.randomBytes(16).toString('hex')}\n`;
   const res = await inject(responder.sid, { prompt, from: requester.sid, exact_target: true,
     reply_capability: { v: 1, not_after_ms: Date.now() + 10 * 60 * 1000, reply_prefix: replyPrefix } },
-  { 'x-telepty-session-token': requester.bearer });
+  { 'x-telepty-session-token': requester.bearer }, signal);
   assert.equal(res.status, 200, `PRECONDITION: mint ${JSON.stringify(res.body)}`);
   const cap = res.body.reply_capability;
   assert.deepEqual(cap.responder, { session_id: responder.sid, epoch: responder.epoch, generation: responder.generation });
@@ -89,9 +118,9 @@ async function mint(requester, responder, prompt) {
 }
 
 // Every inject frame the owner has received, read once a later no-Enter sentinel has arrived on the same socket.
-async function drained(owner) {
+async function drained(owner, signal) {
   const mark = `w6-sentinel-${crypto.randomUUID()}`;
-  const res = await inject(owner.sid, { prompt: mark, no_enter: true });
+  const res = await inject(owner.sid, { prompt: mark, no_enter: true }, undefined, signal);
   assert.equal(res.status, 200, `PRECONDITION: sentinel ${JSON.stringify(res.body)}`);
   await waitFor(() => owner.texts().some((text) => text.includes(mark)), { timeoutMs: 5000, description: 'the sentinel at the owner' });
   return owner.texts();
@@ -143,7 +172,7 @@ function tempHome(t, label) {
 test('I1 two CLIs, two state roots: one token presented at once by two processes → exactly one write at the receiver, one success audit line', CASE, async (t) => {
   const requester = await wrapped(REQUESTERS.i1);
   const responder = await wrapped(createSessionId('w6-resp-i1'));
-  const cap = await mint(requester, responder, 'w6 I1 request: answer once');
+  const cap = await mint(requester, responder, 'w6 I1 request: answer once', t.signal);
   const body = `w6 I1 reply ${crypto.randomUUID()}`;
   const homes = [tempHome(t, 'i1a'), tempHome(t, 'i1b')];
   const audit = await beginAuditCompletion(harness, t.signal);
@@ -162,7 +191,7 @@ test('I1 two CLIs, two state roots: one token presented at once by two processes
     || (other.stage === 'accepted' && other.replayed === true && other.reply_inject_id === fresh[0].result.reply_inject_id),
   `the other process met the in-flight record or replayed the recorded answer: ${JSON.stringify(other)}`);
 
-  const texts = await drained(requester);
+  const texts = await drained(requester, t.signal);
   assert.equal(texts.filter((text) => text.includes(cap.replyPrefix + body)).length, 1, 'exactly one write at the receiver');
   const rows = await audit.settledRows({ read: readAudit,
     match: (row) => row.reply_capability_id === cap.id && row.source === 'reply-capability-v1' && row.delivery_result === 'success' });
@@ -172,41 +201,37 @@ test('I1 two CLIs, two state roots: one token presented at once by two processes
   for (const home of homes) assert.deepEqual(fs.readdirSync(home), [], 'the CLI wrote nothing under its own HOME');
 });
 
-test('I2 ordinary traffic never blocks: 300 unrelated injects to the responder and 300 ordinary messages to the requester in the request window; the reply is accepted and attributed', CASE, async (t) => {
+test('I2 ordinary traffic never blocks: unrelated injects to the responder and ordinary messages to the requester before, during and after the consume in the request window; the reply is accepted, ordered and attributed', CASE, async (t) => {
   const requester = await wrapped(REQUESTERS.i2);
   const responder = await wrapped(createSessionId('w6-resp-i2'));
-  const cap = await mint(requester, responder, 'w6 I2 request');
+  const cap = await mint(requester, responder, 'w6 I2 request', t.signal);
   const body = `w6 I2 reply ${crypto.randomUUID()}`;
   const audit = await beginAuditCompletion(harness, t.signal);
 
-  // No-Enter traffic: it neither claims the per-session submit barrier nor waits 500 ms for a CR (see W6-GAPS.md).
-  let halfway;
-  const reachedHalf = new Promise((resolve) => { halfway = resolve; });
-  const traffic = async (sid, label) => {
-    const statuses = [];
-    for (let i = 0; i < TRAFFIC; i += BATCH) {
-      if (i >= TRAFFIC / 2) halfway();
-      const batch = Array.from({ length: Math.min(BATCH, TRAFFIC - i) }, (_, k) => inject(sid, { prompt: `${label} ${i + k}`, no_enter: true }));
-      for (const res of await Promise.all(batch)) statuses.push(res.status);
-    }
-    return statuses;
-  };
-  const [unrelated, ordinary, reply] = await Promise.all([
-    traffic(responder.sid, 'w6-i2-unrelated'),
-    traffic(requester.sid, 'w6-i2-ordinary'),
-    reachedHalf.then(() => consume(cap.token, body)),
-  ]);
+  // No-Enter traffic: it never claims the per-session submit barrier and never waits 500 ms for a CR (see W6-GAPS.md).
+  const traffic = (from, count) => Promise.all([ordinary(responder.sid, 'w6-i2-unrelated', from, count, t.signal),
+    ordinary(requester.sid, 'w6-i2-ordinary', from, count, t.signal)]);
+  const early = await traffic(0, BEFORE);
+  const [during, reply] = await Promise.all([traffic(BEFORE, DURING), consume(cap.token, body, undefined, t.signal)]);
+  const late = await traffic(BEFORE + DURING, AFTER);
+  const [unrelated, ordinaryStatuses] = [0, 1].map((side) => [early, during, late].flatMap((phase) => phase[side]));
 
-  assert.deepEqual({ unrelated: unrelated.filter((s) => s === 200).length, ordinary: ordinary.filter((s) => s === 200).length },
+  assert.deepEqual({ unrelated: unrelated.filter((s) => s === 200).length, ordinary: ordinaryStatuses.filter((s) => s === 200).length },
     { unrelated: TRAFFIC, ordinary: TRAFFIC }, 'PRECONDITION: all ordinary traffic was delivered');
   assert.equal(reply.status, 200, JSON.stringify(reply.body));
   assert.deepEqual(pick(reply.body, ['schema', 'stage', 'outcome', 'reason', 'capability_id', 'destination_session_id', 'replayed', 'retryable']),
     { schema: RESULT_SCHEMA, stage: 'accepted', outcome: 'delivered', reason: null, capability_id: cap.id,
       destination_session_id: requester.sid, replayed: false, retryable: false });
-  const texts = await drained(requester);
+  const texts = await drained(requester, t.signal);
   assert.equal(texts.filter((text) => text.includes(cap.replyPrefix + body)).length, 1, 'the reply was written once');
   assert.equal(texts.filter((text) => text.includes('w6-i2-ordinary')).length, TRAFFIC, 'and the ordinary messages beside it');
-  assert.equal((await drained(responder)).filter((text) => text.includes('w6-i2-unrelated')).length, TRAFFIC);
+  // Order at the requester. Every message answered before the consume was sent precedes the reply (one FIFO mailbox).
+  // Every message sent after the consume answered `delivered` follows it.
+  const replyAt = texts.findIndex((text) => text.includes(cap.replyPrefix + body));
+  const at = (i) => texts.findIndex((text) => text.includes(`w6-i2-ordinary #${i}#`));
+  for (let i = 0; i < BEFORE; i += 1) assert.ok(at(i) >= 0 && at(i) < replyAt, `ordinary #${i} (answered before the consume) precedes the reply`);
+  for (let i = BEFORE + DURING; i < TRAFFIC; i += 1) assert.ok(at(i) > replyAt, `ordinary #${i} (sent after the consume answered) follows the reply`);
+  assert.equal((await drained(responder, t.signal)).filter((text) => text.includes('w6-i2-unrelated')).length, TRAFFIC);
   const rows = await audit.settledRows({ read: readAudit,
     match: (row) => row.reply_capability_id === cap.id && row.source === 'reply-capability-v1' && row.delivery_result === 'success' });
   const success = rows.filter((row) => row.reply_capability_id === cap.id && row.source === 'reply-capability-v1' && row.delivery_result === 'success');
@@ -222,15 +247,15 @@ test('I5 rollback (daemon side): no new field in sessions.json and nothing in th
   const audit = await beginAuditCompletion(harness, t.signal);
 
   // With the feature: mint on the inject, spend through the consume route.
-  const cap = await mint(requester, responder, 'w6 I5 request');
-  const consumed = await consume(cap.token, 'w6 I5 answer');
+  const cap = await mint(requester, responder, 'w6 I5 request', t.signal);
+  const consumed = await consume(cap.token, 'w6 I5 answer', undefined, t.signal);
   assert.equal(consumed.status, 200, JSON.stringify(consumed.body));
   assert.equal(consumed.body.stage, 'accepted');
   // Without it: the same inject, and an ordinary bearer reply.
   const controlInbound = await inject(controlResponder.sid, { prompt: 'w6 I5 request', from: controlRequester.sid, exact_target: true },
-    { 'x-telepty-session-token': controlRequester.bearer });
+    { 'x-telepty-session-token': controlRequester.bearer }, t.signal);
   const controlReply = await inject(controlRequester.sid, { prompt: 'w6 I5 answer', from: controlResponder.sid, exact_target: true },
-    { 'x-telepty-session-token': controlResponder.bearer });
+    { 'x-telepty-session-token': controlResponder.bearer }, t.signal);
   assert.deepEqual([controlInbound.status, controlReply.status], [200, 200], 'PRECONDITION: the control run delivered');
 
   // Audit: every line parses (readAudit), and each feature row differs from its control row by the additive fields only.
@@ -271,7 +296,7 @@ test('I5 rollback (daemon side): no new field in sessions.json and nothing in th
 test('I6 direct reply plus capability reply: the responder answers once with its bearer and once with the capability → two writes, each separately attributed', CASE, async (t) => {
   const requester = await wrapped(REQUESTERS.i6);
   const responder = await wrapped(createSessionId('w6-resp-i6'));
-  const cap = await mint(requester, responder, 'w6 I6 request');
+  const cap = await mint(requester, responder, 'w6 I6 request', t.signal);
   const home = tempHome(t, 'i6');
   const origin = `http://127.0.0.1:${harness.port}`;
   const direct = `w6 I6 direct ${crypto.randomUUID()}`;
@@ -283,14 +308,14 @@ test('I6 direct reply plus capability reply: the responder answers once with its
 
   const audit = await beginAuditCompletion(harness, t.signal);
   const directRes = await inject(requester.sid, { prompt: direct, from: responder.sid, exact_target: true },
-    { 'x-telepty-session-token': responder.bearer });
+    { 'x-telepty-session-token': responder.bearer }, t.signal);
   assert.equal(directRes.status, 200, JSON.stringify(directRes.body));
   const capRun = await replyCli(cap.token, viaCapability, { home, env: { TELEPTY_SESSION_TOKEN: responder.bearer, TELEPTY_SESSION_ORIGIN: origin } });
   assert.equal(capRun.code, 0, capRun.stderr);
   assert.deepEqual(pick(capRun.result, ['stage', 'outcome', 'capability_id', 'replayed']),
     { stage: 'accepted', outcome: 'delivered', capability_id: cap.id, replayed: false });
 
-  const texts = await drained(requester);
+  const texts = await drained(requester, t.signal);
   assert.equal(texts.filter((text) => text.includes(direct)).length, 1, 'the direct reply was written once');
   assert.equal(texts.filter((text) => text.includes(cap.replyPrefix + viaCapability)).length, 1, 'the capability reply was written once');
   const rows = await audit.settledRows({ read: readAudit, match: (row) => row.inject_id === capRun.result.reply_inject_id });
