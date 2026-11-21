@@ -366,6 +366,12 @@ have not registered as a peer — append `@<host>` to the session ID. `<host>` c
 hostname, LAN IP, or Tailnet name. This needs no `connect`/`connect-http` first: the target
 is resolved directly, which is why the relay demo above works between fresh machines.
 
+A bare ID that exists on **this** machine resolves to the local session, even when a peer runs a
+session with the same ID (for example `orchestrator`); the remote copy needs `<id>@<peer>`, with
+the peer's registered name, machine ID, host or `host:port` exactly — names are not resolved, so a
+peer registered by host name is not found by its IP. Without `TELEPTY_AUTH_TOKEN`,
+`<id>@<this machine's name>` addresses the local daemon unless a registered peer uses that name.
+
 ```bash
 # Hostname / Tailnet name
 telepty inject my-session@macbook "hello"

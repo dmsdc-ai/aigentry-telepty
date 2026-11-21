@@ -59,8 +59,8 @@ package currently owns the command. To migrate:
 ```bash
 telepty service stop                                  # only if a service is installed
 npm rm -g aigentry-telepty
-npm i -g @dmsdc-ai/aigentry-telepty@0.11.3 --force   # --force relinks the shared command
-telepty --version                                     # must print 0.11.3
+npm i -g @dmsdc-ai/aigentry-telepty@0.11.4 --force   # --force relinks the shared command
+telepty --version                                     # must print 0.11.4
 ```
 
 **Windows is BETA.** It installs and the cross-machine demo below is a real Windows box, but
@@ -366,6 +366,12 @@ have not registered as a peer — append `@<host>` to the session ID. `<host>` c
 hostname, LAN IP, or Tailnet name. This needs no `connect`/`connect-http` first: the target
 is resolved directly, which is why the relay demo above works between fresh machines.
 
+A bare ID that exists on **this** machine resolves to the local session, even when a peer runs a
+session with the same ID (for example `orchestrator`); the remote copy needs `<id>@<peer>`, with
+the peer's registered name, machine ID, host or `host:port` exactly — names are not resolved, so a
+peer registered by host name is not found by its IP. Without `TELEPTY_AUTH_TOKEN`,
+`<id>@<this machine's name>` addresses the local daemon unless a registered peer uses that name.
+
 ```bash
 # Hostname / Tailnet name
 telepty inject my-session@macbook "hello"
@@ -518,7 +524,7 @@ telepty runs **standalone** — it needs none of the other aigentry modules and 
 
 | Module | Package | Version | Role | Maturity |
 | --- | --- | --- | --- | --- |
-| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.11.3 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
+| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.11.4 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
 | **brain** | `@dmsdc-ai/aigentry-brain` | 0.3.1 | Persistent cross-session memory (MCP server) | Early |
 | **deliberation** | `@dmsdc-ai/aigentry-deliberation` | 0.0.47 | Multi-AI structured debate + synthesis (MCP server) | Early |
 | **devkit** | `@dmsdc-ai/aigentry-devkit` | 0.1.14 | Installer/scaffold for the AI dev environment | Early |

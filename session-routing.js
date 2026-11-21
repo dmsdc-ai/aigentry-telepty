@@ -31,7 +31,9 @@ function resolveRegisteredPeerTarget(sessionRef, peers = {}) {
       peer.dnsName, peer.magicDnsName].some((alias) => typeof alias === 'string' && alias === parsed.host);
   });
   if (matches.length > 1) {
-    throw new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(([name]) => name).sort().join(', ')}. Use a registered address:port.`);
+    // #1288 (R5): the code lets a --json caller print this refusal as a document; the text is unchanged.
+    throw Object.assign(new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(([name]) => name).sort().join(', ')}. Use a registered address:port.`),
+      { code: 'AMBIGUOUS_PEER' });
   }
   if (matches.length === 0) return null;
   const [name, peer] = matches[0];
@@ -105,13 +107,33 @@ function pickSessionTarget(sessionRef, sessions, defaultHost = '127.0.0.1') {
   }
 
   const hosts = matches.map((session) => session.host).sort().join(', ');
-  throw new Error(`Session '${parsed.id}' exists on multiple hosts: ${hosts}. Use <session_id>@<host> or set TELEPTY_HOST.`);
+  // #1288: the code lets a --json caller print this refusal as a document; the text is unchanged.
+  throw Object.assign(new Error(`Session '${parsed.id}' exists on multiple hosts: ${hosts}. Use <session_id>@<host> or set TELEPTY_HOST.`),
+    { code: 'AMBIGUOUS_SESSION' });
+}
+
+// #1288 (FACT C): is `name` this machine's own name? Case-insensitive, because Windows reports
+// upper-case host names. The caller decides precedence: a registered peer always wins (F5).
+function isLocalMachineName(name, localNames = []) {
+  if (typeof name !== 'string' || !name) return false;
+  const wanted = name.toLowerCase();
+  return localNames.some((local) => typeof local === 'string' && local !== '' && local.toLowerCase() === wanted);
+}
+
+// #1288 (F5): does any registered peer use `name` as its name, machine id or host, ignoring case?
+// A local-name match must never shadow such a peer, not even one that differs only in case.
+function registeredPeerUsesName(name, peers = {}) {
+  const wanted = String(name || '').toLowerCase();
+  return Object.entries(peers).some(([peerName, peer]) => [peerName, peer && peer.machineId, peer && peer.host]
+    .some((alias) => typeof alias === 'string' && alias.toLowerCase() === wanted));
 }
 
 module.exports = {
   formatHostLabel,
   groupSessionsByHost,
+  isLocalMachineName,
   parseSessionReference,
   pickSessionTarget,
+  registeredPeerUsesName,
   resolveRegisteredPeerTarget
 };
