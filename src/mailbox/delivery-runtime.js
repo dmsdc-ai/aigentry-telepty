@@ -57,6 +57,8 @@ function bindImmediateSubmitCapability(session, headerValue) {
   const generation = typeof session.interactionOwnerGeneration === 'string' ? session.interactionOwnerGeneration : null;
   session.immediateSubmitGeneration = declared.includes(IMMEDIATE_SUBMIT_CAPABILITY) ? generation : null;
   session.busyInputGeneration = declared.includes(BUSY_INPUT_CAPABILITY) ? generation : null;
+  // Task 1292 rc-fix6: reply-guard-v1 (the bridge re-checks a reply's deadline and instance at its own final write), bound the same way.
+  session.replyGuardGeneration = declared.includes(require('../reply-capability').BRIDGE_REPLY_GUARD_CAPABILITY) ? generation : null;
   return session.immediateSubmitGeneration !== null;
 }
 // Honoured only for the CURRENT owner generation, and only together with that generation's negotiated

@@ -11,9 +11,11 @@ const { rememberSubmitPair, holdBodyCustody, settleBodyCustody, bodyCustodyFull,
 
 // #137: the ids a wrapped owner inject frame carries so the bridge can file receipts against them.
 // owner_generation is always the CURRENT owner's; the rest is what the caller actually knows.
-function injectFrame(session, data, ids = {}) {
+// Task 1292 rc-fix6: `reply` (reply-capability deliveries only) appends the reply_* fields the bridge re-checks at its own
+// final write. null for every other frame, so the spread adds no key and the JSON is byte-identical.
+function injectFrame(session, data, ids = {}, reply = null) {
   return JSON.stringify({ type: 'inject', data,
-    ...bridgeFrameMeta({ ...ids, owner_generation: session.interactionOwnerGeneration }) });
+    ...bridgeFrameMeta({ ...ids, owner_generation: session.interactionOwnerGeneration }), ...(reply || {}) });
 }
 
 // Domain dependencies are the daemon's actual shared helpers and records.
@@ -47,9 +49,9 @@ function createSessionDeliveryContext({
   getMailbox, getMailboxNotifier, getMailboxDelivery,
   persistSessions = () => ({ok:false}),
   net = require('net'), fetch = globalThis.fetch, AbortSignal = globalThis.AbortSignal,
-  setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
+  setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout, monoNow = () => performance.now()   // monoNow: Task 1292 GB-02 reply bound only
 }) {
-  async function writeDataToSession(id, session, data, { beforeWrite, frameMeta } = {}) {
+  async function writeDataToSession(id, session, data, { beforeWrite, frameMeta, replyGuard, replyFrame } = {}) {
     if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return denied;
@@ -179,7 +181,9 @@ function createSessionDeliveryContext({
         return buildErrorBody('DISCONNECTED', 'Session owner is disconnected.', { httpStatus: 503 });
       }
       if (session.sshRemote) return requestSshWrite(session, data);
-      session.ownerWs.send(injectFrame(session, data, frameMeta));
+      const replyRefusal = replyGuard ? replyGuard() : null;   // Task 1292 rc-fix6: instance + deadline (+ headroom) at the owner send
+      if (replyRefusal) return replyRefusal;
+      session.ownerWs.send(injectFrame(session, data, frameMeta, replyFrame ? replyFrame() : null));
       // #732: every wrapped delivery doubles as an upstream probe — a live PTY answers with
       // at least an echo. See armUpstreamProbe (no-op while an earlier probe is unanswered).
       armUpstreamProbe(session);
@@ -194,6 +198,8 @@ function createSessionDeliveryContext({
       return buildErrorBody('DISCONNECTED', 'PTY input channel failed.', { httpStatus: 503, bytes_written: 0, reason: 'pty_input_failed' });
     }
 
+    const replyRefusal = replyGuard ? replyGuard() : null;   // Task 1292 rc-fix6 (P1): instance + deadline + headroom at the PTY body write
+    if (replyRefusal) return replyRefusal;
     session.ptyProcess.write(data);
     return { success: true };
   }
@@ -221,6 +227,236 @@ function createSessionDeliveryContext({
   function sessionGoneResult() {
     return { success: false, httpStatus: 410, code: 'SESSION_GONE',
       error: 'Session was destroyed or replaced while this write was pending; it was not written.' };
+  }
+
+  // Task 1292 reply-capability-v1 (SPEC §6.4) — the write-time deadline. ONE predicate over an object carrying
+  // `notAfterMs` (the delivery options, or the `injectionTargets` entry). Absent ⇒ false, so every existing producer
+  // skips it. Present but not a safe integer ⇒ passed (fail closed). Checked only BEFORE a text write, never between
+  // a written text and its CR.
+  // rc-fix6: `headroomMs` (default 0 = the unchanged check) is the time the body's own deferred CR still needs; a body
+  // write passes REPLY_SUBMIT_HEADROOM_MS so a body is written only while its submit can follow inside the deadline.
+  function replyDeadlinePassed(holder, headroomMs = 0) {
+    if (!holder || holder.notAfterMs === undefined) return false;
+    // rc-fix7 GB2-06: ONE deadline, fixed at mint — the store's monotonic deadline (notAfterMonoMs, passed by the consume
+    // route) is compared as given, never re-anchored here. A reply without it is refused (fail closed).
+    const mono = monoNow(), wall = Date.now();
+    if (!(Number.isFinite(holder.notAfterMonoMs) && mono + headroomMs <= holder.notAfterMonoMs)) return true;
+    if (!(Number.isSafeInteger(holder.notAfterMs) && wall + headroomMs <= holder.notAfterMs)) return true;
+    // rc-fix8 GB3-05: both clocks must also agree on the time elapsed since mint. The store fixed notAfterMonoMs =
+    // mono_at_mint + (notAfterMs - wall_at_mint), so wall - mono stays at notAfterMs - notAfterMonoMs while both count the
+    // same time. A drift beyond REPLY_CLOCK_DRIFT_MAX_MS (a wall step back or forward, or a suspend that one clock did not
+    // count) is a discontinuity, treated as the deadline passed.
+    return Math.abs((wall - mono) - (holder.notAfterMs - holder.notAfterMonoMs)) > REPLY_CLOCK_DRIFT_MAX_MS;
+  }
+  // rc-fix8 GB3-05: 2000 ms > the 1800 ms a 500 ppm clock slew can accumulate over the longest window a mint allows (1 h).
+  const REPLY_CLOCK_DRIFT_MAX_MS = 2000;
+
+  // Task 1292 rc-fix6 (SUPPORT-MATRIX.md P1/P2) — a reply body is written to a daemon-owned PTY, or sent to a wrapped
+  // bridge, only while its deferred CR can still follow inside the deadline: 300 ms (PTY) / 500 ms (wrapped) submit
+  // delay, plus the bridge's 250 ms submit gap, inside this headroom. Residual: an event-loop stall longer than the
+  // headroom between the body write and the CR timer leaves the body unsubmitted (stranded, settled outcome unknown).
+  const REPLY_SUBMIT_HEADROOM_MS = 1500;
+  // How long a wrapped reply waits for the bridge's receipts before it is settled outcome unknown: the deadline plus
+  // REPLY_VERDICT_GRACE_MS, and never longer than REPLY_VERDICT_MAX_WAIT_MS after the body was handed to the bridge.
+  const REPLY_VERDICT_GRACE_MS = 2000;
+  const REPLY_VERDICT_MAX_WAIT_MS = 20000;
+  // The reply_* fields of a wrapped reply frame: the absolute deadline (rc-fix7 GB2-06: no relative TTL, so the bridge
+  // can never re-anchor it) and the instance facts the bridge holds itself — the session epoch of its owner binding
+  // and the child_seq of the child it announced (process_started). owner_generation already rides on every frame.
+  function replyFrameFields(bound, sessionEpoch, childSeq) {
+    return { reply_not_after_ms: bound.notAfterMs, reply_session_epoch: sessionEpoch, reply_child_seq: childSeq };
+  }
+  // rc-fix7 GB2-02/GB2-08: the delivery binding of a reply — transport, endpoint, owner generation, child — captured at
+  // delivery entry. Any change before a write is a refusal (zero bytes, destination gone), and settlement strands only
+  // the composer of this same binding.
+  // rc-fix8 GB3-03: only what decides where the bytes go — the writer branch (type, ssh), the owner connection and
+  // generation and the announced child (wrapped), the PTY handle (spawned). The aterm/HTTP transport, address and endpoint
+  // are not in it: no supported requester writes through them (GB3-02), and a type change away from wrapped/spawned is.
+  function replyBindingOf(session) {
+    const child = session.type === 'wrapped' ? require('../transport/readiness-handshake').observedChild(session) : null;
+    return { type: session.type, ownerWs: session.ownerWs, ownerGeneration: session.interactionOwnerGeneration,
+      childSeq: child ? child.child_seq : null, pty: session.ptyProcess, ssh: session.sshRemote };   // ssh: re-register can set it in place
+  }
+  function replyBindingChanged(session, binding) {
+    if (!binding) return true;
+    const current = replyBindingOf(session);
+    return Object.keys(binding).some(key => current[key] !== binding[key]);
+  }
+  // The body's (part body) and its CR's (part submit) bridge receipts for ONE wrapped reply, read from the same owner
+  // socket and validated by the same validator the owner handler uses (owner generation, shape, size). Listening only;
+  // the socket's own handler is untouched. `decision` resolves once the outcome is decided:
+  //   dropped  — the body was refused or quarantined not_written (zero bytes; its CR is refused by `pair` at the bridge)
+  //   written  — body and CR both pty_written
+  //   stranded — the body was written (or is unknown) and its CR was not written or is unknown
+  //   unknown  — no decision by the bound, the socket closed, or a body receipt said unknown
+  //   late     — (rc-fix7 GB2-05/06) both written, but a written receipt reached the daemon after the mint-time deadline:
+  //              the daemon's own evidence cannot place the write inside the deadline (rc-fix8 GB3-06: what was observed is
+  //              a late receipt ARRIVAL, so that is the reason it names)
+  // rc-fix7 GB2-05: a reply record is never queued by the bridge, so each part has exactly ONE receipt, of its own part,
+  // and the submit's only after the daemon sent the CR. Anything else (a second receipt, a wrong part, a submit receipt
+  // before the CR left the daemon or before its body's) is a contradiction: decided outcome unknown, never accepted.
+  function watchReplyReceipts(session, ownerWs, bodyMsgId, bound) {
+    const submitMsgId = `${bodyMsgId}:submit`;
+    let body = null, submit = null, daemonSubmit = null, decided = null, resolveDecision, writtenLate = false;
+    const decision = new Promise(resolve => { resolveDecision = resolve; });
+    const decide = (kind, reason = null) => {
+      if (decided) return;
+      decided = { kind, reason };
+      try { ownerWs.removeListener('message', onMessage); ownerWs.removeListener('close', onClose); } catch {}
+      resolveDecision(decided);
+    };
+    const notWritten = r => r && r.certainty === 'not_written' && (r.stage === 'refused' || r.stage === 'quarantined');
+    const evaluate = () => {
+      if (notWritten(body)) return decide('dropped', body.reason);
+      if (body && body.certainty === 'unknown') return decide('stranded', 'body_outcome_unknown');
+      if (body && body.stage === 'pty_written') {
+        if (submit && submit.stage === 'pty_written') return decide(writtenLate ? 'late' : 'written', writtenLate ? 'receipt_arrived_after_deadline' : null);
+        if (notWritten(submit)) return decide('stranded', 'submit_refused_after_body');
+        if (submit && submit.certainty === 'unknown') return decide('stranded', 'submit_outcome_unknown');
+        if (daemonSubmit && !daemonSubmit.success) return decide('stranded', daemonSubmit.unknown ? 'submit_outcome_unknown' : 'submit_refused_after_body');
+      }
+      return null;
+    };
+    const contradiction = () => decide('stranded', 'receipt_contradiction');
+    function onMessage(raw) {
+      // The owner handler runs first (registered at connect); a frame it refused (strict-owner sequence) closes the socket,
+      // which this check sees synchronously, so such a frame never decides a reply.
+      if (decided || session.ownerWs !== ownerWs || ownerWs.readyState !== 1) return;
+      let msg;
+      try { msg = JSON.parse(String(raw)); } catch { return; }
+      if (!msg || msg.type !== 'bridge_receipt') return;
+      const checked = require('./bridge-stage').validateBridgeReceipt(msg, session.interactionOwnerGeneration);
+      if (!checked.ok) return;
+      const receipt = checked.receipt;
+      if (receipt.daemon_msg_id === bodyMsgId) {
+        if (body || receipt.part !== 'body') return contradiction();
+        body = receipt;
+      } else if (receipt.daemon_msg_id === submitMsgId) {
+        if (submit || receipt.part !== 'submit' || !body || !daemonSubmit) return contradiction();
+        submit = receipt;
+      } else return;
+      // The daemon's own evidence: a write precedes its receipt, so a receipt that arrives by the deadline (both daemon
+      // clocks, the mint-time bound) proves an in-time write; a later one cannot, whatever the bridge's clocks said.
+      if (receipt.stage === 'pty_written' && replyDeadlinePassed(bound)) writtenLate = true;
+      evaluate();
+    }
+    function onClose() { decide(body && notWritten(body) ? 'dropped' : 'unknown', 'owner_closed'); }
+    ownerWs.on('message', onMessage);
+    ownerWs.on('close', onClose);
+    return {
+      decision,
+      bodyDropped: () => notWritten(body),
+      bodyWritten: () => !decided && !!body && body.stage === 'pty_written',   // rc-fix8 GB3-04: the only receipt a CR may follow
+      daemonSubmit(result) { daemonSubmit = result || { success: false, unknown: true }; evaluate(); },   // rc-fix7 GB2-07: undefined = the CR write threw
+      bound(ms) {
+        const timer = setTimeout(() => decide('unknown', 'receipt_timeout'), Math.max(0, ms));
+        if (timer && typeof timer.unref === 'function') timer.unref();
+        decision.then(() => clearTimeout(timer));
+      },
+    };
+  }
+  // A reply whose body may sit in the requester's composer without its CR: the existing Task 1270 strand record (later
+  // input to this instance is refused COMPOSER_STRANDED until the operator clear) plus the existing submit-phase
+  // inject_failed event (`eventCode` null when the CR timer already emitted it for this submit). The capability is
+  // settled outcome unknown — never accepted, never a zero-byte refusal.
+  // rc-fix7 GB2-08: only the composer of THIS reply's binding (same epoch, owner generation, child, transport) is stranded;
+  // a replaced child or owner is never stranded for it. The event says which happened.
+  function strandReplyComposer(id, session, sessionEpoch, options, reason, eventCode, binding) {
+    const sameComposer = (session.sessionEpoch || null) === sessionEpoch && !replyBindingChanged(session, binding);
+    if (sameComposer) {
+      require('./delivery-runtime').strandComposer(session, { epoch: sessionEpoch, injectId: options.pairInjectId || null, reason });
+      try { persistSessions(); } catch { /* the in-memory strand refuses regardless */ }
+    }
+    if (eventCode) emitInjectFailureEvent(id, eventCode, sameComposer
+      ? 'A reply body may be in the composer without its submit; the composer is stranded.'
+      : 'A reply body may have been written without its submit to a composer that has since been replaced; nothing was stranded.', {
+      phase: 'submit', source: options.source || 'inject', reason }, session);
+  }
+  // rc-fix7 GB2-10: `submit` says not_written only when the CR's non-write is known; otherwise unknown.
+  function replyOutcomeUnknown(msgId, reason) {
+    return { success: false, httpStatus: 500, code: 'DELIVERY_UNCERTAIN', delivery_uncertain: true, retryable: false,
+      bytes_written: null, msg_id: msgId, submit: reason === 'submit_refused_after_body' ? 'not_written' : 'unknown', reason,
+      error: 'The reply may have been written, but not provably with its submit inside the deadline; outcome unknown. Do not retry blindly.' };
+  }
+  // The reply CR's own guard, evaluated in the CR timer immediately before its write: the binding (rc-fix7 GB2-02), the
+  // deadline (no headroom: the body is already out), and for a wrapped reply a body the bridge already refused (its CR is
+  // never sent alone).
+  // rc-fix8 GB3-04: a wrapped reply's CR is sent ONLY after the bridge's body receipt says pty_written (on the bound owner
+  // socket and generation; the bridge writes a reply body only to the child the frame names). A body receipt saying
+  // unknown (the write threw), no body receipt yet, or an outcome already decided (a contradiction) sends no CR; the
+  // receipt watcher then settles it.
+  function replySubmitGuard(bound, watch, session) {
+    if (replyBindingChanged(session, bound.replyBinding)) return sessionGoneResult();
+    if (replyDeadlinePassed(bound)) return replyDeadlineResult();
+    if (watch && watch.bodyDropped()) return { success: false, httpStatus: 409, code: 'REPLY_BODY_NOT_WRITTEN', bytes_written: 0,
+      error: 'The bridge refused this reply body before writing it; its submit was not sent.' };
+    if (watch && !watch.bodyWritten()) return { success: false, httpStatus: 409, code: 'REPLY_BODY_UNCONFIRMED', bytes_written: 0,
+      error: 'No undisputed receipt said this reply body was written; its submit was not sent.' };
+    return null;
+  }
+  // P1: the daemon wrote the body to its PTY (deliverFn) and the CR timer's result is the submit. P2: the bridge's
+  // receipts decide (watchReplyReceipts); the daemon's own CR result only says whether the CR frame left the daemon.
+  async function settleReplyDelivery({ id, session, sessionEpoch, options, msgId, ack, submitDone, watch, binding }) {
+    const submitResult = await submitDone;
+    const accepted = { success: true, msg_id: msgId, queued: ack.queued, pending: ack.pending, strategy: 'mailbox', submit: 'written' };
+    // rc-fix7 GB2-07: the CR timer emitted the submit-phase inject_failed event only for a RETURNED refusal; a thrown CR
+    // write (submitResult undefined) gets it here.
+    const timerEmitted = !!(submitResult && !submitResult.success);
+    if (!watch) {
+      if (submitResult && submitResult.success) return accepted;
+      // The body is in the PTY's composer and its CR was not written (or its write threw): stranded, outcome unknown.
+      const reason = submitResult ? 'submit_refused_after_body' : 'submit_outcome_unknown';
+      strandReplyComposer(id, session, sessionEpoch, options, reason, timerEmitted ? null : 'DELIVERY_UNCERTAIN', binding);
+      return replyOutcomeUnknown(msgId, reason);
+    }
+    watch.daemonSubmit(submitResult);
+    const verdict = await watch.decision;
+    if (verdict.kind === 'written') return accepted;
+    // rc-fix7 GB2-05/06: body and CR reported written, but not provably by the deadline: unknown, nothing left unsubmitted.
+    if (verdict.kind === 'late') return replyOutcomeUnknown(msgId, verdict.reason);
+    if (verdict.kind === 'dropped') {
+      // The bridge refused the body before any byte (its CR is refused by `pair`, or was never sent): zero bytes.
+      if (verdict.reason === 'reply_deadline_passed') return { ...replyDeadlineResult(), msg_id: msgId };
+      if (verdict.reason === 'reply_submit_headroom') return { ...replyHeadroomResult(), msg_id: msgId };
+      return { success: false, httpStatus: 409, code: 'REPLY_BRIDGE_NOT_WRITTEN', bytes_written: 0, msg_id: msgId,
+        reason: verdict.reason || null, error: 'The requester\'s bridge refused the reply body before writing it; nothing was written.' };
+    }
+    const reason = verdict.reason === 'submit_refused_after_body' || verdict.reason === 'submit_outcome_unknown'
+      || verdict.reason === 'receipt_contradiction' ? verdict.reason : 'body_outcome_unknown';
+    strandReplyComposer(id, session, sessionEpoch, options, reason, timerEmitted ? null : 'DELIVERY_UNCERTAIN', binding);
+    return replyOutcomeUnknown(msgId, reason);
+  }
+
+  function replyDeadlineResult() {
+    return { success: false, httpStatus: 410, code: 'REPLY_DEADLINE_PASSED', bytes_written: 0,
+      error: 'The reply deadline passed before this write; it was not written.' };
+  }
+  // rc-fix7 GB2-10: the deadline had not passed, but less than the body's submit needs was left. Same code (the capability
+  // is spent: the time left only shrinks), its own reason and text.
+  function replyHeadroomResult() {
+    return { ...replyDeadlineResult(), reason: 'insufficient_submit_headroom',
+      error: 'Too little time was left before the reply deadline for the body and its submit; it was not written.' };
+  }
+
+  // Task 1292 (SPEC-DEVIATIONS W2-D1, Root H1): a branch that cannot carry the trailer or honour the deadline (the
+  // bootstrap queue, the modal park and the external-approval write keep the RAW prompt; a `mailbox` target is read
+  // by poll after the enqueue) refuses a reply-capability delivery before any enqueue or write.
+  function replyDeliveryUnsupportedResult() {
+    return { success: false, httpStatus: 409, code: 'REPLY_CAPABILITY_DELIVERY_UNSUPPORTED', bytes_written: 0,
+      error: 'The requester\'s current delivery path cannot deliver a guarded reply; it was not written.' };   // rc-fix7 GB2-10
+  }
+
+  function carriesReplyCapability(options) {
+    return options.replyCapabilityTrailer !== undefined || options.notAfterMs !== undefined;
+  }
+
+  // Task 1292 GB-01: the mailbox row of a reply carries its marker in the one field FileMailbox persists verbatim, the
+  // msg_id. Every other msg_id this file mints ends in 8 hex digits, so it can never end with this suffix. A marked row
+  // with no `injectionTargets` entry (another daemon incarnation, or a target dropped while the row stayed pending) has
+  // lost its instance binding and deadline and is withdrawn unwritten.
+  const REPLY_MSG_ID_SUFFIX = ':reply-capability-v1';
+  function isReplyMsgId(msgId) {
+    return typeof msgId === 'string' && msgId.endsWith(REPLY_MSG_ID_SUFFIX);
   }
 
   // PR #108 TP2: an inject that owes a CR waits for ITS msg_id to be written, not for "a tick".
@@ -469,9 +705,23 @@ function createSessionDeliveryContext({
   }
 
   async function deliverInjectionToSession(id, session, prompt, options = {}) {
+    if (replyDeadlinePassed(options)) return replyDeadlineResult();   // Task 1292 §6.4: at delivery entry
+    // Task 1292 GB-01/GB-02: a reply goes only where the guard reaches the final write (SUPPORT-MATRIX.md); every other
+    // requester state is refused here, before any await, enqueue or write.
+    if (options.notAfterMs !== undefined && !require('../reply-capability').replyDeliverySupported(session)) return replyDeliveryUnsupportedResult();
+    // rc-fix6 (P2): a wrapped reply names the child this owner generation announced; the bridge refuses any other child.
+    // Its outcome is read from the bridge's receipts on the owner socket, so a socket that cannot be listened on is refused.
+    const replyChild = options.notAfterMs !== undefined && session.type === 'wrapped'
+      ? require('../transport/readiness-handshake').observedChild(session) : null;
+    if (options.notAfterMs !== undefined && session.type === 'wrapped' && (!replyChild || !session.ownerWs
+      || typeof session.ownerWs.on !== 'function' || typeof session.ownerWs.removeListener !== 'function')) return replyDeliveryUnsupportedResult();
+    // rc-fix6: a reply body to a requester that owes a CR always travels with that CR (never noEnter: it would stay unsubmitted).
+    if (options.notAfterMs !== undefined && session.type !== 'aterm' && options.noEnter) return replyDeliveryUnsupportedResult();
+    const replyBinding = options.notAfterMs !== undefined ? replyBindingOf(session) : null;   // rc-fix7 GB2-02/GB2-08: pinned here
     if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     if (options.externalApproval && !session.externalApprovalPolicy) return { success: false, httpStatus: 403, code: 'APPROVAL_POLICY_REQUIRED', error: 'Signed inject requires the enrolled target policy.', bytes_written: 0 };
     const denied = protectedInputFailure(session);
+    if (denied && options.externalApproval && carriesReplyCapability(options)) return replyDeliveryUnsupportedResult();   // Task 1292 W2-D1
     if (denied) return options.externalApproval
       ? deliverApprovedInjection(id, session, prompt, options) : denied;
     const sshFailure = sshInputFailure(session, prompt);
@@ -496,6 +746,7 @@ function createSessionDeliveryContext({
     // record and the epoch but replaces ownerWs, and that replacement never saw this inject.
     const entryOwnerWs = session.ownerWs;
     if (!options.bypassBootstrapQueue && shouldQueueBootstrapOperation(session)) {
+      if (carriesReplyCapability(options)) return replyDeliveryUnsupportedResult();   // Task 1292 W2-D1: before the enqueue
       const healthStatus = getSessionHealthStatus(session, { nowMs: now });
       if (healthStatus === 'STALE') {
         return { success: false, httpStatus: 410, code: 'STALE', error: 'Session is stale and awaiting cleanup.' };
@@ -535,6 +786,7 @@ function createSessionDeliveryContext({
     // screen (shouldApplyOwnerAliveFloor).
     const modalDecision = session.type === 'mailbox' ? null : await resolveModalGate(id, session, options);
     if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
+    if (replyDeadlinePassed(options)) return replyDeadlineResult();   // Task 1292 §6.4
     const currentFailure = getInjectFailure(session, { nowMs: Date.now() });
     if (currentFailure) return { success: false, ...currentFailure };
 
@@ -555,6 +807,7 @@ function createSessionDeliveryContext({
       // re-inject, and re-injecting into a modal that is still up is how #743 turned one
       // blocked REPORT into three lost ones.
       if (injectParkDecision.action === 'park') {
+        if (carriesReplyCapability(options)) return replyDeliveryUnsupportedResult();   // Task 1292 W2-D1: before the park
         const op = parkOperationOnModal(id, session, {
           type: 'inject',
           prompt,
@@ -579,7 +832,10 @@ function createSessionDeliveryContext({
     // Reason: combining text+CR in one write triggers bracketed paste mode in modern
     // terminals. CLIs ignore \r inside paste brackets, so Enter never fires.
     const from = options.from || 'daemon';
-    const msgId = `${from}:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
+    // Task 1292 GB-01 marker; rc-fix7 GB2-04: a reply's id is a bounded opaque id (73 units, 80 with ':submit', under the
+    // 128-unit frame/receipt id bound) — the sender sid stays in `from`. An ordinary id is the pre-change id, unchanged.
+    const msgId = options.notAfterMs !== undefined ? `rc:${Date.now()}:${crypto.randomUUID()}${REPLY_MSG_ID_SUFFIX}`
+      : `${from}:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
 
     // #47 P4 — capability-gated delivery provenance banner (spec §6). Default-OFF: only sessions
     // that registered as provenance-capable (and have a minted nonce) get the nonce-gated banner;
@@ -588,13 +844,17 @@ function createSessionDeliveryContext({
     // wrapper, not a content change. `from`='daemon'/'inject' are routing sentinels, not real
     // claimed senders, so they are not surfaced as a `claimed:` label.
     const claimedSender = (from && from !== 'daemon' && from !== 'inject') ? from : null;
-    const deliveredPrompt = applyProvenance(prompt, {
+    const provenancePayload = applyProvenance(prompt, {
       capable: !!(session && session.provenanceCapable),
       nonce: session && session.provenanceNonce,
       verified: options.verifiedSenderSid || null,
       claimed: claimedSender,
       origin: options.origin
     }).payload;
+    // Task 1292 §2.3: the reply-capability trailer goes AFTER the provenance fence, into the delivered text only (the
+    // audit, viewer, bus and pending-report preview keep the raw prompt). Absent ⇒ the provenance payload unchanged.
+    const deliveredPrompt = typeof options.replyCapabilityTrailer === 'string'
+      ? provenancePayload + options.replyCapabilityTrailer : provenancePayload;
 
     // #716: wrap the delivered text in bracketed paste for paste-capable CLIs so the
     // deferred/gated submit CR (written separately, outside the 200~/201~ envelope)
@@ -602,6 +862,7 @@ function createSessionDeliveryContext({
     const deliveredBody = session.type === 'mailbox' ? deliveredPrompt : maybeBracketedPaste(deliveredPrompt, session);
 
     if (session.type === 'mailbox') {
+      if (options.notAfterMs !== undefined) return replyDeliveryUnsupportedResult();   // Task 1292 W2-D1 (a1): read by poll
       let ack;
       try {
         ack = getMailbox().enqueue({ msg_id: msgId, from, to: id, payload: deliveredBody,
@@ -651,6 +912,7 @@ function createSessionDeliveryContext({
       if (timedOut) return queueTimeoutRefusal();
     }
     if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) return sessionGoneResult();
+    if (replyDeadlinePassed(options)) return replyDeadlineResult();   // Task 1292 §6.4
     const liveFailure = getInjectFailure(session, { nowMs: Date.now() });
     if (liveFailure) return { success: false, ...liveFailure };
     // Task 1215 queue80 (P1, reproduced on win32 run 41252716256): the bound is enforced AT ADMISSION too, not only by
@@ -669,6 +931,7 @@ function createSessionDeliveryContext({
     let enqueueAttempted = false;
     try {
       if (session.sshRemote) {
+        if (replyBinding) { releaseSubmit(); return sessionGoneResult(); }   // rc-fix8 GB3-03: ssh is pinned null at entry; set since = moved
         const failure = sshInputFailure(session, deliveredBody, sshGeneration);
         if (failure) { releaseSubmit(); return failure; }
         const text = await requestSshWrite(session, deliveredBody, { expectedGeneration: sshGeneration });
@@ -706,7 +969,14 @@ function createSessionDeliveryContext({
       if (QUEUE_DIAG) markQueueDiag(barrier, 'enqueue_done');
       const immediate = { result: null }; immediateAttempts.set(msgId, immediate);
       if (QUEUE_DIAG) immediate.barrier = barrier;
-      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || options.pairInjectId || null });
+      // rc-fix6: the reply's deadline pair, shared by the target (body write) and the deferred CR below. null otherwise.
+      const replyBound = options.notAfterMs !== undefined ? { notAfterMs: options.notAfterMs,   // Task 1292 §6.4: only when supplied
+        notAfterMonoMs: options.notAfterMonoMs, replyBinding } : null;   // rc-fix7 GB2-06: the mint-time monotonic deadline, as given
+      injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || options.pairInjectId || null,
+        ...(replyBound ? { ...replyBound, ...(replyChild ? { replyChildSeq: replyChild.child_seq } : {}) } : {}) });
+      // rc-fix6 (P2): listen for this reply's bridge receipts before its body can be handed over; bounded from here.
+      const replyWatch = replyBound && session.type === 'wrapped' ? watchReplyReceipts(session, entryOwnerWs, msgId, replyBound) : null;
+      if (replyWatch) replyWatch.bound(Math.min(replyBound.notAfterMs + REPLY_VERDICT_GRACE_MS - Date.now(), REPLY_VERDICT_MAX_WAIT_MS));
       if (session.type === 'wrapped') holdBodyCustody(session, msgId, options.injectId || options.pairInjectId || null);   // hotfix480 F1
       // Registered synchronously after the enqueue: no tick can run in between.
       const owesSubmit = !options.noEnter && session.type !== 'aterm';
@@ -727,6 +997,8 @@ function createSessionDeliveryContext({
       immediateAttempts.delete(msgId);
       if (immediate.result?.delivery_uncertain) {
         injectionTargets.delete(msgId); releaseSubmit();
+        // rc-fix7 GB2-07: a reply body whose write threw may sit in a composer that owes its CR: strand that same composer.
+        if (replyBound && owesSubmit) strandReplyComposer(id, session, sessionEpoch, options, 'body_outcome_unknown', 'DELIVERY_UNCERTAIN', replyBinding);
         return { ...immediate.result, success: false, code: 'DELIVERY_UNCERTAIN', msg_id: msgId, retryable: false,
           error: 'Delivery outcome unknown after an attempt; automatic retry disabled. Do not retry blindly.', submit: 'skipped' };
       }
@@ -740,6 +1012,7 @@ function createSessionDeliveryContext({
             strategy: 'mailbox', delivery_status: 'retry_pending', bytes_written: 0, submit: 'skipped' };
           if (text.lastFailure?.delivery_uncertain) {
             injectionTargets.delete(msgId); releaseSubmit();
+            if (replyBound && owesSubmit) strandReplyComposer(id, session, sessionEpoch, options, 'body_outcome_unknown', 'DELIVERY_UNCERTAIN', replyBinding);   // rc-fix7 GB2-07
             return { ...text.lastFailure, success: false, code: 'DELIVERY_UNCERTAIN', msg_id: msgId, retryable: false, submit: 'skipped',
               error: 'Delivery outcome unknown after an attempt; automatic retry disabled. Do not retry blindly.' };
           }
@@ -762,30 +1035,48 @@ function createSessionDeliveryContext({
           }
           return { success: false, httpStatus: (failure && failure.httpStatus) || 504, code: (failure && failure.code) || 'TIMEOUT',
             error: withdrawn ? 'Pending text was withdrawn before delivery; nothing was written.' : 'Delivery was refused before text was written.',
-            msg_id: msgId, bytes_written: 0 };
+            msg_id: msgId, bytes_written: 0,
+            // rc-fix8 CI: a reply's deadline refusal keeps its reason (insufficient_submit_headroom, GB2-10) through this rebuild.
+            ...(replyBound && failure && failure.code === 'REPLY_DEADLINE_PASSED' && failure.reason !== undefined ? { reason: failure.reason } : {}) };
         }
         if (owesSubmit) {
           const submitDelay = session.type === 'wrapped' ? 500 : 300;
+          let replySubmitSettled = null;   // rc-fix6: a reply waits for its own CR's result (P1/P2); null otherwise
+          const replySubmitDone = replyBound ? new Promise(resolve => { replySubmitSettled = resolve; }) : null;
           setTimeout(async () => {
             let submitResult;
             markBarrier(barrier, 'cr_timer_fired');
             try {
+              // rc-fix6: a reply's CR also needs its deadline (and, wrapped, a body the bridge did not drop) — next to the instance check.
+              const replySubmitRefusal = replyBound ? replySubmitGuard(replyBound, replyWatch, session) : null;
               // #109: never a bare CR into an instance that did not get this inject's text.
               // PR #108 TP1: nor into an owner socket other than the one that got it.
               submitResult = isLiveSessionInstance(session, sessionEpoch) && session.ownerWs === text.ownerWs
-                ? await writeDataToSession(id, session, '\r', { frameMeta: submitIds(msgId, options.injectId) })
+                ? (replySubmitRefusal || await writeDataToSession(id, session, '\r', { frameMeta: submitIds(msgId, options.injectId),
+                  ...(replyBound && replyChild ? { replyFrame: () => replyFrameFields(replyBound, sessionEpoch, replyChild.child_seq) } : {}) }))
                 : sessionGoneResult();
+            } catch (error) {
+              // rc-fix7 GB2-07: a reply's thrown CR write never rejects this detached callback; it settles outcome unknown
+              // (submitResult stays undefined) through settleReplyDelivery's strand and event. An ordinary CR rethrows as before.
+              if (!replyBound) throw error;
             } finally {
               markBarrier(barrier, 'cr_write_done'); if (barrier) barrier.cr_ok = !!(submitResult && submitResult.success);
-              releaseSubmit();
+              if (!replyBound) releaseSubmit();   // rc-fix8 GB3-03: a reply releases the barrier only once settled (below)
+              if (replySubmitSettled) replySubmitSettled(submitResult);   // rc-fix6: undefined when the write threw
             }
-            if (!submitResult.success) {
+            if (submitResult && !submitResult.success) {   // rc-fix7 GB2-07: undefined only for a reply's thrown CR (an ordinary throw left above)
               emitInjectFailureEvent(id, submitResult.code, submitResult.error, {
                 phase: 'submit',
                 source: options.source || 'inject'
               }, session);
             }
           }, submitDelay);
+          // rc-fix6: a reply is settled on what reached the child — body AND submit — never on the body hand-over alone.
+          // rc-fix8 GB3-03: no later input is admitted to this composer until it is settled — accepted, or stranded.
+          if (replyBound) {
+            try { return await settleReplyDelivery({ id, session, sessionEpoch, options, msgId, ack, submitDone: replySubmitDone, watch: replyWatch, binding: replyBinding }); }
+            finally { releaseSubmit(); }
+          }
         }
       }
 
@@ -816,6 +1107,9 @@ function createSessionDeliveryContext({
       // Fallback only when the mailbox could not even be obtained: enqueue was never called.
       injectionTargets.delete(msgId);
       if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) { releaseSubmit(); return sessionGoneResult(); }
+      if (replyDeadlinePassed(options)) { releaseSubmit(); return replyDeadlineResult(); }   // Task 1292 §6.4
+      // Task 1292 GB-02: this fallback's write carries no socket-time guard; a reply refuses it (nothing was enqueued).
+      if (options.notAfterMs !== undefined) { releaseSubmit(); return replyDeliveryUnsupportedResult(); }
       const textOwnerWs = session.ownerWs;
       const textResult = await writeDataToSession(id, session, deliveredBody,
         { frameMeta: { daemon_msg_id: msgId, inject_id: options.injectId || null, part: 'body' } });
@@ -906,6 +1200,11 @@ function createSessionDeliveryContext({
         return result;
       }
       const target = injectionTargets.get(msg.msg_id);
+      // Task 1292 GB-01: a reply row whose binding is gone is never written (withdrawn like `session_gone`, zero bytes).
+      if (!target && isReplyMsgId(msg.msg_id)) {
+        getMailbox().withdraw(sessionId, msg.msg_id, 'reply_binding_lost', { inFlight: true });
+        return { ...sessionGoneResult(), bytes_written: 0 };
+      }
       if (target && (!isSameSessionInstance(sessionId, target.session, target.sessionEpoch)
           || session.ownerWs !== target.ownerWs)) {
         injectionTargets.delete(msg.msg_id);
@@ -914,11 +1213,42 @@ function createSessionDeliveryContext({
         if (waiter) waiter.lastFailure = sessionGoneResult();
         return sessionGoneResult();
       }
+      // Task 1292 §6.4: a message carrying a reply deadline is withdrawn after it, by the same call as `session_gone`.
+      if (target && replyDeadlinePassed(target)) {
+        injectionTargets.delete(msg.msg_id);
+        getMailbox().withdraw(sessionId, msg.msg_id, 'reply_deadline_passed', { inFlight: true });
+        const waiter = mailboxTextWaiters.get(msg.msg_id);
+        if (waiter) waiter.lastFailure = replyDeadlineResult();
+        return replyDeadlineResult();
+      }
       const ownerWs = session.ownerWs;
       const beforeWrite = session.type === 'aterm'
         ? () => getMailbox().beginNonRetryableAttempt(sessionId, msg.msg_id) : undefined;
-      const result = await writeDataToSession(sessionId, session, msg.payload,
-        { beforeWrite, frameMeta: { daemon_msg_id: msg.msg_id, inject_id: target?.injectId || null, part: 'body' } });
+      // rc-fix8 GB3-01/GB3-02: no reply reaches the UDS branch (an aterm requester is refused at mint and at entry, and a
+      // type change since entry is a binding change refused just below), so its connect callback carries no reply guard.
+      let replyRefused = null;
+      // rc-fix6: the same guard now also runs right before the PTY write (P1) and the owner send (P2). A requester that owes
+      // a CR needs REPLY_SUBMIT_HEADROOM_MS left at the body write; a wrapped one also gets the reply_* frame fields.
+      // rc-fix7 GB2-02: plus the binding pinned at entry (transport, endpoint, owner generation, child); GB2-10: a headroom
+      // refusal is reported as such.
+      const replyGuard = target && target.notAfterMs !== undefined ? () => (replyRefused =
+        !isSameSessionInstance(sessionId, target.session, target.sessionEpoch) || session.ownerWs !== target.ownerWs
+          || replyBindingChanged(session, target.replyBinding) ? sessionGoneResult() : replyDeadlinePassed(target) ? replyDeadlineResult()
+          : session.type !== 'aterm' && replyDeadlinePassed(target, REPLY_SUBMIT_HEADROOM_MS) ? replyHeadroomResult() : null) : undefined;
+      const replyFrame = replyGuard && target.replyChildSeq !== undefined ? () => replyFrameFields(target, target.sessionEpoch, target.replyChildSeq) : undefined;
+      // rc-fix7 GB2-02: checked once more in the same synchronous turn as the writer's branch choice, so a reply whose
+      // binding moved (e.g. a type change to the aterm UDS/HTTP branches, which have no write-time guard) is refused here
+      // with zero bytes.
+      if (replyGuard) replyGuard();
+      const result = replyRefused || await writeDataToSession(sessionId, session, msg.payload,
+        { beforeWrite, frameMeta: { daemon_msg_id: msg.msg_id, inject_id: target?.injectId || null, part: 'body' }, ...(replyGuard ? { replyGuard, ...(replyFrame ? { replyFrame } : {}) } : {}) });
+      if (replyRefused) {   // Task 1292 GB-02: refused at the socket, nothing written; withdrawn as in the two branches above
+        injectionTargets.delete(msg.msg_id);
+        getMailbox().withdraw(sessionId, msg.msg_id, replyRefused.code === 'SESSION_GONE' ? 'session_gone' : 'reply_deadline_passed', { inFlight: true });
+        const waiter = mailboxTextWaiters.get(msg.msg_id);
+        if (waiter) waiter.lastFailure = replyRefused;
+        return replyRefused;
+      }
       const immediate = immediateAttempts.get(msg.msg_id); if (immediate) immediate.result = result;
       const waiter = mailboxTextWaiters.get(msg.msg_id);
       if (waiter) {

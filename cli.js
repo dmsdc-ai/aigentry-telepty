@@ -2385,7 +2385,7 @@ function bootCapabilitiesLine() {
   // way. The document's schema, shape, key order and viewer_detach value are unchanged, parseBootCapabilities
   // already accepts extra verbs (it requires allow-create-v1 and rejects only duplicates), and this query
   // stays purely local — printing it starts, restarts, repairs or contacts nothing.
-  return JSON.stringify({ schema: BOOT_CAPABILITIES_SCHEMA, verbs: ['allow-create-v1', 'inject-bound-v1', 'clear-strand-v1'], viewer_detach: 'nondeleting-v1' });
+  return JSON.stringify({ schema: BOOT_CAPABILITIES_SCHEMA, verbs: ['allow-create-v1', 'inject-bound-v1', 'clear-strand-v1', 'reply-v1'], viewer_detach: 'nondeleting-v1' });
 }
 function runBootCapabilities(argv, { stdout = process.stdout, stderr = process.stderr } = {}) {
   if (!Array.isArray(argv) || argv.length !== 1 || argv[0] !== 'boot-capabilities') {
@@ -2518,6 +2518,7 @@ async function main() {
     });
     return;
   }
+  if (cmd === 'reply-v1') { process.exitCode = await require('./src/cli/reply-v1').runReplyV1(args.slice(1), { fetchWithAuth, daemonUrl: daemonUrl('127.0.0.1'), remoteHost: REMOTE_HOST }); return; }
 
   // tp941 Guard A: before ANY command branch, so no subcommand can execute on its way to
   // printing its own usage. Deliberately below the version check, which takes no argv.
@@ -3527,7 +3528,9 @@ async function main() {
         // / `bindImmediateSubmitCapability` — but the adjacency the test pins is kept anyway, because the test
         // is about the wiring staying visible in one place, not about the wire format.
         'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', ' + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY
-          + ', ' + require('./src/mailbox/delivery-runtime').BUSY_INPUT_CAPABILITY, ...policyCapabilityHeaders(),
+          + ', ' + require('./src/mailbox/delivery-runtime').BUSY_INPUT_CAPABILITY
+          // Task 1292 rc-fix6: THIS bridge re-checks a reply's deadline and instance at its own final write (security-actions.js).
+          + ', ' + require('./src/reply-capability').BRIDGE_REPLY_GUARD_CAPABILITY, ...policyCapabilityHeaders(),
         ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
       const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
       daemonWs = ownerSocket;

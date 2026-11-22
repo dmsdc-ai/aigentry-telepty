@@ -321,7 +321,8 @@ function createAllowSecurityContext(shared, {
   clearInterval = (...args) => (0, globalThis.clearInterval)(...args),
   getStdout = () => process.stdout,
   removeSignalHandler = (...args) => process.off(...args),
-  bridgeRoot
+  bridgeRoot,
+  monoNow = () => performance.now()   // Task 1292 rc-fix6: the reply deadline's monotonic half only
 } = {}) {
     // This fence belongs to this context, even if another context resets shared state.
     let closed = false;
@@ -387,6 +388,47 @@ function createAllowSecurityContext(shared, {
     }
     function submitGapRemaining(child) {
       return lastBodyWrite && lastBodyWrite.child === child ? Math.max(0, lastBodyWrite.atMs + SUBMIT_GAP_MS - now()) : 0;
+    }
+    // Task 1292 rc-fix6 (SUPPORT-MATRIX.md P2) — a reply-capability frame carries reply_* fields (an ordinary frame has
+    // none, and nothing below runs for it). Its body and its CR are written to the child only if, at the last synchronous
+    // point before child.write: the frame's session epoch and owner generation are this bridge's current owner binding, its
+    // child_seq is the child this context spawned last and that child is current and alive, and the deadline holds. rc-fix7
+    // GB2-06: ONE absolute deadline (reply_not_after_ms, fixed at mint) and no relative TTL: it is compared with the wall
+    // clock now AND with the wall clock at frame receipt plus this process's monotonic time elapsed since — both must
+    // pass, so a wall-clock step after receipt can only shorten the window, never extend it. A body also needs
+    // REPLY_SUBMIT_HEADROOM_MS left, so its CR (sent by the daemon 500 ms after it, then held for the 250 ms submit gap)
+    // can follow inside the deadline. Otherwise the record is dropped with zero bytes and a refused receipt names it; the
+    // daemon settles the capability on those receipts. Same value as the daemon's headroom. rc-fix7 GB2-03: a reply
+    // record is never queued (enqueueBridgeMessage), so it is never persisted and no recovery path can replay it.
+    const REPLY_SUBMIT_HEADROOM_MS = 1500;
+    const REPLY_CLOCK_DRIFT_MAX_MS = 2000;   // rc-fix8 GB3-05: same bound as the daemon's
+    const REPLY_FRAME_KEYS = ['reply_not_after_ms', 'reply_session_epoch', 'reply_child_seq'];
+    function replyGuardOf(msg) {
+      if (!msg || typeof msg !== 'object' || !REPLY_FRAME_KEYS.some(key => Object.hasOwn(msg, key))) return null;
+      return { not_after_ms: msg.reply_not_after_ms, session_epoch: msg.reply_session_epoch, child_seq: msg.reply_child_seq,
+        owner_generation: msg.owner_generation, received_wall: now(), received_mono: monoNow() };
+    }
+    function replyRefusal(reply, child, isCr) {
+      const binding = shared.interactionBinding;
+      if (!binding || typeof reply.session_epoch !== 'string' || reply.session_epoch !== binding.session_epoch
+        || typeof reply.owner_generation !== 'string' || reply.owner_generation !== binding.owner_generation
+        || !Number.isSafeInteger(reply.child_seq) || reply.child_seq !== childSeq
+        || !child || child !== shared.child || childExited(child)) return 'reply_instance_changed';
+      const passed = headroom => !(Number.isSafeInteger(reply.not_after_ms) && now() + headroom <= reply.not_after_ms
+        && reply.received_wall + (monoNow() - reply.received_mono) + headroom <= reply.not_after_ms);
+      // rc-fix8 GB3-05: wall and monotonic time elapsed since receipt must agree (a step or an uncounted suspend = passed).
+      const drifted = Math.abs((now() - reply.received_wall) - (monoNow() - reply.received_mono)) > REPLY_CLOCK_DRIFT_MAX_MS;
+      if (drifted || passed(0)) return 'reply_deadline_passed';
+      return !isCr && passed(REPLY_SUBMIT_HEADROOM_MS) ? 'reply_submit_headroom' : null;   // rc-fix7 GB2-10: its own reason
+    }
+    // A direct (never queued) reply frame refused before any byte. A body is remembered unwritten, so its CR is refused by
+    // `pair`; a CR refused after its body was written strands that child's composer (Task 1270 R1).
+    function dropReplyDirect(text, ids, guard, reason, child) {
+      if (guard) guard.state = 'not_written';
+      if (text !== '\r') { rememberUnwritten(ids.daemon_msg_id); unwrittenBodyAdjacentAt = now(); }
+      else strandComposer(child, ids.pair);
+      sendReceipt(null, ids, 'refused', 'not_written', reason);
+      return false;
     }
     // Task 1215 F2: child sequence for spawn-readiness milestones; the subscribed child is the one
     // whose output/exit handlers are attached.
@@ -708,6 +750,9 @@ function createAllowSecurityContext(shared, {
         sendReceipt(null, ids, 'refused', 'not_written', 'child_exited');
         return false;
       }
+      // Task 1292 rc-fix6: a reply frame's instance + deadline, immediately before the write (direct body, direct or held CR).
+      const replyDrop = meta && meta.reply ? replyRefusal(meta.reply, child, text === '\r') : null;
+      if (replyDrop) return dropReplyDirect(text, ids, guard, replyDrop, child);
       // Task 1215 hotfix 0.10.1: the attempt is recorded before the effect, so a throw can never read as "not written".
       if (guard) guard.state = 'attempted';
       if (text !== '\r') lastBodyWrite = { child, atMs: now(), id: ids.daemon_msg_id || null };   // Task 1270: a thrown body write is unknown, not absent
@@ -784,6 +829,8 @@ function createAllowSecurityContext(shared, {
       for (const key of ['daemon_msg_id', 'inject_id', 'part', 'pair', 'owner_generation']) {
         if (msg[key] !== undefined) meta[key] = msg[key];
       }
+      const reply = replyGuardOf(msg);   // Task 1292 rc-fix6: only a reply-capability frame has one (frameMeta never copies it)
+      if (reply) meta.reply = reply;
       let textWritten = false;
       if (!rawData) return { rawData, textWritten };
       const isCr = rawData === '\r';
@@ -970,6 +1017,14 @@ function createAllowSecurityContext(shared, {
     function enqueueBridgeMessage(text, meta, guard = null) {
       if (isClosed() || shared.handoffPending) { if (guard) guard.state = 'not_written'; return; }
       const child = shared.child;
+      // Task 1292 rc-fix6, rc-fix7 GB2-03: a reply record (body or CR) is never queued, so it is never persisted for
+      // recovery: dropped with zero bytes and reported (its own refusal reason first, else reply_not_queued). A dropped body's
+      // CR is then refused by `pair`; a dropped CR after its written body strands that composer.
+      if (meta && meta.reply) {
+        adjacentQueuedBody = null; refusedIdlessBodyAt = null;
+        dropReplyDirect(text, bridgeStage.frameMeta(meta), guard, replyRefusal(meta.reply, child, text === '\r') || 'reply_not_queued', child);
+        return;
+      }
       const msgId = `${shared.sessionId}:${now()}:${++shared.bridgeMsgSeq}`;
       const ids = bridgeStage.frameMeta(meta);
       try {
