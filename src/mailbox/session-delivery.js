@@ -47,9 +47,9 @@ function createSessionDeliveryContext({
   getMailbox, getMailboxNotifier, getMailboxDelivery,
   persistSessions = () => ({ok:false}),
   net = require('net'), fetch = globalThis.fetch, AbortSignal = globalThis.AbortSignal,
-  setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout
+  setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout, monoNow = () => performance.now()   // monoNow: Task 1292 GB-02 reply bound only
 }) {
-  async function writeDataToSession(id, session, data, { beforeWrite, frameMeta } = {}) {
+  async function writeDataToSession(id, session, data, { beforeWrite, frameMeta, replyGuard } = {}) {
     if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     const denied = protectedInputFailure(session);
     if (denied) return denied;
@@ -83,6 +83,8 @@ function createSessionDeliveryContext({
               sock.destroy();
               return;
             }
+            const replyRefusal = replyGuard ? replyGuard() : null;   // Task 1292 GB-02: instance + deadline at the socket write
+            if (replyRefusal) { finish(replyRefusal); sock.destroy(); return; }
             try {
               if (beforeWrite && beforeWrite() !== true) {
                 finish(buildErrorBody('TRACKING_PERSISTENCE_FAILED', 'UDS attempt could not be durably fenced; nothing written.', { httpStatus: 503, bytes_written: 0 }));
@@ -229,6 +231,9 @@ function createSessionDeliveryContext({
   // a written text and its CR.
   function replyDeadlinePassed(holder) {
     if (!holder || holder.notAfterMs === undefined) return false;
+    // GB-02: an injection target also carries a monotonic bound anchored at enqueue, so a backward wall-clock jump after
+    // that point cannot keep the final-write checks open.
+    if (holder.notAfterMonoMs !== undefined && !(monoNow() <= holder.notAfterMonoMs)) return true;
     return !(Number.isSafeInteger(holder.notAfterMs) && Date.now() <= holder.notAfterMs);
   }
 
@@ -247,6 +252,15 @@ function createSessionDeliveryContext({
 
   function carriesReplyCapability(options) {
     return options.replyCapabilityTrailer !== undefined || options.notAfterMs !== undefined;
+  }
+
+  // Task 1292 GB-01: the mailbox row of a reply carries its marker in the one field FileMailbox persists verbatim, the
+  // msg_id. Every other msg_id this file mints ends in 8 hex digits, so it can never end with this suffix. A marked row
+  // with no `injectionTargets` entry (another daemon incarnation, or a target dropped while the row stayed pending) has
+  // lost its instance binding and deadline and is withdrawn unwritten.
+  const REPLY_MSG_ID_SUFFIX = ':reply-capability-v1';
+  function isReplyMsgId(msgId) {
+    return typeof msgId === 'string' && msgId.endsWith(REPLY_MSG_ID_SUFFIX);
   }
 
   // PR #108 TP2: an inject that owes a CR waits for ITS msg_id to be written, not for "a tick".
@@ -496,6 +510,9 @@ function createSessionDeliveryContext({
 
   async function deliverInjectionToSession(id, session, prompt, options = {}) {
     if (replyDeadlinePassed(options)) return replyDeadlineResult();   // Task 1292 §6.4: at delivery entry
+    // Task 1292 GB-01/GB-02: a reply goes only where the guard reaches the final write (SUPPORT-MATRIX.md); every other
+    // requester state is refused here, before any await, enqueue or write.
+    if (options.notAfterMs !== undefined && !require('../reply-capability').replyDeliverySupported(session)) return replyDeliveryUnsupportedResult();
     if (session.isClosing || require('../principal/cooperative-handoff').activeHandoff(session)) return { success: false, httpStatus: 409, code: 'SESSION_CLOSING', error: 'Session is closing', bytes_written: 0 };
     if (options.externalApproval && !session.externalApprovalPolicy) return { success: false, httpStatus: 403, code: 'APPROVAL_POLICY_REQUIRED', error: 'Signed inject requires the enrolled target policy.', bytes_written: 0 };
     const denied = protectedInputFailure(session);
@@ -610,7 +627,7 @@ function createSessionDeliveryContext({
     // Reason: combining text+CR in one write triggers bracketed paste mode in modern
     // terminals. CLIs ignore \r inside paste brackets, so Enter never fires.
     const from = options.from || 'daemon';
-    const msgId = `${from}:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
+    const msgId = `${from}:${Date.now()}:${crypto.randomUUID().slice(0, 8)}${options.notAfterMs !== undefined ? REPLY_MSG_ID_SUFFIX : ''}`;   // Task 1292 GB-01
 
     // #47 P4 — capability-gated delivery provenance banner (spec §6). Default-OFF: only sessions
     // that registered as provenance-capable (and have a minted nonce) get the nonce-gated banner;
@@ -744,7 +761,8 @@ function createSessionDeliveryContext({
       const immediate = { result: null }; immediateAttempts.set(msgId, immediate);
       if (QUEUE_DIAG) immediate.barrier = barrier;
       injectionTargets.set(msgId, { session, sessionEpoch, ownerWs: entryOwnerWs, injectId: options.injectId || options.pairInjectId || null,
-        ...(options.notAfterMs !== undefined ? { notAfterMs: options.notAfterMs } : {}) });   // Task 1292 §6.4: only when supplied
+        ...(options.notAfterMs !== undefined ? { notAfterMs: options.notAfterMs,   // Task 1292 §6.4: only when supplied
+          notAfterMonoMs: monoNow() + (options.notAfterMs - Date.now()) } : {}) });   // GB-02: monotonic, anchored here
       if (session.type === 'wrapped') holdBodyCustody(session, msgId, options.injectId || options.pairInjectId || null);   // hotfix480 F1
       // Registered synchronously after the enqueue: no tick can run in between.
       const owesSubmit = !options.noEnter && session.type !== 'aterm';
@@ -855,6 +873,8 @@ function createSessionDeliveryContext({
       injectionTargets.delete(msgId);
       if (!isSameSessionInstance(id, session, sessionEpoch) || session.ownerWs !== entryOwnerWs) { releaseSubmit(); return sessionGoneResult(); }
       if (replyDeadlinePassed(options)) { releaseSubmit(); return replyDeadlineResult(); }   // Task 1292 §6.4
+      // Task 1292 GB-02: this fallback's write carries no socket-time guard; a reply refuses it (nothing was enqueued).
+      if (options.notAfterMs !== undefined) { releaseSubmit(); return replyDeliveryUnsupportedResult(); }
       const textOwnerWs = session.ownerWs;
       const textResult = await writeDataToSession(id, session, deliveredBody,
         { frameMeta: { daemon_msg_id: msgId, inject_id: options.injectId || null, part: 'body' } });
@@ -945,6 +965,11 @@ function createSessionDeliveryContext({
         return result;
       }
       const target = injectionTargets.get(msg.msg_id);
+      // Task 1292 GB-01: a reply row whose binding is gone is never written (withdrawn like `session_gone`, zero bytes).
+      if (!target && isReplyMsgId(msg.msg_id)) {
+        getMailbox().withdraw(sessionId, msg.msg_id, 'reply_binding_lost', { inFlight: true });
+        return { ...sessionGoneResult(), bytes_written: 0 };
+      }
       if (target && (!isSameSessionInstance(sessionId, target.session, target.sessionEpoch)
           || session.ownerWs !== target.ownerWs)) {
         injectionTargets.delete(msg.msg_id);
@@ -964,8 +989,21 @@ function createSessionDeliveryContext({
       const ownerWs = session.ownerWs;
       const beforeWrite = session.type === 'aterm'
         ? () => getMailbox().beginNonRetryableAttempt(sessionId, msg.msg_id) : undefined;
+      // Task 1292 GB-02: for a reply row the instance and deadline checks above run again inside the UDS connect callback,
+      // right before the socket write (the only write a reply can reach, SUPPORT-MATRIX.md).
+      let replyRefused = null;
+      const replyGuard = target && target.notAfterMs !== undefined ? () => (replyRefused =
+        !isSameSessionInstance(sessionId, target.session, target.sessionEpoch) || session.ownerWs !== target.ownerWs
+          ? sessionGoneResult() : replyDeadlinePassed(target) ? replyDeadlineResult() : null) : undefined;
       const result = await writeDataToSession(sessionId, session, msg.payload,
-        { beforeWrite, frameMeta: { daemon_msg_id: msg.msg_id, inject_id: target?.injectId || null, part: 'body' } });
+        { beforeWrite, frameMeta: { daemon_msg_id: msg.msg_id, inject_id: target?.injectId || null, part: 'body' }, ...(replyGuard ? { replyGuard } : {}) });
+      if (replyRefused) {   // Task 1292 GB-02: refused at the socket, nothing written; withdrawn as in the two branches above
+        injectionTargets.delete(msg.msg_id);
+        getMailbox().withdraw(sessionId, msg.msg_id, replyRefused.code === 'SESSION_GONE' ? 'session_gone' : 'reply_deadline_passed', { inFlight: true });
+        const waiter = mailboxTextWaiters.get(msg.msg_id);
+        if (waiter) waiter.lastFailure = replyRefused;
+        return replyRefused;
+      }
       const immediate = immediateAttempts.get(msg.msg_id); if (immediate) immediate.result = result;
       const waiter = mailboxTextWaiters.get(msg.msg_id);
       if (waiter) {

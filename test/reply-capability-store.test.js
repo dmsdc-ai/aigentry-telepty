@@ -479,14 +479,16 @@ test('sweeper: never started at construction; one unref()d 60 s interval; stop c
   assert.deepEqual(log, [['set', 60000], ['unref'], ['clear']]);
 });
 
+// GB-06: SPEC §2.3 as amended — the printed command uses --file, which runs unchanged in POSIX shells, cmd.exe and
+// PowerShell (no `<` input redirection).
 test('trailer text is exactly SPEC §2.3', () => {
   const token = `rc1.${'A'.repeat(22)}.${'b'.repeat(43)}`;
   const trailer = replyCapabilityTrailer({ id: 'A'.repeat(22), token, not_after_ms: 1795262400000 });
   assert.equal(trailer,
     `\n\n⟦telepty:reply-capability v=1 id=${'A'.repeat(22)} expires=2026-11-21T12:00:00.000Z⟧\n`
-    + 'To reply to this request once, run in any shell on this machine:\n'
-    + `  telepty reply-v1 ${token} < reply.txt\n`
-    + '(or pipe the reply text on stdin). The reply goes only to the requester and only once.\n'
+    + 'To reply to this request once, write the reply text to reply.txt and run on this machine:\n'
+    + `  telepty reply-v1 ${token} --file reply.txt\n`
+    + '(or pipe the reply text to the same command without --file). The reply goes only to the requester and only once.\n'
     + `⟦telepty:end reply-capability id=${'A'.repeat(22)}⟧`);
 });
 

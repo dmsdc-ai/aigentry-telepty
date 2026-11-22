@@ -231,9 +231,10 @@ test('U17 exit codes: answers without the closed object, and status/stage mismat
   const t = makeToken();
   const rows = [
     { status: 404, body: '<!DOCTYPE html><pre>Cannot POST /api/reply-capability-v1</pre>', exit: 2, stage: 'refused' },
-    { status: 401, body: { error: 'credential required' }, exit: 2, stage: 'refused' },
-    { status: 403, body: { error: 'origin denied' }, exit: 2, stage: 'refused' },
-    { status: 413, body: '', exit: 2, stage: 'refused' },
+    // GB-05: an unstructured 4xx that is not a positively identified pre-route answer may follow a delivery → exit 3.
+    { status: 401, body: { error: 'credential required' }, exit: 3, stage: 'outcome_unknown' },
+    { status: 403, body: { error: 'origin denied' }, exit: 3, stage: 'outcome_unknown' },
+    { status: 413, body: '', exit: 3, stage: 'outcome_unknown' },
     { status: 200, body: { success: true }, exit: 3, stage: 'outcome_unknown' },
     { status: 500, body: { error: 'Internal Server Error' }, exit: 3, stage: 'outcome_unknown' },
     { status: 200, body: closed({ stage: 'refused', reason: 'REPLY_CAPABILITY_CONSUMED' }), exit: 3, stage: 'outcome_unknown' },
@@ -252,6 +253,97 @@ test('U17 exit codes: answers without the closed object, and status/stage mismat
     assert.deepEqual(out.result, { ...closed({ stage: row.stage, reason: 'REPLY_CLI_RESPONSE_UNRECOGNIZED',
       retryable: row.exit === 4 }), http_status: row.status }, label);
     assertTokenAbsent(t, out, label);
+  }
+});
+
+// GB-05: exit 2 is reserved for a closed result or an answer the stock daemon provably gives before the consume route
+// runs. The stock pre-route bodies are exact (src/protocol/http-auth.js:153-158,220); every other 4xx is exit 3.
+test('GB-05 an unstructured 4xx is exit 3 (outcome unknown) unless it is a positively identified pre-route answer', async () => {
+  const t = makeToken();
+  const rows = [
+    { status: 403, body: { error: 'Forbidden: browser origin not allowed.', code: 'ORIGIN_NOT_ALLOWED' }, exit: 2 },
+    { status: 403, body: { error: 'Forbidden: this address is not in TELEPTY_PEER_ALLOWLIST.', code: 'PEER_NOT_ALLOWED' }, exit: 2 },
+    { status: 401, body: { error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED' }, exit: 2 },
+    { status: 401, body: { error: 'Principal request refused', code: 'PRINCIPAL_PROOF_INVALID' }, exit: 2 },
+    { status: 404, body: '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<title>Error</title>\n</head>\n<body>\n<pre>Cannot POST /api/reply-capability-v1</pre>\n</body>\n</html>\n', exit: 2 },
+    // Same status, any other shape: not provably before the route.
+    { status: 401, body: { error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED', extra: 1 }, exit: 3 },
+    { status: 403, body: { error: 'Forbidden: browser origin not allowed.', code: 'PEER_NOT_ALLOWED' }, exit: 3 },
+    { status: 409, body: { error: 'Principal request refused', code: 'PRINCIPAL_PROOF_INVALID' }, exit: 3 },
+    { status: 400, body: '<!DOCTYPE html><pre>Bad Request</pre>', exit: 3 },
+    { status: 404, body: '<!DOCTYPE html><pre>Not Found</pre>', exit: 3 },
+    { status: 404, body: { error: 'not here' }, exit: 3 },
+    { status: 429, body: '', exit: 3 },
+    { status: 499, body: 'proxy closed', exit: 3 },
+  ];
+  for (const row of rows) {
+    const out = await run({ argv: [t.token], answer: respond(row.status, row.body) });
+    const label = `${row.status} ${JSON.stringify(row.body).slice(0, 60)}`;
+    assert.equal(out.exit, row.exit, label);
+    assert.equal(out.calls.length, 1, `${label}: no retry`);
+    assert.deepEqual(out.result, { ...closed({ stage: row.exit === 2 ? 'refused' : 'outcome_unknown',
+      reason: 'REPLY_CLI_RESPONSE_UNRECOGNIZED' }), http_status: row.status }, label);
+    if (row.exit === 3) assert.match(out.stderr, /do not resend/, label);
+    else assert.match(out.stderr, /Nothing was written/, label);
+    assertTokenAbsent(t, out, label);
+  }
+});
+
+// GB-07: one deadline bounds reading the source and the request. A source that never ends is a local refusal, nothing sent.
+test('GB-07 a stdin that never ends is refused at the deadline: exit 2, no request, the stream is destroyed, no timer left', { timeout: 10000 }, async () => {
+  const t = makeToken();
+  const stdout = writer();
+  const stderr = writer();
+  const endless = new Readable({ read() {} });   // never pushes, never ends
+  let calls = 0;
+  const liveTimers = () => process.getActiveResourcesInfo().filter(name => name === 'Timeout').length;
+  const before = liveTimers();
+  const exit = await replyV1.runReplyV1([t.token], {
+    fetchWithAuth: () => { calls += 1; return Promise.resolve(new Response('{}', { status: 200 })); },
+    daemonUrl: DAEMON_URL, remoteHost: '127.0.0.1', stdin: endless, stdout, stderr, timeoutMs: 50,
+  });
+  assert.equal(exit, 2);
+  assert.equal(calls, 0);
+  assert.deepEqual(JSON.parse(stdout.text), closed({ reason: 'REPLY_CLI_BODY_TIMEOUT' }));
+  assert.match(stderr.text, /Nothing was sent/);
+  assert.equal(endless.destroyed, true);
+  assert.equal(liveTimers(), before, 'the deadline timer is cleared');
+  assertTokenAbsent(t, { stdout: stdout.text, stderr: stderr.text }, 'endless stdin');
+});
+
+test('GB-07 a stdin that trickles past the deadline is refused; one that ends in time is sent with the time left', { timeout: 10000 }, async () => {
+  const t = makeToken();
+  const trickle = new Readable({ read() {} });
+  const timer = setInterval(() => trickle.push('x'), 5);
+  try {
+    const stdout = writer();
+    let calls = 0;
+    const exit = await replyV1.runReplyV1([t.token], {
+      fetchWithAuth: () => { calls += 1; return Promise.resolve(new Response('{}', { status: 200 })); },
+      daemonUrl: DAEMON_URL, remoteHost: '127.0.0.1', stdin: trickle, stdout, stderr: writer(), timeoutMs: 60,
+    });
+    assert.equal(exit, 2);
+    assert.equal(calls, 0);
+    assert.equal(JSON.parse(stdout.text).reason, 'REPLY_CLI_BODY_TIMEOUT');
+  } finally {
+    clearInterval(timer);
+  }
+  const ok = await run({ argv: [t.token], body: 'in time', timeoutMs: 5000 });
+  assert.equal(ok.exit, 0);
+  assert.equal(ok.calls.length, 1);
+});
+
+test('GB-07 --file reads only a regular file: a directory is refused locally before any request', async () => {
+  const t = makeToken();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'reply-v1-dir-'));
+  try {
+    const out = await run({ argv: [t.token, '--file', dir] });
+    assert.equal(out.exit, 2);
+    assert.equal(out.calls.length, 0);
+    assert.equal(out.result.reason, 'REPLY_CLI_BODY_INVALID');
+    assert.equal(out.stdinRead, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -372,6 +464,39 @@ test('U17 process: env {PATH, HOME} with no host token → exit 2 HOST_TOKEN_UNA
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+// GB-07: a FIFO with no writer used to block the synchronous open forever (the token stays in argv). It is now refused
+// locally at once. POSIX only: mkfifo has no Windows equivalent reachable from a path (a named pipe needs a live server).
+test('GB-07 process: --file naming a FIFO with no writer is refused at once (exit 2, nothing sent)', {
+  skip: process.platform === 'win32' ? 'mkfifo is POSIX-only' : false, timeout: 30000,
+}, async () => {
+  const t = makeToken();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'reply-v1-fifo-'));
+  try {
+    const fifo = path.join(home, 'reply.fifo');
+    const made = require('node:child_process').spawnSync('mkfifo', [fifo]);
+    assert.equal(made.status, 0, 'PRECONDITION: mkfifo');
+    const r = await runCliProcess(['reply-v1', t.token, '--file', fifo], minimalEnv(home), '', 15000);
+    assert.equal(r.code, 2, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout), closed({ reason: 'REPLY_CLI_BODY_INVALID' }));
+    assert.equal(r.stdout.includes(t.secret) || r.stderr.includes(t.secret), false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// GB-06: the command the daemon prints must run as printed in every shell: no `<` redirection, and its argv is exactly the
+// verb's --file form.
+test('GB-06 the trailer\'s printed command uses --file (no input redirection) and parses as the verb\'s argv', () => {
+  const t = makeToken();
+  const trailer = require(path.join(ROOT, 'src', 'reply-capability.js')).replyCapabilityTrailer({ id: t.id, token: t.token, not_after_ms: 1795262400000 });
+  const lines = trailer.split('\n').filter(line => line.trimStart().startsWith('telepty reply-v1 '));
+  assert.equal(lines.length, 1);
+  assert.equal(/[<>|]/.test(lines[0]), false, 'no shell redirection or pipe in the printed command');
+  const argv = lines[0].trim().split(/\s+/).slice(2);
+  assert.deepEqual(argv, [t.token, '--file', 'reply.txt']);
+  assert.deepEqual(replyV1.parseReplyArgv(argv), { ok: true, token: t.token, file: 'reply.txt' });
 });
 
 test('U17 process: env {PATH, HOME} plus the daemon port, real daemon → host token from config.json, closed UNKNOWN answer, exit 2', async () => {

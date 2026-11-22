@@ -76,6 +76,7 @@ const ERROR_STATUS = Object.freeze({
   REPLY_CAPABILITY_SENDER_UNVERIFIED: 403,
   REPLY_CAPABILITY_REQUESTER_STALE: 409,
   REPLY_CAPABILITY_TARGET_UNSUPPORTED: 409,
+  REPLY_CAPABILITY_REQUESTER_UNSUPPORTED: 409,
   REPLY_CAPABILITY_DEADLINE_INVALID: 400,
   REPLY_CAPABILITY_CAPACITY: 503,
   REPLY_TRANSPORT_REFUSED: 403,
@@ -149,14 +150,24 @@ function validReplyPrefix(prefix) {
   return /^[\x20-\x7E]*$/.test(head);
 }
 
-// §2.3: the exact trailer appended to the responder's delivered text.
+// §2.3: the exact trailer appended to the responder's delivered text. GB-06: the printed command uses --file, not
+// `<` input redirection, so the same line runs in POSIX shells, cmd.exe and PowerShell (which has no `<`).
 function replyCapabilityTrailer({ id, token, not_after_ms }) {
   const exp = new Date(not_after_ms).toISOString();
   return `\n\n⟦telepty:reply-capability v=1 id=${id} expires=${exp}⟧\n`
-    + 'To reply to this request once, run in any shell on this machine:\n'
-    + `  telepty reply-v1 ${token} < reply.txt\n`
-    + '(or pipe the reply text on stdin). The reply goes only to the requester and only once.\n'
+    + 'To reply to this request once, write the reply text to reply.txt and run on this machine:\n'
+    + `  telepty reply-v1 ${token} --file reply.txt\n`
+    + '(or pipe the reply text to the same command without --file). The reply goes only to the requester and only once.\n'
     + `⟦telepty:end reply-capability id=${id}⟧`;
+}
+
+// Task 1292 GB-01/GB-02/GB-03 — the support matrix (SUPPORT-MATRIX.md). A reply is written only where the requester-
+// instance check and the deadline check run at the last synchronous point before the daemon's final write and nothing
+// can stay pending in a queue or composer: an aterm session reached over its unix socket (one UDS write per attempt,
+// no daemon-side deferred CR). Every other requester state is refused: at mint (M7a) and again at delivery entry.
+function replyDeliverySupported(session) {
+  return !!session && typeof session === 'object' && session.type === 'aterm' && !session.sshRemote
+    && !!session.delivery && session.delivery.transport === 'unix_socket' && !!session.delivery.address;
 }
 
 function checkPrincipal(p, label) {
@@ -565,5 +576,5 @@ module.exports = {
   CAPABILITY, RESULT_SCHEMA, SENDER_PROOF, TOKEN_RE, LIMITS, STATES, ERROR_STATUS,
   SUBMIT_QUEUE_TIMEOUT_MS, ACCEPT_MARGIN_MS, REPLY_PREFIX_MAX_BYTES, REPLY_BODY_MAX_BYTES, REQUEST_MAX_BYTES,
   createReplyCapabilityStore, parseToken, validReplyPrefix, replyCapabilityTrailer, buildResult, refusalAnswer,
-  bodySha256: sha256Hex
+  replyDeliverySupported, bodySha256: sha256Hex
 };

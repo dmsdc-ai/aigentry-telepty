@@ -17,6 +17,7 @@
 //   4 no usable response, running the SAME command again is safe (the daemon replays or answers IN_FLIGHT).
 
 const fs = require('node:fs');
+const { performance } = require('node:perf_hooks');
 const { RESULT_SCHEMA, TOKEN_RE, REPLY_BODY_MAX_BYTES, REQUEST_MAX_BYTES, buildResult } = require('../reply-capability');
 
 const ROUTE = '/api/reply-capability-v1';
@@ -29,6 +30,7 @@ const LOCAL = Object.freeze({
   BODY_EMPTY: 'REPLY_CLI_BODY_EMPTY',
   BODY_TOO_LARGE: 'REPLY_CLI_BODY_TOO_LARGE',
   BODY_INVALID: 'REPLY_CLI_BODY_INVALID',
+  BODY_TIMEOUT: 'REPLY_CLI_BODY_TIMEOUT',
   REMOTE_HOST_REFUSED: 'REPLY_CLI_REMOTE_HOST_REFUSED',
   HOST_TOKEN_UNAVAILABLE: 'REPLY_CLI_HOST_TOKEN_UNAVAILABLE',
   NO_RESPONSE: 'REPLY_CLI_NO_RESPONSE',
@@ -42,12 +44,23 @@ const STDERR = Object.freeze({
   [LOCAL.BODY_EMPTY]: 'reply-v1: the reply body is empty. Nothing was sent.\n',
   [LOCAL.BODY_TOO_LARGE]: `reply-v1: the reply body exceeds ${REPLY_BODY_MAX_BYTES} bytes. Nothing was sent.\n`,
   [LOCAL.BODY_INVALID]: 'reply-v1: the reply body could not be read, or is not valid UTF-8 without NUL. Nothing was sent.\n',
+  [LOCAL.BODY_TIMEOUT]: 'reply-v1: the reply body was not read completely before the request deadline. Nothing was sent.\n',
   [LOCAL.REMOTE_HOST_REFUSED]: 'reply-v1: only the local daemon at 127.0.0.1 is supported. Nothing was sent.\n',
   [LOCAL.HOST_TOKEN_UNAVAILABLE]: 'reply-v1: the daemon host token could not be read (TELEPTY_AUTH_TOKEN or ~/.telepty/config.json). Nothing was sent.\n',
 });
 const RETRY_SAME_HINT = 'reply-v1: no usable response from the local daemon. Running the SAME command again is safe; do not change the body.\n';
 const DO_NOT_RESEND_HINT = 'reply-v1: the reply outcome is unknown; do not resend. Check the requester\'s audit.\n';
-const UNRECOGNIZED_REFUSAL_HINT = 'reply-v1: the daemon refused the request without a reply-capability result (it may not support reply-capability-v1). Nothing was written.\n';
+const UNRECOGNIZED_REFUSAL_HINT = 'reply-v1: the daemon refused the request before its reply-capability route ran (wrong host credential, refused peer, or a daemon without reply-capability-v1). Nothing was written.\n';
+// GB-05: the only answers without the closed result that are exit 2. Each is produced by the stock daemon BEFORE the
+// consume route runs (src/protocol/http-auth.js:153-158,195,207,220,242), or by Express when no such route exists, so no
+// delivery can have started. Exact key set and exact code; anything else in 4xx is exit 3 (outcome unknown).
+const PRE_ROUTE_REFUSALS = Object.freeze([
+  { status: 403, error: 'Forbidden: browser origin not allowed.', code: 'ORIGIN_NOT_ALLOWED' },
+  { status: 403, error: 'Forbidden: this address is not in TELEPTY_PEER_ALLOWLIST.', code: 'PEER_NOT_ALLOWED' },
+  { status: 401, error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED' },
+]);
+const STRICT_PRINCIPAL_REFUSAL = 'Principal request refused';
+const ROUTE_NOT_FOUND_TEXT = '<pre>Cannot POST /api/reply-capability-v1</pre>';
 
 const RESULT_KEYS = Object.freeze(['schema', 'stage', 'outcome', 'reason', 'capability_id', 'reply_inject_id',
   'destination_session_id', 'replayed', 'retryable']);
@@ -76,10 +89,14 @@ function remoteHostRefusal(remoteHost) {
 }
 
 // Reads at most `max + 1` bytes, so an oversized source is detected without reading it whole.
+// GB-07: only a regular file is read. The open is non-blocking where the platform has O_NONBLOCK, so a FIFO with no
+// writer cannot stall it, and fstat on the open descriptor refuses a FIFO, socket, pipe or device (an endless or
+// producer-paced source) before any read.
 function readFileCapped(file, max) {
   let fd = null;
   try {
-    fd = fs.openSync(file, 'r');
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0));
+    if (!fs.fstatSync(fd).isFile()) return { ok: false, code: LOCAL.BODY_INVALID };
     const buffer = Buffer.alloc(max + 1);
     let total = 0;
     for (;;) {
@@ -96,15 +113,30 @@ function readFileCapped(file, max) {
   }
 }
 
-async function readStreamCapped(stream, max) {
+// GB-07: every chunk wait races the request deadline (`expired`). At the deadline the stream is destroyed (so a live
+// stdin handle cannot keep the process up) and the source is a local refusal: nothing was sent.
+async function readStreamCapped(stream, max, expired) {
   const chunks = [];
   let total = 0;
+  const iterator = stream[Symbol.asyncIterator]();
   try {
-    for await (const chunk of stream) {
+    for (;;) {
+      const next = iterator.next();
+      next.catch(() => {});   // settled by the destroy below when the deadline wins; nothing waits on it then
+      const step = await Promise.race([next, expired]);
+      if (step === NO_ANSWER) {
+        try { stream.destroy(); } catch { /* already closed */ }
+        return { ok: false, code: LOCAL.BODY_TIMEOUT };
+      }
+      if (step.done) break;
+      const chunk = step.value;
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       total += bytes.length;
-      // Leaving the loop early destroys the stream; the remainder is never read.
-      if (total > max) return { ok: false, code: LOCAL.BODY_TOO_LARGE };
+      // Leaving early destroys the stream (iterator.return); the remainder is never read.
+      if (total > max) {
+        try { await iterator.return(); } catch { /* already destroyed */ }
+        return { ok: false, code: LOCAL.BODY_TOO_LARGE };
+      }
       chunks.push(bytes);
     }
   } catch {
@@ -135,11 +167,14 @@ function startDeadline(ms) {
   const controller = new AbortController();
   let fire;
   const expired = new Promise(resolve => { fire = resolve; });
+  const at = performance.now() + ms;
   const timer = setTimeout(() => {
     controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
     fire(NO_ANSWER);
   }, ms);
-  return { signal: controller.signal, expired, clear: () => clearTimeout(timer) };
+  // GB-07: `passed()` also covers a synchronous file read that held the event loop past the timer.
+  return { signal: controller.signal, expired, clear: () => clearTimeout(timer),
+    passed: () => controller.signal.aborted || performance.now() >= at };
 }
 
 // → { ok:true, bytes } or { ok:false } (read error, abort/timeout, missing reader, or more than `max` bytes).
@@ -199,6 +234,17 @@ function stageAgreesWithStatus(stage, status) {
   return Number.isInteger(status) && status >= 400 && status <= 599;
 }
 
+// GB-05: the positively identified pre-route answers (PRE_ROUTE_REFUSALS, the strict-principal refusal, and Express's
+// not-found page naming exactly this route, which an older daemon without the route returns).
+function preRouteRefusal(status, doc, bytes) {
+  if (status === 404) return Buffer.from(bytes).toString('utf8').includes(ROUTE_NOT_FOUND_TEXT);
+  if (!isPlainObject(doc)) return false;
+  const keys = Object.keys(doc).sort();
+  if (keys.length !== 2 || keys[0] !== 'code' || keys[1] !== 'error' || typeof doc.code !== 'string') return false;
+  if (doc.error === STRICT_PRINCIPAL_REFUSAL) return status === 401 || status === 403;
+  return PRE_ROUTE_REFUSALS.some(known => known.status === status && known.error === doc.error && known.code === doc.code);
+}
+
 // Pure. (HTTP status, complete response bytes) → { exit, line, hint }.
 function classifyReplyResponse(status, bytes) {
   let doc;
@@ -211,10 +257,13 @@ function classifyReplyResponse(status, bytes) {
     }
     return { exit: EXIT.unknown, line: localResult('outcome_unknown', LOCAL.RESPONSE_UNRECOGNIZED, status), hint: DO_NOT_RESEND_HINT };
   }
-  // Earlier middleware (401/403/413, profile gate) or a daemon without the route (plain 404): the consume
-  // handler never ran, so nothing was written.
-  if (Number.isInteger(status) && status >= 400 && status <= 499) {
+  // GB-05: exit 2 only for an answer the stock daemon provably gives before the consume route runs; every other 4xx
+  // may come from a path after delivery started (an intermediary, a thrown error carrying a 4xx status) → exit 3.
+  if (preRouteRefusal(status, json ? doc : undefined, bytes)) {
     return { exit: EXIT.refused, line: localResult('refused', LOCAL.RESPONSE_UNRECOGNIZED, status), hint: UNRECOGNIZED_REFUSAL_HINT };
+  }
+  if (Number.isInteger(status) && status >= 400 && status <= 499) {
+    return { exit: EXIT.unknown, line: localResult('outcome_unknown', LOCAL.RESPONSE_UNRECOGNIZED, status), hint: DO_NOT_RESEND_HINT };
   }
   if (!json) {
     return { exit: EXIT.noResponse, line: localResult('outcome_unknown', LOCAL.RESPONSE_UNRECOGNIZED, status, true), hint: RETRY_SAME_HINT };
@@ -247,17 +296,20 @@ async function runReplyV1(argv, deps) {
   const hostRefusal = remoteHostRefusal(deps.remoteHost);
   if (hostRefusal) return refuseLocally(hostRefusal);
 
-  const source = parsed.file !== null
-    ? readFileCapped(parsed.file, REPLY_BODY_MAX_BYTES)
-    : await readStreamCapped(deps.stdin || process.stdin, REPLY_BODY_MAX_BYTES);
-  if (!source.ok) return refuseLocally(source.code);
-  const body = validateBody(source.bytes);
-  if (!body.ok) return refuseLocally(body.code);
-  const payload = JSON.stringify({ v: 1, capability: parsed.token, body: body.text });
-  if (Buffer.byteLength(payload) > REQUEST_MAX_BYTES) return refuseLocally(LOCAL.BODY_TOO_LARGE);
-
+  // GB-07: ONE deadline bounds reading the reply source and the request together. A source not read completely by then
+  // is a local refusal (exit 2): nothing was sent.
   const deadline = startDeadline(Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : REQUEST_TIMEOUT_MS);
   try {
+    const source = parsed.file !== null
+      ? readFileCapped(parsed.file, REPLY_BODY_MAX_BYTES)
+      : await readStreamCapped(deps.stdin || process.stdin, REPLY_BODY_MAX_BYTES, deadline.expired);
+    if (!source.ok) return refuseLocally(source.code);
+    if (deadline.passed()) return refuseLocally(LOCAL.BODY_TIMEOUT);
+    const body = validateBody(source.bytes);
+    if (!body.ok) return refuseLocally(body.code);
+    const payload = JSON.stringify({ v: 1, capability: parsed.token, body: body.text });
+    if (Buffer.byteLength(payload) > REQUEST_MAX_BYTES) return refuseLocally(LOCAL.BODY_TOO_LARGE);
+
     let pending;
     try {
       // A synchronous throw happens before any socket: the host token could not be resolved.

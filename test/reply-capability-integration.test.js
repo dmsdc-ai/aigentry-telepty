@@ -5,7 +5,9 @@
 // Written by the coder, NOT executed by the coder.
 // One REAL isolated daemon for the file (test-support/daemon-harness), started in before() and stopped in after(). Sessions
 // are registered through the real route and claimed by owner WebSockets that present their bearer, so each epoch is PROVED
-// (SPEC M7). Every frame the daemon writes to a session is recorded. The token is taken only from the trailer delivered to
+// (SPEC M7). Every frame the daemon writes to a session is recorded. GB-01/GB-02/GB-03: a requester must be in the support
+// matrix (SUPPORT-MATRIX.md), so every requester is an aterm session registered with a unix-socket endpoint (a named pipe
+// on Windows) served by this file; every Inject the daemon writes to that endpoint is recorded the same way. The token is taken only from the trailer delivered to
 // the responder, which is how a responder gets it. The requester sids are the configured orchestrator lane
 // (AIGENTRY_ORCHESTRATOR_SIDS), so the unchanged peer-lane guard admits the request and both kinds of reply. It is not
 // disabled.
@@ -19,6 +21,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
@@ -67,12 +70,17 @@ const REQUESTERS = { i1: createSessionId('w6-req-i1'), i2: createSessionId('w6-r
 
 let harness;
 const sockets = [];
+const endpoints = [];
 before(async () => {
   harness = await startTestDaemon({ env: { TELEPTY_AUDIT_FLUSH_MS: '10', AIGENTRY_ORCHESTRATOR_SIDS: Object.values(REQUESTERS).join(' ') } });
 });
 after(async () => {
   for (const ws of sockets) { try { ws.close(); } catch { /* already closed */ } }
   if (harness) await harness.stop();
+  for (const { server, connections } of endpoints) {
+    for (const socket of connections) socket.destroy();
+    await new Promise((resolve) => server.close(() => resolve()));
+  }
 });
 
 // A registered wrapped session whose owner socket proved the registered epoch. texts() lists every inject frame written to it.
@@ -89,6 +97,39 @@ async function wrapped(sid) {
   assert.equal(claim.interaction_binding.session_epoch, reg.body.session_epoch, 'PRECONDITION: the owner claim proved the registered epoch');
   return { sid, bearer: reg.body.session_token, epoch: reg.body.session_epoch, generation: reg.body.credential_generation,
     texts: () => frames.filter((f) => f.type === 'inject').map((f) => f.data) };
+}
+
+// A registered aterm session whose endpoint is a unix socket (a named pipe on Windows) served here: the requester state the
+// support matrix admits. Each daemon write is one connection carrying one JSON line; the endpoint answers the positive
+// receipt. texts() lists the text of every Inject, in arrival order (the daemon's mailbox engine writes one at a time).
+async function atermRequester(sid) {
+  const address = process.platform === 'win32'
+    ? `\\\\.\\pipe\\telepty-w6-${crypto.randomUUID()}`
+    : path.join(os.tmpdir(), `w6-${crypto.randomBytes(6).toString('hex')}.sock`);
+  const received = [];
+  const connections = new Set();
+  const server = net.createServer((socket) => {
+    connections.add(socket);
+    socket.on('close', () => connections.delete(socket));
+    socket.on('error', () => { /* the daemon side closed first */ });
+    const chunks = [];
+    socket.on('data', (chunk) => {
+      chunks.push(chunk);
+      const input = Buffer.concat(chunks).toString('utf8');
+      const nl = input.indexOf('\n');
+      if (nl === -1) return;
+      let message = null;
+      try { message = JSON.parse(input.slice(0, nl)); } catch { /* not a line we record */ }
+      if (message && message.action === 'Inject') received.push(message.text);
+      socket.end('{"success":true}');
+    });
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(address, resolve); });
+  endpoints.push({ server, connections });
+  const reg = await harness.registerSession(sid, { delivery_type: 'aterm', delivery: { transport: 'unix_socket', address } });
+  assert.ok(reg.status === 201 && typeof reg.body.session_token === 'string', `PRECONDITION: register ${sid} -> ${reg.status}`);
+  return { sid, bearer: reg.body.session_token, epoch: reg.body.session_epoch, generation: reg.body.credential_generation,
+    texts: () => received.slice() };
 }
 
 const inject = (sid, body, headers, signal) => harness.request(`/api/sessions/${encodeURIComponent(sid)}/inject`,
@@ -183,7 +224,7 @@ function tempHome(t, label) {
 }
 
 test('I1 two CLIs, two state roots: one token presented at once by two processes → exactly one write at the receiver, one success audit line', CASE, async (t) => {
-  const requester = await wrapped(REQUESTERS.i1);
+  const requester = await atermRequester(REQUESTERS.i1);
   const responder = await wrapped(createSessionId('w6-resp-i1'));
   const cap = await mint(requester, responder, 'w6 I1 request: answer once', t.signal);
   const body = `w6 I1 reply ${crypto.randomUUID()}`;
@@ -215,7 +256,7 @@ test('I1 two CLIs, two state roots: one token presented at once by two processes
 });
 
 test('I2 ordinary traffic never blocks: unrelated injects to the responder and ordinary messages to the requester before, during and after the consume in the request window; the reply is accepted, ordered and attributed', { ...CASE, skip: I2_WIN32_SKIP }, async (t) => {
-  const requester = await wrapped(REQUESTERS.i2);
+  const requester = await atermRequester(REQUESTERS.i2);
   const responder = await wrapped(createSessionId('w6-resp-i2'));
   const cap = await mint(requester, responder, 'w6 I2 request', t.signal);
   const body = `w6 I2 reply ${crypto.randomUUID()}`;
@@ -255,9 +296,9 @@ test('I2 ordinary traffic never blocks: unrelated injects to the responder and o
 });
 
 test('I5 rollback (daemon side): no new field in sessions.json and nothing in the tracked ledger; audit rows parse and differ from a run without the feature only by the additive fields', CASE, async (t) => {
-  const requester = await wrapped(REQUESTERS.i5);
+  const requester = await atermRequester(REQUESTERS.i5);
   const responder = await wrapped(createSessionId('w6-resp-i5'));
-  const controlRequester = await wrapped(REQUESTERS.i5control);
+  const controlRequester = await atermRequester(REQUESTERS.i5control);
   const controlResponder = await wrapped(createSessionId('w6-resp-i5c'));
   const audit = await beginAuditCompletion(harness, t.signal);
 
@@ -309,7 +350,7 @@ test('I5 rollback (daemon side): no new field in sessions.json and nothing in th
 });
 
 test('I6 direct reply plus capability reply: the responder answers once with its bearer and once with the capability → two writes, each separately attributed', CASE, async (t) => {
-  const requester = await wrapped(REQUESTERS.i6);
+  const requester = await atermRequester(REQUESTERS.i6);
   const responder = await wrapped(createSessionId('w6-resp-i6'));
   const cap = await mint(requester, responder, 'w6 I6 request', t.signal);
   const home = tempHome(t, 'i6');

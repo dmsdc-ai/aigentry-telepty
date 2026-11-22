@@ -1625,6 +1625,11 @@ function createSessionActions(shared, effects = {}) {
           || !Number.isSafeInteger(responderGeneration) || responderGeneration < 1) {
           return refuse('REPLY_CAPABILITY_TARGET_UNSUPPORTED', 'The target cannot receive a reply capability.');
         }
+        // M7a (GB-03): a requester that could never receive the reply under the support matrix is refused here,
+        // before the store is touched, so it learns at mint time and the responder never gets a dead token.
+        if (!rc.replyDeliverySupported(requesterRecord)) {
+          return refuse('REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', 'The requesting session cannot receive a capability reply.');
+        }
         const deadlineCode = store.deadlineRefusal(request.not_after_ms);
         if (deadlineCode) return refuse(deadlineCode, 'not_after_ms must be 30 s to 1 h from now.');
         const responder = { sid: id, epoch: session.sessionEpoch, generation: responderGeneration };
