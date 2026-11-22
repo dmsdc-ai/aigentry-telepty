@@ -372,7 +372,9 @@ or exactly `127.0.0.1`, `<id>` is bare (no `@`, or its last `@` is its first or 
 it equals, byte for byte, an ID in the local list 0.11.3 already reads first. Otherwise, and on
 every other command (`multicast` included), a bare ID resolves as in 0.11.3. So does a qualified
 `<id>@<host>` on every command: a registered peer whose name, machine id, host, `host:port`,
-target or DNS name equals `<host>` is used (two such peers are refused as ambiguous); only if none
+target or DNS name equals `<host>` is used if it was registered with `connect` (SSH) or
+`connect-http` (HTTP) (two matching peers of any transport are refused as ambiguous; a single
+matching `connect-broker` peer is not routed by alias and counts as no match); only if none
 matches does a loopback `<host>` (`127.0.0.1`, `localhost`, `::1`) go to this machine's loopback on
 the CLI's port, with `TELEPTY_AUTH_TOKEN`, else a token stored for that address, else the local
 token, and any other `<host>` is refused as an unregistered peer unless `TELEPTY_AUTH_TOKEN` is set.

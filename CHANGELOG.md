@@ -12,6 +12,11 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   runs the same id (0.11.3 refused it as existing on multiple hosts). Any other `TELEPTY_HOST`
   (empty, `127.0.0.1:<port>`, `localhost`, `::1`), a prefix, a qualified id, an unlisted id and a
   failed local read keep the 0.11.3 path. Every other command, `multicast` included, is unchanged.
+  On such an exact local hit where a peer runs the same id, the command no longer stops at the
+  refusal, so it goes on to the session detail request to the local daemon (`GET /api/sessions/<id>`)
+  that 0.11.3 makes for an id only the local daemon runs, with the same credential 0.11.3 attaches to
+  that request. On every exact local hit the peer list requests are no longer sent, and no peer
+  receives a request or credential it did not receive in 0.11.3.
 - With `--json`, `session info` and `read-screen` print three refusals as
   `{"success":false,"code":…,"error":…}` on stdout: cross-host ambiguity (`AMBIGUOUS_SESSION`),
   unregistered peer (`PEER_NOT_REGISTERED`) and ambiguous peer identity (`AMBIGUOUS_PEER`). They keep
@@ -20,7 +25,25 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   Every other command, and every qualified `<id>@<host>`, resolves as in 0.11.3: an exactly matching
   registered peer alias (name, machine id, host, `host:port`, target, DNS name) wins and two are
   refused as ambiguous; only if none matches does a loopback `<host>` go to this machine's loopback,
-  and any other `<host>` is refused as unregistered unless `TELEPTY_AUTH_TOKEN` is set.
+  and any other `<host>` is refused as unregistered unless `TELEPTY_AUTH_TOKEN` is set. An alias
+  routes only to a peer registered with `connect` (SSH) or `connect-http` (HTTP): a `connect-broker`
+  entry whose alias matches still counts toward the ambiguity refusal, but on its own the reference
+  continues as if no peer matched.
+
+**Upgrading**
+
+- Unchanged from earlier releases, and triggered by every version bump: when a 0.11.4 `telepty`
+  command that checks the local daemon first (`list`, `session info` and most other commands) finds
+  an older daemon (such as 0.11.3) answering on its port, it restarts that daemon and prints
+  `⚙️ Daemon version mismatch (running v0.11.3, installed v0.11.4). Restarting...` on stderr. The
+  restart ends every `spawn`ed session: its PTY is a child of the daemon process and dies with it.
+  `allow`-wrapped sessions survive it. A daemon owned by launchd/systemd/schtasks is left to its
+  supervisor. `TELEPTY_CLIENT_RESTART=off` (or `"clientRestart": "off"` in
+  `~/.telepty/config.json`) prevents the restart on any host: no client stops, spawns or kickstarts
+  the daemon, and the command prints on stderr that the daemon needs a restart and which command to
+  run. To keep `spawn`ed sessions, set it before the first 0.11.4 command, then restart the daemon
+  yourself when those sessions may end. The switch governs `telepty` commands only; a direct global
+  `npm install -g` can still replace an older recorded daemon itself, as described under 0.11.3.
 
 ## 0.11.3
 
