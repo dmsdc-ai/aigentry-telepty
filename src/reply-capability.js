@@ -170,10 +170,15 @@ function replyCapabilityTrailer({ id, token, not_after_ms }) {
 //             handshake (bound by bindImmediateSubmitCapability) and its started child is known (the child_seq the
 //             bridge re-checks). A bridge that did not declare it never receives a capability reply (fail closed).
 //   spawned — the daemon-owned PTY: body write guarded with deadline + headroom, deferred CR guarded with deadline.
+//             rc-fix7 GB2-09: only while the record holds the live PTY handle that write will use (not killed, input
+//             channel not failed); a record merely labelled spawned (registered, exited) is refused.
 const BRIDGE_REPLY_GUARD_CAPABILITY = 'reply-guard-v1';
 function replyDeliverySupported(session) {
   if (!session || typeof session !== 'object' || session.sshRemote) return false;
-  if (session.type === 'spawned') return true;
+  if (session.type === 'spawned') {
+    return !!session.ptyProcess && !session.ptyProcess.killed && typeof session.ptyProcess.write === 'function'
+      && !require('./pty-input-lifecycle').ptyInputFailure(session);
+  }
   if (session.type === 'wrapped') {
     return typeof session.replyGuardGeneration === 'string' && session.replyGuardGeneration === session.interactionOwnerGeneration
       && !!require('./transport/readiness-handshake').observedChild(session);
@@ -463,6 +468,7 @@ function createReplyCapabilityStore(options = {}) {
       inbound_inject_id: rec.inbound_inject_id,
       reply_prefix: rec.reply_prefix,
       not_after_ms: rec.not_after_ms,
+      deadline_mono_ms: rec.deadline_mono_ms,   // rc-fix7 GB2-06: the mint-time monotonic deadline, carried unchanged to every write check
       delivered_text: rec.reply_prefix + body
     };
   }

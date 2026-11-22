@@ -392,19 +392,20 @@ function createAllowSecurityContext(shared, {
     // Task 1292 rc-fix6 (SUPPORT-MATRIX.md P2) — a reply-capability frame carries reply_* fields (an ordinary frame has
     // none, and nothing below runs for it). Its body and its CR are written to the child only if, at the last synchronous
     // point before child.write: the frame's session epoch and owner generation are this bridge's current owner binding, its
-    // child_seq is the child this context spawned last and that child is current and alive, and the deadline holds — on
-    // the wall clock (reply_not_after_ms) and on this process's monotonic clock (reply_ttl_ms anchored at arrival). A body
-    // also needs REPLY_SUBMIT_HEADROOM_MS left, so its CR (sent by the daemon 500 ms after it, then held for the 250 ms
-    // submit gap) can follow inside the deadline. Otherwise the record is dropped with zero bytes and a refused/quarantined
-    // receipt names it; the daemon settles the capability on those receipts. Same value as the daemon's headroom.
+    // child_seq is the child this context spawned last and that child is current and alive, and the deadline holds. rc-fix7
+    // GB2-06: ONE absolute deadline (reply_not_after_ms, fixed at mint) and no relative TTL: it is compared with the wall
+    // clock now AND with the wall clock at frame receipt plus this process's monotonic time elapsed since — both must
+    // pass, so a wall-clock step after receipt can only shorten the window, never extend it. A body also needs
+    // REPLY_SUBMIT_HEADROOM_MS left, so its CR (sent by the daemon 500 ms after it, then held for the 250 ms submit gap)
+    // can follow inside the deadline. Otherwise the record is dropped with zero bytes and a refused receipt names it; the
+    // daemon settles the capability on those receipts. Same value as the daemon's headroom. rc-fix7 GB2-03: a reply
+    // record is never queued (enqueueBridgeMessage), so it is never persisted and no recovery path can replay it.
     const REPLY_SUBMIT_HEADROOM_MS = 1500;
-    const REPLY_FRAME_KEYS = ['reply_not_after_ms', 'reply_ttl_ms', 'reply_session_epoch', 'reply_child_seq'];
-    const replyRecords = new Map();   // bridge msg_id -> reply guard of a queued reply record (deleted when it leaves)
+    const REPLY_FRAME_KEYS = ['reply_not_after_ms', 'reply_session_epoch', 'reply_child_seq'];
     function replyGuardOf(msg) {
       if (!msg || typeof msg !== 'object' || !REPLY_FRAME_KEYS.some(key => Object.hasOwn(msg, key))) return null;
-      const ttl = msg.reply_ttl_ms;
       return { not_after_ms: msg.reply_not_after_ms, session_epoch: msg.reply_session_epoch, child_seq: msg.reply_child_seq,
-        owner_generation: msg.owner_generation, mono_deadline: Number.isSafeInteger(ttl) && ttl >= 0 ? monoNow() + ttl : NaN };
+        owner_generation: msg.owner_generation, received_wall: now(), received_mono: monoNow() };
     }
     function replyRefusal(reply, child, isCr) {
       const binding = shared.interactionBinding;
@@ -412,10 +413,10 @@ function createAllowSecurityContext(shared, {
         || typeof reply.owner_generation !== 'string' || reply.owner_generation !== binding.owner_generation
         || !Number.isSafeInteger(reply.child_seq) || reply.child_seq !== childSeq
         || !child || child !== shared.child || childExited(child)) return 'reply_instance_changed';
-      const headroom = isCr ? 0 : REPLY_SUBMIT_HEADROOM_MS;
-      if (!(Number.isSafeInteger(reply.not_after_ms) && now() + headroom <= reply.not_after_ms)
-        || !(monoNow() + headroom <= reply.mono_deadline)) return 'reply_deadline_passed';
-      return null;
+      const passed = headroom => !(Number.isSafeInteger(reply.not_after_ms) && now() + headroom <= reply.not_after_ms
+        && reply.received_wall + (monoNow() - reply.received_mono) + headroom <= reply.not_after_ms);
+      if (passed(0)) return 'reply_deadline_passed';
+      return !isCr && passed(REPLY_SUBMIT_HEADROOM_MS) ? 'reply_submit_headroom' : null;   // rc-fix7 GB2-10: its own reason
     }
     // A direct (never queued) reply frame refused before any byte. A body is remembered unwritten, so its CR is refused by
     // `pair`; a CR refused after its body was written strands that child's composer (Task 1270 R1).
@@ -492,7 +493,6 @@ function createAllowSecurityContext(shared, {
     function quarantine(msgId, reason, certainty, { inFlight = false, deliveryUncertain = false } = {}) {
       const record = bridgeRecords.get(msgId);
       const meta = record ? record.meta : {};
-      replyRecords.delete(msgId);   // Task 1292 rc-fix6: a record leaving the queue takes its reply guard with it
       let moved;
       try { moved = shared.bridgeMailbox.withdraw(shared.bridgeTarget, msgId, reason, { inFlight, deliveryUncertain, meta }); }
       catch { return null; }
@@ -1014,9 +1014,14 @@ function createAllowSecurityContext(shared, {
     function enqueueBridgeMessage(text, meta, guard = null) {
       if (isClosed() || shared.handoffPending) { if (guard) guard.state = 'not_written'; return; }
       const child = shared.child;
-      // Task 1292 rc-fix6: a reply body is never queued once it could not be written with its submit inside the deadline.
-      const replyEarly = meta && meta.reply && text !== '\r' ? replyRefusal(meta.reply, child, false) : null;
-      if (replyEarly) { adjacentQueuedBody = null; refusedIdlessBodyAt = null; dropReplyDirect(text, bridgeStage.frameMeta(meta), guard, replyEarly, child); return; }
+      // Task 1292 rc-fix6, rc-fix7 GB2-03: a reply record (body or CR) is never queued, so it is never persisted for
+      // recovery: dropped with zero bytes and reported (its own refusal reason first, else reply_not_queued). A dropped body's
+      // CR is then refused by `pair`; a dropped CR after its written body strands that composer.
+      if (meta && meta.reply) {
+        adjacentQueuedBody = null; refusedIdlessBodyAt = null;
+        dropReplyDirect(text, bridgeStage.frameMeta(meta), guard, replyRefusal(meta.reply, child, text === '\r') || 'reply_not_queued', child);
+        return;
+      }
       const msgId = `${shared.sessionId}:${now()}:${++shared.bridgeMsgSeq}`;
       const ids = bridgeStage.frameMeta(meta);
       try {
@@ -1042,7 +1047,6 @@ function createAllowSecurityContext(shared, {
       }
       rememberRecord(msgId, ids, text === '\r');
       if (guard) bridgeRecords.get(msgId).guard = guard;   // Task 1215 hotfix 0.10.1
-      if (meta && meta.reply) replyRecords.set(msgId, meta.reply);   // Task 1292 rc-fix6: re-checked at the flush write
       adjacentQueuedBody = text !== '\r' && !ids.daemon_msg_id ? msgId : null;
       refusedIdlessBodyAt = null;
       if (!canWrite(child)) return;
@@ -1184,22 +1188,6 @@ function createAllowSecurityContext(shared, {
           }
           invalidateBridgeInteraction('automated_input');
           if (!canWrite(child)) return false;
-          // Task 1292 rc-fix6: a queued reply record's instance + deadline, immediately before the flush write. A refused CR
-          // after its written body strands that composer; a refused body is quarantined unwritten (its CR then pair_unwritten).
-          const queuedReply = replyRecords.get(msgId);
-          const queuedReplyDrop = queuedReply ? replyRefusal(queuedReply, child, text === '\r') : null;
-          if (queuedReplyDrop) {
-            replyRecords.delete(msgId);
-            const replyRecordGuard = bridgeRecords.get(msgId)?.guard;
-            if (quarantine(msgId, queuedReplyDrop, 'not_written', { inFlight: true }) !== true) {   // still said, never written
-              if (text !== '\r') rememberUnwritten(meta.daemon_msg_id);
-              sendReceipt(msgId, meta, 'refused', 'not_written', queuedReplyDrop);
-            }
-            if (replyRecordGuard) replyRecordGuard.state = 'not_written';
-            if (text === '\r') strandComposer(child, meta.pair);
-            return false;
-          }
-          if (queuedReply) replyRecords.delete(msgId);
           const guard = bridgeRecords.get(msgId)?.guard || null;   // Task 1215 hotfix 0.10.1
           if (guard) guard.state = 'attempted';
           if (text !== '\r') lastBodyWrite = { child, atMs: now(), id: meta.daemon_msg_id || null };   // Task 1270

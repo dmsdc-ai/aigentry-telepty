@@ -131,7 +131,8 @@ function registerReplyCapabilityV1Route(app, { shared, verifyHostToken }) {
         injectId: null,
         pairInjectId: attempt.reply_inject_id,
         verifiedSenderSid: responder.sid,
-        notAfterMs: attempt.not_after_ms
+        notAfterMs: attempt.not_after_ms,
+        notAfterMonoMs: attempt.deadline_mono_ms   // rc-fix7 GB2-06: the one deadline fixed at mint, never re-anchored
       });
       settled = store.settle(id, delivery, {
         queued: delivery?.success === true && shared.deliveryAuditResult(delivery) === 'queued'

@@ -2,12 +2,13 @@
 
 // Task 1292 rc-fix6 — the reply-capability guard at the wrapped bridge's final write (SUPPORT-MATRIX.md P2).
 //
-// A reply-capability inject frame carries reply_not_after_ms, reply_ttl_ms, reply_session_epoch and reply_child_seq (an
-// ordinary frame carries none). At every point where the bridge writes such a body or its CR to the child — the direct
-// write, the busy-queue flush and the deferred (held) submit — the instance (session epoch + owner generation of the
-// current owner binding, the child_seq of the current live child) and the deadline (wall clock and the monotonic
-// remaining time, plus a 1500 ms submit headroom for a body) are checked immediately before child.write. A refusal
-// writes zero bytes for that record and says so on the existing receipt channel (refused / quarantined, not_written).
+// A reply-capability inject frame carries reply_not_after_ms, reply_session_epoch and reply_child_seq (an ordinary frame
+// carries none; rc-fix7 GB2-06 dropped the relative reply_ttl_ms). At every point where the bridge writes such a body or
+// its CR to the child — the direct write and the deferred (held) submit — the instance (session epoch + owner generation
+// of the current owner binding, the child_seq of the current live child) and the deadline (the wall clock, and the wall
+// clock at receipt plus the monotonic time elapsed since, plus a 1500 ms submit headroom for a body) are checked
+// immediately before child.write. rc-fix7 GB2-03: a reply record is never queued. A refusal writes zero bytes for that
+// record and says so on the existing receipt channel (refused, not_written).
 //
 // Expected to FAIL on the rc-fix5 snapshot (src/cli/security-actions.js ignores the reply_* fields and writes) through
 // actual effects (child.write calls), and to pass on the candidate. The two golden tests pass on both by design.
@@ -79,6 +80,7 @@ function childDouble(clock, name) {
 function createBridge(t, { sid, command = 'codex' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'telepty-1292-reply-'));
   const clock = createClock();
+  const skew = { wallBack: 0 };   // rc-fix7 GB2-06: the bridge's wall clock may step back; its monotonic clock never does
   const sends = [];
   const stdout = { columns: 80, rows: 24, isTTY: true, write() { return true; } };
   const children = [];
@@ -108,7 +110,7 @@ function createBridge(t, { sid, command = 'codex' } = {}) {
     allowSignalHandlers: new Map(), FileMailbox, path, os,
   };
   const allow = security.createAllowSecurityContext(shared, {
-    now: clock.now, monoNow: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+    now: () => clock.now() - skew.wallBack, monoNow: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
     setInterval: clock.setInterval, clearInterval: clock.clearInterval,
     getStdout: () => stdout, removeSignalHandler() {},
     spawnPty() { const next = childDouble(clock, `child-${children.length}`); children.push(next); return next; },
@@ -140,11 +142,9 @@ function createBridge(t, { sid, command = 'codex' } = {}) {
       pair: body.daemon_msg_id, owner_generation: OWNER_GENERATION };
     return { body, submit };
   }
-  // The reply_* fields exactly as the daemon builds them at send time (replyFrameFields): the remaining time is computed
-  // when the frame leaves, so call this right before frame().
+  // The reply_* fields exactly as the daemon builds them (replyFrameFields): the absolute deadline and the instance facts.
   function reply(notAfter, over = {}) {
-    return { reply_not_after_ms: notAfter, reply_ttl_ms: Math.max(0, notAfter - clock.now()), reply_session_epoch: EPOCH,
-      reply_child_seq: 1, ...over };
+    return { reply_not_after_ms: notAfter, reply_session_epoch: EPOCH, reply_child_seq: 1, ...over };
   }
   const receipts = () => sends.filter(m => m.type === 'bridge_receipt');
   const stages = id => receipts().filter(r => r.daemon_msg_id === id).map(r => [r.stage, r.certainty, r.reason ?? null]);
@@ -152,7 +152,7 @@ function createBridge(t, { sid, command = 'codex' } = {}) {
     try { allow.closeAllowSession({ destroySession: false }); } catch {}
     fs.rmSync(root, { recursive: true, force: true });
   });
-  return { shared, allow, clock, child, children, spawn, sends, frame, pair, reply, receipts, stages };
+  return { shared, allow, clock, skew, child, children, spawn, sends, frame, pair, reply, receipts, stages };
 }
 
 const NOT_WRITTEN = reason => ['refused', 'not_written', reason];
@@ -174,7 +174,8 @@ test('rc-fix6 control: an in-time reply on a quiet surface — body written dire
 
 // ── the immediate (direct) write ─────────────────────────────────────────────────────────────────────────────────
 test('rc-fix6 direct write: a reply body without its submit headroom (or past its deadline) is dropped — zero bytes, drop reported', { timeout: 30000 }, async t => {
-  for (const [label, offset] of [['inside the 1500 ms headroom', 1000], ['already past not_after', -1]]) {
+  for (const [label, offset, reason] of [['inside the 1500 ms headroom', 1000, 'reply_submit_headroom'],   // rc-fix7 GB2-10: own reason
+    ['already past not_after', -1, 'reply_deadline_passed']]) {
     const b = createBridge(t, { sid: `b1292-direct-${offset < 0 ? 'past' : 'headroom'}` });
     const p = b.pair('R-DIRECT');
     const notAfter = b.clock.now() + offset;
@@ -183,25 +184,28 @@ test('rc-fix6 direct write: a reply body without its submit headroom (or past it
     b.frame({ ...p.submit, ...b.reply(notAfter) });
     await b.clock.advance(2000);
     assert.equal(b.child.attempts, 0, `${label}: child.write was never called`);
-    assert.deepEqual(b.stages(p.body.daemon_msg_id), [NOT_WRITTEN('reply_deadline_passed')], label);
+    assert.deepEqual(b.stages(p.body.daemon_msg_id), [NOT_WRITTEN(reason)], label);
     assert.deepEqual(b.stages(p.submit.daemon_msg_id), [NOT_WRITTEN('pair_unwritten')], `${label}: its CR is never written alone`);
   }
 });
 
-// ── the busy-queue flush ─────────────────────────────────────────────────────────────────────────────────────────
-test('rc-fix6 queue flush: a reply body queued behind local typing whose deadline passes before the flush is quarantined unwritten', { timeout: 30000 }, async t => {
-  const b = createBridge(t, { sid: 'b1292-flush' });
-  const p = b.pair('R-FLUSH');
-  const notAfter = b.clock.now() + 3000;   // admissible at enqueue (now + 1500 <= not_after), not at the flush (>= now + 2500)
-  b.shared.lastUserInputTime = b.clock.now();   // the human is typing: the body cannot be written now and is queued
+// ── rc-fix7 GB2-03: a reply record is never queued, never persisted ─────────────────────────────────────────────
+// Fails on the snapshot, which queued the body in the bridge's FileMailbox (a row a later recovery path could replay).
+test('GB2-03 a reply body that would have to queue behind local typing is refused, never queued or persisted', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1292-noqueue' });
+  const p = b.pair('R-NOQUEUE');
+  const notAfter = b.clock.now() + 60000;
+  b.shared.lastUserInputTime = b.clock.now();   // the human is typing: a direct write is not permitted now
   b.frame({ ...p.body, ...b.reply(notAfter) });
   await b.clock.advance(5);
   b.frame({ ...p.submit, ...b.reply(notAfter) });
-  assert.deepEqual(b.stages(p.body.daemon_msg_id), [['queued', 'not_written', null]], 'CHECKPOINT: the body was queued');
-  await b.clock.advance(6000);   // the typing window closes; the idle tick flushes the queue
+  assert.deepEqual(b.stages(p.body.daemon_msg_id), [NOT_WRITTEN('reply_not_queued')], 'refused, never queued');
+  const rows = b.shared.bridgeMailbox.peek(b.shared.bridgeTarget).filter(m => m.state === 'pending' || m.state === 'in_flight');
+  assert.deepEqual(rows, [], 'no row of this reply exists for any recovery path');
+  assert.equal(b.shared.bridgePendingCount, 0);
+  await b.clock.advance(6000);
   assert.equal(b.child.attempts, 0, 'neither the body nor its CR reached the child');
-  assert.deepEqual(b.stages(p.body.daemon_msg_id), [['queued', 'not_written', null], ['quarantined', 'not_written', 'reply_deadline_passed']]);
-  assert.deepEqual(b.stages(p.submit.daemon_msg_id).at(-1), ['quarantined', 'not_written', 'pair_unwritten']);
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [NOT_WRITTEN('pair_unwritten')], 'its CR is never written alone');
 });
 
 test('rc-fix6 enqueue: a reply body that would have to queue without its submit headroom is dropped instead of queued', { timeout: 30000 }, async t => {
@@ -209,7 +213,7 @@ test('rc-fix6 enqueue: a reply body that would have to queue without its submit 
   const p = b.pair('R-ENQUEUE');
   b.shared.lastUserInputTime = b.clock.now();
   b.frame({ ...p.body, ...b.reply(b.clock.now() + 1000) });
-  assert.deepEqual(b.stages(p.body.daemon_msg_id), [NOT_WRITTEN('reply_deadline_passed')], 'refused, never queued');
+  assert.deepEqual(b.stages(p.body.daemon_msg_id), [NOT_WRITTEN('reply_submit_headroom')], 'refused, never queued');   // rc-fix7 GB2-10
   assert.equal(b.shared.bridgePendingCount, 0);
   await b.clock.advance(6000);
   assert.equal(b.child.attempts, 0);
@@ -244,7 +248,7 @@ test('rc-fix6 deferred submit: the held CR wakes after not_after (event-loop sta
 // ── instance ─────────────────────────────────────────────────────────────────────────────────────────────────────
 test('rc-fix6 instance: a reply for another session epoch or another child is dropped at the direct write — zero bytes', { timeout: 30000 }, async t => {
   for (const [label, over] of [['other session epoch', { reply_session_epoch: 'epoch-other' }], ['other child', { reply_child_seq: 2 }],
-    ['malformed child', { reply_child_seq: '1' }]]) {
+    ['malformed child', { reply_child_seq: '1' }], ['other owner generation', { owner_generation: 'owner-gen-1292-next' }]]) {
     const b = createBridge(t, { sid: `b1292-inst-${label.replace(/\W+/g, '-')}` });
     const p = b.pair('R-INSTANCE');
     const notAfter = b.clock.now() + 60000;
@@ -257,18 +261,22 @@ test('rc-fix6 instance: a reply for another session epoch or another child is dr
   }
 });
 
-test('rc-fix6 instance: the owner generation changes while the reply body is queued — quarantined at the flush, zero bytes', { timeout: 30000 }, async t => {
-  const b = createBridge(t, { sid: 'b1292-owner' });
-  const p = b.pair('R-OWNER');
-  const notAfter = b.clock.now() + 60000;
-  b.shared.lastUserInputTime = b.clock.now();
+// rc-fix7 GB2-06: one absolute deadline, compared at the write with the wall clock now AND with the wall clock at receipt
+// plus the monotonic time elapsed since — a wall clock that steps back after the frame arrived cannot extend the window.
+test('GB2-06 the wall clock steps back after the CR frame arrived: the held CR is still refused at not_after (elapsed since receipt)', { timeout: 30000 }, async t => {
+  const b = createBridge(t, { sid: 'b1292-wallback' });
+  const p = b.pair('R-WALLBACK');
+  const notAfter = b.clock.now() + 1600;
   b.frame({ ...p.body, ...b.reply(notAfter) });
+  assert.deepEqual(b.child.writes, ['R-WALLBACK'], 'CHECKPOINT: body written in time');
   await b.clock.advance(5);
   b.frame({ ...p.submit, ...b.reply(notAfter) });
-  b.shared.interactionBinding = { ...b.shared.interactionBinding, owner_generation: 'owner-gen-1292-next' };   // re-claimed owner
-  await b.clock.advance(6000);
-  assert.equal(b.child.attempts, 0, 'never written into a child under a different owner claim');
-  assert.deepEqual(b.stages(p.body.daemon_msg_id).at(-1), ['quarantined', 'not_written', 'reply_instance_changed']);
+  assert.deepEqual(b.child.writes, ['R-WALLBACK'], 'CHECKPOINT: the CR is held for its submit gap');
+  b.skew.wallBack = 5000;   // the wall clock steps back 5 s; by the wall clock alone the CR would still be in time
+  b.clock.stall(2000);
+  await b.clock.advance(20000);
+  assert.deepEqual(b.child.writes, ['R-WALLBACK'], 'zero bytes of the CR after not_after');
+  assert.deepEqual(b.stages(p.submit.daemon_msg_id), [NOT_WRITTEN('reply_deadline_passed')]);
 });
 
 // ── golden: the ordinary inject is unchanged ─────────────────────────────────────────────────────────────────────

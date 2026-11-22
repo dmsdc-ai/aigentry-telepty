@@ -50,17 +50,16 @@ const STDERR = Object.freeze({
 });
 const RETRY_SAME_HINT = 'reply-v1: no usable response from the local daemon. Running the SAME command again is safe; do not change the body.\n';
 const DO_NOT_RESEND_HINT = 'reply-v1: the reply outcome is unknown; do not resend. Check the requester\'s audit.\n';
-const UNRECOGNIZED_REFUSAL_HINT = 'reply-v1: the daemon refused the request before its reply-capability route ran (wrong host credential, refused peer, or a daemon without reply-capability-v1). Nothing was written.\n';
+const UNRECOGNIZED_REFUSAL_HINT = 'reply-v1: the daemon refused the request before its reply-capability route ran (wrong host credential or refused peer). Nothing was written.\n';
 // GB-05: the only answers without the closed result that are exit 2. Each is produced by the stock daemon BEFORE the
-// consume route runs (src/protocol/http-auth.js:153-158,195,207,220,242), or by Express when no such route exists, so no
-// delivery can have started. Exact key set and exact code; anything else in 4xx is exit 3 (outcome unknown).
+// consume route runs (src/protocol/http-auth.js:153-158,195,207,242), so no delivery can have started. Exact key set,
+// exact text and exact code; anything else in 4xx is exit 3 (outcome unknown). rc-fix7 GB2-11: the not-found page and
+// the strict-principal refusal (any code) are no longer recognized — neither is distinguishable from a lookalike.
 const PRE_ROUTE_REFUSALS = Object.freeze([
   { status: 403, error: 'Forbidden: browser origin not allowed.', code: 'ORIGIN_NOT_ALLOWED' },
   { status: 403, error: 'Forbidden: this address is not in TELEPTY_PEER_ALLOWLIST.', code: 'PEER_NOT_ALLOWED' },
   { status: 401, error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED' },
 ]);
-const STRICT_PRINCIPAL_REFUSAL = 'Principal request refused';
-const ROUTE_NOT_FOUND_TEXT = '<pre>Cannot POST /api/reply-capability-v1</pre>';
 
 const RESULT_KEYS = Object.freeze(['schema', 'stage', 'outcome', 'reason', 'capability_id', 'reply_inject_id',
   'destination_session_id', 'replayed', 'retryable']);
@@ -234,14 +233,11 @@ function stageAgreesWithStatus(stage, status) {
   return Number.isInteger(status) && status >= 400 && status <= 599;
 }
 
-// GB-05: the positively identified pre-route answers (PRE_ROUTE_REFUSALS, the strict-principal refusal, and Express's
-// not-found page naming exactly this route, which an older daemon without the route returns).
-function preRouteRefusal(status, doc, bytes) {
-  if (status === 404) return Buffer.from(bytes).toString('utf8').includes(ROUTE_NOT_FOUND_TEXT);
+// GB-05: the positively identified pre-route answers (PRE_ROUTE_REFUSALS only; rc-fix7 GB2-11).
+function preRouteRefusal(status, doc) {
   if (!isPlainObject(doc)) return false;
   const keys = Object.keys(doc).sort();
   if (keys.length !== 2 || keys[0] !== 'code' || keys[1] !== 'error' || typeof doc.code !== 'string') return false;
-  if (doc.error === STRICT_PRINCIPAL_REFUSAL) return status === 401 || status === 403;
   return PRE_ROUTE_REFUSALS.some(known => known.status === status && known.error === doc.error && known.code === doc.code);
 }
 
@@ -259,7 +255,7 @@ function classifyReplyResponse(status, bytes) {
   }
   // GB-05: exit 2 only for an answer the stock daemon provably gives before the consume route runs; every other 4xx
   // may come from a path after delivery started (an intermediary, a thrown error carrying a 4xx status) → exit 3.
-  if (preRouteRefusal(status, json ? doc : undefined, bytes)) {
+  if (preRouteRefusal(status, json ? doc : undefined)) {
     return { exit: EXIT.refused, line: localResult('refused', LOCAL.RESPONSE_UNRECOGNIZED, status), hint: UNRECOGNIZED_REFUSAL_HINT };
   }
   if (Number.isInteger(status) && status >= 400 && status <= 499) {

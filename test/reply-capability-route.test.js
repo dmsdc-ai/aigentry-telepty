@@ -449,8 +449,10 @@ test('U11 delivery audit and bus correlate the bound sender and never expose the
     assert.equal(prompt === PREFIX + body, true);
     assert.deepEqual(options, {
       from: R, source: rc.CAPABILITY, injectId: null, pairInjectId: answer.result.reply_inject_id,
-      verifiedSenderSid: R, notAfterMs: cap.not_after_ms
+      verifiedSenderSid: R, notAfterMs: cap.not_after_ms,
+      notAfterMonoMs: h.store.get(cap.id).deadline_mono_ms   // rc-fix7 GB2-06: the mint-time monotonic deadline, unchanged
     });
+    assert.equal(Number.isFinite(options.notAfterMonoMs), true, 'rc-fix7 GB2-06: the route forwards the store\'s monotonic deadline');
     assert.equal(h.audits.length, 1);
     const row = h.audits[0];
     const line = JSON.parse(buildAuditLine({ ...row, preview: row.preview ?? true }));

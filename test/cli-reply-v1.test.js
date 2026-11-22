@@ -230,7 +230,8 @@ test('U17 exit codes: every closed answer maps by stage and is printed verbatim'
 test('U17 exit codes: answers without the closed object, and status/stage mismatches (HOLD-1 Q2)', async () => {
   const t = makeToken();
   const rows = [
-    { status: 404, body: '<!DOCTYPE html><pre>Cannot POST /api/reply-capability-v1</pre>', exit: 2, stage: 'refused' },
+    // rc-fix7 GB2-11: a not-found page cannot be told from an intermediary's lookalike → outcome unknown (was exit 2).
+    { status: 404, body: '<!DOCTYPE html><pre>Cannot POST /api/reply-capability-v1</pre>', exit: 3, stage: 'outcome_unknown' },
     // GB-05: an unstructured 4xx that is not a positively identified pre-route answer may follow a delivery → exit 3.
     { status: 401, body: { error: 'credential required' }, exit: 3, stage: 'outcome_unknown' },
     { status: 403, body: { error: 'origin denied' }, exit: 3, stage: 'outcome_unknown' },
@@ -264,8 +265,12 @@ test('GB-05 an unstructured 4xx is exit 3 (outcome unknown) unless it is a posit
     { status: 403, body: { error: 'Forbidden: browser origin not allowed.', code: 'ORIGIN_NOT_ALLOWED' }, exit: 2 },
     { status: 403, body: { error: 'Forbidden: this address is not in TELEPTY_PEER_ALLOWLIST.', code: 'PEER_NOT_ALLOWED' }, exit: 2 },
     { status: 401, body: { error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED' }, exit: 2 },
-    { status: 401, body: { error: 'Principal request refused', code: 'PRINCIPAL_PROOF_INVALID' }, exit: 2 },
-    { status: 404, body: '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<title>Error</title>\n</head>\n<body>\n<pre>Cannot POST /api/reply-capability-v1</pre>\n</body>\n</html>\n', exit: 2 },
+    // rc-fix7 GB2-11: the strict-principal refusal (any code) and Express's not-found page are no longer recognized: a
+    // lookalike from an intermediary after forwarding is indistinguishable → exit 3 (both rows were exit 2).
+    { status: 401, body: { error: 'Principal request refused', code: 'PRINCIPAL_PROOF_INVALID' }, exit: 3 },
+    { status: 403, body: { error: 'Principal request refused', code: 'ANY_STRING' }, exit: 3 },
+    { status: 404, body: '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<title>Error</title>\n</head>\n<body>\n<pre>Cannot POST /api/reply-capability-v1</pre>\n</body>\n</html>\n', exit: 3 },
+    { status: 404, body: '<html><body>proxy error page<pre>Cannot POST /api/reply-capability-v1</pre></body></html>', exit: 3 },
     // Same status, any other shape: not provably before the route.
     { status: 401, body: { error: 'Unauthorized: Invalid or missing token.', code: 'PERMISSION_DENIED', extra: 1 }, exit: 3 },
     { status: 403, body: { error: 'Forbidden: browser origin not allowed.', code: 'PEER_NOT_ALLOWED' }, exit: 3 },
