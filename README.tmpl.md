@@ -279,12 +279,15 @@ readiness-aware inject/submit, event streams, cross-machine session control.
 | `TELEPTY_CLIENT_RESTART` | `auto`, `off` | `auto` | Whether a `telepty` command may stop, start or kickstart the local daemon when it finds it missing or outdated. Also settable as `"clientRestart"` in `~/.telepty/config.json`; the env var wins. |
 
 `TELEPTY_CLIENT_RESTART=off` is for hosts where launchd/systemd supervises the daemon and many
-sessions share it: no client ever stops, spawns or kickstarts the daemon, and a command that cannot
+sessions share it: no `telepty` command stops, spawns or kickstarts the daemon on its own, and a
+command that cannot
 reach it fails at once with the command to run instead (`launchctl kickstart -k
 gui/<uid>/com.aigentry.telepty`, `systemctl --user restart telepty`, or `telepty daemon start`).
 Under the default `auto`, a daemon owned by launchd/systemd/schtasks is already left to its
 supervisor on every verdict (missing, slow or outdated); `off` applies the same refusal on hosts
-with no supervisor.
+with no supervisor. The switch does not gate the install hook that a direct global npm install, or
+`telepty update` on Linux and macOS, runs (it can stop an older recorded daemon and start a
+replacement), nor explicit commands such as `telepty daemon stop|restart`.
 
 `TELEPTY_SUBMIT_FORCE_DEFAULT=1` is for orchestrators and automation that
 already know their targets are real, initialized REPLs. It avoids the transient
@@ -365,6 +368,25 @@ To target a specific host — the same session ID existing on several hosts, or 
 have not registered as a peer — append `@<host>` to the session ID. `<host>` can be a
 hostname, LAN IP, or Tailnet name. This needs no `connect`/`connect-http` first: the target
 is resolved directly, which is why the relay demo above works between fresh machines.
+
+The same ID on several machines (every machine runs `orchestrator`): since 0.11.4,
+`telepty session info <id>` reads the local session, asking no peer, when `TELEPTY_HOST` is unset
+or exactly `127.0.0.1`, `<id>` is bare (no `@`, or its last `@` is its first or last character) and
+it equals, byte for byte, an ID in the local list 0.11.3 already reads first. Otherwise, and on
+every other command (`multicast` included), a bare ID resolves as in 0.11.3. So does a qualified
+`<id>@<host>` on every command. On a command that resolves it through the shared session resolver
+(for example `session info`, `read-screen`, `inject`, `kill`), a registered peer whose name,
+machine id, host, `host:port`,
+target or DNS name equals `<host>` is used if it was registered with `connect` (SSH) or
+`connect-http` (HTTP) (two matching peers of any transport are refused as ambiguous; a single
+matching `connect-broker` peer is not routed by alias and counts as no match); only if none
+matches does a loopback `<host>` (`127.0.0.1`, `localhost`, `::1`) go to this machine's loopback on
+the CLI's port, with `TELEPTY_AUTH_TOKEN`, else a token stored for that address, else the local
+token, and any other `<host>` is refused as an unregistered peer unless `TELEPTY_AUTH_TOKEN` is set.
+`readiness` and `wait-ready` do not use that resolver: they send their request straight to `<host>`
+and match no alias. Name a remote copy `<id>@<peer>`. With `--json`, `session info` and `read-screen` print the
+multiple-hosts, unregistered-peer and ambiguous-peer refusals as JSON on stdout, keep the `❌` line
+on stderr, and exit 1.
 
 ```bash
 # Hostname / Tailnet name

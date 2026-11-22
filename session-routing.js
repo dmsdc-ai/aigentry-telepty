@@ -31,7 +31,9 @@ function resolveRegisteredPeerTarget(sessionRef, peers = {}) {
       peer.dnsName, peer.magicDnsName].some((alias) => typeof alias === 'string' && alias === parsed.host);
   });
   if (matches.length > 1) {
-    throw new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(([name]) => name).sort().join(', ')}. Use a registered address:port.`);
+    // #1288 (D3): the code lets a --json caller print this refusal as a document; the text is unchanged.
+    throw Object.assign(new Error(`Peer '${parsed.host}' is ambiguous: ${matches.map(([name]) => name).sort().join(', ')}. Use a registered address:port.`),
+      { code: 'AMBIGUOUS_PEER' });
   }
   if (matches.length === 0) return null;
   const [name, peer] = matches[0];
@@ -105,7 +107,9 @@ function pickSessionTarget(sessionRef, sessions, defaultHost = '127.0.0.1') {
   }
 
   const hosts = matches.map((session) => session.host).sort().join(', ');
-  throw new Error(`Session '${parsed.id}' exists on multiple hosts: ${hosts}. Use <session_id>@<host> or set TELEPTY_HOST.`);
+  // #1288 (D3): the code lets a --json caller print this refusal as a document; the text is unchanged.
+  throw Object.assign(new Error(`Session '${parsed.id}' exists on multiple hosts: ${hosts}. Use <session_id>@<host> or set TELEPTY_HOST.`),
+    { code: 'AMBIGUOUS_SESSION' });
 }
 
 module.exports = {

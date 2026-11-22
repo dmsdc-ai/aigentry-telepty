@@ -1263,6 +1263,10 @@ async function discoverSessions(options = {}) {
     }
   }
 
+  // #1288 (D1, `session info` only): the caller may stop on this one local read, before any peer
+  // is asked. The read and its failure handling above are 0.11.3's; otherwise everything below runs.
+  if (options.exactLocal && options.exactLocal(allSessions)) return allSessions;
+
   // Remote peer sessions via SSH direct
   const remoteSessions = crossMachine.discoverAllRemoteSessions();
   allSessions.push(...remoteSessions.sessions);
@@ -1349,6 +1353,18 @@ async function resolveLocalSessionTarget(sessionRef) {
   return pickSessionTarget(parsed.id, sessions.map((s) => ({ host: '127.0.0.1', ...s })), '127.0.0.1');
 }
 
+// #1288 (D3): under --json, the three routing refusals (cross-host ambiguity, unregistered peer,
+// ambiguous peer identity) are a JSON document on stdout with exit 1; stderr keeps the same human
+// line text mode prints. Every other failure keeps its 0.11.3 output.
+const ROUTING_REFUSAL_CODES = new Set(['AMBIGUOUS_SESSION', 'PEER_NOT_REGISTERED', 'AMBIGUOUS_PEER']);
+function printRoutingRefusalJson(error, json) {
+  if (!json || !error || !ROUTING_REFUSAL_CODES.has(error.code)) return false;
+  console.log(JSON.stringify({ success: false, code: error.code, error: error.message }));
+  console.error(`❌ ${error.message}`);
+  process.exitCode = 1;
+  return true;
+}
+
 async function resolveSessionTarget(sessionRef, options = {}) {
   // Qualified registered identities retain the peer's endpoint and credential lane,
   // even when discovery cannot list the session. Never shorten the requested id.
@@ -1365,7 +1381,8 @@ async function resolveSessionTarget(sessionRef, options = {}) {
   if (qualified.host && !isLocalHostname(qualified.host) && !process.env.TELEPTY_AUTH_TOKEN) {
     markCommandFailed();
     const known = Object.entries(registeredPeers).map(([name, peer]) => (peer && peer.machineId) || name).sort();
-    throw new Error(`No peer registered with machine id or address '${qualified.host}'; known: ${known.join(', ') || '(none)'}. Use telepty connect-http or telepty connect to register it.`);
+    throw Object.assign(new Error(`No peer registered with machine id or address '${qualified.host}'; known: ${known.join(', ') || '(none)'}. Use telepty connect-http or telepty connect to register it.`),
+      { code: 'PEER_NOT_REGISTERED' });
   }
   if (!options.sessions) {
     // #837: a hit here means no peer was consulted. A caller that already did its own discovery
@@ -4152,7 +4169,10 @@ async function main() {
       await require('./src/cli/read-screen').readScreen(args, {
         resolveTarget: resolveSessionTarget, daemonUrl, fetchWithAuth
       });
-    } catch (e) { console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); process.exitCode = 1; }
+    } catch (e) {
+      if (printRoutingRefusalJson(e, args.includes('--json'))) return;
+      console.error(`❌ ${e.message || 'Failed to connect to the target daemon.'}`); process.exitCode = 1;
+    }
     return;
   }
 
@@ -5123,7 +5143,11 @@ async function main() {
     }
 
     try {
-      const sessions = await discoverSessions({ silent: true });
+      // #1288 (D1): TELEPTY_HOST unset or exactly 127.0.0.1, and a bare id (the parser leaves it whole)
+      // equal to an id in discovery's own local read: discovery stops there and no peer is asked.
+      const exactLocal = [undefined, '127.0.0.1'].includes(process.env.TELEPTY_HOST) && parseSessionReference(sessionRef).id === sessionRef
+        ? (local) => local.some((s) => s.id === sessionRef) : undefined;
+      const sessions = await discoverSessions({ silent: true, exactLocal });
       const target = await resolveSessionTarget(sessionRef, { sessions });
       if (!target) {
         console.error(`❌ Session '${sessionRef}' was not found on any discovered host.`);
@@ -5160,6 +5184,7 @@ async function main() {
 
       printSessionInfo(data, { host: target.host });
     } catch (e) {
+      if (printRoutingRefusalJson(e, args.includes('--json'))) return;
       console.error(`❌ ${e.message || 'Failed to fetch session info.'}`);
     }
     return;

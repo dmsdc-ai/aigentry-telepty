@@ -157,6 +157,19 @@ literals and nothing else. That is a deliberate false positive. The predicate is
 the address, and widening it to "any address this host happens to answer on" would make the boundary
 depend on interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the escape hatch.
 This is a named limitation, not a solved problem.
+To name the session on this machine when a peer runs the same id, use the bare `<sid>` with
+`session info` (0.11.4: local, asking no peer, when it equals byte for byte an id in the local list
+0.11.3 already reads first and `TELEPTY_HOST` is unset or exactly `127.0.0.1`). Other commands, and
+every qualified `<sid>@<host>`, resolve as in 0.11.3. On a command that resolves the reference
+through the shared session resolver (for example `session info`, `read-screen`, `inject`, `kill`),
+an exactly matching alias of a peer registered
+with `connect` (SSH) or `connect-http` (HTTP) wins (two matching peers of any transport are refused
+as ambiguous; a single matching `connect-broker` peer is not routed by alias and counts as no
+match), so `<sid>@127.0.0.1` is not a local route when a peer has that alias. `readiness` and
+`wait-ready` do not use that resolver: they send their request straight to `<host>` and match no
+alias. Under `--json`,
+`session info` and `read-screen` print the multiple-hosts, unregistered-peer and ambiguous-peer
+refusals as JSON on stdout, with the same line on stderr, and exit 1.
 
 ### `TELEPTY_AUTH_TOKEN` must be set at every end, or at none
 
