@@ -113,14 +113,16 @@ function writePeers(peers) {
 
 // A peer daemon stand-in: lists `ids`, answers `/api/sessions/<id>` and a multicast for them, counts
 // every request and records its method, path, Host header and token. `host` is the literal address
-// it listens on; a failed listen rejects (S2's IPv6 stand-in uses this to skip without `::1`).
-// `failList` answers the session list with a 500 and everything else normally (a failed D1 probe).
-async function fakePeer(ids, { refuse = false, host = '127.0.0.1', failList = false } = {}) {
+// it listens on; a failed listen rejects (an IPv6 stand-in uses this to skip without `::1`).
+// `alsoOn` also listens on that second literal address with the same port and the same records;
+// each request records which of the two it arrived on (`at`: `v4` or `v6`).
+async function fakePeer(ids, { refuse = false, host = '127.0.0.1', alsoOn = null } = {}) {
   const state = { hits: 0, requests: [] };
-  const server = http.createServer((req, res) => {
+  const handle = (req, res) => {
     state.hits += 1;
     const pathname = new URL(req.url, 'http://fake-peer').pathname;
-    state.requests.push({ method: req.method, path: pathname, host: req.headers.host, token: req.headers['x-telepty-token'] });
+    state.requests.push({ method: req.method, path: pathname, host: req.headers.host, token: req.headers['x-telepty-token'],
+      at: req.socket.localFamily === 'IPv6' ? 'v6' : 'v4' });
     res.setHeader('content-type', 'application/json');
     if (refuse) { res.statusCode = 401; res.end(JSON.stringify({ error: 'fake peer refuses' })); return; }
     if (req.method === 'POST' && pathname === '/api/sessions/multicast/inject') {
@@ -134,7 +136,6 @@ async function fakePeer(ids, { refuse = false, host = '127.0.0.1', failList = fa
       return;
     }
     if (pathname === '/api/sessions') {
-      if (failList) { res.statusCode = 500; res.end(JSON.stringify({ error: 'fake list failure' })); return; }
       res.end(JSON.stringify(ids.map((id) => ({ id, command: 'fake-peer', cwd: '/', active_clients: 0 }))));
       return;
     }
@@ -145,11 +146,15 @@ async function fakePeer(ids, { refuse = false, host = '127.0.0.1', failList = fa
     }
     res.statusCode = 404;
     res.end(JSON.stringify({ error: 'not on the fake peer' }));
-  });
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, host, resolve); });
-  state.port = server.address().port;
-  state.close = () => new Promise((resolve) => server.close(() => resolve()));
-  servers.push(state);
+  };
+  const listen = async (address, port) => {
+    const server = http.createServer(handle);
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, address, resolve); });
+    servers.push({ close: () => new Promise((resolve) => server.close(() => resolve())) });
+    return server.address().port;
+  };
+  state.port = await listen(host, 0);
+  if (alsoOn) await listen(alsoOn, state.port);
   return state;
 }
 
@@ -166,6 +171,39 @@ async function closedPort() {
   const { port } = server.address();
   await new Promise((resolve) => server.close(resolve));
   return port;
+}
+
+// A transparent recorder in front of the real local daemon, on 127.0.0.1 only. A CLI run with
+// TELEPTY_PORT set to its port uses it as the local daemon, so every local request is recorded
+// (method, path, body). `failList` answers `GET /api/sessions` itself with a 500, a failed local
+// read; everything else (the version probe, session reads, deliveries) reaches the real daemon.
+async function localRecorder({ failList = false } = {}) {
+  const state = { requests: [] };
+  const server = http.createServer((req, res) => {
+    const entry = { method: req.method, path: new URL(req.url, 'http://local-recorder').pathname, body: '' };
+    state.requests.push(entry);
+    req.on('data', (chunk) => { entry.body += chunk; });
+    if (failList && req.method === 'GET' && entry.path === '/api/sessions') {
+      res.statusCode = 500;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ error: 'recorder list failure' }));
+      return;
+    }
+    const upstream = http.request({ host: '127.0.0.1', port: daemon.port, method: req.method, path: req.url,
+      headers: { ...req.headers, connection: 'close' }, agent: false }, (answer) => {
+      res.writeHead(answer.statusCode, answer.headers);
+      answer.pipe(res);
+    });
+    upstream.on('error', () => { if (!res.headersSent) res.statusCode = 502; res.end(); });
+    req.pipe(upstream);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  state.port = server.address().port;
+  servers.push({ close: () => new Promise((resolve) => server.close(() => resolve())) });
+  // The session routes only: the version probe before them is 0.11.3's ensureDaemonRunning.
+  state.sessionRequests = () => state.requests.filter(({ path: p }) => p.startsWith('/api/sessions'))
+    .map(({ method, path: p }) => `${method} ${p}`);
+  return state;
 }
 
 async function cli(args, env = {}) {
@@ -187,28 +225,43 @@ test('#1288 D1/FACT A+B: an id on the local daemon resolves locally and no peer 
   const msid = createSessionId('tp1288-d1-spawned');
   const spawned = await daemon.spawnSession(msid);
   assert.equal(spawned.status, 201, `spawn failed: ${JSON.stringify(spawned.body)}`);
+  // A competing registered peer runs both ids too (FACT A).
   const peer = await fakePeer([sid, msid]);
   writePeers({ 'peer-a': peerEntry(peer) });
 
-  const info = await cli(['session', 'info', sid, '--json']);
-  assert.equal(info.code, 0, info.stderr);
-  const doc = JSON.parse(info.stdout);
-  assert.equal(doc.host, '127.0.0.1');
-  assert.equal(doc.id, sid);
-  assert.equal(peer.hits, 0, 'a peer was consulted for an id the local daemon has');
+  // R4-5: TELEPTY_HOST unset (`undefined` drops it from the CLI's environment) and exactly
+  // 127.0.0.1 (FACT B). The recorder shows the local requests: the one 0.11.3 list read, then the
+  // session read or the delivery, and nothing else.
+  for (const hostSetting of [undefined, '127.0.0.1']) {
+    const label = `TELEPTY_HOST=${hostSetting === undefined ? '(unset)' : hostSetting}`;
+    const local = await localRecorder();
+    const env = { TELEPTY_HOST: hostSetting, TELEPTY_PORT: String(local.port) };
 
-  const text = await cli(['session', 'info', sid]);
-  assert.equal(text.code, 0, text.stderr);
-  assert.doesNotMatch(text.stderr, /multiple hosts/);
-  // V4: the text block is the local session's, and nothing else is printed.
-  assert.equal(text.stderr, '');
-  assert.ok(text.stdout.startsWith(`\x1b[1mSession Info:\x1b[0m\n  - ID: \x1b[36m${sid}\x1b[0m\n    Host: Local\n`), text.stdout);
-  assert.equal(peer.hits, 0);
+    const info = await cli(['session', 'info', sid, '--json'], env);
+    assert.equal(info.code, 0, `${label}: ${info.stderr}`);
+    const doc = JSON.parse(info.stdout);
+    assert.equal(doc.host, '127.0.0.1');
+    assert.equal(doc.id, sid);
+    assert.equal(peer.hits, 0, `${label}: a peer was consulted for an id the local daemon has`);
 
-  const multicast = await cli(['multicast', msid, 'tp1288 exact probe']);
-  assert.deepEqual({ code: multicast.code, stdout: multicast.stdout, stderr: multicast.stderr },
-    { code: 0, stdout: '✅ Context multicasted successfully to 1 session(s).\n', stderr: '' });
-  assert.equal(peer.hits, 0, 'multicast consulted a peer for an id the local daemon has');
+    const text = await cli(['session', 'info', sid], env);
+    assert.equal(text.code, 0, text.stderr);
+    assert.doesNotMatch(text.stderr, /multiple hosts/);
+    // V4: the text block is the local session's, and nothing else is printed.
+    assert.equal(text.stderr, '');
+    assert.ok(text.stdout.startsWith(`\x1b[1mSession Info:\x1b[0m\n  - ID: \x1b[36m${sid}\x1b[0m\n    Host: Local\n`), text.stdout);
+    assert.equal(peer.hits, 0);
+
+    const multicast = await cli(['multicast', msid, 'tp1288 exact probe'], env);
+    assert.deepEqual({ code: multicast.code, stdout: multicast.stdout, stderr: multicast.stderr },
+      { code: 0, stdout: '✅ Context multicasted successfully to 1 session(s).\n', stderr: '' }, label);
+    assert.equal(peer.hits, 0, `${label}: multicast consulted a peer for an id the local daemon has`);
+
+    assert.deepEqual(local.sessionRequests(), ['GET /api/sessions', `GET /api/sessions/${sid}`,
+      'GET /api/sessions', `GET /api/sessions/${sid}`, 'GET /api/sessions', 'POST /api/sessions/multicast/inject'], label);
+    const delivery = local.requests.find(({ method }) => method === 'POST');
+    assert.deepEqual(JSON.parse(delivery.body).session_ids, [msid], `${label}: the local delivery named the wrong session`);
+  }
 });
 
 test('#1288 D1: a bare id absent locally still reaches the single peer that has it', async () => {
@@ -324,64 +377,67 @@ test('#1288 R1/R8: an explicit host token goes to the typed address; a registere
   assert.deepEqual(sessionRequests().map(({ host, token }) => ({ host, token })), [{ host: typed, token: PEER_TOKEN }]);
 });
 
-test('#1288 D1/S2: with TELEPTY_HOST=[::1] or ::1 an exact id on an IPv6-only local listener consults no peer', async (t) => {
+test('#1288 R4-1/R4-2: with TELEPTY_HOST=localhost, ::1 or [::1] both commands keep the 0.11.3 path and add no request', async (t) => {
   await ensureDaemon();
-  const sid = createSessionId('tp1288-s2-v6');
-  const peer = await fakePeer([sid]);
-  writePeers({ 'peer-a': peerEntry(peer) });
-  // The local daemon stand-in listens on the literal `::1` only, so nothing answers 127.0.0.1 on
-  // its port: a short-circuit that reads the list from 127.0.0.1 misses and fans out to the peer.
+  const sid = createSessionId('tp1288-alt-loopback');
+  const sid2 = createSessionId('tp1288-alt-loopback-b');
+  const rid = createSessionId('tp1288-alt-loopback-remote');
+  const peer = await fakePeer([sid, rid]);
+  writePeers({ 'peer-a': peerEntry(peer, { machineId: 'tp1288-peer-a' }) });
+  // A local stand-in on 127.0.0.1 AND ::1 (one port, one record), so the result does not depend on
+  // the family `localhost` resolves to. 0.11.3 reads the list from 127.0.0.1 only, so a request that
+  // arrives on ::1 before the operation is one 0.11.3 never sends (r4's probe).
   let local;
-  try { local = await fakePeer([sid], { host: '::1' }); } catch (error) {
+  try { local = await fakePeer([sid, sid2], { alsoOn: '::1' }); } catch (error) {
     t.skip(`no IPv6 loopback on this runner (${error.code || error.message})`);
     return;
   }
+  const seen = (requests) => requests.map(({ method, path: requestPath }) => `${method} ${requestPath}`);
+  const onV6 = () => seen(local.requests.filter(({ at }) => at === 'v6'));
+  const reset = () => { peer.requests.length = 0; local.requests.length = 0; };
 
-  for (const host of ['[::1]', '::1']) {
-    const env = { TELEPTY_HOST: host, TELEPTY_PORT: String(local.port) };
+  for (const setting of ['localhost', '::1', '[::1]']) {
+    reset();
+    const env = { TELEPTY_HOST: setting, TELEPTY_PORT: String(local.port) };
+    // 0.11.3: discovery reads 127.0.0.1 and lists the peer (which has the same id); a bare id
+    // resolves to the configured host, without an ambiguity refusal.
     const info = await cli(['session', 'info', sid, '--json'], env);
-    assert.deepEqual({ code: info.code, stderr: info.stderr }, { code: 0, stderr: '' }, host);
-    assert.deepEqual(JSON.parse(info.stdout), { host: '::1', id: sid, command: 'fake-peer' });
-
-    local.multicast = null;
-    const multicast = await cli(['multicast', sid, 'tp1288 v6 probe'], env);
+    assert.deepEqual({ code: info.code, stderr: info.stderr }, { code: 0, stderr: '' }, setting);
+    assert.deepEqual(JSON.parse(info.stdout), { host: setting === 'localhost' ? 'localhost' : '::1', id: sid, command: 'fake-peer' }, setting);
+    const multicast = await cli(['multicast', sid, 'tp1288 alternate loopback'], env);
     assert.deepEqual({ code: multicast.code, stdout: multicast.stdout, stderr: multicast.stderr },
-      { code: 0, stdout: '✅ Context multicasted successfully to 1 session(s).\n', stderr: '' }, host);
-    assert.deepEqual(local.multicast, [sid], `${host}: the local listener did not receive the multicast`);
+      { code: 0, stdout: '✅ Context multicasted successfully to 1 session(s).\n', stderr: '' }, setting);
+    // One peer listing per command, as in 0.11.3 (r4 asked no peer: its probe hit).
+    assert.deepEqual(seen(peer.requests), ['GET /api/sessions', 'GET /api/sessions'], `${setting}: peer requests`);
+    assert.deepEqual(seen(local.requests), ['GET /api/sessions', `GET /api/sessions/${sid}`, 'GET /api/sessions',
+      'POST /api/sessions/multicast/inject'], `${setting}: local requests`);
+    if (setting !== 'localhost') {
+      assert.deepEqual(onV6(), [`GET /api/sessions/${sid}`, 'POST /api/sessions/multicast/inject'], `${setting}: requests to ::1`);
+    }
   }
-  assert.equal(peer.hits, 0, 'an exact id on the configured local listener fanned out to a peer');
-});
 
-test('#1288 V2: a failed D1 probe of the configured address falls through to the unchanged 0.11.3 path', async (t) => {
-  await ensureDaemon();
-  const sid = createSessionId('tp1288-v2-probe-fail');
-  const sid2 = createSessionId('tp1288-v2-probe-fail-b');
-  const refusing = await fakePeer([], { refuse: true });
-  writePeers({ refusing: peerEntry(refusing) });
-  // The configured local listener has the ids, but its session list fails (500), so the probe misses.
-  let local;
-  try { local = await fakePeer([sid, sid2], { host: '::1', failList: true }); } catch (error) {
-    t.skip(`no IPv6 loopback on this runner (${error.code || error.message})`);
-    return;
-  }
+  // R4-1: TELEPTY_HOST=[::1]:<port>, a qualified id of a registered HTTP peer, no env token. 0.11.3
+  // reaches the peer with its stored token and sends nothing to ::1; r4 first sent ::1 a list probe
+  // carrying the local daemon token.
+  reset();
+  const qualified = await cli(['session', 'info', `${rid}@peer-a`, '--json'], { TELEPTY_HOST: `[::1]:${local.port}`, TELEPTY_PORT: undefined });
+  assert.equal(qualified.code, 0, qualified.stderr);
+  assert.equal(JSON.parse(qualified.stdout).host, `127.0.0.1:${peer.port}`);
+  assert.deepEqual(peer.requests.filter(({ path: requestPath }) => requestPath === `/api/sessions/${rid}`).map(({ token }) => token), [PEER_TOKEN]);
+  assert.deepEqual(onV6(), [], 'a qualified peer read sent a request to the configured address');
+
+  // R4-2: TELEPTY_HOST=::1, a bare id with a second id qualified @[::1], then an empty list. 0.11.3's
+  // first connection to ::1 is the delivery itself, after discovery; r4 opened one before discovery.
   const env = { TELEPTY_HOST: '::1', TELEPTY_PORT: String(local.port) };
-  const seen = (peer) => peer.requests.map(({ method, path: requestPath }) => `${method} ${requestPath}`);
-
-  // 0.11.3: one fan-out (the refusing peer warns and sets exit 1), target {id, host:'::1'}.
-  const info = await cli(['session', 'info', sid, '--json'], env);
-  assert.equal(info.code, 1, 'the peer warning no longer sets the 0.11.3 exit status');
-  assert.deepEqual(JSON.parse(info.stdout), { host: '::1', id: sid, command: 'fake-peer' });
-  assert.match(info.stderr, /INCOMPLETE/);
-  const multicast = await cli(['multicast', `${sid},${sid2}`, 'tp1288 failed probe'], env);
-  assert.equal(multicast.code, 1);
-  assert.equal(multicast.stdout, '✅ Context multicasted successfully to 2 session(s).\n');
-  assert.match(multicast.stderr, /INCOMPLETE/);
-  assert.deepEqual(local.multicast, [sid, sid2]);
-
-  // The probe is one request per command, also for a list (r3 probed once per id), and is never
-  // retried; the peer sees one discovery per command.
-  assert.deepEqual(seen(local), ['GET /api/sessions', `GET /api/sessions/${sid}`, 'GET /api/sessions', 'POST /api/sessions/multicast/inject']);
-  assert.deepEqual(seen(refusing), ['GET /api/sessions', 'GET /api/sessions']);
+  const mixed = await cli(['multicast', `${sid},${sid2}@[::1]`, 'tp1288 mixed loopback'], env);
+  assert.deepEqual({ code: mixed.code, stdout: mixed.stdout, stderr: mixed.stderr },
+    { code: 0, stdout: '✅ Context multicasted successfully to 2 session(s).\n', stderr: '' });
+  const empty = await cli(['multicast', ',', 'tp1288 empty loopback'], env);
+  assert.deepEqual({ code: empty.code, stdout: empty.stdout, stderr: empty.stderr },
+    { code: 0, stdout: '✅ Context multicasted successfully to 0 session(s).\n', stderr: '' });
+  assert.deepEqual(onV6(), ['POST /api/sessions/multicast/inject', 'POST /api/sessions/multicast/inject'],
+    'the configured address received a request other than the deliveries');
+  assert.deepEqual(seen(peer.requests), ['GET /api/sessions', `GET /api/sessions/${rid}`, 'GET /api/sessions', 'GET /api/sessions']);
 });
 
 // V2 with TELEPTY_HOST unset or 127.0.0.1: the D1 check reads discovery's own local read, so a
@@ -415,6 +471,39 @@ test('#1288 V2: on 127.0.0.1 the D1 check never sees a failed local read and nev
   assert.deepEqual(given, [{ host: '127.0.0.1', id: 'tp1288-seam' }]);
   assert.deepEqual(hit, [{ host: '127.0.0.1', id: 'tp1288-seam' }]);
   assert.equal(reads, 1);
+
+  // R4-5: a refused connection is 0.11.3's empty local list, so the check sees [] and no reference
+  // can hit. (The check returns true here only to stop before this process's own peers.)
+  let refusedList;
+  await discoverSessions({ silent: true, _ensureDaemonRunning: async () => {},
+    _fetchWithAuth: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); },
+    exactLocal: (list) => { refusedList = list; return true; } });
+  assert.deepEqual(refusedList, []);
+});
+
+// R4-5 through the real CLI: with TELEPTY_HOST unset or 127.0.0.1, a local list read that fails
+// (HTTP 500) is classified by the 0.11.3 code: the command fails with its message and exit 1, and no
+// peer is asked. A refused connection cannot be driven through the CLI here without the 0.11.3
+// auto-start starting a daemon; the in-process test above covers it, with the timeout and the 500.
+test('#1288 R4-5: on 127.0.0.1 a failed local read fails both commands as in 0.11.3 and asks no peer', async () => {
+  await ensureDaemon();
+  const sid = await registerLocal('tp1288-read-fails');
+  const peer = await fakePeer([sid]);
+  writePeers({ 'peer-a': peerEntry(peer) });
+  const local = await localRecorder({ failList: true });
+  const expected = { code: 1, stdout: '',
+    stderr: `❌ Local telepty daemon (port ${local.port}) answered /api/sessions with HTTP 500 — running, but not serving. This is not an empty result.\n` };
+
+  for (const hostSetting of [undefined, '127.0.0.1']) {
+    const env = { TELEPTY_HOST: hostSetting, TELEPTY_PORT: String(local.port) };
+    for (const args of [['session', 'info', sid, '--json'], ['session', 'info', sid], ['multicast', sid, 'tp1288 failed read']]) {
+      const result = await cli(args, env);
+      assert.deepEqual({ code: result.code, stdout: result.stdout, stderr: result.stderr }, expected,
+        `TELEPTY_HOST=${hostSetting === undefined ? '(unset)' : hostSetting} ${args.join(' ')}`);
+    }
+  }
+  assert.deepEqual(local.sessionRequests(), Array(6).fill('GET /api/sessions'), 'one local read per command, never retried');
+  assert.equal(peer.hits, 0, 'a peer was asked after a failed local read');
 });
 
 test('#1288 V1: <id>@<this machine hostname> behaves as in 0.11.3 and never selects a peer', async (t) => {

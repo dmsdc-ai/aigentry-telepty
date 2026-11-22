@@ -1357,27 +1357,18 @@ async function resolveLocalSessionTarget(sessionRef) {
 // which 0.11.3's parser treats as bare AND equals a local session id byte for byte is resolved
 // against the local daemon's list alone. When every reference is such a hit, no peer is asked.
 // Returns the session list to resolve each reference against.
-// TELEPTY_HOST unset or 127.0.0.1: the check reads discovery's own local read (one read, as in
-// 0.11.3). Another loopback spelling (localhost, ::1): one probe of that configured address first;
-// unless every reference hits, its result is dropped and the 0.11.3 discovery runs untouched.
+// Only when TELEPTY_HOST is unset or 127.0.0.1: the check reads discovery's own local read (one
+// read, as in 0.11.3) and sends nothing. Any other TELEPTY_HOST runs the 0.11.3 discovery untouched.
 async function discoverExactLocal(sessionRefs) {
-  let local = [];
-  const isHit = (ref) => { const parsed = parseSessionReference(ref);
-    return !parsed.host && parsed.id === ref && local.some((s) => s && s.id === ref); };
-  const allHit = () => sessionRefs.length > 0 && sessionRefs.every(isHit);
   if (REMOTE_HOST !== '127.0.0.1') {
-    if (isLocalHostname(REMOTE_HOST)) {
-      try {
-        const res = await fetchWithAuth(`${daemonUrl(REMOTE_HOST)}/api/sessions`, { signal: AbortSignal.timeout(probeTimeoutMs()) });
-        const list = res.ok ? await res.json() : null;
-        if (Array.isArray(list)) local = list;
-      } catch { /* a failed probe is a miss */ }
-      if (allHit()) return () => local;
-    }
     const discovered = await discoverSessions({ silent: true });
     return () => discovered;
   }
-  const discovered = await discoverSessions({ silent: true, exactLocal: (list) => { local = list; return allHit(); } });
+  let local = [];
+  const isHit = (ref) => { const parsed = parseSessionReference(ref);
+    return !parsed.host && parsed.id === ref && local.some((s) => s && s.id === ref); };
+  const discovered = await discoverSessions({ silent: true,
+    exactLocal: (list) => { local = list; return sessionRefs.length > 0 && sessionRefs.every(isHit); } });
   return (ref) => (isHit(ref) ? local : discovered);
 }
 
