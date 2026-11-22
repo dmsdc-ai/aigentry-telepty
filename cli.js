@@ -5954,6 +5954,7 @@ function printGlobalHelp() {
   telepty broadcast [--ref [file]] "<prompt>"    Inject into ALL sessions
   telepty diagnose <exact-id@host> [--json] [--machine-id ID] [--epoch EPOCH]
     --inject-id UUID correlates ledger facts; --tcp adds one bounded connection probe
+    --machine-id binds an running-at-observation result to the expected machine; silence is not power-off
     --process-state reads bounded Linux /proc scheduler state (no responsiveness claim)
     Read-only, two bounded authenticated probes; no discovery or automatic repair
   telepty read-screen <id[@host]> [--lines N]    Read session screen buffer

@@ -199,7 +199,7 @@ server.tool(
 // Read-only exact-target diagnostics; never borrow credentials for an arbitrary host.
 server.tool(
   "telepty_diagnose_session",
-  "Read-only layered diagnostics for an exact session on the configured daemon; daemon/MCP availability does not establish agent responsiveness or completion.",
+  "Read-only diagnostics for the configured daemon and exact session. A matching host reply establishes running-at-observation only; lack of reply never proves power-off, and availability is not agent completion.",
   { target: z.string().max(513).describe("Exact session_id@configured-host"),
     machine_id: z.string().max(256).describe("Expected daemon machine identity"),
     session_epoch: z.string().max(256).optional().describe("Expected session epoch, if already known"),
