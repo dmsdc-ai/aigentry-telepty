@@ -6,20 +6,22 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 **Behaviour changes**
 
-- `session info` and `multicast`: with `TELEPTY_HOST` unset or a loopback spelling (`127.0.0.1`,
-  `localhost`, `::1`, `[::1]`), a bare id that exactly matches a local session means the local
-  session; the remote copy needs `<id>@<peer>`. No peer is asked for it, as the other commands
-  already did with the default host (#837); 0.11.3 refused it as existing on multiple hosts, even
-  with `TELEPTY_HOST=127.0.0.1`. The local list is read from the address `TELEPTY_HOST` configures. A
-  prefix, a qualified id, an id the local daemon does not list, or a failed local read resolve as in
+- `session info` and `multicast`: a bare id that equals, byte for byte, a session id the local
+  daemon lists resolves to that local session, and no peer is asked. This holds even when a peer runs
+  a session with the same id. 0.11.3 listed every peer first and refused such an id as existing on
+  multiple hosts. Bare means 0.11.3 finds no host part in it (no `@`, or an `@` only as its first or
+  last character). This applies when `TELEPTY_HOST` is unset or a loopback address (`127.0.0.1`,
+  `localhost`, `::1`, `[::1]`), and the local list is read from that configured address. In a
+  `multicast` list each such id resolves locally; if any other id is present, peers are listed once,
+  as before. A prefix, a qualified id, an id the local daemon does not list, or a failed local read
+  takes the unchanged 0.11.3 path. Other commands are unchanged.
+- With `--json`, `session info` and `read-screen` print three refusals as
+  `{"success":false,"code":…,"error":…}` on stdout: cross-host ambiguity (`AMBIGUOUS_SESSION`),
+  unregistered peer (`PEER_NOT_REGISTERED`) and ambiguous peer identity (`AMBIGUOUS_PEER`). They keep
+  the same `❌` line on stderr and exit 1. Text mode is unchanged.
+- To address one copy of an id that several machines run, name the local session
+  `<id>@127.0.0.1` and the remote one `<id>@<peer>`. `<id>@<this machine's hostname>` behaves as in
   0.11.3.
-- Without `TELEPTY_AUTH_TOKEN`, `<id>@<this machine's name>` (host name, `TELEPTY_MACHINE_ID` or the
-  local daemon's machine ID, any letter case) addresses the local daemon instead of being refused,
-  unless a registered peer uses that name as name, machine ID or host in any letter case. A peer
-  matching it exactly is used, as before. With the token set the name is dialled directly, as before.
-- With `--json`, `session info` and `read-screen` print the cross-host ambiguity, unregistered-peer
-  and ambiguous-peer refusals as `{"success":false,"code":"AMBIGUOUS_SESSION"|"PEER_NOT_REGISTERED"|"AMBIGUOUS_PEER","error":…}`
-  on stdout, keep the `❌` line on stderr, and exit 1.
 
 ## 0.11.3
 

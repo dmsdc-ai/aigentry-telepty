@@ -366,10 +366,16 @@ have not registered as a peer — append `@<host>` to the session ID. `<host>` c
 hostname, LAN IP, or Tailnet name. This needs no `connect`/`connect-http` first: the target
 is resolved directly, which is why the relay demo above works between fresh machines.
 
-With `TELEPTY_HOST` unset or a loopback address, a bare ID that exactly matches a local session
-means the local session, even when a peer runs a session with the same ID (for example
-`orchestrator`); the remote copy needs `<id>@<peer>`. Without `TELEPTY_AUTH_TOKEN`,
-`<id>@<this machine's name>` addresses the local daemon unless a registered peer uses that name.
+The same ID on several machines (every machine runs `orchestrator`): name the session on this
+machine `<id>@127.0.0.1` and the remote one `<id>@<peer>` (its registered peer name). Since 0.11.4,
+`session info` and `multicast` also resolve a bare ID to the local session without asking any peer
+when it equals, byte for byte, a session ID the local daemon lists. Bare means 0.11.3 finds no host
+part in it (no `@`, or an `@` only as its first or last character). This applies when `TELEPTY_HOST`
+is unset or a loopback address (`127.0.0.1`, `localhost`, `::1`, `[::1]`), and the local list is
+read from that configured address. A prefix, an ID the local daemon does not list, or a failed local
+read takes the unchanged 0.11.3 path; other commands are unchanged. With `--json`,
+`session info` and `read-screen` print the multiple-hosts, unregistered-peer and ambiguous-peer
+refusals as a JSON document on stdout, keep the `❌` line on stderr, and exit 1.
 
 ```bash
 # Hostname / Tailnet name

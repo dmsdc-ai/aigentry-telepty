@@ -152,16 +152,18 @@ What does **not** exist: any discovery, rotation, revocation, or per-peer scopin
 Step 2 only helps an operator who has already run `connect-http --token`, and addressing forms with
 no `peers.json` entry (`<sid>@<tailnet-ip>`, `TELEPTY_HOST`) must use the env variable or are
 refused. Note the consequence worth stating: addressing **your own** daemon by a non-loopback name —
-its tailnet IP, its LAN IP — is refused as well, because `isLocalHostname` recognises loopback
+its tailnet IP, its hostname — is refused as well, because `isLocalHostname` recognises loopback
 literals and nothing else. That is a deliberate false positive. The predicate is a syntactic check on
 the address, and widening it to "any address this host happens to answer on" would make the boundary
 depend on interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the escape hatch.
 This is a named limitation, not a solved problem.
-Since 0.11.4, without `TELEPTY_AUTH_TOKEN`, session routing (not this predicate) treats
-`<sid>@<this machine's name>` as `<sid>@127.0.0.1` when no registered peer uses that name as its
-name, machine ID or host in any letter case, so the local token still goes to loopback only. With
-`TELEPTY_HOST` unset or a loopback spelling, a bare id that exactly matches a local session means the
-local session; the remote copy needs `<id>@<peer>`.
+To name the session on this machine when a peer runs the same id, use `<sid>@127.0.0.1`; the remote
+copy is `<sid>@<peer>`. Since 0.11.4, `session info` and `multicast` resolve a bare id to the local
+session with no peer request when it equals, byte for byte, a session id the local daemon lists.
+Bare means 0.11.3 finds no host part in it. This applies when `TELEPTY_HOST` is unset or a loopback
+address, and the list is read from that configured address. Under `--json`, `session info` and
+`read-screen` print the multiple-hosts, unregistered-peer and ambiguous-peer refusals as JSON on
+stdout, with the same line on stderr, and exit 1. Neither change adds a destination for any token.
 
 ### `TELEPTY_AUTH_TOKEN` must be set at every end, or at none
 
