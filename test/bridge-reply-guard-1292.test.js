@@ -279,6 +279,31 @@ test('GB2-06 the wall clock steps back after the CR frame arrived: the held CR i
   assert.deepEqual(b.stages(p.submit.daemon_msg_id), [NOT_WRITTEN('reply_deadline_passed')]);
 });
 
+// rc-fix8 GB3-05: wall and monotonic time elapsed since the frame arrived must agree. A suspend the monotonic clock did not
+// count (here: the wall clock ran 5 s ahead of it while the CR was held) is a discontinuity, treated as the deadline passed,
+// although each clock alone still shows time left. Fails on the snapshot, which checked each clock alone and wrote the CR.
+// Control: a 1 s disagreement (inside the 2 s bound) still writes.
+test('GB3-05 the wall clock runs 5 s ahead of the monotonic clock while the CR is held: refused as passed, zero bytes', { timeout: 30000 }, async t => {
+  for (const [label, ahead, expected] of [['5 s apart', 5000, null], ['1 s apart (control)', 1000, 'written']]) {
+    const b = createBridge(t, { sid: `b1292-drift-${ahead}` });
+    const p = b.pair('R-DRIFT');
+    const notAfter = b.clock.now() + 10000;
+    b.frame({ ...p.body, ...b.reply(notAfter) });
+    assert.deepEqual(b.child.writes, ['R-DRIFT'], `CHECKPOINT ${label}: body written in time`);
+    await b.clock.advance(5);
+    b.frame({ ...p.submit, ...b.reply(notAfter) });
+    b.skew.wallBack = -ahead;   // the wall clock moves ahead of the monotonic clock by `ahead` (both still before not_after)
+    await b.clock.advance(1000);
+    if (expected) {
+      assert.deepEqual(b.child.writes, ['R-DRIFT', '\r'], label);
+      assert.deepEqual(b.stages(p.submit.daemon_msg_id), [['pty_written', 'written', null]], label);
+    } else {
+      assert.deepEqual(b.child.writes, ['R-DRIFT'], `${label}: zero bytes of the CR`);
+      assert.deepEqual(b.stages(p.submit.daemon_msg_id), [NOT_WRITTEN('reply_deadline_passed')], label);
+    }
+  }
+});
+
 // ── golden: the ordinary inject is unchanged ─────────────────────────────────────────────────────────────────────
 test('rc-fix6 golden: an ordinary pair (no reply_* fields) produces exactly the pre-change writes and receipts', { timeout: 30000 }, async t => {
   const b = createBridge(t, { sid: 'b1292-golden' });

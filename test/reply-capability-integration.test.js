@@ -6,8 +6,9 @@
 // One REAL isolated daemon for the file (test-support/daemon-harness), started in before() and stopped in after(). Sessions
 // are registered through the real route and claimed by owner WebSockets that present their bearer, so each epoch is PROVED
 // (SPEC M7). Every frame the daemon writes to a session is recorded. GB-01/GB-02/GB-03: a requester must be in the support
-// matrix (SUPPORT-MATRIX.md), so every requester is an aterm session registered with a unix-socket endpoint (a named pipe
-// on Windows) served by this file; every Inject the daemon writes to that endpoint is recorded the same way. The token is taken only from the trailer delivered to
+// matrix (SUPPORT-MATRIX.md). rc-fix8 GB3-02: aterm left it, so every requester is a wrapped session whose owner socket is
+// a fake current bridge in this file (guardedRequester): it declares reply-guard-v1, announces its child and answers each
+// reply frame with a bridge_receipt. The token is taken only from the trailer delivered to
 // the responder, which is how a responder gets it. The requester sids are the configured orchestrator lane
 // (AIGENTRY_ORCHESTRATOR_SIDS), so the unchanged peer-lane guard admits the request and both kinds of reply. It is not
 // disabled.
@@ -99,37 +100,59 @@ async function wrapped(sid) {
     texts: () => frames.filter((f) => f.type === 'inject').map((f) => f.data) };
 }
 
-// A registered aterm session whose endpoint is a unix socket (a named pipe on Windows) served here: the requester state the
-// support matrix admits. Each daemon write is one connection carrying one JSON line; the endpoint answers the positive
-// receipt. texts() lists the text of every Inject, in arrival order (the daemon's mailbox engine writes one at a time).
-async function atermRequester(sid) {
-  const address = process.platform === 'win32'
-    ? `\\\\.\\pipe\\telepty-w6-${crypto.randomUUID()}`
-    : path.join(os.tmpdir(), `w6-${crypto.randomBytes(6).toString('hex')}.sock`);
-  const received = [];
-  const connections = new Set();
-  const server = net.createServer((socket) => {
-    connections.add(socket);
-    socket.on('close', () => connections.delete(socket));
-    socket.on('error', () => { /* the daemon side closed first */ });
-    const chunks = [];
-    socket.on('data', (chunk) => {
-      chunks.push(chunk);
-      const input = Buffer.concat(chunks).toString('utf8');
-      const nl = input.indexOf('\n');
-      if (nl === -1) return;
-      let message = null;
-      try { message = JSON.parse(input.slice(0, nl)); } catch { /* not a line we record */ }
-      if (message && message.action === 'Inject') received.push(message.text);
-      socket.end('{"success":true}');
-    });
+// rc-fix8 GB3-02: a registered WRAPPED requester driven by a fake bridge in this file (aterm left the support matrix: its
+// endpoint proves no instance). The fake claims the owner socket the way a current bridge does — with its bearer, declaring
+// input-transport-ready-v1 and reply-guard-v1 (cli.js:3514-3516) — and announces its child (process_started, then
+// input_transport_ready, as test/delivery-discriminators-1215.test.js drives a current bridge), so the daemon admits the
+// requester at mint (M7a) and at delivery. For each inject frame carrying the reply_* fields (a reply body and its CR) it
+// checks what a current bridge checks at its final write (session epoch, owner generation, child_seq 1, the absolute
+// deadline) and answers with the real bridge_receipt wire shape (src/mailbox/bridge-stage.js receiptFrame): pty_written,
+// or refused/not_written naming the failed check. Ordinary frames are recorded only. texts() lists the data of every
+// inject frame in arrival order (a CR frame's data is "\r").
+const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+async function guardedRequester(sid) {
+  const reg = await harness.registerSession(sid, { command: 'test-wrap' });
+  assert.ok([200, 201].includes(reg.status) && typeof reg.body.session_token === 'string', `PRECONDITION: register ${sid} -> ${reg.status}`);
+  const frames = [];
+  let token = null;
+  let bridgeSeq = 0;
+  const ws = new WebSocket(`ws://${harness.host}:${harness.port}/api/sessions/${encodeURIComponent(sid)}?owner=1`,
+    { headers: { 'x-telepty-session-token': reg.body.session_token, 'x-telepty-token': harness.authToken(),
+      'x-telepty-bridge-capabilities': 'input-transport-ready-v1, reply-guard-v1' } });
+  sockets.push(ws);
+  ws.on('message', (raw) => {
+    let frame;
+    try { frame = JSON.parse(raw); } catch { return; }
+    frames.push(frame);
+    if (!token || !frame || frame.type !== 'inject' || !Object.hasOwn(frame, 'reply_not_after_ms')) return;
+    const binding = token.interaction_binding;
+    const sameInstance = frame.reply_session_epoch === binding.session_epoch && frame.owner_generation === binding.owner_generation
+      && frame.reply_child_seq === 1;
+    const inTime = Number.isSafeInteger(frame.reply_not_after_ms) && Date.now() <= frame.reply_not_after_ms;
+    const written = sameInstance && inTime;
+    ws.send(JSON.stringify({ type: 'bridge_receipt', schema: 1, daemon_msg_id: frame.daemon_msg_id ?? null,
+      inject_id: typeof frame.inject_id === 'string' && UUID_RE.test(frame.inject_id) ? frame.inject_id : null,
+      part: frame.part ?? null, bridge_msg_id: null, stage: written ? 'pty_written' : 'refused',
+      reason: written ? null : (sameInstance ? 'reply_deadline_passed' : 'reply_instance_changed'),
+      certainty: written ? 'written' : 'not_written', bridge_seq: ++bridgeSeq, at_ms: Date.now(), clock: 'bridge_wall',
+      owner_generation: binding.owner_generation }));
   });
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(address, resolve); });
-  endpoints.push({ server, connections });
-  const reg = await harness.registerSession(sid, { delivery_type: 'aterm', delivery: { transport: 'unix_socket', address } });
-  assert.ok(reg.status === 201 && typeof reg.body.session_token === 'string', `PRECONDITION: register ${sid} -> ${reg.status}`);
+  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  token = await waitFor(() => frames.find((f) => f.type === 'owner_token'), { timeoutMs: 5000, description: `${sid} owner_token` });
+  assert.equal(token.interaction_binding.session_epoch, reg.body.session_epoch, 'PRECONDITION: the owner claim proved the registered epoch');
+  assert.equal(typeof token.readiness_nonce, 'string', 'PRECONDITION: the daemon negotiated the readiness handshake');
+  const b = token.interaction_binding;
+  const base = { schema: 1, session_id: sid, session_epoch: b.session_epoch ?? null, owner_generation: b.owner_generation,
+    readiness_nonce: token.readiness_nonce, child_seq: 1 };
+  ws.send(JSON.stringify({ type: 'process_started', ...base, pid: process.pid, exec: 'unverified' }));
+  ws.send(JSON.stringify({ type: 'input_transport_ready', ...base, input_loop: 'attached' }));
+  await waitFor(async () => {
+    const res = await harness.request(`/api/sessions/${encodeURIComponent(sid)}`);
+    const readiness = res.body && res.body.transport && res.body.transport.readiness;
+    return readiness && readiness.input_transport_ready && readiness.input_transport_ready.status === 'observed' ? true : null;
+  }, { timeoutMs: 5000, description: `${sid}: the child announced and the input loop attached` });
   return { sid, bearer: reg.body.session_token, epoch: reg.body.session_epoch, generation: reg.body.credential_generation,
-    texts: () => received.slice() };
+    texts: () => frames.filter((f) => f.type === 'inject').map((f) => f.data) };
 }
 
 const inject = (sid, body, headers, signal) => harness.request(`/api/sessions/${encodeURIComponent(sid)}/inject`,
@@ -224,7 +247,7 @@ function tempHome(t, label) {
 }
 
 test('I1 two CLIs, two state roots: one token presented at once by two processes → exactly one write at the receiver, one success audit line', CASE, async (t) => {
-  const requester = await atermRequester(REQUESTERS.i1);
+  const requester = await guardedRequester(REQUESTERS.i1);
   const responder = await wrapped(createSessionId('w6-resp-i1'));
   const cap = await mint(requester, responder, 'w6 I1 request: answer once', t.signal);
   const body = `w6 I1 reply ${crypto.randomUUID()}`;
@@ -256,7 +279,7 @@ test('I1 two CLIs, two state roots: one token presented at once by two processes
 });
 
 test('I2 ordinary traffic never blocks: unrelated injects to the responder and ordinary messages to the requester before, during and after the consume in the request window; the reply is accepted, ordered and attributed', { ...CASE, skip: I2_WIN32_SKIP }, async (t) => {
-  const requester = await atermRequester(REQUESTERS.i2);
+  const requester = await guardedRequester(REQUESTERS.i2);
   const responder = await wrapped(createSessionId('w6-resp-i2'));
   const cap = await mint(requester, responder, 'w6 I2 request', t.signal);
   const body = `w6 I2 reply ${crypto.randomUUID()}`;
@@ -296,9 +319,9 @@ test('I2 ordinary traffic never blocks: unrelated injects to the responder and o
 });
 
 test('I5 rollback (daemon side): no new field in sessions.json and nothing in the tracked ledger; audit rows parse and differ from a run without the feature only by the additive fields', CASE, async (t) => {
-  const requester = await atermRequester(REQUESTERS.i5);
+  const requester = await guardedRequester(REQUESTERS.i5);
   const responder = await wrapped(createSessionId('w6-resp-i5'));
-  const controlRequester = await atermRequester(REQUESTERS.i5control);
+  const controlRequester = await guardedRequester(REQUESTERS.i5control);
   const controlResponder = await wrapped(createSessionId('w6-resp-i5c'));
   const audit = await beginAuditCompletion(harness, t.signal);
 
@@ -350,7 +373,7 @@ test('I5 rollback (daemon side): no new field in sessions.json and nothing in th
 });
 
 test('I6 direct reply plus capability reply: the responder answers once with its bearer and once with the capability → two writes, each separately attributed', CASE, async (t) => {
-  const requester = await atermRequester(REQUESTERS.i6);
+  const requester = await guardedRequester(REQUESTERS.i6);
   const responder = await wrapped(createSessionId('w6-resp-i6'));
   const cap = await mint(requester, responder, 'w6 I6 request', t.signal);
   const home = tempHome(t, 'i6');

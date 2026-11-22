@@ -38,8 +38,9 @@ function mockClock(t) {
 function routeFixture(t, { store = 'real', limits, deliver, begin, peer } = {}) {
   mockClock(t);
   const calls = { begin: [], deliver: [], abort: [], audit: [], events: [], failures: [], bus: [], store: [], peer: [], mintedIds: [], errorReplies: [] };
-  // GB-03: the requester is in the support matrix (an aterm session reached over its unix socket).
-  const requester = { id: 'requester-q', type: 'aterm', delivery: { transport: 'unix_socket', address: '/synthetic/requester-q.sock' },
+  // GB-03: the requester is in the support matrix. rc-fix8 GB3-02: aterm left it, so the default requester is a
+  // daemon-owned PTY session holding its live handle (the state rc-fix6 M7a admits).
+  const requester = { id: 'requester-q', type: 'spawned', ptyProcess: { killed: false, write() {} },
     sessionEpoch: 'epoch-q', credentialGeneration: 1, isClosing: false, clients: new Set() };
   const responder = { id: 'responder-a', type: 'wrapped', sessionEpoch: 'epoch-r', sessionEpochProved: 'epoch-r',
     credentialGeneration: 1, isClosing: false, clients: new Set() };
@@ -190,13 +191,19 @@ const CONDITIONS = {
   // rc-fix6: a daemon-owned PTY requester is now in the matrix; one over SSH is not (replaces the former M7a_spawned row).
   M7a_spawned_ssh: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'spawned'; f.requester.sshRemote = { host: 'h' }; delete f.requester.delivery; } },
   // rc-fix7 GB2-09: labelled spawned but without the live PTY handle the write would use (registered only; exited/killed).
-  M7a_spawned_no_pty: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'spawned'; delete f.requester.delivery; } },
+  M7a_spawned_no_pty: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'spawned'; delete f.requester.delivery;
+    delete f.requester.ptyProcess; } },   // rc-fix8: the default requester now holds one
   M7a_spawned_killed_pty: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'spawned'; delete f.requester.delivery;
     f.requester.ptyProcess = { killed: true, write() {} }; } },
   // rc-fix6: a wrapped requester whose bridge announced reply-guard-v1 only in an EARLIER owner generation (old bridge now).
   M7a_wrapped_stale_announcement: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { announcingWrapped(f.requester, 'owner-gen-q'); f.requester.replyGuardGeneration = 'owner-gen-q-previous'; } },
-  M7a_aterm_http: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.delivery = null; f.requester.deliveryEndpoint = 'http://127.0.0.1:9/inject'; } },
-  M7a_aterm_ssh: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.sshRemote = { host: 'h' }; } },
+  M7a_aterm_http: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'aterm'; f.requester.delivery = null; f.requester.deliveryEndpoint = 'http://127.0.0.1:9/inject'; } },
+  M7a_aterm_ssh: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'aterm';
+    f.requester.delivery = { transport: 'unix_socket', address: '/synthetic/requester-q.sock' }; f.requester.sshRemote = { host: 'h' }; } },
+  // rc-fix8 GB3-02: an aterm requester over its unix socket — the endpoint proves no instance, so it is refused at mint.
+  // Fails on the snapshot, which admitted it (the former support-matrix row).
+  M7a_aterm_unix_socket: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'aterm';
+    f.requester.delivery = { transport: 'unix_socket', address: '/synthetic/requester-q.sock' }; } },
   M8_soon: { code: 'REPLY_CAPABILITY_DEADLINE_INVALID', rcOver: { not_after_ms: T0 + 29999 } },
   M8_late: { code: 'REPLY_CAPABILITY_DEADLINE_INVALID', rcOver: { not_after_ms: T0 + 3600001 } },
   M9_responder: { code: 'REPLY_CAPABILITY_CAPACITY', fx: { limits: { maxLivePerResponder: 1 } },
@@ -696,35 +703,42 @@ function deadlineRefusal(result) {
   assert.equal(result.bytes_written, 0);
 }
 
+// rc-fix8 GB3-02: the U7(d), U7(e), GB-01 and GB-02 delivery mechanics below were driven through an aterm requester. aterm left
+// the support matrix (it is now refused at mint and at entry, GB3-02 tests), so each mechanic runs on the daemon-owned PTY
+// requester (ptyReplyFixture) with the same assertions on what reached the requester (ptyWrites instead of UDS writes). A
+// reply to a PTY always owes its CR, so none of them is noEnter; `tick busy` keeps the row queued where a test needs it.
+const tickBusy = { DELIVERY_TIMEOUT_MS: 500, getMailboxDelivery: () => ({ tick: async () => {} }) };   // text wait 1 s
+
 test('U7(d) entry: a deadline already passed (or malformed) refuses before anything runs', async t => {
   let gateCalls = 0;
-  const f = atermFixture(t, { dependencies: { resolveModalGate: async () => { gateCalls++; return null; } } });
+  const f = ptyReplyFixture(t, { dependencies: { resolveModalGate: async () => { gateCalls++; return null; } } });
   deadlineRefusal(await f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(T0 - 1) }));
   deadlineRefusal(await f.context.deliverInjectionToSession('target', f.session, PROMPT, { notAfterMs: String(NOT_AFTER) }));
   assert.equal(gateCalls, 0);
   assert.deepEqual(f.enqueued, []);
   assert.deepEqual(f.frames, []);
-  assert.deepEqual(f.writes, []);
-  const ok = await f.context.deliverInjectionToSession('target', f.session, PROMPT, { noEnter: true, ...deadline(T0) });
-  assert.equal(ok.success, true, 'not_after itself is still in time');
-  assert.deepEqual(f.writes, [PROMPT]);
+  assert.deepEqual(f.ptyWrites, []);
+  // A PTY body needs its submit headroom (1500 ms) left: not_after minus the headroom is the last instant still in time.
+  const ok = await f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(T0 + 1500) });
+  assert.equal(ok.success, true, 'not_after minus the submit headroom is still in time');
+  assert.deepEqual(f.ptyWrites, [PROMPT, '\r']);
 });
 
 test('U7(d) suspended across the modal gate: the clock passes not_after during the await → refused, zero bytes', async t => {
   let release;
-  const f = atermFixture(t, { dependencies: { resolveModalGate: () => new Promise(resolve => { release = resolve; }) } });
-  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, { noEnter: true, ...deadline(T0 + 1000) });
+  const f = ptyReplyFixture(t, { dependencies: { resolveModalGate: () => new Promise(resolve => { release = resolve; }) } });
+  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(T0 + 1000) });
   await new Promise(resolve => setImmediate(resolve));
   t.mock.timers.tick(1001);
   release(null);
   deadlineRefusal(await pending);
   assert.deepEqual(f.enqueued, []);
   assert.deepEqual(f.frames, []);
-  assert.deepEqual(f.writes, []);
+  assert.deepEqual(f.ptyWrites, []);
 });
 
 test('U7(d) suspended behind the submit barrier: the clock passes not_after during the wait → refused, zero bytes', async t => {
-  const f = atermFixture(t);
+  const f = ptyReplyFixture(t);
   let releaseHolder;
   f.session.pendingSubmit = new Promise(resolve => { releaseHolder = resolve; });
   const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(T0 + 1000) });
@@ -735,17 +749,17 @@ test('U7(d) suspended behind the submit barrier: the clock passes not_after duri
   deadlineRefusal(await pending);
   assert.deepEqual(f.enqueued, []);
   assert.deepEqual(f.frames, []);
-  assert.deepEqual(f.writes, []);
+  assert.deepEqual(f.ptyWrites, []);
 });
 
 test('U7(d) direct fallback: the clock passes not_after before the fallback write → refused, zero bytes, barrier released', async t => {
   let gets = 0;
-  const f = atermFixture(t, { dependencies: { getMailbox: () => { gets++; t.mock.timers.tick(1001); throw new Error('mailbox unavailable'); } } });
+  const f = ptyReplyFixture(t, { dependencies: { getMailbox: () => { gets++; t.mock.timers.tick(1001); throw new Error('mailbox unavailable'); } } });
   const { result } = await quietly(() => f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(T0 + 1000) }));
   deadlineRefusal(result);
   assert.equal(gets, 1);
   assert.deepEqual(f.frames, []);
-  assert.equal(f.connects, 0);
+  assert.deepEqual(f.ptyWrites, []);
   assert.equal(f.session.pendingSubmit, null);
 });
 
@@ -767,100 +781,86 @@ test('GB-01/02 a reply into a requester that owes a deferred CR is refused befor
 // ───────────────────────────── U7(e): parked in the mailbox queue ─────────────────────────────
 
 test('U7(e) a message queued with notAfterMs and ticked after not_after is withdrawn, zero bytes', async t => {
-  const f = atermFixture(t, { failFirstConnect: true });
-  const queued = await quietly(() => f.context.deliverInjectionToSession('target', f.session, PROMPT, { noEnter: true, ...deadline(T0 + 1000) }));
-  assert.equal(queued.result.success, true);
-  assert.equal(queued.result.delivery_status, 'retry_pending');
+  const f = ptyReplyFixture(t, { dependencies: tickBusy });
+  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(T0 + 1000) });
+  await until(() => f.enqueued.length === 1);
   const msg = f.enqueued[0];
   t.mock.timers.tick(1001);
   const result = await f.context.mailboxDeliveryOptions.deliverFn('target', msg);
   deadlineRefusal(result);
   assert.deepEqual(f.withdrawn, [['target', msg.msg_id, 'reply_deadline_passed', { inFlight: true }]]);
   assert.deepEqual(f.frames, []);
-  assert.deepEqual(f.writes, []);
+  assert.deepEqual(f.ptyWrites, []);
+  deadlineRefusal(await pending);   // the waiting caller gets the same zero-byte refusal
 });
 
 test('U7(e) control: the same message ticked before not_after is written', async t => {
-  const f = atermFixture(t, { failFirstConnect: true });
-  await quietly(() => f.context.deliverInjectionToSession('target', f.session, PROMPT, { noEnter: true, ...deadline(T0 + 1000) }));
+  const f = ptyReplyFixture(t, { dependencies: tickBusy });
+  // T0 + 3000: ticked at T0 + 999, the body still has its 1500 ms submit headroom.
+  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(T0 + 3000) });
+  await until(() => f.enqueued.length === 1);
   t.mock.timers.tick(999);
   const result = await f.context.mailboxDeliveryOptions.deliverFn('target', f.enqueued[0]);
   assert.equal(result.success, true);
-  assert.deepEqual(f.writes, [PROMPT]);
   assert.deepEqual(f.withdrawn, []);
+  assert.equal((await pending).success, true);
+  assert.deepEqual(f.ptyWrites, [PROMPT, '\r']);
 });
 
 test('GB-02 a wall clock that stands still or runs back after the enqueue cannot keep the final-write check open (monotonic bound)', async t => {
   let mono = 5000;
-  const f = atermFixture(t, { failFirstConnect: true, dependencies: { monoNow: () => mono } });
-  const queued = await quietly(() => f.context.deliverInjectionToSession('target', f.session, PROMPT,
-    { noEnter: true, notAfterMs: T0 + 1000, notAfterMonoMs: 6000 }));   // rc-fix7: the mint-time monotonic deadline (mono 5000 + 1000)
-  assert.equal(queued.result.delivery_status, 'retry_pending');
+  const f = ptyReplyFixture(t, { dependencies: { ...tickBusy, monoNow: () => mono } });
+  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT,
+    { notAfterMs: T0 + 1000, notAfterMonoMs: 6000 });   // rc-fix7: the mint-time monotonic deadline (mono 5000 + 1000)
+  await until(() => f.enqueued.length === 1);
   mono += 1001;   // monotonic time passes not_after; the (mocked) wall clock stays at T0
   assert.equal(Date.now(), T0, 'PRECONDITION: the wall clock did not advance');
   const result = await f.context.mailboxDeliveryOptions.deliverFn('target', f.enqueued[0]);
   deadlineRefusal(result);
-  assert.deepEqual(f.writes, []);
+  assert.deepEqual(f.ptyWrites, []);
   assert.deepEqual(f.withdrawn, [['target', f.enqueued[0].msg_id, 'reply_deadline_passed', { inFlight: true }]]);
+  deadlineRefusal(await pending);
 });
 
-// rc-fix7 GB2-06: the monotonic deadline is the one fixed at MINT, never re-anchored at enqueue. Here the wall clock stepped
-// back between mint and delivery: the wall half still shows 60 s left, the mint-time monotonic half only 1 s. Fails on the
+// rc-fix7 GB2-06: the monotonic deadline is the one fixed at MINT, never re-anchored. Here the wall clock stepped back
+// between mint and delivery: the wall half still shows 60 s left, the mint-time monotonic half only 1 s. Fails on the
 // snapshot, which re-derived the monotonic bound from the wall clock at enqueue (mono + 60 s) and wrote the reply.
+// rc-fix8 GB3-05: the 59 s disagreement between the two clocks since mint is now a discontinuity caught at entry, before
+// anything is enqueued (stricter than the former refusal at the queued write).
 test('GB2-06 the mint-time monotonic deadline is not re-anchored at enqueue: a wall clock that stepped back cannot extend it', async t => {
   let mono = 5000;
-  const f = atermFixture(t, { failFirstConnect: true, dependencies: { monoNow: () => mono } });
-  const queued = await quietly(() => f.context.deliverInjectionToSession('target', f.session, PROMPT,
-    { noEnter: true, notAfterMs: T0 + 60000, notAfterMonoMs: 6000 }));
-  assert.equal(queued.result.delivery_status, 'retry_pending', 'PRECONDITION: in time at entry, queued for retry');
-  mono += 1001;   // past the mint-time monotonic deadline; the wall clock still says 60 s are left
-  const result = await f.context.mailboxDeliveryOptions.deliverFn('target', f.enqueued[0]);
-  deadlineRefusal(result);
-  assert.deepEqual(f.writes, [], 'nothing reached the socket after the mint-time deadline');
+  const f = ptyReplyFixture(t, { dependencies: { monoNow: () => mono } });
+  deadlineRefusal(await f.context.deliverInjectionToSession('target', f.session, PROMPT, { notAfterMs: T0 + 60000, notAfterMonoMs: 6000 }));
+  assert.deepEqual(f.enqueued, []);
+  assert.deepEqual(f.ptyWrites, [], 'nothing reached the requester after the mint-time deadline');
   // Control: a reply without the mint-time half is refused at entry (fail closed), before anything is enqueued.
   const g = atermFixture(t);
   deadlineRefusal(await g.context.deliverInjectionToSession('target', g.session, PROMPT, { noEnter: true, notAfterMs: NOT_AFTER }));
   assert.deepEqual(g.enqueued, []);
 });
 
-// rc-fix7 GB2-01: the instance + binding + deadline check runs AFTER the callback's mailbox fence (which takes the lock and
-// re-reads state), immediately before sock.end. Fails on the snapshot, which checked before the fence.
-test('GB2-01 the deadline passes inside the UDS callback\'s mailbox fence → nothing written, withdrawn as passed', async t => {
-  const f = atermFixture(t);
-  let fences = 0;
-  f.mailbox.beginNonRetryableAttempt = () => { fences++; t.mock.timers.tick(1001); return true; };   // a fence that straddles not_after
-  const result = await f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(T0 + 1000) });
-  assert.equal(fences, 1, 'PRECONDITION: the callback fenced the attempt');
-  deadlineRefusal(result);
-  assert.deepEqual(f.writes, [], 'sock.end was never called');
-  assert.deepEqual(f.withdrawn[0], ['target', f.enqueued[0].msg_id, 'reply_deadline_passed', { inFlight: true }]);
-});
-
-// rc-fix7 GB2-02: the aterm endpoint is pinned at delivery entry. A re-registration that moves the record to a successor
-// socket, or to HTTP (whose branch has no write-time guard), before the write is a zero-byte refusal (destination gone).
-// Fails on the snapshot, which wrote to the successor socket / POSTed to the HTTP endpoint.
-test('GB2-02 an aterm requester re-registered to another socket or to HTTP before the write gets nothing: destination gone', async t => {
-  let connected = null;
-  const f = atermFixture(t, { holdConnect: cb => { connected = cb; } });
-  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(NOT_AFTER) });
-  await until(() => connected !== null);
-  f.session.delivery = { transport: 'unix_socket', address: '/synthetic/successor.sock' };   // same record and epoch
-  connected();
-  const moved = await pending;
-  assert.equal(moved.code, 'SESSION_GONE');
-  assert.equal(moved.bytes_written, 0);
-  assert.deepEqual(f.writes, []);
-
-  let fetches = 0;
-  const h = atermFixture(t, { failFirstConnect: true, dependencies: { fetch: async () => { fetches++; return { ok: true, body: null }; } } });
-  const queued = await quietly(() => h.context.deliverInjectionToSession('target', h.session, PROMPT, { noEnter: true, ...deadline(NOT_AFTER) }));
-  assert.equal(queued.result.delivery_status, 'retry_pending', 'PRECONDITION: queued for retry');
-  h.session.delivery = null;
-  h.session.deliveryEndpoint = 'http://127.0.0.1:9/inject';
-  const refused = await h.context.mailboxDeliveryOptions.deliverFn('target', h.enqueued[0]);
-  assert.equal(refused.code, 'SESSION_GONE');
-  assert.equal(fetches, 0, 'the HTTP branch was never entered');
-  assert.deepEqual(h.withdrawn, [['target', h.enqueued[0].msg_id, 'session_gone', { inFlight: true }]]);
+// rc-fix7 GB2-02: the binding is pinned at delivery entry. A re-registration that moves the record in place to an aterm
+// socket or to HTTP (branches with no write-time guard) before the write is a zero-byte refusal (destination gone).
+test('GB2-02 a requester re-registered in place to an aterm socket or to HTTP before the write gets nothing: destination gone', async t => {
+  for (const [label, move] of [
+    ['unix socket', s => { s.type = 'aterm'; s.delivery = { transport: 'unix_socket', address: '/synthetic/successor.sock' }; }],
+    ['HTTP', s => { s.type = 'aterm'; s.delivery = null; s.deliveryEndpoint = 'http://127.0.0.1:9/inject'; }]]) {
+    let fetches = 0, connects = 0;
+    const f = ptyReplyFixture(t, { dependencies: { ...tickBusy, fetch: async () => { fetches++; return { ok: true, body: null }; },
+      net: { connect() { connects++; throw new Error('PRECONDITION: the UDS branch was entered'); } } } });
+    const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(NOT_AFTER) });
+    await until(() => f.enqueued.length === 1);
+    move(f.session);   // same record and epoch
+    const refused = await f.context.mailboxDeliveryOptions.deliverFn('target', f.enqueued[0]);
+    assert.equal(refused.code, 'SESSION_GONE', label);
+    assert.equal(fetches, 0, `${label}: the HTTP branch was never entered`);
+    assert.equal(connects, 0, `${label}: the UDS branch was never entered`);
+    assert.deepEqual(f.ptyWrites, [], label);
+    assert.deepEqual(f.withdrawn, [['target', f.enqueued[0].msg_id, 'session_gone', { inFlight: true }]], label);
+    const moved = await pending;
+    assert.equal(moved.code, 'SESSION_GONE', label);
+    assert.equal(moved.bytes_written, 0, label);
+  }
 });
 
 // ───────────────────────────── GB-01/GB-02: the support matrix at delivery ─────────────────────────────
@@ -888,68 +888,53 @@ for (const [label, session] of Object.entries(OUTSIDE_MATRIX)) {
   });
 }
 
-test('GB-01/02 control: the same reply to an aterm requester over its unix socket is written once', async t => {
-  const f = atermFixture(t);
+// rc-fix8 GB3-01/GB3-02 (replaces "GB-01/02 control: the same reply to an aterm requester over its unix socket is written
+// once"): the aterm endpoint proves no instance (no handshake, epoch echo or peer pid) and its positive answer carries no
+// time, so the same reply is now refused at delivery entry like every state outside the matrix. Fails on the snapshot,
+// which connected and wrote it.
+test('GB3-02 a reply to an aterm requester over its unix socket is refused at entry: no connect, nothing enqueued or written', async t => {
+  let gateCalls = 0;
+  const f = atermFixture(t, { dependencies: { resolveModalGate: async () => { gateCalls++; return null; } } });
   const result = await f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(NOT_AFTER) });
-  assert.equal(result.success, true);
-  assert.deepEqual(f.writes, [PROMPT]);
-  assert.match(f.enqueued[0].msg_id, /:reply-capability-v1$/);
-  assert.deepEqual(f.withdrawn, []);
-});
-
-test('GB-02 the deadline passes between deliverFn\'s check and the UDS connect callback → nothing written, withdrawn', async t => {
-  let connected = null;
-  const f = atermFixture(t, { holdConnect: cb => { connected = cb; } });
-  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(T0 + 1000) });
-  await until(() => connected !== null);
-  t.mock.timers.tick(1001);
-  connected();
-  deadlineRefusal(await pending);
-  assert.deepEqual(f.writes, [], 'sock.end was never called');
-  assert.deepEqual(f.withdrawn[0], ['target', f.enqueued[0].msg_id, 'reply_deadline_passed', { inFlight: true }]);
-});
-
-test('GB-02 the requester instance changes before the UDS connect callback → nothing written, destination gone', async t => {
-  let connected = null;
-  const f = atermFixture(t, { holdConnect: cb => { connected = cb; } });
-  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(NOT_AFTER) });
-  await until(() => connected !== null);
-  f.session.sessionEpoch = 'epoch-t2';   // same record, new instance: the pre-existing callback check compares the record only
-  connected();
-  const result = await pending;
-  assert.equal(result.success, false);
-  assert.equal(result.code, 'SESSION_GONE');
-  assert.equal(result.bytes_written, 0);
-  assert.deepEqual(f.writes, []);
-  assert.deepEqual(f.withdrawn[0], ['target', f.enqueued[0].msg_id, 'session_gone', { inFlight: true }]);
-});
-
-test('GB-02 the direct fallback (mailbox unavailable) refuses a reply: no UDS connect at all', async t => {
-  const f = atermFixture(t, { dependencies: { getMailbox: () => { throw new Error('mailbox unavailable'); } } });
-  const { result } = await quietly(() => f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(NOT_AFTER) }));
   assert.deepEqual({ ...result, error: undefined }, { ...UNSUPPORTED, error: undefined });
+  assert.equal(gateCalls, 0);
   assert.equal(f.connects, 0);
   assert.deepEqual(f.writes, []);
+  assert.deepEqual(f.enqueued, []);
+  // Control: an ordinary inject to the same requester still goes over its socket.
+  const ordinary = await f.context.deliverInjectionToSession('target', f.session, 'ordinary text', { noEnter: true });
+  assert.equal(ordinary.success, true);
+  assert.deepEqual(f.writes, ['ordinary text']);
+});
+
+test('GB-02 the direct fallback (mailbox unavailable) refuses a reply: nothing reaches the requester', async t => {
+  const f = ptyReplyFixture(t, { dependencies: { getMailbox: () => { throw new Error('mailbox unavailable'); } } });
+  const { result } = await quietly(() => f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(NOT_AFTER) }));
+  assert.deepEqual({ ...result, error: undefined }, { ...UNSUPPORTED, error: undefined });
+  assert.deepEqual(f.ptyWrites, []);
+  assert.equal(f.session.pendingSubmit, null);
 });
 
 test('GB-01 a reply row still pending when the daemon restarts is withdrawn unwritten by the new incarnation; an ordinary row is not', async t => {
-  const f = atermFixture(t, { dependencies: { getMailboxDelivery: () => ({ tick: async () => {} }) } });   // tick busy elsewhere
-  await quietly(() => f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(NOT_AFTER) }));
-  await quietly(() => f.context.deliverInjectionToSession('target', f.session, 'ordinary text', { noEnter: true }));
-  const [reply, ordinary] = f.enqueued;
-  assert.match(reply.msg_id, /:reply-capability-v1$/);
+  const f = ptyReplyFixture(t, { dependencies: tickBusy });   // tick busy elsewhere: both rows stay queued
+  const reply = quietly(() => f.context.deliverInjectionToSession('target', f.session, PROMPT, { ...deadline(NOT_AFTER) }));
+  await until(() => f.enqueued.length === 1);
+  const ordinaryInject = quietly(() => f.context.deliverInjectionToSession('target', f.session, 'ordinary text', { noEnter: true }));
+  await Promise.all([reply, ordinaryInject]);
+  const [replyRow, ordinary] = f.enqueued;
+  assert.match(replyRow.msg_id, /:reply-capability-v1$/);
   assert.match(ordinary.msg_id, /^daemon:\d+:[0-9a-f]{8}$/, 'an ordinary msg_id keeps its exact format');
   f.withdrawn.length = 0;
   // The new incarnation: same mailbox rows and session record, no in-memory injection targets.
   const restarted = createSessionDeliveryContext(f.dependencies);
-  const refused = await restarted.mailboxDeliveryOptions.deliverFn('target', reply);
+  const refused = await restarted.mailboxDeliveryOptions.deliverFn('target', replyRow);
   assert.equal(refused.success, false);
   assert.equal(refused.bytes_written, 0);
-  assert.deepEqual(f.writes, [], 'the reply row was not written by the new daemon');
-  assert.deepEqual(f.withdrawn, [['target', reply.msg_id, 'reply_binding_lost', { inFlight: true }]]);
+  assert.deepEqual(f.ptyWrites, [], 'the reply row was not written by the new daemon');
+  assert.deepEqual(f.withdrawn, [['target', replyRow.msg_id, 'reply_binding_lost', { inFlight: true }]]);
   const written = await restarted.mailboxDeliveryOptions.deliverFn('target', ordinary);
   assert.equal(written.success, true, 'an ordinary row is delivered exactly as before');
-  assert.deepEqual(f.writes, ['ordinary text']);
+  assert.deepEqual(f.ptyWrites, ['ordinary text']);
 });
 
 // ───────────────────────────── rc-fix6: wrapped (P2) and daemon-owned PTY (P1) requesters ─────────────────────────────
@@ -1014,6 +999,7 @@ function ptyReplyFixture(t, over = {}) {
           { success: false, code: 'DELIVERY_UNCERTAIN', delivery_uncertain: true, bytes_written: null }); }
       } }),
       emitInjectFailureEvent: (...args) => f.failures.push(args),
+      ...(over.dependencies || {}),   // rc-fix8: a test may replace any of them (default: none, the unchanged fixture)
     },
   });
   f.failures = [];
@@ -1221,7 +1207,9 @@ test('GB2-05/06 body and CR reported written, but the submit receipt reaches the
   const result = await pending;
   assert.equal(result.success, false);
   assert.equal(result.code, 'DELIVERY_UNCERTAIN');
-  assert.equal(result.reason, 'written_after_deadline');
+  // rc-fix8 GB3-06: what the daemon observed is a late receipt ARRIVAL, not a late write. Fails on the snapshot
+  // ('written_after_deadline').
+  assert.equal(result.reason, 'receipt_arrived_after_deadline');
   assert.equal(result.bytes_written, null);
   assert.equal(f.session.strandedComposer, undefined, 'both parts were reported written: nothing is left unsubmitted');
 });
@@ -1290,4 +1278,94 @@ test('GB2-09 a spawned requester without its live PTY handle is refused at deliv
     assert.equal(gateCalls, 0, label);
     assert.deepEqual(f.enqueued, [], label);
   }
+});
+
+// ───────────────────────────── rc-fix8: third security review (GB3-*) ─────────────────────────────
+
+// GB3-03: the binding compares only what decides where the bytes go. A re-registration that changes only unrelated
+// delivery metadata (the HTTP endpoint of a wrapped record) leaves the same composer; if its CR is then refused (here: the
+// deadline passed before the CR timer), THAT composer is stranded, and the submit barrier is held until it is, so a later
+// input cannot be written into the unsubmitted reply text. Fails on the snapshot, which compared the endpoint too: it
+// skipped the strand and released the barrier first, so the later inject was written after the reply body.
+test('GB3-03 only unrelated delivery metadata changed and the CR is then refused: that same composer is stranded before later input is admitted', async t => {
+  const f = wrappedReplyFixture(t);
+  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, replyOptions(T0 + 2000));
+  await waitFor(() => f.raw.length === 1, 'the reply body was sent');
+  f.receipt(f.enqueued[0].msg_id, 'body', 'pty_written', 'written');
+  f.session.deliveryEndpoint = 'http://127.0.0.1:9/re-registered';   // in-place re-registration: metadata only
+  const later = f.context.deliverInjectionToSession('target', f.session, 'ordinary text', {});   // waits behind the reply
+  t.mock.timers.tick(2001);   // the CR timer fires after not_after: the daemon refuses the CR
+  const result = await pending;
+  assert.equal(f.raw.length, 1, 'no CR after not_after');
+  assert.equal(result.code, 'DELIVERY_UNCERTAIN');
+  assert.equal(result.bytes_written, null);
+  assert.equal(f.session.strandedComposer.epoch, 'epoch-t', 'the same composer is stranded despite the metadata change');
+  assert.equal(f.session.strandedComposer.reason, 'submit_refused_after_body');
+  const ordinary = await later;
+  assert.equal(ordinary.success, false, 'the later inject was not written behind the unsubmitted reply');
+  assert.equal(f.parsed().some(frame => frame.data === 'ordinary text'), false);
+});
+
+// GB3-04: a wrapped reply's CR is sent ONLY after the bridge's body receipt says pty_written. A body receipt saying the
+// write threw (outcome unknown), no body receipt yet, or an outcome already decided by a contradiction sends no CR; the
+// reply settles outcome unknown (never zero bytes once a byte may be in the composer) and that composer is stranded.
+// Fails on the snapshot, which consulted only a dropped body and sent the CR in all three cases.
+test('GB3-04 a wrapped reply CR follows only a written body receipt: body write threw, no receipt yet, or a contradiction → no CR', async t => {
+  const a = wrappedReplyFixture(t);
+  const pendingA = a.context.deliverInjectionToSession('target', a.session, PROMPT, replyOptions());
+  await waitFor(() => a.raw.length === 1, 'the reply body was sent');
+  a.receipt(a.enqueued[0].msg_id, 'body', 'unknown', 'unknown', 'write_threw');
+  const resultA = await pendingA;   // settled only after the CR timer ran
+  assert.equal(a.raw.length, 1, 'no CR after a body whose write threw');
+  assert.equal(resultA.code, 'DELIVERY_UNCERTAIN');
+  assert.equal(resultA.bytes_written, null, 'not zero bytes: the throw may have followed a partial write');
+  assert.equal(resultA.reason, 'body_outcome_unknown');
+  assert.equal(a.session.strandedComposer.reason, 'body_outcome_unknown');
+
+  const b = wrappedReplyFixture(t);
+  const pendingB = b.context.deliverInjectionToSession('target', b.session, PROMPT, replyOptions());
+  await waitFor(() => b.raw.length === 1, 'the reply body was sent');
+  await waitFor(() => b.raw.length === 2 || b.failures.some(([, code, , extra]) => extra && extra.phase === 'submit'),
+    'the CR timer ran with no body receipt yet');
+  assert.equal(b.raw.length, 1, 'no CR before a receipt says the body was written');
+  b.receipt(b.enqueued[0].msg_id, 'body', 'pty_written', 'written');   // late: the body is in the composer, unsubmitted
+  const resultB = await pendingB;
+  assert.equal(resultB.code, 'DELIVERY_UNCERTAIN');
+  assert.equal(resultB.bytes_written, null);
+  assert.equal(resultB.submit, 'not_written', 'the daemon knows it sent no CR');
+  assert.equal(b.session.strandedComposer.reason, 'submit_refused_after_body');
+
+  const c = wrappedReplyFixture(t);
+  const pendingC = c.context.deliverInjectionToSession('target', c.session, PROMPT, replyOptions());
+  await waitFor(() => c.raw.length === 1, 'the reply body was sent');
+  const id = c.enqueued[0].msg_id;
+  c.receipt(id, 'body', 'pty_written', 'written');
+  c.receipt(id, 'body', 'pty_written', 'written');   // a second body receipt: a contradiction, decided before the CR timer
+  const resultC = await pendingC;
+  assert.equal(c.raw.length, 1, 'no CR once the outcome was decided');
+  assert.equal(resultC.reason, 'receipt_contradiction');
+  assert.equal(c.session.strandedComposer.reason, 'receipt_contradiction');
+});
+
+// GB3-05: a write needs the wall clock AND the monotonic time since mint to agree. The host slept across the deadline with
+// a monotonic clock that does not count suspend (it moved 1 s) while the wall clock moved 20 s and was then corrected back
+// by 15 s: each clock alone still shows time left. Their 4 s disagreement since mint (wall − mono is fixed at mint) is a
+// discontinuity, treated as the deadline passed: zero bytes. Fails on the snapshot, which compared each clock alone and
+// wrote the body. Control: a disagreement within the 2 s bound still delivers.
+test('GB3-05 a suspend the monotonic clock did not count plus a wall-clock correction is refused as passed: zero bytes', async t => {
+  let mono = 0;
+  const f = ptyReplyFixture(t, { dependencies: { monoNow: () => mono } });
+  const minted = { ...replyOptions(T0 + 10000), notAfterMonoMs: 10000 };   // minted at wall T0, mono 0: 10 s on both clocks
+  mono = 1000;
+  t.mock.timers.tick(5000);   // wall T0 + 5000 (20 s elapsed, corrected back 15 s)
+  const refused = await f.context.deliverInjectionToSession('target', f.session, PROMPT, minted);
+  deadlineRefusal(refused);
+  assert.deepEqual(f.ptyWrites, [], 'nothing was written');
+  assert.deepEqual(f.enqueued, [], 'refused at entry');
+
+  const mono2 = 4000;   // wall − mono moved by 1 s since mint: inside the bound
+  const g = ptyReplyFixture(t, { dependencies: { monoNow: () => mono2 } });
+  const ok = await g.context.deliverInjectionToSession('target', g.session, PROMPT, { ...replyOptions(T0 + 10000), notAfterMonoMs: 10000 });
+  assert.equal(ok.success, true);
+  assert.deepEqual(g.ptyWrites, [PROMPT, '\r']);
 });

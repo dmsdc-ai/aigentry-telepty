@@ -172,6 +172,9 @@ function replyCapabilityTrailer({ id, token, not_after_ms }) {
 //   spawned — the daemon-owned PTY: body write guarded with deadline + headroom, deferred CR guarded with deadline.
 //             rc-fix7 GB2-09: only while the record holds the live PTY handle that write will use (not killed, input
 //             channel not failed); a record merely labelled spawned (registered, exited) is refused.
+// rc-fix8 GB3-01/GB3-02: aterm is no longer in the matrix. Its socket protocol proves no endpoint instance (the request
+// is {action, workspace, text}, the answer {success}/{status}; no handshake, epoch echo or peer pid), so a successor
+// listening at the same address cannot be told apart, and its positive answer carries no time. Refused like the rest.
 const BRIDGE_REPLY_GUARD_CAPABILITY = 'reply-guard-v1';
 function replyDeliverySupported(session) {
   if (!session || typeof session !== 'object' || session.sshRemote) return false;
@@ -183,8 +186,7 @@ function replyDeliverySupported(session) {
     return typeof session.replyGuardGeneration === 'string' && session.replyGuardGeneration === session.interactionOwnerGeneration
       && !!require('./transport/readiness-handshake').observedChild(session);
   }
-  return session.type === 'aterm'
-    && !!session.delivery && session.delivery.transport === 'unix_socket' && !!session.delivery.address;
+  return false;
 }
 
 function checkPrincipal(p, label) {

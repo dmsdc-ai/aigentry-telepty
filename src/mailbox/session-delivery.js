@@ -90,9 +90,6 @@ function createSessionDeliveryContext({
                 finish(buildErrorBody('TRACKING_PERSISTENCE_FAILED', 'UDS attempt could not be durably fenced; nothing written.', { httpStatus: 503, bytes_written: 0 }));
                 sock.destroy(); return;
               }
-              // Task 1292 GB-02, rc-fix7 GB2-01: instance + binding + deadline AFTER the (lock-taking) fence, immediately before the socket write.
-              const replyRefusal = replyGuard ? replyGuard() : null;
-              if (replyRefusal) { finish(replyRefusal); sock.destroy(); return; }
               attempted = true;
               sock.end(payload);
             } catch {
@@ -242,9 +239,17 @@ function createSessionDeliveryContext({
     if (!holder || holder.notAfterMs === undefined) return false;
     // rc-fix7 GB2-06: ONE deadline, fixed at mint — the store's monotonic deadline (notAfterMonoMs, passed by the consume
     // route) is compared as given, never re-anchored here. A reply without it is refused (fail closed).
-    if (!(Number.isFinite(holder.notAfterMonoMs) && monoNow() + headroomMs <= holder.notAfterMonoMs)) return true;
-    return !(Number.isSafeInteger(holder.notAfterMs) && Date.now() + headroomMs <= holder.notAfterMs);
+    const mono = monoNow(), wall = Date.now();
+    if (!(Number.isFinite(holder.notAfterMonoMs) && mono + headroomMs <= holder.notAfterMonoMs)) return true;
+    if (!(Number.isSafeInteger(holder.notAfterMs) && wall + headroomMs <= holder.notAfterMs)) return true;
+    // rc-fix8 GB3-05: both clocks must also agree on the time elapsed since mint. The store fixed notAfterMonoMs =
+    // mono_at_mint + (notAfterMs - wall_at_mint), so wall - mono stays at notAfterMs - notAfterMonoMs while both count the
+    // same time. A drift beyond REPLY_CLOCK_DRIFT_MAX_MS (a wall step back or forward, or a suspend that one clock did not
+    // count) is a discontinuity, treated as the deadline passed.
+    return Math.abs((wall - mono) - (holder.notAfterMs - holder.notAfterMonoMs)) > REPLY_CLOCK_DRIFT_MAX_MS;
   }
+  // rc-fix8 GB3-05: 2000 ms > the 1800 ms a 500 ppm clock slew can accumulate over the longest window a mint allows (1 h).
+  const REPLY_CLOCK_DRIFT_MAX_MS = 2000;
 
   // Task 1292 rc-fix6 (SUPPORT-MATRIX.md P1/P2) — a reply body is written to a daemon-owned PTY, or sent to a wrapped
   // bridge, only while its deferred CR can still follow inside the deadline: 300 ms (PTY) / 500 ms (wrapped) submit
@@ -264,11 +269,13 @@ function createSessionDeliveryContext({
   // rc-fix7 GB2-02/GB2-08: the delivery binding of a reply — transport, endpoint, owner generation, child — captured at
   // delivery entry. Any change before a write is a refusal (zero bytes, destination gone), and settlement strands only
   // the composer of this same binding.
+  // rc-fix8 GB3-03: only what decides where the bytes go — the writer branch (type, ssh), the owner connection and
+  // generation and the announced child (wrapped), the PTY handle (spawned). The aterm/HTTP transport, address and endpoint
+  // are not in it: no supported requester writes through them (GB3-02), and a type change away from wrapped/spawned is.
   function replyBindingOf(session) {
     const child = session.type === 'wrapped' ? require('../transport/readiness-handshake').observedChild(session) : null;
     return { type: session.type, ownerWs: session.ownerWs, ownerGeneration: session.interactionOwnerGeneration,
-      childSeq: child ? child.child_seq : null, pty: session.ptyProcess, transport: session.delivery?.transport,
-      address: session.delivery?.address, endpoint: session.deliveryEndpoint, ssh: session.sshRemote };   // ssh: re-register can set it in place
+      childSeq: child ? child.child_seq : null, pty: session.ptyProcess, ssh: session.sshRemote };   // ssh: re-register can set it in place
   }
   function replyBindingChanged(session, binding) {
     if (!binding) return true;
@@ -283,7 +290,8 @@ function createSessionDeliveryContext({
   //   stranded — the body was written (or is unknown) and its CR was not written or is unknown
   //   unknown  — no decision by the bound, the socket closed, or a body receipt said unknown
   //   late     — (rc-fix7 GB2-05/06) both written, but a written receipt reached the daemon after the mint-time deadline:
-  //              the daemon's own evidence cannot place the write inside the deadline
+  //              the daemon's own evidence cannot place the write inside the deadline (rc-fix8 GB3-06: what was observed is
+  //              a late receipt ARRIVAL, so that is the reason it names)
   // rc-fix7 GB2-05: a reply record is never queued by the bridge, so each part has exactly ONE receipt, of its own part,
   // and the submit's only after the daemon sent the CR. Anything else (a second receipt, a wrong part, a submit receipt
   // before the CR left the daemon or before its body's) is a contradiction: decided outcome unknown, never accepted.
@@ -302,7 +310,7 @@ function createSessionDeliveryContext({
       if (notWritten(body)) return decide('dropped', body.reason);
       if (body && body.certainty === 'unknown') return decide('stranded', 'body_outcome_unknown');
       if (body && body.stage === 'pty_written') {
-        if (submit && submit.stage === 'pty_written') return decide(writtenLate ? 'late' : 'written', writtenLate ? 'written_after_deadline' : null);
+        if (submit && submit.stage === 'pty_written') return decide(writtenLate ? 'late' : 'written', writtenLate ? 'receipt_arrived_after_deadline' : null);
         if (notWritten(submit)) return decide('stranded', 'submit_refused_after_body');
         if (submit && submit.certainty === 'unknown') return decide('stranded', 'submit_outcome_unknown');
         if (daemonSubmit && !daemonSubmit.success) return decide('stranded', daemonSubmit.unknown ? 'submit_outcome_unknown' : 'submit_refused_after_body');
@@ -338,6 +346,7 @@ function createSessionDeliveryContext({
     return {
       decision,
       bodyDropped: () => notWritten(body),
+      bodyWritten: () => !decided && !!body && body.stage === 'pty_written',   // rc-fix8 GB3-04: the only receipt a CR may follow
       daemonSubmit(result) { daemonSubmit = result || { success: false, unknown: true }; evaluate(); },   // rc-fix7 GB2-07: undefined = the CR write threw
       bound(ms) {
         const timer = setTimeout(() => decide('unknown', 'receipt_timeout'), Math.max(0, ms));
@@ -372,11 +381,17 @@ function createSessionDeliveryContext({
   // The reply CR's own guard, evaluated in the CR timer immediately before its write: the binding (rc-fix7 GB2-02), the
   // deadline (no headroom: the body is already out), and for a wrapped reply a body the bridge already refused (its CR is
   // never sent alone).
+  // rc-fix8 GB3-04: a wrapped reply's CR is sent ONLY after the bridge's body receipt says pty_written (on the bound owner
+  // socket and generation; the bridge writes a reply body only to the child the frame names). A body receipt saying
+  // unknown (the write threw), no body receipt yet, or an outcome already decided (a contradiction) sends no CR; the
+  // receipt watcher then settles it.
   function replySubmitGuard(bound, watch, session) {
     if (replyBindingChanged(session, bound.replyBinding)) return sessionGoneResult();
     if (replyDeadlinePassed(bound)) return replyDeadlineResult();
     if (watch && watch.bodyDropped()) return { success: false, httpStatus: 409, code: 'REPLY_BODY_NOT_WRITTEN', bytes_written: 0,
       error: 'The bridge refused this reply body before writing it; its submit was not sent.' };
+    if (watch && !watch.bodyWritten()) return { success: false, httpStatus: 409, code: 'REPLY_BODY_UNCONFIRMED', bytes_written: 0,
+      error: 'No undisputed receipt said this reply body was written; its submit was not sent.' };
     return null;
   }
   // P1: the daemon wrote the body to its PTY (deliverFn) and the CR timer's result is the submit. P2: the bridge's
@@ -916,6 +931,7 @@ function createSessionDeliveryContext({
     let enqueueAttempted = false;
     try {
       if (session.sshRemote) {
+        if (replyBinding) { releaseSubmit(); return sessionGoneResult(); }   // rc-fix8 GB3-03: ssh is pinned null at entry; set since = moved
         const failure = sshInputFailure(session, deliveredBody, sshGeneration);
         if (failure) { releaseSubmit(); return failure; }
         const text = await requestSshWrite(session, deliveredBody, { expectedGeneration: sshGeneration });
@@ -1019,7 +1035,9 @@ function createSessionDeliveryContext({
           }
           return { success: false, httpStatus: (failure && failure.httpStatus) || 504, code: (failure && failure.code) || 'TIMEOUT',
             error: withdrawn ? 'Pending text was withdrawn before delivery; nothing was written.' : 'Delivery was refused before text was written.',
-            msg_id: msgId, bytes_written: 0 };
+            msg_id: msgId, bytes_written: 0,
+            // rc-fix8 CI: a reply's deadline refusal keeps its reason (insufficient_submit_headroom, GB2-10) through this rebuild.
+            ...(replyBound && failure && failure.code === 'REPLY_DEADLINE_PASSED' && failure.reason !== undefined ? { reason: failure.reason } : {}) };
         }
         if (owesSubmit) {
           const submitDelay = session.type === 'wrapped' ? 500 : 300;
@@ -1043,7 +1061,7 @@ function createSessionDeliveryContext({
               if (!replyBound) throw error;
             } finally {
               markBarrier(barrier, 'cr_write_done'); if (barrier) barrier.cr_ok = !!(submitResult && submitResult.success);
-              releaseSubmit();
+              if (!replyBound) releaseSubmit();   // rc-fix8 GB3-03: a reply releases the barrier only once settled (below)
               if (replySubmitSettled) replySubmitSettled(submitResult);   // rc-fix6: undefined when the write threw
             }
             if (submitResult && !submitResult.success) {   // rc-fix7 GB2-07: undefined only for a reply's thrown CR (an ordinary throw left above)
@@ -1054,7 +1072,11 @@ function createSessionDeliveryContext({
             }
           }, submitDelay);
           // rc-fix6: a reply is settled on what reached the child — body AND submit — never on the body hand-over alone.
-          if (replyBound) return await settleReplyDelivery({ id, session, sessionEpoch, options, msgId, ack, submitDone: replySubmitDone, watch: replyWatch, binding: replyBinding });
+          // rc-fix8 GB3-03: no later input is admitted to this composer until it is settled — accepted, or stranded.
+          if (replyBound) {
+            try { return await settleReplyDelivery({ id, session, sessionEpoch, options, msgId, ack, submitDone: replySubmitDone, watch: replyWatch, binding: replyBinding }); }
+            finally { releaseSubmit(); }
+          }
         }
       }
 
@@ -1202,8 +1224,8 @@ function createSessionDeliveryContext({
       const ownerWs = session.ownerWs;
       const beforeWrite = session.type === 'aterm'
         ? () => getMailbox().beginNonRetryableAttempt(sessionId, msg.msg_id) : undefined;
-      // Task 1292 GB-02: for a reply row the instance and deadline checks above run again inside the UDS connect callback,
-      // right before the socket write (the only write a reply can reach, SUPPORT-MATRIX.md).
+      // rc-fix8 GB3-01/GB3-02: no reply reaches the UDS branch (an aterm requester is refused at mint and at entry, and a
+      // type change since entry is a binding change refused just below), so its connect callback carries no reply guard.
       let replyRefused = null;
       // rc-fix6: the same guard now also runs right before the PTY write (P1) and the owner send (P2). A requester that owes
       // a CR needs REPLY_SUBMIT_HEADROOM_MS left at the body write; a wrapped one also gets the reply_* frame fields.
@@ -1215,7 +1237,8 @@ function createSessionDeliveryContext({
           : session.type !== 'aterm' && replyDeadlinePassed(target, REPLY_SUBMIT_HEADROOM_MS) ? replyHeadroomResult() : null) : undefined;
       const replyFrame = replyGuard && target.replyChildSeq !== undefined ? () => replyFrameFields(target, target.sessionEpoch, target.replyChildSeq) : undefined;
       // rc-fix7 GB2-02: checked once more in the same synchronous turn as the writer's branch choice, so a reply whose
-      // binding moved (e.g. to the HTTP branch, which has no write-time guard) is refused here with zero bytes.
+      // binding moved (e.g. a type change to the aterm UDS/HTTP branches, which have no write-time guard) is refused here
+      // with zero bytes.
       if (replyGuard) replyGuard();
       const result = replyRefused || await writeDataToSession(sessionId, session, msg.payload,
         { beforeWrite, frameMeta: { daemon_msg_id: msg.msg_id, inject_id: target?.injectId || null, part: 'body' }, ...(replyGuard ? { replyGuard, ...(replyFrame ? { replyFrame } : {}) } : {}) });

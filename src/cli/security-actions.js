@@ -401,6 +401,7 @@ function createAllowSecurityContext(shared, {
     // daemon settles the capability on those receipts. Same value as the daemon's headroom. rc-fix7 GB2-03: a reply
     // record is never queued (enqueueBridgeMessage), so it is never persisted and no recovery path can replay it.
     const REPLY_SUBMIT_HEADROOM_MS = 1500;
+    const REPLY_CLOCK_DRIFT_MAX_MS = 2000;   // rc-fix8 GB3-05: same bound as the daemon's
     const REPLY_FRAME_KEYS = ['reply_not_after_ms', 'reply_session_epoch', 'reply_child_seq'];
     function replyGuardOf(msg) {
       if (!msg || typeof msg !== 'object' || !REPLY_FRAME_KEYS.some(key => Object.hasOwn(msg, key))) return null;
@@ -415,7 +416,9 @@ function createAllowSecurityContext(shared, {
         || !child || child !== shared.child || childExited(child)) return 'reply_instance_changed';
       const passed = headroom => !(Number.isSafeInteger(reply.not_after_ms) && now() + headroom <= reply.not_after_ms
         && reply.received_wall + (monoNow() - reply.received_mono) + headroom <= reply.not_after_ms);
-      if (passed(0)) return 'reply_deadline_passed';
+      // rc-fix8 GB3-05: wall and monotonic time elapsed since receipt must agree (a step or an uncounted suspend = passed).
+      const drifted = Math.abs((now() - reply.received_wall) - (monoNow() - reply.received_mono)) > REPLY_CLOCK_DRIFT_MAX_MS;
+      if (drifted || passed(0)) return 'reply_deadline_passed';
       return !isCr && passed(REPLY_SUBMIT_HEADROOM_MS) ? 'reply_submit_headroom' : null;   // rc-fix7 GB2-10: its own reason
     }
     // A direct (never queued) reply frame refused before any byte. A body is remembered unwritten, so its CR is refused by
