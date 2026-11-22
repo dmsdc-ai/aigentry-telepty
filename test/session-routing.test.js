@@ -117,7 +117,8 @@ function writePeers(peers) {
 // `alsoOn` also listens on that second literal address with the same port and the same records;
 // each request records which of the two it arrived on (`at`: `v4` or `v6`). If that second listen
 // fails, the first keeps serving and `alsoOnError` holds the error (R6-4: the caller skips, with that
-// reason, the cases that need the second address).
+// reason, the cases that need the second address; R8-3: only when the error says IPv6 is unavailable,
+// and otherwise the caller fails).
 async function fakePeer(ids, { refuse = false, host = '127.0.0.1', alsoOn = null } = {}) {
   const state = { hits: 0, requests: [] };
   const handle = (req, res) => {
@@ -235,7 +236,9 @@ test('#1288 D1/FACT A+B: session info on an exact local id asks only the local d
     for (const hostSetting of [undefined, '127.0.0.1']) {
       const label = `${peerLabel}, TELEPTY_HOST=${hostSetting === undefined ? '(unset)' : hostSetting}`;
       const local = await localRecorder();
-      const env = { TELEPTY_HOST: hostSetting, TELEPTY_PORT: String(local.port) };
+      // R8-4: a patient version probe, so a slow runner cannot add a retried `GET /api/meta` to the
+      // complete trace asserted below (the probe and its retries are 0.11.3's ensureDaemonRunning).
+      const env = { TELEPTY_HOST: hostSetting, TELEPTY_PORT: String(local.port), TELEPTY_PROBE_TIMEOUT_MS: '10000' };
 
       const info = await cli(['session', 'info', sid, '--json'], env);
       assert.equal(info.code, 0, `${label}: ${info.stderr}`);
@@ -254,6 +257,13 @@ test('#1288 D1/FACT A+B: session info on an exact local id asks only the local d
 
       assert.deepEqual(local.sessionRequests(), ['GET /api/sessions', `GET /api/sessions/${sid}`,
         'GET /api/sessions', `GET /api/sessions/${sid}`], label);
+      // R8-4: the complete local trace, every method and path the recorder saw: per command exactly
+      // 0.11.3's one version probe, the list read and the detail read, and no other local operation.
+      const perCommand = ['GET /api/meta', 'GET /api/sessions', `GET /api/sessions/${sid}`];
+      assert.deepEqual(local.requests.map(({ method, path: p }) => `${method} ${p}`), [...perCommand, ...perCommand],
+        `${label}: complete local trace`);
+      // ...and no peer operation at all: neither fake peer, registered or not, received a request.
+      assert.deepEqual({ competing: competing.requests, other: other.requests }, { competing: [], other: [] }, label);
       // Each session request carries the one credential the local daemon accepted, never a peer's.
       const tokens = new Set(local.requests.filter(({ path: p }) => p.startsWith('/api/sessions')).map(({ token }) => token));
       assert.equal(tokens.size, 1, `${label}: the local requests carried different credentials`);
@@ -393,6 +403,10 @@ test('#1288 R4-1/R4-2: with TELEPTY_HOST=localhost, ::1 or [::1] both commands k
   // R6-4: `localhost` always runs. Every case that needs ::1 is its own subtest, and on a runner
   // where ::1 cannot be bound each of them is skipped with that reason in TAP (not failed, not passed).
   const local = await fakePeer([sid, sid2], { alsoOn: '::1' });
+  // R8-3: only "IPv6 is not available here" is the named skip: EADDRNOTAVAIL (IPv6 disabled, ::1 not
+  // assigned) or EAFNOSUPPORT (no IPv6 in the kernel). Any other bind error (EADDRINUSE included)
+  // fails the test as a fixture error instead of skipping the ::1 cases.
+  if (local.alsoOnError && !['EADDRNOTAVAIL', 'EAFNOSUPPORT'].includes(local.alsoOnError.code)) throw local.alsoOnError;
   const noV6 = local.alsoOnError
     ? `::1 cannot be bound on this runner (${local.alsoOnError.code || local.alsoOnError.message})` : false;
   const seen = (requests) => requests.map(({ method, path: requestPath }) => `${method} ${requestPath}`);

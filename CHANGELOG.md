@@ -22,28 +22,41 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
   unregistered peer (`PEER_NOT_REGISTERED`) and ambiguous peer identity (`AMBIGUOUS_PEER`). They keep
   the same `❌` line on stderr and exit 1. Text mode is unchanged.
 - To name the local copy of an id that several machines run, use the bare id with `session info`.
-  Every other command, and every qualified `<id>@<host>`, resolves as in 0.11.3: an exactly matching
+  Every other command, and every qualified `<id>@<host>`, resolves as in 0.11.3. On a command that
+  resolves the reference through the shared session resolver (for example `session info`,
+  `read-screen`, `inject`, `kill`), an exactly matching
   registered peer alias (name, machine id, host, `host:port`, target, DNS name) wins and two are
   refused as ambiguous; only if none matches does a loopback `<host>` go to this machine's loopback,
   and any other `<host>` is refused as unregistered unless `TELEPTY_AUTH_TOKEN` is set. An alias
   routes only to a peer registered with `connect` (SSH) or `connect-http` (HTTP): a `connect-broker`
   entry whose alias matches still counts toward the ambiguity refusal, but on its own the reference
-  continues as if no peer matched.
+  continues as if no peer matched. `readiness` and `wait-ready` do not use that resolver: they send
+  their request straight to `<host>` and match no alias.
 
 **Upgrading**
 
-- Unchanged from earlier releases, and triggered by every version bump: when a 0.11.4 `telepty`
-  command that checks the local daemon first (`list`, `session info` and most other commands) finds
-  an older daemon (such as 0.11.3) answering on its port, it restarts that daemon and prints
-  `⚙️ Daemon version mismatch (running v0.11.3, installed v0.11.4). Restarting...` on stderr. The
-  restart ends every `spawn`ed session: its PTY is a child of the daemon process and dies with it.
-  `allow`-wrapped sessions survive it. A daemon owned by launchd/systemd/schtasks is left to its
-  supervisor. `TELEPTY_CLIENT_RESTART=off` (or `"clientRestart": "off"` in
-  `~/.telepty/config.json`) prevents the restart on any host: no client stops, spawns or kickstarts
-  the daemon, and the command prints on stderr that the daemon needs a restart and which command to
-  run. To keep `spawn`ed sessions, set it before the first 0.11.4 command, then restart the daemon
-  yourself when those sessions may end. The switch governs `telepty` commands only; a direct global
-  `npm install -g` can still replace an older recorded daemon itself, as described under 0.11.3.
+Everything in this section is unchanged 0.11.3 behaviour. Only the version number it compares is new.
+
+- A daemon restart, by any path, ends every `spawn`ed session: its PTY is a child of the daemon
+  process and dies with it. `allow`-wrapped sessions survive and re-register.
+- Automatic restart: when a 0.11.4 `telepty` command that checks the local daemon first (`list`,
+  `session info` and most other commands, with `TELEPTY_HOST` addressing `127.0.0.1`) finds an older
+  daemon (such as 0.11.3) answering on its port, it attempts a restart only after its existing gates.
+  It does not attempt one when `TELEPTY_CLIENT_RESTART=off` (or `"clientRestart": "off"` in
+  `~/.telepty/config.json`) is set or launchd/systemd/schtasks owns the daemon; in both cases it
+  prints on stderr that the daemon needs a restart and which command to run. It also does not attempt
+  one when the same blocked restart was already reported or the supervision preflight refuses.
+  Otherwise it prints
+  `⚙️ Daemon version mismatch (running v0.11.3, installed v0.11.4). Restarting...` on stderr and
+  restarts the daemon.
+- The switch gates only this automatic restart and the daemon restart that `telepty update` performs
+  after installing. It does not gate the package's install hook. A direct global npm install or update
+  of telepty runs that hook, and so does `telepty update` on Linux and macOS, because it runs
+  `npm install -g` first. The hook can stop an older recorded daemon and start a replacement, as
+  described under 0.11.3. (On Windows, `telepty update` prints a read-only plan instead.) Explicit
+  lifecycle commands such as `telepty daemon stop` and `telepty daemon restart` are the operator's
+  own action, and the switch does not apply to them.
+- To keep `spawn`ed sessions, let them finish before any upgrade path that can run the install hook.
 
 ## 0.11.3
 
