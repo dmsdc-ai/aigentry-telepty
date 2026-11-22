@@ -1328,21 +1328,20 @@ function isRemoteSession(session) {
 // The cost is one extra local round-trip (~2ms, measured) on the miss path, where the fan-out
 // that follows dwarfs it.
 //
-// #1288: every TELEPTY_HOST spelling isLocalHostname() accepts is this machine (R3). `exactOnly`
-// (session info, multicast — and any spelling other than 127.0.0.1) short-circuits a bare id the
-// local daemon has EXACTLY, and returns the target 0.11.3 picked for it after the fan-out; a
-// prefix or a qualified id keeps the 0.11.3 path.
+// #1288: `exactOnly` (session info, multicast) short-circuits only a bare id the local daemon has
+// EXACTLY, for every loopback TELEPTY_HOST spelling isLocalHostname() accepts, and returns the
+// target 0.11.3 picked for it after the fan-out. The list is read from the address the caller
+// configured (S2: an IPv6-only listener is found); a miss or a failed read keeps the 0.11.3 path.
 async function resolveLocalSessionTarget(sessionRef, { exactOnly = false } = {}) {
-  if (!isLocalHostname(REMOTE_HOST)) return null;
+  if (exactOnly ? !isLocalHostname(REMOTE_HOST) : REMOTE_HOST !== '127.0.0.1') return null;
   const parsed = parseSessionReference(sessionRef);
   if (!parsed.id) return null;
   if (parsed.host && !isLocalHostname(parsed.host)) return null;
-  exactOnly = exactOnly || REMOTE_HOST !== '127.0.0.1';
   if (exactOnly && parsed.host) return null;
 
   let sessions;
   try {
-    const res = await fetchWithAuth(`${daemonUrl('127.0.0.1')}/api/sessions`, {
+    const res = await fetchWithAuth(`${daemonUrl(REMOTE_HOST)}/api/sessions`, {
       signal: AbortSignal.timeout(probeTimeoutMs())
     });
     if (!res.ok) return null;
@@ -4860,9 +4859,10 @@ async function main() {
     const sessionRefs = sessionIdsRaw.split(',').map(s => s.trim()).filter(s => s);
     try {
       // #1288 (D1): a bare id the local daemon has EXACTLY resolves there without the peer fan-out;
-      // every other reference resolves exactly as in 0.11.3, against one fan-out.
+      // every other reference resolves exactly as in 0.11.3, against one fan-out. A list with no ids
+      // keeps the 0.11.3 fan-out, its warnings and its exit status (S4).
       await ensureDaemonRunning();
-      let discovered = null;
+      let discovered = sessionRefs.length ? null : await discoverSessions({ silent: true, _ensureDaemonRunning: async () => {} });
       const groupedTargets = new Map();
       for (const sessionRef of sessionRefs) {
         const target = await resolveLocalSessionTarget(sessionRef, { exactOnly: true })

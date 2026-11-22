@@ -6,26 +6,20 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 **Behaviour changes**
 
-- `session info` and `multicast` resolve a bare ID that the local daemon has exactly to the local
-  session without asking any peer, as every other command already did (#837); 0.11.3 refused it as
-  existing on multiple hosts, even with `TELEPTY_HOST=127.0.0.1`. For these two commands a prefix, a
-  qualified ID and an ID absent locally resolve as before. The remote copy needs `<id>@<peer>`.
-- `TELEPTY_HOST=localhost`, `::1` or `[::1]` now take the same local-first path for an exact bare ID;
-  the request still goes to the host `TELEPTY_HOST` names.
+- `session info` and `multicast`: with `TELEPTY_HOST` unset or a loopback spelling (`127.0.0.1`,
+  `localhost`, `::1`, `[::1]`), a bare id that exactly matches a local session means the local
+  session; the remote copy needs `<id>@<peer>`. No peer is asked for it, as the other commands
+  already did with the default host (#837); 0.11.3 refused it as existing on multiple hosts, even
+  with `TELEPTY_HOST=127.0.0.1`. The local list is read from the address `TELEPTY_HOST` configures. A
+  prefix, a qualified id, an id the local daemon does not list, or a failed local read resolve as in
+  0.11.3.
 - Without `TELEPTY_AUTH_TOKEN`, `<id>@<this machine's name>` (host name, `TELEPTY_MACHINE_ID` or the
   local daemon's machine ID, any letter case) addresses the local daemon instead of being refused,
   unless a registered peer uses that name as name, machine ID or host in any letter case. A peer
   matching it exactly is used, as before. With the token set the name is dialled directly, as before.
-- `connect` and `connect-http` without `--name` name a peer registered by IP after the whole address
-  (`100.64.0.7`, not `100`). An endpoint that already has an entry keeps that entry's key, with or
-  without `--name`; an IP name held by a different endpoint is refused with a hint to pass `--name`.
 - With `--json`, `session info` and `read-screen` print the cross-host ambiguity, unregistered-peer
   and ambiguous-peer refusals as `{"success":false,"code":"AMBIGUOUS_SESSION"|"PEER_NOT_REGISTERED"|"AMBIGUOUS_PEER","error":…}`
   on stdout, keep the `❌` line on stderr, and exit 1.
-
-Routing resolves no names: `<id>@<address>` selects a registered peer only when the address equals
-its registered name, machine ID, host, `host:port` or target. Without `TELEPTY_AUTH_TOKEN`,
-`<id>@<ip>` for a peer registered by host name is refused with the list of known peers.
 
 ## 0.11.3
 
