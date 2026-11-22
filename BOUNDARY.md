@@ -157,14 +157,13 @@ literals and nothing else. That is a deliberate false positive. The predicate is
 the address, and widening it to "any address this host happens to answer on" would make the boundary
 depend on interface enumeration at the moment of the call. `TELEPTY_AUTH_TOKEN` is the escape hatch.
 This is a named limitation, not a solved problem.
-To name the session on this machine when a peer runs the same id, use the bare `<sid>`: since
-0.11.4, `session info` and `multicast` resolve it locally, with no peer request, when it equals byte
-for byte an id in the local list 0.11.3 already reads, and only when `TELEPTY_HOST` is unset, empty
-or names the host `127.0.0.1`. `<sid>@127.0.0.1` (`@localhost`, `@::1`) is not a guaranteed local
-route: as in 0.11.3 an exactly matching registered peer alias wins, and only otherwise does it go to
-that loopback address with the token order above. Under `--json`, `session info` and `read-screen`
-print the multiple-hosts, unregistered-peer and ambiguous-peer refusals as JSON on stdout, with the
-same line on stderr, and exit 1. Neither change sends a request or a token 0.11.3 would not send.
+To name the session on this machine when a peer runs the same id, use the bare `<sid>` with
+`session info` (0.11.4: local, asking no peer, when it equals byte for byte an id in the local list
+0.11.3 already reads first and `TELEPTY_HOST` is unset or exactly `127.0.0.1`). Other commands, and
+every qualified `<sid>@<host>`, resolve as in 0.11.3: an exactly matching registered peer alias wins
+(two are refused as ambiguous), so `<sid>@127.0.0.1` is not a local route when a peer has that
+alias. Under `--json`, `session info` and `read-screen` print the multiple-hosts, unregistered-peer
+and ambiguous-peer refusals as JSON on stdout, with the same line on stderr, and exit 1.
 
 ### `TELEPTY_AUTH_TOKEN` must be set at every end, or at none
 

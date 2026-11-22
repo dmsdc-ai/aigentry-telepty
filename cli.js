@@ -1263,9 +1263,9 @@ async function discoverSessions(options = {}) {
     }
   }
 
-  // #1288 (D1): a caller may stop on this one local read, before any peer is asked. The read and
-  // its failure handling above are 0.11.3's; on a miss everything below runs unchanged.
-  if (options.exactLocal && options.exactLocal(allSessions.slice())) return allSessions;
+  // #1288 (D1, `session info` only): the caller may stop on this one local read, before any peer
+  // is asked. The read and its failure handling above are 0.11.3's; otherwise everything below runs.
+  if (options.exactLocal && options.exactLocal(allSessions)) return allSessions;
 
   // Remote peer sessions via SSH direct
   const remoteSessions = crossMachine.discoverAllRemoteSessions();
@@ -1351,25 +1351,6 @@ async function resolveLocalSessionTarget(sessionRef) {
   // prefix fallback both resolve here, and a local session never reaches the fan-out by having
   // been spelled shorter. The list is one daemon's, so the multi-host arm cannot fire.
   return pickSessionTarget(parsed.id, sessions.map((s) => ({ host: '127.0.0.1', ...s })), '127.0.0.1');
-}
-
-// #1288 (D1) for `session info` and `multicast`: discover as 0.11.3 does, except that a reference
-// which 0.11.3's parser treats as bare AND equals a local session id byte for byte is resolved
-// against the local daemon's list alone. When every reference is such a hit, no peer is asked.
-// Returns the session list to resolve each reference against.
-// Only when TELEPTY_HOST is unset or 127.0.0.1: the check reads discovery's own local read (one
-// read, as in 0.11.3) and sends nothing. Any other TELEPTY_HOST runs the 0.11.3 discovery untouched.
-async function discoverExactLocal(sessionRefs) {
-  if (REMOTE_HOST !== '127.0.0.1') {
-    const discovered = await discoverSessions({ silent: true });
-    return () => discovered;
-  }
-  let local = [];
-  const isHit = (ref) => { const parsed = parseSessionReference(ref);
-    return !parsed.host && parsed.id === ref && local.some((s) => s && s.id === ref); };
-  const discovered = await discoverSessions({ silent: true,
-    exactLocal: (list) => { local = list; return sessionRefs.length > 0 && sessionRefs.every(isHit); } });
-  return (ref) => (isHit(ref) ? local : discovered);
 }
 
 // #1288 (D3): under --json, the three routing refusals (cross-host ambiguity, unregistered peer,
@@ -4848,10 +4829,10 @@ async function main() {
     }
     const sessionRefs = sessionIdsRaw.split(',').map(s => s.trim()).filter(s => s);
     try {
-      const sessionsFor = await discoverExactLocal(sessionRefs); // #1288 (D1)
+      const discovered = await discoverSessions({ silent: true });
       const groupedTargets = new Map();
       for (const sessionRef of sessionRefs) {
-        const target = await resolveSessionTarget(sessionRef, { sessions: sessionsFor(sessionRef) });
+        const target = await resolveSessionTarget(sessionRef, { sessions: discovered });
         if (!target) {
           throw new Error(`Session '${sessionRef}' was not found on any discovered host.`);
         }
@@ -5162,8 +5143,12 @@ async function main() {
     }
 
     try {
-      const sessionsFor = await discoverExactLocal([sessionRef]); // #1288 (D1)
-      const target = await resolveSessionTarget(sessionRef, { sessions: sessionsFor(sessionRef) });
+      // #1288 (D1): TELEPTY_HOST unset or exactly 127.0.0.1, and a bare id (the parser leaves it whole)
+      // equal to an id in discovery's own local read: discovery stops there and no peer is asked.
+      const exactLocal = [undefined, '127.0.0.1'].includes(process.env.TELEPTY_HOST) && parseSessionReference(sessionRef).id === sessionRef
+        ? (local) => local.some((s) => s.id === sessionRef) : undefined;
+      const sessions = await discoverSessions({ silent: true, exactLocal });
+      const target = await resolveSessionTarget(sessionRef, { sessions });
       if (!target) {
         console.error(`❌ Session '${sessionRef}' was not found on any discovered host.`);
         process.exit(1);

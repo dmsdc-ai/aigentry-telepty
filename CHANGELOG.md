@@ -6,23 +6,21 @@ All notable changes to `@dmsdc-ai/aigentry-telepty` are documented here.
 
 **Behaviour changes**
 
-- `session info` and `multicast`: a bare id (0.11.3 finds no host part in it: no `@`, or its last `@` is
-  its first or last character) that equals, byte for byte, a session id the local daemon lists
-  resolves to that local session and no peer is asked, even when a peer runs the same id (0.11.3
-  refused it as existing on multiple hosts). This applies only when `TELEPTY_HOST` is unset or empty
-  or names the host `127.0.0.1` (any port); the check uses the local list 0.11.3 already reads and
-  adds no request. Any other `TELEPTY_HOST`, `localhost` and `::1` included, behaves as in 0.11.3. In
-  a `multicast` list each such id resolves locally and peers are listed once for the others, as
-  before. A prefix, a qualified id, an unlisted id or a failed local read takes the 0.11.3 path.
-  Other commands are unchanged.
+- `session info <id>`: when `TELEPTY_HOST` is unset or exactly `127.0.0.1`, a bare id (no `@`, or its
+  last `@` is its first or last character) equal, byte for byte, to a session id in the local list
+  0.11.3 already reads first resolves to that local session and no peer is asked, even when a peer
+  runs the same id (0.11.3 refused it as existing on multiple hosts). Any other `TELEPTY_HOST`
+  (empty, `127.0.0.1:<port>`, `localhost`, `::1`), a prefix, a qualified id, an unlisted id and a
+  failed local read keep the 0.11.3 path. Every other command, `multicast` included, is unchanged.
 - With `--json`, `session info` and `read-screen` print three refusals as
   `{"success":false,"code":…,"error":…}` on stdout: cross-host ambiguity (`AMBIGUOUS_SESSION`),
   unregistered peer (`PEER_NOT_REGISTERED`) and ambiguous peer identity (`AMBIGUOUS_PEER`). They keep
   the same `❌` line on stderr and exit 1. Text mode is unchanged.
-- To name the local copy of an id that several machines run, use the bare id. Qualified references
-  are unchanged: `<id>@127.0.0.1` (or `@localhost`, `@::1`) goes to a registered peer whose alias
-  equals the qualifier if there is one, else to that loopback address; `<id>@<this machine's
-  hostname>` is refused unless `TELEPTY_AUTH_TOKEN` is set. Name a remote copy `<id>@<peer>`.
+- To name the local copy of an id that several machines run, use the bare id with `session info`.
+  Every other command, and every qualified `<id>@<host>`, resolves as in 0.11.3: an exactly matching
+  registered peer alias (name, machine id, host, `host:port`, target, DNS name) wins and two are
+  refused as ambiguous; only if none matches does a loopback `<host>` go to this machine's loopback,
+  and any other `<host>` is refused as unregistered unless `TELEPTY_AUTH_TOKEN` is set.
 
 ## 0.11.3
 

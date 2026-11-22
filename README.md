@@ -366,21 +366,19 @@ have not registered as a peer — append `@<host>` to the session ID. `<host>` c
 hostname, LAN IP, or Tailnet name. This needs no `connect`/`connect-http` first: the target
 is resolved directly, which is why the relay demo above works between fresh machines.
 
-The same ID on several machines (every machine runs `orchestrator`): name the local session by its
-**bare ID**. Since 0.11.4, `session info` and `multicast` resolve a bare ID (one in which 0.11.3
-finds no host part: no `@`, or its last `@` is its first or last character) to the local session
-without asking any peer when it equals, byte for byte, an ID in the local daemon's list. This holds
-only when `TELEPTY_HOST` is unset or empty or names the host `127.0.0.1` (any port). Any other value,
-`localhost` and `::1` included, keeps 0.11.3's behaviour, as do a prefix, an ID the local daemon
-does not list, a failed local read, and all other commands. A qualified reference is unchanged from
-0.11.3 and is not a guaranteed local route: `<id>@127.0.0.1` (or `@localhost`, `@::1`) goes to a
-registered peer whose name, machine id, host, `host:port`, target or DNS name equals the qualifier
-(two such peers are refused as ambiguous), and only otherwise to that loopback address on the CLI's
-port, carrying `TELEPTY_AUTH_TOKEN`, else a token stored for that address, else the local daemon
-token. `<id>@<this machine's own non-loopback name or address>` is refused as an unregistered peer
-unless `TELEPTY_AUTH_TOKEN` is set. Name a remote copy `<id>@<peer>`. With `--json`, `session info`
-and `read-screen` print the multiple-hosts, unregistered-peer and ambiguous-peer refusals as a JSON
-document on stdout, keep the `❌` line on stderr, and exit 1.
+The same ID on several machines (every machine runs `orchestrator`): since 0.11.4,
+`telepty session info <id>` reads the local session, asking no peer, when `TELEPTY_HOST` is unset
+or exactly `127.0.0.1`, `<id>` is bare (no `@`, or its last `@` is its first or last character) and
+it equals, byte for byte, an ID in the local list 0.11.3 already reads first. Otherwise, and on
+every other command (`multicast` included), a bare ID resolves as in 0.11.3. So does a qualified
+`<id>@<host>` on every command: a registered peer whose name, machine id, host, `host:port`,
+target or DNS name equals `<host>` is used (two such peers are refused as ambiguous); only if none
+matches does a loopback `<host>` (`127.0.0.1`, `localhost`, `::1`) go to this machine's loopback on
+the CLI's port, with `TELEPTY_AUTH_TOKEN`, else a token stored for that address, else the local
+token, and any other `<host>` is refused as an unregistered peer unless `TELEPTY_AUTH_TOKEN` is set.
+Name a remote copy `<id>@<peer>`. With `--json`, `session info` and `read-screen` print the
+multiple-hosts, unregistered-peer and ambiguous-peer refusals as JSON on stdout, keep the `❌` line
+on stderr, and exit 1.
 
 ```bash
 # Hostname / Tailnet name
