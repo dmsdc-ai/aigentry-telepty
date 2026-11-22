@@ -136,6 +136,20 @@ function assertNoEffect(f, before) {
 
 // ───────────────────────────── U2: admission M1–M9 ─────────────────────────────
 
+// rc-fix6: a wrapped session whose CURRENT owner generation's bridge declared reply-guard-v1 on its owner-WS handshake
+// (what bindImmediateSubmitCapability records) and announced its started child (process_started, child_seq 1).
+function announcingWrapped(record, generation) {
+  record.type = 'wrapped';
+  record.sessionEpochProved = record.sessionEpoch;
+  delete record.delivery;
+  record.interactionOwnerGeneration = generation;
+  record.replyGuardGeneration = generation;
+  record.transportReadiness = { owner_generation: generation, capable: true, nonce: 'n'.repeat(22),
+    process_started: { child_seq: 1, pid: 4242, exec: 'unverified', observed_at: new Date(T0).toISOString() },
+    input_transport_ready: null, retired_child_seq: 0, cleared_reason: null };
+  return record;
+}
+
 const OTHER = { sid: 'other-q', epoch: 'epoch-o', generation: 1 };
 const RESPONDER_A = { sid: 'responder-a', epoch: 'epoch-r', generation: 1 };
 const REQUESTER_Q = { sid: 'requester-q', epoch: 'epoch-q', generation: 1 };
@@ -173,7 +187,10 @@ const CONDITIONS = {
   // GB-03 (M7a): requesters outside the support matrix, refused at mint.
   M7a_mailbox: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'mailbox'; delete f.requester.delivery; } },
   M7a_wrapped: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'wrapped'; f.requester.sessionEpochProved = 'epoch-q'; delete f.requester.delivery; } },
-  M7a_spawned: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'spawned'; delete f.requester.delivery; } },
+  // rc-fix6: a daemon-owned PTY requester is now in the matrix; one over SSH is not (replaces the former M7a_spawned row).
+  M7a_spawned_ssh: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.type = 'spawned'; f.requester.sshRemote = { host: 'h' }; delete f.requester.delivery; } },
+  // rc-fix6: a wrapped requester whose bridge announced reply-guard-v1 only in an EARLIER owner generation (old bridge now).
+  M7a_wrapped_stale_announcement: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { announcingWrapped(f.requester, 'owner-gen-q'); f.requester.replyGuardGeneration = 'owner-gen-q-previous'; } },
   M7a_aterm_http: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.delivery = null; f.requester.deliveryEndpoint = 'http://127.0.0.1:9/inject'; } },
   M7a_aterm_ssh: { code: 'REPLY_CAPABILITY_REQUESTER_UNSUPPORTED', setup: f => { f.requester.sshRemote = { host: 'h' }; } },
   M8_soon: { code: 'REPLY_CAPABILITY_DEADLINE_INVALID', rcOver: { not_after_ms: T0 + 29999 } },
@@ -783,7 +800,8 @@ test('GB-02 a wall clock that stands still or runs back after the enqueue cannot
 
 const OUTSIDE_MATRIX = {
   wrapped: {},
-  spawned: { type: 'spawned', ownerWs: undefined, ptyProcess: { killed: false, write() { throw new Error('PTY written'); } } },
+  // rc-fix6: a spawned (daemon-owned PTY) requester is now supported; the same over SSH is not (replaces the former row).
+  'spawned over SSH': { type: 'spawned', ownerWs: undefined, sshRemote: { host: 'h' }, ptyProcess: { killed: false, write() { throw new Error('PTY written'); } } },
   'ssh-remote wrapped': { sshRemote: { host: 'h' } },
   'aterm over HTTP': { type: 'aterm', ownerWs: undefined, deliveryEndpoint: 'http://127.0.0.1:9/inject' },
   mailbox: { type: 'mailbox' },
@@ -865,4 +883,196 @@ test('GB-01 a reply row still pending when the daemon restarts is withdrawn unwr
   const written = await restarted.mailboxDeliveryOptions.deliverFn('target', ordinary);
   assert.equal(written.success, true, 'an ordinary row is delivered exactly as before');
   assert.deepEqual(f.writes, ['ordinary text']);
+});
+
+// ───────────────────────────── rc-fix6: wrapped (P2) and daemon-owned PTY (P1) requesters ─────────────────────────────
+
+const OWNER_GEN = 'owner-gen-target';
+const REPLY_INJECT_ID = uuid(77);   // the consume route's reply_inject_id, passed as pairInjectId → the frames' inject_id
+const replyOptions = (notAfterMs = NOT_AFTER) => ({ from: 'responder-a', source: 'reply-capability-v1', injectId: null,
+  pairInjectId: REPLY_INJECT_ID, verifiedSenderSid: 'responder-a', notAfterMs });
+// Real-time wait: the deferred CR is a real 300/500 ms timer (only Date is mocked).
+async function waitFor(predicate, label) {
+  for (let i = 0; i < 400 && !predicate(); i += 1) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(predicate(), `PRECONDITION: ${label}`);
+}
+
+// The requester is wrapped. Its owner socket is an EventEmitter (the daemon reads this reply's bridge receipts from it)
+// that records every raw frame; `receipt()` plays the bridge's answer in the exact bridge_receipt wire shape.
+function wrappedReplyFixture(t, over = {}) {
+  const raw = [];
+  const ownerWs = new EventEmitter();
+  ownerWs.readyState = 1;
+  ownerWs.send = frame => raw.push(String(frame));
+  let f;
+  f = deliveryFixture(t, {
+    session: { ownerWs, interactionOwnerGeneration: OWNER_GEN, pendingSubmit: null },
+    dependencies: {
+      getMailboxDelivery: () => ({ tick: async () => {
+        const msg = f.enqueued[f.enqueued.length - 1];
+        if (msg) await f.context.mailboxDeliveryOptions.deliverFn('target', msg);
+      } }),
+      emitInjectFailureEvent: (...args) => f.failures.push(args),
+    },
+  });
+  f.failures = [];
+  if (over.announce !== false) announcingWrapped(f.session, OWNER_GEN);
+  f.raw = raw;
+  f.parsed = () => raw.map(frame => JSON.parse(frame));
+  f.receipt = (daemonMsgId, part, stage, certainty, reason = null) => ownerWs.emit('message', Buffer.from(JSON.stringify({
+    type: 'bridge_receipt', schema: 1, daemon_msg_id: daemonMsgId, inject_id: part === 'body' ? REPLY_INJECT_ID : null, part, bridge_msg_id: null,
+    stage, reason, certainty, bridge_seq: 1, at_ms: T0, clock: 'bridge_wall', owner_generation: OWNER_GEN })));
+  return f;
+}
+
+// The requester is a daemon-owned PTY (type spawned); every PTY write is recorded.
+function ptyReplyFixture(t) {
+  const ptyWrites = [];
+  let f;
+  f = deliveryFixture(t, {
+    session: { type: 'spawned', ownerWs: undefined, pendingSubmit: null,
+      ptyProcess: { killed: false, write: data => ptyWrites.push(String(data)) } },
+    dependencies: {
+      getMailboxDelivery: () => ({ tick: async () => {
+        const msg = f.enqueued[f.enqueued.length - 1];
+        if (msg) await f.context.mailboxDeliveryOptions.deliverFn('target', msg);
+      } }),
+      emitInjectFailureEvent: (...args) => f.failures.push(args),
+    },
+  });
+  f.failures = [];
+  f.ptyWrites = ptyWrites;
+  return f;
+}
+
+test('rc-fix6 golden: an ordinary inject to a wrapped session sends the pre-change frames byte for byte; a reply adds exactly the four reply_* keys', async t => {
+  const o = wrappedReplyFixture(t);
+  const ordinary = await o.context.deliverInjectionToSession('target', o.session, PROMPT, { from: 'requester-q' });
+  assert.deepEqual(ordinary, { success: true, msg_id: o.enqueued[0].msg_id, queued: true, pending: 1, strategy: 'mailbox', submit: 'deferred' });
+  await waitFor(() => o.raw.length === 2, 'the ordinary CR was sent');
+  const id = o.enqueued[0].msg_id;
+  assert.match(id, /^requester-q:1800000000000:[0-9a-f]{8}$/);
+  assert.deepEqual(o.raw, [
+    '{"type":"inject","data":"synthetic task text","daemon_msg_id":"' + id + '","part":"body","owner_generation":"owner-gen-target"}',
+    '{"type":"inject","data":"\\r","daemon_msg_id":"' + id + ':submit","part":"submit","pair":"' + id + '","owner_generation":"owner-gen-target"}',
+  ], 'the ordinary frames are the snapshot\'s frames, byte for byte');
+  assert.equal(o.ownerWs.listenerCount('message'), 0, 'an ordinary inject never listens on the owner socket');
+  assert.equal(o.session.strandedComposer, undefined);
+
+  const r = wrappedReplyFixture(t);
+  const pending = r.context.deliverInjectionToSession('target', r.session, PROMPT, replyOptions());
+  await waitFor(() => r.raw.length === 1, 'the reply body was sent');
+  const replyId = r.enqueued[0].msg_id;
+  const reply = {
+    reply_not_after_ms: NOT_AFTER, reply_ttl_ms: NOT_AFTER - T0, reply_session_epoch: 'epoch-t', reply_child_seq: 1 };
+  assert.equal(r.raw[0], JSON.stringify({ type: 'inject', data: PROMPT, daemon_msg_id: replyId, inject_id: REPLY_INJECT_ID,
+    part: 'body', owner_generation: OWNER_GEN, ...reply }));
+  r.receipt(replyId, 'body', 'pty_written', 'written');
+  await waitFor(() => r.raw.length === 2, 'the reply CR was sent');
+  assert.equal(r.raw[1], JSON.stringify({ type: 'inject', data: '\r', daemon_msg_id: `${replyId}:submit`, part: 'submit',
+    pair: replyId, owner_generation: OWNER_GEN, ...reply }));
+  r.receipt(`${replyId}:submit`, 'submit', 'pty_written', 'written');
+  const result = await pending;
+  assert.equal(result.success, true);
+  assert.equal(result.submit, 'written');
+  assert.equal(r.ownerWs.listenerCount('message'), 0, 'the receipt listener is removed once decided');
+});
+
+test('rc-fix6 P2: the bridge drops the reply body (deadline or instance) → zero-byte settlement, the CR is never sent', async t => {
+  for (const [reason, code, status] of [['reply_deadline_passed', 'REPLY_DEADLINE_PASSED', 410],
+    ['reply_instance_changed', 'REPLY_BRIDGE_NOT_WRITTEN', 409]]) {
+    const f = wrappedReplyFixture(t);
+    const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, replyOptions());
+    await waitFor(() => f.raw.length === 1, 'the reply body was sent');
+    f.receipt(f.enqueued[0].msg_id, 'body', 'refused', 'not_written', reason);
+    const result = await pending;
+    assert.equal(result.success, false, reason);
+    assert.equal(result.code, code, reason);
+    assert.equal(result.httpStatus, status, reason);
+    assert.equal(result.bytes_written, 0, reason);
+    assert.equal(f.raw.length, 1, `${reason}: no CR frame followed a dropped body`);
+    assert.equal(f.session.strandedComposer, undefined, `${reason}: nothing is in the composer`);
+  }
+});
+
+test('rc-fix6 P2: the bridge refuses the CR after the body was written → outcome unknown, composer stranded, inject_failed', async t => {
+  const f = wrappedReplyFixture(t);
+  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, replyOptions());
+  await waitFor(() => f.raw.length === 1, 'the reply body was sent');
+  const id = f.enqueued[0].msg_id;
+  f.receipt(id, 'body', 'pty_written', 'written');
+  await waitFor(() => f.raw.length === 2, 'the reply CR was sent');
+  f.receipt(`${id}:submit`, 'submit', 'refused', 'not_written', 'reply_deadline_passed');
+  const result = await pending;
+  assert.equal(result.success, false);
+  assert.equal(result.code, 'DELIVERY_UNCERTAIN');
+  assert.equal(result.delivery_uncertain, true);
+  assert.equal(result.bytes_written, null, 'never a zero-byte refusal: the body is in the composer');
+  assert.equal(f.session.strandedComposer.epoch, 'epoch-t');
+  assert.equal(f.session.strandedComposer.reason, 'submit_refused_after_body');
+  assert.equal(f.session.strandedComposer.inject_id, REPLY_INJECT_ID);
+  assert.ok(f.failures.some(([sid, code, , extra]) => sid === 'target' && code === 'DELIVERY_UNCERTAIN' && extra.phase === 'submit'));
+});
+
+test('rc-fix6 P2: an old bridge (no reply-guard-v1 for this owner generation) is refused at delivery before any frame', async t => {
+  const unannounced = wrappedReplyFixture(t, { announce: false });
+  const stale = wrappedReplyFixture(t);
+  stale.session.replyGuardGeneration = 'owner-gen-previous';   // declared by an earlier owner generation only
+  const noChild = wrappedReplyFixture(t);
+  noChild.session.transportReadiness.process_started = null;   // the bridge announced no child for this generation
+  for (const [label, f] of [['unannounced', unannounced], ['stale generation', stale], ['no announced child', noChild]]) {
+    const result = await f.context.deliverInjectionToSession('target', f.session, PROMPT, replyOptions());
+    assert.deepEqual({ ...result, error: undefined }, { ...UNSUPPORTED, error: undefined }, label);
+    assert.deepEqual(f.raw, [], label);
+    assert.deepEqual(f.enqueued, [], label);
+  }
+  // Control: the same bridge with the announcement is admitted (refused at entry on the snapshot).
+  const ok = wrappedReplyFixture(t);
+  const pending = ok.context.deliverInjectionToSession('target', ok.session, PROMPT, replyOptions());
+  await waitFor(() => ok.raw.length === 1, 'the announcing bridge received the body');
+  ok.receipt(ok.enqueued[0].msg_id, 'body', 'refused', 'not_written', 'reply_deadline_passed');
+  assert.equal((await pending).code, 'REPLY_DEADLINE_PASSED');
+});
+
+test('rc-fix6 P1: a PTY reply body is written only with the submit headroom left → otherwise zero bytes, withdrawn', async t => {
+  const f = ptyReplyFixture(t);
+  const result = await f.context.deliverInjectionToSession('target', f.session, PROMPT, replyOptions(T0 + 1000));
+  deadlineRefusal(result);
+  assert.deepEqual(f.ptyWrites, [], 'neither the body nor a CR reached the PTY');
+  assert.deepEqual(f.withdrawn[0], ['target', f.enqueued[0].msg_id, 'reply_deadline_passed', { inFlight: true }]);
+});
+
+test('rc-fix6 P1: the deadline passes between the PTY body and its CR → no CR, stranded, settled outcome unknown', async t => {
+  const f = ptyReplyFixture(t);
+  const pending = f.context.deliverInjectionToSession('target', f.session, PROMPT, replyOptions(T0 + 2000));
+  await waitFor(() => f.ptyWrites.length === 1, 'the body was written inside the headroom');
+  t.mock.timers.tick(2001);   // the CR timer fires after not_after (an event-loop stall longer than the headroom)
+  const result = await pending;
+  assert.deepEqual(f.ptyWrites, [PROMPT], 'the CR was not written after the deadline');
+  assert.equal(result.success, false);
+  assert.equal(result.code, 'DELIVERY_UNCERTAIN');
+  assert.equal(result.bytes_written, null, 'never accepted and never a zero-byte refusal');
+  assert.equal(f.session.strandedComposer.reason, 'submit_refused_after_body');
+  assert.ok(f.failures.some(([sid, code, , extra]) => sid === 'target' && code === 'REPLY_DEADLINE_PASSED' && extra.phase === 'submit'),
+    'the existing submit-phase inject_failed event');
+});
+
+test('rc-fix6 P1 control: an in-time PTY reply writes the body and its CR and is accepted only after the CR', async t => {
+  const f = ptyReplyFixture(t);
+  const result = await f.context.deliverInjectionToSession('target', f.session, PROMPT, replyOptions());
+  assert.deepEqual(f.ptyWrites, [PROMPT, '\r'], 'the result waited for the CR write');
+  assert.equal(result.success, true);
+  assert.equal(result.submit, 'written');
+  assert.equal(f.session.strandedComposer, undefined);
+});
+
+test('rc-fix6 M7a: a spawned requester and a wrapped requester whose bridge announced reply-guard-v1 are admitted at mint', async t => {
+  for (const setup of [r => { r.type = 'spawned'; delete r.delivery; }, r => announcingWrapped(r, 'owner-gen-q')]) {
+    const f = routeFixture(t);
+    setup(f.requester);
+    const { result: res } = await quietly(() => f.call('responder-a', mintBody()));
+    assert.equal(res.statusCode, 200);
+    assert.equal(f.realStore.size(), 1);
+    assert.match(f.calls.deliver[0].options.replyCapabilityTrailer, TOKEN_ANYWHERE);
+  }
 });

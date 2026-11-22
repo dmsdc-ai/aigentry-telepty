@@ -3511,7 +3511,9 @@ async function main() {
         // / `bindImmediateSubmitCapability` — but the adjacency the test pins is kept anyway, because the test
         // is about the wiring staying visible in one place, not about the wire format.
         'x-telepty-bridge-capabilities': require('./src/transport/readiness-handshake').CAPABILITY + ', ' + require('./src/mailbox/delivery-runtime').IMMEDIATE_SUBMIT_CAPABILITY
-          + ', ' + require('./src/mailbox/delivery-runtime').BUSY_INPUT_CAPABILITY, ...policyCapabilityHeaders(),
+          + ', ' + require('./src/mailbox/delivery-runtime').BUSY_INPUT_CAPABILITY
+          // Task 1292 rc-fix6: THIS bridge re-checks a reply's deadline and instance at its own final write (security-actions.js).
+          + ', ' + require('./src/reply-capability').BRIDGE_REPLY_GUARD_CAPABILITY, ...policyCapabilityHeaders(),
         ...(strictOwnerProof ? {'x-telepty-principal':strictOwnerProof} : {})}});
       const strictOwnerWire = strictOwnerClient ? require('./src/cli/strict-owner-client').bindStrictOwnerClient(ownerSocket) : null;
       daemonWs = ownerSocket;

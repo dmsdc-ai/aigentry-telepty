@@ -165,8 +165,20 @@ function replyCapabilityTrailer({ id, token, not_after_ms }) {
 // instance check and the deadline check run at the last synchronous point before the daemon's final write and nothing
 // can stay pending in a queue or composer: an aterm session reached over its unix socket (one UDS write per attempt,
 // no daemon-side deferred CR). Every other requester state is refused: at mint (M7a) and again at delivery entry.
+// rc-fix6 (maintainer decision 2026-11-22): two more states, each guarded at its own final write.
+//   wrapped — only while the CURRENT owner generation's bridge declared BRIDGE_REPLY_GUARD_CAPABILITY on its owner-WS
+//             handshake (bound by bindImmediateSubmitCapability) and its started child is known (the child_seq the
+//             bridge re-checks). A bridge that did not declare it never receives a capability reply (fail closed).
+//   spawned — the daemon-owned PTY: body write guarded with deadline + headroom, deferred CR guarded with deadline.
+const BRIDGE_REPLY_GUARD_CAPABILITY = 'reply-guard-v1';
 function replyDeliverySupported(session) {
-  return !!session && typeof session === 'object' && session.type === 'aterm' && !session.sshRemote
+  if (!session || typeof session !== 'object' || session.sshRemote) return false;
+  if (session.type === 'spawned') return true;
+  if (session.type === 'wrapped') {
+    return typeof session.replyGuardGeneration === 'string' && session.replyGuardGeneration === session.interactionOwnerGeneration
+      && !!require('./transport/readiness-handshake').observedChild(session);
+  }
+  return session.type === 'aterm'
     && !!session.delivery && session.delivery.transport === 'unix_socket' && !!session.delivery.address;
 }
 
@@ -576,5 +588,5 @@ module.exports = {
   CAPABILITY, RESULT_SCHEMA, SENDER_PROOF, TOKEN_RE, LIMITS, STATES, ERROR_STATUS,
   SUBMIT_QUEUE_TIMEOUT_MS, ACCEPT_MARGIN_MS, REPLY_PREFIX_MAX_BYTES, REPLY_BODY_MAX_BYTES, REQUEST_MAX_BYTES,
   createReplyCapabilityStore, parseToken, validReplyPrefix, replyCapabilityTrailer, buildResult, refusalAnswer,
-  replyDeliverySupported, bodySha256: sha256Hex
+  replyDeliverySupported, BRIDGE_REPLY_GUARD_CAPABILITY, bodySha256: sha256Hex
 };
